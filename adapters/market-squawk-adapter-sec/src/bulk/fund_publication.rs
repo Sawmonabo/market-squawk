@@ -29,8 +29,8 @@ use market_squawk_domain::{
 use market_squawk_platform::{ResearchObjectControl, SealedResearchJournalStore};
 use market_squawk_sources::{
     LogicalItemRange, LogicalPartitionFamily, LogicalPartitionSetAdmission,
-    PendingLogicalPartitionSet, ProviderLogicalTerminalInput, SealedLogicalObjectInput,
-    SealedLogicalPartitionInput, StagedLogicalItemCoordinate,
+    PendingLogicalPartitionSet, ProviderLogicalTerminalInput, SEC_EDGAR_SOURCE_ID,
+    SealedLogicalObjectInput, SealedLogicalPartitionInput, StagedLogicalItemCoordinate,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -45,7 +45,6 @@ use super::{
     SecNportRegistrantRow, SecNportSubmissionRow,
 };
 
-const SEC_SOURCE_ID: &str = "sec-edgar";
 const SEC_FUND_NATIVE_SCHEMA_DOMAIN: &[u8] = b"market-squawk/sec-fund/provider-native-envelope/v1";
 const SEC_FUND_ROW_MAP_SCHEMA_DOMAIN: &[u8] = b"market-squawk/sec-fund/canonical-row-map/v1";
 const SEC_FUND_CANONICAL_PARTITION_DOMAIN: &[u8] = b"market-squawk/sec-fund/canonical-partition/v1";
@@ -517,8 +516,8 @@ fn prepare_selected_fund<A: SecFundIdentityAuthority>(
     })?;
     let source_revision_digest =
         sec_fund_source_revision(&selected.scope, report, terminal_evidence);
-    let source_id =
-        SourceId::try_from(SEC_SOURCE_ID).map_err(|_| SecBulkError::InvalidCanonicalMapping)?;
+    let source_id = SourceId::try_from(SEC_EDGAR_SOURCE_ID)
+        .map_err(|_| SecBulkError::InvalidCanonicalMapping)?;
     let terminal = ProviderLogicalTerminalInput {
         source_id,
         source_revision_digest,
@@ -1067,7 +1066,8 @@ fn filing_identity(
     .map_err(|_| SecBulkError::InvalidCanonicalMapping)?;
     FundFilingIdentity::try_new(
         SchemaVersion::CURRENT,
-        SourceId::try_from(SEC_SOURCE_ID).map_err(|_| SecBulkError::InvalidCanonicalMapping)?,
+        SourceId::try_from(SEC_EDGAR_SOURCE_ID)
+            .map_err(|_| SecBulkError::InvalidCanonicalMapping)?,
         family,
         cik,
         accession,

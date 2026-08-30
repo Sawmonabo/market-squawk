@@ -59,6 +59,12 @@ struct EndpointAuthority {
     path_scope: PathScope,
 }
 
+const SEC_EDGAR_LOGICAL_HOSTS: &[&str] = &["data.sec.gov", "www.sec.gov", "xbrl.sec.gov"];
+const FASB_XBRL_TAXONOMY_LOGICAL_HOSTS: &[&str] = &["fasb.org", "xbrl.fasb.org"];
+const XBRL_US_LEGACY_TAXONOMY_LOGICAL_HOSTS: &[&str] = &["xbrl.us", "taxonomies.xbrl.us"];
+const XBRL_INTERNATIONAL_STANDARDS_LOGICAL_HOSTS: &[&str] = &["www.xbrl.org"];
+const W3C_XML_SCHEMA_STANDARDS_LOGICAL_HOSTS: &[&str] = &["www.w3.org"];
+
 const SEC_EDGAR_ENDPOINTS: &[EndpointAuthority] = &[
     EndpointAuthority {
         base_url: "https://data.sec.gov/submissions",
@@ -108,6 +114,10 @@ const SEC_EDGAR_TAXONOMY_ENDPOINTS: &[EndpointAuthority] = &[
         path_scope: PathScope::Descendants,
     },
     EndpointAuthority {
+        base_url: "https://xbrl.sec.gov/naics",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
         base_url: "https://xbrl.sec.gov/rr",
         path_scope: PathScope::Descendants,
     },
@@ -136,7 +146,11 @@ const SEC_EDGAR_TAXONOMY_ENDPOINTS: &[EndpointAuthority] = &[
         path_scope: PathScope::Descendants,
     },
     EndpointAuthority {
-        base_url: "https://xbrl.sec.gov/state",
+        base_url: "https://xbrl.sec.gov/spac",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://xbrl.sec.gov/srt",
         path_scope: PathScope::Descendants,
     },
     EndpointAuthority {
@@ -241,6 +255,7 @@ pub struct FilingTaxonomySourceAuthority {
     source_id: &'static str,
     rate_scope: &'static str,
     rate_policy_id: &'static str,
+    logical_hosts: &'static [&'static str],
     endpoints: &'static [EndpointAuthority],
     taxonomy_endpoints: &'static [EndpointAuthority],
     request_header_class: FilingTaxonomyRequestHeaderClass,
@@ -329,6 +344,13 @@ impl FilingTaxonomySourceAuthority {
             b"request-header-class",
             self.request_header_class.evidence_label().as_bytes(),
         );
+        for logical_host in self.logical_hosts {
+            hash_field(
+                &mut hasher,
+                b"logical-publisher-host",
+                logical_host.as_bytes(),
+            );
+        }
         hash_field(&mut hasher, b"endpoint-policy", &endpoint_policy);
         hash_field(&mut hasher, b"taxonomy-route-policy", &taxonomy_policy);
         hash_field(&mut hasher, b"budget-policy", &budget_policy);
@@ -416,6 +438,24 @@ impl FilingTaxonomySourceAuthority {
             .map_err(|_| FilingTaxonomyAuthorityLookupError::UnsupportedPhysicalLocator)?;
         Ok(())
     }
+
+    fn owns_logical_host(self, host: &str) -> bool {
+        self.logical_hosts.contains(&host)
+    }
+
+    fn owns_taxonomy_physical_host(
+        self,
+        host: &str,
+    ) -> Result<bool, FilingTaxonomyAuthorityContractError> {
+        for endpoint in self.taxonomy_endpoints {
+            let base = Url::parse(endpoint.base_url)
+                .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidEndpointPolicy)?;
+            if base.host_str() == Some(host) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// SEC-owned EDGAR authority. Its three origins share one aggregate SEC budget.
@@ -423,6 +463,7 @@ pub const SEC_EDGAR_AUTHORITY: FilingTaxonomySourceAuthority = FilingTaxonomySou
     source_id: SEC_EDGAR_SOURCE_ID,
     rate_scope: SEC_EDGAR_RATE_SCOPE,
     rate_policy_id: "sec.edgar-public.aggregate-rate-policy.v1",
+    logical_hosts: SEC_EDGAR_LOGICAL_HOSTS,
     endpoints: SEC_EDGAR_ENDPOINTS,
     taxonomy_endpoints: SEC_EDGAR_TAXONOMY_ENDPOINTS,
     request_header_class: FilingTaxonomyRequestHeaderClass::SecIdentifyingContact,
@@ -438,6 +479,7 @@ pub const FASB_XBRL_TAXONOMY_AUTHORITY: FilingTaxonomySourceAuthority =
         source_id: FASB_XBRL_TAXONOMY_SOURCE_ID,
         rate_scope: FASB_XBRL_TAXONOMY_RATE_SCOPE,
         rate_policy_id: "fasb.xbrl-taxonomy-public.rate-policy.v1",
+        logical_hosts: FASB_XBRL_TAXONOMY_LOGICAL_HOSTS,
         endpoints: FASB_XBRL_TAXONOMY_ENDPOINTS,
         taxonomy_endpoints: FASB_XBRL_TAXONOMY_ENDPOINTS,
         request_header_class: FilingTaxonomyRequestHeaderClass::ProductOnlyNoSecContact,
@@ -453,6 +495,7 @@ pub const XBRL_US_LEGACY_TAXONOMY_AUTHORITY: FilingTaxonomySourceAuthority =
         source_id: XBRL_US_LEGACY_TAXONOMY_SOURCE_ID,
         rate_scope: XBRL_US_LEGACY_TAXONOMY_RATE_SCOPE,
         rate_policy_id: "xbrl-us.legacy-taxonomy-public.rate-policy.v1",
+        logical_hosts: XBRL_US_LEGACY_TAXONOMY_LOGICAL_HOSTS,
         endpoints: XBRL_US_LEGACY_TAXONOMY_ENDPOINTS,
         taxonomy_endpoints: XBRL_US_LEGACY_TAXONOMY_ENDPOINTS,
         request_header_class: FilingTaxonomyRequestHeaderClass::ProductOnlyNoSecContact,
@@ -468,6 +511,7 @@ pub const XBRL_INTERNATIONAL_STANDARDS_AUTHORITY: FilingTaxonomySourceAuthority 
         source_id: XBRL_INTERNATIONAL_STANDARDS_SOURCE_ID,
         rate_scope: XBRL_INTERNATIONAL_STANDARDS_RATE_SCOPE,
         rate_policy_id: "xbrl-international.taxonomy-standards-public.rate-policy.v1",
+        logical_hosts: XBRL_INTERNATIONAL_STANDARDS_LOGICAL_HOSTS,
         endpoints: XBRL_INTERNATIONAL_STANDARDS_ENDPOINTS,
         taxonomy_endpoints: XBRL_INTERNATIONAL_STANDARDS_ENDPOINTS,
         request_header_class: FilingTaxonomyRequestHeaderClass::ProductOnlyNoSecContact,
@@ -483,6 +527,7 @@ pub const W3C_XML_SCHEMA_STANDARDS_AUTHORITY: FilingTaxonomySourceAuthority =
         source_id: W3C_XML_SCHEMA_STANDARDS_SOURCE_ID,
         rate_scope: W3C_XML_SCHEMA_STANDARDS_RATE_SCOPE,
         rate_policy_id: "w3c.xml-schema-standards-public.rate-policy.v1",
+        logical_hosts: W3C_XML_SCHEMA_STANDARDS_LOGICAL_HOSTS,
         endpoints: W3C_XML_SCHEMA_STANDARDS_ENDPOINTS,
         taxonomy_endpoints: W3C_XML_SCHEMA_STANDARDS_ENDPOINTS,
         request_header_class: FilingTaxonomyRequestHeaderClass::ProductOnlyNoSecContact,
@@ -656,27 +701,43 @@ fn validate_physical_locator(
 fn authority_for_logical_host(
     host: Option<&str>,
 ) -> Result<FilingTaxonomySourceAuthority, FilingTaxonomyAuthorityLookupError> {
-    match host {
-        Some("data.sec.gov" | "www.sec.gov" | "xbrl.sec.gov") => Ok(SEC_EDGAR_AUTHORITY),
-        Some("fasb.org" | "xbrl.fasb.org") => Ok(FASB_XBRL_TAXONOMY_AUTHORITY),
-        Some("xbrl.us" | "taxonomies.xbrl.us") => Ok(XBRL_US_LEGACY_TAXONOMY_AUTHORITY),
-        Some("www.xbrl.org") => Ok(XBRL_INTERNATIONAL_STANDARDS_AUTHORITY),
-        Some("www.w3.org") => Ok(W3C_XML_SCHEMA_STANDARDS_AUTHORITY),
-        _ => Err(FilingTaxonomyAuthorityLookupError::UnsupportedLogicalLocator),
-    }
+    let host = host.ok_or(FilingTaxonomyAuthorityLookupError::UnsupportedLogicalLocator)?;
+    unique_authority_matching(
+        |authority| Ok(authority.owns_logical_host(host)),
+        FilingTaxonomyAuthorityLookupError::UnsupportedLogicalLocator,
+    )
 }
 
 fn authority_for_physical_host(
     host: Option<&str>,
 ) -> Result<FilingTaxonomySourceAuthority, FilingTaxonomyAuthorityLookupError> {
-    match host {
-        Some("data.sec.gov" | "www.sec.gov" | "xbrl.sec.gov") => Ok(SEC_EDGAR_AUTHORITY),
-        Some("xbrl.fasb.org") => Ok(FASB_XBRL_TAXONOMY_AUTHORITY),
-        Some("taxonomies.xbrl.us") => Ok(XBRL_US_LEGACY_TAXONOMY_AUTHORITY),
-        Some("www.xbrl.org") => Ok(XBRL_INTERNATIONAL_STANDARDS_AUTHORITY),
-        Some("www.w3.org") => Ok(W3C_XML_SCHEMA_STANDARDS_AUTHORITY),
-        _ => Err(FilingTaxonomyAuthorityLookupError::UnsupportedPhysicalLocator),
+    let host = host.ok_or(FilingTaxonomyAuthorityLookupError::UnsupportedPhysicalLocator)?;
+    unique_authority_matching(
+        |authority| {
+            authority
+                .owns_taxonomy_physical_host(host)
+                .map_err(|_| FilingTaxonomyAuthorityLookupError::InvalidAuthorityContract)
+        },
+        FilingTaxonomyAuthorityLookupError::UnsupportedPhysicalLocator,
+    )
+}
+
+fn unique_authority_matching(
+    mut predicate: impl FnMut(
+        FilingTaxonomySourceAuthority,
+    ) -> Result<bool, FilingTaxonomyAuthorityLookupError>,
+    unsupported: FilingTaxonomyAuthorityLookupError,
+) -> Result<FilingTaxonomySourceAuthority, FilingTaxonomyAuthorityLookupError> {
+    let mut selected = None;
+    for authority in FILING_TAXONOMY_SOURCE_AUTHORITIES {
+        if predicate(authority)? {
+            if selected.is_some() {
+                return Err(FilingTaxonomyAuthorityLookupError::InvalidAuthorityContract);
+            }
+            selected = Some(authority);
+        }
     }
+    selected.ok_or(unsupported)
 }
 
 fn has_explicit_port(locator: &str) -> bool {

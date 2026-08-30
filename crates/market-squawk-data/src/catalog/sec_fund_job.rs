@@ -6,6 +6,7 @@ use std::time::Instant;
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, FundSourceFamily, InstrumentId, SourceIdentifier, Timestamp,
 };
+use market_squawk_sources::SEC_EDGAR_SOURCE_ID;
 use rusqlite::{Connection, OptionalExtension as _, params};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -20,7 +21,6 @@ use crate::{
 };
 
 pub(crate) const SEC_FUND_DATASET_ID: &str = "sec.fund-holdings.v1";
-const SEC_FUND_SOURCE_ID: &str = "sec-edgar";
 const SQLITE_PROGRESS_OPERATIONS: i32 = 1_000;
 
 /// Maximum equally-new durable SEC fund publications retained in one selector outcome.
@@ -1041,7 +1041,7 @@ impl Catalog {
                     coordinate.job_id.to_string(),
                     to_i64(coordinate.generation)?,
                     digest_bytes(coordinate.admitted_request_digest),
-                    SEC_FUND_SOURCE_ID,
+                    SEC_EDGAR_SOURCE_ID,
                 ],
                 |row| {
                     Ok((

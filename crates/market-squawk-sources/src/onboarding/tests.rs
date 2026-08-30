@@ -1478,6 +1478,11 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
             SEC_EDGAR_SOURCE_ID,
         ),
         (
+            "https://xbrl.sec.gov/srt/2025/srt-2025.xsd",
+            "https://xbrl.sec.gov/srt/2025/srt-2025.xsd",
+            SEC_EDGAR_SOURCE_ID,
+        ),
+        (
             "http://fasb.org/us-gaap/2025",
             "https://xbrl.fasb.org/us-gaap/2025/us-gaap-2025.xsd",
             FASB_XBRL_TAXONOMY_SOURCE_ID,
