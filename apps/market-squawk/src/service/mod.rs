@@ -447,7 +447,7 @@ impl InstalledService {
             config,
             installation_paths,
             logs,
-            InstalledSecretBackendPolicy::PlatformKeyring,
+            InstalledSecretBackendPolicy::EncryptedFileOnly,
         )
         .await
     }
@@ -462,7 +462,7 @@ impl InstalledService {
             config,
             installation_paths,
             logs,
-            InstalledSecretBackendPolicy::PlatformKeyring,
+            InstalledSecretBackendPolicy::EncryptedFileOnly,
         )
         .await
     }
@@ -523,7 +523,7 @@ impl InstalledService {
             secret_store,
             logs,
             false,
-            InstalledSecretBackendPolicy::PlatformKeyring,
+            InstalledSecretBackendPolicy::EncryptedFileOnly,
         )
         .await
     }
@@ -549,7 +549,7 @@ impl InstalledService {
             workspace_paths,
             secret_store,
             logs,
-            InstalledSecretBackendPolicy::PlatformKeyring,
+            InstalledSecretBackendPolicy::EncryptedFileOnly,
             board_fixture,
         )
         .await

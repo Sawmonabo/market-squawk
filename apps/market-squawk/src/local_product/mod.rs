@@ -605,7 +605,7 @@ impl LocalProduct {
             registrations,
             SourceAuthorityStartupPolicy::RejectUncleanPredecessor,
             None,
-            InstalledSecretBackendPolicy::PlatformKeyring,
+            InstalledSecretBackendPolicy::EncryptedFileOnly,
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
             None,
         )
