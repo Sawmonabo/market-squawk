@@ -9,12 +9,12 @@ import {
 } from "lucide-react"
 import { useSearchParams } from "react-router-dom"
 
-import { useProduct, useSystem } from "@/app/product-context"
+import { useProduct } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
-import { useAnalyticalControllerStatus } from "@/features/advanced/use-analytical-profile"
+import { useAnalyticalProductProjection } from "@/features/advanced/use-analytical-profile"
 import { hasProductCapability } from "@/lib/product-capabilities"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -49,7 +49,6 @@ export function OpportunitiesReadExperience({
   const [selectedActionToken, setSelectedActionToken] = useState<string | null>(null)
   const [searchParams] = useSearchParams()
   const product = useProduct()
-  const system = useSystem()
   const requestedScreenValue = searchParams.get("screenId")
   const requestedScreenId = admittedSavedScreenId(requestedScreenValue)
   const screenReadAvailable =
@@ -74,7 +73,7 @@ export function OpportunitiesReadExperience({
       requestedScreenId !== null &&
       screenReadAvailable,
   })
-  const controller = useAnalyticalControllerStatus(system.transport, scope)
+  const profile = useAnalyticalProductProjection(transport, scope)
   const analyses = useInfiniteQuery({
     queryKey: productKeys.operation(
       scope,
@@ -197,11 +196,9 @@ export function OpportunitiesReadExperience({
             id="find-opportunities-readiness"
             className="mt-2 text-xs leading-5 text-muted-foreground"
           >
-            {controller.data
-              ? `${controller.data.activeProfile.displayName} is active. Opportunity finding will be available when the required research is ready.`
-              : controller.isError
-                ? "Analysis readiness could not be checked. Try again later."
-                : "Checking whether opportunity finding is ready."}
+            {profile.data
+              ? `${profile.data.label} settings are active. ${profile.data.nextAction}`
+              : "Review saved investment analyses, or try again later."}
           </p>
         </div>
       </header>

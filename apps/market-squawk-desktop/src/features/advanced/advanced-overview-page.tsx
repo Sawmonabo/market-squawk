@@ -9,14 +9,14 @@ import {
 } from "lucide-react"
 import { Link } from "react-router-dom"
 
-import { useSystem } from "@/app/product-context"
+import { useProduct } from "@/app/product-context"
 import type { ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Skeleton } from "@/components/ui/skeleton"
 import { formatUnixNanos } from "@/features/opportunities/format"
-import type { SystemTransport } from "@/lib/transport"
+import type { ProductTransport } from "@/lib/transport"
 
-import { useAnalyticalControllerStatus } from "./use-analytical-profile"
+import { useAnalyticalProductProjection } from "./use-analytical-profile"
 
 const workspaces = [
   {
@@ -52,11 +52,11 @@ const workspaces = [
 ]
 
 export function AdvancedOverviewPage() {
-  const system = useSystem()
-  if (system.status === "loading") {
+  const product = useProduct()
+  if (product.status === "loading") {
     return <AdvancedLoading />
   }
-  if (system.status !== "ready") {
+  if (product.status !== "ready") {
     return (
       <main className="mx-auto w-full max-w-[1180px] px-4 py-6 sm:px-6 lg:px-8">
         <Alert variant="destructive">
@@ -71,8 +71,8 @@ export function AdvancedOverviewPage() {
   }
   return (
     <ReadyAdvancedOverview
-      transport={system.transport}
-      scope={system.bootstrap.productSessionToken}
+      transport={product.transport}
+      scope={product.bootstrap.productSessionToken}
     />
   )
 }
@@ -81,10 +81,10 @@ function ReadyAdvancedOverview({
   transport,
   scope,
 }: {
-  transport: SystemTransport
+  transport: ProductTransport
   scope: ProductScope
 }) {
-  const controller = useAnalyticalControllerStatus(transport, scope)
+  const profile = useAnalyticalProductProjection(transport, scope)
 
   return (
     <main className="mx-auto w-full max-w-[1180px] px-4 py-6 sm:px-6 lg:px-8">
@@ -100,7 +100,7 @@ function ReadyAdvancedOverview({
         </p>
       </header>
 
-      <AnalyticalProfileStatus query={controller} />
+      <AnalyticalProfileStatus query={profile} />
 
       <section className="mt-6" aria-labelledby="advanced-workspaces">
         <div className="flex items-center gap-2">
@@ -130,7 +130,7 @@ function ReadyAdvancedOverview({
 function AnalyticalProfileStatus({
   query,
 }: {
-  query: ReturnType<typeof useAnalyticalControllerStatus>
+  query: ReturnType<typeof useAnalyticalProductProjection>
 }) {
   if (query.isPending) {
     return <Skeleton className="mt-6 h-40 w-full rounded-xl" />
@@ -147,8 +147,7 @@ function AnalyticalProfileStatus({
     )
   }
 
-  const status = query.data
-  const active = status.activeProfile
+  const active = query.data
   return (
     <section
       className="mt-6 rounded-xl border border-border bg-card/45 p-5"
@@ -157,25 +156,25 @@ function AnalyticalProfileStatus({
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
-            Active analytical profile
+            Analysis settings
           </p>
           <h2 id="advanced-profile-status" className="mt-2 text-lg font-semibold">
-            {active.displayName}
+            {active.label}
           </h2>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            {active.kind === "default"
-              ? "Market Squawk's recommended analysis settings are active. You can compare and validate custom settings without changing earlier results."
+            {active.kind === "recommended"
+              ? "Market Squawk's recommended analysis settings are active. Earlier results keep the settings used when they were created."
               : "Your validated custom analysis settings are active. Earlier results continue to reflect the settings used when they were created."}
           </p>
         </div>
         <span className="rounded-full border border-border bg-background/40 px-2.5 py-1 text-[10px] uppercase tracking-wider text-muted-foreground">
-          {active.kind === "default" ? "Default" : "Custom"}
+          {active.kind === "recommended" ? "Recommended" : "Custom"}
         </span>
       </div>
       <dl className="mt-4 grid gap-3 border-t border-border/70 pt-4 sm:grid-cols-3">
         <ProfileFact
           label="Settings"
-          value={active.kind === "default" ? "Recommended" : "Custom"}
+          value={active.kind === "recommended" ? "Recommended" : "Custom"}
         />
         <ProfileFact label="Status" value="Active" />
         <ProfileFact label="Activated" value={formatUnixNanos(active.activatedAt)} />
@@ -184,32 +183,14 @@ function AnalyticalProfileStatus({
       <div className="mt-5 flex gap-3 rounded-lg border border-amber-400/25 bg-amber-400/5 p-4">
         <CircleAlert className="mt-0.5 size-4 shrink-0 text-amber-300" aria-hidden="true" />
         <div>
-          <h3 className="text-sm font-semibold">Find and Analyze are not ready yet</h3>
+          <h3 className="text-sm font-semibold">New analysis is unavailable</h3>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            Market Squawk will wait until the required investment information and analysis tools
-            are ready. This prevents incomplete information from being presented as investment
-            guidance.
+            {active.nextAction}
           </p>
-          <ul className="mt-3 space-y-2 text-xs leading-5 text-muted-foreground">
-            {status.workflowReadiness.blockers.map((blocker) => (
-              <li key={blocker.code}>• {readinessMessage(blocker.code)}</li>
-            ))}
-          </ul>
         </div>
       </div>
     </section>
   )
-}
-
-function readinessMessage(code: string) {
-  switch (code) {
-    case "canonical_data_and_backend_composition_required":
-      return "The investment information needed for a complete analysis is still being prepared."
-    case "desktop_start_resume_not_registered":
-      return "Starting or resuming an analysis is not available in the app yet."
-    default:
-      return "A required analysis capability is not ready yet."
-  }
 }
 
 function ProfileFact({ label, value }: { label: string; value: string }) {

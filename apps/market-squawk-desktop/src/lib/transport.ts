@@ -69,6 +69,7 @@ export type ProductQuery =
       categories?: ProductLookupCategory[]
     }
   | { query: "marketOverview"; pageToken?: string }
+  | { query: "analysisSettings" }
   | { query: "marketUniverse"; text: string; pageToken?: string }
   | {
       query: "marketInstrument"

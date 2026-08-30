@@ -113,7 +113,10 @@ class TauriTransport implements ProductTransport, SystemTransport {
   }
 
   async query(request: ProductQuery) {
-    const value = await invoke("dashboard_query", { request })
+    const value =
+      request.query === "analysisSettings"
+        ? await invoke("analytical_product")
+        : await invoke("dashboard_query", { request })
     return applicationResultSchema.parse(value)
   }
 

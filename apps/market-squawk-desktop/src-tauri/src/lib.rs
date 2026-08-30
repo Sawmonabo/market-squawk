@@ -31,7 +31,7 @@ mod mcp_clients;
 mod service;
 mod service_client;
 
-use analytical_controller::analytical_controller;
+use analytical_controller::{analytical_controller, analytical_product};
 use bridge::{
     DesktopBootstrapState, DesktopCompositionContext, DesktopState, desktop_bootstrap,
     desktop_service_bootstrap, desktop_service_reconnect, installation_control,
@@ -266,6 +266,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         .manage(DesktopEventSubscriptions::default())
         .invoke_handler(tauri::generate_handler![
             analytical_controller,
+            analytical_product,
             analysis_control,
             backtest_products,
             commit_research_file_import,

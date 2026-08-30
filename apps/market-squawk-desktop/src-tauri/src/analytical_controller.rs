@@ -3,7 +3,9 @@
 //! This module owns only the opinionated Desktop composition boundary. Financial calculations,
 //! evidence admission, recommendation generation, and immutable domain results remain owned by
 //! the installed application service. Until those pure capabilities are composed end to end, this
-//! controller exposes a truthful blocked state and no Find/Analyze start command.
+//! controller exposes a truthful unavailable state and no Find/Analyze start command. Ordinary
+//! product pages receive only the closed investment-facing projection defined in this module;
+//! controller authority remains reserved for System, Settings, and Diagnostics.
 
 use std::{
     collections::HashSet,
@@ -32,6 +34,8 @@ const MAXIMUM_CHECKPOINTS_PER_RUN: usize = 64;
 const MAXIMUM_CHILD_REFERENCES_PER_RUN: usize = 64;
 const MAXIMUM_RESULT_REFERENCES_PER_RUN: usize = 128;
 const DEFAULT_PROFILE_NAMESPACE: Uuid = Uuid::from_u128(0xd446_3dc7_70cf_56de_a09c_682b_e6d3_4691);
+const UNAVAILABLE_WORKFLOW_NEXT_ACTION: &str =
+    "Review saved investment analyses, or try again later.";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
@@ -888,6 +892,24 @@ impl DesktopAnalyticalController {
         })
     }
 
+    fn product_projection(&self) -> Result<AnalyticalProductProjection, DesktopCommandError> {
+        let document = self.lock_document()?;
+        let active = &document.active_profile;
+        Ok(AnalyticalProductProjection {
+            label: match active.kind {
+                AnalyticalProfileKind::Default => "Recommended analysis".to_owned(),
+                AnalyticalProfileKind::Custom => active.display_name.clone(),
+            },
+            kind: match active.kind {
+                AnalyticalProfileKind::Default => AnalyticalProductKind::Recommended,
+                AnalyticalProfileKind::Custom => AnalyticalProductKind::Custom,
+            },
+            activated_at: active.activated_at.clone(),
+            workflow_availability: AnalyticalWorkflowAvailability::Unavailable,
+            next_action: UNAVAILABLE_WORKFLOW_NEXT_ACTION,
+        })
+    }
+
     fn copy_default(
         &self,
         display_name: String,
@@ -1258,6 +1280,29 @@ impl DesktopAnalyticalController {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
+enum AnalyticalProductKind {
+    Recommended,
+    Custom,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AnalyticalWorkflowAvailability {
+    Unavailable,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalyticalProductProjection {
+    label: String,
+    kind: AnalyticalProductKind,
+    activated_at: String,
+    workflow_availability: AnalyticalWorkflowAvailability,
+    next_action: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum WorkflowReadinessState {
     Blocked,
 }
@@ -1416,6 +1461,25 @@ pub(crate) async fn analytical_controller(
         .dispatch(request, confirmed)?;
     state.admit_current(&generation)?;
     serde_json::to_value(response).map_err(|_error| DesktopCommandError::internal())
+}
+
+#[tauri::command]
+pub(crate) async fn analytical_product(
+    state: State<'_, crate::bridge::DesktopState>,
+) -> Result<serde_json::Value, DesktopCommandError> {
+    let generation = state.generation()?;
+    let _fence = generation.analytical_retirement_fence().await;
+    state.admit_current(&generation)?;
+    let response = generation.analytical_controller().product_projection()?;
+    state.admit_current(&generation)?;
+    Ok(serde_json::json!({
+        "data": response,
+        "metadata": {
+            "completeness": "complete",
+            "returnedItems": 1,
+            "availableItems": 1,
+        },
+    }))
 }
 
 fn valid_validation_receipt(receipt: &ProfileValidationReceipt) -> bool {

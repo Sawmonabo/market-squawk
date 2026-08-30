@@ -17,6 +17,16 @@ const unsignedIntegerSchema = z.string().regex(/^(?:0|[1-9]\d*)$/)
 const positiveIntegerSchema = z.string().regex(/^[1-9]\d*$/)
 const nonemptyIdentitySchema = z.string().min(1).max(128)
 
+export const analyticalProductProjectionSchema = z
+  .object({
+    label: z.string().min(1).max(64),
+    kind: z.enum(["recommended", "custom"]),
+    activatedAt: unsignedIntegerSchema,
+    workflowAvailability: z.literal("unavailable"),
+    nextAction: z.string().min(1).max(256),
+  })
+  .strict()
+
 const profileComponentBindingSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("default_required") }).strict(),
   z
@@ -324,6 +334,9 @@ export const analyticalControllerResponseSchema = z.discriminatedUnion("kind", [
 
 export type AnalyticalProfileConfig = z.infer<
   typeof analyticalProfileConfigSchema
+>
+export type AnalyticalProductProjection = z.infer<
+  typeof analyticalProductProjectionSchema
 >
 export type AnalyticalControllerStatus = z.infer<
   typeof analyticalControllerStatusSchema
