@@ -199,22 +199,6 @@ pub(crate) struct ApplicationInvocation {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub(crate) struct FredAlfredImmutableGeneration {
-    pub(crate) manifest_version: String,
-    pub(crate) schema: FredAlfredSchemaIdentity,
-    pub(crate) content_hash: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub(crate) struct FredAlfredSchemaIdentity {
-    pub(crate) name: String,
-    pub(crate) version: u16,
-    pub(crate) fingerprint: String,
-}
-
-#[derive(Debug, Deserialize)]
 #[serde(
     deny_unknown_fields,
     rename_all = "camelCase",
@@ -223,15 +207,9 @@ pub(crate) struct FredAlfredSchemaIdentity {
 )]
 pub(crate) enum DashboardQueryCommand {
     Overview,
-    MacroDashboard {
-        provider: String,
-        release: String,
-    },
-    FredAlfredLatestKnownStatus,
-    FredAlfredLatestKnownRead {
-        generation: FredAlfredImmutableGeneration,
-        knowledge_cutoff: String,
-        effective_date_cutoff: String,
+    MacroContext {
+        knowledge_cutoff: Option<String>,
+        effective_date_cutoff: Option<String>,
     },
     Lookup {
         text: String,

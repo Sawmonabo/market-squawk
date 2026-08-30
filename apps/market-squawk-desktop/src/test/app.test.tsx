@@ -369,30 +369,6 @@ function localRead(
   }
 }
 
-function macroDashboardRead(): DesktopBootstrap["operations"][number] {
-  return {
-    name: "Macro.GetDashboard",
-    description: "Return the exact stored H.15 dashboard publication.",
-    domain: "macro",
-    authorization: "read_only",
-    readOnly: true,
-    destructive: false,
-    inputSchema: {
-      type: "object",
-      properties: {
-        resultLimits: resultLimitsInputSchema,
-        provider: {
-          type: "string",
-          enum: ["federal-reserve-board.data-download-program"],
-        },
-        release: { type: "string", enum: ["h15"] },
-      },
-      required: ["resultLimits", "provider", "release"],
-      additionalProperties: false,
-    },
-  }
-}
-
 function sourceStatusRead(): DesktopBootstrap["operations"][number] {
   return {
     name: "Source.GetStatus",
@@ -506,81 +482,6 @@ function recommendationTrackRecordRead(): DesktopBootstrap["operations"][number]
       additionalProperties: false,
     },
   }
-}
-
-const h15DashboardData = {
-  schemaIdentity: "market-squawk-macro-dashboard/v1",
-  binding: {
-    surfaceId: "federal-reserve-board.data-download-program",
-    sourceId: "federal-reserve-board-ddp",
-    providerDatasetId:
-      "federal-reserve-board:h15:h15-treasury-constant-maturities:339413969849b22570e106bc02f2a86916f18345b8bb907b86147e69fe0a037f",
-    analyticalDatasetId:
-      "federal-reserve-board.h15.h15-treasury-constant-maturities.339413969849b22570e106bc02f2a86916f18345b8bb907b86147e69fe0a037f",
-    manifest: {
-      datasetId:
-        "federal-reserve-board.h15.h15-treasury-constant-maturities.339413969849b22570e106bc02f2a86916f18345b8bb907b86147e69fe0a037f",
-      manifestVersion: "3",
-      schema: {
-        name: "market-squawk-research-v3",
-        version: 3,
-        fingerprint: "1".repeat(64),
-      },
-      contentHash: "2".repeat(64),
-    },
-    objectGraphDigest: "3".repeat(64),
-    queryIdentity: "4".repeat(64),
-    resultDigest: "5".repeat(64),
-  },
-  release: {
-    code: "H15",
-    title: "H.15 Selected Interest Rates",
-    family: "h15-treasury-constant-maturities",
-    frequency: "business_daily",
-    quality: "official_delayed",
-  },
-  selection: {
-    policy: "latest_known_by_series_as_of_cutoff_v1",
-    evaluatedAt: "2026-08-11T20:30:00Z",
-    selectionDigest: "7".repeat(64),
-    returnedSeries: 11,
-    availableSeries: 10,
-    missingSeries: 1,
-    complete: true,
-  },
-  observations: [
-    ["1m", "1 Month", "RIFLGFCM01_N.B"],
-    ["3m", "3 Month", "RIFLGFCM03_N.B"],
-    ["6m", "6 Month", "RIFLGFCM06_N.B"],
-    ["1y", "1 Year", "RIFLGFCY01_N.B"],
-    ["2y", "2 Year", "RIFLGFCY02_N.B"],
-    ["3y", "3 Year", "RIFLGFCY03_N.B"],
-    ["5y", "5 Year", "RIFLGFCY05_N.B"],
-    ["7y", "7 Year", "RIFLGFCY07_N.B"],
-    ["10y", "10 Year", "RIFLGFCY10_N.B"],
-    ["20y", "20 Year", "RIFLGFCY20_N.B"],
-    ["30y", "30 Year", "RIFLGFCY30_N.B"],
-  ].map(([slot, label, providerSeriesName], index) => ({
-    slot,
-    label,
-    maturityOrder: index + 1,
-    seriesId: `federal-reserve-board:h15:H15%2FH15%2F${providerSeriesName}`,
-    unitId: "federal-reserve-board-unit:Percent%3A_Per_Year:multiplier:1",
-    unitPresentation: "percent_per_year",
-    effectiveDate: "2026-08-11",
-    availableAt: "2026-08-11T20:25:00Z",
-    revision: 1,
-    observation:
-      slot === "20y"
-        ? {
-            state: "missing",
-            marker: "ND",
-            reason: "Provider reported no observation for this date.",
-          }
-        : { state: "observed", decimal: index === 0 ? "4.25" : "4.5" },
-    sourceIdentifier: `frb-ddp:h15:${providerSeriesName}:2026-08-11`,
-    sourcePayloadDigest: "6".repeat(64),
-  })),
 }
 
 const h15ProviderProfile: DesktopBootstrap["providerProfiles"][number] = {
@@ -990,243 +891,6 @@ function alpacaLifecycleResult(
   }
   parseSourceLifecycleReceipt(result, action, request)
   return result
-}
-
-const h15DashboardResult: ApplicationResult = {
-  data: h15DashboardData,
-  metadata: {
-    completeness: "complete",
-    returnedItems: 11,
-    availableItems: 11,
-    sourceCoverage: {
-      status: "complete",
-      providers: ["federal-reserve-board.data-download-program"],
-    },
-    dataQuality: { status: "official_delayed" },
-  },
-}
-
-const refreshedH15DashboardResult: ApplicationResult = {
-  data: {
-    ...h15DashboardData,
-    binding: {
-      ...h15DashboardData.binding,
-      manifest: {
-        ...h15DashboardData.binding.manifest,
-        manifestVersion: "4",
-        contentHash: "8".repeat(64),
-      },
-      resultDigest: "9".repeat(64),
-    },
-    selection: {
-      ...h15DashboardData.selection,
-      evaluatedAt: "2026-08-12T20:30:00Z",
-      selectionDigest: "a".repeat(64),
-    },
-    observations: h15DashboardData.observations.map((observation, index) =>
-      index === 0
-        ? {
-            ...observation,
-            effectiveDate: "2026-08-12",
-            availableAt: "2026-08-12T20:25:00Z",
-            observation: { state: "observed", decimal: "4.35" },
-            sourceIdentifier: "frb-ddp:h15:RIFLGFCM01_N.B:2026-08-12",
-            sourcePayloadDigest: "b".repeat(64),
-          }
-        : observation,
-    ),
-  },
-  metadata: h15DashboardResult.metadata,
-}
-
-const fredAlfredGeneration = {
-  manifestVersion: "7",
-  schema: {
-    name: "market-squawk-research-v3",
-    version: 3,
-    fingerprint: "c".repeat(64),
-  },
-  contentHash: "d".repeat(64),
-}
-
-const fredAlfredProviderBinding = {
-  surfaceId: "fred-alfred.api-v1-v2",
-  providerDatasetId:
-    "fred:series-observations:UNRATE:1776-07-04:9999-12-31",
-  analyticalDatasetId: "fred.unrate.latest-known",
-}
-
-function fredAlfredStatus(
-  state: "setup_required" | "unavailable" | "ready",
-): ApplicationResult {
-  if (state === "setup_required") {
-    return {
-      data: {
-        schemaIdentity: "market-squawk-fred-alfred-operation/v1",
-        operation: "Macro.GetFredAlfredLatestKnown",
-        state,
-        reason: "desired_activation_absent",
-      },
-      metadata: {
-        completeness: "complete",
-        returnedItems: 0,
-        availableItems: 0,
-        sourceCoverage: {
-          operation: "Macro.GetFredAlfredLatestKnown",
-          surfaceId: "fred-alfred.api-v1-v2",
-          state,
-          configured: false,
-        },
-        dataQuality: {
-          classification: "unavailable",
-          reason: "desired_activation_absent",
-          manifestPinned: false,
-          executionEligible: false,
-        },
-      },
-    }
-  }
-
-  if (state === "unavailable") {
-    return {
-      data: {
-        schemaIdentity: "market-squawk-fred-alfred-operation/v1",
-        operation: "Macro.GetFredAlfredLatestKnown",
-        state,
-        reason: "exact_provider_dataset_absent",
-      },
-      metadata: {
-        completeness: "complete",
-        returnedItems: 0,
-        availableItems: 0,
-        sourceCoverage: {
-          operation: "Macro.GetFredAlfredLatestKnown",
-          surfaceId: "fred-alfred.api-v1-v2",
-          state,
-          configured: true,
-          datasetState: "unbound",
-        },
-        dataQuality: {
-          classification: "unavailable",
-          reason: "exact_provider_dataset_absent",
-          manifestPinned: false,
-          executionEligible: false,
-        },
-      },
-    }
-  }
-
-  return {
-    data: {
-      schemaIdentity: "market-squawk-fred-alfred-operation/v1",
-      operation: "Macro.GetFredAlfredLatestKnown",
-      state,
-      binding: fredAlfredProviderBinding,
-      generation: fredAlfredGeneration,
-    },
-    metadata: {
-      completeness: "complete",
-      returnedItems: 0,
-      availableItems: 0,
-      sourceCoverage: {
-        operation: "Macro.GetFredAlfredLatestKnown",
-        state,
-        binding: fredAlfredProviderBinding,
-        generation: fredAlfredGeneration,
-      },
-      dataQuality: {
-        classification: "manifest_bound_not_read",
-        manifestPinned: true,
-        executionEligible: false,
-        executionEligibility: "research_only_execution_ineligible",
-      },
-    },
-  }
-}
-
-function fredAlfredReadResult(
-  request: {
-    knowledgeCutoff: string
-    effectiveDateCutoff: string
-  },
-  changedGeneration: "outer" | "inner" | null,
-): ApplicationResult {
-  const changed = {
-    ...fredAlfredGeneration,
-    contentHash: "e".repeat(64),
-  }
-  const outerGeneration =
-    changedGeneration === "outer" ? changed : fredAlfredGeneration
-  const innerGeneration =
-    changedGeneration === "inner" ? changed : fredAlfredGeneration
-  const selection = {
-    policy: "latest_known_by_series_as_of_cutoff_v1",
-    knowledgeCutoff: request.knowledgeCutoff,
-    effectiveDateCutoff: request.effectiveDateCutoff,
-    evaluatedAt: request.knowledgeCutoff,
-    selectionDigest: "4".repeat(64),
-    complete: true,
-  }
-  const binding = {
-    provider: {
-      ...fredAlfredProviderBinding,
-      sourceId: "fred-fred-alfred.api-v1-v2",
-      seriesId: "UNRATE",
-    },
-    manifest: {
-      datasetId: fredAlfredProviderBinding.analyticalDatasetId,
-      ...innerGeneration,
-    },
-    objectGraphDigest: "5".repeat(64),
-    queryIdentity: "6".repeat(64),
-    resultDigest: "7".repeat(64),
-  }
-  return {
-    data: {
-      schemaIdentity: "market-squawk-fred-alfred-operation/v1",
-      operation: "Macro.GetFredAlfredLatestKnown",
-      state: "ready",
-      generation: outerGeneration,
-      result: {
-        schemaIdentity: "market-squawk-fred-alfred-point-in-time/v1",
-        binding,
-        selection,
-        observation: {
-          seriesId: "UNRATE",
-          unitId: "fred-unit:v1:percent",
-          effectiveDate: "2026-08-20",
-          publishedVintage: "2026-08-21",
-          supersededAfter: null,
-          availableAt: "2026-08-21T12:00:00Z",
-          receivedAt: "2026-08-21T12:00:00Z",
-          ingestedAt: "2026-08-21T12:01:00Z",
-          revision: 2,
-          value: { state: "observed", decimal: "4.875" },
-          sourceIdentifier: "fred:UNRATE:2026-08-20:2026-08-21",
-          rawPageDigest: "8".repeat(64),
-          quality: "official_delayed",
-        },
-      },
-    },
-    metadata: {
-      completeness: "complete",
-      returnedItems: 1,
-      availableItems: 1,
-      sourceCoverage: {
-        operation: "Macro.GetFredAlfredLatestKnown",
-        binding,
-        selection,
-      },
-      dataQuality: {
-        classification: "official_delayed_point_in_time",
-        recordLevelProvenance: true,
-        manifestPinned: true,
-        selectionComplete: true,
-        executionEligible: false,
-        executionEligibility: "research_only_execution_ineligible",
-      },
-    },
-  }
 }
 
 const inactiveH15SourceStatus: ApplicationResult = {
@@ -1924,6 +1588,84 @@ const marketInstrumentResult = marketResult({
   },
 })
 
+const macroKnowledgeCutoff = "2026-08-28T14:30:00Z"
+const macroEffectiveDateCutoff = "2026-08-27"
+const macroIndicatorDefinitions = [
+  ["us-government-yield-1m", "1-month government yield", "4.32"],
+  ["us-government-yield-3m", "3-month government yield", "4.28"],
+  ["us-government-yield-6m", "6-month government yield", "4.18"],
+  ["us-government-yield-1y", "1-year government yield", "4.02"],
+  ["us-government-yield-2y", "2-year government yield", "3.88"],
+  ["us-government-yield-3y", "3-year government yield", "3.82"],
+  ["us-government-yield-5y", "5-year government yield", "3.86"],
+  ["us-government-yield-7y", "7-year government yield", "3.98"],
+  ["us-government-yield-10y", "10-year government yield", "4.12"],
+  ["us-government-yield-20y", "20-year government yield", "4.48"],
+  ["us-government-yield-30y", "30-year government yield", "4.39"],
+  ["us-unemployment-rate", "Unemployment rate", "4.2"],
+] as const
+
+function macroContextResult(cutoffs = {
+  knowledgeCutoff: macroKnowledgeCutoff,
+  effectiveDateCutoff: macroEffectiveDateCutoff,
+}): ApplicationResult {
+  return {
+    data: {
+      schemaIdentity: "market-squawk-macro-context/v1",
+      availability: "available",
+      selection: {
+        ...cutoffs,
+        evaluatedAt: "2026-08-28T14:30:01Z",
+        complete: true,
+      },
+      confidence: {
+        level: "moderate",
+        summary: "All requested economic indicators are available for the selected dates.",
+      },
+      coverage: {
+        requested: 12,
+        observed: 12,
+        missing: 0,
+        unavailable: 0,
+      },
+      observations: macroIndicatorDefinitions.map(
+        ([indicatorId, label, decimal], index) => ({
+          indicatorId,
+          label,
+          category: index < 11 ? "interest_rates" : "labor_market",
+          frequency: index < 11 ? "business_daily" : "monthly",
+          seasonalAdjustment:
+            index < 11 ? "not_applicable" : "seasonally_adjusted",
+          unit: {
+            code:
+              index < 11 ? "percent_per_year" : "percent_of_labor_force",
+            label: index < 11 ? "Percent per year" : "Percent of labor force",
+            symbol: "%",
+          },
+          effectiveDate: index < 11 ? "2026-08-27" : "2026-07-01",
+          recorded: { state: "known", date: "2026-08-27" },
+          availableAt: "2026-08-28T12:00:00Z",
+          revision: 1,
+          supersededAfter: null,
+          value: { state: "observed", decimal },
+          availability: "available",
+          confidence: {
+            level: "moderate",
+            summary: "Available for the selected dates.",
+          },
+        }),
+      ),
+    },
+    metadata: {
+      completeness: "complete",
+      returnedItems: 12,
+      availableItems: 12,
+      sourceCoverage: { status: "complete" },
+      dataQuality: { status: "current" },
+    },
+  }
+}
+
 const portfolioAccountId = "55e7626c-81c8-4e78-8aa6-45a1d9c2949a"
 const heldInstrumentId = "7e8299e7-9757-4441-926f-d0b22c767a65"
 const candidateInstrumentId = "0467d4c9-befd-5b7d-b4b5-99b673662c86"
@@ -2207,6 +1949,89 @@ describe("Market Squawk desktop boundary", () => {
     expect(renderedText).not.toMatch(/\bticks?\b|\blots?\b/i)
   })
 
+  it("renders one provider-neutral economic context with paired date cutoffs", async () => {
+    const user = userEvent.setup()
+    const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
+    const readyBootstrap: DesktopBootstrap = {
+      ...blockedBootstrap,
+      operations: [
+        datasetRead(
+          "Research.ListDatasets",
+          "research",
+          "Return the local research collection.",
+        ),
+        localRead(
+          "Macro.GetContext",
+          "macro",
+          "Return the economic context for the selected dates.",
+        ),
+      ],
+    }
+    render(
+      <MemoryRouter initialEntries={["/advanced/research-data"]}>
+        <App
+          transport={transport(readyBootstrap, undefined, async (request) => {
+            issuedQueries.push(request)
+            if (request.query === "macroContext") {
+              return macroContextResult({
+                knowledgeCutoff:
+                  request.knowledgeCutoff ?? macroKnowledgeCutoff,
+                effectiveDateCutoff:
+                  request.effectiveDateCutoff ?? macroEffectiveDateCutoff,
+              })
+            }
+            if (request.query === "researchDatasets" || request.query === "jobs") {
+              return emptyRowsResult
+            }
+            throw new Error(`Unexpected research query: ${request.query}`)
+          })}
+        />
+      </MemoryRouter>,
+    )
+
+    const macroHeading = await screen.findByRole("heading", {
+      name: "Rates and labor conditions",
+    })
+    const macroSection = macroHeading.closest("section")
+    expect(macroSection).toBeInstanceOf(HTMLElement)
+    if (!(macroSection instanceof HTMLElement)) {
+      throw new Error("The economic context is absent")
+    }
+    expect(within(macroSection).getByText("12 of 12 available")).toBeTruthy()
+    expect(
+      within(macroSection)
+        .getAllByRole("heading", { level: 4 })
+        .map((heading) => heading.textContent),
+    ).toEqual(macroIndicatorDefinitions.map(([, label]) => label))
+
+    fireEvent.change(within(macroSection).getByLabelText("What was known by"), {
+      target: { value: "2026-08-26T15:00:00Z" },
+    })
+    fireEvent.change(within(macroSection).getByLabelText("Use data through"), {
+      target: { value: "2026-08-25" },
+    })
+    await user.click(
+      within(macroSection).getByRole("button", { name: "Apply dates" }),
+    )
+    await waitFor(() => {
+      expect(
+        issuedQueries.filter((request) => request.query === "macroContext"),
+      ).toEqual([
+        { query: "macroContext" },
+        {
+          query: "macroContext",
+          knowledgeCutoff: "2026-08-26T15:00:00Z",
+          effectiveDateCutoff: "2026-08-25",
+        },
+      ])
+    })
+
+    const renderedMacro = macroSection.textContent ?? ""
+    expect(renderedMacro).not.toMatch(
+      /Federal Reserve|FRED|ALFRED|H\.?15|Macro\.GetContext|\bprovider\b|\bsource\b|\bmanifest\b|\bdigest\b/i,
+    )
+  })
+
   it("keeps candidate impact server-resolved and visibly analysis-only", async () => {
     const user = userEvent.setup()
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
@@ -2320,9 +2145,6 @@ describe("Market Squawk desktop boundary", () => {
     const user = userEvent.setup()
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
     let alpacaStage: AlpacaSourceStage = "unconfigured"
-    let fredStatusState: "setup_required" | "unavailable" | "ready" =
-      "setup_required"
-    let fredReadAttempt = 0
     let corruptSecondaryEvidence = false
     const credentialProviders = [
       "schwab",
@@ -2396,12 +2218,6 @@ describe("Market Squawk desktop boundary", () => {
           "macro",
           "Return bounded macroeconomic revision history.",
         ),
-        macroDashboardRead(),
-        localRead(
-          "Macro.GetFredAlfredLatestKnown",
-          "macro",
-          "Return FRED/ALFRED availability or one exact manifest-pinned latest-known observation.",
-        ),
         sourceStatusRead(),
         {
           name: "Source.ImportCredentialBundle",
@@ -2466,24 +2282,6 @@ describe("Market Squawk desktop boundary", () => {
     const dashboardTransport: ProductTransport = {
       ...transport(readyBootstrap, undefined, async (request) => {
         issuedQueries.push(request)
-        if (request.query === "macroDashboard") {
-          return admittedServiceGeneration === 2
-            ? refreshedH15DashboardResult
-            : h15DashboardResult
-        }
-        if (request.query === "fredAlfredLatestKnownStatus") {
-          return fredAlfredStatus(fredStatusState)
-        }
-        if (request.query === "fredAlfredLatestKnownRead") {
-          const changedGeneration =
-            fredReadAttempt === 0
-              ? "outer"
-              : fredReadAttempt === 1
-                ? "inner"
-                : null
-          fredReadAttempt += 1
-          return fredAlfredReadResult(request, changedGeneration)
-        }
         if (request.query === "sourceStatus") {
           return request.sourceIds?.includes("alpaca.basic-market-data") === true
             ? alpacaSourceStatus(alpacaStage)
@@ -2625,7 +2423,6 @@ describe("Market Squawk desktop boundary", () => {
 
     await waitFor(() => expect(eventSubscriptions).toHaveLength(1))
     expect(screen.queryByRole("heading", { name: "Research" })).toBeNull()
-    expect(readCount("macroDashboard")).toBe(0)
     expect(readCount("sourceStatus")).toBe(0)
     await act(async () => {
       admitInitialEventSubscription()
@@ -2634,116 +2431,6 @@ describe("Market Squawk desktop boundary", () => {
 
     const heading = await screen.findByRole("heading", { name: "Research" })
     expect(heading.tagName).toBe("H1")
-    expect(
-      await screen.findByText("Connect FRED/ALFRED research"),
-    ).toBeTruthy()
-    expect(
-      issuedQueries.filter(
-        (request) => request.query === "fredAlfredLatestKnownStatus",
-      ),
-    ).toEqual([{ query: "fredAlfredLatestKnownStatus" }])
-    expect(readCount("fredAlfredLatestKnownRead")).toBe(0)
-
-    fredStatusState = "unavailable"
-    await notifyAuthorityChanged(
-      "1",
-      "research",
-      "Macro.GetFredAlfredLatestKnown",
-    )
-    expect(
-      await screen.findByText("FRED/ALFRED dataset is not bound"),
-    ).toBeTruthy()
-    expect(readCount("fredAlfredLatestKnownRead")).toBe(0)
-
-    fredStatusState = "ready"
-    fireEvent.click(
-      screen.getByRole("button", { name: "Check publication again" }),
-    )
-    const fredHeading = await screen.findByRole("heading", {
-      name: "Latest known observation at your cutoffs",
-    })
-    const fredSection = fredHeading.closest("section")
-    expect(fredSection).toBeInstanceOf(HTMLElement)
-    if (!(fredSection instanceof HTMLElement)) {
-      throw new Error("The FRED/ALFRED point-in-time research section is absent")
-    }
-    expect(within(fredSection).getByText("v7")).toBeTruthy()
-    expect(within(fredSection).getByText("c".repeat(64))).toBeTruthy()
-    expect(within(fredSection).getByText("d".repeat(64))).toBeTruthy()
-
-    const knowledgeCutoff = within(fredSection).getByLabelText("Knowledge cutoff")
-    const effectiveDateCutoff = within(fredSection).getByLabelText(
-      "Effective-date cutoff",
-    )
-    fireEvent.change(knowledgeCutoff, {
-      target: { value: "2026-08-28T14:30:00Z" },
-    })
-    fireEvent.change(effectiveDateCutoff, {
-      target: { value: "2026-08-22" },
-    })
-    fireEvent.click(
-      within(fredSection).getByRole("button", {
-        name: "Read point-in-time value",
-      }),
-    )
-    expect(
-      await within(fredSection).findByText(
-        "The exact point-in-time read was rejected",
-      ),
-    ).toBeTruthy()
-    expect(readCount("fredAlfredLatestKnownRead")).toBe(1)
-
-    fireEvent.change(knowledgeCutoff, {
-      target: { value: "2026-08-29T14:30:00Z" },
-    })
-    fireEvent.click(
-      within(fredSection).getByRole("button", {
-        name: "Read point-in-time value",
-      }),
-    )
-    await waitFor(() => expect(readCount("fredAlfredLatestKnownRead")).toBe(2))
-    expect(
-      within(fredSection).getByText("The exact point-in-time read was rejected"),
-    ).toBeTruthy()
-
-    fireEvent.change(knowledgeCutoff, {
-      target: { value: "2026-08-30T14:30:00Z" },
-    })
-    fireEvent.click(
-      within(fredSection).getByRole("button", {
-        name: "Read point-in-time value",
-      }),
-    )
-    expect(await within(fredSection).findByText("4.875")).toBeTruthy()
-    expect(within(fredSection).getByText("2026-08-21")).toBeTruthy()
-    expect(
-      within(fredSection).getAllByText("Official delayed · research only")
-        .length,
-    ).toBeGreaterThan(0)
-    expect(
-      issuedQueries.filter(
-        (request) => request.query === "fredAlfredLatestKnownRead",
-      ),
-    ).toEqual([
-      {
-        query: "fredAlfredLatestKnownRead",
-        generation: fredAlfredGeneration,
-        knowledgeCutoff: "2026-08-28T14:30:00Z",
-        effectiveDateCutoff: "2026-08-22",
-      },
-      {
-        query: "fredAlfredLatestKnownRead",
-        generation: fredAlfredGeneration,
-        knowledgeCutoff: "2026-08-29T14:30:00Z",
-        effectiveDateCutoff: "2026-08-22",
-      },
-      {
-        query: "fredAlfredLatestKnownRead",
-        generation: fredAlfredGeneration,
-        knowledgeCutoff: "2026-08-30T14:30:00Z",
-        effectiveDateCutoff: "2026-08-22",
-      },
-    ])
     const workspaceHome = screen.getByRole("link", {
       name: "Market Squawk workspace",
     })
@@ -2799,77 +2486,6 @@ describe("Market Squawk desktop boundary", () => {
       }),
     ).toBeTruthy()
     expect(await screen.findByText("No analytical datasets yet")).toBeTruthy()
-    const h15Heading = await screen.findByRole("heading", {
-      name: "H.15 Selected Interest Rates",
-    })
-    const h15Section = h15Heading.closest("section")
-    expect(h15Section).toBeInstanceOf(HTMLElement)
-    if (!(h15Section instanceof HTMLElement)) {
-      throw new Error("The H.15 research section is absent")
-    }
-    expect(within(h15Section).getByText("Stored publication")).toBeTruthy()
-    expect(within(h15Section).getByText("Queryable")).toBeTruthy()
-    expect(within(h15Section).getByText("Source readiness")).toBeTruthy()
-    expect(within(h15Section).getByText("Inactive")).toBeTruthy()
-    expect(
-      within(h15Section).getByText("Source lifecycle observed"),
-    ).toBeTruthy()
-    expect(
-      within(h15Section).getByText("Source runtime observed"),
-    ).toBeTruthy()
-    expect(within(h15Section).getAllByText("Not reported").length).toBeGreaterThan(0)
-    expect(within(h15Section).getByText("4.25%")).toBeTruthy()
-    expect(
-      within(h15Section).getByText("Pinned query result digest"),
-    ).toBeTruthy()
-    expect(
-      within(h15Section).getByText("Final typed selection digest"),
-    ).toBeTruthy()
-    expect(within(h15Section).getByText("5".repeat(64))).toBeTruthy()
-    expect(within(h15Section).getByText("7".repeat(64))).toBeTruthy()
-    const missingHeading = within(h15Section).getByRole("heading", {
-      name: "20 Year",
-    })
-    const missingObservation = missingHeading.closest("article")
-    expect(missingObservation).toBeInstanceOf(HTMLElement)
-    if (!(missingObservation instanceof HTMLElement)) {
-      throw new Error("The explicit H.15 missing observation is absent")
-    }
-    expect(within(missingObservation).getByText("Missing")).toBeTruthy()
-    expect(within(missingObservation).getByText("ND")).toBeTruthy()
-    expect(
-      within(missingObservation).getByText(
-        "Provider reported no observation for this date.",
-      ),
-    ).toBeTruthy()
-    expect(
-      within(missingObservation).getByText(
-        "federal-reserve-board:h15:H15%2FH15%2FRIFLGFCY20_N.B",
-      ),
-    ).toBeTruthy()
-    const initialMacroDashboardQueries = issuedQueries.filter(
-      (request) => request.query === "macroDashboard",
-    )
-    expect(initialMacroDashboardQueries.length).toBeGreaterThan(0)
-    for (const request of initialMacroDashboardQueries) {
-      expect(request).toEqual({
-        query: "macroDashboard",
-        provider: "federal-reserve-board.data-download-program",
-        release: "h15",
-      })
-    }
-    expect(
-      issuedQueries.filter((request) => request.query === "sourceStatus"),
-    ).toEqual([
-      {
-        query: "sourceStatus",
-        sourceIds: ["federal-reserve-board.data-download-program"],
-      },
-    ])
-    expect(screen.queryByText("Operation arguments")).toBeNull()
-
-    const initialMacroReads = readCount("macroDashboard")
-    const initialSourceReads = readCount("sourceStatus")
     const notifyDesktopEvent = desktopEvents.listener
     if (!notifyDesktopEvent) {
       throw new Error("The Desktop event subscription was not installed")
@@ -2891,36 +2507,7 @@ describe("Market Squawk desktop boundary", () => {
         },
       })
     })
-
-    expect(await screen.findByText("4.35%")).toBeTruthy()
-    const refreshedH15Heading = screen.getByRole("heading", {
-      name: "H.15 Selected Interest Rates",
-    })
-    const refreshedH15Section = refreshedH15Heading.closest("section")
-    expect(refreshedH15Section).toBeInstanceOf(HTMLElement)
-    if (!(refreshedH15Section instanceof HTMLElement)) {
-      throw new Error("The refreshed H.15 research section is absent")
-    }
-    expect(within(refreshedH15Section).queryByText("4.25%")).toBeNull()
-    expect(
-      within(refreshedH15Section).queryByText("5".repeat(64)),
-    ).toBeNull()
-    expect(
-      within(refreshedH15Section).getByText("9".repeat(64)),
-    ).toBeTruthy()
-    expect(readCount("macroDashboard")).toBeGreaterThan(initialMacroReads)
-    expect(readCount("sourceStatus")).toBeGreaterThan(initialSourceReads)
-    expect(issuedBootstrapGenerations).toContain(2)
-
-    const macroReadsBeforeResearchInvalidation = readCount("macroDashboard")
-    const sourceReadsBeforeResearchInvalidation = readCount("sourceStatus")
-    await notifyAuthorityChanged("1", "research", "Research.IngestSource")
-    await waitFor(() => {
-      expect(readCount("macroDashboard")).toBeGreaterThan(
-        macroReadsBeforeResearchInvalidation,
-      )
-    })
-    expect(readCount("sourceStatus")).toBe(sourceReadsBeforeResearchInvalidation)
+    await waitFor(() => expect(issuedBootstrapGenerations).toContain(2))
 
     const refreshedNavigation = document.querySelector(
       'nav[aria-label="Market Squawk"]',
@@ -3252,7 +2839,6 @@ describe("Market Squawk desktop boundary", () => {
     const sourceReadsBeforeSourceInvalidation = readCount("sourceStatus")
     const coverageReadsBeforeSourceInvalidation = readCount("sourceCoverage")
     const healthReadsBeforeSourceInvalidation = readCount("sourceHealth")
-    const macroReadsBeforeSourceInvalidation = readCount("macroDashboard")
     corruptSecondaryEvidence = true
     await notifyAuthorityChanged("2", "source", "Source.Setup")
     await waitFor(() => {
@@ -3266,7 +2852,6 @@ describe("Market Squawk desktop boundary", () => {
         healthReadsBeforeSourceInvalidation,
       )
     })
-    expect(readCount("macroDashboard")).toBe(macroReadsBeforeSourceInvalidation)
     expect(
       await screen.findByText(/source evidence reads could not be completed/),
     ).toBeTruthy()

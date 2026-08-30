@@ -45,6 +45,7 @@ mod dataset_preparation;
 mod forecast_evidence;
 mod fred;
 mod ingest;
+mod macro_context;
 
 pub(crate) use dataset_preparation::{
     DatasetPreparationAuthority, DatasetPreparationError, DatasetPreparationOptions,
@@ -86,6 +87,7 @@ pub use ingest::{
     ResearchSourceDiscovery, ResearchSourceDiscoveryObject, ResearchSourceDiscoveryRights,
     ResearchSourceObjectListing,
 };
+pub(crate) use macro_context::{MACRO_GET_CONTEXT, MacroContextOperation};
 
 const RESEARCH_LIST_DATASETS: &str = "Research.ListDatasets";
 const RESEARCH_GET_MANIFEST: &str = "Research.GetManifest";
@@ -255,6 +257,7 @@ impl ResearchApplicationServices {
         fred_latest_known: FredLatestKnownOperation,
     ) -> Self {
         let reader = service.analytical_reader();
+        let macro_context = MacroContextOperation::new(reader.clone(), fred_latest_known.clone());
         Self {
             controller: Arc::new(ResearchController {
                 authority: service,
@@ -262,6 +265,7 @@ impl ResearchApplicationServices {
                 ingest,
                 artifacts,
                 fred_latest_known,
+                macro_context,
                 lifecycle: DomainLifecycle::new(),
             }),
         }
@@ -449,6 +453,13 @@ impl ApplicationDomainService for MacroDomainService {
     ) -> Result<TypedToolResult, ServiceError> {
         let _call = DomainLifecycle::enter(&self.controller.lifecycle, &context)?;
         match request.name() {
+            MACRO_GET_CONTEXT => {
+                let limits = effective_service_limits(&request, &context)?;
+                self.controller
+                    .macro_context
+                    .call(&request, &context, limits)
+                    .await
+            }
             crate::provider_activation::FRED_ALFRED_READ_OPERATION => {
                 let limits = effective_service_limits(&request, &context)?;
                 self.controller
@@ -495,6 +506,7 @@ struct ResearchController {
     ingest: Arc<dyn ResearchIngestCoordinator>,
     artifacts: Option<Arc<dyn ArtifactRepository>>,
     fred_latest_known: FredLatestKnownOperation,
+    macro_context: MacroContextOperation,
     lifecycle: Arc<DomainLifecycle>,
 }
 
@@ -729,6 +741,7 @@ impl fmt::Debug for ResearchController {
                 &self.artifacts.as_ref().map(|_| "[OPAQUE REPOSITORY]"),
             )
             .field("fred_latest_known", &self.fred_latest_known)
+            .field("macro_context", &self.macro_context)
             .field("lifecycle", &self.lifecycle)
             .finish()
     }

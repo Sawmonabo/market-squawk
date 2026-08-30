@@ -136,33 +136,21 @@ impl FredPointInTimeReadCapability {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<FredDesktopPointInTimeReadDto, FredPointInTimeReadError> {
-        if cancellation.is_cancelled() {
-            return Err(FredPointInTimeReadError::Cancelled);
-        }
-        if manifest.dataset_id() != &self.analytical_dataset || knowledge_cutoff > evaluated_at {
+        if knowledge_cutoff > evaluated_at {
             return Err(FredPointInTimeReadError::InvalidBinding);
         }
-        let allowlist = AnalyticalMacroSeriesAllowlist::try_from_code_owned_identifiers(vec![
-            self.series_id.clone(),
-        ])?;
-        let request = AnalyticalMacroLatestKnownRequest::try_new(
-            manifest,
-            self.source_id.clone(),
-            knowledge_cutoff,
-            effective_date_cutoff,
-            allowlist,
-        )?;
-        let limits = fred_query_limits(&request, deadline)?;
         let output = self
-            .reader
-            .read_macro_latest_known_snapshot(request, limits, deadline, cancellation)
+            .read_analytical_latest_known(
+                manifest,
+                knowledge_cutoff,
+                effective_date_cutoff,
+                deadline,
+                cancellation,
+            )
             .await?;
         let [observation] = output.observations() else {
             return Err(FredPointInTimeReadError::InvalidReadResult);
         };
-        if output.source_id() != &self.source_id || observation.series() != &self.series_id {
-            return Err(FredPointInTimeReadError::InvalidReadResult);
-        }
         let observation = desktop_observation(
             observation,
             &self.source_id,
@@ -174,9 +162,6 @@ impl FredPointInTimeReadCapability {
             effective_date_cutoff,
         )?;
         let pinned = output.output();
-        if pinned.manifest().dataset_id() != &self.analytical_dataset {
-            return Err(FredPointInTimeReadError::InvalidReadResult);
-        }
         Ok(FredDesktopPointInTimeReadDto {
             schema_identity: FRED_DESKTOP_READ_SCHEMA,
             binding: FredDesktopReadBindingDto {
@@ -211,6 +196,56 @@ impl FredPointInTimeReadCapability {
             },
             observation,
         })
+    }
+
+    /// Returns the typed manifest-pinned Macro selection without provider transport DTOs.
+    pub(crate) async fn read_analytical_latest_known(
+        &self,
+        manifest: DatasetManifestRef,
+        knowledge_cutoff: Timestamp,
+        effective_date_cutoff: CalendarDate,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<market_squawk_data::AnalyticalMacroLatestKnownOutput, FredPointInTimeReadError>
+    {
+        if cancellation.is_cancelled() {
+            return Err(FredPointInTimeReadError::Cancelled);
+        }
+        if manifest.dataset_id() != &self.analytical_dataset {
+            return Err(FredPointInTimeReadError::InvalidBinding);
+        }
+        let expected_manifest = manifest.clone();
+        let allowlist = AnalyticalMacroSeriesAllowlist::try_from_code_owned_identifiers(vec![
+            self.series_id.clone(),
+        ])?;
+        let request = AnalyticalMacroLatestKnownRequest::try_new(
+            manifest,
+            self.source_id.clone(),
+            knowledge_cutoff,
+            effective_date_cutoff,
+            allowlist,
+        )?;
+        let limits = fred_query_limits(&request, deadline)?;
+        let output = self
+            .reader
+            .read_macro_latest_known_snapshot(request, limits, deadline, cancellation)
+            .await?;
+        if output.source_id() != &self.source_id
+            || output.observations().len() > 1
+            || output
+                .observations()
+                .iter()
+                .any(|observation| observation.series() != &self.series_id)
+        {
+            return Err(FredPointInTimeReadError::InvalidReadResult);
+        }
+        let pinned = output.output();
+        if pinned.manifest() != &expected_manifest
+            || pinned.manifest().dataset_id() != &self.analytical_dataset
+        {
+            return Err(FredPointInTimeReadError::InvalidReadResult);
+        }
+        Ok(output)
     }
 }
 

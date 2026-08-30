@@ -21,6 +21,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
+import { MacroContext } from "@/features/macro"
 import { friendlyResearchCollectionName } from "@/lib/formatters"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { JobControlRequest, ProductTransport } from "@/lib/transport"
@@ -176,6 +177,10 @@ function ResearchWorkspace({
           Refresh
         </Button>
       </header>
+
+      <div className="mt-6">
+        <MacroContext bootstrap={bootstrap} transport={transport} />
+      </div>
 
       <DatasetBuilder
         bootstrap={bootstrap}

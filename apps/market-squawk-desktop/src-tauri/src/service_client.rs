@@ -16,9 +16,6 @@ use crate::{
 
 // Canonical string conversion happens after the shared bridge's size check, so retain its cap.
 const MAXIMUM_CANONICAL_JOB_RESULT_BYTES: usize = 1024 * 1024;
-const FEDERAL_RESERVE_BOARD_DDP_PROVIDER: &str = "federal-reserve-board.data-download-program";
-const FRED_ALFRED_LATEST_KNOWN_OPERATION: &str = "Macro.GetFredAlfredLatestKnown";
-const H15_RELEASE: &str = "h15";
 
 #[tauri::command]
 pub(crate) async fn dashboard_query(
@@ -28,44 +25,19 @@ pub(crate) async fn dashboard_query(
     let generation = state.generation()?;
     let (operation, arguments) = match request {
         DashboardQueryCommand::Overview => ("Analysis.GetDecisionOverview", Map::new()),
-        DashboardQueryCommand::MacroDashboard { provider, release } => {
-            if provider != FEDERAL_RESERVE_BOARD_DDP_PROVIDER || release != H15_RELEASE {
-                return Err(DesktopCommandError::invalid_request(
-                    "The selected macro dashboard is unsupported.",
-                ));
-            }
-            let mut arguments = Map::new();
-            arguments.insert("provider".to_owned(), json!(provider));
-            arguments.insert("release".to_owned(), json!(release));
-            ("Macro.GetDashboard", arguments)
-        }
-        DashboardQueryCommand::FredAlfredLatestKnownStatus => {
-            (FRED_ALFRED_LATEST_KNOWN_OPERATION, Map::new())
-        }
-        DashboardQueryCommand::FredAlfredLatestKnownRead {
-            generation,
+        DashboardQueryCommand::MacroContext {
             knowledge_cutoff,
             effective_date_cutoff,
         } => {
+            if knowledge_cutoff.is_some() != effective_date_cutoff.is_some() {
+                return Err(DesktopCommandError::invalid_request(
+                    "Economic context dates must be supplied together.",
+                ));
+            }
             let mut arguments = Map::new();
-            arguments.insert(
-                "generation".to_owned(),
-                json!({
-                    "manifestVersion": generation.manifest_version,
-                    "schema": {
-                        "name": generation.schema.name,
-                        "version": generation.schema.version,
-                        "fingerprint": generation.schema.fingerprint,
-                    },
-                    "contentHash": generation.content_hash,
-                }),
-            );
-            arguments.insert("knowledgeCutoff".to_owned(), json!(knowledge_cutoff));
-            arguments.insert(
-                "effectiveDateCutoff".to_owned(),
-                json!(effective_date_cutoff),
-            );
-            (FRED_ALFRED_LATEST_KNOWN_OPERATION, arguments)
+            insert_optional(&mut arguments, "knowledgeCutoff", knowledge_cutoff);
+            insert_optional(&mut arguments, "effectiveDateCutoff", effective_date_cutoff);
+            ("Macro.GetContext", arguments)
         }
         DashboardQueryCommand::Lookup { text, categories } => {
             let mut arguments = Map::new();

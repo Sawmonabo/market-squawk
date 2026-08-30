@@ -10,6 +10,7 @@ use market_squawk_decisions::{
 };
 use market_squawk_sources::FRED_ALFRED_API_SURFACE_ID;
 
+use super::super::research::MACRO_GET_CONTEXT;
 use crate::provider_activation::FRED_ALFRED_READ_OPERATION;
 
 pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
@@ -174,6 +175,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         | "Fundamental.GetFacts"
         | "Fundamental.GetStatements"
         | "Fundamental.GetRatios" => observation_result(),
+        MACRO_GET_CONTEXT => macro_context(),
         "Macro.GetDashboard" => macro_dashboard(),
         FRED_ALFRED_READ_OPERATION => fred_alfred_latest_known(),
         "Macro.ListSeries"
@@ -4822,6 +4824,206 @@ fn canonical_decimal_text() -> Value {
     })
 }
 
+fn macro_context() -> Value {
+    closed(
+        vec![
+            ("schemaIdentity", constant("market-squawk-macro-context/v1")),
+            (
+                "availability",
+                enumeration(&["available", "partial", "unavailable"]),
+            ),
+            ("selection", macro_context_selection()),
+            ("confidence", macro_context_confidence()),
+            ("coverage", macro_context_coverage()),
+            ("observations", fixed_array(macro_context_observation(), 12)),
+        ],
+        &[
+            "schemaIdentity",
+            "availability",
+            "selection",
+            "confidence",
+            "coverage",
+            "observations",
+        ],
+    )
+}
+
+fn macro_context_selection() -> Value {
+    closed(
+        vec![
+            ("knowledgeCutoff", canonical_market_timestamp()),
+            ("effectiveDateCutoff", exact_calendar_date()),
+            ("evaluatedAt", canonical_market_timestamp()),
+            ("complete", boolean()),
+        ],
+        &[
+            "knowledgeCutoff",
+            "effectiveDateCutoff",
+            "evaluatedAt",
+            "complete",
+        ],
+    )
+}
+
+fn macro_context_confidence() -> Value {
+    closed(
+        vec![
+            (
+                "level",
+                enumeration(&["moderate", "limited", "unavailable"]),
+            ),
+            ("summary", bounded_text(512)),
+        ],
+        &["level", "summary"],
+    )
+}
+
+fn macro_context_coverage() -> Value {
+    closed(
+        vec![
+            ("requested", constant_unsigned(12)),
+            ("observed", bounded_unsigned(12)),
+            ("missing", bounded_unsigned(12)),
+            ("unavailable", bounded_unsigned(12)),
+        ],
+        &["requested", "observed", "missing", "unavailable"],
+    )
+}
+
+fn macro_context_observation() -> Value {
+    let indicators = [
+        ("us-government-yield-1m", "1-month government bond yield"),
+        ("us-government-yield-3m", "3-month government bond yield"),
+        ("us-government-yield-6m", "6-month government bond yield"),
+        ("us-government-yield-1y", "1-year government bond yield"),
+        ("us-government-yield-2y", "2-year government bond yield"),
+        ("us-government-yield-3y", "3-year government bond yield"),
+        ("us-government-yield-5y", "5-year government bond yield"),
+        ("us-government-yield-7y", "7-year government bond yield"),
+        ("us-government-yield-10y", "10-year government bond yield"),
+        ("us-government-yield-20y", "20-year government bond yield"),
+        ("us-government-yield-30y", "30-year government bond yield"),
+    ];
+    let mut schemas = indicators
+        .into_iter()
+        .map(|(indicator_id, label)| {
+            macro_context_indicator(
+                indicator_id,
+                label,
+                "interest_rates",
+                "business_daily",
+                "not_applicable",
+                "percent_per_year",
+                "Percent per year",
+            )
+        })
+        .collect::<Vec<_>>();
+    schemas.push(macro_context_indicator(
+        "us-unemployment-rate",
+        "U.S. unemployment rate",
+        "labor_market",
+        "monthly",
+        "seasonally_adjusted",
+        "percent_of_labor_force",
+        "Percent of labor force",
+    ));
+    one_of(schemas)
+}
+
+fn macro_context_indicator(
+    indicator_id: &'static str,
+    label: &'static str,
+    category: &'static str,
+    frequency: &'static str,
+    seasonal_adjustment: &'static str,
+    unit_code: &'static str,
+    unit_label: &'static str,
+) -> Value {
+    closed(
+        vec![
+            ("indicatorId", constant(indicator_id)),
+            ("label", constant(label)),
+            ("category", constant(category)),
+            ("frequency", constant(frequency)),
+            ("seasonalAdjustment", constant(seasonal_adjustment)),
+            (
+                "unit",
+                closed(
+                    vec![
+                        ("code", constant(unit_code)),
+                        ("label", constant(unit_label)),
+                        ("symbol", constant("%")),
+                    ],
+                    &["code", "label", "symbol"],
+                ),
+            ),
+            ("effectiveDate", nullable(exact_calendar_date())),
+            ("recorded", macro_context_recorded()),
+            ("availableAt", nullable(canonical_market_timestamp())),
+            (
+                "revision",
+                nullable(bounded_unsigned_range(1, u64::from(u32::MAX))),
+            ),
+            ("supersededAfter", nullable(exact_calendar_date())),
+            ("value", macro_context_value()),
+            (
+                "availability",
+                enumeration(&["available", "missing", "unavailable"]),
+            ),
+            ("confidence", macro_context_confidence()),
+        ],
+        &[
+            "indicatorId",
+            "label",
+            "category",
+            "frequency",
+            "seasonalAdjustment",
+            "unit",
+            "effectiveDate",
+            "recorded",
+            "availableAt",
+            "revision",
+            "supersededAfter",
+            "value",
+            "availability",
+            "confidence",
+        ],
+    )
+}
+
+fn macro_context_recorded() -> Value {
+    one_of(vec![
+        closed(
+            vec![
+                ("state", constant("known")),
+                ("date", exact_calendar_date()),
+            ],
+            &["state", "date"],
+        ),
+        closed(vec![("state", constant("not_supplied"))], &["state"]),
+    ])
+}
+
+fn macro_context_value() -> Value {
+    one_of(vec![
+        closed(
+            vec![
+                ("state", constant("observed")),
+                ("decimal", canonical_decimal_text()),
+            ],
+            &["state", "decimal"],
+        ),
+        closed(
+            vec![
+                ("state", constant("missing")),
+                ("reason", enumeration(&["not_reported", "unavailable"])),
+                ("explanation", bounded_text(512)),
+            ],
+            &["state", "reason", "explanation"],
+        ),
+    ])
+}
+
 fn macro_dashboard() -> Value {
     closed(
         vec![
@@ -5104,6 +5306,7 @@ fn nonzero_lowercase_sha256() -> Value {
         "maxLength": 64,
         "pattern": "^[0-9a-f]{64}$",
         "not": {
+            "type": "string",
             "const": "0000000000000000000000000000000000000000000000000000000000000000",
         },
     })

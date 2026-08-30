@@ -16,6 +16,7 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use self::output::output_data_schema;
+use super::research::MACRO_GET_CONTEXT;
 use crate::provider_activation::FRED_ALFRED_READ_OPERATION;
 
 /// Exact contract version shared by CLI and MCP for the first local release.
@@ -126,9 +127,13 @@ const MACRO_DASHBOARD_ARGUMENTS: &[ArgumentSpec] = &[
     ),
     ArgumentSpec::required("release", ArgumentKind::Enumeration(&["h15"])),
 ];
+const MACRO_CONTEXT_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("knowledgeCutoff", ArgumentKind::BoundedTimestamp),
+    ArgumentSpec::optional("effectiveDateCutoff", ArgumentKind::CalendarDate),
+];
 const FRED_ALFRED_LATEST_KNOWN_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::optional("generation", ArgumentKind::FredGeneration),
-    ArgumentSpec::optional("knowledgeCutoff", ArgumentKind::FredTimestamp),
+    ArgumentSpec::optional("knowledgeCutoff", ArgumentKind::BoundedTimestamp),
     ArgumentSpec::optional("effectiveDateCutoff", ArgumentKind::CalendarDate),
 ];
 const PROVIDER_CREDENTIAL_BUNDLE_ARGUMENTS: &[ArgumentSpec] =
@@ -1133,6 +1138,14 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         idempotent: true,
         open_world: false,
     },
+    read(
+        MACRO_GET_CONTEXT,
+        "Return a provider-neutral point-in-time economic and interest-rate context.",
+        ServiceDomain::Macro,
+        LOCAL_SCOPE,
+        MACRO_CONTEXT_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
     read(
         FRED_ALFRED_READ_OPERATION,
         "Return FRED/ALFRED availability or one exact manifest-pinned latest-known observation.",
@@ -2452,7 +2465,7 @@ enum ArgumentKind {
     Array,
     Timestamp,
     CalendarDate,
-    FredTimestamp,
+    BoundedTimestamp,
     FredGeneration,
     FairValueMeasurement,
     ForecastRequest,
@@ -2509,6 +2522,22 @@ fn schema_for(spec: OperationSpec) -> Value {
                     }
                 },
                 {"required": ["generation", "knowledgeCutoff", "effectiveDateCutoff"]},
+            ]),
+        );
+    }
+    if spec.name == MACRO_GET_CONTEXT {
+        schema.insert(
+            "oneOf".to_owned(),
+            json!([
+                {
+                    "not": {
+                        "anyOf": [
+                            {"required": ["knowledgeCutoff"]},
+                            {"required": ["effectiveDateCutoff"]},
+                        ]
+                    }
+                },
+                {"required": ["knowledgeCutoff", "effectiveDateCutoff"]},
             ]),
         );
     }
@@ -2646,7 +2675,7 @@ fn argument_schema(kind: ArgumentKind) -> Value {
         ArgumentKind::Array => json!({"type": "array", "minItems": 1}),
         ArgumentKind::Timestamp => json!({"type": "string", "format": "date-time"}),
         ArgumentKind::CalendarDate => calendar_date_argument_schema(),
-        ArgumentKind::FredTimestamp => json!({
+        ArgumentKind::BoundedTimestamp => json!({
             "type": "string",
             "format": "date-time",
             "minLength": 1,
@@ -2680,6 +2709,9 @@ fn admit(spec: OperationSpec, arguments: &Map<String, Value>) -> Result<(), Tool
         .map_err(|_| ToolInputError::Invalid)?;
     if spec.name == FRED_ALFRED_READ_OPERATION {
         admit_fred_latest_known_argument_group(arguments)?;
+    }
+    if spec.name == MACRO_GET_CONTEXT {
+        admit_macro_context_cutoffs(arguments)?;
     }
     admit_scope(arguments, spec.scope, &mut allowed)?;
     if spec.name == "Market.GetInstrument"
@@ -2919,7 +2951,7 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
             .ok_or(ToolInputError::Invalid),
         ArgumentKind::Timestamp => admit_timestamp(value),
         ArgumentKind::CalendarDate => admit_calendar_date(value),
-        ArgumentKind::FredTimestamp => admit_fred_timestamp(value),
+        ArgumentKind::BoundedTimestamp => admit_bounded_timestamp(value),
         ArgumentKind::FredGeneration => admit_fred_generation(value),
         ArgumentKind::FairValueMeasurement => admit_fair_value_measurement(value),
         ArgumentKind::ForecastRequest => admit_forecast_request(value),
@@ -3020,6 +3052,18 @@ fn admit_fred_latest_known_argument_group(
     }
 }
 
+fn admit_macro_context_cutoffs(arguments: &Map<String, Value>) -> Result<(), ToolInputError> {
+    let supplied = ["knowledgeCutoff", "effectiveDateCutoff"]
+        .into_iter()
+        .filter(|name| arguments.contains_key(*name))
+        .count();
+    if matches!(supplied, 0 | 2) {
+        Ok(())
+    } else {
+        Err(ToolInputError::Invalid)
+    }
+}
+
 fn admit_fred_generation(value: &Value) -> Result<(), ToolInputError> {
     let generation = value.as_object().ok_or(ToolInputError::Invalid)?;
     if generation.len() != 3
@@ -3085,7 +3129,7 @@ fn admit_calendar_date(value: &Value) -> Result<(), ToolInputError> {
         .ok_or(ToolInputError::Invalid)
 }
 
-fn admit_fred_timestamp(value: &Value) -> Result<(), ToolInputError> {
+fn admit_bounded_timestamp(value: &Value) -> Result<(), ToolInputError> {
     value
         .as_str()
         .filter(|value| !value.is_empty() && value.len() <= 64)

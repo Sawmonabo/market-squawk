@@ -1,9 +1,15 @@
 //! Transport-neutral FRED/ALFRED point-in-time application operation.
 
-use std::{fmt, time::Instant};
+use std::{
+    fmt,
+    sync::{Arc, RwLock},
+    time::Instant,
+};
 
 use chrono::{DateTime, Datelike, Utc};
-use market_squawk_data::{AnalyticalGeneration, DatasetManifestRef};
+use market_squawk_data::{
+    AnalyticalGeneration, AnalyticalMacroLatestKnownOutput, DatasetManifestRef,
+};
 use market_squawk_domain::{CalendarDate, Timestamp};
 use market_squawk_services::{
     RequestContext, ServiceError, ServiceLimits, ToolResultMetadata, TypedToolRequest,
@@ -12,6 +18,7 @@ use market_squawk_services::{
 use market_squawk_sources::FRED_ALFRED_API_SURFACE_ID;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 use super::{encode_hex, map_query_error, map_read_error, parse_timestamp};
 use crate::provider_activation::{
@@ -45,12 +52,11 @@ pub(crate) enum FredLatestKnownAvailability {
 /// [`FredPointInTimeReadCapability`]; it owns no provider, credential, acquisition, or publication
 /// authority.
 pub(crate) struct FredLatestKnownOperation {
-    state: FredLatestKnownState,
+    state: Arc<RwLock<Arc<FredLatestKnownState>>>,
 }
 
 enum FredLatestKnownState {
     SetupRequired,
-    DesiredDatasetUnbound,
     Unavailable {
         capability: FredPointInTimeReadCapability,
     },
@@ -63,17 +69,9 @@ enum FredLatestKnownState {
 impl FredLatestKnownOperation {
     /// Creates the truthful state used when no durable desired activation exists.
     #[must_use]
-    pub(crate) const fn setup_required() -> Self {
+    pub(crate) fn setup_required() -> Self {
         Self {
-            state: FredLatestKnownState::SetupRequired,
-        }
-    }
-
-    /// Creates the truthful state used when activation exists but no exact dataset is retained.
-    #[must_use]
-    pub(crate) const fn desired_dataset_unbound() -> Self {
-        Self {
-            state: FredLatestKnownState::DesiredDatasetUnbound,
+            state: Arc::new(RwLock::new(Arc::new(FredLatestKnownState::SetupRequired))),
         }
     }
 
@@ -109,15 +107,19 @@ impl FredLatestKnownOperation {
             }
             None => FredLatestKnownState::Unavailable { capability },
         };
-        Ok(Self { state })
+        Ok(Self {
+            state: Arc::new(RwLock::new(Arc::new(state))),
+        })
     }
 
     /// Returns the application-owned availability state without provider or filesystem access.
     #[must_use]
-    pub(crate) const fn availability(&self) -> FredLatestKnownAvailability {
-        match &self.state {
+    pub(crate) fn availability(&self) -> FredLatestKnownAvailability {
+        let Ok(state) = self.state.read() else {
+            return FredLatestKnownAvailability::Unavailable;
+        };
+        match state.as_ref() {
             FredLatestKnownState::SetupRequired => FredLatestKnownAvailability::SetupRequired,
-            FredLatestKnownState::DesiredDatasetUnbound => FredLatestKnownAvailability::Unavailable,
             FredLatestKnownState::Unavailable { .. } => FredLatestKnownAvailability::Unavailable,
             FredLatestKnownState::Ready { .. } => FredLatestKnownAvailability::Ready,
         }
@@ -136,9 +138,13 @@ impl FredLatestKnownOperation {
     ) -> Result<TypedToolResult, ServiceError> {
         ensure_request_live(request, context)?;
         let invocation = parse_invocation(request.arguments())?;
-        match &self.state {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| ServiceError::Unavailable)?
+            .clone();
+        match state.as_ref() {
             FredLatestKnownState::SetupRequired => setup_required_result(limits),
-            FredLatestKnownState::DesiredDatasetUnbound => desired_dataset_unbound_result(limits),
             FredLatestKnownState::Unavailable { capability } => {
                 unavailable_result(capability, limits)
             }
@@ -155,6 +161,55 @@ impl FredLatestKnownOperation {
             },
         }
     }
+
+    /// Returns the current exact FRED Macro selection for neutral application composition.
+    ///
+    /// Setup-required and configured-unavailable states return `None`. Ready reads remain pinned
+    /// to the installed manifest and return the typed analytical output directly, without
+    /// provider DTO serialization or JSON reparsing.
+    pub(crate) async fn read_current_analytical_latest_known(
+        &self,
+        knowledge_cutoff: Timestamp,
+        effective_date_cutoff: CalendarDate,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<Option<AnalyticalMacroLatestKnownOutput>, ServiceError> {
+        if cancellation.is_cancelled() {
+            return Err(ServiceError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(ServiceError::DeadlineExceeded);
+        }
+        let evaluated_at = evaluated_at()?;
+        if knowledge_cutoff > evaluated_at
+            || effective_date_cutoff > timestamp_calendar_date(knowledge_cutoff)?
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let state = self
+            .state
+            .read()
+            .map_err(|_| ServiceError::Unavailable)?
+            .clone();
+        let FredLatestKnownState::Ready {
+            capability,
+            manifest,
+        } = state.as_ref()
+        else {
+            return Ok(None);
+        };
+        capability
+            .read_analytical_latest_known(
+                manifest.clone(),
+                knowledge_cutoff,
+                effective_date_cutoff,
+                deadline,
+                cancellation,
+            )
+            .await
+            .map(Some)
+            .map_err(map_fred_read_error)
+    }
 }
 
 impl fmt::Debug for FredLatestKnownOperation {
@@ -164,6 +219,14 @@ impl fmt::Debug for FredLatestKnownOperation {
             .field("operation", &FRED_ALFRED_READ_OPERATION)
             .field("availability", &self.availability())
             .finish_non_exhaustive()
+    }
+}
+
+impl Clone for FredLatestKnownOperation {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
     }
 }
 
@@ -370,24 +433,6 @@ fn setup_required_result(limits: ServiceLimits) -> Result<TypedToolResult, Servi
         "configured": false,
     });
     let quality = unavailable_quality("desired_activation_absent");
-    typed_result(content, 0, coverage, quality, limits)
-}
-
-fn desired_dataset_unbound_result(limits: ServiceLimits) -> Result<TypedToolResult, ServiceError> {
-    let content = json!({
-        "schemaIdentity": FRED_OPERATION_SCHEMA,
-        "operation": FRED_ALFRED_READ_OPERATION,
-        "state": "unavailable",
-        "reason": "exact_provider_dataset_absent",
-    });
-    let coverage = json!({
-        "operation": FRED_ALFRED_READ_OPERATION,
-        "surfaceId": FRED_ALFRED_API_SURFACE_ID,
-        "state": "unavailable",
-        "configured": true,
-        "datasetState": "unbound",
-    });
-    let quality = unavailable_quality("exact_provider_dataset_absent");
     typed_result(content, 0, coverage, quality, limits)
 }
 
