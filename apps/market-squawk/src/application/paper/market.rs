@@ -13,10 +13,13 @@ use market_squawk_data::{
     InstrumentDefinitionReadCapability, MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS,
     MarketDataInstrumentPopulationDisposition, MarketDataInstrumentPopulationQuery,
     MarketDataInstrumentReadCapability, MarketDataInstrumentRecord,
+    ProviderMarketEventEffectiveTimeBasis, ProviderMarketEventSelectedCandidate,
+    ProviderMarketEventSelectionCompleteness,
 };
 use market_squawk_domain::{
     AssetClass, CoverageDelay, DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentDefinition,
-    InstrumentId, LiveEventClass, MarketDepth, SourceId, SourceIdentifier, Timestamp, VenueId,
+    InstrumentId, LiveEventClass, MarketDepth, MarketEvent, SourceId, SourceIdentifier, Timestamp,
+    VenueId,
 };
 use market_squawk_live::{
     RouteSnapshot, ShardSnapshot, SnapshotCompleteness, SnapshotDimension, StreamSnapshot,
@@ -29,10 +32,12 @@ use serde_json::Value;
 
 use super::ensure_live;
 use crate::application::market_runtime::{
-    MarketDisplaySnapshotBatch, MarketDisplaySnapshotLease, MarketKrakenPriceProjectionLease,
-    MarketOrderLevelSnapshot, MarketRuntimeRegistry, MarketRuntimeSnapshotBatch,
+    CryptoMarketDurableRouteRead, MarketDisplaySnapshotBatch, MarketDisplaySnapshotLease,
+    MarketKrakenPriceProjectionLease, MarketOrderLevelSnapshot, MarketRuntimeRegistry,
+    MarketRuntimeSnapshotBatch,
 };
 use crate::application::market_selection::{MarketOperation, MarketOperationSet};
+use crate::application::research::CryptoMarketPointInTimeReceipt;
 use crate::application::{ApplicationDomainService, effective_service_limits};
 pub(super) use candidate::ProductionPortfolioCandidateResolutionFactory;
 use results::{
@@ -42,7 +47,7 @@ use results::{
 use serialization::{source_coverage_value, timestamp_value};
 use unified::{
     MarketSurfaceRightsPolicy, MarketSurfaceSelectionPolicy, build_market_instrument_result,
-    build_market_overview_result, build_unified_market_result,
+    build_market_overview_result, build_unified_market_result, market_event_provenance,
 };
 
 const MARKET_GET_SNAPSHOT: &str = "Market.GetSnapshot";
@@ -59,6 +64,301 @@ const MAXIMUM_UNIFIED_MARKET_INSTRUMENTS: usize = 4_096;
 const MAXIMUM_UNIFIED_DISPLAY_SOURCES_PER_INSTRUMENT: usize = 256;
 const MAXIMUM_UNIFIED_ORDER_SAMPLE: usize = 64;
 const MAXIMUM_REFERENCE_SEARCH_ROWS: usize = 100;
+const MAXIMUM_DURABLE_EVENT_CANDIDATES: usize = 32;
+const DURABLE_CURRENT_EVENT_KINDS: [LiveEventClass; 4] = [
+    LiveEventClass::Trade,
+    LiveEventClass::Quote,
+    LiveEventClass::BookSnapshot,
+    LiveEventClass::BookDelta,
+];
+
+/// Provider-neutral proof that one current runtime coordinate also exists in the immutable store.
+///
+/// Source identity remains internal because it is required to prevent cross-source substitution.
+/// Ordinary product results receive only the selected canonical market state.
+#[derive(Debug, Default)]
+struct DurableMarketEvidenceSet {
+    bound_sources: Vec<SourceId>,
+    routes: Vec<DurableMarketRouteEvidence>,
+    expected_route_count: usize,
+}
+
+impl DurableMarketEvidenceSet {
+    fn try_new(
+        mut bound_sources: Vec<SourceId>,
+        routes: Vec<DurableMarketRouteEvidence>,
+        expected_route_count: usize,
+    ) -> Result<Self, ServiceError> {
+        bound_sources.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        bound_sources.dedup();
+        if routes.len() > expected_route_count
+            || routes.iter().any(|route| {
+                bound_sources
+                    .binary_search_by(|source| source.as_str().cmp(route.source_id.as_str()))
+                    .is_err()
+            })
+            || routes.iter().enumerate().any(|(index, route)| {
+                routes.iter().skip(index + 1).any(|candidate| {
+                    candidate.source_id == route.source_id
+                        && candidate.instrument_id == route.instrument_id
+                        && candidate.venue_id == route.venue_id
+                })
+            })
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        Ok(Self {
+            bound_sources,
+            routes,
+            expected_route_count,
+        })
+    }
+
+    fn source_requires_durable_evidence(&self, source_id: &SourceId) -> bool {
+        self.bound_sources
+            .binary_search_by(|source| source.as_str().cmp(source_id.as_str()))
+            .is_ok()
+    }
+
+    fn complete_for(&self, streams: &[StreamView<'_>]) -> bool {
+        self.routes.len() == self.expected_route_count
+            && streams.iter().all(|view| {
+                !self.source_requires_durable_evidence(view.stream.source())
+                    || self.route_for(view).is_some()
+            })
+    }
+
+    fn route_for(&self, view: &StreamView<'_>) -> Option<&DurableMarketRouteEvidence> {
+        self.routes.iter().find(|route| {
+            &route.source_id == view.stream.source()
+                && route.instrument_id == view.route.route().instrument()
+                && &route.venue_id == view.route.route().venue()
+        })
+    }
+}
+
+#[derive(Debug)]
+struct DurableMarketRouteEvidence {
+    surface_id: SourceIdentifier,
+    metadata: SourceMetadata,
+    source_id: SourceId,
+    instrument_id: InstrumentId,
+    venue_id: VenueId,
+    selections: Vec<CryptoMarketPointInTimeReceipt>,
+}
+
+impl DurableMarketRouteEvidence {
+    fn try_new(
+        surface_id: SourceIdentifier,
+        metadata: SourceMetadata,
+        source_id: SourceId,
+        instrument_id: InstrumentId,
+        venue_id: VenueId,
+        mut selections: Vec<CryptoMarketPointInTimeReceipt>,
+    ) -> Result<Option<Self>, ServiceError> {
+        let mut seen_event_kinds = Vec::new();
+        seen_event_kinds
+            .try_reserve_exact(selections.len())
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        for receipt in &selections {
+            let selection = receipt.selection();
+            let request = selection.request();
+            let source = selection
+                .sources()
+                .first()
+                .ok_or(ServiceError::InvalidResult)?;
+            let candidate = source
+                .tied_candidates()
+                .first()
+                .ok_or(ServiceError::InvalidResult)?;
+            if receipt.source_surface() != &source_id
+                || metadata.source_id() != &source_id
+                || request.instrument_id() != instrument_id
+                || request.venue_id() != &venue_id
+                || selection.completeness() != ProviderMarketEventSelectionCompleteness::Complete
+                || selection.sources().len() != 1
+                || source.source_surface() != &source_id
+                || source.tied_candidates().iter().skip(1).any(|tied| {
+                    tied.coordinate().canonical_event_digest()
+                        != candidate.coordinate().canonical_event_digest()
+                        || tied.event() != candidate.event()
+                })
+                || seen_event_kinds.contains(&request.event_kind())
+            {
+                return Err(ServiceError::InvalidResult);
+            }
+            if candidate.coordinate().instrument_id() != instrument_id
+                || candidate.coordinate().venue_id() != &venue_id
+                || candidate.coordinate().event_kind() != request.event_kind()
+                || market_event_class(candidate.event()) != request.event_kind()
+            {
+                return Err(ServiceError::InvalidResult);
+            }
+            seen_event_kinds.push(request.event_kind());
+        }
+        let mut selected_cohort: Option<(
+            (Timestamp, Timestamp, Timestamp, u64, Timestamp),
+            market_squawk_domain::LiveEvidenceBinding,
+        )> = None;
+        for candidate in selections
+            .iter()
+            .flat_map(|receipt| receipt.selection().sources())
+            .flat_map(|source| source.tied_candidates().first())
+        {
+            let key = durable_cohort_recency_key(candidate);
+            let binding = market_event_provenance(candidate.event()).binding();
+            match selected_cohort.as_ref() {
+                None => selected_cohort = Some((key, binding.clone())),
+                Some((selected_key, _selected_binding)) if key > *selected_key => {
+                    selected_cohort = Some((key, binding.clone()));
+                }
+                Some((selected_key, selected_binding))
+                    if key == *selected_key && !same_durable_cohort(binding, selected_binding) =>
+                {
+                    return Err(ServiceError::InvalidResult);
+                }
+                Some(_) => {}
+            }
+        }
+        let (_cohort_key, cohort_binding) = selected_cohort.ok_or(ServiceError::Unavailable)?;
+        let live = metadata
+            .coverage()
+            .live()
+            .ok_or(ServiceError::InvalidResult)?;
+        if cohort_binding.source_id() != &source_id
+            || cohort_binding.instrument_id() != instrument_id
+            || cohort_binding.venue_id() != &venue_id
+            || cohort_binding.metadata_revision() != metadata.revision()
+            || cohort_binding.provider_product() != live.provider_product()
+            || cohort_binding.provider_channel() != live.provider_channel()
+        {
+            return Err(ServiceError::InvalidResult);
+        }
+        selections.retain(|receipt| {
+            same_durable_cohort(
+                market_event_provenance(
+                    receipt.selection().sources()[0].tied_candidates()[0].event(),
+                )
+                .binding(),
+                &cohort_binding,
+            )
+        });
+        let route = Self {
+            surface_id,
+            metadata,
+            source_id,
+            instrument_id,
+            venue_id,
+            selections,
+        };
+        if route.presentation_candidate().is_some() {
+            Ok(Some(route))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn candidate(
+        &self,
+        event_kind: LiveEventClass,
+    ) -> Option<&ProviderMarketEventSelectedCandidate> {
+        self.selections
+            .iter()
+            .find(|receipt| receipt.selection().request().event_kind() == event_kind)
+            .map(|receipt| &receipt.selection().sources()[0].tied_candidates()[0])
+    }
+
+    fn presentation_candidate(&self) -> Option<&ProviderMarketEventSelectedCandidate> {
+        self.candidate(LiveEventClass::Trade)
+            .into_iter()
+            .chain(self.candidate(LiveEventClass::Quote))
+            .chain(self.safe_book_snapshot_candidate())
+            .max_by_key(|candidate| durable_candidate_effective_at(candidate))
+    }
+
+    fn primary_effective_at(&self) -> Option<Timestamp> {
+        self.presentation_candidate()
+            .map(durable_candidate_effective_at)
+    }
+
+    fn event(&self, event_kind: LiveEventClass) -> Option<&MarketEvent> {
+        self.candidate(event_kind)
+            .map(ProviderMarketEventSelectedCandidate::event)
+    }
+
+    fn safe_book_snapshot_candidate(&self) -> Option<&ProviderMarketEventSelectedCandidate> {
+        let snapshot = self.candidate(LiveEventClass::BookSnapshot)?;
+        let Some(delta) = self.candidate(LiveEventClass::BookDelta) else {
+            return Some(snapshot);
+        };
+        if matches!(
+            (
+                snapshot.coordinate().source_sequence(),
+                delta.coordinate().source_sequence(),
+            ),
+            (Some(snapshot_sequence), Some(delta_sequence))
+                if snapshot_sequence >= delta_sequence
+        ) {
+            Some(snapshot)
+        } else {
+            None
+        }
+    }
+
+    fn best_quote_candidate(&self) -> Option<&ProviderMarketEventSelectedCandidate> {
+        self.candidate(LiveEventClass::Quote)
+            .into_iter()
+            .chain(self.safe_book_snapshot_candidate())
+            .max_by_key(|candidate| durable_candidate_effective_at(candidate))
+    }
+}
+
+fn durable_candidate_effective_at(candidate: &ProviderMarketEventSelectedCandidate) -> Timestamp {
+    candidate
+        .coordinate()
+        .source_timestamp()
+        .unwrap_or(candidate.coordinate().received_at())
+}
+
+fn durable_cohort_recency_key(
+    candidate: &ProviderMarketEventSelectedCandidate,
+) -> (Timestamp, Timestamp, Timestamp, u64, Timestamp) {
+    (
+        candidate.coordinate().origin_generation_published_at(),
+        candidate.coordinate().available_at(),
+        candidate.coordinate().received_at(),
+        candidate.coordinate().connection_generation(),
+        durable_candidate_effective_at(candidate),
+    )
+}
+
+fn same_durable_cohort(
+    left: &market_squawk_domain::LiveEvidenceBinding,
+    right: &market_squawk_domain::LiveEvidenceBinding,
+) -> bool {
+    left.source_id() == right.source_id()
+        && left.session_id() == right.session_id()
+        && left.metadata_revision() == right.metadata_revision()
+        && left.authorization_basis() == right.authorization_basis()
+        && left.venue_id() == right.venue_id()
+        && left.instrument_id() == right.instrument_id()
+        && left.connection_generation() == right.connection_generation()
+        && left.provider_product() == right.provider_product()
+        && left.provider_channel() == right.provider_channel()
+}
+
+const fn market_event_class(event: &MarketEvent) -> LiveEventClass {
+    match event {
+        MarketEvent::Trade(_) => LiveEventClass::Trade,
+        MarketEvent::Quote(_) => LiveEventClass::Quote,
+        MarketEvent::BookSnapshot(_) => LiveEventClass::BookSnapshot,
+        MarketEvent::BookDelta(_) => LiveEventClass::BookDelta,
+        MarketEvent::Auction(_) => LiveEventClass::Auction,
+        MarketEvent::TradingHalt(_) => LiveEventClass::TradingHalt,
+        MarketEvent::InstrumentStatus(_) => LiveEventClass::InstrumentStatus,
+        MarketEvent::CorporateAction(_) => LiveEventClass::CorporateAction,
+    }
+}
 
 /// Why one official reference record matched the user's bounded search.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -331,6 +631,18 @@ impl ApplicationDomainService for MarketDomainService {
                 if request.name() == MARKET_GET_INSTRUMENT && filters.instruments.len() != 1 {
                     return Err(ServiceError::InvalidRequest);
                 }
+                let durable_market =
+                    if matches!(request.name(), MARKET_GET_OVERVIEW | MARKET_GET_INSTRUMENT) {
+                        load_durable_market_evidence(
+                            self.registry.as_ref(),
+                            &filters,
+                            reference_at,
+                            &context,
+                        )
+                        .await?
+                    } else {
+                        DurableMarketEvidenceSet::default()
+                    };
                 let display_instrument_ids =
                     load_display_instrument_ids(self.registry.as_ref(), &filters, &context).await?;
                 let market_instrument_ids =
@@ -355,6 +667,7 @@ impl ApplicationDomainService for MarketDomainService {
                     &self.instrument_definitions,
                     &streams,
                     &kraken_price_projections,
+                    &durable_market,
                     &context,
                 )?;
                 let market_data_records = load_market_data_instrument_records(
@@ -375,6 +688,7 @@ impl ApplicationDomainService for MarketDomainService {
                     &snapshots,
                     &display_snapshots,
                     &kraken_projection_refs,
+                    &durable_market,
                     reference_at,
                     presentation_surface_operations()?,
                 )?;
@@ -409,8 +723,9 @@ impl ApplicationDomainService for MarketDomainService {
                         &kraken_projection_refs,
                         &surface_policies,
                         &order_level,
+                        &durable_market,
                         reference_at,
-                        snapshots.failures().is_empty(),
+                        snapshots.failures().is_empty() && durable_market.complete_for(&streams),
                         limits,
                         &context,
                     ),
@@ -423,8 +738,9 @@ impl ApplicationDomainService for MarketDomainService {
                         &kraken_projection_refs,
                         &surface_policies,
                         &order_level,
+                        &durable_market,
                         reference_at,
-                        snapshots.failures().is_empty(),
+                        snapshots.failures().is_empty() && durable_market.complete_for(&streams),
                         limits,
                         &context,
                     ),
@@ -503,6 +819,7 @@ fn load_instrument_definitions(
     reader: &InstrumentDefinitionReadCapability,
     streams: &[StreamView<'_>],
     kraken: &[MarketKrakenPriceProjectionLease],
+    durable_market: &DurableMarketEvidenceSet,
     context: &RequestContext,
 ) -> Result<Vec<InstrumentDefinition>, ServiceError> {
     let mut instrument_ids = Vec::new();
@@ -511,11 +828,18 @@ fn load_instrument_definitions(
             streams
                 .len()
                 .checked_add(kraken.len())
+                .and_then(|count| count.checked_add(durable_market.routes.len()))
                 .ok_or(ServiceError::ResourceExhausted)?,
         )
         .map_err(|_error| ServiceError::ResourceExhausted)?;
     instrument_ids.extend(streams.iter().map(|view| view.route.route().instrument()));
     instrument_ids.extend(kraken.iter().map(|snapshot| snapshot.key().instrument_id()));
+    instrument_ids.extend(
+        durable_market
+            .routes
+            .iter()
+            .map(|route| route.instrument_id),
+    );
     instrument_ids.sort_unstable();
     instrument_ids.dedup();
     if instrument_ids.len() > MAXIMUM_UNIFIED_MARKET_INSTRUMENTS {
@@ -620,6 +944,113 @@ fn display_snapshot_refs<'batch>(
         }
     }
     Ok(snapshots)
+}
+
+async fn load_durable_market_evidence(
+    registry: &MarketRuntimeRegistry,
+    filters: &MarketFilters<'_>,
+    reference_at: Timestamp,
+    context: &RequestContext,
+) -> Result<DurableMarketEvidenceSet, ServiceError> {
+    let mut bindings = registry
+        .crypto_market_durable_route_reads(context.deadline(), context.cancellation())
+        .await?;
+    bindings.retain(|binding| filters.matches_durable_identity(binding));
+    let mut bound_sources = Vec::new();
+    bound_sources
+        .try_reserve_exact(bindings.len())
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    let maximum_selection_count = bindings
+        .len()
+        .checked_mul(DURABLE_CURRENT_EVENT_KINDS.len())
+        .ok_or(ServiceError::ResourceExhausted)?;
+    let mut routes = Vec::new();
+    routes
+        .try_reserve_exact(maximum_selection_count / DURABLE_CURRENT_EVENT_KINDS.len())
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+
+    for binding in &bindings {
+        ensure_live(context)?;
+        let source_id = binding.read().point_in_time_selector().source_surface();
+        bound_sources.push(source_id.clone());
+        if let Some(route) = load_durable_route_evidence(binding, reference_at, context).await?
+            && route
+                .primary_effective_at()
+                .is_some_and(|observed_at| filters.matches_time(observed_at))
+        {
+            routes.push(route);
+        }
+    }
+    DurableMarketEvidenceSet::try_new(bound_sources, routes, bindings.len())
+}
+
+async fn load_durable_route_evidence(
+    binding: &CryptoMarketDurableRouteRead,
+    reference_at: Timestamp,
+    context: &RequestContext,
+) -> Result<Option<DurableMarketRouteEvidence>, ServiceError> {
+    let read = binding.read();
+    let route = binding.route();
+    if binding.metadata().source_id() != read.point_in_time_selector().source_surface() {
+        return Err(ServiceError::InvalidResult);
+    }
+    let mut selections = Vec::new();
+    selections
+        .try_reserve_exact(DURABLE_CURRENT_EVENT_KINDS.len())
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    for event_kind in DURABLE_CURRENT_EVENT_KINDS {
+        ensure_live(context)?;
+        match read
+            .point_in_time_selector()
+            .select_latest(
+                route.instrument(),
+                route.venue().clone(),
+                event_kind,
+                reference_at,
+                reference_at,
+                ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
+                MAXIMUM_DURABLE_EVENT_CANDIDATES,
+                context.cancellation().clone(),
+            )
+            .await
+        {
+            Ok(Some(receipt)) => selections.push(receipt),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    source_id = %binding.metadata().source_id(),
+                    instrument_id = %route.instrument(),
+                    venue_id = %route.venue(),
+                    ?event_kind,
+                    %error,
+                    "durable current-market evidence is unavailable for this runtime route"
+                );
+                return Ok(None);
+            }
+        }
+    }
+    ensure_live(context)?;
+    match DurableMarketRouteEvidence::try_new(
+        binding.surface_id().clone(),
+        binding.metadata().clone(),
+        binding.metadata().source_id().clone(),
+        route.instrument(),
+        route.venue().clone(),
+        selections,
+    ) {
+        Ok(route) => Ok(route),
+        Err(ServiceError::ResourceExhausted) => Err(ServiceError::ResourceExhausted),
+        Err(error) => {
+            tracing::warn!(
+                source_id = %binding.metadata().source_id(),
+                instrument_id = %route.instrument(),
+                venue_id = %route.venue(),
+                %error,
+                "durable current-market route failed closed"
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn kraken_projection_refs(
@@ -834,6 +1265,7 @@ fn build_surface_policies(
     snapshots: &MarketRuntimeSnapshotBatch,
     display_snapshots: &[&MarketDisplaySnapshotLease],
     kraken_projections: &[&MarketKrakenPriceProjectionLease],
+    durable_market: &DurableMarketEvidenceSet,
     reference_at: Timestamp,
     operations: MarketOperationSet,
 ) -> Result<Vec<MarketSurfaceSelectionPolicy>, ServiceError> {
@@ -852,6 +1284,10 @@ fn build_surface_policies(
     let policy_count = kraken_projections.iter().try_fold(
         policy_count.ok_or(ServiceError::ResourceExhausted)?,
         |count, snapshot| count.checked_add(snapshot.metadata().coverage().asset_classes().len()),
+    );
+    let policy_count = durable_market.routes.iter().try_fold(
+        policy_count.ok_or(ServiceError::ResourceExhausted)?,
+        |count, route| count.checked_add(route.metadata.coverage().asset_classes().len()),
     );
     let policy_count = policy_count.ok_or(ServiceError::ResourceExhausted)?;
     let mut policies = Vec::new();
@@ -895,6 +1331,19 @@ fn build_surface_policies(
                 &mut policies,
                 snapshot.surface_id(),
                 metadata,
+                *asset_class,
+                operations,
+                rights,
+            )?;
+        }
+    }
+    for route in &durable_market.routes {
+        for asset_class in route.metadata.coverage().asset_classes() {
+            let rights = surface_rights(&route.metadata, operations, reference_at)?;
+            push_surface_policy(
+                &mut policies,
+                &route.surface_id,
+                &route.metadata,
                 *asset_class,
                 operations,
                 rights,
@@ -1136,6 +1585,19 @@ impl<'request> MarketFilters<'request> {
                 || self
                     .sources
                     .binary_search(&snapshot.surface_id().as_str())
+                    .is_ok())
+    }
+
+    fn matches_durable_identity(&self, binding: &CryptoMarketDurableRouteRead) -> bool {
+        matches_instrument_filter(self, binding.route().instrument())
+            && (self.sources.is_empty()
+                || self
+                    .sources
+                    .binary_search(&binding.metadata().source_id().as_str())
+                    .is_ok()
+                || self
+                    .sources
+                    .binary_search(&binding.surface_id().as_str())
                     .is_ok())
     }
 

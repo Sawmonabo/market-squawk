@@ -9,9 +9,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::application::{
-    CoinbaseMarketApplicationOutcome, CryptoCommittedRowIngress, CryptoMarketDurableRead,
-    CryptoMarketDurableReadWriter, CryptoMarketPublicationAuthority, CryptoMarketPublicationError,
-    CryptoPendingFrameIngress, CryptoPublicationRendezvousLimits,
+    CoinbaseMarketApplicationOutcome, CryptoCommittedRowIngress, CryptoMarketDurableReadWriter,
+    CryptoMarketPublicationAuthority, CryptoMarketPublicationError, CryptoPendingFrameIngress,
+    CryptoPublicationRendezvousLimits,
 };
 use crate::provider_activation::CoinbaseMarketPublicationPackage;
 
@@ -25,7 +25,6 @@ pub(super) struct CoinbasePublicationSupervisor {
     raw: Option<JoinHandle<Result<(), CoinbasePublicationSupervisorError>>>,
     committed: Vec<JoinHandle<Result<(), CoinbasePublicationSupervisorError>>>,
     authority: Option<Arc<CryptoMarketPublicationAuthority>>,
-    durable_read: CryptoMarketDurableRead,
 }
 
 impl CoinbasePublicationSupervisor {
@@ -47,9 +46,8 @@ impl CoinbasePublicationSupervisor {
         if committed_rows.is_empty() {
             return Err(CoinbasePublicationSupervisorError::InvalidTopology);
         }
-        let authority = package.into_authority();
+        let (authority, durable_writer) = package.into_parts();
         authority.validate_precommit()?;
-        let (durable_writer, durable_read) = authority.durable_read_capability();
         let (pending, committed) =
             CryptoPendingFrameIngress::try_new(limits, cancellation.clone())?;
 
@@ -98,16 +96,7 @@ impl CoinbasePublicationSupervisor {
             raw: Some(raw),
             committed: committed_tasks,
             authority: Some(authority),
-            durable_read,
         })
-    }
-
-    pub(super) const fn durable_read_count(&self) -> usize {
-        1
-    }
-
-    pub(super) fn append_durable_reads(&self, destination: &mut Vec<CryptoMarketDurableRead>) {
-        destination.push(self.durable_read.clone());
     }
 
     pub(super) fn is_healthy(&self) -> bool {

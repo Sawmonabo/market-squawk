@@ -5,8 +5,9 @@ use market_squawk_domain::{
     AssetClass, CaptureIntegrityState, ChecksumIntegrity, CoverageConsolidation, CoverageDelay,
     CoverageStatus, Currency, DataQuality, DeliveryEvidence, DigestAlgorithm, EvidenceDigest,
     ExecutionEligibility, InstrumentDefinition, InstrumentExecutionTerms, InstrumentId,
-    LiveEventClass, MarketDataInstrumentDefinition, MarketDepth, ProviderChannel, ProviderProduct,
-    SequenceIntegrity, SourceId, SourceIdentifier, StreamIntegrityState, Timestamp,
+    LiveEventClass, MarketDataInstrumentDefinition, MarketDepth, MarketEvent, ProviderChannel,
+    ProviderProduct, SequenceIntegrity, SourceId, SourceIdentifier, StreamIntegrityState,
+    Timestamp,
 };
 use market_squawk_live::{
     BookLevelSnapshot, BookSide, OrderLevelBatchKind, OrderLevelPhase, OrderLevelPriceProjection,
@@ -22,7 +23,9 @@ use serde_json::{Value, json};
 
 use super::results::bounded_result;
 use super::serialization::{QualitySummary, timestamp_value, with_availability};
-use super::{MarketFilters, StreamView, ensure_live};
+use super::{
+    DurableMarketEvidenceSet, DurableMarketRouteEvidence, MarketFilters, StreamView, ensure_live,
+};
 use crate::application::domain_support::encode_hex;
 use crate::application::market_runtime::{
     MarketDisplaySnapshotLease, MarketKrakenPriceProjectionLease, MarketOrderLevelSnapshot,
@@ -328,6 +331,7 @@ pub(super) fn build_market_overview_result(
     kraken_projections: &[&MarketKrakenPriceProjectionLease],
     surface_policies: &[MarketSurfaceSelectionPolicy],
     order_level: &[MarketOrderLevelSnapshot],
+    durable_market: &DurableMarketEvidenceSet,
     reference_at: Timestamp,
     coverage_complete: bool,
     limits: ServiceLimits,
@@ -346,6 +350,7 @@ pub(super) fn build_market_overview_result(
         MarketResultProjection::Product {
             include_depth: false,
             coverage_complete,
+            durable_market,
         },
         limits,
         context,
@@ -366,6 +371,7 @@ pub(super) fn build_market_instrument_result(
     kraken_projections: &[&MarketKrakenPriceProjectionLease],
     surface_policies: &[MarketSurfaceSelectionPolicy],
     order_level: &[MarketOrderLevelSnapshot],
+    durable_market: &DurableMarketEvidenceSet,
     reference_at: Timestamp,
     coverage_complete: bool,
     limits: ServiceLimits,
@@ -387,19 +393,21 @@ pub(super) fn build_market_instrument_result(
         MarketResultProjection::Product {
             include_depth: true,
             coverage_complete,
+            durable_market,
         },
         limits,
         context,
     )
 }
 
-enum MarketResultProjection {
+enum MarketResultProjection<'durable> {
     Diagnostics {
         source_coverage: Value,
     },
     Product {
         include_depth: bool,
         coverage_complete: bool,
+        durable_market: &'durable DurableMarketEvidenceSet,
     },
 }
 
@@ -417,7 +425,7 @@ fn build_market_result(
     surface_policies: &[MarketSurfaceSelectionPolicy],
     order_level: &[MarketOrderLevelSnapshot],
     reference_at: Timestamp,
-    projection: MarketResultProjection,
+    projection: MarketResultProjection<'_>,
     limits: ServiceLimits,
     context: &RequestContext,
 ) -> Result<TypedToolResult, ServiceError> {
@@ -486,15 +494,27 @@ fn build_market_result(
                     && filters.matches_time(snapshot.projection().received_at())
             })
             .collect::<Vec<_>>();
-        let candidates = build_candidates(
-            &instrument_streams,
-            definition,
-            &candidate_display,
-            &instrument_kraken,
-            surface_policies,
-            order_level,
-            reference_at,
-        )?;
+        let candidates = match &projection {
+            MarketResultProjection::Diagnostics { .. } => build_candidates(
+                &instrument_streams,
+                definition,
+                &candidate_display,
+                &instrument_kraken,
+                surface_policies,
+                order_level,
+                reference_at,
+            )?,
+            MarketResultProjection::Product { durable_market, .. } => build_product_candidates(
+                &instrument_streams,
+                definition,
+                &candidate_display,
+                &instrument_kraken,
+                surface_policies,
+                order_level,
+                durable_market,
+                reference_at,
+            )?,
+        };
         let request = presentation_request(
             definition.asset_class(),
             reference_at,
@@ -511,12 +531,17 @@ fn build_market_result(
                 order_level,
                 &receipt,
             )?,
-            MarketResultProjection::Product { include_depth, .. } => product_instrument_row(
+            MarketResultProjection::Product {
+                include_depth,
+                durable_market,
+                ..
+            } => product_instrument_row(
                 definition,
                 &instrument_streams,
                 &instrument_display,
                 &instrument_kraken,
                 order_level,
+                durable_market,
                 &receipt,
                 *include_depth,
             )?,
@@ -525,7 +550,15 @@ fn build_market_result(
 
     let observed_streams = streams
         .iter()
-        .filter(|view| filters.matches_time(view.stream.evaluated_at()))
+        .filter(|view| {
+            filters.matches_time(view.stream.evaluated_at())
+                && match &projection {
+                    MarketResultProjection::Diagnostics { .. } => true,
+                    MarketResultProjection::Product { durable_market, .. } => !durable_market
+                        .route_for(view)
+                        .is_some_and(|route| !hot_view_shadows_durable(route, view, reference_at)),
+                }
+        })
         .count();
     let observed_display = display_snapshots
         .iter()
@@ -541,9 +574,24 @@ fn build_market_result(
         .copied()
         .filter(|snapshot| filters.matches_time(snapshot.projection().received_at()))
         .count();
+    let observed_durable_only = match &projection {
+        MarketResultProjection::Diagnostics { .. } => 0,
+        MarketResultProjection::Product { durable_market, .. } => durable_market
+            .routes
+            .iter()
+            .filter(|route| {
+                matches_instrument(filters, route.instrument_id)
+                    && route
+                        .primary_effective_at()
+                        .is_some_and(|observed_at| filters.matches_time(observed_at))
+                    && !durable_route_is_shadowed(route, streams, reference_at)
+            })
+            .count(),
+    };
     let observed = observed_streams
         .checked_add(observed_display)
         .and_then(|count| count.checked_add(observed_kraken))
+        .and_then(|count| count.checked_add(observed_durable_only))
         .ok_or(ServiceError::ResourceExhausted)?;
     let mut quality = QualitySummary::new(reference_at);
     for view in streams
@@ -747,10 +795,80 @@ pub(super) fn build_candidates(
     order_level: &[MarketOrderLevelSnapshot],
     reference_at: Timestamp,
 ) -> Result<Vec<SourceCandidate>, ServiceError> {
-    let candidate_count = streams
-        .len()
+    build_candidate_set(
+        streams,
+        definition,
+        display_snapshots,
+        kraken_projections,
+        surface_policies,
+        order_level,
+        None,
+        reference_at,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the product-only durable evidence remains separate from diagnostics"
+)]
+fn build_product_candidates(
+    streams: &[StreamView<'_>],
+    definition: UnifiedInstrumentDefinition<'_>,
+    display_snapshots: &[&MarketDisplaySnapshotLease],
+    kraken_projections: &[&MarketKrakenPriceProjectionLease],
+    surface_policies: &[MarketSurfaceSelectionPolicy],
+    order_level: &[MarketOrderLevelSnapshot],
+    durable_market: &DurableMarketEvidenceSet,
+    reference_at: Timestamp,
+) -> Result<Vec<SourceCandidate>, ServiceError> {
+    build_candidate_set(
+        streams,
+        definition,
+        display_snapshots,
+        kraken_projections,
+        surface_policies,
+        order_level,
+        Some(durable_market),
+        reference_at,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shared candidate builder receives only optional product-owned durable evidence"
+)]
+fn build_candidate_set(
+    streams: &[StreamView<'_>],
+    definition: UnifiedInstrumentDefinition<'_>,
+    display_snapshots: &[&MarketDisplaySnapshotLease],
+    kraken_projections: &[&MarketKrakenPriceProjectionLease],
+    surface_policies: &[MarketSurfaceSelectionPolicy],
+    order_level: &[MarketOrderLevelSnapshot],
+    durable_market: Option<&DurableMarketEvidenceSet>,
+    reference_at: Timestamp,
+) -> Result<Vec<SourceCandidate>, ServiceError> {
+    let durable_only_count = durable_market.map_or(0, |evidence| {
+        evidence
+            .routes
+            .iter()
+            .filter(|route| {
+                route.instrument_id == definition.instrument_id()
+                    && !durable_route_is_shadowed(route, streams, reference_at)
+            })
+            .count()
+    });
+    let hot_candidate_count = streams
+        .iter()
+        .filter(|view| {
+            durable_market
+                .and_then(|evidence| evidence.route_for(view))
+                .is_none_or(|route| hot_view_shadows_durable(route, view, reference_at))
+        })
+        .count();
+    let candidate_count = hot_candidate_count
         .checked_add(display_snapshots.len())
         .and_then(|count| count.checked_add(kraken_projections.len()))
+        .and_then(|count| count.checked_add(durable_only_count))
         .ok_or(ServiceError::ResourceExhausted)?;
     if candidate_count > MAXIMUM_CANDIDATES_PER_INSTRUMENT {
         return Err(ServiceError::ResourceExhausted);
@@ -760,6 +878,12 @@ pub(super) fn build_candidates(
         .try_reserve_exact(candidate_count)
         .map_err(|_error| ServiceError::ResourceExhausted)?;
     for view in streams {
+        if durable_market
+            .and_then(|evidence| evidence.route_for(view))
+            .is_some_and(|route| !hot_view_shadows_durable(route, view, reference_at))
+        {
+            continue;
+        }
         let executable = definition.executable.ok_or(ServiceError::Unavailable)?;
         let policy = exact_surface_policy(surface_policies, view, definition.asset_class())?;
         candidates.push(source_candidate(
@@ -795,6 +919,23 @@ pub(super) fn build_candidates(
             definition.definition_revision_digest(),
         )?);
     }
+    if let Some(durable_market) = durable_market {
+        for durable in durable_market.routes.iter().filter(|route| {
+            route.instrument_id == definition.instrument_id()
+                && !durable_route_is_shadowed(route, streams, reference_at)
+        }) {
+            let executable = definition.executable.ok_or(ServiceError::Unavailable)?;
+            let policy =
+                exact_durable_surface_policy(surface_policies, durable, definition.asset_class())?;
+            candidates.push(durable_source_candidate(
+                durable,
+                executable,
+                policy,
+                reference_at,
+                definition.definition_revision_digest(),
+            )?);
+        }
+    }
     Ok(candidates)
 }
 
@@ -807,6 +948,24 @@ fn exact_surface_policy<'policy>(
         policy.surface_id == *view.surface_id
             && policy.source_id == *view.stream.source()
             && policy.provider_id == *view.metadata.provider()
+            && policy.asset_class == asset_class
+    });
+    let policy = matching.next().ok_or(ServiceError::Unavailable)?;
+    if matching.next().is_some() {
+        return Err(ServiceError::InvalidResult);
+    }
+    Ok(policy)
+}
+
+fn exact_durable_surface_policy<'policy>(
+    policies: &'policy [MarketSurfaceSelectionPolicy],
+    route: &DurableMarketRouteEvidence,
+    asset_class: AssetClass,
+) -> Result<&'policy MarketSurfaceSelectionPolicy, ServiceError> {
+    let mut matching = policies.iter().filter(|policy| {
+        policy.surface_id == route.surface_id
+            && policy.source_id == route.source_id
+            && policy.provider_id == *route.metadata.provider()
             && policy.asset_class == asset_class
     });
     let policy = matching.next().ok_or(ServiceError::Unavailable)?;
@@ -1072,6 +1231,134 @@ fn source_candidate(
         admission,
     )
     .map_err(selection_error)
+}
+
+fn durable_source_candidate(
+    evidence: &DurableMarketRouteEvidence,
+    definition: &InstrumentDefinition,
+    policy: &MarketSurfaceSelectionPolicy,
+    reference_at: Timestamp,
+    definition_revision_digest: Option<EvidenceDigest>,
+) -> Result<SourceCandidate, ServiceError> {
+    let primary = evidence
+        .presentation_candidate()
+        .ok_or(ServiceError::Unavailable)?;
+    let provenance = market_event_provenance(primary.event());
+    let live = evidence
+        .metadata
+        .coverage()
+        .live()
+        .ok_or(ServiceError::InvalidResult)?;
+    if provenance.source_id() != &evidence.source_id
+        || provenance.instrument_id() != Some(definition.instrument_id())
+        || provenance.venue_id() != Some(&evidence.venue_id)
+        || provenance.connection_generation().get() != primary.coordinate().connection_generation()
+        || evidence.metadata.provider() != &policy.provider_id
+        || evidence.metadata.source_id() != &policy.source_id
+        || evidence.surface_id != policy.surface_id
+    {
+        return Err(ServiceError::InvalidResult);
+    }
+    let timestamps = CandidateTimestamps::try_new(
+        provenance
+            .source_timestamp()
+            .unwrap_or(provenance.received_at()),
+        provenance.source_timestamp(),
+        provenance.received_at(),
+        provenance.available_at(),
+        provenance.ingested_at(),
+    )
+    .map_err(selection_error)?;
+    let admission = CandidateAdmissionState::new(
+        CandidateHealth::new(HealthState::Degraded, provenance.available_at()),
+        ProviderBudgetSnapshot::try_new(BudgetAvailability::NotRequired, None, None, reference_at)
+            .map_err(selection_error)?,
+        policy.rights.admission().map_err(selection_error)?,
+        CandidateIntegrity::new(
+            IntegrityState::Verified,
+            Some(provenance.connection_generation()),
+            primary.coordinate().origin_generation_published_at(),
+        ),
+        ExecutionEligibility::Ineligible,
+    );
+    SourceCandidate::try_new(
+        CandidateIdentity::new(
+            policy.provider_id.clone(),
+            live.provider_product().clone(),
+            live.provider_channel().clone(),
+            evidence.source_id.clone(),
+            Some(evidence.venue_id.clone()),
+            definition.instrument_id(),
+            evidence.surface_id.clone(),
+            definition_revision_digest,
+        ),
+        CandidateCapabilities::try_new(
+            definition.asset_class(),
+            policy.operations,
+            ObservationTiming::Stored,
+            durable_market_depth(evidence),
+            provenance.recorded_quality(),
+            policy.coverage,
+        )
+        .map_err(selection_error)?,
+        timestamps,
+        admission,
+    )
+    .map_err(selection_error)
+}
+
+fn durable_market_depth(evidence: &DurableMarketRouteEvidence) -> Option<MarketDepth> {
+    match evidence
+        .safe_book_snapshot_candidate()
+        .map(|candidate| candidate.event())
+    {
+        Some(MarketEvent::BookSnapshot(snapshot)) => Some(match snapshot.depth() {
+            MarketDepth::TopOfBook => MarketDepth::TopOfBook,
+            MarketDepth::PriceLevel | MarketDepth::OrderLevel => MarketDepth::PriceLevel,
+        }),
+        Some(_) => None,
+        None => None,
+    }
+}
+
+fn durable_route_is_shadowed(
+    route: &DurableMarketRouteEvidence,
+    streams: &[StreamView<'_>],
+    reference_at: Timestamp,
+) -> bool {
+    streams
+        .iter()
+        .any(|view| hot_view_shadows_durable(route, view, reference_at))
+}
+
+fn hot_view_shadows_durable(
+    route: &DurableMarketRouteEvidence,
+    view: &StreamView<'_>,
+    reference_at: Timestamp,
+) -> bool {
+    view.stream.source() == &route.source_id
+        && view.route.route().instrument() == route.instrument_id
+        && view.route.route().venue() == &route.venue_id
+        && candidate_health(view.stream, reference_at) == HealthState::Healthy
+        && !matches!(
+            candidate_integrity(view.stream).state(),
+            IntegrityState::Failed | IntegrityState::Quarantined
+        )
+}
+
+pub(super) const fn market_event_provenance(
+    event: &MarketEvent,
+) -> &market_squawk_domain::LiveProvenance {
+    match event {
+        MarketEvent::Trade(event) => event.provenance(),
+        MarketEvent::Quote(event) => event.provenance(),
+        MarketEvent::BookSnapshot(event) => event.provenance(),
+        MarketEvent::BookDelta(event) => event.provenance(),
+        MarketEvent::Auction(event) => event.provenance(),
+        MarketEvent::TradingHalt(event) => event.provenance(),
+        MarketEvent::InstrumentStatus(event) => event.provenance(),
+        MarketEvent::CorporateAction(event) => event.provenance(),
+    }
 }
 
 fn display_source_candidate(
@@ -1460,7 +1747,13 @@ fn instrument_row(
     let selected = receipt.selected();
     let selected_view = selected
         .map(|selected| {
-            exact_selected_view(streams, display_snapshots, kraken_projections, selected)
+            exact_selected_view(
+                streams,
+                display_snapshots,
+                kraken_projections,
+                None,
+                selected,
+            )
         })
         .transpose()?;
     let market_observation = json!({
@@ -1498,6 +1791,7 @@ fn instrument_row(
         Some((selected, UnifiedSelectedView::Live(view))) => {
             selected_source_value(selected, view, receipt.selected_at())
         }
+        Some((_, UnifiedSelectedView::Durable(..))) => return Err(ServiceError::InvalidResult),
         Some((selected, UnifiedSelectedView::Display(snapshot))) => {
             display_selected_source_value(selected, snapshot, receipt.selected_at())?
         }
@@ -1513,6 +1807,7 @@ fn instrument_row(
                 .transpose()?
                 .unwrap_or(Value::Null)
         }
+        (Some(UnifiedSelectedView::Durable(..)), _) => return Err(ServiceError::InvalidResult),
         (Some(UnifiedSelectedView::Kraken(snapshot)), Some(executable)) => {
             validate_kraken_projection(snapshot, executable)?;
             order_level_snapshot_for_kraken(order_level, snapshot)?
@@ -1642,6 +1937,7 @@ fn product_instrument_row(
     display_snapshots: &[&MarketDisplaySnapshotLease],
     kraken_projections: &[&MarketKrakenPriceProjectionLease],
     order_level: &[MarketOrderLevelSnapshot],
+    durable_market: &DurableMarketEvidenceSet,
     receipt: &MarketSelectionReceipt,
     include_depth: bool,
 ) -> Result<Value, ServiceError> {
@@ -1651,7 +1947,13 @@ fn product_instrument_row(
     let selected = receipt.selected();
     let selected_view = selected
         .map(|selected| {
-            exact_selected_view(streams, display_snapshots, kraken_projections, selected)
+            exact_selected_view(
+                streams,
+                display_snapshots,
+                kraken_projections,
+                Some(durable_market),
+                selected,
+            )
         })
         .transpose()?;
     let quote = selected_view
@@ -1703,7 +2005,13 @@ fn product_instrument_row(
         },
         "depthSummary": depth_summary,
         "depthDetails": depth_details,
-        "analysisUse": if selected.is_some() { "current_only" } else { "unavailable" },
+        "analysisUse": if selected_view
+            .is_some_and(|view| product_view_is_fresh(view, receipt.selected_at()))
+        {
+            "current_only"
+        } else {
+            "unavailable"
+        },
     }))
 }
 
@@ -1811,6 +2119,9 @@ fn product_quote(
                     .is_some_and(|value| selected_at <= value.qualification_valid_until()),
             })
         }
+        UnifiedSelectedView::Durable(evidence) => {
+            durable_product_quote(evidence, definition, selected_at)
+        }
         UnifiedSelectedView::Display(snapshot) => {
             let actor = snapshot.lease();
             let quote_observation = actor.quote();
@@ -1905,6 +2216,87 @@ fn product_quote(
     }
 }
 
+fn durable_product_quote(
+    evidence: &DurableMarketRouteEvidence,
+    definition: UnifiedInstrumentDefinition<'_>,
+    _selected_at: Timestamp,
+) -> Result<ProductQuote, ServiceError> {
+    let executable = definition.executable.ok_or(ServiceError::InvalidResult)?;
+    let quote_candidate = evidence.best_quote_candidate();
+    let quote = match quote_candidate.map(|candidate| candidate.event()) {
+        Some(MarketEvent::Quote(quote)) => Some(quote),
+        Some(MarketEvent::BookSnapshot(_)) => None,
+        Some(_) => return Err(ServiceError::InvalidResult),
+        None => None,
+    };
+    let snapshot_candidate = quote_candidate
+        .filter(|candidate| matches!(candidate.event(), MarketEvent::BookSnapshot(_)));
+    let snapshot = match snapshot_candidate.map(|candidate| candidate.event()) {
+        Some(MarketEvent::BookSnapshot(snapshot)) => Some(snapshot),
+        Some(_) => return Err(ServiceError::InvalidResult),
+        None => None,
+    };
+    let (bid, ask, quote_evidence) = if let Some(quote) = quote {
+        (quote.bid(), quote.ask(), quote_candidate)
+    } else if let Some(snapshot) = snapshot {
+        (
+            snapshot.bids().first().copied(),
+            snapshot.asks().first().copied(),
+            snapshot_candidate,
+        )
+    } else {
+        (None, None, None)
+    };
+    let trade_candidate = evidence.candidate(LiveEventClass::Trade);
+    let trade = match evidence.event(LiveEventClass::Trade) {
+        Some(MarketEvent::Trade(trade)) => Some(trade),
+        Some(_) => return Err(ServiceError::InvalidResult),
+        None => None,
+    };
+    let bid_price = bid
+        .map(|level| decimal_price(level.price(), executable))
+        .transpose()?;
+    let ask_price = ask
+        .map(|level| decimal_price(level.price(), executable))
+        .transpose()?;
+    let quote_observed_at = quote_evidence.map(|candidate| {
+        candidate
+            .coordinate()
+            .source_timestamp()
+            .unwrap_or(candidate.coordinate().received_at())
+    });
+    let last_observed_at = trade_candidate.map(|candidate| {
+        candidate
+            .coordinate()
+            .source_timestamp()
+            .unwrap_or(candidate.coordinate().received_at())
+    });
+    Ok(ProductQuote {
+        bid_price: bid_price.map(|value| value.normalize().to_string()),
+        bid_size: bid
+            .map(|level| decimal_quantity(level.quantity(), executable))
+            .transpose()?,
+        ask_price: ask_price.map(|value| value.normalize().to_string()),
+        ask_size: ask
+            .map(|level| decimal_quantity(level.quantity(), executable))
+            .transpose()?,
+        midpoint: checked_midpoint(bid_price, ask_price)?,
+        last_price: trade
+            .map(|value| decimal_price(value.price(), executable))
+            .transpose()?
+            .map(|value| value.normalize().to_string()),
+        last_size: trade
+            .map(|value| decimal_quantity(value.quantity(), executable))
+            .transpose()?,
+        quote_observed_at,
+        last_observed_at,
+        quote_current_through: None,
+        last_current_through: None,
+        quote_fresh: false,
+        last_fresh: false,
+    })
+}
+
 fn product_market_state(
     selected: SelectedMarketSource<'_>,
     view: UnifiedSelectedView<'_>,
@@ -1916,19 +2308,19 @@ fn product_market_state(
     let timestamps = candidate.timestamps();
     let current_through = product_current_through(view);
     let is_fresh = product_view_is_fresh(view, selected_at);
-    let freshness = if is_fresh {
-        "fresh"
+    let freshness = if is_fresh { "fresh" } else { "stale" };
+    let availability = if matches!(view, UnifiedSelectedView::Durable(_)) {
+        "stored"
     } else {
-        "stale"
-    };
-    let availability = match (is_fresh, capabilities.quality()) {
-        (false, _) | (_, DataQuality::Stale) => "stale",
-        _ => match capabilities.timing() {
-            ObservationTiming::RealTime => "live",
-            ObservationTiming::Delayed => "delayed",
-            ObservationTiming::EndOfDay => "end_of_day",
-            ObservationTiming::Historical | ObservationTiming::Stored => "stored",
-        },
+        match (is_fresh, capabilities.quality()) {
+            (false, _) | (_, DataQuality::Stale) => "stale",
+            _ => match capabilities.timing() {
+                ObservationTiming::RealTime => "live",
+                ObservationTiming::Delayed => "delayed",
+                ObservationTiming::EndOfDay => "end_of_day",
+                ObservationTiming::Historical | ObservationTiming::Stored => "stored",
+            },
+        }
     };
     let confidence = product_confidence(selected, is_fresh);
     (
@@ -1954,6 +2346,7 @@ fn product_market_state(
 fn product_view_is_fresh(view: UnifiedSelectedView<'_>, selected_at: Timestamp) -> bool {
     match view {
         UnifiedSelectedView::Live(view) => selected_at <= view.stream.source_valid_until(),
+        UnifiedSelectedView::Durable(_) => false,
         UnifiedSelectedView::Display(snapshot) => display_selection_observation(snapshot.lease())
             .is_some_and(|value| {
                 matches!(
@@ -1973,6 +2366,7 @@ fn product_view_is_fresh(view: UnifiedSelectedView<'_>, selected_at: Timestamp) 
 fn product_current_through(view: UnifiedSelectedView<'_>) -> Option<Timestamp> {
     match view {
         UnifiedSelectedView::Live(view) => Some(view.stream.source_valid_until()),
+        UnifiedSelectedView::Durable(_) => None,
         UnifiedSelectedView::Display(snapshot) => display_selection_observation(snapshot.lease())
             .and_then(|value| display_expires_at(value.availability())),
         UnifiedSelectedView::Kraken(_) => None,
@@ -1988,9 +2382,7 @@ fn product_confidence(selected: SelectedMarketSource<'_>, is_fresh: bool) -> &'s
         && admission.integrity().state() == IntegrityState::Verified
         && matches!(
             quality,
-            DataQuality::DirectVerified
-                | DataQuality::OfficialDelayed
-                | DataQuality::Aggregated
+            DataQuality::DirectVerified | DataQuality::OfficialDelayed | DataQuality::Aggregated
         )
     {
         "moderate"
@@ -2066,6 +2458,39 @@ fn product_depth(
                 levels_truncated,
             )
         }
+        UnifiedSelectedView::Durable(evidence) => {
+            let executable = definition.executable.ok_or(ServiceError::InvalidResult)?;
+            let snapshot = match evidence
+                .safe_book_snapshot_candidate()
+                .map(|candidate| candidate.event())
+            {
+                Some(MarketEvent::BookSnapshot(snapshot)) => Some(snapshot),
+                Some(_) => return Err(ServiceError::InvalidResult),
+                None => None,
+            };
+            let bids = snapshot
+                .map(|snapshot| product_durable_levels(snapshot.bids(), executable))
+                .transpose()?
+                .unwrap_or_default();
+            let asks = snapshot
+                .map(|snapshot| product_durable_levels(snapshot.asks(), executable))
+                .transpose()?
+                .unwrap_or_default();
+            let levels_truncated = snapshot.is_some_and(|snapshot| {
+                snapshot.bids().len() > MAXIMUM_PRODUCT_DEPTH_LEVELS
+                    || snapshot.asks().len() > MAXIMUM_PRODUCT_DEPTH_LEVELS
+            });
+            (
+                snapshot.map_or("none", |snapshot| match snapshot.depth() {
+                    MarketDepth::TopOfBook => "top_of_book",
+                    MarketDepth::PriceLevel | MarketDepth::OrderLevel => "price_level",
+                }),
+                bids,
+                asks,
+                None,
+                levels_truncated,
+            )
+        }
         UnifiedSelectedView::Display(snapshot) => {
             let actor = snapshot.lease();
             let quote = match actor.quote().map(|value| value.observation().payload()) {
@@ -2127,8 +2552,8 @@ fn product_depth(
         }
     };
     let total_individual = individual.map_or(0, |value| value.orders().total_order_count());
-    let truncated = levels_truncated
-        || individual.is_some_and(|value| value.orders().is_truncated());
+    let truncated =
+        levels_truncated || individual.is_some_and(|value| value.orders().is_truncated());
     let summary = json!({
         "kind": kind,
         "bidLevels": bids.len(),
@@ -2152,6 +2577,23 @@ fn product_depth(
             "individualOrders": individual_orders,
         }),
     ))
+}
+
+fn product_durable_levels(
+    levels: &[market_squawk_domain::BookLevel],
+    definition: &InstrumentDefinition,
+) -> Result<Vec<Value>, ServiceError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(levels.len().min(MAXIMUM_PRODUCT_DEPTH_LEVELS))
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    for level in levels.iter().take(MAXIMUM_PRODUCT_DEPTH_LEVELS).copied() {
+        values.push(json!({
+            "price": decimal_price(level.price(), definition)?.normalize().to_string(),
+            "quantity": decimal_quantity(level.quantity(), definition)?,
+        }));
+    }
+    Ok(values)
 }
 
 fn product_live_levels(
@@ -2228,6 +2670,7 @@ fn definition_revision_digest_value(digest: Option<EvidenceDigest>) -> Value {
 #[derive(Clone, Copy)]
 enum UnifiedSelectedView<'snapshot> {
     Live(StreamView<'snapshot>),
+    Durable(&'snapshot DurableMarketRouteEvidence),
     Display(&'snapshot MarketDisplaySnapshotLease),
     Kraken(&'snapshot MarketKrakenPriceProjectionLease),
 }
@@ -2242,8 +2685,17 @@ fn exact_selected_view<'snapshot>(
     streams: &[StreamView<'snapshot>],
     display_snapshots: &[&'snapshot MarketDisplaySnapshotLease],
     kraken_projections: &[&'snapshot MarketKrakenPriceProjectionLease],
+    durable_market: Option<&'snapshot DurableMarketEvidenceSet>,
     selected: SelectedMarketSource<'_>,
 ) -> Result<UnifiedSelectedView<'snapshot>, ServiceError> {
+    if selected.candidate().capabilities().timing() == ObservationTiming::Stored
+        && let Some(evidence) = durable_market
+            .map(|durable_market| exact_selected_durable(durable_market, selected))
+            .transpose()?
+            .flatten()
+    {
+        return Ok(UnifiedSelectedView::Durable(evidence));
+    }
     let live = exact_selected_stream(streams, selected)?;
     let display = exact_selected_display(display_snapshots, selected)?;
     let kraken = exact_selected_kraken(kraken_projections, selected)?;
@@ -2251,8 +2703,43 @@ fn exact_selected_view<'snapshot>(
         (Some(view), None, None) => Ok(UnifiedSelectedView::Live(view)),
         (None, Some(snapshot), None) => Ok(UnifiedSelectedView::Display(snapshot)),
         (None, None, Some(snapshot)) => Ok(UnifiedSelectedView::Kraken(snapshot)),
+        (None, None, None) => durable_market
+            .map(|durable_market| exact_selected_durable(durable_market, selected))
+            .transpose()?
+            .flatten()
+            .map(UnifiedSelectedView::Durable)
+            .ok_or(ServiceError::InvalidResult),
         _ => Err(ServiceError::InvalidResult),
     }
+}
+
+fn exact_selected_durable<'snapshot>(
+    durable_market: &'snapshot DurableMarketEvidenceSet,
+    selected: SelectedMarketSource<'_>,
+) -> Result<Option<&'snapshot DurableMarketRouteEvidence>, ServiceError> {
+    let identity = selected.candidate().identity();
+    let generation = selected.candidate().admission().integrity().generation();
+    let mut matches = durable_market.routes.iter().filter(|evidence| {
+        let Some(primary) = evidence.presentation_candidate() else {
+            return false;
+        };
+        let Some(live) = evidence.metadata.coverage().live() else {
+            return false;
+        };
+        evidence.metadata.provider() == identity.provider()
+            && live.provider_product() == identity.product()
+            && live.provider_channel() == identity.feed()
+            && &evidence.source_id == identity.source_id()
+            && Some(&evidence.venue_id) == identity.venue_id()
+            && evidence.instrument_id == identity.instrument_id()
+            && &evidence.surface_id == identity.observation_id()
+            && Some(market_event_provenance(primary.event()).connection_generation()) == generation
+    });
+    let selected = matches.next();
+    if matches.next().is_some() {
+        return Err(ServiceError::InvalidResult);
+    }
+    Ok(selected)
 }
 
 fn unified_symbol(
@@ -2265,6 +2752,19 @@ fn unified_symbol(
         Some(UnifiedSelectedView::Live(view)) => {
             let executable = definition.executable.ok_or(ServiceError::InvalidResult)?;
             let mapping = display_mapping(executable, Some(view))?;
+            return Ok(UnifiedSymbol {
+                value: mapping.venue_symbol().as_str().to_owned(),
+                venue_id: Some(mapping.venue_id().as_str().to_owned()),
+                kind: "venue_symbol",
+            });
+        }
+        Some(UnifiedSelectedView::Durable(evidence)) => {
+            let executable = definition.executable.ok_or(ServiceError::InvalidResult)?;
+            let mapping = executable
+                .venue_mappings()
+                .iter()
+                .find(|mapping| mapping.venue_id() == &evidence.venue_id)
+                .ok_or(ServiceError::Unavailable)?;
             return Ok(UnifiedSymbol {
                 value: mapping.venue_symbol().as_str().to_owned(),
                 venue_id: Some(mapping.venue_id().as_str().to_owned()),
@@ -2480,6 +2980,7 @@ fn unified_quote_value(
             definition.executable.ok_or(ServiceError::InvalidResult)?,
             selected_at,
         ),
+        UnifiedSelectedView::Durable(_) => Err(ServiceError::InvalidResult),
         UnifiedSelectedView::Display(snapshot) => display_quote_value(snapshot.lease()),
         UnifiedSelectedView::Kraken(snapshot) => kraken_quote_value(snapshot, definition),
     }

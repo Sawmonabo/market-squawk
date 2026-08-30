@@ -127,23 +127,6 @@ impl CryptoPublicationSupervisor {
         }
     }
 
-    fn durable_read_count(&self) -> usize {
-        match self {
-            Self::Coinbase(supervisor) => supervisor.durable_read_count(),
-            Self::Kraken(supervisor) => supervisor.durable_read_count(),
-        }
-    }
-
-    fn append_durable_reads(
-        &self,
-        destination: &mut Vec<crate::application::CryptoMarketDurableRead>,
-    ) {
-        match self {
-            Self::Coinbase(supervisor) => supervisor.append_durable_reads(destination),
-            Self::Kraken(supervisor) => supervisor.append_durable_reads(destination),
-        }
-    }
-
     async fn shutdown(self, deadline: Instant) -> Result<(), ProductionLiveSourceRuntimeError> {
         match self {
             Self::Coinbase(supervisor) => supervisor
@@ -1112,23 +1095,6 @@ impl ProductionLiveSourceRuntime {
     /// Returns authority-free immutable snapshot access.
     pub fn snapshots(&self) -> LiveSnapshotReader {
         self.live.snapshots()
-    }
-
-    pub(crate) fn crypto_market_durable_read_count(&self) -> usize {
-        self.publication
-            .as_ref()
-            .map_or(0, CryptoPublicationSupervisor::durable_read_count)
-    }
-
-    /// Appends source-bound durable reads for internal provider-neutral selection. The caller
-    /// reserves the exact closed topology before taking the runtime registry lock.
-    pub(crate) fn append_crypto_market_durable_reads(
-        &self,
-        destination: &mut Vec<crate::application::CryptoMarketDurableRead>,
-    ) {
-        if let Some(publication) = self.publication.as_ref() {
-            publication.append_durable_reads(destination);
-        }
     }
 
     /// Installs one complete disabled action-hook group without reconnecting the source.

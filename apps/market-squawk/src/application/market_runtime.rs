@@ -111,6 +111,37 @@ pub(crate) struct MarketSourceSnapshotLease {
     lease: LiveRuntimeSnapshotLease,
 }
 
+/// One source-bound immutable market reader joined to one validated runtime route.
+///
+/// This is an internal application capability. Provider and route coordinates remain below the
+/// ordinary product boundary and are used only to prevent cross-source or cross-venue reads.
+#[derive(Clone, Debug)]
+pub(crate) struct CryptoMarketDurableRouteRead {
+    read: CryptoMarketDurableRead,
+    surface_id: SourceIdentifier,
+    metadata: Arc<[SourceMetadata]>,
+    source_index: usize,
+    route: ShardKey,
+}
+
+impl CryptoMarketDurableRouteRead {
+    pub(crate) const fn read(&self) -> &CryptoMarketDurableRead {
+        &self.read
+    }
+
+    pub(crate) const fn surface_id(&self) -> &SourceIdentifier {
+        &self.surface_id
+    }
+
+    pub(crate) fn metadata(&self) -> &SourceMetadata {
+        &self.metadata[self.source_index]
+    }
+
+    pub(crate) const fn route(&self) -> &ShardKey {
+        &self.route
+    }
+}
+
 impl MarketSourceSnapshotLease {
     pub(crate) const fn surface_id(&self) -> &SourceIdentifier {
         &self.surface_id
@@ -237,6 +268,7 @@ pub(crate) struct MarketRuntimeRegistry {
     shutdown: Mutex<Option<Result<(), ServiceError>>>,
     mutation: Mutex<()>,
     entries: Mutex<Vec<MarketRuntimeEntry>>,
+    durable_market_routes: Mutex<Vec<CryptoMarketDurableRouteRead>>,
     account_health_cancellation: CancellationToken,
     account_health_drain: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -276,6 +308,10 @@ impl MarketRuntimeRegistry {
         let mut entries = Vec::new();
         entries
             .try_reserve_exact(MAXIMUM_CONCURRENT_MARKET_SURFACES)
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        let mut durable_market_routes = Vec::new();
+        durable_market_routes
+            .try_reserve_exact(MAX_DISPLAY_MARKET_ROUTES)
             .map_err(|_error| ServiceError::ResourceExhausted)?;
         let lifecycle = CancellationToken::new();
         let capture_process = market_squawk_platform::initialize_capture_process_infrastructure(
@@ -321,6 +357,7 @@ impl MarketRuntimeRegistry {
             shutdown: Mutex::new(None),
             mutation: Mutex::new(()),
             entries: Mutex::new(entries),
+            durable_market_routes: Mutex::new(durable_market_routes),
             account_health_cancellation: CancellationToken::new(),
             account_health_drain: Mutex::new(None),
         }))
@@ -740,6 +777,24 @@ impl MarketRuntimeRegistry {
                 let route_keys = clone_route_keys(composition.live_routes())?;
                 let topology =
                     MarketRuntimeTopology::try_new(provider, Arc::clone(&metadata), route_keys)?;
+                let mut durable_reads = Vec::new();
+                durable_reads
+                    .try_reserve_exact(publication_package.durable_read_count())
+                    .map_err(|_error| ServiceError::ResourceExhausted)?;
+                publication_package.append_durable_reads(&mut durable_reads);
+                let durable_routes = durable_route_bindings(
+                    provider,
+                    Arc::clone(&metadata),
+                    &topology,
+                    durable_reads,
+                )?;
+                self.replace_durable_market_routes(
+                    provider,
+                    durable_routes,
+                    deadline,
+                    cancellation,
+                )
+                .await?;
                 let (exports, drains) = LiveFairValueExportDrains::try_start(
                     composition.qualified_market_export_source_id().clone(),
                     composition.live_routes(),
@@ -1494,37 +1549,59 @@ impl MarketRuntimeRegistry {
         Ok(MarketRuntimeSnapshotBatch { sources, failures })
     }
 
-    /// Clones the bounded source-bound durable reads consumed by the internal neutral selector.
-    /// Provider identities and runtime metadata never cross this capability boundary.
-    pub(crate) async fn crypto_market_durable_reads(
+    /// Joins each bounded source-bound durable reader to its validated runtime routes.
+    ///
+    /// The returned coordinates remain internal to neutral product selection. The immutable
+    /// topology, rather than a hot snapshot, is the route authority after process restart.
+    pub(crate) async fn crypto_market_durable_route_reads(
         &self,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<CryptoMarketDurableRead>, ServiceError> {
+    ) -> Result<Vec<CryptoMarketDurableRouteRead>, ServiceError> {
         ensure_active(&self.accepting, deadline, cancellation)?;
-        let reads = {
-            let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
-            let count = entries
-                .iter()
-                .filter(|entry| entry.is_published_healthy())
-                .try_fold(0_usize, |count, entry| {
-                    count.checked_add(entry.runtime.crypto_market_durable_read_count())
-                })
-                .ok_or(ServiceError::ResourceExhausted)?;
-            let mut reads = Vec::new();
-            reads
-                .try_reserve_exact(count)
+        let bindings = {
+            let retained =
+                bounded_lock(&self.durable_market_routes, deadline, cancellation).await?;
+            let mut bindings = Vec::new();
+            bindings
+                .try_reserve_exact(retained.len())
                 .map_err(|_error| ServiceError::ResourceExhausted)?;
-            for entry in entries.iter().filter(|entry| entry.is_published_healthy()) {
-                entry.runtime.append_crypto_market_durable_reads(&mut reads);
-            }
-            if reads.len() != count {
-                return Err(ServiceError::Unavailable);
-            }
-            reads
+            bindings.extend(retained.iter().cloned());
+            bindings
         };
         ensure_active(&self.accepting, deadline, cancellation)?;
-        Ok(reads)
+        Ok(bindings)
+    }
+
+    async fn replace_durable_market_routes(
+        &self,
+        surface_id: &SourceIdentifier,
+        routes: Vec<CryptoMarketDurableRouteRead>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        if routes.iter().any(|route| route.surface_id() != surface_id) {
+            return Err(ServiceError::InvalidResult);
+        }
+        let mut retained =
+            bounded_lock(&self.durable_market_routes, deadline, cancellation).await?;
+        let retained_other_count = retained
+            .iter()
+            .filter(|route| route.surface_id() != surface_id)
+            .count();
+        let next_len = retained_other_count
+            .checked_add(routes.len())
+            .ok_or(ServiceError::ResourceExhausted)?;
+        if next_len > MAX_DISPLAY_MARKET_ROUTES {
+            return Err(ServiceError::ResourceExhausted);
+        }
+        let additional_capacity = next_len.saturating_sub(retained.capacity());
+        retained
+            .try_reserve_exact(additional_capacity)
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        retained.retain(|route| route.surface_id() != surface_id);
+        retained.extend(routes);
+        Ok(())
     }
 
     /// Reads every account-backed display source for one instrument in exact actor-key order.
@@ -2373,6 +2450,67 @@ impl MarketRuntimeEntry {
     }
 }
 
+fn durable_route_bindings(
+    surface_id: &SourceIdentifier,
+    metadata: Arc<[SourceMetadata]>,
+    topology: &MarketRuntimeTopology,
+    reads: Vec<CryptoMarketDurableRead>,
+) -> Result<Vec<CryptoMarketDurableRouteRead>, ServiceError> {
+    if reads.is_empty() {
+        return Ok(Vec::new());
+    }
+    if topology.metadata().as_ref() != metadata.as_ref() {
+        return Err(ServiceError::InvalidResult);
+    }
+    let mut bindings = Vec::new();
+    for read in reads {
+        let source_id = read.point_in_time_selector().source_surface();
+        let mut source_indexes = topology
+            .metadata()
+            .iter()
+            .enumerate()
+            .filter(|(_index, metadata)| metadata.source_id() == source_id);
+        let (source_index, _metadata) = source_indexes.next().ok_or(ServiceError::InvalidResult)?;
+        if source_indexes.next().is_some() {
+            return Err(ServiceError::InvalidResult);
+        }
+        let matching_route_count = topology
+            .routes()
+            .iter()
+            .filter(|route| route.source_indexes().contains(&source_index))
+            .count();
+        if matching_route_count == 0 {
+            return Err(ServiceError::InvalidResult);
+        }
+        bindings
+            .try_reserve_exact(matching_route_count)
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        for route in topology
+            .routes()
+            .iter()
+            .filter(|route| route.source_indexes().contains(&source_index))
+        {
+            bindings.push(CryptoMarketDurableRouteRead {
+                read: read.clone(),
+                surface_id: surface_id.clone(),
+                metadata: Arc::clone(&metadata),
+                source_index,
+                route: route.route().clone(),
+            });
+        }
+    }
+    if bindings.iter().enumerate().any(|(index, binding)| {
+        bindings.iter().skip(index + 1).any(|candidate| {
+            binding.read.point_in_time_selector().source_surface()
+                == candidate.read.point_in_time_selector().source_surface()
+                && binding.route == candidate.route
+        })
+    }) {
+        return Err(ServiceError::InvalidResult);
+    }
+    Ok(bindings)
+}
+
 impl fmt::Debug for MarketRuntimeEntry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -2418,19 +2556,6 @@ impl MarketRuntime {
             Self::Public(runtime) => Ok(runtime.snapshots()),
             Self::CoinbaseDirect(runtime) => Ok(runtime.snapshots()),
             Self::Account(_) => Err(ServiceError::InvalidRequest),
-        }
-    }
-
-    fn crypto_market_durable_read_count(&self) -> usize {
-        match self {
-            Self::Public(runtime) => runtime.crypto_market_durable_read_count(),
-            Self::CoinbaseDirect(_) | Self::Account(_) => 0,
-        }
-    }
-
-    fn append_crypto_market_durable_reads(&self, destination: &mut Vec<CryptoMarketDurableRead>) {
-        if let Self::Public(runtime) = self {
-            runtime.append_crypto_market_durable_reads(destination);
         }
     }
 

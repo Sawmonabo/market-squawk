@@ -40,8 +40,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::application::{
-    CryptoMarketPublicationAuthority, ManagedResearchExtractionSource,
-    ProductionResearchIngestCoordinator,
+    CryptoMarketDurableRead, CryptoMarketDurableReadWriter, CryptoMarketPublicationAuthority,
+    ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,
     ResearchProviderRuntimeGeneration, ResearchProviderRuntimeMutationAuthority,
     ResearchProviderRuntimeReplacement, ResearchRightsAuthority,
 };
@@ -122,6 +122,8 @@ const CRYPTO_PUBLICATION_PROCESS_LIFETIME: Duration = Duration::from_secs(3_153_
 /// Exact research authority retained for one public Coinbase runtime incarnation.
 pub(crate) struct CoinbaseMarketPublicationPackage {
     market: Arc<CryptoMarketPublicationAuthority>,
+    durable_writer: CryptoMarketDurableReadWriter,
+    durable_read: CryptoMarketDurableRead,
 }
 
 /// Closed exact-authority topology for the selected public crypto runtime.
@@ -131,9 +133,34 @@ pub(crate) enum CryptoMarketPublicationPackage {
     Kraken(KrakenMarketPublicationPackage),
 }
 
+impl CryptoMarketPublicationPackage {
+    pub(crate) const fn durable_read_count(&self) -> usize {
+        match self {
+            Self::Coinbase(_) => 1,
+            Self::Kraken(package) => package.durable_reads.len(),
+        }
+    }
+
+    pub(crate) fn append_durable_reads(&self, destination: &mut Vec<CryptoMarketDurableRead>) {
+        match self {
+            Self::Coinbase(package) => destination.push(package.durable_read().clone()),
+            Self::Kraken(package) => destination.extend(package.durable_reads().iter().cloned()),
+        }
+    }
+}
+
 impl CoinbaseMarketPublicationPackage {
-    pub(crate) fn into_authority(self) -> Arc<CryptoMarketPublicationAuthority> {
-        self.market
+    pub(crate) fn durable_read(&self) -> &CryptoMarketDurableRead {
+        &self.durable_read
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Arc<CryptoMarketPublicationAuthority>,
+        CryptoMarketDurableReadWriter,
+    ) {
+        (self.market, self.durable_writer)
     }
 }
 
@@ -150,16 +177,30 @@ impl fmt::Debug for CoinbaseMarketPublicationPackage {
 pub(crate) struct KrakenMarketPublicationPackage {
     book: Arc<CryptoMarketPublicationAuthority>,
     trades: Arc<CryptoMarketPublicationAuthority>,
+    book_durable_writer: CryptoMarketDurableReadWriter,
+    trade_durable_writer: CryptoMarketDurableReadWriter,
+    durable_reads: [CryptoMarketDurableRead; 2],
 }
 
 impl KrakenMarketPublicationPackage {
+    pub(crate) fn durable_reads(&self) -> &[CryptoMarketDurableRead; 2] {
+        &self.durable_reads
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
         Arc<CryptoMarketPublicationAuthority>,
         Arc<CryptoMarketPublicationAuthority>,
+        CryptoMarketDurableReadWriter,
+        CryptoMarketDurableReadWriter,
     ) {
-        (self.book, self.trades)
+        (
+            self.book,
+            self.trades,
+            self.book_durable_writer,
+            self.trade_durable_writer,
+        )
     }
 }
 
@@ -287,8 +328,13 @@ impl ProviderAdapterActivation {
                 dataset,
             )
             .await?;
+        let (durable_writer, durable_read) = market.durable_read_capability();
         Ok(CryptoMarketPublicationPackage::Coinbase(
-            CoinbaseMarketPublicationPackage { market },
+            CoinbaseMarketPublicationPackage {
+                market,
+                durable_writer,
+                durable_read,
+            },
         ))
     }
 
@@ -331,8 +377,16 @@ impl ProviderAdapterActivation {
                 dataset,
             )
             .await?;
+        let (book_durable_writer, book_durable_read) = book.durable_read_capability();
+        let (trade_durable_writer, trade_durable_read) = trades.durable_read_capability();
         Ok(CryptoMarketPublicationPackage::Kraken(
-            KrakenMarketPublicationPackage { book, trades },
+            KrakenMarketPublicationPackage {
+                book,
+                trades,
+                book_durable_writer,
+                trade_durable_writer,
+                durable_reads: [book_durable_read, trade_durable_read],
+            },
         ))
     }
 

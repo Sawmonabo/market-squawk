@@ -10,9 +10,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     application::{
-        CryptoCommittedRowIngress, CryptoMarketDurableRead, CryptoMarketDurableReadWriter,
-        CryptoMarketPublicationAuthority, CryptoMarketPublicationError, CryptoPendingFrameIngress,
-        CryptoPublicationRendezvousLimits, KrakenMarketApplicationOutcome,
+        CryptoCommittedRowIngress, CryptoMarketDurableReadWriter, CryptoMarketPublicationAuthority,
+        CryptoMarketPublicationError, CryptoPendingFrameIngress, CryptoPublicationRendezvousLimits,
+        KrakenMarketApplicationOutcome,
     },
     provider_activation::KrakenMarketPublicationPackage,
 };
@@ -29,7 +29,6 @@ pub(super) struct KrakenPublicationSupervisor {
     committed: Vec<JoinHandle<Result<(), KrakenPublicationSupervisorError>>>,
     book: Option<Arc<CryptoMarketPublicationAuthority>>,
     trades: Option<Arc<CryptoMarketPublicationAuthority>>,
-    durable_reads: [CryptoMarketDurableRead; 2],
 }
 
 impl KrakenPublicationSupervisor {
@@ -54,9 +53,7 @@ impl KrakenPublicationSupervisor {
         }
         let (pending, committed) =
             CryptoPendingFrameIngress::try_new(limits, cancellation.clone())?;
-        let (book, trades) = package.into_parts();
-        let (book_durable_writer, book_durable_read) = book.durable_read_capability();
-        let (trade_durable_writer, trade_durable_read) = trades.durable_read_capability();
+        let (book, trades, book_durable_writer, trade_durable_writer) = package.into_parts();
 
         let expiry_pending = pending.clone();
         let expiry = tokio::spawn(async move { expiry_pending.run_expiry_driver().await });
@@ -108,16 +105,7 @@ impl KrakenPublicationSupervisor {
             committed: committed_tasks,
             book: Some(book),
             trades: Some(trades),
-            durable_reads: [book_durable_read, trade_durable_read],
         })
-    }
-
-    pub(super) const fn durable_read_count(&self) -> usize {
-        self.durable_reads.len()
-    }
-
-    pub(super) fn append_durable_reads(&self, destination: &mut Vec<CryptoMarketDurableRead>) {
-        destination.extend(self.durable_reads.iter().cloned());
     }
 
     pub(super) fn is_healthy(&self) -> bool {
