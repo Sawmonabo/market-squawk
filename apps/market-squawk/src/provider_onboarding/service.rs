@@ -243,6 +243,19 @@ pub(crate) struct RetainedRuntimeVerificationEvidence {
     onboarding_state: OnboardingState,
 }
 
+/// Serialized disposition for one exact OAuth generation's market-doctor admission.
+#[derive(Debug)]
+pub(crate) enum SchwabMarketDoctorRunPreparation {
+    /// The retained doctor receipt already covers the exact current OAuth generation.
+    Current,
+    /// The doctor may run immediately under this exact bootstrap authority.
+    Ready(SchwabOAuthBootstrapLease),
+    /// OAuth rotated before the predecessor receipt's exclusive currentness horizon elapsed.
+    /// One application-owned task waits this exact remaining duration, then revalidates every
+    /// authority before it can issue a provider request.
+    Deferred { wait: Duration },
+}
+
 impl RetainedRuntimeVerificationEvidence {
     pub(crate) const fn evidence(&self) -> &RuntimeVerificationEvidence {
         &self.evidence
@@ -546,6 +559,105 @@ impl ProviderOnboardingService {
                 | None => return Err(ProviderOnboardingError::ActivationUnavailable),
             }
         }
+    }
+
+    /// Serializes initial Schwab doctor admission and exact active-generation renewal.
+    ///
+    /// A current receipt for the same OAuth token generation needs no provider call. Once an
+    /// active receipt expires, this method records `RenewalRequired` before issuing the only lease
+    /// that can replace it. Candidate receipts are never replaced in place because they have not
+    /// yet crossed application-owned runtime activation.
+    pub(crate) async fn prepare_schwab_market_doctor_run(
+        &self,
+        session_id: Uuid,
+        access_token_generation: u64,
+        cancellation: CancellationToken,
+    ) -> Result<SchwabMarketDoctorRunPreparation, ProviderOnboardingError> {
+        if access_token_generation == 0 {
+            return Err(ProviderOnboardingError::InvalidRequest);
+        }
+        let _activation = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                return Err(ProviderOnboardingError::OperationCancelled);
+            }
+            activation = self.activation.lock() => activation,
+        };
+        if cancellation.is_cancelled() {
+            return Err(ProviderOnboardingError::OperationCancelled);
+        }
+        let resumed = self.catalog.resume_provider_onboarding(session_id)?;
+        let profile = self.current_profile_for(&resumed)?;
+        if profile.id() != SCHWAB_MARKET_DATA_SURFACE_ID
+            || profile.release_state() == ProfileReleaseState::RightsBlocked
+        {
+            return Err(ProviderOnboardingError::InvalidProfile);
+        }
+        let lifecycle = resumed.lifecycle();
+        let generation = lifecycle
+            .candidate_generation()
+            .or_else(|| lifecycle.active_generation())
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        let retained = lifecycle
+            .generation_runtime_evidence(generation)
+            .map(|evidence| {
+                evidence
+                    .schwab_market_data_receipt()
+                    .ok_or(ProviderOnboardingError::InvalidSessionState)
+            })
+            .transpose()?;
+        let Some(retained) = retained else {
+            if lifecycle.candidate_generation() != Some(generation) {
+                return Err(ProviderOnboardingError::InvalidSessionState);
+            }
+            return self
+                .mint_schwab_oauth_bootstrap_lease(&resumed, profile)
+                .map(SchwabMarketDoctorRunPreparation::Ready);
+        };
+        let now = system_timestamp()?;
+        if retained.access_token_generation() == access_token_generation
+            && retained.is_current_at(now)
+        {
+            return Ok(SchwabMarketDoctorRunPreparation::Current);
+        }
+        if lifecycle.active_generation() != Some(generation)
+            || lifecycle.candidate_generation().is_some()
+        {
+            return Err(ProviderOnboardingError::ActivationUnavailable);
+        }
+        if now < retained.exclusive_expires_at() {
+            let wait_nanos = retained
+                .exclusive_expires_at()
+                .unix_nanos()
+                .checked_sub(now.unix_nanos())
+                .and_then(|nanos| u64::try_from(nanos).ok())
+                .ok_or(ProviderOnboardingError::Clock)?;
+            return Ok(SchwabMarketDoctorRunPreparation::Deferred {
+                wait: Duration::from_nanos(wait_nanos),
+            });
+        }
+        let renewal = match lifecycle.state() {
+            OnboardingState::ActiveScoped => {
+                self.append(
+                    resumed.reservation(),
+                    resumed.next_sequence(),
+                    OnboardingEvent::RenewalRequired {
+                        generation,
+                        expires_at: retained.exclusive_expires_at(),
+                        evidence_digest: event_digest(
+                            b"schwab-market-doctor-renewal-required",
+                            session_id,
+                            Some(generation),
+                        ),
+                    },
+                )?;
+                self.catalog.resume_provider_onboarding(session_id)?
+            }
+            OnboardingState::RenewalRequired => resumed,
+            _ => return Err(ProviderOnboardingError::InvalidSessionState),
+        };
+        self.mint_schwab_oauth_bootstrap_lease(&renewal, profile)
+            .map(SchwabMarketDoctorRunPreparation::Ready)
     }
 
     /// Revalidates one exact bootstrap lease and returns an opaque factory over the same protected

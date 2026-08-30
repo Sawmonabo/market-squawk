@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
@@ -14,6 +15,7 @@ use std::time::Instant;
 use market_squawk_adapter_schwab::SchwabOAuthAuthorityReceipt;
 use market_squawk_sources::RuntimeVerificationEvidence;
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -23,6 +25,7 @@ use super::schwab_market_doctor::{
     SchwabMarketDataDoctorRun, SchwabMarketDoctorCaptureSealer, SchwabMarketDoctorProbeExecutor,
     SchwabMarketDoctorSetupRequiredEvidence,
 };
+use super::schwab_market_doctor_probe::ProviderNativeSchwabMarketDoctorProbeExecutor;
 use super::schwab_oauth_runtime::SchwabOAuthMarketAuthority;
 use super::{ProviderOnboardingError, ProviderOnboardingService};
 use crate::research_service::ResearchService;
@@ -56,6 +59,7 @@ pub(crate) struct SchwabMarketDoctorRuntimeCoordinator {
     onboarding: Arc<ProviderOnboardingService>,
     research: Arc<ResearchService>,
     probes: Arc<dyn SchwabMarketDoctorProbeExecutor>,
+    run: Mutex<()>,
 }
 
 impl SchwabMarketDoctorRuntimeCoordinator {
@@ -68,7 +72,21 @@ impl SchwabMarketDoctorRuntimeCoordinator {
             onboarding,
             research,
             probes,
+            run: Mutex::new(()),
         }
+    }
+
+    /// Constructs the complete provider-native production doctor and restart-safe Streamer
+    /// connection-control authority beneath the selected workspace's controlled root.
+    pub(crate) fn try_production(
+        onboarding: Arc<ProviderOnboardingService>,
+        research: Arc<ResearchService>,
+        control_root: &Path,
+    ) -> Result<Self, SchwabMarketDoctorRuntimeError> {
+        let probes = Arc::new(
+            ProviderNativeSchwabMarketDoctorProbeExecutor::try_production_installed(control_root)?,
+        );
+        Ok(Self::new(onboarding, research, probes))
     }
 
     /// Runs one doctor against one exact current bootstrap lease and OAuth market authority.
@@ -83,6 +101,8 @@ impl SchwabMarketDoctorRuntimeCoordinator {
         cancellation: CancellationToken,
         deadline: Instant,
     ) -> Result<SchwabMarketDoctorRuntimeTerminal, SchwabMarketDoctorRuntimeError> {
+        ensure_active(&cancellation, deadline)?;
+        let _run = bounded(self.run.lock(), &cancellation, deadline).await?;
         ensure_active(&cancellation, deadline)?;
         if lease.session_id() != authority.session_id() {
             return Err(SchwabMarketDoctorRuntimeError::AuthorityMismatch);
@@ -297,6 +317,7 @@ impl fmt::Debug for SchwabMarketDoctorRuntimeCoordinator {
             .field("onboarding", &"[SERVICE-OWNED CATALOG/RATE AUTHORITY]")
             .field("research", &"[APPLICATION RAW-SEAL AUTHORITY]")
             .field("probes", &self.probes)
+            .field("run", &"[SERIALIZED]")
             .finish()
     }
 }

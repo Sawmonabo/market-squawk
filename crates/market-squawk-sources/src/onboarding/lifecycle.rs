@@ -1270,6 +1270,10 @@ impl OnboardingLifecycle {
                 let currentness_deadline = self
                     .generation_alpaca_paper_iex_doctor_receipt(generation)
                     .map(super::AlpacaPaperIexDoctorReceiptV1::exclusive_expires_at)
+                    .or_else(|| {
+                        self.generation_schwab_market_data_doctor_receipt(generation)
+                            .map(super::SchwabMarketDataDoctorReceiptV1::exclusive_expires_at)
+                    })
                     .or_else(|| verification.expires_at());
                 if self.state != OnboardingState::ActiveScoped
                     || self.active_generation != Some(generation)

@@ -5,26 +5,35 @@
 //! the injected application sealer. The closed plans below cannot represent account, position,
 //! transaction, order, money-movement, or Streamer account-activity operations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use market_squawk_adapter_schwab::{
-    AccessTokenAdmission, MarketDataService, ParseBounds, ProductionSchwabStreamerConnector,
-    RawRestResponseReceipt, ReadOnlyRequest, ReadOnlyRoute, RestExecutionOutcome,
-    RestItemAccounting, SchwabAccessTokenSource, SchwabAdapterError, SchwabCaptureCoordinates,
-    SchwabRestExecutor, SchwabRestFamily, SchwabRestFamilyDoctorInput, SchwabSealedRawRestCapture,
-    SchwabSealedRestResponse, SchwabSealedStreamerCapture, SchwabStreamerConnectionControlSource,
+    AccessTokenAdmission, ChainRequest, ConnectionGeneration, ExpirationChainRequest,
+    InstrumentProjection, MarketDataService, MarketId, MoverFrequency, MoverSort, ParseBounds,
+    PriceHistoryFrequency, PriceHistoryFrequencyType, PriceHistoryPeriodType, PriceHistoryRequest,
+    ProductionSchwabStreamerConnector, ProviderIdentifier, QuoteField, QuoteRequest,
+    RawRestResponseReceipt, ReadOnlyRequest, ReadOnlyRoute, RequestAdmission, RestExecutionOutcome,
+    RestItemAccounting, RestTransportBounds, SchwabAccessTokenSource, SchwabAdapterError,
+    SchwabCaptureCoordinates, SchwabRestExecutor, SchwabRestFamily, SchwabRestFamilyDoctorInput,
+    SchwabSealedRawRestCapture, SchwabSealedRestResponse, SchwabSealedStreamerCapture,
+    SchwabStreamerConnectionControl, SchwabStreamerConnectionControlSource,
     SchwabStreamerConnector, SchwabStreamerExecutor, SchwabStreamerFamilyDoctorAccumulator,
     SchwabStreamerFamilyDoctorHandoff, SchwabTransportError, SchwabTransportTelemetry,
     SchwabUserPreferenceEvidence, SchwabVerticalError, StreamerAdmission, StreamerCaptureSink,
     StreamerCaptureSinkError, StreamerMicrobatch, StreamerSubscription, StreamerTransportBounds,
-    TokenAuthorityError,
+    TokenAuthorityError, build_instrument_search_request, build_market_hours_request,
+    build_movers_request,
 };
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
+};
+use market_squawk_platform::LocalAuthorityStateStore;
 use market_squawk_sources::{RuntimeCapabilityDisposition, SchwabMarketDataFamily};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{Mutex, mpsc};
@@ -48,6 +57,13 @@ const USER_PREFERENCE_REASON_DOMAIN: &[u8] =
     b"market-squawk/schwab-user-preference-doctor-reason/v1";
 const USER_PREFERENCE_OFFER_DOMAIN: &[u8] =
     b"market-squawk/schwab-user-preference-market-data-offer/v1";
+const PRODUCTION_CONTROL_STATE_DOMAIN: &[u8] =
+    b"market-squawk/schwab-market-doctor-streamer-control/v1\0";
+const PRODUCTION_OPTION_STREAMER_SELECTION_DOMAIN: &[u8] =
+    b"market-squawk/schwab-market-doctor/returned-unexpired-option-contract/v1\0";
+const PRODUCTION_CONTROL_DIRECTORY: &str = "sources/schwab-market-doctor-streamer-v1";
+const PRODUCTION_SOURCE_ID: &str = "schwab-market-doctor";
+const PRODUCTION_METADATA_REVISION: &str = "schwab-market-doctor-native-v1";
 
 const REST_FAMILIES: [SchwabMarketDataFamily; 7] = [
     SchwabMarketDataFamily::Quotes,
@@ -99,11 +115,20 @@ impl SchwabMarketDoctorRestProbe {
     }
 }
 
-/// One exact admitted subscription for one selected Streamer service.
+/// One exact admitted subscription or provider-returned contract selection for one service.
 #[derive(Clone, Debug)]
 pub(crate) struct SchwabMarketDoctorStreamerProbe {
     family: SchwabMarketDataFamily,
-    subscription: StreamerSubscription,
+    target: SchwabMarketDoctorStreamerTarget,
+}
+
+#[derive(Clone, Debug)]
+enum SchwabMarketDoctorStreamerTarget {
+    Exact(StreamerSubscription),
+    ReturnedOptionContract {
+        service: MarketDataService,
+        field_ids: BTreeSet<u16>,
+    },
 }
 
 impl SchwabMarketDoctorStreamerProbe {
@@ -116,8 +141,45 @@ impl SchwabMarketDoctorStreamerProbe {
         }
         Ok(Self {
             family,
-            subscription,
+            target: SchwabMarketDoctorStreamerTarget::Exact(subscription),
         })
+    }
+
+    fn try_returned_option_contract(
+        family: SchwabMarketDataFamily,
+        field_ids: Vec<u16>,
+        admission: StreamerAdmission,
+    ) -> Result<Self, SchwabMarketDataDoctorError> {
+        let service = streamer_service(family)
+            .filter(|service| {
+                matches!(
+                    service,
+                    MarketDataService::LevelOneOptions | MarketDataService::OptionsBook
+                )
+            })
+            .ok_or(SchwabMarketDataDoctorError::InvalidProbeContract)?;
+        let field_ids = field_ids.into_iter().collect::<BTreeSet<_>>();
+        if field_ids.is_empty() || field_ids.len() > admission.max_fields_per_service() {
+            return Err(SchwabMarketDataDoctorError::InvalidProbeContract);
+        }
+        Ok(Self {
+            family,
+            target: SchwabMarketDoctorStreamerTarget::ReturnedOptionContract { service, field_ids },
+        })
+    }
+
+    const fn service(&self) -> MarketDataService {
+        match &self.target {
+            SchwabMarketDoctorStreamerTarget::Exact(subscription) => subscription.service(),
+            SchwabMarketDoctorStreamerTarget::ReturnedOptionContract { service, .. } => *service,
+        }
+    }
+
+    fn field_ids(&self) -> &BTreeSet<u16> {
+        match &self.target {
+            SchwabMarketDoctorStreamerTarget::Exact(subscription) => subscription.field_ids(),
+            SchwabMarketDoctorStreamerTarget::ReturnedOptionContract { field_ids, .. } => field_ids,
+        }
     }
 }
 
@@ -132,6 +194,110 @@ impl fmt::Debug for RetainedUserPreference {
             .debug_struct("RetainedUserPreference")
             .field("token_generation", &self.token_generation)
             .field("provider", &self.provider)
+            .finish()
+    }
+}
+
+struct ProductionStreamerControlState {
+    store: LocalAuthorityStateStore,
+    last_generation: u64,
+}
+
+/// Restart-safe, application-owned allocator for the doctor's one-use Streamer controls.
+struct ProductionSchwabMarketDoctorStreamerControlSource {
+    state: Arc<std::sync::Mutex<ProductionStreamerControlState>>,
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    dataset: SourceIdentifier,
+}
+
+impl ProductionSchwabMarketDoctorStreamerControlSource {
+    fn try_open(control_root: &Path) -> Result<Self, SchwabMarketDataDoctorError> {
+        let store =
+            LocalAuthorityStateStore::try_open(control_root.join(PRODUCTION_CONTROL_DIRECTORY))
+                .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?;
+        let last_generation = match store
+            .load()
+            .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?
+        {
+            Some(payload) => decode_production_control_state(&payload)?,
+            None => 0,
+        };
+        Ok(Self {
+            state: Arc::new(std::sync::Mutex::new(ProductionStreamerControlState {
+                store,
+                last_generation,
+            })),
+            source_id: source_id(PRODUCTION_SOURCE_ID)?,
+            metadata_revision: metadata_revision(PRODUCTION_METADATA_REVISION)?,
+            dataset: identifier("schwab-market-doctor-streamer")?,
+        })
+    }
+}
+
+impl SchwabStreamerConnectionControlSource for ProductionSchwabMarketDoctorStreamerControlSource {
+    fn mint(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = Result<SchwabStreamerConnectionControl, SchwabTransportError>>
+                + Send
+                + '_,
+        >,
+    > {
+        let state = Arc::clone(&self.state);
+        let source_id = self.source_id.clone();
+        let metadata_revision = self.metadata_revision.clone();
+        let dataset = self.dataset.clone();
+        Box::pin(async move {
+            let generation = tokio::task::spawn_blocking(move || {
+                let mut state = state
+                    .lock()
+                    .map_err(|_| SchwabTransportError::CaptureMaterial)?;
+                let generation = state
+                    .last_generation
+                    .checked_add(1)
+                    .ok_or(SchwabTransportError::Overflow)?;
+                state
+                    .store
+                    .store(&encode_production_control_state(generation))
+                    .map_err(|_| SchwabTransportError::CaptureMaterial)?;
+                state.last_generation = generation;
+                Ok::<u64, SchwabTransportError>(generation)
+            })
+            .await
+            .map_err(|_| SchwabTransportError::CaptureMaterial)??;
+            let generation = NonZeroU64::new(generation)
+                .map(ConnectionGeneration::new)
+                .ok_or(SchwabTransportError::Overflow)?;
+            let coordinates = SchwabCaptureCoordinates::try_new(
+                source_id,
+                metadata_revision,
+                dataset,
+                Uuid::new_v4(),
+            )?;
+            let stream_identity = SourceIdentifier::try_from(format!(
+                "schwab-market-doctor-stream-{}",
+                generation.get()
+            ))
+            .map_err(|_| SchwabTransportError::CaptureMaterial)?;
+            Ok(SchwabStreamerConnectionControl::new(
+                generation,
+                coordinates,
+                stream_identity,
+            ))
+        })
+    }
+}
+
+impl fmt::Debug for ProductionSchwabMarketDoctorStreamerControlSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProductionSchwabMarketDoctorStreamerControlSource")
+            .field("state", &"[DURABLE APPLICATION AUTHORITY]")
+            .field("source_id", &self.source_id)
+            .field("metadata_revision", &self.metadata_revision)
+            .field("dataset", &self.dataset)
             .finish()
     }
 }
@@ -152,9 +318,82 @@ pub(crate) struct ProviderNativeSchwabMarketDoctorProbeExecutor {
     channel_capacity: NonZeroUsize,
     probe_contract_digest: EvidenceDigest,
     user_preference: Mutex<Option<RetainedUserPreference>>,
+    streamer_option_contract: Mutex<Option<ProviderIdentifier>>,
 }
 
 impl ProviderNativeSchwabMarketDoctorProbeExecutor {
+    /// Constructs the complete code-owned read-only production doctor plan.
+    ///
+    /// The sample identifiers keep each request bounded to one instrument or market. They are
+    /// provider-native probe inputs only; no provider identity escapes into product reads.
+    pub(crate) fn try_production_installed(
+        control_root: &Path,
+    ) -> Result<Self, SchwabMarketDataDoctorError> {
+        let request_admission = RequestAdmission::new(nonzero(16 * 1024)?, NonZeroUsize::MIN);
+        let parse_bounds = ParseBounds::new(
+            nonzero(4 * 1024 * 1024)?,
+            nonzero(8 * 1024)?,
+            nonzero(256 * 1024)?,
+            nonzero(64)?,
+            512,
+            512 * 1024,
+        );
+        let token_admission =
+            AccessTokenAdmission::new(nonzero(16 * 1024)?, Duration::from_secs(60));
+        let telemetry = SchwabTransportTelemetry::default();
+        let rest_bounds = RestTransportBounds::try_new(
+            Duration::from_secs(5),
+            Duration::from_secs(15),
+            Duration::from_secs(20),
+            nonzero(4 * 1024 * 1024)?,
+            nonzero(64)?,
+            nonzero(64 * 1024)?,
+        )
+        .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?;
+        let rest_executor = Arc::new(
+            SchwabRestExecutor::try_production(
+                rest_bounds,
+                parse_bounds,
+                token_admission,
+                telemetry.clone(),
+            )
+            .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?,
+        );
+        let streamer_admission = StreamerAdmission::new(
+            request_admission,
+            nonzero(STREAMER_FAMILIES.len())?,
+            nonzero(8)?,
+        );
+        let streamer_bounds = StreamerTransportBounds::try_new(
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            Duration::ZERO,
+            0,
+            nonzero(4 * 1024 * 1024)?,
+            nonzero(64)?,
+            nonzero(8 * 1024 * 1024)?,
+            Duration::from_millis(250),
+        )
+        .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?;
+        let streamer_control_source = Arc::new(
+            ProductionSchwabMarketDoctorStreamerControlSource::try_open(control_root)?,
+        );
+        Self::try_production(
+            rest_executor,
+            ReadOnlyRequest::user_preference(request_admission)
+                .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?,
+            production_rest_probes(request_admission)?,
+            production_streamer_probes(streamer_admission)?,
+            streamer_control_source,
+            streamer_admission,
+            streamer_bounds,
+            parse_bounds,
+            token_admission,
+            telemetry,
+            nonzero(8)?,
+        )
+    }
+
     /// Builds the production WSS probe boundary. REST production/injected transport is supplied
     /// explicitly so it shares the application's configured bounds and telemetry.
     #[allow(
@@ -236,6 +475,7 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
             channel_capacity,
             probe_contract_digest,
             user_preference: Mutex::new(None),
+            streamer_option_contract: Mutex::new(None),
         })
     }
 
@@ -328,6 +568,9 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
         cancellation: CancellationToken,
         deadline: Instant,
     ) -> Result<SchwabMarketDoctorFamilyProbeEvidence, SchwabMarketDataDoctorError> {
+        if family == SchwabMarketDataFamily::OptionChains {
+            *self.streamer_option_contract.lock().await = None;
+        }
         let probe = self
             .rest
             .get(&family)
@@ -372,6 +615,13 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
                     .seal(request, cancellation.child_token(), deadline)
                     .await?;
                 let sealed = rejoin.try_rejoin(sealed).map_err(map_transport_error)?;
+                if family == SchwabMarketDataFamily::OptionChains {
+                    let selected = sealed
+                        .select_unexpired_option_contract()
+                        .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeEvidence)?
+                        .ok_or(SchwabMarketDataDoctorError::InvalidProbeEvidence)?;
+                    *self.streamer_option_contract.lock().await = Some(selected);
+                }
                 accepted_rest_evidence(family, token_generation, receipt, accounting, sealed)
             }
             RestExecutionOutcome::ProviderRejected(capture) => {
@@ -443,8 +693,26 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
             self.telemetry.clone(),
         )
         .map_err(map_transport_error)?;
+        let subscription = match &probe.target {
+            SchwabMarketDoctorStreamerTarget::Exact(subscription) => subscription.clone(),
+            SchwabMarketDoctorStreamerTarget::ReturnedOptionContract { service, field_ids } => {
+                let selected = self
+                    .streamer_option_contract
+                    .lock()
+                    .await
+                    .clone()
+                    .ok_or(SchwabMarketDataDoctorError::InvalidProbeEvidence)?;
+                StreamerSubscription::try_new(
+                    *service,
+                    vec![selected],
+                    field_ids.iter().copied().collect(),
+                    self.streamer_admission,
+                )
+                .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?
+            }
+        };
         executor
-            .replace_desired(probe.subscription.clone())
+            .replace_desired(subscription)
             .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?;
 
         let run_cancellation = cancellation.child_token();
@@ -606,8 +874,168 @@ impl fmt::Debug for ProviderNativeSchwabMarketDoctorProbeExecutor {
                 "user_preference",
                 &"[PROVIDER BOOTSTRAP RETAINED IN MEMORY]",
             )
+            .field(
+                "streamer_option_contract",
+                &"[SELECTED FROM SEALED OPTION CHAIN]",
+            )
             .finish()
     }
+}
+
+fn production_rest_probes(
+    admission: RequestAdmission,
+) -> Result<Vec<SchwabMarketDoctorRestProbe>, SchwabMarketDataDoctorError> {
+    let equity = provider_identifier("SPY")?;
+    let quotes = QuoteRequest::try_new(
+        vec![equity.clone()],
+        vec![QuoteField::Quote, QuoteField::Reference],
+        None,
+        admission,
+    )
+    .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?;
+    let history = PriceHistoryRequest::new(equity.clone())
+        .period(PriceHistoryPeriodType::Month, NonZeroU16::MIN)
+        .frequency(
+            PriceHistoryFrequencyType::Daily,
+            PriceHistoryFrequency::new(NonZeroU16::MIN),
+        )
+        .extended_hours(false)
+        .previous_close(true)
+        .build(admission)
+        .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?;
+    let chains = ChainRequest::new(equity.clone())
+        .strike_count(NonZeroU16::new(2).ok_or(SchwabMarketDataDoctorError::InvalidProbeContract)?)
+        .include_underlying_quote(true)
+        .build(admission)
+        .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?;
+    let expirations = ExpirationChainRequest::new(equity.clone())
+        .build(admission)
+        .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?;
+    let movers = build_movers_request(
+        provider_identifier("$SPX")?,
+        Some(MoverSort::PercentChangeUp),
+        Some(MoverFrequency::Five),
+        admission,
+    )
+    .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?;
+    let hours = build_market_hours_request(vec![MarketId::Equity], None, admission)
+        .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?;
+    let instruments =
+        build_instrument_search_request(equity, InstrumentProjection::SymbolSearch, admission)
+            .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?;
+    [
+        (SchwabMarketDataFamily::Quotes, quotes.request().clone()),
+        (SchwabMarketDataFamily::PriceHistory, history),
+        (SchwabMarketDataFamily::OptionChains, chains),
+        (SchwabMarketDataFamily::ExpirationChains, expirations),
+        (SchwabMarketDataFamily::Movers, movers),
+        (SchwabMarketDataFamily::MarketHours, hours),
+        (SchwabMarketDataFamily::Instruments, instruments),
+    ]
+    .into_iter()
+    .map(|(family, request)| {
+        SchwabMarketDoctorRestProbe::try_new(family, request, production_rest_coordinates(family)?)
+    })
+    .collect()
+}
+
+fn production_streamer_probes(
+    admission: StreamerAdmission,
+) -> Result<Vec<SchwabMarketDoctorStreamerProbe>, SchwabMarketDataDoctorError> {
+    STREAMER_FAMILIES
+        .into_iter()
+        .map(|family| {
+            let service = streamer_service(family)
+                .ok_or(SchwabMarketDataDoctorError::InvalidProbeContract)?;
+            let fields = vec![0, 1, 2, 3, 4];
+            if matches!(
+                service,
+                MarketDataService::LevelOneOptions | MarketDataService::OptionsBook
+            ) {
+                return SchwabMarketDoctorStreamerProbe::try_returned_option_contract(
+                    family, fields, admission,
+                );
+            }
+            let subscription = StreamerSubscription::try_new(
+                service,
+                vec![provider_identifier(
+                    production_streamer_key(service)
+                        .ok_or(SchwabMarketDataDoctorError::InvalidProbeContract)?,
+                )?],
+                fields,
+                admission,
+            )
+            .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)?;
+            SchwabMarketDoctorStreamerProbe::try_new(family, subscription)
+        })
+        .collect()
+}
+
+const fn production_streamer_key(service: MarketDataService) -> Option<&'static str> {
+    Some(match service {
+        MarketDataService::LevelOneEquities
+        | MarketDataService::NyseBook
+        | MarketDataService::NasdaqBook
+        | MarketDataService::ChartEquity => "SPY",
+        MarketDataService::LevelOneFutures | MarketDataService::ChartFutures => "/ES",
+        MarketDataService::LevelOneFuturesOptions => "/ES",
+        MarketDataService::LevelOneForex => "EUR/USD",
+        MarketDataService::ScreenerEquity => "$SPX",
+        MarketDataService::ScreenerOption => "SPY",
+        MarketDataService::LevelOneOptions | MarketDataService::OptionsBook => {
+            return None;
+        }
+    })
+}
+
+fn production_rest_coordinates(
+    family: SchwabMarketDataFamily,
+) -> Result<SchwabCaptureCoordinates, SchwabMarketDataDoctorError> {
+    SchwabCaptureCoordinates::try_new(
+        source_id(PRODUCTION_SOURCE_ID)?,
+        metadata_revision(PRODUCTION_METADATA_REVISION)?,
+        identifier(&format!("schwab-market-doctor-rest-{}", family_tag(family)))?,
+        Uuid::new_v4(),
+    )
+    .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)
+}
+
+fn source_id(value: &str) -> Result<SourceId, SchwabMarketDataDoctorError> {
+    SourceId::try_from(value).map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)
+}
+
+fn identifier(value: &str) -> Result<SourceIdentifier, SchwabMarketDataDoctorError> {
+    SourceIdentifier::try_from(value).map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)
+}
+
+fn metadata_revision(value: &str) -> Result<MetadataRevision, SchwabMarketDataDoctorError> {
+    Ok(MetadataRevision::new(identifier(value)?))
+}
+
+fn provider_identifier(value: &str) -> Result<ProviderIdentifier, SchwabMarketDataDoctorError> {
+    ProviderIdentifier::try_new(value)
+        .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeContract)
+}
+
+fn nonzero(value: usize) -> Result<NonZeroUsize, SchwabMarketDataDoctorError> {
+    NonZeroUsize::new(value).ok_or(SchwabMarketDataDoctorError::InvalidProbeContract)
+}
+
+fn encode_production_control_state(generation: u64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(PRODUCTION_CONTROL_STATE_DOMAIN.len() + 8);
+    payload.extend_from_slice(PRODUCTION_CONTROL_STATE_DOMAIN);
+    payload.extend_from_slice(&generation.to_be_bytes());
+    payload
+}
+
+fn decode_production_control_state(payload: &[u8]) -> Result<u64, SchwabMarketDataDoctorError> {
+    let generation = payload
+        .strip_prefix(PRODUCTION_CONTROL_STATE_DOMAIN)
+        .and_then(|generation| <[u8; 8]>::try_from(generation).ok())
+        .map(u64::from_be_bytes)
+        .filter(|generation| *generation > 0)
+        .ok_or(SchwabMarketDataDoctorError::InvalidProbeContract)?;
+    Ok(generation)
 }
 
 struct DoctorStreamerSink {
@@ -716,16 +1144,24 @@ fn probe_contract_digest(
             .to_be_bytes(),
     );
     for family in STREAMER_FAMILIES {
-        let subscription = &streamer
+        let probe = streamer
             .get(&family)
-            .ok_or(SchwabMarketDataDoctorError::InvalidProbeContract)?
-            .subscription;
+            .ok_or(SchwabMarketDataDoctorError::InvalidProbeContract)?;
         hasher.update([family_tag(family)]);
-        hash_text(&mut hasher, subscription.service().as_str())?;
-        for key in subscription.keys() {
-            hash_text(&mut hasher, key.as_str())?;
+        hash_text(&mut hasher, probe.service().as_str())?;
+        match &probe.target {
+            SchwabMarketDoctorStreamerTarget::Exact(subscription) => {
+                hasher.update([0]);
+                for key in subscription.keys() {
+                    hash_text(&mut hasher, key.as_str())?;
+                }
+            }
+            SchwabMarketDoctorStreamerTarget::ReturnedOptionContract { .. } => {
+                hasher.update([1]);
+                hasher.update(PRODUCTION_OPTION_STREAMER_SELECTION_DOMAIN);
+            }
         }
-        for field in subscription.field_ids() {
+        for field in probe.field_ids() {
             hasher.update(field.to_be_bytes());
         }
     }

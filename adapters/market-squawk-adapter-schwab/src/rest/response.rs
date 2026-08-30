@@ -1,10 +1,13 @@
 use std::collections::BTreeSet;
 
+use chrono::Datelike;
+use market_squawk_domain::CalendarDate;
 use serde_json::{Map, Value};
 
+use crate::transport::{SchwabRestPayload, SchwabSealedRestResponse};
 use crate::{ParseBounds, SchwabAdapterError};
 
-use super::native::{NativeNumber, take_object};
+use super::native::{NativeNumber, take_object, validate_unique_top_level_keys};
 use super::{
     NativeField, NativeFieldEntry, NativeScalar, ParseContext, ParsedNative, ProviderIdentifier,
     parse_json_payload,
@@ -247,6 +250,7 @@ pub fn parse_quote_response(
     bounds: ParseBounds,
 ) -> Result<ParsedNative<QuoteResponse>, SchwabAdapterError> {
     let (value, digest, mut context) = parse_json_payload(bytes, bounds)?;
+    validate_unique_top_level_keys(bytes)?;
     let object = take_object(value)?;
     let mut quotes = Vec::new();
     for (key, value) in object {
@@ -514,6 +518,80 @@ impl OptionChain {
     pub fn contracts(&self) -> &[OptionContract] {
         &self.contracts
     }
+}
+
+impl SchwabSealedRestResponse {
+    /// Selects one deterministic, actually returned contract whose expiration is still future at
+    /// the sealed response's receipt date.
+    ///
+    /// Same-day contracts are conservatively excluded so a doctor cannot subscribe to a contract
+    /// that expires between the REST response and its bounded Streamer probe.
+    pub fn select_unexpired_option_contract(
+        &self,
+    ) -> Result<Option<ProviderIdentifier>, SchwabAdapterError> {
+        let SchwabRestPayload::OptionChain(parsed) = &self.parts().payload else {
+            return Err(SchwabAdapterError::InvalidInput);
+        };
+        let received_date =
+            calendar_date_from_unix_millis(self.receipt().received_at_unix_millis())?;
+        let mut selected: Option<(CalendarDate, ProviderIdentifier)> = None;
+        for contract in parsed.value().contracts() {
+            let Some(expiration) = option_contract_expiration(contract) else {
+                continue;
+            };
+            if expiration <= received_date {
+                continue;
+            }
+            let Some(symbol) = option_contract_text(contract, OptionContractField::Symbol) else {
+                continue;
+            };
+            let Ok(symbol) = ProviderIdentifier::try_new(symbol.to_owned()) else {
+                continue;
+            };
+            let candidate = (expiration, symbol);
+            if selected.as_ref().is_none_or(|current| {
+                (candidate.0, candidate.1.as_str()) < (current.0, current.1.as_str())
+            }) {
+                selected = Some(candidate);
+            }
+        }
+        Ok(selected.map(|(_, symbol)| symbol))
+    }
+}
+
+fn calendar_date_from_unix_millis(value: u64) -> Result<CalendarDate, SchwabAdapterError> {
+    let value = i64::try_from(value).map_err(|_| SchwabAdapterError::ArithmeticOverflow)?;
+    let received = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(value)
+        .ok_or(SchwabAdapterError::ArithmeticOverflow)?;
+    let year =
+        u16::try_from(received.year()).map_err(|_| SchwabAdapterError::ArithmeticOverflow)?;
+    let month =
+        u8::try_from(received.month()).map_err(|_| SchwabAdapterError::ArithmeticOverflow)?;
+    let day = u8::try_from(received.day()).map_err(|_| SchwabAdapterError::ArithmeticOverflow)?;
+    CalendarDate::new(year, month, day).map_err(|_| SchwabAdapterError::SchemaViolation)
+}
+
+fn option_contract_expiration(contract: &OptionContract) -> Option<CalendarDate> {
+    let value = contract
+        .expiration_group()
+        .split_once(':')
+        .map_or(contract.expiration_group(), |(date, _)| date);
+    let mut parts = value.split('-');
+    let year = parts.next()?.parse::<u16>().ok()?;
+    let month = parts.next()?.parse::<u8>().ok()?;
+    let day = parts.next()?.parse::<u8>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    CalendarDate::new(year, month, day).ok()
+}
+
+fn option_contract_text(contract: &OptionContract, name: OptionContractField) -> Option<&str> {
+    contract
+        .fields()
+        .iter()
+        .find(|field| field.name() == &name)
+        .and_then(|field| field.value().text())
 }
 
 pub fn parse_option_chain_response(
