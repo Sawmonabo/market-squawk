@@ -23,6 +23,7 @@ use market_squawk_sources::{
     ProviderOrderedCaptureSegments, SealedProviderCaptureBinding, SealedProviderCaptureSetReceipt,
     SourceMetadata, SourceObjectCaptureIdentity,
 };
+use serde::Deserialize;
 
 use crate::types::{digest_bytes, digest_parts};
 use crate::{
@@ -821,7 +822,11 @@ impl EiaPublicationCandidate {
         provider: &EiaActivatedProvider,
         retrieval: EiaDataRetrievalSealRejoin,
         normalization_admitted_at: Timestamp,
+        max_publication_bytes: usize,
     ) -> Result<Self, EiaError> {
+        if max_publication_bytes == 0 || max_publication_bytes > MAX_OBSERVED_REVISION_BATCH_BYTES {
+            return Err(EiaError::InvalidLimit);
+        }
         if provider.publication_mode() != EiaPublicationMode::CanonicalMacro {
             return Err(EiaError::Canonicalization);
         }
@@ -872,6 +877,9 @@ impl EiaPublicationCandidate {
             provider,
             &ordered_capture,
         )?;
+        if publication_retained_bytes > max_publication_bytes {
+            return Err(EiaError::InvalidLimit);
+        }
         let mut root_page_rejoins = Vec::new();
         root_page_rejoins
             .try_reserve_exact(pages.len())
@@ -1193,6 +1201,34 @@ impl EiaPublicationCandidate {
     }
 }
 
+/// Adapter-owned precision recovered from one exact EIA native-lineage row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EiaNativePublishedSeriesPrecision {
+    /// The provider supplied a civil calendar date.
+    CalendarDate,
+    /// The provider supplied a coarser source period with this exact series-bound scheme.
+    SourcePeriod { scheme: SourceIdentifier },
+}
+
+/// Adapter-owned canonical series/time coordinate decoded from native-lineage schema v1.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EiaNativePublishedSeriesCoordinate {
+    canonical_series: SourceIdentifier,
+    precision: EiaNativePublishedSeriesPrecision,
+}
+
+impl EiaNativePublishedSeriesCoordinate {
+    /// Returns the canonical series derived by the EIA adapter's own identity rule.
+    pub const fn canonical_series(&self) -> &SourceIdentifier {
+        &self.canonical_series
+    }
+
+    /// Returns the exact effective-time precision retained by the native row.
+    pub const fn precision(&self) -> &EiaNativePublishedSeriesPrecision {
+        &self.precision
+    }
+}
+
 #[derive(serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct EiaNativeLineageRowV1<'a> {
@@ -1203,6 +1239,142 @@ struct EiaNativeLineageRowV1<'a> {
     updated_at: Option<Timestamp>,
     available_at: Option<Timestamp>,
     series_digest: EiaDigest,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EiaNativeLineageCoordinateV1 {
+    native_series: EiaNativeSeriesCoordinateV1,
+    native_period: EiaNativePeriodCoordinateV1,
+    native_value: serde_json::Value,
+    released_at: Option<serde_json::Value>,
+    updated_at: Option<serde_json::Value>,
+    available_at: Option<serde_json::Value>,
+    series_digest: EiaDigest,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EiaNativeSeriesCoordinateV1 {
+    route: serde_json::Value,
+    data_field: serde_json::Value,
+    frequency: serde_json::Value,
+    facets: Vec<serde_json::Value>,
+    descriptors: Vec<serde_json::Value>,
+    unit: String,
+    digest: EiaDigest,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EiaNativePeriodCoordinateV1 {
+    raw: String,
+    format: String,
+    frequency: serde_json::Value,
+    kind: EiaNativePeriodKindCoordinateV1,
+}
+
+#[derive(Deserialize)]
+enum EiaNativePeriodKindCoordinateV1 {
+    CalendarDate(serde_json::Value),
+    Month { year: u16, month: u8 },
+    Quarter { year: u16, quarter: u8 },
+    Year(u16),
+    Provider(String),
+}
+
+/// Decodes one exact EIA native-lineage v1 row using the adapter-owned wire schema.
+///
+/// The returned identities use the same canonical series and provider-period scheme algorithms
+/// as live normalization. Application restart code therefore never parses private JSON paths or
+/// recreates EIA digest formatting.
+pub fn decode_eia_native_published_series_coordinate(
+    payload: &[u8],
+) -> Result<EiaNativePublishedSeriesCoordinate, EiaError> {
+    let decoded: EiaNativeLineageCoordinateV1 =
+        serde_json::from_slice(payload).map_err(|_| EiaError::Canonicalization)?;
+    let EiaNativeLineageCoordinateV1 {
+        native_series,
+        native_period,
+        native_value,
+        released_at,
+        updated_at,
+        available_at,
+        series_digest,
+    } = decoded;
+    let EiaNativeSeriesCoordinateV1 {
+        route,
+        data_field,
+        frequency: series_frequency,
+        facets,
+        descriptors,
+        unit,
+        digest,
+    } = native_series;
+    let EiaNativePeriodCoordinateV1 {
+        raw,
+        format,
+        frequency: period_frequency,
+        kind,
+    } = native_period;
+    if digest != series_digest
+        || raw.is_empty()
+        || format.is_empty()
+        || unit.is_empty()
+        || route.is_null()
+        || data_field.is_null()
+        || series_frequency.is_null()
+        || period_frequency.is_null()
+        || facets.iter().any(serde_json::Value::is_null)
+        || descriptors.iter().any(serde_json::Value::is_null)
+        || native_value.is_null()
+        || released_at.as_ref().is_some_and(serde_json::Value::is_null)
+        || updated_at.as_ref().is_some_and(serde_json::Value::is_null)
+        || available_at
+            .as_ref()
+            .is_some_and(serde_json::Value::is_null)
+    {
+        return Err(EiaError::Canonicalization);
+    }
+    let canonical_series = source_identifier_from_digest("eia-series", series_digest)?;
+    let precision = match kind {
+        EiaNativePeriodKindCoordinateV1::CalendarDate(value) if !value.is_null() => {
+            EiaNativePublishedSeriesPrecision::CalendarDate
+        }
+        EiaNativePeriodKindCoordinateV1::Month { year, month }
+            if year != 0 && (1..=12).contains(&month) =>
+        {
+            EiaNativePublishedSeriesPrecision::SourcePeriod {
+                scheme: source_identifier_from_digest("eia-period-scheme", series_digest)?,
+            }
+        }
+        EiaNativePeriodKindCoordinateV1::Quarter { year, quarter }
+            if year != 0 && (1..=4).contains(&quarter) =>
+        {
+            EiaNativePublishedSeriesPrecision::SourcePeriod {
+                scheme: source_identifier_from_digest("eia-period-scheme", series_digest)?,
+            }
+        }
+        EiaNativePeriodKindCoordinateV1::Year(year) if year != 0 => {
+            EiaNativePublishedSeriesPrecision::SourcePeriod {
+                scheme: source_identifier_from_digest("eia-period-scheme", series_digest)?,
+            }
+        }
+        EiaNativePeriodKindCoordinateV1::Provider(value) => {
+            let _ = value;
+            return Err(EiaError::Canonicalization);
+        }
+        EiaNativePeriodKindCoordinateV1::CalendarDate(_)
+        | EiaNativePeriodKindCoordinateV1::Month { .. }
+        | EiaNativePeriodKindCoordinateV1::Quarter { .. }
+        | EiaNativePeriodKindCoordinateV1::Year(_) => {
+            return Err(EiaError::Canonicalization);
+        }
+    };
+    Ok(EiaNativePublishedSeriesCoordinate {
+        canonical_series,
+        precision,
+    })
 }
 
 fn eia_native_lineage(

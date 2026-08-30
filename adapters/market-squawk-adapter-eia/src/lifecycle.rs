@@ -4,10 +4,10 @@ use market_squawk_domain::{
     EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    ExtractionAuthority, ProviderCaptureMaterial, ProviderCaptureSealExpectation,
-    ProviderCaptureSealRequest, ProviderCaptureSetReceipt, ProviderWholeCaptureToken,
-    RejoinedProviderCapture, SealedProviderCaptureMaterial, SealedProviderCaptureSetReceipt,
-    SourceMetadata, SourceMetadataProvider,
+    ExtractionAuthority, MAX_OBSERVED_REVISION_BATCH_BYTES, ProviderCaptureMaterial,
+    ProviderCaptureSealExpectation, ProviderCaptureSealRequest, ProviderCaptureSetReceipt,
+    ProviderWholeCaptureToken, RejoinedProviderCapture, SealedProviderCaptureMaterial,
+    SealedProviderCaptureSetReceipt, SourceMetadata, SourceMetadataProvider,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -887,6 +887,45 @@ impl EiaActivatedProvider {
             .begin_data_retrieval(authority, &self.contract)?)
     }
 
+    /// Starts one acquisition after preflighting the doctor-known page/observation envelope.
+    pub fn begin_bounded_retrieval(
+        &self,
+        authority: &ExtractionAuthority,
+        deadline: Timestamp,
+        max_pages: u16,
+        max_observations: u32,
+        max_publication_bytes: usize,
+    ) -> Result<EiaDataAcquisitionCursor, EiaLifecycleError> {
+        let observed_at = crate::transport::system_timestamp()?;
+        self.ensure_transition_deadline(observed_at, deadline)?;
+        let required_pages =
+            required_data_pages(self.report.provider_total(), self.contract.query().length())?;
+        let expected_observations = self
+            .report
+            .provider_total()
+            .checked_mul(
+                u64::try_from(self.contract.fields().len())
+                    .map_err(|_| EiaLifecycleError::InvalidEvidence)?,
+            )
+            .ok_or(EiaLifecycleError::InvalidEvidence)?;
+        if max_pages == 0
+            || required_pages == 0
+            || required_pages > u64::from(max_pages)
+            || max_observations == 0
+            || expected_observations > u64::from(max_observations)
+            || max_publication_bytes == 0
+            || max_publication_bytes > MAX_OBSERVED_REVISION_BATCH_BYTES
+        {
+            return Err(EiaLifecycleError::InvalidEvidence);
+        }
+        Ok(self.transport.begin_bounded_data_retrieval(
+            authority,
+            &self.contract,
+            max_pages,
+            max_publication_bytes,
+        )?)
+    }
+
     /// Fetches exactly one bounded page and withholds all continuation until root seals it.
     pub async fn fetch_next_retrieval_page(
         &self,
@@ -946,6 +985,24 @@ impl EiaActivatedProvider {
         deadline: Timestamp,
         cancellation: &CancellationToken,
     ) -> Result<crate::EiaPublicationCandidate, EiaLifecycleError> {
+        self.publication_candidate_bounded(
+            authority,
+            retrieval,
+            deadline,
+            MAX_OBSERVED_REVISION_BATCH_BYTES,
+            cancellation,
+        )
+    }
+
+    /// Builds canonical/native publication material under the caller's admitted working set.
+    pub fn publication_candidate_bounded(
+        &self,
+        authority: &ExtractionAuthority,
+        retrieval: EiaDataRetrievalSealRejoin,
+        deadline: Timestamp,
+        max_publication_bytes: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::EiaPublicationCandidate, EiaLifecycleError> {
         let operation_at = crate::transport::system_timestamp()?;
         if cancellation.is_cancelled() {
             return Err(EiaLifecycleError::Cancelled);
@@ -963,7 +1020,12 @@ impl EiaActivatedProvider {
         for page in capture_pages {
             self.ensure_current_at(page.received_at())?;
         }
-        let candidate = crate::EiaPublicationCandidate::try_new(self, retrieval, operation_at)?;
+        let candidate = crate::EiaPublicationCandidate::try_new(
+            self,
+            retrieval,
+            operation_at,
+            max_publication_bytes,
+        )?;
         if cancellation.is_cancelled() {
             return Err(EiaLifecycleError::Cancelled);
         }

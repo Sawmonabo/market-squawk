@@ -17,8 +17,9 @@ mod types;
 mod wire;
 
 pub use canonical::{
-    EiaCanonicalObservation, EiaPublicationCandidate, EiaPublicationPolicyEvidence,
-    EiaPublicationRejoin, EiaPublishedSeries, EiaSharedPublicationParts,
+    EiaCanonicalObservation, EiaNativePublishedSeriesCoordinate, EiaNativePublishedSeriesPrecision,
+    EiaPublicationCandidate, EiaPublicationPolicyEvidence, EiaPublicationRejoin,
+    EiaPublishedSeries, EiaSharedPublicationParts, decode_eia_native_published_series_coordinate,
 };
 pub use capacity::{
     EIA_APPLICATION_MAX_CONCURRENT_REQUESTS, EIA_APPLICATION_MIN_REQUEST_INTERVAL,

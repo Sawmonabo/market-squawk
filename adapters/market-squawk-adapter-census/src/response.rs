@@ -459,6 +459,36 @@ impl CensusGeographyValue {
         }
         digest.finalize().into()
     }
+
+    /// Returns the stable provider row geography used by canonical analytical series identity.
+    ///
+    /// Aggregate/detail scope is a property of the request shape, not of the returned provider
+    /// coordinate. It remains in native/provenance evidence through [`Self::identity_digest`] but
+    /// is deliberately excluded here so the same row joins across differently batched requests.
+    pub fn canonical_row_identity_digest(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        update_digest_component(
+            &mut digest,
+            b"market-squawk/census-canonical-row-geography/v1",
+        );
+        match self {
+            Self::Standard { components, .. } => {
+                update_digest_component(&mut digest, b"standard");
+                for component in components {
+                    update_digest_component(&mut digest, component.level.as_bytes());
+                    update_digest_component(&mut digest, component.code.as_bytes());
+                }
+            }
+            Self::Uniform {
+                fully_qualified_geoid,
+                ..
+            } => {
+                update_digest_component(&mut digest, b"uniform");
+                update_digest_component(&mut digest, fully_qualified_geoid.as_bytes());
+            }
+        }
+        digest.finalize().into()
+    }
 }
 
 /// A locally observed source-revision candidate.

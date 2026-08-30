@@ -96,10 +96,15 @@ impl BlsMacroApplicationClosure {
             .doctor(authority.clone(), doctor_deadline, cancellation.clone())
             .await?;
         let (pending_doctor, doctor_seal) = doctor.into_sealing_parts();
+        // The provider response is already official evidence. Preserve it under the physical-seal
+        // deadline even when caller cancellation races completion, then recheck caller authority
+        // before the sealed response can activate another provider transition.
+        let raw_seal = CancellationToken::new();
         let sealed_doctor = self
             .research
-            .seal_provider_capture(doctor_seal, &cancellation, seal_deadline)
+            .seal_provider_capture(doctor_seal, &raw_seal, seal_deadline)
             .await?;
+        ensure_not_cancelled(&cancellation)?;
         let activation = source.activation_candidate(pending_doctor, sealed_doctor)?;
 
         let extraction_deadline = discovery.deadline();
@@ -112,10 +117,12 @@ impl BlsMacroApplicationClosure {
             )
             .await?;
         let (pending_discovery, discovery_seal) = discovered.into_sealing_parts()?;
+        let raw_seal = CancellationToken::new();
         let sealed_discovery = self
             .research
-            .seal_provider_capture(discovery_seal, &cancellation, seal_deadline)
+            .seal_provider_capture(discovery_seal, &raw_seal, seal_deadline)
             .await?;
+        ensure_not_cancelled(&cancellation)?;
         let admissions = source
             .admit_sealed_discovery(pending_discovery, sealed_discovery, &activation)?
             .into_objects();
@@ -374,15 +381,23 @@ pub(crate) struct BlsProviderPeriodLatestKnownRequest {
 }
 
 impl BlsProviderPeriodLatestKnownRequest {
-    /// Pins the source-qualified series and exact provider-period cutoffs to one proven generation.
+    /// Pins source-qualified series and provider-period cutoffs to one durable plan selector.
+    ///
+    /// This constructor is activation-independent: startup recovery may rebuild the typed read
+    /// directly from catalog-retained selector coordinates without a live registered credential.
     pub(crate) fn try_new(
-        publication: &BlsMacroPlanPublication,
+        restart_selector: ProviderMacroPlanRestartSelector,
         series_allowlist: AnalyticalMacroSeriesAllowlist,
         knowledge_cutoff: Timestamp,
         effective_period_cutoff: ResearchPeriod,
     ) -> Result<Self, BlsMacroApplicationError> {
-        let restart_selector = publication.restart_selector();
-        if publication.reopened().manifest() != restart_selector.manifest() {
+        if restart_selector.total_chunks() == 0
+            || restart_selector.total_rows() == 0
+            || restart_selector.completion_digest().bytes() == [0; 32]
+            || restart_selector.publication_digest().bytes() == [0; 32]
+            || restart_selector.catalog_receipt_digest().bytes() == [0; 32]
+            || restart_selector.source_generation_digest().bytes() == [0; 32]
+        {
             return Err(BlsMacroApplicationError::RestartVerificationMismatch);
         }
         let source_series = AnalyticalMacroSourceQualifiedSeries::new(
@@ -502,6 +517,16 @@ impl BlsProviderPeriodLatestKnownDto {
     /// Returns the sole source-rights owner for the fixed series selection.
     pub(crate) const fn source_id(&self) -> &SourceId {
         self.output.source_id()
+    }
+}
+
+fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), BlsMacroApplicationError> {
+    if cancellation.is_cancelled() {
+        Err(BlsMacroApplicationError::Extraction(
+            ExtractionSourceError::Cancelled,
+        ))
+    } else {
+        Ok(())
     }
 }
 

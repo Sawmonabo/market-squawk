@@ -430,6 +430,8 @@ pub struct EiaDataAcquisitionCursor {
     query_digest: EiaDigest,
     contract_schema_digest: EiaDigest,
     api_version: crate::EiaApiVersion,
+    max_pages: u16,
+    max_publication_bytes: usize,
     next_ordinal: u16,
     next_offset: u64,
     retained_bytes: u64,
@@ -1028,15 +1030,41 @@ impl EiaSourceTransport {
         authority: &ExtractionAuthority,
         contract: &EiaDatasetContract,
     ) -> Result<EiaDataAcquisitionCursor, EiaSourceTransportError> {
+        self.begin_bounded_data_retrieval(
+            authority,
+            contract,
+            self.limits.max_pages,
+            MAX_OBSERVED_REVISION_BATCH_BYTES,
+        )
+    }
+
+    /// Starts one application-bounded acquisition without reserving transport-wide capacity.
+    pub(crate) fn begin_bounded_data_retrieval(
+        &self,
+        authority: &ExtractionAuthority,
+        contract: &EiaDatasetContract,
+        max_pages: u16,
+        max_publication_bytes: usize,
+    ) -> Result<EiaDataAcquisitionCursor, EiaSourceTransportError> {
         self.validate_authority(authority)?;
+        if max_pages == 0
+            || max_pages > self.limits.max_pages
+            || max_publication_bytes == 0
+            || max_publication_bytes > MAX_OBSERVED_REVISION_BATCH_BYTES
+        {
+            return Err(EiaSourceTransportError::InvalidConfiguration);
+        }
         let dataset = eia_data_dataset_identifier(contract)?;
         let publication_retained_bytes = cursor_base_publication_retained_bytes(
             &self.metadata,
             &dataset,
             contract.metadata().api_version(),
-            self.limits.max_pages,
+            max_pages,
         )?;
-        let capacity = usize::from(self.limits.max_pages);
+        if publication_retained_bytes > max_publication_bytes {
+            return Err(EiaSourceTransportError::InvalidConfiguration);
+        }
+        let capacity = usize::from(max_pages);
         let mut typed_pages = Vec::new();
         typed_pages
             .try_reserve_exact(capacity)
@@ -1055,6 +1083,8 @@ impl EiaSourceTransport {
             query_digest: contract.query().identity(),
             contract_schema_digest: contract.schema_digest(),
             api_version: contract.metadata().api_version().clone(),
+            max_pages,
+            max_publication_bytes,
             next_ordinal: 0,
             next_offset: 0,
             retained_bytes: 0,
@@ -1077,9 +1107,9 @@ impl EiaSourceTransport {
         cancellation: CancellationToken,
     ) -> Result<EiaPendingDataPage, EiaSourceTransportError> {
         self.validate_data_cursor(authority, contract, &cursor)?;
-        if cursor.next_ordinal >= self.limits.max_pages {
+        if cursor.next_ordinal >= cursor.max_pages {
             return Err(EiaSourceTransportError::PageLimitExceeded {
-                max: self.limits.max_pages,
+                max: cursor.max_pages,
             });
         }
         let fetched = self
@@ -1088,7 +1118,9 @@ impl EiaSourceTransport {
                 contract,
                 cursor.next_offset,
                 cursor.next_ordinal,
-                MAX_OBSERVED_REVISION_BATCH_BYTES
+                cursor.max_pages,
+                cursor
+                    .max_publication_bytes
                     .checked_sub(cursor.publication_retained_bytes)
                     .ok_or(EiaSourceTransportError::InvalidConfiguration)?,
                 deadline,
@@ -1130,7 +1162,7 @@ impl EiaSourceTransport {
             .publication_retained_bytes
             .checked_add(fetched.page.receipt().publication_retained_bytes())
             .and_then(|bytes| bytes.checked_add(raw_capture_copy_retained_bytes))
-            .filter(|bytes| *bytes <= MAX_OBSERVED_REVISION_BATCH_BYTES)
+            .filter(|bytes| *bytes <= cursor.max_publication_bytes)
             .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
         let standalone_page = ProviderCapturePageReceipt::try_new(
             0,
@@ -1224,7 +1256,7 @@ impl EiaSourceTransport {
             .checked_add(rejoin.typed_page.receipt().publication_retained_bytes())
             .and_then(|bytes| bytes.checked_add(page_lineage_retained_bytes))
             .and_then(|bytes| bytes.checked_add(raw_capture_copy_retained_bytes))
-            .filter(|bytes| *bytes <= MAX_OBSERVED_REVISION_BATCH_BYTES)
+            .filter(|bytes| *bytes <= cursor.max_publication_bytes)
             .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
         cursor.raw_capture_copy_retained_bytes = cursor
             .raw_capture_copy_retained_bytes
@@ -1247,7 +1279,7 @@ impl EiaSourceTransport {
                     cursor.source_metadata.as_ref(),
                     &cursor.provider_dataset,
                     &cursor.api_version,
-                    self.limits.max_pages,
+                    cursor.max_pages,
                 )?
                 .checked_add(page_lineage_retained_bytes)
                 .and_then(|bytes| bytes.checked_add(raw_capture_copy_retained_bytes))
@@ -1273,7 +1305,7 @@ impl EiaSourceTransport {
             EiaPageCompleteness::More { next_offset } => {
                 cursor.next_ordinal = cursor.next_ordinal.checked_add(1).ok_or(
                     EiaSourceTransportError::PageLimitExceeded {
-                        max: self.limits.max_pages,
+                        max: cursor.max_pages,
                     },
                 )?;
                 cursor.next_offset = next_offset;
@@ -1339,6 +1371,12 @@ impl EiaSourceTransport {
             || cursor.query_digest != contract.query().identity()
             || cursor.contract_schema_digest != contract.schema_digest()
             || &cursor.api_version != contract.metadata().api_version()
+            || cursor.max_pages == 0
+            || cursor.max_pages > self.limits.max_pages
+            || cursor.max_publication_bytes == 0
+            || cursor.max_publication_bytes > MAX_OBSERVED_REVISION_BATCH_BYTES
+            || cursor.publication_retained_bytes > cursor.max_publication_bytes
+            || cursor.next_ordinal >= cursor.max_pages
             || cursor.typed_pages.len() != cursor.page_materials.len()
             || cursor.page_materials.len() != cursor.sealed_pages.len()
             || cursor.page_materials.len() != usize::from(cursor.next_ordinal)
@@ -1353,7 +1391,7 @@ impl EiaSourceTransport {
             cursor.source_metadata.as_ref(),
             &cursor.provider_dataset,
             &cursor.api_version,
-            self.limits.max_pages,
+            cursor.max_pages,
         )?;
         let mut raw_capture_copy_retained_bytes = 0_usize;
         let mut expected_offset = 0_u64;
@@ -1402,7 +1440,7 @@ impl EiaSourceTransport {
                 .checked_add(typed.receipt().publication_retained_bytes())
                 .and_then(|bytes| bytes.checked_add(page_lineage_retained_bytes))
                 .and_then(|bytes| bytes.checked_add(page_raw_capture_copy_retained_bytes))
-                .filter(|bytes| *bytes <= MAX_OBSERVED_REVISION_BATCH_BYTES)
+                .filter(|bytes| *bytes <= cursor.max_publication_bytes)
                 .ok_or(EiaSourceTransportError::InvalidConfiguration)?;
             raw_capture_copy_retained_bytes = raw_capture_copy_retained_bytes
                 .checked_add(page_raw_capture_copy_retained_bytes)
@@ -1441,6 +1479,7 @@ impl EiaSourceTransport {
                 contract,
                 0,
                 0,
+                self.limits.max_pages,
                 MAX_OBSERVED_REVISION_BATCH_BYTES,
                 deadline,
                 cancellation,
@@ -1479,6 +1518,7 @@ impl EiaSourceTransport {
         contract: &EiaDatasetContract,
         offset: u64,
         ordinal: u16,
+        max_pages: u16,
         remaining_publication_bytes: usize,
         deadline: Timestamp,
         cancellation: CancellationToken,
@@ -1517,7 +1557,7 @@ impl EiaSourceTransport {
         validate_provider_page_total(
             parsed.value.receipt().total(),
             contract.query().length(),
-            self.limits.max_pages,
+            max_pages,
         )?;
         let request_token = (offset != 0).then(|| offset_token_digest(offset));
         let next_token = match parsed.value.receipt().completeness() {

@@ -179,8 +179,8 @@ pub struct CensusVariableMapping {
 }
 
 impl CensusVariableMapping {
-    /// Constructs a numeric macro mapping whose final geography/predicate-scoped series identity
-    /// remains representable without truncation.
+    /// Constructs a numeric macro mapping whose final stable row-scoped series identity remains
+    /// representable without truncation.
     pub fn try_new(
         provider_variable: SourceIdentifier,
         series_namespace: SourceIdentifier,
@@ -229,8 +229,8 @@ impl CensusVariableMapping {
         &self.provider_variable
     }
 
-    /// Returns the base canonical series namespace; geography and predicates are appended by a
-    /// stable digest during normalization.
+    /// Returns the base canonical series namespace; stable provider row coordinates are appended
+    /// by digest during normalization.
     pub const fn series_namespace(&self) -> &SourceIdentifier {
         &self.series_namespace
     }
@@ -2750,7 +2750,7 @@ fn canonical_records(
             continue;
         };
         let effective = effective_coordinate(&contract.effective_time, observation)?;
-        let series = scoped_series(mapping, observation.revision_candidate().family_digest())?;
+        let series = scoped_series(mapping, observation)?;
         let source_identifier = SourceIdentifier::try_from(format!(
             "census:v1:family:{}:content:{}",
             lower_hex(observation.revision_candidate().family_digest()),
@@ -2945,12 +2945,26 @@ fn source_period(
 
 fn scoped_series(
     mapping: &CensusVariableMapping,
-    family_digest: [u8; 32],
+    observation: &crate::CensusObservation,
 ) -> Result<SourceIdentifier, CensusSourceError> {
+    let stable_scope = serde_json::to_vec(&(
+        observation.dataset().path(),
+        observation.variable(),
+        observation.geography().canonical_row_identity_digest(),
+        observation.predicates(),
+    ))
+    .map_err(|_| CensusSourceError::Protocol)?;
+    let mut digest = Sha256::new();
+    crate::update_digest_component(
+        &mut digest,
+        b"market-squawk/census-canonical-series-scope/v1",
+    );
+    crate::update_digest_component(&mut digest, &stable_scope);
+    let stable_scope_digest: [u8; 32] = digest.finalize().into();
     SourceIdentifier::try_from(format!(
         "{}:scope:{}",
         mapping.series_namespace(),
-        lower_hex(family_digest)
+        lower_hex(stable_scope_digest)
     ))
     .map_err(|_| CensusSourceError::Protocol)
 }
