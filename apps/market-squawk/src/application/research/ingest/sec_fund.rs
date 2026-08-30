@@ -22,7 +22,7 @@ use market_squawk_domain::{
 use market_squawk_services::ServiceError;
 use market_squawk_sources::{
     CanonicalPartitionExpectation, LogicalPartitionFamily, ProviderLogicalPublicationError,
-    SealedProviderLogicalPublicationBinding, SourceMetadata,
+    SEC_EDGAR_SOURCE_ID, SealedProviderLogicalPublicationBinding, SourceMetadata,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -31,7 +31,6 @@ use tokio_util::sync::CancellationToken;
 use super::ResearchRightsAuthority;
 use crate::ResearchService;
 
-const SEC_SOURCE_ID: &str = "sec-edgar";
 const SEC_FUND_INGEST_IDENTITY_DOMAIN: &[u8] =
     b"market-squawk/application/sec-fund-logical-ingest/v1";
 
@@ -69,7 +68,7 @@ impl SecFundApplicationBridge {
         rights: ResearchRightsAuthority,
         source_registered_at: Timestamp,
     ) -> Result<Self, SecFundApplicationError> {
-        if source.source_id().as_str() != SEC_SOURCE_ID
+        if source.source_id().as_str() != SEC_EDGAR_SOURCE_ID
             || source.source_id() != rights.source_id()
             || !source.is_effective_at(source_registered_at)
         {

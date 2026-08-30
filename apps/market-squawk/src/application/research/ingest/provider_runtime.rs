@@ -12,7 +12,8 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::{SecretGeneration, SecretRef};
 use market_squawk_sources::{
-    ProviderCapabilityRevision, SchwabMarketDataDoctorReceiptV1, SourceMetadata,
+    ProviderCapabilityRevision, SEC_EDGAR_PROFILE_ID, SEC_EDGAR_SOURCE_ID,
+    SchwabMarketDataDoctorReceiptV1, SourceMetadata,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -1437,8 +1438,8 @@ impl ResearchProviderRuntimeMutationAuthority {
         let metadata =
             market_squawk_sources::SourceMetadataProvider::metadata(source.as_ref()).clone();
         if self.coordinator.lifecycle.shutdown_token().is_cancelled()
-            || generation.profile().as_str() != super::sec_live::SEC_PROFILE
-            || metadata.source_id().as_str() != super::sec_live::SEC_RUNTIME_SOURCE_ID
+            || generation.profile().as_str() != SEC_EDGAR_PROFILE_ID
+            || metadata.source_id().as_str() != SEC_EDGAR_SOURCE_ID
             || metadata != *generation.metadata()
             || rights != generation.rights
             || rights.source_id() != metadata.source_id()
@@ -2165,8 +2166,8 @@ impl ResearchProviderRuntimeMutationAuthority {
         &self,
         expected: &ResearchProviderRuntimeGeneration,
     ) -> Result<(), ResearchIngestCompositionError> {
-        if expected.profile().as_str() != super::sec_live::SEC_PROFILE
-            || expected.metadata().source_id().as_str() != super::sec_live::SEC_RUNTIME_SOURCE_ID
+        if expected.profile().as_str() != SEC_EDGAR_PROFILE_ID
+            || expected.metadata().source_id().as_str() != SEC_EDGAR_SOURCE_ID
         {
             return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration);
         }

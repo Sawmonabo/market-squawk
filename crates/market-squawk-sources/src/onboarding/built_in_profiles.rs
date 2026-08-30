@@ -7,7 +7,8 @@ use market_squawk_domain::{DataQuality, DigestAlgorithm, EvidenceDigest, SourceI
 use super::{
     AuthoritySet, CredentialKind, EvidenceBinding, FRED_ALFRED_API_SURFACE_ID, HumanBoundary,
     LifecycleSupport, ProviderCapability, ProviderCapabilityInput, ProviderCapabilityRevision,
-    RatePolicyDescriptor, RightsAdmissionState, SetupMode,
+    RatePolicyDescriptor, RightsAdmissionState, SEC_EDGAR_AUTHORITY, SEC_EDGAR_PROFILE_ID,
+    SetupMode,
 };
 use crate::onboarding::profile::{
     DataUseOperation, DataUseRight, OperationAdmission, ProbeTransport, ProfileActivationMode,
@@ -108,7 +109,6 @@ const SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST: EvidenceDigest = EvidenceDigest:
     ],
 );
 const COINBASE_DIRECT_PROFILE: &str = "coinbase.exchange-direct-market-data";
-const SEC_PROFILE: &str = "sec.edgar-public";
 const BLS_PUBLIC_V1_PROFILE: &str = "bls.v1-unregistered";
 const FRED_PROFILE: &str = FRED_ALFRED_API_SURFACE_ID;
 const ALPACA_BASIC_PROFILE: &str = "alpaca.basic-market-data";
@@ -1163,7 +1163,7 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
             vec![legacy_capability, revision_two, revision_three],
             current,
         )
-    } else if matches!(spec.id, SEC_PROFILE | BLS_PUBLIC_V1_PROFILE) {
+    } else if matches!(spec.id, SEC_EDGAR_PROFILE_ID | BLS_PUBLIC_V1_PROFILE) {
         let revision_three = build_capability(
             &spec,
             ProviderCapabilityRevision::new(3)?,
@@ -1389,7 +1389,7 @@ fn build_capability_with_rights_state(
         },
         evidence: capability_evidence(spec, revision)?,
         refresh_trigger: SourceIdentifier::try_from(
-            if spec.id == SEC_PROFILE && revision.get() >= 4 {
+            if spec.id == SEC_EDGAR_PROFILE_ID && revision.get() >= 4 {
                 SEC_PUBLIC_API_AUTHORITY_SOURCE
             } else if spec.id == BLS_PUBLIC_V1_PROFILE && revision.get() >= 4 {
                 BLS_PUBLIC_V1_AUTHORITY_SOURCE
@@ -1452,7 +1452,7 @@ fn capability_evidence(
             TREASURY_DAILY_RATES_AUTHORITY_DIGEST,
         ));
     }
-    if spec.id == SEC_PROFILE && revision.get() >= 4 {
+    if spec.id == SEC_EDGAR_PROFILE_ID && revision.get() >= 4 {
         evidence.push(EvidenceBinding::new(
             SourceIdentifier::try_from(SEC_PUBLIC_API_AUTHORITY_SOURCE)?,
             SEC_PUBLIC_API_AUTHORITY_DIGEST,
@@ -1485,7 +1485,7 @@ fn capability_evidence(
 fn has_provider_release_revision(profile_id: &str) -> bool {
     matches!(
         profile_id,
-        "sec.edgar-public"
+        SEC_EDGAR_PROFILE_ID
             | "fred-alfred.api-v1-v2"
             | "bls.v1-unregistered"
             | "bls.v2-registered"
@@ -1536,7 +1536,9 @@ fn built_in_budget(
     let backoff =
         BackoffPolicy::try_new(nonzero_u64(SECOND_NANOS)?, nonzero_u64(MINUTE_NANOS)?, 0)?;
     match spec.id {
-        "sec.edgar-public" => simple_budget("us-sec-edgar", None, 8, SECOND_NANOS, 4, backoff),
+        SEC_EDGAR_PROFILE_ID => SEC_EDGAR_AUTHORITY
+            .budget_policy()
+            .map_err(|_| ProviderProfileError::InvalidProfile),
         "bls.v1-unregistered" => bls_budget(None, 25, backoff),
         "bls.v2-registered" => bls_budget(Some("bls.registered-onboarding"), 500, backoff),
         FRED_PROFILE if current_revision => fred_budget(backoff, "fred.onboarding-api-key"),
@@ -2418,7 +2420,7 @@ fn kraken_l3() -> Result<BuiltInSpec, ProviderProfileError> {
 
 fn sec() -> Result<BuiltInSpec, ProviderProfileError> {
     Ok(BuiltInSpec {
-        id: SEC_PROFILE,
+        id: SEC_EDGAR_PROFILE_ID,
         display_name: "SEC EDGAR submissions and XBRL",
         official_entry: "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
         setup: ProfileActivationMode::NoCredential,
@@ -2429,7 +2431,7 @@ fn sec() -> Result<BuiltInSpec, ProviderProfileError> {
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: None,
         permissions: &[],
-        coverage: "Public EDGAR submissions and company facts only; other sec.gov assets excluded",
+        coverage: "Public SEC-owned EDGAR submissions, filing documents, XBRL, bulk submissions and company facts, and quarterly N-PORT/N-CEN archives",
         quality: DataQuality::OfficialDelayed,
         probe: VerificationProbe::network(
             ProbeTransport::HttpGet,
@@ -2446,7 +2448,7 @@ fn sec() -> Result<BuiltInSpec, ProviderProfileError> {
         revocation: "remove the source configuration locally",
         recovery: COMMON_RECOVERY,
         evidence: SEC_EVIDENCE,
-        rate_policy: "sec.edgar-public.aggregate-rate-policy.v1",
+        rate_policy: SEC_EDGAR_AUTHORITY.rate_policy_id(),
         refresh_trigger: "SEC",
         handoff_instruction: "Provide a truthful non-secret organization and monitored administrative email, then continue with the bounded public probe.",
     })

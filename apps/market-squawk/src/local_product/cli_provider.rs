@@ -53,8 +53,9 @@ use market_squawk_sources::{
     BudgetWindowSemantics, CoverageDomain, CoverageTopology, EndpointPolicy,
     FRED_ALFRED_API_SURFACE_ID, FreshnessPolicy, HistoricalCapability, HttpRequestBounds,
     InstrumentCoverage, NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
-    ProviderRateDeclaration, QueryParameterRule, QuerySensitivity, SourceCapabilities, SourceClass,
-    SourceCoverage, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
+    ProviderRateDeclaration, QueryParameterRule, QuerySensitivity, SEC_EDGAR_AUTHORITY,
+    SEC_EDGAR_PROFILE_ID, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
+    SourceMetadataInput, SourceProtocolProfile,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -113,7 +114,7 @@ const FRED_CAPABILITY_REVISION: u64 = 4;
 const SECOND_NANOS: u64 = 1_000_000_000;
 const MINUTE_NANOS: u64 = 60 * SECOND_NANOS;
 const DAY_NANOS: u64 = 86_400 * SECOND_NANOS;
-const SEC_SURFACE: &str = "sec.edgar-public";
+const SEC_SURFACE: &str = SEC_EDGAR_PROFILE_ID;
 const SEC_IDENTITY_NAMESPACE_V1: &str =
     "https://market-squawk.local/identity/sec-cik-instrument/v1";
 const BLS_PUBLIC_SURFACE: &str = "bls.v1-unregistered";
@@ -2651,18 +2652,24 @@ fn build_research_activation(
     .map_err(|_| CliProviderActivationError::InvalidRights)?;
     let activation = match request.provider {
         ProviderRequest::Sec { identities } => {
-            let metadata = metadata(
+            let metadata = metadata_with_source_id(
                 lease,
                 activation_evidence,
-                "sec",
-                "us-sec-edgar",
+                SEC_EDGAR_AUTHORITY
+                    .canonical_source_id()
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+                SEC_EDGAR_AUTHORITY.rate_scope(),
                 SourceClass::RegulatoryFiling,
                 CoverageDomain::RegulatoryFilings,
                 AuthorizationMode::PublicInterface,
                 HistoricalCapability::RevisionPreserving,
                 metadata_effective,
-                sec_network_policy()?,
-                simple_budget("us-sec-edgar", 8, SECOND_NANOS, 4, None)?,
+                SEC_EDGAR_AUTHORITY
+                    .endpoint_policy()
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+                SEC_EDGAR_AUTHORITY
+                    .budget_policy()
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
             )?;
             let identities = sec_identity_registry(
                 &metadata,
@@ -4872,28 +4879,6 @@ fn bls_budget(
         backoff()?,
     )
     .map_err(|_| CliProviderActivationError::InvalidMetadata)
-}
-
-fn sec_network_policy() -> Result<EndpointPolicy, CliProviderActivationError> {
-    let rules = [
-        ("https://data.sec.gov/submissions", PathScope::Descendants),
-        (
-            "https://data.sec.gov/api/xbrl/companyfacts",
-            PathScope::Descendants,
-        ),
-        (
-            "https://www.sec.gov/Archives/edgar/data",
-            PathScope::Descendants,
-        ),
-    ]
-    .into_iter()
-    .map(|(endpoint, scope)| {
-        ApiEndpointRule::try_new(endpoint, scope, Vec::new(), 1, 1)
-            .map_err(|_| CliProviderActivationError::InvalidMetadata)
-    })
-    .collect::<Result<Vec<_>, _>>()?;
-    EndpointPolicy::try_from_api_rules(rules, request_bounds(64 * 1024 * 1024)?)
-        .map_err(|_| CliProviderActivationError::InvalidMetadata)
 }
 
 fn sec_state(

@@ -33,8 +33,8 @@ use market_squawk_domain::{
 use market_squawk_platform::SealedResearchJournalStore;
 use market_squawk_services::ServiceError;
 use market_squawk_sources::{
-    ExtractionAuthority, ExtractionAuthorityError, LogicalObjectRole, SourceMetadata,
-    SourceMetadataProvider,
+    ExtractionAuthority, ExtractionAuthorityError, LogicalObjectRole, SEC_EDGAR_PROFILE_ID,
+    SEC_EDGAR_SOURCE_ID, SourceMetadata, SourceMetadataProvider,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -50,10 +50,6 @@ use crate::ResearchService;
 use crate::application::research::{
     SecFundJobCommitAuthority, SecFundProductFamily, SecFundProductRequestFactory,
 };
-
-pub(super) const SEC_PROFILE: &str = "sec.edgar-public";
-pub(super) const SEC_RUNTIME_SOURCE_ID: &str = "us-sec-edgar";
-const SEC_CANONICAL_FUND_SOURCE_ID: &str = "sec-edgar";
 
 /// One bounded exact SEC fund-family request.
 #[derive(Clone, Debug)]
@@ -176,8 +172,8 @@ impl SecLiveFundSource {
         )?;
         let generation_digest = generation.generation_digest()?;
         admission.ensure_live()?;
-        if generation.profile().as_str() != SEC_PROFILE
-            || metadata.source_id().as_str() != SEC_RUNTIME_SOURCE_ID
+        if generation.profile().as_str() != SEC_EDGAR_PROFILE_ID
+            || metadata.source_id().as_str() != SEC_EDGAR_SOURCE_ID
             || extraction.metadata() != metadata
             || generation.metadata() != metadata
             || rejoined_generation != generation
@@ -885,7 +881,7 @@ fn validate_prepared_graph(
         .checked_add(readme.size_bytes())
         .ok_or(SecLiveFundApplicationError::CapturedGraphMismatch)?;
     if prepared.scope() != captured.request.scope()
-        || prepared.terminal().source_id.as_str() != SEC_CANONICAL_FUND_SOURCE_ID
+        || prepared.terminal().source_id.as_str() != SEC_EDGAR_SOURCE_ID
         || prepared.terminal().total_decoded_events != 0
         || prepared.terminal().total_logical_object_bytes != expected_bytes
         || prepared.canonical_partitions().is_empty()

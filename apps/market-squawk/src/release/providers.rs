@@ -24,7 +24,9 @@ use market_squawk_domain::{
 use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, RequestOrigin, ServiceError, ServiceLimits,
 };
-use market_squawk_sources::{DataUseOperation, OnboardingState};
+use market_squawk_sources::{
+    DataUseOperation, OnboardingState, SEC_EDGAR_PROFILE_ID, SEC_EDGAR_SOURCE_ID,
+};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
@@ -58,8 +60,6 @@ const LIVE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const COINBASE_PUBLIC: &str = "coinbase.public-market-data";
 const COINBASE_DIRECT: &str = "coinbase.exchange-direct-market-data";
 const KRAKEN_PUBLIC: &str = "kraken.spot-public-market-data";
-const SEC_EDGAR: &str = "sec.edgar-public";
-const SEC_SOURCE_ID: &str = "sec-sec.edgar-public";
 const SEC_SUBMISSIONS_FAMILY: &str = "sec_submissions_filings";
 const SEC_COMPANY_FACTS_FAMILY: &str = "sec_company_facts";
 const SEC_SUBMISSIONS_OPERATION: &str = "Fundamental.GetFilings";
@@ -78,7 +78,7 @@ const ADMITTED_SURFACES: [&str; 9] = [
     COINBASE_PUBLIC,
     COINBASE_DIRECT,
     KRAKEN_PUBLIC,
-    SEC_EDGAR,
+    SEC_EDGAR_PROFILE_ID,
     FRED_ALFRED,
     BLS_PUBLIC,
     BLS_REGISTERED,
@@ -485,7 +485,7 @@ async fn collect_provider_evidence(
                     .treasury_fiscal_release_query()
                     .context("Treasury Fiscal Data activation has no exact admitted query")?;
                 exercise_treasury_fiscal_research(product.application().as_ref(), &query).await?
-            } else if *surface_id == SEC_EDGAR {
+            } else if *surface_id == SEC_EDGAR_PROFILE_ID {
                 let cik = admit_sec_release_cik(arguments)?;
                 exercise_sec_research(product.application().as_ref(), cik).await?
             } else if *surface_id == FRED_ALFRED {
@@ -1012,16 +1012,16 @@ async fn exercise_sec_research(
             application,
             "Source.Discover",
             json_object(json!({
-                "provider": SEC_EDGAR,
+                "provider": SEC_EDGAR_PROFILE_ID,
                 "dataset": dataset.as_str(),
                 "confirm": true,
-                "sourceCoverage": [SEC_EDGAR],
+                "sourceCoverage": [SEC_EDGAR_PROFILE_ID],
             }))?,
             RESEARCH_ACCEPTANCE_TIMEOUT,
         )
         .await?;
         let discovery = ResearchSourceDiscovery::from_publication(discovery)?;
-        if discovery.profile().as_str() != SEC_EDGAR
+        if discovery.profile().as_str() != SEC_EDGAR_PROFILE_ID
             || discovery.request().dataset() != &dataset
             || discovery.objects().len() != 1
             || !discovery.rights().persistence_operation_admitted()
@@ -1047,18 +1047,18 @@ async fn exercise_sec_research(
             application,
             "Research.IngestSource",
             json_object(json!({
-                "provider": SEC_EDGAR,
+                "provider": SEC_EDGAR_PROFILE_ID,
                 "object": source_object_id,
                 "dataset": dataset.as_str(),
                 "discoveryReceipt": object.discovery_receipt(),
                 "confirm": true,
-                "sourceCoverage": [SEC_EDGAR],
+                "sourceCoverage": [SEC_EDGAR_PROFILE_ID],
             }))?,
             RESEARCH_ACCEPTANCE_TIMEOUT,
         )
         .await?;
         let mut publication = parse_research_publication(
-            SEC_EDGAR,
+            SEC_EDGAR_PROFILE_ID,
             family,
             dataset.as_str(),
             source_object_id,
@@ -1489,14 +1489,14 @@ async fn verify_sec_publication(
                 if *observed_at == provenance.received_at()
         );
         if !source_specific_valid
-            || provenance.source_id().as_str() != SEC_SOURCE_ID
+            || provenance.source_id().as_str() != SEC_EDGAR_SOURCE_ID
             || provenance.venue_id().is_some()
             || provenance.quality() != DataQuality::OfficialDelayed
             || provenance.ingested_at() < provenance.received_at()
             || !payload_matches
             || !availability_matches
             || row.get("observation_kind").and_then(Value::as_str) != Some(observation_kind)
-            || row.get("source_id").and_then(Value::as_str) != Some(SEC_SOURCE_ID)
+            || row.get("source_id").and_then(Value::as_str) != Some(SEC_EDGAR_SOURCE_ID)
             || row.get("instrument_id").and_then(Value::as_str) != Some(instrument_id.as_str())
             || row.get("venue_id").is_some_and(|value| !value.is_null())
             || row.get("source_identifier").and_then(Value::as_str)
@@ -2826,7 +2826,7 @@ fn admit_selected_surfaces(arguments: &ReleaseProviderArguments) -> Result<Vec<&
     } else if arguments.fred_dataset.is_some() {
         bail!("FRED/ALFRED release dataset requires the selected FRED/ALFRED surface");
     }
-    if requested.contains(SEC_EDGAR) {
+    if requested.contains(SEC_EDGAR_PROFILE_ID) {
         admit_sec_release_cik(arguments)?;
     } else if arguments.sec_cik.is_some() {
         bail!("SEC release inputs require the selected SEC surface");
@@ -2917,7 +2917,12 @@ fn is_live_surface(surface_id: &str) -> bool {
 fn requires_research_runtime(surface_id: &str) -> bool {
     matches!(
         surface_id,
-        SEC_EDGAR | FRED_ALFRED | BLS_PUBLIC | BLS_REGISTERED | TREASURY_XML | TREASURY_FISCAL
+        SEC_EDGAR_PROFILE_ID
+            | FRED_ALFRED
+            | BLS_PUBLIC
+            | BLS_REGISTERED
+            | TREASURY_XML
+            | TREASURY_FISCAL
     )
 }
 

@@ -1369,6 +1369,150 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
             .iter()
             .any(|evidence| evidence.source_id() == "SEC-FAIR-ACCESS")
     );
+    assert_eq!(SEC_EDGAR_AUTHORITY.source_id(), SEC_EDGAR_SOURCE_ID);
+    assert_eq!(SEC_EDGAR_AUTHORITY.rate_scope(), SEC_EDGAR_RATE_SCOPE);
+    let sec_budget = sec
+        .capability()
+        .rate_policy()
+        .enforcement_policy()
+        .ok_or("SEC profile omitted aggregate rate enforcement")?;
+    assert_eq!(
+        sec_budget.scope().as_source_identifier().as_str(),
+        SEC_EDGAR_RATE_SCOPE
+    );
+    assert_eq!(sec_budget.requests_per_window(), 2);
+    assert_eq!(sec_budget.window_nanos(), 1_000_000_000);
+    assert_eq!(sec_budget.max_concurrent(), 1);
+    let hidden_source_ids = [
+        FASB_XBRL_TAXONOMY_SOURCE_ID,
+        XBRL_US_LEGACY_TAXONOMY_SOURCE_ID,
+        XBRL_INTERNATIONAL_STANDARDS_SOURCE_ID,
+        W3C_XML_SCHEMA_STANDARDS_SOURCE_ID,
+    ];
+    assert!(
+        profiles
+            .iter()
+            .all(|profile| !hidden_source_ids.contains(&profile.id()))
+    );
+
+    let mut descriptor_identities = Vec::new();
+    for (index, authority) in FILING_TAXONOMY_SOURCE_AUTHORITIES.iter().enumerate() {
+        assert_eq!(
+            authority.canonical_source_id()?.as_str(),
+            authority.source_id()
+        );
+        let budget = authority.budget_policy()?;
+        let endpoint = authority.endpoint_policy()?;
+        let evidence = authority.revision_evidence()?;
+        assert_eq!(
+            evidence.payload_evidence().content_digest(),
+            authority.descriptor_evidence_digest()
+        );
+        assert_eq!(
+            evidence.metadata_revision(),
+            &authority.metadata_revision()?
+        );
+        assert_eq!(
+            budget.scope().as_source_identifier().as_str(),
+            authority.rate_scope()
+        );
+        assert_eq!(budget.window_nanos(), 1_000_000_000);
+        assert_eq!(budget.max_concurrent(), 1);
+        assert_eq!(endpoint.request_bounds().max_redirects(), 0);
+        assert!(endpoint.client_profile().automatic_redirects_disabled());
+        if index == 0 {
+            assert_eq!(budget.requests_per_window(), 2);
+            assert_eq!(
+                authority.request_header_class(),
+                FilingTaxonomyRequestHeaderClass::SecIdentifyingContact
+            );
+            assert_eq!(
+                endpoint.request_bounds().max_response_bytes(),
+                1024 * 1024 * 1024
+            );
+        } else {
+            assert_eq!(budget.requests_per_window(), 1);
+            assert_eq!(
+                authority.request_header_class(),
+                FilingTaxonomyRequestHeaderClass::ProductOnlyNoSecContact
+            );
+            assert_eq!(
+                endpoint.request_bounds().max_response_bytes(),
+                8 * 1024 * 1024
+            );
+        }
+        descriptor_identities.push((
+            authority.source_id(),
+            authority.rate_scope(),
+            authority.descriptor_evidence_digest(),
+            authority
+                .metadata_revision()?
+                .as_source_identifier()
+                .as_str()
+                .to_owned(),
+        ));
+    }
+    for (index, identity) in descriptor_identities.iter().enumerate() {
+        for other in &descriptor_identities[index + 1..] {
+            assert_ne!(identity.0, other.0);
+            assert_ne!(identity.1, other.1);
+            assert_ne!(identity.2, other.2);
+            assert_ne!(identity.3, other.3);
+        }
+    }
+
+    let locator_cases = [
+        (
+            "https://xbrl.sec.gov/dei/2025/dei-2025.xsd",
+            "https://xbrl.sec.gov/dei/2025/dei-2025.xsd",
+            SEC_EDGAR_SOURCE_ID,
+        ),
+        (
+            "http://fasb.org/us-gaap/2025",
+            "https://xbrl.fasb.org/us-gaap/2025/us-gaap-2025.xsd",
+            FASB_XBRL_TAXONOMY_SOURCE_ID,
+        ),
+        (
+            "http://xbrl.us/us-gaap/2009-01-31",
+            "https://taxonomies.xbrl.us/us-gaap/2009/elts/us-gaap-2009-01-31.xsd",
+            XBRL_US_LEGACY_TAXONOMY_SOURCE_ID,
+        ),
+        (
+            "http://www.xbrl.org/2003/xbrl-instance-2003-12-31.xsd",
+            "https://www.xbrl.org/2003/xbrl-instance-2003-12-31.xsd",
+            XBRL_INTERNATIONAL_STANDARDS_SOURCE_ID,
+        ),
+        (
+            "http://www.w3.org/2001/XMLSchema.xsd",
+            "https://www.w3.org/2001/XMLSchema.xsd",
+            W3C_XML_SCHEMA_STANDARDS_SOURCE_ID,
+        ),
+    ];
+    for (logical, physical, source_id) in locator_cases {
+        let resolved =
+            resolve_filing_taxonomy_authority(FilingTaxonomyLocator::new(logical, physical))?;
+        assert_eq!(resolved.locator().logical_locator(), logical);
+        assert_eq!(resolved.locator().physical_locator(), physical);
+        assert_eq!(resolved.authority().source_id(), source_id);
+        assert_eq!(
+            route_filing_taxonomy_physical_locator(physical)?.source_id(),
+            source_id
+        );
+    }
+    assert!(matches!(
+        resolve_filing_taxonomy_authority(FilingTaxonomyLocator::new(
+            "http://fasb.org/us-gaap/2025",
+            "https://www.w3.org/2001/XMLSchema.xsd",
+        )),
+        Err(FilingTaxonomyAuthorityLookupError::LogicalPhysicalAuthorityMismatch)
+    ));
+    assert!(matches!(
+        resolve_filing_taxonomy_authority(FilingTaxonomyLocator::new(
+            "not-a-url",
+            "https://xbrl.fasb.org/us-gaap/2025/us-gaap-2025.xsd",
+        )),
+        Err(FilingTaxonomyAuthorityLookupError::UnsupportedLogicalLocator)
+    ));
     assert!(
         bls_public
             .evidence()
