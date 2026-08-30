@@ -10,6 +10,7 @@ const LOWERCASE_SHA256_PATTERN: &str = "^[0-9a-f]{64}$";
 const LOWERCASE_IEEE754_HEX_PATTERN: &str = "^[0-9a-f]{16}$";
 const NANOSECOND_UTC_TIMESTAMP_PATTERN: &str =
     "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{9}Z$";
+const CALENDAR_DATE_PATTERN: &str = "^[0-9]{4}-[0-9]{2}-[0-9]{2}$";
 const CANONICAL_DECIMAL_PATTERN: &str = "^-?(?:0|[1-9][0-9]*)(?:\\.[0-9]*[1-9])?$";
 const POSITIVE_INTEGER_PATTERN: &str = "^[1-9][0-9]*$";
 const UNSIGNED_INTEGER_PATTERN: &str = "^(?:0|[1-9][0-9]*)$";
@@ -217,6 +218,7 @@ fn string_pattern_is_supported(schema: &Map<String, Value>, schema_type: &str) -
                 | LOWERCASE_SHA256_PATTERN
                 | LOWERCASE_IEEE754_HEX_PATTERN
                 | NANOSECOND_UTC_TIMESTAMP_PATTERN
+                | CALENDAR_DATE_PATTERN
                 | CANONICAL_DECIMAL_PATTERN
                 | POSITIVE_INTEGER_PATTERN
                 | UNSIGNED_INTEGER_PATTERN
@@ -231,7 +233,7 @@ fn string_format_is_supported(schema: &Map<String, Value>, schema_type: &str) ->
     match schema.get("format") {
         None => true,
         Some(Value::String(format)) if schema_type == "string" => {
-            matches!(format.as_str(), "uuid" | "date-time")
+            matches!(format.as_str(), "uuid" | "date-time" | "date")
         }
         Some(_) => false,
     }
@@ -356,6 +358,7 @@ fn string_pattern_matches(pattern: Option<&Value>, value: &str) -> bool {
         Some(LOWERCASE_SHA256_PATTERN) => lowercase_hex_matches(value, 64),
         Some(LOWERCASE_IEEE754_HEX_PATTERN) => lowercase_hex_matches(value, 16),
         Some(NANOSECOND_UTC_TIMESTAMP_PATTERN) => nanosecond_utc_timestamp_matches(value),
+        Some(CALENDAR_DATE_PATTERN) => calendar_date_matches(value),
         Some(CANONICAL_DECIMAL_PATTERN) => canonical_decimal_matches(value),
         Some(POSITIVE_INTEGER_PATTERN) => positive_integer_matches(value),
         Some(UNSIGNED_INTEGER_PATTERN) => value == "0" || positive_integer_matches(value),
@@ -389,6 +392,11 @@ fn nanosecond_utc_timestamp_matches(value: &str) -> bool {
         29 => byte == b'Z',
         _ => byte.is_ascii_digit(),
     })
+}
+
+fn calendar_date_matches(value: &str) -> bool {
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .is_ok_and(|parsed| parsed.format("%Y-%m-%d").to_string() == value)
 }
 
 fn canonical_decimal_matches(value: &str) -> bool {
@@ -428,6 +436,7 @@ fn string_format_matches(format: Option<&Value>, value: &str) -> bool {
         Some("uuid") => uuid::Uuid::parse_str(value)
             .is_ok_and(|parsed| parsed.hyphenated().to_string() == value),
         Some("date-time") => chrono::DateTime::parse_from_rfc3339(value).is_ok(),
+        Some("date") => calendar_date_matches(value),
         Some(_) => false,
     }
 }
@@ -489,8 +498,8 @@ fn bounded_number(value: &Value, minimum: Option<&Value>, maximum: Option<&Value
 #[cfg(test)]
 mod tests {
     use super::{
-        CANONICAL_DECIMAL_PATTERN, INTEGER_PATTERN, LOWERCASE_SHA256_PATTERN,
-        UNSIGNED_INTEGER_PATTERN, validate_data, validate_data_schema,
+        CALENDAR_DATE_PATTERN, CANONICAL_DECIMAL_PATTERN, INTEGER_PATTERN,
+        LOWERCASE_SHA256_PATTERN, UNSIGNED_INTEGER_PATTERN, validate_data, validate_data_schema,
     };
     use serde_json::json;
 
@@ -526,6 +535,15 @@ mod tests {
             &json!("2026-07-26T12:34:56.123456789Z")
         ));
         assert!(!validate_data(&timestamp_schema, &json!("2026-07-26")));
+
+        let calendar_date_schema = json!({
+            "type": "string",
+            "format": "date",
+            "pattern": CALENDAR_DATE_PATTERN,
+        });
+        assert!(validate_data_schema(&calendar_date_schema));
+        assert!(validate_data(&calendar_date_schema, &json!("2026-07-26")));
+        assert!(!validate_data(&calendar_date_schema, &json!("2026-02-30")));
 
         let sha256_schema = json!({
             "type": "string",
