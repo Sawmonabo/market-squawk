@@ -23,9 +23,8 @@ use market_squawk::{
 };
 use market_squawk_installer::default_installation_data_root;
 #[cfg(target_os = "macos")]
-use market_squawk_installer::{
-    NativeTrustMode, ProgramName, active_native_trust_mode, installation_root_for_installed_program,
-};
+use market_squawk_installer::{NativeTrustMode, active_native_trust_mode};
+use market_squawk_installer::{ProgramName, installation_root_for_installed_program};
 use market_squawk_platform::{ConfigOverrides, ConfigSources};
 use market_squawk_runtime::{
     InstallationId, ServiceStartupEvidenceWriter, ServiceStartupPhase, ServiceStartupState,
@@ -119,7 +118,7 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
             .map(|()| InstalledServiceRunOutcome::Stopped)
             .map_err(|_error| anyhow::anyhow!("secure startup could not be completed"));
     }
-    let secret_backend_policy = installed_secret_backend_policy()?;
+    let secret_backend_policy = installed_secret_backend_policy(&installation_data_root)?;
     let ephemeral_verification_root = if arguments.ephemeral_verification_credentials {
         Some(EphemeralVerificationRoot::try_new(&installation_data_root)?)
     } else {
@@ -335,7 +334,8 @@ async fn run_foreground_keyring_broker(
     arguments: &ServiceArguments,
     installation_data_root: &Path,
 ) -> Result<()> {
-    if installed_secret_backend_policy()? != InstalledSecretBackendPolicy::PlatformKeyring
+    if installed_secret_backend_policy(installation_data_root)?
+        != InstalledSecretBackendPolicy::PlatformKeyring
         || arguments.ephemeral_verification_credentials
         || arguments.data_dir.is_some()
         || arguments.config.is_some()
@@ -361,17 +361,31 @@ async fn run_foreground_keyring_broker(
     .map_err(Into::into)
 }
 
-fn installed_secret_backend_policy() -> Result<InstalledSecretBackendPolicy> {
+fn installed_secret_backend_policy(
+    installation_data_root: &Path,
+) -> Result<InstalledSecretBackendPolicy> {
+    let executable = std::env::current_exe()?;
+    let Some(program_root) =
+        installation_root_for_installed_program(&executable, ProgramName::Service)?
+    else {
+        return Ok(InstalledSecretBackendPolicy::EncryptedFileOnly);
+    };
+    let Some(expected_data_root) = program_root.parent() else {
+        return Ok(InstalledSecretBackendPolicy::EncryptedFileOnly);
+    };
+    let roots_match = std::fs::canonicalize(expected_data_root)
+        .ok()
+        .zip(std::fs::canonicalize(installation_data_root).ok())
+        .is_some_and(|(expected, selected)| expected == selected);
+    if !roots_match {
+        return Ok(InstalledSecretBackendPolicy::EncryptedFileOnly);
+    }
     #[cfg(target_os = "macos")]
     {
-        let executable = std::env::current_exe()?;
-        let Some(root) =
-            installation_root_for_installed_program(&executable, ProgramName::Service)?
-        else {
-            return Ok(InstalledSecretBackendPolicy::EncryptedFileOnly);
-        };
         return Ok(
-            if active_native_trust_mode(&root)? == NativeTrustMode::DeveloperIdSignedAndNotarized {
+            if active_native_trust_mode(&program_root)?
+                == NativeTrustMode::DeveloperIdSignedAndNotarized
+            {
                 InstalledSecretBackendPolicy::PlatformKeyring
             } else {
                 InstalledSecretBackendPolicy::EncryptedFileOnly
