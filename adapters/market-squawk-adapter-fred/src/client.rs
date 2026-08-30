@@ -33,16 +33,23 @@ use crate::{
 
 mod http;
 mod lineage;
+mod macro_pages;
 mod metadata;
 mod normalize;
 
 pub use metadata::{FredSeriesMetadata, FredSeriesMetadataDocument, fred_series_endpoint_rule};
 
 use http::{
-    FredHttpRequest, FredHttpResponse, FredTransport, ReqwestFredTransport, system_timestamp,
+    FredHttpAuthorization, FredHttpRequest, FredHttpResponse, FredTransport, ReqwestFredTransport,
+    system_timestamp,
 };
 pub use lineage::FredPageObjectIdentity;
 use lineage::{evidence_for_payload, map_adapter_error, page_object_id, parse_object_id};
+pub use macro_pages::{
+    FredReleaseExtraction, FredReleaseExtractionPage, FredVintageExtraction,
+    FredVintageExtractionPage, fred_observations_endpoint_rule,
+    fred_release_observations_v2_endpoint_rule, fred_vintage_dates_endpoint_rule,
+};
 use normalize::{CanonicalPageContext, FredNativeLineagePlan, canonical_observation_payloads};
 
 const OBSERVATIONS_ENDPOINT: &str = "https://api.stlouisfed.org/fred/series/observations";
@@ -988,6 +995,7 @@ impl FredSource {
             .append_pair("offset", &offset.to_string())
             .append_pair("sort_order", "asc")
             .append_pair("output_type", "1")
+            .append_pair("units", "lin")
             .append_pair("file_type", "json");
         let mut authorization_target = public_url.clone();
         authorization_target
@@ -1015,6 +1023,7 @@ impl FredSource {
                 FredHttpRequest {
                     public_url: public_url.clone(),
                     api_key: self.api_key.clone(),
+                    authorization: FredHttpAuthorization::QueryParameter,
                 },
                 self.response_limit,
                 timeout,
@@ -1070,6 +1079,7 @@ impl FredSource {
             &public_url,
             &response,
         )?;
+        in_flight.record_success()?;
         Ok(FetchedPage {
             response,
             page,

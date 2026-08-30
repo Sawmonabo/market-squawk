@@ -138,6 +138,7 @@ impl FredObservationPage {
             limits,
         )?;
         if wire.output_type != 1
+            || wire.units != "lin"
             || wire.file_type != "json"
             || wire.order_by != "observation_date"
             || wire.sort_order != "asc"

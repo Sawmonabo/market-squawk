@@ -1,14 +1,22 @@
 //! Bounded FRED and ALFRED extraction with fail-closed per-series rights.
 
 mod client;
+mod release;
 mod rights;
 mod series;
 mod vintages;
 
 pub use client::{
     FredApiKey, FredExtractedPage, FredExtractionOutput, FredPageObjectIdentity,
-    FredSeriesMetadata, FredSeriesMetadataDocument, FredSource, FredSourceError,
-    MAX_FRED_EPHEMERAL_PAGE_RECORDS, fred_series_endpoint_rule,
+    FredReleaseExtraction, FredReleaseExtractionPage, FredSeriesMetadata,
+    FredSeriesMetadataDocument, FredSource, FredSourceError, FredVintageExtraction,
+    FredVintageExtractionPage, MAX_FRED_EPHEMERAL_PAGE_RECORDS, fred_observations_endpoint_rule,
+    fred_release_observations_v2_endpoint_rule, fred_series_endpoint_rule,
+    fred_vintage_dates_endpoint_rule,
+};
+pub use release::{
+    FredReleaseCursor, FredReleaseMetadata, FredReleaseObservation, FredReleaseObservationPage,
+    FredReleaseSeries, FredReleaseSource, MAX_FRED_V2_RELEASE_PAGE_OBSERVATIONS,
 };
 pub use rights::{
     CURRENT_FRED_RIGHTS_ARTIFACT_BYTE_LENGTH, CURRENT_FRED_RIGHTS_ARTIFACT_SHA256,

@@ -17,8 +17,8 @@ use crate::{FredOperation, FredParseLimits, FredRightsDisposition};
 use super::http::system_timestamp;
 use super::lineage::{evidence_for_payload, map_adapter_error};
 use super::{
-    FredDataset, FredHttpRequest, FredSource, FredSourceError, acquire_request_permit,
-    standalone_capture_material,
+    FredDataset, FredHttpAuthorization, FredHttpRequest, FredSource, FredSourceError,
+    acquire_request_permit, standalone_capture_material,
 };
 
 const SERIES_ENDPOINT: &str = "https://api.stlouisfed.org/fred/series";
@@ -320,6 +320,7 @@ impl FredSource {
                 FredHttpRequest {
                     public_url: public_url.clone(),
                     api_key: self.api_key.clone(),
+                    authorization: FredHttpAuthorization::QueryParameter,
                 },
                 self.response_limit,
                 timeout,
@@ -367,6 +368,7 @@ impl FredSource {
             evidence_for_payload(&response.body, &public_url).map_err(map_adapter_error)?;
         let capture =
             standalone_capture_material(&self.metadata, dataset.clone(), &public_url, &response)?;
+        in_flight.record_success()?;
         Ok(FredSeriesMetadataDocument {
             source_id: self.metadata.source_id().clone(),
             metadata_revision: self.metadata.revision().clone(),
