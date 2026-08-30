@@ -37,14 +37,14 @@ export function initialEvidence(bootstrap: DesktopBootstrap, loading = false): E
     ? {
         tone: "loading",
         complete: false,
-        headline: "Reading owner evidence",
-        detail: "No completion is assumed while the owner query is in progress.",
+        headline: "Checking your setup",
+        detail: "Current readiness will appear when these checks finish.",
       }
     : {
         tone: "unavailable",
         complete: false,
-        headline: "Owner evidence has not been refreshed",
-        detail: "Open the accepted checklist or refresh to read the current owner state.",
+        headline: "Setup status has not been checked",
+        detail: "Refresh to see what is ready and what still needs attention.",
       }
   return {
     goals_and_starter_plan: { ...base },
@@ -53,8 +53,9 @@ export function initialEvidence(bootstrap: DesktopBootstrap, loading = false): E
       : readinessEvidence(
           bootstrap.storage.state === "ready" && bootstrap.installation.state === "ready",
           "Workspace and installed release are ready",
-          `${bootstrap.storage.detail} ${bootstrap.installation.detail}`,
+          "Your workspace and installed application passed their readiness checks.",
           "Storage or release verification still needs attention",
+          "Open Updates & Repair, then run this check again.",
         ),
     public_and_zero_fee_providers: { ...base },
     file_and_portfolio_import: { ...base },
@@ -63,8 +64,9 @@ export function initialEvidence(bootstrap: DesktopBootstrap, loading = false): E
       : readinessEvidence(
           bootstrap.modelRuntime.state === "ready",
           "Local model runtime is verified",
-          bootstrap.modelRuntime.detail,
+          "Local forecasting and analysis can use the installed model runtime.",
           "Local model runtime is not verified",
+          "Open Models to review the local runtime, then run this check again.",
         ),
     paper_and_risk: { ...base },
     claude_code: { ...base },
@@ -94,14 +96,15 @@ export function paperRiskEvidence(
         complete: true,
         headline: "Paper execution is stopped behind central risk",
         detail:
-          "Bot.GetStatus proves the stopped lifecycle state, and the installed surface exposes the closed Bot, Execution, and central Risk operations.",
+          "Paper trading is stopped, and its required safety controls are available.",
       }
     }
     return {
       tone: "degraded",
       complete: false,
-      headline: "Paper execution is stopped, but the installed safety surface is incomplete",
-      detail: `Bot.GetStatus proves the stopped state. Missing installed operations: ${missingOperations.join(", ")}.`,
+      headline: "Some paper-trading safeguards are unavailable",
+      detail:
+        "Some required paper-trading safety controls are unavailable. Reopen Market Squawk, then check again.",
     }
   }
   if (status.state === "running") {
@@ -110,7 +113,7 @@ export function paperRiskEvidence(
       complete: false,
       headline: "Paper execution is running, not stopped",
       detail:
-        "Stop the paper account in Paper Execution. Central risk remains authoritative while it runs, but the approved setup outcome is stopped-by-default.",
+        "Stop the paper account in Paper Execution before completing setup.",
     }
   }
   if (status.state === "failed") {
@@ -118,14 +121,14 @@ export function paperRiskEvidence(
       tone: "degraded",
       complete: false,
       headline: "Paper execution failed and requires a stop",
-      detail: `Provider ${status.provider} reports a failed state. Open Paper Execution and stop or recover it explicitly.`,
+      detail: "Paper execution reports a failed state. Open Paper Execution and stop or recover it explicitly.",
     }
   }
   return {
     tone: "unfinished",
     complete: false,
     headline: `Paper execution is ${status.state}`,
-    detail: "Wait for the lifecycle transition to settle, then refresh owner evidence.",
+    detail: "Wait for the change to finish, then run this check again.",
   }
 }
 
@@ -134,11 +137,16 @@ export function mcpClientEvidence(
   client: McpClientsStatus["clients"][number] | undefined,
   read: OwnerRead<McpClientsStatus>,
 ): StepEvidence {
-  if (!read.ok) return unavailableEvidence(`${label} evidence is unavailable`, read.error)
+  if (!read.ok) {
+    return unavailableEvidence(
+      `${label} status is unavailable`,
+      "Try again or review Logs & Diagnostics for details.",
+    )
+  }
   if (!client) {
     return unavailableEvidence(
-      `${label} has no distinct owner state`,
-      "The MCP owner did not return the required separate client record.",
+      `${label} status is unavailable`,
+      `Open MCP and check the ${label} connection.`,
     )
   }
   const verified = client.state === "owned" && client.verification !== null
@@ -146,8 +154,8 @@ export function mcpClientEvidence(
     ? {
         tone: "ready",
         complete: true,
-        headline: `${label} is owned and verified`,
-        detail: `A real ${label} handshake, discovery, and safe read were recorded at ${formatUnixSeconds(String(client.verification!.verifiedAtUnixSeconds))}.`,
+        headline: `${label} is connected and verified`,
+        detail: `The connection and a safe read were verified at ${formatUnixSeconds(String(client.verification!.verifiedAtUnixSeconds))}.`,
       }
     : {
         tone: client.state === "repair_required" || client.state === "conflict" ? "degraded" : "unfinished",
@@ -186,19 +194,19 @@ export function storageEvidence(
       tone: "unfinished",
       complete: false,
       headline: "Storage or installed-release verification needs attention",
-      detail: `${bootstrap.storage.detail} ${bootstrap.installation.detail}`,
+      detail: "Open Updates & Repair, resolve the listed issue, then check again.",
     }
   }
   if (!settingsRead.ok) {
     return unavailableEvidence(
-      "Workspace settings evidence is unavailable",
-      `${settingsRead.error} The ready storage bootstrap alone does not prove the selected retention and disk budget.`,
+      "Workspace settings are unavailable",
+      "Try again or review Logs & Diagnostics for details.",
     )
   }
   if (!step || step.choice.kind !== "storage") {
     return unavailableEvidence(
-      "The planned storage policy cannot be interpreted",
-      "The accepted plan did not expose its closed retention, disk, and time-policy choice.",
+      "The planned storage settings are unavailable",
+      "Review your storage choices, save the setup plan again, then check this item.",
     )
   }
 
@@ -225,20 +233,19 @@ export function storageEvidence(
         tone: "ready",
         complete: true,
         headline: "Workspace retention, time, and disk policy match the accepted plan",
-        detail: `${expectedRetention} days retention · ${expectedSoftLimit} byte soft limit · point-in-time research with first-observed-locally provenance.`,
+        detail: `${expectedRetention} days retention · ${expectedSoftLimit} byte soft limit · point-in-time research.`,
       }
     : {
         tone: "degraded",
-        complete: false,
-        headline: "Workspace settings do not match the accepted storage plan",
-        detail:
-          "Open Settings to review the typed retention and storage values, then refresh owner evidence. No value is inferred from plan acceptance.",
+      complete: false,
+      headline: "Workspace settings do not match the accepted storage plan",
+      detail:
+          "Open Settings to review retention and storage, then run this check again.",
       }
 }
 
 interface FirstResultFacts {
   overviewReady: boolean
-  overviewError: string | null
   marketsReady: boolean
   marketResults: number
   researchReady: boolean
@@ -258,13 +265,13 @@ export function firstResultEvidence(
   if (!step || step.choice.kind !== "first_useful_result") {
     return unavailableEvidence(
       "The planned first result cannot be identified",
-      "The accepted plan did not expose its closed first-result choice. Refresh the setup authority; no substitute result is inferred.",
+      "Review and save your first-result choice, then check this item again.",
     )
   }
   if (!facts.overviewReady) {
     return unavailableEvidence(
-      "Home owner data is unavailable",
-      `${facts.overviewError ?? "The Home read failed."} No first result is inferred. Refresh owner evidence, then open Home.`,
+      "Home information is unavailable",
+      "Refresh this check, then open Home. Review Logs & Diagnostics if the problem continues.",
     )
   }
 
@@ -274,19 +281,19 @@ export function firstResultEvidence(
       return resultEvidence(
         facts.marketsReady,
         facts.marketResults > 0,
-        "A verified public market result is available",
-        `${facts.marketResults} observed market trade result${facts.marketResults === 1 ? " is" : "s are"} available to Home with source, time, and quality evidence.`,
-        "The planned public market result is unavailable",
-        "No observed market trade is available. Finish every included provider outcome in Sources, refresh evidence, then open Home.",
+        "Current market information is available",
+        `${facts.marketResults} investment${facts.marketResults === 1 ? " has" : "s have"} a current price on Home.`,
+        "Current market information is unavailable",
+        "No current price is available. Review Connections & Sources, refresh this check, then open Home.",
       )
     case "point_in_time_research_result":
       return resultEvidence(
         facts.researchReady,
         facts.researchCount > 0,
         "A point-in-time research result is available",
-        `${facts.researchCount} durable research dataset${facts.researchCount === 1 ? " is" : "s are"} available with lineage evidence.`,
+        `${facts.researchCount} research dataset${facts.researchCount === 1 ? " is" : "s are"} available.`,
         "The planned research result is unavailable",
-        "No durable research dataset exists. Complete a controlled Research workflow, refresh evidence, then open Home.",
+        "No research dataset is available. Complete a Research workflow, refresh this check, then open Home.",
       )
     case "reconciled_portfolio_summary":
       return resultEvidence(
@@ -302,32 +309,32 @@ export function firstResultEvidence(
         facts.forecastsReady,
         facts.forecastCount > 0,
         "An admitted-model forecast is available",
-        `${facts.forecastCount} durable forecast${facts.forecastCount === 1 ? " is" : "s are"} available from the forecast owner.`,
+        `${facts.forecastCount} forecast${facts.forecastCount === 1 ? " is" : "s are"} available.`,
         "The planned forecast result is unavailable",
-        "No admitted-model forecast exists. Verify the model runtime and complete a Models forecast workflow, refresh evidence, then open Home.",
+        "No forecast is available. Verify the model runtime, create a forecast in Models, then refresh this check.",
       )
     case "stopped_paper_and_risk_review":
       return resultEvidence(
         true,
         facts.paperReady,
         "A stopped paper and central-risk review is available",
-        "The paper lifecycle is stopped and the installed Bot, Execution, and central Risk surface is closed and available.",
+        "Paper trading is stopped and the required risk controls are available.",
         "The planned paper and risk result is unavailable",
-        "Paper/risk owner evidence is not ready. Open Paper Execution and Risk, restore the stopped safe state, then refresh and open Home.",
+        "Paper trading or its risk controls need attention. Restore the stopped safe state, then refresh this check.",
       )
     case "verified_mcp_safe_read":
       return resultEvidence(
         true,
         facts.mcpReady,
-        "A verified MCP safe-read result is available",
-        "At least one separately owned AI client has a real handshake, discovery, and bounded safe-read result.",
+        "A verified MCP safe read is available",
+        "At least one AI client is connected and has completed a safe read.",
         "The planned MCP safe-read result is unavailable",
-        "Neither Claude Code nor Codex has a verified safe read. Complete one client's own MCP connect and verify workflow, then refresh and open Home.",
+        "Neither Claude Code nor Codex has completed a verified safe read. Connect and verify one client, then refresh this check.",
       )
     default:
       return unavailableEvidence(
         "The planned first-result choice is unsupported",
-        `The setup authority returned ${typeof result === "string" ? result : "a non-text result"}; no substitute result is inferred.`,
+        "Review your first-result choice and save the setup plan again.",
       )
   }
 }
@@ -343,7 +350,7 @@ function resultEvidence(
   if (!ownerReadReady) {
     return unavailableEvidence(
       missingHeadline,
-      `The required owner read failed. ${missingDetail}`,
+      `The required information is unavailable. ${missingDetail}`,
     )
   }
   return complete
@@ -402,17 +409,17 @@ export function providerEvidence(
 ): StepEvidence {
   if (!step || step.choice.kind !== "providers" || !Array.isArray(step.choice.outcomes)) {
     return unavailableEvidence(
-      "Provider plan outcomes are unavailable",
-      "The accepted provider step did not expose its closed provider outcome list, so no completion is inferred.",
+      "Connection choices are unavailable",
+      "Review and save your connection choices, then check this item again.",
     )
   }
   if (step.disposition === "available_to_finish_later") {
     return {
       tone: "unfinished",
       complete: false,
-      headline: "Provider setup was skipped in this setup run",
+      headline: "Connections were skipped in this setup run",
       detail:
-        "The providers remain installed and available when setup resumes. A skipped setup outcome stays incomplete until every included provider has real owner evidence.",
+        "You can return to Connections & Sources later. This item remains unfinished until every selected connection is ready.",
     }
   }
 
@@ -422,8 +429,8 @@ export function providerEvidence(
   )
   if (outcomes.length !== step.choice.outcomes.length || outcomes.length === 0) {
     return unavailableEvidence(
-      "Provider plan outcomes cannot be interpreted",
-      "The accepted plan contains an unknown or empty provider outcome. Refresh the setup authority before continuing.",
+      "Connection choices cannot be checked",
+      "Review and save your connection choices, then try again.",
     )
   }
 
@@ -442,9 +449,9 @@ export function providerEvidence(
     return {
       tone: "ready",
       complete: true,
-      headline: `All ${outcomes.length} included provider outcomes are active`,
+      headline: `All ${outcomes.length} selected connections are ready`,
       detail:
-        "Coinbase, Kraken, SEC, BLS, Treasury, and authority-gated FRED/ALFRED each have real active owner evidence. Coverage, freshness, and quality remain separately visible in Sources.",
+        "Coverage, freshness, and data quality are available in Connections & Sources.",
     }
   }
 
@@ -453,16 +460,16 @@ export function providerEvidence(
     tone:
       readFailures >= totalReads && totalReads > 0 ? "unavailable" : "degraded",
     complete: false,
-    headline: `${completed} of ${outcomes.length} included provider outcomes are active`,
+    headline: `${completed} of ${outcomes.length} selected connections are ready`,
     detail: `${
       missingLabels.length > 0
         ? `Still missing: ${missingLabels.join(", ")}. `
         : ""
     }${
       readFailures > 0
-        ? `${readFailures} owner evidence reads failed. `
+        ? `${readFailures} connection check${readFailures === 1 ? "" : "s"} could not be completed. `
         : ""
-    }A profile, onboarding session, or successful status read is not an active provider result.`,
+    }Complete the remaining connection setup, then check again.`,
   }
 }
 

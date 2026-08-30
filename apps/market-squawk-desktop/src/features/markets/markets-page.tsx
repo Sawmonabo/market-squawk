@@ -1,5 +1,5 @@
 import * as React from "react"
-import { useQuery, type UseQueryResult } from "@tanstack/react-query"
+import { useQuery } from "@tanstack/react-query"
 import {
   Activity,
   CircleAlert,
@@ -7,7 +7,6 @@ import {
   DatabaseZap,
   RefreshCw,
   Search,
-  ShieldCheck,
 } from "lucide-react"
 import { useSearchParams } from "react-router-dom"
 
@@ -16,25 +15,20 @@ import { productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
-import { humanize } from "@/lib/formatters"
-import type { ApplicationResult, DesktopBootstrap } from "@/lib/schemas"
+import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
-  type BookLevel,
-  instrumentBooks,
-  instrumentComparison,
-  instrumentQuotes,
-  instrumentTrades,
-  resultState,
-} from "./market-evidence"
+  marketInstrumentRow,
+  marketOverviewRows,
+  type MarketProductRow,
+} from "./market-product"
 import {
   type ReferenceMarketRow,
   referenceMarketRows,
 } from "./reference-market"
-import { type UnifiedMarketRow, unifiedMarketRows } from "./unified-market"
 
-const UNIFIED_FEED_POLL_INTERVAL_MS = 5_000
+const MARKET_POLL_INTERVAL_MS = 5_000
 
 export function MarketsPage() {
   const product = useProduct()
@@ -72,30 +66,31 @@ function ReadyMarketsPage({
   const operationNames = new Set(
     bootstrap.operations.map((operation) => operation.name),
   )
-  const feedAvailable = operationNames.has("Market.GetUnifiedFeed")
+  const overviewAvailable = operationNames.has("Market.GetOverview")
+  const instrumentAvailable = operationNames.has("Market.GetInstrument")
+  const universeAvailable = operationNames.has("Market.SearchUniverse")
   const pageVisible = usePageVisibility()
-  const feed = useQuery({
+  const overview = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
       "market",
-      "Market.GetUnifiedFeed",
+      "Market.GetOverview",
       {},
     ),
-    enabled: feedAvailable,
-    queryFn: () => transport.query({ query: "marketUnifiedFeed" }),
+    enabled: overviewAvailable,
+    queryFn: () => transport.query({ query: "marketOverview" }),
     refetchInterval:
-      feedAvailable && pageVisible ? UNIFIED_FEED_POLL_INTERVAL_MS : false,
+      overviewAvailable && pageVisible ? MARKET_POLL_INTERVAL_MS : false,
     refetchIntervalInBackground: false,
   })
-  const feedRead = parseRead(() => unifiedMarketRows(feed.data))
-  const rows = feedRead.value ?? []
+  const overviewRead = parseRead(() => marketOverviewRows(overview.data))
+  const rows = overviewRead.value ?? []
   const [searchText, setSearchText] = React.useState("")
   const [referenceQuery, setReferenceQuery] = React.useState("")
   React.useEffect(() => {
     const timer = window.setTimeout(() => setReferenceQuery(searchText.trim()), 250)
     return () => window.clearTimeout(timer)
   }, [searchText])
-  const universeAvailable = operationNames.has("Market.SearchUniverse")
   const universe = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
@@ -111,33 +106,22 @@ function ReadyMarketsPage({
       }),
   })
   const universeRead = parseRead(() => referenceMarketRows(universe.data))
-  const liveReferenceKeys = new Set(
-    rows.map((row) => `${row.symbol.toLocaleUpperCase()}|${row.symbolVenueId}`),
+  const currentSymbols = new Set(
+    rows.flatMap((row) =>
+      row.displaySymbol ? [row.displaySymbol.toLocaleUpperCase()] : [],
+    ),
   )
-  const referenceRows = (universeRead.value ?? []).filter(
-    (row) =>
-      !liveReferenceKeys.has(`${row.symbol.toLocaleUpperCase()}|${row.venueId}`),
+  const references = (universeRead.value ?? []).filter(
+    (row) => !currentSymbols.has(row.symbol.toLocaleUpperCase()),
   )
   const normalizedSearch = searchText.trim().toLocaleLowerCase()
   const visibleRows = normalizedSearch
     ? rows.filter((row) =>
-        [
-          row.symbol,
-          row.instrumentId,
-          row.displayName,
-          row.assetClass,
-          row.quoteCurrency,
-        ]
+        [row.displaySymbol, row.name, assetClassName(row.assetClass), row.currency]
           .filter((value): value is string => Boolean(value))
           .some((value) => value.toLocaleLowerCase().includes(normalizedSearch)),
       )
     : rows
-  const instrumentIds = [
-    ...new Set([
-      ...(requestedInstrumentId ? [requestedInstrumentId] : []),
-      ...rows.map((row) => row.instrumentId),
-    ]),
-  ]
   const [selectedId, setSelectedId] =
     React.useState<string | null>(requestedInstrumentId)
   const [selectedReferenceId, setSelectedReferenceId] =
@@ -153,95 +137,50 @@ function ReadyMarketsPage({
   }, [requestedInstrumentId, requestedReferenceId])
   const selectedInstrument =
     selectedReferenceId === null
-      ? instrumentIds.find((instrumentId) => instrumentId === selectedId) ??
-        instrumentIds[0] ??
-        null
+      ? selectedId ?? rows[0]?.instrumentId ?? null
       : null
-  const selectedRow = rows.find((row) => row.instrumentId === selectedInstrument) ?? null
+  const overviewSelection =
+    rows.find((row) => row.instrumentId === selectedInstrument) ?? null
   const selectedReference =
-    referenceRows.find((row) => row.referenceId === selectedReferenceId) ?? null
-  const tradesAvailable = operationNames.has("Market.GetTrades")
-  const quotesAvailable = operationNames.has("Market.GetQuotes")
-  const booksAvailable = operationNames.has("Market.GetBooks")
-  const comparisonsAvailable = operationNames.has("Market.GetComparisons")
-  const trades = useQuery({
+    references.find((row) => row.referenceId === selectedReferenceId) ?? null
+  const instrument = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
       "market",
-      "Market.GetTrades",
+      "Market.GetInstrument",
       { instrumentId: selectedInstrument },
     ),
-    enabled: selectedInstrument !== null && tradesAvailable,
+    enabled: instrumentAvailable && selectedInstrument !== null,
     queryFn: () =>
       transport.query({
-        query: "marketTrades",
+        query: "marketInstrument",
         instrumentId: requiredInstrument(selectedInstrument),
       }),
+    refetchInterval:
+      instrumentAvailable && selectedInstrument !== null && pageVisible
+        ? MARKET_POLL_INTERVAL_MS
+        : false,
+    refetchIntervalInBackground: false,
   })
-  const quotes = useQuery({
-    queryKey: productKeys.operation(
-      bootstrap.runtime,
-      "market",
-      "Market.GetQuotes",
-      { instrumentId: selectedInstrument },
-    ),
-    enabled: selectedInstrument !== null && quotesAvailable,
-    queryFn: () =>
-      transport.query({
-        query: "marketQuotes",
-        instrumentId: requiredInstrument(selectedInstrument),
-      }),
-  })
-  const books = useQuery({
-    queryKey: productKeys.operation(
-      bootstrap.runtime,
-      "market",
-      "Market.GetBooks",
-      { instrumentId: selectedInstrument },
-    ),
-    enabled: selectedInstrument !== null && booksAvailable,
-    queryFn: () =>
-      transport.query({
-        query: "marketBooks",
-        instrumentId: requiredInstrument(selectedInstrument),
-      }),
-  })
-  const comparisons = useQuery({
-    queryKey: productKeys.operation(
-      bootstrap.runtime,
-      "market",
-      "Market.GetComparisons",
-      { instrumentId: selectedInstrument },
-    ),
-    enabled: selectedInstrument !== null && comparisonsAvailable,
-    queryFn: () =>
-      transport.query({
-        query: "marketComparisons",
-        instrumentId: requiredInstrument(selectedInstrument),
-      }),
-  })
-  const refreshing =
-    feed.isFetching ||
-    universe.isFetching ||
-    trades.isFetching ||
-    quotes.isFetching ||
-    books.isFetching ||
-    comparisons.isFetching
-  const feedFailed = feedRead.error !== null || feed.isError
+  const instrumentRead = parseRead(() =>
+    selectedInstrument
+      ? marketInstrumentRow(instrument.data, selectedInstrument)
+      : null,
+  )
+  const selectedMarket = instrumentRead.value ?? overviewSelection
+  const overviewFailed = overviewRead.error !== null || overview.isError
   const universeFailed = universeRead.error !== null || universe.isError
-  const live = rows.filter((row) => row.availability === "Live").length
-  const verified = rows.filter((row) => row.confidence === "Verified").length
+  const instrumentFailed = instrumentRead.error !== null || instrument.isError
+  const refreshing =
+    overview.isFetching || universe.isFetching || instrument.isFetching
+  const live = rows.filter((row) => row.availability === "live").length
+  const currentPrices = rows.filter((row) => row.currentPrice !== null).length
 
   const refresh = () => {
     void Promise.all([
-      feed.refetch(),
+      ...(overviewAvailable ? [overview.refetch()] : []),
       ...(universeAvailable ? [universe.refetch()] : []),
-      ...(selectedInstrument && tradesAvailable ? [trades.refetch()] : []),
-      ...(selectedInstrument && quotesAvailable ? [quotes.refetch()] : []),
-      ...(selectedInstrument && booksAvailable ? [books.refetch()] : []),
-      ...(selectedInstrument && comparisonsAvailable
-        ? [comparisons.refetch()]
-        : []),
+      ...(instrumentAvailable && selectedInstrument ? [instrument.refetch()] : []),
     ])
   }
 
@@ -262,59 +201,55 @@ function ReadyMarketsPage({
       action={
         <Button variant="outline" size="sm" onClick={refresh} disabled={refreshing}>
           <RefreshCw className={refreshing ? "animate-spin" : ""} aria-hidden="true" />
-          Refresh evidence
+          Refresh markets
         </Button>
       }
     >
-      {!feedAvailable && !universeAvailable ? (
+      {!overviewAvailable && !universeAvailable ? (
         <EmptyState
-          title="Markets are not available in this build"
-          detail="Update Market Squawk, then reopen the app."
+          title="Markets are unavailable"
+          detail="Reopen Market Squawk, then try again."
         />
-      ) : feedFailed && universeFailed ? (
+      ) : overviewFailed && universeFailed ? (
         <EmptyState
-          title="Market data is temporarily unavailable"
+          title="Market information is temporarily unavailable"
           detail="Try again or review Logs & Diagnostics for details."
         />
       ) : rows.length === 0 &&
-        referenceRows.length === 0 &&
-        (feed.isLoading || universe.isLoading) ? (
+        references.length === 0 &&
+        (overview.isLoading || universe.isLoading) ? (
         <MarketGridLoading />
-      ) : rows.length === 0 && referenceRows.length === 0 && feedFailed ? (
+      ) : rows.length === 0 && references.length === 0 && overviewFailed ? (
         <EmptyState
-          title="Live market observations are unavailable"
-          detail="Check your connections, then try again."
+          title="Current prices are unavailable"
+          detail="Check Connections & Sources, then try again."
         />
-      ) : rows.length === 0 && referenceRows.length === 0 && universeFailed ? (
+      ) : rows.length === 0 && references.length === 0 && universeFailed ? (
         <EmptyState
-          title="U.S. listing search is unavailable"
+          title="Investment search is unavailable"
           detail="Try again or review Logs & Diagnostics for details."
         />
-      ) : rows.length === 0 && referenceRows.length === 0 ? (
+      ) : rows.length === 0 && references.length === 0 ? (
         <EmptyState
           title="No markets are available yet"
-          detail="Market Squawk could not load either an active public market or the official U.S. listing reference. Check Sources, then retry."
+          detail="Check Connections & Sources, then refresh this page."
         />
       ) : (
         <>
-          {feedFailed ? (
-            <Notice
-              text="Live prices are unavailable. Official listing search remains usable."
-            />
+          {overviewFailed ? (
+            <Notice text="Current prices are unavailable. Investment search remains usable." />
           ) : null}
           {universeFailed ? (
-            <Notice
-              text="U.S. listing search is unavailable. Current markets remain usable."
-            />
+            <Notice text="Investment search is unavailable. Current markets remain usable." />
           ) : null}
           <div className="grid gap-3 sm:grid-cols-3">
             <Summary
               label="Markets in view"
-              value={rows.length + referenceRows.length}
+              value={rows.length + references.length}
               icon={Activity}
             />
             <Summary label="Live now" value={live} icon={Clock3} />
-            <Summary label="High confidence" value={verified} icon={ShieldCheck} />
+            <Summary label="Current prices" value={currentPrices} icon={DatabaseZap} />
           </div>
           <section className="mt-4 rounded-xl border border-border bg-card/35 p-4">
             <label htmlFor="market-search" className="text-xs font-semibold">
@@ -331,12 +266,12 @@ function ReadyMarketsPage({
               />
             </div>
             <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
-              Market Squawk shows the best available current information and clearly labels delays,
+              Market Squawk uses the best available information and clearly labels delays,
               coverage limits, and confidence.
             </p>
           </section>
-          {visibleRows.length === 0 && referenceRows.length === 0 ? (
-            <Notice text="No admitted market or official listing matches that search." />
+          {visibleRows.length === 0 && references.length === 0 ? (
+            <Notice text="No market or listed investment matches that search." />
           ) : (
             <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
               {visibleRows.map((row) => (
@@ -347,7 +282,7 @@ function ReadyMarketsPage({
                   onSelect={() => selectInstrument(row.instrumentId)}
                 />
               ))}
-              {referenceRows.map((row) => (
+              {references.map((row) => (
                 <ReferenceMarketCard
                   key={row.referenceId}
                   row={row}
@@ -357,33 +292,23 @@ function ReadyMarketsPage({
               ))}
             </div>
           )}
-          {selectedInstrument && !selectedRow ? (
-            <Notice text="The selected instrument has no active unified market observation." />
-          ) : null}
           {selectedInstrument ? (
-            <details className="mt-5 rounded-xl border border-border bg-card/30 p-4">
-              <summary className="cursor-pointer text-sm font-semibold">
-                Show detailed trades, quotes, order book, and data agreement
-              </summary>
-              <InstrumentWorkspace
-                instrumentId={selectedInstrument}
-                market={selectedRow}
-                trades={{ available: tradesAvailable, query: trades }}
-                quotes={{ available: quotesAvailable, query: quotes }}
-                books={{ available: booksAvailable, query: books }}
-                comparisons={{
-                  available: comparisonsAvailable,
-                  query: comparisons,
-                }}
-              />
-            </details>
+            !instrumentAvailable ? (
+              <Notice text="Detailed market information is unavailable right now." />
+            ) : instrument.isPending && !overviewSelection ? (
+              <Skeleton className="mt-5 h-64 rounded-xl" />
+            ) : instrumentFailed && !overviewSelection ? (
+              <Notice text="Detailed market information could not be loaded. Try refreshing the page." />
+            ) : selectedMarket ? (
+              <MarketWorkspace row={selectedMarket} detailLimited={instrumentFailed} />
+            ) : (
+              <Notice text="Current information is unavailable for the selected investment." />
+            )
           ) : null}
           {selectedReference ? (
             <ReferenceWorkspace row={selectedReference} />
           ) : selectedReferenceId ? (
-            <Notice
-              text="That reference listing is no longer present in the current search result."
-            />
+            <Notice text="That listing is no longer present in the current search result." />
           ) : null}
         </>
       )}
@@ -406,6 +331,79 @@ function validReferenceId(value: string | null): string | null {
     : null
 }
 
+function MarketCard({ row, selected, onSelect }: {
+  row: MarketProductRow
+  selected: boolean
+  onSelect: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className={`rounded-xl border p-5 text-left transition-colors ${
+        selected
+          ? "border-primary/50 bg-primary/5"
+          : "border-border bg-card/45 hover:border-primary/25 hover:bg-card/70"
+      }`}
+      aria-pressed={selected}
+    >
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+            {assetClassName(row.assetClass)} · {row.currency}
+          </p>
+          <h2 className="mt-2 truncate text-xl font-semibold">
+            {row.displaySymbol ?? row.name ?? assetClassName(row.assetClass)}
+          </h2>
+          <p className="mt-1 truncate text-[11px] text-muted-foreground">
+            {row.name ?? assetClassName(row.assetClass)}
+          </p>
+        </div>
+        <EvidenceBadge
+          label={availabilityName(row.availability)}
+          tone={
+            row.availability === "live" && row.marketState.health === "healthy"
+              ? "good"
+              : row.availability === "unavailable" || row.availability === "stale"
+                ? "bad"
+                : "neutral"
+          }
+        />
+      </div>
+      <div className="mt-5 rounded-lg border border-border/70 bg-background/35 p-3">
+        <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
+          Current price
+        </p>
+        <p className="mt-1 font-mono text-2xl font-semibold">
+          {price(row.currentPrice?.value ?? null, row.currency)}
+        </p>
+        <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
+          {row.currentPrice
+            ? `${priceBasisName(row.currentPrice.basis)}${
+                row.currentPrice.currentThrough
+                  ? ` · current through ${dateTime(row.currentPrice.currentThrough)}`
+                  : ""
+              }`
+            : "No current trade or bid-and-ask midpoint is available."}
+        </p>
+      </div>
+      <dl className="mt-5 grid grid-cols-2 gap-x-4 gap-y-3 border-t border-border/70 pt-4">
+        <Fact label="Bid" value={price(row.quote.bidPrice, row.currency)} />
+        <Fact label="Ask" value={price(row.quote.askPrice, row.currency)} />
+        <Fact label="Confidence" value={confidenceName(row.confidence)} />
+        <Fact label="Coverage" value={coverageName(row.marketState.coverage)} />
+        <Fact label="Market depth" value={depthName(row.depthSummary.kind)} />
+        <Fact label="Updated" value={dateTime(row.marketState.updatedAt)} />
+      </dl>
+      {row.analysisUse === "current_only" ? (
+        <p className="mt-4 text-[10px] leading-5 text-amber-200">
+          Current-market view only. Historical analysis is not available yet.
+        </p>
+      ) : null}
+    </button>
+  )
+}
+
 function ReferenceMarketCard({ row, selected, onSelect }: {
   row: ReferenceMarketRow
   selected: boolean
@@ -425,567 +423,154 @@ function ReferenceMarketCard({ row, selected, onSelect }: {
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
-            {row.isEtf ? "ETF" : "Stock"} · {row.venueId}
+            {row.isEtf ? "ETF" : "Stock"}
           </p>
           <h2 className="mt-2 truncate text-xl font-semibold">{row.symbol}</h2>
           <p className="mt-1 line-clamp-2 text-[11px] leading-5 text-muted-foreground">
             {row.name}
           </p>
         </div>
-        <EvidenceBadge label="Reference" tone="neutral" />
+        <EvidenceBadge label="Listed" tone="neutral" />
       </div>
       <div className="mt-5 rounded-lg border border-border/70 bg-background/35 p-3">
         <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
           Current price
         </p>
-        <p className="mt-1 text-sm font-medium">Connect an account-backed market feed</p>
+        <p className="mt-1 text-sm font-medium">Not available</p>
       </div>
       <dl className="mt-5 grid grid-cols-2 gap-x-4 gap-y-3 border-t border-border/70 pt-4">
-        <Fact label="Identity" value="Official listing" />
-        <Fact label="Price coverage" value="Live data connection required" />
-        <Fact label="Round lot" value={`${row.roundLotSize.toLocaleString()} shares`} />
+        <Fact label="Identity" value="U.S. listed investment" />
+        <Fact label="Asset type" value={row.isEtf ? "ETF" : "Stock"} />
+        <Fact label="Price coverage" value="Current price unavailable" />
         <Fact label="Updated" value={dateTime(row.availableAt)} />
       </dl>
-      <p className="mt-4 text-[10px] leading-5 text-muted-foreground">
-        This proves the listing identity only. It is not a quote, order book, or trading-status
-        claim.
-      </p>
     </button>
   )
 }
 
-function ReferenceWorkspace({ row }: { row: ReferenceMarketRow }) {
+function MarketWorkspace({
+  row,
+  detailLimited,
+}: {
+  row: MarketProductRow
+  detailLimited: boolean
+}) {
   return (
     <section className="mt-5 rounded-xl border border-border bg-card/30 p-5">
-      <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
-        Official listing reference
-      </p>
-      <div className="mt-2 flex flex-wrap items-start justify-between gap-4">
+      <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h2 className="text-lg font-semibold">
-            {row.symbol} · {row.name}
+          <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
+            Current market information
+          </p>
+          <h2 className="mt-2 text-lg font-semibold">
+            {row.displaySymbol ?? row.name ?? assetClassName(row.assetClass)}
+            {row.displaySymbol && row.name ? ` · ${row.name}` : ""}
           </h2>
           <p className="mt-2 max-w-2xl text-xs leading-5 text-muted-foreground">
-            Market Squawk found this U.S. listing without inventing a price. Connect an eligible
-            live market-data account in Connections to add a current observation.
-          </p>
-        </div>
-        <EvidenceBadge label="Live data connection required" tone="neutral" />
-      </div>
-      <dl className="mt-5 grid gap-4 border-t border-border/70 pt-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Fact label="Listing venue" value={row.venueId} />
-        <Fact label="Asset type" value={row.isEtf ? "ETF" : "Stock"} />
-        <Fact label="Reference quality" value="Official delayed" />
-        <Fact label="Observed" value={dateTime(row.availableAt)} />
-      </dl>
-      <p className="mt-5 text-xs leading-5 text-muted-foreground">
-        Listing details were effective {dateTime(row.effectiveAt)}. Technical provenance is
-        available in Logs &amp; Diagnostics.
-      </p>
-    </section>
-  )
-}
-
-type RuntimeDisplayMark = {
-  value: string
-  currency: string
-  basis: "fresh_last_trade" | "fresh_bid_ask_midpoint"
-  sourceValidUntil: string | null
-}
-
-function runtimeDisplayMark(row: UnifiedMarketRow): RuntimeDisplayMark | null {
-  const source = row.selectedSource
-  if (!source) return null
-  if (
-    row.quote.lastPrice !== null &&
-    row.quote.lastFreshAtSelection === true &&
-    source.freshness.freshAtSelection
-  ) {
-    return {
-      value: row.quote.lastPrice,
-      currency: row.quoteCurrency,
-      basis: "fresh_last_trade",
-      sourceValidUntil: source.freshness.sourceValidUntil,
-    }
-  }
-  if (row.quote.midPrice !== null && source.freshness.freshAtSelection) {
-    return {
-      value: row.quote.midPrice,
-      currency: row.quoteCurrency,
-      basis: "fresh_bid_ask_midpoint",
-      sourceValidUntil: source.freshness.sourceValidUntil,
-    }
-  }
-  return null
-}
-
-function runtimeDisplayMarkSummary(
-  row: UnifiedMarketRow,
-  mark: RuntimeDisplayMark | null,
-): string {
-  if (!mark) {
-    return row.selectedSource
-      ? "No fresh completed trade or bid-and-ask midpoint is available."
-      : marketObservationUnavailableName(row.marketObservation.reason)
-  }
-  const validThrough = mark.sourceValidUntil
-    ? ` · current through ${dateTime(mark.sourceValidUntil)}`
-    : " · no precise freshness deadline reported"
-  return `${markBasisName(mark.basis)}${validThrough}`
-}
-
-function MarketCard({ row, selected, onSelect }: {
-  row: UnifiedMarketRow
-  selected: boolean
-  onSelect: () => void
-}) {
-  const source = row.selectedSource
-  const mark = runtimeDisplayMark(row)
-  const markSummary = runtimeDisplayMarkSummary(row, mark)
-  return (
-    <button
-      type="button"
-      onClick={onSelect}
-      className={`rounded-xl border p-5 text-left transition-colors ${
-        selected
-          ? "border-primary/50 bg-primary/5"
-          : "border-border bg-card/45 hover:border-primary/25 hover:bg-card/70"
-      }`}
-      aria-pressed={selected}
-    >
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
-            {humanize(row.assetClass)} · {row.quoteCurrency}
-          </p>
-          <h2 className="mt-2 truncate text-xl font-semibold">{row.symbol}</h2>
-          <p className="mt-1 truncate text-[11px] text-muted-foreground">
-            {row.displayName ?? "Current market"}
+            {row.currentPrice
+              ? "This view uses the best current information available for this investment."
+              : "A current price is not available, but the remaining market information may still be useful."}
           </p>
         </div>
         <EvidenceBadge
-          label={row.availability}
-          tone={
-            row.availability === "Live" && source?.health === "healthy"
-              ? "good"
-              : row.availability === "Unavailable" || row.availability === "Stale"
-                ? "bad"
-                : "neutral"
-          }
+          label={confidenceName(row.confidence)}
+          tone={row.confidence === "high" ? "good" : row.confidence === "unavailable" ? "bad" : "neutral"}
         />
       </div>
-      <div className="mt-5">
-        <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
-          Current display price
-        </p>
-        <p className="mt-1 font-mono text-2xl font-semibold">
-          {mark ? `${mark.value} ${mark.currency}` : "Not available"}
-        </p>
-        <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-          {markSummary}
-        </p>
-        <p className="mt-2 text-[10px] font-medium text-amber-200">
-          {analyticalReadinessName(row.analyticalReadiness)}
-        </p>
-      </div>
-      <dl className="mt-5 grid grid-cols-2 gap-x-4 gap-y-3 border-t border-border/70 pt-4">
-        <Fact label="Bid" value={row.quote.bidPrice ?? "Not available"} />
-        <Fact label="Ask" value={row.quote.askPrice ?? "Not available"} />
-        <Fact label="Confidence" value={row.confidence} />
-        <Fact label="Coverage" value={source ? humanize(source.coverage) : "Not available"} />
-        <Fact label="Market depth" value={source?.depthLabel ?? "Not available"} />
-        <Fact
-          label="Individual orders"
-          value={
-            row.orderBook
-              ? `${row.orderBook.returnedOrderCount.toLocaleString()} of ${row.orderBook.totalOrderCount.toLocaleString()}`
-              : "Not available"
-          }
-        />
-        <Fact label="Updated" value={dateTime(source?.freshness.availableAt ?? null)} />
-      </dl>
-      {source &&
-      (source.integrity.generationCurrent === false || !source.integrity.snapshotInitialized) ? (
-        <div className="mt-4 flex gap-2 rounded-lg border border-amber-400/20 bg-amber-400/5 p-3 text-xs text-amber-200">
-          <CircleAlert className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-          <span>Market data is still updating and is not treated as current yet.</span>
-        </div>
+      {detailLimited ? (
+        <Notice text="Some detailed market information could not be refreshed. The latest summary remains visible." />
       ) : null}
-    </button>
-  )
-}
-
-type InstrumentQuery = {
-  available: boolean
-  query: UseQueryResult<ApplicationResult, Error>
-}
-
-function InstrumentWorkspace({
-  instrumentId,
-  market,
-  trades,
-  quotes,
-  books,
-  comparisons,
-}: {
-  instrumentId: string
-  market: UnifiedMarketRow | null
-  trades: InstrumentQuery
-  quotes: InstrumentQuery
-  books: InstrumentQuery
-  comparisons: InstrumentQuery
-}) {
-  const tradeRead = parseRead(() => instrumentTrades(trades.query.data, instrumentId))
-  const quoteRead = parseRead(() => instrumentQuotes(quotes.query.data, instrumentId))
-  const bookRead = parseRead(() => instrumentBooks(books.query.data, instrumentId))
-  const comparisonRead = parseRead(() =>
-    instrumentComparison(comparisons.query.data, instrumentId),
-  )
-  const tradeRows = tradeRead.value ?? []
-  const quoteRows = quoteRead.value ?? []
-  const bookRows = bookRead.value ?? []
-  const comparison = comparisonRead.value ?? null
-
-  return (
-    <section className="mt-4" aria-labelledby="instrument-workspace-title">
-      <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
-            Instrument-scoped reads
-          </p>
-          <h2 id="instrument-workspace-title" className="mt-1 text-lg font-semibold">
-            Trades, quotes, book, and data agreement
-          </h2>
-        </div>
-      </div>
-      {market ? <SelectedSourceSummary row={market} /> : null}
-      {market?.orderBook ? <IndividualOrderBook book={market.orderBook} /> : null}
-      <div className="grid gap-4 xl:grid-cols-2">
-        <InstrumentPanel
-          title="Last trades"
-          available={trades.available}
-          query={trades.query}
-          parseError={tradeRead.error}
-          empty="No current trade observation exists for this instrument. Quotes or book state may still be available."
-        >
-          {tradeRows.length ? (
-            <ul className="divide-y divide-border">
-              {tradeRows.map((trade) => (
-                <li key={trade.key} className="grid gap-2 py-3 first:pt-0 last:pb-0 sm:grid-cols-[1fr_auto]">
-                  <div>
-                    <p className="text-xs font-medium">Trade observation · {trade.venueId}</p>
-                    <p className="mt-1 font-mono text-[10px] text-muted-foreground">{trade.stableTradeId}</p>
-                  </div>
-                  <div className="text-left sm:text-right">
-                    <p className="font-mono text-xs">{trade.priceTicks.toLocaleString()} ticks</p>
-                    <p className="mt-1 text-[10px] text-muted-foreground">
-                      {trade.quantityLots.toLocaleString()} lots
-                      {trade.takerOrderType ? ` · ${trade.takerOrderType === "market" ? "Market" : "Limit"} taker` : ""}
-                      {` · ${dateTime(trade.availableAt)}`}
-                    </p>
-                  </div>
-                  <p className="text-[10px] text-muted-foreground sm:col-span-2">
-                    {qualityName(trade.currentQuality)} · {truth(trade.fresh, "fresh", "stale")}
-                  </p>
-                </li>
-              ))}
-            </ul>
-          ) : null}
-        </InstrumentPanel>
-
-        <InstrumentPanel
-          title="Top quotes"
-          available={quotes.available}
-          query={quotes.query}
-          parseError={quoteRead.error}
-          empty="No current bid or ask was returned for this instrument."
-        >
-          {quoteRows.length ? (
-            <ul className="space-y-3">
-              {quoteRows.map((quote) => (
-                <li key={quote.key} className="rounded-lg border border-border bg-background/35 p-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="text-xs font-medium">Quote observation · {quote.venueId}</p>
-                    <span className="text-[10px] text-muted-foreground">{qualityName(quote.currentQuality)}</span>
-                  </div>
-                  <div className="mt-3 grid grid-cols-2 gap-2">
-                    <PriceLevel label="Bid" level={quote.bid} />
-                    <PriceLevel label="Ask" level={quote.ask} />
-                  </div>
-                  <p className="mt-2 text-[10px] text-muted-foreground">
-                    As of {dateTime(quote.asOf)} · evaluated {dateTime(quote.stateEvaluatedAt)}
-                    {quote.crossed === true ? " · crossed quote" : ""}
-                  </p>
-                </li>
-              ))}
-            </ul>
-          ) : null}
-        </InstrumentPanel>
-
-        <InstrumentPanel
-          title="Order-book depth"
-          available={books.available}
-          query={books.query}
-          parseError={bookRead.error}
-          empty="No current order book was returned for this instrument."
-        >
-          {bookRows.length ? (
-            <div className="space-y-3">
-              {bookRows.map((book) => (
-                <div key={book.key} className="rounded-lg border border-border bg-background/35 p-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="text-xs font-medium">Order book · {book.venueId}</p>
-                    <span className="text-[10px] text-muted-foreground">{qualityName(book.currentQuality)}</span>
-                  </div>
-                  <div className="mt-3 grid grid-cols-2 gap-3 text-[10px]">
-                    <DepthSide label="Bids" levels={book.bids} completeness={book.bidCompleteness} />
-                    <DepthSide label="Asks" levels={book.asks} completeness={book.askCompleteness} />
-                  </div>
-                  <p className="mt-2 text-[10px] text-muted-foreground">As of {dateTime(book.asOf)} · evaluated {dateTime(book.stateEvaluatedAt)}</p>
-                </div>
-              ))}
-            </div>
-          ) : null}
-        </InstrumentPanel>
-
-        <InstrumentPanel
-          title="Independent data agreement"
-          available={comparisons.available}
-          query={comparisons.query}
-          parseError={comparisonRead.error}
-          empty="No comparable current observation was returned for this instrument."
-        >
-          {comparison ? (
-            <div>
-              <p className="text-xs font-medium">
-                {comparison.comparable
-                  ? `${comparison.observationCount} current observations can be compared.`
-                  : "Only one current observation is available, so independent agreement cannot be measured."}
-              </p>
-              <ul className="mt-3 divide-y divide-border">
-                {comparison.observations.map((observation, index) => (
-                  <li key={observation.key} className="flex items-start justify-between gap-3 py-3 first:pt-0 last:pb-0">
-                    <div>
-                      <p className="text-xs font-medium">
-                        Observation {index + 1} · {observation.venueId}
-                      </p>
-                      <p className="mt-1 text-[10px] text-muted-foreground">{qualityName(observation.currentQuality)} · {dateTime(observation.asOf)}</p>
-                    </div>
-                    <p className="font-mono text-[10px] text-muted-foreground">
-                      {levelSummary(observation.bid)} / {levelSummary(observation.ask)}
-                    </p>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ) : null}
-        </InstrumentPanel>
-      </div>
-    </section>
-  )
-}
-
-function SelectedSourceSummary({ row }: { row: UnifiedMarketRow }) {
-  const source = row.selectedSource
-  const observation = row.marketObservation
-  const mark = runtimeDisplayMark(row)
-  const receipt = row.selectionReceipt
-
-  return (
-    <section className="mb-4 rounded-xl border border-border bg-card/35 p-5">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
-            Current market data
-          </p>
-          <h3 className="mt-1 text-sm font-semibold">
-            {source ? row.symbol : `${row.symbol} · current data unavailable`}
-          </h3>
-          <p className="mt-1 max-w-2xl text-[11px] leading-5 text-muted-foreground">
-            {source
-              ? mark
-                ? "This is the best current market observation available. Historical analysis data is not ready yet."
-                : "Current market data is available, but it has no fresh completed trade or bid-and-ask midpoint to display."
-              : marketObservationUnavailableName(observation.reason)}
-          </p>
-          <p className="mt-2 text-[10px] font-medium text-amber-200">
-            {analyticalReadinessName(row.analyticalReadiness)}
-          </p>
-        </div>
-        <div className="flex flex-wrap justify-end gap-2">
-          <EvidenceBadge
-            label={mark ? "Current display price" : "Display price unavailable"}
-            tone={mark ? "good" : "bad"}
-          />
-        </div>
-      </div>
-      <dl className="mt-4 grid gap-3 border-t border-border/70 pt-4 sm:grid-cols-2 lg:grid-cols-4">
+      <dl className="mt-5 grid gap-4 border-t border-border/70 pt-4 sm:grid-cols-2 lg:grid-cols-4">
         <Fact
-          label="Current display price"
-          value={mark ? `${mark.value} ${mark.currency}` : "Not available"}
+          label="Current price"
+          value={price(row.currentPrice?.value ?? null, row.currency)}
         />
-        <Fact label="Price basis" value={mark ? markBasisName(mark.basis) : "Not available"} />
         <Fact
-          label="Price current through"
-          value={
-            mark
-              ? mark.sourceValidUntil
-                ? dateTime(mark.sourceValidUntil)
-                : "No precise deadline reported"
-              : "Not available"
-          }
+          label="Price basis"
+          value={row.currentPrice ? priceBasisName(row.currentPrice.basis) : "Not available"}
         />
-        <Fact label="Updated" value={dateTime(receipt.selectedAt)} />
+        <Fact label="Bid" value={priceWithSize(row.quote.bidPrice, row.quote.bidSize, row.currency)} />
+        <Fact label="Ask" value={priceWithSize(row.quote.askPrice, row.quote.askSize, row.currency)} />
+        <Fact label="Last trade" value={priceWithSize(row.quote.lastPrice, row.quote.lastSize, row.currency)} />
+        <Fact label="Availability" value={availabilityName(row.availability)} />
+        <Fact label="Market depth" value={depthName(row.depthSummary.kind)} />
+        <Fact label="Updated" value={dateTime(row.marketState.updatedAt)} />
       </dl>
-      <details className="mt-4 rounded-lg border border-border bg-background/30 p-3">
-        <summary className="cursor-pointer text-xs font-semibold">
-          Data confidence
-        </summary>
-        <dl className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <Fact label="Venue" value={source?.venueId ?? "Not reported"} />
-          <Fact label="Timing" value={source ? humanize(source.timing) : "Not available"} />
-          <Fact label="Data health" value={source ? humanize(source.health) : "Not available"} />
+      <details className="mt-5 rounded-lg border border-border bg-background/30 p-4">
+        <summary className="cursor-pointer text-xs font-semibold">Data confidence</summary>
+        <dl className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <Fact label="Confidence" value={confidenceName(row.confidence)} />
+          <Fact label="Freshness" value={freshnessName(row.marketState.freshness)} />
+          <Fact label="Timing" value={timingName(row.marketState.timing)} />
+          <Fact label="Quality" value={qualityName(row.marketState.quality)} />
+          <Fact label="Coverage" value={coverageName(row.marketState.coverage)} />
           <Fact
-            label="Quality"
-            value={source ? humanize(source.quality) : "Not available"}
+            label="Current through"
+            value={dateTime(row.marketState.currentThrough)}
           />
           <Fact
-            label="Market depth"
-            value={
-              source
-                ? source.depth
-                  ? humanize(source.depth)
-                  : "No market book"
-                : "Not available"
-            }
+            label="Usable observations"
+            value={row.observations.admittedCount.toLocaleString()}
           />
-          <Fact
-            label="Coverage"
-            value={source ? humanize(source.coverage) : "Not available"}
-          />
-          <Fact
-            label="Integrity"
-            value={source ? humanize(source.integrity.state) : "Not available"}
-          />
-          <Fact
-            label="Independent observations"
-            value={receipt.eligibleCount.toLocaleString()}
-          />
-          <Fact label="Analytical use" value={analyticalReadinessName(row.analyticalReadiness)} />
+          <Fact label="Independent agreement" value="Not established" />
         </dl>
+        <p className="mt-4 text-[11px] leading-5 text-muted-foreground">
+          The observation count shows usable current information. It does not prove that the
+          observations are independent or that they agree.
+        </p>
       </details>
+      <DepthWorkspace row={row} />
+      {row.analysisUse === "current_only" ? (
+        <p className="mt-5 text-xs leading-5 text-amber-200">
+          This current-market view is not yet available for forecasts, backtests, or other
+          historical analysis.
+        </p>
+      ) : null}
     </section>
   )
 }
 
-function IndividualOrderBook({
-  book,
-}: {
-  book: NonNullable<UnifiedMarketRow["orderBook"]>
-}) {
-  const bids = book.orders.filter((order) => order.side === "bid")
-  const asks = book.orders.filter((order) => order.side === "ask")
+function DepthWorkspace({ row }: { row: MarketProductRow }) {
+  const details = row.depthDetails
+  if (!details || details.kind === "none") {
+    return (
+      <div className="mt-5 rounded-lg border border-dashed border-border p-4 text-xs text-muted-foreground">
+        Detailed market depth is not available for this investment.
+      </div>
+    )
+  }
   return (
-    <section className="mb-4 rounded-xl border border-border bg-card/35 p-5">
+    <section className="mt-5 rounded-lg border border-border bg-background/30 p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
-            Individual-order depth
-          </p>
-          <h3 className="mt-1 text-sm font-semibold">Orders behind the visible market</h3>
+          <h3 className="text-sm font-semibold">Market depth</h3>
           <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-            Each row is a distinct live order. Market Squawk keeps them separate when several
-            orders share the same price.
+            Current buy and sell interest at the available price levels.
           </p>
         </div>
-        <EvidenceBadge
-          label={book.usableForSelection ? "Current order-level book" : humanize(book.phase)}
-          tone={book.usableForSelection ? "good" : "bad"}
-        />
+        <EvidenceBadge label={depthName(details.kind)} tone="neutral" />
       </div>
       <div className="mt-4 grid gap-4 sm:grid-cols-2">
-        <IndividualOrderSide label="Buy orders" orders={bids} />
-        <IndividualOrderSide label="Sell orders" orders={asks} />
+        <DepthSide label="Buy interest" levels={details.bids} currency={row.currency} />
+        <DepthSide label="Sell interest" levels={details.asks} currency={row.currency} />
       </div>
-      <p className="mt-3 text-[10px] leading-5 text-muted-foreground">
-        Showing {book.returnedOrderCount.toLocaleString()} of {book.totalOrderCount.toLocaleString()}
-        {book.sampleTruncated ? " distinct orders; more are available." : " distinct orders."}
-        {book.lastMarketAt ? ` Last market update ${dateTime(book.lastMarketAt)}.` : ""}
-        {` Available to this installation ${dateTime(book.availableAt)}.`}
+      {details.individualOrders ? (
+        <div className="mt-4 grid gap-4 sm:grid-cols-2">
+          <DepthSide
+            label="Individual buy orders"
+            levels={details.individualOrders.bidOrders}
+            currency={row.currency}
+          />
+          <DepthSide
+            label="Individual sell orders"
+            levels={details.individualOrders.askOrders}
+            currency={row.currency}
+          />
+        </div>
+      ) : null}
+      <p className="mt-4 text-[10px] leading-5 text-muted-foreground">
+        {depthLimitation(row)}
       </p>
-    </section>
-  )
-}
-
-function IndividualOrderSide({
-  label,
-  orders,
-}: {
-  label: string
-  orders: NonNullable<UnifiedMarketRow["orderBook"]>["orders"]
-}) {
-  return (
-    <div className="rounded-lg border border-border bg-background/35 p-3">
-      <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-        {label}
-      </p>
-      {orders.length ? (
-        <ol className="mt-2 divide-y divide-border font-mono text-[10px]">
-          {orders.slice(0, 10).map((order) => (
-            <li key={order.orderId} className="grid grid-cols-[1fr_auto] gap-3 py-2 first:pt-0 last:pb-0">
-              <p>{order.price}</p>
-              <p className="text-right">{order.quantity}</p>
-            </li>
-          ))}
-        </ol>
-      ) : (
-        <p className="mt-2 text-[10px] text-muted-foreground">No current orders available</p>
-      )}
-    </div>
-  )
-}
-
-function InstrumentPanel({
-  title,
-  available,
-  query,
-  parseError,
-  empty,
-  children,
-}: {
-  title: string
-  available: boolean
-  query: UseQueryResult<ApplicationResult, Error>
-  parseError: string | null
-  empty: string
-  children: React.ReactNode
-}) {
-  const stateRead = parseRead(() => resultState(query.data))
-  const state = stateRead.value ?? null
-  const boundaryError = parseError ?? stateRead.error
-  return (
-    <section className="rounded-xl border border-border bg-card/35 p-5">
-      <div className="mb-4 flex items-start justify-between gap-3">
-        <h3 className="text-sm font-semibold">{title}</h3>
-        {state ? (
-          <span className="font-mono text-[9px] text-muted-foreground">
-            {state.returned}/{state.available} · {humanize(state.completeness)}
-          </span>
-        ) : null}
-      </div>
-      {!available ? (
-        <NoInstrumentData text="This market detail is unavailable in the current build." />
-      ) : query.isPending ? (
-        <Skeleton className="h-28 rounded-lg" />
-      ) : query.isError ? (
-        <NoInstrumentData text="This market detail is unavailable right now." />
-      ) : boundaryError ? (
-        <NoInstrumentData text="This market detail could not be loaded safely." />
-      ) : query.data.metadata.returnedItems === 0 || !children ? (
-        <NoInstrumentData text={empty} />
-      ) : (
-        children
-      )}
     </section>
   )
 }
@@ -993,50 +578,57 @@ function InstrumentPanel({
 function DepthSide({
   label,
   levels,
-  completeness,
+  currency,
 }: {
   label: string
-  levels: BookLevel[]
-  completeness: string | null
+  levels: Array<{ price: string; quantity: string }>
+  currency: string
 }) {
   return (
-    <div>
-      <p className="font-medium">{label} · {completeness ? humanize(completeness) : "Not reported"}</p>
+    <div className="rounded-lg border border-border bg-card/30 p-3">
+      <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+        {label}
+      </p>
       {levels.length ? (
-        <ol className="mt-2 space-y-1 font-mono text-muted-foreground">
-          {levels.slice(0, 6).map((level, index) => (
-            <li key={`${level.priceTicks}:${level.quantityLots}:${index}`} className="flex justify-between gap-2">
-              <span>{level.priceTicks.toLocaleString()}</span>
-              <span>{level.quantityLots.toLocaleString()}</span>
+        <ol className="mt-3 divide-y divide-border font-mono text-[10px]">
+          {levels.map((level, index) => (
+            <li key={`${level.price}:${level.quantity}:${index}`} className="flex justify-between gap-3 py-2 first:pt-0 last:pb-0">
+              <span>{price(level.price, currency)}</span>
+              <span className="text-right">{level.quantity}</span>
             </li>
           ))}
         </ol>
       ) : (
-        <p className="mt-2 text-muted-foreground">No levels returned</p>
+        <p className="mt-2 text-[10px] text-muted-foreground">No current levels</p>
       )}
     </div>
   )
 }
 
-function NoInstrumentData({ text }: { text: string }) {
+function ReferenceWorkspace({ row }: { row: ReferenceMarketRow }) {
   return (
-    <div className="rounded-lg border border-dashed border-border p-4 text-xs leading-5 text-muted-foreground">
-      {text}
-    </div>
-  )
-}
-
-function PriceLevel({ label, level }: { label: string; level: BookLevel | null }) {
-  return (
-    <div className="rounded-lg border border-border bg-background/45 p-3">
-      <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
-      <p className="mt-2 font-mono text-lg font-semibold">
-        {level ? `${level.priceTicks.toLocaleString()} ticks` : "Not reported"}
+    <section className="mt-5 rounded-xl border border-border bg-card/30 p-5">
+      <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
+        Listed investment
       </p>
-      <p className="mt-1 text-[10px] text-muted-foreground">
-        {level ? `${level.quantityLots.toLocaleString()} lots` : "No book level returned"}
-      </p>
-    </div>
+      <div className="mt-2 flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h2 className="text-lg font-semibold">
+            {row.symbol} · {row.name}
+          </h2>
+          <p className="mt-2 max-w-2xl text-xs leading-5 text-muted-foreground">
+            This investment is listed, but a current price is not available. Check Connections
+            &amp; Sources if you expected current market coverage.
+          </p>
+        </div>
+        <EvidenceBadge label="Current price unavailable" tone="neutral" />
+      </div>
+      <dl className="mt-5 grid gap-4 border-t border-border/70 pt-4 sm:grid-cols-2 lg:grid-cols-3">
+        <Fact label="Asset type" value={row.isEtf ? "ETF" : "Stock"} />
+        <Fact label="Listing effective" value={dateTime(row.effectiveAt)} />
+        <Fact label="Updated" value={dateTime(row.availableAt)} />
+      </dl>
+    </section>
   )
 }
 
@@ -1064,12 +656,11 @@ function PageFrame({ children, action }: { children: React.ReactNode; action?: R
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-            Market Squawk · Live market view
+            Market Squawk · Current market view
           </p>
           <h1 className="mt-2 text-3xl font-semibold tracking-tight">Markets</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Current market prices, trading activity, depth, freshness, and plain-language data
-            confidence.
+            Current prices, quotes, market depth, freshness, and plain-language data confidence.
           </p>
         </div>
         {action}
@@ -1108,7 +699,7 @@ function MarketGridLoading() {
 
 function Notice({ text }: { text: string }) {
   return (
-    <div className="mb-4 flex gap-2 rounded-lg border border-amber-400/20 bg-amber-400/5 p-3 text-xs text-amber-100">
+    <div className="my-4 flex gap-2 rounded-lg border border-amber-400/20 bg-amber-400/5 p-3 text-xs text-amber-100">
       <CircleAlert className="size-4 shrink-0" aria-hidden="true" />
       {text}
     </div>
@@ -1138,43 +729,123 @@ function Fact({ label, value }: { label: string; value: string }) {
   )
 }
 
-function markBasisName(
-  value: RuntimeDisplayMark["basis"],
-): string {
+function assetClassName(value: MarketProductRow["assetClass"]): string {
   switch (value) {
-    case "fresh_last_trade":
-      return "Last completed trade"
-    case "fresh_bid_ask_midpoint":
-      return "Midpoint of current bid and ask"
+    case "equity": return "Stock"
+    case "fixed_income": return "Fixed income"
+    case "option": return "Option"
+    case "future": return "Futures"
+    case "foreign_exchange": return "Foreign exchange"
+    case "crypto": return "Crypto"
+    case "commodity": return "Commodity"
+    case "fund": return "Fund"
+    case "index": return "Index"
+    case "cash": return "Cash"
   }
 }
 
-function marketObservationUnavailableName(
-  value: Extract<
-    UnifiedMarketRow["marketObservation"],
-    { availability: "unavailable" }
-  >["reason"],
-): string {
+function availabilityName(value: MarketProductRow["availability"]): string {
   switch (value) {
-    case "no_eligible_source":
-      return "No current observation met the data requirements."
-    case "durable_pit_evidence_not_established":
-      return "Current market data is available, but historical analysis data is not ready yet."
+    case "live": return "Live"
+    case "delayed": return "Delayed"
+    case "end_of_day": return "End of day"
+    case "stored": return "Stored"
+    case "stale": return "Out of date"
+    case "unavailable": return "Unavailable"
   }
 }
 
-function analyticalReadinessName(
-  _readiness: UnifiedMarketRow["analyticalReadiness"],
-) {
-  return "Current price only · unavailable for historical analysis"
+function confidenceName(value: MarketProductRow["confidence"]): string {
+  switch (value) {
+    case "high": return "High confidence"
+    case "moderate": return "Moderate confidence"
+    case "limited": return "Limited confidence"
+    case "unavailable": return "Confidence unavailable"
+  }
 }
 
-function qualityName(value: string | null) {
-  return value ? humanize(value) : "Not reported"
+function coverageName(value: MarketProductRow["marketState"]["coverage"]): string {
+  switch (value) {
+    case "broad": return "Broad"
+    case "partial": return "Partial"
+    case "single_market": return "One market"
+    case "benchmark": return "Benchmark"
+    case "reference": return "Reference information"
+    case "account_owned": return "Connected account"
+    case "unavailable": return "Unavailable"
+  }
 }
 
-function truth(value: boolean | null, yes: string, no: string) {
-  return value === null ? "Not reported" : value ? yes : no
+function depthName(value: MarketProductRow["depthSummary"]["kind"]): string {
+  switch (value) {
+    case "top_of_book": return "Best bid and ask"
+    case "price_level": return "Multiple price levels"
+    case "order_level": return "Individual orders"
+    case "none": return "Unavailable"
+  }
+}
+
+function freshnessName(value: MarketProductRow["marketState"]["freshness"]): string {
+  switch (value) {
+    case "fresh": return "Current"
+    case "stale": return "Out of date"
+    case "unavailable": return "Unavailable"
+  }
+}
+
+function timingName(value: MarketProductRow["marketState"]["timing"]): string {
+  switch (value) {
+    case "real_time": return "Real time"
+    case "delayed": return "Delayed"
+    case "end_of_day": return "End of day"
+    case "historical": return "Historical"
+    case "stored": return "Stored"
+    case null: return "Not reported"
+  }
+}
+
+function qualityName(value: MarketProductRow["marketState"]["quality"]): string {
+  switch (value) {
+    case "verified": return "Verified"
+    case "direct": return "Direct observation"
+    case "official_delayed": return "Official, delayed"
+    case "aggregated": return "Combined observation"
+    case "indicative": return "Indicative"
+    case "modeled": return "Modeled"
+    case "estimated": return "Estimated"
+    case "stale": return "Out of date"
+    case "unavailable": return "Unavailable"
+  }
+}
+
+function price(value: string | null, currency: string): string {
+  return value ? `${value} ${currency}` : "Not available"
+}
+
+function priceWithSize(
+  priceValue: string | null,
+  size: string | null,
+  currency: string,
+): string {
+  if (!priceValue) return "Not available"
+  return size ? `${priceValue} ${currency} · size ${size}` : `${priceValue} ${currency}`
+}
+
+function priceBasisName(value: NonNullable<MarketProductRow["currentPrice"]>["basis"]): string {
+  return value === "last_trade" ? "Last completed trade" : "Midpoint of current bid and ask"
+}
+
+function depthLimitation(row: MarketProductRow): string {
+  const details = row.depthDetails?.individualOrders
+  if (details) {
+    return details.truncated
+      ? `Showing ${details.returnedCount.toLocaleString()} of ${details.totalCount.toLocaleString()} available individual orders.`
+      : `${details.totalCount.toLocaleString()} individual orders are available.`
+  }
+  if (row.depthSummary.truncated) {
+    return "Only part of the available market depth is shown."
+  }
+  return "All available price levels are shown."
 }
 
 function dateTime(value: string | null) {
@@ -1184,14 +855,8 @@ function dateTime(value: string | null) {
 }
 
 function requiredInstrument(value: string | null) {
-  if (!value) throw new Error("Select a market instrument first.")
+  if (!value) throw new Error("Select an investment first.")
   return value
-}
-
-function levelSummary(value: BookLevel | null) {
-  return value
-    ? `${value.priceTicks.toLocaleString()} × ${value.quantityLots.toLocaleString()}`
-    : "No level"
 }
 
 function parseRead<T>(read: () => T): { value: T | null; error: string | null } {

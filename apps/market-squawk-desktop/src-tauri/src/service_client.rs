@@ -73,25 +73,14 @@ pub(crate) async fn dashboard_query(
             insert_optional(&mut arguments, "categories", categories);
             ("Analysis.Lookup", arguments)
         }
-        DashboardQueryCommand::MarketSnapshot => ("Market.GetSnapshot", Map::new()),
-        DashboardQueryCommand::MarketQuality => ("Market.GetQuality", Map::new()),
-        DashboardQueryCommand::MarketUnifiedFeed => ("Market.GetUnifiedFeed", Map::new()),
+        DashboardQueryCommand::MarketOverview => ("Market.GetOverview", Map::new()),
         DashboardQueryCommand::MarketUniverse { text } => {
             let mut arguments = Map::new();
             insert_optional(&mut arguments, "query", text);
             ("Market.SearchUniverse", arguments)
         }
-        DashboardQueryCommand::MarketTrades { instrument_id } => {
-            ("Market.GetTrades", instrument_arguments(instrument_id))
-        }
-        DashboardQueryCommand::MarketQuotes { instrument_id } => {
-            ("Market.GetQuotes", instrument_arguments(instrument_id))
-        }
-        DashboardQueryCommand::MarketBooks { instrument_id } => {
-            ("Market.GetBooks", instrument_arguments(instrument_id))
-        }
-        DashboardQueryCommand::MarketComparisons { instrument_id } => {
-            ("Market.GetComparisons", instrument_arguments(instrument_id))
+        DashboardQueryCommand::MarketInstrument { instrument_id } => {
+            ("Market.GetInstrument", instrument_arguments(instrument_id))
         }
         DashboardQueryCommand::SourceStatus { source_ids } => {
             ("Source.GetStatus", source_arguments(source_ids))

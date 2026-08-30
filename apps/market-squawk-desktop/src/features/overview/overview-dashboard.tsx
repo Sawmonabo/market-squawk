@@ -18,6 +18,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import type { InvestmentAnalysisPage } from "@/features/opportunities/contracts"
+import type { MarketProductRow } from "@/features/markets/market-product"
 import {
   formatPercent,
   formatTimestamp,
@@ -36,7 +37,7 @@ import { formatMoney, humanize } from "@/lib/formatters"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
-import type { MarketSnapshot, OverviewJob } from "./schemas"
+import type { OverviewJob } from "./schemas"
 import { type ReadState, useOverviewQueries } from "./use-overview"
 
 type OverviewQueries = ReturnType<typeof useOverviewQueries>
@@ -68,12 +69,12 @@ export function OverviewDashboard({
       >
         <StatusCard
           icon={Activity}
-          label="Live markets"
-          value={countValue(queries.markets, "markets")}
+          label="Current markets"
+          value={marketPriceCount(queries.markets)}
           state={queries.markets.status}
           detail={
             queries.markets.status === "ready"
-              ? freshMarketDetail(queries.markets.data)
+              ? currentMarketDetail(queries.markets.data)
               : "Current market information is unavailable."
           }
         />
@@ -602,8 +603,8 @@ function SetupGuidance({
       <div className="mt-5 space-y-3">
         <GuidanceItem
           icon={Sparkles}
-          title="Automatic opportunity search is not available yet"
-          detail="Opportunity search is still being completed. You can review saved analyses now."
+          title="Opportunity search is unavailable right now"
+          detail="You can still review saved analyses."
           path="/opportunities"
           linkLabel="Review retained analyses"
         />
@@ -633,14 +634,14 @@ function SetupGuidance({
           />
         )}
         {markets.status === "unavailable" ||
-        (markets.status === "ready" && (markets.data?.length ?? 0) === 0) ? (
+        (markets.status === "ready" && !hasCurrentMarketPrice(markets.data)) ? (
           <GuidanceItem
             icon={ServerCog}
             title="Market data needs attention"
             detail={
               markets.status === "unavailable"
                 ? "Current market information is unavailable. Review your connections to restore coverage."
-                : "No current market information is available. Connect a data service to continue."
+                : "No current prices are available. Review Connections & Sources to restore coverage."
             }
             path="/connections/sources"
             linkLabel="Open Connections & Sources"
@@ -727,34 +728,36 @@ function LiveMarketPanel({
 }) {
   return (
     <EvidencePanel
-      title="Live market truth"
+      title="Current market information"
       icon={Activity}
       state={markets.status}
     >
-      {markets.status === "ready" && markets.data && markets.data.length > 0 ? (
+      {markets.status === "ready" && markets.data.length > 0 ? (
         <ul className="divide-y divide-border">
-          {markets.data.slice(0, 5).map((stream, index) => (
+          {markets.data.slice(0, 5).map((market) => (
             <li
-              key={`${stream.instrumentId}:${stream.venueId}:${index}`}
+              key={market.instrumentId}
               className="flex items-center gap-3 py-3 first:pt-0 last:pb-0"
             >
               <span
-                className={`size-2 rounded-full ${stream.freshAtReference ? "bg-[var(--success)]" : "bg-[var(--warning)]"}`}
+                className={`size-2 rounded-full ${market.marketState.freshness === "fresh" ? "bg-[var(--success)]" : "bg-[var(--warning)]"}`}
                 aria-hidden="true"
               />
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-xs font-medium">
-                  {stream.instrumentId}
+                  {market.displaySymbol ?? market.name ?? "Selected investment"}
                 </span>
-                <span className="mt-0.5 block truncate font-mono text-[9px] text-muted-foreground">
-                  {stream.venueId}
-                </span>
+                {market.displaySymbol && market.name ? (
+                  <span className="mt-0.5 block truncate text-[9px] text-muted-foreground">
+                    {market.name}
+                  </span>
+                ) : null}
               </span>
               <span className="text-right text-[10px] text-muted-foreground">
-                <span className="block">
-                  {humanize(stream.currentDisplayQuality)}
+                <span className="block font-mono text-foreground">
+                  {formatMarketPrice(market)}
                 </span>
-                <span className="block">{humanize(stream.tradingStatus)}</span>
+                <span className="block">{marketAvailabilityLabel(market)}</span>
               </span>
             </li>
           ))}
@@ -939,27 +942,46 @@ function formatHistoricalValueAtRisk(risk: PortfolioRisk | null): string {
   return `${formatPercent(risk.valueAtRisk)} at ${formatPercent(risk.confidence)} confidence`
 }
 
-function countValue<T extends readonly unknown[] | null>(
-  state: ReadState<T>,
-  suffix: string,
-) {
-  return state.status === "ready"
-    ? `${state.data?.length ?? 0} ${suffix}`
-    : "Unavailable"
-}
-
 function analysisCount(state: ReadState<InvestmentAnalysisPage>) {
   return state.status === "ready"
     ? state.data.availableCount.toLocaleString()
     : "Unavailable"
 }
 
-function freshMarketDetail(markets: MarketSnapshot) {
-  if (!markets || markets.length === 0) {
-    return "No active qualified live streams."
+function marketPriceCount(state: OverviewQueries["markets"]) {
+  if (state.status !== "ready") return "Unavailable"
+  const count = state.data.filter((market) => market.currentPrice !== null).length
+  return `${count.toLocaleString()} priced`
+}
+
+function currentMarketDetail(markets: MarketProductRow[]) {
+  if (markets.length === 0) {
+    return "No current market information is available."
   }
-  const fresh = markets.filter((stream) => stream.freshAtReference).length
-  return `${fresh} of ${markets.length} markets are current.`
+  const fresh = markets.filter(
+    (market) =>
+      market.currentPrice !== null && market.marketState.freshness === "fresh",
+  ).length
+  return `${fresh} of ${markets.length} markets in view have current prices.`
+}
+
+function hasCurrentMarketPrice(markets: MarketProductRow[]) {
+  return markets.some((market) => market.currentPrice !== null)
+}
+
+function formatMarketPrice(market: MarketProductRow) {
+  return market.currentPrice
+    ? formatMoney({
+        amount: market.currentPrice.value,
+        currency: market.currentPrice.currency,
+      })
+    : "Price unavailable"
+}
+
+function marketAvailabilityLabel(market: MarketProductRow) {
+  if (market.marketState.freshness === "stale") return "May be out of date"
+  if (market.marketState.freshness === "unavailable") return "Unavailable"
+  return humanize(market.availability)
 }
 
 function isAnalysisJob(kind: string) {

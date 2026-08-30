@@ -38,22 +38,6 @@ export const decisionOverviewSchema = z.object({
   ),
 })
 
-export const marketSnapshotSchema = z
-  .array(
-    z
-      .object({
-        venueId: z.string(),
-        instrumentId: z.string(),
-        phase: z.string(),
-        currentDisplayQuality: z.string(),
-        freshAtReference: z.boolean(),
-        tradingStatus: z.string(),
-        lastTrade: z.unknown().nullable(),
-      })
-      .loose(),
-  )
-  .nullable()
-
 export const paperStatusSchema = z
   .object({
     state: z.enum(["stopped", "starting", "stopping", "failed", "running"]),
@@ -73,6 +57,5 @@ export const jobListSchema = z.object({
 })
 
 export type DecisionOverview = z.infer<typeof decisionOverviewSchema>
-export type MarketSnapshot = z.infer<typeof marketSnapshotSchema>
 export type OverviewJob = z.infer<typeof overviewJobSchema>
 export type PaperStatus = z.infer<typeof paperStatusSchema>

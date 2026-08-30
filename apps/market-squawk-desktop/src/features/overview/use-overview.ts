@@ -2,21 +2,19 @@ import { useQuery } from "@tanstack/react-query"
 import type { z } from "zod"
 
 import { productKeys, type ProductScope } from "@/app/query-client"
+import { marketOverviewRows } from "@/features/markets/market-product"
 import { parseInvestmentAnalysisPage } from "@/features/opportunities/contracts"
 import type { ApplicationResult } from "@/lib/schemas"
 import type { DashboardQuery, ProductTransport } from "@/lib/transport"
 
-import {
-  jobListSchema,
-  marketSnapshotSchema,
-} from "./schemas"
+import { jobListSchema } from "./schemas"
 
 export type ReadState<T> =
   | { status: "loading"; data: null; message: null }
   | { status: "ready"; data: T; message: null }
   | { status: "unavailable"; data: null; message: string }
 
-const MARKET_INPUT = { query: "marketSnapshot" } as const
+const MARKET_INPUT = { query: "marketOverview" } as const
 const JOB_INPUT = { query: "jobs", limit: 24 } as const
 const ANALYSIS_INPUT = {
   query: "decisionInvestmentAnalyses",
@@ -36,7 +34,7 @@ export function useOverviewQueries(
     (result) =>
       parseInvestmentAnalysisPage(result, { limit: ANALYSIS_INPUT.limit }),
   )
-  const markets = useMarketSnapshotQuery(transport, scope)
+  const markets = useMarketOverviewQuery(transport, scope)
   const jobs = useJobListQuery(transport, scope)
   return { analyses, markets, jobs }
 }
@@ -46,22 +44,22 @@ export function useOperationalQueries(
   scope: ProductScope,
 ) {
   return {
-    markets: useMarketSnapshotQuery(transport, scope),
+    markets: useMarketOverviewQuery(transport, scope),
     jobs: useJobListQuery(transport, scope),
   }
 }
 
-function useMarketSnapshotQuery(
+function useMarketOverviewQuery(
   transport: ProductTransport,
   scope: ProductScope,
 ) {
-  return useProductQuery(
+  return useParsedProductQuery(
     transport,
     scope,
     "market",
-    "snapshot",
+    "overview",
     MARKET_INPUT,
-    marketSnapshotSchema,
+    marketOverviewRows,
   )
 }
 

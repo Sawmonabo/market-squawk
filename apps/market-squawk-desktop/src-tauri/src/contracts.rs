@@ -237,22 +237,11 @@ pub(crate) enum DashboardQueryCommand {
         text: String,
         categories: Option<Vec<String>>,
     },
-    MarketSnapshot,
-    MarketQuality,
-    MarketUnifiedFeed,
+    MarketOverview,
     MarketUniverse {
         text: Option<String>,
     },
-    MarketTrades {
-        instrument_id: Uuid,
-    },
-    MarketQuotes {
-        instrument_id: Uuid,
-    },
-    MarketBooks {
-        instrument_id: Uuid,
-    },
-    MarketComparisons {
+    MarketInstrument {
         instrument_id: Uuid,
     },
     SourceStatus {

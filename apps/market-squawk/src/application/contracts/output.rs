@@ -156,24 +156,15 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         ]),
         "Market.GetComparisons" => market_comparison_rows(),
         "Market.GetUnifiedFeed" => unified_market_rows(),
+        "Market.GetOverview" | "Market.GetInstrument" => market_product_rows(),
         "Market.SearchUniverse" => market_rows(&[
             "referenceId",
             "symbol",
             "name",
-            "venueId",
             "assetClass",
-            "referenceOnly",
             "isEtf",
-            "roundLotSize",
-            "directoryPresence",
-            "quality",
             "effectiveAt",
             "availableAt",
-            "sourceId",
-            "providerId",
-            "sourcePayloadSha256",
-            "matchKind",
-            "quoteAvailability",
         ]),
         "Research.ListDatasets" => nullable(page(generation())),
         "Research.GetManifest" => generation(),
@@ -3115,6 +3106,203 @@ fn unified_market_rows() -> Value {
             "selectionReceipt",
         ],
     ))
+}
+
+fn market_product_rows() -> Value {
+    nullable_rows(closed(
+        vec![
+            ("instrumentId", uuid()),
+            ("displaySymbol", nullable(bounded_text(512))),
+            ("name", nullable(bounded_text(512))),
+            ("assetClass", market_asset_class()),
+            ("currency", investment_analysis_currency()),
+            (
+                "availability",
+                enumeration(&[
+                    "live",
+                    "delayed",
+                    "end_of_day",
+                    "stored",
+                    "stale",
+                    "unavailable",
+                ]),
+            ),
+            (
+                "confidence",
+                enumeration(&["high", "moderate", "limited", "unavailable"]),
+            ),
+            ("currentPrice", nullable(market_product_current_price())),
+            ("quote", market_product_quote()),
+            ("marketState", market_product_state()),
+            ("observations", market_product_observations()),
+            ("depthSummary", market_product_depth_summary()),
+            ("depthDetails", nullable(market_product_depth_details())),
+            ("analysisUse", enumeration(&["current_only", "unavailable"])),
+        ],
+        &[
+            "instrumentId",
+            "displaySymbol",
+            "name",
+            "assetClass",
+            "currency",
+            "availability",
+            "confidence",
+            "currentPrice",
+            "quote",
+            "marketState",
+            "observations",
+            "depthSummary",
+            "depthDetails",
+            "analysisUse",
+        ],
+    ))
+}
+
+fn market_product_current_price() -> Value {
+    closed_complete(vec![
+        ("value", canonical_decimal_text()),
+        ("currency", investment_analysis_currency()),
+        ("basis", enumeration(&["last_trade", "bid_ask_midpoint"])),
+        ("observedAt", nullable(canonical_market_timestamp())),
+        ("currentThrough", nullable(canonical_market_timestamp())),
+    ])
+}
+
+fn market_product_quote() -> Value {
+    closed_complete(vec![
+        ("bidPrice", nullable(canonical_decimal_text())),
+        ("bidSize", nullable(canonical_decimal_text())),
+        ("askPrice", nullable(canonical_decimal_text())),
+        ("askSize", nullable(canonical_decimal_text())),
+        ("midPrice", nullable(canonical_decimal_text())),
+        ("lastPrice", nullable(canonical_decimal_text())),
+        ("lastSize", nullable(canonical_decimal_text())),
+        ("quoteObservedAt", nullable(canonical_market_timestamp())),
+        ("lastObservedAt", nullable(canonical_market_timestamp())),
+    ])
+}
+
+fn market_product_state() -> Value {
+    closed_complete(vec![
+        (
+            "timing",
+            nullable(enumeration(&[
+                "real_time",
+                "delayed",
+                "end_of_day",
+                "historical",
+                "stored",
+            ])),
+        ),
+        (
+            "quality",
+            enumeration(&[
+                "verified",
+                "direct",
+                "official_delayed",
+                "aggregated",
+                "indicative",
+                "modeled",
+                "estimated",
+                "stale",
+                "unavailable",
+            ]),
+        ),
+        (
+            "health",
+            enumeration(&["healthy", "degraded", "unavailable", "quarantined"]),
+        ),
+        (
+            "integrity",
+            enumeration(&[
+                "verified",
+                "unverified",
+                "not_applicable",
+                "failed",
+                "quarantined",
+                "unavailable",
+            ]),
+        ),
+        (
+            "coverage",
+            enumeration(&[
+                "broad",
+                "partial",
+                "single_market",
+                "benchmark",
+                "reference",
+                "account_owned",
+                "unavailable",
+            ]),
+        ),
+        (
+            "depth",
+            enumeration(&["top_of_book", "price_level", "order_level", "none"]),
+        ),
+        ("freshness", enumeration(&["fresh", "stale", "unavailable"])),
+        ("observedAt", nullable(canonical_market_timestamp())),
+        ("updatedAt", canonical_market_timestamp()),
+        ("currentThrough", nullable(canonical_market_timestamp())),
+    ])
+}
+
+fn market_product_observations() -> Value {
+    closed_complete(vec![
+        ("admittedCount", bounded_unsigned(u64::from(u32::MAX))),
+        (
+            "independentCount",
+            nullable(bounded_unsigned(u64::from(u32::MAX))),
+        ),
+        ("agreement", constant("not_established")),
+    ])
+}
+
+fn market_product_depth_summary() -> Value {
+    closed_complete(vec![
+        (
+            "kind",
+            enumeration(&["top_of_book", "price_level", "order_level", "none"]),
+        ),
+        ("bidLevels", bounded_unsigned(u64::from(u32::MAX))),
+        ("askLevels", bounded_unsigned(u64::from(u32::MAX))),
+        (
+            "individualOrderCount",
+            bounded_unsigned(u64::from(u32::MAX)),
+        ),
+        ("truncated", boolean()),
+    ])
+}
+
+fn market_product_depth_details() -> Value {
+    closed_complete(vec![
+        (
+            "kind",
+            enumeration(&["top_of_book", "price_level", "order_level", "none"]),
+        ),
+        ("bids", bounded_array(market_product_level(), 64)),
+        ("asks", bounded_array(market_product_level(), 64)),
+        (
+            "individualOrders",
+            nullable(market_product_individual_orders()),
+        ),
+    ])
+}
+
+fn market_product_level() -> Value {
+    closed_complete(vec![
+        ("price", canonical_decimal_text()),
+        ("quantity", canonical_decimal_text()),
+    ])
+}
+
+fn market_product_individual_orders() -> Value {
+    closed_complete(vec![
+        ("bidOrders", bounded_array(market_product_level(), 64)),
+        ("askOrders", bounded_array(market_product_level(), 64)),
+        ("totalCount", bounded_unsigned(u64::from(u32::MAX))),
+        ("returnedCount", bounded_unsigned(128)),
+        ("truncated", boolean()),
+    ])
 }
 
 fn market_reference_evidence() -> Value {

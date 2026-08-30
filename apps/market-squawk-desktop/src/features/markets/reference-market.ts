@@ -7,20 +7,10 @@ export const referenceMarketRowSchema = z
     referenceId: z.string().min(1),
     symbol: z.string().min(1),
     name: z.string().min(1),
-    venueId: z.string().min(1),
     assetClass: z.enum(["equity", "fund"]),
-    referenceOnly: z.literal(true),
     isEtf: z.boolean(),
-    roundLotSize: z.number().int().nonnegative(),
-    directoryPresence: z.literal("current_directory"),
-    quality: z.literal("official_delayed"),
     effectiveAt: z.string().min(1),
     availableAt: z.string().min(1),
-    sourceId: z.string().min(1),
-    providerId: z.string().min(1),
-    sourcePayloadSha256: z.string().regex(/^[0-9a-f]{64}$/),
-    matchKind: z.string().min(1),
-    quoteAvailability: z.literal("account_required"),
   })
   .strict()
 

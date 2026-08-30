@@ -9,8 +9,8 @@ use market_squawk_domain::{
     SequenceIntegrity, SourceId, SourceIdentifier, StreamIntegrityState, Timestamp,
 };
 use market_squawk_live::{
-    BookSide, OrderLevelBatchKind, OrderLevelPhase, OrderLevelPriceProjection,
-    OrderLevelQuarantineReason, StreamPhaseSnapshot, StreamSnapshot,
+    BookLevelSnapshot, BookSide, OrderLevelBatchKind, OrderLevelPhase, OrderLevelPriceProjection,
+    OrderLevelQuarantineReason, PriceLevelProjection, StreamPhaseSnapshot, StreamSnapshot,
 };
 use market_squawk_services::{RequestContext, ServiceError, ServiceLimits, TypedToolResult};
 use market_squawk_sources::{
@@ -298,6 +298,129 @@ pub(super) fn build_unified_market_result(
     limits: ServiceLimits,
     context: &RequestContext,
 ) -> Result<TypedToolResult, ServiceError> {
+    build_market_result(
+        streams,
+        filters,
+        definitions,
+        market_data_records,
+        display_snapshots,
+        kraken_projections,
+        surface_policies,
+        order_level,
+        reference_at,
+        MarketResultProjection::Diagnostics { source_coverage },
+        limits,
+        context,
+    )
+}
+
+/// Builds the provider-neutral current-market collection consumed by ordinary product pages.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the selected market inputs and result limits remain explicit at the product boundary"
+)]
+pub(super) fn build_market_overview_result(
+    streams: &[StreamView<'_>],
+    filters: &MarketFilters<'_>,
+    definitions: &[InstrumentDefinition],
+    market_data_records: &[MarketDataInstrumentRecord],
+    display_snapshots: &[&MarketDisplaySnapshotLease],
+    kraken_projections: &[&MarketKrakenPriceProjectionLease],
+    surface_policies: &[MarketSurfaceSelectionPolicy],
+    order_level: &[MarketOrderLevelSnapshot],
+    reference_at: Timestamp,
+    coverage_complete: bool,
+    limits: ServiceLimits,
+    context: &RequestContext,
+) -> Result<TypedToolResult, ServiceError> {
+    build_market_result(
+        streams,
+        filters,
+        definitions,
+        market_data_records,
+        display_snapshots,
+        kraken_projections,
+        surface_policies,
+        order_level,
+        reference_at,
+        MarketResultProjection::Product {
+            include_depth: false,
+            coverage_complete,
+        },
+        limits,
+        context,
+    )
+}
+
+/// Builds one provider-neutral current-market detail row for an exact instrument.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the selected market inputs and result limits remain explicit at the product boundary"
+)]
+pub(super) fn build_market_instrument_result(
+    streams: &[StreamView<'_>],
+    filters: &MarketFilters<'_>,
+    definitions: &[InstrumentDefinition],
+    market_data_records: &[MarketDataInstrumentRecord],
+    display_snapshots: &[&MarketDisplaySnapshotLease],
+    kraken_projections: &[&MarketKrakenPriceProjectionLease],
+    surface_policies: &[MarketSurfaceSelectionPolicy],
+    order_level: &[MarketOrderLevelSnapshot],
+    reference_at: Timestamp,
+    coverage_complete: bool,
+    limits: ServiceLimits,
+    context: &RequestContext,
+) -> Result<TypedToolResult, ServiceError> {
+    if filters.instruments.len() != 1 {
+        return Err(ServiceError::InvalidRequest);
+    }
+    build_market_result(
+        streams,
+        filters,
+        definitions,
+        market_data_records,
+        display_snapshots,
+        kraken_projections,
+        surface_policies,
+        order_level,
+        reference_at,
+        MarketResultProjection::Product {
+            include_depth: true,
+            coverage_complete,
+        },
+        limits,
+        context,
+    )
+}
+
+enum MarketResultProjection {
+    Diagnostics {
+        source_coverage: Value,
+    },
+    Product {
+        include_depth: bool,
+        coverage_complete: bool,
+    },
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one shared selection pass serves both the product projection and diagnostics"
+)]
+fn build_market_result(
+    streams: &[StreamView<'_>],
+    filters: &MarketFilters<'_>,
+    definitions: &[InstrumentDefinition],
+    market_data_records: &[MarketDataInstrumentRecord],
+    display_snapshots: &[&MarketDisplaySnapshotLease],
+    kraken_projections: &[&MarketKrakenPriceProjectionLease],
+    surface_policies: &[MarketSurfaceSelectionPolicy],
+    order_level: &[MarketOrderLevelSnapshot],
+    reference_at: Timestamp,
+    projection: MarketResultProjection,
+    limits: ServiceLimits,
+    context: &RequestContext,
+) -> Result<TypedToolResult, ServiceError> {
     validate_inputs(
         streams,
         definitions,
@@ -379,14 +502,25 @@ pub(super) fn build_unified_market_result(
         )?;
         let receipt =
             select_market_source(selection_policy, request, candidates).map_err(selection_error)?;
-        rows.push(instrument_row(
-            definition,
-            &instrument_streams,
-            &instrument_display,
-            &instrument_kraken,
-            order_level,
-            &receipt,
-        )?);
+        rows.push(match &projection {
+            MarketResultProjection::Diagnostics { .. } => instrument_row(
+                definition,
+                &instrument_streams,
+                &instrument_display,
+                &instrument_kraken,
+                order_level,
+                &receipt,
+            )?,
+            MarketResultProjection::Product { include_depth, .. } => product_instrument_row(
+                definition,
+                &instrument_streams,
+                &instrument_display,
+                &instrument_kraken,
+                order_level,
+                &receipt,
+                *include_depth,
+            )?,
+        });
     }
 
     let observed_streams = streams
@@ -418,19 +552,31 @@ pub(super) fn build_unified_market_result(
     {
         quality.observe_stream(view.stream);
     }
-    let mut quality = quality.into_value();
-    quality["summaryScope"] = Value::String("live_price_level_streams".to_owned());
-    quality["summarizedObservationCount"] = Value::from(observed_streams);
-    quality["displayObservationCount"] = Value::from(observed_display);
-    quality["krakenOrderLevelProjectionCount"] = Value::from(observed_kraken);
-    bounded_result(
-        &rows,
-        available,
-        with_availability(source_coverage, observed),
-        quality,
-        limits,
-        context,
-    )
+    let (coverage, quality) = match projection {
+        MarketResultProjection::Diagnostics { source_coverage } => {
+            let mut quality = quality.into_value();
+            quality["summaryScope"] = Value::String("live_price_level_streams".to_owned());
+            quality["summarizedObservationCount"] = Value::from(observed_streams);
+            quality["displayObservationCount"] = Value::from(observed_display);
+            quality["krakenOrderLevelProjectionCount"] = Value::from(observed_kraken);
+            (with_availability(source_coverage, observed), quality)
+        }
+        MarketResultProjection::Product {
+            coverage_complete, ..
+        } => (
+            json!({
+                "availability": if observed == 0 { "unavailable" } else { "available" },
+                "complete": coverage_complete && rows.len() == available,
+                "returnedInstrumentCount": rows.len(),
+                "observationCount": observed,
+            }),
+            json!({
+                "referenceAt": timestamp_value(reference_at),
+                "observationCount": observed,
+            }),
+        ),
+    };
+    bounded_result(&rows, available, coverage, quality, limits, context)
 }
 
 pub(super) fn validate_inputs(
@@ -1427,6 +1573,646 @@ fn instrument_row(
             "selectionClass": selected.map(|value| selection_class(value.class())),
             "downgradeDimensions": selected_downgrades.iter().map(downgrade_value).collect::<Vec<_>>()
         }
+    }))
+}
+
+const MAXIMUM_PRODUCT_DEPTH_LEVELS: usize = 64;
+
+struct ProductQuote {
+    bid_price: Option<String>,
+    bid_size: Option<String>,
+    ask_price: Option<String>,
+    ask_size: Option<String>,
+    midpoint: Option<String>,
+    last_price: Option<String>,
+    last_size: Option<String>,
+    quote_observed_at: Option<Timestamp>,
+    last_observed_at: Option<Timestamp>,
+    quote_current_through: Option<Timestamp>,
+    last_current_through: Option<Timestamp>,
+    quote_fresh: bool,
+    last_fresh: bool,
+}
+
+impl ProductQuote {
+    fn value(&self) -> Value {
+        json!({
+            "bidPrice": self.bid_price,
+            "bidSize": self.bid_size,
+            "askPrice": self.ask_price,
+            "askSize": self.ask_size,
+            "midPrice": self.midpoint,
+            "lastPrice": self.last_price,
+            "lastSize": self.last_size,
+            "quoteObservedAt": self.quote_observed_at.map(timestamp_value),
+            "lastObservedAt": self.last_observed_at.map(timestamp_value),
+        })
+    }
+
+    fn current_price(&self, currency: Currency) -> Value {
+        if self.last_fresh
+            && let Some(value) = self.last_price.as_ref()
+        {
+            return json!({
+                "value": value,
+                "currency": currency.as_str(),
+                "basis": "last_trade",
+                "observedAt": self.last_observed_at.map(timestamp_value),
+                "currentThrough": self.last_current_through.map(timestamp_value),
+            });
+        }
+        if self.quote_fresh
+            && let Some(value) = self.midpoint.as_ref()
+        {
+            return json!({
+                "value": value,
+                "currency": currency.as_str(),
+                "basis": "bid_ask_midpoint",
+                "observedAt": self.quote_observed_at.map(timestamp_value),
+                "currentThrough": self.quote_current_through.map(timestamp_value),
+            });
+        }
+        Value::Null
+    }
+}
+
+fn product_instrument_row(
+    definition: UnifiedInstrumentDefinition<'_>,
+    streams: &[StreamView<'_>],
+    display_snapshots: &[&MarketDisplaySnapshotLease],
+    kraken_projections: &[&MarketKrakenPriceProjectionLease],
+    order_level: &[MarketOrderLevelSnapshot],
+    receipt: &MarketSelectionReceipt,
+    include_depth: bool,
+) -> Result<Value, ServiceError> {
+    if receipt.definition_revision_digest() != definition.definition_revision_digest() {
+        return Err(ServiceError::InvalidResult);
+    }
+    let selected = receipt.selected();
+    let selected_view = selected
+        .map(|selected| {
+            exact_selected_view(streams, display_snapshots, kraken_projections, selected)
+        })
+        .transpose()?;
+    let quote = selected_view
+        .map(|view| product_quote(view, definition, receipt.selected_at()))
+        .transpose()?
+        .unwrap_or_else(empty_product_quote);
+    let (depth_summary, depth_details) =
+        product_depth(selected_view, definition, order_level, include_depth)?;
+    let (market_state, availability, confidence) = selected
+        .zip(selected_view)
+        .map(|(selected, view)| product_market_state(selected, view, receipt.selected_at()))
+        .unwrap_or_else(|| {
+            (
+                json!({
+                    "timing": Value::Null,
+                    "quality": "unavailable",
+                    "health": "unavailable",
+                    "integrity": "unavailable",
+                    "coverage": "unavailable",
+                    "depth": "none",
+                    "freshness": "unavailable",
+                    "observedAt": Value::Null,
+                    "updatedAt": timestamp_value(receipt.selected_at()),
+                    "currentThrough": Value::Null,
+                }),
+                "unavailable",
+                "unavailable",
+            )
+        });
+    let observation_count = receipt.eligible().len();
+    Ok(json!({
+        "instrumentId": definition.instrument_id().to_string(),
+        "displaySymbol": product_display_symbol(definition)?,
+        "name": definition
+            .market_data
+            .and_then(MarketDataInstrumentDefinition::display_name)
+            .map(|value| value.as_str()),
+        "assetClass": definition.asset_class(),
+        "currency": definition.quote_currency().as_str(),
+        "availability": availability,
+        "confidence": confidence,
+        "currentPrice": quote.current_price(definition.quote_currency()),
+        "quote": quote.value(),
+        "marketState": market_state,
+        "observations": {
+            "admittedCount": observation_count,
+            "independentCount": Value::Null,
+            "agreement": "not_established",
+        },
+        "depthSummary": depth_summary,
+        "depthDetails": depth_details,
+        "analysisUse": if selected.is_some() { "current_only" } else { "unavailable" },
+    }))
+}
+
+fn product_display_symbol(
+    definition: UnifiedInstrumentDefinition<'_>,
+) -> Result<Option<String>, ServiceError> {
+    let mut symbol: Option<&str> = None;
+    let mappings = definition
+        .market_data
+        .into_iter()
+        .flat_map(MarketDataInstrumentDefinition::venue_mappings)
+        .chain(
+            definition
+                .executable
+                .into_iter()
+                .flat_map(InstrumentDefinition::venue_mappings),
+        );
+    for mapping in mappings {
+        let candidate = mapping.venue_symbol().as_str();
+        match symbol {
+            None => symbol = Some(candidate),
+            Some(existing) if existing.eq_ignore_ascii_case(candidate) => {}
+            Some(_) => return Ok(None),
+        }
+    }
+    Ok(symbol.map(str::to_owned))
+}
+
+fn empty_product_quote() -> ProductQuote {
+    ProductQuote {
+        bid_price: None,
+        bid_size: None,
+        ask_price: None,
+        ask_size: None,
+        midpoint: None,
+        last_price: None,
+        last_size: None,
+        quote_observed_at: None,
+        last_observed_at: None,
+        quote_current_through: None,
+        last_current_through: None,
+        quote_fresh: false,
+        last_fresh: false,
+    }
+}
+
+fn checked_midpoint(
+    bid: Option<Decimal>,
+    ask: Option<Decimal>,
+) -> Result<Option<String>, ServiceError> {
+    bid.zip(ask)
+        .map(|(bid, ask)| {
+            bid.checked_add(ask)
+                .and_then(|sum| sum.checked_div(Decimal::from(2_u8)))
+                .map(|value| value.normalize().to_string())
+                .ok_or(ServiceError::InvalidResult)
+        })
+        .transpose()
+}
+
+fn product_quote(
+    selected: UnifiedSelectedView<'_>,
+    definition: UnifiedInstrumentDefinition<'_>,
+    selected_at: Timestamp,
+) -> Result<ProductQuote, ServiceError> {
+    match selected {
+        UnifiedSelectedView::Live(view) => {
+            let executable = definition.executable.ok_or(ServiceError::InvalidResult)?;
+            let bid = view.stream.bids().first().copied();
+            let ask = view.stream.asks().first().copied();
+            let bid_price = bid
+                .map(|level| decimal_price(level.price(), executable))
+                .transpose()?;
+            let ask_price = ask
+                .map(|level| decimal_price(level.price(), executable))
+                .transpose()?;
+            let trade = view.stream.last_trade();
+            Ok(ProductQuote {
+                bid_price: bid_price.map(|value| value.normalize().to_string()),
+                bid_size: bid
+                    .map(|level| decimal_quantity(level.quantity(), executable))
+                    .transpose()?,
+                ask_price: ask_price.map(|value| value.normalize().to_string()),
+                ask_size: ask
+                    .map(|level| decimal_quantity(level.quantity(), executable))
+                    .transpose()?,
+                midpoint: checked_midpoint(bid_price, ask_price)?,
+                last_price: trade
+                    .map(|value| decimal_price(value.price(), executable))
+                    .transpose()?
+                    .map(|value| value.normalize().to_string()),
+                last_size: trade
+                    .map(|value| decimal_quantity(value.quantity(), executable))
+                    .transpose()?,
+                quote_observed_at: view
+                    .stream
+                    .source_timestamp()
+                    .or(Some(view.stream.received_at())),
+                last_observed_at: trade
+                    .map(|value| value.source_timestamp().unwrap_or(value.received_at())),
+                quote_current_through: Some(view.stream.source_valid_until()),
+                last_current_through: trade.map(|value| value.qualification_valid_until()),
+                quote_fresh: selected_at <= view.stream.source_valid_until(),
+                last_fresh: trade
+                    .is_some_and(|value| selected_at <= value.qualification_valid_until()),
+            })
+        }
+        UnifiedSelectedView::Display(snapshot) => {
+            let actor = snapshot.lease();
+            let quote_observation = actor.quote();
+            let quote = match quote_observation.map(|value| value.observation().payload()) {
+                Some(DisplayMarketPayload::Quote(quote)) => Some(quote),
+                None => None,
+                Some(_) => return Err(ServiceError::InvalidResult),
+            };
+            let trade_observation = actor.trade();
+            let trade = match trade_observation.map(|value| value.observation().payload()) {
+                Some(DisplayMarketPayload::Trade(trade)) => Some(trade),
+                None => None,
+                Some(_) => return Err(ServiceError::InvalidResult),
+            };
+            let bid = quote.and_then(|value| value.bid());
+            let ask = quote.and_then(|value| value.ask());
+            let bid_price = bid.map(|value| value.price().value());
+            let ask_price = ask.map(|value| value.price().value());
+            Ok(ProductQuote {
+                bid_price: bid_price.map(|value| value.normalize().to_string()),
+                bid_size: bid.map(|value| display_decimal_string(value.quantity())),
+                ask_price: ask_price.map(|value| value.normalize().to_string()),
+                ask_size: ask.map(|value| display_decimal_string(value.quantity())),
+                midpoint: checked_midpoint(bid_price, ask_price)?,
+                last_price: trade.map(|value| display_decimal_string(value.price())),
+                last_size: trade.map(|value| display_decimal_string(value.quantity())),
+                quote_observed_at: quote_observation.map(|value| {
+                    value
+                        .observation()
+                        .provenance()
+                        .source_at()
+                        .unwrap_or(value.observation().provenance().received_at())
+                }),
+                last_observed_at: trade_observation.map(|value| {
+                    value
+                        .observation()
+                        .provenance()
+                        .source_at()
+                        .unwrap_or(value.observation().provenance().received_at())
+                }),
+                quote_current_through: quote_observation
+                    .and_then(|value| display_expires_at(value.availability())),
+                last_current_through: trade_observation
+                    .and_then(|value| display_expires_at(value.availability())),
+                quote_fresh: quote_observation.is_some_and(|value| {
+                    matches!(
+                        value.availability(),
+                        DisplayMarketAvailability::Fresh { .. }
+                    )
+                }),
+                last_fresh: trade_observation.is_some_and(|value| {
+                    matches!(
+                        value.availability(),
+                        DisplayMarketAvailability::Fresh { .. }
+                    )
+                }),
+            })
+        }
+        UnifiedSelectedView::Kraken(snapshot) => {
+            let executable = definition.executable.ok_or(ServiceError::InvalidResult)?;
+            validate_kraken_projection(snapshot, executable)?;
+            let terms = snapshot.execution_terms();
+            let projection = snapshot.projection();
+            let bid = projection.bids().first().copied();
+            let ask = projection.asks().first().copied();
+            let bid_price = bid
+                .map(|level| decimal_price_with_terms(level.price(), terms))
+                .transpose()?;
+            let ask_price = ask
+                .map(|level| decimal_price_with_terms(level.price(), terms))
+                .transpose()?;
+            Ok(ProductQuote {
+                bid_price: bid_price.map(|value| value.normalize().to_string()),
+                bid_size: bid
+                    .map(|level| decimal_quantity_with_terms(level.quantity(), terms))
+                    .transpose()?,
+                ask_price: ask_price.map(|value| value.normalize().to_string()),
+                ask_size: ask
+                    .map(|level| decimal_quantity_with_terms(level.quantity(), terms))
+                    .transpose()?,
+                midpoint: checked_midpoint(bid_price, ask_price)?,
+                last_price: None,
+                last_size: None,
+                quote_observed_at: Some(projection.source_timestamp()),
+                last_observed_at: None,
+                quote_current_through: None,
+                last_current_through: None,
+                quote_fresh: matches!(projection.freshness(), MarketFreshness::Fresh { .. }),
+                last_fresh: false,
+            })
+        }
+    }
+}
+
+fn product_market_state(
+    selected: SelectedMarketSource<'_>,
+    view: UnifiedSelectedView<'_>,
+    selected_at: Timestamp,
+) -> (Value, &'static str, &'static str) {
+    let candidate = selected.candidate();
+    let capabilities = candidate.capabilities();
+    let admission = candidate.admission();
+    let timestamps = candidate.timestamps();
+    let current_through = product_current_through(view);
+    let is_fresh = product_view_is_fresh(view, selected_at);
+    let freshness = if is_fresh {
+        "fresh"
+    } else {
+        "stale"
+    };
+    let availability = match (is_fresh, capabilities.quality()) {
+        (false, _) | (_, DataQuality::Stale) => "stale",
+        _ => match capabilities.timing() {
+            ObservationTiming::RealTime => "live",
+            ObservationTiming::Delayed => "delayed",
+            ObservationTiming::EndOfDay => "end_of_day",
+            ObservationTiming::Historical | ObservationTiming::Stored => "stored",
+        },
+    };
+    let confidence = product_confidence(selected, is_fresh);
+    (
+        json!({
+            "timing": timing_name(capabilities.timing()),
+            "quality": product_quality_name(capabilities.quality()),
+            "health": health_name(admission.health().state()),
+            "integrity": integrity_name(admission.integrity().state()),
+            "coverage": product_coverage_name(capabilities.coverage()),
+            "depth": capabilities.depth().map(depth_name).unwrap_or("none"),
+            "freshness": freshness,
+            "observedAt": timestamp_value(
+                timestamps.source_timestamp().unwrap_or(timestamps.received_at()),
+            ),
+            "updatedAt": timestamp_value(timestamps.available_at()),
+            "currentThrough": current_through.map(timestamp_value),
+        }),
+        availability,
+        confidence,
+    )
+}
+
+fn product_view_is_fresh(view: UnifiedSelectedView<'_>, selected_at: Timestamp) -> bool {
+    match view {
+        UnifiedSelectedView::Live(view) => selected_at <= view.stream.source_valid_until(),
+        UnifiedSelectedView::Display(snapshot) => display_selection_observation(snapshot.lease())
+            .is_some_and(|value| {
+                matches!(
+                    value.availability(),
+                    DisplayMarketAvailability::Fresh { .. }
+                )
+            }),
+        UnifiedSelectedView::Kraken(snapshot) => {
+            matches!(
+                snapshot.projection().freshness(),
+                MarketFreshness::Fresh { .. }
+            )
+        }
+    }
+}
+
+fn product_current_through(view: UnifiedSelectedView<'_>) -> Option<Timestamp> {
+    match view {
+        UnifiedSelectedView::Live(view) => Some(view.stream.source_valid_until()),
+        UnifiedSelectedView::Display(snapshot) => display_selection_observation(snapshot.lease())
+            .and_then(|value| display_expires_at(value.availability())),
+        UnifiedSelectedView::Kraken(_) => None,
+    }
+}
+
+fn product_confidence(selected: SelectedMarketSource<'_>, is_fresh: bool) -> &'static str {
+    let candidate = selected.candidate();
+    let admission = candidate.admission();
+    let quality = candidate.capabilities().quality();
+    if is_fresh
+        && admission.health().state() == HealthState::Healthy
+        && admission.integrity().state() == IntegrityState::Verified
+        && matches!(
+            quality,
+            DataQuality::DirectVerified
+                | DataQuality::OfficialDelayed
+                | DataQuality::Aggregated
+        )
+    {
+        "moderate"
+    } else {
+        "limited"
+    }
+}
+
+const fn product_quality_name(quality: DataQuality) -> &'static str {
+    match quality {
+        DataQuality::DirectVerified => "verified",
+        DataQuality::DirectUnverified => "direct",
+        DataQuality::OfficialDelayed => "official_delayed",
+        DataQuality::Aggregated => "aggregated",
+        DataQuality::Indicative => "indicative",
+        DataQuality::Modeled => "modeled",
+        DataQuality::Estimated => "estimated",
+        DataQuality::Stale => "stale",
+        DataQuality::Quarantined => "unavailable",
+    }
+}
+
+const fn product_coverage_name(coverage: MarketCoverage) -> &'static str {
+    match coverage {
+        MarketCoverage::Consolidated => "broad",
+        MarketCoverage::MultiVenuePartial => "partial",
+        MarketCoverage::SingleVenue => "single_market",
+        MarketCoverage::Benchmark => "benchmark",
+        MarketCoverage::Reference => "reference",
+        MarketCoverage::UserOwned => "account_owned",
+    }
+}
+
+fn product_depth(
+    selected: Option<UnifiedSelectedView<'_>>,
+    definition: UnifiedInstrumentDefinition<'_>,
+    order_level: &[MarketOrderLevelSnapshot],
+    include_depth: bool,
+) -> Result<(Value, Value), ServiceError> {
+    let Some(selected) = selected else {
+        return Ok((
+            json!({
+                "kind": "none",
+                "bidLevels": 0,
+                "askLevels": 0,
+                "individualOrderCount": 0,
+                "truncated": false,
+            }),
+            Value::Null,
+        ));
+    };
+    let (kind, bids, asks, individual, levels_truncated) = match selected {
+        UnifiedSelectedView::Live(view) => {
+            let executable = definition.executable.ok_or(ServiceError::InvalidResult)?;
+            let levels_truncated = view.stream.bids().len() > MAXIMUM_PRODUCT_DEPTH_LEVELS
+                || view.stream.asks().len() > MAXIMUM_PRODUCT_DEPTH_LEVELS;
+            let bids = product_live_levels(view.stream.bids(), executable)?;
+            let asks = product_live_levels(view.stream.asks(), executable)?;
+            let individual = exact_order_level_snapshot(order_level, &view)?;
+            (
+                if individual.is_some_and(order_level_is_usable) {
+                    "order_level"
+                } else if bids.len() > 1 || asks.len() > 1 {
+                    "price_level"
+                } else if !bids.is_empty() || !asks.is_empty() {
+                    "top_of_book"
+                } else {
+                    "none"
+                },
+                bids,
+                asks,
+                individual,
+                levels_truncated,
+            )
+        }
+        UnifiedSelectedView::Display(snapshot) => {
+            let actor = snapshot.lease();
+            let quote = match actor.quote().map(|value| value.observation().payload()) {
+                Some(DisplayMarketPayload::Quote(quote)) => Some(quote),
+                None => None,
+                Some(_) => return Err(ServiceError::InvalidResult),
+            };
+            let bids = quote
+                .and_then(|value| value.bid())
+                .map(|value| {
+                    vec![json!({
+                        "price": display_decimal_string(value.price()),
+                        "quantity": display_decimal_string(value.quantity()),
+                    })]
+                })
+                .unwrap_or_default();
+            let asks = quote
+                .and_then(|value| value.ask())
+                .map(|value| {
+                    vec![json!({
+                        "price": display_decimal_string(value.price()),
+                        "quantity": display_decimal_string(value.quantity()),
+                    })]
+                })
+                .unwrap_or_default();
+            (
+                if bids.is_empty() && asks.is_empty() {
+                    "none"
+                } else {
+                    "top_of_book"
+                },
+                bids,
+                asks,
+                None,
+                false,
+            )
+        }
+        UnifiedSelectedView::Kraken(snapshot) => {
+            let executable = definition.executable.ok_or(ServiceError::InvalidResult)?;
+            validate_kraken_projection(snapshot, executable)?;
+            let terms = snapshot.execution_terms();
+            let projection = snapshot.projection();
+            let levels_truncated = projection.bids().len() > MAXIMUM_PRODUCT_DEPTH_LEVELS
+                || projection.asks().len() > MAXIMUM_PRODUCT_DEPTH_LEVELS;
+            let bids = product_projection_levels(projection.bids(), terms)?;
+            let asks = product_projection_levels(projection.asks(), terms)?;
+            let individual = order_level_snapshot_for_kraken(order_level, snapshot)?;
+            (
+                if individual.is_some_and(order_level_is_usable) {
+                    "order_level"
+                } else {
+                    "price_level"
+                },
+                bids,
+                asks,
+                individual,
+                levels_truncated,
+            )
+        }
+    };
+    let total_individual = individual.map_or(0, |value| value.orders().total_order_count());
+    let truncated = levels_truncated
+        || individual.is_some_and(|value| value.orders().is_truncated());
+    let summary = json!({
+        "kind": kind,
+        "bidLevels": bids.len(),
+        "askLevels": asks.len(),
+        "individualOrderCount": total_individual,
+        "truncated": truncated,
+    });
+    if !include_depth {
+        return Ok((summary, Value::Null));
+    }
+    let individual_orders = individual
+        .map(|value| product_individual_orders(value, definition))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    Ok((
+        summary,
+        json!({
+            "kind": kind,
+            "bids": bids,
+            "asks": asks,
+            "individualOrders": individual_orders,
+        }),
+    ))
+}
+
+fn product_live_levels(
+    levels: &[BookLevelSnapshot],
+    definition: &InstrumentDefinition,
+) -> Result<Vec<Value>, ServiceError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(levels.len().min(MAXIMUM_PRODUCT_DEPTH_LEVELS))
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    for level in levels.iter().take(MAXIMUM_PRODUCT_DEPTH_LEVELS) {
+        values.push(json!({
+            "price": decimal_price(level.price(), definition)?.normalize().to_string(),
+            "quantity": decimal_quantity(level.quantity(), definition)?,
+        }));
+    }
+    Ok(values)
+}
+
+fn product_projection_levels(
+    levels: &[PriceLevelProjection],
+    terms: InstrumentExecutionTerms,
+) -> Result<Vec<Value>, ServiceError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(levels.len().min(MAXIMUM_PRODUCT_DEPTH_LEVELS))
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    for level in levels.iter().take(MAXIMUM_PRODUCT_DEPTH_LEVELS) {
+        values.push(json!({
+            "price": decimal_price_with_terms(level.price(), terms)?.normalize().to_string(),
+            "quantity": decimal_quantity_with_terms(level.quantity(), terms)?,
+        }));
+    }
+    Ok(values)
+}
+
+fn product_individual_orders(
+    snapshot: &MarketOrderLevelSnapshot,
+    definition: UnifiedInstrumentDefinition<'_>,
+) -> Result<Value, ServiceError> {
+    let terms = definition.execution_terms()?;
+    let read = snapshot.orders();
+    let mut bids = Vec::new();
+    let mut asks = Vec::new();
+    for order in read.orders().iter().take(MAXIMUM_PRODUCT_DEPTH_LEVELS) {
+        let value = json!({
+            "price": decimal_price_with_terms(order.price(), terms)?.normalize().to_string(),
+            "quantity": decimal_quantity_with_terms(order.quantity(), terms)?,
+        });
+        match order.side() {
+            BookSide::Bid => bids.push(value),
+            BookSide::Ask => asks.push(value),
+        }
+    }
+    Ok(json!({
+        "bidOrders": bids,
+        "askOrders": asks,
+        "totalCount": read.total_order_count(),
+        "returnedCount": bids.len().saturating_add(asks.len()),
+        "truncated": read.is_truncated()
+            || read.orders().len() > MAXIMUM_PRODUCT_DEPTH_LEVELS,
     }))
 }
 

@@ -11,13 +11,6 @@ import { ProviderStep } from "@/components/setup/provider-step"
 import type { AnalyticalControllerStatus } from "@/features/advanced/analytical-profile-contracts"
 import { lookupRoute } from "@/features/lookup/lookup-surface"
 import {
-  instrumentBooks,
-  instrumentComparison,
-  instrumentQuotes,
-  instrumentTrades,
-} from "@/features/markets/market-evidence"
-import { parseUnifiedMarketResult } from "@/features/markets/unified-market"
-import {
   parseSourceCoverageResult,
   parseSourceHealthResult,
   parseSourceLifecycleReceipt,
@@ -1820,519 +1813,116 @@ function retainedTrackRecord(request: TrackRecordQuery): ApplicationResult {
   }
 }
 
-const krakenInstrumentId = "7e8299e7-9757-4441-926f-d0b22c767a65"
-const krakenSourceAt = "2026-08-09T14:30:00.000000000Z"
-const krakenReceivedAt = "2026-08-09T14:30:00.010000000Z"
-const krakenAvailableAt = "2026-08-09T14:30:00.011000000Z"
+const marketInstrumentId = "7e8299e7-9757-4441-926f-d0b22c767a65"
+const marketObservedAt = "2026-08-09T14:30:00.000000000Z"
+const marketUpdatedAt = "2026-08-09T14:30:00.011000000Z"
 
-function krakenProjectionEvidence() {
-  return {
-    surfaceId: "kraken-l3",
-    providerId: "kraken",
-    providerSymbol: "BTC/USD",
-    sourceId: "kraken-l3-account",
-    venueId: "kraken",
-    instrumentId: krakenInstrumentId,
-    providerInstrument: "BTC/USD",
-    connectionGeneration: "1",
-    batchIdentifier: "kraken-l3-g1-f42-snapshot",
-    revision: "17",
-    phase: "healthy",
-    quarantineReason: null,
-    quality: "direct_unverified",
-    sourceDepth: "order_level",
-    projectionDepth: "price_level",
-    executionTerms: {
-      instrumentId: krakenInstrumentId,
-      definitionRevision: "3",
-      priceTick: "0.1",
-      lotSize: "0.00000001",
-      quoteCurrency: "USD",
-      settlementDenomination: { kind: "currency", value: "USD" },
-      contractMultiplier: "1",
-    },
+const marketOverviewRow = {
+  instrumentId: marketInstrumentId,
+  displaySymbol: "BTC-USD",
+  name: "Bitcoin",
+  assetClass: "crypto",
+  currency: "USD",
+  availability: "live",
+  confidence: "moderate",
+  currentPrice: {
+    value: "68000.15",
+    currency: "USD",
+    basis: "bid_ask_midpoint",
+    observedAt: marketObservedAt,
+    currentThrough: marketObservedAt,
+  },
+  quote: {
+    bidPrice: "68000.1",
+    bidSize: "0.25",
+    askPrice: "68000.2",
+    askSize: "0.3",
+    midPrice: "68000.15",
+    lastPrice: null,
+    lastSize: null,
+    quoteObservedAt: marketObservedAt,
+    lastObservedAt: null,
+  },
+  marketState: {
+    timing: "real_time",
+    quality: "direct",
+    health: "healthy",
+    integrity: "verified",
+    coverage: "single_market",
+    depth: "order_level",
     freshness: "fresh",
-    lastMarketAt: krakenSourceAt,
-    sourceTimestamp: krakenSourceAt,
-    receivedAt: krakenReceivedAt,
-    availableAt: krakenAvailableAt,
-    providerSequence: "42",
-    diagnosticOrdinal: "1",
-    sequenceEvidence: {
-      capability: "provided",
-      rule: { provider_rule: "kraken-v2-sequence", version: 1 },
-      validation_rule: "consecutive",
-      connection_generation: "1",
-      snapshot_sequence: "41",
-      previous_sequence: "41",
-      observed_sequence: "42",
-      integrity: "valid",
-    },
-    checksumEvidence: {
-      capability: "provided",
-      rule: { provider_rule: "kraken-v2-book-checksum", version: 1 },
-      connection_generation: "1",
-      target: {
-        kind: "book",
-        scope: {
-          depth: "order_level",
-          level_count: 2,
-          provider_scope: "kraken-l3-btc-usd",
-        },
-      },
-      expected: "123456",
-      computed: "123456",
-      integrity: "valid",
-    },
-    bidLevelCount: 1,
-    askLevelCount: 1,
-  }
+    observedAt: marketObservedAt,
+    updatedAt: marketUpdatedAt,
+    currentThrough: marketObservedAt,
+  },
+  observations: {
+    admittedCount: 2,
+    independentCount: null,
+    agreement: "not_established",
+  },
+  depthSummary: {
+    kind: "order_level",
+    bidLevels: 1,
+    askLevels: 1,
+    individualOrderCount: 2,
+    truncated: false,
+  },
+  depthDetails: null,
+  analysisUse: "current_only",
 }
 
-function krakenSourceMetadataEvidence() {
+function marketResult(
+  row: typeof marketOverviewRow | (Omit<typeof marketOverviewRow, "depthDetails"> & {
+    depthDetails: {
+      kind: "order_level"
+      bids: Array<{ price: string; quantity: string }>
+      asks: Array<{ price: string; quantity: string }>
+      individualOrders: {
+        bidOrders: Array<{ price: string; quantity: string }>
+        askOrders: Array<{ price: string; quantity: string }>
+        totalCount: number
+        returnedCount: number
+        truncated: boolean
+      }
+    }
+  }),
+): ApplicationResult {
   return {
-    schemaVersion: 1,
-    sourceId: "kraken-l3-account",
-    providerId: "kraken",
-    sourceClass: "exchange",
-    metadataRevision: "kraken-l3-metadata-v1",
-    metadataPayloadDigest: { algorithm: "sha256", bytes: "44".repeat(32) },
-    metadataPayloadLocator: null,
-    qualityCeiling: "direct_unverified",
-    coverage: {
-      payloadDigest: { algorithm: "sha256", bytes: "55".repeat(32) },
-      payloadLocator: null,
-      effectiveFrom: "2026-08-09T00:00:00.000000000Z",
-      effectiveUntil: null,
-      assetClasses: ["crypto"],
-      topology: { kind: "single_venue", venues: ["kraken"] },
-      instruments: { kind: "enumerated", instruments: [krakenInstrumentId] },
-      live: {
-        provider_product: "websocket-v2",
-        provider_channel: "level3",
-        rules: [
-          {
-            event_class: "book_snapshot",
-            depth: "order_level",
-            snapshot_applicability: { kind: "required" },
-          },
-          {
-            event_class: "book_delta",
-            depth: "order_level",
-            snapshot_applicability: { kind: "required" },
-          },
-        ],
+    data: [row],
+    metadata: {
+      completeness: "complete",
+      returnedItems: 1,
+      availableItems: 1,
+      sourceCoverage: {
+        availability: "available",
+        complete: true,
+        returnedInstrumentCount: 1,
+        observationCount: 2,
       },
-      delay: { kind: "real_time" },
-      delivery: "direct_venue",
+      dataQuality: {
+        referenceAt: marketUpdatedAt,
+        observationCount: 2,
+      },
     },
   }
 }
 
-const unifiedKrakenMarket: ApplicationResult = {
-  data: [
-    {
-      instrumentId: krakenInstrumentId,
-      symbol: "BTC/USD",
-      symbolKind: "provider_subscription_symbol",
-      symbolVenueId: "kraken",
-      assetClass: "crypto",
-      quoteCurrency: "USD",
-      definitionKind: "execution",
-      definitionRevision: "3",
-      referenceRevision: null,
-      displayName: "Bitcoin",
-      tickSize: "0.1",
-      lotSize: "0.00000001",
-      executionTermsAvailable: true,
-      executionEligible: false,
-      definitionRevisionDigest: null,
-      referenceEvidence: null,
-      availability: "Live",
-      confidence: "Direct, unverified",
-      quote: {
-        bidPrice: "68000.1",
-        bidPriceProviderLexeme: null,
-        bidSize: "0.25",
-        bidSizeProviderLexeme: null,
-        askPrice: "68000.2",
-        askPriceProviderLexeme: null,
-        askSize: "0.3",
-        askSizeProviderLexeme: null,
-        midPrice: "68000.15",
-        midPriceBasis: "calculated_from_selected_bid_and_ask",
-        lastPrice: null,
-        lastPriceProviderLexeme: null,
-        lastSize: null,
-        lastSizeProviderLexeme: null,
-        lastSourceTimestamp: null,
-        lastReceivedAt: null,
-        lastAvailableAt: null,
-        lastQuality: null,
-        lastFreshAtSelection: null,
-        quoteEvidence: krakenProjectionEvidence(),
-        tradeEvidence: null,
-      },
-      orderBook: {
-        depth: "order_level",
-        revision: "17",
-        phase: "healthy",
-        quarantineReason: null,
-        quality: "direct_unverified",
-        freshness: "fresh",
-        lastMarketAt: krakenSourceAt,
-        availableAt: krakenAvailableAt,
-        usableForSelection: true,
-        totalOrderCount: 2,
-        returnedOrderCount: 2,
-        sampleTruncated: false,
-        samplePolicy: "stable_provider_order_id_prefix",
-        orders: [
-          {
-            orderId: "kraken-bid-1",
-            side: "bid",
-            price: "68000.1",
-            priceTicks: "680001",
-            quantity: "0.25",
-            quantityLots: "25000000",
-            providerOrderTimestamp: krakenSourceAt,
-            providerPriority: null,
-            firstSeenIn: "snapshot",
-            lastUpdatedIn: "snapshot",
-            lastSourceTimestamp: krakenSourceAt,
-            lastReceivedAt: krakenReceivedAt,
-            arrivalOrdinal: "1",
-          },
-          {
-            orderId: "kraken-ask-1",
-            side: "ask",
-            price: "68000.2",
-            priceTicks: "680002",
-            quantity: "0.3",
-            quantityLots: "30000000",
-            providerOrderTimestamp: krakenSourceAt,
-            providerPriority: null,
-            firstSeenIn: "snapshot",
-            lastUpdatedIn: "snapshot",
-            lastSourceTimestamp: krakenSourceAt,
-            lastReceivedAt: krakenReceivedAt,
-            arrivalOrdinal: "2",
-          },
-        ],
-      },
-      analyticalReadiness: "runtime_display_only",
-      marketObservation: {
-        availability: "unavailable",
-        reason: "durable_pit_evidence_not_established",
-      },
-      selectedSource: {
-        surfaceId: "kraken-l3",
-        providerId: "kraken",
-        providerSymbol: "BTC/USD",
-        sourceId: "kraken-l3-account",
-        venueId: "kraken",
-        providerProduct: "websocket-v2",
-        providerChannel: "level3",
-        timing: "real_time",
-        depth: "price_level",
-        depthLabel: "Price-level book",
-        sourceDepth: "order_level",
-        projectionDepth: "price_level",
-        quality: "direct_unverified",
-        qualityCeiling: "direct_unverified",
-        coverage: "single_venue",
-        health: "healthy",
-        healthObservedAt: krakenAvailableAt,
-        stateRevision: "17",
-        snapshotPublishedAt: krakenAvailableAt,
-        executionEligible: false,
-        providerBudget: {
-          availability: "not_required",
-          observedAt: krakenAvailableAt,
-        },
-        rights: {
-          decisionId: "kraken-snapshot-display-v1",
-          state: "admitted",
-          decidedAt: krakenAvailableAt,
-          effectiveFrom: "2026-08-09T00:00:00.000000000Z",
-          effectiveUntil: null,
-          snapshotDisplayPermitted: true,
-        },
-        freshness: {
-          ageNanos: "0",
-          state: "fresh",
-          lastMarketAt: krakenSourceAt,
-          sourceTimestamp: krakenSourceAt,
-          effectiveAt: krakenSourceAt,
-          receivedAt: krakenReceivedAt,
-          availableAt: krakenAvailableAt,
-          ingestedAt: krakenAvailableAt,
-          sourceValidUntil: null,
-          freshAtSelection: true,
-          selectedAt: krakenAvailableAt,
-        },
-        integrity: {
-          state: "verified",
-          assessedAt: krakenAvailableAt,
-          connectionGeneration: "1",
-          phase: "healthy",
-          generationCurrent: true,
-          snapshotInitialized: true,
-          lastSequence: "42",
-          runtimeEvidence: krakenProjectionEvidence(),
-        },
-        sourceMetadataEvidence: krakenSourceMetadataEvidence(),
-      },
-      alternatives: [],
-      selectionReceipt: {
-        policyRevision: 2,
-        policyCandidateLimit: 256,
-        policyDigest: {
-          algorithm: "sha256",
-          bytes: "33".repeat(32),
-        },
-        selectionDigest: {
-          algorithm: "sha256",
-          bytes: "22".repeat(32),
-        },
-        definitionRevisionDigest: null,
-        selectedAt: krakenAvailableAt,
-        eligibleCount: 1,
-        rejectedCount: 0,
-        availableAlternativeCount: 0,
-        returnedAlternativeCount: 0,
-        alternativesComplete: true,
-        selectionClass: "exact_requirements",
-        downgradeDimensions: [],
-      },
-    },
-  ],
-  metadata: {
-    completeness: "complete",
-    returnedItems: 1,
-    availableItems: 1,
-    sourceCoverage: {
-      mode: "unified_current_market_runtime",
-      consistency: "per_shard_current_non_atomic",
-      historicalDataset: null,
-      requestedSourceCount: 0,
-      listedRequestedSources: [],
-      listedRequestedSourcesComplete: true,
-      observedSourceCount: 1,
-      listedSources: ["kraken-l3-account"],
-      listedSourcesComplete: true,
-      observedVenueCount: 1,
-      listedVenues: ["kraken"],
-      listedVenuesComplete: true,
-      failedSourceCount: 0,
-      failedSources: [],
-      listedFailedSourcesComplete: true,
-      streamIdentityScope: "complete",
-      bookDepthScope: "per_record_explicit",
-      displayObservationCount: 0,
-      krakenOrderLevelProjectionCount: 1,
-      availability: "current",
-    },
-    dataQuality: {
-      referenceAt: krakenAvailableAt,
-      recordedClassifications: [],
-      currentDisplayClassifications: [],
-      freshObservations: 0,
-      staleObservations: 0,
-      authority: "not_exposed",
-      summaryScope: "live_price_level_streams",
-      summarizedObservationCount: 0,
-      displayObservationCount: 0,
-      krakenOrderLevelProjectionCount: 1,
+const marketOverviewResult = marketResult(marketOverviewRow)
+const marketInstrumentResult = marketResult({
+  ...marketOverviewRow,
+  depthDetails: {
+    kind: "order_level",
+    bids: [{ price: "68000.1", quantity: "0.25" }],
+    asks: [{ price: "68000.2", quantity: "0.3" }],
+    individualOrders: {
+      bidOrders: [{ price: "68000.1", quantity: "0.25" }],
+      askOrders: [{ price: "68000.2", quantity: "0.3" }],
+      totalCount: 2,
+      returnedCount: 2,
+      truncated: false,
     },
   },
-}
-
-const krakenDetailIdentity = {
-  sourceId: "kraken-l3-account",
-  venueId: "kraken",
-  instrumentId: krakenInstrumentId,
-  providerProduct: "websocket-v2",
-  providerChannel: "level3",
-  connectionGeneration: "1",
-  stateRevision: "17",
-  shardId: "0/1",
-  shardSnapshotRevision: "17",
-}
-
-function marketDetailMetadata({
-  availableItems,
-  observations,
-  sources = ["kraken-l3-account"],
-  venues = ["kraken"],
-}: {
-  availableItems: number
-  observations: number
-  sources?: string[]
-  venues?: string[]
-}): ApplicationResult["metadata"] {
-  const classifications = observations > 0
-    ? [{ quality: "direct_unverified", count: observations }]
-    : []
-  return {
-    completeness: "complete",
-    returnedItems: availableItems,
-    availableItems,
-    sourceCoverage: {
-      mode: "current_live_runtime",
-      consistency: "per_shard_current_non_atomic",
-      historicalDataset: null,
-      requestedSourceCount: 0,
-      listedRequestedSources: [],
-      listedRequestedSourcesComplete: true,
-      observedSourceCount: sources.length,
-      listedSources: sources,
-      listedSourcesComplete: true,
-      observedVenueCount: venues.length,
-      listedVenues: venues,
-      listedVenuesComplete: true,
-      failedSourceCount: 0,
-      failedSources: [],
-      listedFailedSourcesComplete: true,
-      streamIdentityScope: "complete",
-      bookDepthScope: "per_record_explicit",
-      displayObservationCount: 0,
-      krakenOrderLevelProjectionCount: 0,
-      availability: availableItems === 0 ? "no_current_observation" : "current",
-    },
-    dataQuality: {
-      referenceAt: krakenAvailableAt,
-      recordedClassifications: classifications,
-      currentDisplayClassifications: classifications,
-      freshObservations: observations,
-      staleObservations: 0,
-      authority: "not_exposed",
-    },
-  }
-}
-
-const krakenTradeResult: ApplicationResult = {
-  data: [{
-    ...krakenDetailIdentity,
-    sourceIdentifier: "kraken:trade:42",
-    stableTradeId: "kraken-trade-42",
-    tradeConnectionGeneration: "1",
-    priceTicks: "680001",
-    quantityLots: "25000000",
-    aggressorSide: "buy",
-    takerOrderType: "market",
-    sourceTimestamp: krakenSourceAt,
-    receivedAt: krakenReceivedAt,
-    availableAt: krakenAvailableAt,
-    ingestedAt: krakenAvailableAt,
-    recordedQuality: "direct_unverified",
-    currentDisplayQuality: "direct_unverified",
-    recordedCoverage: "sufficient",
-    assessmentId: "kraken-assessment-17",
-    qualificationEvaluatedAt: krakenAvailableAt,
-    qualificationValidUntil: "2026-08-09T14:30:10.000000000Z",
-    freshAtReference: true,
-    payloadDigest: { algorithm: "blake3", bytes: "6".repeat(64) },
-    bindingDigest: "7".repeat(64),
-    tradeTradingStatus: "active",
-    committedStateRevision: "17",
-    authority: "not_exposed",
-  }],
-  metadata: marketDetailMetadata({ availableItems: 1, observations: 1 }),
-}
-
-const krakenQuoteResult: ApplicationResult = {
-  data: [{
-    ...krakenDetailIdentity,
-    bid: { priceTicks: "680001", quantityLots: "25000000" },
-    ask: { priceTicks: "680002", quantityLots: "30000000" },
-    sourceTimestamp: null,
-    asOf: krakenAvailableAt,
-    stateEvaluatedAt: krakenReceivedAt,
-    recordedQuality: "direct_unverified",
-    currentDisplayQuality: "direct_unverified",
-    crossed: false,
-    authority: "not_exposed",
-  }],
-  metadata: marketDetailMetadata({ availableItems: 1, observations: 1 }),
-}
-
-function completeBookDimension() {
-  return { completeness: "complete", available: 1, returned: 1, configuredLimit: 10 }
-}
-
-const krakenBookResult: ApplicationResult = {
-  data: [{
-    ...krakenDetailIdentity,
-    asOf: krakenAvailableAt,
-    stateEvaluatedAt: krakenReceivedAt,
-    book: {
-      configuredDepth: 10,
-      stateBidDepth: 1,
-      stateAskDepth: 1,
-      snapshotBidDimension: completeBookDimension(),
-      snapshotAskDimension: completeBookDimension(),
-      resultBidDimension: completeBookDimension(),
-      resultAskDimension: completeBookDimension(),
-      bids: [{ priceTicks: "680001", quantityLots: "25000000" }],
-      asks: [{ priceTicks: "680002", quantityLots: "30000000" }],
-    },
-    currentDisplayQuality: "direct_unverified",
-  }],
-  metadata: marketDetailMetadata({ availableItems: 1, observations: 1 }),
-}
-
-const krakenComparisonResult: ApplicationResult = {
-  data: [{
-    instrumentId: krakenInstrumentId,
-    observationCount: 2,
-    comparable: true,
-    observations: [
-      {
-        sourceId: "coinbase-public",
-        venueId: "coinbase",
-        providerProduct: "advanced-trade",
-        providerChannel: "ticker",
-        bid: { priceTicks: "679999", quantityLots: "11000000" },
-        ask: { priceTicks: "680003", quantityLots: "12000000" },
-        midpoint: { numeratorTicks: "1360002", denominator: "2" },
-        asOf: krakenAvailableAt,
-        stateEvaluatedAt: krakenReceivedAt,
-        recordedQuality: "direct_unverified",
-        currentDisplayQuality: "direct_unverified",
-      },
-      {
-        sourceId: "kraken-l3-account",
-        venueId: "kraken",
-        providerProduct: "websocket-v2",
-        providerChannel: "level3",
-        bid: { priceTicks: "680001", quantityLots: "25000000" },
-        ask: { priceTicks: "680002", quantityLots: "30000000" },
-        midpoint: { numeratorTicks: "1360003", denominator: "2" },
-        asOf: krakenAvailableAt,
-        stateEvaluatedAt: krakenReceivedAt,
-        recordedQuality: "direct_unverified",
-        currentDisplayQuality: "direct_unverified",
-      },
-    ],
-    authority: "not_exposed",
-  }],
-  metadata: marketDetailMetadata({
-    availableItems: 1,
-    observations: 2,
-    sources: ["coinbase-public", "kraken-l3-account"],
-    venues: ["coinbase", "kraken"],
-  }),
-}
-
-// Keep this production-shaped evidence fixture at the strict Rust/Desktop wire boundary.
-// Parsing here makes a schema drift failure point at the fixture instead of disappearing
-// behind the Markets page's deliberately user-facing unavailable state.
-parseUnifiedMarketResult(unifiedKrakenMarket)
-instrumentTrades(krakenTradeResult, krakenInstrumentId)
-instrumentQuotes(krakenQuoteResult, krakenInstrumentId)
-instrumentBooks(krakenBookResult, krakenInstrumentId)
-instrumentComparison(krakenComparisonResult, krakenInstrumentId)
+})
 
 const portfolioAccountId = "55e7626c-81c8-4e78-8aa6-45a1d9c2949a"
 const heldInstrumentId = "7e8299e7-9757-4441-926f-d0b22c767a65"
@@ -2538,24 +2128,21 @@ describe("Market Squawk desktop boundary", () => {
     ).toBe(`/markets?instrumentId=${instrumentId}`)
   })
 
-  it("renders one unified market with automatic source confidence and order-level detail", async () => {
+  it("renders one provider-neutral market journey with current price and depth", async () => {
     const user = userEvent.setup()
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
     const readyBootstrap: DesktopBootstrap = {
       ...blockedBootstrap,
       operations: [
         datasetRead(
-          "Market.GetUnifiedFeed",
+          "Market.GetOverview",
           "market",
-          "Return the bounded unified market view.",
+          "Return the current market overview.",
         ),
-        datasetRead("Market.GetTrades", "market", "Return current trades."),
-        datasetRead("Market.GetQuotes", "market", "Return current quotes."),
-        datasetRead("Market.GetBooks", "market", "Return current books."),
         datasetRead(
-          "Market.GetComparisons",
+          "Market.GetInstrument",
           "market",
-          "Compare current sources.",
+          "Return current information for one investment.",
         ),
       ],
     }
@@ -2564,11 +2151,8 @@ describe("Market Squawk desktop boundary", () => {
         <App
           transport={transport(readyBootstrap, undefined, async (request) => {
             issuedQueries.push(request)
-            if (request.query === "marketUnifiedFeed") return unifiedKrakenMarket
-            if (request.query === "marketTrades") return krakenTradeResult
-            if (request.query === "marketQuotes") return krakenQuoteResult
-            if (request.query === "marketBooks") return krakenBookResult
-            if (request.query === "marketComparisons") return krakenComparisonResult
+            if (request.query === "marketOverview") return marketOverviewResult
+            if (request.query === "marketInstrument") return marketInstrumentResult
             throw new Error(`Unexpected market query: ${request.query}`)
           })}
         />
@@ -2576,132 +2160,51 @@ describe("Market Squawk desktop boundary", () => {
     )
 
     expect(await screen.findByRole("heading", { name: "Markets" })).toBeTruthy()
-    const marketHeading = await screen.findByRole("heading", { name: "BTC/USD" })
+    const marketHeading = await screen.findByRole("heading", { name: "BTC-USD" })
     const marketCard = marketHeading.closest("button")
     expect(marketCard).toBeInstanceOf(HTMLButtonElement)
     if (!(marketCard instanceof HTMLButtonElement)) {
-      throw new Error("Unified market card is absent")
+      throw new Error("The market card is absent")
     }
+
     expect(within(marketCard).getByText("Bitcoin")).toBeTruthy()
     expect(within(marketCard).getByText("Live")).toBeTruthy()
-    expect(within(marketCard).getByText("Price-level book")).toBeTruthy()
-    expect(within(marketCard).getByText("2 of 2")).toBeTruthy()
-    expect(
-      within(marketCard).getByText(
-        "Live runtime display · this feed is not PIT evidence",
-      ),
-    ).toBeTruthy()
     expect(within(marketCard).getByText("68000.15 USD")).toBeTruthy()
+    expect(within(marketCard).getByText("Individual orders")).toBeTruthy()
+
+    await user.click(marketCard)
+    expect(await screen.findByRole("heading", { name: "Market depth" })).toBeTruthy()
+    expect(screen.getByText("Buy interest")).toBeTruthy()
+    expect(screen.getByText("Sell interest")).toBeTruthy()
+    expect(screen.getByText("2 individual orders are available.")).toBeTruthy()
+    await waitFor(() => {
+      expect(
+        issuedQueries.filter((request) => request.query === "marketInstrument"),
+      ).toEqual([
+        { query: "marketInstrument", instrumentId: marketInstrumentId },
+      ])
+    })
     expect(
-      within(marketCard).getByText(
-        "Midpoint of current bid and ask · runtime display only · no precise source deadline reported",
+      issuedQueries.some((request) => request.query === "marketOverview"),
+    ).toBe(true)
+    expect(
+      issuedQueries.some((request) =>
+        [
+          "marketSnapshot",
+          "marketQuality",
+          "marketUnifiedFeed",
+          "marketTrades",
+          "marketQuotes",
+          "marketBooks",
+          "marketComparisons",
+        ].includes(request.query),
       ),
-    ).toBeTruthy()
-    expect(screen.queryByRole("combobox", { name: /provider/i })).toBeNull()
+    ).toBe(false)
 
-    await user.click(
-      screen.getByText("Show detailed trades, quotes, order book, and source comparison"),
-    )
-    expect(await screen.findByText("Selected market evidence")).toBeTruthy()
-    expect(screen.getByText("Orders behind the visible market")).toBeTruthy()
-    expect(await screen.findByText("kraken-trade-42")).toBeTruthy()
-    expect(screen.getAllByText("680001 ticks").length).toBeGreaterThan(0)
-    expect(screen.getByText("25000000 lots")).toBeTruthy()
-    expect(screen.getByText("Bids · Complete")).toBeTruthy()
-    expect(screen.getByText("Asks · Complete")).toBeTruthy()
-    expect(screen.getByText("2 current observations can be compared.")).toBeTruthy()
-    expect(screen.getByText("coinbase-public · coinbase")).toBeTruthy()
-    await user.click(screen.getByText("Source, quality, and evidence details"))
-    expect(screen.getAllByText("kraken").length).toBeGreaterThan(0)
-    expect(screen.getByText("Runtime display only")).toBeTruthy()
-    expect(
-      issuedQueries.filter((request) => [
-        "marketTrades",
-        "marketQuotes",
-        "marketBooks",
-        "marketComparisons",
-      ].includes(request.query)),
-    ).toEqual([
-      { query: "marketTrades", instrumentId: krakenInstrumentId },
-      { query: "marketQuotes", instrumentId: krakenInstrumentId },
-      { query: "marketBooks", instrumentId: krakenInstrumentId },
-      { query: "marketComparisons", instrumentId: krakenInstrumentId },
-    ])
-
-    const numericTrade = structuredClone(krakenTradeResult)
-    const numericTradeRows = numericTrade.data as Array<Record<string, unknown>>
-    if (!numericTradeRows[0]) throw new Error("The trade fixture is absent")
-    numericTradeRows[0].priceTicks = 680001
-    expect(() => instrumentTrades(numericTrade, krakenInstrumentId)).toThrow()
-
-    const extraEnvelope = { ...krakenQuoteResult, unexpected: true }
-    expect(() => instrumentQuotes(extraEnvelope, krakenInstrumentId)).toThrow()
-
-    const wrongInstrument = structuredClone(krakenBookResult)
-    const wrongInstrumentRows = wrongInstrument.data as Array<Record<string, unknown>>
-    if (!wrongInstrumentRows[0]) throw new Error("The book fixture is absent")
-    wrongInstrumentRows[0].instrumentId = candidateInstrumentId
-    expect(() => instrumentBooks(wrongInstrument, krakenInstrumentId)).toThrow()
-
-    const duplicateComparison = structuredClone(krakenComparisonResult)
-    const duplicateComparisonRows = duplicateComparison.data as Array<Record<string, unknown>>
-    const duplicateObservations = duplicateComparisonRows[0]?.observations as
-      | Array<Record<string, unknown>>
-      | undefined
-    if (!duplicateObservations?.[0] || !duplicateObservations[1]) {
-      throw new Error("The comparison fixture is absent")
-    }
-    duplicateObservations[1] = { ...duplicateObservations[0] }
-    expect(() =>
-      instrumentComparison(duplicateComparison, krakenInstrumentId)
-    ).toThrow()
-
-    const inconsistentCounts = structuredClone(krakenQuoteResult)
-    inconsistentCounts.metadata.returnedItems = 0
-    expect(() => instrumentQuotes(inconsistentCounts, krakenInstrumentId)).toThrow()
-
-    const mismatchedDefinitionRevision = structuredClone(unifiedKrakenMarket)
-    const mismatchedDefinitionRows =
-      mismatchedDefinitionRevision.data as Array<Record<string, unknown>>
-    if (!mismatchedDefinitionRows[0]) throw new Error("The unified fixture is absent")
-    const inventedDefinitionRevisionDigest = {
-      algorithm: "sha256",
-      bytes: "66".repeat(32),
-    }
-    mismatchedDefinitionRows[0].definitionRevisionDigest = inventedDefinitionRevisionDigest
-    const mismatchedDefinitionReceipt = mismatchedDefinitionRows[0]
-      .selectionReceipt as Record<string, unknown>
-    mismatchedDefinitionReceipt.definitionRevisionDigest = inventedDefinitionRevisionDigest
-    expect(() => parseUnifiedMarketResult(mismatchedDefinitionRevision)).toThrow()
-
-    const falseDurableAnalyticalAuthority = structuredClone(unifiedKrakenMarket)
-    const falseAnalyticalRows =
-      falseDurableAnalyticalAuthority.data as Array<Record<string, unknown>>
-    if (!falseAnalyticalRows[0]) throw new Error("The unified fixture is absent")
-    falseAnalyticalRows[0].analyticalReadiness = "durable_pit_available"
-    falseAnalyticalRows[0].marketObservation = {
-      availability: "available",
-      instrumentId: krakenInstrumentId,
-      mark: {
-        value: "68000.15",
-        currency: "USD",
-        basis: "fresh_bid_ask_midpoint",
-        evidenceIdentity: { algorithm: "sha256", bytes: "22".repeat(32) },
-        freshUntil: null,
-      },
-      selectionDigest: { algorithm: "sha256", bytes: "22".repeat(32) },
-      selectedAt: krakenAvailableAt,
-      generation: "1",
-      quality: "direct_unverified",
-      depth: "price_level",
-      coverage: "single_venue",
-      integrity: "verified",
-      features: {
-        availability: "unavailable",
-        reason: "source_does_not_publish_live_features",
-      },
-    }
-    expect(() => parseUnifiedMarketResult(falseDurableAnalyticalAuthority)).toThrow()
+    const renderedText = document.body.textContent ?? ""
+    expect(renderedText).not.toMatch(/kraken|coinbase|websocket-v2/i)
+    expect(renderedText).not.toContain(marketInstrumentId)
+    expect(renderedText).not.toMatch(/\bticks?\b|\blots?\b/i)
   })
 
   it("keeps candidate impact server-resolved and visibly analysis-only", async () => {
@@ -3707,7 +3210,7 @@ describe("Market Squawk desktop boundary", () => {
       state: "active",
       sourceId: "alpaca-iex-runtime",
       venueId: "iex",
-      instrumentId: krakenInstrumentId,
+      instrumentId: marketInstrumentId,
       connectionGeneration: "1",
       sessionId: "alpaca-runtime-session",
       healthEpoch: "1",

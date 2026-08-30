@@ -6,10 +6,8 @@ import {
   parseForecasts,
   parseModelBundles,
 } from "@/features/models/models-contracts"
-import {
-  decisionOverviewSchema,
-  marketSnapshotSchema,
-} from "@/features/overview/schemas"
+import { marketOverviewRows } from "@/features/markets/market-product"
+import { decisionOverviewSchema } from "@/features/overview/schemas"
 import { parsePaperStatus } from "@/features/paper/contracts"
 import {
   parsePortfolioResult,
@@ -113,8 +111,8 @@ export function useOwnerEvidence(
       ),
       settle(
         transport
-          .query({ query: "marketSnapshot" })
-          .then((result) => marketSnapshotSchema.parse(result.data)),
+          .query({ query: "marketOverview" })
+          .then(marketOverviewRows),
       ),
       settle(
         transport
@@ -145,7 +143,7 @@ export function useOwnerEvidence(
     const bundleCount = bundlesRead.ok ? bundlesRead.value.bundles.length : 0
     const forecastCount = forecastsRead.ok ? forecastsRead.value.forecasts.length : 0
     const marketResults = marketsRead.ok
-      ? (marketsRead.value ?? []).filter((row) => row.lastTrade !== null).length
+      ? marketsRead.value.filter((row) => row.currentPrice !== null).length
       : 0
     const claude = mcpRead.ok
       ? mcpRead.value.clients.find((client) => client.client === "claude_code")
@@ -156,7 +154,10 @@ export function useOwnerEvidence(
     const backupCount = backupsRead.ok ? backupsRead.value.manifests.length : 0
     const paperOwnerEvidence = paperRead.ok
       ? paperRiskEvidence(paperRead.value.value, bootstrap)
-      : unavailableEvidence("Paper and risk evidence is unavailable", paperRead.error)
+      : unavailableEvidence(
+          "Paper trading and risk status are unavailable",
+          "Try again or review Logs & Diagnostics for details.",
+        )
     const providerStep =
       planSteps?.find((step) => step.id === "public_and_zero_fee_providers") ?? null
     const firstResultStep =
@@ -170,9 +171,9 @@ export function useOwnerEvidence(
       goals_and_starter_plan: {
         tone: "recorded",
         complete: true,
-        headline: "Goals and starter plan are durably accepted",
+        headline: "Your goals and starter plan are saved",
         detail:
-          "The setup-plan authority proves this planning outcome. It grants no completion to the independently owned capability steps below.",
+          "The remaining setup items are checked separately so unfinished work stays visible.",
       },
       storage_retention_time_and_disk: storageEvidence(
         storageStep,
@@ -190,13 +191,13 @@ export function useOwnerEvidence(
           ? readinessEvidence(
               researchCount + portfolioCount > 0,
               `${researchCount} research dataset${researchCount === 1 ? "" : "s"} and ${portfolioCount} portfolio account${portfolioCount === 1 ? "" : "s"} are recorded`,
-              "The dataset and portfolio owners supplied durable import evidence.",
+              "Your imported research and portfolio information is available.",
               "No owned-file dataset or portfolio account is recorded",
-              "Use the controlled Research or Portfolio import workflow; operation availability does not count as an import.",
+              "Import a research file or add a portfolio account to continue.",
             )
           : unavailableEvidence(
               "Import evidence is unavailable",
-              joinErrors(researchRead, portfolioRead),
+              "Try again or review Logs & Diagnostics for details.",
             ),
       model_runtime: readinessEvidence(
         bootstrap.modelRuntime.state === "ready",
@@ -213,27 +214,28 @@ export function useOwnerEvidence(
           ? {
               tone: "ready",
               complete: true,
-              headline: `${backupCount} verified backup${backupCount === 1 ? " is" : "s are"} inventoried`,
+              headline: `${backupCount} verified backup${backupCount === 1 ? " is" : "s are"} available`,
               detail:
-                "Operations.ListBackups admits verified product-backup manifests, so this inventory is the backup owner's completion evidence.",
+                "Your verified backup inventory is ready for recovery use.",
             }
           : {
               tone: "unfinished",
               complete: false,
               headline: "No backup is inventoried",
-              detail: "Create and verify a backup through Backup & Recovery, then refresh owner evidence.",
+              detail: "Create and verify a backup through Backup & Recovery, then refresh this check.",
             }
-        : unavailableEvidence("Backup evidence is unavailable", backupsRead.error),
+        : unavailableEvidence(
+            "Backup information is unavailable",
+            "Try again or review Logs & Diagnostics for details.",
+          ),
       review: {
         tone: "recorded",
         complete: false,
-        headline: "Capability review is being derived",
-        detail:
-          "The review completes only after every bounded owner read settles. No separate acknowledgment receipt is fabricated.",
+        headline: "Checking your setup",
+        detail: "This status updates when the checks finish.",
       },
       first_useful_result: firstResultEvidence(firstResultStep, {
         overviewReady: overviewRead.ok,
-        overviewError: overviewRead.ok ? null : overviewRead.error,
         marketsReady: marketsRead.ok,
         marketResults,
         researchReady: researchRead.ok,
@@ -262,7 +264,7 @@ export function useOwnerEvidence(
           complete: false,
           headline: `${plainToken(step.id)} was skipped in this setup run`,
           detail:
-            "The capability remains installed and available when setup resumes. The skip itself never records owner success or counts as completion.",
+            "You can return to this item later. It remains unfinished until its setup checks pass.",
         }
       }
     }
@@ -276,8 +278,8 @@ export function useOwnerEvidence(
       headline: `Capability review completed with ${reviewGapCount} visible gap${reviewGapCount === 1 ? "" : "s"}`,
       detail:
         reviewGapCount === 0
-          ? "Every bounded owner check completed with current evidence."
-          : "Every bounded owner check settled. Unfinished, degraded, skipped-in-this-run, and unavailable capabilities remain visible in this checklist and are not counted as complete.",
+          ? "Every setup check is complete."
+          : "Items that still need attention remain visible in this checklist.",
     }
 
     const errors = collectErrors([
@@ -296,7 +298,11 @@ export function useOwnerEvidence(
       settingsRead,
     ])
     setMap(next)
-    setError(errors.length ? `${errors.length} reads failed. ${errors[0]}` : null)
+    setError(
+      errors.length
+        ? "Some setup information could not be checked. Try again or review Logs & Diagnostics."
+        : null,
+    )
     setRefreshing(false)
   }, [bootstrap, planSteps, transport])
 
@@ -310,8 +316,8 @@ export function useOwnerEvidence(
 async function settle<T>(promise: Promise<T>): Promise<OwnerRead<T>> {
   try {
     return { ok: true, value: await promise }
-  } catch (error) {
-    return { ok: false, error: messageFrom(error, "An owner read failed.") }
+  } catch {
+    return { ok: false, error: "This setup information is unavailable right now." }
   }
 }
 
@@ -321,14 +327,4 @@ function readValue(read: OwnerRead<ApplicationResult>): ApplicationResult | unde
 
 function collectErrors(reads: OwnerRead<unknown>[]) {
   return reads.flatMap((read) => (read.ok ? [] : [read.error]))
-}
-
-function joinErrors(...reads: OwnerRead<unknown>[]) {
-  const errors = collectErrors(reads)
-  return errors.length ? errors.join(" ") : "The owner evidence could not be interpreted."
-}
-
-
-function messageFrom(error: unknown, fallback: string) {
-  return error instanceof Error ? error.message : fallback
 }

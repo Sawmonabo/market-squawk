@@ -41,7 +41,8 @@ use results::{
 };
 use serialization::{source_coverage_value, timestamp_value};
 use unified::{
-    MarketSurfaceRightsPolicy, MarketSurfaceSelectionPolicy, build_unified_market_result,
+    MarketSurfaceRightsPolicy, MarketSurfaceSelectionPolicy, build_market_instrument_result,
+    build_market_overview_result, build_unified_market_result,
 };
 
 const MARKET_GET_SNAPSHOT: &str = "Market.GetSnapshot";
@@ -51,6 +52,8 @@ const MARKET_GET_BOOKS: &str = "Market.GetBooks";
 const MARKET_GET_QUALITY: &str = "Market.GetQuality";
 const MARKET_GET_COMPARISONS: &str = "Market.GetComparisons";
 const MARKET_GET_UNIFIED_FEED: &str = "Market.GetUnifiedFeed";
+const MARKET_GET_OVERVIEW: &str = "Market.GetOverview";
+const MARKET_GET_INSTRUMENT: &str = "Market.GetInstrument";
 const MARKET_SEARCH_UNIVERSE: &str = "Market.SearchUniverse";
 const MAXIMUM_UNIFIED_MARKET_INSTRUMENTS: usize = 4_096;
 const MAXIMUM_UNIFIED_DISPLAY_SOURCES_PER_INSTRUMENT: usize = 256;
@@ -324,7 +327,10 @@ impl ApplicationDomainService for MarketDomainService {
                 limits,
                 &context,
             ),
-            MARKET_GET_UNIFIED_FEED => {
+            MARKET_GET_UNIFIED_FEED | MARKET_GET_OVERVIEW | MARKET_GET_INSTRUMENT => {
+                if request.name() == MARKET_GET_INSTRUMENT && filters.instruments.len() != 1 {
+                    return Err(ServiceError::InvalidRequest);
+                }
                 let display_instrument_ids =
                     load_display_instrument_ids(self.registry.as_ref(), &filters, &context).await?;
                 let market_instrument_ids =
@@ -379,20 +385,51 @@ impl ApplicationDomainService for MarketDomainService {
                     &display_snapshots,
                     &kraken_projection_refs,
                 );
-                build_unified_market_result(
-                    &streams,
-                    &filters,
-                    &definitions,
-                    &market_data_records,
-                    &display_snapshots,
-                    &kraken_projection_refs,
-                    &surface_policies,
-                    &order_level,
-                    reference_at,
-                    source_coverage,
-                    limits,
-                    &context,
-                )
+                match request.name() {
+                    MARKET_GET_UNIFIED_FEED => build_unified_market_result(
+                        &streams,
+                        &filters,
+                        &definitions,
+                        &market_data_records,
+                        &display_snapshots,
+                        &kraken_projection_refs,
+                        &surface_policies,
+                        &order_level,
+                        reference_at,
+                        source_coverage,
+                        limits,
+                        &context,
+                    ),
+                    MARKET_GET_OVERVIEW => build_market_overview_result(
+                        &streams,
+                        &filters,
+                        &definitions,
+                        &market_data_records,
+                        &display_snapshots,
+                        &kraken_projection_refs,
+                        &surface_policies,
+                        &order_level,
+                        reference_at,
+                        snapshots.failures().is_empty(),
+                        limits,
+                        &context,
+                    ),
+                    MARKET_GET_INSTRUMENT => build_market_instrument_result(
+                        &streams,
+                        &filters,
+                        &definitions,
+                        &market_data_records,
+                        &display_snapshots,
+                        &kraken_projection_refs,
+                        &surface_policies,
+                        &order_level,
+                        reference_at,
+                        snapshots.failures().is_empty(),
+                        limits,
+                        &context,
+                    ),
+                    _ => Err(ServiceError::NotFound),
+                }
             }
             _ => Err(ServiceError::NotFound),
         }?;
@@ -417,8 +454,6 @@ fn build_reference_search_result(
     limits: market_squawk_services::ServiceLimits,
     context: &RequestContext,
 ) -> Result<TypedToolResult, ServiceError> {
-    use crate::application::domain_support::encode_hex;
-
     let MarketReferenceSearchPage {
         records,
         available,
@@ -430,32 +465,22 @@ fn build_reference_search_result(
         .map_err(|_error| ServiceError::ResourceExhausted)?;
     for record in records {
         ensure_live(context)?;
-        let quality = match record.quality {
-            DataQuality::OfficialDelayed => "official_delayed",
+        match record.quality {
+            DataQuality::OfficialDelayed => {}
             _ => return Err(ServiceError::InvalidResult),
-        };
+        }
         values.push(serde_json::json!({
             "referenceId": record.reference_id.as_str(),
             "symbol": record.symbol,
             "name": record.security_name.trim(),
-            "venueId": record.venue_id.as_str(),
             "assetClass": match record.asset_class {
                 AssetClass::Equity => "equity",
                 AssetClass::Fund => "fund",
                 _ => return Err(ServiceError::InvalidResult),
             },
-            "referenceOnly": true,
             "isEtf": record.is_etf,
-            "roundLotSize": record.round_lot_size,
-            "directoryPresence": "current_directory",
-            "quality": quality,
             "effectiveAt": timestamp_value(record.effective_at),
             "availableAt": timestamp_value(record.available_at),
-            "sourceId": record.source_id.as_str(),
-            "providerId": record.provider_id.as_str(),
-            "sourcePayloadSha256": encode_hex(record.source_payload_digest.bytes()),
-            "matchKind": record.match_kind.as_str(),
-            "quoteAvailability": "account_required",
         }));
     }
     results::bounded_result(
@@ -463,8 +488,7 @@ fn build_reference_search_result(
         available,
         serde_json::json!({
             "complete": !has_more,
-            "referenceOnly": true,
-            "provider": "nasdaq-trader-symbol-directory",
+            "availability": if values.is_empty() { "unavailable" } else { "available" },
         }),
         serde_json::json!({
             "quality": "official_delayed",

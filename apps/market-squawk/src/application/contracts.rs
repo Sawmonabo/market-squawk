@@ -60,6 +60,18 @@ const DATA_SCOPE: ToolScope = ToolScope::new(
     ScopeRequirement::Required,
     ScopeRequirement::Optional,
 );
+const MARKET_OVERVIEW_SCOPE: ToolScope = ToolScope::new(
+    ScopeRequirement::Optional,
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::Required,
+    ScopeRequirement::NotApplicable,
+);
+const MARKET_INSTRUMENT_SCOPE: ToolScope = ToolScope::new(
+    ScopeRequirement::Required,
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::Required,
+    ScopeRequirement::NotApplicable,
+);
 const JOB_SCOPE: ToolScope = ToolScope::new(
     ScopeRequirement::NotApplicable,
     ScopeRequirement::NotApplicable,
@@ -975,6 +987,22 @@ const OPERATION_SPECS: &[OperationSpec] = &[
     read_data(
         "Market.GetUnifiedFeed",
         "Return one source-preserving market view per exact instrument.",
+    ),
+    read(
+        "Market.GetOverview",
+        "Return provider-neutral current-market summaries selected by Market Squawk.",
+        ServiceDomain::Market,
+        MARKET_OVERVIEW_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        "Market.GetInstrument",
+        "Return provider-neutral current-market detail for one exact instrument.",
+        ServiceDomain::Market,
+        MARKET_INSTRUMENT_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::Required,
     ),
     read(
         "Market.SearchUniverse",
@@ -2441,6 +2469,13 @@ fn schema_for(spec: OperationSpec) -> Value {
     let mut properties = Map::new();
     let mut required = Vec::new();
     insert_scope_schema(&mut properties, &mut required, spec.scope);
+    if spec.name == "Market.GetInstrument"
+        && let Some(instruments) = properties
+            .get_mut("instrumentIds")
+            .and_then(Value::as_object_mut)
+    {
+        instruments.insert("maxItems".to_owned(), Value::from(1));
+    }
     for argument in spec.arguments {
         properties.insert(argument.name.to_owned(), argument_schema(argument.kind));
         if argument.required {
@@ -2647,6 +2682,14 @@ fn admit(spec: OperationSpec, arguments: &Map<String, Value>) -> Result<(), Tool
         admit_fred_latest_known_argument_group(arguments)?;
     }
     admit_scope(arguments, spec.scope, &mut allowed)?;
+    if spec.name == "Market.GetInstrument"
+        && arguments
+            .get("instrumentIds")
+            .and_then(Value::as_array)
+            .is_none_or(|values| values.len() != 1)
+    {
+        return Err(ToolInputError::Invalid);
+    }
     for argument in spec.arguments {
         allowed.insert(argument.name);
         match arguments.get(argument.name) {

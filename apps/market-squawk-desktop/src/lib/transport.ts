@@ -76,14 +76,10 @@ export type DashboardQuery =
       effectiveDateCutoff: string
     }
   | { query: "lookup"; text: string; categories?: string[] }
-  | { query: "marketSnapshot" | "marketQuality" | "marketUnifiedFeed" }
+  | { query: "marketOverview" }
   | { query: "marketUniverse"; text?: string }
   | {
-      query:
-        | "marketTrades"
-        | "marketQuotes"
-        | "marketBooks"
-        | "marketComparisons"
+      query: "marketInstrument"
       instrumentId: string
     }
   | {
