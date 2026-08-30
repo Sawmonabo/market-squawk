@@ -122,34 +122,122 @@ pub enum CapacityUnit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapacityObservation {
     /// Unit measured by requested/returned/missing dispositions.
-    pub unit: CapacityUnit,
+    unit: CapacityUnit,
     /// Work submitted to the provider.
-    pub requested: u64,
+    requested: u64,
     /// Valid unique units returned.
-    pub returned: u64,
+    returned: u64,
     /// Requested units absent from the response.
-    pub missing: u64,
+    missing: u64,
     /// Extra duplicate units, never counted as valid returns.
-    pub duplicates: u64,
+    duplicates: u64,
     /// Returned units rejected by native validation.
-    pub malformed: u64,
+    malformed: u64,
     /// Unrequested units returned by the provider.
-    pub unexpected: u64,
-    /// Exact encoded request bytes.
-    pub request_bytes: u64,
+    unexpected: u64,
+    /// Exact encoded HTTP request-target or Streamer request-payload bytes.
+    request_bytes: u64,
     /// Exact received response bytes.
-    pub response_bytes: u64,
+    response_bytes: u64,
     /// End-to-end request latency in milliseconds.
-    pub latency_ms: u64,
+    latency_ms: u64,
     /// Provider HTTP status, or zero for a Streamer frame.
-    pub status: u16,
+    status: u16,
     /// Whether a Retry-After value was present and validated by the transport.
-    pub retry_after_present: bool,
+    retry_after_present: bool,
     /// Whether parsing or semantic validation failed.
-    pub validation_failed: bool,
+    validation_failed: bool,
 }
 
 impl CapacityObservation {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "transport measurements remain an atomic, response-owned receipt"
+    )]
+    pub(crate) const fn from_transport(
+        unit: CapacityUnit,
+        requested: u64,
+        returned: u64,
+        missing: u64,
+        duplicates: u64,
+        malformed: u64,
+        unexpected: u64,
+        request_bytes: u64,
+        response_bytes: u64,
+        latency_ms: u64,
+        status: u16,
+        retry_after_present: bool,
+        validation_failed: bool,
+    ) -> Self {
+        Self {
+            unit,
+            requested,
+            returned,
+            missing,
+            duplicates,
+            malformed,
+            unexpected,
+            request_bytes,
+            response_bytes,
+            latency_ms,
+            status,
+            retry_after_present,
+            validation_failed,
+        }
+    }
+
+    pub const fn unit(self) -> CapacityUnit {
+        self.unit
+    }
+
+    pub const fn requested(self) -> u64 {
+        self.requested
+    }
+
+    pub const fn returned(self) -> u64 {
+        self.returned
+    }
+
+    pub const fn missing(self) -> u64 {
+        self.missing
+    }
+
+    pub const fn duplicates(self) -> u64 {
+        self.duplicates
+    }
+
+    pub const fn malformed(self) -> u64 {
+        self.malformed
+    }
+
+    pub const fn unexpected(self) -> u64 {
+        self.unexpected
+    }
+
+    pub const fn request_bytes(self) -> u64 {
+        self.request_bytes
+    }
+
+    pub const fn response_bytes(self) -> u64 {
+        self.response_bytes
+    }
+
+    pub const fn latency_ms(self) -> u64 {
+        self.latency_ms
+    }
+
+    pub const fn status(self) -> u16 {
+        self.status
+    }
+
+    pub const fn retry_after_present(self) -> bool {
+        self.retry_after_present
+    }
+
+    pub const fn validation_failed(self) -> bool {
+        self.validation_failed
+    }
+
     /// Validates internally consistent request/return accounting.
     pub fn validate(self) -> Result<Self, SchwabAdapterError> {
         if self.unit == CapacityUnit::Requests {
@@ -215,7 +303,7 @@ pub struct CapacityCounters {
     pub malformed: u64,
     /// Unexpected work.
     pub unexpected: u64,
-    /// Encoded request bytes.
+    /// Encoded HTTP request-target or Streamer request-payload bytes.
     pub request_bytes: u64,
     /// Received response bytes.
     pub response_bytes: u64,

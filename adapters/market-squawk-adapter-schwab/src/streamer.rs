@@ -258,8 +258,13 @@ impl StreamerSubscription {
         field_ids: Vec<u16>,
         admission: StreamerAdmission,
     ) -> Result<Self, SchwabAdapterError> {
+        let key_count = keys.len();
+        let field_count = field_ids.len();
         let keys = keys.into_iter().collect::<BTreeSet<_>>();
         let field_ids = field_ids.into_iter().collect::<BTreeSet<_>>();
+        if keys.len() != key_count || field_ids.len() != field_count {
+            return Err(SchwabAdapterError::InvalidInput);
+        }
         if keys.is_empty()
             || keys.len() > admission.request().max_items()
             || field_ids.is_empty()
@@ -423,6 +428,42 @@ impl DesiredStateController {
             None
         };
         self.desired.insert(combined.service, combined);
+        Ok(request)
+    }
+    pub fn remove_desired(
+        &mut self,
+        removal: StreamerSubscription,
+    ) -> Result<Option<TransientStreamerRequest>, SchwabAdapterError> {
+        let existing = self
+            .desired
+            .get(&removal.service)
+            .cloned()
+            .ok_or(SchwabAdapterError::InvalidInput)?;
+        if !removal.keys.is_subset(&existing.keys) || removal.field_ids != existing.field_ids {
+            return Err(SchwabAdapterError::InvalidInput);
+        }
+        let remaining_keys = existing
+            .keys
+            .difference(&removal.keys)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let request = if matches!(self.state, ConnectionState::Active(_)) {
+            Some(self.subscription_request(&removal, StreamerCommand::Unsubscribe)?)
+        } else {
+            None
+        };
+        if remaining_keys.is_empty() {
+            self.desired.remove(&removal.service);
+        } else {
+            self.desired.insert(
+                removal.service,
+                StreamerSubscription {
+                    service: removal.service,
+                    keys: remaining_keys,
+                    field_ids: existing.field_ids.clone(),
+                },
+            );
+        }
         Ok(request)
     }
     pub fn replay_desired(&mut self) -> Result<Vec<TransientStreamerRequest>, SchwabAdapterError> {

@@ -12,11 +12,12 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use futures_util::StreamExt as _;
 use market_squawk_platform::{
     LocalAuthorityStateStore, LocalAuthorityStateStoreError, LocalSecretStoreError,
     SecretCancellation, SecretDeletionDisposition, SecretGeneration, SecretInteractionPolicy,
-    SecretMutationKind, SecretMutationPlan, SecretOperationControl,
+    SecretKey, SecretMutationKind, SecretMutationPlan, SecretOperationControl,
     SecretReconciliationObservation, SecretRef, SecretStore, SecretValue,
 };
 use reqwest::header::{
@@ -76,6 +77,7 @@ pub enum SchwabOAuthInteraction {
 /// authority in `AwaitingAuthorization` state. The replacement secret is validated before the
 /// durable transition begins.
 pub struct SchwabApplicationCredentialReplacement {
+    series: SecretKey,
     expected: SecretRef,
     replacement: SecretRef,
 }
@@ -94,6 +96,7 @@ pub enum SchwabApplicationCredentialReplacementBinding {
 impl SchwabApplicationCredentialReplacement {
     /// Binds a strictly newer credential generation to the exact current reference.
     pub fn try_new(
+        series: SecretKey,
         expected: SecretRef,
         replacement: SecretRef,
     ) -> Result<Self, SchwabOAuthAuthorityError> {
@@ -103,6 +106,7 @@ impl SchwabApplicationCredentialReplacement {
             return Err(SchwabOAuthAuthorityError::InvalidConfiguration);
         }
         Ok(Self {
+            series,
             expected,
             replacement,
         })
@@ -113,6 +117,7 @@ impl fmt::Debug for SchwabApplicationCredentialReplacement {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SchwabApplicationCredentialReplacement")
+            .field("series", &"[REDACTED CREDENTIAL SERIES]")
             .field("expected_generation", &self.expected.generation())
             .field("replacement_generation", &self.replacement.generation())
             .finish_non_exhaustive()
@@ -334,9 +339,11 @@ impl SchwabOAuthWire for ReqwestSchwabOAuthWire {
         Box<dyn Future<Output = Result<SchwabOAuthWireResponse, SchwabOAuthWireError>> + Send + '_>,
     > {
         Box::pin(async move {
-            let mut authorization = HeaderValue::from_str(request.expose_authorization())
-                .map_err(|_| SchwabOAuthWireError::Protocol)?;
+            let (mut authorization, form) =
+                ReqwestSchwabOAuthRequestMaterial::from_wire(request).into_reqwest()?;
             authorization.set_sensitive(true);
+            // HeaderValue and reqwest Body retain shared `Bytes` backed by zeroizing owners.
+            // Clones share those owners; their final drop clears the exact request buffers.
             let response = self
                 .client
                 .post(SCHWAB_TOKEN_ENDPOINT)
@@ -345,7 +352,7 @@ impl SchwabOAuthWire for ReqwestSchwabOAuthWire {
                 .header(USER_AGENT, USER_AGENT_VALUE)
                 .header(AUTHORIZATION, authorization)
                 .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(request.expose_form().to_owned())
+                .body(form)
                 .send()
                 .await
                 .map_err(|_| SchwabOAuthWireError::Network)?;
@@ -405,6 +412,41 @@ impl SchwabOAuthWire for ReqwestSchwabOAuthWire {
                 self.bounds.max_response_bytes,
             )
         })
+    }
+}
+
+/// Adapter-owned OAuth material at the reqwest transport handoff.
+///
+/// Reqwest necessarily takes its own request buffers while sending. This carrier makes the
+/// narrower enforceable guarantee: no adapter-owned authorization or form buffer survives the
+/// completion of `send`, whether the transport succeeds or fails.
+struct ReqwestSchwabOAuthRequestMaterial {
+    authorization: Zeroizing<Vec<u8>>,
+    form: Zeroizing<Vec<u8>>,
+}
+
+impl ReqwestSchwabOAuthRequestMaterial {
+    fn from_wire(mut request: SchwabOAuthWireRequest) -> Self {
+        Self {
+            authorization: Zeroizing::new(std::mem::take(&mut *request.authorization).into_bytes()),
+            form: Zeroizing::new(std::mem::take(&mut *request.form).into_bytes()),
+        }
+    }
+
+    fn into_reqwest(self) -> Result<(HeaderValue, Bytes), SchwabOAuthWireError> {
+        let Self {
+            authorization,
+            form,
+        } = self;
+        let authorization = HeaderValue::from_maybe_shared(Bytes::from_owner(authorization))
+            .map_err(|_| SchwabOAuthWireError::Protocol)?;
+        Ok((authorization, Bytes::from_owner(form)))
+    }
+}
+
+impl fmt::Debug for ReqwestSchwabOAuthRequestMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReqwestSchwabOAuthRequestMaterial([REDACTED])")
     }
 }
 
@@ -811,9 +853,22 @@ impl ProtectedSchwabOAuthAuthority {
             | DurablePhase::ExchangingAuthorization { .. } => {
                 Ok(SchwabOAuthAuthorityStatus::AwaitingAuthorization)
             }
-            DurablePhase::Active { current, .. } => Ok(SchwabOAuthAuthorityStatus::Active(
-                SchwabOAuthAuthorityReceipt::try_from(&current)?,
-            )),
+            DurablePhase::Active {
+                application,
+                current,
+                ..
+            } => {
+                if current.decision(unix_seconds()?, self.refresh_early_seconds)?
+                    == TokenDecision::Reauthorize
+                {
+                    self.force_reauthorization(application, current).await?;
+                    Ok(SchwabOAuthAuthorityStatus::ReauthorizationRequired)
+                } else {
+                    Ok(SchwabOAuthAuthorityStatus::Active(
+                        SchwabOAuthAuthorityReceipt::try_from(&current)?,
+                    ))
+                }
+            }
             DurablePhase::Refreshing { .. }
             | DurablePhase::Rotating { .. }
             | DurablePhase::ReplacingApplication { .. }
@@ -856,6 +911,17 @@ impl ProtectedSchwabOAuthAuthority {
                 self,
                 binding,
                 SchwabOAuthAuthorityError::ApplicationCredentialMismatch,
+            ));
+        }
+        if let Err(error) = self
+            .validate_application_credential_replacement(&replacement, interaction.policy())
+            .await
+        {
+            drop(guard);
+            return Err(SchwabApplicationCredentialReplacementFailure::new(
+                self,
+                SchwabApplicationCredentialReplacementBinding::Previous,
+                error,
             ));
         }
         let candidate_secret = match self
@@ -1134,6 +1200,7 @@ impl ProtectedSchwabOAuthAuthority {
             }
         };
         if current.decision(now, self.refresh_early_seconds)? == TokenDecision::Reauthorize {
+            self.force_reauthorization(application, current).await?;
             return Err(SchwabOAuthAuthorityError::ReauthorizationRequired);
         }
         let secret = match self
@@ -1180,10 +1247,24 @@ impl ProtectedSchwabOAuthAuthority {
             } => (application, current),
             _ => return Err(SchwabOAuthAuthorityError::InvalidState),
         };
-        let prior_secret = self
+        let prior_secret = match self
             .read_token(&prior, SecretInteractionPolicy::Forbid)
-            .await?;
-        let prior_bundle = ProtectedTokenSecret::try_parse(prior_secret.expose_secret())?;
+            .await
+        {
+            Ok(secret) => secret,
+            Err(error) if token_is_absent(&error) => {
+                self.force_reauthorization(application, prior).await?;
+                return Err(SchwabOAuthAuthorityError::ReauthorizationRequired);
+            }
+            Err(error) => return Err(error),
+        };
+        let prior_bundle = match ProtectedTokenSecret::try_parse(prior_secret.expose_secret()) {
+            Ok(bundle) => bundle,
+            Err(_) => {
+                self.force_reauthorization(application, prior).await?;
+                return Err(SchwabOAuthAuthorityError::ReauthorizationRequired);
+            }
+        };
         let request = self
             .prepare_exchange(
                 &application,
@@ -1634,6 +1715,32 @@ impl ProtectedSchwabOAuthAuthority {
             store.read(&reference, &control)
         })
         .await
+    }
+
+    async fn validate_application_credential_replacement(
+        &self,
+        replacement: &SchwabApplicationCredentialReplacement,
+        interaction: SecretInteractionPolicy,
+    ) -> Result<(), SchwabOAuthAuthorityError> {
+        let store = self.secrets.clone();
+        let series = replacement.series.clone();
+        let expected = replacement.expected.clone();
+        let generation = replacement.replacement.generation();
+        let policy = self.secret_policy;
+        let plan = spawn_secret(move || {
+            let control = secret_control(policy, interaction)?;
+            store.plan_replace(&series, &expected, generation, &control)
+        })
+        .await?;
+        if plan.target() != &replacement.replacement
+            || !matches!(
+                plan.kind(),
+                SecretMutationKind::Replace { current } if current == &replacement.expected
+            )
+        {
+            return Err(SchwabOAuthAuthorityError::ApplicationCredentialMismatch);
+        }
+        Ok(())
     }
 
     async fn read_token(

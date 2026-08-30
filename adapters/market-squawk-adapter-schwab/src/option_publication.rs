@@ -5,7 +5,7 @@ use std::num::NonZeroU16;
 
 use bytes::Bytes;
 use market_squawk_domain::{
-    CalendarDate, Currency, DigestAlgorithm, EvidenceDigest, InstrumentId, MarketDepth, Money,
+    CalendarDate, Currency, DigestAlgorithm, EvidenceDigest, InstrumentId, Money,
     OccOptionIdentity, OptionComponent, OptionComponentState, OptionContractTerms,
     OptionContractTermsInput, OptionExpirationClass, OptionExpirationObservation,
     OptionExpirationObservationInput, OptionKind, OptionSettlementKind, OptionSnapshotObservation,
@@ -17,7 +17,7 @@ use market_squawk_sources::{
     OptionMarketCompleteness, OptionMarketCompletenessInput, OptionMarketCursorState,
     OptionMarketRequestFilter, OptionMarketRequestScope, OptionMarketRequestScopeInput,
     OptionStrikeRange, ProviderCaptureError, ProviderNativeLineageImplementation,
-    ProviderOptionMarketBatch, ProviderOptionMarketNativeLineageBatch,
+    ProviderOptionMarketBatch, ProviderOptionMarketNativeLineageBatch, SchwabMarketDataFamily,
     SealedProviderOptionMarketBinding,
 };
 use rust_decimal::Decimal;
@@ -29,101 +29,73 @@ use crate::rest::ExpirationEntry;
 use crate::transport::SchwabSealedRestResponseParts;
 use crate::{
     NativeField, NativeNumber, NativeScalar, OptionContract, OptionContractField, OptionSide,
-    ProviderIdentifier, ReadOnlyRoute, SchwabResolvedProviderIdentity, SchwabRestDelayEvidence,
-    SchwabRestPayload, SchwabSealedRestResponse,
+    ProviderIdentifier, ReadOnlyRoute, SchwabMarketDataDelay, SchwabMarketDataDepth,
+    SchwabMarketDataQualification, SchwabResolvedProviderIdentity, SchwabRestPayload,
+    SchwabSealedRestResponse,
 };
 
 /// Exact feed/venue/depth/delay and authorization evidence for one REST option response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SchwabRestOptionMarketDataEvidence {
-    feed: SourceIdentifier,
-    venue_id: Option<VenueId>,
-    depth: MarketDepth,
-    delay: SchwabRestDelayEvidence,
-    provider_product: ProviderProduct,
-    provider_channel: ProviderChannel,
-    qualification_evidence: EvidenceDigest,
-    entitlement_evidence: EvidenceDigest,
-    capability_evidence: EvidenceDigest,
+    reference_venue_id: Option<VenueId>,
+    qualification: SchwabMarketDataQualification,
     currency: Currency,
 }
 
 impl SchwabRestOptionMarketDataEvidence {
     /// Constructs caller-qualified option-market semantics without inventing a venue or delay.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "feed, entitlement, and canonical money semantics remain explicit"
-    )]
     pub fn try_new(
-        feed: SourceIdentifier,
-        venue_id: Option<VenueId>,
-        depth: MarketDepth,
-        delay: SchwabRestDelayEvidence,
-        provider_product: ProviderProduct,
-        provider_channel: ProviderChannel,
-        qualification_evidence: EvidenceDigest,
-        entitlement_evidence: EvidenceDigest,
-        capability_evidence: EvidenceDigest,
+        reference_venue_id: Option<VenueId>,
+        qualification: SchwabMarketDataQualification,
         currency: Currency,
     ) -> Result<Self, SchwabRestOptionPublicationError> {
-        for evidence in [
-            qualification_evidence,
-            entitlement_evidence,
-            capability_evidence,
-        ] {
-            require_evidence(evidence)?;
-        }
-        if depth != MarketDepth::TopOfBook {
+        if !matches!(
+            qualification.family(),
+            SchwabMarketDataFamily::OptionChains | SchwabMarketDataFamily::ExpirationChains
+        ) {
             return Err(SchwabRestOptionPublicationError::InvalidEvidence);
         }
         Ok(Self {
-            feed,
-            venue_id,
-            depth,
-            delay,
-            provider_product,
-            provider_channel,
-            qualification_evidence,
-            entitlement_evidence,
-            capability_evidence,
+            reference_venue_id,
+            qualification,
             currency,
         })
     }
 
     pub const fn feed(&self) -> &SourceIdentifier {
-        &self.feed
+        self.qualification.feed()
     }
 
     pub const fn venue_id(&self) -> Option<&VenueId> {
-        self.venue_id.as_ref()
+        self.reference_venue_id.as_ref()
     }
 
-    pub const fn depth(&self) -> MarketDepth {
-        self.depth
+    pub const fn depth(&self) -> SchwabMarketDataDepth {
+        self.qualification.depth()
     }
 
-    pub const fn delay(&self) -> SchwabRestDelayEvidence {
-        self.delay
+    pub const fn delay(&self) -> SchwabMarketDataDelay {
+        self.qualification.delay()
     }
 
     pub const fn provider_product(&self) -> &ProviderProduct {
-        &self.provider_product
+        self.qualification.provider_product()
     }
 
     pub const fn provider_channel(&self) -> &ProviderChannel {
-        &self.provider_channel
+        self.qualification.provider_channel()
     }
 
     pub const fn qualification_evidence(&self) -> EvidenceDigest {
-        self.qualification_evidence
+        self.qualification.observation_evidence()
     }
 
     pub const fn entitlement_evidence(&self) -> EvidenceDigest {
-        self.entitlement_evidence
+        self.qualification.entitlement_evidence()
     }
 
     pub const fn capability_evidence(&self) -> EvidenceDigest {
-        self.capability_evidence
+        self.qualification.capability_evidence()
     }
 
     pub const fn currency(&self) -> Currency {
@@ -308,6 +280,18 @@ impl SchwabSealedRestResponse {
         }
         validate_underlying(&self, &request.underlying)?;
         let parts = self.parts();
+        let qualification_family = match parts.receipt.route() {
+            ReadOnlyRoute::Chains => SchwabMarketDataFamily::OptionChains,
+            ReadOnlyRoute::ExpirationChain => SchwabMarketDataFamily::ExpirationChains,
+            _ => return Err(SchwabRestOptionPublicationError::FamilyMismatch),
+        };
+        if !request
+            .market_data
+            .qualification
+            .validates_rest_receipt(qualification_family, &parts.receipt)
+        {
+            return Err(SchwabRestOptionPublicationError::InvalidEvidence);
+        }
         let received_at = timestamp_from_millis(parts.receipt.received_at_unix_millis())?;
         if request.ingested_at < received_at {
             return Err(SchwabRestOptionPublicationError::InvalidEvidence);
@@ -377,16 +361,16 @@ impl SchwabSealedRestResponse {
             source_id: parts.coordinates.source_id().clone(),
             metadata_revision: parts.coordinates.metadata_revision().clone(),
             dataset: parts.coordinates.dataset().clone(),
-            provider_product: request.market_data.provider_product.clone(),
-            provider_channel: request.market_data.provider_channel.clone(),
-            venue_id: request.market_data.venue_id.clone(),
+            provider_product: request.market_data.provider_product().clone(),
+            provider_channel: request.market_data.provider_channel().clone(),
+            venue_id: request.market_data.reference_venue_id.clone(),
             underlying_instrument_id: request.underlying.instrument_id,
             underlying_definition_revision: request.underlying.definition_revision,
             provider_instrument_id: request.underlying.identity.provider_instrument_id().clone(),
             request_identity: capture.request_set_identity(),
             observation_identity: capture.observation_digest(),
-            entitlement_evidence: request.market_data.entitlement_evidence,
-            capability_evidence: request.market_data.capability_evidence,
+            entitlement_evidence: request.market_data.entitlement_evidence(),
+            capability_evidence: request.market_data.capability_evidence(),
             available_at: received_at,
             received_at,
             ingested_at: request.ingested_at,
@@ -1286,13 +1270,18 @@ struct SchwabOptionNativeSidecarV1<'a> {
     unexpected_items: u64,
     provider_records: u64,
     feed: &'a str,
-    venue: Option<&'a str>,
-    depth: MarketDepth,
-    delay: SchwabRestDelayEvidence,
+    reference_venue: Option<&'a str>,
+    provider_reported_venue: Option<&'a str>,
+    depth: SchwabMarketDataDepth,
+    delay: SchwabMarketDataDelay,
     provider_product: &'a str,
     provider_channel: &'a str,
     currency: &'a str,
     qualification_evidence: EvidenceDigest,
+    qualification_receipt_evidence: EvidenceDigest,
+    qualification_family: SchwabMarketDataFamily,
+    qualification_observed_at: Timestamp,
+    qualification_response_observed_at: Timestamp,
     entitlement_evidence: EvidenceDigest,
     capability_evidence: EvidenceDigest,
     chain: Option<SchwabOptionChainSemanticsV1<'a>>,
@@ -1389,16 +1378,21 @@ fn encode_sidecar(
         missing_items: parts.accounting.missing,
         unexpected_items: parts.accounting.unexpected,
         provider_records: parts.accounting.provider_records,
-        feed: market.feed.as_str(),
-        venue: market.venue_id.as_ref().map(VenueId::as_str),
-        depth: market.depth,
-        delay: market.delay,
-        provider_product: market.provider_product.as_source_identifier().as_str(),
-        provider_channel: market.provider_channel.as_source_identifier().as_str(),
+        feed: market.feed().as_str(),
+        reference_venue: market.reference_venue_id.as_ref().map(VenueId::as_str),
+        provider_reported_venue: None,
+        depth: market.depth(),
+        delay: market.delay(),
+        provider_product: market.provider_product().as_source_identifier().as_str(),
+        provider_channel: market.provider_channel().as_source_identifier().as_str(),
         currency: market.currency.as_str(),
-        qualification_evidence: market.qualification_evidence,
-        entitlement_evidence: market.entitlement_evidence,
-        capability_evidence: market.capability_evidence,
+        qualification_evidence: market.qualification_evidence(),
+        qualification_receipt_evidence: market.qualification.receipt_evidence(),
+        qualification_family: market.qualification.family(),
+        qualification_observed_at: market.qualification.family_observed_at(),
+        qualification_response_observed_at: market.qualification.response_observed_at(),
+        entitlement_evidence: market.entitlement_evidence(),
+        capability_evidence: market.capability_evidence(),
         chain,
         unknown_field_count: unknown.field_count(),
         unknown_field_bytes: unknown.encoded_bytes(),

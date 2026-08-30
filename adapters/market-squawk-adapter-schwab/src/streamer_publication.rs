@@ -17,72 +17,39 @@ use thiserror::Error;
 
 use crate::streamer::StreamerContent;
 use crate::{
-    MarketDataService, NativeScalar, SchwabCanonicalError, SchwabQuoteAbstention,
-    SchwabQuoteCanonicalOutcome, SchwabResolvedProviderIdentity, SchwabSealedStreamerCapture,
+    MarketDataService, NativeScalar, SchwabCanonicalError, SchwabMarketDataDelay,
+    SchwabMarketDataQualification, SchwabQuoteAbstention, SchwabQuoteCanonicalOutcome,
+    SchwabResolvedProviderIdentity, SchwabSealedStreamerCapture, SchwabStreamerFamilyDoctorHandoff,
     SchwabStreamerFieldDictionary, SchwabStreamerFrameSealEvidence, StreamerNativeValue,
     StreamerNestedField, canonicalize_streamer_batch, canonicalize_streamer_quote_record,
 };
-
-/// Exact Streamer delay state. Unknown remains explicit and is never promoted to real-time.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "nanoseconds")]
-pub enum SchwabStreamerDelayEvidence {
-    /// The current qualification evidence establishes real-time delivery.
-    RealTime,
-    /// The current qualification evidence establishes a positive delay.
-    Delayed(std::num::NonZeroU64),
-    /// The current qualification evidence does not establish a numeric delay.
-    Unknown,
-}
 
 /// Provider/feed/venue/depth/quality evidence for one Level-One Streamer quote record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SchwabStreamerQuoteMarketDataEvidence {
     service: MarketDataService,
-    feed: SourceIdentifier,
-    venue_id: VenueId,
-    depth: MarketDepth,
-    delay: SchwabStreamerDelayEvidence,
-    quality: DataQuality,
-    provider_product: ProviderProduct,
-    provider_channel: ProviderChannel,
-    qualification_evidence: EvidenceDigest,
+    reference_venue_id: VenueId,
+    qualification: SchwabMarketDataQualification,
 }
 
 impl SchwabStreamerQuoteMarketDataEvidence {
     /// Constructs exact market evidence for one selected Level-One service.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "provider qualification coordinates remain explicit"
-    )]
     pub fn try_new(
-        service: MarketDataService,
-        feed: SourceIdentifier,
-        venue_id: VenueId,
-        depth: MarketDepth,
-        delay: SchwabStreamerDelayEvidence,
-        quality: DataQuality,
-        provider_product: ProviderProduct,
-        provider_channel: ProviderChannel,
-        qualification_evidence: EvidenceDigest,
+        reference_venue_id: VenueId,
+        qualification: SchwabMarketDataQualification,
     ) -> Result<Self, SchwabStreamerPublicationError> {
+        let service = qualification
+            .streamer_service()
+            .ok_or(SchwabStreamerPublicationError::InvalidEvidence)?;
         if !is_level_one(service)
-            || depth != MarketDepth::TopOfBook
-            || qualification_evidence.algorithm() != DigestAlgorithm::Sha256
-            || qualification_evidence.bytes() == [0; 32]
+            || qualification.depth().canonical() != Some(MarketDepth::TopOfBook)
         {
             return Err(SchwabStreamerPublicationError::InvalidEvidence);
         }
         Ok(Self {
             service,
-            feed,
-            venue_id,
-            depth,
-            delay,
-            quality,
-            provider_product,
-            provider_channel,
-            qualification_evidence,
+            reference_venue_id,
+            qualification,
         })
     }
 
@@ -93,42 +60,42 @@ impl SchwabStreamerQuoteMarketDataEvidence {
 
     /// Exact qualified provider feed label.
     pub const fn feed(&self) -> &SourceIdentifier {
-        &self.feed
+        self.qualification.feed()
     }
 
     /// Exact venue represented by this record.
     pub const fn venue_id(&self) -> &VenueId {
-        &self.venue_id
+        &self.reference_venue_id
     }
 
     /// Exact admitted depth; Level-One quote publication requires top-of-book.
     pub const fn depth(&self) -> MarketDepth {
-        self.depth
+        MarketDepth::TopOfBook
     }
 
     /// Explicit delay evidence.
-    pub const fn delay(&self) -> SchwabStreamerDelayEvidence {
-        self.delay
+    pub const fn delay(&self) -> SchwabMarketDataDelay {
+        self.qualification.delay()
     }
 
     /// Exact archival quality retained by the canonical event.
     pub const fn quality(&self) -> DataQuality {
-        self.quality
+        self.qualification.quality()
     }
 
     /// Exact provider-product binding retained by canonical provenance.
     pub const fn provider_product(&self) -> &ProviderProduct {
-        &self.provider_product
+        self.qualification.provider_product()
     }
 
     /// Exact provider-channel binding retained by canonical provenance.
     pub const fn provider_channel(&self) -> &ProviderChannel {
-        &self.provider_channel
+        self.qualification.provider_channel()
     }
 
     /// Nonzero SHA-256 qualification evidence for the supplied market semantics.
     pub const fn qualification_evidence(&self) -> EvidenceDigest {
-        self.qualification_evidence
+        self.qualification.observation_evidence()
     }
 }
 
@@ -185,15 +152,22 @@ impl SchwabStreamerQuoteRecordRequest {
 
 /// Complete caller-owned mapping inputs for one already sealed Streamer microbatch.
 #[derive(Debug)]
-pub struct SchwabStreamerQuotePublicationRequest {
+pub struct SchwabStreamerQuotePublicationRequest<'a> {
+    doctor_handoff: &'a SchwabStreamerFamilyDoctorHandoff,
     records: Vec<SchwabStreamerQuoteRecordRequest>,
 }
 
-impl SchwabStreamerQuotePublicationRequest {
+impl<'a> SchwabStreamerQuotePublicationRequest<'a> {
     /// Constructs a bounded record mapping request; duplicate logical coordinates are rejected
     /// when the sealed capture is consumed.
-    pub fn new(records: Vec<SchwabStreamerQuoteRecordRequest>) -> Self {
-        Self { records }
+    pub fn new(
+        doctor_handoff: &'a SchwabStreamerFamilyDoctorHandoff,
+        records: Vec<SchwabStreamerQuoteRecordRequest>,
+    ) -> Self {
+        Self {
+            doctor_handoff,
+            records,
+        }
     }
 }
 
@@ -309,8 +283,22 @@ impl SchwabSealedStreamerCapture {
     /// Maps Level-One content only after the exact raw frames have crossed the physical seal.
     pub fn into_level_one_quote_publication(
         self,
-        request: SchwabStreamerQuotePublicationRequest,
+        request: SchwabStreamerQuotePublicationRequest<'_>,
     ) -> Result<SchwabStreamerQuotePublicationOutcome, SchwabStreamerPublicationError> {
+        if request.records.is_empty()
+            || request.records.iter().any(|input| {
+                !input
+                    .market_data
+                    .qualification
+                    .validates_streamer_publication(
+                        input.market_data.service,
+                        request.doctor_handoff,
+                        &self,
+                    )
+            })
+        {
+            return Err(SchwabStreamerPublicationError::InvalidEvidence);
+        }
         let mut inputs = BTreeMap::new();
         for input in request.records {
             let coordinate = (
@@ -478,7 +466,18 @@ impl SchwabSealedStreamerCapture {
             )));
         }
 
-        let sidecar = encode_sidecar(&self, &dispositions)?;
+        let qualification = inputs
+            .values()
+            .next()
+            .map(|input| &input.market_data.qualification)
+            .ok_or(SchwabStreamerPublicationError::InvalidEvidence)?;
+        if inputs
+            .values()
+            .any(|input| &input.market_data.qualification != qualification)
+        {
+            return Err(SchwabStreamerPublicationError::InvalidEvidence);
+        }
+        let sidecar = encode_sidecar(&self, qualification, &dispositions)?;
         let crate::transport::SchwabSealedStreamerCaptureParts {
             token, coordinates, ..
         } = self.into_parts();
@@ -524,23 +523,23 @@ fn validate_mapping(
             .map_err(|_| SchwabStreamerPublicationError::InvalidEvidence)?;
     if record.service != input.market_data.service
         || record.provider_identifier != *input.identity.provider_symbol()
-        || input.market_data.depth != MarketDepth::TopOfBook
+        || input.market_data.depth() != MarketDepth::TopOfBook
         || input.identity.resolution_evidence().algorithm() != DigestAlgorithm::Sha256
         || input.identity.resolution_evidence().bytes() == [0; 32]
         || binding.source_id() != coordinates.source_id()
         || binding.metadata_revision() != coordinates.metadata_revision()
         || binding.session_id() != stream_identity
-        || binding.venue_id() != &input.market_data.venue_id
+        || binding.venue_id() != input.market_data.venue_id()
         || binding.instrument_id() != input.instrument_id
         || binding.connection_generation() != connection_generation
-        || binding.provider_product() != &input.market_data.provider_product
-        || binding.provider_channel() != &input.market_data.provider_channel
+        || binding.provider_product() != input.market_data.provider_product()
+        || binding.provider_channel() != input.market_data.provider_channel()
         || binding.event_class() != LiveEventClass::Quote
         || binding.source_identifier() != &input.source_identifier
         || binding.payload_digest() != frame.payload_digest()
         || input.provenance.source_timestamp() != record.provider_envelope_timestamp
         || input.provenance.received_at() != received_at
-        || input.provenance.recorded_quality() != input.market_data.quality
+        || input.provenance.recorded_quality() != input.market_data.quality()
     {
         return Err(SchwabStreamerPublicationError::InvalidEvidence);
     }
@@ -606,13 +605,18 @@ struct SchwabStreamerQuoteNativeRowV1<'a> {
     provider_source_identifier: &'a str,
     resolution_evidence: EvidenceDigest,
     feed: &'a str,
-    venue: &'a str,
+    reference_venue: &'a str,
+    provider_reported_venue: Option<&'a str>,
     depth: MarketDepth,
-    delay: SchwabStreamerDelayEvidence,
+    delay: SchwabMarketDataDelay,
     quality: DataQuality,
     provider_product: &'a str,
     provider_channel: &'a str,
     qualification_evidence: EvidenceDigest,
+    qualification_receipt_evidence: EvidenceDigest,
+    qualification_family: market_squawk_sources::SchwabMarketDataFamily,
+    qualification_observed_at: Timestamp,
+    qualification_response_observed_at: Timestamp,
 }
 
 #[derive(Serialize)]
@@ -677,22 +681,27 @@ fn encode_native_row(
         provider_instrument_id: input.identity.provider_instrument_id().as_str(),
         provider_source_identifier: input.source_identifier.as_str(),
         resolution_evidence: input.identity.resolution_evidence(),
-        feed: input.market_data.feed.as_str(),
-        venue: input.market_data.venue_id.as_str(),
-        depth: input.market_data.depth,
-        delay: input.market_data.delay,
-        quality: input.market_data.quality,
+        feed: input.market_data.feed().as_str(),
+        reference_venue: input.market_data.venue_id().as_str(),
+        provider_reported_venue: None,
+        depth: input.market_data.depth(),
+        delay: input.market_data.delay(),
+        quality: input.market_data.quality(),
         provider_product: input
             .market_data
-            .provider_product
+            .provider_product()
             .as_source_identifier()
             .as_str(),
         provider_channel: input
             .market_data
-            .provider_channel
+            .provider_channel()
             .as_source_identifier()
             .as_str(),
-        qualification_evidence: input.market_data.qualification_evidence,
+        qualification_evidence: input.market_data.qualification_evidence(),
+        qualification_receipt_evidence: input.market_data.qualification.receipt_evidence(),
+        qualification_family: input.market_data.qualification.family(),
+        qualification_observed_at: input.market_data.qualification.family_observed_at(),
+        qualification_response_observed_at: input.market_data.qualification.response_observed_at(),
     })
     .map(Bytes::from)
     .map_err(|_| SchwabStreamerPublicationError::NativeEncoding)
@@ -754,6 +763,11 @@ struct SchwabStreamerNativeSidecarV1<'a> {
     last_received_at_unix_millis: u64,
     content_sha256: [u8; 32],
     observation_sha256: [u8; 32],
+    qualification_receipt_evidence: EvidenceDigest,
+    qualification_family: market_squawk_sources::SchwabMarketDataFamily,
+    qualification_observation_evidence: EvidenceDigest,
+    qualification_observed_at: Timestamp,
+    qualification_response_observed_at: Timestamp,
     frames: Vec<SchwabStreamerFrameNativeSidecarV1<'a>>,
     dispositions: Vec<SchwabStreamerDispositionSidecarV1<'a>>,
 }
@@ -791,6 +805,7 @@ struct SchwabStreamerDispositionSidecarV1<'a> {
 
 fn encode_sidecar(
     capture: &SchwabSealedStreamerCapture,
+    qualification: &SchwabMarketDataQualification,
     dispositions: &[SchwabStreamerRecordDisposition],
 ) -> Result<Bytes, SchwabStreamerPublicationError> {
     let receipt = capture.streamer_receipt();
@@ -849,6 +864,11 @@ fn encode_sidecar(
         last_received_at_unix_millis: receipt.last_received_at_unix_millis(),
         content_sha256: receipt.content_sha256(),
         observation_sha256: receipt.observation_sha256(),
+        qualification_receipt_evidence: qualification.receipt_evidence(),
+        qualification_family: qualification.family(),
+        qualification_observation_evidence: qualification.observation_evidence(),
+        qualification_observed_at: qualification.family_observed_at(),
+        qualification_response_observed_at: qualification.response_observed_at(),
         frames,
         dispositions: disposition_rows,
     })

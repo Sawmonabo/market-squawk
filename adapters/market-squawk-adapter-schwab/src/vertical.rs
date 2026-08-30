@@ -8,7 +8,13 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
+use market_squawk_domain::{
+    CoverageDelay, DataQuality, DigestAlgorithm, EvidenceDigest, MarketDepth, ProviderChannel,
+    ProviderProduct, SourceIdentifier, Timestamp,
+};
+use market_squawk_sources::{
+    RuntimeCapabilityDisposition, SchwabMarketDataDoctorReceiptV1, SchwabMarketDataFamily,
+};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -30,6 +36,396 @@ pub enum SchwabObservedCapabilityFamily {
     Movers,
     Instruments,
     Streamer(MarketDataService),
+}
+
+/// Exact delivery timing established by the current family qualification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "nanoseconds")]
+pub enum SchwabMarketDataDelay {
+    RealTime,
+    Delayed(NonZeroU64),
+    Unknown,
+}
+
+/// Exact market depth established by the current family qualification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchwabMarketDataDepth {
+    TopOfBook,
+    PriceLevel,
+    NotReported,
+}
+
+impl SchwabMarketDataDepth {
+    pub(crate) const fn canonical(self) -> Option<MarketDepth> {
+        match self {
+            Self::TopOfBook => Some(MarketDepth::TopOfBook),
+            Self::PriceLevel => Some(MarketDepth::PriceLevel),
+            Self::NotReported => None,
+        }
+    }
+}
+
+/// Opaque, family-scoped authority minted only from a current Schwab doctor receipt.
+///
+/// Callers can retain or clone this proof, but cannot manufacture any of its market semantics or
+/// receipt digests independently.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchwabMarketDataQualification {
+    family: SchwabMarketDataFamily,
+    disposition: RuntimeCapabilityDisposition,
+    response_observed_at: Timestamp,
+    family_observed_at: Timestamp,
+    token_generation: AccessTokenGeneration,
+    receipt_evidence: EvidenceDigest,
+    observation_evidence: EvidenceDigest,
+    disposition_evidence: EvidenceDigest,
+    entitlement_evidence: EvidenceDigest,
+    capability_evidence: EvidenceDigest,
+    feed: SourceIdentifier,
+    depth: SchwabMarketDataDepth,
+    delay: SchwabMarketDataDelay,
+    quality: DataQuality,
+    provider_product: ProviderProduct,
+    provider_channel: ProviderChannel,
+}
+
+impl SchwabMarketDataQualification {
+    pub fn try_from_doctor_receipt(
+        doctor: &SchwabMarketDataDoctorReceiptV1,
+        family: SchwabMarketDataFamily,
+        response_observed_at: Timestamp,
+        token_generation: AccessTokenGeneration,
+    ) -> Result<Self, SchwabVerticalError> {
+        let evidence = doctor
+            .observation()
+            .families
+            .iter()
+            .find(|evidence| evidence.family == family)
+            .ok_or(SchwabVerticalError::InvalidCapabilityEvidence)?;
+        let family_observed_at = evidence
+            .observed_at
+            .ok_or(SchwabVerticalError::InvalidCapabilityEvidence)?;
+        let observation_evidence = evidence
+            .observation_sha256
+            .ok_or(SchwabVerticalError::InvalidCapabilityEvidence)?;
+        let receipt_evidence = doctor.receipt_sha256();
+        let entitlement_evidence = doctor.rights_decision_digest();
+        let capability_evidence = doctor.capability_digest();
+        for digest in [
+            receipt_evidence,
+            observation_evidence,
+            evidence.disposition_evidence_sha256,
+            entitlement_evidence,
+            capability_evidence,
+        ] {
+            require_qualification_digest(digest)?;
+        }
+        if !doctor.is_current_at(response_observed_at)
+            || doctor.access_token_generation() != token_generation.get()
+            || family_observed_at > doctor.verified_at()
+            || family_observed_at > response_observed_at
+            || !matches!(
+                evidence.disposition,
+                RuntimeCapabilityDisposition::Available | RuntimeCapabilityDisposition::Degraded
+            )
+        {
+            return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+        }
+
+        let (product, channel, depth) = qualification_semantics(family);
+        let feed = SourceIdentifier::try_from(channel)
+            .map_err(|_| SchwabVerticalError::InvalidCapabilityEvidence)?;
+        let provider_product = ProviderProduct::new(
+            SourceIdentifier::try_from(product)
+                .map_err(|_| SchwabVerticalError::InvalidCapabilityEvidence)?,
+        );
+        let provider_channel = ProviderChannel::new(feed.clone());
+        let delay = match (family, doctor.quote_delay()) {
+            (SchwabMarketDataFamily::Quotes, Some(CoverageDelay::RealTime)) => {
+                SchwabMarketDataDelay::RealTime
+            }
+            (SchwabMarketDataFamily::Quotes, Some(CoverageDelay::Delayed(value))) => {
+                SchwabMarketDataDelay::Delayed(
+                    NonZeroU64::new(value).ok_or(SchwabVerticalError::InvalidCapabilityEvidence)?,
+                )
+            }
+            (SchwabMarketDataFamily::Quotes, None) => {
+                return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+            }
+            _ => SchwabMarketDataDelay::Unknown,
+        };
+        let quality = if matches!(delay, SchwabMarketDataDelay::Delayed(_)) {
+            DataQuality::OfficialDelayed
+        } else {
+            DataQuality::DirectUnverified
+        };
+        Ok(Self {
+            family,
+            disposition: evidence.disposition,
+            response_observed_at,
+            family_observed_at,
+            token_generation,
+            receipt_evidence,
+            observation_evidence,
+            disposition_evidence: evidence.disposition_evidence_sha256,
+            entitlement_evidence,
+            capability_evidence,
+            feed,
+            depth,
+            delay,
+            quality,
+            provider_product,
+            provider_channel,
+        })
+    }
+
+    pub const fn family(&self) -> SchwabMarketDataFamily {
+        self.family
+    }
+    pub const fn disposition(&self) -> RuntimeCapabilityDisposition {
+        self.disposition
+    }
+    pub const fn response_observed_at(&self) -> Timestamp {
+        self.response_observed_at
+    }
+    pub const fn family_observed_at(&self) -> Timestamp {
+        self.family_observed_at
+    }
+    pub const fn token_generation(&self) -> AccessTokenGeneration {
+        self.token_generation
+    }
+    pub const fn receipt_evidence(&self) -> EvidenceDigest {
+        self.receipt_evidence
+    }
+    pub const fn observation_evidence(&self) -> EvidenceDigest {
+        self.observation_evidence
+    }
+    pub const fn disposition_evidence(&self) -> EvidenceDigest {
+        self.disposition_evidence
+    }
+    pub const fn entitlement_evidence(&self) -> EvidenceDigest {
+        self.entitlement_evidence
+    }
+    pub const fn capability_evidence(&self) -> EvidenceDigest {
+        self.capability_evidence
+    }
+    pub const fn feed(&self) -> &SourceIdentifier {
+        &self.feed
+    }
+    pub const fn depth(&self) -> SchwabMarketDataDepth {
+        self.depth
+    }
+    pub const fn delay(&self) -> SchwabMarketDataDelay {
+        self.delay
+    }
+    pub const fn quality(&self) -> DataQuality {
+        self.quality
+    }
+    pub const fn provider_product(&self) -> &ProviderProduct {
+        &self.provider_product
+    }
+    pub const fn provider_channel(&self) -> &ProviderChannel {
+        &self.provider_channel
+    }
+    pub const fn rest_service(&self) -> Option<&'static str> {
+        match self.family {
+            SchwabMarketDataFamily::Quotes
+            | SchwabMarketDataFamily::PriceHistory
+            | SchwabMarketDataFamily::OptionChains
+            | SchwabMarketDataFamily::ExpirationChains
+            | SchwabMarketDataFamily::Movers
+            | SchwabMarketDataFamily::MarketHours
+            | SchwabMarketDataFamily::Instruments => Some("schwab-market-data-rest"),
+            _ => None,
+        }
+    }
+    pub const fn streamer_service(&self) -> Option<MarketDataService> {
+        family_streamer_service(self.family)
+    }
+
+    pub(crate) fn validates_rest_response(
+        &self,
+        family: SchwabMarketDataFamily,
+        response: &ExecutedRestResponse,
+    ) -> bool {
+        self.validates_rest_receipt(family, response.capture().receipt())
+    }
+
+    pub(crate) fn validates_rest_receipt(
+        &self,
+        family: SchwabMarketDataFamily,
+        receipt: &crate::RawRestResponseReceipt,
+    ) -> bool {
+        self.family == family
+            && self.rest_service().is_some()
+            && receipt.token_generation() == self.token_generation
+            && millis_timestamp(receipt.received_at_unix_millis())
+                .is_some_and(|received_at| received_at == self.response_observed_at)
+    }
+
+    pub(crate) fn validates_streamer_publication(
+        &self,
+        service: MarketDataService,
+        handoff: &SchwabStreamerFamilyDoctorHandoff,
+        capture: &SchwabSealedStreamerCapture,
+    ) -> bool {
+        let receipt = capture.streamer_receipt();
+        let last_ack_ordinal = handoff
+            .capture_frame_ordinals(handoff.capture_count().saturating_sub(1))
+            .map(|(_, last)| last);
+        self.streamer_service() == Some(service)
+            && handoff.service() == service
+            && handoff.token_generation() == self.token_generation
+            && receipt.token_generation() == self.token_generation
+            && handoff.generation() == receipt.generation()
+            && last_ack_ordinal.is_some_and(|last| {
+                capture
+                    .frames()
+                    .first()
+                    .is_some_and(|frame| frame.transport_ordinal() > last)
+            })
+            && capture.service_responses().is_empty()
+            && capture.parsed_frames().iter().all(|frame| {
+                frame
+                    .value()
+                    .data
+                    .iter()
+                    .all(|batch| batch.service == service)
+            })
+            && capture
+                .frames()
+                .last()
+                .and_then(|frame| millis_timestamp(frame.received_at_unix_millis()))
+                .is_some_and(|received_at| received_at == self.response_observed_at)
+    }
+}
+
+fn require_qualification_digest(digest: EvidenceDigest) -> Result<(), SchwabVerticalError> {
+    if digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32] {
+        return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+    }
+    Ok(())
+}
+
+const fn qualification_semantics(
+    family: SchwabMarketDataFamily,
+) -> (&'static str, &'static str, SchwabMarketDataDepth) {
+    match family {
+        SchwabMarketDataFamily::Quotes => (
+            "schwab-rest",
+            "schwab-rest-quotes",
+            SchwabMarketDataDepth::TopOfBook,
+        ),
+        SchwabMarketDataFamily::PriceHistory => (
+            "schwab-rest",
+            "schwab-rest-price-history",
+            SchwabMarketDataDepth::NotReported,
+        ),
+        SchwabMarketDataFamily::OptionChains => (
+            "schwab-rest",
+            "schwab-rest-option-chains",
+            SchwabMarketDataDepth::TopOfBook,
+        ),
+        SchwabMarketDataFamily::ExpirationChains => (
+            "schwab-rest",
+            "schwab-rest-expiration-chains",
+            SchwabMarketDataDepth::NotReported,
+        ),
+        SchwabMarketDataFamily::Movers => (
+            "schwab-rest",
+            "schwab-rest-movers",
+            SchwabMarketDataDepth::NotReported,
+        ),
+        SchwabMarketDataFamily::MarketHours => (
+            "schwab-rest",
+            "schwab-rest-market-hours",
+            SchwabMarketDataDepth::NotReported,
+        ),
+        SchwabMarketDataFamily::Instruments => (
+            "schwab-rest",
+            "schwab-rest-instruments",
+            SchwabMarketDataDepth::NotReported,
+        ),
+        SchwabMarketDataFamily::LevelOneEquities => (
+            "schwab-streamer",
+            "schwab-streamer-level-one-equities",
+            SchwabMarketDataDepth::TopOfBook,
+        ),
+        SchwabMarketDataFamily::LevelOneOptions => (
+            "schwab-streamer",
+            "schwab-streamer-level-one-options",
+            SchwabMarketDataDepth::TopOfBook,
+        ),
+        SchwabMarketDataFamily::LevelOneFutures => (
+            "schwab-streamer",
+            "schwab-streamer-level-one-futures",
+            SchwabMarketDataDepth::TopOfBook,
+        ),
+        SchwabMarketDataFamily::LevelOneFuturesOptions => (
+            "schwab-streamer",
+            "schwab-streamer-level-one-futures-options",
+            SchwabMarketDataDepth::TopOfBook,
+        ),
+        SchwabMarketDataFamily::LevelOneForex => (
+            "schwab-streamer",
+            "schwab-streamer-level-one-forex",
+            SchwabMarketDataDepth::TopOfBook,
+        ),
+        SchwabMarketDataFamily::NyseBook => (
+            "schwab-streamer",
+            "schwab-streamer-nyse-book",
+            SchwabMarketDataDepth::PriceLevel,
+        ),
+        SchwabMarketDataFamily::NasdaqBook => (
+            "schwab-streamer",
+            "schwab-streamer-nasdaq-book",
+            SchwabMarketDataDepth::PriceLevel,
+        ),
+        SchwabMarketDataFamily::OptionsBook => (
+            "schwab-streamer",
+            "schwab-streamer-options-book",
+            SchwabMarketDataDepth::PriceLevel,
+        ),
+        SchwabMarketDataFamily::ChartEquity => (
+            "schwab-streamer",
+            "schwab-streamer-chart-equity",
+            SchwabMarketDataDepth::NotReported,
+        ),
+        SchwabMarketDataFamily::ChartFutures => (
+            "schwab-streamer",
+            "schwab-streamer-chart-futures",
+            SchwabMarketDataDepth::NotReported,
+        ),
+        SchwabMarketDataFamily::ScreenerEquity => (
+            "schwab-streamer",
+            "schwab-streamer-screener-equity",
+            SchwabMarketDataDepth::NotReported,
+        ),
+        SchwabMarketDataFamily::ScreenerOption => (
+            "schwab-streamer",
+            "schwab-streamer-screener-option",
+            SchwabMarketDataDepth::NotReported,
+        ),
+    }
+}
+
+const fn family_streamer_service(family: SchwabMarketDataFamily) -> Option<MarketDataService> {
+    Some(match family {
+        SchwabMarketDataFamily::LevelOneEquities => MarketDataService::LevelOneEquities,
+        SchwabMarketDataFamily::LevelOneOptions => MarketDataService::LevelOneOptions,
+        SchwabMarketDataFamily::LevelOneFutures => MarketDataService::LevelOneFutures,
+        SchwabMarketDataFamily::LevelOneFuturesOptions => MarketDataService::LevelOneFuturesOptions,
+        SchwabMarketDataFamily::LevelOneForex => MarketDataService::LevelOneForex,
+        SchwabMarketDataFamily::NyseBook => MarketDataService::NyseBook,
+        SchwabMarketDataFamily::NasdaqBook => MarketDataService::NasdaqBook,
+        SchwabMarketDataFamily::OptionsBook => MarketDataService::OptionsBook,
+        SchwabMarketDataFamily::ChartEquity => MarketDataService::ChartEquity,
+        SchwabMarketDataFamily::ChartFutures => MarketDataService::ChartFutures,
+        SchwabMarketDataFamily::ScreenerEquity => MarketDataService::ScreenerEquity,
+        SchwabMarketDataFamily::ScreenerOption => MarketDataService::ScreenerOption,
+        _ => return None,
+    })
 }
 
 /// Typed REST doctor input. The constructor proves route, decoded response family, accounting,

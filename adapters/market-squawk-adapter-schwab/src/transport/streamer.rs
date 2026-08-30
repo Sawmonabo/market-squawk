@@ -19,6 +19,7 @@ use market_squawk_sources::{
 };
 use sha2::{Digest as _, Sha256};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::{
     Error as WebSocketError, Message, error::CapacityError, protocol::WebSocketConfig,
 };
@@ -28,9 +29,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    ConnectionGeneration, ConnectionState, DesiredStateController, ParseBounds, ParsedNative,
-    SchwabAdapterError, StreamerAdmission, StreamerBootstrap, StreamerFrame, StreamerResponseCode,
-    StreamerSubscription, TransientStreamerRequest, parse_streamer_frame,
+    CapacityObservation, CapacityUnit, ConnectionGeneration, ConnectionState,
+    DesiredStateController, ParseBounds, ParsedNative, SchwabAdapterError, StreamerAdmission,
+    StreamerBootstrap, StreamerCommand, StreamerFrame, StreamerResponseCode, StreamerSubscription,
+    TransientStreamerRequest, parse_streamer_frame,
 };
 
 use super::{
@@ -376,6 +378,7 @@ struct PendingStreamerServiceResponseEvidence {
     provider_timestamp_millis: Option<u64>,
     round_trip_latency_ms: Option<u64>,
     request_payload_sha256: Option<EvidenceDigest>,
+    request_payload_bytes: Option<u64>,
     frame_ordinal: NonZeroU64,
 }
 
@@ -389,6 +392,7 @@ pub struct SchwabStreamerServiceResponseEvidence {
     provider_timestamp_millis: Option<u64>,
     round_trip_latency_ms: Option<u64>,
     request_payload_sha256: Option<EvidenceDigest>,
+    request_payload_bytes: Option<u64>,
     generation: ConnectionGeneration,
     transport_ordinal: NonZeroU64,
     received_at_unix_millis: u64,
@@ -429,6 +433,39 @@ impl SchwabStreamerServiceResponseEvidence {
     /// SHA-256 of the exact owned outbound subscription request when request matching succeeded.
     pub const fn request_payload_sha256(&self) -> Option<EvidenceDigest> {
         self.request_payload_sha256
+    }
+
+    /// Exact encoded request bytes when this response matched an owned outbound command.
+    pub const fn request_payload_bytes(&self) -> Option<u64> {
+        self.request_payload_bytes
+    }
+
+    /// Response-scoped adaptive evidence for this exact sealed service acknowledgement.
+    pub fn capacity_observation(&self) -> Result<CapacityObservation, SchwabTransportError> {
+        let request_bytes = self
+            .request_payload_bytes
+            .ok_or(SchwabTransportError::Protocol)?;
+        let latency_ms = self
+            .round_trip_latency_ms
+            .ok_or(SchwabTransportError::Protocol)?;
+        let succeeded = self.status_code == 0;
+        CapacityObservation::from_transport(
+            CapacityUnit::Requests,
+            1,
+            u64::from(succeeded),
+            u64::from(!succeeded),
+            0,
+            0,
+            0,
+            request_bytes,
+            self.payload_bytes,
+            latency_ms,
+            0,
+            false,
+            false,
+        )
+        .validate()
+        .map_err(|_| SchwabTransportError::Protocol)
     }
 
     pub const fn generation(&self) -> ConnectionGeneration {
@@ -653,6 +690,7 @@ fn bind_service_response_evidence(
             provider_timestamp_millis: response.provider_timestamp_millis,
             round_trip_latency_ms: response.round_trip_latency_ms,
             request_payload_sha256: response.request_payload_sha256,
+            request_payload_bytes: response.request_payload_bytes,
             generation: frame.generation,
             transport_ordinal: frame.transport_ordinal,
             received_at_unix_millis: frame.received_at_unix_millis,
@@ -680,6 +718,7 @@ fn service_response_observation_sha256(
     hash_optional_u64(&mut hasher, response.provider_timestamp_millis);
     hash_optional_u64(&mut hasher, response.round_trip_latency_ms);
     hash_optional_digest(&mut hasher, response.request_payload_sha256);
+    hash_optional_u64(&mut hasher, response.request_payload_bytes);
     hasher.update(frame.generation.get().to_be_bytes());
     hasher.update(frame.transport_ordinal.get().to_be_bytes());
     hasher.update(frame.received_at_unix_millis.to_be_bytes());
@@ -1104,6 +1143,49 @@ pub struct SchwabStreamerExecutor {
     token_admission: AccessTokenAdmission,
     telemetry: SchwabTransportTelemetry,
     last_generation: Option<ConnectionGeneration>,
+    desired_state_sender: Option<mpsc::Sender<(StreamerCommand, StreamerSubscription)>>,
+    desired_state_receiver: Option<mpsc::Receiver<(StreamerCommand, StreamerSubscription)>>,
+}
+
+/// Bounded application input to the sole Streamer connection owner.
+#[derive(Debug)]
+pub struct SchwabStreamerDesiredStateSender {
+    sender: mpsc::Sender<(StreamerCommand, StreamerSubscription)>,
+}
+
+/// Exact desired-state queue pressure retaining the command that was not admitted.
+#[derive(Debug)]
+pub enum SchwabStreamerDesiredStateSendError {
+    Saturated(StreamerCommand, StreamerSubscription),
+    Closed(StreamerCommand, StreamerSubscription),
+}
+
+impl SchwabStreamerDesiredStateSender {
+    /// Attempts one nonblocking serialized update. Saturation is returned to the scheduler as
+    /// measured queue pressure; the adapter never creates another socket or silently retries.
+    pub fn try_send(
+        &self,
+        command: StreamerCommand,
+        subscription: StreamerSubscription,
+    ) -> Result<(), SchwabStreamerDesiredStateSendError> {
+        match self.sender.try_send((command, subscription)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full((command, subscription))) => Err(
+                SchwabStreamerDesiredStateSendError::Saturated(command, subscription),
+            ),
+            Err(mpsc::error::TrySendError::Closed((command, subscription))) => Err(
+                SchwabStreamerDesiredStateSendError::Closed(command, subscription),
+            ),
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+
+    pub fn remaining_capacity(&self) -> usize {
+        self.sender.capacity()
+    }
 }
 
 impl fmt::Debug for SchwabStreamerExecutor {
@@ -1119,6 +1201,10 @@ impl fmt::Debug for SchwabStreamerExecutor {
             .field("token_admission", &self.token_admission)
             .field("telemetry", &self.telemetry)
             .field("last_generation", &self.last_generation)
+            .field(
+                "desired_state_channel_owned",
+                &self.desired_state_sender.is_some(),
+            )
             .finish()
     }
 }
@@ -1164,6 +1250,8 @@ impl SchwabStreamerExecutor {
         if parse_bounds.max_response_bytes() > transport_bounds.max_frame_bytes() {
             return Err(SchwabTransportError::InvalidConfiguration);
         }
+        let (desired_state_sender, desired_state_receiver) =
+            mpsc::channel(admission.max_services());
         Ok(Self {
             connector,
             token_source,
@@ -1174,7 +1262,19 @@ impl SchwabStreamerExecutor {
             token_admission,
             telemetry,
             last_generation: None,
+            desired_state_sender: Some(desired_state_sender),
+            desired_state_receiver: Some(desired_state_receiver),
         })
+    }
+
+    /// Transfers the sole bounded runtime desired-state command sender to the application owner.
+    ///
+    /// `Subscribe` replaces one service, `Add` extends it, and `Unsubscribe` removes the supplied
+    /// keys. Commands are serialized by this executor and never create another socket.
+    pub fn take_desired_state_sender(&mut self) -> Option<SchwabStreamerDesiredStateSender> {
+        self.desired_state_sender
+            .take()
+            .map(|sender| SchwabStreamerDesiredStateSender { sender })
     }
 
     /// Returns the currently desired read-only services.
@@ -1212,6 +1312,20 @@ impl SchwabStreamerExecutor {
         Ok(())
     }
 
+    /// Removes keys from one service's desired state while disconnected.
+    pub fn remove_desired(
+        &mut self,
+        subscription: StreamerSubscription,
+    ) -> Result<(), SchwabAdapterError> {
+        if self.controller.state() != ConnectionState::Disconnected {
+            return Err(SchwabAdapterError::InvalidStreamerState);
+        }
+        if self.controller.remove_desired(subscription)?.is_some() {
+            return Err(SchwabAdapterError::InvalidStreamerState);
+        }
+        Ok(())
+    }
+
     pub const fn telemetry(&self) -> &SchwabTransportTelemetry {
         &self.telemetry
     }
@@ -1227,19 +1341,19 @@ impl SchwabStreamerExecutor {
             return Err(SchwabTransportError::Protocol);
         }
         validate_wss_endpoint(bootstrap.socket_url())?;
-        let mut attempt = 0usize;
+        let mut consecutive_failures = 0usize;
+        let mut reconnecting = false;
         loop {
             if cancellation.is_cancelled() {
                 return Ok(StreamerRunExit::Cancelled);
             }
-            if attempt > self.transport_bounds.max_reconnect_attempts() {
+            if consecutive_failures > self.transport_bounds.max_reconnect_attempts() {
                 return Err(SchwabTransportError::ReconnectExhausted);
             }
-            if attempt > 0 {
+            if reconnecting {
                 wait_reconnect(self.transport_bounds.reconnect_delay(), &cancellation).await?;
             }
-            let reconnect = attempt > 0;
-            self.telemetry.record_stream_connect_attempt(reconnect)?;
+            self.telemetry.record_stream_connect_attempt(reconnecting)?;
             let control = await_operation(
                 self.control_source.mint(),
                 self.transport_bounds.connect_timeout(),
@@ -1263,9 +1377,10 @@ impl SchwabStreamerExecutor {
                 Err(SchwabTransportError::Cancelled) => return Ok(StreamerRunExit::Cancelled),
                 Err(error) if retryable(error) => {
                     self.telemetry.record_stream_connect_failure()?;
-                    attempt = attempt
+                    consecutive_failures = consecutive_failures
                         .checked_add(1)
                         .ok_or(SchwabTransportError::Overflow)?;
+                    reconnecting = true;
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -1287,9 +1402,10 @@ impl SchwabStreamerExecutor {
                 Err(error) if retryable(error) => {
                     self.controller.disconnected(generation)?;
                     self.telemetry.record_stream_connect_failure()?;
-                    attempt = attempt
+                    consecutive_failures = consecutive_failures
                         .checked_add(1)
                         .ok_or(SchwabTransportError::Overflow)?;
+                    reconnecting = true;
                     continue;
                 }
                 Err(error) => {
@@ -1312,6 +1428,10 @@ impl SchwabStreamerExecutor {
                     &cancellation,
                 )
                 .await;
+            let authenticated = matches!(
+                self.controller.state(),
+                ConnectionState::Active(current) if current == generation
+            );
             match outcome {
                 Ok(ConnectionExit::Cancelled) => {
                     self.controller.disconnected(generation)?;
@@ -1321,9 +1441,14 @@ impl SchwabStreamerExecutor {
                 Ok(ConnectionExit::Retry) => {
                     self.controller.disconnected(generation)?;
                     self.telemetry.record_stream_disconnect()?;
-                    attempt = attempt
-                        .checked_add(1)
-                        .ok_or(SchwabTransportError::Overflow)?;
+                    consecutive_failures = if authenticated {
+                        0
+                    } else {
+                        consecutive_failures
+                            .checked_add(1)
+                            .ok_or(SchwabTransportError::Overflow)?
+                    };
+                    reconnecting = true;
                 }
                 Err(SchwabTransportError::Cancelled) => {
                     self.controller.disconnected(generation)?;
@@ -1333,9 +1458,14 @@ impl SchwabStreamerExecutor {
                 Err(error) if retryable(error) => {
                     self.controller.disconnected(generation)?;
                     self.telemetry.record_stream_disconnect()?;
-                    attempt = attempt
-                        .checked_add(1)
-                        .ok_or(SchwabTransportError::Overflow)?;
+                    consecutive_failures = if authenticated {
+                        0
+                    } else {
+                        consecutive_failures
+                            .checked_add(1)
+                            .ok_or(SchwabTransportError::Overflow)?
+                    };
+                    reconnecting = true;
                 }
                 Err(error) => {
                     self.controller.disconnected(generation)?;
@@ -1458,9 +1588,23 @@ impl SchwabStreamerExecutor {
             .ok_or(SchwabTransportError::Overflow)?;
         loop {
             let flush_deadline = batch.flush_deadline();
-            let next_deadline = idle_deadline.min(refresh_deadline).min(flush_deadline);
-            match read_or_deadline(connection, next_deadline, cancellation).await {
-                Ok(incoming) => {
+            let mut next_deadline = idle_deadline.min(refresh_deadline).min(flush_deadline);
+            for sent in pending.values() {
+                let acknowledgement_deadline = sent
+                    .dispatched_at
+                    .checked_add(self.transport_bounds.io_timeout())
+                    .ok_or(SchwabTransportError::Overflow)?;
+                next_deadline = next_deadline.min(acknowledgement_deadline);
+            }
+            match read_active_connection_input(
+                connection,
+                self.desired_state_receiver.as_mut(),
+                next_deadline,
+                cancellation,
+            )
+            .await
+            {
+                Ok(ActiveConnectionInput::Incoming(incoming)) => {
                     idle_deadline = Instant::now()
                         .checked_add(self.transport_bounds.io_timeout())
                         .ok_or(SchwabTransportError::Overflow)?;
@@ -1490,11 +1634,14 @@ impl SchwabStreamerExecutor {
                                     .transpose()?;
                                 let request_payload_sha256 =
                                     sent.as_ref().map(|sent| sent.request_payload_sha256);
+                                let request_payload_bytes =
+                                    sent.as_ref().map(|sent| sent.request_payload_bytes);
                                 batch.record_service_response(
                                     captured_ordinal,
                                     response,
                                     latency,
                                     request_payload_sha256,
+                                    request_payload_bytes,
                                 )?;
                                 let Some(sent) = sent else {
                                     response_error.get_or_insert(SchwabTransportError::Protocol);
@@ -1524,9 +1671,42 @@ impl SchwabStreamerExecutor {
                         }
                     }
                 }
-                Err(SchwabTransportError::Deadline) => {
+                Ok(ActiveConnectionInput::DesiredState(command, subscription)) => {
+                    let request = match command {
+                        StreamerCommand::Subscribe => {
+                            self.controller.replace_desired(subscription)?
+                        }
+                        StreamerCommand::Add => self.controller.add_desired(subscription)?,
+                        StreamerCommand::Unsubscribe => {
+                            self.controller.remove_desired(subscription)?
+                        }
+                    }
+                    .ok_or(SchwabTransportError::Protocol)?;
+                    let sent = send_request(
+                        connection,
+                        request,
+                        &self.telemetry,
+                        self.transport_bounds.io_timeout(),
+                        cancellation,
+                    )
+                    .await?;
+                    if sent.service.is_none()
+                        || pending.insert(sent.request_id.clone(), sent).is_some()
+                    {
+                        return Err(SchwabTransportError::Protocol);
+                    }
+                }
+                Ok(ActiveConnectionInput::DesiredStateChannelClosed) => {
+                    self.desired_state_receiver = None;
+                }
+                Ok(ActiveConnectionInput::Deadline) => {
                     let now = Instant::now();
-                    if now >= refresh_deadline || now >= idle_deadline {
+                    let acknowledgement_expired = pending.values().any(|sent| {
+                        sent.dispatched_at
+                            .checked_add(self.transport_bounds.io_timeout())
+                            .is_none_or(|deadline| now >= deadline)
+                    });
+                    if now >= refresh_deadline || now >= idle_deadline || acknowledgement_expired {
                         flush_batch(&mut batch, sink, &self.telemetry)?;
                         close_with_deadline(connection, self.transport_bounds.io_timeout()).await;
                         return Ok(ConnectionExit::Retry);
@@ -1649,6 +1829,13 @@ enum ConnectionExit {
     Retry,
 }
 
+enum ActiveConnectionInput {
+    Incoming(InboundStreamerFrame),
+    DesiredState(StreamerCommand, StreamerSubscription),
+    DesiredStateChannelClosed,
+    Deadline,
+}
+
 enum ProcessedFrame {
     Parsed {
         frame: ParsedNative<StreamerFrame>,
@@ -1749,6 +1936,7 @@ impl MicrobatchBuilder {
         response: &crate::StreamerResponse,
         round_trip_latency_ms: Option<u64>,
         request_payload_sha256: Option<EvidenceDigest>,
+        request_payload_bytes: Option<u64>,
     ) -> Result<(), SchwabTransportError> {
         let Some(service) = selected_service(response.service.as_ref()) else {
             if response.service.as_ref() == "ADMIN" {
@@ -1775,6 +1963,7 @@ impl MicrobatchBuilder {
                 provider_timestamp_millis: response.timestamp_millis,
                 round_trip_latency_ms,
                 request_payload_sha256,
+                request_payload_bytes,
                 frame_ordinal,
             });
         Ok(())
@@ -1870,6 +2059,7 @@ struct SentStreamerRequest {
     command: Box<str>,
     request_id: Box<str>,
     request_payload_sha256: EvidenceDigest,
+    request_payload_bytes: u64,
     dispatched_at: Instant,
 }
 
@@ -1889,6 +2079,8 @@ async fn send_request(
         command: request.command().to_owned().into_boxed_str(),
         request_id: request.request_id().get().to_string().into_boxed_str(),
         request_payload_sha256,
+        request_payload_bytes: u64::try_from(request.expose_body().len())
+            .map_err(|_| SchwabTransportError::Overflow)?,
         dispatched_at: Instant::now(),
     };
     let bytes = Bytes::copy_from_slice(request.expose_body());
@@ -1939,15 +2131,36 @@ async fn read_until(
         .ok_or(SchwabTransportError::ResynchronizationRequired)
 }
 
-async fn read_or_deadline(
+async fn read_active_connection_input(
     connection: &mut dyn SchwabStreamerConnection,
+    desired_state: Option<&mut mpsc::Receiver<(StreamerCommand, StreamerSubscription)>>,
     deadline: Instant,
     cancellation: &CancellationToken,
-) -> Result<InboundStreamerFrame, SchwabTransportError> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    await_operation(connection.next(), remaining, cancellation)
-        .await?
-        .ok_or(SchwabTransportError::ResynchronizationRequired)
+) -> Result<ActiveConnectionInput, SchwabTransportError> {
+    let deadline = tokio::time::Instant::from_std(deadline);
+    if let Some(desired_state) = desired_state {
+        tokio::select! {
+            () = cancellation.cancelled() => Err(SchwabTransportError::Cancelled),
+            incoming = connection.next() => incoming?
+                .map(ActiveConnectionInput::Incoming)
+                .ok_or(SchwabTransportError::ResynchronizationRequired),
+            update = desired_state.recv() => Ok(match update {
+                Some((command, subscription)) => {
+                    ActiveConnectionInput::DesiredState(command, subscription)
+                }
+                None => ActiveConnectionInput::DesiredStateChannelClosed,
+            }),
+            () = tokio::time::sleep_until(deadline) => Ok(ActiveConnectionInput::Deadline),
+        }
+    } else {
+        tokio::select! {
+            () = cancellation.cancelled() => Err(SchwabTransportError::Cancelled),
+            incoming = connection.next() => incoming?
+                .map(ActiveConnectionInput::Incoming)
+                .ok_or(SchwabTransportError::ResynchronizationRequired),
+            () = tokio::time::sleep_until(deadline) => Ok(ActiveConnectionInput::Deadline),
+        }
+    }
 }
 
 async fn await_operation<T>(

@@ -10,7 +10,8 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     ProviderCaptureError, ProviderMarketEventBatch, ProviderMarketEventNativeLineageBatch,
-    ProviderNativeLineageImplementation, SealedProviderResponseMarketEventBinding,
+    ProviderNativeLineageImplementation, SchwabMarketDataFamily,
+    SealedProviderResponseMarketEventBinding,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -18,8 +19,8 @@ use thiserror::Error;
 use crate::transport::SchwabSealedRestResponseParts;
 use crate::{
     NativeField, NativeScalar, QuoteComponentField, ReadOnlyRoute, SchwabCanonicalError,
-    SchwabQuote, SchwabQuoteAbstention, SchwabQuoteCanonicalOutcome,
-    SchwabResolvedProviderIdentity, SchwabRestDelayEvidence, SchwabRestPayload,
+    SchwabMarketDataDelay, SchwabMarketDataQualification, SchwabQuote, SchwabQuoteAbstention,
+    SchwabQuoteCanonicalOutcome, SchwabResolvedProviderIdentity, SchwabRestPayload,
     SchwabSealedRestResponse, canonicalize_quote,
 };
 
@@ -28,51 +29,28 @@ use crate::{
 pub struct SchwabRestQuoteMarketDataEvidence {
     session_id: SourceIdentifier,
     connection_generation: DomainConnectionGeneration,
-    feed: SourceIdentifier,
-    venue_id: VenueId,
-    depth: MarketDepth,
-    delay: SchwabRestDelayEvidence,
-    quality: DataQuality,
-    provider_product: ProviderProduct,
-    provider_channel: ProviderChannel,
-    qualification_evidence: EvidenceDigest,
+    reference_venue_id: VenueId,
+    qualification: SchwabMarketDataQualification,
 }
 
 impl SchwabRestQuoteMarketDataEvidence {
     /// Constructs explicit top-of-book REST quote evidence.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "provider qualification and live-provenance coordinates remain explicit"
-    )]
     pub fn try_new(
         session_id: SourceIdentifier,
         connection_generation: DomainConnectionGeneration,
-        feed: SourceIdentifier,
-        venue_id: VenueId,
-        depth: MarketDepth,
-        delay: SchwabRestDelayEvidence,
-        quality: DataQuality,
-        provider_product: ProviderProduct,
-        provider_channel: ProviderChannel,
-        qualification_evidence: EvidenceDigest,
+        reference_venue_id: VenueId,
+        qualification: SchwabMarketDataQualification,
     ) -> Result<Self, SchwabRestQuotePublicationError> {
-        if depth != MarketDepth::TopOfBook
-            || qualification_evidence.algorithm() != DigestAlgorithm::Sha256
-            || qualification_evidence.bytes() == [0; 32]
+        if qualification.family() != SchwabMarketDataFamily::Quotes
+            || qualification.depth().canonical() != Some(MarketDepth::TopOfBook)
         {
             return Err(SchwabRestQuotePublicationError::InvalidEvidence);
         }
         Ok(Self {
             session_id,
             connection_generation,
-            feed,
-            venue_id,
-            depth,
-            delay,
-            quality,
-            provider_product,
-            provider_channel,
-            qualification_evidence,
+            reference_venue_id,
+            qualification,
         })
     }
 
@@ -88,42 +66,42 @@ impl SchwabRestQuoteMarketDataEvidence {
 
     /// Exact qualified provider feed label.
     pub const fn feed(&self) -> &SourceIdentifier {
-        &self.feed
+        self.qualification.feed()
     }
 
-    /// Exact provider/market venue evidence retained by canonical provenance.
+    /// Canonical/reference venue retained for product identity; the REST payload reports no venue.
     pub const fn venue_id(&self) -> &VenueId {
-        &self.venue_id
+        &self.reference_venue_id
     }
 
     /// Exact top-of-book depth classification.
     pub const fn depth(&self) -> MarketDepth {
-        self.depth
+        MarketDepth::TopOfBook
     }
 
     /// Explicit provider delay state.
-    pub const fn delay(&self) -> SchwabRestDelayEvidence {
-        self.delay
+    pub const fn delay(&self) -> SchwabMarketDataDelay {
+        self.qualification.delay()
     }
 
     /// Exact archival quality retained by canonical provenance.
     pub const fn quality(&self) -> DataQuality {
-        self.quality
+        self.qualification.quality()
     }
 
     /// Exact provider product retained by canonical provenance.
     pub const fn provider_product(&self) -> &ProviderProduct {
-        &self.provider_product
+        self.qualification.provider_product()
     }
 
     /// Exact provider channel retained by canonical provenance.
     pub const fn provider_channel(&self) -> &ProviderChannel {
-        &self.provider_channel
+        self.qualification.provider_channel()
     }
 
     /// Nonzero SHA-256 evidence for the supplied market semantics.
     pub const fn qualification_evidence(&self) -> EvidenceDigest {
-        self.qualification_evidence
+        self.qualification.observation_evidence()
     }
 }
 
@@ -299,6 +277,14 @@ impl SchwabSealedRestResponse {
         {
             return Err(SchwabRestQuotePublicationError::InvalidEvidence);
         }
+        if inputs.values().any(|input| {
+            !input
+                .market_data
+                .qualification
+                .validates_rest_receipt(SchwabMarketDataFamily::Quotes, &parts.receipt)
+        }) {
+            return Err(SchwabRestQuotePublicationError::InvalidEvidence);
+        }
         let mut used = BTreeSet::new();
         let mut events = Vec::new();
         let mut native_rows = Vec::new();
@@ -411,23 +397,23 @@ fn validate_quote_mapping(
     if input.identity.provider_symbol() != quote.symbol()
         || input.identity.resolution_evidence().algorithm() != DigestAlgorithm::Sha256
         || input.identity.resolution_evidence().bytes() == [0; 32]
-        || input.market_data.depth != MarketDepth::TopOfBook
+        || input.market_data.depth() != MarketDepth::TopOfBook
         || binding.source_id() != parts.coordinates.source_id()
         || binding.metadata_revision() != parts.coordinates.metadata_revision()
         || binding.session_id() != &input.market_data.session_id
         || binding.connection_generation() != input.market_data.connection_generation
-        || binding.venue_id() != &input.market_data.venue_id
+        || binding.venue_id() != input.market_data.venue_id()
         || binding.instrument_id() != input.instrument_id
-        || binding.provider_product() != &input.market_data.provider_product
-        || binding.provider_channel() != &input.market_data.provider_channel
+        || binding.provider_product() != input.market_data.provider_product()
+        || binding.provider_channel() != input.market_data.provider_channel()
         || binding.event_class() != LiveEventClass::Quote
         || binding.source_identifier() != &input.source_identifier
         || binding.payload_digest()
             != EvidenceDigest::new(DigestAlgorithm::Sha256, parts.receipt.body_sha256())
         || input.provenance.source_timestamp() != source_timestamp
         || input.provenance.received_at() != received_at
-        || input.provenance.recorded_quality() != input.market_data.quality
-        || realtime_delay_conflicts(quote, input.market_data.delay)?
+        || input.provenance.recorded_quality() != input.market_data.quality()
+        || realtime_delay_conflicts(quote, input.market_data.delay())?
     {
         return Err(SchwabRestQuotePublicationError::InvalidEvidence);
     }
@@ -436,11 +422,11 @@ fn validate_quote_mapping(
 
 fn realtime_delay_conflicts(
     quote: &SchwabQuote,
-    delay: SchwabRestDelayEvidence,
+    delay: SchwabMarketDataDelay,
 ) -> Result<bool, SchwabRestQuotePublicationError> {
     Ok(match quote.realtime() {
-        NativeField::Value(true) => delay != SchwabRestDelayEvidence::RealTime,
-        NativeField::Value(false) => delay == SchwabRestDelayEvidence::RealTime,
+        NativeField::Value(true) => delay != SchwabMarketDataDelay::RealTime,
+        NativeField::Value(false) => delay == SchwabMarketDataDelay::RealTime,
         NativeField::Absent | NativeField::Null => false,
     })
 }
@@ -496,13 +482,18 @@ struct SchwabRestQuoteNativeRowV1<'a> {
     source_identifier: &'a str,
     resolution_evidence: EvidenceDigest,
     feed: &'a str,
-    venue: &'a str,
+    reference_venue: &'a str,
+    provider_reported_venue: Option<&'a str>,
     depth: MarketDepth,
-    delay: SchwabRestDelayEvidence,
+    delay: SchwabMarketDataDelay,
     quality: DataQuality,
     provider_product: &'a str,
     provider_channel: &'a str,
     qualification_evidence: EvidenceDigest,
+    qualification_receipt_evidence: EvidenceDigest,
+    qualification_family: SchwabMarketDataFamily,
+    qualification_observed_at: Timestamp,
+    qualification_response_observed_at: Timestamp,
 }
 
 #[derive(Serialize)]
@@ -540,22 +531,27 @@ fn encode_quote_native_row(
         provider_instrument_id: input.identity.provider_instrument_id().as_str(),
         source_identifier: input.source_identifier.as_str(),
         resolution_evidence,
-        feed: input.market_data.feed.as_str(),
-        venue: input.market_data.venue_id.as_str(),
-        depth: input.market_data.depth,
-        delay: input.market_data.delay,
-        quality: input.market_data.quality,
+        feed: input.market_data.feed().as_str(),
+        reference_venue: input.market_data.venue_id().as_str(),
+        provider_reported_venue: None,
+        depth: input.market_data.depth(),
+        delay: input.market_data.delay(),
+        quality: input.market_data.quality(),
         provider_product: input
             .market_data
-            .provider_product
+            .provider_product()
             .as_source_identifier()
             .as_str(),
         provider_channel: input
             .market_data
-            .provider_channel
+            .provider_channel()
             .as_source_identifier()
             .as_str(),
-        qualification_evidence: input.market_data.qualification_evidence,
+        qualification_evidence: input.market_data.qualification_evidence(),
+        qualification_receipt_evidence: input.market_data.qualification.receipt_evidence(),
+        qualification_family: input.market_data.qualification.family(),
+        qualification_observed_at: input.market_data.qualification.family_observed_at(),
+        qualification_response_observed_at: input.market_data.qualification.response_observed_at(),
     })
     .map(Bytes::from)
     .map_err(|_| SchwabRestQuotePublicationError::NativeEncoding)

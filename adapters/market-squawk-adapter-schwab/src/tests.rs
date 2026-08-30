@@ -11,12 +11,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use market_squawk_domain::{
     AuthorizationBasis, BarTimeSemantics, BarTimestampBasis, CanonicalStateDigest,
-    CanonicalizationRule, CoverageStatus, Currency, DataQuality, DecodedLiveProvenanceInput,
-    DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentId,
-    LiveEventClass, LiveEvidenceBinding, LiveProvenance, LotSize, MarketBarAdjustment,
-    MarketBarSessionEvidence, MarketBarSessionKind, MarketDepth, MarketEvent, MetadataRevision,
-    OptionComponentState, PayloadHash, PayloadReference, ProviderChannel, ProviderInstrumentId,
-    ProviderProduct, RuleVersion, SourceId, SourceIdentifier, TickSize, Timestamp, VenueId,
+    CanonicalizationRule, CoverageDelay, CoverageStatus, Currency, DataQuality,
+    DecodedLiveProvenanceInput, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
+    ExactPayloadEvidence, InstrumentId, LiveEventClass, LiveEvidenceBinding, LiveProvenance,
+    LotSize, MarketBarAdjustment, MarketBarSessionEvidence, MarketBarSessionKind, MarketEvent,
+    MetadataRevision, OptionComponentState, PayloadHash, PayloadReference, ProviderInstrumentId,
+    RuleVersion, SourceId, SourceIdentifier, TickSize, Timestamp, VenueId,
 };
 use market_squawk_platform::{
     EncryptedFileSecretStore, LocalPaths, SealedResearchJournalStore, SecretCancellation,
@@ -24,7 +24,11 @@ use market_squawk_platform::{
     SecretValue,
 };
 use market_squawk_sources::{
-    AvailabilityEvidence, DiscoveryRequest, ExtractionRequest, OptionMarketBatchKind, SourceObject,
+    AvailabilityEvidence, DiscoveryRequest, ExtractionRequest, OptionMarketBatchKind,
+    ProviderCapabilityRevision, RuntimeCapabilityDisposition, SCHWAB_MARKET_DATA_SURFACE_ID,
+    SchwabMarketDataDoctorObservation, SchwabMarketDataDoctorReceiptInput,
+    SchwabMarketDataDoctorReceiptV1, SchwabMarketDataFamily, SchwabMarketDataFamilyEvidence,
+    SchwabUserPreferenceDoctorEvidence, SourceObject,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
@@ -44,20 +48,21 @@ use crate::{
     SchwabAccessTokenSource, SchwabAdapterError, SchwabApplicationCredentialReplacement,
     SchwabCanonicalError, SchwabCanonicalField, SchwabCaptureCoordinates,
     SchwabDailyPriceHistoryCalendarRangeReceipt, SchwabDailyPriceHistoryPublicationRequest,
-    SchwabHttpWire, SchwabHttpWireRequest, SchwabHttpWireResponse,
-    SchwabOAuthAuthorityConfiguration, SchwabOAuthAuthorityError, SchwabOAuthAuthorityStatus,
-    SchwabOAuthInteraction, SchwabOAuthSecretPolicy, SchwabOAuthWire, SchwabOAuthWireError,
-    SchwabOAuthWireRequest, SchwabOAuthWireResponse, SchwabObservedCapabilityFamily,
-    SchwabOptionCandidateOutcome, SchwabPriceHistoryCapabilityObservation,
-    SchwabPriceHistoryMarketDataEvidence, SchwabResolvedProviderIdentity, SchwabRestDelayEvidence,
-    SchwabRestExecutor, SchwabRestFamily, SchwabRestFamilyDoctorInput,
-    SchwabRestOptionContractRequest, SchwabRestOptionMarketDataEvidence,
-    SchwabRestOptionPublicationOutcome, SchwabRestOptionPublicationRequest,
-    SchwabRestOptionUnderlyingRequest, SchwabRestQuoteMarketDataEvidence,
-    SchwabRestQuotePublicationOutcome, SchwabRestQuotePublicationRequest,
-    SchwabRestQuoteRecordRequest, SchwabStreamerConnection, SchwabStreamerConnectionControl,
-    SchwabStreamerConnectionControlSource, SchwabStreamerConnector, SchwabStreamerDelayEvidence,
-    SchwabStreamerExecutor, SchwabStreamerFamilyDoctorInput, SchwabStreamerFieldDictionary,
+    SchwabHttpWire, SchwabHttpWireRequest, SchwabHttpWireResponse, SchwabMarketDataDelay,
+    SchwabMarketDataQualification, SchwabOAuthAuthorityConfiguration, SchwabOAuthAuthorityError,
+    SchwabOAuthAuthorityStatus, SchwabOAuthInteraction, SchwabOAuthSecretPolicy, SchwabOAuthWire,
+    SchwabOAuthWireError, SchwabOAuthWireRequest, SchwabOAuthWireResponse,
+    SchwabObservedCapabilityFamily, SchwabOptionCandidateOutcome,
+    SchwabPriceHistoryCapabilityObservation, SchwabPriceHistoryMarketDataEvidence,
+    SchwabResolvedProviderIdentity, SchwabRestExecutor, SchwabRestFamily,
+    SchwabRestFamilyDoctorInput, SchwabRestOptionContractRequest,
+    SchwabRestOptionMarketDataEvidence, SchwabRestOptionPublicationOutcome,
+    SchwabRestOptionPublicationRequest, SchwabRestOptionUnderlyingRequest,
+    SchwabRestQuoteMarketDataEvidence, SchwabRestQuotePublicationOutcome,
+    SchwabRestQuotePublicationRequest, SchwabRestQuoteRecordRequest, SchwabSealedStreamerCapture,
+    SchwabStreamerConnection, SchwabStreamerConnectionControl,
+    SchwabStreamerConnectionControlSource, SchwabStreamerConnector, SchwabStreamerExecutor,
+    SchwabStreamerFamilyDoctorAccumulator, SchwabStreamerFieldDictionary,
     SchwabStreamerQuoteMarketDataEvidence, SchwabStreamerQuotePublicationOutcome,
     SchwabStreamerQuotePublicationRequest, SchwabStreamerQuoteRecordRequest,
     SchwabStreamerSemanticField, SchwabTransportError, SchwabTransportTelemetry, StreamerAdmission,
@@ -876,9 +881,11 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
     .unwrap_or_else(|error| panic!("history extraction request: {error}"));
     let market_data = SchwabPriceHistoryMarketDataEvidence::try_new(
         venue_id.clone(),
-        feed.clone(),
-        SchwabRestDelayEvidence::Unknown,
-        EvidenceDigest::new(DigestAlgorithm::Sha256, [26; 32]),
+        test_market_data_qualification(
+            SchwabMarketDataFamily::PriceHistory,
+            received_at,
+            token_generation,
+        ),
     )
     .unwrap_or_else(|error| panic!("history market-data evidence: {error}"));
     let publication_request = SchwabDailyPriceHistoryPublicationRequest::new(
@@ -917,7 +924,7 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
     assert_eq!(publication.market_data().route(), route);
     assert_eq!(
         publication.market_data().delay(),
-        SchwabRestDelayEvidence::Unknown
+        SchwabMarketDataDelay::Unknown
     );
     assert_eq!(publication.revision_plan().len(), 1);
     assert!(publication.revision_plan().native_lineage_required());
@@ -932,8 +939,12 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
         .unwrap_or_else(|error| panic!("Schwab REST sidecar JSON: {error}"));
     assert_eq!(sidecar_value["service"], "schwab-market-data-rest");
     assert_eq!(sidecar_value["route"], "price-history");
-    assert_eq!(sidecar_value["feed"], "schwab-daily-price-history");
-    assert_eq!(sidecar_value["venue"], "XNYS");
+    assert_eq!(sidecar_value["feed"], "schwab-rest-price-history");
+    assert_eq!(sidecar_value["reference_venue"], "XNYS");
+    assert_eq!(
+        sidecar_value["provider_reported_venue"],
+        serde_json::Value::Null
+    );
     assert_eq!(sidecar_value["delay"]["kind"], "unknown");
     let native_row: serde_json::Value =
         serde_json::from_slice(binding.native_lineage().rows()[0].semantic_payload())
@@ -1011,14 +1022,13 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
         .unwrap_or_else(|error| panic!("quote instrument: {error}"));
     let quote_venue = VenueId::try_from("schwab-us-equities")
         .unwrap_or_else(|error| panic!("quote venue: {error}"));
-    let quote_product = ProviderProduct::new(
-        SourceIdentifier::try_from("schwab-rest")
-            .unwrap_or_else(|error| panic!("quote product: {error}")),
+    let quote_qualification = test_market_data_qualification(
+        SchwabMarketDataFamily::Quotes,
+        quote_received_at,
+        sealed_quote.receipt().token_generation(),
     );
-    let quote_channel = ProviderChannel::new(
-        SourceIdentifier::try_from("quotes")
-            .unwrap_or_else(|error| panic!("quote channel: {error}")),
-    );
+    let quote_product = quote_qualification.provider_product().clone();
+    let quote_channel = quote_qualification.provider_channel().clone();
     let quote_source_identifier = SourceIdentifier::try_from("AAPL")
         .unwrap_or_else(|error| panic!("quote source identifier: {error}"));
     let quote_payload_digest = EvidenceDigest::new(
@@ -1077,15 +1087,8 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
     let quote_market_data = SchwabRestQuoteMarketDataEvidence::try_new(
         quote_session,
         quote_generation,
-        SourceIdentifier::try_from("schwab-rest-quotes")
-            .unwrap_or_else(|error| panic!("quote feed: {error}")),
         quote_venue,
-        MarketDepth::TopOfBook,
-        SchwabRestDelayEvidence::RealTime,
-        DataQuality::DirectUnverified,
-        quote_product,
-        quote_channel,
-        EvidenceDigest::new(DigestAlgorithm::Sha256, [47; 32]),
+        quote_qualification,
     )
     .unwrap_or_else(|error| panic!("quote market data: {error}"));
     let outcome = sealed_quote
@@ -1159,37 +1162,13 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
     .unwrap_or_else(|error| panic!("option contract identity: {error}"));
     let option_underlying_revision = EvidenceDigest::new(DigestAlgorithm::Sha256, [52; 32]);
     let option_contract_revision = EvidenceDigest::new(DigestAlgorithm::Sha256, [53; 32]);
-    let option_market_data = |channel: &str| {
-        SchwabRestOptionMarketDataEvidence::try_new(
-            SourceIdentifier::try_from("schwab-rest-options")
-                .unwrap_or_else(|error| panic!("option feed: {error}")),
-            Some(
-                VenueId::try_from("schwab-us-options")
-                    .unwrap_or_else(|error| panic!("option venue: {error}")),
-            ),
-            MarketDepth::TopOfBook,
-            SchwabRestDelayEvidence::Unknown,
-            ProviderProduct::new(
-                SourceIdentifier::try_from("schwab-rest")
-                    .unwrap_or_else(|error| panic!("option product: {error}")),
-            ),
-            ProviderChannel::new(
-                SourceIdentifier::try_from(channel)
-                    .unwrap_or_else(|error| panic!("option channel: {error}")),
-            ),
-            EvidenceDigest::new(DigestAlgorithm::Sha256, [54; 32]),
-            EvidenceDigest::new(DigestAlgorithm::Sha256, [55; 32]),
-            EvidenceDigest::new(DigestAlgorithm::Sha256, [56; 32]),
-            currency,
-        )
-        .unwrap_or_else(|error| panic!("option market-data evidence: {error}"))
-    };
     let chain_received_at = Timestamp::from_unix_nanos(
         i64::try_from(sealed_chain.receipt().received_at_unix_millis())
             .unwrap_or_else(|error| panic!("chain received milliseconds: {error}"))
             .checked_mul(1_000_000)
             .unwrap_or_else(|| panic!("chain received timestamp overflow")),
     );
+    let chain_token_generation = sealed_chain.receipt().token_generation();
     let chain_outcome = sealed_chain
         .into_option_publication(SchwabRestOptionPublicationRequest::new(
             SchwabRestOptionUnderlyingRequest::new(
@@ -1203,7 +1182,19 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
                 option_contract_revision,
                 None,
             )],
-            option_market_data("chains"),
+            SchwabRestOptionMarketDataEvidence::try_new(
+                Some(
+                    VenueId::try_from("schwab-us-options")
+                        .unwrap_or_else(|error| panic!("option venue: {error}")),
+                ),
+                test_market_data_qualification(
+                    SchwabMarketDataFamily::OptionChains,
+                    chain_received_at,
+                    chain_token_generation,
+                ),
+                currency,
+            )
+            .unwrap_or_else(|error| panic!("option market-data evidence: {error}")),
             chain_received_at,
         ))
         .unwrap_or_else(|error| panic!("typed option-chain publication: {error}"));
@@ -1259,6 +1250,7 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
             .checked_mul(1_000_000)
             .unwrap_or_else(|| panic!("expiration received timestamp overflow")),
     );
+    let expiration_token_generation = sealed_expirations.receipt().token_generation();
     let expiration_outcome = sealed_expirations
         .into_option_publication(SchwabRestOptionPublicationRequest::new(
             SchwabRestOptionUnderlyingRequest::new(
@@ -1267,7 +1259,19 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
                 option_underlying_revision,
             ),
             Vec::new(),
-            option_market_data("expiration-chain"),
+            SchwabRestOptionMarketDataEvidence::try_new(
+                Some(
+                    VenueId::try_from("schwab-us-options")
+                        .unwrap_or_else(|error| panic!("expiration venue: {error}")),
+                ),
+                test_market_data_qualification(
+                    SchwabMarketDataFamily::ExpirationChains,
+                    expiration_received_at,
+                    expiration_token_generation,
+                ),
+                currency,
+            )
+            .unwrap_or_else(|error| panic!("expiration market-data evidence: {error}")),
             expiration_received_at,
         ))
         .unwrap_or_else(|error| panic!("typed expiration publication: {error}"));
@@ -1290,6 +1294,16 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
             .windows(b"days_to_expiration".len())
             .any(|value| value == b"days_to_expiration")
     );
+    let empty_expirations = execute_market_fixture(
+        &expiration_request,
+        br#"{"expirationList":[]}"#,
+        &token,
+        token_admission,
+    )
+    .await;
+    assert_eq!(empty_expirations.accounting().returned, 0);
+    assert_eq!(empty_expirations.accounting().missing, 1);
+    assert_eq!(empty_expirations.accounting().provider_records, 0);
 
     let hours_request = build_market_hours_request(vec![MarketId::Equity], None, admission())
         .unwrap_or_else(|error| panic!("hours request: {error}"));
@@ -1352,6 +1366,7 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
         )
         .unwrap_or_else(|error| panic!("replacement application credential: {error}"));
     let replacement = SchwabApplicationCredentialReplacement::try_new(
+        application_key.clone(),
         application_credential,
         replacement_credential.clone(),
     )
@@ -1371,6 +1386,7 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
         )
         .unwrap_or_else(|error| panic!("invalid replacement credential: {error}"));
     let invalid_replacement = SchwabApplicationCredentialReplacement::try_new(
+        application_key,
         replacement_credential.clone(),
         invalid_replacement_credential,
     )
@@ -1452,9 +1468,13 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     let connector_state = Arc::new(Mutex::new(MockStreamerState {
         connects: 0,
         inbound: Some(VecDeque::from([
-            InboundStreamerFrame::Text(login),
-            InboundStreamerFrame::Text(subscribed.clone()),
-            InboundStreamerFrame::Text(Bytes::from_static(market_data)),
+            MockStreamerInbound::Frame(InboundStreamerFrame::Text(login)),
+            MockStreamerInbound::Frame(InboundStreamerFrame::Text(subscribed.clone())),
+            MockStreamerInbound::FlushBoundary,
+            MockStreamerInbound::Frame(InboundStreamerFrame::Text(Bytes::from_static(market_data))),
+            MockStreamerInbound::FlushBoundary,
+            MockStreamerInbound::Frame(InboundStreamerFrame::Text(Bytes::from_static(market_data))),
+            MockStreamerInbound::FlushBoundary,
         ])),
         sent: Vec::new(),
     }));
@@ -1514,129 +1534,90 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     let cancellation = CancellationToken::new();
     let mut sink = CancellingCaptureSink {
         cancellation: cancellation.clone(),
+        cancel_after: 3,
         microbatches: Vec::new(),
     };
     streamer
         .run(bootstrap.value(), &mut sink, cancellation)
         .await
         .unwrap_or_else(|error| panic!("stream run: {error}"));
-    assert_eq!(sink.microbatches.len(), 1);
-    let stream_microbatch = sink
-        .microbatches
-        .pop()
-        .unwrap_or_else(|| panic!("missing stream microbatch"));
-    assert!(!format!("{stream_microbatch:?}").contains("LEVELONE_EQUITIES"));
-    assert_eq!(
-        stream_microbatch.receipt().token_generation(),
-        AccessTokenGeneration::new(NonZeroU64::MIN)
-    );
-    assert_eq!(stream_microbatch.receipt().frame_count(), 2);
-    assert_eq!(
-        stream_microbatch.connection().generation(),
-        application_generation
-    );
-    assert_eq!(stream_microbatch.connection().coordinates(), &coordinates);
-    assert_eq!(
-        stream_microbatch.connection().stream_identity(),
-        &stream_identity
-    );
-    assert_ne!(stream_microbatch.receipt().content_sha256(), [0; 32]);
-    assert_ne!(stream_microbatch.receipt().observation_sha256(), [0; 32]);
-    let [acknowledgement, frame] = stream_microbatch.frames() else {
-        panic!("validated stream microbatch did not retain acknowledgement and data frames");
-    };
-    assert_eq!(acknowledgement.payload(), &subscribed);
-    assert!(!format!("{frame:?}").contains("LEVELONE_EQUITIES"));
-    assert_eq!(frame.kind(), RawStreamerFrameKind::Text);
-    assert_eq!(frame.generation(), stream_microbatch.receipt().generation());
-    assert_eq!(
-        acknowledgement.ordinal(),
-        stream_microbatch.receipt().first_ordinal()
-    );
-    assert_eq!(frame.ordinal(), stream_microbatch.receipt().last_ordinal());
-    assert_eq!(frame.payload(), market_data);
-    assert_ne!(frame.payload_sha256(), [0; 32]);
-    assert_eq!(
-        acknowledgement.received_at_unix_millis(),
-        stream_microbatch.receipt().first_received_at_unix_millis()
-    );
-    assert_eq!(
-        frame.received_at_unix_millis(),
-        stream_microbatch.receipt().last_received_at_unix_millis()
-    );
-    assert!(
-        !frame
-            .payload()
-            .windows(b"mock-access-token".len())
-            .any(|window| window == b"mock-access-token")
-    );
-    let frame_ordinal = frame.ordinal();
-    let frame_generation = frame.generation();
-    let frame_digest = frame.payload_sha256();
-    let frame_received_at_unix_millis = frame.received_at_unix_millis();
-    let acknowledgement_event_id = Uuid::new_v4();
-    let event_id = Uuid::new_v4();
-    let (pending, seal_request) = stream_microbatch
-        .into_pending_capture(vec![acknowledgement_event_id, event_id], bounds())
-        .unwrap_or_else(|error| panic!("pending Streamer capture: {error}"));
+    assert_eq!(sink.microbatches.len(), 3);
     let temporary = TemporaryDirectory::new();
     let paths = LocalPaths::prepare(temporary.path().join("stream-raw-publication"))
         .unwrap_or_else(|error| panic!("Streamer publication paths: {error}"));
     let store = paths
         .sealed_research_journal_store()
         .unwrap_or_else(|error| panic!("Streamer publication store: {error}"));
-    let sealed_material = seal_request
-        .seal(&store)
-        .unwrap_or_else(|error| panic!("Streamer physical seal: {error}"));
-    let sealed = pending
-        .try_rejoin(sealed_material)
-        .unwrap_or_else(|error| panic!("sealed Streamer capture: {error}"));
+    let mut microbatches = sink.microbatches.into_iter();
+    let acknowledgement = seal_stream_microbatch(
+        microbatches
+            .next()
+            .unwrap_or_else(|| panic!("missing acknowledgement microbatch")),
+        &store,
+    );
+    let doctor_data = seal_stream_microbatch(
+        microbatches
+            .next()
+            .unwrap_or_else(|| panic!("missing doctor data microbatch")),
+        &store,
+    );
+    let sealed = seal_stream_microbatch(
+        microbatches
+            .next()
+            .unwrap_or_else(|| panic!("missing publication microbatch")),
+        &store,
+    );
+    assert!(microbatches.next().is_none());
+
+    let mut doctor = SchwabStreamerFamilyDoctorAccumulator::try_from_ack_capture(
+        MarketDataService::LevelOneEquities,
+        acknowledgement,
+    )
+    .unwrap_or_else(|rejection| panic!("typed Streamer acknowledgement: {:?}", rejection.error()));
+    doctor
+        .try_push_data_capture(doctor_data)
+        .unwrap_or_else(|rejection| panic!("typed Streamer doctor data: {:?}", rejection.error()));
+    let streamer_doctor = doctor
+        .try_finish()
+        .unwrap_or_else(|error| panic!("typed Streamer doctor handoff: {error}"));
+    assert_eq!(streamer_doctor.provider_records(), 1);
+    let service_response = streamer_doctor.acknowledgement();
+    assert_eq!(service_response.status_code(), 0);
+    let stream_capacity = service_response
+        .capacity_observation()
+        .unwrap_or_else(|error| panic!("sealed Streamer capacity evidence: {error}"));
+    assert_eq!(
+        (stream_capacity.requested(), stream_capacity.returned()),
+        (1, 1)
+    );
+
     assert_eq!(sealed.coordinates(), &coordinates);
     assert_eq!(sealed.stream_identity(), &stream_identity);
-    assert_eq!(sealed.frames().len(), 2);
-    assert_eq!(sealed.frames()[0].event_id(), acknowledgement_event_id);
-    assert_eq!(sealed.frames()[1].event_id(), event_id);
-    assert_eq!(sealed.frames()[1].transport_ordinal(), frame_ordinal);
-    assert_eq!(sealed.frames()[1].payload_digest().bytes(), frame_digest);
-    assert_eq!(
-        sealed.frames()[1].received_at_unix_millis(),
-        frame_received_at_unix_millis
-    );
-    let [service_response] = sealed.service_responses() else {
-        panic!("sealed Streamer capture must retain one service acknowledgement");
+    let [frame] = sealed.frames() else {
+        panic!("publication capture must retain one data frame");
     };
     assert_eq!(
-        service_response.service(),
-        MarketDataService::LevelOneEquities
+        frame.payload_bytes(),
+        u64::try_from(market_data.len())
+            .unwrap_or_else(|error| panic!("market-data payload bytes: {error}"))
     );
-    assert_eq!(service_response.status_code(), 0);
-    assert!(service_response.round_trip_latency_ms().is_some());
-    assert_eq!(service_response.event_id(), acknowledgement_event_id);
-    assert_ne!(service_response.observation_sha256().bytes(), [0; 32]);
+    assert_eq!(frame.kind(), RawStreamerFrameKind::Text);
+    let frame_generation = frame.generation();
+    let frame_digest = frame.payload_digest().bytes();
+    let frame_received_at_unix_millis = frame.received_at_unix_millis();
     let persisted = sealed.persisted_receipt();
     assert_eq!(persisted.capture().source_id(), coordinates.source_id());
     assert_eq!(persisted.capture().dataset(), coordinates.dataset());
     assert_eq!(persisted.capture().stream_identity(), &stream_identity);
     assert_ne!(persisted.receipt_digest().bytes(), [0; 32]);
-    assert_eq!(persisted.capture().frames().len(), 2);
-    assert_eq!(
-        persisted.capture().frames()[1].event_id(),
-        *event_id.as_bytes()
-    );
-    assert_eq!(persisted.capture().frames()[1].source_sequence(), None);
-    let streamer_doctor =
-        SchwabStreamerFamilyDoctorInput::try_new(MarketDataService::LevelOneEquities, &sealed)
-            .unwrap_or_else(|error| panic!("typed Streamer doctor input: {error}"));
-    assert_eq!(streamer_doctor.provider_records(), 1);
+    assert_eq!(persisted.capture().frames().len(), 1);
+    assert_eq!(persisted.capture().frames()[0].source_sequence(), None);
     let reopened = store
         .open_verified(persisted.segment())
         .unwrap_or_else(|error| panic!("reopen Streamer physical seal: {error}"));
-    let [acknowledgement_record, record] = reopened.records() else {
-        panic!("sealed Streamer microbatch must contain acknowledgement and data frames");
+    let [record] = reopened.records() else {
+        panic!("sealed Streamer publication microbatch must contain one data frame");
     };
-    assert_eq!(acknowledgement_record.event_id(), acknowledgement_event_id);
-    assert_eq!(acknowledgement_record.payload(), &subscribed);
-    assert_eq!(record.event_id(), event_id);
     assert_eq!(record.connection_id(), coordinates.connection_id());
     assert_eq!(record.payload(), market_data);
     assert_eq!(record.source_sequence(), None);
@@ -1651,14 +1632,13 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         .unwrap_or_else(|error| panic!("instrument id: {error}"));
     let venue_id =
         VenueId::try_from("schwab-us-equities").unwrap_or_else(|error| panic!("venue: {error}"));
-    let provider_product = ProviderProduct::new(
-        SourceIdentifier::try_from("schwab-streamer")
-            .unwrap_or_else(|error| panic!("provider product: {error}")),
+    let stream_qualification = test_market_data_qualification(
+        SchwabMarketDataFamily::LevelOneEquities,
+        received_at,
+        sealed.streamer_receipt().token_generation(),
     );
-    let provider_channel = ProviderChannel::new(
-        SourceIdentifier::try_from("LEVELONE_EQUITIES")
-            .unwrap_or_else(|error| panic!("provider channel: {error}")),
-    );
+    let provider_product = stream_qualification.provider_product().clone();
+    let provider_channel = stream_qualification.provider_channel().clone();
     let source_identifier = SourceIdentifier::try_from("AAPL")
         .unwrap_or_else(|error| panic!("source identifier: {error}"));
     let canonical_state = CanonicalStateDigest::new(
@@ -1722,22 +1702,13 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         EvidenceDigest::new(DigestAlgorithm::Sha256, [43; 32]),
     )
     .unwrap_or_else(|error| panic!("resolved identity: {error}"));
-    let market_evidence = SchwabStreamerQuoteMarketDataEvidence::try_new(
-        MarketDataService::LevelOneEquities,
-        SourceIdentifier::try_from("schwab-level-one-equities")
-            .unwrap_or_else(|error| panic!("feed: {error}")),
-        venue_id,
-        MarketDepth::TopOfBook,
-        SchwabStreamerDelayEvidence::Unknown,
-        DataQuality::DirectUnverified,
-        provider_product,
-        provider_channel,
-        EvidenceDigest::new(DigestAlgorithm::Sha256, [44; 32]),
-    )
-    .unwrap_or_else(|error| panic!("market evidence: {error}"));
+    let market_evidence =
+        SchwabStreamerQuoteMarketDataEvidence::try_new(venue_id, stream_qualification)
+            .unwrap_or_else(|error| panic!("market evidence: {error}"));
     let outcome = sealed
-        .into_level_one_quote_publication(SchwabStreamerQuotePublicationRequest::new(vec![
-            SchwabStreamerQuoteRecordRequest::new(
+        .into_level_one_quote_publication(SchwabStreamerQuotePublicationRequest::new(
+            &streamer_doctor,
+            vec![SchwabStreamerQuoteRecordRequest::new(
                 0,
                 0,
                 0,
@@ -1750,8 +1721,8 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
                 LotSize::try_from_decimal(rust_decimal::Decimal::ONE)
                     .unwrap_or_else(|error| panic!("lot size: {error}")),
                 market_evidence,
-            ),
-        ]))
+            )],
+        ))
         .unwrap_or_else(|error| panic!("typed Streamer publication: {error}"));
     let SchwabStreamerQuotePublicationOutcome::Published(publication) = outcome else {
         panic!("complete Level-One quote should publish a typed event batch");
@@ -1835,10 +1806,26 @@ async fn execute_market_fixture(
     token: &TransientAccessToken,
     token_admission: AccessTokenAdmission,
 ) -> crate::ExecutedRestResponse {
-    match execute_fixture(request, body, token, token_admission).await {
+    let outcome = execute_fixture(request, body, token, token_admission).await;
+    let capacity = outcome
+        .capacity_observation()
+        .unwrap_or_else(|error| panic!("response-owned capacity evidence: {error}"));
+    let response = match outcome {
         RestExecutionOutcome::Accepted(response) => response,
         other => panic!("unexpected market REST outcome: {other:?}"),
-    }
+    };
+    let accounting = response.accounting();
+    assert_eq!(capacity.requested(), accounting.requested);
+    assert_eq!(capacity.returned(), accounting.returned);
+    assert_eq!(capacity.missing(), accounting.missing);
+    assert_eq!(capacity.unexpected(), accounting.unexpected);
+    assert_eq!(
+        capacity.response_bytes(),
+        response.capture().receipt().body_bytes()
+    );
+    assert_eq!(capacity.status(), response.capture().receipt().status());
+    assert!(!capacity.validation_failed());
+    response
 }
 
 async fn assert_sealed_rest_family(
@@ -2004,8 +1991,14 @@ impl SchwabStreamerConnectionControlSource for MockStreamerControlSource {
 #[derive(Debug)]
 struct MockStreamerState {
     connects: u64,
-    inbound: Option<VecDeque<InboundStreamerFrame>>,
+    inbound: Option<VecDeque<MockStreamerInbound>>,
     sent: Vec<(String, String)>,
+}
+
+#[derive(Debug)]
+enum MockStreamerInbound {
+    Frame(InboundStreamerFrame),
+    FlushBoundary,
 }
 
 #[derive(Debug)]
@@ -2047,7 +2040,7 @@ impl SchwabStreamerConnector for MockStreamerConnector {
 
 struct MockStreamerConnection {
     state: Arc<Mutex<MockStreamerState>>,
-    inbound: VecDeque<InboundStreamerFrame>,
+    inbound: VecDeque<MockStreamerInbound>,
 }
 
 impl fmt::Debug for MockStreamerConnection {
@@ -2107,7 +2100,10 @@ impl SchwabStreamerConnection for MockStreamerConnection {
     > {
         Box::pin(async move {
             match self.inbound.pop_front() {
-                Some(frame) => Ok(Some(frame)),
+                Some(MockStreamerInbound::Frame(frame)) => Ok(Some(frame)),
+                Some(MockStreamerInbound::FlushBoundary) => {
+                    pending::<Result<Option<InboundStreamerFrame>, SchwabTransportError>>().await
+                }
                 None => {
                     pending::<Result<Option<InboundStreamerFrame>, SchwabTransportError>>().await
                 }
@@ -2124,6 +2120,7 @@ impl SchwabStreamerConnection for MockStreamerConnection {
 
 struct CancellingCaptureSink {
     cancellation: CancellationToken,
+    cancel_after: usize,
     microbatches: Vec<StreamerMicrobatch>,
 }
 
@@ -2133,9 +2130,29 @@ impl StreamerCaptureSink for CancellingCaptureSink {
         microbatch: StreamerMicrobatch,
     ) -> Result<(), StreamerCaptureSinkError> {
         self.microbatches.push(microbatch);
-        self.cancellation.cancel();
+        if self.microbatches.len() >= self.cancel_after {
+            self.cancellation.cancel();
+        }
         Ok(())
     }
+}
+
+fn seal_stream_microbatch(
+    microbatch: StreamerMicrobatch,
+    store: &SealedResearchJournalStore,
+) -> SchwabSealedStreamerCapture {
+    let event_ids = (0..microbatch.frames().len())
+        .map(|_| Uuid::new_v4())
+        .collect::<Vec<_>>();
+    let (pending, request) = microbatch
+        .into_pending_capture(event_ids, bounds())
+        .unwrap_or_else(|error| panic!("pending Streamer capture: {error}"));
+    let sealed = request
+        .seal(store)
+        .unwrap_or_else(|error| panic!("Streamer physical seal: {error}"));
+    pending
+        .try_rejoin(sealed)
+        .unwrap_or_else(|error| panic!("sealed Streamer capture: {error}"))
 }
 
 fn mock_token(admission: AccessTokenAdmission) -> TransientAccessToken {
@@ -2152,6 +2169,127 @@ fn mock_token(admission: AccessTokenAdmission) -> TransientAccessToken {
         admission,
     )
     .unwrap_or_else(|error| panic!("mock token: {error}"))
+}
+
+fn test_market_data_qualification(
+    family: SchwabMarketDataFamily,
+    response_observed_at: Timestamp,
+    token_generation: AccessTokenGeneration,
+) -> SchwabMarketDataQualification {
+    let issued_at = Timestamp::from_unix_nanos(
+        response_observed_at
+            .unix_nanos()
+            .checked_sub(60_000_000_000)
+            .unwrap_or_else(|| panic!("test qualification issue time underflow")),
+    );
+    let access_expires_at = Timestamp::from_unix_nanos(
+        response_observed_at
+            .unix_nanos()
+            .checked_add(600_000_000_000)
+            .unwrap_or_else(|| panic!("test qualification access expiry overflow")),
+    );
+    let refresh_expires_at = Timestamp::from_unix_nanos(
+        issued_at
+            .unix_nanos()
+            .checked_add(604_800_000_000_000)
+            .unwrap_or_else(|| panic!("test qualification refresh expiry overflow")),
+    );
+    let exclusive_expires_at = access_expires_at;
+    let digest = |byte| EvidenceDigest::new(DigestAlgorithm::Sha256, [byte; 32]);
+    let families = schwab_market_data_families()
+        .into_iter()
+        .map(|candidate| {
+            let observed = candidate == family;
+            SchwabMarketDataFamilyEvidence {
+                family: candidate,
+                disposition: if observed {
+                    RuntimeCapabilityDisposition::Available
+                } else {
+                    RuntimeCapabilityDisposition::NotProbed
+                },
+                disposition_evidence_sha256: digest(71),
+                observation_sha256: observed.then(|| digest(72)),
+                observed_at: observed.then_some(response_observed_at),
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let receipt = SchwabMarketDataDoctorReceiptV1::try_new(SchwabMarketDataDoctorReceiptInput {
+        surface_id: SourceIdentifier::try_from(SCHWAB_MARKET_DATA_SURFACE_ID)
+            .unwrap_or_else(|error| panic!("test qualification surface: {error}")),
+        session_identifier: SourceIdentifier::try_from("8d9bc9ee-fca2-4f1d-a077-5104408e3727")
+            .unwrap_or_else(|error| panic!("test qualification session: {error}")),
+        application_credential_generation: SecretGeneration::new(1)
+            .unwrap_or_else(|error| panic!("test application generation: {error}")),
+        capability_revision: ProviderCapabilityRevision::new(1)
+            .unwrap_or_else(|error| panic!("test capability revision: {error}")),
+        capability_digest: digest(73),
+        public_configuration_digest: digest(74),
+        rights_decision_digest: digest(75),
+        rate_policy_digest: digest(76),
+        data_quality: DataQuality::DirectUnverified,
+        observation: SchwabMarketDataDoctorObservation {
+            provider_observation_origin:
+                SchwabMarketDataDoctorObservation::provider_observed_origin()
+                    .unwrap_or_else(|error| panic!("test provider observation origin: {error}")),
+            access_token_generation: token_generation.get(),
+            access_issued_at: issued_at,
+            access_expires_at,
+            refresh_authorized_at: issued_at,
+            refresh_expires_at,
+            user_preference: SchwabUserPreferenceDoctorEvidence {
+                endpoint_contract_sha256: digest(77),
+                request_sha256: digest(78),
+                response_sha256: digest(79),
+                status_code: 200,
+                response_bytes: 1,
+                received_at: response_observed_at,
+                latency_nanos: 1,
+                market_data_principal_sha256: digest(80),
+                streamer_bootstrap_sha256: digest(81),
+                market_data_offer_sha256: None,
+            },
+            quote_delay: (family == SchwabMarketDataFamily::Quotes)
+                .then_some(CoverageDelay::RealTime),
+            families,
+            completed_at: response_observed_at,
+        },
+        exclusive_expires_at,
+        predecessor_digest: None,
+    })
+    .unwrap_or_else(|error| panic!("test market-data doctor receipt: {error}"));
+    SchwabMarketDataQualification::try_from_doctor_receipt(
+        &receipt,
+        family,
+        response_observed_at,
+        token_generation,
+    )
+    .unwrap_or_else(|error| panic!("test market-data qualification: {error}"))
+}
+
+fn schwab_market_data_families() -> [SchwabMarketDataFamily; 19] {
+    use SchwabMarketDataFamily::*;
+    [
+        Quotes,
+        PriceHistory,
+        OptionChains,
+        ExpirationChains,
+        Movers,
+        MarketHours,
+        Instruments,
+        LevelOneEquities,
+        LevelOneOptions,
+        LevelOneFutures,
+        LevelOneFuturesOptions,
+        LevelOneForex,
+        NyseBook,
+        NasdaqBook,
+        OptionsBook,
+        ChartEquity,
+        ChartFutures,
+        ScreenerEquity,
+        ScreenerOption,
+    ]
 }
 
 fn capture_coordinates() -> SchwabCaptureCoordinates {

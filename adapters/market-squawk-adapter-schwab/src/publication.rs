@@ -1,6 +1,6 @@
 //! Seal-first Schwab REST publication boundaries.
 
-use std::{num::NonZeroU64, sync::Arc};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use market_squawk_domain::{
@@ -13,7 +13,7 @@ use market_squawk_sources::{
     AvailabilityEvidence, CURRENT_RESEARCH_RECORD_SCHEMA, ExtractionBatch, ExtractionRecord,
     ExtractionRequest, ExtractionRevisionPlan, ProviderCaptureSealRequest,
     ProviderNativeLineageBatch, ProviderNativeLineageBatchBuilder,
-    ProviderNativeLineageImplementation, SealedProviderCaptureBinding,
+    ProviderNativeLineageImplementation, SchwabMarketDataFamily, SealedProviderCaptureBinding,
     SealedProviderCaptureMaterial,
 };
 use serde::Serialize;
@@ -30,7 +30,8 @@ use crate::canonical::{
 use crate::transport::SchwabSealedRestResponseParts;
 use crate::{
     ExecutedRestResponse, NativeField, NativeNumber, PriceHistoryResponse, ReadOnlyRoute,
-    SchwabCanonicalError, SchwabCaptureCoordinates, SchwabOAuthAuthorityReceipt,
+    SchwabCanonicalError, SchwabCaptureCoordinates, SchwabMarketDataDelay,
+    SchwabMarketDataQualification, SchwabOAuthAuthorityReceipt,
     SchwabPriceHistoryCapabilityObservation, SchwabResolvedProviderIdentity,
     SchwabRestCaptureSealRejoin, SchwabRestPayload, SchwabTransportError,
     SchwabUserPreferenceEvidence,
@@ -40,45 +41,25 @@ use market_squawk_domain::{
     ProviderInstrumentId, Timestamp,
 };
 
-/// Exact delivery-delay evidence attached to a Schwab REST market-data response.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "nanoseconds")]
-pub enum SchwabRestDelayEvidence {
-    /// The current provider evidence explicitly identifies real-time delivery.
-    RealTime,
-    /// The current provider evidence identifies a positive delivery delay.
-    Delayed(NonZeroU64),
-    /// The current provider evidence does not establish a numeric delay.
-    Unknown,
-}
-
 /// Provider/feed/venue/delay evidence for one Schwab daily price-history response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SchwabPriceHistoryMarketDataEvidence {
     venue_id: VenueId,
-    feed: SourceIdentifier,
-    delay: SchwabRestDelayEvidence,
-    qualification_evidence: EvidenceDigest,
+    qualification: SchwabMarketDataQualification,
 }
 
 impl SchwabPriceHistoryMarketDataEvidence {
     /// Constructs explicit market-data evidence. The REST service and route remain code-owned.
     pub fn try_new(
         venue_id: VenueId,
-        feed: SourceIdentifier,
-        delay: SchwabRestDelayEvidence,
-        qualification_evidence: EvidenceDigest,
+        qualification: SchwabMarketDataQualification,
     ) -> Result<Self, SchwabPriceHistoryPublicationError> {
-        if qualification_evidence.algorithm() != DigestAlgorithm::Sha256
-            || qualification_evidence.bytes() == [0; 32]
-        {
+        if qualification.family() != SchwabMarketDataFamily::PriceHistory {
             return Err(SchwabPriceHistoryPublicationError::InvalidEvidence);
         }
         Ok(Self {
             venue_id,
-            feed,
-            delay,
-            qualification_evidence,
+            qualification,
         })
     }
 
@@ -89,22 +70,25 @@ impl SchwabPriceHistoryMarketDataEvidence {
 
     /// Exact provider feed label retained on the canonical bars.
     pub const fn feed(&self) -> &SourceIdentifier {
-        &self.feed
+        self.qualification.feed()
     }
 
     /// Explicit provider delay state, including honest unknown evidence.
-    pub const fn delay(&self) -> SchwabRestDelayEvidence {
-        self.delay
+    pub const fn delay(&self) -> SchwabMarketDataDelay {
+        self.qualification.delay()
     }
 
     /// Exact external evidence binding the supplied feed, venue, and delay declaration.
     pub const fn qualification_evidence(&self) -> EvidenceDigest {
-        self.qualification_evidence
+        self.qualification.observation_evidence()
     }
 
     /// Code-owned REST service identity.
     pub const fn service(&self) -> &'static str {
-        "schwab-market-data-rest"
+        match self.qualification.rest_service() {
+            Some(service) => service,
+            None => "invalid",
+        }
     }
 
     /// Code-owned read-only route family.
@@ -283,7 +267,10 @@ impl ExecutedRestResponse {
         let interval = SourceIdentifier::try_from(SCHWAB_DAILY_INTERVAL)
             .map_err(|_| SchwabPriceHistoryPublicationError::InvalidEvidence)?;
         let adjustment = MarketBarAdjustment::Raw;
-        if calendar_range.publication_source_id() != coordinates.source_id()
+        if !market_data
+            .qualification
+            .validates_rest_response(SchwabMarketDataFamily::PriceHistory, &self)
+            || calendar_range.publication_source_id() != coordinates.source_id()
             || calendar_range.venue_id() != market_data.venue_id()
             || calendar_range.interval() != &interval
             || calendar_range.adjustment() != adjustment
@@ -311,7 +298,7 @@ impl ExecutedRestResponse {
             admitted_plan_digest,
             identity,
             venue_id: market_data.venue_id.clone(),
-            feed: market_data.feed.clone(),
+            feed: market_data.feed().clone(),
             interval,
             adjustment,
             currency,
@@ -639,10 +626,15 @@ struct SchwabPriceHistoryNativeSidecarV1<'a> {
     missing_items: u64,
     unexpected_items: u64,
     provider_records: u64,
-    venue: &'a str,
+    reference_venue: &'a str,
+    provider_reported_venue: Option<&'a str>,
     feed: &'a str,
-    delay: SchwabRestDelayEvidence,
+    delay: SchwabMarketDataDelay,
     qualification_evidence: EvidenceDigest,
+    qualification_receipt_evidence: EvidenceDigest,
+    qualification_family: SchwabMarketDataFamily,
+    qualification_observed_at: Timestamp,
+    qualification_response_observed_at: Timestamp,
     market_data_permission: Option<&'a str>,
     previous_close_state: &'static str,
     previous_close: Option<&'a str>,
@@ -690,7 +682,7 @@ fn native_lineage(
     if history.candles().len() != batch.records().len()
         || history.symbol.as_str() != candidate.identity.provider_symbol().as_str()
         || parsed.raw_sha256() != sealed.receipt.body_sha256()
-        || candidate.feed != market_data.feed
+        || candidate.feed != *market_data.feed()
         || candidate.venue_id != market_data.venue_id
     {
         return Err(SchwabPriceHistoryPublicationError::InvalidEvidence);
@@ -738,10 +730,15 @@ fn native_lineage(
             missing_items: sealed.accounting.missing,
             unexpected_items: sealed.accounting.unexpected,
             provider_records: sealed.accounting.provider_records,
-            venue: market_data.venue_id.as_str(),
-            feed: market_data.feed.as_str(),
-            delay: market_data.delay,
-            qualification_evidence: market_data.qualification_evidence,
+            reference_venue: market_data.venue_id.as_str(),
+            provider_reported_venue: None,
+            feed: market_data.feed().as_str(),
+            delay: market_data.delay(),
+            qualification_evidence: market_data.qualification_evidence(),
+            qualification_receipt_evidence: market_data.qualification.receipt_evidence(),
+            qualification_family: market_data.qualification.family(),
+            qualification_observed_at: market_data.qualification.family_observed_at(),
+            qualification_response_observed_at: market_data.qualification.response_observed_at(),
             market_data_permission: candidate.market_data_permission.as_deref(),
             previous_close_state,
             previous_close,

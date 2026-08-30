@@ -36,9 +36,10 @@ pub use streamer::{
     RawStreamerFrameKind, SchwabPendingStreamerCapture, SchwabSealedStreamerCapture,
     SchwabStreamerConnection, SchwabStreamerConnectionControl,
     SchwabStreamerConnectionControlSource, SchwabStreamerConnectionEvidence,
-    SchwabStreamerConnector, SchwabStreamerExecutor, SchwabStreamerFrameSealEvidence,
-    SchwabStreamerServiceResponseEvidence, StreamerCaptureSink, StreamerCaptureSinkError,
-    StreamerMicrobatch, StreamerMicrobatchReceipt, StreamerRunExit,
+    SchwabStreamerConnector, SchwabStreamerDesiredStateSendError, SchwabStreamerDesiredStateSender,
+    SchwabStreamerExecutor, SchwabStreamerFrameSealEvidence, SchwabStreamerServiceResponseEvidence,
+    StreamerCaptureSink, StreamerCaptureSinkError, StreamerMicrobatch, StreamerMicrobatchReceipt,
+    StreamerRunExit,
 };
 
 /// Source-neutral capture coordinates supplied by the registered provider/runtime owner.

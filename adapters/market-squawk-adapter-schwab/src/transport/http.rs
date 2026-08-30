@@ -28,12 +28,12 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    ExpirationResponse, InstrumentResponse, MarketHours, MoversResponse, OptionChain, ParseBounds,
-    ParsedNative, PriceHistoryResponse, ProviderIdentifier, QuoteResponse, ReadOnlyRequest,
-    ReadOnlyRoute, SchwabAdapterError, StreamerBootstrapResponse, parse_expiration_response,
-    parse_instrument_response, parse_market_hours_response, parse_movers_response,
-    parse_option_chain_response, parse_price_history_response, parse_quote_response,
-    parse_user_preference,
+    CapacityObservation, CapacityUnit, ExpirationResponse, InstrumentResponse, MarketHours,
+    MoversResponse, OptionChain, ParseBounds, ParsedNative, PriceHistoryResponse,
+    ProviderIdentifier, QuoteResponse, ReadOnlyRequest, ReadOnlyRoute, SchwabAdapterError,
+    StreamerBootstrapResponse, parse_expiration_response, parse_instrument_response,
+    parse_market_hours_response, parse_movers_response, parse_option_chain_response,
+    parse_price_history_response, parse_quote_response, parse_user_preference,
 };
 
 use super::{
@@ -270,6 +270,13 @@ impl CapturedRestResponse {
     /// Same-unit request completion retained even when the body is rejected or cannot be parsed.
     pub const fn accounting(&self) -> RestItemAccounting {
         self.accounting
+    }
+
+    fn capacity_observation(
+        &self,
+        validation_failed: bool,
+    ) -> Result<CapacityObservation, SchwabTransportError> {
+        capacity_observation_from_receipt(&self.receipt, self.accounting, validation_failed)
     }
 
     /// Consumes one rejected or invalid market-data body into the sole raw-sealing handoff.
@@ -992,6 +999,64 @@ pub enum RestExecutionOutcome {
     },
 }
 
+impl RestExecutionOutcome {
+    /// Returns exact response-scoped capacity evidence for this completed transport operation.
+    ///
+    /// Values are derived from the retained receipt and same-unit accounting. Callers cannot
+    /// substitute a status, byte count, latency, Retry-After observation, or completion count.
+    pub fn capacity_observation(&self) -> Result<CapacityObservation, SchwabTransportError> {
+        match self {
+            Self::Accepted(response) => response.capture.capacity_observation(false),
+            Self::AcceptedUserPreference(response) => {
+                capacity_observation_from_receipt(&response.receipt, response.accounting, false)
+            }
+            Self::ProviderRejected(capture) => capture.capacity_observation(false),
+            Self::UserPreferenceRejected(receipt) => {
+                capacity_observation_from_receipt(receipt, unavailable_accounting(1)?, false)
+            }
+            Self::InvalidPayload { capture, .. } => capture.capacity_observation(true),
+            Self::InvalidUserPreference { receipt, .. } => {
+                capacity_observation_from_receipt(receipt, unavailable_accounting(1)?, true)
+            }
+        }
+    }
+}
+
+fn capacity_observation_from_receipt(
+    receipt: &RawRestResponseReceipt,
+    accounting: RestItemAccounting,
+    validation_failed: bool,
+) -> Result<CapacityObservation, SchwabTransportError> {
+    let unit = match receipt.route() {
+        ReadOnlyRoute::Quotes | ReadOnlyRoute::SingleQuote => CapacityUnit::Symbols,
+        ReadOnlyRoute::Markets | ReadOnlyRoute::SingleMarket => CapacityUnit::MarketSegments,
+        ReadOnlyRoute::UserPreference => CapacityUnit::Requests,
+        ReadOnlyRoute::Chains
+        | ReadOnlyRoute::ExpirationChain
+        | ReadOnlyRoute::PriceHistory
+        | ReadOnlyRoute::Movers
+        | ReadOnlyRoute::Instruments
+        | ReadOnlyRoute::InstrumentByCusip => CapacityUnit::LookupKeys,
+    };
+    CapacityObservation::from_transport(
+        unit,
+        accounting.requested,
+        accounting.returned,
+        accounting.missing,
+        0,
+        0,
+        accounting.unexpected,
+        u64::try_from(receipt.request_url().len()).map_err(|_| SchwabTransportError::Overflow)?,
+        receipt.body_bytes(),
+        receipt.latency_ms(),
+        receipt.status(),
+        receipt.retry_after_present(),
+        validation_failed,
+    )
+    .validate()
+    .map_err(|_| SchwabTransportError::Protocol)
+}
+
 /// Read-only REST executor with no credential or response persistence.
 #[derive(Debug)]
 pub struct SchwabRestExecutor {
@@ -1318,9 +1383,25 @@ fn account_items(
                 crate::NativeField::Absent | crate::NativeField::Null => (0, 0),
             }
         }
-        (ReadOnlyRoute::ExpirationChain, SchwabRestPayload::Expirations(_))
-        | (ReadOnlyRoute::Instruments, SchwabRestPayload::Instruments(_))
-        | (ReadOnlyRoute::InstrumentByCusip, SchwabRestPayload::Instruments(_)) => (1, 0),
+        (ReadOnlyRoute::ExpirationChain, SchwabRestPayload::Expirations(value)) => {
+            (u64::from(!value.value().expirations().is_empty()), 0)
+        }
+        (ReadOnlyRoute::Instruments, SchwabRestPayload::Instruments(value)) => {
+            (u64::from(!value.value().instruments().is_empty()), 0)
+        }
+        (ReadOnlyRoute::InstrumentByCusip, SchwabRestPayload::Instruments(value)) => {
+            let expected = last_path_segment(request.url())?;
+            let actual = value
+                .value()
+                .instruments()
+                .iter()
+                .filter_map(|instrument| match &instrument.cusip {
+                    crate::NativeField::Value(value) => Some(value.as_ref().to_owned()),
+                    crate::NativeField::Absent | crate::NativeField::Null => None,
+                })
+                .collect::<BTreeSet<_>>();
+            set_overlap(&BTreeSet::from([expected]), &actual)?
+        }
         _ => return Err(SchwabTransportError::Protocol),
     };
     if returned > requested {

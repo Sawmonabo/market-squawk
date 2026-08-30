@@ -62,8 +62,7 @@ pub use option_publication::{
 pub use publication::{
     SchwabDailyPriceHistoryCalendarRangeReceipt, SchwabDailyPriceHistoryPublicationRequest,
     SchwabPendingDailyPriceHistoryPublication, SchwabPriceHistoryMarketDataEvidence,
-    SchwabPriceHistoryPublicationError, SchwabRestDelayEvidence,
-    SchwabSealedDailyPriceHistoryPublication,
+    SchwabPriceHistoryPublicationError, SchwabSealedDailyPriceHistoryPublication,
 };
 pub use rest::{
     ChainContractType, ChainRequest, ChainStrategy, ExpirationChainRequest, ExpirationMonth,
@@ -97,10 +96,10 @@ pub use streamer::{
 };
 pub use streamer_publication::{
     SchwabSealedRawStreamerPublication, SchwabSealedStreamerQuotePublication,
-    SchwabStreamerDelayEvidence, SchwabStreamerPublicationError,
-    SchwabStreamerQuoteMarketDataEvidence, SchwabStreamerQuotePublicationOutcome,
-    SchwabStreamerQuotePublicationRequest, SchwabStreamerQuoteRecordRequest,
-    SchwabStreamerRecordDisposition, SchwabStreamerRecordDispositionReason,
+    SchwabStreamerPublicationError, SchwabStreamerQuoteMarketDataEvidence,
+    SchwabStreamerQuotePublicationOutcome, SchwabStreamerQuotePublicationRequest,
+    SchwabStreamerQuoteRecordRequest, SchwabStreamerRecordDisposition,
+    SchwabStreamerRecordDispositionReason,
 };
 pub use transport::{
     AccessTokenAdmission, AccessTokenGeneration, CapturedRestResponse, ExecutedRestResponse,
@@ -113,14 +112,16 @@ pub use transport::{
     SchwabRestFamily, SchwabRestPayload, SchwabSealedRawRestCapture, SchwabSealedRestResponse,
     SchwabSealedStreamerCapture, SchwabStreamerConnection, SchwabStreamerConnectionControl,
     SchwabStreamerConnectionControlSource, SchwabStreamerConnectionEvidence,
-    SchwabStreamerConnector, SchwabStreamerExecutor, SchwabStreamerFrameSealEvidence,
-    SchwabStreamerServiceResponseEvidence, SchwabTransportError, SchwabTransportTelemetry,
-    SchwabTransportTelemetrySnapshot, SchwabUserPreferenceEvidence, StreamerCaptureSink,
-    StreamerCaptureSinkError, StreamerMicrobatch, StreamerMicrobatchReceipt, StreamerRunExit,
-    StreamerTransportBounds, TokenAuthorityError, TransientAccessToken,
+    SchwabStreamerConnector, SchwabStreamerDesiredStateSendError, SchwabStreamerDesiredStateSender,
+    SchwabStreamerExecutor, SchwabStreamerFrameSealEvidence, SchwabStreamerServiceResponseEvidence,
+    SchwabTransportError, SchwabTransportTelemetry, SchwabTransportTelemetrySnapshot,
+    SchwabUserPreferenceEvidence, StreamerCaptureSink, StreamerCaptureSinkError,
+    StreamerMicrobatch, StreamerMicrobatchReceipt, StreamerRunExit, StreamerTransportBounds,
+    TokenAuthorityError, TransientAccessToken,
 };
 pub use vertical::{
-    SchwabCapabilityCurrentness, SchwabFamilyDoctorInput, SchwabObservedCapabilityFamily,
+    SchwabCapabilityCurrentness, SchwabFamilyDoctorInput, SchwabMarketDataDelay,
+    SchwabMarketDataDepth, SchwabMarketDataQualification, SchwabObservedCapabilityFamily,
     SchwabPriceHistoryCapabilityObservation, SchwabRestFamilyDoctorInput,
     SchwabStreamerDoctorCaptureRejection, SchwabStreamerFamilyDoctorAccumulator,
     SchwabStreamerFamilyDoctorHandoff, SchwabStreamerFamilyDoctorInput, SchwabVerticalError,

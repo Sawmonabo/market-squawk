@@ -1017,6 +1017,9 @@ pub fn parse_instrument_response(
         let description = remove_native_text(&mut item, "description")?;
         let exchange = remove_native_text(&mut item, "exchange")?;
         let asset_type = remove_native_text(&mut item, "assetType")?;
+        if !matches!(cusip, NativeField::Value(_)) && !matches!(symbol, NativeField::Value(_)) {
+            return Err(SchwabAdapterError::SchemaViolation);
+        }
         let fundamental = parse_typed_block(
             &mut item,
             "fundamental",
