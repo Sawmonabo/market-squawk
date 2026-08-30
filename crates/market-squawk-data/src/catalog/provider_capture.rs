@@ -1,6 +1,10 @@
 //! Immutable provider raw observations and their canonical publication bindings.
 
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
+use std::collections::BTreeSet;
+
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, Timestamp,
+};
 use market_squawk_platform::{SealedResearchJournalSegmentClaim, SealedResearchRawClaim};
 use market_squawk_sources::{
     MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES,
@@ -1282,6 +1286,7 @@ fn load_provider_capture_binding_evidence(
     if capture.observation_digest() != observation_digest {
         return Err(CatalogError::CorruptCatalog);
     }
+    validate_retained_source_revisions(connection, &capture)?;
     type NativeHeader = (
         i64,
         String,
@@ -1467,22 +1472,100 @@ fn validate_source_revision(
     connection: &Connection,
     capture: &ProviderCaptureSetReceipt,
 ) -> Result<(), CatalogError> {
+    for (source_id, metadata_revision) in capture_source_authorities(capture) {
+        validate_current_source_revision(
+            connection,
+            &source_id,
+            &MetadataRevision::new(metadata_revision),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_current_source_revision(
+    connection: &Connection,
+    source_id: &SourceId,
+    metadata_revision: &MetadataRevision,
+) -> Result<(), CatalogError> {
     let (digest, json): (Vec<u8>, String) = connection.query_row(
         "SELECT sources.current_revision_digest, revisions.metadata_json
          FROM sources JOIN source_revisions AS revisions
            ON revisions.source_id=sources.source_id
           AND revisions.revision_digest=sources.current_revision_digest
          WHERE sources.source_id=?1",
-        [capture.source_id().as_str()],
+        [source_id.as_str()],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     if digest.as_slice() != sha256(json.as_bytes()) {
         return Err(CatalogError::CorruptCatalog);
     }
     let source: SourceMetadata = serde_json::from_str(&json)?;
-    if source.source_id() != capture.source_id() || source.revision() != capture.metadata_revision()
-    {
+    if source.source_id() != source_id || source.revision() != metadata_revision {
         return Err(CatalogError::ProviderCaptureMismatch);
+    }
+    Ok(())
+}
+
+fn validate_retained_source_revisions(
+    connection: &Connection,
+    capture: &ProviderCaptureSetReceipt,
+) -> Result<(), CatalogError> {
+    for (source_id, metadata_revision) in capture_source_authorities(capture) {
+        validate_retained_source_revision(
+            connection,
+            &source_id,
+            &MetadataRevision::new(metadata_revision),
+        )?;
+    }
+    Ok(())
+}
+
+fn capture_source_authorities(
+    capture: &ProviderCaptureSetReceipt,
+) -> BTreeSet<(SourceId, market_squawk_domain::SourceIdentifier)> {
+    let mut authorities = BTreeSet::new();
+    authorities.insert((
+        capture.source_id().clone(),
+        capture.metadata_revision().as_source_identifier().clone(),
+    ));
+    for component in capture.request_graph_components() {
+        authorities.insert((
+            component.source_id().clone(),
+            component.metadata_revision().as_source_identifier().clone(),
+        ));
+    }
+    authorities
+}
+
+fn validate_retained_source_revision(
+    connection: &Connection,
+    source_id: &SourceId,
+    metadata_revision: &MetadataRevision,
+) -> Result<(), CatalogError> {
+    let mut statement = connection.prepare(
+        "SELECT revision_digest, metadata_json
+         FROM source_revisions
+         WHERE source_id=?1
+           AND json_extract(metadata_json, '$.revision_evidence.metadata_revision')=?2
+         ORDER BY revision_digest
+         LIMIT 2",
+    )?;
+    let mut rows = statement.query(params![
+        source_id.as_str(),
+        metadata_revision.as_source_identifier().as_str()
+    ])?;
+    let Some(row) = rows.next()? else {
+        return Err(CatalogError::CorruptCatalog);
+    };
+    let digest: Vec<u8> = row.get(0)?;
+    let json: String = row.get(1)?;
+    if rows.next()?.is_some() || digest.as_slice() != sha256(json.as_bytes()) {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    let source: SourceMetadata =
+        serde_json::from_str(&json).map_err(|_| CatalogError::CorruptCatalog)?;
+    if source.source_id() != source_id || source.revision() != metadata_revision {
+        return Err(CatalogError::CorruptCatalog);
     }
     Ok(())
 }

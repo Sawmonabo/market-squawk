@@ -1878,6 +1878,8 @@ fn bind_complete_market_history_capture_graph(
 ) -> Result<ManagedExtraction, ExtractionSourceError> {
     let dataset = batch.request().object().dataset().clone();
     let capture_material = ProviderCaptureMaterial::try_combine_request_graph_with_semantic(
+        batch.request().object().source_id().clone(),
+        batch.request().object().metadata_revision().clone(),
         dataset,
         components,
         semantic_binding,

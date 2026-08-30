@@ -2425,7 +2425,9 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
 
     let authority = CatalogAuthority::open(catalog_config.clone())?;
     let source = complete_history_source(instrument_id)?;
+    let calendar_source = complete_history_calendar_source(instrument_id)?;
     authority.register_source(&source, Timestamp::from_unix_nanos(10))?;
+    authority.register_source(&calendar_source, Timestamp::from_unix_nanos(10))?;
     let service = AnalyticalDataService::initialize(
         authority,
         AnalyticalManifestCatalog::open(&location, 8)?,
@@ -2987,6 +2989,32 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         Err(AnalyticalReadError::Manifest(
             ManifestCatalogError::MarketBarHistoryMismatch
         ))
+    ));
+    drop(restarted);
+
+    let revision_corruption = rusqlite::Connection::open(location.path())?;
+    revision_corruption.execute_batch("DROP TRIGGER source_revisions_immutable_update;")?;
+    assert_eq!(
+        revision_corruption.execute(
+            "UPDATE source_revisions
+             SET metadata_json=json_set(metadata_json, '$.provider', 'corrupt-provider')
+             WHERE source_id=?1",
+            ["alpaca-iex-calendar-reference"],
+        )?,
+        1
+    );
+    drop(revision_corruption);
+
+    let corrupt_restart = AnalyticalDataService::open(
+        CatalogAuthority::open(test_catalog_config(location.clone())?)?,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        paths.artifacts()?.clone(),
+        ObjectStoreConfig::try_new(8 * 1024 * 1024, 64, Duration::from_secs(60))?,
+    )?;
+    assert!(matches!(
+        corrupt_restart
+            .generation_owned_provider_capture_evidence(&short_append_manifest, &capture_store),
+        Err(IngestError::Catalog(CatalogError::CorruptCatalog))
     ));
     Ok(())
 }
@@ -3982,9 +4010,13 @@ fn complete_history_capture_fixture(
         DigestAlgorithm::Sha256,
         Sha256::digest(&calendar_body).into(),
     );
+    let calendar_source_id = SourceId::try_from("alpaca-iex-calendar-reference")?;
+    let calendar_metadata_revision = MetadataRevision::new(SourceIdentifier::try_from(
+        "alpaca-iex-calendar-reference-revision-v1",
+    )?);
     let calendar_capture = ProviderCaptureSetReceipt::try_new(
-        source_id.clone(),
-        metadata_revision.clone(),
+        calendar_source_id.clone(),
+        calendar_metadata_revision,
         dataset.clone(),
         digest(digest_base + 2),
         ProviderCaptureTerminalDisposition::StandaloneResponse,
@@ -4003,7 +4035,7 @@ fn complete_history_capture_fixture(
         calendar_capture,
         vec![RawCaptureRecord::try_new_live(
             Uuid::from_u128(uuid_base + 2),
-            Arc::from(source_id.as_str()),
+            Arc::from(calendar_source_id.as_str()),
             Uuid::from_u128(uuid_base + 3),
             Some(0),
             None,
@@ -4120,6 +4152,8 @@ fn complete_history_capture_fixture(
             .collect(),
     )?;
     let capture_material = ProviderCaptureMaterial::try_combine_request_graph_with_semantic(
+        batch.request().object().source_id().clone(),
+        batch.request().object().metadata_revision().clone(),
         dataset,
         vec![bar_material, calendar_material],
         ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(semantic),
@@ -4291,6 +4325,34 @@ fn complete_history_market_data_definition(
 }
 
 fn complete_history_source(instrument_id: InstrumentId) -> Result<SourceMetadata, Box<dyn Error>> {
+    complete_history_source_for(
+        instrument_id,
+        "alpaca-basic-iex-market-data",
+        "alpaca-history-source-revision-v1",
+        132,
+        133,
+    )
+}
+
+fn complete_history_calendar_source(
+    instrument_id: InstrumentId,
+) -> Result<SourceMetadata, Box<dyn Error>> {
+    complete_history_source_for(
+        instrument_id,
+        "alpaca-iex-calendar-reference",
+        "alpaca-iex-calendar-reference-revision-v1",
+        134,
+        135,
+    )
+}
+
+fn complete_history_source_for(
+    instrument_id: InstrumentId,
+    source_id: &str,
+    metadata_revision: &str,
+    revision_digest_byte: u8,
+    coverage_digest_byte: u8,
+) -> Result<SourceMetadata, Box<dyn Error>> {
     let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
     let provider = SourceIdentifier::try_from("alpaca-market-data")?;
     let authorization = AuthorizationGrant::new(
@@ -4312,18 +4374,16 @@ fn complete_history_source(instrument_id: InstrumentId) -> Result<SourceMetadata
     )?;
     Ok(SourceMetadata::try_new(SourceMetadataInput::new(
         SchemaVersion::CURRENT,
-        SourceId::try_from("alpaca-basic-iex-market-data")?,
+        SourceId::try_from(source_id)?,
         RevisionBoundPayloadEvidence::new(
-            MetadataRevision::new(SourceIdentifier::try_from(
-                "alpaca-history-source-revision-v1",
-            )?),
-            ExactPayloadEvidence::from_content_digest(digest(132)),
+            MetadataRevision::new(SourceIdentifier::try_from(metadata_revision)?),
+            ExactPayloadEvidence::from_content_digest(digest(revision_digest_byte)),
         ),
         SourceClass::Broker,
         provider,
         authorization,
         SourceCoverage::try_instrument(
-            ExactPayloadEvidence::from_content_digest(digest(133)),
+            ExactPayloadEvidence::from_content_digest(digest(coverage_digest_byte)),
             effective,
             vec![AssetClass::Equity],
             CoverageTopology::partial_venues(vec![VenueId::try_from("iex")?])?,

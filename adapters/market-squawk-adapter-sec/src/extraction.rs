@@ -161,6 +161,8 @@ impl SecPendingFilingXbrlAdmission {
         components.extend(taxonomy_materials);
         let graph_identity = filing_xbrl_request_graph_identity(&dataset, &components)?;
         let material = ProviderCaptureMaterial::try_combine_request_graph(
+            source_id.clone(),
+            metadata_revision.clone(),
             dataset.dataset().clone(),
             graph_identity,
             components,
@@ -1417,6 +1419,15 @@ fn filing_xbrl_request_graph_identity(
     );
     for component in components {
         let receipt = component.receipt();
+        hash_request_graph_field(&mut digest, receipt.source_id().as_str().as_bytes())?;
+        hash_request_graph_field(
+            &mut digest,
+            receipt
+                .metadata_revision()
+                .as_source_identifier()
+                .as_str()
+                .as_bytes(),
+        )?;
         hash_request_graph_field(&mut digest, receipt.dataset().as_str().as_bytes())?;
         digest.update(receipt.request_set_identity().bytes());
         digest.update(receipt.content_digest().bytes());

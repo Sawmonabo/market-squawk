@@ -873,7 +873,10 @@ impl BeaDatasetAcquisition {
             &capture_refs,
         )
         .map_err(|_| BeaSourceError::Protocol)?;
+        let graph_owner = materials.first().ok_or(BeaSourceError::Protocol)?.receipt();
         let graph = ProviderCaptureMaterial::try_combine_request_graph(
+            graph_owner.source_id().clone(),
+            graph_owner.metadata_revision().clone(),
             evidence.metadata().dataset_id().clone(),
             graph_identity,
             materials,

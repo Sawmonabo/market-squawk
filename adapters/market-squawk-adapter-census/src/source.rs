@@ -2588,6 +2588,8 @@ fn combined_capture_material(
     let graph_identity =
         census_capture_graph_identity(metadata, contract, &captures).map_err(map_source_error)?;
     ProviderCaptureMaterial::try_combine_request_graph(
+        metadata.source_id().clone(),
+        metadata.revision().clone(),
         contract.dataset_id().clone(),
         graph_identity,
         captures.into_vec(),

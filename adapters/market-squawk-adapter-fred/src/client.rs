@@ -293,6 +293,8 @@ impl FredExtractionOutput {
         }
         let graph_identity = fred_request_graph_identity(&batch, &captures)?;
         let capture = ProviderCaptureMaterial::try_combine_request_graph(
+            batch.request().object().source_id().clone(),
+            batch.request().object().metadata_revision().clone(),
             batch.request().object().dataset().clone(),
             graph_identity,
             captures.into_vec(),

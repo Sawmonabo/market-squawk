@@ -662,6 +662,8 @@ impl BlsSource {
                 source_generation_digest,
             )?;
             ProviderCaptureMaterial::try_combine_request_graph(
+                self.metadata.source_id().clone(),
+                self.metadata.revision().clone(),
                 self.config.dataset().clone(),
                 graph_identity,
                 capture_components,

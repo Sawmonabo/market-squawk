@@ -196,6 +196,8 @@ pub fn prepare_latest_publication(
     let metadata_material = metadata.capture_material(metadata_event_id, connection_id)?;
     let latest_material = latest.capture_material(latest_event_id, connection_id)?;
     let graph = ProviderCaptureMaterial::try_combine_request_graph(
+        metadata_material.receipt().source_id().clone(),
+        metadata_material.receipt().metadata_revision().clone(),
         identifier(TIINGO_LATEST_PUBLICATION_DATASET)?,
         request_graph_identity,
         vec![metadata_material, latest_material],

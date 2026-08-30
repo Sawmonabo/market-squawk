@@ -522,6 +522,8 @@ impl NasdaqSymbolDirectorySource {
                 .insert(entry);
         }
         let capture_material = ProviderCaptureMaterial::try_combine_request_graph(
+            self.metadata.source_id().clone(),
+            self.metadata.revision().clone(),
             self.config.dataset().clone(),
             request_graph_identity(&self.metadata, &self.config)?,
             captures,

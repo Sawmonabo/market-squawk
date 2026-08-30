@@ -344,6 +344,8 @@ pub enum ProviderCaptureSemanticBinding {
 #[serde(deny_unknown_fields)]
 pub struct ProviderCaptureRequestGraphComponent {
     ordinal: u16,
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
     dataset: SourceIdentifier,
     request_set_identity: EvidenceDigest,
     terminal: ProviderCaptureTerminalDisposition,
@@ -358,6 +360,16 @@ impl ProviderCaptureRequestGraphComponent {
     /// Returns this component's contiguous zero-based graph ordinal.
     pub const fn ordinal(&self) -> u16 {
         self.ordinal
+    }
+
+    /// Returns the exact registered source that produced this component.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the exact source metadata revision that governed this component.
+    pub const fn metadata_revision(&self) -> &MetadataRevision {
+        &self.metadata_revision
     }
 
     /// Returns the exact provider dataset addressed by this component.
@@ -835,14 +847,20 @@ impl ProviderCaptureMaterial {
         let mut total_body_bytes = 0_u64;
         let mut previous_received_at = None;
         for (page, record) in receipt.pages().iter().zip(&records) {
-            if receipt.terminal == ProviderCaptureTerminalDisposition::CompleteRequestGraph
-                && receipt
-                    .request_graph_components
-                    .iter()
-                    .any(|component| component.first_page_ordinal == page.ordinal)
-            {
-                previous_received_at = None;
-            }
+            let expected_source =
+                if receipt.terminal == ProviderCaptureTerminalDisposition::CompleteRequestGraph {
+                    let component = request_graph_component_for_page(
+                        &receipt.request_graph_components,
+                        page.ordinal,
+                    )
+                    .ok_or(ProviderCaptureError::MaterialBindingMismatch)?;
+                    if component.first_page_ordinal == page.ordinal {
+                        previous_received_at = None;
+                    }
+                    component.source_id.as_str()
+                } else {
+                    receipt.source_id().as_str()
+                };
             let expected_sequence = Some(u64::from(page.ordinal()));
             let received_at = record
                 .received_at()
@@ -865,7 +883,7 @@ impl ProviderCaptureMaterial {
                 });
             }
             if previous_received_at.is_some_and(|previous| previous > page.received_at())
-                || record.source() != receipt.source_id().as_str()
+                || record.source() != expected_source
                 || record.event_id().is_nil()
                 || record.connection_id().is_nil()
                 || record.source_sequence() != expected_sequence
@@ -888,7 +906,9 @@ impl ProviderCaptureMaterial {
 
     /// Combines independently complete captures into one ordered complete request graph.
     ///
-    /// The caller supplies the provider dataset and request-set identity for the complete graph.
+    /// The caller supplies the graph owner's source authority, provider dataset, and request-set
+    /// identity for the complete graph. The first component must share that owner authority;
+    /// later independently governed components retain their own source and metadata revisions.
     /// Each component remains independently framed by its original dataset, request-set identity,
     /// terminal condition, page-token evidence, content digest, and observation digest. Flattened
     /// pages and raw records receive fresh contiguous ordinals solely for the one sealed segment;
@@ -897,15 +917,24 @@ impl ProviderCaptureMaterial {
     ///
     /// # Errors
     ///
-    /// Rejects fewer than two components, nested request graphs, source or metadata-revision
-    /// mismatches, invalid graph identity, nonmonotonic request ordering, and aggregate page/byte
-    /// bounds above the existing capture-set ceilings.
+    /// Rejects fewer than two components, nested request graphs, a first component that does not
+    /// match the graph owner, invalid graph identity, nonmonotonic request ordering, and aggregate
+    /// page/byte bounds above the existing capture-set ceilings.
     pub fn try_combine_request_graph(
+        owner_source_id: SourceId,
+        owner_metadata_revision: MetadataRevision,
         dataset: SourceIdentifier,
         request_set_identity: EvidenceDigest,
         components: Vec<Self>,
     ) -> Result<Self, ProviderCaptureError> {
-        Self::try_combine_request_graph_inner(dataset, request_set_identity, components, None)
+        Self::try_combine_request_graph_inner(
+            owner_source_id,
+            owner_metadata_revision,
+            dataset,
+            request_set_identity,
+            components,
+            None,
+        )
     }
 
     /// Combines a complete request graph with one typed, hash-bound semantic proof.
@@ -916,6 +945,8 @@ impl ProviderCaptureMaterial {
     /// semantic's versioned purpose and the exact ordered component receipts; callers cannot
     /// supply or accidentally drift that authority-critical hash.
     pub fn try_combine_request_graph_with_semantic(
+        owner_source_id: SourceId,
+        owner_metadata_revision: MetadataRevision,
         dataset: SourceIdentifier,
         components: Vec<Self>,
         semantic_binding: ProviderCaptureSemanticBinding,
@@ -928,22 +959,21 @@ impl ProviderCaptureMaterial {
                 max: MAX_PROVIDER_CAPTURE_PAGES,
             });
         }
-        let first = components
-            .first()
-            .ok_or(ProviderCaptureError::RequestGraphInvalid)?;
         let purpose = match &semantic_binding {
             ProviderCaptureSemanticBinding::CompleteMarketBarHistoryV1(binding) => {
                 binding.graph_purpose()
             }
         };
         let request_set_identity = semantic_material_request_graph_identity(
-            first.receipt.source_id(),
-            first.receipt.metadata_revision(),
+            &owner_source_id,
+            &owner_metadata_revision,
             &dataset,
             purpose,
             &components,
         );
         Self::try_combine_request_graph_inner(
+            owner_source_id,
+            owner_metadata_revision,
             dataset,
             request_set_identity,
             components,
@@ -952,6 +982,8 @@ impl ProviderCaptureMaterial {
     }
 
     fn try_combine_request_graph_inner(
+        owner_source_id: SourceId,
+        owner_metadata_revision: MetadataRevision,
         dataset: SourceIdentifier,
         request_set_identity: EvidenceDigest,
         components: Vec<Self>,
@@ -969,14 +1001,12 @@ impl ProviderCaptureMaterial {
         let first = components
             .first()
             .ok_or(ProviderCaptureError::RequestGraphInvalid)?;
-        let source_id = first.receipt.source_id.clone();
-        let metadata_revision = first.receipt.metadata_revision.clone();
+        if first.receipt.source_id != owner_source_id
+            || first.receipt.metadata_revision != owner_metadata_revision
+        {
+            return Err(ProviderCaptureError::RequestGraphComponentMismatch);
+        }
         let total_page_count = components.iter().try_fold(0_usize, |total, component| {
-            if component.receipt.source_id != source_id
-                || component.receipt.metadata_revision != metadata_revision
-            {
-                return Err(ProviderCaptureError::RequestGraphComponentMismatch);
-            }
             if component.receipt.terminal
                 == ProviderCaptureTerminalDisposition::CompleteRequestGraph
                 || !component.receipt.request_graph_components.is_empty()
@@ -1030,6 +1060,8 @@ impl ProviderCaptureMaterial {
                         max: MAX_PROVIDER_CAPTURE_PAGES,
                     }
                 })?,
+                source_id: receipt.source_id.clone(),
+                metadata_revision: receipt.metadata_revision.clone(),
                 dataset: receipt.dataset.clone(),
                 request_set_identity: receipt.request_set_identity,
                 terminal: receipt.terminal,
@@ -1061,8 +1093,8 @@ impl ProviderCaptureMaterial {
             }
         }
         let receipt = ProviderCaptureSetReceipt::try_new_with_request_graph(
-            source_id,
-            metadata_revision,
+            owner_source_id,
+            owner_metadata_revision,
             dataset,
             request_set_identity,
             ProviderCaptureTerminalDisposition::CompleteRequestGraph,
@@ -2717,6 +2749,15 @@ where
     hash_binding_length(&mut digest, root_capture.request_graph_components().len())?;
     for component in root_capture.request_graph_components() {
         digest.update(component.ordinal().to_be_bytes());
+        hash_binding_field(&mut digest, component.source_id().as_str().as_bytes())?;
+        hash_binding_field(
+            &mut digest,
+            component
+                .metadata_revision()
+                .as_source_identifier()
+                .as_str()
+                .as_bytes(),
+        )?;
         hash_binding_field(&mut digest, component.dataset().as_str().as_bytes())?;
         hash_digest(&mut digest, component.request_set_identity());
         hash_binding_field(&mut digest, component.terminal().tag())?;
@@ -3133,8 +3174,8 @@ fn validate_component_capture(
     }
     validate_page_chain(component.terminal(), &local_pages)?;
     let content_digest = capture_content_digest(
-        capture.source_id(),
-        capture.metadata_revision(),
+        component.source_id(),
+        component.metadata_revision(),
         component.dataset(),
         component.request_set_identity(),
         component.terminal(),
@@ -3151,8 +3192,8 @@ fn validate_component_capture(
     if total_body_bytes != component.total_body_bytes()
         || content_digest != component.content_digest()
         || observation_digest != component.observation_digest()
-        || object.source_id() != capture.source_id()
-        || object.metadata_revision() != capture.metadata_revision()
+        || object.source_id() != component.source_id()
+        || object.metadata_revision() != component.metadata_revision()
         || object.dataset() != component.dataset()
         || object.capture_identity() != expected_identity
     {
@@ -3475,8 +3516,8 @@ pub enum ProviderCaptureError {
     /// Complete request-graph framing is missing, discontinuous, or internally inconsistent.
     #[error("provider capture request graph is invalid")]
     RequestGraphInvalid,
-    /// A component belongs to a different source or metadata revision.
-    #[error("provider capture request-graph component does not share source authority")]
+    /// The first component does not establish the request graph's canonical owner authority.
+    #[error("provider capture request-graph root component does not match owner authority")]
     RequestGraphComponentMismatch,
     /// A complete request graph cannot be used as another graph's component.
     #[error("nested provider capture request graphs are not admitted")]
@@ -3524,6 +3565,20 @@ fn validate_page_chain(
     Ok(())
 }
 
+fn request_graph_component_for_page(
+    components: &[ProviderCaptureRequestGraphComponent],
+    page_ordinal: u16,
+) -> Option<&ProviderCaptureRequestGraphComponent> {
+    let index = components
+        .partition_point(|component| component.first_page_ordinal <= page_ordinal)
+        .checked_sub(1)?;
+    let component = components.get(index)?;
+    let end = component
+        .first_page_ordinal
+        .checked_add(component.page_count.get())?;
+    (page_ordinal < end).then_some(component)
+}
+
 fn validate_request_graph_components(
     source_id: &SourceId,
     metadata_revision: &MetadataRevision,
@@ -3538,6 +3593,9 @@ fn validate_request_graph_components(
         if usize::from(component.ordinal) != expected_component_ordinal
             || usize::from(component.first_page_ordinal) != expected_first_page
             || component.terminal == ProviderCaptureTerminalDisposition::CompleteRequestGraph
+            || (expected_component_ordinal == 0
+                && (&component.source_id != source_id
+                    || &component.metadata_revision != metadata_revision))
         {
             return Err(ProviderCaptureError::RequestGraphInvalid);
         }
@@ -3570,8 +3628,8 @@ fn validate_request_graph_components(
         }
         validate_page_chain(component.terminal, &local_pages)?;
         let content_digest = capture_content_digest(
-            source_id,
-            metadata_revision,
+            &component.source_id,
+            &component.metadata_revision,
             &component.dataset,
             component.request_set_identity,
             component.terminal,
@@ -3637,9 +3695,14 @@ fn semantic_request_graph_identity(
         dataset,
         purpose,
         components.len(),
-        components
-            .iter()
-            .map(|component| (&component.dataset, component.request_set_identity)),
+        components.iter().map(|component| {
+            (
+                &component.source_id,
+                &component.metadata_revision,
+                &component.dataset,
+                component.request_set_identity,
+            )
+        }),
     )
 }
 
@@ -3658,6 +3721,8 @@ fn semantic_material_request_graph_identity(
         components.len(),
         components.iter().map(|component| {
             (
+                component.receipt().source_id(),
+                component.receipt().metadata_revision(),
                 component.receipt().dataset(),
                 component.receipt().request_set_identity(),
             )
@@ -3671,7 +3736,14 @@ fn request_graph_identity_from_fields<'a>(
     dataset: &SourceIdentifier,
     purpose: &SourceIdentifier,
     component_count: usize,
-    components: impl IntoIterator<Item = (&'a SourceIdentifier, EvidenceDigest)>,
+    components: impl IntoIterator<
+        Item = (
+            &'a SourceId,
+            &'a MetadataRevision,
+            &'a SourceIdentifier,
+            EvidenceDigest,
+        ),
+    >,
 ) -> EvidenceDigest {
     let mut hash = Sha256::new();
     hash.update(b"market-squawk/provider-request-graph-composition/v1\0");
@@ -3683,7 +3755,21 @@ fn request_graph_identity_from_fields<'a>(
     );
     hash_field(&mut hash, dataset.as_str().as_bytes());
     hash.update((component_count as u64).to_be_bytes());
-    for (component_dataset, component_request_identity) in components {
+    for (
+        component_source_id,
+        component_metadata_revision,
+        component_dataset,
+        component_request_identity,
+    ) in components
+    {
+        hash_field(&mut hash, component_source_id.as_str().as_bytes());
+        hash_field(
+            &mut hash,
+            component_metadata_revision
+                .as_source_identifier()
+                .as_str()
+                .as_bytes(),
+        );
         hash_field(&mut hash, component_dataset.as_str().as_bytes());
         hash.update(component_request_identity.bytes());
     }
@@ -3816,6 +3902,15 @@ fn request_graph_content_digest(
     hash.update((components.len() as u64).to_be_bytes());
     for component in components {
         hash.update(component.ordinal.to_be_bytes());
+        hash_field(&mut hash, component.source_id.as_str().as_bytes());
+        hash_field(
+            &mut hash,
+            component
+                .metadata_revision
+                .as_source_identifier()
+                .as_str()
+                .as_bytes(),
+        );
         hash_field(&mut hash, component.dataset.as_str().as_bytes());
         hash_digest(&mut hash, component.request_set_identity);
         hash.update(component.terminal.tag());
@@ -3908,6 +4003,15 @@ fn request_graph_observation_digest(
     hash_digest(&mut hash, content_digest);
     for component in components {
         hash.update(component.ordinal.to_be_bytes());
+        hash_field(&mut hash, component.source_id.as_str().as_bytes());
+        hash_field(
+            &mut hash,
+            component
+                .metadata_revision
+                .as_source_identifier()
+                .as_str()
+                .as_bytes(),
+        );
         hash_digest(&mut hash, component.observation_digest);
     }
     EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
@@ -4167,9 +4271,12 @@ mod tests {
 
         let second_payload = b"secondary".to_vec();
         let second_received_at = Timestamp::from_unix_nanos(300);
+        let second_source_id = SourceId::try_from("fixture-secondary")?;
+        let second_metadata_revision =
+            MetadataRevision::new(SourceIdentifier::try_from("fixture-secondary-r1")?);
         let second_receipt = ProviderCaptureSetReceipt::try_new(
-            material_receipt.source_id().clone(),
-            material_receipt.metadata_revision().clone(),
+            second_source_id.clone(),
+            second_metadata_revision.clone(),
             SourceIdentifier::try_from("fixture-metadata")?,
             digest(31),
             ProviderCaptureTerminalDisposition::StandaloneResponse,
@@ -4191,16 +4298,30 @@ mod tests {
             batch.clone().try_bind_provider_capture(&second_receipt),
             Err(ExtractionError::SourceBindingMismatch)
         ));
+        assert_eq!(
+            ProviderCaptureMaterial::try_new(
+                second_receipt.clone(),
+                vec![record(
+                    material_receipt.source_id().as_str(),
+                    0,
+                    second_received_at,
+                    second_payload.clone(),
+                )?],
+            ),
+            Err(ProviderCaptureError::MaterialBindingMismatch)
+        );
         let second = ProviderCaptureMaterial::try_new(
             second_receipt,
             vec![record(
-                material_receipt.source_id().as_str(),
+                second_source_id.as_str(),
                 0,
                 second_received_at,
                 second_payload,
             )?],
         )?;
         let graph = ProviderCaptureMaterial::try_combine_request_graph(
+            material_receipt.source_id().clone(),
+            material_receipt.metadata_revision().clone(),
             material_receipt.dataset().clone(),
             digest(33),
             vec![material, second],
@@ -4212,6 +4333,18 @@ mod tests {
         assert_eq!(graph.receipt().request_graph_components().len(), 2);
         assert_eq!(graph.receipt().pages().len(), 3);
         assert_eq!(graph.records()[2].payload(), b"secondary");
+        assert_eq!(
+            graph.receipt().request_graph_components()[1].source_id(),
+            &second_source_id
+        );
+        assert_eq!(
+            graph.receipt().request_graph_components()[1].metadata_revision(),
+            &second_metadata_revision
+        );
+        assert_eq!(graph.records()[2].source(), second_source_id.as_str());
+        let reopened_graph: ProviderCaptureSetReceipt =
+            serde_json::from_slice(&serde_json::to_vec(graph.receipt())?)?;
+        assert_eq!(&reopened_graph, graph.receipt());
         let rebound = batch.try_bind_provider_capture(graph.receipt())?;
         assert_eq!(rebound.request().object().evidence(), &primary_evidence);
         assert_eq!(
@@ -4225,21 +4358,21 @@ mod tests {
             crate::SourceObjectCaptureIdentity::try_from_capture(graph.receipt())?
         );
 
-        let component = &graph.receipt().request_graph_components()[0];
+        let component = &graph.receipt().request_graph_components()[1];
         let component_identity = crate::SourceObjectCaptureIdentity::Paged {
             content_digest: component.content_digest(),
             page_count: component.page_count(),
             terminal: component.terminal(),
         };
         let component_discovery = DiscoveryRequest::try_new(
-            graph.receipt().dataset().clone(),
+            component.dataset().clone(),
             None,
             NonZeroU16::MIN,
             Timestamp::from_unix_nanos(1_000),
         )?;
         let component_object = SourceObject::try_new_with_capture_identity(
-            graph.receipt().source_id().clone(),
-            graph.receipt().metadata_revision().clone(),
+            component.source_id().clone(),
+            component.metadata_revision().clone(),
             &component_discovery,
             SourceIdentifier::try_from("fixture-component-object")?,
             SourceIdentifier::try_from("application-json")?,
@@ -4258,12 +4391,18 @@ mod tests {
             NonZeroU64::new(100_000).ok_or("fixture byte bound")?,
             Timestamp::from_unix_nanos(1_000),
         )?;
+        let component_payload = Bytes::from_static(b"secondary-normalized");
+        let component_record_evidence =
+            ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                Sha256::digest(&component_payload).into(),
+            ));
         let component_batch = ExtractionBatch::try_new(
             &component_request,
             vec![ExtractionRecord::try_new(
                 &component_request,
                 SourceIdentifier::try_from("schema-v1")?,
-                record_evidence,
+                component_record_evidence,
                 Timestamp::from_unix_nanos(2),
                 None,
                 AvailabilityEvidence::LocalFirstObserved {
@@ -4271,7 +4410,7 @@ mod tests {
                 },
                 SourceIdentifier::try_from("record-r1")?,
                 None,
-                payload,
+                component_payload,
             )?],
         )?;
         let temporary = TemporaryDirectory::new();
@@ -4299,27 +4438,27 @@ mod tests {
         let wrong_native_lineage = build_native_lineage(&component_batch)?;
         assert!(matches!(
             SealedProviderCaptureBinding::try_component(
-                component_one,
+                component_zero,
                 component_batch.clone(),
                 wrong_native_lineage,
-                vec![0],
+                vec![2],
             ),
             Err(ProviderCaptureError::SealedBindingMismatch)
         ));
         let native_lineage = build_native_lineage(&component_batch)?;
         let component_binding = SealedProviderCaptureBinding::try_component(
-            component_zero,
+            component_one,
             component_batch.clone(),
             native_lineage,
-            vec![0],
+            vec![2],
         )?;
         assert_eq!(
             component_binding.scope(),
-            ProviderCaptureScope::RequestGraphComponent { ordinal: 0 }
+            ProviderCaptureScope::RequestGraphComponent { ordinal: 1 }
         );
-        assert_eq!(component_binding.component_ordinal(), Some(0));
+        assert_eq!(component_binding.component_ordinal(), Some(1));
         assert_eq!(component_binding.record_count(), 1);
-        assert_eq!(component_binding.row_frames()[0].capture_page_ordinal(), 0);
+        assert_eq!(component_binding.row_frames()[0].capture_page_ordinal(), 2);
         let binding_digest = component_binding.evidence_digest();
         assert_eq!(binding_digest, component_binding.evidence_digest());
         assert_eq!(
@@ -4329,9 +4468,9 @@ mod tests {
         assert_eq!(
             binding_digest.evidence().bytes(),
             [
-                0xf3, 0x03, 0xdc, 0x8f, 0xc1, 0x40, 0xfc, 0x1d, 0x0e, 0x9a, 0x09, 0x58, 0x2b, 0x1d,
-                0x90, 0x06, 0x4a, 0x15, 0xb4, 0x9b, 0x3d, 0x5c, 0xe2, 0x01, 0x97, 0xee, 0x1f, 0x97,
-                0x10, 0x50, 0x37, 0xeb,
+                0xc8, 0xb6, 0xba, 0x0a, 0xd3, 0xfd, 0x27, 0x8f, 0x8a, 0xec, 0x74, 0x83, 0xc4, 0xf7,
+                0x48, 0x18, 0xbb, 0xe7, 0xa8, 0xab, 0x46, 0x8b, 0x75, 0x2d, 0x2c, 0xfc, 0xd1, 0xa8,
+                0x0d, 0x75, 0x76, 0xe8,
             ]
         );
         assert_ne!(
@@ -4445,7 +4584,7 @@ mod tests {
         let native_lineage = build_native_lineage(&component_batch)?;
         let replay_native_digest = build_native_lineage(&component_batch)?.batch_digest();
         assert_eq!(native_lineage.batch_digest(), replay_native_digest);
-        assert_eq!(native_lineage.schema().version(), 1);
+        assert_eq!(native_lineage.schema().version(), 2);
         assert_eq!(
             native_lineage.schema().implementation(),
             ProviderNativeLineageImplementation::BlsTimeseriesV1
