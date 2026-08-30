@@ -70,7 +70,7 @@ function ModelsWorkspace({
 
   const models = useQuery({
     queryKey: productKeys.operation(
-      bootstrap.runtime,
+      bootstrap.productSessionToken,
       "Model",
       "Model.ListProductEvidence",
       {},
@@ -82,7 +82,7 @@ function ModelsWorkspace({
   })
   const forecasts = useQuery({
     queryKey: productKeys.operation(
-      bootstrap.runtime,
+      bootstrap.productSessionToken,
       "Model",
       "Model.ListForecasts",
       {},
@@ -93,7 +93,7 @@ function ModelsWorkspace({
   })
   const activities = useQuery({
     queryKey: productKeys.operation(
-      bootstrap.runtime,
+      bootstrap.productSessionToken,
       "Model",
       "Model.ListProductActivity",
       {},
@@ -109,20 +109,16 @@ function ModelsWorkspace({
 
   const modelRows = models.data ?? []
   const selectedModel =
-    modelRows.find((model) => model.modelToken === selectedModelToken) ??
-    modelRows[0] ??
-    null
+    modelRows.find((model) => model.modelToken === selectedModelToken) ?? null
   const forecastRows = forecasts.data?.forecasts ?? []
   const selectedForecast =
     forecastRows.find(
       (forecast) => forecast.forecastToken === selectedForecastToken,
-    ) ??
-    forecastRows[0] ??
-    null
+    ) ?? null
   const activityRows = activities.data ?? []
   const activeCount = activityRows.filter(isActiveModelActivity).length
   const calibratedForecasts = forecastRows.filter(
-    (forecast) => forecast.evidenceState === "calibrated",
+    (forecast) => forecast.modelEvidence.calibration === "calibrated",
   ).length
   const refreshing =
     models.isFetching || forecasts.isFetching || activities.isFetching

@@ -12,12 +12,14 @@ This section supersedes older active-state statements below. Historical release 
 remain unchanged as locators.
 
 - Frozen and pushed feature checkpoint:
-  `a66970fc337ee0c30db2429081ddb0ee5f98294c` on
+  `fe8c130cd48301874705f6b665b826c904b5d6a2` on
   `feature/v1-installed-product-experience`. No release-branch or mainline merge, public release,
   package publication, or CI/CD dispatch occurred.
 - Accepted focused evidence at that unchanged checkpoint:
-  application library compilation, Desktop TypeScript compilation, diff integrity, and the exact
-  installed-service single-authority journey shared by native and MCP clients. These are integration
+  application library compilation, diff integrity, and the existing critical publication journey
+  covering sealed provider capture, canonical and derived publication, product admission, exact
+  historical forecast evidence, process reopen, backup, and fresh restore. The Desktop TypeScript
+  tree was unchanged from the earlier accepted `a66970fc` typecheck. These are focused integration
   proofs, not the final release gate.
 - Integrated provider/data outcomes include the existing durable Federal Reserve Board H.15
   vertical plus durable provider leaves for FRED/ALFRED, Treasury fiscal and daily rates, BEA, BLS,
@@ -26,11 +28,20 @@ remain unchanged as locators.
   H.15 remains the only source currently counted as a complete installed live-to-restart product
   vertical; the other entries are not represented as fully composed merely because their durable
   leaves exist.
-- The ordinary Desktop product boundary is provider-neutral. Provider names, source/runtime state,
-  retry details, manifests, digests, and configuration evidence remain confined to Connections,
-  Settings, Logs, and Diagnostics. Forecasts and backtests now use opaque product tokens and expose
-  financial meaning, point-in-time/out-of-sample evidence, costs, uncertainty, limitations, expiry,
-  invalidators, and honest unavailable/no-action states.
+- The shared ordinary-result envelope and the rewritten Markets, Macro, Forecast, and Backtest
+  slices are provider-neutral. Provider names, source/runtime state, retry details, manifests,
+  digests, and configuration evidence are being confined to Connections, Settings, Logs, and
+  Diagnostics. Older Advanced Research and Decisions browser contracts still expose some
+  data-management coordinates and remain active release-blocking remediation; the complete
+  ordinary Desktop boundary is not yet accepted. Forecasts and backtests now use opaque product
+  tokens and expose financial meaning, point-in-time/out-of-sample evidence, costs, uncertainty,
+  limitations, expiry, invalidators, and honest unavailable/no-action states.
+- The single V1 product dataset recipe now combines immutable price-return evidence with the closed
+  twelve-component macro context and the fixed-horizon forward-return label. The production
+  publication path retains capture, provider-publication, and complete-history lineage transitively
+  across derived generations, and the same admitted generations reopen for forecast and backtest
+  consumers. Schwab quote activation now requires exact sealed provider-authored timing evidence;
+  unknown timing is retained internally and fails closed.
 - Active Wave C uses disjoint ownership for: the single V1 macro-enriched feature recipe; neutral
   reference/fundamental/fund reads; neutral options and history reads; Schwab current quote runtime;
   Schwab history/options adapter mapping; credential/live-evidence verification; and one serialized
@@ -40,7 +51,7 @@ remain unchanged as locators.
   neutral consumer composition -> features/forecasts/valuation/backtests -> recommendations and
   portfolio/risk/paper -> fully wired Desktop/CLI/MCP -> installed live restart journey -> one final
   unchanged release gate.
-- The main worktree was clean immediately after pushing `a66970fc`. Seven older auxiliary worktrees
+- The main worktree was clean immediately after pushing `fe8c130c`. Seven older auxiliary worktrees
   remain preserved because each contains unique uncommitted state: `alpaca-history-shutdown` (17
   paths), `common-seal-root-integration` (255), `crypto-canonical-data` (24),
   `fred-shared-integration` (41), `postqualified-live-export` (5), `sec-product-handoff` (28), and

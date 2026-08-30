@@ -7,13 +7,14 @@ use std::{
 };
 
 use async_trait::async_trait;
-use market_squawk_data::{DatasetManifestRef, Sha256Digest};
+use market_squawk_data::{DatasetManifestRef, FeatureLabelComponentSpec, Sha256Digest};
 use market_squawk_domain::{
     Currency, DigestAlgorithm, EvidenceDigest, InstrumentId, SourceId, Timestamp,
 };
 use market_squawk_modeling::{
-    CalibrationEvidence, ForecastCentralStatistic, ForecastCoverage, ForecastOutcome, ForecastPath,
-    ForecastValue, ForecastVintage, ModelMetadata,
+    CalibrationEvidence, ForecastCentralStatistic, ForecastCoverage, ForecastHorizon,
+    ForecastMeasurement, ForecastOutcome, ForecastOutputBinding, ForecastPath,
+    ForecastTargetMeaning, ForecastValue, ForecastVintage, ModelMetadata,
 };
 use market_squawk_platform::{LocalAuthorityStateStore, LocalAuthorityStateStoreError};
 use market_squawk_services::{
@@ -28,11 +29,11 @@ use uuid::Uuid;
 
 use persistence::{
     ForecastIndex, ForecastIndexSelection, ForecastPayloadRecord, OutcomeRecord, VintageRecord,
-    decimal_text, digest_from_hex, hex,
+    digest_from_hex, hex,
 };
 
 use super::{
-    ModelDomainService,
+    ForecastModelEvidenceProjection, ModelDomainService,
     runtime::{
         ProductionModelRuntime, ProductionModelRuntimeError, ProductionModelRuntimeLimits,
         RetainedRuntimeBackup,
@@ -59,6 +60,242 @@ const MAXIMUM_VINTAGES: usize = 100_000;
 const MAXIMUM_OUTCOMES: usize = 1_000_000;
 const MAXIMUM_DRIFT_OUTCOMES: usize = 4_096;
 const FORECAST_SELECTION_POLICY_REVISION: u32 = 4;
+
+const MAXIMUM_PRODUCT_INVESTMENT_NAME_BYTES: usize = 240;
+const MAXIMUM_PRODUCT_INVESTMENT_SYMBOL_BYTES: usize = 64;
+const MAXIMUM_PRODUCT_INVESTMENT_DESCRIPTION_BYTES: usize = 400;
+
+/// Provider-neutral investment identity frozen beside one exact point-in-time forecast input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ForecastProductIdentity {
+    display_name: Box<str>,
+    canonical_symbol: Option<Box<str>>,
+    description: Box<str>,
+    quote_currency: Currency,
+    knowledge_at: Timestamp,
+    effective_at: Timestamp,
+}
+
+impl ForecastProductIdentity {
+    pub(crate) fn try_new(
+        display_name: impl Into<Box<str>>,
+        canonical_symbol: Option<impl Into<Box<str>>>,
+        description: impl Into<Box<str>>,
+        quote_currency: Currency,
+        knowledge_at: Timestamp,
+        effective_at: Timestamp,
+    ) -> Result<Self, ForecastApplicationError> {
+        let display_name = display_name.into();
+        let canonical_symbol = canonical_symbol.map(Into::into);
+        let description = description.into();
+        if !valid_product_text(&display_name, MAXIMUM_PRODUCT_INVESTMENT_NAME_BYTES)
+            || canonical_symbol.as_deref().is_some_and(|value| {
+                !valid_product_text(value, MAXIMUM_PRODUCT_INVESTMENT_SYMBOL_BYTES)
+            })
+            || !valid_product_text(&description, MAXIMUM_PRODUCT_INVESTMENT_DESCRIPTION_BYTES)
+            || effective_at > knowledge_at
+        {
+            return Err(ForecastApplicationError::InvalidRecord);
+        }
+        Ok(Self {
+            display_name,
+            canonical_symbol,
+            description,
+            quote_currency,
+            knowledge_at,
+            effective_at,
+        })
+    }
+
+    pub(crate) fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    pub(crate) fn canonical_symbol(&self) -> Option<&str> {
+        self.canonical_symbol.as_deref()
+    }
+
+    pub(crate) fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub(crate) const fn quote_currency(&self) -> Currency {
+        self.quote_currency
+    }
+
+    pub(crate) const fn knowledge_at(&self) -> Timestamp {
+        self.knowledge_at
+    }
+
+    pub(crate) const fn effective_at(&self) -> Timestamp {
+        self.effective_at
+    }
+}
+
+/// Closed investment-facing semantics derived only from one admitted forecast output binding.
+pub(crate) struct ForecastProductTarget {
+    label: Box<str>,
+    meaning: &'static str,
+    value_kind: &'static str,
+    unit_label: Box<str>,
+    currency_code: Option<Currency>,
+}
+
+impl ForecastProductTarget {
+    pub(crate) fn try_from_binding(
+        binding: &ForecastOutputBinding,
+    ) -> Result<Self, ForecastApplicationError> {
+        Self::try_from_admitted_parts(binding.measurement(), binding.target(), binding.label())
+    }
+
+    fn try_from_admitted_parts(
+        measurement: ForecastMeasurement,
+        target: ForecastTargetMeaning,
+        label: &FeatureLabelComponentSpec,
+    ) -> Result<Self, ForecastApplicationError> {
+        let (value_kind, unit_label, currency_code) = match measurement {
+            ForecastMeasurement::Price { currency } => {
+                ("market_price", currency.as_str().into(), Some(currency))
+            }
+            ForecastMeasurement::Return => ("percentage_return", "decimal return".into(), None),
+            ForecastMeasurement::Probability => ("probability", "probability".into(), None),
+            ForecastMeasurement::OtherRegression => {
+                return Err(ForecastApplicationError::Unavailable);
+            }
+        };
+        let meaning = match target {
+            ForecastTargetMeaning::FixedHorizonTerminal { .. } => {
+                "The modeled value at the end of the selected forecast horizon."
+            }
+            ForecastTargetMeaning::Unsupported => {
+                return Err(ForecastApplicationError::Unavailable);
+            }
+        };
+        Ok(Self {
+            label: product_label(label.name())?.into(),
+            meaning,
+            value_kind,
+            unit_label,
+            currency_code,
+        })
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) const fn meaning(&self) -> &'static str {
+        self.meaning
+    }
+
+    pub(crate) const fn value_kind(&self) -> &'static str {
+        self.value_kind
+    }
+
+    pub(crate) fn unit_label(&self) -> &str {
+        &self.unit_label
+    }
+
+    pub(crate) fn currency_code(&self) -> Option<&str> {
+        self.currency_code.as_ref().map(Currency::as_str)
+    }
+}
+
+/// Plain-language horizon copy that never exposes storage or scheduler units.
+pub(crate) struct ForecastProductHorizon {
+    label: String,
+    description: String,
+    points: u16,
+}
+
+impl ForecastProductHorizon {
+    pub(crate) fn try_from_horizon(
+        horizon: ForecastHorizon,
+    ) -> Result<Self, ForecastApplicationError> {
+        const SECOND: u64 = 1_000_000_000;
+        const MINUTE: u64 = 60 * SECOND;
+        const HOUR: u64 = 60 * MINUTE;
+        const DAY: u64 = 24 * HOUR;
+
+        let points = horizon.points().get();
+        let total = horizon
+            .step_nanos()
+            .get()
+            .checked_mul(u64::from(points))
+            .ok_or(ForecastApplicationError::InvalidRecord)?;
+        let (amount, unit) = if total.is_multiple_of(DAY) {
+            (total / DAY, "day")
+        } else if total.is_multiple_of(HOUR) {
+            (total / HOUR, "hour")
+        } else if total.is_multiple_of(MINUTE) {
+            (total / MINUTE, "minute")
+        } else if total.is_multiple_of(SECOND) {
+            (total / SECOND, "second")
+        } else {
+            return Err(ForecastApplicationError::InvalidRecord);
+        };
+        if amount == 0 {
+            return Err(ForecastApplicationError::InvalidRecord);
+        }
+        let label = format!("{amount} {unit}{}", if amount == 1 { "" } else { "s" });
+        let description = format!(
+            "Estimate the modeled investment outcome {label} after the latest available evidence."
+        );
+        Ok(Self {
+            label,
+            description,
+            points,
+        })
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub(crate) const fn points(&self) -> u16 {
+        self.points
+    }
+}
+
+fn product_label(value: &str) -> Result<String, ForecastApplicationError> {
+    if value == "research.fixed-horizon-forward-return" {
+        return Ok("Forward return".to_owned());
+    }
+    let leaf = value.rsplit('.').next().unwrap_or(value);
+    let mut label = String::new();
+    label
+        .try_reserve_exact(leaf.len())
+        .map_err(|_| ForecastApplicationError::Capacity)?;
+    let mut capitalize = true;
+    for character in leaf.chars() {
+        if matches!(character, '-' | '_') {
+            if !label.ends_with(' ') {
+                label.push(' ');
+            }
+            capitalize = true;
+        } else if capitalize {
+            label.extend(character.to_uppercase());
+            capitalize = false;
+        } else {
+            label.push(character);
+        }
+    }
+    if !valid_product_text(&label, 200) {
+        return Err(ForecastApplicationError::InvalidRecord);
+    }
+    Ok(label)
+}
+
+fn valid_product_text(value: &str, maximum_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum_bytes
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
 
 /// Exact separately admitted AnalysisV1 product generation that authorized one forecast request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1397,6 +1634,8 @@ impl ForecastApplicationService {
         &self,
         request_hash: Sha256Digest,
         path: ForecastPath,
+        product_identity: ForecastProductIdentity,
+        model_evidence: ForecastModelEvidenceProjection,
         analysis_evidence: ForecastAnalysisEvidence,
         serving_evidence: ForecastServingEvidence,
         created_at: market_squawk_domain::Timestamp,
@@ -1410,6 +1649,8 @@ impl ForecastApplicationService {
         context.ensure_live()?;
         let payload = ForecastPayloadRecord::from_path(
             &path,
+            &product_identity,
+            &model_evidence,
             &analysis_evidence,
             &serving_evidence,
             created_at,
@@ -1527,7 +1768,7 @@ impl ForecastApplicationService {
             .iter()
             .filter(|value| value.vintage_id == vintage.vintage_id)
             .take(maximum.get().min(self.limits.maximum_outcomes.get()))
-            .map(OutcomeRecord::product_value)
+            .map(|outcome| vintage.product_outcome(outcome))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(json!({
             "forecastToken": token,
@@ -1721,7 +1962,7 @@ async fn read_forecast_index_selection(
         .await?;
     context.ensure_live()?;
     selected.vintage.verify_artifact_read(&artifact)?;
-    let price_evidence = selected.vintage.revalidated_price_evidence(metadata)?;
+    let price_evidence = selected.vintage.revalidated_price_evidence(&bundle)?;
     let (selected_pairing, selected_serving_feature) = match &price_evidence {
         ForecastPriceEvidence::Available(evidence) => (
             evidence.analysis_evidence().pairing_sha256(),
@@ -1776,6 +2017,9 @@ fn drift_monitoring_value(
         let absolute = outcome
             .absolute_error_mantissa()
             .ok_or(ForecastApplicationError::CorruptIndex)?;
+        if absolute.is_negative() {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
         total_absolute_error = total_absolute_error
             .checked_add(absolute)
             .ok_or(ForecastApplicationError::CorruptIndex)?;
@@ -1794,12 +2038,15 @@ fn drift_monitoring_value(
     let mean_absolute_error = if included == 0 {
         None
     } else {
-        Some(decimal_text(
-            &(total_absolute_error
-                / i128::try_from(included).map_err(|_| ForecastApplicationError::CorruptIndex)?)
-            .to_string(),
-            scale,
-        )?)
+        let mean = checked_decimal_mean(total_absolute_error, included, scale)?;
+        Some(json!({
+            "value": vintage.product_amount(&mean.mantissa.to_string(), mean.scale)?,
+            "rounding": {
+                "state": mean.state.as_str(),
+                "decimalPlaces": mean.scale,
+                "mode": "half_even",
+            },
+        }))
     };
     Ok(json!({
         "state": state,
@@ -1809,6 +2056,92 @@ fn drift_monitoring_value(
         "meanAbsoluteError": mean_absolute_error,
         "interpretation": "Observed outcome error is monitoring evidence, not a future-performance guarantee."
     }))
+}
+
+#[derive(Clone, Copy)]
+enum DecimalMeanState {
+    Exact,
+    Rounded,
+}
+
+impl DecimalMeanState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Rounded => "rounded",
+        }
+    }
+}
+
+struct DecimalMean {
+    mantissa: i128,
+    scale: u8,
+    state: DecimalMeanState,
+}
+
+fn checked_decimal_mean(
+    total_mantissa: i128,
+    count: usize,
+    input_scale: u8,
+) -> Result<DecimalMean, ForecastApplicationError> {
+    const MAXIMUM_EXTRA_DECIMAL_PLACES: u8 = 6;
+    if total_mantissa.is_negative() || count == 0 {
+        return Err(ForecastApplicationError::CorruptIndex);
+    }
+    let divisor = i128::try_from(count).map_err(|_| ForecastApplicationError::CorruptIndex)?;
+    let integral = total_mantissa
+        .checked_div(divisor)
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    let remainder = total_mantissa
+        .checked_rem(divisor)
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    if remainder == 0 {
+        return Ok(DecimalMean {
+            mantissa: integral,
+            scale: input_scale,
+            state: DecimalMeanState::Exact,
+        });
+    }
+    let count_digits = u8::try_from(count.to_string().len())
+        .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+    let extra_places = count_digits
+        .checked_add(2)
+        .ok_or(ForecastApplicationError::CorruptIndex)?
+        .min(MAXIMUM_EXTRA_DECIMAL_PLACES);
+    let scale = input_scale
+        .checked_add(extra_places)
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    let factor = 10_i128
+        .checked_pow(u32::from(extra_places))
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    let scaled_remainder = remainder
+        .checked_mul(factor)
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    let fractional = scaled_remainder
+        .checked_div(divisor)
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    let residual = scaled_remainder
+        .checked_rem(divisor)
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    let twice_residual = residual
+        .checked_mul(2)
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    let round_up =
+        twice_residual > divisor || (twice_residual == divisor && fractional.rem_euclid(2) == 1);
+    let mantissa = integral
+        .checked_mul(factor)
+        .and_then(|value| value.checked_add(fractional))
+        .and_then(|value| value.checked_add(if round_up { 1 } else { 0 }))
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    Ok(DecimalMean {
+        mantissa,
+        scale,
+        state: if residual == 0 {
+            DecimalMeanState::Exact
+        } else {
+            DecimalMeanState::Rounded
+        },
+    })
 }
 
 fn product_vintage(

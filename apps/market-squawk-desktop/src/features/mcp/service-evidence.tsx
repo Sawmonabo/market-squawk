@@ -8,7 +8,7 @@ import {
 } from "lucide-react"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import type { DesktopBootstrap } from "@/lib/schemas"
+import type { DesktopSystemBootstrap } from "@/lib/schemas"
 
 import type { McpClientsStatus } from "./contracts"
 
@@ -16,7 +16,7 @@ export function ServiceEvidence({
   bootstrap,
   status,
 }: {
-  bootstrap: DesktopBootstrap
+  bootstrap: DesktopSystemBootstrap
   status: McpClientsStatus
 }) {
   const verifiedClients = status.clients.filter(

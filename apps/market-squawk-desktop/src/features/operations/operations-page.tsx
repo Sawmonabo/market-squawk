@@ -14,7 +14,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { messageFrom, useSystem } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -29,7 +29,7 @@ import {
 import { humanize } from "@/lib/formatters"
 import { compareLosslessIntegers, type LosslessInteger } from "@/lib/lossless-integer"
 import { formatTimestamp } from "@/lib/time"
-import type { JobControlRequest, ProductTransport } from "@/lib/transport"
+import type { JobControlRequest, SystemTransport } from "@/lib/transport"
 import { cn } from "@/lib/utils"
 
 import {
@@ -52,9 +52,9 @@ const JOB_PAGE_LIMIT = 50
 const MAXIMUM_JOB_PAGES = 4
 
 export function OperationsPage() {
-  const product = useProduct()
+  const system = useSystem()
 
-  if (product.status !== "ready") {
+  if (system.status !== "ready") {
     return (
       <OperationsFrame>
         <Alert>
@@ -71,8 +71,8 @@ export function OperationsPage() {
 
   return (
     <ReadyOperations
-      transport={product.transport}
-      scope={product.bootstrap.runtime}
+      transport={system.transport}
+      scope={system.bootstrap.productSessionToken}
     />
   )
 }
@@ -81,7 +81,7 @@ function ReadyOperations({
   transport,
   scope,
 }: {
-  transport: ProductTransport
+  transport: SystemTransport
   scope: ProductScope
 }) {
   const queryClient = useQueryClient()
@@ -96,7 +96,7 @@ function ReadyOperations({
     initialPageParam: undefined as string | undefined,
     queryFn: async ({ pageParam }) =>
       parseJobPage(
-        await transport.query({
+        await transport.systemQuery({
           query: "jobs",
           afterJobId: pageParam,
           limit: JOB_PAGE_LIMIT,
@@ -117,7 +117,7 @@ function ReadyOperations({
     ),
     queryFn: async () =>
       parseRuntimeStatus(
-        await transport.query({ query: "operationRuntimeStatus" }),
+        await transport.systemQuery({ query: "operationRuntimeStatus" }),
       ),
     refetchInterval: 5_000,
   })

@@ -5,7 +5,7 @@ import ReactDOM from "react-dom/client"
 import { HashRouter } from "react-router-dom"
 
 import { App } from "@/app/app"
-import { createProductTransport } from "@/lib/tauri-transport"
+import { createDesktopTransport } from "@/lib/tauri-transport"
 import "@/styles/globals.css"
 
 const root = document.getElementById("root")
@@ -14,7 +14,7 @@ if (!root) {
 }
 
 function DesktopRoot() {
-  return <App transport={createProductTransport()} />
+  return <App transport={createDesktopTransport()} />
 }
 
 class DesktopRootErrorBoundary extends Component<

@@ -2,12 +2,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    num::NonZeroU16,
     sync::Arc,
 };
 
-use market_squawk_data::InstrumentDefinitionReadCapability;
-use market_squawk_domain::{InstrumentDefinition, InstrumentId};
+use market_squawk_domain::{AssetClass, InstrumentId, Timestamp};
 use market_squawk_modeling::{ForecastHorizon, ModelOutputSemantics};
 use market_squawk_runtime::RuntimeIdentity;
 use market_squawk_services::{
@@ -21,8 +19,11 @@ use uuid::Uuid;
 use crate::{
     LocalProduct,
     application::{
-        AnalyticalForecastEvidenceReader, internal_forecast_generation_descriptor,
+        AnalyticalForecastEvidenceReader, InstrumentContext, InstrumentContextOutcome,
+        InstrumentContextReadCapability, InstrumentContextRequest,
+        internal_forecast_generation_descriptor,
         lifecycle::WorkspaceRuntimeIdentity,
+        model::forecast::{ForecastProductHorizon, ForecastProductIdentity, ForecastProductTarget},
         model::forecast_preparation::{
             ForecastEvidenceDataset, ForecastEvidencePolicy, ForecastInstrumentAvailability,
             ForecastModelSummary, ForecastPreparationAuthority, ForecastPreparationCatalog,
@@ -42,7 +43,7 @@ const MAXIMUM_CATALOG_INSTRUMENTS: usize = 4_096;
 /// One process-owned preparation authority, absent only when no model runtime is admitted.
 pub(super) struct InstalledForecastPreparation {
     authority: Option<Arc<ForecastPreparationAuthority>>,
-    instruments: InstrumentDefinitionReadCapability,
+    instruments: Option<InstrumentContextReadCapability>,
     runtime: RuntimeIdentity,
 }
 
@@ -73,7 +74,7 @@ impl InstalledForecastPreparation {
             .transpose()?;
         Ok(Self {
             authority,
-            instruments: product.research().instrument_definitions(),
+            instruments: product.instrument_context_read_capability(),
             runtime,
         })
     }
@@ -102,8 +103,8 @@ impl InstalledForecastPreparation {
                     )
                     .await
                     .map_err(map_preparation)?;
-                let labels = self.labels_for_catalog(&catalog, context)?;
-                catalog_value(&catalog, &labels)
+                let identities = self.identities_for_catalog(&catalog, context)?;
+                catalog_value(&catalog, &identities)?
             }
             PREPARE_FORECAST => {
                 let input: ForecastPreparationRequest =
@@ -118,18 +119,28 @@ impl InstalledForecastPreparation {
                     .await
                     .map_err(map_preparation)?;
                 let selection = resolve_selection(&catalog, input.selection)?;
+                let instruments = self.instruments.as_ref().ok_or(ServiceError::Unavailable)?;
                 let prepared = authority
                     .prepare(
                         origin,
                         workspace,
-                        selection,
+                        selection.selection.clone(),
+                        |instrument_id, knowledge_at, effective_at| {
+                            resolve_product_identity(
+                                instruments,
+                                instrument_id,
+                                knowledge_at,
+                                effective_at,
+                                context,
+                            )
+                            .map_err(|_| ForecastPreparationError::Unavailable)
+                        },
                         context.deadline(),
                         context.cancellation().clone(),
                     )
                     .await
                     .map_err(map_preparation)?;
-                let label = self.instrument_label(prepared.preview().instrument_id(), context)?;
-                (prepared_value(&prepared, &label), 1)
+                (prepared_value(&prepared, &selection)?, 1)
             }
             _ => return Err(ServiceError::NotFound),
         };
@@ -168,54 +179,43 @@ impl InstalledForecastPreparation {
             .map_err(|_error| ServiceError::Unavailable)
     }
 
-    fn labels_for_catalog(
+    fn identities_for_catalog(
         &self,
         catalog: &ForecastPreparationCatalog,
         context: &RequestContext,
-    ) -> Result<BTreeMap<InstrumentId, String>, ServiceError> {
-        let ids = catalog
+    ) -> Result<BTreeMap<(InstrumentId, i64, i64), ForecastProductIdentity>, ServiceError> {
+        let coordinates = catalog
             .evidence()
             .datasets()
             .iter()
             .flat_map(|dataset| dataset.instruments().iter())
-            .map(ForecastInstrumentAvailability::instrument_id)
+            .map(|instrument| {
+                (
+                    instrument.instrument_id(),
+                    instrument.available_at().unix_nanos(),
+                    instrument.observed_through().unix_nanos(),
+                )
+            })
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        if ids.len() > MAXIMUM_CATALOG_INSTRUMENTS {
+        if coordinates.len() > MAXIMUM_CATALOG_INSTRUMENTS {
             return Err(ServiceError::ResourceExhausted);
         }
-        let definitions = self
-            .instruments
-            .latest(
-                &ids,
-                MAXIMUM_CATALOG_INSTRUMENTS,
-                context.deadline(),
-                context.cancellation(),
-            )
-            .map_err(|_error| ServiceError::Unavailable)?;
-        Ok(definitions
-            .iter()
-            .map(|definition| (definition.instrument_id(), definition_label(definition)))
-            .collect())
-    }
-
-    fn instrument_label(
-        &self,
-        instrument_id: InstrumentId,
-        context: &RequestContext,
-    ) -> Result<String, ServiceError> {
-        self.instruments
-            .latest(
-                &[instrument_id],
-                1,
-                context.deadline(),
-                context.cancellation(),
-            )
-            .map_err(|_error| ServiceError::Unavailable)?
-            .first()
-            .map(definition_label)
-            .ok_or(ServiceError::NotFound)
+        let instruments = self.instruments.as_ref().ok_or(ServiceError::Unavailable)?;
+        coordinates
+            .into_iter()
+            .map(|coordinate @ (instrument_id, knowledge_at, effective_at)| {
+                resolve_product_identity(
+                    instruments,
+                    instrument_id,
+                    Timestamp::from_unix_nanos(knowledge_at),
+                    Timestamp::from_unix_nanos(effective_at),
+                    context,
+                )
+                .map(|identity| (coordinate, identity))
+            })
+            .collect()
     }
 }
 
@@ -244,10 +244,8 @@ struct ForecastPreparationRequest {
 struct ForecastSelectionWire {
     model_token: Uuid,
     history_token: Uuid,
-    investment_token: InstrumentId,
-    policy_token: Uuid,
-    horizon_points: u16,
-    validity_nanos: String,
+    investment_token: Uuid,
+    horizon_token: Uuid,
 }
 
 #[derive(Deserialize)]
@@ -256,10 +254,19 @@ struct PreparedForecastStart {
     confirmation_token: Uuid,
 }
 
+#[derive(Clone)]
+struct ResolvedForecastSelection {
+    selection: ForecastPreparationSelection,
+    investment_token: Uuid,
+    horizon_label: String,
+    horizon_description: String,
+}
+
 fn resolve_selection(
     catalog: &ForecastPreparationCatalog,
     selection: ForecastSelectionWire,
-) -> Result<ForecastPreparationSelection, ServiceError> {
+) -> Result<ResolvedForecastSelection, ServiceError> {
+    let retained_investment_token = selection.investment_token;
     let mut models = catalog
         .models()
         .iter()
@@ -272,49 +279,53 @@ fn resolve_selection(
         dataset_matches_model(dataset, model) && history_token(dataset) == selection.history_token
     });
     let history = histories.next().ok_or(ServiceError::InvalidRequest)?;
-    if histories.next().is_some()
-        || !history
-            .instruments()
-            .iter()
-            .any(|instrument| instrument.instrument_id() == selection.investment_token)
-    {
+    if histories.next().is_some() {
         return Err(ServiceError::InvalidRequest);
+    }
+    let mut investments = history.instruments().iter().filter(|investment| {
+        investment_token(history, investment.instrument_id()) == selection.investment_token
+    });
+    let investment = investments.next().ok_or(ServiceError::InvalidRequest)?;
+    if investments.next().is_some() {
+        return Err(ServiceError::InvalidResult);
     }
     let mut policies = history
         .policies()
         .iter()
         .copied()
-        .filter(|policy| policy_token(*policy) == selection.policy_token);
+        .filter(|policy| horizon_token(history, *policy) == selection.horizon_token);
     let policy = policies.next().ok_or(ServiceError::InvalidRequest)?;
     if policies.next().is_some() {
-        return Err(ServiceError::InvalidRequest);
+        return Err(ServiceError::InvalidResult);
     }
-    ForecastPreparationSelection::try_new(
+    let horizon =
+        ForecastHorizon::try_new(policy.maximum_horizon_points(), policy.horizon_step_nanos())
+            .map_err(|_| ServiceError::InvalidResult)?;
+    let product_horizon = ForecastProductHorizon::try_from_horizon(horizon)
+        .map_err(|_| ServiceError::InvalidResult)?;
+    let horizon_label = product_horizon.label().to_owned();
+    let horizon_description = product_horizon.description().to_owned();
+    let selection = ForecastPreparationSelection::try_new(
         model.model_id(),
         model.bundle_id().clone(),
         model.bundle_version(),
         history.dataset().manifest().clone(),
         history.analysis_manifest().clone(),
-        selection.investment_token,
-        ForecastHorizon::try_new(
-            NonZeroU16::new(selection.horizon_points).ok_or(ServiceError::InvalidRequest)?,
-            policy.horizon_step_nanos(),
-        )
-        .map_err(|_| ServiceError::InvalidRequest)?,
-        parse_u64(&selection.validity_nanos)?,
+        investment.instrument_id(),
+        horizon,
+        policy.maximum_validity_nanos().get(),
     )
-    .map_err(map_preparation)
+    .map_err(map_preparation)?;
+    Ok(ResolvedForecastSelection {
+        selection,
+        investment_token: retained_investment_token,
+        horizon_label,
+        horizon_description,
+    })
 }
 
 fn model_token(model: &ForecastModelSummary) -> Uuid {
-    let model_id = model.model_id().as_uuid();
-    let bundle_version = model.bundle_version().get().to_be_bytes();
-    let components: [&[u8]; 3] = [
-        model_id.as_bytes(),
-        model.bundle_id().as_str().as_bytes(),
-        &bundle_version,
-    ];
-    opaque_product_token(b"market-squawk/forecast-model-choice/v1\0", &components)
+    model.product_evidence().model_token()
 }
 
 fn history_token(dataset: &ForecastEvidenceDataset) -> Uuid {
@@ -345,40 +356,57 @@ fn history_token(dataset: &ForecastEvidenceDataset) -> Uuid {
     opaque_product_token(b"market-squawk/forecast-history-choice/v1\0", &components)
 }
 
-fn policy_token(policy: ForecastEvidencePolicy) -> Uuid {
+fn investment_token(dataset: &ForecastEvidenceDataset, instrument_id: InstrumentId) -> Uuid {
+    let history_token = history_token(dataset);
+    opaque_product_token(
+        b"market-squawk/forecast-investment-choice/v1\0",
+        &[history_token.as_bytes(), instrument_id.as_uuid().as_bytes()],
+    )
+}
+
+fn horizon_token(dataset: &ForecastEvidenceDataset, policy: ForecastEvidencePolicy) -> Uuid {
+    let history_token = history_token(dataset);
     let maximum_horizon_points = policy.maximum_horizon_points().get().to_be_bytes();
     let horizon_step_nanos = policy.horizon_step_nanos().get().to_be_bytes();
     let maximum_validity_nanos = policy.maximum_validity_nanos().get().to_be_bytes();
     let minimum_observed_points = policy.minimum_observed_points().get().to_be_bytes();
-    let components: [&[u8]; 4] = [
+    let components: [&[u8]; 5] = [
+        history_token.as_bytes(),
         &maximum_horizon_points,
         &horizon_step_nanos,
         &maximum_validity_nanos,
         &minimum_observed_points,
     ];
-    opaque_product_token(b"market-squawk/forecast-policy-choice/v1\0", &components)
+    opaque_product_token(b"market-squawk/forecast-horizon-choice/v1\0", &components)
 }
 
 fn catalog_value(
     catalog: &ForecastPreparationCatalog,
-    labels: &BTreeMap<InstrumentId, String>,
-) -> (Value, usize) {
+    identities: &BTreeMap<(InstrumentId, i64, i64), ForecastProductIdentity>,
+) -> Result<(Value, usize), ServiceError> {
     let models = catalog
         .models()
         .iter()
-        .filter_map(|model| {
+        .map(|model| {
             let datasets = catalog
                 .evidence()
                 .datasets()
                 .iter()
                 .filter(|dataset| dataset_matches_model(dataset, model))
-                .map(|dataset| dataset_value(dataset, labels))
-                .collect::<Vec<_>>();
-            (!datasets.is_empty()).then(|| model_value(model, Some(datasets)))
+                .map(|dataset| dataset_value(dataset, identities))
+                .collect::<Result<Vec<_>, _>>()?;
+            if datasets.is_empty() {
+                Ok(None)
+            } else {
+                Ok(model_value(model, Some(datasets)))
+            }
         })
+        .collect::<Result<Vec<_>, ServiceError>>()?
+        .into_iter()
+        .flatten()
         .collect::<Vec<_>>();
     let item_count = models.len();
-    (json!({ "models": models }), item_count)
+    Ok((json!({ "models": models }), item_count))
 }
 
 fn dataset_matches_model(dataset: &ForecastEvidenceDataset, model: &ForecastModelSummary) -> bool {
@@ -390,58 +418,97 @@ fn dataset_matches_model(dataset: &ForecastEvidenceDataset, model: &ForecastMode
 
 fn dataset_value(
     dataset: &ForecastEvidenceDataset,
-    labels: &BTreeMap<InstrumentId, String>,
-) -> Value {
-    json!({
+    identities: &BTreeMap<(InstrumentId, i64, i64), ForecastProductIdentity>,
+) -> Result<Value, ServiceError> {
+    let investments = dataset
+        .instruments()
+        .iter()
+        .map(|instrument| {
+            let identity = identities
+                .get(&(
+                    instrument.instrument_id(),
+                    instrument.available_at().unix_nanos(),
+                    instrument.observed_through().unix_nanos(),
+                ))
+                .ok_or(ServiceError::InvalidResult)?;
+            Ok(json!({
+                "investmentToken": investment_token(dataset, instrument.instrument_id()),
+                "label": identity.display_name(),
+                "observedFromUnixNanos": instrument.observed_from().unix_nanos().to_string(),
+                "observedThroughUnixNanos": instrument.observed_through().unix_nanos().to_string(),
+                "availableAtUnixNanos": instrument.available_at().unix_nanos().to_string(),
+                "observationCount": instrument.observed_points().get(),
+            }))
+        })
+        .collect::<Result<Vec<_>, ServiceError>>()?;
+    Ok(json!({
         "historyToken": history_token(dataset),
-        "instruments": dataset.instruments().iter().map(|instrument| json!({
-            "investmentToken": instrument.instrument_id().to_string(),
-            "label": labels.get(&instrument.instrument_id()).cloned().unwrap_or_else(|| instrument.instrument_id().to_string()),
-            "observedFromUnixNanos": instrument.observed_from().unix_nanos().to_string(),
-            "observedThroughUnixNanos": instrument.observed_through().unix_nanos().to_string(),
-            "availableAtUnixNanos": instrument.available_at().unix_nanos().to_string(),
-            "observedPoints": instrument.observed_points().get(),
-        })).collect::<Vec<_>>(),
-        "policies": dataset.policies().iter().map(|policy| json!({
-            "policyToken": policy_token(*policy),
-            "maximumHorizonPoints": policy.maximum_horizon_points().get(),
-            "horizonStepNanos": policy.horizon_step_nanos().get().to_string(),
-            "maximumValidityNanos": policy.maximum_validity_nanos().get().to_string(),
-            "minimumObservedPoints": policy.minimum_observed_points().get(),
-        })).collect::<Vec<_>>(),
-    })
+        "label": "Verified point-in-time investment history",
+        "investments": investments,
+        "horizons": dataset.policies().iter().filter_map(|policy| {
+            let horizon = ForecastHorizon::try_new(
+                policy.maximum_horizon_points(),
+                policy.horizon_step_nanos(),
+            ).ok()?;
+            let product = ForecastProductHorizon::try_from_horizon(horizon).ok()?;
+            Some(json!({
+                "horizonToken": horizon_token(dataset, *policy),
+                "label": product.label(),
+                "description": product.description(),
+            }))
+        }).collect::<Vec<_>>(),
+    }))
 }
 
-fn prepared_value(prepared: &PreparedForecast, instrument_label: &str) -> Value {
+fn prepared_value(
+    prepared: &PreparedForecast,
+    resolved: &ResolvedForecastSelection,
+) -> Result<Value, ServiceError> {
     let receipt = prepared.receipt();
     let preview = prepared.preview();
-    json!({
-        "receipt": {
-            "confirmationToken": receipt.receipt_id(),
-            "expiresAtUnixNanos": receipt.expires_at().unix_nanos().to_string(),
-        },
-        "preview": preview_value(preview, instrument_label),
-    })
-}
-
-fn preview_value(preview: &ForecastPreparationPreview, instrument_label: &str) -> Value {
-    json!({
-        "model": model_value(preview.model(), None),
-        "investmentToken": preview.instrument_id().to_string(),
-        "instrumentLabel": instrument_label,
+    let limitations = preview_limitations(preview);
+    Ok(json!({
+        "confirmationToken": receipt.receipt_id(),
+        "expiresAtUnixNanos": receipt.expires_at().unix_nanos().to_string(),
+        "model": model_value(preview.model(), None).ok_or(ServiceError::InvalidResult)?,
+        "investmentToken": resolved.investment_token,
+        "instrumentLabel": prepared.product_identity().display_name(),
         "observedFromUnixNanos": preview.observed_from().unix_nanos().to_string(),
         "observedThroughUnixNanos": preview.observed_through().unix_nanos().to_string(),
         "availableAtUnixNanos": preview.available_at().unix_nanos().to_string(),
-        "observedPoints": preview.observed_points(),
-        "horizonPoints": preview.horizon().points().get(),
-        "horizonStepNanos": preview.horizon().step_nanos().get().to_string(),
-        "validityNanos": preview.validity_nanos().to_string(),
-        "evidenceState": if preview.model().has_calibrated_intervals() { "calibrated" } else { "limited" },
+        "observationCount": preview.observed_points(),
+        "horizon": {
+            "label": resolved.horizon_label,
+            "description": resolved.horizon_description,
+        },
+        "limitations": limitations,
         "analysisOnly": true,
-    })
+    }))
 }
 
-fn model_value(model: &ForecastModelSummary, datasets: Option<Vec<Value>>) -> Value {
+fn preview_limitations(preview: &ForecastPreparationPreview) -> Vec<String> {
+    let mut limitations = preview
+        .model()
+        .limitations()
+        .iter()
+        .map(|limitation| limitation.to_string())
+        .collect::<Vec<_>>();
+    if !preview.model().has_calibrated_intervals() {
+        limitations.push(
+            "Calibrated forecast ranges are unavailable, so this forecast must be treated as limited evidence."
+                .to_owned(),
+        );
+    }
+    limitations.push(
+        "A forecast is uncertain investment research, not a promise of profit or permission to trade."
+            .to_owned(),
+    );
+    limitations.sort_unstable();
+    limitations.dedup();
+    limitations
+}
+
+fn model_value(model: &ForecastModelSummary, datasets: Option<Vec<Value>>) -> Option<Value> {
     let (name, objective) = match model.output_semantics() {
         ModelOutputSemantics::Regression => ("Numeric outcome forecast", "numeric_outcome"),
         ModelOutputSemantics::BinaryProbability => ("Likelihood estimate", "likelihood"),
@@ -450,44 +517,81 @@ fn model_value(model: &ForecastModelSummary, datasets: Option<Vec<Value>>) -> Va
         ("modelToken".to_owned(), json!(model_token(model))),
         ("name".to_owned(), json!(name)),
         ("objective".to_owned(), json!(objective)),
+        ("target".to_owned(), target_value(model)?),
+        (
+            "modelEvidence".to_owned(),
+            model.product_evidence().product_value(),
+        ),
         ("intendedUse".to_owned(), json!(model.intended_use())),
         ("limitations".to_owned(), json!(model.limitations())),
-        (
-            "evidenceState".to_owned(),
-            json!(if model.has_calibrated_intervals() {
-                "calibrated"
-            } else {
-                "limited"
-            }),
-        ),
         ("unavailableBehavior".to_owned(), json!("no_action")),
     ]);
     if let Some(datasets) = datasets {
         value.insert("histories".to_owned(), Value::Array(datasets));
     }
-    Value::Object(value)
+    Some(Value::Object(value))
 }
 
-fn definition_label(definition: &InstrumentDefinition) -> String {
-    let mut mappings = definition
-        .venue_mappings()
-        .iter()
-        .map(|mapping| mapping.venue_symbol().to_string())
-        .collect::<Vec<_>>();
-    mappings.sort_unstable();
-    mappings
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| definition.instrument_id().to_string())
+fn resolve_product_identity(
+    instruments: &InstrumentContextReadCapability,
+    instrument_id: InstrumentId,
+    knowledge_at: Timestamp,
+    effective_at: Timestamp,
+    context: &RequestContext,
+) -> Result<ForecastProductIdentity, ServiceError> {
+    let request = InstrumentContextRequest::try_new(instrument_id, knowledge_at, effective_at)
+        .map_err(|_| ServiceError::InvalidResult)?;
+    let read = instruments
+        .read(request, context.deadline(), context.cancellation())
+        .map_err(|_| ServiceError::Unavailable)?;
+    let InstrumentContextOutcome::Exact(identity) = read.outcome() else {
+        return Err(ServiceError::Unavailable);
+    };
+    ForecastProductIdentity::try_new(
+        identity.display_name(),
+        Some(identity.listed_symbol()),
+        investment_description(identity),
+        identity.quote_currency(),
+        knowledge_at,
+        effective_at,
+    )
+    .map_err(|_| ServiceError::InvalidResult)
+}
+
+fn investment_description(identity: &InstrumentContext) -> &'static str {
+    if identity.exchange_traded_fund() {
+        return "Exchange-traded fund with point-in-time verified listing identity.";
+    }
+    match identity.asset_class() {
+        AssetClass::Equity => "Listed company investment with point-in-time verified identity.",
+        AssetClass::FixedIncome => "Fixed-income investment with point-in-time verified identity.",
+        AssetClass::Option => "Listed option with point-in-time verified identity.",
+        AssetClass::Future => "Futures investment with point-in-time verified identity.",
+        AssetClass::ForeignExchange => {
+            "Foreign-exchange investment with point-in-time verified identity."
+        }
+        AssetClass::Crypto => "Crypto investment with point-in-time verified identity.",
+        AssetClass::Commodity => "Commodity investment with point-in-time verified identity.",
+        AssetClass::Fund => "Fund investment with point-in-time verified identity.",
+        AssetClass::Index => "Market index with point-in-time verified identity.",
+        AssetClass::Cash => "Cash investment with point-in-time verified identity.",
+    }
+}
+
+fn target_value(model: &ForecastModelSummary) -> Option<Value> {
+    let target = ForecastProductTarget::try_from_binding(model.output_binding()).ok()?;
+    Some(json!({
+        "label": target.label(),
+        "meaning": target.meaning(),
+        "valueKind": target.value_kind(),
+        "unitLabel": target.unit_label(),
+        "currencyCode": target.currency_code(),
+    }))
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(arguments: &Map<String, Value>) -> Result<T, ServiceError> {
     serde_json::from_value(Value::Object(arguments.clone()))
         .map_err(|_error| ServiceError::InvalidRequest)
-}
-
-fn parse_u64(value: &str) -> Result<u64, ServiceError> {
-    value.parse().map_err(|_error| ServiceError::InvalidRequest)
 }
 
 fn ensure_live(context: &RequestContext) -> Result<(), ServiceError> {

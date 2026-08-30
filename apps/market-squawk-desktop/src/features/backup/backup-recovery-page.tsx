@@ -12,7 +12,7 @@ import {
   Trash2,
 } from "lucide-react"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { messageFrom, useSystem } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -26,8 +26,8 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Progress } from "@/components/ui/progress"
-import type { DesktopBootstrap } from "@/lib/schemas"
-import type { OperationsControlRequest, ProductTransport } from "@/lib/transport"
+import type { DesktopSystemBootstrap } from "@/lib/schemas"
+import type { OperationsControlRequest, SystemTransport } from "@/lib/transport"
 
 import {
   encryptionLabel,
@@ -60,21 +60,24 @@ type PendingConfirmation =
   | { kind: "programRollback"; preview: ProgramRollbackPreview }
 
 export function BackupRecoveryPage() {
-  const product = useProduct()
+  const system = useSystem()
 
-  if (product.status === "loading") return <BackupLoading />
-  if (product.status === "error") {
+  if (system.status === "loading") return <BackupLoading />
+  if (system.status !== "ready") {
     return (
       <BackupFrame>
-        <Unavailable detail={product.error} onRetry={product.refresh} />
+        <Unavailable
+          detail={system.status === "unavailable" ? system.error : "Finish secure storage setup in Settings before using backup and recovery."}
+          onRetry={system.refresh}
+        />
       </BackupFrame>
     )
   }
 
   return (
     <ReadyBackupRecovery
-      bootstrap={product.bootstrap}
-      transport={product.transport}
+      bootstrap={system.bootstrap}
+      transport={system.transport}
     />
   )
 }
@@ -83,11 +86,11 @@ function ReadyBackupRecovery({
   bootstrap,
   transport,
 }: {
-  bootstrap: DesktopBootstrap
-  transport: ProductTransport
+  bootstrap: DesktopSystemBootstrap
+  transport: SystemTransport
 }) {
   const queryClient = useQueryClient()
-  const scope = bootstrap.runtime
+  const scope = bootstrap.productSessionToken
   const [keepLatestInput, setKeepLatestInput] = React.useState("3")
   const [retentionPreview, setRetentionPreview] = React.useState<RetentionPreview | null>(null)
   const [restorePreview, setRestorePreview] = React.useState<RestorePreview | null>(null)
@@ -104,7 +107,7 @@ function ReadyBackupRecovery({
     initialPageParam: undefined as string | undefined,
     queryFn: ({ pageParam }) =>
       transport
-        .query({
+        .systemQuery({
           query: "operationBackups",
           afterBackupId: pageParam,
           limit: INVENTORY_LIMIT,
@@ -132,7 +135,7 @@ function ReadyBackupRecovery({
 
   const retainedJob = useQuery({
     queryKey: productKeys.operation(scope, "job", "Job.List", { limit: JOB_LIMIT }),
-    queryFn: () => transport.query({ query: "jobs", limit: JOB_LIMIT }).then(parseBackupJobs),
+    queryFn: () => transport.systemQuery({ query: "jobs", limit: JOB_LIMIT }).then(parseBackupJobs),
     enabled: receipt !== null,
     refetchInterval: receipt ? 5_000 : false,
   })
@@ -145,7 +148,7 @@ function ReadyBackupRecovery({
   const previewRetention = useMutation({
     mutationFn: (keepLatest: number) =>
       transport
-        .query({ query: "operationBackupRetentionPreview", keepLatest })
+        .systemQuery({ query: "operationBackupRetentionPreview", keepLatest })
         .then(parseRetentionPreview),
     onSuccess: (preview) => {
       setRetentionPreview(preview)
@@ -155,7 +158,7 @@ function ReadyBackupRecovery({
   const previewRestore = useMutation({
     mutationFn: (backupId: string) =>
       transport
-        .query({ query: "operationRestorePreview", backupId })
+        .systemQuery({ query: "operationRestorePreview", backupId })
         .then(parseRestorePreview),
     onSuccess: (preview) => {
       setRestorePreview(preview)
@@ -165,7 +168,7 @@ function ReadyBackupRecovery({
   const previewRollback = useMutation({
     mutationFn: () =>
       transport
-        .query({ query: "operationProgramRollbackPreview" })
+        .systemQuery({ query: "operationProgramRollbackPreview" })
         .then(parseProgramRollbackPreview),
     onSuccess: (preview) => {
       setRollbackPreview(preview)

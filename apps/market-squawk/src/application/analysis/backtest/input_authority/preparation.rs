@@ -207,6 +207,23 @@ pub struct BacktestPreparationOptions {
     pub default_limit_policy: String,
 }
 
+impl BacktestPreparationOptions {
+    /// Resolves the exact execution assumptions behind one admitted cost choice.
+    pub fn execution_assumptions(
+        &self,
+        cost_policy: &str,
+    ) -> Result<ResearchExecutionAssumptionsInput, BacktestPreparationError> {
+        if !self
+            .cost_policies
+            .iter()
+            .any(|option| option.id == cost_policy)
+        {
+            return Err(BacktestPreparationError::InvalidSelection);
+        }
+        execution_assumptions(cost_policy)
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BacktestDatasetOption {
@@ -451,6 +468,31 @@ impl ReceiptRegistry {
         }
         Ok((retained.selection.clone(), retained.registration_digest))
     }
+
+    fn receipt(
+        &mut self,
+        receipt_id: Uuid,
+        owner: RequestOrigin,
+        workspace: WorkspaceRuntimeIdentity,
+        catalog_digest: [u8; 32],
+        now: Instant,
+    ) -> Result<BacktestPreparationReceipt, BacktestPreparationError> {
+        let (receipt, retained) = self
+            .entries
+            .get(&receipt_id)
+            .ok_or(BacktestPreparationError::NotFound)?;
+        if retained.expires_at <= now {
+            self.entries.remove(&receipt_id);
+            return Err(BacktestPreparationError::Expired);
+        }
+        if retained.owner != owner
+            || retained.workspace != workspace
+            || retained.catalog_digest != catalog_digest
+        {
+            return Err(BacktestPreparationError::Unauthorized);
+        }
+        Ok(*receipt)
+    }
 }
 
 /// Process-owned guided preparation authority. Restart invalidates every outstanding receipt.
@@ -609,6 +651,27 @@ impl GovernedBacktestPreparationAuthority {
         }
         receipts.consume(receipt, owner, workspace, catalog.digest, now)?;
         recipe.into_registration_input().map_err(map_recipe_error)
+    }
+
+    /// Resolves one opaque product confirmation token inside the process-owned receipt registry,
+    /// then applies the same one-use catalog and registration revalidation as direct consumption.
+    pub fn consume_token(
+        &self,
+        catalog: &BacktestPreparationCatalog,
+        confirmation_token: Uuid,
+        owner: RequestOrigin,
+        workspace: WorkspaceRuntimeIdentity,
+        now: Instant,
+    ) -> Result<GovernedBacktestInputRegistrationInput, BacktestPreparationError> {
+        ensure_origin(owner, workspace)?;
+        let receipt = {
+            let mut receipts = self
+                .receipts
+                .lock()
+                .map_err(|_| BacktestPreparationError::Unavailable)?;
+            receipts.receipt(confirmation_token, owner, workspace, catalog.digest, now)?
+        };
+        self.consume(catalog, receipt, owner, workspace, now)
     }
 }
 

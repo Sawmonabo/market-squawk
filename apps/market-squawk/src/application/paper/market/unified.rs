@@ -616,11 +616,9 @@ fn build_market_result(
                 "availability": if observed == 0 { "unavailable" } else { "available" },
                 "complete": coverage_complete && rows.len() == available,
                 "returnedInstrumentCount": rows.len(),
-                "observationCount": observed,
             }),
             json!({
                 "referenceAt": timestamp_value(reference_at),
-                "observationCount": observed,
             }),
         ),
     };
@@ -1968,14 +1966,7 @@ fn product_instrument_row(
         .unwrap_or_else(|| {
             (
                 json!({
-                    "timing": Value::Null,
-                    "quality": "unavailable",
-                    "health": "unavailable",
-                    "integrity": "unavailable",
-                    "coverage": "unavailable",
-                    "depth": "none",
                     "freshness": "unavailable",
-                    "observedAt": Value::Null,
                     "updatedAt": timestamp_value(receipt.selected_at()),
                     "currentThrough": Value::Null,
                 }),
@@ -1983,7 +1974,6 @@ fn product_instrument_row(
                 "unavailable",
             )
         });
-    let observation_count = receipt.eligible().len();
     Ok(json!({
         "instrumentId": definition.instrument_id().to_string(),
         "displaySymbol": product_display_symbol(definition)?,
@@ -1998,20 +1988,8 @@ fn product_instrument_row(
         "currentPrice": quote.current_price(definition.quote_currency()),
         "quote": quote.value(),
         "marketState": market_state,
-        "observations": {
-            "admittedCount": observation_count,
-            "independentCount": Value::Null,
-            "agreement": "not_established",
-        },
         "depthSummary": depth_summary,
         "depthDetails": depth_details,
-        "analysisUse": if selected_view
-            .is_some_and(|view| product_view_is_fresh(view, receipt.selected_at()))
-        {
-            "current_only"
-        } else {
-            "unavailable"
-        },
     }))
 }
 
@@ -2304,7 +2282,6 @@ fn product_market_state(
 ) -> (Value, &'static str, &'static str) {
     let candidate = selected.candidate();
     let capabilities = candidate.capabilities();
-    let admission = candidate.admission();
     let timestamps = candidate.timestamps();
     let current_through = product_current_through(view);
     let is_fresh = product_view_is_fresh(view, selected_at);
@@ -2325,16 +2302,7 @@ fn product_market_state(
     let confidence = product_confidence(selected, is_fresh);
     (
         json!({
-            "timing": timing_name(capabilities.timing()),
-            "quality": product_quality_name(capabilities.quality()),
-            "health": health_name(admission.health().state()),
-            "integrity": integrity_name(admission.integrity().state()),
-            "coverage": product_coverage_name(capabilities.coverage()),
-            "depth": capabilities.depth().map(depth_name).unwrap_or("none"),
             "freshness": freshness,
-            "observedAt": timestamp_value(
-                timestamps.source_timestamp().unwrap_or(timestamps.received_at()),
-            ),
             "updatedAt": timestamp_value(timestamps.available_at()),
             "currentThrough": current_through.map(timestamp_value),
         }),
@@ -2388,31 +2356,6 @@ fn product_confidence(selected: SelectedMarketSource<'_>, is_fresh: bool) -> &'s
         "moderate"
     } else {
         "limited"
-    }
-}
-
-const fn product_quality_name(quality: DataQuality) -> &'static str {
-    match quality {
-        DataQuality::DirectVerified => "verified",
-        DataQuality::DirectUnverified => "direct",
-        DataQuality::OfficialDelayed => "official_delayed",
-        DataQuality::Aggregated => "aggregated",
-        DataQuality::Indicative => "indicative",
-        DataQuality::Modeled => "modeled",
-        DataQuality::Estimated => "estimated",
-        DataQuality::Stale => "stale",
-        DataQuality::Quarantined => "unavailable",
-    }
-}
-
-const fn product_coverage_name(coverage: MarketCoverage) -> &'static str {
-    match coverage {
-        MarketCoverage::Consolidated => "broad",
-        MarketCoverage::MultiVenuePartial => "partial",
-        MarketCoverage::SingleVenue => "single_market",
-        MarketCoverage::Benchmark => "benchmark",
-        MarketCoverage::Reference => "reference",
-        MarketCoverage::UserOwned => "account_owned",
     }
 }
 

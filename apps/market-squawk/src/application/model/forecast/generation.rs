@@ -10,7 +10,7 @@ use market_squawk_data::{
     DatasetId, DatasetManifestRef, DatasetSchemaRef, DatasetSchemaRegistry, Sha256Digest,
 };
 use market_squawk_domain::{
-    DataQuality, InstrumentId, ModelId, SchemaVersion, SourceId, Timestamp,
+    Currency, DataQuality, InstrumentId, ModelId, SchemaVersion, SourceId, Timestamp,
 };
 use market_squawk_modeling::{
     BundleId, CalibrationEvidence, ForecastError, ForecastHorizon, ForecastObservedPoint,
@@ -24,8 +24,14 @@ use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use super::super::{ModelDomainService, admitted_model_id, one_result};
-use super::{ForecastAnalysisEvidence, ForecastApplicationError, ForecastServingEvidence};
+use super::super::{
+    ForecastModelEvidenceProjection, ModelDomainService, admitted_model_id,
+    forecast_model_evidence_projection_for_horizon, one_result,
+};
+use super::{
+    ForecastAnalysisEvidence, ForecastApplicationError, ForecastProductIdentity,
+    ForecastProductTarget, ForecastServingEvidence,
+};
 use crate::application::domain_support::{admitted_result_limits, ensure_request_live};
 
 const MAXIMUM_FORECAST_VALIDITY_NANOS: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
@@ -57,6 +63,24 @@ impl ModelDomainService {
             })
             .ok_or(ServiceError::NotFound)?;
         let metadata = backend.metadata();
+        let bundle = image
+            .registry
+            .get(metadata.bundle_id(), metadata.bundle_version())
+            .map_err(|_| ServiceError::Unavailable)?
+            .ok_or(ServiceError::Unavailable)?;
+        let authoritative_evidence =
+            forecast_model_evidence_projection_for_horizon(&bundle, parsed.horizon)?;
+        if authoritative_evidence != parsed.model_evidence {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let product_target = ForecastProductTarget::try_from_binding(metadata.output_binding())
+            .map_err(|_| ServiceError::Unavailable)?;
+        if product_target
+            .currency_code()
+            .is_some_and(|currency| currency != parsed.product_identity.quote_currency().as_str())
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
         let mut rows = Vec::new();
         rows.try_reserve_exact(parsed.inputs.len())
             .map_err(|_error| ServiceError::ResourceExhausted)?;
@@ -121,6 +145,8 @@ impl ModelDomainService {
             .publish_vintage(
                 parsed.request_hash(model_id)?,
                 path,
+                parsed.product_identity.clone(),
+                parsed.model_evidence.clone(),
                 parsed.analysis_evidence.clone(),
                 parsed.serving_evidence.clone(),
                 created_at,
@@ -191,6 +217,8 @@ impl ModelDomainService {
 
 struct ParsedForecastRequest {
     instrument_id: InstrumentId,
+    product_identity: ForecastProductIdentity,
+    model_evidence: ForecastModelEvidenceProjection,
     bundle_id: BundleId,
     bundle_version: NonZeroU64,
     observed_cutoff: Timestamp,
@@ -210,6 +238,53 @@ impl ParsedForecastRequest {
         digest.update(b"market-squawk/forecast-request/v3\0");
         digest.update(model_id.as_uuid().as_bytes());
         digest.update(self.instrument_id.as_uuid().as_bytes());
+        hash_bytes(&mut digest, self.product_identity.display_name().as_bytes())?;
+        match self.product_identity.canonical_symbol() {
+            Some(symbol) => {
+                digest.update([1]);
+                hash_bytes(&mut digest, symbol.as_bytes())?;
+            }
+            None => digest.update([0]),
+        }
+        hash_bytes(&mut digest, self.product_identity.description().as_bytes())?;
+        hash_bytes(
+            &mut digest,
+            self.product_identity.quote_currency().as_str().as_bytes(),
+        )?;
+        digest.update(
+            self.product_identity
+                .knowledge_at()
+                .unix_nanos()
+                .to_be_bytes(),
+        );
+        digest.update(
+            self.product_identity
+                .effective_at()
+                .unix_nanos()
+                .to_be_bytes(),
+        );
+        digest.update(self.model_evidence.model_token().as_bytes());
+        hash_bytes(
+            &mut digest,
+            self.model_evidence.overall().as_str().as_bytes(),
+        )?;
+        hash_bytes(
+            &mut digest,
+            self.model_evidence.pit_inputs().as_str().as_bytes(),
+        )?;
+        hash_bytes(
+            &mut digest,
+            self.model_evidence.out_of_sample().as_str().as_bytes(),
+        )?;
+        hash_bytes(
+            &mut digest,
+            self.model_evidence.horizon_alignment().as_str().as_bytes(),
+        )?;
+        hash_bytes(
+            &mut digest,
+            self.model_evidence.calibration().as_str().as_bytes(),
+        )?;
+        hash_bytes(&mut digest, self.model_evidence.interpretation().as_bytes())?;
         digest.update(self.bundle_id.as_str().as_bytes());
         digest.update([0]);
         digest.update(self.bundle_version.get().to_be_bytes());
@@ -274,8 +349,10 @@ impl TryFrom<&Map<String, Value>> for ParsedForecastRequest {
     type Error = ServiceError;
 
     fn try_from(input: &Map<String, Value>) -> Result<Self, Self::Error> {
-        const FIELDS: [&str; 13] = [
+        const FIELDS: [&str; 15] = [
             "instrumentId",
+            "productIdentity",
+            "modelEvidence",
             "bundleId",
             "bundleVersion",
             "observedThroughUnixNanos",
@@ -294,6 +371,12 @@ impl TryFrom<&Map<String, Value>> for ParsedForecastRequest {
         }
         let instrument_id = identifier(input, "instrumentId")
             .and_then(|value| InstrumentId::from_str(value).map_err(invalid))?;
+        let product_identity = parse_product_identity(
+            input
+                .get("productIdentity")
+                .and_then(Value::as_object)
+                .ok_or(ServiceError::InvalidRequest)?,
+        )?;
         let bundle_id = identifier(input, "bundleId")
             .and_then(|value| BundleId::try_new(value).map_err(invalid))?;
         let bundle_version = unsigned(input, "bundleVersion")
@@ -309,6 +392,13 @@ impl TryFrom<&Map<String, Value>> for ParsedForecastRequest {
             .and_then(NonZeroU64::new)
             .ok_or(ServiceError::InvalidRequest)?;
         let horizon = ForecastHorizon::try_new(horizon_points, horizon_step).map_err(invalid)?;
+        let model_evidence = parse_model_evidence(
+            input
+                .get("modelEvidence")
+                .and_then(Value::as_object)
+                .ok_or(ServiceError::InvalidRequest)?,
+            horizon,
+        )?;
         let decimal_scale = unsigned(input, "decimalScale")
             .and_then(|value| u8::try_from(value).ok())
             .filter(|value| *value <= market_squawk_modeling::MAX_FORECAST_DECIMAL_SCALE)
@@ -374,11 +464,15 @@ impl TryFrom<&Map<String, Value>> for ParsedForecastRequest {
         )?;
         if serving_evidence.observed_through() != observed_cutoff
             || available_at > serving_evidence.knowledge_cutoff()
+            || product_identity.knowledge_at() != serving_evidence.knowledge_cutoff()
+            || product_identity.effective_at() != observed_cutoff
         {
             return Err(ServiceError::InvalidRequest);
         }
         Ok(Self {
             instrument_id,
+            product_identity,
+            model_evidence,
             bundle_id,
             bundle_version,
             observed_cutoff,
@@ -392,6 +486,43 @@ impl TryFrom<&Map<String, Value>> for ParsedForecastRequest {
             serving_evidence,
         })
     }
+}
+
+fn parse_product_identity(
+    input: &Map<String, Value>,
+) -> Result<ForecastProductIdentity, ServiceError> {
+    const FIELDS: [&str; 6] = [
+        "displayName",
+        "canonicalSymbol",
+        "description",
+        "quoteCurrency",
+        "knowledgeAtUnixNanos",
+        "effectiveAtUnixNanos",
+    ];
+    if input.len() != FIELDS.len() || input.keys().any(|key| !FIELDS.contains(&key.as_str())) {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let display_name = identifier(input, "displayName")?;
+    let canonical_symbol = match input.get("canonicalSymbol") {
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(Value::Null) => None,
+        _ => return Err(ServiceError::InvalidRequest),
+    };
+    let description = identifier(input, "description")?;
+    let encoded_currency = identifier(input, "quoteCurrency")?;
+    let quote_currency = Currency::try_from(encoded_currency).map_err(invalid)?;
+    if quote_currency.as_str() != encoded_currency {
+        return Err(ServiceError::InvalidRequest);
+    }
+    ForecastProductIdentity::try_new(
+        display_name,
+        canonical_symbol,
+        description,
+        quote_currency,
+        timestamp(input, "knowledgeAtUnixNanos")?,
+        timestamp(input, "effectiveAtUnixNanos")?,
+    )
+    .map_err(|_| ServiceError::InvalidRequest)
 }
 
 fn parse_serving_evidence(
@@ -428,6 +559,37 @@ fn parse_serving_evidence(
         digest(input, "featureSha256")?,
     )
     .map_err(|_| ServiceError::InvalidRequest)
+}
+
+fn parse_model_evidence(
+    input: &Map<String, Value>,
+    selected_horizon: ForecastHorizon,
+) -> Result<ForecastModelEvidenceProjection, ServiceError> {
+    const FIELDS: [&str; 7] = [
+        "modelToken",
+        "overall",
+        "pitInputs",
+        "outOfSample",
+        "horizonAlignment",
+        "calibration",
+        "interpretation",
+    ];
+    if input.len() != FIELDS.len() || input.keys().any(|key| !FIELDS.contains(&key.as_str())) {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let model_token = identifier(input, "modelToken")
+        .and_then(|value| Uuid::parse_str(value).map_err(invalid))?;
+    ForecastModelEvidenceProjection::try_from_product_fields_for_horizon(
+        model_token,
+        selected_horizon,
+        identifier(input, "overall")?,
+        identifier(input, "pitInputs")?,
+        identifier(input, "outOfSample")?,
+        identifier(input, "horizonAlignment")?,
+        identifier(input, "calibration")?,
+        identifier(input, "interpretation")?,
+    )
+    .ok_or(ServiceError::InvalidRequest)
 }
 
 fn parse_analysis_evidence(

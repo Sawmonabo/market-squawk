@@ -89,6 +89,7 @@ pub(crate) use reference_identity::{
     MarketReferenceIdentityError, MarketReferenceIdentityRequest,
     MarketReferenceIdentityResolution, MarketReferenceIdentityUnavailable,
 };
+pub(crate) use schwab::{PreparedSchwabMarketRuntimeStart, SchwabMarketRuntimeStartError};
 pub use schwab::{SchwabMarketDataAccountActivation, SchwabMarketDataActivationError};
 pub use specs::{
     BlsAdapterActivation, BoardAdapterActivation, COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS,

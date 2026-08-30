@@ -167,6 +167,7 @@ pub(crate) struct ProviderResearchActivationService {
     state: DurableProviderActivationState,
     tasks: Arc<ProviderActivationTaskAuthority>,
     schwab_doctor_tasks: Arc<SchwabMarketDoctorTaskAuthority>,
+    schwab_oauth_lifecycle: Arc<SchwabOAuthServiceLifecycle>,
     schwab_oauth: Arc<OnceCell<Arc<SchwabOAuthRuntime>>>,
     schwab_oauth_factory: Option<SchwabOAuthRuntimeFactory>,
     schwab_doctor: Option<Arc<SchwabMarketDoctorRuntimeCoordinator>>,
@@ -204,10 +205,35 @@ impl ProviderResearchActivationService {
             state,
             tasks: Arc::new(ProviderActivationTaskAuthority::new()),
             schwab_doctor_tasks: Arc::new(SchwabMarketDoctorTaskAuthority::new()),
+            schwab_oauth_lifecycle: Arc::new(SchwabOAuthServiceLifecycle::new()),
             schwab_oauth: Arc::new(OnceCell::new()),
             schwab_oauth_factory,
             schwab_doctor,
         }
+    }
+
+    /// Returns only the protected market authority from the portal-owned OAuth runtime.
+    /// Tokens and secret material never cross this installed composition boundary.
+    pub(crate) async fn schwab_market_authority(
+        &self,
+        session_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<SchwabOAuthMarketAuthority, ProviderPortalActivationError> {
+        if cancellation.is_cancelled() || session_id.is_nil() {
+            return Err(ProviderPortalActivationError::Unavailable);
+        }
+        let runtime = self
+            .schwab_oauth_lifecycle
+            .runtime(
+                &self.schwab_oauth,
+                self.schwab_oauth_factory.as_ref(),
+                &cancellation,
+            )
+            .await?;
+        runtime
+            .market_authority(session_id, cancellation)
+            .await
+            .map_err(map_schwab_oauth_error)
     }
 
     /// Publishes one exact workspace-controlled local-file bundle through the same durable
@@ -532,6 +558,107 @@ impl ProviderResearchActivationService {
         response
             .await
             .map_err(|_error| CliProviderActivationError::StateUnavailable)?
+    }
+}
+
+#[derive(Default)]
+struct SchwabOAuthServiceLifecycleState {
+    drained: bool,
+}
+
+/// Sole installed authority serializing lazy OAuth construction against application shutdown.
+///
+/// The state lock spans construction and final drain. `begin_shutdown` closes admission without
+/// waiting for that lock; an initializer that already owns it observes the closed atomic after
+/// construction, closes the new runtime immediately, and rejects the request. Final shutdown then
+/// waits for that exact initializer before discovering and draining the sole `OnceCell` runtime.
+struct SchwabOAuthServiceLifecycle {
+    accepting: AtomicBool,
+    state: AsyncMutex<SchwabOAuthServiceLifecycleState>,
+}
+
+impl SchwabOAuthServiceLifecycle {
+    fn new() -> Self {
+        Self {
+            accepting: AtomicBool::new(true),
+            state: AsyncMutex::new(SchwabOAuthServiceLifecycleState::default()),
+        }
+    }
+
+    async fn runtime(
+        &self,
+        cell: &OnceCell<Arc<SchwabOAuthRuntime>>,
+        factory: Option<&SchwabOAuthRuntimeFactory>,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<SchwabOAuthRuntime>, ProviderPortalActivationError> {
+        self.require_admission(cancellation)?;
+        let state = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                return Err(ProviderPortalActivationError::Cancelled);
+            }
+            state = self.state.lock() => state,
+        };
+        if state.drained {
+            return Err(ProviderPortalActivationError::Unavailable);
+        }
+        self.require_admission(cancellation)?;
+        let factory = factory.ok_or(ProviderPortalActivationError::Unavailable)?;
+        let runtime = cell
+            .get_or_try_init(|| async { factory() })
+            .await
+            .map_err(|_error| ProviderPortalActivationError::Unavailable)?
+            .clone();
+        if !self.accepting.load(Ordering::Acquire) {
+            runtime.begin_shutdown();
+            return Err(ProviderPortalActivationError::Unavailable);
+        }
+        drop(state);
+        Ok(runtime)
+    }
+
+    fn require_admission(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ProviderPortalActivationError> {
+        if cancellation.is_cancelled() {
+            Err(ProviderPortalActivationError::Cancelled)
+        } else if self.accepting.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(ProviderPortalActivationError::Unavailable)
+        }
+    }
+
+    fn begin_shutdown(&self, runtime: Option<&Arc<SchwabOAuthRuntime>>) {
+        self.accepting.store(false, Ordering::Release);
+        if let Some(runtime) = runtime {
+            runtime.begin_shutdown();
+        }
+    }
+
+    async fn finish_shutdown(
+        &self,
+        cell: &OnceCell<Arc<SchwabOAuthRuntime>>,
+        deadline: Instant,
+    ) -> Result<(), ProviderPortalActivationError> {
+        self.begin_shutdown(cell.get());
+        let deadline_at = TokioInstant::from_std(deadline);
+        let mut state = tokio::time::timeout_at(deadline_at, self.state.lock())
+            .await
+            .map_err(|_elapsed| ProviderPortalActivationError::StateUnavailable)?;
+        if state.drained {
+            return Ok(());
+        }
+        if let Some(runtime) = cell.get() {
+            runtime.begin_shutdown();
+            runtime
+                .finish_shutdown(deadline)
+                .await
+                .map_err(map_schwab_oauth_error)?;
+        }
+        state.drained = true;
+        Ok(())
     }
 }
 
@@ -1583,15 +1710,14 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
                 .await
                 .map_err(map_portal_activation_error)?;
         }
-        let factory = self
-            .schwab_oauth_factory
-            .as_ref()
-            .ok_or(ProviderPortalActivationError::Unavailable)?;
         let runtime = self
-            .schwab_oauth
-            .get_or_try_init(|| async { factory() })
-            .await
-            .map_err(|_error| ProviderPortalActivationError::Unavailable)?;
+            .schwab_oauth_lifecycle
+            .runtime(
+                &self.schwab_oauth,
+                self.schwab_oauth_factory.as_ref(),
+                &cancellation,
+            )
+            .await?;
         let view = runtime
             .apply(session_id, action, cancellation)
             .await
@@ -1659,9 +1785,8 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
     fn begin_shutdown(&self) {
         self.tasks.begin_shutdown();
         self.schwab_doctor_tasks.begin_shutdown();
-        if let Some(runtime) = self.schwab_oauth.get() {
-            runtime.begin_shutdown();
-        }
+        self.schwab_oauth_lifecycle
+            .begin_shutdown(self.schwab_oauth.get());
     }
 
     async fn finish_shutdown(
@@ -1670,15 +1795,9 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
     ) -> Result<(), ProviderPortalActivationError> {
         let tasks = self.tasks.finish_shutdown(deadline);
         let schwab_doctor_tasks = self.schwab_doctor_tasks.finish_shutdown(deadline);
-        let oauth = async {
-            match self.schwab_oauth.get() {
-                Some(runtime) => runtime
-                    .finish_shutdown(deadline)
-                    .await
-                    .map_err(map_schwab_oauth_error),
-                None => Ok(()),
-            }
-        };
+        let oauth = self
+            .schwab_oauth_lifecycle
+            .finish_shutdown(&self.schwab_oauth, deadline);
         let (tasks, schwab_doctor_tasks, oauth) = tokio::join!(tasks, schwab_doctor_tasks, oauth);
         tasks.map_err(map_portal_activation_error)?;
         schwab_doctor_tasks.map_err(map_portal_activation_error)?;

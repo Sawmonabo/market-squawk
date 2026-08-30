@@ -22,7 +22,7 @@ use market_squawk_domain::{
     SourceIdentifier,
 };
 use market_squawk_services::{
-    JsonStructureLimits, RequestContext, RequestId, ServiceError, ServiceLimits,
+    JsonStructureLimits, RequestContext, RequestId, RequestOrigin, ServiceError, ServiceLimits,
 };
 use market_squawk_sources::{DataUseOperation, OnboardingState};
 use serde::Serialize;
@@ -287,6 +287,13 @@ struct LiveRuntimeEvidence {
     action_completed: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReleasePaperStartFixture {
+    virtual_cash_amount: &'static str,
+    estimated_trading_cost: &'static str,
+    mode_label: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RestartRecoveryEvidence {
@@ -510,6 +517,17 @@ async fn collect_provider_evidence(
                 product.application().as_ref(),
                 surface_id,
                 arguments.require_direct_verified_action && *surface_id == COINBASE_DIRECT,
+                ReleasePaperStartFixture {
+                    virtual_cash_amount: "100000",
+                    estimated_trading_cost: "0.25%",
+                    mode_label: if arguments.require_direct_verified_action
+                        && *surface_id == COINBASE_DIRECT
+                    {
+                        "Guided practice"
+                    } else {
+                        "Manual practice"
+                    },
+                },
                 shutdown_timeout,
             )
             .await?;
@@ -2153,10 +2171,52 @@ fn lower_hex(bytes: [u8; 32]) -> String {
     encoded
 }
 
+fn exact_release_choice_token(
+    preparation: &Value,
+    catalog: &str,
+    matches: impl Fn(&Value) -> bool,
+) -> Result<String> {
+    let choices = preparation
+        .get(catalog)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("paper start {catalog} catalog is absent"))?;
+    let mut found = choices.iter().filter(|choice| matches(choice));
+    let selected = found
+        .next()
+        .ok_or_else(|| anyhow!("paper start {catalog} fixture choice is absent"))?;
+    if found.next().is_some() {
+        bail!("paper start {catalog} fixture choice is ambiguous");
+    }
+    required_text(selected.get("choiceToken"), "paper start choiceToken")
+}
+
+fn require_release_start_preview(preview: &Value, fixture: ReleasePaperStartFixture) -> Result<()> {
+    if preview
+        .pointer("/virtualCash/amount")
+        .and_then(Value::as_str)
+        != Some(fixture.virtual_cash_amount)
+        || preview.get("estimatedTradingCost").and_then(Value::as_str)
+            != Some(fixture.estimated_trading_cost)
+        || preview.get("modeLabel").and_then(Value::as_str) != Some(fixture.mode_label)
+    {
+        bail!("paper start preview does not match the explicit release fixture");
+    }
+    required_text(preview.get("expiresAt"), "paper start expiresAt")?;
+    let safeguards = preview
+        .get("safeguards")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("paper start safeguards are absent"))?;
+    if safeguards.len() != 3 || safeguards.iter().any(|value| value.as_str().is_none()) {
+        bail!("paper start safeguards do not match the release contract");
+    }
+    Ok(())
+}
+
 async fn exercise_live_surface(
     application: &Application,
     surface_id: &'static str,
     require_action: bool,
+    paper_start: ReleasePaperStartFixture,
     shutdown_timeout: Duration,
 ) -> Result<LiveRuntimeEvidence> {
     let expected_quality = match surface_id {
@@ -2164,16 +2224,50 @@ async fn exercise_live_surface(
         COINBASE_DIRECT => "direct_verified",
         _ => bail!("selected provider surface is not a live runtime"),
     };
-    let start_arguments = json_object(json!({
-        "initialCash": "100000",
-        "feeBasisPoints": 100,
-    }))?;
+    let origin = RequestOrigin::try_new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4())?;
+    let preparation = invoke_with_origin(
+        application,
+        "Bot.GetStartPreparation",
+        Map::new(),
+        LIVE_START_TIMEOUT,
+        origin,
+    )
+    .await?;
+    let cash_choice = exact_release_choice_token(&preparation, "virtualCashChoices", |choice| {
+        choice.pointer("/amount/amount").and_then(Value::as_str)
+            == Some(paper_start.virtual_cash_amount)
+    })?;
+    let cost_choice = exact_release_choice_token(&preparation, "costChoices", |choice| {
+        choice.get("estimatedTradingCost").and_then(Value::as_str)
+            == Some(paper_start.estimated_trading_cost)
+    })?;
+    let mode_choice = exact_release_choice_token(&preparation, "modeChoices", |choice| {
+        choice.get("label").and_then(Value::as_str) == Some(paper_start.mode_label)
+    })?;
+    let preview = invoke_with_origin(
+        application,
+        "Bot.PrepareStart",
+        json_object(json!({
+            "cashChoice": cash_choice,
+            "costChoice": cost_choice,
+            "modeChoice": mode_choice,
+        }))?,
+        LIVE_START_TIMEOUT,
+        origin,
+    )
+    .await?;
+    require_release_start_preview(&preview, paper_start)?;
+    let confirmation_token = required_text(
+        preview.get("confirmationToken"),
+        "paper start confirmationToken",
+    )?;
     let run = async {
-        let start = invoke(
+        let start = invoke_with_origin(
             application,
             "Bot.Start",
-            start_arguments,
+            json_object(json!({"confirmationToken": confirmation_token}))?,
             LIVE_START_TIMEOUT,
+            origin,
         )
         .await?;
         let source_status =
@@ -2422,8 +2516,28 @@ async fn wait_for_orders(application: &Application) -> Result<Value> {
 async fn invoke(
     application: &Application,
     operation: &str,
+    arguments: Map<String, Value>,
+    timeout: Duration,
+) -> Result<Value> {
+    invoke_request(application, operation, arguments, timeout, None).await
+}
+
+async fn invoke_with_origin(
+    application: &Application,
+    operation: &str,
+    arguments: Map<String, Value>,
+    timeout: Duration,
+    origin: RequestOrigin,
+) -> Result<Value> {
+    invoke_request(application, operation, arguments, timeout, Some(origin)).await
+}
+
+async fn invoke_request(
+    application: &Application,
+    operation: &str,
     mut arguments: Map<String, Value>,
     timeout: Duration,
+    origin: Option<RequestOrigin>,
 ) -> Result<Value> {
     arguments.insert(
         "resultLimits".to_owned(),
@@ -2446,12 +2560,12 @@ async fn invoke(
         "release-provider-{}",
         uuid::Uuid::new_v4().simple()
     ))?;
+    let mut context = RequestContext::new(request_id, CancellationToken::new(), deadline, limits);
+    if let Some(origin) = origin {
+        context = context.with_origin(origin);
+    }
     application
-        .invoke(
-            operation,
-            arguments,
-            RequestContext::new(request_id, CancellationToken::new(), deadline, limits),
-        )
+        .invoke(operation, arguments, context)
         .await
         .map(|result| result.structured_content().clone())
         .map_err(|error| application_error(operation, error))

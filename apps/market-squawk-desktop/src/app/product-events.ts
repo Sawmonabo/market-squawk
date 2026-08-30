@@ -12,28 +12,25 @@ const SOURCE_MARKET_AUTHORITY_OPERATIONS = new Set([
   "Source.Remove",
 ])
 
-export function sameRuntime(
+export function sameProductSession(
   left: ProductScope,
   right: ProductScope,
 ): boolean {
-  return (
-    left.installationId === right.installationId &&
-    left.workspaceId === right.workspaceId &&
-    left.serviceGeneration === right.serviceGeneration
-  )
+  return left === right
 }
 
-export function requiresResync(
+export function rejectsProductEvent(
   scope: ProductScope,
   previousSequence: string,
   event: DesktopEvent,
 ): boolean {
-  if (!sameRuntime(scope, event.runtime) || event.body.type === "resync_required") {
+  if (
+    !sameProductSession(scope, event.productSessionToken) ||
+    event.body.type !== "authority_changed"
+  ) {
     return true
   }
-  return event.body.type === "stream_disconnected"
-    ? event.sequence !== previousSequence
-    : BigInt(event.sequence) !== BigInt(previousSequence) + 1n
+  return BigInt(event.sequence) !== BigInt(previousSequence) + 1n
 }
 
 export function affectedDomains(event: DesktopEvent): readonly string[] {
@@ -45,8 +42,4 @@ export function affectedDomains(event: DesktopEvent): readonly string[] {
     return ["source", "market"]
   }
   return [event.body.domain]
-}
-
-export function isRetryableDisconnect(event: DesktopEvent): boolean {
-  return event.body.type === "stream_disconnected"
 }

@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   CheckCircle2,
   CircleAlert,
+  KeyRound,
   LoaderCircle,
   RefreshCw,
   RotateCcw,
@@ -13,7 +14,7 @@ import {
 } from "lucide-react"
 import type { LucideIcon } from "lucide-react"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { messageFrom, useSystem } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -31,7 +32,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { humanize } from "@/lib/formatters"
 import { compareLosslessIntegers, type LosslessInteger } from "@/lib/lossless-integer"
 import { formatTimestamp } from "@/lib/time"
-import type { OperationSettingValue, ProductTransport } from "@/lib/transport"
+import type { OperationSettingValue, SystemTransport } from "@/lib/transport"
 
 import {
   asOperationSettingValue,
@@ -64,22 +65,34 @@ type Confirmation =
   | { kind: "workspace"; preview: WorkspaceSwitchPreview }
 
 export function SettingsPage() {
-  const product = useProduct()
+  const system = useSystem()
 
-  if (product.status === "loading") return <SettingsFrame><SettingsSkeleton /></SettingsFrame>
-  if (product.status === "error") {
+  if (system.status === "loading") return <SettingsFrame><SettingsSkeleton /></SettingsFrame>
+  if (system.status === "recovery_required") {
     return (
       <SettingsFrame>
-        <Unavailable detail={product.error} />
+        <SecureStorageRecovery
+          requiresUnlock={system.serviceBootstrap.requirement === "encrypted_fallback_locked"}
+          pending={system.recoveryPending}
+          error={system.recoveryError}
+          onRecover={system.recoverService}
+        />
+      </SettingsFrame>
+    )
+  }
+  if (system.status === "unavailable") {
+    return (
+      <SettingsFrame>
+        <Unavailable detail={system.error} />
       </SettingsFrame>
     )
   }
 
   return (
     <SettingsWorkspace
-      transport={product.transport}
-      scope={product.bootstrap.runtime}
-      refreshProduct={product.refresh}
+      transport={system.transport}
+      scope={system.bootstrap.productSessionToken}
+      refreshSystem={system.refresh}
     />
   )
 }
@@ -87,11 +100,11 @@ export function SettingsPage() {
 function SettingsWorkspace({
   transport,
   scope,
-  refreshProduct,
+  refreshSystem,
 }: {
-  transport: ProductTransport
+  transport: SystemTransport
   scope: ProductScope
-  refreshProduct: () => void
+  refreshSystem: () => void
 }) {
   const queryClient = useQueryClient()
   const [draft, setDraft] = React.useState<DraftValues>({})
@@ -108,14 +121,14 @@ function SettingsWorkspace({
   })
   const settings = useQuery({
     queryKey: settingsKey,
-    queryFn: async () => parseSettingsSnapshot(await transport.query({ query: "operationSettings" })),
+    queryFn: async () => parseSettingsSnapshot(await transport.systemQuery({ query: "operationSettings" })),
     refetchInterval: 15_000,
   })
   const workspaces = useQuery({
     queryKey: workspaceKey,
     queryFn: async () =>
       parseWorkspacePage(
-        await transport.query({ query: "operationWorkspaces", limit: WORKSPACE_PAGE_LIMIT }),
+        await transport.systemQuery({ query: "operationWorkspaces", limit: WORKSPACE_PAGE_LIMIT }),
       ),
     refetchInterval: 15_000,
   })
@@ -132,7 +145,7 @@ function SettingsWorkspace({
       const snapshot = settings.data
       if (!snapshot) throw new Error("Settings are not available yet.")
       return parseSettingsChangePreview(
-        await transport.query({
+        await transport.systemQuery({
           query: "operationSettingsChangePreview",
           expectedRevision: snapshot.revision,
           changes,
@@ -160,7 +173,7 @@ function SettingsWorkspace({
       setDraft({})
       setAnnouncement(`Settings revision ${next.activeRevision} was durably saved.`)
       await queryClient.invalidateQueries({ queryKey: settingsKey })
-      refreshProduct()
+      refreshSystem()
     },
   })
   const rollbackPreview = useMutation({
@@ -168,7 +181,7 @@ function SettingsWorkspace({
       const snapshot = settings.data
       if (!snapshot) throw new Error("Settings are not available yet.")
       return parseSettingsRollbackPreview(
-        await transport.query({
+        await transport.systemQuery({
           query: "operationSettingsRollbackPreview",
           expectedRevision: snapshot.revision,
           targetRevision,
@@ -198,13 +211,13 @@ function SettingsWorkspace({
         `A new durable settings revision ${next.activeRevision} was created from revision ${next.rolledBackFromRevision ?? "the selected retained revision"}.`,
       )
       await queryClient.invalidateQueries({ queryKey: settingsKey })
-      refreshProduct()
+      refreshSystem()
     },
   })
   const switchPreview = useMutation({
     mutationFn: async (workspaceId: string) =>
       parseWorkspaceSwitchPreview(
-        await transport.query({ query: "operationWorkspaceSwitchPreview", workspaceId }),
+        await transport.systemQuery({ query: "operationWorkspaceSwitchPreview", workspaceId }),
       ),
     onSuccess: (preview) => setConfirmation({ kind: "workspace", preview }),
   })
@@ -537,6 +550,17 @@ function ReceiptFact({ label, value }: { label: string; value: string }) { retur
 function SectionHeading({ eyebrow, title, detail }: { eyebrow: string; title: string; detail: string }) { return <div><p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">{eyebrow}</p><h2 className="mt-2 text-xl font-semibold">{title}</h2><p className="mt-2 max-w-4xl text-sm leading-6 text-muted-foreground">{detail}</p></div> }
 function InlineError({ children }: { children: React.ReactNode }) { return <p className="mt-3 text-sm text-destructive" role="alert">{children}</p> }
 function MutationFailure({ error }: { error: unknown }) { const detail = messageFrom(error); const stale = /preview|expired|stale|revision|conflict/i.test(detail); return <Alert variant="destructive" className="mt-5"><CircleAlert aria-hidden="true" /><AlertTitle>{stale ? "Preview is stale or conflicts with current service state" : "The requested change was not completed"}</AlertTitle><AlertDescription>{detail}{stale ? <p>Refresh the service facts, resolve the reported conflict, and create a new preview before confirming again.</p> : null}</AlertDescription></Alert> }
+function SecureStorageRecovery({ requiresUnlock, pending, error, onRecover }: { requiresUnlock: boolean; pending: boolean; error: string | null; onRecover: (unlock?: string) => Promise<void> }) {
+  const recover = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const form = event.currentTarget
+    const fields = new FormData(form)
+    const unlock = String(fields.get("unlock") ?? "")
+    form.reset()
+    void onRecover(unlock)
+  }
+  return <section className="rounded-xl border border-amber-400/30 bg-amber-400/5 p-5"><div className="flex gap-3"><KeyRound className="mt-0.5 size-5 text-amber-300" aria-hidden="true" /><div><h2 className="font-semibold">Finish secure storage setup</h2><p className="mt-1 text-sm leading-6 text-muted-foreground">{requiresUnlock ? "Enter your local security password to unlock saved connection credentials." : "Continue once to approve secure credential storage with your operating system."}</p></div></div><form className="mt-5 flex max-w-xl flex-wrap items-end gap-3" onSubmit={recover}>{requiresUnlock ? <div className="min-w-56 flex-1"><Label htmlFor="service-fallback-unlock">Local security password</Label><Input id="service-fallback-unlock" name="unlock" type="password" autoComplete="current-password" spellCheck={false} className="mt-2 font-mono" disabled={pending} /></div> : null}<Button type="submit" disabled={pending}>{pending ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : null}{pending ? "Finishing setup…" : requiresUnlock ? "Unlock secure storage" : "Continue securely"}</Button></form>{error ? <InlineError>{error}</InlineError> : null}</section>
+}
 function Unavailable({ detail }: { detail: string }) { return <Alert className="mt-5"><CircleAlert aria-hidden="true" /><AlertTitle>Settings service is unavailable</AlertTitle><AlertDescription>{detail} Reconnect to the installed Market Squawk service and retry; no local fallback can edit these authorities.</AlertDescription></Alert> }
 function SettingsFrame({ children, action }: { children: React.ReactNode; action?: React.ReactNode }) { return <div className="mx-auto w-full max-w-[1320px] p-5 lg:p-7"><header className="flex flex-col gap-4 border-b border-border pb-6 md:flex-row md:items-end md:justify-between"><div><p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">Service-owned configuration and workspace authority</p><h1 className="mt-2 text-3xl font-semibold tracking-tight">Settings</h1><p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">Review effective typed configuration, preview revision-fenced changes, and switch only through the service’s durable workspace transition workflow.</p></div>{action}</header><div className="mt-6">{children}</div></div> }
 function SettingsSkeleton() { return <><div className="grid gap-3 sm:grid-cols-3"><Skeleton className="h-32" /><Skeleton className="h-32" /><Skeleton className="h-32" /></div><div className="mt-6 grid gap-3 xl:grid-cols-2"><Skeleton className="h-72" /><Skeleton className="h-72" /></div></> }

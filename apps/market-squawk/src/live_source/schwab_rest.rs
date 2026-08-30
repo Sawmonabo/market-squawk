@@ -38,7 +38,9 @@ use market_squawk_sources::{
 use tokio_util::sync::CancellationToken;
 
 use super::display_market::{
-    DisplayMarketActorShutdown, DisplayMarketDirectory, DisplayMarketIngress,
+    DisplayMarketActorLimits, DisplayMarketActorShutdown, DisplayMarketDirectory,
+    DisplayMarketIngress, DisplayMarketKey, DisplayMarketReadAdmission,
+    DisplayMarketSupervisorMonitor,
 };
 
 /// Exact canonical/provider identity and execution terms admitted for one requested symbol.
@@ -199,7 +201,8 @@ pub(crate) struct SchwabRestQuoteCurrentSessionInput {
     display_directory: DisplayMarketDirectory,
     display_ingresses: Vec<DisplayMarketIngress>,
     ingress_timeout: Duration,
-    shutdown_timeout: Duration,
+    display_shutdown_timeout: Duration,
+    capture_shutdown_timeout: Duration,
 }
 
 impl SchwabRestQuoteCurrentSessionInput {
@@ -218,7 +221,8 @@ impl SchwabRestQuoteCurrentSessionInput {
         display_directory: DisplayMarketDirectory,
         display_ingresses: Vec<DisplayMarketIngress>,
         ingress_timeout: Duration,
-        shutdown_timeout: Duration,
+        display_shutdown_timeout: Duration,
+        capture_shutdown_timeout: Duration,
     ) -> Self {
         Self {
             registry,
@@ -231,7 +235,8 @@ impl SchwabRestQuoteCurrentSessionInput {
             display_directory,
             display_ingresses,
             ingress_timeout,
-            shutdown_timeout,
+            display_shutdown_timeout,
+            capture_shutdown_timeout,
         }
     }
 
@@ -243,10 +248,43 @@ impl SchwabRestQuoteCurrentSessionInput {
         self.session.generation()
     }
 
+    /// Activates the already constructed capture channel before any display route is registered.
+    pub(crate) fn activate_capture_initial(
+        &mut self,
+    ) -> Result<(), SchwabRestQuoteCurrentUnavailable> {
+        self.capture_control
+            .activate_initial()
+            .map_err(|_error| SchwabRestQuoteCurrentUnavailable::Capture)
+    }
+
+    /// Registers and retains one exact display route under this session's cleanup owner.
+    pub(crate) async fn register_display_route(
+        &mut self,
+        key: DisplayMarketKey,
+        limits: DisplayMarketActorLimits,
+        read_admission: DisplayMarketReadAdmission,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<DisplayMarketSupervisorMonitor, SchwabRestQuoteCurrentUnavailable> {
+        if key.source_id() != self.session.source_id()
+            || key.generation() != self.session.generation()
+        {
+            return Err(SchwabRestQuoteCurrentUnavailable::Display);
+        }
+        let registration = self
+            .display_directory
+            .register(key, limits, read_admission, cancellation, deadline)
+            .await
+            .map_err(|_error| SchwabRestQuoteCurrentUnavailable::Display)?;
+        let (ingress, monitor) = registration.into_parts();
+        self.display_ingresses.push(ingress);
+        Ok(monitor)
+    }
+
     pub(crate) async fn shutdown(mut self) -> Result<(), SchwabRestQuoteCurrentUnavailable> {
         let mut failure = None;
         let deadline = Instant::now()
-            .checked_add(self.shutdown_timeout)
+            .checked_add(self.display_shutdown_timeout)
             .ok_or(SchwabRestQuoteCurrentUnavailable::Deadline)?;
         retain_current_failure(
             &mut failure,
@@ -278,7 +316,7 @@ impl SchwabRestQuoteCurrentSessionInput {
         drop(self.capture_control);
         retain_current_failure(
             &mut failure,
-            shutdown_capture_writer(self.capture_writer, self.shutdown_timeout).await,
+            shutdown_capture_writer(self.capture_writer, self.capture_shutdown_timeout).await,
         );
         retain_current_failure(
             &mut failure,
@@ -539,7 +577,8 @@ fn validate_session_input(
     instruments: &[SchwabRestQuoteCurrentInstrument],
 ) -> Result<(), SchwabRestQuoteCurrentUnavailable> {
     if input.ingress_timeout.is_zero()
-        || input.shutdown_timeout.is_zero()
+        || input.display_shutdown_timeout.is_zero()
+        || input.capture_shutdown_timeout.is_zero()
         || input.display_ingresses.is_empty()
         || instruments.is_empty()
         || input.display_ingresses.len() != instruments.len()

@@ -262,6 +262,7 @@ impl PreparedMarketProviderConfigurationResolver for ProductionMarketProviderCon
             AccountMarketSurface::KrakenLevel3 => {
                 self.resolve_kraken(lease, deadline, &cancellation)
             }
+            AccountMarketSurface::SchwabMarketData => Err(ServiceError::InvalidRequest),
         }
     }
 

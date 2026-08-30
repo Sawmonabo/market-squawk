@@ -2,8 +2,6 @@ import { useQuery } from "@tanstack/react-query"
 import { AlertTriangle, CalendarClock, ChartNoAxesCombined, ShieldCheck } from "lucide-react"
 
 import { productKeys } from "@/app/query-client"
-import { humanize } from "@/lib/formatters"
-import type { LosslessInteger } from "@/lib/lossless-integer"
 import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import { formatTimestamp } from "@/lib/time"
@@ -41,7 +39,7 @@ export function ForecastReview({
   const outcomesAvailable = capabilities.has("forecast_outcomes")
   const detail = useQuery({
     queryKey: productKeys.operation(
-      bootstrap.runtime,
+      bootstrap.productSessionToken,
       "Model",
       "Model.GetForecast",
       { forecastToken: selected?.forecastToken ?? null },
@@ -59,7 +57,7 @@ export function ForecastReview({
   })
   const outcomes = useQuery({
     queryKey: productKeys.operation(
-      bootstrap.runtime,
+      bootstrap.productSessionToken,
       "Model",
       "Model.GetForecastOutcomes",
       { forecastToken: selected?.forecastToken ?? null },
@@ -98,11 +96,11 @@ export function ForecastReview({
       ) : error ? (
         <Unavailable text="Forecasts cannot be shown right now. Try refreshing the page." />
       ) : forecasts.length === 0 ? (
-        <Unavailable text="No forecast is ready for this model yet." />
+        <Unavailable text="No forecast is ready yet." />
       ) : (
         <>
           <div className="mt-4 flex gap-2 overflow-x-auto pb-1" aria-label="Forecast selection">
-            {forecasts.map((forecast, index) => (
+            {forecasts.map((forecast) => (
               <button
                 key={forecast.forecastToken}
                 type="button"
@@ -115,10 +113,10 @@ export function ForecastReview({
                 }`}
               >
                 <span className="block text-[10px] text-muted-foreground">
-                  Forecast {index + 1} · {formatUnixNanos(forecast.createdAtUnixNanos)}
+                  {investmentLabel(forecast.investment)} · {formatTimestamp(forecast.createdAtUnixNanos)}
                 </span>
                 <span className="mt-1 block text-xs font-medium">
-                  {forecast.horizon.points} × {formatDuration(forecast.horizon.stepNanos)}
+                  {forecast.target.label} · {forecast.horizon.label}
                 </span>
               </button>
             ))}
@@ -145,13 +143,26 @@ export function ForecastReview({
 function SummaryEvidence({ summary }: { summary: ForecastSummary }) {
   return (
     <dl className="mt-4 grid gap-x-6 gap-y-3 border-y border-border py-4 sm:grid-cols-2 xl:grid-cols-4">
-      <Fact label="Observed through" value={formatUnixNanos(summary.observedThroughUnixNanos)} />
-      <Fact label="Created" value={formatUnixNanos(summary.createdAtUnixNanos)} />
-      <Fact label="Expires" value={formatUnixNanos(summary.expiresAtUnixNanos)} />
+      <Fact label="Investment" value={investmentLabel(summary.investment)} />
+      <Fact label="Forecast target" value={summary.target.label} />
+      <Fact label="Target type" value={targetKindLabel(summary.target.valueKind)} />
+      <Fact label="Target unit" value={summary.target.unitLabel} />
+      {summary.target.currencyCode ? (
+        <Fact label="Currency" value={summary.target.currencyCode} />
+      ) : null}
+      <Fact label="Horizon" value={summary.horizon.label} />
+      <Fact label="Observed through" value={formatTimestamp(summary.observedThroughUnixNanos)} />
+      <Fact label="Created" value={formatTimestamp(summary.createdAtUnixNanos)} />
+      <Fact label="Expires" value={formatTimestamp(summary.expiresAtUnixNanos)} />
       <Fact
-        label="Uncertainty evidence"
-        value={summary.evidenceState === "calibrated" ? "Calibrated ranges available" : "Limited"}
+        label="Overall model evidence"
+        value={evidenceLevelLabel(summary.modelEvidence.overall)}
       />
+      <Fact label="Point-in-time inputs" value={evidenceLevelLabel(summary.modelEvidence.pitInputs)} />
+      <Fact label="Held-out evaluation" value={evidenceLevelLabel(summary.modelEvidence.outOfSample)} />
+      <Fact label="Horizon alignment" value={evidenceLevelLabel(summary.modelEvidence.horizonAlignment)} />
+      <Fact label="Calibration" value={calibrationStateLabel(summary.modelEvidence.calibration)} />
+      <Fact label="Evidence meaning" value={summary.modelEvidence.interpretation} />
       <Fact label="Historical observations" value={summary.historicalObservationCount.toLocaleString()} />
       <Fact label="Use" value="Investment research only" />
       <Fact label="If unavailable" value="No action suggested" />
@@ -189,16 +200,39 @@ function ForecastDetail({
   if (detailLoading) return <Unavailable text="Loading forecast evidence…" />
   if (detailError) return <Unavailable text="Forecast details are unavailable right now." />
   if (!detail) return <Unavailable text="No complete forecast was returned." />
+  if (detail.forecastToken !== summary.forecastToken) {
+    return <Unavailable text="The selected forecast could not be verified." />
+  }
+  if (!sameModelEvidence(detail.modelEvidence, summary.modelEvidence)) {
+    return <Unavailable text="The selected forecast evidence could not be verified." />
+  }
 
   const outcomeByTarget = new Map(
     outcomes.map((outcome) => [outcome.targetAtUnixNanos, outcome]),
   )
   return (
     <div className="mt-5 space-y-4">
+      <div className="rounded-lg border border-primary/20 bg-primary/[0.04] p-4">
+        <p className="text-sm font-semibold">
+          {investmentLabel(detail.investment)} · {detail.target.label}
+        </p>
+        <p className="mt-2 text-xs leading-5 text-muted-foreground">
+          {detail.investment.description}
+        </p>
+        <p className="mt-2 text-xs leading-5 text-muted-foreground">
+          {detail.target.meaning} This is a{" "}
+          {targetKindLabel(detail.target.valueKind).toLowerCase()} forecast.
+          Values are shown in {detail.target.unitLabel}
+          {detail.target.currencyCode ? ` (${detail.target.currencyCode})` : ""}.
+        </p>
+        <p className="mt-2 text-xs leading-5 text-muted-foreground">
+          {detail.horizon.description}
+        </p>
+      </div>
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <MiniFact icon={ChartNoAxesCombined} label="Forecast points" value={detail.estimates.length.toLocaleString()} />
-        <MiniFact icon={CalendarClock} label="Information through" value={formatUnixNanos(detail.observedThroughUnixNanos)} />
-        <MiniFact icon={CalendarClock} label="Valid until" value={formatUnixNanos(detail.expiresAtUnixNanos)} />
+        <MiniFact icon={CalendarClock} label="Information through" value={formatTimestamp(detail.observedThroughUnixNanos)} />
+        <MiniFact icon={CalendarClock} label="Valid until" value={formatTimestamp(detail.expiresAtUnixNanos)} />
         <MiniFact
           icon={ShieldCheck}
           label="Outcome evidence"
@@ -220,7 +254,7 @@ function ForecastDetail({
       <div className="overflow-x-auto rounded-lg border border-border">
         <table className="w-full min-w-[720px] text-left text-xs">
           <caption className="border-b border-border px-3 py-2 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
-            Statistical forecast · estimates only
+            {detail.target.label} · {detail.target.unitLabel} · estimates only
           </caption>
           <thead className="bg-background/35 text-[10px] uppercase tracking-wider text-muted-foreground">
             <tr>
@@ -236,15 +270,15 @@ function ForecastDetail({
             {detail.estimates.map((point) => {
               const outcome = outcomeByTarget.get(point.targetAtUnixNanos)
               return (
-                <tr key={`${point.targetAtUnixNanos}:${point.central}`} className="border-t border-border">
-                  <td className="px-3 py-2 text-muted-foreground">{formatUnixNanos(point.targetAtUnixNanos)}</td>
-                  <td className="px-3 py-2 font-mono">{point.central}</td>
+                <tr key={`${point.targetAtUnixNanos}:${point.central.exact}`} className="border-t border-border">
+                  <td className="px-3 py-2 text-muted-foreground">{formatTimestamp(point.targetAtUnixNanos)}</td>
+                  <td className="px-3 py-2 font-mono">{point.central.formatted}</td>
                   <td className="px-3 py-2 font-mono">{formatRange(point.ranges?.likely)}</td>
                   <td className="px-3 py-2 font-mono">{formatRange(point.ranges?.wider)}</td>
                   <td className="px-3 py-2 font-mono">{formatRange(point.ranges?.stress)}</td>
                   <td className="px-3 py-2 font-mono">
                     {outcome ? (
-                      outcome.actual
+                      outcome.actual.formatted
                     ) : (
                       <span className="font-sans text-muted-foreground">Not observed</span>
                     )}
@@ -289,12 +323,20 @@ function DriftMonitoring({ vintage }: { vintage: ForecastVintage }) {
     <div className="rounded-lg border border-violet-400/25 bg-violet-400/5 p-3">
       <p className="text-xs font-medium text-violet-200">Outcome drift monitoring</p>
       <dl className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <Fact label="State" value={humanize(monitoring.state)} />
+        <Fact label="State" value={monitoringStateLabel(monitoring.state)} />
         <Fact
           label="Observed outcomes"
           value={`${monitoring.includedCount.toLocaleString()}${monitoring.truncated ? "+" : ""} of ${monitoring.observedCount.toLocaleString()}`}
         />
-        <Fact label="Mean absolute error" value={monitoring.meanAbsoluteError ?? "Not available"} mono />
+        <Fact
+          label="Mean absolute error"
+          value={monitoring.meanAbsoluteError?.value.formatted ?? "Not available"}
+          mono
+        />
+        <Fact
+          label="Mean calculation"
+          value={roundingLabel(monitoring.meanAbsoluteError?.rounding ?? null)}
+        />
       </dl>
       <p className="mt-3 text-xs leading-5 text-muted-foreground">
         {monitoring.interpretation}
@@ -319,9 +361,9 @@ function CalibrationEvidence({ vintage }: { vintage: ForecastVintage }) {
       </div>
       <div className="mt-3 grid gap-2 sm:grid-cols-3">
         {calibration.coverage.map((band) => (
-          <div key={band.targetCoveragePercent} className="rounded-md border border-border bg-background/25 p-2.5">
+          <div key={band.targetCoveragePercent.exact} className="rounded-md border border-border bg-background/25 p-2.5">
             <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
-              {band.targetCoveragePercent}% target
+              {band.targetCoveragePercent.formatted} target
             </p>
             <p className="mt-1 font-mono text-sm">
               {band.realizedCovered.toLocaleString()} / {band.realizedTotal.toLocaleString()} realized
@@ -336,8 +378,17 @@ function CalibrationEvidence({ vintage }: { vintage: ForecastVintage }) {
   )
 }
 
-function formatRange(range: { lower: string; upper: string } | undefined): string {
-  return range ? `${range.lower} – ${range.upper}` : "Unavailable"
+function formatRange(
+  range:
+    | {
+        lower: { exact: string; formatted: string }
+        upper: { exact: string; formatted: string }
+      }
+    | undefined,
+): string {
+  return range
+    ? `${range.lower.formatted} – ${range.upper.formatted}`
+    : "Unavailable"
 }
 
 function Fact({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
@@ -367,19 +418,83 @@ function Unavailable({ text }: { text: string }) {
   )
 }
 
-function formatUnixNanos(value: LosslessInteger): string {
-  return formatTimestamp(value)
+function investmentLabel(investment: ForecastSummary["investment"]): string {
+  return investment.symbol
+    ? `${investment.name} (${investment.symbol})`
+    : investment.name
 }
 
-function formatDuration(value: LosslessInteger): string {
-  const nanos = BigInt(value)
-  if (nanos < 0n) return "Unavailable"
-  const seconds = Number(nanos) / 1_000_000_000
-  if (!Number.isFinite(seconds)) return `${value} ns`
-  if (seconds < 60) return `${seconds.toLocaleString(undefined, { maximumFractionDigits: 2 })} sec`
-  const minutes = seconds / 60
-  if (minutes < 60) return `${minutes.toLocaleString(undefined, { maximumFractionDigits: 2 })} min`
-  const hours = minutes / 60
-  if (hours < 48) return `${hours.toLocaleString(undefined, { maximumFractionDigits: 2 })} hr`
-  return `${(hours / 24).toLocaleString(undefined, { maximumFractionDigits: 2 })} days`
+function monitoringStateLabel(
+  state: ForecastVintage["outcomeMonitoring"]["state"],
+): string {
+  return state === "outcomes_available"
+    ? "Observed outcomes available"
+    : "Waiting for outcomes"
+}
+
+function evidenceLevelLabel(
+  state: ForecastSummary["modelEvidence"]["overall"],
+): string {
+  switch (state) {
+    case "sufficient":
+      return "Sufficient for this research use"
+    case "limited":
+      return "Limited"
+    case "unavailable":
+      return "Unavailable"
+  }
+}
+
+function calibrationStateLabel(
+  state: ForecastSummary["modelEvidence"]["calibration"],
+): string {
+  switch (state) {
+    case "calibrated":
+      return "Calibrated ranges available"
+    case "limited":
+      return "Limited; ranges may be unavailable"
+    case "unavailable":
+      return "Unavailable"
+  }
+}
+
+function roundingLabel(
+  rounding:
+    | NonNullable<
+        ForecastVintage["outcomeMonitoring"]["meanAbsoluteError"]
+      >["rounding"]
+    | null,
+): string {
+  if (!rounding) return "Not available"
+  return rounding.state === "exact"
+    ? `Exact at ${rounding.decimalPlaces.toLocaleString()} decimal places · half-even policy`
+    : `Rounded to ${rounding.decimalPlaces.toLocaleString()} decimal places · half-even`
+}
+
+function sameModelEvidence(
+  left: ForecastVintage["modelEvidence"],
+  right: ForecastSummary["modelEvidence"],
+): boolean {
+  return (
+    left.modelToken === right.modelToken &&
+    left.overall === right.overall &&
+    left.pitInputs === right.pitInputs &&
+    left.outOfSample === right.outOfSample &&
+    left.horizonAlignment === right.horizonAlignment &&
+    left.calibration === right.calibration &&
+    left.interpretation === right.interpretation
+  )
+}
+
+function targetKindLabel(
+  valueKind: ForecastSummary["target"]["valueKind"],
+): string {
+  switch (valueKind) {
+    case "market_price":
+      return "Market price"
+    case "percentage_return":
+      return "Percentage return"
+    case "probability":
+      return "Probability"
+  }
 }

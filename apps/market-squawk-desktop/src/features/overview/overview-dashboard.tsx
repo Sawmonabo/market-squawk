@@ -1,398 +1,253 @@
-import * as React from "react"
+import { useQuery } from "@tanstack/react-query"
 import {
   Activity,
   BriefcaseBusiness,
   CircleAlert,
-  Clock3,
-  Database,
-  Gauge,
-  ListChecks,
-  ServerCog,
-  ShieldAlert,
+  Compass,
   Sparkles,
 } from "lucide-react"
 import { Link } from "react-router-dom"
 
-import type { ProductScope } from "@/app/query-client"
+import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
-import type { InvestmentAnalysisPage } from "@/features/opportunities/contracts"
 import type { MarketProductRow } from "@/features/markets/market-product"
-import type { ResearchActivity } from "@/features/research/research-contracts"
 import {
-  formatPercent,
-  formatTimestamp,
-} from "@/features/portfolio/portfolio-format"
-import type {
-  PortfolioAccount,
-  PortfolioExposure,
-  PortfolioPerformance,
-  PortfolioRisk,
-} from "@/features/portfolio/portfolio-contracts"
-import {
-  usePortfolioAccounts,
-  usePortfolioDetails,
-} from "@/features/portfolio/use-portfolio"
-import { formatMoney, humanize } from "@/lib/formatters"
-import type { DesktopBootstrap } from "@/lib/schemas"
+  parseInvestmentAnalysis,
+  type InvestmentAnalysis,
+  type InvestmentAnalysisLocator,
+} from "@/features/opportunities/contracts"
+import { formatUnixNanos } from "@/features/opportunities/format"
+import { formatMoney } from "@/lib/formatters"
 import type { ProductTransport } from "@/lib/transport"
 
-import {
-  isActiveResearchActivity,
-  type ReadState,
-  useOverviewQueries,
-} from "./use-overview"
+import { useOverviewQueries } from "./use-overview"
 
 type OverviewQueries = ReturnType<typeof useOverviewQueries>
-type PortfolioAccountsRead = ReturnType<typeof usePortfolioAccounts>
 
 export function OverviewDashboard({
   transport,
   scope,
-  bootstrap,
 }: {
   transport: ProductTransport
   scope: ProductScope
-  bootstrap: DesktopBootstrap
 }) {
   const queries = useOverviewQueries(transport, scope)
-  const accounts = usePortfolioAccounts(transport, bootstrap)
-  const activeActivities =
-    queries.activities.status === "ready"
-      ? queries.activities.data.filter(isActiveResearchActivity)
-      : []
 
   return (
-    <div className="space-y-4">
-      <section
-        aria-label="Home summary"
-        className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3"
-      >
-        <StatusCard
-          icon={Activity}
-          label="Current markets"
-          value={marketPriceCount(queries.markets)}
-          state={queries.markets.status}
-          detail={
-            queries.markets.status === "ready"
-              ? currentMarketDetail(queries.markets.data)
-              : "Current market information is unavailable."
-          }
-        />
-        <StatusCard
-          icon={Gauge}
-          label="Running analyses"
-          value={
-            queries.activities.status === "ready"
-              ? activeActivities.length.toLocaleString()
-              : "Unavailable"
-          }
-          state={queries.activities.status}
-          detail={
-            queries.activities.status === "ready"
-              ? "Current research, forecasting, and investment analysis in progress."
-              : "Analysis status is unavailable."
-          }
-        />
-        <StatusCard
-          icon={Sparkles}
-          label="Retained analyses"
-          value={analysisCount(queries.analyses)}
-          state={queries.analyses.status}
-          detail={
-            queries.analyses.status === "ready"
-              ? "Saved analyses ready for review."
-              : "Saved analyses are unavailable."
-          }
-        />
-      </section>
+    <div className="space-y-5">
+      <DecisionSummary
+        analyses={queries.analyses}
+        transport={transport}
+        scope={scope}
+      />
 
-      <section className="grid gap-4 xl:grid-cols-[minmax(0,1.25fr)_minmax(340px,0.75fr)]">
-        <PortfolioSummary
-          transport={transport}
-          scope={scope}
-          bootstrap={bootstrap}
-          accounts={accounts}
-        />
-        <RecommendationSummary analyses={queries.analyses} />
-      </section>
-
-      <section className="grid gap-4 xl:grid-cols-2">
-        <RunningAnalysisPanel
-          activities={queries.activities}
-          activeActivities={activeActivities}
-        />
-        <SetupGuidance
-          accounts={accounts}
-          markets={queries.markets}
-          analyses={queries.analyses}
-        />
-      </section>
-
-      <section aria-labelledby="home-evidence-title" className="space-y-3 pt-1">
-        <div>
-          <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
-            Current context
-          </p>
-          <h2 id="home-evidence-title" className="mt-1 text-base font-semibold">
-            Market context
-          </h2>
-          <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            A compact view of current market availability. Open Markets for the full workspace.
-          </p>
-        </div>
-        <LiveMarketPanel markets={queries.markets} />
+      <section className="grid gap-4 lg:grid-cols-[minmax(0,1.25fr)_minmax(300px,0.75fr)]">
+        <MarketContext markets={queries.markets} />
+        <NextSteps />
       </section>
     </div>
   )
 }
 
-function PortfolioSummary({
+function DecisionSummary({
+  analyses,
   transport,
   scope,
-  bootstrap,
-  accounts,
 }: {
+  analyses: OverviewQueries["analyses"]
   transport: ProductTransport
   scope: ProductScope
-  bootstrap: DesktopBootstrap
-  accounts: PortfolioAccountsRead
 }) {
-  const accountRows =
-    accounts.query.data?.pages.flatMap((page) => page.value) ?? []
-  const [selectedAccountId, setSelectedAccountId] = React.useState("")
-  const account =
-    accountRows.find(
-      (candidate) => candidate.accountId === selectedAccountId,
-    ) ?? null
-  const details = usePortfolioDetails(
-    transport,
-    scope,
-    bootstrap,
-    account?.accountId ?? null,
-  )
-
-  if (!accounts.available) {
-    return (
-      <PortfolioUnavailable
-        title="Portfolio summary is unavailable"
-        detail="Portfolio accounts are unavailable right now."
-      />
-    )
-  }
-  if (accounts.query.isPending) {
-    return <Skeleton className="h-80 rounded-xl" />
-  }
-  if (accounts.query.isError) {
-    return (
-      <PortfolioUnavailable
-        title="Portfolio accounts could not be read"
-        detail="Portfolio accounts could not be loaded. Refresh Home and try again."
-      />
-    )
-  }
-  if (accountRows.length === 0) {
-    return (
-      <PortfolioUnavailable
-        title="No portfolio account is loaded"
-        detail="Add an account to see its value, cash, performance, exposure, and risk."
-      />
-    )
-  }
-
   return (
     <section
       className="rounded-xl border border-border bg-card/45 p-5"
-      aria-labelledby="portfolio-summary-title"
+      aria-labelledby="home-guidance-title"
     >
-      <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+      <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="flex items-start gap-3">
           <span className="rounded-lg border border-border bg-background/70 p-2.5">
-            <BriefcaseBusiness
-              className="size-4 text-primary"
-              aria-hidden="true"
-            />
+            <Sparkles className="size-4 text-primary" aria-hidden="true" />
           </span>
           <div>
             <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
-              Financial position
+              Saved investment guidance
             </p>
-            <h2 id="portfolio-summary-title" className="mt-1 text-base font-semibold">
-              Your account at a glance
+            <h2 id="home-guidance-title" className="mt-1 text-lg font-semibold">
+              Decisions to review
             </h2>
             <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
-              Choose an account to review its current financial position.
+              Review the action, time horizon, price ranges, reasons, risks, expiry,
+              and uncertainty before deciding what to do.
             </p>
           </div>
         </div>
-        <Button asChild variant="outline" size="sm">
-          <Link to="/portfolio">Open Portfolio</Link>
+        <Button asChild size="sm" variant="outline">
+          <Link to="/opportunities">Open all guidance</Link>
         </Button>
       </div>
 
-      <label className="mt-4 block max-w-xl text-xs font-medium">
-        Account to summarize
-        <select
-          className="mt-2 h-9 w-full rounded-md border border-input bg-background px-3 font-mono text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          value={account?.accountId ?? ""}
-          onChange={(event) => setSelectedAccountId(event.target.value)}
-        >
-          <option value="">Choose an account</option>
-          {accountRows.map((candidate) => (
-            <option key={candidate.accountId} value={candidate.accountId}>
-              {candidate.accountId} · {candidate.currency.toUpperCase()}
-            </option>
+      {analyses.status === "loading" ? (
+        <div className="mt-5 grid gap-4 xl:grid-cols-2">
+          <Skeleton className="h-80 rounded-xl" />
+          <Skeleton className="h-80 rounded-xl" />
+        </div>
+      ) : analyses.status === "unavailable" ? (
+        <UnavailableGuidance
+          title="Investment guidance is unavailable"
+          detail="No action should be taken from this page until the guidance can be read again."
+        />
+      ) : analyses.data.availableCount === 0 ? (
+        <UnavailableGuidance
+          title="No investment guidance is available yet"
+          detail="Market Squawk has not produced a decision with enough evidence to review. Explore investments or start research before acting."
+        />
+      ) : (
+        <div className="mt-5 grid gap-4 xl:grid-cols-2">
+          {analyses.data.analyses.map((analysis) => (
+            <DecisionCard
+              key={analysis.actionToken}
+              locator={analysis}
+              transport={transport}
+              scope={scope}
+            />
           ))}
-        </select>
-      </label>
-      {accounts.query.hasNextPage ? (
-        <p className="mt-2 text-[10px] leading-4 text-muted-foreground">
-          Open Portfolio to review more accounts.
+        </div>
+      )}
+
+      {analyses.status === "ready" && analyses.data.completeness === "truncated" ? (
+        <p className="mt-4 text-[11px] leading-5 text-muted-foreground">
+          Additional saved guidance is available in Opportunities.
         </p>
       ) : null}
-
-      {account === null ? (
-        <div className="mt-4 rounded-lg border border-dashed border-border p-5">
-          <p className="text-xs font-medium">Choose before values are read</p>
-          <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-            Choose an account to view its summary.
-          </p>
-        </div>
-      ) : (
-        <SelectedPortfolioSummary account={account} details={details} />
-      )}
     </section>
   )
 }
 
-function SelectedPortfolioSummary({
-  account,
-  details,
+function DecisionCard({
+  locator,
+  transport,
+  scope,
 }: {
-  account: PortfolioAccount
-  details: ReturnType<typeof usePortfolioDetails>
+  locator: InvestmentAnalysisLocator
+  transport: ProductTransport
+  scope: ProductScope
 }) {
-  const holdings = details.holdings.data?.value ?? null
-  const performance = details.performance.data?.value ?? null
-  const exposure = details.exposure.data?.value ?? null
-  const risk = details.risk.data?.value ?? null
-  const expectedSnapshotToken = account.currentSnapshot.snapshotToken
-  const changedWhileReading =
-    holdings?.some(
-      (holding) =>
-        holding.accountId !== account.accountId ||
-        holding.snapshotToken !== expectedSnapshotToken,
-    ) === true ||
-    [performance, exposure, risk].some(
-      (detail) =>
-        detail !== null &&
-        (detail.accountId !== account.accountId ||
-          detail.snapshotToken !== expectedSnapshotToken),
-    )
-
-  if (changedWhileReading) {
-    return (
-      <Alert className="mt-4">
-        <CircleAlert aria-hidden="true" />
-        <AlertTitle>Portfolio changed while Home was reading it</AlertTitle>
-        <AlertDescription>
-          The account changed while this page was loading. Refresh to view one consistent update.
-        </AlertDescription>
-      </Alert>
-    )
-  }
-
-  const failures = [
-    details.holdings.error,
-    details.performance.error,
-    details.exposure.error,
-    details.risk.error,
-  ].filter((value): value is Error => value instanceof Error)
-  const currentValue = factFromPerformance(
-    performance,
-    details.performance.isPending,
-  )
-  const reportedCash = performance?.accountingEvidence?.cash.amount ?? null
+  const analysis = useQuery({
+    queryKey: productKeys.operation(
+      scope,
+      "decision",
+      "investment-analysis",
+      { actionToken: locator.actionToken },
+    ),
+    queryFn: async () =>
+      parseInvestmentAnalysis(
+        await transport.query({
+          query: "decisionInvestmentAnalysis",
+          actionToken: locator.actionToken,
+        }),
+        locator.actionToken,
+      ),
+  })
+  const displayed = analysis.data ?? locator
 
   return (
-    <div className="mt-4">
-      {failures.length > 0 ? (
-        <p className="mb-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-[11px] leading-5 text-destructive">
-          Some portfolio details could not be loaded. Refresh Home and try again.
-        </p>
-      ) : null}
-
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <TruthFact
-          label="Current value"
-          value={currentValue.value}
-          detail={currentValue.detail}
-        />
-        <TruthFact
-          label="Recent performance"
-          value="Not available"
-          detail={
-            performance?.timeWeightedReturn === undefined
-              ? "No comparable performance result was returned."
-              : "A comparable recent period is not available for this account."
-          }
-        />
-        <TruthFact
-          label="Available cash"
-          value="Not available"
-          detail={
-            reportedCash
-              ? `The account reports ${formatMoney(reportedCash)}, but settlement availability and reservations are not included.`
-              : "No cash balance is available for this account."
-          }
-        />
-        <TruthFact
-          label="Major risk alerts"
-          value="Not available"
-          detail={
-            risk
-              ? "The current risk read supplies historical measures, not alert severity, active limit breaches, or an all-clear state."
-              : "No current risk-alert status is available."
-          }
-        />
+    <article className="rounded-xl border border-border bg-background/35 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            {displayed.portfolioLabel}
+          </p>
+          <h3 className="mt-1 truncate text-base font-semibold">
+            {investmentName(displayed)}
+          </h3>
+        </div>
+        <ActionBadge recommendation={displayed.recommendation} />
       </div>
 
-      <details className="mt-4 rounded-lg border border-border bg-background/35 px-4 py-3">
+      <p className="mt-3 text-xs leading-5 text-foreground/85">
+        {displayed.recommendation.summary}
+      </p>
+      <dl className="mt-4 grid gap-3 border-t border-border/70 pt-3 sm:grid-cols-2">
+        <Fact label="Horizon ends" value={formatUnixNanos(displayed.horizon.endsAt)} />
+        <Fact label="Review by" value={formatUnixNanos(displayed.horizon.expiresAt)} />
+      </dl>
+
+      {analysis.isPending ? (
+        <Skeleton className="mt-4 h-36 rounded-lg" />
+      ) : analysis.isError || !analysis.data ? (
+        <Alert className="mt-4">
+          <CircleAlert aria-hidden="true" />
+          <AlertTitle>Supporting detail is unavailable</AlertTitle>
+          <AlertDescription>
+            Treat this saved action as incomplete until its ranges, reasons, risks,
+            and uncertainty can be reviewed.
+          </AlertDescription>
+        </Alert>
+      ) : (
+        <DecisionEvidence analysis={analysis.data} />
+      )}
+    </article>
+  )
+}
+
+function DecisionEvidence({ analysis }: { analysis: InvestmentAnalysis }) {
+  return (
+    <div className="mt-4 space-y-4">
+      <PriceContext analysis={analysis} />
+      <div className="grid gap-4 sm:grid-cols-2">
+        <ProductList title="Why this guidance" values={analysis.reasons} />
+        <ProductList
+          title="What could go wrong"
+          values={analysis.risks}
+          empty="No specific risk explanation is available."
+        />
+      </div>
+      <details className="rounded-lg border border-border bg-card/30 px-3 py-2.5">
         <summary className="cursor-pointer text-xs font-medium">
-          Additional account evidence
+          Assumptions, invalidators, and uncertainty
         </summary>
-        <p className="mt-2 text-[10px] leading-4 text-muted-foreground">
-          Additional values currently available for this account.
-        </p>
-        <dl className="mt-3 grid gap-3 text-[10px] sm:grid-cols-2 xl:grid-cols-4">
-          <EvidenceFact
-            label="Reported cash"
-            value={reportedCash ? formatMoney(reportedCash) : "Not returned"}
+        <div className="mt-3 grid gap-4 sm:grid-cols-2">
+          <ProductList
+            title="Assumptions"
+            values={analysis.assumptions}
+            empty="No additional assumptions were stated."
           />
-          <EvidenceFact
-            label="Available-history return"
-            value={formatAvailableHistoryReturn(performance)}
+          <ProductList
+            title="What would invalidate it"
+            values={analysis.invalidators}
+            empty="No explicit invalidator is available."
           />
-          <EvidenceFact
-            label="Net exposure"
-            value={formatExposure(exposure)}
+        </div>
+        <dl className="mt-4 grid gap-3 border-t border-border/70 pt-3 sm:grid-cols-2">
+          <Fact
+            label="Evidence coverage"
+            value={analysis.evidenceSummary.coverage.summary}
           />
-          <EvidenceFact
-            label="Historical value at risk"
-            value={formatHistoricalValueAtRisk(risk)}
+          <Fact
+            label="Out-of-sample evidence"
+            value={analysis.evidenceSummary.outOfSample.summary}
           />
-          <EvidenceFact
-            label="Reporting currency"
-            value={account.currency.toUpperCase()}
+          <Fact
+            label="Calibration"
+            value={analysis.evidenceSummary.calibration.summary}
           />
-          <EvidenceFact
-            label="Holdings"
-            value={account.holdingCount.toLocaleString()}
+          <Fact label="Costs" value={analysis.evidenceSummary.costs.summary} />
+          <Fact
+            label="Uncertainty"
+            value={analysis.evidenceSummary.uncertainty.summary}
           />
-          <EvidenceFact
-            label="Last updated"
-            value={formatTimestamp(account.currentSnapshot.effectiveAtUnixNanos)}
+          <Fact
+            label="Historical test"
+            value={
+              analysis.evidenceSummary.historicalTest?.summary ??
+              "No suitable historical test is available."
+            }
+          />
+          <Fact
+            label="Information current through"
+            value={formatUnixNanos(analysis.horizon.informationCurrentThrough)}
           />
         </dl>
       </details>
@@ -400,271 +255,184 @@ function SelectedPortfolioSummary({
   )
 }
 
-function RecommendationSummary({
-  analyses,
-}: {
-  analyses: OverviewQueries["analyses"]
-}) {
+function PriceContext({ analysis }: { analysis: InvestmentAnalysis }) {
+  const ranges = analysis.priceSummary.actionRanges
+  const scenarios = analysis.priceSummary.scenarios
   return (
-    <section
-      className="rounded-xl border border-border bg-card/45 p-5"
-      aria-labelledby="recommendation-summary-title"
-    >
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
-            Recommendations
-          </p>
-          <h2 id="recommendation-summary-title" className="mt-1 text-base font-semibold">
-            What may need attention
-          </h2>
-        </div>
-        <Sparkles className="size-5 text-primary" aria-hidden="true" />
-      </div>
-
-      {analyses.status === "loading" ? (
-        <div className="mt-5 space-y-3">
-          <Skeleton className="h-16 rounded-lg" />
-          <Skeleton className="h-16 rounded-lg" />
-        </div>
-      ) : analyses.status === "unavailable" ? (
-        <Alert className="mt-5">
-          <CircleAlert aria-hidden="true" />
-          <AlertTitle>Saved analyses are unavailable</AlertTitle>
-          <AlertDescription>
-            Refresh Home and try again.
-          </AlertDescription>
-        </Alert>
-      ) : analyses.data.availableCount === 0 ? (
-        <div className="mt-5 rounded-lg border border-dashed border-border p-5">
-          <p className="text-xs font-medium">No saved investment analysis yet</p>
-          <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-            Run an analysis to see recommendations and supporting evidence here.
-          </p>
-        </div>
-      ) : (
-        <RecommendationFacts page={analyses.data} />
-      )}
-
-      <div className="mt-4 flex flex-wrap gap-2">
-        <Button asChild size="sm" variant="outline">
-          <Link to="/opportunities">Open Opportunities</Link>
-        </Button>
-      </div>
-    </section>
-  )
-}
-
-function RecommendationFacts({ page }: { page: InvestmentAnalysisPage }) {
-  const generatedInPage = page.analyses.filter(
-    (analysis) => analysis.outcome.kind === "generated",
-  )
-  const heldActionsInPage = generatedInPage.filter(
-    (analysis) =>
-      analysis.outcome.kind === "generated" &&
-      analysis.outcome.action !== "buy",
-  )
-
-  return (
-    <div className="mt-5 space-y-3">
-      <QueueItem
-        label="Retained analyses"
-        value={page.availableCount.toLocaleString()}
-        detail={`${generatedInPage.length.toLocaleString()} completed analyses and ${heldActionsInPage.length.toLocaleString()} non-Buy actions are ready to review.`}
-      />
-      <QueueItem
-        label="Strongest current opportunities"
-        value="Not available"
-        detail="No ranked opportunity set is available yet."
-      />
-      <QueueItem
-        label="Current held-position actions"
-        value="Not available"
-        detail="No current position guidance is available yet."
-      />
-      <QueueItem
-        label="Changed, expired, or invalidated"
-        value="Not available"
-        detail="No current changes or expired recommendations are available yet."
-      />
-      {page.completeness === "truncated" ? (
-        <p className="rounded-lg border border-border bg-background/35 p-3 text-[10px] leading-4 text-muted-foreground">
-          More saved analyses are available in Opportunities.
-        </p>
-      ) : null}
+    <div className="rounded-lg border border-border bg-card/30 p-3">
+      <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+        Price context
+      </p>
+      <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+        <Fact
+          label="Current price"
+          value={
+            analysis.priceSummary.current
+              ? formatMoney(analysis.priceSummary.current)
+              : "Not available"
+          }
+        />
+        <Fact
+          label="Fair value"
+          value={
+            analysis.priceSummary.fairValue
+              ? formatMoney(analysis.priceSummary.fairValue)
+              : "Not available"
+          }
+        />
+        {ranges ? (
+          <>
+            <Fact label="Buy range" value={formatRange(ranges.entry)} />
+            <Fact label="Add range" value={formatRange(ranges.add)} />
+            <Fact label="Trim range" value={formatRange(ranges.trim)} />
+            <Fact label="Sell range" value={formatRange(ranges.exit)} />
+          </>
+        ) : (
+          <Fact
+            label="Action ranges"
+            value="Not available for this guidance."
+          />
+        )}
+        {scenarios ? (
+          <>
+            <Fact label="Downside range" value={formatRange(scenarios.downside)} />
+            <Fact label="Expected range" value={formatRange(scenarios.base)} />
+            <Fact label="Upside range" value={formatRange(scenarios.upside)} />
+            <Fact
+              label="Range horizon"
+              value={formatUnixNanos(scenarios.endsAt)}
+            />
+          </>
+        ) : null}
+      </dl>
     </div>
   )
 }
 
-function RunningAnalysisPanel({
-  activities,
-  activeActivities,
-}: {
-  activities: OverviewQueries["activities"]
-  activeActivities: ResearchActivity[]
-}) {
+function MarketContext({ markets }: { markets: OverviewQueries["markets"] }) {
   return (
     <section
       className="rounded-xl border border-border bg-card/45 p-5"
-      aria-labelledby="running-analysis-title"
+      aria-labelledby="home-market-title"
     >
       <div className="flex items-start justify-between gap-3">
         <div>
           <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
-            Work in progress
+            Current context
           </p>
-          <h2 id="running-analysis-title" className="mt-1 text-base font-semibold">
-            Running analyses
+          <h2 id="home-market-title" className="mt-1 text-base font-semibold">
+            Investments in view
           </h2>
         </div>
-        <Clock3 className="size-5 text-primary" aria-hidden="true" />
+        <Activity className="size-5 text-primary" aria-hidden="true" />
       </div>
 
-      {activities.status === "loading" ? (
-        <Skeleton className="mt-5 h-32 rounded-lg" />
-      ) : activities.status === "unavailable" ? (
+      {markets.status === "loading" ? (
+        <Skeleton className="mt-5 h-40 rounded-lg" />
+      ) : markets.status === "unavailable" ? (
         <Alert className="mt-5">
           <CircleAlert aria-hidden="true" />
-          <AlertTitle>Analysis activity is unavailable</AlertTitle>
+          <AlertTitle>Current market information is unavailable</AlertTitle>
           <AlertDescription>
-            Refresh Home and try again.
+            Do not rely on a saved price until current information can be checked again.
           </AlertDescription>
         </Alert>
-      ) : activeActivities.length === 0 ? (
-        <div className="mt-5 rounded-lg border border-dashed border-border p-5">
-          <p className="text-xs font-medium">
-            No analysis is running
-          </p>
-          <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-            Start an analysis when you are ready to research an investment.
-          </p>
-        </div>
+      ) : markets.data.length === 0 ? (
+        <p className="mt-5 rounded-lg border border-dashed border-border p-5 text-xs text-muted-foreground">
+          No current market information is available yet.
+        </p>
       ) : (
         <ul className="mt-5 divide-y divide-border">
-          {activeActivities.slice(0, 4).map((activity) => (
-            <li
-              key={activity.activityToken}
-              className="py-3 first:pt-0 last:pb-0"
-            >
-              <div className="flex items-baseline justify-between gap-3">
-                <p className="truncate text-xs font-medium" title={activity.label}>
-                  {activity.label}
-                </p>
-                <span className="font-mono text-[9px] uppercase tracking-wider text-primary">
-                  {activityStateLabel(activity.state)}
-                </span>
-              </div>
-              {activity.completedUnits !== null && activity.totalUnits !== null ? (
-                <p className="mt-1 text-[10px] leading-4 text-muted-foreground">
-                  {activity.completedUnits.toLocaleString()} of{" "}
-                  {activity.totalUnits.toLocaleString()} complete
-                </p>
-              ) : null}
-            </li>
+          {markets.data.slice(0, 6).map((market) => (
+            <MarketRow key={market.selectionToken} market={market} />
           ))}
         </ul>
       )}
 
       <Button asChild className="mt-4" size="sm" variant="outline">
-        <Link to="/opportunities">Review investment analyses</Link>
+        <Link to="/markets">Explore markets</Link>
       </Button>
     </section>
   )
 }
 
-function SetupGuidance({
-  accounts,
-  markets,
-  analyses,
-}: {
-  accounts: PortfolioAccountsRead
-  markets: OverviewQueries["markets"]
-  analyses: OverviewQueries["analyses"]
-}) {
-  const accountCount =
-    accounts.query.data?.pages.reduce(
-      (count, page) => count + page.value.length,
-      0,
-    ) ?? 0
+function MarketRow({ market }: { market: MarketProductRow }) {
+  return (
+    <li className="flex items-center gap-3 py-3 first:pt-0 last:pb-0">
+      <span
+        className={`size-2 rounded-full ${market.availability === "current" ? "bg-[var(--success)]" : "bg-[var(--warning)]"}`}
+        aria-hidden="true"
+      />
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-xs font-medium">
+          {market.identity.name ?? market.identity.symbol ?? "Investment"}
+        </span>
+        {market.identity.name && market.identity.symbol ? (
+          <span className="mt-0.5 block truncate text-[10px] text-muted-foreground">
+            {market.identity.symbol}
+          </span>
+        ) : null}
+      </span>
+      <span className="text-right text-[10px] text-muted-foreground">
+        <span className="block font-mono text-foreground">
+          {market.price
+            ? formatMoney({
+                amount: market.price.value,
+                currency: market.price.currency,
+              })
+            : "Price unavailable"}
+        </span>
+        <span className="block">{marketAvailabilityLabel(market)}</span>
+      </span>
+    </li>
+  )
+}
+
+function NextSteps() {
   return (
     <section
       className="rounded-xl border border-border bg-card/45 p-5"
-      aria-labelledby="setup-guidance-title"
+      aria-labelledby="home-next-steps-title"
     >
       <div className="flex items-start justify-between gap-3">
         <div>
           <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-primary">
-            Readiness
+            Before you act
           </p>
-          <h2 id="setup-guidance-title" className="mt-1 text-base font-semibold">
-            What to set up next
+          <h2 id="home-next-steps-title" className="mt-1 text-base font-semibold">
+            Complete the decision
           </h2>
         </div>
-        <ListChecks className="size-5 text-primary" aria-hidden="true" />
+        <Compass className="size-5 text-primary" aria-hidden="true" />
       </div>
-
       <div className="mt-5 space-y-3">
-        <GuidanceItem
+        <NextStep
           icon={Sparkles}
-          title="Opportunity search is unavailable right now"
-          detail="You can still review saved analyses."
+          title="Review the full investment case"
+          detail="Check ranges, reasons, risks, assumptions, expiry, and uncertainty together."
           path="/opportunities"
-          linkLabel="Review retained analyses"
+          linkLabel="Review guidance"
         />
-        {accounts.query.isPending ? (
-          <GuidanceItem
-            icon={BriefcaseBusiness}
-            title="Checking portfolio accounts"
-            detail="Checking your connected accounts."
-            path="/portfolio"
-            linkLabel="Open Portfolio"
-          />
-        ) : !accounts.available || accounts.query.isError || accountCount === 0 ? (
-          <GuidanceItem
-            icon={BriefcaseBusiness}
-            title="Add a portfolio account"
-            detail="Add an account and choose its currency before requesting portfolio-aware recommendations."
-            path="/portfolio"
-            linkLabel="Open Portfolio"
-          />
-        ) : (
-          <GuidanceItem
-            icon={BriefcaseBusiness}
-            title="Review your recommendation account"
-            detail="Confirm which account and investment preferences recommendations should use."
-            path="/portfolio"
-            linkLabel="Open Portfolio setup"
-          />
-        )}
-        {markets.status === "unavailable" ||
-        (markets.status === "ready" && !hasCurrentMarketPrice(markets.data)) ? (
-          <GuidanceItem
-            icon={ServerCog}
-            title="Market data needs attention"
-            detail={
-              markets.status === "unavailable"
-                ? "Current market information is unavailable. Review your connections to restore coverage."
-                : "No current prices are available. Review your connections to restore coverage."
-            }
-            path="/connections/sources"
-            linkLabel="Open Connections"
-          />
-        ) : null}
-        {analyses.status === "unavailable" ? (
-          <GuidanceItem
-            icon={ShieldAlert}
-            title="Saved analyses are unavailable"
-            detail="Refresh Home and try again."
-            path="/opportunities"
-            linkLabel="Open Opportunities"
-          />
-        ) : null}
+        <NextStep
+          icon={BriefcaseBusiness}
+          title="Check portfolio impact"
+          detail="Consider concentration, cash, downside, and account fit before making a decision."
+          path="/portfolio"
+          linkLabel="Open Portfolio"
+        />
+        <NextStep
+          icon={Activity}
+          title="Check the latest market context"
+          detail="Confirm the current price, freshness, and available depth before acting."
+          path="/markets"
+          linkLabel="Open Markets"
+        />
       </div>
     </section>
   )
 }
 
-function GuidanceItem({
+function NextStep({
   icon: Icon,
   title,
   detail,
@@ -680,7 +448,7 @@ function GuidanceItem({
   return (
     <div className="rounded-lg border border-border bg-background/35 p-3">
       <div className="flex items-start gap-3">
-        <Icon className="mt-0.5 size-4 shrink-0 text-amber-300" aria-hidden="true" />
+        <Icon className="mt-0.5 size-4 shrink-0 text-primary" aria-hidden="true" />
         <div>
           <p className="text-xs font-medium">{title}</p>
           <p className="mt-1 text-[10px] leading-4 text-muted-foreground">{detail}</p>
@@ -696,318 +464,102 @@ function GuidanceItem({
   )
 }
 
-function PortfolioUnavailable({
-  title,
-  detail,
-}: {
-  title: string
-  detail: string
-}) {
+function UnavailableGuidance({ title, detail }: { title: string; detail: string }) {
   return (
-    <section className="rounded-xl border border-border bg-card/45 p-5">
-      <div className="flex items-start gap-3">
-        <BriefcaseBusiness
-          className="mt-0.5 size-4 text-primary"
-          aria-hidden="true"
-        />
-        <div>
-          <h2 className="text-sm font-semibold">{title}</h2>
-          <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
-            {detail}
-          </p>
-          <Button asChild className="mt-3" size="sm">
-            <Link to="/portfolio">Open Portfolio</Link>
-          </Button>
-        </div>
-      </div>
-    </section>
+    <Alert className="mt-5">
+      <CircleAlert aria-hidden="true" />
+      <AlertTitle>{title}</AlertTitle>
+      <AlertDescription>{detail}</AlertDescription>
+    </Alert>
   )
 }
 
-function LiveMarketPanel({
-  markets,
+function ActionBadge({
+  recommendation,
 }: {
-  markets: OverviewQueries["markets"]
+  recommendation: InvestmentAnalysisLocator["recommendation"]
+}) {
+  const label =
+    recommendation.kind === "action"
+      ? `SAVED ${recommendation.action.toUpperCase()}`
+      : recommendation.kind === "abstain"
+        ? "ABSTAIN"
+        : "UNAVAILABLE"
+  const tone =
+    recommendation.kind === "action"
+      ? "border-primary/30 bg-primary/10 text-primary"
+      : "border-amber-400/25 bg-amber-400/10 text-amber-200"
+  return (
+    <span className={`rounded-full border px-2.5 py-1 text-[10px] font-semibold ${tone}`}>
+      {label}
+    </span>
+  )
+}
+
+function ProductList({
+  title,
+  values,
+  empty = "Not available.",
+}: {
+  title: string
+  values: string[]
+  empty?: string
 }) {
   return (
-    <EvidencePanel
-      title="Current market information"
-      icon={Activity}
-      state={markets.status}
-    >
-      {markets.status === "ready" && markets.data.length > 0 ? (
-        <ul className="divide-y divide-border">
-          {markets.data.slice(0, 5).map((market) => (
-            <li
-              key={market.instrumentId}
-              className="flex items-center gap-3 py-3 first:pt-0 last:pb-0"
-            >
-              <span
-                className={`size-2 rounded-full ${market.marketState.freshness === "fresh" ? "bg-[var(--success)]" : "bg-[var(--warning)]"}`}
-                aria-hidden="true"
-              />
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-xs font-medium">
-                  {market.displaySymbol ?? market.name ?? "Selected investment"}
-                </span>
-                {market.displaySymbol && market.name ? (
-                  <span className="mt-0.5 block truncate text-[9px] text-muted-foreground">
-                    {market.name}
-                  </span>
-                ) : null}
-              </span>
-              <span className="text-right text-[10px] text-muted-foreground">
-                <span className="block font-mono text-foreground">
-                  {formatMarketPrice(market)}
-                </span>
-                <span className="block">{marketAvailabilityLabel(market)}</span>
-              </span>
+    <div>
+      <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+        {title}
+      </p>
+      {values.length > 0 ? (
+        <ul className="mt-2 space-y-1.5 text-[11px] leading-5 text-foreground/80">
+          {values.slice(0, 4).map((value, index) => (
+            <li key={`${index}:${value}`} className="flex gap-2">
+              <span aria-hidden="true">•</span>
+              <span>{value}</span>
             </li>
           ))}
         </ul>
-      ) : null}
-    </EvidencePanel>
-  )
-}
-
-function EvidencePanel({
-  title,
-  icon: Icon,
-  state,
-  children,
-}: {
-  title: string
-  icon: typeof Activity
-  state: ReadState<unknown>["status"]
-  children: React.ReactNode
-}) {
-  return (
-    <section className="rounded-xl border border-border bg-card/45 p-5">
-      <div className="mb-4 flex items-center gap-2">
-        <Icon className="size-4 text-primary" aria-hidden="true" />
-        <h3 className="text-sm font-semibold">{title}</h3>
-      </div>
-      {state === "loading" ? <Skeleton className="h-28 rounded-lg" /> : null}
-      {state === "unavailable" ? (
-        <div className="rounded-lg border border-border bg-background/35 p-4">
-          <p className="text-xs font-medium">Not available right now</p>
-          <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-            Refresh Home and try again.
-          </p>
-        </div>
-      ) : null}
-      {state === "ready" && !children ? (
-        <p className="rounded-lg border border-dashed border-border p-5 text-center text-xs text-muted-foreground">
-          No current records were returned.
-        </p>
       ) : (
-        children
+        <p className="mt-2 text-[11px] leading-5 text-muted-foreground">{empty}</p>
       )}
-    </section>
-  )
-}
-
-function StatusCard({
-  icon: Icon,
-  label,
-  value,
-  detail,
-  state,
-}: {
-  icon: typeof Database
-  label: string
-  value: string
-  detail: string | null
-  state: ReadState<unknown>["status"]
-}) {
-  return (
-    <section className="rounded-xl border border-border bg-card/45 p-4">
-      <div className="flex items-center justify-between">
-        <Icon className="size-4 text-primary" aria-hidden="true" />
-        <span
-          className={`size-2 rounded-full ${state === "ready" ? "bg-[var(--success)]" : state === "loading" ? "animate-pulse bg-primary" : "bg-[var(--warning)]"}`}
-          aria-label={state}
-        />
-      </div>
-      <p className="mt-4 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
-        {label}
-      </p>
-      <p className="mt-1 text-lg font-semibold">
-        {state === "loading" ? "Checking…" : value}
-      </p>
-      <p className="mt-1 min-h-8 text-[10px] leading-4 text-muted-foreground">
-        {detail}
-      </p>
-    </section>
-  )
-}
-
-function TruthFact({
-  label,
-  value,
-  detail,
-}: {
-  label: string
-  value: string
-  detail: string
-}) {
-  return (
-    <div className="rounded-lg border border-border bg-background/35 p-3">
-      <p className="font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
-        {label}
-      </p>
-      <p className="mt-2 text-base font-semibold">{value}</p>
-      <p className="mt-1 text-[10px] leading-4 text-muted-foreground">{detail}</p>
     </div>
   )
 }
 
-function EvidenceFact({
-  label,
-  value,
-  mono = false,
-}: {
-  label: string
-  value: string
-  mono?: boolean
-}) {
+function Fact({ label, value }: { label: string; value: string }) {
   return (
-    <div className="min-w-0">
-      <dt className="uppercase tracking-wider text-muted-foreground">{label}</dt>
-      <dd
-        className={`mt-1 break-all text-foreground/80 ${mono ? "font-mono" : ""}`}
-      >
-        {value}
-      </dd>
+    <div>
+      <dt className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</dt>
+      <dd className="mt-1 text-[11px] leading-5 text-foreground/85">{value}</dd>
     </div>
   )
 }
 
-function QueueItem({
-  label,
-  value,
-  detail,
-}: {
-  label: string
-  value: string
-  detail: string
-}) {
-  return (
-    <div className="rounded-lg border border-border bg-background/35 p-3">
-      <div className="flex items-baseline justify-between gap-3">
-        <p className="text-xs font-medium">{label}</p>
-        <p className="font-mono text-[10px] text-primary">{value}</p>
-      </div>
-      <p className="mt-1 text-[10px] leading-4 text-muted-foreground">{detail}</p>
-    </div>
-  )
-}
-
-function factFromPerformance(
-  performance: PortfolioPerformance | null,
-  loading: boolean,
-): { value: string; detail: string } {
-  if (performance) {
-    return {
-      value: formatMoney(performance.currentValue),
-      detail: "Current value for the selected account.",
-    }
-  }
-  if (loading) {
-    return {
-      value: "Loading…",
-      detail: "Reading the selected account.",
-    }
-  }
-  return {
-    value: "Not available",
-    detail: "No current value is available for this account.",
-  }
-}
-
-function formatAvailableHistoryReturn(
-  performance: PortfolioPerformance | null,
+function investmentName(
+  analysis: Pick<InvestmentAnalysisLocator, "investment">,
 ): string {
-  if (performance?.timeWeightedReturn === undefined) return "Not returned"
-  const periods =
-    performance.periods === undefined
-      ? "period count not returned"
-      : `${performance.periods.toLocaleString()} comparable periods`
-  return `${formatPercent(performance.timeWeightedReturn)} · ${periods}`
-}
-
-function formatExposure(exposure: PortfolioExposure | null): string {
-  return exposure?.net ? formatMoney(exposure.net) : "Not returned"
-}
-
-function formatHistoricalValueAtRisk(risk: PortfolioRisk | null): string {
-  if (risk?.valueAtRisk === undefined) return "Not returned"
-  return `${formatPercent(risk.valueAtRisk)} at ${formatPercent(risk.confidence)} confidence`
-}
-
-function analysisCount(state: ReadState<InvestmentAnalysisPage>) {
-  return state.status === "ready"
-    ? state.data.availableCount.toLocaleString()
-    : "Unavailable"
-}
-
-function marketPriceCount(state: OverviewQueries["markets"]) {
-  if (state.status !== "ready") return "Unavailable"
-  const count = state.data.filter((market) => market.currentPrice !== null).length
-  return `${count.toLocaleString()} priced`
-}
-
-function currentMarketDetail(markets: MarketProductRow[]) {
-  if (markets.length === 0) {
-    return "No current market information is available."
+  if (analysis.investment.symbol && analysis.investment.name) {
+    return `${analysis.investment.symbol} · ${analysis.investment.name}`
   }
-  const fresh = markets.filter(
-    (market) =>
-      market.currentPrice !== null && market.marketState.freshness === "fresh",
-  ).length
-  return `${fresh} of ${markets.length} markets in view have current prices.`
+  return analysis.investment.symbol ?? analysis.investment.name ?? "Investment"
 }
 
-function hasCurrentMarketPrice(markets: MarketProductRow[]) {
-  return markets.some((market) => market.currentPrice !== null)
+function formatRange(range: {
+  lower: { amount: string; currency: string }
+  upper: { amount: string; currency: string }
+}): string {
+  return `${formatMoney(range.lower)} to ${formatMoney(range.upper)}`
 }
 
-function formatMarketPrice(market: MarketProductRow) {
-  return market.currentPrice
-    ? formatMoney({
-        amount: market.currentPrice.value,
-        currency: market.currentPrice.currency,
-      })
-    : "Price unavailable"
-}
-
-function marketAvailabilityLabel(market: MarketProductRow) {
-  if (market.marketState.freshness === "stale") return "May be out of date"
-  if (market.marketState.freshness === "unavailable") return "Unavailable"
-  return humanize(market.availability)
-}
-
-function activityStateLabel(state: ResearchActivity["state"]) {
-  switch (state) {
-    case "queued":
-      return "Waiting"
-    case "preparing":
-      return "Preparing"
-    case "running":
-      return "In progress"
-    case "awaiting_confirmation":
-      return "Needs confirmation"
-    case "cancelling":
-      return "Stopping"
-    case "recovering":
-      return "Resuming"
-    case "completed":
-      return "Completed"
-    case "failed":
-      return "Needs attention"
-    case "cancelled":
-      return "Stopped"
-    case "interrupted":
-      return "Interrupted"
+function marketAvailabilityLabel(market: MarketProductRow): string {
+  switch (market.availability) {
+    case "current":
+      return "Current"
+    case "delayed":
+      return "Delayed"
+    case "previous_close":
+      return "Previous close"
+    case "unavailable":
+      return "Unavailable"
   }
 }

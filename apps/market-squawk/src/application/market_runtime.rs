@@ -7,6 +7,7 @@ mod generation;
 mod group;
 mod kraken;
 mod schwab;
+mod schwab_current;
 mod schwab_sink;
 
 pub(crate) use alpaca_historical::{
@@ -15,7 +16,7 @@ pub(crate) use alpaca_historical::{
 };
 pub(crate) use configuration::{
     AccountMarketSurface, PreparedMarketProviderConfigurationRequest,
-    PreparedMarketProviderConfigurationResolver,
+    PreparedMarketProviderConfigurationResolver, PreparedSchwabMarketRuntimeResolver,
 };
 pub(crate) use display::{MarketDisplaySnapshotBatch, MarketDisplaySnapshotLease};
 pub(crate) use generation::{MarketRuntimeGroupGeneration, MarketSourceRuntimeGeneration};
@@ -27,8 +28,10 @@ pub(crate) use schwab::{
     SchwabRestQuotePublicationReceipt, SchwabRestQuoteRuntimeBounds, SchwabRestQuoteRuntimeError,
     SchwabRestQuoteSinkError, SchwabRestQuoteSourceEvidence,
 };
+pub(crate) use schwab_current::SCHWAB_CURRENT_LIVE_AUTHORITY_KEY;
 #[cfg(test)]
 pub(crate) use schwab_sink::SchwabRestQuoteSealFirstSink;
+pub(crate) use schwab_sink::{SchwabRestQuoteCurrentRuntime, SchwabRestQuoteCurrentRuntimeInput};
 
 use std::{
     fmt,
@@ -61,7 +64,9 @@ use self::{
     alpaca_historical::AlpacaHistoricalCapabilityError,
     display::DisplaySourceDescriptor,
     generation::MarketRuntimeTopology,
-    group::{AccountMarketRuntimeGroup, AccountMarketRuntimeLimits},
+    group::{
+        AccountMarketRuntimeGroup, AccountMarketRuntimeLimits, PreparedAccountMarketRuntimeStart,
+    },
     kraken::KrakenSourceDescriptor,
 };
 use super::live_fair_value::{LiveFairValueExportDrains, LiveFairValueObservationBuffer};
@@ -281,6 +286,7 @@ pub(crate) struct MarketRuntimeRegistry {
     provider_activation: Arc<ProviderAdapterActivation>,
     alpaca_historical_source: AlpacaHistoricalSourceMutationAuthority,
     prepared_configuration: Arc<dyn PreparedMarketProviderConfigurationResolver>,
+    prepared_schwab: Arc<dyn PreparedSchwabMarketRuntimeResolver>,
     live_fair_value: Arc<LiveFairValueObservationBuffer>,
     accepting: std::sync::atomic::AtomicBool,
     lifecycle: CancellationToken,
@@ -306,7 +312,7 @@ enum AccountGroupStartPreparation {
     Existing(MarketProviderGroupLifecycleEvidence),
     Ready {
         surface_id: SourceIdentifier,
-        prepared: PreparedMarketProviderConfiguration,
+        prepared: PreparedAccountMarketRuntimeStart,
         runtime_cancellation: CancellationToken,
     },
 }
@@ -326,12 +332,14 @@ impl MarketRuntimeRegistry {
         provider_activation: Arc<ProviderAdapterActivation>,
         alpaca_historical_source: AlpacaHistoricalSourceMutationAuthority,
         prepared_configuration: Arc<dyn PreparedMarketProviderConfigurationResolver>,
+        prepared_schwab: Arc<dyn PreparedSchwabMarketRuntimeResolver>,
         live_fair_value: Arc<LiveFairValueObservationBuffer>,
     ) -> Result<Arc<Self>, ServiceError> {
         let mut entries = Vec::new();
         entries
             .try_reserve_exact(MAXIMUM_CONCURRENT_MARKET_SURFACES)
             .map_err(|_error| ServiceError::ResourceExhausted)?;
+        validate_unique_schwab_account_surface(&entries)?;
         let mut durable_market_routes = Vec::new();
         durable_market_routes
             .try_reserve_exact(MAX_DISPLAY_MARKET_ROUTES)
@@ -370,6 +378,7 @@ impl MarketRuntimeRegistry {
             provider_activation,
             alpaca_historical_source,
             prepared_configuration,
+            prepared_schwab,
             live_fair_value,
             accepting: std::sync::atomic::AtomicBool::new(true),
             lifecycle,
@@ -531,6 +540,10 @@ impl MarketRuntimeRegistry {
     ) -> Result<AccountGroupStartPreparation, ServiceError> {
         ensure_active(&self.accepting, deadline, cancellation)?;
         let surface_id = try_surface_identifier(request.surface())?;
+        if request.surface() == AccountMarketSurface::SchwabMarketData {
+            let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
+            validate_unique_schwab_account_surface(&entries)?;
+        }
         match self
             .verify_account_group_owned(request, deadline, cancellation)
             .await
@@ -543,13 +556,31 @@ impl MarketRuntimeRegistry {
             .await?;
 
         let mut resolution_guard = StartupCancellation::new(self.lifecycle.child_token());
-        let prepared = await_service_before(
-            deadline,
-            cancellation,
-            self.prepared_configuration
-                .resolve(request, deadline, resolution_guard.token()),
-        )
-        .await?;
+        let prepared = match request.surface() {
+            AccountMarketSurface::SchwabMarketData => PreparedAccountMarketRuntimeStart::Schwab(
+                await_service_before(
+                    deadline,
+                    cancellation,
+                    self.prepared_schwab
+                        .resolve(request, deadline, resolution_guard.token()),
+                )
+                .await?,
+            ),
+            AccountMarketSurface::AlpacaBasic | AccountMarketSurface::KrakenLevel3 => {
+                PreparedAccountMarketRuntimeStart::Standard(
+                    await_service_before(
+                        deadline,
+                        cancellation,
+                        self.prepared_configuration.resolve(
+                            request,
+                            deadline,
+                            resolution_guard.token(),
+                        ),
+                    )
+                    .await?,
+                )
+            }
+        };
         resolution_guard.disarm();
         let runtime_cancellation = self.lifecycle.child_token();
         Ok(AccountGroupStartPreparation::Ready {
@@ -576,11 +607,34 @@ impl MarketRuntimeRegistry {
             return Err(error);
         }
         let evidence = group.evidence().clone();
+        let metadata = group.metadata();
+        let routes = group.routes();
+        let topology = match (metadata.is_empty(), routes.is_empty()) {
+            (true, true) => None,
+            (false, false) => {
+                match MarketRuntimeTopology::try_new(&surface_id, Arc::clone(&metadata), routes) {
+                    Ok(topology) => Some(topology),
+                    Err(error) => {
+                        let cleanup: Pin<
+                            Box<dyn Future<Output = Result<(), ServiceError>> + Send + '_>,
+                        > = Box::pin(group.shutdown_before(deadline, cancellation));
+                        let _cleanup = cleanup.await;
+                        return Err(error);
+                    }
+                }
+            }
+            (true, false) | (false, true) => {
+                let cleanup: Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send + '_>> =
+                    Box::pin(group.shutdown_before(deadline, cancellation));
+                let _cleanup = cleanup.await;
+                return Err(ServiceError::InvalidResult);
+            }
+        };
         let entry = MarketRuntimeEntry {
             surface_id,
             onboarding_session_id: Some(request.onboarding_session_id()),
-            metadata: Arc::<[SourceMetadata]>::from([]),
-            topology: None,
+            metadata,
+            topology,
             cancellation: runtime_cancellation,
             runtime: MarketRuntime::Account(group),
             exports: None,
@@ -1046,7 +1100,36 @@ impl MarketRuntimeRegistry {
             .require_active(group.activation_lease())
             .map_err(|_error| ServiceError::Unauthorized)?;
         ensure_active(&self.accepting, deadline, cancellation)?;
-        group.admit_reads()
+        let durable_routes = match entry.topology.as_ref() {
+            Some(topology) => durable_route_bindings(
+                &surface_id,
+                Arc::clone(&entry.metadata),
+                topology,
+                group.durable_reads(),
+            )?,
+            None if group.durable_reads().is_empty() => Vec::new(),
+            None => return Err(ServiceError::InvalidResult),
+        };
+        let mut retained =
+            bounded_lock(&self.durable_market_routes, deadline, cancellation).await?;
+        let retained_other_count = retained
+            .iter()
+            .filter(|route| route.surface_id() != &surface_id)
+            .count();
+        let next_len = retained_other_count
+            .checked_add(durable_routes.len())
+            .ok_or(ServiceError::ResourceExhausted)?;
+        if next_len > MAX_DISPLAY_MARKET_ROUTES {
+            return Err(ServiceError::ResourceExhausted);
+        }
+        let additional_capacity = next_len.saturating_sub(retained.capacity());
+        retained
+            .try_reserve_exact(additional_capacity)
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        group.admit_reads()?;
+        retained.retain(|route| route.surface_id() != &surface_id);
+        retained.extend(durable_routes);
+        Ok(())
     }
 
     async fn verify_account_group_owned(
@@ -1355,6 +1438,8 @@ impl MarketRuntimeRegistry {
         let Some((entry, group_generation)) = entry else {
             return Ok(None);
         };
+        self.clear_durable_market_routes(&entry.surface_id, deadline, cancellation)
+            .await?;
         entry.shutdown(self.config.source_shutdown()).await?;
         Ok(Some(group_generation))
     }
@@ -1388,6 +1473,8 @@ impl MarketRuntimeRegistry {
             (entries.swap_remove(index), generation)
         };
         let (entry, generation) = entry;
+        self.clear_durable_market_routes(&entry.surface_id, deadline, cancellation)
+            .await?;
         entry.shutdown(self.config.source_shutdown()).await?;
         Ok(Some(generation))
     }
@@ -1444,6 +1531,8 @@ impl MarketRuntimeRegistry {
             }
             entries.swap_remove(index)
         };
+        self.clear_durable_market_routes(&entry.surface_id, deadline, cancellation)
+            .await?;
         entry.shutdown(self.config.source_shutdown()).await
     }
 
@@ -1646,6 +1735,18 @@ impl MarketRuntimeRegistry {
             .map_err(|_error| ServiceError::ResourceExhausted)?;
         retained.retain(|route| route.surface_id() != surface_id);
         retained.extend(routes);
+        Ok(())
+    }
+
+    async fn clear_durable_market_routes(
+        &self,
+        surface_id: &SourceIdentifier,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        let mut retained =
+            bounded_lock(&self.durable_market_routes, deadline, cancellation).await?;
+        retained.retain(|route| route.surface_id() != surface_id);
         Ok(())
     }
 
@@ -2089,6 +2190,7 @@ impl MarketRuntimeRegistry {
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
             self.prepared_configuration.begin_shutdown();
+            self.prepared_schwab.begin_shutdown();
         }
     }
 
@@ -2164,6 +2266,12 @@ impl MarketRuntimeRegistry {
                 failure = Some(error);
             }
         }
+        match bounded_lock(&self.durable_market_routes, deadline, &cleanup).await {
+            Ok(mut routes) => routes.clear(),
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
 
         self.lifecycle.cancel();
         let display_shutdown = self.display.shutdown(&cleanup, deadline);
@@ -2173,8 +2281,17 @@ impl MarketRuntimeRegistry {
             &cleanup,
             self.prepared_configuration.finish_shutdown(deadline),
         );
-        let (display_result, order_level_result, resolver_result) =
-            tokio::join!(display_shutdown, order_level_shutdown, resolver_shutdown);
+        let schwab_resolver_shutdown = await_service_before(
+            deadline,
+            &cleanup,
+            self.prepared_schwab.finish_shutdown(deadline),
+        );
+        let (display_result, order_level_result, resolver_result, schwab_resolver_result) = tokio::join!(
+            display_shutdown,
+            order_level_shutdown,
+            resolver_shutdown,
+            schwab_resolver_shutdown
+        );
         match display_result {
             Ok(report) if report.is_complete() => {}
             Ok(_report) => {
@@ -2204,6 +2321,11 @@ impl MarketRuntimeRegistry {
             }
         }
         if let Err(error) = resolver_result
+            && failure.is_none()
+        {
+            failure = Some(error);
+        }
+        if let Err(error) = schwab_resolver_result
             && failure.is_none()
         {
             failure = Some(error);
@@ -2263,6 +2385,8 @@ impl MarketRuntimeRegistry {
             }
             entries.swap_remove(index)
         };
+        self.clear_durable_market_routes(&entry.surface_id, deadline, cancellation)
+            .await?;
         entry.shutdown(self.config.source_shutdown()).await
     }
 
@@ -2392,6 +2516,10 @@ impl MarketRuntimeRegistry {
             entries[index].begin_shutdown();
             entries.swap_remove(index)
         };
+        let deadline = self.cleanup_deadline()?;
+        let cleanup = CancellationToken::new();
+        self.clear_durable_market_routes(&entry.surface_id, deadline, &cleanup)
+            .await?;
         entry.shutdown(self.config.source_shutdown()).await
     }
 }
@@ -2595,6 +2723,23 @@ fn durable_route_bindings(
         return Err(ServiceError::InvalidResult);
     }
     Ok(bindings)
+}
+
+fn validate_unique_schwab_account_surface(
+    entries: &[MarketRuntimeEntry],
+) -> Result<(), ServiceError> {
+    if entries
+        .iter()
+        .filter(|entry| {
+            entry.surface_id.as_str() == AccountMarketSurface::SchwabMarketData.surface_id()
+        })
+        .count()
+        > 1
+    {
+        Err(ServiceError::InvalidResult)
+    } else {
+        Ok(())
+    }
 }
 
 impl fmt::Debug for MarketRuntimeEntry {

@@ -49,7 +49,7 @@ pub(crate) use contracts::{
     PRODUCT_LOOKUP_CATEGORY_SAVED_SCREEN, PRODUCT_LOOKUP_QUERY_MAXIMUM_CHARACTERS,
     internal_forecast_generation_descriptor, product_lookup_query_is_canonical,
 };
-pub(crate) use domain_support::opaque_product_token;
+pub(crate) use domain_support::{opaque_product_text_token, opaque_product_token};
 pub use fair_value::{
     AnalyticsFairValueInputPublisher, FairValueDomainService, FairValueInputAuthorityError,
     FairValueInputAuthorityLimitInput, FairValueInputAuthorityLimits,
@@ -65,6 +65,9 @@ pub(crate) use market_runtime::{
     AccountMarketSurface, MarketProviderGroupLifecycleEvidence, MarketRuntimeGroupGeneration,
     MarketRuntimeRegistry, MarketSourceRuntimeGeneration,
     PreparedMarketProviderConfigurationRequest, PreparedMarketProviderConfigurationResolver,
+    PreparedSchwabMarketRuntimeResolver, SCHWAB_CURRENT_LIVE_AUTHORITY_KEY,
+    SchwabRestQuoteCurrentRuntimeInput, SchwabRestQuoteRuntimeBounds, SchwabRestQuoteRuntimeError,
+    SchwabRestQuoteSourceEvidence,
 };
 pub use paper::PaperApplicationServices;
 pub(crate) use paper::{
@@ -80,18 +83,19 @@ pub(crate) use research::{
     DatasetPreparationAuthority, DatasetPreparationError, DatasetPreparationOptions,
     DatasetPreparationPreview, DatasetPreparationPreviewRequest, DatasetPreparationReceipt,
     DatasetPreparationSelection, FeatureDatasetProductionFinalizer, FredLatestKnownOperation,
-    FredPublishedGenerationHandoff, InstrumentContextReadCapability,
-    KrakenMarketApplicationOutcome, MacroContextReadCapability, MacroFeatureVector,
-    MarketEventDurableRead, MarketEventDurableReadWriter, MarketEventReadError,
-    MarketEventRestartSelector, MarketHistoryReadCapability, OptionsContextReadCapability,
-    PreparedFeatureDatasetBuild, ResearchProviderPublicationOperation,
-    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
-    SEC_FUNDAMENTALS_RESEARCH_STATUS_OPERATION, SchwabMarketPublicationError,
-    SchwabRestQuoteGenerationAuthority, SchwabRestQuotePostSealFailure,
-    SchwabRestQuotePublicationPackage, SchwabRestQuoteSourceHealthOutcome,
-    SecFundPublicationReceipt, SecFundamentalsResearchError, SecFundamentalsResearchOperation,
-    SecFundamentalsResearchRequest, SecFundamentalsResearchStatus, SecLiveFundApplicationError,
-    SecLiveFundRequest, SecLiveFundSource, SecResearchFamilyBinding, TreasuryApplicationClosure,
+    FredPublishedGenerationHandoff, InstrumentContext, InstrumentContextOutcome,
+    InstrumentContextReadCapability, InstrumentContextRequest, KrakenMarketApplicationOutcome,
+    MacroContextReadCapability, MacroFeatureVector, MarketEventDurableRead,
+    MarketEventDurableReadWriter, MarketEventReadError, MarketEventRestartSelector,
+    MarketHistoryReadCapability, OptionsContextReadCapability, PreparedFeatureDatasetBuild,
+    ResearchProviderPublicationOperation, ResearchProviderRuntimeMutationAuthority,
+    ResearchProviderRuntimeReplacement, SEC_FUNDAMENTALS_RESEARCH_STATUS_OPERATION,
+    SchwabMarketPublicationError, SchwabRestQuoteGenerationAuthority,
+    SchwabRestQuotePostSealFailure, SchwabRestQuotePublicationPackage,
+    SchwabRestQuoteSourceHealthOutcome, SecFundPublicationReceipt, SecFundamentalsResearchError,
+    SecFundamentalsResearchOperation, SecFundamentalsResearchRequest,
+    SecFundamentalsResearchStatus, SecLiveFundApplicationError, SecLiveFundRequest,
+    SecLiveFundSource, SecResearchFamilyBinding, TreasuryApplicationClosure,
     TreasuryLatestKnownOperation, TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
     read_macro_feature_vector,
 };

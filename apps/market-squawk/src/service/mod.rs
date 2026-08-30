@@ -24,7 +24,6 @@ mod ready_admission;
 mod recommendation_setup;
 mod research_dataset;
 mod research_file_import;
-mod resources;
 mod runtime;
 mod tool_services;
 mod update_package;
@@ -60,7 +59,6 @@ use market_squawk_services::{
     JsonStructureLimits, RequestContext, RequestId, RequestOrigin, ServiceDomain, ServiceLimits,
     ToolServices,
 };
-use resources::InstalledResourceProvider;
 use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -1210,12 +1208,6 @@ async fn compose_transport(
     let audit = Arc::new(crate::mcp::audit::DurableAuditSink::try_new(
         paths.control_root()?.try_clone_directory()?,
     )?);
-    let resources = Arc::new(InstalledResourceProvider::new(
-        runtime.runtime(),
-        Arc::clone(&application),
-        jobs.repository(),
-        product.artifact_authority(),
-    ));
     let limits = McpLimits::try_from(mcp_limit_spec)
         .map_err(|_error| InstalledServiceError::InvalidComposition)?;
     let services: Arc<dyn ToolServices> = services;
@@ -1224,8 +1216,6 @@ async fn compose_transport(
         services,
         limits,
         audit_sink,
-        product.artifacts(),
-        resources,
         runtime.runtime().workspace_id(),
     )
     .map_err(|_error| InstalledServiceError::CompositionStage("MCP handler factory"))?;

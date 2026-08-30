@@ -32,8 +32,8 @@ use crate::analytical_controller::DesktopAnalyticalController;
 use crate::contracts::{
     ApplicationInvocation, DesktopBootstrap, DesktopCommandError, DesktopServiceBootstrapCommand,
     DesktopServiceBootstrapRequirement, DesktopServiceBootstrapStatus, DesktopServiceReconnect,
-    DesktopStartup, InstallationControlCommand, ProductCapability, ProviderOnboardingCommand,
-    Readiness, ReadinessState,
+    DesktopStartup, InstallationControlCommand, ProductCapability, ProductSessionToken,
+    ProviderOnboardingCommand, Readiness, ReadinessState,
 };
 use crate::events::DesktopEventSubscriptions;
 use crate::mcp_clients::{DesktopMcpClientState, DesktopMcpRuntimeBinding};
@@ -334,7 +334,7 @@ fn required_string<'a>(value: &'a Value, pointer: &str) -> Result<&'a str, Deskt
 
 pub(crate) struct DesktopState {
     current: RwLock<Arc<DesktopGeneration>>,
-    webview_admitted_runtime: RwLock<RuntimeIdentity>,
+    webview_admitted_product_session: RwLock<ProductSessionToken>,
     service: Arc<DesktopServiceAuthority>,
     context: DesktopCompositionContext,
     restart_program: OnceLock<PathBuf>,
@@ -343,6 +343,7 @@ pub(crate) struct DesktopState {
 pub(crate) struct DesktopGeneration {
     application: Arc<LoopbackApplicationClient>,
     service_bootstrap: ServiceBootstrapSnapshot,
+    product_session_token: ProductSessionToken,
     data_root: PathBuf,
     cancellation: CancellationToken,
     governance_authorizations: Mutex<HashMap<Uuid, NativeGovernanceAuthorization>>,
@@ -501,10 +502,10 @@ impl DesktopState {
     ) -> Result<Self, DesktopCommandError> {
         let service = Arc::clone(&connection.authority);
         let generation = DesktopGeneration::try_new(connection, &context)?;
-        let runtime = generation.runtime();
+        let product_session_token = generation.product_session_token();
         Ok(Self {
             current: RwLock::new(Arc::new(generation)),
-            webview_admitted_runtime: RwLock::new(runtime),
+            webview_admitted_product_session: RwLock::new(product_session_token),
             service,
             context,
             restart_program: OnceLock::new(),
@@ -514,10 +515,10 @@ impl DesktopState {
     pub(crate) fn generation(&self) -> Result<Arc<DesktopGeneration>, DesktopCommandError> {
         let generation = self.current_generation()?;
         let admitted = self
-            .webview_admitted_runtime
+            .webview_admitted_product_session
             .read()
             .map_err(|_error| DesktopCommandError::internal())?;
-        admit_webview_runtime(*admitted, generation.runtime())?;
+        admit_webview_product_session(*admitted, generation.product_session_token())?;
         Ok(generation)
     }
 
@@ -598,21 +599,21 @@ impl DesktopState {
         Ok(std::mem::replace(&mut current, replacement))
     }
 
-    pub(crate) fn acknowledge_webview_runtime(
+    pub(crate) fn acknowledge_webview_product_session(
         &self,
         generation: &Arc<DesktopGeneration>,
-        runtime: RuntimeIdentity,
+        product_session_token: ProductSessionToken,
     ) -> Result<(), DesktopCommandError> {
         self.admit_current(generation)?;
-        if generation.runtime() != runtime {
+        if generation.product_session_token() != product_session_token {
             return Err(service_generation_changed());
         }
         let mut admitted = self
-            .webview_admitted_runtime
+            .webview_admitted_product_session
             .write()
             .map_err(|_error| DesktopCommandError::internal())?;
         self.admit_current(generation)?;
-        *admitted = runtime;
+        *admitted = product_session_token;
         Ok(())
     }
 
@@ -678,9 +679,9 @@ fn service_generation_changed() -> DesktopCommandError {
     )
 }
 
-fn admit_webview_runtime(
-    admitted: RuntimeIdentity,
-    current: RuntimeIdentity,
+fn admit_webview_product_session(
+    admitted: ProductSessionToken,
+    current: ProductSessionToken,
 ) -> Result<(), DesktopCommandError> {
     if admitted == current {
         Ok(())
@@ -719,6 +720,7 @@ impl DesktopGeneration {
         Ok(Self {
             application: Arc::new(connection.application),
             service_bootstrap,
+            product_session_token: ProductSessionToken::random(),
             data_root,
             cancellation: CancellationToken::new(),
             governance_authorizations: Mutex::new(HashMap::new()),
@@ -754,6 +756,7 @@ impl DesktopGeneration {
         Ok(Self {
             application: Arc::new(connection.application),
             service_bootstrap,
+            product_session_token: ProductSessionToken::random(),
             data_root,
             cancellation: CancellationToken::new(),
             governance_authorizations: Mutex::new(HashMap::new()),
@@ -773,6 +776,10 @@ impl DesktopGeneration {
 
     pub(crate) const fn runtime(&self) -> RuntimeIdentity {
         self.service_bootstrap.runtime
+    }
+
+    pub(crate) const fn product_session_token(&self) -> ProductSessionToken {
+        self.product_session_token
     }
 
     pub(crate) fn cancellation(&self) -> CancellationToken {
@@ -978,7 +985,7 @@ impl DesktopGeneration {
                 "release"
             },
             self.data_root.to_string_lossy().into_owned(),
-            self.service_bootstrap.runtime,
+            self.product_session_token,
             Readiness::new(
                 ReadinessState::Ready,
                 "Ready",
@@ -1315,7 +1322,7 @@ pub(crate) async fn desktop_service_reconnect(
         ));
     }
     let generation = state.current_generation()?;
-    if generation.runtime() != request.expected_runtime() {
+    if generation.product_session_token() != request.expected_product_session_token() {
         return Err(DesktopCommandError::new(
             "service_reconnect_stale",
             "The reconnect request belongs to an earlier desktop service generation.",
@@ -2048,8 +2055,11 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
+    use crate::contracts::ProductSessionToken;
+
     use super::{
-        admit_replacement, admit_webview_runtime, decode_application_result, lossless_webview_value,
+        admit_replacement, admit_webview_product_session, decode_application_result,
+        lossless_webview_value,
     };
 
     #[test]
@@ -2117,8 +2127,16 @@ mod tests {
             )
             .is_err()
         );
-        assert!(admit_webview_runtime(current, replacement).is_err());
-        assert!(admit_webview_runtime(replacement, replacement).is_ok());
+        let admitted_product_session = ProductSessionToken::random();
+        let replacement_product_session = ProductSessionToken::random();
+        assert!(
+            admit_webview_product_session(admitted_product_session, replacement_product_session)
+                .is_err()
+        );
+        assert!(
+            admit_webview_product_session(replacement_product_session, replacement_product_session)
+                .is_ok()
+        );
         Ok(())
     }
 

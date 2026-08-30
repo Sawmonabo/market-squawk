@@ -727,16 +727,16 @@ impl GovernedBacktestRecord {
         let Some(total_return) = terminal.metric("cost-adjusted-total-return") else {
             return Ok(unavailable_backtest_value(
                 token,
-                "The retained result does not include cost-adjusted total return.",
-                vec!["A profit-oriented conclusion requires an exact cost-adjusted return."],
+                "This result does not include return after estimated trading costs.",
+                vec!["A profit-oriented conclusion requires return after estimated trading costs."],
             ));
         };
         let Some(maximum_drawdown) = terminal.metric("maximum-drawdown") else {
             return Ok(unavailable_backtest_value(
                 token,
-                "The retained result does not include maximum drawdown.",
+                "This result does not include its largest historical decline.",
                 vec![
-                    "A result without drawdown evidence is not shown as usable investment research.",
+                    "The result cannot be used for investment research without its largest historical decline.",
                 ],
             ));
         };
@@ -779,7 +779,7 @@ impl GovernedBacktestRecord {
                 "observedThrough": timestamp_text(partition.ends_at())?,
                 "observationCount": observations,
                 "coveragePercent": Value::Null,
-                "interpretation": "The governed run proves its immutable event-time interval and execution assumptions. A separate row-level availability-coverage percentage is not retained, so point-in-time coverage remains limited.",
+                "interpretation": "The test used only information available within the displayed historical period and applied the trading-cost assumptions shown below. The share of individual records available at each historical cutoff was not measured, so point-in-time coverage remains limited.",
             },
             "outOfSampleEvidence": out_of_sample,
             "performance": {
@@ -792,16 +792,16 @@ impl GovernedBacktestRecord {
                 "turnoverPercent": Value::Null,
             },
             "costs": {
-                "fees": format!("{} basis points of filled notional", assumptions.fee_basis_points().get()),
-                "spread": "Observed point-in-time half-spread",
+                "fees": format!("{}% of each filled amount", basis_points_percent(assumptions.fee_basis_points().get())),
+                "spread": "Historical half of the bid-ask spread at each simulated fill",
                 "slippage": format!(
-                    "{} basis points plus up to {} seeded basis points",
-                    assumptions.slippage_basis_points().get(),
-                    assumptions.maximum_random_slippage_basis_points().get(),
+                    "{}% expected, plus up to {}% additional variation",
+                    basis_points_percent(assumptions.slippage_basis_points().get()),
+                    basis_points_percent(assumptions.maximum_random_slippage_basis_points().get()),
                 ),
-                "latency": format!("{} nanoseconds after each signal", assumptions.latency_nanos()),
+                "latency": product_latency_label(assumptions.latency_nanos()),
                 "participationLimit": format!(
-                    "{}% of evidenced executable depth",
+                    "{}% of available simulated market depth",
                     basis_points_percent(assumptions.maximum_participation_basis_points().get()),
                 ),
                 "partialFills": if assumptions.allow_partial_fills() { "Allowed" } else { "Not allowed" },
@@ -818,7 +818,7 @@ impl GovernedBacktestRecord {
             "limitations": limitations,
             "invalidators": [
                 "Treat the result as invalid if the investment universe, cost assumptions, or decision horizon no longer match the intended use.",
-                "Do not use the result for an investment action after newer point-in-time evidence materially changes the tested conditions."
+                "Do not use the result for an investment action after newer information materially changes the tested conditions."
             ],
             "analysisOnly": true,
         }))
@@ -1073,9 +1073,9 @@ fn backtest_evidence_summary(
     observations: u64,
 ) -> Result<(Value, &'static str, &'static str, Vec<&'static str>), ServiceError> {
     let common_limitations = vec![
-        "Annualized return, volatility, win rate, turnover, and a benchmark comparison are not retained by this terminal and are not inferred.",
-        "The displayed fixed cost percentage excludes the observed point-in-time spread, which varies by simulated fill.",
-        "Historical results do not guarantee future profit and cannot authorize a live trade.",
+        "Annualized return, volatility, win rate, turnover, and a benchmark comparison are not included and are not estimated.",
+        "The displayed fixed cost percentage excludes the historical bid-ask spread, which varies by simulated fill.",
+        "Historical results do not guarantee future profit and do not place or approve a live trade.",
     ];
     match terminal.cohort_diagnostics() {
         GovernedBacktestCohortDiagnosticsEvidence::Completed(evidence) => Ok((
@@ -1083,34 +1083,34 @@ fn backtest_evidence_summary(
                 "state": "evaluated",
                 "foldCount": evidence.fold_count(),
                 "observationCount": observations,
-                "method": "Governed cohort evaluation across independently retained folds",
+                "method": "Cross-validation across independent historical groups",
                 "probabilityOfOverfittingPercent": percent_decimal(evidence.probability_of_backtest_overfitting())?,
                 "deflatedPerformanceProbabilityPercent": percent_decimal(evidence.deflated_performance_probability())?,
                 "expectedMaximumSharpe": finite_decimal(evidence.expected_maximum_sharpe())?,
-                "interpretation": "The retained cohort diagnostics test selection risk across folds. These statistics measure research stability, not the probability of making a profit.",
+                "interpretation": "The cross-validation statistics test how sensitive the result is to strategy selection. They measure historical stability, not the probability of making a profit.",
             }),
             "supported",
-            "The result retains cost-adjusted return, drawdown, execution outcomes, and governed cohort diagnostics. Treat it as historical research with explicit uncertainty, not a promise of profit.",
+            "The result includes return after estimated costs, its largest decline, simulated fills, and cross-validation checks. Treat it as historical research with explicit uncertainty, not a promise of profit.",
             common_limitations,
         )),
         GovernedBacktestCohortDiagnosticsEvidence::NotEvaluated => {
             let mut limitations = common_limitations;
             limitations.push(
-                "No independent cohort evaluation is retained, so selection bias and overfitting risk remain unmeasured.",
+                "No independent cross-validation is available, so selection bias and overfitting risk remain unmeasured.",
             );
             Ok((
                 json!({
                     "state": "not_evaluated",
                     "foldCount": 0,
                     "observationCount": observations,
-                    "method": "No independent cohort evaluation retained",
+                    "method": "No independent cross-validation available",
                     "probabilityOfOverfittingPercent": Value::Null,
                     "deflatedPerformanceProbabilityPercent": Value::Null,
                     "expectedMaximumSharpe": Value::Null,
-                    "interpretation": "This run has no retained cross-fold cohort diagnostics, so it cannot establish robustness against selection bias or overfitting.",
+                    "interpretation": "This test has no independent cross-validation, so it cannot show whether the result is robust to selection bias or overfitting.",
                 }),
                 "limited",
-                "The result retains cost-adjusted return, drawdown, and execution outcomes, but lacks independent cohort evidence. Use it only as limited historical research.",
+                "The result includes return after estimated costs, its largest decline, and simulated fills, but lacks independent cross-validation. Use it only as limited historical research.",
                 limitations,
             ))
         }
@@ -1121,7 +1121,7 @@ fn product_method_label(selection_criterion: &str) -> &'static str {
     if selection_criterion == "cost-adjusted-total-return" {
         "Cost-adjusted portfolio simulation"
     } else {
-        "Governed investment approach simulation"
+        "Investment approach simulation"
     }
 }
 
@@ -1149,6 +1149,14 @@ fn finite_decimal(value: f64) -> Result<String, ServiceError> {
 
 fn basis_points_percent(value: i32) -> String {
     Decimal::new(i64::from(value), 2).normalize().to_string()
+}
+
+fn product_latency_label(nanoseconds: i64) -> String {
+    let milliseconds = Decimal::from(nanoseconds) / Decimal::from(1_000_000_i64);
+    format!(
+        "{} milliseconds after each signal",
+        milliseconds.normalize()
+    )
 }
 
 fn timestamp_text(timestamp: Timestamp) -> Result<String, ServiceError> {

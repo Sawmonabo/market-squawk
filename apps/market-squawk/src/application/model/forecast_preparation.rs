@@ -14,8 +14,9 @@ use async_trait::async_trait;
 use market_squawk_data::{DatasetManifestRef, ForecastDatasetEvidenceFence, Sha256Digest};
 use market_squawk_domain::{CalendarDate, DataQuality, InstrumentId, ModelId, SourceId, Timestamp};
 use market_squawk_modeling::{
-    BundleId, ForecastHorizon, ForecastObservedPoint, ForecastRequest, ModelFeatureValue,
-    ModelFormat, ModelInput, ModelMetadata, ModelOutputSemantics, TrainingDatasetIdentity,
+    BundleId, ForecastHorizon, ForecastObservedPoint, ForecastOutputBinding, ForecastRequest,
+    ModelBundle, ModelFeatureValue, ModelFormat, ModelInput, ModelMetadata, ModelOutputSemantics,
+    TrainingDatasetIdentity,
 };
 use market_squawk_services::{RequestOrigin, ServiceDomain, ToolDescriptor, TypedToolRequest};
 use serde_json::{Map, Value, json};
@@ -25,8 +26,13 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    forecast::GENERATE_FORECAST,
-    runtime::{ProductionModelRuntime, ProductionModelRuntimeError, RetainedForecastRuntime},
+    ForecastModelCalibrationState, ForecastModelEvidenceProjection, ForecastModelEvidenceState,
+    forecast::{ForecastProductIdentity, ForecastProductTarget, GENERATE_FORECAST},
+    forecast_model_evidence_projection, forecast_model_evidence_projection_for_horizon,
+    runtime::{
+        ProductionModelRuntime, ProductionModelRuntimeError, RetainedForecastRuntime,
+        RetainedRuntimeBackup,
+    },
 };
 use crate::application::lifecycle::WorkspaceRuntimeIdentity;
 
@@ -82,7 +88,8 @@ impl ForecastPreparationLimits {
 #[derive(Clone, Debug)]
 pub(crate) struct ForecastModelRequirement {
     runtime_generation_sha256: Sha256Digest,
-    metadata: Arc<ModelMetadata>,
+    bundle: Arc<ModelBundle>,
+    product_evidence: ForecastModelEvidenceProjection,
 }
 
 impl ForecastModelRequirement {
@@ -92,14 +99,30 @@ impl ForecastModelRequirement {
     }
 
     /// Returns the complete admitted model, feature, label, and dataset contract.
-    pub(crate) const fn metadata(&self) -> &Arc<ModelMetadata> {
-        &self.metadata
+    pub(crate) fn metadata(&self) -> &ModelMetadata {
+        self.bundle.metadata()
+    }
+
+    pub(crate) const fn product_evidence(&self) -> &ForecastModelEvidenceProjection {
+        &self.product_evidence
+    }
+
+    fn bind_selected_horizon(
+        &self,
+        horizon: ForecastHorizon,
+    ) -> Result<Self, ForecastPreparationError> {
+        Ok(Self {
+            runtime_generation_sha256: self.runtime_generation_sha256,
+            bundle: Arc::clone(&self.bundle),
+            product_evidence: forecast_model_evidence_projection_for_horizon(&self.bundle, horizon)
+                .map_err(|_| ForecastPreparationError::InvalidEvidence)?,
+        })
     }
 
     fn matches_coordinate(&self, selection: &ForecastPreparationSelection) -> bool {
-        self.metadata.model_id() == selection.model_id
-            && self.metadata.bundle_id() == &selection.bundle_id
-            && self.metadata.bundle_version() == selection.bundle_version
+        self.metadata().model_id() == selection.model_id
+            && self.metadata().bundle_id() == &selection.bundle_id
+            && self.metadata().bundle_version() == selection.bundle_version
     }
 }
 
@@ -950,9 +973,10 @@ pub struct ForecastModelSummary {
     dataset_export_sha256: Sha256Digest,
     dataset_policy_sha256: Sha256Digest,
     feature_count: usize,
-    calibrated_intervals: bool,
+    product_evidence: ForecastModelEvidenceProjection,
     format: ModelFormat,
     output_semantics: ModelOutputSemantics,
+    output_binding: ForecastOutputBinding,
     intended_use: Box<str>,
     limitations: Box<[Box<str>]>,
     fallback_reason: Box<str>,
@@ -960,7 +984,7 @@ pub struct ForecastModelSummary {
 
 impl ForecastModelSummary {
     fn from_requirement(requirement: &ForecastModelRequirement) -> Self {
-        let metadata = requirement.metadata.as_ref();
+        let metadata = requirement.metadata();
         Self {
             model_id: metadata.model_id(),
             bundle_id: metadata.bundle_id().clone(),
@@ -971,9 +995,10 @@ impl ForecastModelSummary {
             dataset_export_sha256: metadata.dataset().export_digest(),
             dataset_policy_sha256: metadata.dataset().policy_digest(),
             feature_count: metadata.features().len(),
-            calibrated_intervals: metadata.forecast_calibration().is_some(),
+            product_evidence: requirement.product_evidence.clone(),
             format: metadata.format(),
             output_semantics: metadata.output_semantics(),
+            output_binding: metadata.output_binding().clone(),
             intended_use: metadata.intended_use().into(),
             limitations: metadata.limitations().into(),
             fallback_reason: metadata.fallback_reason().into(),
@@ -1027,7 +1052,15 @@ impl ForecastModelSummary {
 
     #[must_use]
     pub const fn has_calibrated_intervals(&self) -> bool {
-        self.calibrated_intervals
+        matches!(
+            self.product_evidence.calibration(),
+            ForecastModelCalibrationState::Calibrated
+        )
+    }
+
+    #[must_use]
+    pub(crate) const fn product_evidence(&self) -> &ForecastModelEvidenceProjection {
+        &self.product_evidence
     }
 
     #[must_use]
@@ -1038,6 +1071,11 @@ impl ForecastModelSummary {
     #[must_use]
     pub const fn output_semantics(&self) -> ModelOutputSemantics {
         self.output_semantics
+    }
+
+    #[must_use]
+    pub const fn output_binding(&self) -> &ForecastOutputBinding {
+        &self.output_binding
     }
 
     #[must_use]
@@ -1184,6 +1222,7 @@ impl ForecastPreparationPreview {
 pub struct PreparedForecast {
     preview: ForecastPreparationPreview,
     receipt: ForecastPreparationReceipt,
+    product_identity: ForecastProductIdentity,
 }
 
 impl PreparedForecast {
@@ -1195,6 +1234,10 @@ impl PreparedForecast {
     #[must_use]
     pub const fn receipt(&self) -> ForecastPreparationReceipt {
         self.receipt
+    }
+
+    pub(crate) const fn product_identity(&self) -> &ForecastProductIdentity {
+        &self.product_identity
     }
 }
 
@@ -1373,7 +1416,8 @@ impl ForecastPreparationAuthority {
         validate_origin(origin, workspace)?;
         check_control(deadline, &cancellation)?;
         let retained = self.runtime.retain_forecast_runtime()?;
-        let request = catalog_request(&retained);
+        let backup = self.runtime.retain_backup()?;
+        let request = catalog_request(&retained, &backup)?;
         let models = request
             .models
             .iter()
@@ -1393,18 +1437,28 @@ impl ForecastPreparationAuthority {
     }
 
     /// Builds a human preview and retains the exact descriptor-admitted terminal request.
-    pub(crate) async fn prepare(
+    pub(crate) async fn prepare<F>(
         &self,
         origin: RequestOrigin,
         workspace: WorkspaceRuntimeIdentity,
         selection: ForecastPreparationSelection,
+        resolve_product_identity: F,
         deadline: Instant,
         cancellation: CancellationToken,
-    ) -> Result<PreparedForecast, ForecastPreparationError> {
+    ) -> Result<PreparedForecast, ForecastPreparationError>
+    where
+        F: FnOnce(
+                InstrumentId,
+                Timestamp,
+                Timestamp,
+            ) -> Result<ForecastProductIdentity, ForecastPreparationError>
+            + Send,
+    {
         validate_origin(origin, workspace)?;
         check_control(deadline, &cancellation)?;
         let retained = self.runtime.retain_forecast_runtime()?;
-        let catalog_request = catalog_request(&retained);
+        let backup = self.runtime.retain_backup()?;
+        let catalog_request = catalog_request(&retained, &backup)?;
         let model = catalog_request
             .models
             .iter()
@@ -1432,6 +1486,10 @@ impl ForecastPreparationAuthority {
             .copied()
             .find(|candidate| candidate.admits(&selection))
             .ok_or(ForecastPreparationError::IncompatibleSelection)?;
+        if option.pairing.fixed_horizon_nanos() != selection.horizon.step_nanos() {
+            return Err(ForecastPreparationError::IncompatibleSelection);
+        }
+        let model = model.bind_selected_horizon(selection.horizon)?;
         if instrument.observed_points.get() < policy.minimum_observed_points.get() {
             return Err(ForecastPreparationError::IncompatibleSelection);
         }
@@ -1452,9 +1510,31 @@ impl ForecastPreparationAuthority {
             .prepare(materialization.clone(), deadline, cancellation)
             .await?;
         validate_prepared_evidence(&materialization, &evidence)?;
+        let product_identity = resolve_product_identity(
+            selection.instrument_id,
+            evidence.serving_input.knowledge_cutoff(),
+            evidence.observed_cutoff,
+        )?;
+        if product_identity.knowledge_at() != evidence.serving_input.knowledge_cutoff()
+            || product_identity.effective_at() != evidence.observed_cutoff
+        {
+            return Err(ForecastPreparationError::InvalidEvidence);
+        }
+        let product_target =
+            ForecastProductTarget::try_from_binding(model.metadata().output_binding())
+                .map_err(|_| ForecastPreparationError::ModelUnavailable)?;
+        if model.product_evidence.overall() == ForecastModelEvidenceState::Unavailable {
+            return Err(ForecastPreparationError::ModelUnavailable);
+        }
+        if product_target
+            .currency_code()
+            .is_some_and(|currency| currency != product_identity.quote_currency().as_str())
+        {
+            return Err(ForecastPreparationError::IncompatibleSelection);
+        }
         let request = self
             .generate_descriptor
-            .admit(typed_arguments(&evidence)?)
+            .admit(typed_arguments(&evidence, &product_identity)?)
             .map_err(|_| ForecastPreparationError::InvalidEvidence)?;
         let (request_sha256, retained_request_bytes) = request_digest(&request)?;
         if retained_request_bytes > MAXIMUM_SINGLE_REQUEST_BYTES {
@@ -1523,7 +1603,11 @@ impl ForecastPreparationAuthority {
                 retained_request_bytes,
             },
         )?;
-        Ok(PreparedForecast { preview, receipt })
+        Ok(PreparedForecast {
+            preview,
+            receipt,
+            product_identity,
+        })
     }
 
     /// Consumes one matching receipt after revalidating model and analytical generations.
@@ -1598,20 +1682,48 @@ impl fmt::Debug for ForecastPreparationAuthority {
     }
 }
 
-fn catalog_request(retained: &RetainedForecastRuntime) -> ForecastEvidenceCatalogRequest {
-    let models = retained
-        .backends
-        .iter()
-        .map(|backend| ForecastModelRequirement {
-            runtime_generation_sha256: retained.generation_sha256,
-            metadata: Arc::new(backend.metadata().clone()),
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    ForecastEvidenceCatalogRequest {
-        runtime_generation_sha256: retained.generation_sha256,
-        models,
+fn catalog_request(
+    retained: &RetainedForecastRuntime,
+    backup: &RetainedRuntimeBackup,
+) -> Result<ForecastEvidenceCatalogRequest, ForecastPreparationError> {
+    if Sha256Digest::new(Sha256::digest(backup.canonical_index.as_ref()).into())
+        != retained.generation_sha256
+        || backup.models.len() != retained.backends.len()
+    {
+        return Err(ForecastPreparationError::ModelUnavailable);
     }
+    let mut models = Vec::new();
+    models
+        .try_reserve_exact(retained.backends.len())
+        .map_err(|_| ForecastPreparationError::Capacity)?;
+    for backend in &retained.backends {
+        let metadata = backend.metadata();
+        let mut matching = backup.models.iter().filter(|(_, bundle)| {
+            let candidate = bundle.metadata();
+            candidate.model_id() == metadata.model_id()
+                && candidate.bundle_id() == metadata.bundle_id()
+                && candidate.bundle_version() == metadata.bundle_version()
+                && candidate.metadata_hash() == metadata.metadata_hash()
+                && candidate.training_run_hash() == metadata.training_run_hash()
+                && candidate.output_binding().identity() == metadata.output_binding().identity()
+        });
+        let (_, bundle) = matching
+            .next()
+            .ok_or(ForecastPreparationError::InvalidEvidence)?;
+        if matching.next().is_some() {
+            return Err(ForecastPreparationError::InvalidEvidence);
+        }
+        models.push(ForecastModelRequirement {
+            runtime_generation_sha256: retained.generation_sha256,
+            bundle: Arc::clone(bundle),
+            product_evidence: forecast_model_evidence_projection(bundle)
+                .map_err(|_| ForecastPreparationError::InvalidEvidence)?,
+        });
+    }
+    Ok(ForecastEvidenceCatalogRequest {
+        runtime_generation_sha256: retained.generation_sha256,
+        models: models.into_boxed_slice(),
+    })
 }
 
 fn validate_catalog(
@@ -1623,7 +1735,7 @@ fn validate_catalog(
     }
     for dataset in catalog.datasets() {
         let model = request.models.iter().find(|model| {
-            let metadata = model.metadata.as_ref();
+            let metadata = model.metadata();
             metadata.model_id() == dataset.model_id
                 && metadata.bundle_id() == &dataset.bundle_id
                 && metadata.bundle_version() == dataset.bundle_version
@@ -1634,9 +1746,9 @@ fn validate_catalog(
         if model.runtime_generation_sha256 != request.runtime_generation_sha256 {
             return Err(ForecastPreparationError::InvalidEvidence);
         }
-        if dataset.pairing.training() != model.metadata.dataset()
+        if dataset.pairing.training() != model.metadata().dataset()
             || dataset.pairing.analysis_fence().as_of()
-                != model.metadata.dataset().selection_as_of()
+                != model.metadata().dataset().selection_as_of()
         {
             return Err(ForecastPreparationError::InvalidEvidence);
         }
@@ -1685,7 +1797,7 @@ fn validate_prepared_evidence(
         return Err(ForecastPreparationError::InvalidEvidence);
     }
     validate_forecast_shape(
-        expected.model.metadata.as_ref(),
+        expected.model.metadata(),
         &expected.selection,
         evidence.observed_cutoff,
         evidence.available_at,
@@ -1751,6 +1863,7 @@ fn validate_forecast_shape(
 
 fn typed_arguments(
     evidence: &PreparedForecastEvidence,
+    product_identity: &ForecastProductIdentity,
 ) -> Result<Map<String, Value>, ForecastPreparationError> {
     let selection = &evidence.request.selection;
     let observed = evidence
@@ -1788,6 +1901,15 @@ fn typed_arguments(
             "request".to_owned(),
             json!({
                 "instrumentId": selection.instrument_id.to_string(),
+                "productIdentity": {
+                    "displayName": product_identity.display_name(),
+                    "canonicalSymbol": product_identity.canonical_symbol(),
+                    "description": product_identity.description(),
+                    "quoteCurrency": product_identity.quote_currency().as_str(),
+                    "knowledgeAtUnixNanos": product_identity.knowledge_at().unix_nanos(),
+                    "effectiveAtUnixNanos": product_identity.effective_at().unix_nanos(),
+                },
+                "modelEvidence": evidence.request.model.product_evidence().product_value(),
                 "bundleId": selection.bundle_id.as_str(),
                 "bundleVersion": selection.bundle_version.get(),
                 "observedThroughUnixNanos": evidence.observed_cutoff.unix_nanos(),

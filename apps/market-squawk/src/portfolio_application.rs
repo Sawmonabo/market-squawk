@@ -7,6 +7,7 @@ mod backup;
 mod candidate;
 mod import;
 mod model;
+mod product;
 mod read;
 mod recommendation;
 

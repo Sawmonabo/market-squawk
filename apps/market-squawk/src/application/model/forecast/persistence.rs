@@ -19,8 +19,8 @@ use market_squawk_modeling::{
     ForecastCentralStatistic, ForecastCoverage, ForecastEstimatorProfile, ForecastHorizon,
     ForecastMeasurement, ForecastObservedPoint, ForecastOutcome, ForecastOutputBinding,
     ForecastPath, ForecastTargetMeaning, ForecastTrainingObjective, ForecastTransform,
-    ForecastValue, ForecastVintage, ModelMetadata, ModelOutputSemantics, RealizedCoverage,
-    verify_forecast_vintage_identity,
+    ForecastValue, ForecastVintage, ModelBundle, ModelMetadata, ModelOutputSemantics,
+    RealizedCoverage, verify_forecast_vintage_identity,
 };
 use market_squawk_services::{ArtifactRead, ArtifactReference};
 use serde::{Deserialize, Serialize};
@@ -29,11 +29,16 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::application::domain_support::opaque_product_token;
+use crate::application::model::{
+    ForecastModelCalibrationState, ForecastModelEvidenceProjection, ForecastModelEvidenceState,
+    forecast_model_evidence_projection_for_horizon,
+};
 
 use super::{
     FORECAST_PAYLOAD_SCHEMA_VERSION, FORECAST_SELECTION_POLICY_REVISION, ForecastAnalysisEvidence,
     ForecastApplicationError, ForecastApplicationLimits, ForecastPriceEvidence,
-    ForecastPriceUnavailableReason, ForecastSelectionOrder, ForecastSelectionQualification,
+    ForecastPriceUnavailableReason, ForecastProductHorizon, ForecastProductIdentity,
+    ForecastProductTarget, ForecastSelectionOrder, ForecastSelectionQualification,
     ForecastSelectionReceipt, ForecastSelectionReceiptBody, ForecastServingEvidence,
     INDEX_SCHEMA_VERSION, SelectedForecastPriceUnavailable, SelectedPriceForecast,
     SelectedPriceForecastPoint, SelectedPriceInterval, SelectedPriceIntervals,
@@ -88,19 +93,16 @@ impl VintageRecord {
     pub(super) fn product_summary(&self) -> Result<Value, ForecastApplicationError> {
         Ok(json!({
             "forecastToken": self.product_token()?,
-            "investmentToken": self.payload.instrument_id,
+            "investment": self.payload.product_identity.product_value(),
+            "target": self.payload.output_binding.product_value()?,
+            "modelEvidence": self.payload.model_evidence.product_value()?,
             "observedThroughUnixNanos": self.payload.observed_through_unix_nanos.to_string(),
             "createdAtUnixNanos": self.payload.created_at_unix_nanos.to_string(),
             "expiresAtUnixNanos": self.payload.expires_at_unix_nanos.to_string(),
-            "horizon": {
-                "points": self.payload.horizon_points,
-                "stepNanos": self.payload.horizon_step_nanos.to_string(),
-            },
-            "evidenceState": if self.payload.calibration.is_some() {
-                "calibrated"
-            } else {
-                "limited"
-            },
+            "horizon": product_horizon(
+                self.payload.horizon_points,
+                self.payload.horizon_step_nanos,
+            )?,
             "historicalObservationCount": self.payload.observed_history.len(),
             "limitations": self.payload.limitations,
         }))
@@ -114,13 +116,13 @@ impl VintageRecord {
             .payload
             .points
             .iter()
-            .map(PointRecord::product_value)
+            .map(|point| point.product_value(&self.payload.output_binding))
             .collect::<Result<Vec<_>, _>>()?;
         let observed_history = self
             .payload
             .observed_history
             .iter()
-            .map(ObservedPointRecord::product_value)
+            .map(|point| point.product_value(&self.payload.output_binding))
             .collect::<Result<Vec<_>, _>>()?;
         let calibration = self
             .payload
@@ -130,20 +132,17 @@ impl VintageRecord {
             .transpose()?;
         Ok(json!({
             "forecastToken": self.product_token()?,
-            "investmentToken": self.payload.instrument_id,
+            "investment": self.payload.product_identity.product_value(),
+            "target": self.payload.output_binding.product_value()?,
+            "modelEvidence": self.payload.model_evidence.product_value()?,
             "observedThroughUnixNanos": self.payload.observed_through_unix_nanos.to_string(),
             "availableAtUnixNanos": self.payload.available_at_unix_nanos.to_string(),
             "createdAtUnixNanos": self.payload.created_at_unix_nanos.to_string(),
             "expiresAtUnixNanos": self.payload.expires_at_unix_nanos.to_string(),
-            "horizon": {
-                "points": self.payload.horizon_points,
-                "stepNanos": self.payload.horizon_step_nanos.to_string(),
-            },
-            "evidenceState": if self.payload.calibration.is_some() {
-                "calibrated"
-            } else {
-                "limited"
-            },
+            "horizon": product_horizon(
+                self.payload.horizon_points,
+                self.payload.horizon_step_nanos,
+            )?,
             "observedHistory": observed_history,
             "estimates": estimates,
             "calibration": calibration,
@@ -156,6 +155,21 @@ impl VintageRecord {
 
     pub(super) fn decimal_scale(&self) -> Option<u8> {
         self.payload.points.first().map(|point| point.decimal_scale)
+    }
+
+    pub(super) fn product_outcome(
+        &self,
+        outcome: &OutcomeRecord,
+    ) -> Result<Value, ForecastApplicationError> {
+        outcome.product_value(&self.payload.output_binding)
+    }
+
+    pub(super) fn product_amount(
+        &self,
+        mantissa: &str,
+        scale: u8,
+    ) -> Result<Value, ForecastApplicationError> {
+        self.payload.output_binding.product_amount(mantissa, scale)
     }
 
     pub(in crate::application::model) fn artifact_reference(
@@ -253,9 +267,23 @@ impl VintageRecord {
 
     pub(super) fn revalidated_price_evidence(
         &self,
-        metadata: &ModelMetadata,
+        bundle: &ModelBundle,
     ) -> Result<ForecastPriceEvidence, ForecastApplicationError> {
+        let metadata = bundle.metadata();
         if !self.validate() || !self.payload.matches_model_metadata(metadata) {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        let selected_horizon = ForecastHorizon::try_new(
+            NonZeroU16::new(self.payload.horizon_points)
+                .ok_or(ForecastApplicationError::CorruptIndex)?,
+            NonZeroU64::new(self.payload.horizon_step_nanos)
+                .ok_or(ForecastApplicationError::CorruptIndex)?,
+        )
+        .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+        let authoritative_model_evidence =
+            forecast_model_evidence_projection_for_horizon(bundle, selected_horizon)
+                .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+        if self.payload.model_evidence.typed()? != authoritative_model_evidence {
             return Err(ForecastApplicationError::CorruptIndex);
         }
         let instrument_id = InstrumentId::from_str(&self.payload.instrument_id)
@@ -428,6 +456,170 @@ struct ForecastOutputBindingRecord {
     label: ForecastOutputLabelRecord,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForecastProductIdentityRecord {
+    display_name: String,
+    canonical_symbol: Option<String>,
+    description: String,
+    quote_currency: String,
+    knowledge_at_unix_nanos: i64,
+    effective_at_unix_nanos: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForecastModelEvidenceRecord {
+    model_token: String,
+    selected_horizon_points: u16,
+    selected_horizon_step_nanos: u64,
+    overall: String,
+    pit_inputs: String,
+    out_of_sample: String,
+    horizon_alignment: String,
+    calibration: String,
+    interpretation: String,
+}
+
+impl ForecastModelEvidenceRecord {
+    fn from_projection(
+        value: &ForecastModelEvidenceProjection,
+    ) -> Result<Self, ForecastApplicationError> {
+        let selected_horizon = value
+            .selected_horizon()
+            .ok_or(ForecastApplicationError::InvalidRecord)?;
+        Ok(Self {
+            model_token: value.model_token().to_string(),
+            selected_horizon_points: selected_horizon.points().get(),
+            selected_horizon_step_nanos: selected_horizon.step_nanos().get(),
+            overall: value.overall().as_str().to_owned(),
+            pit_inputs: value.pit_inputs().as_str().to_owned(),
+            out_of_sample: value.out_of_sample().as_str().to_owned(),
+            horizon_alignment: value.horizon_alignment().as_str().to_owned(),
+            calibration: value.calibration().as_str().to_owned(),
+            interpretation: value.interpretation().to_owned(),
+        })
+    }
+
+    fn typed(&self) -> Result<ForecastModelEvidenceProjection, ForecastApplicationError> {
+        let selected_horizon = ForecastHorizon::try_new(
+            NonZeroU16::new(self.selected_horizon_points)
+                .ok_or(ForecastApplicationError::CorruptIndex)?,
+            NonZeroU64::new(self.selected_horizon_step_nanos)
+                .ok_or(ForecastApplicationError::CorruptIndex)?,
+        )
+        .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+        ForecastModelEvidenceProjection::try_from_product_fields_for_horizon(
+            Uuid::parse_str(&self.model_token)
+                .map_err(|_| ForecastApplicationError::CorruptIndex)?,
+            selected_horizon,
+            &self.overall,
+            &self.pit_inputs,
+            &self.out_of_sample,
+            &self.horizon_alignment,
+            &self.calibration,
+            &self.interpretation,
+        )
+        .ok_or(ForecastApplicationError::CorruptIndex)
+    }
+
+    fn validate(&self) -> bool {
+        self.typed().is_ok()
+    }
+
+    fn product_value(&self) -> Result<Value, ForecastApplicationError> {
+        self.typed().map(|value| value.product_value())
+    }
+
+    fn matches_product_model(
+        &self,
+        model_id: &str,
+        bundle_id: &str,
+        bundle_version: u64,
+        horizon_points: u16,
+        horizon_step_nanos: u64,
+        calibrated: bool,
+    ) -> bool {
+        let Ok(model_id) = ModelId::from_str(model_id) else {
+            return false;
+        };
+        let Ok(bundle_id) = BundleId::try_new(bundle_id) else {
+            return false;
+        };
+        let Some(bundle_version) = NonZeroU64::new(bundle_version) else {
+            return false;
+        };
+        let Ok(value) = self.typed() else {
+            return false;
+        };
+        let expected_token = opaque_product_token(
+            b"market-squawk/product-model/v1\0",
+            &[
+                model_id.as_uuid().as_bytes(),
+                bundle_id.as_str().as_bytes(),
+                &bundle_version.get().to_be_bytes(),
+            ],
+        );
+        value.model_token() == expected_token
+            && value.selected_horizon().is_some_and(|selected| {
+                selected.points().get() == horizon_points
+                    && selected.step_nanos().get() == horizon_step_nanos
+            })
+            && value.overall() != ForecastModelEvidenceState::Unavailable
+            && matches!(
+                (value.calibration(), calibrated),
+                (ForecastModelCalibrationState::Calibrated, true)
+                    | (
+                        ForecastModelCalibrationState::Limited
+                            | ForecastModelCalibrationState::Unavailable,
+                        false
+                    )
+            )
+    }
+}
+
+impl ForecastProductIdentityRecord {
+    fn from_identity(identity: &ForecastProductIdentity) -> Self {
+        Self {
+            display_name: identity.display_name().to_owned(),
+            canonical_symbol: identity.canonical_symbol().map(str::to_owned),
+            description: identity.description().to_owned(),
+            quote_currency: identity.quote_currency().as_str().to_owned(),
+            knowledge_at_unix_nanos: identity.knowledge_at().unix_nanos(),
+            effective_at_unix_nanos: identity.effective_at().unix_nanos(),
+        }
+    }
+
+    fn typed(&self) -> Result<ForecastProductIdentity, ForecastApplicationError> {
+        let currency = Currency::try_from(self.quote_currency.as_str())
+            .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+        if currency.as_str() != self.quote_currency {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        ForecastProductIdentity::try_new(
+            self.display_name.clone(),
+            self.canonical_symbol.clone(),
+            self.description.clone(),
+            currency,
+            Timestamp::from_unix_nanos(self.knowledge_at_unix_nanos),
+            Timestamp::from_unix_nanos(self.effective_at_unix_nanos),
+        )
+        .map_err(|_| ForecastApplicationError::CorruptIndex)
+    }
+
+    fn validate(&self) -> bool {
+        self.typed().is_ok()
+    }
+
+    fn product_value(&self) -> Value {
+        json!({
+            "name": self.display_name,
+            "symbol": self.canonical_symbol,
+            "description": self.description,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum ForecastTargetRecord {
@@ -474,7 +666,10 @@ impl ForecastOutputBindingRecord {
             && self.decoded_semantics().is_some()
             && self.decoded_measurement().is_some()
             && self.decoded_central_statistic().is_some()
-            && self.target.decoded().is_some()
+            && matches!(
+                self.target.decoded(),
+                Some(ForecastTargetMeaning::FixedHorizonTerminal { .. })
+            )
             && self.decoded_target_transform().is_some()
             && self.decoded_output_transform().is_some()
             && self.decoded_objective().is_some()
@@ -603,6 +798,49 @@ impl ForecastOutputBindingRecord {
             && target_transform == ForecastTransform::Identity
             && (statistic != ForecastCentralStatistic::ModelEstimatedConditionalMean
                 || expected_value_contract)
+    }
+
+    fn product_value(&self) -> Result<Value, ForecastApplicationError> {
+        if !self.validate() {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        let measurement = self
+            .decoded_measurement()
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+        let target_meaning = self
+            .target
+            .decoded()
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+        let label = self
+            .label
+            .decoded()
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+        let target =
+            ForecastProductTarget::try_from_admitted_parts(measurement, target_meaning, &label)?;
+        Ok(json!({
+            "label": target.label(),
+            "meaning": target.meaning(),
+            "valueKind": target.value_kind(),
+            "unitLabel": target.unit_label(),
+            "currencyCode": target.currency_code(),
+        }))
+    }
+
+    fn product_amount(&self, mantissa: &str, scale: u8) -> Result<Value, ForecastApplicationError> {
+        let exact = decimal_text(mantissa, scale)?;
+        let formatted = match self
+            .decoded_measurement()
+            .ok_or(ForecastApplicationError::CorruptIndex)?
+        {
+            ForecastMeasurement::Price { currency } => format!("{exact} {}", currency.as_str()),
+            ForecastMeasurement::Return => format!("{exact} return"),
+            ForecastMeasurement::Probability => format!("{exact} probability"),
+            ForecastMeasurement::OtherRegression => exact.clone(),
+        };
+        Ok(json!({
+            "exact": exact,
+            "formatted": formatted,
+        }))
     }
 }
 
@@ -969,6 +1207,8 @@ struct ForecastAnalysisSchemaRecord {
 pub(super) struct ForecastPayloadRecord {
     payload_schema_version: u32,
     instrument_id: String,
+    product_identity: ForecastProductIdentityRecord,
+    model_evidence: ForecastModelEvidenceRecord,
     model_id: String,
     bundle_id: String,
     bundle_version: u64,
@@ -1003,6 +1243,8 @@ pub(super) struct ForecastPayloadRecord {
 impl ForecastPayloadRecord {
     pub(super) fn from_path(
         path: &ForecastPath,
+        product_identity: &ForecastProductIdentity,
+        model_evidence: &ForecastModelEvidenceProjection,
         analysis_evidence: &ForecastAnalysisEvidence,
         serving_evidence: &ForecastServingEvidence,
         created_at: market_squawk_domain::Timestamp,
@@ -1030,9 +1272,11 @@ impl ForecastPayloadRecord {
         if model_age_nanos_at_publication < 0 || data_age_nanos_at_publication < 0 {
             return Err(ForecastApplicationError::InvalidRecord);
         }
-        Ok(Self {
+        let record = Self {
             payload_schema_version: FORECAST_PAYLOAD_SCHEMA_VERSION,
             instrument_id: path.instrument_id().to_string(),
+            product_identity: ForecastProductIdentityRecord::from_identity(product_identity),
+            model_evidence: ForecastModelEvidenceRecord::from_projection(model_evidence)?,
             model_id: path.model_id().to_string(),
             bundle_id: path.bundle_id().as_str().to_owned(),
             bundle_version: path.bundle_version().get(),
@@ -1080,7 +1324,11 @@ impl ForecastPayloadRecord {
                 .map(|value| value.to_string())
                 .collect(),
             unavailable_reason: path.fallback_reason().to_owned(),
-        })
+        };
+        if !record.validate() {
+            return Err(ForecastApplicationError::InvalidRecord);
+        }
+        Ok(record)
     }
 
     fn validate(&self) -> bool {
@@ -1096,6 +1344,16 @@ impl ForecastPayloadRecord {
             .checked_sub(self.observed_through_unix_nanos);
         if self.payload_schema_version != FORECAST_PAYLOAD_SCHEMA_VERSION
             || !self.output_binding.validate()
+            || !self.product_identity.validate()
+            || !self.model_evidence.validate()
+            || !self.model_evidence.matches_product_model(
+                &self.model_id,
+                &self.bundle_id,
+                self.bundle_version,
+                self.horizon_points,
+                self.horizon_step_nanos,
+                self.calibration.is_some(),
+            )
             || !self.analysis_evidence.validate()
             || !self.serving_evidence.validate()
             || InstrumentId::from_str(&self.instrument_id).is_err()
@@ -1122,6 +1380,9 @@ impl ForecastPayloadRecord {
             || self.training_end_unix_nanos > self.observed_through_unix_nanos
             || self.available_at_unix_nanos < self.observed_through_unix_nanos
             || self.serving_evidence.observed_through_unix_nanos != self.observed_through_unix_nanos
+            || self.product_identity.knowledge_at_unix_nanos
+                != self.serving_evidence.knowledge_cutoff_unix_nanos
+            || self.product_identity.effective_at_unix_nanos != self.observed_through_unix_nanos
             || self.available_at_unix_nanos > self.serving_evidence.knowledge_cutoff_unix_nanos
             || self.created_at_unix_nanos < self.available_at_unix_nanos
             || self.created_at_unix_nanos >= first.target_at_unix_nanos
@@ -1139,6 +1400,11 @@ impl ForecastPayloadRecord {
                 .any(|point| point.decimal_scale != first.decimal_scale)
             || self.observed_history.len() > market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS
             || self.quality != "modeled"
+            || matches!(
+                self.output_binding.decoded_measurement(),
+                Some(ForecastMeasurement::Price { currency })
+                    if currency.as_str() != self.product_identity.quote_currency
+            )
         {
             return false;
         }
@@ -1333,11 +1599,14 @@ impl ObservedPointRecord {
         .map_err(|_error| ForecastApplicationError::CorruptIndex)
     }
 
-    fn product_value(&self) -> Result<Value, ForecastApplicationError> {
+    fn product_value(
+        &self,
+        binding: &ForecastOutputBindingRecord,
+    ) -> Result<Value, ForecastApplicationError> {
         Ok(json!({
             "observedAtUnixNanos": self.observed_at_unix_nanos.to_string(),
             "availableAtUnixNanos": self.available_at_unix_nanos.to_string(),
-            "value": decimal_text(&self.mantissa, self.decimal_scale)?,
+            "value": binding.product_amount(&self.mantissa, self.decimal_scale)?,
         }))
     }
 }
@@ -1407,12 +1676,15 @@ impl PointRecord {
         })
     }
 
-    fn product_value(&self) -> Result<Value, ForecastApplicationError> {
-        let central = decimal_text(&self.central_mantissa, self.decimal_scale)?;
+    fn product_value(
+        &self,
+        binding: &ForecastOutputBindingRecord,
+    ) -> Result<Value, ForecastApplicationError> {
+        let central = binding.product_amount(&self.central_mantissa, self.decimal_scale)?;
         let ranges = self
             .intervals
             .as_ref()
-            .map(|intervals| intervals.product_value(self.decimal_scale))
+            .map(|intervals| intervals.product_value(self.decimal_scale, binding))
             .transpose()?;
         Ok(json!({
             "targetAtUnixNanos": self.target_at_unix_nanos.to_string(),
@@ -1533,11 +1805,15 @@ impl IntervalRecord {
         })
     }
 
-    fn product_value(&self, scale: u8) -> Result<Value, ForecastApplicationError> {
+    fn product_value(
+        &self,
+        scale: u8,
+        binding: &ForecastOutputBindingRecord,
+    ) -> Result<Value, ForecastApplicationError> {
         let range = |pair: &[String; 2]| -> Result<Value, ForecastApplicationError> {
             Ok(json!({
-                "lower": decimal_text(&pair[0], scale)?,
-                "upper": decimal_text(&pair[1], scale)?,
+                "lower": binding.product_amount(&pair[0], scale)?,
+                "upper": binding.product_amount(&pair[1], scale)?,
             }))
         };
         Ok(json!({
@@ -1634,7 +1910,7 @@ impl CalibrationRecord {
         let bands = [0_usize, 1, 2]
             .map(|index| {
                 Ok(json!({
-                    "targetCoveragePercent": decimal_text(
+                    "targetCoveragePercent": product_percent(
                         &self.target_coverage_basis_points[index].to_string(),
                         2,
                     )?,
@@ -1787,14 +2063,17 @@ impl OutcomeRecord {
         self.absolute_error_mantissa.parse().ok()
     }
 
-    pub(super) fn product_value(&self) -> Result<Value, ForecastApplicationError> {
+    fn product_value(
+        &self,
+        binding: &ForecastOutputBindingRecord,
+    ) -> Result<Value, ForecastApplicationError> {
         Ok(json!({
             "targetAtUnixNanos": self.target_at_unix_nanos.to_string(),
             "observedAtUnixNanos": self.observed_at_unix_nanos.to_string(),
             "availableAtUnixNanos": self.available_at_unix_nanos.to_string(),
-            "actual": decimal_text(&self.actual_mantissa, self.decimal_scale)?,
-            "signedError": decimal_text(&self.signed_error_mantissa, self.decimal_scale)?,
-            "absoluteError": decimal_text(&self.absolute_error_mantissa, self.decimal_scale)?,
+            "actual": binding.product_amount(&self.actual_mantissa, self.decimal_scale)?,
+            "signedError": binding.product_amount(&self.signed_error_mantissa, self.decimal_scale)?,
+            "absoluteError": binding.product_amount(&self.absolute_error_mantissa, self.decimal_scale)?,
         }))
     }
 
@@ -2289,6 +2568,30 @@ pub(super) fn decimal_text(value: &str, scale: u8) -> Result<String, ForecastApp
     Ok(rendered)
 }
 
+fn product_horizon(points: u16, step_nanos: u64) -> Result<Value, ForecastApplicationError> {
+    let horizon = ForecastHorizon::try_new(
+        NonZeroU16::new(points).ok_or(ForecastApplicationError::CorruptIndex)?,
+        NonZeroU64::new(step_nanos).ok_or(ForecastApplicationError::CorruptIndex)?,
+    )
+    .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+    let product = ForecastProductHorizon::try_from_horizon(horizon)
+        .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+    Ok(json!({
+        "label": product.label(),
+        "description": product.description(),
+        "points": product.points(),
+    }))
+}
+
+fn product_percent(value: &str, scale: u8) -> Result<Value, ForecastApplicationError> {
+    let exact = decimal_text(value, scale)?;
+    let formatted = format!("{exact}%");
+    Ok(json!({
+        "exact": exact,
+        "formatted": formatted,
+    }))
+}
+
 fn decoded_observed_quality(value: &str) -> Option<DataQuality> {
     match value {
         "direct_verified" => Some(DataQuality::DirectVerified),
@@ -2588,6 +2891,7 @@ mod tests {
             expires_at_unix_nanos,
         );
         vintage.payload.horizon_step_nanos = horizon_nanos;
+        vintage.payload.model_evidence.selected_horizon_step_nanos = horizon_nanos;
         vintage.payload.points[0].target_at_unix_nanos =
             available_at_unix_nanos + i64::try_from(horizon_nanos).expect("fixture horizon fits");
         vintage.payload.points[0].intervals = Some(IntervalRecord {
@@ -2614,6 +2918,7 @@ mod tests {
                 "realized marginal empirical coverage; not a per-observation guarantee".to_owned(),
             dependence_assumptions: "fixture marginal calibration".to_owned(),
         });
+        vintage.payload.model_evidence.calibration = "calibrated".to_owned();
         vintage.payload.output_binding.target =
             ForecastTargetRecord::FixedHorizonTerminal { horizon_nanos };
         if return_measurement {
@@ -2639,12 +2944,44 @@ mod tests {
         expires_at_unix_nanos: i64,
     ) -> VintageRecord {
         let observed_through_unix_nanos = available_at_unix_nanos;
+        let model_id =
+            ModelId::from_str("cccccccc-cccc-4ccc-8ccc-cccccccccccc").expect("fixture model id");
+        let bundle_id = BundleId::try_new("selection-fixture").expect("fixture bundle id");
+        let bundle_version = NonZeroU64::new(1).expect("fixture bundle version");
+        let model_token = opaque_product_token(
+            b"market-squawk/product-model/v1\0",
+            &[
+                model_id.as_uuid().as_bytes(),
+                bundle_id.as_str().as_bytes(),
+                &bundle_version.get().to_be_bytes(),
+            ],
+        );
         let payload = ForecastPayloadRecord {
             payload_schema_version: FORECAST_PAYLOAD_SCHEMA_VERSION,
             instrument_id: instrument_id.to_string(),
-            model_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc".to_owned(),
-            bundle_id: "selection-fixture".to_owned(),
-            bundle_version: 1,
+            product_identity: ForecastProductIdentityRecord {
+                display_name: "Fixture investment".to_owned(),
+                canonical_symbol: Some("FIX".to_owned()),
+                description: "Listed company investment with point-in-time verified identity."
+                    .to_owned(),
+                quote_currency: "USD".to_owned(),
+                knowledge_at_unix_nanos: available_at_unix_nanos,
+                effective_at_unix_nanos: observed_through_unix_nanos,
+            },
+            model_evidence: ForecastModelEvidenceRecord {
+                model_token: model_token.to_string(),
+                selected_horizon_points: 1,
+                selected_horizon_step_nanos: 100,
+                overall: "limited".to_owned(),
+                pit_inputs: "sufficient".to_owned(),
+                out_of_sample: "limited".to_owned(),
+                horizon_alignment: "sufficient".to_owned(),
+                calibration: "limited".to_owned(),
+                interpretation: "Some required model evidence is limited or unavailable. Use this forecast only as supporting research, and take no action when required evidence is missing.".to_owned(),
+            },
+            model_id: model_id.to_string(),
+            bundle_id: bundle_id.as_str().to_owned(),
+            bundle_version: bundle_version.get(),
             metadata_hash: hex([10; 32]),
             artifact_hash: hex([11; 32]),
             training_run_hash: hex([12; 32]),

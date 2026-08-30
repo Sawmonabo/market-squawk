@@ -32,7 +32,10 @@ pub use request::{
     JsonContractError, JsonStructureLimits, RequestContext, RequestId, RequestIdError,
     RequestOrigin, RequestOriginError, ServiceLimits, ServiceLimitsError, validate_json_contract,
 };
-pub use response::{ResultCompleteness, ServiceContractError, ToolResultMetadata, TypedToolResult};
+pub use response::{
+    ResultCompleteness, ResultEnvelopeProjection, ServiceContractError, ToolResultMetadata,
+    TypedToolResult,
+};
 pub use traits::{
     ServiceCapabilities, ServiceCapabilityError, ServiceError, ServiceErrorClass, ToolDescriptor,
     ToolEffects, ToolInputAdmission, ToolInputError, ToolServices, TypedToolRequest,

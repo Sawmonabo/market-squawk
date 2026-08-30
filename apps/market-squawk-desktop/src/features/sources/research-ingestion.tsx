@@ -14,13 +14,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import type { DesktopBootstrap } from "@/lib/schemas"
-import type { ProductTransport } from "@/lib/transport"
+import { projectDesktopBootstrap, type DesktopSystemBootstrap } from "@/lib/schemas"
+import type { SystemTransport } from "@/lib/transport"
 
 import {
   parseResearchJobReceipt,
   type ResearchJobReceipt,
-} from "@/features/research/research-contracts"
+} from "./research-system-contracts"
 import { ResearchFileImport } from "@/features/research/research-file-import"
 
 import {
@@ -37,14 +37,14 @@ export function ResearchIngestion({
   transport,
   onStarted,
 }: {
-  bootstrap: DesktopBootstrap
+  bootstrap: DesktopSystemBootstrap
   connectedSourceIngestionAvailable: boolean
-  transport: ProductTransport
+  transport: SystemTransport
   onStarted: () => void
 }) {
   const queryClient = useQueryClient()
   const sourceKey = [
-    ...productKeys.domain(bootstrap.runtime, "source"),
+    ...productKeys.domain(bootstrap.productSessionToken, "source"),
     "research-inputs",
   ] as const
   const sources = useQuery({
@@ -52,13 +52,13 @@ export function ResearchIngestion({
     enabled: connectedSourceIngestionAvailable,
     queryFn: async () =>
       parseResearchSourceInputs(
-        await transport.query({ query: "sourceStatus" }),
+        await transport.systemQuery({ query: "sourceStatus" }),
       ),
   })
   const [sourceIdentity, setSourceIdentity] = React.useState("")
   const source = selectedSource(sources.data ?? [], sourceIdentity)
   const objectKey = [
-    ...productKeys.domain(bootstrap.runtime, "source"),
+    ...productKeys.domain(bootstrap.productSessionToken, "source"),
     "research-objects",
     source?.provider ?? null,
     source?.dataset ?? null,
@@ -69,7 +69,7 @@ export function ResearchIngestion({
     queryFn: async () => {
       const selected = requiredSource(source)
       return parseResearchSourceObjects(
-        await transport.query({
+        await transport.systemQuery({
           query: "researchSourceObjects",
           provider: selected.provider,
           dataset: selected.dataset,
@@ -139,7 +139,7 @@ export function ResearchIngestion({
   if (!connectedSourceIngestionAvailable) {
     return (
       <>
-        <ResearchFileImport bootstrap={bootstrap} onStarted={onStarted} />
+        <ResearchFileImport bootstrap={projectDesktopBootstrap(bootstrap)} onStarted={onStarted} />
         <ActionUnavailable
           title="Connected-source ingestion is not available"
           detail="Connect and verify an eligible source before starting a durable import."
@@ -150,7 +150,7 @@ export function ResearchIngestion({
 
   return (
     <>
-      <ResearchFileImport bootstrap={bootstrap} onStarted={onStarted} />
+      <ResearchFileImport bootstrap={projectDesktopBootstrap(bootstrap)} onStarted={onStarted} />
       <section className="mt-5 rounded-xl border border-border bg-card/35 p-5">
         <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
           <div>

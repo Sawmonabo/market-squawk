@@ -43,13 +43,12 @@ export function MacroContext({ bootstrap, transport }: MacroContextProps) {
     effectiveDateCutoff,
   })
   const context = useQuery({
-    queryKey: productKeys.operation(bootstrap.runtime, "research", operation, {
+    queryKey: productKeys.operation(bootstrap.productSessionToken, "research", operation, {
       knowledgeCutoff: cutoffs?.knowledgeCutoff ?? null,
       effectiveDateCutoff: cutoffs?.effectiveDateCutoff ?? null,
       requestVersion,
     }),
     enabled: operationAvailable,
-    retry: false,
     queryFn: async () =>
       parseMacroContext(
         await transport.query({

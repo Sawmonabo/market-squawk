@@ -3,13 +3,31 @@
 use std::fmt;
 
 use market_squawk::ProviderPortalActivationRequest;
-use market_squawk_runtime::RuntimeIdentity;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
 /// Version of the desktop presentation contract.
 pub(crate) const DESKTOP_CONTRACT_VERSION: &str = "market-squawk-desktop-v1";
+
+/// Random, non-authoritative cache epoch projected to the WebView.
+///
+/// Native installation, workspace, and service-generation identities never cross this boundary.
+#[derive(Clone, Copy, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub(crate) struct ProductSessionToken(Uuid);
+
+impl ProductSessionToken {
+    pub(crate) fn random() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl fmt::Debug for ProductSessionToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProductSessionToken([OPAQUE CACHE EPOCH])")
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,7 +70,9 @@ pub(crate) enum ProductCapability {
     BacktestPreparedStart,
     BacktestPreview,
     BacktestResult,
+    BotPrepareStart,
     BotStart,
+    BotStartPreparation,
     BotStatus,
     BotStop,
     DecisionAnalysis,
@@ -62,10 +82,10 @@ pub(crate) enum ProductCapability {
     DecisionTargetReview,
     ExecutionCancel,
     ExecutionFills,
-    ExecutionManualDraft,
+    ExecutionManualPrepare,
+    ExecutionManualSubmit,
     ExecutionManualTargets,
     ExecutionOrders,
-    ExecutionReconcile,
     FairValueGovernanceCommit,
     FairValueGovernancePreview,
     FairValueMeasurement,
@@ -74,9 +94,7 @@ pub(crate) enum ProductCapability {
     FeatureDatasetPreparedStart,
     FeatureDatasetPreview,
     ForecastDetail,
-    ForecastEvaluate,
     ForecastList,
-    ForecastMetadata,
     ForecastOutcomes,
     ForecastPreparation,
     ForecastPrepare,
@@ -90,6 +108,7 @@ pub(crate) enum ProductCapability {
     JobWatch,
     MacroContext,
     MacroRevisions,
+    MarketHistory,
     MarketInstrument,
     MarketOverview,
     MarketUniverse,
@@ -149,6 +168,8 @@ impl ProductCapability {
             "Analysis.StartPreparedFeatureDatasetBuild" => Self::FeatureDatasetPreparedStart,
             "Analysis.ListProductBacktests" => Self::BacktestActivity,
             "Bot.GetStatus" => Self::BotStatus,
+            "Bot.GetStartPreparation" => Self::BotStartPreparation,
+            "Bot.PrepareStart" => Self::BotPrepareStart,
             "Bot.Start" => Self::BotStart,
             "Bot.Stop" => Self::BotStop,
             "Decision.GetInvestmentAnalysis" => Self::DecisionAnalysis,
@@ -161,8 +182,8 @@ impl ProductCapability {
             "Execution.GetFills" => Self::ExecutionFills,
             "Execution.GetManualPaperTargets" => Self::ExecutionManualTargets,
             "Execution.GetOrders" => Self::ExecutionOrders,
-            "Execution.Reconcile" => Self::ExecutionReconcile,
-            "Execution.SubmitManualPaperDraft" => Self::ExecutionManualDraft,
+            "Execution.PrepareManualPaperDraft" => Self::ExecutionManualPrepare,
+            "Execution.SubmitManualPaperDraft" => Self::ExecutionManualSubmit,
             "FairValue.CommitGovernanceAction" => Self::FairValueGovernanceCommit,
             "FairValue.Measure" => Self::FairValueMeasurement,
             "FairValue.GetWorkspace" => Self::FairValueWorkspace,
@@ -175,14 +196,13 @@ impl ProductCapability {
             "Job.Watch" => Self::JobWatch,
             "Macro.GetContext" => Self::MacroContext,
             "Macro.GetRevisions" => Self::MacroRevisions,
+            "Market.GetHistory" => Self::MarketHistory,
             "Market.GetInstrument" => Self::MarketInstrument,
             "Market.GetOverview" => Self::MarketOverview,
             "Market.SearchUniverse" => Self::MarketUniverse,
-            "Model.Evaluate" => Self::ForecastEvaluate,
             "Model.GetForecast" => Self::ForecastDetail,
             "Model.GetForecastOutcomes" => Self::ForecastOutcomes,
             "Model.GetForecastPreparation" => Self::ForecastPreparation,
-            "Model.GetMetadata" => Self::ForecastMetadata,
             "Model.ListBundles" => Self::ModelEvidence,
             "Model.ListForecasts" => Self::ForecastList,
             "Model.ListProductActivity" => Self::ModelActivity,
@@ -238,7 +258,7 @@ pub(crate) struct DesktopBootstrap {
     build_profile: &'static str,
     platform: &'static str,
     data_root: String,
-    runtime: RuntimeIdentity,
+    product_session_token: ProductSessionToken,
     storage: Readiness,
     installation: Readiness,
     model_runtime: Readiness,
@@ -293,12 +313,12 @@ pub(crate) enum DesktopServiceBootstrapCommand {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct DesktopServiceReconnect {
-    expected_runtime: RuntimeIdentity,
+    expected_product_session_token: ProductSessionToken,
 }
 
 impl DesktopServiceReconnect {
-    pub(crate) const fn expected_runtime(self) -> RuntimeIdentity {
-        self.expected_runtime
+    pub(crate) const fn expected_product_session_token(self) -> ProductSessionToken {
+        self.expected_product_session_token
     }
 }
 
@@ -311,7 +331,7 @@ impl DesktopBootstrap {
         application_version: &'static str,
         build_profile: &'static str,
         data_root: String,
-        runtime: RuntimeIdentity,
+        product_session_token: ProductSessionToken,
         storage: Readiness,
         installation: Readiness,
         model_runtime: Readiness,
@@ -324,7 +344,7 @@ impl DesktopBootstrap {
             build_profile,
             platform: std::env::consts::OS,
             data_root,
-            runtime,
+            product_session_token,
             storage,
             installation,
             model_runtime,
@@ -351,7 +371,6 @@ pub(crate) struct ApplicationInvocation {
     tag = "query"
 )]
 pub(crate) enum DashboardQueryCommand {
-    Overview,
     MacroContext {
         knowledge_cutoff: Option<String>,
         effective_date_cutoff: Option<String>,
@@ -360,12 +379,18 @@ pub(crate) enum DashboardQueryCommand {
         text: String,
         categories: Option<Vec<String>>,
     },
-    MarketOverview,
+    MarketOverview {
+        page_token: Option<String>,
+    },
     MarketUniverse {
-        text: Option<String>,
+        text: String,
+        page_token: Option<String>,
     },
     MarketInstrument {
-        instrument_id: Uuid,
+        selection_token: String,
+    },
+    MarketHistory {
+        history_token: String,
     },
     SourceStatus {
         source_ids: Option<Vec<String>>,
@@ -406,7 +431,7 @@ pub(crate) enum DashboardQueryCommand {
         dataset: String,
     },
     PortfolioAccounts {
-        after_account_id: Option<String>,
+        after_account_token: Option<String>,
     },
     PortfolioHoldings {
         account_id: String,
@@ -421,7 +446,7 @@ pub(crate) enum DashboardQueryCommand {
         account_id: String,
     },
     PortfolioRisk {
-        account_id: String,
+        account_token: String,
     },
     PortfolioRevisions {
         account_id: String,
@@ -452,13 +477,6 @@ pub(crate) enum DashboardQueryCommand {
     LatestValidForecast {
         instrument_id: Uuid,
         as_of: String,
-    },
-    ModelMetadata {
-        model_id: String,
-    },
-    ModelPrediction {
-        model_id: String,
-        input: Map<String, Value>,
     },
     Forecast {
         forecast_token: Uuid,
@@ -495,18 +513,14 @@ pub(crate) enum DashboardQueryCommand {
         candidate_id: String,
     },
     DecisionInvestmentAnalysis {
-        analysis_id: String,
+        action_token: Uuid,
     },
     DecisionInvestmentAnalyses {
-        after_analysis_id: Option<String>,
+        after_action_token: Option<Uuid>,
         limit: u16,
     },
     DecisionRecommendationTrackRecord {
-        profile_id: String,
-        profile_revision: u32,
-        profile_digest: String,
-        horizon_nanos: String,
-        evaluated_at_unix_nanos: String,
+        action_token: Uuid,
     },
     DecisionTargetPreparation {
         dossier_id: String,
@@ -745,14 +759,14 @@ pub(crate) enum AnalysisControlCommand {
         intended_use: DatasetPreparationUse,
     },
     StartPreparedFeatureDataset {
-        receipt: Uuid,
+        confirmation_token: Uuid,
     },
     BacktestOptions,
     PreviewBacktest {
         selection: Map<String, Value>,
     },
     StartPreparedBacktest {
-        receipt: Map<String, Value>,
+        confirmation_token: Uuid,
     },
 }
 
@@ -776,10 +790,6 @@ pub(crate) enum BacktestProductCommand {
     tag = "action"
 )]
 pub(crate) enum ModelControlCommand {
-    Evaluate {
-        model_id: String,
-        input: Map<String, Value>,
-    },
     StartTraining {
         config_ticket_id: Uuid,
         authority_ticket_id: Uuid,
@@ -789,7 +799,7 @@ pub(crate) enum ModelControlCommand {
         selection: Map<String, Value>,
     },
     StartPreparedForecast {
-        receipt: Map<String, Value>,
+        confirmation_token: Uuid,
     },
 }
 
@@ -1027,9 +1037,18 @@ impl fmt::Debug for GovernanceControlCommand {
     tag = "action"
 )]
 pub(crate) enum PaperControlCommand {
+    StartPreparation,
+    PrepareStart {
+        cash_choice: String,
+        cost_choice: String,
+        mode_choice: String,
+    },
+    Start {
+        confirmation_token: String,
+    },
     Targets,
-    Submit {
-        target_token: Uuid,
+    PrepareManual {
+        target_token: String,
         side: String,
         order_type: String,
         quantity_lots: String,
@@ -1037,18 +1056,15 @@ pub(crate) enum PaperControlCommand {
         stop_target_level: Option<String>,
         time_in_force: String,
     },
-    Start {
-        strategy_mode: String,
-        initial_cash: String,
-        fee_basis_points: u16,
+    SubmitManual {
+        confirmation_token: String,
     },
     Stop {
         reason: String,
     },
     Cancel {
-        order_token: Uuid,
+        action_token: String,
     },
-    Reconcile,
     TriggerKillSwitch {
         reason: String,
     },
@@ -1129,7 +1145,7 @@ pub(crate) enum SourceLifecycleAction {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopEvent {
-    runtime: RuntimeIdentity,
+    product_session_token: ProductSessionToken,
     #[serde(serialize_with = "serialize_u64_as_decimal")]
     sequence: u64,
     body: DesktopEventBody,
@@ -1144,14 +1160,14 @@ where
 
 impl DesktopEvent {
     pub(crate) const fn authority_changed(
-        runtime: RuntimeIdentity,
+        product_session_token: ProductSessionToken,
         sequence: u64,
         domain: String,
         operation: String,
         request_id: String,
     ) -> Self {
         Self {
-            runtime,
+            product_session_token,
             sequence,
             body: DesktopEventBody::AuthorityChanged {
                 domain,
@@ -1162,24 +1178,24 @@ impl DesktopEvent {
     }
 
     pub(crate) const fn resync_required(
-        runtime: RuntimeIdentity,
+        product_session_token: ProductSessionToken,
         sequence: u64,
         reason: &'static str,
     ) -> Self {
         Self {
-            runtime,
+            product_session_token,
             sequence,
             body: DesktopEventBody::ResyncRequired { reason },
         }
     }
 
     pub(crate) const fn stream_disconnected(
-        runtime: RuntimeIdentity,
+        product_session_token: ProductSessionToken,
         sequence: u64,
         reason: &'static str,
     ) -> Self {
         Self {
-            runtime,
+            product_session_token,
             sequence,
             body: DesktopEventBody::StreamDisconnected { reason },
         }
@@ -1209,14 +1225,14 @@ enum DesktopEventBody {
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct DesktopEventSubscriptionRequest {
-    runtime: RuntimeIdentity,
+    product_session_token: ProductSessionToken,
     #[serde(deserialize_with = "deserialize_u64_from_decimal")]
     after_sequence: u64,
 }
 
 impl DesktopEventSubscriptionRequest {
-    pub(crate) const fn runtime(self) -> RuntimeIdentity {
-        self.runtime
+    pub(crate) const fn product_session_token(self) -> ProductSessionToken {
+        self.product_session_token
     }
 
     pub(crate) const fn after_sequence(self) -> u64 {
@@ -1244,7 +1260,7 @@ where
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopEventSubscriptionReceipt {
     subscription_id: Uuid,
-    runtime: RuntimeIdentity,
+    product_session_token: ProductSessionToken,
     #[serde(serialize_with = "serialize_u64_as_decimal")]
     sequence: u64,
     resumed: bool,
@@ -1253,13 +1269,13 @@ pub(crate) struct DesktopEventSubscriptionReceipt {
 impl DesktopEventSubscriptionReceipt {
     pub(crate) const fn new(
         subscription_id: Uuid,
-        runtime: RuntimeIdentity,
+        product_session_token: ProductSessionToken,
         sequence: u64,
         resumed: bool,
     ) -> Self {
         Self {
             subscription_id,
-            runtime,
+            product_session_token,
             sequence,
             resumed,
         }

@@ -288,8 +288,12 @@ impl ApplicationOperationJobRunner {
         if context.cancellation().is_cancelled() {
             return Err(JobRunError::Cancelled);
         }
-        let encoded = serde_json::to_vec(&result.clone().into_envelope())
-            .map_err(|_error| failed("result-encoding-invalid", false))?;
+        let encoded = serde_json::to_vec(
+            &result
+                .clone()
+                .into_envelope(market_squawk_services::ResultEnvelopeProjection::NativeEvidenceV1),
+        )
+        .map_err(|_error| failed("result-encoding-invalid", false))?;
         let digest = EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&encoded).into());
         let permit = context.claim_terminal_publication(prepared.expected)?;
         let publication = ArtifactPublication::try_json(encoded).map_err(map_artifact_error)?;
@@ -836,8 +840,11 @@ impl JobRunner for ResearchJobRunner {
                 .claim_terminal_publication(prepared.expected)
                 .map(market_squawk_jobs::JobTerminalPublicationPermit::seal)
         })?;
-        let encoded = serde_json::to_vec(&result.into_envelope())
-            .map_err(|_error| failed("result-encoding-invalid", false))?;
+        let encoded = serde_json::to_vec(
+            &result
+                .into_envelope(market_squawk_services::ResultEnvelopeProjection::NativeEvidenceV1),
+        )
+        .map_err(|_error| failed("result-encoding-invalid", false))?;
         let digest = EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&encoded).into());
         let artifact = self
             .artifacts

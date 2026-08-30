@@ -41,10 +41,12 @@ use serde_json::{Value, json};
 use super::{ApplicationDomainService, domain_support::DomainLifecycle, effective_service_limits};
 use crate::ResearchService;
 
+mod company_product;
 mod company_research;
 mod dataset_preparation;
 mod forecast_evidence;
 mod fred;
+mod fund_product;
 mod ingest;
 mod instrument_context;
 mod macro_context;
@@ -56,7 +58,11 @@ mod sec_fund_product;
 mod sec_fundamentals;
 mod treasury;
 
-pub(crate) use company_research::CompanyResearchReadCapability;
+pub(crate) use company_product::CompanyProductResult;
+pub(crate) use company_research::{
+    CompanyProductRead, CompanyResearchReadCapability, FundProductRead,
+    ResearchProductReadCapability, ResearchProductReadError,
+};
 pub(crate) use dataset_preparation::{
     DatasetPreparationAuthority, DatasetPreparationError, DatasetPreparationOptions,
     DatasetPreparationPreview, DatasetPreparationPreviewRequest, DatasetPreparationReceipt,
@@ -66,6 +72,7 @@ pub(crate) use forecast_evidence::AnalyticalForecastEvidenceReader;
 pub(crate) use fred::{
     FredLatestKnownAvailability, FredLatestKnownCompositionError, FredLatestKnownOperation,
 };
+pub(crate) use fund_product::FundProductResult;
 pub(crate) use ingest::{
     AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
     AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
@@ -105,12 +112,21 @@ pub use ingest::{
     ResearchSourceDiscovery, ResearchSourceDiscoveryObject, ResearchSourceDiscoveryRights,
     ResearchSourceObjectListing,
 };
-pub(crate) use instrument_context::InstrumentContextReadCapability;
+pub(crate) use instrument_context::{
+    InstrumentContext, InstrumentContextOutcome, InstrumentContextReadCapability,
+    InstrumentContextRequest,
+};
 pub(crate) use macro_context::{
     MACRO_GET_CONTEXT, MacroContextOperation, MacroContextReadCapability,
 };
 pub(crate) use macro_features::{MacroFeatureVector, read_macro_feature_vector};
-pub(crate) use market_history::MarketHistoryReadCapability;
+pub(crate) use market_history::{
+    LatestMarketHistoryReadRequest, MAX_MARKET_HISTORY_BARS, MarketHistoryAdjustmentPolicy,
+    MarketHistoryBar, MarketHistoryCoverage, MarketHistoryMissingReason,
+    MarketHistoryPartialReason, MarketHistoryQuality, MarketHistoryReadCapability,
+    MarketHistoryReadLimit, MarketHistoryReadOutcome, MarketHistorySeries,
+    MarketHistorySessionPolicy, MarketHistoryTimeframe, MarketHistoryUnavailableReason,
+};
 pub(crate) use options_context::{
     OptionsContextReadCapability, OptionsObservationReadAvailability,
     OptionsReferenceReadAvailability,
@@ -327,9 +343,21 @@ impl ResearchApplicationServices {
             treasury_daily_latest_known.clone(),
         );
         let company_research = CompanyResearchReadCapability::new(Arc::clone(&service));
+        let product_identity = listing_reference.as_ref().cloned().map(|listings| {
+            Arc::new(InstrumentContextReadCapability::new(
+                service.market_data_instruments(),
+                listings,
+            ))
+        });
+        let product_research =
+            ResearchProductReadCapability::new(company_research.clone(), product_identity);
         let options_context = OptionsContextReadCapability::new(
             Arc::clone(&service),
-            OptionsReferenceReadAvailability::Unavailable,
+            OptionsReferenceReadAvailability::Ready(
+                service
+                    .analytical()
+                    .official_options_reference_catalog_reader(),
+            ),
             OptionsObservationReadAvailability::SetupRequired,
         );
         let market_history = MarketHistoryReadCapability::new(reader.clone());
@@ -341,6 +369,7 @@ impl ResearchApplicationServices {
                 artifacts,
                 listing_reference,
                 company_research,
+                product_research,
                 fred_latest_known,
                 macro_context,
                 options_context,
@@ -397,6 +426,11 @@ impl ResearchApplicationServices {
     /// Returns canonical company and fund research reads over the rich local store.
     pub(crate) fn company_research_read_capability(&self) -> CompanyResearchReadCapability {
         self.controller.company_research.clone()
+    }
+
+    /// Returns fixed provider-neutral company and fund product research operations.
+    pub(crate) fn product_research_read_capability(&self) -> ResearchProductReadCapability {
+        self.controller.product_research.clone()
     }
 
     /// Returns provider-neutral option context with truthful startup availability.
@@ -684,6 +718,7 @@ struct ResearchController {
     artifacts: Option<Arc<dyn ArtifactRepository>>,
     listing_reference: Option<ListingReferenceReadCapability>,
     company_research: CompanyResearchReadCapability,
+    product_research: ResearchProductReadCapability,
     fred_latest_known: FredLatestKnownOperation,
     macro_context: MacroContextOperation,
     options_context: OptionsContextReadCapability,

@@ -5,8 +5,8 @@ use std::io::{self, Write};
 use std::num::NonZeroU64;
 
 use market_squawk_domain::{
-    AccountId, BasisPoints, ClientOrderId, Money, OrderId, OrderSide, PriceTicks, QuantityLots,
-    Timestamp,
+    AccountId, BasisPoints, ClientOrderId, InstrumentExecutionTerms, Money, OrderId, OrderSide,
+    PriceTicks, QuantityLots, Timestamp,
 };
 use market_squawk_execution::{
     OrderTargetReference, ReconciliationBatchBinding, ReconciliationBatchId,
@@ -99,6 +99,7 @@ impl PaperSimulationSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaperOrderSnapshot {
     order_id: OrderId,
+    execution_terms: InstrumentExecutionTerms,
     account_id: AccountId,
     target_reference: Option<OrderTargetReference>,
     state: PaperOrderState,
@@ -121,6 +122,7 @@ impl PaperOrderSnapshot {
     pub(crate) fn from_order(order: &PaperOrder) -> Self {
         Self {
             order_id: order.order_id,
+            execution_terms: order.terms,
             account_id: order.account_id,
             target_reference: order.target_reference.clone(),
             state: order.lifecycle.state(),
@@ -142,6 +144,10 @@ impl PaperOrderSnapshot {
 
     pub const fn order_id(&self) -> OrderId {
         self.order_id
+    }
+    /// Returns the immutable instrument identity and conversion terms accepted with the order.
+    pub const fn execution_terms(&self) -> InstrumentExecutionTerms {
+        self.execution_terms
     }
     pub const fn account_id(&self) -> AccountId {
         self.account_id

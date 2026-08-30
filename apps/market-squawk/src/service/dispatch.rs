@@ -6,7 +6,10 @@ use async_trait::async_trait;
 use market_squawk_runtime::{
     AppRequestEnvelope, ApplicationDispatcher, DispatchError, NamedClient, OperationEffect,
 };
-use market_squawk_services::{ServiceError, ServiceErrorClass, ToolAuthorization, ToolServices};
+use market_squawk_services::{
+    ResultEnvelopeProjection, ServiceCapabilities, ServiceError, ServiceErrorClass,
+    ToolAuthorization, ToolServices,
+};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -22,6 +25,7 @@ use super::{
 /// Runtime dispatch adapter over the sole transport-neutral application authority.
 pub(super) struct InstalledApplicationDispatcher {
     services: Arc<InstalledToolServices>,
+    product_capabilities: ServiceCapabilities,
     mcp: Arc<InstalledMcpControl>,
     governance: Arc<InstalledGovernanceOperations>,
     settings: Arc<ProductionSettingsOperations>,
@@ -63,6 +67,8 @@ impl InstalledApplicationDispatcher {
         if claude_code.client() != NamedClient::ClaudeCode || codex.client() != NamedClient::Codex {
             return Err(DispatchError::Unavailable);
         }
+        let product_capabilities =
+            <InstalledToolServices as ToolServices>::capabilities(services.as_ref());
         let mut operations = services
             .capabilities()
             .tools()
@@ -137,6 +143,7 @@ impl InstalledApplicationDispatcher {
         });
         Ok(Self {
             services,
+            product_capabilities,
             mcp,
             governance,
             settings,
@@ -150,6 +157,7 @@ impl fmt::Debug for InstalledApplicationDispatcher {
         formatter
             .debug_struct("InstalledApplicationDispatcher")
             .field("services", &"[INSTALLED TOOL SERVICES]")
+            .field("product_capabilities", &"[PRODUCT CAPABILITY PROJECTION]")
             .field("mcp", &"[DYNAMIC MCP CLIENT AUTHORITY]")
             .field("governance", &"[PRIVATE GOVERNANCE AUTHORITY]")
             .field("settings", &"[INSTALLED SETTINGS AUTHORITY]")
@@ -258,10 +266,15 @@ impl ApplicationDispatcher for InstalledApplicationDispatcher {
         let request = descriptor
             .admit(arguments.clone())
             .map_err(map_service_error)?;
+        let projection = if self.product_capabilities.find(descriptor.name()).is_some() {
+            ResultEnvelopeProjection::ProductV1
+        } else {
+            ResultEnvelopeProjection::NativeEvidenceV1
+        };
         self.services
             .call(request, context)
             .await
-            .map(market_squawk_services::TypedToolResult::into_envelope)
+            .map(|result| result.into_envelope(projection))
             .map_err(map_service_error)
     }
 

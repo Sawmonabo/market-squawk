@@ -13,7 +13,7 @@ import { Progress } from "@/components/ui/progress"
 import { humanize } from "@/lib/formatters"
 import { formatTimestamp } from "@/lib/time"
 import type { LosslessInteger } from "@/lib/lossless-integer"
-import type { ProductTransport } from "@/lib/transport"
+import type { SystemTransport } from "@/lib/transport"
 import { cn } from "@/lib/utils"
 
 import {
@@ -40,7 +40,7 @@ export function JobCard({
   presentation = "operations",
 }: {
   job: JobView
-  transport: ProductTransport
+  transport: SystemTransport
   scope: ProductScope
   mutationPending: boolean
   onAction: (action: PendingJobAction) => void
@@ -217,7 +217,7 @@ function JobArtifactPreview({
   scope,
 }: {
   artifact: JobArtifact
-  transport: ProductTransport
+  transport: SystemTransport
   scope: ProductScope
 }) {
   const previewBytes = Math.min(artifact.byteCount, ARTIFACT_PREVIEW_BYTES)
@@ -237,7 +237,7 @@ function JobArtifactPreview({
       }
       const firstMaximum = Math.min(previewBytes, ARTIFACT_CHUNK_BYTES)
       const first = parseArtifactChunk(
-        await transport.query({
+        await transport.systemQuery({
           query: "analysisArtifact",
           artifactId: artifact.id,
           sha256: artifact.sha256,
@@ -265,7 +265,7 @@ function JobArtifactPreview({
         ARTIFACT_CHUNK_BYTES,
       )
       const second = parseArtifactChunk(
-        await transport.query({
+        await transport.systemQuery({
           query: "analysisArtifact",
           artifactId: artifact.id,
           sha256: artifact.sha256,

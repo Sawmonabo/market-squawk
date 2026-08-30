@@ -8,15 +8,15 @@ export const readinessSchema = z.object({
   detail: z.string(),
 })
 
-export const productCapabilitySchema = z.enum([
-  "backtest_advanced_start",
+const productCapabilities = [
   "backtest_activity",
-  "backtest_artifact_read",
   "backtest_preparation",
   "backtest_prepared_start",
   "backtest_preview",
   "backtest_result",
+  "bot_prepare_start",
   "bot_start",
+  "bot_start_preparation",
   "bot_status",
   "bot_stop",
   "decision_analysis",
@@ -26,60 +26,29 @@ export const productCapabilitySchema = z.enum([
   "decision_target_review",
   "execution_cancel",
   "execution_fills",
-  "execution_manual_draft",
+  "execution_manual_prepare",
+  "execution_manual_submit",
   "execution_manual_targets",
   "execution_orders",
-  "execution_reconcile",
-  "fair_value_approvals",
-  "fair_value_audit",
-  "fair_value_classification",
-  "fair_value_classify",
-  "fair_value_evidence",
-  "fair_value_explain",
-  "fair_value_governance_commit",
-  "fair_value_governance_preview",
-  "fair_value_market_access",
-  "fair_value_measurement",
-  "fair_value_measurement_list",
-  "fair_value_workspace",
   "feature_dataset_preparation",
   "feature_dataset_prepared_start",
   "feature_dataset_preview",
   "forecast_detail",
-  "forecast_evaluate",
   "forecast_list",
-  "forecast_metadata",
   "forecast_outcomes",
   "forecast_preparation",
   "forecast_prepare",
   "forecast_prepared_start",
   "fundamental_facts",
-  "governance_authenticate",
-  "governance_principals",
-  "installation_status",
   "investment_lookup",
-  "job_list",
-  "job_watch",
   "macro_context",
   "macro_revisions",
+  "market_history",
   "market_instrument",
   "market_overview",
   "market_universe",
   "model_activity",
   "model_evidence",
-  "model_training_start",
-  "operations_backup_list",
-  "operations_log_export",
-  "operations_log_query",
-  "operations_rollback_preview",
-  "operations_rollback_start",
-  "operations_runtime_status",
-  "operations_settings",
-  "operations_update_check",
-  "operations_update_preview",
-  "operations_update_start",
-  "operations_update_status",
-  "operations_workspace_list",
   "portfolio_account_list",
   "portfolio_attribution",
   "portfolio_candidate_impact",
@@ -104,6 +73,48 @@ export const productCapabilitySchema = z.enum([
   "research_file_preview",
   "research_manifest",
   "risk_kill_switch",
+] as const
+
+const systemOnlyCapabilities = [
+  "backtest_advanced_start",
+  "backtest_artifact_read",
+  "execution_reconcile",
+  "fair_value_approvals",
+  "fair_value_audit",
+  "fair_value_classification",
+  "fair_value_classify",
+  "fair_value_evidence",
+  "fair_value_explain",
+  "fair_value_governance_commit",
+  "fair_value_governance_preview",
+  "fair_value_market_access",
+  "fair_value_measurement",
+  "fair_value_measurement_list",
+  "fair_value_workspace",
+  "governance_authenticate",
+  "governance_principals",
+  "installation_status",
+  "job_list",
+  "job_watch",
+  "model_training_start",
+  "operations_backup_list",
+  "operations_log_export",
+  "operations_log_query",
+  "operations_rollback_preview",
+  "operations_rollback_start",
+  "operations_runtime_status",
+  "operations_settings",
+  "operations_update_check",
+  "operations_update_preview",
+  "operations_update_start",
+  "operations_update_status",
+  "operations_workspace_list",
+] as const
+
+export const productCapabilitySchema = z.enum(productCapabilities)
+const desktopCapabilitySchema = z.enum([
+  ...productCapabilities,
+  ...systemOnlyCapabilities,
 ])
 
 export const providerProfileSchema = z
@@ -145,24 +156,40 @@ export const encryptedFileFallbackSchema = z.enum([
   "ready",
 ])
 
-export const desktopBootstrapSchema = z.object({
+export const desktopSystemBootstrapSchema = z.object({
   contractVersion: z.literal("market-squawk-desktop-v1"),
   applicationVersion: z.string(),
   buildProfile: z.string(),
   platform: z.string(),
   dataRoot: z.string(),
-  runtime: z.object({
-    installationId: z.string().uuid(),
-    workspaceId: z.string().uuid(),
-    serviceGeneration: z.number().int().positive(),
-  }),
+  productSessionToken: z.string().uuid(),
   storage: readinessSchema,
   installation: readinessSchema,
   modelRuntime: readinessSchema,
   mcp: readinessSchema,
   telemetryEnabled: z.boolean(),
-  capabilities: z.array(productCapabilitySchema),
+  capabilities: z.array(desktopCapabilitySchema),
 }).strict()
+
+export const desktopBootstrapSchema = z
+  .object({
+    productSessionToken:
+      desktopSystemBootstrapSchema.shape.productSessionToken,
+    capabilities: z.array(productCapabilitySchema),
+  })
+  .strict()
+
+export function projectDesktopBootstrap(
+  system: DesktopSystemBootstrap,
+): DesktopBootstrap {
+  return desktopBootstrapSchema.parse({
+    productSessionToken: system.productSessionToken,
+    capabilities: system.capabilities.filter(
+      (capability): capability is ProductCapability =>
+        productCapabilitySchema.safeParse(capability).success,
+    ),
+  })
+}
 
 export const installationStatusSchema = z.object({
   installed: z.boolean(),
@@ -197,6 +224,19 @@ export const installationControlResultSchema = z.object({
 })
 
 export const applicationResultSchema = z
+  .object({
+    data: z.unknown(),
+    metadata: z
+      .object({
+        completeness: z.string(),
+        returnedItems: z.number().int().nonnegative(),
+        availableItems: z.number().int().nonnegative(),
+      })
+      .strict(),
+  })
+  .strict()
+
+export const nativeEvidenceApplicationResultSchema = z
   .object({
     data: z.unknown(),
     metadata: z
@@ -352,7 +392,7 @@ const desktopEventSequenceSchema = z
   )
 
 export const desktopEventSchema = z.object({
-  runtime: desktopBootstrapSchema.shape.runtime,
+  productSessionToken: desktopSystemBootstrapSchema.shape.productSessionToken,
   sequence: desktopEventSequenceSchema,
   body: z.discriminatedUnion("type", [
     z.object({
@@ -374,7 +414,7 @@ export const desktopEventSchema = z.object({
 
 export const desktopEventSubscriptionReceiptSchema = z.object({
   subscriptionId: z.string().uuid(),
-  runtime: desktopBootstrapSchema.shape.runtime,
+  productSessionToken: desktopSystemBootstrapSchema.shape.productSessionToken,
   sequence: desktopEventSequenceSchema,
   resumed: z.boolean(),
 })
@@ -387,18 +427,26 @@ export const desktopServiceBootstrapSchema = z.object({
   ]),
 })
 
-export const desktopStartupSchema = z.union([
-  desktopBootstrapSchema,
+export const desktopSystemStartupSchema = z.union([
+  desktopSystemBootstrapSchema,
   desktopServiceBootstrapSchema,
 ])
 
 export type ApplicationResult = z.infer<typeof applicationResultSchema>
+export type NativeEvidenceApplicationResult = z.infer<
+  typeof nativeEvidenceApplicationResultSchema
+>
 export type DesktopBootstrap = z.infer<typeof desktopBootstrapSchema>
 export type ProductCapability = z.infer<typeof productCapabilitySchema>
+export type DesktopSystemBootstrap = z.infer<
+  typeof desktopSystemBootstrapSchema
+>
 export type DesktopServiceBootstrap = z.infer<
   typeof desktopServiceBootstrapSchema
 >
-export type DesktopStartup = z.infer<typeof desktopStartupSchema>
+export type DesktopSystemStartup = z.infer<
+  typeof desktopSystemStartupSchema
+>
 export type DesktopEvent = z.infer<typeof desktopEventSchema>
 export type DesktopEventSubscriptionReceipt = z.infer<
   typeof desktopEventSubscriptionReceiptSchema

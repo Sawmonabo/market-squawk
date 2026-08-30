@@ -17,14 +17,29 @@ use market_squawk_data::{
     SecResearchIdentitySelection, SecResearchReadError,
 };
 use market_squawk_domain::{
-    CalendarDate, FundSourceFamily, FundamentalPeriod, InstrumentId, ResearchContext,
-    ResearchObservation, ResearchTemporalCoordinate, SourceIdentifier, Timestamp,
+    CalendarDate, FundSourceFamily, FundamentalAmendmentStatus, FundamentalCadence,
+    FundamentalConsolidation, FundamentalPeriod, FundamentalRestatementStatus, InstrumentId,
+    ResearchContext, ResearchObservation, ResearchTemporalCoordinate, RevisionNumber,
+    SourceIdentifier, Timestamp,
 };
 use rust_decimal::Decimal;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use super::instrument_context::{
+    InstrumentContextOutcome, InstrumentContextRead, InstrumentContextReadCapability,
+    InstrumentContextReadError, InstrumentContextRequest,
+};
 use super::sec_fund_product::{FundResearchData, SecFundProductBoundaryError};
+use super::{
+    company_product::{
+        CompanyProductProjectionError, CompanyProductResult, ResearchProductIdentity,
+        project_company_product,
+    },
+    fund_product::{
+        FundProductProjectionError, FundProductReadSet, FundProductResult, project_fund_product,
+    },
+};
 use crate::ResearchService;
 
 const MAX_COMPANY_RESEARCH_CANDIDATES: usize = 65_536;
@@ -335,6 +350,349 @@ impl CompanyResearchReadCapability {
     }
 }
 
+/// Fixed product projection over canonical company and fund point-in-time reads.
+///
+/// Private restart evidence never crosses this capability. Daily NAV remains unavailable until
+/// startup composition supplies an immutable canonical NAV generation selector; market price is
+/// never substituted.
+#[derive(Clone, Debug)]
+pub(crate) struct ResearchProductReadCapability {
+    canonical: CompanyResearchReadCapability,
+    identity: Option<Arc<InstrumentContextReadCapability>>,
+}
+
+impl ResearchProductReadCapability {
+    pub(crate) const fn new(
+        canonical: CompanyResearchReadCapability,
+        identity: Option<Arc<InstrumentContextReadCapability>>,
+    ) -> Self {
+        Self {
+            canonical,
+            identity,
+        }
+    }
+
+    pub(crate) async fn read_company_product(
+        &self,
+        request: CompanyResearchRequest,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<CompanyProductRead, ResearchProductReadError> {
+        let canonical = self
+            .canonical
+            .read_company(request, deadline, cancellation.child_token())
+            .await
+            .map_err(ResearchProductReadError::Canonical)?;
+        let identity = self.read_identity(
+            canonical.request().instrument_id(),
+            canonical.request().knowledge_at(),
+            deadline,
+            &cancellation,
+        )?;
+        let product = project_company_product(&canonical, product_identity(&identity)?)
+            .map_err(ResearchProductReadError::CompanyProjection)?;
+        Ok(CompanyProductRead {
+            canonical,
+            identity,
+            product,
+        })
+    }
+
+    pub(crate) async fn verify_company_product_restart(
+        &self,
+        expected: &CompanyProductRead,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<CompanyProductRead, ResearchProductReadError> {
+        let canonical = self
+            .canonical
+            .verify_company_restart(&expected.canonical, deadline, cancellation.child_token())
+            .await
+            .map_err(ResearchProductReadError::Canonical)?;
+        let identity = self.verify_identity_restart(&expected.identity, deadline, &cancellation)?;
+        let product = project_company_product(&canonical, product_identity(&identity)?)
+            .map_err(ResearchProductReadError::CompanyProjection)?;
+        if product != expected.product {
+            return Err(ResearchProductReadError::RestartConflict);
+        }
+        Ok(CompanyProductRead {
+            canonical,
+            identity,
+            product,
+        })
+    }
+
+    pub(crate) async fn read_fund_product(
+        &self,
+        fund_instrument_id: InstrumentId,
+        knowledge_at: Timestamp,
+        revision_policy: FundResearchRevisionPolicy,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<FundProductRead, ResearchProductReadError> {
+        let portfolio_request = FundResearchRequest::new(
+            fund_instrument_id,
+            FundResearchFamily::PortfolioHoldings,
+            knowledge_at,
+            revision_policy,
+        );
+        let annual_request = FundResearchRequest::new(
+            fund_instrument_id,
+            FundResearchFamily::AnnualFundReport,
+            knowledge_at,
+            revision_policy,
+        );
+        let portfolio = self
+            .canonical
+            .read_fund(portfolio_request, deadline, cancellation.child_token())
+            .await
+            .map_err(ResearchProductReadError::Canonical)?;
+        let annual = self
+            .canonical
+            .read_fund(annual_request, deadline, cancellation.child_token())
+            .await
+            .map_err(ResearchProductReadError::Canonical)?;
+        let identity =
+            self.read_identity(fund_instrument_id, knowledge_at, deadline, &cancellation)?;
+        let (holding_identities, holding_evidence) =
+            self.read_holding_identities(&portfolio, knowledge_at, deadline, &cancellation)?;
+        let product = project_fund_product(
+            FundProductReadSet::new(&portfolio, &annual),
+            None,
+            product_identity(&identity)?,
+            &holding_identities,
+        )
+        .map_err(ResearchProductReadError::FundProjection)?;
+        Ok(FundProductRead {
+            portfolio,
+            annual,
+            identity,
+            holding_evidence,
+            product,
+        })
+    }
+
+    pub(crate) async fn verify_fund_product_restart(
+        &self,
+        expected: &FundProductRead,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<FundProductRead, ResearchProductReadError> {
+        let portfolio = self
+            .canonical
+            .verify_fund_restart(&expected.portfolio, deadline, cancellation.child_token())
+            .await
+            .map_err(ResearchProductReadError::Canonical)?;
+        let annual = self
+            .canonical
+            .verify_fund_restart(&expected.annual, deadline, cancellation.child_token())
+            .await
+            .map_err(ResearchProductReadError::Canonical)?;
+        let identity = self.verify_identity_restart(&expected.identity, deadline, &cancellation)?;
+        let (holding_identities, holding_evidence) =
+            self.verify_holding_identities(&expected.holding_evidence, deadline, &cancellation)?;
+        let product = project_fund_product(
+            FundProductReadSet::new(&portfolio, &annual),
+            None,
+            product_identity(&identity)?,
+            &holding_identities,
+        )
+        .map_err(ResearchProductReadError::FundProjection)?;
+        if product != expected.product {
+            return Err(ResearchProductReadError::RestartConflict);
+        }
+        Ok(FundProductRead {
+            portfolio,
+            annual,
+            identity,
+            holding_evidence,
+            product,
+        })
+    }
+
+    fn read_identity(
+        &self,
+        instrument_id: InstrumentId,
+        knowledge_at: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<InstrumentContextRead, ResearchProductReadError> {
+        let capability = self
+            .identity
+            .as_ref()
+            .ok_or(ResearchProductReadError::IdentityUnavailable)?;
+        let request = InstrumentContextRequest::try_new(instrument_id, knowledge_at, knowledge_at)
+            .map_err(ResearchProductReadError::Identity)?;
+        capability
+            .read(request, deadline, cancellation)
+            .map_err(ResearchProductReadError::Identity)
+    }
+
+    fn verify_identity_restart(
+        &self,
+        expected: &InstrumentContextRead,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<InstrumentContextRead, ResearchProductReadError> {
+        self.identity
+            .as_ref()
+            .ok_or(ResearchProductReadError::IdentityUnavailable)?
+            .verify_restart(expected, deadline, cancellation)
+            .map_err(ResearchProductReadError::Identity)
+    }
+
+    fn read_holding_identities(
+        &self,
+        portfolio: &FundResearchRead,
+        knowledge_at: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<FundHoldingIdentityReads, ResearchProductReadError> {
+        let holdings = match portfolio.outcome() {
+            FundResearchOutcome::Available(snapshot) => snapshot.holdings().holdings(),
+            FundResearchOutcome::Missing
+            | FundResearchOutcome::Ambiguous
+            | FundResearchOutcome::Unavailable(_) => &[],
+        };
+        let mut identities = Vec::new();
+        let mut evidence = Vec::new();
+        identities
+            .try_reserve_exact(holdings.len())
+            .map_err(|_| ResearchProductReadError::ResourceExhausted)?;
+        evidence
+            .try_reserve_exact(holdings.len())
+            .map_err(|_| ResearchProductReadError::ResourceExhausted)?;
+        for holding in holdings {
+            let Some(instrument_id) = holding.instrument_id() else {
+                identities.push(None);
+                evidence.push(None);
+                continue;
+            };
+            let read = self.read_identity(instrument_id, knowledge_at, deadline, cancellation)?;
+            identities.push(product_identity_optional(&read)?);
+            evidence.push(Some(read));
+        }
+        Ok((identities, evidence.into_boxed_slice()))
+    }
+
+    fn verify_holding_identities(
+        &self,
+        expected: &[Option<InstrumentContextRead>],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<FundHoldingIdentityReads, ResearchProductReadError> {
+        let mut identities = Vec::new();
+        let mut evidence = Vec::new();
+        identities
+            .try_reserve_exact(expected.len())
+            .map_err(|_| ResearchProductReadError::ResourceExhausted)?;
+        evidence
+            .try_reserve_exact(expected.len())
+            .map_err(|_| ResearchProductReadError::ResourceExhausted)?;
+        for expected_read in expected {
+            let Some(expected_read) = expected_read else {
+                identities.push(None);
+                evidence.push(None);
+                continue;
+            };
+            let read = self.verify_identity_restart(expected_read, deadline, cancellation)?;
+            identities.push(product_identity_optional(&read)?);
+            evidence.push(Some(read));
+        }
+        Ok((identities, evidence.into_boxed_slice()))
+    }
+}
+
+type FundHoldingIdentityReads = (
+    Vec<Option<ResearchProductIdentity>>,
+    Box<[Option<InstrumentContextRead>]>,
+);
+
+fn product_identity(
+    read: &InstrumentContextRead,
+) -> Result<ResearchProductIdentity, ResearchProductReadError> {
+    product_identity_optional(read)?.ok_or(ResearchProductReadError::IdentityUnavailable)
+}
+
+fn product_identity_optional(
+    read: &InstrumentContextRead,
+) -> Result<Option<ResearchProductIdentity>, ResearchProductReadError> {
+    match read.outcome() {
+        InstrumentContextOutcome::Exact(identity) => {
+            ResearchProductIdentity::try_new(identity.display_name(), identity.listed_symbol())
+                .map(Some)
+                .map_err(ResearchProductReadError::CompanyProjection)
+        }
+        InstrumentContextOutcome::Missing(_)
+        | InstrumentContextOutcome::Ambiguous
+        | InstrumentContextOutcome::Unavailable(_) => Ok(None),
+    }
+}
+
+pub(crate) struct CompanyProductRead {
+    canonical: CompanyResearchRead,
+    identity: InstrumentContextRead,
+    product: CompanyProductResult,
+}
+
+impl CompanyProductRead {
+    pub(crate) const fn product(&self) -> &CompanyProductResult {
+        &self.product
+    }
+}
+
+impl fmt::Debug for CompanyProductRead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompanyProductRead")
+            .field("product", &self.product)
+            .field("canonical", &"[PRIVATE CANONICAL RESTART EVIDENCE]")
+            .finish()
+    }
+}
+
+pub(crate) struct FundProductRead {
+    portfolio: FundResearchRead,
+    annual: FundResearchRead,
+    identity: InstrumentContextRead,
+    holding_evidence: Box<[Option<InstrumentContextRead>]>,
+    product: FundProductResult,
+}
+
+impl FundProductRead {
+    pub(crate) const fn product(&self) -> &FundProductResult {
+        &self.product
+    }
+}
+
+impl fmt::Debug for FundProductRead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FundProductRead")
+            .field("product", &self.product)
+            .field("canonical", &"[PRIVATE CANONICAL RESTART EVIDENCE]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum ResearchProductReadError {
+    #[error("canonical research read failed")]
+    Canonical(CanonicalResearchReadError),
+    #[error("company product projection failed")]
+    CompanyProjection(CompanyProductProjectionError),
+    #[error("fund product projection failed")]
+    FundProjection(FundProductProjectionError),
+    #[error("canonical display identity read failed")]
+    Identity(InstrumentContextReadError),
+    #[error("canonical display identity is unavailable or ambiguous")]
+    IdentityUnavailable,
+    #[error("research product identity projection exceeded its fixed resource bound")]
+    ResourceExhausted,
+    #[error("research product restart did not reproduce the same result")]
+    RestartConflict,
+}
+
 /// Product company result plus inaccessible selector receipts.
 pub(crate) struct CompanyResearchRead {
     request: CompanyResearchRequest,
@@ -441,6 +799,35 @@ pub(crate) enum CompanyFactScope {
     FilingDetail,
 }
 
+/// Fiscal-period meaning retained without the source's lexical period coordinate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompanyResearchFiscalPeriod {
+    FiscalYear,
+    CalendarYear,
+    FirstQuarter,
+    SecondQuarter,
+    ThirdQuarter,
+    FourthQuarter,
+    Unavailable,
+    Unsupported,
+}
+
+/// Whether the exact source context reported no dimensions, some dimensions, or no assertion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompanyResearchDimensionState {
+    Unavailable,
+    NoDimensions,
+    Dimensions { count: usize },
+}
+
+/// Source-reported restatement meaning without its source-native status identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompanyResearchRestatementState {
+    Unavailable,
+    ReportedNotRestated,
+    ReportedRestated,
+}
+
 /// One exact point-in-time fact stripped of provider and raw-object coordinates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CompanyResearchFact {
@@ -450,6 +837,14 @@ pub(crate) struct CompanyResearchFact {
     value: Decimal,
     unit: Box<str>,
     period: FundamentalPeriod,
+    fiscal_year: Option<u16>,
+    fiscal_period: CompanyResearchFiscalPeriod,
+    cadence: FundamentalCadence,
+    dimension_state: CompanyResearchDimensionState,
+    consolidation: FundamentalConsolidation,
+    amendment_status: FundamentalAmendmentStatus,
+    restatement_state: CompanyResearchRestatementState,
+    occurrence: RevisionNumber,
     filed_on: Option<CalendarDate>,
     effective: ResearchTemporalCoordinate,
     known_at: Timestamp,
@@ -473,6 +868,30 @@ impl CompanyResearchFact {
     }
     pub(crate) const fn period(&self) -> FundamentalPeriod {
         self.period
+    }
+    pub(crate) const fn fiscal_year(&self) -> Option<u16> {
+        self.fiscal_year
+    }
+    pub(crate) const fn fiscal_period(&self) -> CompanyResearchFiscalPeriod {
+        self.fiscal_period
+    }
+    pub(crate) const fn cadence(&self) -> FundamentalCadence {
+        self.cadence
+    }
+    pub(crate) const fn dimension_state(&self) -> CompanyResearchDimensionState {
+        self.dimension_state
+    }
+    pub(crate) const fn consolidation(&self) -> FundamentalConsolidation {
+        self.consolidation
+    }
+    pub(crate) const fn amendment_status(&self) -> FundamentalAmendmentStatus {
+        self.amendment_status
+    }
+    pub(crate) const fn restatement_state(&self) -> CompanyResearchRestatementState {
+        self.restatement_state
+    }
+    pub(crate) const fn occurrence(&self) -> RevisionNumber {
+        self.occurrence
     }
     pub(crate) const fn filed_on(&self) -> Option<CalendarDate> {
         self.filed_on
@@ -818,6 +1237,7 @@ fn append_company_rows(
         match (family, observation) {
             (SecResearchFamily::CompanyFacts, ResearchObservation::Fundamental(fundamental))
             | (SecResearchFamily::FilingXbrl, ResearchObservation::Fundamental(fundamental)) => {
+                let fact_context = fundamental.fact_context();
                 facts
                     .try_reserve(1)
                     .map_err(|_| CanonicalResearchReadError::ResourceExhausted)?;
@@ -833,8 +1253,18 @@ fn append_company_rows(
                     metric: try_boxed_text(fundamental.concept().as_str())?,
                     value: fundamental.value(),
                     unit: try_boxed_text(fundamental.unit().as_str())?,
-                    period: fundamental.fact_context().period(),
-                    filed_on: fundamental.fact_context().filed_on(),
+                    period: fact_context.period(),
+                    fiscal_year: fact_context.fiscal_year(),
+                    fiscal_period: company_fiscal_period(fact_context.fiscal_period()),
+                    cadence: fact_context.cadence(),
+                    dimension_state: company_dimension_state(
+                        fact_context.dimensions().dimensions(),
+                    ),
+                    consolidation: fact_context.consolidation(),
+                    amendment_status: fact_context.amendment_status(),
+                    restatement_state: company_restatement_state(fact_context.restatement_status()),
+                    occurrence: fact_context.revision_order().ordinal(),
+                    filed_on: fact_context.filed_on(),
                     effective: fundamental.context().time().effective().clone(),
                     known_at,
                 });
@@ -855,6 +1285,45 @@ fn append_company_rows(
         }
     }
     Ok(())
+}
+
+fn company_fiscal_period(fiscal_period: Option<&SourceIdentifier>) -> CompanyResearchFiscalPeriod {
+    match fiscal_period.map(SourceIdentifier::as_str) {
+        Some("FY") => CompanyResearchFiscalPeriod::FiscalYear,
+        Some("CY") => CompanyResearchFiscalPeriod::CalendarYear,
+        Some("Q1") => CompanyResearchFiscalPeriod::FirstQuarter,
+        Some("Q2") => CompanyResearchFiscalPeriod::SecondQuarter,
+        Some("Q3") => CompanyResearchFiscalPeriod::ThirdQuarter,
+        Some("Q4") => CompanyResearchFiscalPeriod::FourthQuarter,
+        None => CompanyResearchFiscalPeriod::Unavailable,
+        Some(_) => CompanyResearchFiscalPeriod::Unsupported,
+    }
+}
+
+fn company_dimension_state(
+    dimensions: Option<&[market_squawk_domain::XbrlDimensionEvidence]>,
+) -> CompanyResearchDimensionState {
+    match dimensions {
+        None => CompanyResearchDimensionState::Unavailable,
+        Some([]) => CompanyResearchDimensionState::NoDimensions,
+        Some(dimensions) => CompanyResearchDimensionState::Dimensions {
+            count: dimensions.len(),
+        },
+    }
+}
+
+fn company_restatement_state(
+    state: &FundamentalRestatementStatus,
+) -> CompanyResearchRestatementState {
+    match state {
+        FundamentalRestatementStatus::Unavailable => CompanyResearchRestatementState::Unavailable,
+        FundamentalRestatementStatus::SourceReported {
+            restated: false, ..
+        } => CompanyResearchRestatementState::ReportedNotRestated,
+        FundamentalRestatementStatus::SourceReported { restated: true, .. } => {
+            CompanyResearchRestatementState::ReportedRestated
+        }
+    }
 }
 
 fn fund_data_request(
@@ -1124,6 +1593,9 @@ fn map_fund_projection_error(error: SecFundProductBoundaryError) -> CanonicalRes
         }
         SecFundProductBoundaryError::PublicationMismatch => {
             CanonicalResearchReadError::EvidenceConflict
+        }
+        SecFundProductBoundaryError::ResourceExhausted => {
+            CanonicalResearchReadError::ResourceExhausted
         }
     }
 }

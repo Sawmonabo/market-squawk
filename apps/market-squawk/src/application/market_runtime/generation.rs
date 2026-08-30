@@ -12,7 +12,7 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    provider_activation::PreparedMarketProviderConfiguration,
+    provider_activation::{PreparedMarketProviderConfiguration, PreparedSchwabMarketRuntimeStart},
     provider_onboarding::ProviderActivationLease,
 };
 
@@ -241,6 +241,47 @@ impl MarketRuntimeGroupGeneration {
         prepared: &PreparedMarketProviderConfiguration,
         runtime_incarnation: Uuid,
     ) -> Result<Self, ServiceError> {
+        let lease = match prepared {
+            PreparedMarketProviderConfiguration::AlpacaBasic(value) => value.lease(),
+            PreparedMarketProviderConfiguration::KrakenLevel3(value) => value.lease(),
+        };
+        let metadata = match prepared {
+            PreparedMarketProviderConfiguration::AlpacaBasic(value) => {
+                let optional = value.options_config().map(|config| config.metadata());
+                return Self::try_from_account_parts(
+                    request,
+                    lease,
+                    &[value.iex_config().metadata()],
+                    optional,
+                    runtime_incarnation,
+                );
+            }
+            PreparedMarketProviderConfiguration::KrakenLevel3(value) => [value.config().metadata()],
+        };
+        Self::try_from_account_parts(request, lease, &metadata, None, runtime_incarnation)
+    }
+
+    pub(super) fn try_from_schwab(
+        request: PreparedMarketProviderConfigurationRequest,
+        prepared: &PreparedSchwabMarketRuntimeStart,
+        runtime_incarnation: Uuid,
+    ) -> Result<Self, ServiceError> {
+        Self::try_from_account_parts(
+            request,
+            prepared.activation_lease(),
+            &[prepared.metadata()],
+            None,
+            runtime_incarnation,
+        )
+    }
+
+    fn try_from_account_parts(
+        request: PreparedMarketProviderConfigurationRequest,
+        lease: &ProviderActivationLease,
+        required_metadata: &[&SourceMetadata],
+        optional_metadata: Option<&SourceMetadata>,
+        runtime_incarnation: Uuid,
+    ) -> Result<Self, ServiceError> {
         if runtime_incarnation.is_nil() {
             return Err(ServiceError::Unavailable);
         }
@@ -255,19 +296,11 @@ impl MarketRuntimeGroupGeneration {
             request.expected_runtime_verification_receipt_digest(),
         );
         hasher.update(request.expected_credential_generation().get().to_be_bytes());
-        let lease = match prepared {
-            PreparedMarketProviderConfiguration::AlpacaBasic(value) => value.lease(),
-            PreparedMarketProviderConfiguration::KrakenLevel3(value) => value.lease(),
-        };
         update_lease(&mut hasher, lease);
-        match prepared {
-            PreparedMarketProviderConfiguration::AlpacaBasic(value) => {
-                let optional = value.options_config().map(|config| config.metadata());
-                update_optional_metadata(&mut hasher, value.iex_config().metadata(), optional)?;
-            }
-            PreparedMarketProviderConfiguration::KrakenLevel3(value) => {
-                update_metadata(&mut hasher, &[value.config().metadata()])?;
-            }
+        match (required_metadata, optional_metadata) {
+            ([required], optional) => update_optional_metadata(&mut hasher, required, optional)?,
+            (_, None) => update_metadata(&mut hasher, required_metadata)?,
+            (_, Some(_)) => return Err(ServiceError::InvalidRequest),
         }
         let bytes: [u8; 32] = hasher.finalize().into();
         if bytes == [0; 32] {

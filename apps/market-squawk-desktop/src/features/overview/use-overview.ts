@@ -1,37 +1,21 @@
 import { useQuery } from "@tanstack/react-query"
 
 import { productKeys, type ProductScope } from "@/app/query-client"
-import { marketOverviewRows } from "@/features/markets/market-product"
+import { parseMarketProductResult } from "@/features/markets/market-product"
 import { parseInvestmentAnalysisPage } from "@/features/opportunities/contracts"
-import {
-  parseResearchActivities,
-  type ResearchActivity,
-} from "@/features/research/research-contracts"
 import type { ApplicationResult } from "@/lib/schemas"
-import type { DashboardQuery, ProductTransport } from "@/lib/transport"
+import type { ProductQuery, ProductTransport } from "@/lib/transport"
 
 export type ReadState<T> =
-  | { status: "loading"; data: null; message: null }
-  | { status: "ready"; data: T; message: null }
-  | { status: "unavailable"; data: null; message: string }
+  | { status: "loading"; data: null }
+  | { status: "ready"; data: T }
+  | { status: "unavailable"; data: null }
 
 const MARKET_INPUT = { query: "marketOverview" } as const
-const ACTIVITY_INPUT = { query: "researchActivities" } as const
 const ANALYSIS_INPUT = {
   query: "decisionInvestmentAnalyses",
-  limit: 12,
+  limit: 4,
 } as const
-
-export function isActiveResearchActivity(activity: ResearchActivity) {
-  return [
-    "queued",
-    "preparing",
-    "running",
-    "awaiting_confirmation",
-    "cancelling",
-    "recovering",
-  ].includes(activity.state)
-}
 
 export function useOverviewQueries(
   transport: ProductTransport,
@@ -47,18 +31,7 @@ export function useOverviewQueries(
       parseInvestmentAnalysisPage(result, { limit: ANALYSIS_INPUT.limit }),
   )
   const markets = useMarketOverviewQuery(transport, scope)
-  const activities = useResearchActivityQuery(transport, scope)
-  return { activities, analyses, markets }
-}
-
-export function useHomeStatusQueries(
-  transport: ProductTransport,
-  scope: ProductScope,
-) {
-  return {
-    activities: useResearchActivityQuery(transport, scope),
-    markets: useMarketOverviewQuery(transport, scope),
-  }
+  return { analyses, markets }
 }
 
 function useMarketOverviewQuery(
@@ -71,21 +44,7 @@ function useMarketOverviewQuery(
     "market",
     "overview",
     MARKET_INPUT,
-    marketOverviewRows,
-  )
-}
-
-function useResearchActivityQuery(
-  transport: ProductTransport,
-  scope: ProductScope,
-) {
-  return useParsedProductQuery(
-    transport,
-    scope,
-    "research",
-    "activity",
-    ACTIVITY_INPUT,
-    parseResearchActivities,
+    (result) => parseMarketProductResult(result).data,
   )
 }
 
@@ -94,7 +53,7 @@ function useParsedProductQuery<Result>(
   scope: ProductScope,
   domain: string,
   operation: string,
-  input: DashboardQuery,
+  input: ProductQuery,
   parse: (result: ApplicationResult) => Result,
 ): ReadState<Result> {
   const query = useQuery({
@@ -103,22 +62,14 @@ function useParsedProductQuery<Result>(
   })
 
   if (query.isPending) {
-    return { status: "loading", data: null, message: null }
+    return { status: "loading", data: null }
   }
   if (query.isError) {
-    return {
-      status: "unavailable",
-      data: null,
-      message: "This information is unavailable right now.",
-    }
+    return { status: "unavailable", data: null }
   }
   try {
-    return { status: "ready", data: parse(query.data), message: null }
+    return { status: "ready", data: parse(query.data) }
   } catch {
-    return {
-      status: "unavailable",
-      data: null,
-      message: "This information is unavailable right now.",
-    }
+    return { status: "unavailable", data: null }
   }
 }

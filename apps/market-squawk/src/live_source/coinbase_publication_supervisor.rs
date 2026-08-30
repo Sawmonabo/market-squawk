@@ -1,4 +1,4 @@
-//! Owned Coinbase public raw/committed publication rendezvous lifecycle.
+//! Owned Coinbase raw/committed publication rendezvous lifecycle.
 
 use std::{num::NonZeroUsize, sync::Arc, time::Instant};
 
@@ -51,6 +51,11 @@ impl CoinbasePublicationSupervisor {
         let (pending, committed) =
             CryptoPendingFrameIngress::try_new(limits, cancellation.clone())?;
 
+        let mut committed_tasks = Vec::new();
+        committed_tasks
+            .try_reserve_exact(committed_rows.len())
+            .map_err(|_| CoinbasePublicationSupervisorError::Allocation)?;
+
         let expiry_pending = pending.clone();
         let expiry = tokio::spawn(async move { expiry_pending.run_expiry_driver().await });
 
@@ -73,10 +78,6 @@ impl CoinbasePublicationSupervisor {
             outcome
         });
 
-        let mut committed_tasks = Vec::new();
-        committed_tasks
-            .try_reserve_exact(committed_rows.len())
-            .map_err(|_| CoinbasePublicationSupervisorError::Allocation)?;
         for mut receiver in committed_rows {
             let committed_ingress = committed.clone();
             let committed_cancellation = cancellation.clone();

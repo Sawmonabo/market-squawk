@@ -16,7 +16,6 @@ mod jobs;
 mod limits;
 mod protocol;
 mod relay;
-mod resources;
 mod server;
 
 pub use audit::{
@@ -43,8 +42,5 @@ pub use market_squawk_services::{
 pub use relay::{
     MCP_PROTOCOL_VERSION, McpRelayError, McpRelayExchange, McpRelayResponse, McpRelayResponseError,
     McpRelayTransport, McpRelayTransportError, McpStdioRelay,
-};
-pub use resources::{
-    McpResourceDocument, McpResourceError, McpResourceProvider, McpResourceRequest,
 };
 pub use server::{McpServer, ServerError, ServerExit, validate_service_capabilities};

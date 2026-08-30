@@ -9,7 +9,7 @@ import {
   ShieldCheck,
 } from "lucide-react"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { messageFrom, useSystem } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import {
@@ -22,13 +22,13 @@ import {
 } from "@/components/ui/dialog"
 import { Skeleton } from "@/components/ui/skeleton"
 import { humanize } from "@/lib/formatters"
-import type { DesktopBootstrap, ProviderBootstrap } from "@/lib/schemas"
-import type { ProductTransport } from "@/lib/transport"
+import type { DesktopSystemBootstrap, ProviderBootstrap } from "@/lib/schemas"
+import type { SystemTransport } from "@/lib/transport"
 
 import {
   parseResearchManifest,
   type ResearchDataset,
-} from "@/features/research/research-contracts"
+} from "./research-system-contracts"
 
 import {
   type DoctorRateEvidence,
@@ -54,19 +54,22 @@ const unavailableConnectionCapabilities: ProviderBootstrap["capabilities"] = {
 }
 
 export function SourcesPage() {
-  const product = useProduct()
-  if (product.status === "loading") return <SourcesLoading />
-  if (product.status === "error") {
+  const system = useSystem()
+  if (system.status === "loading") return <SourcesLoading />
+  if (system.status !== "ready") {
     return (
       <PageFrame>
-        <EmptyState title="Source service is unavailable" detail={product.error} />
+        <EmptyState
+          title="Source service is unavailable"
+          detail={system.status === "unavailable" ? system.error : "Finish secure storage setup in Settings, then return to Connections."}
+        />
       </PageFrame>
     )
   }
   return (
     <ReadySourcesPage
-      bootstrap={product.bootstrap}
-      transport={product.transport}
+      bootstrap={system.bootstrap}
+      transport={system.transport}
     />
   )
 }
@@ -75,13 +78,13 @@ function ReadySourcesPage({
   bootstrap,
   transport,
 }: {
-  bootstrap: DesktopBootstrap
-  transport: ProductTransport
+  bootstrap: DesktopSystemBootstrap
+  transport: SystemTransport
 }) {
   const queryClient = useQueryClient()
   const connections = useQuery({
     queryKey: [
-      ...productKeys.domain(bootstrap.runtime, "source"),
+      ...productKeys.domain(bootstrap.productSessionToken, "source"),
       "connections-bootstrap",
     ],
     queryFn: () => transport.onboard({ action: "bootstrap" }),
@@ -94,14 +97,14 @@ function ReadySourcesPage({
     queries: capabilities.status
       ? profiles.map((profile) => ({
           queryKey: productKeys.operation(
-            bootstrap.runtime,
+            bootstrap.productSessionToken,
             "source",
             "Source.GetStatus",
             { sourceIds: [profile.id] },
           ),
           queryFn: async () =>
             parseSourceStatusResult(
-              await transport.query({
+              await transport.systemQuery({
                 query: "sourceStatus",
                 sourceIds: [profile.id],
               }),
@@ -112,22 +115,22 @@ function ReadySourcesPage({
   })
   const coverage = useQuery({
     queryKey: productKeys.operation(
-      bootstrap.runtime,
+      bootstrap.productSessionToken,
       "source",
       "Source.GetCoverage",
       {},
     ),
-    queryFn: () => transport.query({ query: "sourceCoverage" }),
+    queryFn: () => transport.systemQuery({ query: "sourceCoverage" }),
     enabled: capabilities.coverage,
   })
   const health = useQuery({
     queryKey: productKeys.operation(
-      bootstrap.runtime,
+      bootstrap.productSessionToken,
       "source",
       "Source.GetHealth",
       {},
     ),
-    queryFn: () => transport.query({ query: "sourceHealth" }),
+    queryFn: () => transport.systemQuery({ query: "sourceHealth" }),
     enabled: capabilities.health,
   })
   const statusRows = statusReads.flatMap((query) => query.data ?? [])
@@ -160,14 +163,14 @@ function ReadySourcesPage({
   const manifestReads = useQueries({
     queries: providerDatasets.map((dataset) => ({
       queryKey: productKeys.operation(
-        bootstrap.runtime,
+        bootstrap.productSessionToken,
         "research",
         "Research.GetManifest",
         { dataset },
       ),
       queryFn: async () =>
         parseResearchManifest(
-          await transport.query({ query: "researchManifest", dataset }),
+          await transport.systemQuery({ query: "researchManifest", dataset }),
           dataset,
         ),
     })),
@@ -220,15 +223,15 @@ function ReadySourcesPage({
   }
   const refreshAuthority = () =>
     queryClient.invalidateQueries({
-      queryKey: productKeys.domain(bootstrap.runtime, "source"),
+      queryKey: productKeys.domain(bootstrap.productSessionToken, "source"),
     })
   const refreshLifecycleAuthorities = () =>
     Promise.all([
       queryClient.invalidateQueries({
-        queryKey: productKeys.domain(bootstrap.runtime, "source"),
+        queryKey: productKeys.domain(bootstrap.productSessionToken, "source"),
       }),
       queryClient.invalidateQueries({
-        queryKey: productKeys.domain(bootstrap.runtime, "market"),
+        queryKey: productKeys.domain(bootstrap.productSessionToken, "market"),
       }),
     ]).then(() => undefined)
   const credentialImportAvailable = capabilities.credentialImport
@@ -271,10 +274,10 @@ function ReadySourcesPage({
         onStarted={() => {
           void Promise.all([
             queryClient.invalidateQueries({
-              queryKey: productKeys.domain(bootstrap.runtime, "job"),
+              queryKey: productKeys.domain(bootstrap.productSessionToken, "job"),
             }),
             queryClient.invalidateQueries({
-              queryKey: productKeys.domain(bootstrap.runtime, "research"),
+              queryKey: productKeys.domain(bootstrap.productSessionToken, "research"),
             }),
           ])
         }}
@@ -346,7 +349,7 @@ function SourceCard({
   onChanged,
 }: {
   source: SourceEvidence
-  transport: ProductTransport
+  transport: SystemTransport
   onChanged: () => Promise<void>
 }) {
   const [pending, setPending] = React.useState<string | null>(null)

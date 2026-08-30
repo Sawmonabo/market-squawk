@@ -19,7 +19,7 @@ use crate::{
     bridge::DesktopState,
     contracts::{
         DesktopCommandError, DesktopEvent, DesktopEventSubscriptionReceipt,
-        DesktopEventSubscriptionRequest,
+        DesktopEventSubscriptionRequest, ProductSessionToken,
     },
 };
 
@@ -70,13 +70,14 @@ pub(crate) async fn subscribe_service_events(
         .map_err(|_error| DesktopCommandError::internal())?;
     let subscription_id = Uuid::new_v4();
     let generation = state.current_generation()?;
-    if request.runtime() != generation.runtime() {
+    if request.product_session_token() != generation.product_session_token() {
         return Err(DesktopCommandError::new(
             "event_subscription_rejected",
             "The event subscription does not belong to this window and service generation.",
         ));
     }
     let runtime = generation.runtime();
+    let product_session_token = generation.product_session_token();
     let requested_sequence = request.after_sequence();
     let mut registry = subscriptions.inner.lock().await;
     state.admit_current(&generation)?;
@@ -93,13 +94,13 @@ pub(crate) async fn subscribe_service_events(
     if requested_sequence > 0 && !resumed {
         registry.retained = None;
         let _ = on_event.send(DesktopEvent::resync_required(
-            runtime,
+            product_session_token,
             requested_sequence,
             "service_event_cursor_unavailable",
         ));
         return Ok(DesktopEventSubscriptionReceipt::new(
             subscription_id,
-            runtime,
+            product_session_token,
             requested_sequence,
             false,
         ));
@@ -113,6 +114,7 @@ pub(crate) async fn subscribe_service_events(
     let task = tauri::async_runtime::spawn(forward_service_events(
         generation.application(),
         runtime,
+        product_session_token,
         generation.service_operation_index(),
         limit,
         Arc::clone(&cursor),
@@ -131,9 +133,15 @@ pub(crate) async fn subscribe_service_events(
         registry.retained = None;
         return Err(error);
     }
-    let receipt =
-        DesktopEventSubscriptionReceipt::new(subscription_id, runtime, requested_sequence, resumed);
-    if let Err(error) = state.acknowledge_webview_runtime(&generation, runtime) {
+    let receipt = DesktopEventSubscriptionReceipt::new(
+        subscription_id,
+        product_session_token,
+        requested_sequence,
+        resumed,
+    );
+    if let Err(error) =
+        state.acknowledge_webview_product_session(&generation, product_session_token)
+    {
         stop_active_subscription(&mut registry, Some(subscription_id)).await;
         registry.retained = None;
         return Err(error);
@@ -189,6 +197,7 @@ async fn stop_active_subscription(registry: &mut SubscriptionRegistry, expected_
 async fn forward_service_events(
     application: Arc<LoopbackApplicationClient>,
     runtime: RuntimeIdentity,
+    product_session_token: ProductSessionToken,
     operations: BTreeMap<String, String>,
     limit: EventPageLimit,
     retained_cursor: Arc<Mutex<Option<EventCursor>>>,
@@ -209,7 +218,7 @@ async fn forward_service_events(
             Err(ApplicationClientError::Interrupted) if cancellation.is_cancelled() => return,
             Err(ApplicationClientError::Unavailable | ApplicationClientError::Interrupted) => {
                 let _ = on_event.send(DesktopEvent::stream_disconnected(
-                    runtime,
+                    product_session_token,
                     previous_sequence,
                     "service_event_stream_unavailable",
                 ));
@@ -217,7 +226,7 @@ async fn forward_service_events(
             }
             Err(ApplicationClientError::Rejected | ApplicationClientError::InvalidResponse) => {
                 let _ = on_event.send(DesktopEvent::resync_required(
-                    runtime,
+                    product_session_token,
                     previous_sequence,
                     "service_event_stream_changed",
                 ));
@@ -236,15 +245,17 @@ async fn forward_service_events(
                 .and_then(|value| value.checked_add(1))
             else {
                 let _ = on_event.send(DesktopEvent::resync_required(
-                    runtime,
+                    product_session_token,
                     previous_sequence,
                     "service_event_sequence_exhausted",
                 ));
                 return;
             };
-            let Some(event) = authority_changed(runtime, sequence, value, &operations) else {
+            let Some(event) =
+                authority_changed(product_session_token, sequence, value, &operations)
+            else {
                 let _ = on_event.send(DesktopEvent::resync_required(
-                    runtime,
+                    product_session_token,
                     previous_sequence,
                     "invalid_service_event",
                 ));
@@ -265,7 +276,7 @@ async fn forward_service_events(
         };
         if !cursor_retained {
             let _ = on_event.send(DesktopEvent::resync_required(
-                runtime,
+                product_session_token,
                 previous_sequence,
                 "service_event_cursor_unavailable",
             ));
@@ -281,7 +292,7 @@ async fn forward_service_events(
 }
 
 fn authority_changed(
-    runtime: RuntimeIdentity,
+    product_session_token: ProductSessionToken,
     sequence: u64,
     value: &Value,
     operations: &BTreeMap<String, String>,
@@ -297,7 +308,7 @@ fn authority_changed(
         return None;
     }
     Some(DesktopEvent::authority_changed(
-        runtime,
+        product_session_token,
         sequence,
         domain,
         operation.to_owned(),

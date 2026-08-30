@@ -12,7 +12,7 @@ use std::{
 
 use market_squawk_services::{
     RequestContext as ServiceRequestContext, RequestId as ServiceRequestId, ServiceCapabilities,
-    ServiceError, ServiceErrorClass, ToolArtifactPolicy, ToolDescriptor, ToolServices,
+    ServiceError, ServiceErrorClass, ToolDescriptor, ToolServices,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -25,7 +25,6 @@ use rmcp::{
     },
     service::{NotificationContext, QuitReason, RequestContext as McpRequestContext},
 };
-use serde_json::json;
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -34,8 +33,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRepository,
-    AuditResultClass, AuditSink, LocalProcessIdentityClass, McpLimits,
+    ArtifactRepository, AuditResultClass, AuditSink, LocalProcessIdentityClass, McpLimits,
     framing::OutputChannel,
     isolation::{
         IsolatedSdkOutcome, McpProgressSink, OwnedSdkThread, ProgressDelivery,
@@ -413,12 +411,7 @@ impl<S: ToolServices> ServiceHandler<S> {
                 Ok(result) => result,
                 Err(error) => return tool_execution_error(error),
             };
-            self.render_result(
-                descriptor,
-                result,
-                ArtifactPublicationContext::new(request_cancellation.clone(), deadline),
-            )
-            .await
+            self.render_result(descriptor, result)
         };
         let outcome = tokio::select! {
             biased;
@@ -443,11 +436,10 @@ impl<S: ToolServices> ServiceHandler<S> {
         outcome
     }
 
-    async fn render_result(
+    fn render_result(
         &self,
         descriptor: &ToolDescriptor,
         result: market_squawk_services::TypedToolResult,
-        artifact_context: ArtifactPublicationContext,
     ) -> Result<CallToolResult, McpError> {
         let limits = self.limits.service_limits();
         result
@@ -456,39 +448,16 @@ impl<S: ToolServices> ServiceHandler<S> {
         result
             .validate_for(descriptor)
             .map_err(|_| service_error(ServiceError::InvalidResult))?;
-        let inline = result.encoded_bytes() <= limits.maximum_inline_bytes()
+        let projection = descriptor.result_projection();
+        let projected_bytes = result
+            .projected_encoded_bytes(projection, limits)
+            .map_err(|_| service_error(ServiceError::InvalidResult))?;
+        let inline = projected_bytes <= limits.maximum_inline_bytes()
             && result.item_count() <= limits.maximum_inline_items();
         if inline {
-            return Ok(structured_result(result.into_envelope()));
+            return Ok(structured_result(result.into_envelope(projection)));
         }
-        if matches!(
-            descriptor.contract().result().artifact(),
-            ToolArtifactPolicy::InlineOnly
-        ) {
-            return tool_execution_error(ServiceError::ResourceExhausted);
-        }
-
-        let metadata = result.metadata_value();
-        let structured = result.into_envelope();
-        let encoded = serde_json::to_vec(&structured)
-            .map_err(|_| McpError::internal_error("result encoding failed", None))?;
-        let publication = ArtifactPublication::try_json(encoded).map_err(artifact_error)?;
-        let reference = self
-            .artifacts
-            .publish(publication.clone(), artifact_context)
-            .await
-            .map_err(artifact_error)?;
-        if !reference.matches(&publication) {
-            return Err(McpError::internal_error(
-                "artifact repository returned inconsistent metadata",
-                None,
-            ));
-        }
-        let value = serde_json::to_value(reference)
-            .map_err(|_| McpError::internal_error("artifact reference encoding failed", None))?;
-        Ok(structured_result(
-            json!({ "artifact": value, "metadata": metadata }),
-        ))
+        Err(service_error(ServiceError::ResourceExhausted))
     }
 }
 
@@ -759,18 +728,6 @@ fn cancelled_error() -> McpError {
 
 fn deadline_error() -> McpError {
     McpError::new(ErrorCode(-32_008), "request deadline exceeded", None)
-}
-
-fn artifact_error(error: ArtifactError) -> McpError {
-    match error {
-        ArtifactError::Cancelled => cancelled_error(),
-        ArtifactError::DeadlineExceeded => deadline_error(),
-        ArtifactError::InvalidPublication
-        | ArtifactError::InvalidReference
-        | ArtifactError::ReadLimitExceeded
-        | ArtifactError::NotFound
-        | ArtifactError::Unavailable => McpError::internal_error("artifact operation failed", None),
-    }
 }
 
 fn controlled_or_initialization_error(

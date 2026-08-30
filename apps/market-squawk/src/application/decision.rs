@@ -24,6 +24,9 @@ use market_squawk_decisions::{
 };
 use market_squawk_domain::{EvidenceDigest, RevisionNumber, SourceIdentifier, Timestamp};
 use market_squawk_platform::DecisionDatabaseLocation;
+use uuid::Uuid;
+
+use super::opaque_product_token;
 
 use self::codec::{EncodedRecord, RecoveryContext};
 use self::persistence::DecisionJournal;
@@ -120,6 +123,14 @@ pub(crate) struct InvestmentAnalysisRead {
     pub(crate) current: Option<InvestmentAnalysisCurrentIndexEntry>,
     pub(crate) outcome_projection: Option<InvestmentOutcomeProjection>,
     pub(crate) sizing_projection: Option<InvestmentSizingProjection>,
+}
+
+const INVESTMENT_ANALYSIS_PRODUCT_TOKEN_DOMAIN: &[u8] =
+    b"market-squawk/investment-analysis-product-action/v1\0";
+
+fn investment_analysis_product_token(analysis_id: InvestmentAnalysisId) -> Uuid {
+    let identity = analysis_id.bytes();
+    opaque_product_token(INVESTMENT_ANALYSIS_PRODUCT_TOKEN_DOMAIN, &[&identity])
 }
 
 impl InvestmentProposalIndexReadPage {
@@ -831,6 +842,51 @@ impl DecisionApplication {
             outcome_projection,
             sizing_projection,
         })
+    }
+
+    /// Returns the restart-stable opaque product action token for one retained analysis.
+    ///
+    /// The full bounded retained set is checked before issuing the token so a truncated UUID
+    /// collision fails closed rather than resolving to the wrong durable decision.
+    pub(crate) fn investment_analysis_product_token(
+        &self,
+        analysis_id: InvestmentAnalysisId,
+    ) -> Result<Uuid, DecisionApplicationError> {
+        let state = self.reader()?;
+        let repository = state.authority.repository();
+        if repository.investment_proposal(analysis_id).is_none() {
+            return Err(DecisionRepositoryError::NotFound.into());
+        }
+        let token = investment_analysis_product_token(analysis_id);
+        for decision in repository.investment_proposals() {
+            if decision.analysis_id() != analysis_id
+                && investment_analysis_product_token(decision.analysis_id()) == token
+            {
+                return Err(DecisionApplicationError::InvalidPersistentState);
+            }
+        }
+        Ok(token)
+    }
+
+    /// Resolves one opaque product action token against the complete bounded retained set.
+    ///
+    /// Deterministic derivation makes resolution restart-stable. Multiple matches are treated as
+    /// corrupt state even though a UUID collision is cryptographically improbable.
+    pub(crate) fn resolve_investment_analysis_product_token(
+        &self,
+        token: Uuid,
+    ) -> Result<InvestmentAnalysisId, DecisionApplicationError> {
+        let state = self.reader()?;
+        let mut resolved = None;
+        for decision in state.authority.repository().investment_proposals() {
+            if investment_analysis_product_token(decision.analysis_id()) != token {
+                continue;
+            }
+            if resolved.replace(decision.analysis_id()).is_some() {
+                return Err(DecisionApplicationError::InvalidPersistentState);
+            }
+        }
+        resolved.ok_or_else(|| DecisionRepositoryError::NotFound.into())
     }
 
     /// Computes current-status performance grouped by exact profile, action, and horizon.

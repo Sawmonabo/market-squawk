@@ -16,10 +16,11 @@ use std::{
 
 use market_squawk_data::{
     DatasetId, DatasetManifestRef, IngestError, OfficialOptionsReferenceCanonicalResolution,
+    OfficialOptionsReferenceCatalogReadCapability, OfficialOptionsReferenceCatalogResolution,
     OfficialOptionsReferenceError, OfficialOptionsReferenceGenerationSelection,
     OfficialOptionsReferenceIdentityQuery, OfficialOptionsReferenceIdentityResolution,
-    OfficialOptionsReferenceReadCapability, OfficialOptionsReferenceRecordValue,
-    OptionMarketPointInTimeRequest, OptionMarketPointInTimeSelection,
+    OfficialOptionsReferenceRecordValue, OptionMarketPointInTimeRequest,
+    OptionMarketPointInTimeSelection,
 };
 use market_squawk_domain::{
     CalendarDate, DigestAlgorithm, EvidenceDigest, InstrumentId, MetadataRevision, Money,
@@ -148,7 +149,7 @@ impl OptionsObservationReadAvailability {
 #[derive(Clone)]
 pub(crate) enum OptionsReferenceReadAvailability {
     Unavailable,
-    Ready(OfficialOptionsReferenceReadCapability),
+    Ready(OfficialOptionsReferenceCatalogReadCapability),
 }
 
 impl fmt::Debug for OptionsReferenceReadAvailability {
@@ -444,7 +445,19 @@ impl OptionsContextReadCapability {
             deadline,
             cancellation,
         ) {
-            Ok(resolution) => resolution,
+            Ok(OfficialOptionsReferenceCatalogResolution::Unavailable) => {
+                return Ok((
+                    OptionsReferenceStatus::Unavailable,
+                    PrivateReferenceEvidence::unavailable(),
+                ));
+            }
+            Ok(OfficialOptionsReferenceCatalogResolution::Ambiguous { .. }) => {
+                return Ok((
+                    OptionsReferenceStatus::Ambiguous,
+                    PrivateReferenceEvidence::ambiguous_catalog(),
+                ));
+            }
+            Ok(OfficialOptionsReferenceCatalogResolution::Selected(resolution)) => resolution,
             Err(
                 OfficialOptionsReferenceError::SourceUnavailable
                 | OfficialOptionsReferenceError::RightsUnavailable
@@ -1366,6 +1379,10 @@ impl PrivateReferenceEvidence {
 
     fn ambiguous(generation_digest: EvidenceDigest, details: Vec<EvidenceDigest>) -> Self {
         Self::new(3, Some(generation_digest), None, details)
+    }
+
+    fn ambiguous_catalog() -> Self {
+        Self::new(3, None, None, Vec::new())
     }
 
     fn exact(

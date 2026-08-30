@@ -8,7 +8,8 @@ use std::{fmt, num::NonZeroU32, time::Instant};
 
 use market_squawk_data::{
     AnalyticalReadCapability, AnalyticalReadError, CanonicalMarketBarHistoryRequest,
-    CompleteMarketBarHistoryOutput, DatasetManifestRef, ManifestCatalogError,
+    CompleteMarketBarHistoryOutput, DatasetManifestRef,
+    LatestCanonicalMarketBarHistoryWindowRequest, ManifestCatalogError,
     MarketHistorySelectionPolicy, ParquetStoreError, QueryError, Sha256Digest,
 };
 use market_squawk_domain::{
@@ -114,6 +115,43 @@ pub(crate) struct MarketHistoryReadRequest {
     adjustment: MarketHistoryAdjustmentPolicy,
     knowledge_cutoff: Timestamp,
     limit: MarketHistoryReadLimit,
+}
+
+/// Provider-neutral request for the latest immutable complete financial window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LatestMarketHistoryReadRequest {
+    instrument_id: InstrumentId,
+    timeframe: MarketHistoryTimeframe,
+    session: MarketHistorySessionPolicy,
+    adjustment: MarketHistoryAdjustmentPolicy,
+    knowledge_cutoff: Timestamp,
+    limit: MarketHistoryReadLimit,
+}
+
+impl LatestMarketHistoryReadRequest {
+    pub(crate) const fn new(
+        instrument_id: InstrumentId,
+        timeframe: MarketHistoryTimeframe,
+        session: MarketHistorySessionPolicy,
+        adjustment: MarketHistoryAdjustmentPolicy,
+        knowledge_cutoff: Timestamp,
+        limit: MarketHistoryReadLimit,
+    ) -> Self {
+        Self {
+            instrument_id,
+            timeframe,
+            session,
+            adjustment,
+            knowledge_cutoff,
+            limit,
+        }
+    }
+
+    fn supported_by_current_catalog_policy(&self) -> bool {
+        self.timeframe == MarketHistoryTimeframe::Daily
+            && self.session == MarketHistorySessionPolicy::CompletedTradingSessions
+            && self.adjustment == MarketHistoryAdjustmentPolicy::FullyAdjusted
+    }
 }
 
 impl MarketHistoryReadRequest {
@@ -475,6 +513,81 @@ impl MarketHistoryReadCapability {
             .await
         {
             Ok(Some(output)) => project_output(output, request),
+            Ok(None) => MarketHistoryReadOutcome::Missing(
+                MarketHistoryMissingReason::NoCompleteWindowAtKnowledgeCutoff,
+            ),
+            Err(error) => MarketHistoryReadOutcome::Unavailable(unavailable_reason(&error)),
+        }
+    }
+
+    /// Selects and reads the latest complete immutable window known at the trusted cutoff.
+    pub(crate) async fn read_latest(
+        &self,
+        request: LatestMarketHistoryReadRequest,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> MarketHistoryReadOutcome {
+        if !request.supported_by_current_catalog_policy() {
+            return MarketHistoryReadOutcome::Missing(
+                MarketHistoryMissingReason::PolicyNotMaterialized,
+            );
+        }
+        let lookup = match LatestCanonicalMarketBarHistoryWindowRequest::try_new(
+            request.instrument_id,
+            MarketHistorySelectionPolicy::COMPLETE_DAILY_ADJUSTED_V1,
+            request.knowledge_cutoff,
+        ) {
+            Ok(lookup) => lookup,
+            Err(_error) => {
+                return MarketHistoryReadOutcome::Unavailable(
+                    MarketHistoryUnavailableReason::IntegrityUnproven,
+                );
+            }
+        };
+        let selection = match self
+            .reader
+            .select_latest_canonical_market_bar_history_window(lookup, deadline, &cancellation)
+        {
+            Ok(Some(selection)) => selection,
+            Ok(None) => {
+                return MarketHistoryReadOutcome::Missing(
+                    MarketHistoryMissingReason::NoCompleteWindowAtKnowledgeCutoff,
+                );
+            }
+            Err(error) => {
+                return MarketHistoryReadOutcome::Unavailable(unavailable_reason(&error));
+            }
+        };
+        let (start, end_exclusive) = selection.requested_range();
+        let exact_request =
+            match MarketHistoryInterval::try_new(start, end_exclusive).and_then(|interval| {
+                MarketHistoryReadRequest::try_new(
+                    request.instrument_id,
+                    interval,
+                    request.timeframe,
+                    request.session,
+                    request.adjustment,
+                    request.knowledge_cutoff,
+                    request.limit,
+                )
+            }) {
+                Ok(request) => request,
+                Err(_error) => {
+                    return MarketHistoryReadOutcome::Unavailable(
+                        MarketHistoryUnavailableReason::IntegrityUnproven,
+                    );
+                }
+            };
+        match self
+            .reader
+            .read_canonical_market_bar_history(
+                selection.into_exact_request(),
+                deadline,
+                cancellation,
+            )
+            .await
+        {
+            Ok(Some(output)) => project_output(output, exact_request),
             Ok(None) => MarketHistoryReadOutcome::Missing(
                 MarketHistoryMissingReason::NoCompleteWindowAtKnowledgeCutoff,
             ),

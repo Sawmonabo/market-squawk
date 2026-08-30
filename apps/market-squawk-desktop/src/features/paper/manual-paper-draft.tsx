@@ -15,8 +15,7 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { formatMoney, humanize } from "@/lib/formatters"
-import { formatTimestamp } from "@/lib/time"
+import { formatMoney } from "@/lib/formatters"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
@@ -24,13 +23,12 @@ import {
   isPositiveLotQuantity,
   parseAcceptedManualPaperDraft,
   parseGovernedPaperTargets,
-  requiresLimitLevel,
-  requiresStopLevel,
-  validTimeInForce,
+  parseManualPaperPreview,
   type GovernedPaperTarget,
   type ManualPaperOrderType,
   type ManualPaperSide,
-  type ManualPaperSubmit,
+  type ManualPaperPrepare,
+  type ManualPaperPreview,
   type ManualPaperTimeInForce,
   type TargetLevel,
 } from "./manual-paper-contracts"
@@ -39,13 +37,13 @@ const CONTROL_CLASS =
   "h-10 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
 
 type Draft = {
-  targetKey: string
-  side: ManualPaperSide
-  orderType: ManualPaperOrderType
+  targetIndex: string
+  side: ManualPaperSide | ""
+  orderType: ManualPaperOrderType | ""
   quantityLots: string
   limitTargetLevel: TargetLevel | ""
   stopTargetLevel: TargetLevel | ""
-  timeInForce: ManualPaperTimeInForce
+  timeInForce: ManualPaperTimeInForce | ""
 }
 
 export function ManualPaperDraftPanel({
@@ -63,7 +61,7 @@ export function ManualPaperDraftPanel({
 }) {
   const manualPaper = asManualPaperTransport(transport)
   const [draft, setDraft] = React.useState<Draft>(emptyDraft)
-  const [pending, setPending] = React.useState<ManualPaperSubmit | null>(null)
+  const [pending, setPending] = React.useState<ManualPaperPreview | null>(null)
   const [accepted, setAccepted] = React.useState<string | null>(null)
   const targets = useQuery({
     queryKey: productKeys.operation(scope, "execution", "Execution.GetManualPaperTargets", {}),
@@ -74,51 +72,53 @@ export function ManualPaperDraftPanel({
       return parseGovernedPaperTargets(await manualPaper.manualPaper({ action: "targets" }))
     },
   })
-  const submit = useMutation({
-    mutationFn: async (request: ManualPaperSubmit) => {
+  const prepare = useMutation({
+    mutationFn: async (request: ManualPaperPrepare) => {
       if (!manualPaper) throw new Error("Paper drafting is unavailable.")
-      const result = await manualPaper.manualPaper(request, true)
-      parseAcceptedManualPaperDraft(result, request)
+      return parseManualPaperPreview(await manualPaper.manualPaper(request))
     },
-    onSuccess: async () => {
+    onSuccess: (preview) => setPending(preview),
+  })
+  const submit = useMutation({
+    mutationFn: async (confirmationToken: string) => {
+      if (!manualPaper) throw new Error("Paper drafting is unavailable.")
+      return parseAcceptedManualPaperDraft(
+        await manualPaper.manualPaper({ action: "submitManual", confirmationToken }, true),
+      )
+    },
+    onSuccess: async (message) => {
       setPending(null)
-      setAccepted("Your paper draft is waiting for the next eligible market update.")
-      setDraft((current) => ({ ...current, quantityLots: "" }))
+      setAccepted(message)
+      setDraft(emptyDraft())
       await onAccepted()
     },
+    onError: () => setPending(null),
   })
 
-  React.useEffect(() => {
-    const targetCatalog = targets.data
-    const first = targetCatalog?.[0]
-    if (!targetCatalog || !first) return
-    setDraft((current) =>
-      current.targetKey &&
-      targetCatalog.some((target) => targetKey(target) === current.targetKey)
-        ? current
-        : { ...current, targetKey: targetKey(first) },
-    )
-  }, [targets.data])
-
-  const selected = targets.data?.find((target) => targetKey(target) === draft.targetKey) ?? null
+  const targetIndex = parseSelectedIndex(draft.targetIndex, targets.data?.length ?? 0)
+  const selected = targetIndex === null ? null : targets.data?.[targetIndex] ?? null
+  const orderChoice = selected?.orderChoices.find((choice) => choice.value === draft.orderType)
   const normalized = normalizeDraft(draft, selected)
-  const invalidTarget = draft.targetKey.length > 0 && selected === null
-  const ready = enabled && normalized !== null && !busy && !submit.isPending
+  const ready =
+    enabled && normalized !== null && !busy && !prepare.isPending && !submit.isPending
 
   return (
-    <section className="mt-4 rounded-xl border border-primary/25 bg-primary/5 p-5" aria-labelledby="manual-paper-heading">
+    <section
+      className="mt-4 rounded-xl border border-primary/25 bg-primary/5 p-5"
+      aria-labelledby="manual-paper-heading"
+    >
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
-            Manual paper draft
+            Paper practice
           </p>
           <h2 id="manual-paper-heading" className="mt-1 text-lg font-semibold">
-            Turn an investment target into a paper draft
+            Practice an investment plan without real money
           </h2>
           <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Choose an active target, your side, order constraint, and whole-lot quantity. The next
-            eligible market update supplies the virtual execution terms. Choosing a target does not
-            place an order: every draft must still pass the paper-trading safety checks.
+            Select an active plan and make each choice yourself. Market Squawk supplies only the
+            choices prepared for that plan, then rechecks current conditions and safeguards before
+            a virtual order can proceed.
           </p>
         </div>
         <ShieldCheck className="size-5 text-primary" aria-hidden="true" />
@@ -127,174 +127,183 @@ export function ManualPaperDraftPanel({
       {!enabled || manualPaper === null ? (
         <Unavailable />
       ) : targets.isPending ? (
-        <Status text="Loading active investment targets and their price levels…" />
+        <Status text="Loading prepared paper choices…" />
       ) : targets.isError ? (
-        <Status text="Investment targets could not be loaded. Try again." tone="error" />
+        <Status text="Prepared paper choices are not available right now. Try again." tone="error" />
       ) : targets.data?.length === 0 ? (
-        <Unavailable detail="Create and activate an investment target before preparing a paper draft." />
-      ) : selected ? (
+        <Unavailable detail="Create an investment plan before preparing a paper trade." />
+      ) : (
         <div className="mt-5 space-y-4">
-          <TargetEvidence target={selected} />
           <div className="grid gap-4 lg:grid-cols-2">
-            <Field label="Investment target" htmlFor="manual-paper-target">
+            <Field label="Investment plan" htmlFor="manual-paper-target">
               <select
                 id="manual-paper-target"
                 className={CONTROL_CLASS}
-                value={draft.targetKey}
+                value={draft.targetIndex}
                 onChange={(event) => {
-                  const nextTarget = targets.data?.find(
-                    (target) => targetKey(target) === event.target.value,
-                  )
-                  setDraft((current) => ({
-                    ...current,
-                    targetKey: event.target.value,
-                    limitTargetLevel: "",
-                    stopTargetLevel: "",
-                    timeInForce: nextTarget
-                      ? defaultTimeInForce(current.orderType)
-                      : current.timeInForce,
-                  }))
+                  setDraft({ ...emptyDraft(), targetIndex: event.target.value })
                   setAccepted(null)
                 }}
               >
-                {targets.data.map((target) => (
-                  <option key={targetKey(target)} value={targetKey(target)}>
-                    {target.instrumentId}
+                <option value="">Select an investment plan</option>
+                {targets.data.map((target, index) => (
+                  <option key={`${target.investment.name}:${index}`} value={String(index)}>
+                    {investmentLabel(target.investment)}
                   </option>
                 ))}
               </select>
-              <FieldMessage>Only active investment targets appear here.</FieldMessage>
             </Field>
-            <Field label="Direction" htmlFor="manual-paper-side">
-              <select
-                id="manual-paper-side"
-                className={CONTROL_CLASS}
-                value={draft.side}
-                onChange={(event) => {
-                  setDraft((current) => ({
-                    ...current,
-                    side: event.target.value as ManualPaperSide,
-                  }))
-                  setAccepted(null)
-                }}
-              >
-                <option value="buy">Buy</option>
-                <option value="sell">Sell</option>
-              </select>
-            </Field>
-            <Field label="Order constraint" htmlFor="manual-paper-order-type">
-              <select
-                id="manual-paper-order-type"
-                className={CONTROL_CLASS}
-                value={draft.orderType}
-                onChange={(event) => {
-                  const orderType = event.target.value as ManualPaperOrderType
-                  setDraft((current) => ({
-                    ...current,
-                    orderType,
-                    limitTargetLevel: requiresLimitLevel(orderType)
-                      ? current.limitTargetLevel
-                      : "",
-                    stopTargetLevel: requiresStopLevel(orderType)
-                      ? current.stopTargetLevel
-                      : "",
-                    timeInForce: defaultTimeInForce(orderType),
-                  }))
-                  setAccepted(null)
-                }}
-              >
-                <option value="market">Market</option>
-                <option value="limit">Limit at target level</option>
-                <option value="stop">Stop at target level</option>
-                <option value="stop_limit">Stop-limit at target levels</option>
-              </select>
-              <FieldMessage>
-                This does not supply current market price or market-data quality from the dashboard.
-              </FieldMessage>
-            </Field>
-            <Field label="Whole-lot quantity" htmlFor="manual-paper-quantity">
-              <Input
-                id="manual-paper-quantity"
-                value={draft.quantityLots}
-                inputMode="numeric"
-                autoComplete="off"
-                placeholder="100"
-                aria-invalid={draft.quantityLots.length > 0 && !isPositiveLotQuantity(draft.quantityLots)}
-                onChange={(event) => {
-                  setDraft((current) => ({ ...current, quantityLots: event.target.value }))
-                  setAccepted(null)
-                }}
-              />
-              <FieldMessage>
-                Enter a positive whole number of lots; fractions, separators, and scientific notation are not accepted.
-              </FieldMessage>
-            </Field>
-            {requiresLimitLevel(draft.orderType) ? (
-              <LevelField
-                label="Limit condition"
-                fieldId="manual-paper-limit-level"
-                value={draft.limitTargetLevel}
-                ladder={selected.ladder}
-                onChange={(limitTargetLevel) => {
-                  setDraft((current) => ({ ...current, limitTargetLevel }))
-                  setAccepted(null)
-                }}
-              />
+
+            {selected ? (
+              <>
+                <Field label="Direction" htmlFor="manual-paper-side">
+                  <select
+                    id="manual-paper-side"
+                    className={CONTROL_CLASS}
+                    value={draft.side}
+                    onChange={(event) => {
+                      setDraft((current) => ({
+                        ...current,
+                        side: event.target.value as ManualPaperSide | "",
+                      }))
+                      setAccepted(null)
+                    }}
+                  >
+                    <option value="">Select a direction</option>
+                    {selected.sideChoices.map((choice) => (
+                      <option key={choice.value} value={choice.value}>
+                        {choice.label} — {choice.explanation}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+
+                <Field label="Order approach" htmlFor="manual-paper-order-type">
+                  <select
+                    id="manual-paper-order-type"
+                    className={CONTROL_CLASS}
+                    value={draft.orderType}
+                    onChange={(event) => {
+                      setDraft((current) => ({
+                        ...current,
+                        orderType: event.target.value as ManualPaperOrderType | "",
+                        limitTargetLevel: "",
+                        stopTargetLevel: "",
+                        timeInForce: "",
+                      }))
+                      setAccepted(null)
+                    }}
+                  >
+                    <option value="">Select an order approach</option>
+                    {selected.orderChoices.map((choice) => (
+                      <option key={choice.value} value={choice.value}>
+                        {choice.label} — {choice.explanation}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+
+                <Field label="Whole-lot quantity" htmlFor="manual-paper-quantity">
+                  <Input
+                    id="manual-paper-quantity"
+                    value={draft.quantityLots}
+                    inputMode="numeric"
+                    autoComplete="off"
+                    placeholder="Enter quantity"
+                    aria-invalid={
+                      draft.quantityLots.length > 0 &&
+                      !isPositiveLotQuantity(draft.quantityLots)
+                    }
+                    onChange={(event) => {
+                      setDraft((current) => ({ ...current, quantityLots: event.target.value }))
+                      setAccepted(null)
+                    }}
+                  />
+                  <FieldMessage>Enter a positive whole number of lots.</FieldMessage>
+                </Field>
+
+                {orderChoice?.requiresLimitLevel ? (
+                  <LevelField
+                    label="Limit condition"
+                    fieldId="manual-paper-limit-level"
+                    value={draft.limitTargetLevel}
+                    ladder={selected.ladder}
+                    onChange={(limitTargetLevel) => {
+                      setDraft((current) => ({ ...current, limitTargetLevel }))
+                      setAccepted(null)
+                    }}
+                  />
+                ) : null}
+
+                {orderChoice?.requiresStopLevel ? (
+                  <LevelField
+                    label="Stop condition"
+                    fieldId="manual-paper-stop-level"
+                    value={draft.stopTargetLevel}
+                    ladder={selected.ladder}
+                    onChange={(stopTargetLevel) => {
+                      setDraft((current) => ({ ...current, stopTargetLevel }))
+                      setAccepted(null)
+                    }}
+                  />
+                ) : null}
+
+                {orderChoice ? (
+                  <Field label="How long the order remains active" htmlFor="manual-paper-duration">
+                    <select
+                      id="manual-paper-duration"
+                      className={CONTROL_CLASS}
+                      value={draft.timeInForce}
+                      onChange={(event) => {
+                        setDraft((current) => ({
+                          ...current,
+                          timeInForce: event.target.value as ManualPaperTimeInForce | "",
+                        }))
+                        setAccepted(null)
+                      }}
+                    >
+                      <option value="">Select a duration</option>
+                      {orderChoice.timeInForceChoices.map((choice) => (
+                        <option key={choice.value} value={choice.value}>
+                          {choice.label} — {choice.explanation}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                ) : null}
+              </>
             ) : null}
-            {requiresStopLevel(draft.orderType) ? (
-              <LevelField
-                label="Stop condition"
-                fieldId="manual-paper-stop-level"
-                value={draft.stopTargetLevel}
-                ladder={selected.ladder}
-                onChange={(stopTargetLevel) => {
-                  setDraft((current) => ({ ...current, stopTargetLevel }))
-                  setAccepted(null)
-                }}
-              />
-            ) : null}
-            <Field label="Time in force" htmlFor="manual-paper-time-in-force">
-              <select
-                id="manual-paper-time-in-force"
-                className={CONTROL_CLASS}
-                value={draft.timeInForce}
-                onChange={(event) => {
-                  setDraft((current) => ({
-                    ...current,
-                    timeInForce: event.target.value as ManualPaperTimeInForce,
-                  }))
-                  setAccepted(null)
-                }}
-              >
-                {validTimeInForce(draft.orderType).map((value) => (
-                  <option key={value} value={value}>{humanize(value)}</option>
-                ))}
-              </select>
-            </Field>
           </div>
 
-          {invalidTarget ? <Status text="The selected investment target is no longer active. Refresh before submitting." tone="error" /> : null}
+          {selected ? <TargetEvidence target={selected} /> : null}
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-background/25 p-3">
             <p className="max-w-3xl text-[11px] leading-5 text-muted-foreground">
-              Market Squawk applies the account, timing, slippage, and risk controls when eligible
-              market data arrives. Reviewing a draft does not place or guarantee an order.
+              Reviewing does not place a real or virtual order. A second confirmation and current
+              safety check are required.
             </p>
             <Button
               disabled={!ready}
               onClick={() => {
                 if (normalized) {
+                  prepare.reset()
                   submit.reset()
-                  setPending(normalized)
+                  prepare.mutate(normalized)
                 }
               }}
             >
               <FileCheck2 aria-hidden="true" />
-              Review paper draft
+              {prepare.isPending ? "Preparing…" : "Review paper trade"}
             </Button>
           </div>
+          {prepare.isError ? (
+            <Status text="The virtual trade preview is unavailable. Review the choices and try again." tone="error" />
+          ) : null}
           {accepted ? <Status text={accepted} tone="success" /> : null}
+          {submit.isError && pending === null ? (
+            <Status text="The prepared confirmation is no longer usable. Review the trade again before retrying." tone="error" />
+          ) : null}
         </div>
-      ) : null}
+      )}
 
       <Dialog
         open={pending !== null}
@@ -304,17 +313,13 @@ export function ManualPaperDraftPanel({
       >
         <DialogContent className="max-h-[88vh] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
-            <DialogTitle>Submit this paper draft?</DialogTitle>
+            <DialogTitle>Submit this virtual trade?</DialogTitle>
             <DialogDescription>
-              Review the selected investment, price conditions, and quantity. The draft waits for
-              an eligible market update and must pass the paper-trading safety checks before a
-              virtual order can proceed.
+              Confirm the plan, direction, quantity, price conditions, and duration. Current
+              conditions and safeguards are checked again before virtual execution.
             </DialogDescription>
           </DialogHeader>
-          {pending && selected ? <ConfirmationEvidence request={pending} target={selected} /> : null}
-          {submit.isError ? (
-            <Status text="The paper draft could not be submitted. Review it and try again." tone="error" />
-          ) : null}
+          {pending ? <Confirmation preview={pending} /> : null}
           <DialogFooter>
             <Button variant="outline" disabled={submit.isPending} onClick={() => setPending(null)}>
               Keep editing
@@ -322,11 +327,11 @@ export function ManualPaperDraftPanel({
             <Button
               disabled={!pending || submit.isPending}
               onClick={() => {
-                if (pending) submit.mutate(pending)
+                if (pending) submit.mutate(pending.confirmationToken)
               }}
             >
               <Send aria-hidden="true" />
-              {submit.isPending ? "Submitting draft…" : "Confirm paper draft"}
+              {submit.isPending ? "Submitting…" : "Confirm virtual trade"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -340,20 +345,20 @@ function TargetEvidence({ target }: { target: GovernedPaperTarget }) {
     <div className="rounded-xl border border-border bg-background/35 p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <p className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-            Active investment target
-          </p>
-          <p className="mt-1 font-mono text-sm">{target.instrumentId}</p>
+          <p className="font-semibold">{investmentLabel(target.investment)}</p>
           <p className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">{target.thesis}</p>
         </div>
         <p className="text-right text-[10px] text-muted-foreground">
-          Review due {formatTimestamp(target.reviewDueAt)}
+          Review by {formatProductTimestamp(target.reviewDueAt)} · expires{" "}
+          {formatProductTimestamp(target.expiresAt)}
         </p>
       </div>
       <dl className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
         {target.ladder.map((level) => (
           <div key={level.level} className="rounded-lg border border-border/70 bg-card/40 p-3">
-            <dt className="text-[10px] uppercase tracking-[0.1em] text-muted-foreground">{level.label}</dt>
+            <dt className="text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
+              {level.label}
+            </dt>
             <dd className="mt-1 text-xs font-semibold tabular-nums">{formatMoney(level.value)}</dd>
           </div>
         ))}
@@ -362,31 +367,25 @@ function TargetEvidence({ target }: { target: GovernedPaperTarget }) {
   )
 }
 
-function ConfirmationEvidence({
-  request,
-  target,
+function Confirmation({
+  preview,
 }: {
-  request: ManualPaperSubmit
-  target: GovernedPaperTarget
+  preview: ManualPaperPreview
 }) {
-  const limit = request.limitTargetLevel
-    ? target.ladder.find((level) => level.level === request.limitTargetLevel) ?? null
-    : null
-  const stop = request.stopTargetLevel
-    ? target.ladder.find((level) => level.level === request.stopTargetLevel) ?? null
-    : null
   return (
     <dl className="grid gap-3 rounded-xl border border-border bg-card/35 p-4 text-xs sm:grid-cols-2">
-      <Fact label="Investment" value={target.instrumentId} />
-      <Fact label="Direction" value={humanize(request.side)} />
-      <Fact label="Order constraint" value={humanize(request.orderType)} />
-      <Fact label="Whole-lot quantity" value={`${request.quantityLots} lots`} />
-      <Fact label="Time in force" value={humanize(request.timeInForce)} />
-      {limit ? <Fact label="Limit target level" value={`${limit.label} · ${formatMoney(limit.value)}`} /> : null}
-      {stop ? <Fact label="Stop target level" value={`${stop.label} · ${formatMoney(stop.value)}`} /> : null}
-      <div className="sm:col-span-2 rounded-lg border border-amber-400/20 bg-amber-400/5 p-3 text-[11px] leading-5 text-amber-100">
-        This draft does not use a live price or place an order now. If eligible market data arrives,
-        Market Squawk applies account and risk checks before a virtual order can proceed.
+      <Fact label="Investment" value={investmentLabel(preview.investment)} />
+      <Fact label="Direction" value={preview.direction} />
+      <Fact label="Order approach" value={preview.orderApproach} />
+      <Fact label="Quantity" value={preview.quantity} />
+      <Fact label="Duration" value={preview.duration} />
+      {preview.limitCondition ? <Fact label="Limit condition" value={`${preview.limitCondition.label} · ${formatMoney(preview.limitCondition.value)}`} /> : null}
+      {preview.stopCondition ? <Fact label="Stop condition" value={`${preview.stopCondition.label} · ${formatMoney(preview.stopCondition.value)}`} /> : null}
+      <Fact label="Maximum order value" value={formatMoney(preview.safeguards.maximumOrderValue)} />
+      <Fact label="Maximum slippage" value={preview.safeguards.maximumSlippage} />
+      <Fact label="Preview expires" value={formatProductTimestamp(preview.expiresAt)} />
+      <div className="rounded-lg border border-amber-400/20 bg-amber-400/5 p-3 text-[11px] leading-5 text-amber-100 sm:col-span-2">
+        {preview.simulationWarning}
       </div>
     </dl>
   )
@@ -411,17 +410,15 @@ function LevelField({
         id={fieldId}
         className={CONTROL_CLASS}
         value={value}
-        aria-invalid={value.length === 0}
         onChange={(event) => onChange(event.target.value as TargetLevel | "")}
       >
-        <option value="">Select a target level</option>
+        <option value="">Select a plan price</option>
         {ladder.map((level) => (
           <option key={level.level} value={level.level}>
             {level.label} · {formatMoney(level.value)}
           </option>
         ))}
       </select>
-      <FieldMessage>Only a price level from the selected target can be used.</FieldMessage>
     </Field>
   )
 }
@@ -457,20 +454,26 @@ function Fact({ label, value }: { label: string; value: string }) {
 }
 
 function Unavailable({
-  detail = "Paper drafting is not available in the current setup. Review Connections or Updates & Repair, then try again.",
+  detail = "Paper practice is not available right now. Review Connections or Updates & Repair, then try again.",
 }: {
   detail?: string
 }) {
   return (
     <Alert className="mt-4">
       <CircleAlert aria-hidden="true" />
-      <AlertTitle>Controlled paper drafting is unavailable</AlertTitle>
+      <AlertTitle>Paper practice is unavailable</AlertTitle>
       <AlertDescription>{detail}</AlertDescription>
     </Alert>
   )
 }
 
-function Status({ text, tone = "neutral" }: { text: string; tone?: "neutral" | "error" | "success" }) {
+function Status({
+  text,
+  tone = "neutral",
+}: {
+  text: string
+  tone?: "neutral" | "error" | "success"
+}) {
   const classes =
     tone === "error"
       ? "border-rose-400/25 bg-rose-400/5 text-rose-100"
@@ -480,57 +483,55 @@ function Status({ text, tone = "neutral" }: { text: string; tone?: "neutral" | "
   return <p className={`mt-4 rounded-lg border p-3 text-xs leading-5 ${classes}`}>{text}</p>
 }
 
-function normalizeDraft(draft: Draft, selected: GovernedPaperTarget | null): ManualPaperSubmit | null {
-  if (
-    selected === null ||
-    !isPositiveLotQuantity(draft.quantityLots) ||
-    !validTimeInForce(draft.orderType).includes(draft.timeInForce)
-  ) {
-    return null
-  }
-  const limitTargetLevel = requiresLimitLevel(draft.orderType) ? draft.limitTargetLevel : undefined
-  const stopTargetLevel = requiresStopLevel(draft.orderType) ? draft.stopTargetLevel : undefined
-  if (
-    (requiresLimitLevel(draft.orderType) && !limitTargetLevel) ||
-    (requiresStopLevel(draft.orderType) && !stopTargetLevel)
-  ) {
-    return null
-  }
+function normalizeDraft(
+  draft: Draft,
+  selected: GovernedPaperTarget | null,
+): ManualPaperPrepare | null {
+  if (!selected || !draft.side || !draft.orderType || !draft.timeInForce) return null
+  if (!isPositiveLotQuantity(draft.quantityLots)) return null
+  if (!selected.sideChoices.some((choice) => choice.value === draft.side)) return null
+
+  const order = selected.orderChoices.find((choice) => choice.value === draft.orderType)
+  if (!order) return null
+  if (!order.timeInForceChoices.some((choice) => choice.value === draft.timeInForce)) return null
+  if (order.requiresLimitLevel && !draft.limitTargetLevel) return null
+  if (order.requiresStopLevel && !draft.stopTargetLevel) return null
+
   return {
-    action: "submit",
+    action: "prepareManual",
     targetToken: selected.targetToken,
     side: draft.side,
     orderType: draft.orderType,
     quantityLots: draft.quantityLots,
-    ...(limitTargetLevel ? { limitTargetLevel } : {}),
-    ...(stopTargetLevel ? { stopTargetLevel } : {}),
+    ...(order.requiresLimitLevel ? { limitTargetLevel: draft.limitTargetLevel || undefined } : {}),
+    ...(order.requiresStopLevel ? { stopTargetLevel: draft.stopTargetLevel || undefined } : {}),
     timeInForce: draft.timeInForce,
   }
 }
 
 function emptyDraft(): Draft {
   return {
-    targetKey: "",
-    side: "buy",
-    orderType: "market",
+    targetIndex: "",
+    side: "",
+    orderType: "",
     quantityLots: "",
     limitTargetLevel: "",
     stopTargetLevel: "",
-    timeInForce: "immediate_or_cancel",
+    timeInForce: "",
   }
 }
 
-function defaultTimeInForce(orderType: ManualPaperOrderType): ManualPaperTimeInForce {
-  switch (orderType) {
-    case "market":
-      return "immediate_or_cancel"
-    case "limit":
-    case "stop":
-    case "stop_limit":
-      return "day"
-  }
+function parseSelectedIndex(value: string, length: number): number | null {
+  if (!/^\d+$/.test(value)) return null
+  const index = Number(value)
+  return Number.isSafeInteger(index) && index >= 0 && index < length ? index : null
 }
 
-function targetKey(target: GovernedPaperTarget): string {
-  return target.targetToken
+function investmentLabel(investment: GovernedPaperTarget["investment"]): string {
+  return investment.symbol ? `${investment.name} (${investment.symbol})` : investment.name
+}
+
+function formatProductTimestamp(value: string): string {
+  const date = new Date(value)
+  return Number.isNaN(date.valueOf()) ? "Unavailable" : date.toLocaleString()
 }

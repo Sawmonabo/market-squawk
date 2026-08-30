@@ -22,7 +22,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { productCapabilitySet } from "@/lib/product-capabilities"
-import type { ApplicationResult, DesktopBootstrap } from "@/lib/schemas"
+import type { DesktopBootstrap } from "@/lib/schemas"
 import { formatTimestamp } from "@/lib/time"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -32,7 +32,7 @@ import {
   type DatasetPreparationOption,
   type DatasetPreparationOptions,
   type DatasetPreparationPreview,
-  type DatasetPreparationReceipt,
+  type DatasetPreparationConfirmation,
   type DatasetPreparationSelection,
 } from "./dataset-preparation-contracts"
 import { parseResearchActionAccepted } from "./research-contracts"
@@ -58,7 +58,6 @@ export function DatasetBuilder({
   const capabilitiesAvailable = PREPARATION_CAPABILITIES.every((capability) =>
     capabilities.has(capability),
   )
-  const guidedTransport = asDatasetPreparationTransport(transport)
   const [selection, setSelection] =
     React.useState<DatasetPreparationSelection | null>(null)
   const [preview, setPreview] =
@@ -66,47 +65,35 @@ export function DatasetBuilder({
   const [started, setStarted] = React.useState(false)
   const optionsQuery = useQuery({
     queryKey: [
-      ...productKeys.domain(bootstrap.runtime, "research"),
+      ...productKeys.domain(bootstrap.productSessionToken, "research"),
       "preparation-choices",
     ],
-    enabled: capabilitiesAvailable && guidedTransport !== null,
+    enabled: capabilitiesAvailable,
     staleTime: 30_000,
-    queryFn: async () => {
-      if (!guidedTransport) {
-        throw new Error("Guided dataset preparation is unavailable.")
-      }
-      return parseDatasetPreparationOptions(
-        await guidedTransport.datasetPreparation({ action: "options" }),
-      )
-    },
+    queryFn: async () =>
+      parseDatasetPreparationOptions(
+        await transport.datasetPreparation({ action: "options" }),
+      ),
   })
   const previewMutation = useMutation({
-    mutationFn: async (draft: DatasetPreparationSelection) => {
-      if (!guidedTransport) {
-        throw new Error("Guided dataset preparation is unavailable.")
-      }
-      return parseDatasetPreparationPreview(
-        await guidedTransport.datasetPreparation({
+    mutationFn: async (draft: DatasetPreparationSelection) =>
+      parseDatasetPreparationPreview(
+        await transport.datasetPreparation({
           action: "preview",
           choice: draft.choiceToken,
           intendedUse: draft.intendedUse,
         }),
-      )
-    },
+      ),
     onSuccess: setPreview,
   })
   const startMutation = useMutation({
-    mutationFn: async (receipt: DatasetPreparationReceipt) => {
-      if (!guidedTransport) {
-        throw new Error("Guided dataset preparation is unavailable.")
-      }
-      return parseResearchActionAccepted(
-        await guidedTransport.datasetPreparation(
-          { action: "start", receipt },
+    mutationFn: async (confirmationToken: DatasetPreparationConfirmation) =>
+      parseResearchActionAccepted(
+        await transport.datasetPreparation(
+          { action: "start", confirmationToken },
           true,
         ),
-      )
-    },
+      ),
     onSuccess: async () => {
       setStarted(true)
       setPreview(null)
@@ -156,7 +143,7 @@ export function DatasetBuilder({
         <Layers3 className="size-5 text-primary" aria-hidden="true" />
       </div>
 
-      {!capabilitiesAvailable || guidedTransport === null ? (
+      {!capabilitiesAvailable ? (
         <Alert className="mt-4">
           <AlertCircle aria-hidden="true" />
           <AlertTitle>Research preparation is unavailable</AlertTitle>
@@ -211,7 +198,7 @@ export function DatasetBuilder({
           ) : null}
           {started ? (
             <Status
-              text="Preparation started. You can follow it in Background activity."
+              text="Preparation started. You can follow it in Operations & Jobs."
               tone="success"
             />
           ) : null}
@@ -251,7 +238,7 @@ export function DatasetBuilder({
             <Button
               disabled={!preview || startMutation.isPending}
               onClick={() => {
-                if (preview) startMutation.mutate(preview.receiptToken)
+                if (preview) startMutation.mutate(preview.confirmationToken)
               }}
             >
               <Play aria-hidden="true" />
@@ -459,31 +446,6 @@ function Status({
       {text}
     </p>
   )
-}
-
-type DatasetPreparationRequest =
-  | { action: "options" }
-  | {
-      action: "preview"
-      choice: string
-      intendedUse: DatasetPreparationSelection["intendedUse"]
-    }
-  | { action: "start"; receipt: DatasetPreparationReceipt }
-
-type DatasetPreparationTransport = ProductTransport & {
-  datasetPreparation(
-    request: DatasetPreparationRequest,
-    confirmed?: boolean,
-  ): Promise<ApplicationResult>
-}
-
-function asDatasetPreparationTransport(
-  transport: ProductTransport,
-): DatasetPreparationTransport | null {
-  const candidate = transport as ProductTransport & { datasetPreparation?: unknown }
-  return typeof candidate.datasetPreparation === "function"
-    ? (candidate as DatasetPreparationTransport)
-    : null
 }
 
 function defaultSelection(

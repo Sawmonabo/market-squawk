@@ -12,6 +12,7 @@ mod governance;
 mod market_provider_configuration;
 pub(crate) mod operations;
 mod provider_activation_state;
+mod schwab_market_runtime;
 mod source_lifecycle;
 
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -79,6 +80,7 @@ use self::market_provider_configuration::ProductionMarketProviderConfigurationRe
 use self::provider_activation_state::{
     DurableActivationRecipeState, DurableProviderActivationState, ProviderMetadataBackupAuthority,
 };
+use self::schwab_market_runtime::ProductionSchwabMarketRuntimeResolver;
 use self::source_lifecycle::ProductionSourceLifecycleAuthority;
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 use crate::BoardInstalledFixtureBundle;
@@ -113,9 +115,10 @@ use crate::application::{
     LiveFairValueObservationBufferError, MacroContextReadCapability, MarketHistoryReadCapability,
     MarketReferenceSearchAuthority, MarketRuntimeRegistry, OptionsContextReadCapability,
     PaperApplicationServices, PaperRuntimeActivityAuthority, PortfolioCandidateResolutionFactory,
-    PrepublishedResearchSourceRegistration, ProductionFairValueInputAuthority,
-    ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,
-    ResearchIngestCompositionError, ResearchSourceDiscoveryCoordinator, SourceDomainService,
+    PreparedSchwabMarketRuntimeResolver, PrepublishedResearchSourceRegistration,
+    ProductionFairValueInputAuthority, ProductionResearchIngestCoordinator,
+    ResearchApplicationServices, ResearchExtractionLimits, ResearchIngestCompositionError,
+    ResearchSourceDiscoveryCoordinator, SCHWAB_CURRENT_LIVE_AUTHORITY_KEY, SourceDomainService,
     SourceLifecycleAuthority, TreasuryApplicationClosure, backup::ProductBackupError,
 };
 use crate::artifact_repository::{ControlledArtifactRepository, controlled_artifact_repository};
@@ -664,6 +667,12 @@ impl LocalProduct {
                     KRAKEN_LIVE_AUTHORITY_KEY,
                 )?;
             }
+            if schwab_oauth_installation.is_some() {
+                AuthoritativeSourceRegistry::reconcile_live_authority_for_exclusive_installed_service_replacement(
+                    selected_workspace,
+                    SCHWAB_CURRENT_LIVE_AUTHORITY_KEY,
+                )?;
+            }
         }
 
         let authorization_subject_resolver: Arc<dyn AuthorizationSubjectResolver> =
@@ -792,12 +801,21 @@ impl LocalProduct {
             Arc::clone(&nasdaq_reference),
             research.as_ref(),
         );
+        let prepared_schwab = ProductionSchwabMarketRuntimeResolver::new(
+            Arc::clone(&onboarding),
+            Arc::clone(&provider_activation),
+            Arc::clone(&nasdaq_reference),
+            research.as_ref(),
+        );
+        let prepared_schwab_service: Arc<dyn PreparedSchwabMarketRuntimeResolver> =
+            prepared_schwab.clone();
         let market_runtime = MarketRuntimeRegistry::try_new(
             config.clone(),
             provider_rate.clone(),
             Arc::clone(&provider_activation),
             alpaca_historical_source,
             prepared_market_configuration,
+            prepared_schwab_service,
             Arc::clone(&live_fair_value),
         )?;
         let schwab_market_drain = Arc::new(RegistryBackedSchwabMarketDrain::default());
@@ -847,6 +865,7 @@ impl LocalProduct {
             schwab_oauth_factory,
             schwab_market_doctor,
         ));
+        prepared_schwab.bind_portal(Arc::clone(&portal_activation))?;
         let provider_portal_activation: Arc<dyn crate::ProviderPortalActivationAuthority> =
             portal_activation.clone();
         let reference_search: Arc<dyn MarketReferenceSearchAuthority> = nasdaq_reference.clone();
@@ -857,6 +876,7 @@ impl LocalProduct {
             research.instrument_definitions(),
             research.market_data_instruments(),
             reference_search,
+            MarketHistoryReadCapability::new(research.analytical_reader()),
         );
         let portfolio_candidate_resolution = paper.candidate_resolution_factory()?;
         let source_lifecycle = Arc::new(ProductionSourceLifecycleAuthority::new(
@@ -1199,7 +1219,11 @@ impl LocalProduct {
         let program = verified_installed_cli_program()?;
         let limits = McpLimits::try_from(McpLimitSpec::default())
             .map_err(|_error| LocalMcpAvailabilityError::Limits)?;
-        validate_service_capabilities(&self.application.capabilities(), limits)
+        let capabilities = self
+            .application
+            .product_capabilities()
+            .map_err(|_error| LocalMcpAvailabilityError::ToolContract)?;
+        validate_service_capabilities(&capabilities, limits)
             .map_err(|_error| LocalMcpAvailabilityError::ToolContract)?;
         Ok(program)
     }

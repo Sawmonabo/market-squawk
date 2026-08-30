@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use market_squawk_platform::JournalFileFormat;
-use rust_decimal::Decimal;
 use uuid::Uuid;
 
 /// Market Squawk's complete local command-line surface.
@@ -143,11 +142,19 @@ pub enum Command {
         command: FeatureCommand,
     },
 
-    /// Inspect, evaluate, and run admitted local models.
+    /// Inspect and operate low-level model evidence for diagnostics.
+    #[command(name = "diagnostics-model", hide = true)]
     Model {
-        /// Model operation.
+        /// Diagnostic model operation.
         #[command(subcommand)]
         command: ModelCommand,
+    },
+
+    /// Prepare, start, and inspect investment forecasts.
+    Forecast {
+        /// Forecast operation.
+        #[command(subcommand)]
+        command: ForecastCommand,
     },
 
     /// Import, inspect, and analyze portfolios.
@@ -178,9 +185,10 @@ pub enum Command {
         command: ExecutionCommand,
     },
 
-    /// Create and inspect evidence-bound fair-value measurements.
+    /// Inspect and operate low-level valuation evidence for diagnostics.
+    #[command(name = "diagnostics-fair-value", hide = true)]
     FairValue {
-        /// Fair-value operation.
+        /// Diagnostic valuation operation.
         #[command(subcommand)]
         command: FairValueCommand,
     },
@@ -344,7 +352,28 @@ pub enum SourceCommand {
 #[derive(Debug, Subcommand)]
 pub enum MarketCommand {
     /// Return provider-neutral current-market summaries selected by Market Squawk.
-    Overview,
+    Overview {
+        /// Continue from an opaque Market page token.
+        #[arg(long)]
+        page_token: Option<String>,
+    },
+    /// Find investments by canonical product name.
+    Search {
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        page_token: Option<String>,
+    },
+    /// Return current information for one opaque investment selection.
+    Select {
+        #[arg(long)]
+        selection_token: String,
+    },
+    /// Return immutable daily history for one opaque investment selection.
+    History {
+        #[arg(long)]
+        history_token: String,
+    },
 }
 
 /// Direct capture arguments.
@@ -507,7 +536,7 @@ pub enum FeatureCommand {
     },
 }
 
-/// Model-registry and inference operation.
+/// Low-level model diagnostic operation.
 #[derive(Debug, Subcommand)]
 pub enum ModelCommand {
     /// List model evidence and its usable analytical limits.
@@ -542,17 +571,74 @@ pub enum ModelCommand {
     },
 }
 
+/// Investment-forecast operation.
+#[derive(Debug, Subcommand)]
+pub enum ForecastCommand {
+    /// Show the currently available forecast choices.
+    Options,
+    /// Preview one forecast and receive its one-use confirmation token.
+    Preview {
+        /// Opaque model choice returned by `forecast options`.
+        #[arg(long)]
+        model_token: Uuid,
+        /// Opaque history choice returned by `forecast options`.
+        #[arg(long)]
+        history_token: Uuid,
+        /// Opaque investment choice returned by `forecast options`.
+        #[arg(long)]
+        investment_token: Uuid,
+        /// Opaque horizon choice returned by `forecast options`.
+        #[arg(long)]
+        horizon_token: Uuid,
+    },
+    /// Start the forecast accepted in one preparation preview.
+    Start {
+        /// One-use confirmation token returned by `forecast preview`.
+        #[arg(long)]
+        confirmation_token: Uuid,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// List current forecasts.
+    List,
+    /// Show one forecast.
+    Show {
+        /// Opaque forecast token returned by `forecast list`.
+        forecast_token: Uuid,
+    },
+    /// Show the realized outcomes for one forecast.
+    Outcomes {
+        /// Opaque forecast token returned by `forecast list`.
+        forecast_token: Uuid,
+    },
+}
+
 /// Portfolio operation.
 #[derive(Debug, Subcommand)]
 pub enum PortfolioCommand {
-    /// Import and reconcile a confined holdings or transactions export.
+    /// List named portfolios and their opaque product tokens.
+    Accounts {
+        /// Continue after one opaque portfolio token.
+        #[arg(long)]
+        after_account_token: Option<String>,
+    },
+    /// Import a selected portfolio file through review and approval.
+    #[command(name = "import")]
+    ImportFlow {
+        /// Portfolio import step.
+        #[command(subcommand)]
+        command: PortfolioImportCommand,
+    },
+    /// Run the low-level portfolio manifest importer for diagnostics.
+    #[command(name = "diagnostics-import", hide = true)]
     Import {
-        /// Confined provider export.
+        /// Confined diagnostic manifest.
         path: PathBuf,
-        /// Destination account identity.
+        /// Destination portfolio identity.
         #[arg(long)]
         account: String,
-        /// Explicit local mutation confirmation.
+        /// Explicit diagnostic mutation confirmation.
         #[arg(long)]
         confirm: bool,
     },
@@ -585,13 +671,83 @@ pub enum PortfolioCommand {
     },
 }
 
+/// Reviewed portfolio-import operation.
+#[derive(Debug, Subcommand)]
+pub enum PortfolioImportCommand {
+    /// Review how one selected file will be interpreted before saving it.
+    Preview {
+        /// Selected portfolio file.
+        path: PathBuf,
+        /// Destination portfolio identity.
+        #[arg(long)]
+        account: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Approve the selected interpretations from one import review.
+    Approve {
+        /// Opaque review token returned by `portfolio import preview`.
+        #[arg(long)]
+        review_token: Uuid,
+        /// Confined JSON array selecting an interpretation for each reviewed record.
+        #[arg(long)]
+        interpretations: PathBuf,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Save one approved portfolio import.
+    Commit {
+        /// Opaque approval token returned by `portfolio import approve`.
+        #[arg(long)]
+        approval_token: Uuid,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Discard an import review without saving it.
+    Discard {
+        /// Opaque review token returned by `portfolio import preview`.
+        #[arg(long)]
+        review_token: Uuid,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
 /// Governed-backtest operation.
 #[derive(Debug, Subcommand)]
 pub enum BacktestCommand {
-    /// Run one admitted point-in-time experiment.
-    Run {
-        /// Confined JSON request file.
-        request: PathBuf,
+    /// Show the currently available investment-test choices.
+    Options,
+    /// Preview one investment test and receive its one-use confirmation token.
+    Preview {
+        /// Opaque history choice returned by `backtest options`.
+        #[arg(long)]
+        history_token: Uuid,
+        /// Opaque period choice returned by `backtest options`.
+        #[arg(long)]
+        period_token: Uuid,
+        /// Opaque method choice returned by `backtest options`.
+        #[arg(long)]
+        method_token: Uuid,
+        /// Opaque trading-cost choice returned by `backtest options`.
+        #[arg(long)]
+        cost_token: Uuid,
+        /// Opaque portfolio choice returned by `backtest options`.
+        #[arg(long)]
+        portfolio_token: Uuid,
+        /// Opaque comparison choice returned by `backtest options`.
+        #[arg(long)]
+        comparison_token: Uuid,
+    },
+    /// Start the investment test accepted in one preparation preview.
+    Start {
+        /// One-use confirmation token returned by `backtest preview`.
+        #[arg(long)]
+        confirmation_token: Uuid,
         /// Explicit local mutation confirmation.
         #[arg(long)]
         confirm: bool,
@@ -610,11 +766,28 @@ pub enum BacktestCommand {
 pub enum BotCommand {
     /// Report lifecycle, source qualification, risk, and paper state.
     Status,
-    /// Start controlled local paper operation.
+    /// List the explicit virtual-cash, cost, and mode choices for a paper session.
+    Preparation,
+    /// Prepare one short-lived paper-session confirmation.
+    Prepare {
+        /// Opaque virtual-cash choice returned by `bot preparation`.
+        #[arg(long)]
+        cash_choice: String,
+        /// Opaque trading-cost choice returned by `bot preparation`.
+        #[arg(long)]
+        cost_choice: String,
+        /// Opaque practice-mode choice returned by `bot preparation`.
+        #[arg(long)]
+        mode_choice: String,
+    },
+    /// Start the exact server-prepared paper session.
     Start {
-        /// Controlled paper-run parameters.
-        #[command(flatten)]
-        paper: PaperBotArguments,
+        /// One-use confirmation token returned by `bot prepare`.
+        #[arg(long)]
+        confirmation_token: String,
+        /// Stop after this many seconds; omit to run until interrupted.
+        #[arg(long)]
+        seconds: Option<u64>,
         /// Explicit local mutation confirmation.
         #[arg(long)]
         confirm: bool,
@@ -637,23 +810,40 @@ pub enum ExecutionCommand {
     Orders,
     /// List bounded paper fills.
     Fills,
-    /// Cancel one existing paper order through risk-controlled dispatch.
-    Cancel {
-        /// Paper order identity.
-        order: String,
+    /// List the active investment plans eligible for a manual virtual order.
+    Targets,
+    /// Prepare a manual virtual order from an explicit JSON request.
+    PrepareManual {
+        /// Confined request containing the selected target and every order choice.
+        request: PathBuf,
+    },
+    /// Submit one exact prepared manual virtual order.
+    SubmitManual {
+        /// One-use confirmation token returned by `execution prepare-manual`.
+        #[arg(long)]
+        confirmation_token: String,
         /// Explicit local mutation confirmation.
         #[arg(long)]
         confirm: bool,
     },
-    /// Reconcile paper orders, fills, balances, and positions.
-    Reconcile {
+    /// Cancel one existing paper order through risk-controlled dispatch.
+    Cancel {
+        /// Paper order identity.
+        action_token: String,
         /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Run low-level paper-state reconciliation for diagnostics.
+    #[command(name = "diagnostics-reconcile", hide = true)]
+    Reconcile {
+        /// Explicit diagnostic mutation confirmation.
         #[arg(long)]
         confirm: bool,
     },
 }
 
-/// Fair-value operation.
+/// Low-level valuation diagnostic operation.
 #[derive(Debug, Subcommand)]
 pub enum FairValueCommand {
     /// List bounded immutable measurements.
@@ -1477,20 +1667,6 @@ pub struct MockArguments {
     /// Enable local paper simulation.
     #[arg(long)]
     pub paper_bot: bool,
-}
-
-/// Controlled paper-run arguments.
-#[derive(Debug, Args)]
-pub struct PaperBotArguments {
-    /// Stop after this many seconds; omit to run until interrupted.
-    #[arg(long)]
-    pub seconds: Option<u64>,
-    /// Virtual starting cash in the configured common quote currency.
-    #[arg(long, default_value = "100000")]
-    pub initial_cash: Decimal,
-    /// Maker and taker fee assumption for local paper execution.
-    #[arg(long, default_value_t = 100)]
-    pub fee_basis_points: u32,
 }
 
 /// Diagnostic replay arguments.

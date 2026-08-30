@@ -14,7 +14,7 @@ import {
   ShieldCheck,
 } from "lucide-react"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { messageFrom, useSystem } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -29,9 +29,8 @@ import {
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { groupDecimal, humanize } from "@/lib/formatters"
-import { hasProductCapability } from "@/lib/product-capabilities"
 import { formatTimestamp } from "@/lib/time"
-import type { OperationLogFilter, ProductTransport } from "@/lib/transport"
+import type { OperationLogFilter, SystemTransport } from "@/lib/transport"
 import { cn } from "@/lib/utils"
 
 import {
@@ -49,14 +48,14 @@ import {
 } from "./contracts"
 
 export function LogsPage() {
-  const product = useProduct()
+  const system = useSystem()
 
-  if (product.status === "loading") return <LogsLoading />
-  if (product.status === "error") {
-    return <LogsUnavailable detail={product.error} />
+  if (system.status === "loading") return <LogsLoading />
+  if (system.status !== "ready") {
+    return <LogsUnavailable detail={system.status === "unavailable" ? system.error : "Finish secure storage setup in Settings, then return to Logs."} />
   }
 
-  if (!hasProductCapability(product.bootstrap, "operations_log_query")) {
+  if (!system.bootstrap.capabilities.includes("operations_log_query")) {
     return (
       <LogsUnavailable detail="Log browsing is not available in this installation." />
     )
@@ -64,9 +63,9 @@ export function LogsPage() {
 
   return (
     <LogsWorkspace
-      transport={product.transport}
-      scope={product.bootstrap.runtime}
-      exportAvailable={hasProductCapability(product.bootstrap, "operations_log_export")}
+      transport={system.transport}
+      scope={system.bootstrap.productSessionToken}
+      exportAvailable={system.bootstrap.capabilities.includes("operations_log_export")}
     />
   )
 }
@@ -76,7 +75,7 @@ function LogsWorkspace({
   scope,
   exportAvailable,
 }: {
-  transport: ProductTransport
+  transport: SystemTransport
   scope: ProductScope
   exportAvailable: boolean
 }) {
@@ -96,7 +95,7 @@ function LogsWorkspace({
   const queryKey = productKeys.operation(scope, "operations", "Operations.QueryLogs", request)
   const logs = useQuery({
     queryKey,
-    queryFn: () => transport.query(request).then(parseStructuredLogPage),
+    queryFn: () => transport.systemQuery(request).then(parseStructuredLogPage),
   })
   const exportMutation = useMutation({
     mutationFn: () =>

@@ -1,35 +1,33 @@
 //! Pure read-side transport over retained, authority-recomputed investment analyses.
 
-use std::{num::NonZeroU32, sync::Arc};
+use std::sync::Arc;
 
+use market_squawk_data::{MarketDataInstrumentCatalogError, MarketDataInstrumentReadCapability};
 use market_squawk_decisions::{
-    AnalyticalProfileBindingReference, CostAdjustedPitBacktestEvidence, DecisionContentDigest,
-    FeasibleLotRangeAvailability, ForecastPriceRanges, GeneratedInvestmentProposal,
-    GeneratedPriceLadder, InvestmentAnalysisCurrentIndexEntry, InvestmentAnalysisEvidence,
-    InvestmentAnalysisId, InvestmentOutcomeProjection, InvestmentProposalDecision,
-    InvestmentProposalIndexEntry, InvestmentProposalIndexOutcome, InvestmentSizingProjection,
-    LiquidityEvidence, MarketReferenceAdjustmentBasis, MarketReferenceEvidence,
-    MarketReferencePriceKind, NoActionInvestmentProposal, NoActionReason, PortfolioPositionState,
-    PortfolioRiskEvidence, PriceForecastEvidence, ProposalEvidenceWindow, ProposalInvalidator,
-    ProposalUnavailableReason, RecommendationAction, RecommendationConfidence,
+    CostAdjustedPitBacktestEvidence, FeasibleLotRangeAvailability, InvestmentAnalysisEvidence,
+    InvestmentOutcomeProjection, InvestmentProposalDecision, InvestmentProposalIndexEntry,
+    InvestmentProposalIndexOutcome, InvestmentSizingProjection, NoActionReason,
+    ProposalInvalidator, ProposalUnavailableReason, RecommendationAction, RecommendationConfidence,
     RecommendationConfidenceComponentKind, RecommendationConfidenceMeaning,
-    RecommendationEvidenceKind, RecommendationOutcomeCohort, RecommendationOutcomeStatus,
-    RecommendationOutcomeUnavailableReason, RecommendationPolicy, RecommendationTrackRecord,
-    RecommendationTrackRecordPerformance, SizingUnavailableReason, TargetPriceCases,
-    TargetPriceRange, UnavailableInvestmentAnalysis, ValuationEvidence,
+    RecommendationOutcomeCohort, RecommendationOutcomeStatus,
+    RecommendationOutcomeUnavailableReason, RecommendationTrackRecord,
+    RecommendationTrackRecordGroup, RecommendationTrackRecordPerformance, SizingUnavailableReason,
+    TargetPriceRange,
 };
-use market_squawk_domain::{
-    DataQuality, DigestAlgorithm, EvidenceDigest, Money, SourceIdentifier, Timestamp,
-};
-use market_squawk_modeling::ForecastCentralStatistic;
+use market_squawk_domain::{AccountId, InstrumentId, Money};
 use market_squawk_services::{
     RequestContext, ServiceError, ToolResultMetadata, TypedToolRequest, TypedToolResult,
 };
-use market_squawk_valuation::ValuationAmountBasis;
+use rust_decimal::Decimal;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use uuid::Uuid;
 
 use crate::application::decision::{DecisionApplication, InvestmentAnalysisRead};
+use crate::portfolio_application::{
+    PortfolioAccountCatalogError, PortfolioAccountCatalogReadCapability,
+    PortfolioAccountCatalogSnapshot,
+};
 
 use super::{decode, ensure_live, map_application, page_fetch_limit};
 
@@ -40,11 +38,21 @@ pub(super) const GET_RECOMMENDATION_TRACK_RECORD: &str = "Decision.GetRecommenda
 /// Closed read-only operation family over durable investment-analysis results.
 pub(super) struct InvestmentAnalysisOperations {
     decisions: Arc<DecisionApplication>,
+    instruments: MarketDataInstrumentReadCapability,
+    accounts: PortfolioAccountCatalogReadCapability,
 }
 
 impl InvestmentAnalysisOperations {
-    pub(super) fn new(decisions: Arc<DecisionApplication>) -> Self {
-        Self { decisions }
+    pub(super) fn new(
+        decisions: Arc<DecisionApplication>,
+        instruments: MarketDataInstrumentReadCapability,
+        accounts: PortfolioAccountCatalogReadCapability,
+    ) -> Self {
+        Self {
+            decisions,
+            instruments,
+            accounts,
+        }
     }
 
     pub(super) fn owns(operation: &str) -> bool {
@@ -64,13 +72,31 @@ impl InvestmentAnalysisOperations {
         match request.name() {
             GET_INVESTMENT_ANALYSIS => {
                 let input: InvestmentAnalysisRequest = decode(&arguments)?;
+                let action_token = action_token(&input.action_token)?;
+                let analysis_id = self
+                    .decisions
+                    .resolve_investment_analysis_product_token(action_token)
+                    .map_err(map_application)?;
                 let analysis = self
                     .decisions
-                    .read_investment_analysis(analysis_id(&input.analysis_id)?)
+                    .read_investment_analysis(analysis_id)
                     .map_err(map_application)?;
+                let account_catalog = self
+                    .accounts
+                    .snapshot_current(context.deadline(), context.cancellation())
+                    .map_err(map_account_catalog)?;
+                let value = investment_analysis_value(
+                    &analysis,
+                    action_token,
+                    self.instrument_display(analysis.decision.evidence().instrument_id(), context)?,
+                    portfolio_label(&account_catalog, analysis.decision.evidence().account_id())?,
+                )?;
+                self.accounts
+                    .recheck(&account_catalog, context.deadline(), context.cancellation())
+                    .map_err(map_account_catalog)?;
                 ensure_live(context)?;
                 TypedToolResult::try_new(
-                    investment_analysis_value(&analysis),
+                    value,
                     1,
                     ToolResultMetadata::complete_not_applicable(),
                     context.limits(),
@@ -80,9 +106,16 @@ impl InvestmentAnalysisOperations {
             LIST_INVESTMENT_ANALYSES => {
                 let input: InvestmentAnalysisListRequest = decode(&arguments)?;
                 let after = input
-                    .after_analysis_id
+                    .after_action_token
                     .as_deref()
-                    .map(analysis_id)
+                    .map(action_token)
+                    .transpose()?;
+                let after = after
+                    .map(|token| {
+                        self.decisions
+                            .resolve_investment_analysis_product_token(token)
+                            .map_err(map_application)
+                    })
                     .transpose()?;
                 let fetch_limit = page_fetch_limit(input.limit)?;
                 let page = self
@@ -100,10 +133,16 @@ impl InvestmentAnalysisOperations {
                     analyses.truncate(input.limit);
                 }
                 let returned = analyses.len();
-                let next_after_analysis_id = if truncated {
+                let next_after_action_token = if truncated {
                     analyses
                         .last()
-                        .map(|entry| hex(entry.analysis_id().bytes()))
+                        .map(|entry| {
+                            self.decisions
+                                .investment_analysis_product_token(entry.analysis_id())
+                                .map(|token| token.to_string())
+                                .map_err(map_application)
+                        })
+                        .transpose()?
                 } else {
                     None
                 };
@@ -113,17 +152,36 @@ impl InvestmentAnalysisOperations {
                     ToolResultMetadata::complete_not_applicable()
                 };
                 let completeness = if truncated { "truncated" } else { "complete" };
-                let values = analyses
-                    .iter()
-                    .map(investment_analysis_locator_value)
-                    .collect::<Vec<_>>();
+                let account_catalog = self
+                    .accounts
+                    .snapshot_current(context.deadline(), context.cancellation())
+                    .map_err(map_account_catalog)?;
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(analyses.len())
+                    .map_err(|_| ServiceError::ResourceExhausted)?;
+                for analysis in &analyses {
+                    let token = self
+                        .decisions
+                        .investment_analysis_product_token(analysis.analysis_id())
+                        .map_err(map_application)?;
+                    values.push(investment_analysis_locator_value(
+                        analysis,
+                        token,
+                        self.instrument_display(analysis.instrument_id(), context)?,
+                        portfolio_label(&account_catalog, analysis.account_id())?,
+                    ));
+                }
+                self.accounts
+                    .recheck(&account_catalog, context.deadline(), context.cancellation())
+                    .map_err(map_account_catalog)?;
                 ensure_live(context)?;
                 TypedToolResult::try_new(
                     json!({
                         "completeness": completeness,
                         "returnedCount": returned,
                         "availableCount": available,
-                        "nextAfterAnalysisId": next_after_analysis_id,
+                        "nextAfterActionToken": next_after_action_token,
                         "analyses": values,
                     }),
                     returned,
@@ -134,25 +192,30 @@ impl InvestmentAnalysisOperations {
             }
             GET_RECOMMENDATION_TRACK_RECORD => {
                 let input: RecommendationTrackRecordRequest = decode(&arguments)?;
-                let profile = AnalyticalProfileBindingReference::new(
-                    SourceIdentifier::try_from(input.profile_id)
-                        .map_err(|_error| ServiceError::InvalidRequest)?,
-                    NonZeroU32::new(input.profile_revision).ok_or(ServiceError::InvalidRequest)?,
-                    DecisionContentDigest::try_new(EvidenceDigest::new(
-                        DigestAlgorithm::Sha256,
-                        decode_sha256(&input.profile_digest)?,
-                    ))
-                    .map_err(|_error| ServiceError::InvalidRequest)?,
-                );
+                let action_token = action_token(&input.action_token)?;
+                let analysis_id = self
+                    .decisions
+                    .resolve_investment_analysis_product_token(action_token)
+                    .map_err(map_application)?;
+                let analysis = self
+                    .decisions
+                    .read_investment_analysis(analysis_id)
+                    .map_err(map_application)?;
+                let publication = analysis
+                    .current
+                    .as_ref()
+                    .ok_or(ServiceError::InvalidRequest)?
+                    .publication();
                 let track_record = self
                     .decisions
                     .recommendation_track_record(
-                        &profile,
-                        input.horizon_nanos,
-                        Timestamp::from_unix_nanos(input.evaluated_at_unix_nanos),
+                        publication.analytical_profile(),
+                        analysis.decision.policy().horizon_nanos(),
+                        super::super::runtime::current_timestamp()
+                            .map_err(|_| ServiceError::Unavailable)?,
                     )
                     .map_err(map_application)?;
-                let value = recommendation_track_record_value(&track_record);
+                let value = recommendation_track_record_value(action_token, &track_record)?;
                 let count = track_record.groups().len();
                 ensure_live(context)?;
                 TypedToolResult::try_new(
@@ -168,6 +231,27 @@ impl InvestmentAnalysisOperations {
     }
 }
 
+impl InvestmentAnalysisOperations {
+    fn instrument_display(
+        &self,
+        instrument_id: InstrumentId,
+        context: &RequestContext,
+    ) -> Result<InvestmentDisplay, ServiceError> {
+        let record = self
+            .instruments
+            .latest(instrument_id, context.deadline(), context.cancellation())
+            .map_err(map_instrument_catalog)?;
+        let Some(record) = record else {
+            return Ok(InvestmentDisplay::default());
+        };
+        let definition = record.definition();
+        let name = definition
+            .display_name()
+            .map(|name| name.as_str().to_owned());
+        Ok(InvestmentDisplay { symbol: None, name })
+    }
+}
+
 impl std::fmt::Debug for InvestmentAnalysisOperations {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -180,114 +264,169 @@ impl std::fmt::Debug for InvestmentAnalysisOperations {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct InvestmentAnalysisRequest {
-    analysis_id: String,
+    action_token: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct InvestmentAnalysisListRequest {
-    after_analysis_id: Option<String>,
+    after_action_token: Option<String>,
     limit: usize,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct RecommendationTrackRecordRequest {
-    profile_id: String,
-    profile_revision: u32,
-    profile_digest: String,
-    horizon_nanos: i64,
-    evaluated_at_unix_nanos: i64,
+    action_token: String,
 }
 
-fn investment_analysis_value(read: &InvestmentAnalysisRead) -> Value {
+#[derive(Default)]
+struct InvestmentDisplay {
+    symbol: Option<String>,
+    name: Option<String>,
+}
+
+fn investment_analysis_value(
+    read: &InvestmentAnalysisRead,
+    action_token: Uuid,
+    investment: InvestmentDisplay,
+    portfolio_label: String,
+) -> Result<Value, ServiceError> {
     let decision = &read.decision;
-    json!({
-        "analysisId": hex(decision.analysis_id().bytes()),
-        "executionEligibility": "research_only_execution_ineligible",
-        "policy": recommendation_policy_value(decision.policy()),
-        "evidence": investment_analysis_evidence_value(decision.evidence()),
-        "evidenceDigest": hex(decision.evidence_digest().bytes()),
-        "publication": read.current.as_ref().map(investment_analysis_current_value),
-        "projection": read.outcome_projection.as_ref().map(outcome_projection_value),
+    let evidence = decision.evidence();
+    let realized_outcome = read
+        .current
+        .as_ref()
+        .and_then(|value| value.current_outcome())
+        .map(recommendation_outcome_current_value)
+        .transpose()?;
+    Ok(json!({
+        "actionToken": action_token,
+        "investment": investment_value(&investment),
+        "portfolioLabel": portfolio_label,
+        "currency": evidence.currency().as_str(),
+        "recommendation": recommendation_value(decision),
+        "horizon": horizon_value(decision),
+        "priceSummary": price_summary_value(decision),
+        "reasons": recommendation_reasons(decision, &portfolio_label),
+        "risks": investment_risks(decision),
+        "assumptions": decision.policy().assumptions().iter().map(|value| value.as_str()).collect::<Vec<_>>(),
+        "invalidators": invalidators_value(decision),
+        "evidenceSummary": evidence_summary_value(decision),
+        "outcomeProjection": read.outcome_projection.as_ref().map(outcome_projection_value),
         "sizing": read.sizing_projection.as_ref().map(sizing_projection_value),
-        "realizedOutcome": read.current.as_ref().and_then(|value| value.current_outcome()).map(recommendation_outcome_current_value),
-        "result": match decision {
-            InvestmentProposalDecision::Generated(proposal) => generated_result_value(proposal),
-            InvestmentProposalDecision::NoAction(proposal) => no_action_result_value(proposal),
-            InvestmentProposalDecision::Unavailable(analysis) => unavailable_result_value(analysis),
-        },
+        "realizedOutcome": realized_outcome,
+        "trackRecordActionToken": read.current.as_ref().map(|_| action_token),
+    }))
+}
+
+fn investment_value(value: &InvestmentDisplay) -> Value {
+    json!({"symbol": value.symbol, "name": value.name})
+}
+
+fn recommendation_value(decision: &InvestmentProposalDecision) -> Value {
+    match decision {
+        InvestmentProposalDecision::Generated(proposal) => json!({
+            "kind": "action",
+            "action": action_name(proposal.action()),
+            "summary": generated_action_summary(proposal.action()),
+        }),
+        InvestmentProposalDecision::NoAction(_) => json!({
+            "kind": "abstain",
+            "summary": "No investment action is supported for this saved horizon.",
+        }),
+        InvestmentProposalDecision::Unavailable(_) => json!({
+            "kind": "unavailable",
+            "summary": "The saved analysis cannot support an investment action.",
+        }),
+    }
+}
+
+fn horizon_value(decision: &InvestmentProposalDecision) -> Value {
+    json!({
+        "informationCurrentThrough": super::product_timestamp(decision.evidence().as_of()),
+        "endsAt": super::product_timestamp(match decision {
+            InvestmentProposalDecision::Generated(value) => value.horizon_at(),
+            InvestmentProposalDecision::NoAction(value) => value.horizon_at(),
+            InvestmentProposalDecision::Unavailable(value) => value.horizon_at(),
+        }),
+        "expiresAt": super::product_timestamp(match decision {
+            InvestmentProposalDecision::Generated(value) => value.expires_at(),
+            InvestmentProposalDecision::NoAction(value) => value.expires_at(),
+            InvestmentProposalDecision::Unavailable(value) => value.expires_at(),
+        }),
     })
 }
 
-fn investment_analysis_current_value(value: &InvestmentAnalysisCurrentIndexEntry) -> Value {
-    let publication = value.publication();
+fn price_summary_value(decision: &InvestmentProposalDecision) -> Value {
+    let evidence = decision.evidence();
+    let action_ranges = match decision {
+        InvestmentProposalDecision::Generated(proposal) => {
+            let ladder = proposal.price_ladder();
+            Some(json!({
+                "entry": price_range_value(ladder.entry_range()),
+                "add": price_range_value(ladder.add_range()),
+                "trim": price_range_value(ladder.trim_range()),
+                "exit": price_range_value(ladder.exit_range()),
+            }))
+        }
+        InvestmentProposalDecision::NoAction(_) | InvestmentProposalDecision::Unavailable(_) => {
+            None
+        }
+    };
     json!({
-        "publicationId": hex(publication.publication_id().bytes()),
-        "publishedAt": publication.published_at(),
-        "executionEligibility": "research_only_execution_ineligible",
-        "analyticalProfile": {
-            "profileId": publication.analytical_profile().profile_id().as_str(),
-            "revision": publication.analytical_profile().revision().get(),
-            "contentDigest": content_identity_value(publication.analytical_profile().content_digest()),
-        },
-        "workflow": {
-            "workflowId": publication.workflow().workflow_id().as_str(),
-            "revision": publication.workflow().revision().get(),
-            "contentDigest": content_identity_value(publication.workflow().content_digest()),
-        },
-        "accountSetup": {
-            "accountId": publication.account_id(),
-            "distinctFromAnalyticalProfile": true,
-        },
-        "outcomeProjectionDigest": value.outcome_projection_digest().map(|digest| hex(digest.bytes())),
-        "sizingProjectionDigest": value.sizing_projection_digest().map(|digest| hex(digest.bytes())),
+        "current": evidence.market().map(|value| money_value(value.price())),
+        "fairValue": evidence.valuation().map(|value| money_value(value.fair_value())),
+        "scenarios": evidence.price_forecast().map(|value| json!({
+            "endsAt": super::product_timestamp(value.horizon_at()),
+            "downside": price_range_value(value.ranges().downside()),
+            "base": price_range_value(value.ranges().base()),
+            "upside": price_range_value(value.ranges().upside()),
+        })),
+        "actionRanges": action_ranges,
     })
 }
 
 fn outcome_projection_value(value: &InvestmentOutcomeProjection) -> Value {
     json!({
-        "resultDigest": hex(value.result_digest().bytes()),
-        "proposalId": hex(value.binding().proposal_id().bytes()),
-        "derivationDigest": hex(value.binding().derivation_digest().bytes()),
-        "authority": "analysis_only_no_mutation_no_execution",
-        "executionEligible": false,
-        "mark": money_value(value.mark()),
-        "horizonAt": value.horizon_at(),
+        "startingPrice": money_value(value.mark()),
+        "endsAt": super::product_timestamp(value.horizon_at()),
         "downside": gross_range_value(value.downside()),
         "base": gross_range_value(value.base()),
         "upside": gross_range_value(value.upside()),
-        "netPnl": {"kind": "unavailable", "reason": "exact_forward_cost_evidence_not_supplied"},
-        "benchmarkReturn": {"kind": "unavailable", "reason": "exact_proposal_time_benchmark_evidence_not_supplied"},
-        "afterTaxPnl": {"kind": "unavailable", "reason": "exact_tax_evidence_not_supplied"},
+        "limitations": [
+            "Projected price changes do not include future trading costs.",
+            "Projected price changes are not compared with a benchmark.",
+            "Projected price changes do not include taxes."
+        ],
     })
 }
 
 fn gross_range_value(value: market_squawk_decisions::GrossMarkRelativeRange) -> Value {
     let ratio = value.gross_return_from_mark();
-    json!({
-        "priceRange": price_range_value(value.price_range()),
-        "grossReturnFromMark": {
-            "lowerNumerator": money_value(ratio.lower().numerator()),
-            "upperNumerator": money_value(ratio.upper().numerator()),
-            "denominator": money_value(ratio.lower().denominator()),
-        },
-    })
+    let mut result = Map::from_iter([(
+        "priceRange".to_owned(),
+        price_range_value(value.price_range()),
+    )]);
+    if let (Some(lower), Some(upper)) = (
+        exact_money_ratio_percentage(ratio.lower().numerator(), ratio.lower().denominator()),
+        exact_money_ratio_percentage(ratio.upper().numerator(), ratio.upper().denominator()),
+    ) {
+        result.insert(
+            "priceChangePercent".to_owned(),
+            json!({"lower": lower, "upper": upper}),
+        );
+    }
+    Value::Object(result)
 }
 
 fn sizing_projection_value(value: &InvestmentSizingProjection) -> Value {
     json!({
-        "resultDigest": hex(value.result_digest().bytes()),
-        "proposalId": hex(value.binding().proposal_id().bytes()),
-        "derivationDigest": hex(value.binding().derivation_digest().bytes()),
-        "authority": "analysis_only_no_mutation_no_execution",
-        "executionEligible": false,
-        "evaluatedAt": value.inputs().evaluated_at(),
+        "evaluatedAt": super::product_timestamp(value.inputs().evaluated_at()),
         "currentLots": value.inputs().portfolio().current_lots().get(),
         "hardFeasibleLots": feasible_lots_value(value.hard_feasible_lots()),
         "preferredFeasibleLots": feasible_lots_value(value.preferred_feasible_lots()),
-        "selectedTargetLots": Value::Null,
-        "orderQuantity": Value::Null,
+        "summary": "These are research sizing ranges, not an order or a selected target.",
     })
 }
 
@@ -307,348 +446,340 @@ fn feasible_lots_value(value: &FeasibleLotRangeAvailability) -> Value {
 
 fn recommendation_outcome_current_value(
     value: &market_squawk_decisions::RecommendationOutcomeCurrentIndexEntry,
-) -> Value {
-    let mut result = recommendation_outcome_status_value(value.status());
-    if let Some(object) = result.as_object_mut() {
-        object.insert("seriesId".to_owned(), json!(hex(value.series_id().bytes())));
-        object.insert("revision".to_owned(), json!(value.revision().get()));
-        object.insert(
-            "statusDigest".to_owned(),
-            json!(hex(value.status_digest().bytes())),
-        );
-        object.insert("evaluatedAt".to_owned(), json!(value.evaluated_at()));
-        object.insert("executionEligible".to_owned(), json!(false));
-    }
-    result
+) -> Result<Value, ServiceError> {
+    Ok(json!({
+        "evaluatedAt": super::product_timestamp(value.evaluated_at()),
+        "result": recommendation_outcome_status_value(value.status())?,
+    }))
 }
 
-fn recommendation_outcome_status_value(value: RecommendationOutcomeStatus) -> Value {
-    match value {
+fn recommendation_outcome_status_value(
+    value: RecommendationOutcomeStatus,
+) -> Result<Value, ServiceError> {
+    Ok(match value {
         RecommendationOutcomeStatus::Pending(reason) => json!({
             "kind": "pending",
-            "reason": match reason {
-                market_squawk_decisions::RecommendationOutcomePendingReason::AwaitingHorizon => "awaiting_horizon",
-                market_squawk_decisions::RecommendationOutcomePendingReason::AwaitingOutcomeEvidence => "awaiting_outcome_evidence",
+            "summary": match reason {
+                market_squawk_decisions::RecommendationOutcomePendingReason::AwaitingHorizon => "The recommendation horizon has not ended yet.",
+                market_squawk_decisions::RecommendationOutcomePendingReason::AwaitingOutcomeEvidence => "The horizon has ended, but comparable outcome information is not available yet.",
             },
         }),
         RecommendationOutcomeStatus::Unavailable(reason) => json!({
             "kind": "unavailable",
-            "reason": recommendation_outcome_unavailable_reason_name(reason),
+            "summary": recommendation_outcome_unavailable_reason_summary(reason),
         }),
         RecommendationOutcomeStatus::Completed(outcome) => {
             let observation = outcome.observation();
+            let gross_price_return_percent =
+                percentage_from_decimal_ratio(outcome.gross_price_return())?;
             json!({
                 "kind": "completed",
                 "metric": "gross_instrument_price_return",
                 "startMark": money_value(outcome.start_mark()),
                 "endpointPrice": money_value(observation.endpoint_price()),
-                "grossPriceReturn": outcome.gross_price_return().to_string(),
-                "observedAt": observation.observed_at(),
-                "availableAt": observation.available_at(),
-                "selectionReceiptIdentity": content_identity_value(observation.selection_receipt_identity()),
-                "selectedObservationIdentity": content_identity_value(observation.selected_observation_identity()),
-                "corporateActionEvidenceIdentity": content_identity_value(observation.no_applicable_corporate_actions_identity()),
-                "netReturn": {"kind": "unavailable", "reason": "exact_realized_cost_evidence_not_supplied"},
-                "benchmarkReturn": {"kind": "unavailable", "reason": "exact_benchmark_outcome_evidence_not_supplied"},
-                "afterTaxReturn": {"kind": "unavailable", "reason": "exact_tax_evidence_not_supplied"},
-                "settlement": {"kind": "unavailable", "reason": "no_execution_or_settlement_evidence"},
+                "grossPriceReturnPercent": gross_price_return_percent,
+                "observedAt": super::product_timestamp(observation.observed_at()),
+                "availableAt": super::product_timestamp(observation.available_at()),
+                "limitations": [
+                    "This is the investment's gross price return, not an executed account return.",
+                    "Trading costs, benchmark performance, taxes, and settlement are not included."
+                ],
             })
         }
-    }
+    })
 }
 
-fn recommendation_track_record_value(value: &RecommendationTrackRecord) -> Value {
-    json!({
-        "analyticalProfile": {
-            "profileId": value.analytical_profile().profile_id().as_str(),
-            "revision": value.analytical_profile().revision().get(),
-            "contentDigest": content_identity_value(value.analytical_profile().content_digest()),
-        },
-        "horizonNanos": value.horizon_nanos(),
-        "evaluatedAt": value.evaluated_at(),
-        "analysisUnavailableCount": value.analysis_unavailable_count(),
+fn recommendation_track_record_value(
+    action_token: Uuid,
+    value: &RecommendationTrackRecord,
+) -> Result<Value, ServiceError> {
+    let groups = value
+        .groups()
+        .iter()
+        .map(recommendation_track_record_group_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "actionToken": action_token,
+        "evaluatedAt": super::product_timestamp(value.evaluated_at()),
+        "unavailableAnalysisCount": value.analysis_unavailable_count(),
         "minimumCompletedSamples": market_squawk_decisions::RECOMMENDATION_TRACK_RECORD_MINIMUM_COMPLETED,
-        "minimumCoveragePpm": market_squawk_decisions::RECOMMENDATION_TRACK_RECORD_MINIMUM_COVERAGE_PPM,
-        "groups": value.groups().iter().map(|group| json!({
-            "cohort": recommendation_outcome_cohort_name(group.cohort()),
-            "publicationCount": group.publication_count(),
-            "dueCount": group.due_count(),
-            "completedCount": group.completed_count(),
-            "pendingCount": group.pending_count(),
-            "unavailableCount": group.unavailable_count(),
-            "coveragePpm": group.coverage_ppm(),
-            "performance": match group.performance() {
-                RecommendationTrackRecordPerformance::UnavailableNoDueOutcomes => json!({"kind": "unavailable", "reason": "no_due_outcomes"}),
-                RecommendationTrackRecordPerformance::UnavailableInsufficientCompletedSamples { required, actual } => json!({"kind": "unavailable", "reason": "insufficient_completed_samples", "required": required, "actual": actual}),
-                RecommendationTrackRecordPerformance::UnavailableInsufficientCoverage { required_ppm, actual_ppm } => json!({"kind": "unavailable", "reason": "insufficient_coverage", "requiredPpm": required_ppm, "actualPpm": actual_ppm}),
-                RecommendationTrackRecordPerformance::Available { mean_gross_price_return, positive_outcomes, zero_outcomes, negative_outcomes } => json!({
-                    "kind": "available",
-                    "metric": "mean_gross_instrument_price_return",
-                    "meanGrossPriceReturn": mean_gross_price_return.to_string(),
-                    "positiveOutcomes": positive_outcomes,
-                    "zeroOutcomes": zero_outcomes,
-                    "negativeOutcomes": negative_outcomes,
-                }),
-            },
-        })).collect::<Vec<_>>(),
+        "minimumCoveragePercent": percentage_from_ppm(market_squawk_decisions::RECOMMENDATION_TRACK_RECORD_MINIMUM_COVERAGE_PPM),
+        "groups": groups,
         "forecastCalibrationIncluded": false,
-        "executionPerformanceIncluded": false,
-    })
+        "executionResultsIncluded": false,
+        "summary": "Comparable history reports realized gross price outcomes only. It excludes execution, taxes, and personal portfolio results.",
+    }))
 }
 
-fn recommendation_policy_value(policy: &RecommendationPolicy) -> Value {
-    json!({
-        "version": policy.version().get(),
-        "digest": hex(policy.digest().bytes()),
-        "actionZoneSemanticsVersion": policy.action_zone_semantics_version().get(),
-        "horizonNanos": policy.horizon_nanos(),
-        "proposalLifetimeNanos": policy.proposal_lifetime_nanos(),
-        "assumptions": policy.assumptions().iter().map(|value| value.as_str()).collect::<Vec<_>>(),
-        "invalidationConditions": policy.invalidation_conditions().iter().map(|value| value.as_str()).collect::<Vec<_>>(),
-        "limitations": policy.limitations().iter().map(|value| value.as_str()).collect::<Vec<_>>(),
-    })
+fn recommendation_track_record_group_value(
+    group: &RecommendationTrackRecordGroup,
+) -> Result<Value, ServiceError> {
+    let performance = match group.performance() {
+        RecommendationTrackRecordPerformance::UnavailableNoDueOutcomes => json!({
+            "kind": "unavailable",
+            "summary": "No recommendations in this group have reached their horizon yet."
+        }),
+        RecommendationTrackRecordPerformance::UnavailableInsufficientCompletedSamples {
+            required,
+            actual,
+        } => json!({
+            "kind": "unavailable",
+            "summary": "Too few completed outcomes are available for a meaningful result.",
+            "required": required,
+            "actual": actual
+        }),
+        RecommendationTrackRecordPerformance::UnavailableInsufficientCoverage {
+            required_ppm,
+            actual_ppm,
+        } => json!({
+            "kind": "unavailable",
+            "summary": "Too many due outcomes are still missing for a meaningful result.",
+            "requiredPercent": percentage_from_ppm(required_ppm),
+            "actualPercent": percentage_from_ppm(actual_ppm)
+        }),
+        RecommendationTrackRecordPerformance::Available {
+            mean_gross_price_return,
+            positive_outcomes,
+            zero_outcomes,
+            negative_outcomes,
+        } => json!({
+            "kind": "available",
+            "meanGrossPriceReturnPercent": percentage_from_decimal_ratio(mean_gross_price_return)?,
+            "positiveOutcomes": positive_outcomes,
+            "unchangedOutcomes": zero_outcomes,
+            "negativeOutcomes": negative_outcomes,
+            "summary": "This is realized gross price history, not an executed or guaranteed return."
+        }),
+    };
+    Ok(json!({
+        "action": recommendation_outcome_cohort_name(group.cohort()),
+        "recommendationCount": group.publication_count(),
+        "dueCount": group.due_count(),
+        "completedCount": group.completed_count(),
+        "pendingCount": group.pending_count(),
+        "unavailableCount": group.unavailable_count(),
+        "coveragePercent": percentage_from_ppm(group.coverage_ppm()),
+        "performance": performance,
+    }))
 }
 
-fn investment_analysis_evidence_value(evidence: &InvestmentAnalysisEvidence) -> Value {
-    json!({
-        "instrumentId": evidence.instrument_id(),
-        "currency": evidence.currency().as_str(),
-        "accountId": evidence.account_id(),
-        "asOf": evidence.as_of(),
-        "market": evidence.market().map(market_evidence_value),
-        "priceForecast": evidence.price_forecast().map(price_forecast_evidence_value),
-        "valuation": evidence.valuation().map(valuation_evidence_value),
-        "backtest": evidence.backtest().map(backtest_evidence_value),
-        "liquidity": evidence.liquidity().map(liquidity_evidence_value),
-        "portfolioRisk": evidence.portfolio_risk().map(portfolio_risk_evidence_value),
-    })
+fn recommendation_reasons(
+    decision: &InvestmentProposalDecision,
+    portfolio_label: &str,
+) -> Vec<String> {
+    let evidence = decision.evidence();
+    let mut reasons = Vec::new();
+    match decision {
+        InvestmentProposalDecision::NoAction(value) => {
+            reasons.push(no_action_reason_summary(value.reason()).to_owned());
+        }
+        InvestmentProposalDecision::Unavailable(value) => {
+            reasons.push(unavailable_reason_summary(value.reason()).to_owned());
+        }
+        InvestmentProposalDecision::Generated(_) => {}
+    }
+    if let Some(forecast) = evidence.price_forecast() {
+        let range = forecast.ranges().base();
+        reasons.push(format!(
+            "The base forecast spans {} to {} through the investment horizon.",
+            money_text(range.lower()),
+            money_text(range.upper())
+        ));
+    }
+    if let Some(valuation) = evidence.valuation() {
+        reasons.push(format!(
+            "The saved valuation estimates fair value at {}.",
+            money_text(valuation.fair_value())
+        ));
+    }
+    if let Some(backtest) = evidence.backtest() {
+        reasons.push(format!(
+            "The cost-adjusted historical test returned {}% across {} observations.",
+            percentage_from_basis_points(backtest.net_return().get()),
+            backtest.observations()
+        ));
+    }
+    if let Some(liquidity) = evidence.liquidity() {
+        reasons.push(format!(
+            "Liquidity evidence showed a {}% quoted spread and {}% usable capacity.",
+            percentage_from_basis_points(liquidity.quoted_spread().get()),
+            percentage_from_ppm(liquidity.capacity_ppm())
+        ));
+    }
+    if let Some(portfolio) = evidence.portfolio_risk() {
+        reasons.push(format!(
+            "{} had {}% of its saved risk capacity available.",
+            portfolio_label,
+            percentage_from_ppm(portfolio.risk_capacity_ppm())
+        ));
+    }
+    if reasons.is_empty() {
+        reasons.push("The saved evidence met every required check for this action.".to_owned());
+    }
+    reasons
 }
 
-fn market_evidence_value(evidence: &MarketReferenceEvidence) -> Value {
-    json!({
-        "instrumentId": evidence.instrument_id(),
-        "price": money_value(evidence.price()),
-        "quality": data_quality_name(evidence.quality()),
-        "priceKind": market_price_kind_name(evidence.price_kind()),
-        "adjustmentBasis": market_adjustment_basis_name(evidence.adjustment_basis()),
-        "selectionReceiptIdentity": content_identity_value(evidence.selection_receipt_identity()),
-        "selectedObservationIdentity": content_identity_value(evidence.selected_observation_identity()),
-        "window": evidence_window_value(evidence.window()),
-    })
+fn investment_risks(decision: &InvestmentProposalDecision) -> Vec<&str> {
+    let evidence = decision.evidence();
+    let mut risks = decision
+        .policy()
+        .limitations()
+        .iter()
+        .map(|value| value.as_str())
+        .collect::<Vec<_>>();
+    if evidence.price_forecast().is_some() || evidence.valuation().is_some() {
+        risks.push("Forecast and valuation ranges are estimates, not guaranteed prices.");
+    }
+    if evidence.backtest().is_some() {
+        risks.push("Historical test results may not repeat in future markets.");
+    }
+    if matches!(decision, InvestmentProposalDecision::Generated(_)) {
+        risks.push("Research ranges do not place trades or guarantee account results.");
+    }
+    risks
 }
 
-fn price_forecast_evidence_value(evidence: &PriceForecastEvidence) -> Value {
-    let calibration = evidence.calibration();
+fn invalidators_value<'a>(decision: &'a InvestmentProposalDecision) -> Vec<&'a str> {
+    let mut invalidators: Vec<&'a str> = decision
+        .policy()
+        .invalidation_conditions()
+        .iter()
+        .map(|value| value.as_str())
+        .collect::<Vec<_>>();
+    if let InvestmentProposalDecision::NoAction(value) = decision {
+        for invalidator in value.invalidators().iter().copied() {
+            let summary: &'a str = invalidator_summary(invalidator);
+            invalidators.push(summary);
+        }
+    }
+    invalidators
+}
+
+fn evidence_summary_value(decision: &InvestmentProposalDecision) -> Value {
+    let evidence = decision.evidence();
     json!({
-        "instrumentId": evidence.instrument_id(),
-        "cases": price_cases_value(evidence.cases()),
-        "ranges": forecast_ranges_value(evidence.ranges()),
-        "horizonAt": evidence.horizon_at(),
-        "expectedTerminal": expected_terminal_value(evidence),
-        "vintageId": hex(evidence.vintage_id().bytes()),
-        "outputBindingIdentity": content_identity_value(evidence.output_binding_identity()),
-        "calibrationIdentity": content_identity_value(evidence.calibration_identity()),
-        "outcomeSetIdentity": content_identity_value(evidence.outcome_set_identity()),
-        "calibration": {
-            "nominalCoveragePpm": calibration.nominal_coverage_ppm(),
-            "realizedCoveragePpm": calibration.realized_coverage_ppm(),
-            "completedOutcomes": calibration.completed_outcomes().get(),
+        "coverage": coverage_summary_value(evidence),
+        "calibration": calibration_summary_value(evidence),
+        "outOfSample": {
+            "state": "not_established",
+            "summary": "This saved analysis does not label any result as a separate out-of-sample test."
         },
-        "window": evidence_window_value(evidence.window()),
+        "historicalTest": evidence.backtest().map(historical_test_summary_value),
+        "costs": cost_summary_value(evidence.backtest()),
+        "uncertainty": uncertainty_summary_value(decision),
     })
 }
 
-fn expected_terminal_value(evidence: &PriceForecastEvidence) -> Option<Value> {
-    match (
-        evidence.expected_terminal_statistic(),
-        evidence.expected_terminal_price(),
-        evidence.expected_terminal_horizon_at(),
-        evidence.expected_terminal_statistic_identity(),
-    ) {
-        (
-            Some(ForecastCentralStatistic::ModelEstimatedConditionalMean),
-            Some(price),
-            Some(horizon_at),
-            Some(statistic_identity),
-        ) => Some(json!({
-            "statistic": "model_estimated_conditional_mean",
-            "price": money_value(price),
-            "horizonAt": horizon_at,
-            "statisticIdentity": content_identity_value(statistic_identity),
-        })),
-        (
-            Some(
-                ForecastCentralStatistic::ModelEstimatedConditionalMean
-                | ForecastCentralStatistic::Unavailable,
-            )
-            | None,
-            _,
-            _,
-            _,
-        ) => None,
+fn coverage_summary_value(evidence: &InvestmentAnalysisEvidence) -> Value {
+    let items = [
+        ("current_market", evidence.market().is_some()),
+        ("forecast", evidence.price_forecast().is_some()),
+        ("valuation", evidence.valuation().is_some()),
+        ("historical_test", evidence.backtest().is_some()),
+        ("liquidity", evidence.liquidity().is_some()),
+        ("portfolio_risk", evidence.portfolio_risk().is_some()),
+    ];
+    let available_count = items.iter().filter(|(_, available)| *available).count();
+    json!({
+        "availableCount": available_count,
+        "possibleCount": items.len(),
+        "items": items.into_iter().map(|(kind, available)| json!({
+            "kind": kind,
+            "state": if available { "available" } else { "unavailable" },
+        })).collect::<Vec<_>>(),
+        "summary": format!("{available_count} of {} evidence areas were available to this saved analysis.", items.len()),
+    })
+}
+
+fn calibration_summary_value(evidence: &InvestmentAnalysisEvidence) -> Value {
+    match evidence.price_forecast() {
+        Some(value) => {
+            let calibration = value.calibration();
+            json!({
+                "state": "available",
+                "nominalCoveragePercent": percentage_from_ppm(calibration.nominal_coverage_ppm()),
+                "realizedCoveragePercent": percentage_from_ppm(calibration.realized_coverage_ppm()),
+                "completedOutcomes": calibration.completed_outcomes().get(),
+                "summary": "Coverage compares forecast ranges with completed historical outcomes; it does not measure certainty of profit."
+            })
+        }
+        None => json!({
+            "state": "unavailable",
+            "summary": "Forecast calibration was not available for this saved analysis."
+        }),
     }
 }
 
-fn valuation_evidence_value(evidence: &ValuationEvidence) -> Value {
+fn historical_test_summary_value(evidence: &CostAdjustedPitBacktestEvidence) -> Value {
     json!({
-        "instrumentId": evidence.instrument_id(),
-        "fairValue": money_value(evidence.fair_value()),
-        "basis": valuation_basis_name(evidence.basis()),
-        "horizonAt": evidence.horizon_at(),
-        "measurementId": hex(evidence.measurement_id().bytes()),
-        "classificationDecisionId": hex(evidence.classification_decision_id().bytes()),
-        "selectionReceiptHash": hex(evidence.selection_receipt_hash().bytes()),
-        "window": evidence_window_value(evidence.window()),
-    })
-}
-
-fn backtest_evidence_value(evidence: &CostAdjustedPitBacktestEvidence) -> Value {
-    json!({
-        "instrumentId": evidence.instrument_id(),
-        "currency": evidence.currency().as_str(),
-        "outcomeHorizonNanos": evidence.outcome_horizon_nanos(),
-        "netReturnBasisPoints": evidence.net_return().get(),
-        "maxDrawdownBasisPoints": evidence.max_drawdown().get(),
-        "feeBasisPoints": evidence.fee_basis_points().get(),
-        "slippageBasisPoints": evidence.slippage_basis_points().get(),
-        "maximumRandomSlippageBasisPoints": evidence.maximum_random_slippage_basis_points().get(),
+        "netReturnPercent": percentage_from_basis_points(evidence.net_return().get()),
+        "maximumDrawdownPercent": percentage_from_basis_points(evidence.max_drawdown().get()),
         "observations": evidence.observations().get(),
         "trials": evidence.trials().get(),
-        "stabilityPpm": evidence.stability_ppm(),
-        "simulationCutoffAt": evidence.simulation_cutoff_at(),
-        "datasetIdentity": content_identity_value(evidence.dataset_identity()),
-        "commandIdentity": content_identity_value(evidence.command_identity()),
-        "terminalIdentity": content_identity_value(evidence.terminal_identity()),
-        "reportIdentity": content_identity_value(evidence.report_identity()),
-        "cohortIdentity": content_identity_value(evidence.cohort_identity()),
-        "costModelIdentity": content_identity_value(evidence.cost_model_identity()),
-        "window": evidence_window_value(evidence.window()),
+        "stabilityPercent": percentage_from_ppm(evidence.stability_ppm()),
+        "evaluatedThrough": super::product_timestamp(evidence.simulation_cutoff_at()),
+        "summary": "This is a cost-adjusted point-in-time historical test, not a promise of future performance."
     })
 }
 
-fn liquidity_evidence_value(evidence: &LiquidityEvidence) -> Value {
-    json!({
-        "instrumentId": evidence.instrument_id(),
-        "currency": evidence.currency().as_str(),
-        "quotedSpreadBasisPoints": evidence.quoted_spread().get(),
-        "capacityPpm": evidence.capacity_ppm(),
-        "quality": data_quality_name(evidence.quality()),
-        "assessmentIdentity": content_identity_value(evidence.assessment_identity()),
-        "window": evidence_window_value(evidence.window()),
-    })
+fn cost_summary_value(evidence: Option<&CostAdjustedPitBacktestEvidence>) -> Value {
+    match evidence {
+        Some(value) => json!({
+            "state": "modeled",
+            "feePercent": percentage_from_basis_points(value.fee_basis_points().get()),
+            "slippagePercent": percentage_from_basis_points(value.slippage_basis_points().get()),
+            "maximumRandomSlippagePercent": percentage_from_basis_points(value.maximum_random_slippage_basis_points().get()),
+            "summary": "These modeled costs were included in the historical test, not in the future price ranges."
+        }),
+        None => json!({
+            "state": "unavailable",
+            "summary": "A modeled trading-cost summary was not available for this saved analysis."
+        }),
+    }
 }
 
-fn portfolio_risk_evidence_value(evidence: &PortfolioRiskEvidence) -> Value {
-    json!({
-        "instrumentId": evidence.instrument_id(),
-        "accountId": evidence.account_id(),
-        "currency": evidence.currency().as_str(),
-        "portfolioRevision": hex(evidence.portfolio_revision().bytes()),
-        "positionState": position_state_value(evidence.position_state()),
-        "riskCapacityPpm": evidence.risk_capacity_ppm(),
-        "riskReportIdentity": content_identity_value(evidence.risk_report_identity()),
-        "window": evidence_window_value(evidence.window()),
-    })
+fn uncertainty_summary_value(decision: &InvestmentProposalDecision) -> Value {
+    let reliability = match decision {
+        InvestmentProposalDecision::Generated(value) => Some(value.confidence()),
+        InvestmentProposalDecision::NoAction(value) => Some(value.confidence()),
+        InvestmentProposalDecision::Unavailable(_) => None,
+    };
+    match reliability {
+        Some(value) => evidence_reliability_value(value),
+        None => json!({
+            "state": "unavailable",
+            "summary": "Evidence reliability could not be calculated because the analysis was unavailable."
+        }),
+    }
 }
 
-fn generated_result_value(proposal: &GeneratedInvestmentProposal) -> Value {
+fn investment_analysis_locator_value(
+    entry: &InvestmentProposalIndexEntry,
+    action_token: Uuid,
+    investment: InvestmentDisplay,
+    portfolio_label: String,
+) -> Value {
     json!({
-        "kind": "generated",
-        "proposalId": hex(proposal.proposal_id().bytes()),
-        "derivationDigest": hex(proposal.derivation_digest().bytes()),
-        "action": action_name(proposal.action()),
-        "priceLadder": price_ladder_value(proposal.price_ladder()),
-        "actionZoneSemantics": {
-            "version": proposal.action_zone_semantics_version().get(),
-            "referenceZone": proposal.action_trigger_reference_zone().map(price_range_value),
-            "triggerFloorExclusive": proposal.action_trigger_floor_exclusive().map(money_value),
-            "triggerFloorInclusive": proposal.action_trigger_floor_inclusive().map(money_value),
-            "triggerCeilingInclusive": proposal.action_trigger_ceiling_inclusive().map(money_value),
-        },
-        "evidenceReliability": evidence_reliability_value(proposal.confidence()),
-        "horizonAt": proposal.horizon_at(),
-        "expiresAt": proposal.expires_at(),
-    })
-}
-
-fn no_action_result_value(proposal: &NoActionInvestmentProposal) -> Value {
-    json!({
-        "kind": "no_action",
-        "proposalId": hex(proposal.proposal_id().bytes()),
-        "derivationDigest": hex(proposal.derivation_digest().bytes()),
-        "reason": no_action_reason_name(proposal.reason()),
-        "invalidators": proposal.invalidators().iter().copied().map(invalidator_name).collect::<Vec<_>>(),
-        "evidenceReliability": evidence_reliability_value(proposal.confidence()),
-        "horizonAt": proposal.horizon_at(),
-        "expiresAt": proposal.expires_at(),
-    })
-}
-
-fn unavailable_result_value(analysis: &UnavailableInvestmentAnalysis) -> Value {
-    json!({
-        "kind": "unavailable",
-        "reason": unavailable_reason_value(analysis.reason()),
-        "horizonAt": analysis.horizon_at(),
-        "expiresAt": analysis.expires_at(),
-    })
-}
-
-fn investment_analysis_locator_value(entry: &InvestmentProposalIndexEntry) -> Value {
-    json!({
-        "analysisId": hex(entry.analysis_id().bytes()),
-        "proposalId": entry.proposal_id().map(|value| hex(value.bytes())),
-        "derivationDigest": entry.derivation_digest().map(|value| hex(value.bytes())),
-        "instrumentId": entry.instrument_id(),
-        "accountId": entry.account_id(),
+        "actionToken": action_token,
+        "investment": investment_value(&investment),
+        "portfolioLabel": portfolio_label,
         "currency": entry.currency().as_str(),
-        "asOf": entry.as_of(),
-        "horizonAt": entry.horizon_at(),
-        "expiresAt": entry.expires_at(),
-        "policyDigest": hex(entry.policy_digest().bytes()),
-        "evidenceDigest": hex(entry.evidence_digest().bytes()),
-        "outcome": match entry.outcome() {
+        "horizon": {
+            "informationCurrentThrough": super::product_timestamp(entry.as_of()),
+            "endsAt": super::product_timestamp(entry.horizon_at()),
+            "expiresAt": super::product_timestamp(entry.expires_at()),
+        },
+        "recommendation": match entry.outcome() {
             InvestmentProposalIndexOutcome::Generated(action) => {
-                json!({"kind": "generated", "action": action_name(action)})
+                json!({"kind": "action", "action": action_name(action), "summary": generated_action_summary(action)})
             }
             InvestmentProposalIndexOutcome::NoAction(reason) => {
-                json!({"kind": "no_action", "reason": no_action_reason_name(reason)})
+                json!({"kind": "abstain", "summary": no_action_reason_summary(reason)})
             }
             InvestmentProposalIndexOutcome::Unavailable(reason) => {
-                json!({"kind": "unavailable", "reason": unavailable_reason_value(reason)})
+                json!({"kind": "unavailable", "summary": unavailable_reason_summary(reason)})
             }
         },
-    })
-}
-
-fn price_ladder_value(ladder: GeneratedPriceLadder) -> Value {
-    json!({
-        "cases": price_cases_value(ladder.cases()),
-        "ranges": {
-            "downside": price_range_value(ladder.downside_range()),
-            "base": price_range_value(ladder.base_range()),
-            "upside": price_range_value(ladder.upside_range()),
-            "entry": price_range_value(ladder.entry_range()),
-            "add": price_range_value(ladder.add_range()),
-            "trim": price_range_value(ladder.trim_range()),
-            "exit": price_range_value(ladder.exit_range()),
-        },
-        "addCase": money_value(ladder.add_case()),
-    })
-}
-
-fn price_cases_value(cases: TargetPriceCases) -> Value {
-    json!({
-        "downside": money_value(cases.downside()),
-        "base": money_value(cases.base()),
-        "upside": money_value(cases.upside()),
-    })
-}
-
-fn forecast_ranges_value(ranges: ForecastPriceRanges) -> Value {
-    json!({
-        "downside": price_range_value(ranges.downside()),
-        "base": price_range_value(ranges.base()),
-        "upside": price_range_value(ranges.upside()),
     })
 }
 
@@ -661,186 +792,181 @@ fn price_range_value(range: TargetPriceRange) -> Value {
 
 fn money_value(money: Money) -> Value {
     json!({
-        "amount": money.amount().to_string(),
+        "amount": money.amount().normalize().to_string(),
         "currency": money.currency().as_str(),
     })
 }
 
 fn evidence_reliability_value(reliability: RecommendationConfidence) -> Value {
     json!({
-        "meaning": confidence_meaning_name(reliability.meaning()),
-        "valuePpm": reliability.value_ppm(),
+        "state": "available",
+        "evidenceReliabilityPercent": percentage_from_ppm(reliability.value_ppm()),
         "components": reliability.components().iter().map(|component| json!({
             "kind": confidence_component_name(component.kind()),
-            "valuePpm": component.value_ppm(),
-            "weightPpm": component.weight_ppm(),
+            "reliabilityPercent": percentage_from_ppm(component.value_ppm()),
         })).collect::<Vec<_>>(),
+        "summary": confidence_summary(reliability.meaning()),
     })
 }
 
-fn position_state_value(state: PortfolioPositionState) -> Value {
-    match state {
-        PortfolioPositionState::NoPosition => json!({"kind": "no_position"}),
-        PortfolioPositionState::Position {
-            add_allowed,
-            trim_allowed,
-            exit_allowed,
-        } => json!({
-            "kind": "position",
-            "addAllowed": add_allowed,
-            "trimAllowed": trim_allowed,
-            "exitAllowed": exit_allowed,
-        }),
-    }
-}
-
-fn evidence_window_value(window: ProposalEvidenceWindow) -> Value {
-    json!({
-        "observedAt": window.observed_at(),
-        "availableAt": window.available_at(),
-        "expiresAt": window.expires_at(),
-        "contentIdentity": content_identity_value(window.content_identity()),
-    })
-}
-
-fn content_identity_value(identity: DecisionContentDigest) -> Value {
-    let digest = identity.evidence_digest();
-    json!({
-        "algorithm": digest_algorithm_name(digest.algorithm()),
-        "digest": hex(digest.bytes()),
-    })
-}
-
-fn unavailable_reason_value(reason: ProposalUnavailableReason) -> Value {
+const fn unavailable_reason_summary(reason: ProposalUnavailableReason) -> &'static str {
     match reason {
-        ProposalUnavailableReason::MissingEvidence(evidence) => json!({
-            "kind": "missing_evidence",
-            "evidence": evidence_kind_name(evidence),
-        }),
-        ProposalUnavailableReason::InstrumentMismatch {
-            evidence,
-            expected,
-            actual,
-        } => json!({
-            "kind": "instrument_mismatch",
-            "evidence": evidence_kind_name(evidence),
-            "expected": expected,
-            "actual": actual,
-        }),
-        ProposalUnavailableReason::CurrencyMismatch {
-            evidence,
-            expected,
-            actual,
-        } => json!({
-            "kind": "currency_mismatch",
-            "evidence": evidence_kind_name(evidence),
-            "expected": expected.as_str(),
-            "actual": actual.as_str(),
-        }),
-        ProposalUnavailableReason::AccountMismatch { expected, actual } => json!({
-            "kind": "account_mismatch",
-            "expected": expected,
-            "actual": actual,
-        }),
-        ProposalUnavailableReason::NotAvailableAtCutoff(evidence) => json!({
-            "kind": "not_available_at_cutoff",
-            "evidence": evidence_kind_name(evidence),
-        }),
-        ProposalUnavailableReason::ExpiredEvidence(evidence) => json!({
-            "kind": "expired_evidence",
-            "evidence": evidence_kind_name(evidence),
-        }),
-        ProposalUnavailableReason::StaleEvidence(evidence) => json!({
-            "kind": "stale_evidence",
-            "evidence": evidence_kind_name(evidence),
-        }),
-        ProposalUnavailableReason::RejectedQuality { evidence, quality } => json!({
-            "kind": "rejected_quality",
-            "evidence": evidence_kind_name(evidence),
-            "quality": data_quality_name(quality),
-        }),
-        ProposalUnavailableReason::ForecastHorizonMismatch { expected, actual } => json!({
-            "kind": "forecast_horizon_mismatch",
-            "expected": expected,
-            "actual": actual,
-        }),
-        ProposalUnavailableReason::ValuationHorizonMismatch { expected, actual } => json!({
-            "kind": "valuation_horizon_mismatch",
-            "expected": expected,
-            "actual": actual,
-        }),
-        ProposalUnavailableReason::BacktestHorizonMismatch {
-            expected_nanos,
-            actual_nanos,
-        } => json!({
-            "kind": "backtest_horizon_mismatch",
-            "expectedNanos": expected_nanos,
-            "actualNanos": actual_nanos,
-        }),
-        ProposalUnavailableReason::InsufficientForecastOutcomes { required, actual } => json!({
-            "kind": "insufficient_forecast_outcomes",
-            "required": required.get(),
-            "actual": actual.get(),
-        }),
-        ProposalUnavailableReason::UnsupportedForecastCoverage {
-            minimum_ppm,
-            maximum_ppm,
-            actual_ppm,
-        } => json!({
-            "kind": "unsupported_forecast_coverage",
-            "minimumPpm": minimum_ppm,
-            "maximumPpm": maximum_ppm,
-            "actualPpm": actual_ppm,
-        }),
-        ProposalUnavailableReason::InsufficientBacktestObservations { required, actual } => json!({
-            "kind": "insufficient_backtest_observations",
-            "required": required.get(),
-            "actual": actual.get(),
-        }),
-        ProposalUnavailableReason::InsufficientBacktestTrials { required, actual } => json!({
-            "kind": "insufficient_backtest_trials",
-            "required": required.get(),
-            "actual": actual.get(),
-        }),
+        ProposalUnavailableReason::MissingEvidence(_) => {
+            "Required supporting information was missing."
+        }
+        ProposalUnavailableReason::InstrumentMismatch { .. } => {
+            "Supporting information did not refer to the same investment."
+        }
+        ProposalUnavailableReason::CurrencyMismatch { .. } => {
+            "Supporting information used incompatible currencies."
+        }
+        ProposalUnavailableReason::AccountMismatch { .. } => {
+            "Portfolio information did not refer to the selected account."
+        }
+        ProposalUnavailableReason::NotAvailableAtCutoff(_) => {
+            "Required information was not available by the analysis cutoff."
+        }
+        ProposalUnavailableReason::ExpiredEvidence(_) => {
+            "Required supporting information had expired."
+        }
+        ProposalUnavailableReason::StaleEvidence(_) => {
+            "Required supporting information was too old."
+        }
+        ProposalUnavailableReason::RejectedQuality { .. } => {
+            "Required supporting information did not meet the quality standard."
+        }
+        ProposalUnavailableReason::ForecastHorizonMismatch { .. }
+        | ProposalUnavailableReason::ValuationHorizonMismatch { .. }
+        | ProposalUnavailableReason::BacktestHorizonMismatch { .. } => {
+            "Supporting information did not use the same investment horizon."
+        }
+        ProposalUnavailableReason::InsufficientForecastOutcomes { .. } => {
+            "Too few completed forecast outcomes were available."
+        }
+        ProposalUnavailableReason::UnsupportedForecastCoverage { .. } => {
+            "Forecast coverage was outside the accepted range."
+        }
+        ProposalUnavailableReason::InsufficientBacktestObservations { .. } => {
+            "Too few historical observations were available."
+        }
+        ProposalUnavailableReason::InsufficientBacktestTrials { .. } => {
+            "Too few historical trials were available."
+        }
         ProposalUnavailableReason::ReservedPortfolioRevision => {
-            json!({"kind": "reserved_portfolio_revision"})
+            "Portfolio information was not ready for analysis."
         }
     }
 }
 
-fn analysis_id(value: &str) -> Result<InvestmentAnalysisId, ServiceError> {
-    let bytes = decode_sha256(value)?;
-    InvestmentAnalysisId::try_from_bytes(bytes).map_err(|_error| ServiceError::InvalidRequest)
-}
-
-fn decode_sha256(value: &str) -> Result<[u8; 32], ServiceError> {
-    let bytes = value.as_bytes();
-    if bytes.len() != 64 {
+fn action_token(value: &str) -> Result<Uuid, ServiceError> {
+    let token = Uuid::parse_str(value).map_err(|_| ServiceError::InvalidRequest)?;
+    if token.is_nil() || token.to_string() != value {
         return Err(ServiceError::InvalidRequest);
     }
-    let mut decoded = [0_u8; 32];
-    for (index, pair) in bytes.chunks_exact(2).enumerate() {
-        decoded[index] = hex_digit(pair[0])? * 16 + hex_digit(pair[1])?;
-    }
-    Ok(decoded)
+    Ok(token)
 }
 
-const fn hex_digit(value: u8) -> Result<u8, ServiceError> {
-    match value {
-        b'0'..=b'9' => Ok(value - b'0'),
-        b'a'..=b'f' => Ok(value - b'a' + 10),
-        _ => Err(ServiceError::InvalidRequest),
+fn portfolio_label(
+    catalog: &PortfolioAccountCatalogSnapshot,
+    account_id: AccountId,
+) -> Result<String, ServiceError> {
+    let index = catalog
+        .heads()
+        .iter()
+        .position(|head| head.account_id() == account_id)
+        .ok_or(ServiceError::Unavailable)?;
+    let ordinal = index
+        .checked_add(1)
+        .ok_or(ServiceError::ResourceExhausted)?;
+    Ok(format!("Portfolio {ordinal}"))
+}
+
+fn map_instrument_catalog(error: MarketDataInstrumentCatalogError) -> ServiceError {
+    match error {
+        MarketDataInstrumentCatalogError::Cancelled => ServiceError::Cancelled,
+        MarketDataInstrumentCatalogError::DeadlineExceeded => ServiceError::DeadlineExceeded,
+        MarketDataInstrumentCatalogError::ResultByteLimitExceeded => {
+            ServiceError::ResourceExhausted
+        }
+        MarketDataInstrumentCatalogError::InvalidInput
+        | MarketDataInstrumentCatalogError::InvalidPopulationQuery
+        | MarketDataInstrumentCatalogError::InvalidLimit => ServiceError::InvalidRequest,
+        _ => ServiceError::Unavailable,
     }
 }
 
-fn hex(bytes: [u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut value = String::with_capacity(64);
-    for byte in bytes {
-        value.push(char::from(HEX[usize::from(byte >> 4)]));
-        value.push(char::from(HEX[usize::from(byte & 0x0f)]));
+fn map_account_catalog(error: PortfolioAccountCatalogError) -> ServiceError {
+    match error {
+        PortfolioAccountCatalogError::Portfolio(error) => error.as_service_error(),
+        PortfolioAccountCatalogError::ResourceExhausted => ServiceError::ResourceExhausted,
+        PortfolioAccountCatalogError::CorruptPublication
+        | PortfolioAccountCatalogError::CatalogChanged => ServiceError::Unavailable,
     }
-    value
+}
+
+fn percentage_from_ppm(value: u32) -> String {
+    exact_percentage(Decimal::from(value), Decimal::from(1_000_000_u32))
+}
+
+fn percentage_from_basis_points(value: i32) -> String {
+    exact_percentage(Decimal::from(value), Decimal::from(10_000_u32))
+}
+
+fn percentage_from_decimal_ratio(value: Decimal) -> Result<String, ServiceError> {
+    let hundred = Decimal::from(100_u32);
+    let percentage = value
+        .checked_mul(hundred)
+        .ok_or(ServiceError::InvalidResult)?;
+    if exact_decimal_ratio(percentage, hundred) != Some(value) {
+        return Err(ServiceError::InvalidResult);
+    }
+    Ok(percentage.normalize().to_string())
+}
+
+fn exact_money_ratio_percentage(numerator: Money, denominator: Money) -> Option<String> {
+    if numerator.currency() != denominator.currency() || denominator.amount().is_zero() {
+        return None;
+    }
+    let ratio = exact_decimal_ratio(numerator.amount(), denominator.amount())?;
+    let percentage = ratio.checked_mul(Decimal::from(100_u32))?;
+    if exact_decimal_ratio(percentage, Decimal::from(100_u32))? != ratio {
+        return None;
+    }
+    Some(percentage.normalize().to_string())
+}
+
+fn exact_decimal_ratio(numerator: Decimal, denominator: Decimal) -> Option<Decimal> {
+    if denominator.is_zero() {
+        return None;
+    }
+    let ten = Decimal::from(10_u32);
+    let mut scaled_numerator = numerator;
+    let mut decimal_scale = Decimal::from(1_u32);
+    for scale in 0..=28 {
+        if scaled_numerator.checked_rem(denominator)?.is_zero() {
+            let integral_quotient = scaled_numerator.checked_div(denominator)?;
+            let quotient = integral_quotient.checked_div(decimal_scale)?;
+            if quotient.checked_mul(denominator)? == numerator {
+                return Some(quotient);
+            }
+        }
+        if scale == 28 {
+            break;
+        }
+        scaled_numerator = scaled_numerator.checked_mul(ten)?;
+        decimal_scale = decimal_scale.checked_mul(ten)?;
+    }
+    None
+}
+
+fn exact_percentage(numerator: Decimal, denominator: Decimal) -> String {
+    ((numerator / denominator) * Decimal::from(100_u32))
+        .normalize()
+        .to_string()
+}
+
+fn money_text(value: Money) -> String {
+    format!("{} {}", value.amount().normalize(), value.currency())
 }
 
 const fn action_name(action: RecommendationAction) -> &'static str {
@@ -853,6 +979,24 @@ const fn action_name(action: RecommendationAction) -> &'static str {
     }
 }
 
+const fn generated_action_summary(action: RecommendationAction) -> &'static str {
+    match action {
+        RecommendationAction::Buy => {
+            "The saved evidence supports starting a position within the entry range."
+        }
+        RecommendationAction::Add => "The saved evidence supports adding within the add range.",
+        RecommendationAction::Hold => {
+            "The saved evidence supports holding rather than changing the position."
+        }
+        RecommendationAction::Trim => {
+            "The saved evidence supports reducing the position within the trim range."
+        }
+        RecommendationAction::Sell => {
+            "The saved evidence supports exiting the position within the exit range."
+        }
+    }
+}
+
 const fn recommendation_outcome_cohort_name(cohort: RecommendationOutcomeCohort) -> &'static str {
     match cohort {
         RecommendationOutcomeCohort::Generated(RecommendationAction::Buy) => "buy",
@@ -860,82 +1004,116 @@ const fn recommendation_outcome_cohort_name(cohort: RecommendationOutcomeCohort)
         RecommendationOutcomeCohort::Generated(RecommendationAction::Hold) => "hold",
         RecommendationOutcomeCohort::Generated(RecommendationAction::Trim) => "trim",
         RecommendationOutcomeCohort::Generated(RecommendationAction::Sell) => "sell",
-        RecommendationOutcomeCohort::NoActionControl => "no_action_control",
-        RecommendationOutcomeCohort::AnalysisUnavailable => "analysis_unavailable",
+        RecommendationOutcomeCohort::NoActionControl => "abstain",
+        RecommendationOutcomeCohort::AnalysisUnavailable => "unavailable",
     }
 }
 
-const fn recommendation_outcome_unavailable_reason_name(
+const fn recommendation_outcome_unavailable_reason_summary(
     reason: RecommendationOutcomeUnavailableReason,
 ) -> &'static str {
     match reason {
-        RecommendationOutcomeUnavailableReason::AnalysisUnavailable(_) => "analysis_unavailable",
+        RecommendationOutcomeUnavailableReason::AnalysisUnavailable(_) => {
+            "The original analysis was unavailable, so no comparable outcome can be measured."
+        }
         RecommendationOutcomeUnavailableReason::OutcomeObservationUnavailable => {
-            "outcome_observation_unavailable"
+            "A comparable price was not available at the end of the horizon."
         }
         RecommendationOutcomeUnavailableReason::AmbiguousOutcomeObservation => {
-            "ambiguous_outcome_observation"
+            "More than one possible end-of-horizon price remained unresolved."
         }
         RecommendationOutcomeUnavailableReason::IncompleteOutcomeObservation => {
-            "incomplete_outcome_observation"
+            "The end-of-horizon price information was incomplete."
         }
         RecommendationOutcomeUnavailableReason::CorporateActionEvidenceUnavailable => {
-            "corporate_action_evidence_unavailable"
+            "Corporate-action information was insufficient for a comparable outcome."
         }
     }
 }
 
 const fn sizing_unavailable_reason_name(reason: SizingUnavailableReason) -> &'static str {
     match reason {
-        SizingUnavailableReason::CapacityNotSupplied(_) => "capacity_not_supplied",
-        SizingUnavailableReason::CapacityNotYetAvailable(_) => "capacity_not_yet_available",
-        SizingUnavailableReason::CapacityExpired(_) => "capacity_expired",
+        SizingUnavailableReason::CapacityNotSupplied(_) => {
+            "A required sizing limit was not supplied."
+        }
+        SizingUnavailableReason::CapacityNotYetAvailable(_) => {
+            "A required sizing limit was not available yet."
+        }
+        SizingUnavailableReason::CapacityExpired(_) => "A required sizing limit had expired.",
         SizingUnavailableReason::CapacityRangeContainsNoLots(_) => {
-            "capacity_range_contains_no_lots"
+            "A sizing limit did not permit a whole lot."
         }
         SizingUnavailableReason::CashReserveExceedsGrossLiquidatableValue => {
-            "cash_reserve_exceeds_gross_liquidatable_value"
+            "The required cash reserve exceeded available liquid value."
         }
         SizingUnavailableReason::NoHardFeasibleLotIntersection => {
-            "no_hard_feasible_lot_intersection"
+            "The mandatory sizing limits did not overlap."
         }
         SizingUnavailableReason::PreferredWeightRangeContainsNoLots => {
-            "preferred_weight_range_contains_no_lots"
+            "The preferred range did not permit a whole lot."
         }
         SizingUnavailableReason::NoPreferredFeasibleLotIntersection => {
-            "no_preferred_feasible_lot_intersection"
+            "The preferred sizing limits did not overlap."
         }
     }
 }
 
-const fn no_action_reason_name(reason: NoActionReason) -> &'static str {
+const fn no_action_reason_summary(reason: NoActionReason) -> &'static str {
     match reason {
-        NoActionReason::ConflictingForecastAndValuation => "conflicting_forecast_and_valuation",
-        NoActionReason::BacktestBelowPolicy => "backtest_below_policy",
-        NoActionReason::LiquidityBelowPolicy => "liquidity_below_policy",
-        NoActionReason::PortfolioRiskBelowPolicy => "portfolio_risk_below_policy",
-        NoActionReason::ConfidenceBelowPolicy => "evidence_reliability_below_policy",
-        NoActionReason::PositionStateNotActionable => "position_state_not_actionable",
-        NoActionReason::GeneratedPriceOrderCollapsed => "generated_price_order_collapsed",
+        NoActionReason::ConflictingForecastAndValuation => {
+            "The forecast and valuation evidence point in conflicting directions."
+        }
+        NoActionReason::BacktestBelowPolicy => {
+            "The historical test did not meet the required standard."
+        }
+        NoActionReason::LiquidityBelowPolicy => {
+            "Available liquidity did not meet the required standard."
+        }
+        NoActionReason::PortfolioRiskBelowPolicy => {
+            "The portfolio risk assessment did not permit an action."
+        }
+        NoActionReason::ConfidenceBelowPolicy => {
+            "Supporting-evidence reliability was below the required standard."
+        }
+        NoActionReason::PositionStateNotActionable => {
+            "The current position state did not permit an action."
+        }
+        NoActionReason::GeneratedPriceOrderCollapsed => {
+            "The calculated action ranges were not sufficiently distinct."
+        }
     }
 }
 
-const fn invalidator_name(invalidator: ProposalInvalidator) -> &'static str {
+const fn invalidator_summary(invalidator: ProposalInvalidator) -> &'static str {
     match invalidator {
-        ProposalInvalidator::ForecastValuationConflict => "forecast_valuation_conflict",
-        ProposalInvalidator::BacktestPolicyBreach => "backtest_policy_breach",
-        ProposalInvalidator::LiquidityPolicyBreach => "liquidity_policy_breach",
-        ProposalInvalidator::PortfolioRiskPolicyBreach => "portfolio_risk_policy_breach",
-        ProposalInvalidator::ConfidencePolicyBreach => "evidence_reliability_policy_breach",
-        ProposalInvalidator::PositionStateIncompatible => "position_state_incompatible",
-        ProposalInvalidator::GeneratedPriceOrderCollapsed => "generated_price_order_collapsed",
+        ProposalInvalidator::ForecastValuationConflict => {
+            "Forecast and valuation evidence no longer agree."
+        }
+        ProposalInvalidator::BacktestPolicyBreach => {
+            "The historical result falls below the required standard."
+        }
+        ProposalInvalidator::LiquidityPolicyBreach => {
+            "Liquidity falls below the required standard."
+        }
+        ProposalInvalidator::PortfolioRiskPolicyBreach => {
+            "Portfolio risk no longer permits the action."
+        }
+        ProposalInvalidator::ConfidencePolicyBreach => {
+            "Supporting-evidence reliability falls below the required standard."
+        }
+        ProposalInvalidator::PositionStateIncompatible => {
+            "The current position state no longer permits the action."
+        }
+        ProposalInvalidator::GeneratedPriceOrderCollapsed => {
+            "The action ranges are no longer sufficiently distinct."
+        }
     }
 }
 
-const fn confidence_meaning_name(meaning: RecommendationConfidenceMeaning) -> &'static str {
+const fn confidence_summary(meaning: RecommendationConfidenceMeaning) -> &'static str {
     match meaning {
         RecommendationConfidenceMeaning::PolicyWeightedEvidenceReliabilityV1 => {
-            "policy_weighted_evidence_reliability_v1"
+            "This score summarizes supporting-evidence reliability. It is not the probability of profit."
         }
     }
 }
@@ -948,58 +1126,5 @@ const fn confidence_component_name(kind: RecommendationConfidenceComponentKind) 
         RecommendationConfidenceComponentKind::MarketIntegrity => "market_integrity",
         RecommendationConfidenceComponentKind::LiquidityCapacity => "liquidity_capacity",
         RecommendationConfidenceComponentKind::PortfolioRiskCapacity => "portfolio_risk_capacity",
-    }
-}
-
-const fn evidence_kind_name(kind: RecommendationEvidenceKind) -> &'static str {
-    match kind {
-        RecommendationEvidenceKind::Market => "market",
-        RecommendationEvidenceKind::PriceForecast => "price_forecast",
-        RecommendationEvidenceKind::Valuation => "valuation",
-        RecommendationEvidenceKind::Backtest => "backtest",
-        RecommendationEvidenceKind::Liquidity => "liquidity",
-        RecommendationEvidenceKind::PortfolioRisk => "portfolio_risk",
-    }
-}
-
-const fn data_quality_name(quality: DataQuality) -> &'static str {
-    match quality {
-        DataQuality::DirectVerified => "direct_verified",
-        DataQuality::DirectUnverified => "direct_unverified",
-        DataQuality::OfficialDelayed => "official_delayed",
-        DataQuality::Aggregated => "aggregated",
-        DataQuality::Indicative => "indicative",
-        DataQuality::Modeled => "modeled",
-        DataQuality::Estimated => "estimated",
-        DataQuality::Stale => "stale",
-        DataQuality::Quarantined => "quarantined",
-    }
-}
-
-const fn market_price_kind_name(kind: MarketReferencePriceKind) -> &'static str {
-    match kind {
-        MarketReferencePriceKind::LastTrade => "last_trade",
-        MarketReferencePriceKind::CheckedBidAskMidpoint => "checked_bid_ask_midpoint",
-    }
-}
-
-const fn market_adjustment_basis_name(basis: MarketReferenceAdjustmentBasis) -> &'static str {
-    match basis {
-        MarketReferenceAdjustmentBasis::UnadjustedSpot => "unadjusted_spot",
-    }
-}
-
-const fn valuation_basis_name(basis: ValuationAmountBasis) -> &'static str {
-    match basis {
-        ValuationAmountBasis::PerInstrumentUnit => "per_instrument_unit",
-        ValuationAmountBasis::ReportingEntityTotal => "reporting_entity_total",
-        ValuationAmountBasis::PositionTotal => "position_total",
-    }
-}
-
-const fn digest_algorithm_name(algorithm: DigestAlgorithm) -> &'static str {
-    match algorithm {
-        DigestAlgorithm::Sha256 => "sha256",
-        DigestAlgorithm::Blake3 => "blake3",
     }
 }

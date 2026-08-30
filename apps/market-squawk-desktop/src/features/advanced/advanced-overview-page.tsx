@@ -9,12 +9,12 @@ import {
 } from "lucide-react"
 import { Link } from "react-router-dom"
 
-import { useProduct } from "@/app/product-context"
+import { useSystem } from "@/app/product-context"
 import type { ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Skeleton } from "@/components/ui/skeleton"
 import { formatUnixNanos } from "@/features/opportunities/format"
-import type { ProductTransport } from "@/lib/transport"
+import type { SystemTransport } from "@/lib/transport"
 
 import { useAnalyticalControllerStatus } from "./use-analytical-profile"
 
@@ -52,11 +52,11 @@ const workspaces = [
 ]
 
 export function AdvancedOverviewPage() {
-  const product = useProduct()
-  if (product.status === "loading") {
+  const system = useSystem()
+  if (system.status === "loading") {
     return <AdvancedLoading />
   }
-  if (product.status === "error") {
+  if (system.status !== "ready") {
     return (
       <main className="mx-auto w-full max-w-[1180px] px-4 py-6 sm:px-6 lg:px-8">
         <Alert variant="destructive">
@@ -71,8 +71,8 @@ export function AdvancedOverviewPage() {
   }
   return (
     <ReadyAdvancedOverview
-      transport={product.transport}
-      scope={product.bootstrap.runtime}
+      transport={system.transport}
+      scope={system.bootstrap.productSessionToken}
     />
   )
 }
@@ -81,7 +81,7 @@ function ReadyAdvancedOverview({
   transport,
   scope,
 }: {
-  transport: ProductTransport
+  transport: SystemTransport
   scope: ProductScope
 }) {
   const controller = useAnalyticalControllerStatus(transport, scope)

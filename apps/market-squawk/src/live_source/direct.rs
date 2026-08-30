@@ -408,6 +408,7 @@ async fn start_on_live_runtime(
             return rollback_live_start(startup, live).await;
         }
     };
+    let publication_terminal = publication_cancellation.clone();
     let (startup_sender, startup_receiver) = oneshot::channel();
     let supervisor_cancellation = cancellation.clone();
     let terminal_cancellation = cancellation.clone();
@@ -425,6 +426,7 @@ async fn start_on_live_runtime(
             route_buffer_limits,
             live_ingress,
             publication_ingresses,
+            publication_terminal,
             order_level,
             supervisor_cancellation,
             startup_sender,
@@ -613,6 +615,7 @@ async fn run_account(
     route_buffer_limits: RouteBufferLimits,
     live_ingress: market_squawk_live::LiveRuntimeIngress,
     publication_ingresses: Vec<CoinbaseCapturedPublicationIngress>,
+    publication_terminal: CancellationToken,
     order_level: Option<OrderLevelDirectory>,
     cancellation: CancellationToken,
     startup: oneshot::Sender<()>,
@@ -696,6 +699,13 @@ async fn run_account(
             () = cancellation.cancelled() => {
                 return stop_products(products, cancellation, None).await;
             }
+            () = publication_terminal.cancelled() => {
+                return stop_products(
+                    products,
+                    cancellation,
+                    Some(CoinbaseDirectSupervisorError::PublicationExitedBeforeStartup),
+                ).await;
+            }
             outcome = products.join_next() => {
                 let primary = product_outcome(outcome);
                 return stop_products(products, cancellation, Some(primary)).await;
@@ -759,6 +769,13 @@ async fn run_account(
             biased;
             () = cancellation.cancelled() => {
                 return stop_products(products, cancellation, None).await;
+            }
+            () = publication_terminal.cancelled() => {
+                return stop_products(
+                    products,
+                    cancellation,
+                    Some(CoinbaseDirectSupervisorError::PublicationExited),
+                ).await;
             }
             outcome = products.join_next() => {
                 let primary = product_outcome(outcome);
@@ -945,6 +962,9 @@ pub enum CoinbaseDirectSupervisorError {
     /// A durable publication worker exited before the runtime became externally reachable.
     #[error("Coinbase Direct publication exited before startup")]
     PublicationExitedBeforeStartup,
+    /// A durable publication worker exited while the Direct generation was running.
+    #[error("Coinbase Direct publication exited")]
+    PublicationExited,
     /// Startup rejection and coordinated cleanup both failed.
     #[error("Coinbase Direct startup rejection and cleanup both failed")]
     StartupAndCleanup {

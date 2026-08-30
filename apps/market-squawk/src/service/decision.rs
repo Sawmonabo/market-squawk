@@ -11,6 +11,7 @@ use std::{
     sync::Arc,
 };
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use market_squawk_analytics::{FeatureCompatibility, FeatureKey, StatisticalF64};
 use market_squawk_decisions::{
     AppendOutcome, AsOfSemantics, CandidateAssessment, CandidateFlag, CandidateId,
@@ -75,7 +76,9 @@ impl InstalledDecisionOperations {
         decisions: Arc<DecisionApplication>,
         fair_value: crate::application::fair_value::FairValueDossierReadCapability,
         analytical_reader: market_squawk_data::AnalyticalReadCapability,
+        market_data_instruments: market_squawk_data::MarketDataInstrumentReadCapability,
         portfolio: PortfolioFairValueReadCapability,
+        account_catalog: crate::portfolio_application::PortfolioAccountCatalogReadCapability,
         runtime: market_squawk_runtime::RuntimeIdentity,
     ) -> Result<Self, ServiceError> {
         let features =
@@ -87,7 +90,11 @@ impl InstalledDecisionOperations {
                 fair_value,
                 runtime,
             ),
-            investment_analysis: InvestmentAnalysisOperations::new(Arc::clone(&decisions)),
+            investment_analysis: InvestmentAnalysisOperations::new(
+                Arc::clone(&decisions),
+                market_data_instruments,
+                account_catalog,
+            ),
             screen_workflow: ScreenWorkflowOperations::new(
                 Arc::clone(&decisions),
                 analytical_reader,
@@ -803,7 +810,7 @@ fn screen_run_index_value(entry: &market_squawk_decisions::ScreenRunIndexEntry) 
         "id": run.id().as_str(),
         "screenId": run.screen().id().as_str(),
         "screenRevision": run.screen().revision().get(),
-        "asOf": run.as_of(),
+        "asOf": product_timestamp(run.as_of()),
         "datasetIdentity": run.dataset_identity().evidence_digest(),
         "universeIdentity": run.universe_identity().evidence_digest(),
         "candidateCount": entry.candidate_count(),
@@ -820,7 +827,7 @@ fn candidate_value(candidate: &CandidateAssessment) -> Value {
         "instrumentId": record.instrument_id(),
         "rank": record.rank().get(),
         "score": record.score().get(),
-        "selectedAt": record.selected_at(),
+        "selectedAt": product_timestamp(record.selected_at()),
         "scoreContributions": candidate.score_contributions().iter().map(|contribution| json!({
             "binding": binding_value(contribution.binding()),
             "observed": contribution.observed().map(StatisticalF64::get),
@@ -841,7 +848,7 @@ fn dossier_value(dossier: &DecisionDossier) -> Value {
         "id": core.id().as_str(),
         "candidateId": core.candidate_id().as_str(),
         "instrumentId": core.instrument_id(),
-        "assembledAt": core.assembled_at(),
+        "assembledAt": product_timestamp(core.assembled_at()),
         "evidence": {
             "modelBundle": core.evidence().model_bundle().map(|value| value.as_str()),
             "portfolioRevision": core.evidence().portfolio_revision().map(PortfolioRevisionToken::bytes),
@@ -866,7 +873,7 @@ fn target_state_value(state: &TargetState) -> Value {
             "targetRevision": invalidation.target_revision().get(),
             "kind": invalidation_kind_name(invalidation.kind()),
             "actor": invalidation.actor().as_str(),
-            "observedAt": invalidation.observed_at(),
+            "observedAt": product_timestamp(invalidation.observed_at()),
             "contentIdentity": invalidation.content_identity().evidence_digest(),
         })),
     })
@@ -889,7 +896,7 @@ fn target_value(value: &GovernedTargetSet) -> Value {
         "dossierId": target.dossier_id().as_str(),
         "instrumentId": target.instrument_id(),
         "referencePrice": money_value(target.reference_mark().price()),
-        "referenceObservedAt": target.reference_mark().observed_at(),
+        "referenceObservedAt": product_timestamp(target.reference_mark().observed_at()),
         "referenceIdentity": target.reference_mark().content_identity().evidence_digest(),
         "downside": money_value(target.cases().downside()),
         "base": money_value(target.cases().base()),
@@ -900,9 +907,9 @@ fn target_value(value: &GovernedTargetSet) -> Value {
         "trimUpper": money_value(target.trim_range().upper()),
         "exitLower": money_value(target.exit_range().lower()),
         "exitUpper": money_value(target.exit_range().upper()),
-        "createdAt": target.created_at(),
-        "horizonAt": target.horizon_at(),
-        "expiresAt": target.expires_at(),
+        "createdAt": product_timestamp(target.created_at()),
+        "horizonAt": product_timestamp(target.horizon_at()),
+        "expiresAt": product_timestamp(target.expires_at()),
         "targetIdentity": target.content_identity().evidence_digest(),
         "addCase": money_value(value.add_case()),
         "method": target_method_name(value.method()),
@@ -911,10 +918,10 @@ fn target_value(value: &GovernedTargetSet) -> Value {
             "evidenceIdentity": assumption.evidence_identity().evidence_digest(),
         })).collect::<Vec<_>>(),
         "portfolioRevision": value.decision_context().portfolio_revision().map(PortfolioRevisionToken::bytes),
-        "effectiveAt": value.effective_at(),
-        "reviewDueAt": value.review_due_at(),
+        "effectiveAt": product_timestamp(value.effective_at()),
+        "reviewDueAt": product_timestamp(value.review_due_at()),
         "supersedes": value.supersedes().map(|(revision, at)| json!({
-            "revision": revision.get(), "supersededAt": at,
+            "revision": revision.get(), "supersededAt": product_timestamp(at),
         })),
         "thesis": value.thesis().as_str(),
         "risks": value.risks().iter().map(DecisionText::as_str).collect::<Vec<_>>(),
@@ -933,7 +940,7 @@ fn review_value(review: &TargetReview) -> Value {
         "targetId": review.target_id().as_str(),
         "targetRevision": review.target_revision().get(),
         "reviewer": review.reviewer().as_str(),
-        "reviewedAt": review.reviewed_at(),
+        "reviewedAt": product_timestamp(review.reviewed_at()),
         "disposition": review_disposition_name(review.disposition()),
         "contentIdentity": review.content_identity().evidence_digest(),
     })
@@ -941,6 +948,11 @@ fn review_value(review: &TargetReview) -> Value {
 
 fn money_value(money: Money) -> Value {
     json!({"amount": money.amount().to_string(), "currency": money.currency().as_str()})
+}
+
+pub(super) fn product_timestamp(timestamp: Timestamp) -> String {
+    DateTime::<Utc>::from_timestamp_nanos(timestamp.unix_nanos())
+        .to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
 const fn comparison_name(value: ComparisonOperator) -> &'static str {

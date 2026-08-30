@@ -501,6 +501,7 @@ impl From<SecFundProductBoundaryError> for SecFundJobRunnerError {
             SecFundProductBoundaryError::InvalidConfiguration
             | SecFundProductBoundaryError::DeadlineUnavailable
             | SecFundProductBoundaryError::PublicationMismatch => Self::InvalidConfiguration,
+            SecFundProductBoundaryError::ResourceExhausted => Self::Capacity,
         }
     }
 }
@@ -615,6 +616,9 @@ fn map_boundary_error(error: SecFundProductBoundaryError) -> JobRunError {
         }
         SecFundProductBoundaryError::PublicationMismatch => {
             failed("sec-fund-job-publication-invalid", false)
+        }
+        SecFundProductBoundaryError::ResourceExhausted => {
+            failed("sec-fund-job-resource-exhausted", false)
         }
     }
 }

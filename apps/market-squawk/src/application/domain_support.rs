@@ -18,6 +18,28 @@ use uuid::Uuid;
 const SHUTDOWN_BIT: usize = 1_usize << (usize::BITS - 1);
 const ACTIVE_MASK: usize = SHUTDOWN_BIT - 1;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProductTextCopyError {
+    BoundExceeded,
+    AllocationFailed,
+}
+
+/// Copies product text only within a caller-owned byte ceiling and with fallible allocation.
+pub(crate) fn try_boxed_product_text(
+    value: &str,
+    maximum_bytes: usize,
+) -> Result<Box<str>, ProductTextCopyError> {
+    if value.len() > maximum_bytes {
+        return Err(ProductTextCopyError::BoundExceeded);
+    }
+    let mut output = String::new();
+    output
+        .try_reserve_exact(value.len())
+        .map_err(|_| ProductTextCopyError::AllocationFailed)?;
+    output.push_str(value);
+    Ok(output.into_boxed_str())
+}
+
 /// Produces a deterministic opaque product token without exposing its native coordinates.
 pub(crate) fn opaque_product_token(domain: &[u8], components: &[&[u8]]) -> Uuid {
     let mut digest = Sha256::new();
@@ -32,6 +54,43 @@ pub(crate) fn opaque_product_token(domain: &[u8], components: &[&[u8]]) -> Uuid 
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Uuid::from_bytes(bytes)
+}
+
+/// Produces one bounded, prefixed product token without exposing UUID-shaped text.
+pub(crate) fn opaque_product_text_token(
+    prefix: &str,
+    domain: &[u8],
+    components: &[&[u8]],
+    maximum_bytes: usize,
+) -> Result<Box<str>, ProductTextCopyError> {
+    if prefix.is_empty()
+        || !prefix.ends_with('_')
+        || !prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(ProductTextCopyError::BoundExceeded);
+    }
+    let required = prefix
+        .len()
+        .checked_add(32)
+        .ok_or(ProductTextCopyError::BoundExceeded)?;
+    if required > maximum_bytes {
+        return Err(ProductTextCopyError::BoundExceeded);
+    }
+    let mut token = String::new();
+    token
+        .try_reserve_exact(required)
+        .map_err(|_| ProductTextCopyError::AllocationFailed)?;
+    token.push_str(prefix);
+    use fmt::Write as _;
+    write!(
+        token,
+        "{}",
+        opaque_product_token(domain, components).simple()
+    )
+    .map_err(|_| ProductTextCopyError::AllocationFailed)?;
+    Ok(token.into_boxed_str())
 }
 
 /// Race-free request admission and bounded drain state for one domain service.

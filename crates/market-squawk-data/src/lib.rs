@@ -123,6 +123,7 @@ pub use catalog::{
     OfficialOptionsReferenceAliasResolutionInput, OfficialOptionsReferenceAliasResolutionState,
     OfficialOptionsReferenceAmbiguity, OfficialOptionsReferenceCanonicalCandidate,
     OfficialOptionsReferenceCanonicalMatchKind, OfficialOptionsReferenceCanonicalResolution,
+    OfficialOptionsReferenceCatalogReadCapability, OfficialOptionsReferenceCatalogResolution,
     OfficialOptionsReferenceCboeSeries, OfficialOptionsReferenceConflict,
     OfficialOptionsReferenceConflictInput, OfficialOptionsReferenceConflictKind,
     OfficialOptionsReferenceConflictSetDigestBuilder, OfficialOptionsReferenceConflictSetEvidence,

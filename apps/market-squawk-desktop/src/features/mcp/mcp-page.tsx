@@ -2,7 +2,7 @@ import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { CircleAlert, RefreshCw, ShieldCheck } from "lucide-react"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { messageFrom, useSystem } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -15,8 +15,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Skeleton } from "@/components/ui/skeleton"
-import type { DesktopBootstrap } from "@/lib/schemas"
-import type { ProductTransport } from "@/lib/transport"
+import type { DesktopSystemBootstrap } from "@/lib/schemas"
+import type { SystemTransport } from "@/lib/transport"
 
 import { ClientCard } from "./client-card"
 import {
@@ -28,21 +28,24 @@ import {
 import { ServiceEvidence } from "./service-evidence"
 
 export function McpPage() {
-  const product = useProduct()
+  const system = useSystem()
 
-  if (product.status === "loading") return <McpLoading />
-  if (product.status === "error") {
+  if (system.status === "loading") return <McpLoading />
+  if (system.status !== "ready") {
     return (
       <McpFrame>
-        <Unavailable title="MCP service is unavailable" detail={product.error} />
+        <Unavailable
+          title="MCP service is unavailable"
+          detail={system.status === "unavailable" ? system.error : "Finish secure storage setup in Settings before managing AI connections."}
+        />
       </McpFrame>
     )
   }
 
   return (
     <McpWorkspace
-      bootstrap={product.bootstrap}
-      transport={product.transport}
+      bootstrap={system.bootstrap}
+      transport={system.transport}
     />
   )
 }
@@ -51,13 +54,13 @@ function McpWorkspace({
   bootstrap,
   transport,
 }: {
-  bootstrap: DesktopBootstrap
-  transport: ProductTransport
+  bootstrap: DesktopSystemBootstrap
+  transport: SystemTransport
 }) {
   const queryClient = useQueryClient()
   const [pending, setPending] = React.useState<McpClientControlRequest | null>(null)
   const [announcement, setAnnouncement] = React.useState("")
-  const queryKey = [...productKeys.domain(bootstrap.runtime, "mcp"), "clients"] as const
+  const queryKey = [...productKeys.domain(bootstrap.productSessionToken, "mcp"), "clients"] as const
   const status = useQuery({
     queryKey,
     queryFn: () => transport.mcpClients(),

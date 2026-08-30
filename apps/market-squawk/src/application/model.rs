@@ -15,9 +15,10 @@ use market_squawk_data::{DatasetManifestRef, Sha256Digest};
 use market_squawk_domain::{InstrumentId, ModelId, Timestamp};
 use market_squawk_modeling::{
     BundleId, CalibrationEvidence, CalibrationMethod, FeatureNormalizer, ForecastCentralStatistic,
-    ForecastMeasurement, ForecastOutputBinding, ForecastTargetMeaning, ForecastValue,
-    InferenceBackend, ModelBundle, ModelDecision, ModelFeatureValue, ModelFormat, ModelInput,
-    ModelMetadata, ModelOutput, ModelRegistry, TrainingDatasetIdentity, ValidationMetricName,
+    ForecastHorizon, ForecastMeasurement, ForecastOutputBinding, ForecastTargetMeaning,
+    ForecastValue, InferenceBackend, ModelBundle, ModelDecision, ModelFeatureValue, ModelFormat,
+    ModelInput, ModelMetadata, ModelOutput, ModelRegistry, TrainingDatasetIdentity,
+    ValidationMetricName,
 };
 use market_squawk_services::{
     ArtifactError, ArtifactReadContext, ArtifactReference, RequestContext, ServiceDomain,
@@ -868,8 +869,326 @@ fn model_coordinate(metadata: &ModelMetadata) -> (String, String, u64) {
     )
 }
 
+/// Closed product evidence state derived from one admitted model bundle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ForecastModelEvidenceState {
+    Sufficient,
+    Limited,
+    Unavailable,
+}
+
+impl ForecastModelEvidenceState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sufficient => "sufficient",
+            Self::Limited => "limited",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    fn decode(value: &str) -> Option<Self> {
+        match value {
+            "sufficient" => Some(Self::Sufficient),
+            "limited" => Some(Self::Limited),
+            "unavailable" => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+}
+
+/// Closed calibration state kept separate from the overall model-evidence gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ForecastModelCalibrationState {
+    Calibrated,
+    Limited,
+    Unavailable,
+}
+
+impl ForecastModelCalibrationState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Calibrated => "calibrated",
+            Self::Limited => "limited",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    fn decode(value: &str) -> Option<Self> {
+        match value {
+            "calibrated" => Some(Self::Calibrated),
+            "limited" => Some(Self::Limited),
+            "unavailable" => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+}
+
+/// Restart-bindable product projection of the same evidence gate used by Model.ListBundles.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ForecastModelEvidenceProjection {
+    model_token: uuid::Uuid,
+    selected_horizon: Option<ForecastHorizon>,
+    overall: ForecastModelEvidenceState,
+    pit_inputs: ForecastModelEvidenceState,
+    out_of_sample: ForecastModelEvidenceState,
+    horizon_alignment: ForecastModelEvidenceState,
+    calibration: ForecastModelCalibrationState,
+    interpretation: Box<str>,
+}
+
+impl ForecastModelEvidenceProjection {
+    pub(crate) fn try_from_product_fields_for_horizon(
+        model_token: uuid::Uuid,
+        selected_horizon: ForecastHorizon,
+        overall: &str,
+        pit_inputs: &str,
+        out_of_sample: &str,
+        horizon_alignment: &str,
+        calibration: &str,
+        interpretation: &str,
+    ) -> Option<Self> {
+        Self::try_from_product_fields_inner(
+            model_token,
+            Some(selected_horizon),
+            overall,
+            pit_inputs,
+            out_of_sample,
+            horizon_alignment,
+            calibration,
+            interpretation,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the closed evidence dimensions and optional selected horizon remain explicit"
+    )]
+    fn try_from_product_fields_inner(
+        model_token: uuid::Uuid,
+        selected_horizon: Option<ForecastHorizon>,
+        overall: &str,
+        pit_inputs: &str,
+        out_of_sample: &str,
+        horizon_alignment: &str,
+        calibration: &str,
+        interpretation: &str,
+    ) -> Option<Self> {
+        let overall = ForecastModelEvidenceState::decode(overall)?;
+        let pit_inputs = ForecastModelEvidenceState::decode(pit_inputs)?;
+        let out_of_sample = ForecastModelEvidenceState::decode(out_of_sample)?;
+        let horizon_alignment = ForecastModelEvidenceState::decode(horizon_alignment)?;
+        let calibration = ForecastModelCalibrationState::decode(calibration)?;
+        let expected_interpretation =
+            model_evidence_interpretation(overall, horizon_alignment, selected_horizon.is_some());
+        let core_sufficient = pit_inputs == ForecastModelEvidenceState::Sufficient
+            && out_of_sample == ForecastModelEvidenceState::Sufficient
+            && horizon_alignment == ForecastModelEvidenceState::Sufficient;
+        if model_token.is_nil()
+            || interpretation != expected_interpretation
+            || (overall == ForecastModelEvidenceState::Sufficient && !core_sufficient)
+            || (overall == ForecastModelEvidenceState::Limited && core_sufficient)
+        {
+            return None;
+        }
+        Some(Self {
+            model_token,
+            selected_horizon,
+            overall,
+            pit_inputs,
+            out_of_sample,
+            horizon_alignment,
+            calibration,
+            interpretation: expected_interpretation.into(),
+        })
+    }
+
+    pub(crate) fn model_token(&self) -> uuid::Uuid {
+        self.model_token
+    }
+
+    pub(crate) const fn selected_horizon(&self) -> Option<ForecastHorizon> {
+        self.selected_horizon
+    }
+
+    pub(crate) const fn overall(&self) -> ForecastModelEvidenceState {
+        self.overall
+    }
+
+    pub(crate) const fn pit_inputs(&self) -> ForecastModelEvidenceState {
+        self.pit_inputs
+    }
+
+    pub(crate) const fn out_of_sample(&self) -> ForecastModelEvidenceState {
+        self.out_of_sample
+    }
+
+    pub(crate) const fn horizon_alignment(&self) -> ForecastModelEvidenceState {
+        self.horizon_alignment
+    }
+
+    pub(crate) const fn calibration(&self) -> ForecastModelCalibrationState {
+        self.calibration
+    }
+
+    pub(crate) fn interpretation(&self) -> &str {
+        &self.interpretation
+    }
+
+    pub(crate) fn product_value(&self) -> Value {
+        json!({
+            "modelToken": self.model_token,
+            "overall": self.overall.as_str(),
+            "pitInputs": self.pit_inputs.as_str(),
+            "outOfSample": self.out_of_sample.as_str(),
+            "horizonAlignment": self.horizon_alignment.as_str(),
+            "calibration": self.calibration.as_str(),
+            "interpretation": self.interpretation,
+        })
+    }
+}
+
+/// Derives the single forecast-product evidence projection from the admitted bundle authority.
+pub(crate) fn forecast_model_evidence_projection(
+    bundle: &ModelBundle,
+) -> Result<ForecastModelEvidenceProjection, ServiceError> {
+    forecast_model_evidence_projection_inner(bundle, None)
+}
+
+/// Derives evidence for one exact selected forecast horizon and policy coordinate.
+pub(crate) fn forecast_model_evidence_projection_for_horizon(
+    bundle: &ModelBundle,
+    selected_horizon: ForecastHorizon,
+) -> Result<ForecastModelEvidenceProjection, ServiceError> {
+    forecast_model_evidence_projection_inner(bundle, Some(selected_horizon))
+}
+
+fn forecast_model_evidence_projection_inner(
+    bundle: &ModelBundle,
+    selected_horizon: Option<ForecastHorizon>,
+) -> Result<ForecastModelEvidenceProjection, ServiceError> {
+    let metadata = bundle.metadata();
+    let training = serde_json::from_slice::<TrainingRunEvidenceWire>(bundle.training_run_bytes())
+        .map_err(|_error| ServiceError::InvalidResult)?;
+    let split_counts = &training.trial.split_counts;
+    let forecast = training.trial.forecast.as_ref();
+    let out_of_sample_observations = split_counts.test;
+    let selected_step_matches_output = selected_horizon.is_none_or(|selected| {
+        matches!(
+            metadata.output_binding().target(),
+            ForecastTargetMeaning::FixedHorizonTerminal { horizon_nanos }
+                if horizon_nanos == selected.step_nanos()
+        )
+    });
+    let horizon_alignment = match (forecast, selected_horizon) {
+        (Some(evidence), Some(selected))
+            if evidence.rolling_splits > 0
+                && selected_step_matches_output
+                && evidence
+                    .horizons
+                    .binary_search(&u32::from(selected.points().get()))
+                    .is_ok() =>
+        {
+            ForecastModelEvidenceState::Sufficient
+        }
+        (Some(evidence), Some(_))
+            if evidence.rolling_splits > 0 && !evidence.horizons.is_empty() =>
+        {
+            ForecastModelEvidenceState::Limited
+        }
+        (Some(evidence), None) if evidence.rolling_splits > 0 && !evidence.horizons.is_empty() => {
+            ForecastModelEvidenceState::Sufficient
+        }
+        (Some(_), _) => ForecastModelEvidenceState::Limited,
+        (None, _) => ForecastModelEvidenceState::Unavailable,
+    };
+    let point_in_time_bound =
+        metadata.dataset().selection_as_of() >= metadata.training_period().end();
+    let forecast_evidence_complete = horizon_alignment == ForecastModelEvidenceState::Sufficient;
+    let held_out_evidence_complete = split_counts.validation > 0
+        && out_of_sample_observations > 0
+        && !metadata.validation_metrics().is_empty();
+    let overall = if held_out_evidence_complete && point_in_time_bound && forecast_evidence_complete
+    {
+        ForecastModelEvidenceState::Sufficient
+    } else if split_counts.train > 0 {
+        ForecastModelEvidenceState::Limited
+    } else {
+        ForecastModelEvidenceState::Unavailable
+    };
+    let pit_inputs = if point_in_time_bound {
+        ForecastModelEvidenceState::Sufficient
+    } else {
+        ForecastModelEvidenceState::Unavailable
+    };
+    let out_of_sample = if held_out_evidence_complete {
+        ForecastModelEvidenceState::Sufficient
+    } else if split_counts.validation > 0
+        || out_of_sample_observations > 0
+        || !metadata.validation_metrics().is_empty()
+    {
+        ForecastModelEvidenceState::Limited
+    } else {
+        ForecastModelEvidenceState::Unavailable
+    };
+    let calibration = if forecast.is_none() {
+        ForecastModelCalibrationState::Unavailable
+    } else if metadata.forecast_calibration().is_some() {
+        ForecastModelCalibrationState::Calibrated
+    } else {
+        ForecastModelCalibrationState::Limited
+    };
+    let interpretation: Box<str> =
+        model_evidence_interpretation(overall, horizon_alignment, selected_horizon.is_some())
+            .into();
+    Ok(ForecastModelEvidenceProjection {
+        model_token: opaque_product_token(
+            b"market-squawk/product-model/v1\0",
+            &[
+                metadata.model_id().as_uuid().as_bytes(),
+                metadata.bundle_id().as_str().as_bytes(),
+                &metadata.bundle_version().get().to_be_bytes(),
+            ],
+        ),
+        selected_horizon,
+        overall,
+        pit_inputs,
+        out_of_sample,
+        horizon_alignment,
+        calibration,
+        interpretation,
+    })
+}
+
+const fn model_evidence_interpretation(
+    state: ForecastModelEvidenceState,
+    horizon_alignment: ForecastModelEvidenceState,
+    selection_bound: bool,
+) -> &'static str {
+    match (state, horizon_alignment, selection_bound) {
+        (ForecastModelEvidenceState::Sufficient, ForecastModelEvidenceState::Sufficient, _) => {
+            "The model uses point-in-time information and has held-out, horizon-matched evaluation. Calibration is shown separately and does not mean the forecast is certain."
+        }
+        (ForecastModelEvidenceState::Limited, ForecastModelEvidenceState::Limited, true) => {
+            "The model's retained evaluation does not match the selected forecast horizon and policy. Use this forecast only as supporting research; Market Squawk suggests no action when required evidence is missing."
+        }
+        (ForecastModelEvidenceState::Limited, ForecastModelEvidenceState::Unavailable, true) => {
+            "Retained horizon-matched evaluation is unavailable for the selected forecast horizon. Market Squawk suggests no action."
+        }
+        (ForecastModelEvidenceState::Limited, _, _) => {
+            "Some required model evidence is limited or unavailable. Use this forecast only as supporting research, and take no action when required evidence is missing."
+        }
+        (ForecastModelEvidenceState::Unavailable, _, _) => {
+            "The available model evidence cannot support this forecast. Market Squawk suggests no action."
+        }
+        (ForecastModelEvidenceState::Sufficient, _, _) => {
+            "The available model evidence cannot support this forecast. Market Squawk suggests no action."
+        }
+    }
+}
+
 fn product_model_evidence(bundle: &ModelBundle) -> Result<Value, ServiceError> {
     let metadata = bundle.metadata();
+    let product_evidence = forecast_model_evidence_projection(bundle)?;
     let training = serde_json::from_slice::<TrainingRunEvidenceWire>(bundle.training_run_bytes())
         .map_err(|_error| ServiceError::InvalidResult)?;
     let split_counts = &training.trial.split_counts;
@@ -881,18 +1200,6 @@ fn product_model_evidence(bundle: &ModelBundle) -> Result<Value, ServiceError> {
         metadata.dataset().selection_as_of() >= metadata.training_period().end();
     let forecast_evidence_complete =
         forecast.is_none() || (rolling_out_of_sample_folds > 0 && evaluated_horizons > 0);
-    let evidence_state = if split_counts.validation > 0
-        && out_of_sample_observations > 0
-        && !metadata.validation_metrics().is_empty()
-        && point_in_time_bound
-        && forecast_evidence_complete
-    {
-        "sufficient"
-    } else if split_counts.train > 0 {
-        "limited"
-    } else {
-        "unavailable"
-    };
     let mut limitations = metadata
         .limitations()
         .iter()
@@ -965,21 +1272,14 @@ fn product_model_evidence(bundle: &ModelBundle) -> Result<Value, ServiceError> {
         }),
     ];
     Ok(json!({
-        "modelToken": opaque_product_token(
-            b"market-squawk/product-model/v1\0",
-            &[
-                metadata.model_id().as_uuid().as_bytes(),
-                metadata.bundle_id().as_str().as_bytes(),
-                &metadata.bundle_version().get().to_be_bytes(),
-            ],
-        ),
+        "modelToken": product_evidence.model_token(),
         "label": metadata.label().name(),
         "objective": match metadata.output_semantics() {
             market_squawk_modeling::ModelOutputSemantics::Regression => "numeric_outcome",
             market_squawk_modeling::ModelOutputSemantics::BinaryProbability => "likelihood",
         },
         "intendedUse": metadata.intended_use(),
-        "evidenceState": evidence_state,
+        "evidenceState": product_evidence.overall().as_str(),
         "training": {
             "observedFromUnixNanos": metadata.training_period().start().unix_nanos().to_string(),
             "observedThroughUnixNanos": metadata.training_period().end().unix_nanos().to_string(),
@@ -1004,7 +1304,7 @@ pub(crate) fn product_model_activity(view: &JobView) -> Option<Value> {
         "model.forecast-generation.v1" => "Forecast generation",
         _ => return None,
     };
-    let (state, status_message) = product_activity_state(view);
+    let (state, _status_message) = product_activity_state(view);
     let job_id = view.job_id().as_uuid();
     let generation = view.generation().get().to_be_bytes();
     Some(json!({
@@ -1014,7 +1314,6 @@ pub(crate) fn product_model_activity(view: &JobView) -> Option<Value> {
         ),
         "label": label,
         "state": state,
-        "statusMessage": status_message,
         "progressPercent": product_progress_percent(view),
         "updatedAtUnixNanos": view.updated_at().unix_nanos().to_string(),
     }))

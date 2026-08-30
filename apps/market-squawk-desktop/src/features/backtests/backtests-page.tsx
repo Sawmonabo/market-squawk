@@ -71,7 +71,7 @@ export function BacktestsPage() {
   return (
     <BacktestsWorkspace
       transport={product.transport}
-      scope={product.bootstrap.runtime}
+      scope={product.bootstrap.productSessionToken}
       capabilities={productCapabilitySet(product.bootstrap)}
     />
   )
@@ -109,7 +109,7 @@ function BacktestsWorkspace({
   const selected =
     activitiesQuery.data?.find(
       (activity) => activity.backtestToken === selectedToken,
-    ) ?? activitiesQuery.data?.[0] ?? null
+    ) ?? null
   const resultQuery = useQuery({
     queryKey: productKeys.operation(
       scope,
@@ -269,7 +269,7 @@ function BacktestBuilder({
 
   React.useEffect(() => {
     if (!optionsQuery.data) return
-    setSelection(defaultSelection(optionsQuery.data))
+    setSelection(emptySelection(optionsQuery.data))
     setPreview(null)
     setStarted(false)
   }, [optionsQuery.data])
@@ -278,6 +278,7 @@ function BacktestBuilder({
     optionsQuery.data && selection
       ? resolveSelection(optionsQuery.data, selection)
       : null
+  const ready = context !== null
 
   return (
     <section className="rounded-2xl border border-border bg-card/55 p-5 sm:p-6">
@@ -312,12 +313,11 @@ function BacktestBuilder({
           title="No point-in-time history is ready"
           detail="Backtesting needs enough historical information with known availability times."
         />
-      ) : selection && context ? (
+      ) : selection ? (
         <div className="mt-5 space-y-4">
           <BuilderFields
             options={optionsQuery.data}
             selection={selection}
-            context={context}
             disabled={previewMutation.isPending || startMutation.isPending}
             onChange={(next) => {
               setSelection(next)
@@ -332,8 +332,10 @@ function BacktestBuilder({
               {optionsQuery.data.guidance}
             </p>
             <Button
-              disabled={previewMutation.isPending}
-              onClick={() => previewMutation.mutate(selection)}
+              disabled={!ready || previewMutation.isPending}
+              onClick={() => {
+                if (ready) previewMutation.mutate(selection)
+              }}
             >
               <ShieldCheck aria-hidden="true" />
               {previewMutation.isPending ? "Preparing…" : "Review backtest"}
@@ -392,24 +394,23 @@ function BacktestBuilder({
   )
 }
 
-interface BuilderContext {
-  history: BacktestPreparationOptions["histories"][number]
-  period: BacktestPreparationOptions["histories"][number]["periods"][number]
-}
-
 function BuilderFields({
   options,
   selection,
-  context,
   disabled,
   onChange,
 }: {
   options: BacktestPreparationOptions
   selection: BacktestPreparationSelection
-  context: BuilderContext
   disabled: boolean
   onChange: (selection: BacktestPreparationSelection) => void
 }) {
+  const history = options.histories.find(
+    (candidate) => candidate.historyToken === selection.historyToken,
+  )
+  const period = history?.periods.find(
+    (candidate) => candidate.periodToken === selection.periodToken,
+  )
   return (
     <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
       <Choice
@@ -422,27 +423,17 @@ function BuilderFields({
           label: `${history.label} · ${history.investmentCount.toLocaleString()} investments`,
         }))}
         onChange={(historyToken) => {
-          const history = options.histories.find(
-            (candidate) => candidate.historyToken === historyToken,
-          )
-          const period = history?.periods[0]
-          if (history && period) {
-            onChange({
-              ...selection,
-              historyToken,
-              periodToken: period.periodToken,
-            })
-          }
+          onChange({ ...selection, historyToken, periodToken: "" })
         }}
       />
       <Choice
         id="backtest-period"
         label="Evaluation period"
         value={selection.periodToken}
-        disabled={disabled}
-        options={context.history.periods.map((period) => ({
-          token: period.periodToken,
-          label: period.label,
+        disabled={disabled || !history}
+        options={(history?.periods ?? []).map((candidate) => ({
+          token: candidate.periodToken,
+          label: candidate.label,
         }))}
         onChange={(periodToken) => onChange({ ...selection, periodToken })}
       />
@@ -482,11 +473,13 @@ function BuilderFields({
           onChange({ ...selection, comparisonToken })
         }
       />
-      <p className="rounded-lg border border-border bg-background/25 p-3 text-xs leading-5 text-muted-foreground md:col-span-2 xl:col-span-3">
-        {formatDate(context.period.startsAt)} through{" "}
-        {formatDate(context.period.endsAt)}. Results must disclose incomplete
-        coverage rather than treating missing history as success.
-      </p>
+      {period ? (
+        <p className="rounded-lg border border-border bg-background/25 p-3 text-xs leading-5 text-muted-foreground md:col-span-2 xl:col-span-3">
+          {formatDate(period.startsAt)} through {formatDate(period.endsAt)}.
+          Results must disclose incomplete coverage rather than treating missing
+          history as success.
+        </p>
+      ) : null}
     </div>
   )
 }
@@ -498,7 +491,7 @@ function BacktestPreview({ preview }: { preview: BacktestPreparationPreview }) {
     ["Investment approach", preview.method],
     ["Portfolio rules", preview.portfolio],
     ["Comparison", preview.comparison],
-    ["Point-in-time evidence", sentenceCase(preview.pointInTimeEvidence)],
+    ["Point-in-time evidence", evidenceStateLabel(preview.pointInTimeEvidence)],
     ["Out-of-sample plan", preview.outOfSamplePlan],
   ] as const
   return (
@@ -545,11 +538,11 @@ function ActivityButton({
       <span className="flex items-center justify-between gap-3">
         <span className="truncate text-sm font-medium">{activity.label}</span>
         <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
-          {sentenceCase(activity.state)}
+          {activityStateLabel(activity.state)}
         </span>
       </span>
       <span className="mt-1 block text-xs leading-5 text-muted-foreground">
-        {activity.statusMessage}
+        {activityStateDescription(activity.state)}
       </span>
       <span className="mt-1 block text-[11px] text-muted-foreground">
         Updated {formatDateTime(activity.updatedAt)}
@@ -584,7 +577,7 @@ function BacktestEvidence({
       ) : activity.state !== "completed" ? (
         <Unavailable
           title={activity.label}
-          detail={activity.statusMessage}
+          detail={activityStateDescription(activity.state)}
         />
       ) : loading ? (
         <Loading label="Loading the backtest result…" />
@@ -599,7 +592,12 @@ function BacktestEvidence({
           detail="The completed backtest did not return a reviewable result."
         />
       ) : result.state === "unavailable" ? (
-        <Unavailable title={result.label} detail={result.reason} />
+        <div>
+          <Unavailable title={result.label} detail={result.reason} />
+          <div className="mt-4">
+            <EvidenceList title="Limitations" values={result.limitations} />
+          </div>
+        </div>
       ) : (
         <CompletedBacktestView result={result} />
       )}
@@ -644,6 +642,10 @@ function CompletedBacktestView({ result }: { result: CompletedBacktest }) {
           interpretation={result.pointInTimeEvidence.interpretation}
           facts={[
             ["Information cutoff", formatDateTime(result.pointInTimeEvidence.informationCutoff)],
+            [
+              "History covered",
+              `${formatDate(result.pointInTimeEvidence.observedFrom)} through ${formatDate(result.pointInTimeEvidence.observedThrough)}`,
+            ],
             ["Observations", result.pointInTimeEvidence.observationCount.toLocaleString()],
             ["Coverage", maybePercent(result.pointInTimeEvidence.coveragePercent)],
           ]}
@@ -654,7 +656,11 @@ function CompletedBacktestView({ result }: { result: CompletedBacktest }) {
           state={result.outOfSampleEvidence.state}
           interpretation={result.outOfSampleEvidence.interpretation}
           facts={[
-            ["Folds", result.outOfSampleEvidence.foldCount.toLocaleString()],
+            ["Evaluation method", result.outOfSampleEvidence.method],
+            [
+              "Independent test windows",
+              result.outOfSampleEvidence.foldCount.toLocaleString(),
+            ],
             ["Observations", result.outOfSampleEvidence.observationCount.toLocaleString()],
             [
               "Overfitting probability",
@@ -704,10 +710,18 @@ function CompletedBacktestView({ result }: { result: CompletedBacktest }) {
 
       <EvidenceList title="Limitations" values={result.limitations} />
       <EvidenceList title="What would invalidate this result" values={result.invalidators} />
+      {result.expiresAt ? (
+        <p className="flex gap-2 text-xs leading-5 text-muted-foreground">
+          <CalendarClock className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+          This result expires {formatDateTime(result.expiresAt)}. Re-evaluate it
+          after that time before using it in a current investment decision.
+        </p>
+      ) : null}
       <p className="text-xs leading-5 text-muted-foreground">
         Historical performance does not guarantee future profit. This result is
         investment research, not permission to trade. Its uncertainty is{" "}
-        {sentenceCase(result.uncertainty)}; a score alone is never treated as confidence.
+        {uncertaintyLabel(result.uncertainty)}; a score alone is never treated as
+        confidence.
       </p>
     </div>
   )
@@ -732,7 +746,9 @@ function EvidenceCard({
         <Icon className="size-4 text-primary" aria-hidden="true" />
         {title}
       </p>
-      <p className="mt-1 text-xs text-muted-foreground">{sentenceCase(state)}</p>
+      <p className="mt-1 text-xs text-muted-foreground">
+        {evidenceStateLabel(state)}
+      </p>
       <dl className="mt-3 grid gap-2 sm:grid-cols-2">
         {facts.map(([label, value]) => (
           <Fact key={label} label={label} value={value} />
@@ -783,26 +799,23 @@ function EvidenceList({ title, values }: { title: string; values: string[] }) {
   )
 }
 
-function defaultSelection(
+function emptySelection(
   options: BacktestPreparationOptions,
 ): BacktestPreparationSelection | null {
-  const history = options.histories[0]
-  const period = history?.periods[0]
-  const method = options.methods[0]
-  const costs = options.costPlans[0]
-  const portfolio = options.portfolios[0]
-  const comparison = options.comparisons[0]
-  if (!history || !period || !method || !costs || !portfolio || !comparison) {
-    return null
-  }
+  if (options.histories.length === 0) return null
   return {
-    historyToken: history.historyToken,
-    periodToken: period.periodToken,
-    methodToken: method.token,
-    costToken: costs.token,
-    portfolioToken: portfolio.token,
-    comparisonToken: comparison.token,
+    historyToken: "",
+    periodToken: "",
+    methodToken: "",
+    costToken: "",
+    portfolioToken: "",
+    comparisonToken: "",
   }
+}
+
+interface BuilderContext {
+  history: BacktestPreparationOptions["histories"][number]
+  period: BacktestPreparationOptions["histories"][number]["periods"][number]
 }
 
 function resolveSelection(
@@ -815,13 +828,31 @@ function resolveSelection(
   const period = history?.periods.find(
     (candidate) => candidate.periodToken === selection.periodToken,
   )
-  return history && period ? { history, period } : null
+  const method = options.methods.some(
+    (candidate) => candidate.token === selection.methodToken,
+  )
+  const costs = options.costPlans.some(
+    (candidate) => candidate.token === selection.costToken,
+  )
+  const portfolio = options.portfolios.some(
+    (candidate) => candidate.token === selection.portfolioToken,
+  )
+  const comparison = options.comparisons.some(
+    (candidate) => candidate.token === selection.comparisonToken,
+  )
+  return history && period && method && costs && portfolio && comparison
+    ? { history, period }
+    : null
 }
 
 function choiceOptions(
   values: BacktestPreparationOptions["methods"],
-): { token: string; label: string }[] {
-  return values.map((value) => ({ token: value.token, label: value.label }))
+): { token: string; label: string; description: string }[] {
+  return values.map((value) => ({
+    token: value.token,
+    label: value.label,
+    description: value.description,
+  }))
 }
 
 function Choice({
@@ -835,10 +866,11 @@ function Choice({
   id: string
   label: string
   value: string
-  options: { token: string; label: string }[]
+  options: { token: string; label: string; description?: string }[]
   disabled: boolean
   onChange: (value: string) => void
 }) {
+  const selected = options.find((option) => option.token === value)
   return (
     <label className="grid gap-1.5 text-xs" htmlFor={id}>
       <span>{label}</span>
@@ -849,12 +881,18 @@ function Choice({
         disabled={disabled}
         onChange={(event) => onChange(event.target.value)}
       >
+        <option value="">Choose {label.toLowerCase()}</option>
         {options.map((option) => (
           <option key={option.token} value={option.token}>
             {option.label}
           </option>
         ))}
       </select>
+      {selected?.description ? (
+        <span className="text-[11px] leading-5 text-muted-foreground">
+          {selected.description}
+        </span>
+      ) : null}
     </label>
   )
 }
@@ -938,9 +976,60 @@ function maybePercent(value: string | null): string {
   return value === null ? "Unavailable" : percent(value)
 }
 
-function sentenceCase(value: string): string {
-  const words = value.replaceAll("_", " ")
-  return `${words.charAt(0).toUpperCase()}${words.slice(1)}`
+function activityStateLabel(state: BacktestActivity["state"]): string {
+  switch (state) {
+    case "queued":
+      return "Waiting to start"
+    case "running":
+      return "In progress"
+    case "completed":
+      return "Completed"
+    case "failed":
+      return "Could not complete"
+  }
+}
+
+function activityStateDescription(state: BacktestActivity["state"]): string {
+  switch (state) {
+    case "queued":
+      return "This backtest is waiting to start."
+    case "running":
+      return "Market Squawk is evaluating the historical period."
+    case "completed":
+      return "This backtest is ready to review."
+    case "failed":
+      return "This backtest could not be completed."
+  }
+}
+
+function uncertaintyLabel(
+  uncertainty: CompletedBacktest["uncertainty"],
+): string {
+  switch (uncertainty) {
+    case "supported":
+      return "supported by the disclosed evidence"
+    case "limited":
+      return "limited"
+    case "unavailable":
+      return "unavailable"
+  }
+}
+
+function evidenceStateLabel(state: string): string {
+  switch (state) {
+    case "verified":
+      return "Verified"
+    case "evaluated":
+      return "Evaluated"
+    case "limited":
+      return "Limited"
+    case "unavailable":
+      return "Unavailable"
+    case "not_evaluated":
+      return "Not evaluated"
+    default:
+      return "Unavailable"
+  }
 }
 
 function formatDate(value: string): string {

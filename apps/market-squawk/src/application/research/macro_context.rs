@@ -32,7 +32,6 @@ use super::{FredLatestKnownOperation, map_query_error, map_read_error, parse_tim
 
 pub(crate) const MACRO_GET_CONTEXT: &str = "Macro.GetContext";
 
-const MACRO_CONTEXT_SCHEMA_IDENTITY: &str = "market-squawk-macro-context/v1";
 const KNOWLEDGE_CUTOFF_FIELD: &str = "knowledgeCutoff";
 const EFFECTIVE_DATE_CUTOFF_FIELD: &str = "effectiveDateCutoff";
 const RESULT_LIMITS_FIELD: &str = "resultLimits";
@@ -525,7 +524,6 @@ impl MacroContextIndicatorDefinition {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MacroContextDto {
-    schema_identity: &'static str,
     availability: MacroContextAvailability,
     selection: MacroContextSelectionDto,
     confidence: MacroContextConfidenceDto,
@@ -999,7 +997,6 @@ fn product_snapshot(
         complete,
     };
     let dto = MacroContextDto {
-        schema_identity: MACRO_CONTEXT_SCHEMA_IDENTITY,
         availability,
         selection,
         confidence,

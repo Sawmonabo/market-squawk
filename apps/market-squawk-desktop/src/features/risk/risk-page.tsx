@@ -12,10 +12,9 @@ import {
 
 import { useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
-import { RiskChart, type RiskChartValue } from "@/components/charts/risk-chart"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
-import { formatMoney, humanize } from "@/lib/formatters"
+import { formatMoney } from "@/lib/formatters"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -25,14 +24,6 @@ import {
   parseRiskAccounts,
   parseRiskReport,
 } from "./contracts"
-import {
-  parsePaperOrders,
-  parsePaperStatus,
-  type PaperOrder,
-  type PaperRiskLimits,
-  type PaperRiskDecisions,
-  type PaperStatus,
-} from "../paper/contracts"
 
 export function RiskPage() {
   const product = useProduct()
@@ -42,7 +33,7 @@ export function RiskPage() {
     return (
       <PageFrame>
         <EmptyState
-          title="Risk analysis is unavailable"
+          title="Risk guidance is unavailable"
           detail="Try again. If the problem continues, review the app setup before relying on these estimates."
         />
       </PageFrame>
@@ -61,7 +52,7 @@ function ReadyRiskPage({
 }) {
   const accounts = useQuery({
     queryKey: productKeys.operation(
-      bootstrap.runtime,
+      bootstrap.productSessionToken,
       "portfolio",
       "Portfolio.ListAccounts",
       {},
@@ -69,19 +60,10 @@ function ReadyRiskPage({
     queryFn: async () =>
       parseRiskAccounts(await transport.query({ query: "portfolioAccounts" })),
   })
-  const executionStatus = useQuery({
-    queryKey: productKeys.operation(bootstrap.runtime, "bot", "Bot.GetStatus", {}),
-    queryFn: async () => parsePaperStatus(await transport.query({ query: "paperStatus" })),
-  })
-  const executionOrders = useQuery({
-    queryKey: productKeys.operation(bootstrap.runtime, "execution", "Execution.GetOrders", {}),
-    queryFn: async () => parsePaperOrders(await transport.query({ query: "paperOrders" })),
-  })
   const availableAccounts = accounts.data?.value ?? []
-  const [selectedAccount, setSelectedAccount] = React.useState<string | null>(null)
-  const accountId = availableAccounts.some((account) => account.accountId === selectedAccount)
-    ? selectedAccount
-    : availableAccounts[0]?.accountId ?? null
+  const [selectedIndex, setSelectedIndex] = React.useState("")
+  const index = parseSelectedIndex(selectedIndex, availableAccounts.length)
+  const selected = index === null ? null : availableAccounts[index] ?? null
 
   return (
     <PageFrame
@@ -93,213 +75,74 @@ function ReadyRiskPage({
           disabled={accounts.isFetching}
         >
           <RefreshCw className={accounts.isFetching ? "animate-spin" : ""} aria-hidden="true" />
-          Refresh accounts
+          Refresh
         </Button>
       }
     >
-      <CentralExecutionRisk
-        status={executionStatus.data?.value}
-        orders={executionOrders.data?.value ?? []}
-        error={executionStatus.error ?? executionOrders.error}
-      />
+      <RiskBoundary />
       {accounts.isLoading ? (
         <RiskGridLoading />
       ) : accounts.isError ? (
         <EmptyState
           title="Portfolio risk could not be opened"
-          detail="Try refreshing the account list. If the problem continues, review the portfolio setup."
+          detail="Try refreshing. If the problem continues, review the portfolio setup."
         />
       ) : availableAccounts.length === 0 ? (
         <EmptyState
           title="No portfolio risk is available"
-          detail="Import a portfolio account to review its risk."
+          detail="Import a portfolio account to review its risk and decision context."
         />
       ) : (
         <>
-          <div className="flex flex-wrap items-end justify-between gap-4 rounded-xl border border-border bg-card/45 p-4">
-            <div>
-              <label htmlFor="risk-account" className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                Portfolio account
-              </label>
-              <select
-                id="risk-account"
-                value={accountId ?? ""}
-                onChange={(event) => setSelectedAccount(event.target.value)}
-                className="mt-2 block min-w-64 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                {availableAccounts.map((account) => (
-                  <option key={account.accountId} value={account.accountId}>
-                    {account.accountId} · {account.currency}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <p className="max-w-xl text-xs leading-5 text-muted-foreground">
-              This view reflects the account&apos;s latest available holdings. Historical risk
-              estimates do not approve or place trades.
+          <div className="rounded-xl border border-border bg-card/45 p-4">
+            <label
+              htmlFor="risk-account"
+              className="text-[10px] uppercase tracking-wider text-muted-foreground"
+            >
+              Portfolio
+            </label>
+            <select
+              id="risk-account"
+              value={selectedIndex}
+              onChange={(event) => setSelectedIndex(event.target.value)}
+              className="mt-2 block min-w-64 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <option value="">Select a portfolio</option>
+              {availableAccounts.map((account, accountIndex) => (
+                <option key={`${account.displayName}:${accountIndex}`} value={String(accountIndex)}>
+                  {account.displayName} · {account.currency}
+                </option>
+              ))}
+            </select>
+            <p className="mt-3 max-w-3xl text-xs leading-5 text-muted-foreground">
+              Selecting a portfolio only opens its latest risk guidance. It does not change the
+              portfolio, approve a trade, or start paper trading.
             </p>
           </div>
-          {accountId ? (
+
+          {selected ? (
             <AccountRisk
-              key={accountId}
-              account={availableAccounts.find((account) => account.accountId === accountId)!}
+              key={selected.accountToken}
+              account={selected}
               bootstrap={bootstrap}
               transport={transport}
             />
-          ) : null}
+          ) : (
+            <div className="mt-4">
+              <EmptyState
+                title="Choose a portfolio"
+                detail="Market Squawk will show its action, horizon, ranges, reasons, risks, assumptions, invalidators, and uncertainty."
+              />
+            </div>
+          )}
           <p className="mt-4 text-[10px] leading-relaxed text-muted-foreground">
-            Showing {countBoundary(accounts.data)}. Portfolio analytics describe risk; they do not
-            approve trades or change trading limits.
+            Showing {accounts.data?.returnedItems ?? 0} of {accounts.data?.availableItems ?? 0}{" "}
+            portfolios.
+            Risk guidance informs a decision but never approves or places a trade.
           </p>
         </>
       )}
     </PageFrame>
-  )
-}
-
-function CentralExecutionRisk({
-  status,
-  orders,
-  error,
-}: {
-  status: PaperStatus | undefined
-  orders: PaperOrder[]
-  error: unknown
-}) {
-  const rejected = orders.filter((order) => order.status === "rejected").length
-  const activeBounds = orders.filter((order) => order.maximumExecutionPriceTicks !== undefined).length
-  return (
-    <section className="mb-4 rounded-xl border border-border bg-card/35 p-4">
-      <div className="flex gap-3">
-        <ShieldAlert className="mt-0.5 size-4 shrink-0 text-primary" aria-hidden="true" />
-        <div className="min-w-0">
-          <h2 className="text-sm font-semibold">Paper trading safeguards</h2>
-          {error ? (
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              Paper trading safeguards could not be opened. Try again before relying on paper
-              trading results.
-            </p>
-          ) : status?.state !== "running" ? (
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              Paper trading is not running, so no current risk decisions are available. Risk
-              checks cannot be bypassed.
-            </p>
-          ) : (
-            <>
-              <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                Every paper order shown here was checked before it could proceed. This view is
-                read-only: it cannot change a decision or alter risk limits.
-              </p>
-              <dl className="mt-3 grid gap-3 sm:grid-cols-3">
-                <Fact label="Orders with price protection" value={activeBounds.toLocaleString()} />
-                <Fact label="Rejected orders" value={rejected.toLocaleString()} />
-                <Fact
-                  label="Account checks"
-                  value={
-                    status.reconciliationRequired || !status.financialReconciliationCurrent
-                      ? "Action required"
-                      : "Current"
-                  }
-                />
-              </dl>
-              <RiskLimitEvidence limits={status.riskLimits} />
-              <RiskDecisionEvidence decisions={status.riskDecisions} />
-            </>
-          )}
-        </div>
-      </div>
-    </section>
-  )
-}
-
-function RiskLimitEvidence({ limits }: { limits: PaperRiskLimits | undefined }) {
-  if (!limits) {
-    return (
-      <p className="mt-3 text-xs text-muted-foreground">
-        Risk limits are not available right now.
-      </p>
-    )
-  }
-  return (
-    <div className="mt-4 rounded-lg border border-border/70 bg-background/35 p-3">
-      <h3 className="text-xs font-semibold">Active risk limits</h3>
-      <dl className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <Fact label="Maximum order value" value={formatMoney(limits.maximumOrderNotional)} />
-        <Fact label="Maximum total exposure" value={formatMoney(limits.maximumGrossExposure)} />
-        <Fact label="Position limit" value={`${limits.maximumPositionLots.toLocaleString()} lots`} />
-        <Fact label="Leverage limit" value={formatBasisPoints(limits.maximumLeverageBasisPoints)} />
-        <Fact label="Slippage limit" value={formatBasisPoints(limits.maximumSlippageBasisPoints)} />
-        <Fact
-          label="Price deviation"
-          value={formatBasisPoints(limits.maximumPriceDeviationBasisPoints)}
-        />
-        <Fact
-          label="Loss / drawdown"
-          value={`${formatMoney(limits.maximumLoss)} / ${formatMoney(limits.maximumDrawdown)}`}
-        />
-        <Fact
-          label="Order pace"
-          value={`${limits.maximumOrdersPerWindow} orders / ${durationFromNanos(limits.orderRateWindowNanos)}`}
-        />
-      </dl>
-      <p className="mt-3 text-[10px] text-muted-foreground">
-        Allowed investments: {limits.eligibleInstruments.returnedItems} of{" "}
-        {limits.eligibleInstruments.availableItems}; shorting{" "}
-        {limits.allowShort ? "allowed" : "disabled"}; emergency stop{" "}
-        {limits.killSwitch ? "engaged" : "clear"}.
-      </p>
-    </div>
-  )
-}
-
-function RiskDecisionEvidence({ decisions }: { decisions: PaperRiskDecisions | undefined }) {
-  if (!decisions) {
-    return (
-      <p className="mt-3 text-xs text-muted-foreground">
-        No recent paper-trading decisions are available.
-      </p>
-    )
-  }
-  return (
-    <div className="mt-4 rounded-lg border border-border/70 bg-background/35 p-3">
-      <h3 className="text-xs font-semibold">Recent risk decisions</h3>
-      <p className="mt-1 text-[10px] text-muted-foreground">
-        Showing {decisions.returnedItems} of {decisions.availableItems} recent decisions.
-      </p>
-      {decisions.records.length === 0 ? null : (
-        <div className="mt-3 space-y-2">
-          {decisions.records.map((decision) => (
-            <article
-              key={`${decision.orderToken}:${String(decision.observedAt)}`}
-              className="rounded-md border border-border/70 p-3 text-xs"
-            >
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <p>{humanize(decision.outcome)}</p>
-                <span
-                  className={
-                    decision.reasons.length > 0
-                      ? "rounded-md border border-rose-400/20 bg-rose-400/10 px-2 py-1 text-[10px] text-rose-200"
-                      : "rounded-md border border-border px-2 py-1 text-[10px] text-muted-foreground"
-                  }
-                >
-                  {decision.reasons.length > 0
-                    ? `${decision.reasons.length} reason${decision.reasons.length === 1 ? "" : "s"}`
-                    : "No rejection reason"}
-                </span>
-              </div>
-              <p className="mt-2 text-muted-foreground">
-                Checked {timeValue(decision.observedAt)}
-              </p>
-              {decision.reasons.length > 0 ? (
-                <p className="mt-2 text-rose-200">
-                  {decision.reasons.join(" ")}
-                </p>
-              ) : null}
-            </article>
-          ))}
-        </div>
-      )}
-    </div>
   )
 }
 
@@ -314,16 +157,16 @@ function AccountRisk({
 }) {
   const risk = useQuery({
     queryKey: productKeys.operation(
-      bootstrap.runtime,
+      bootstrap.productSessionToken,
       "portfolio",
       "Portfolio.GetRisk",
-      { accountId: account.accountId },
+      { accountToken: account.accountToken },
     ),
     queryFn: async () =>
       parseRiskReport(
         await transport.query({
           query: "portfolioRisk",
-          accountId: account.accountId,
+          accountToken: account.accountToken,
         }),
       ),
   })
@@ -339,115 +182,160 @@ function AccountRisk({
     return (
       <div className="mt-4">
         <EmptyState
-          title="This account&apos;s risk could not be opened"
+          title="This portfolio&apos;s risk guidance could not be opened"
           detail="Try again. If the problem continues, refresh the portfolio before relying on these estimates."
         />
       </div>
     )
   }
-  if (!risk.data) {
-    return (
-      <div className="mt-4">
-        <RiskGridLoading />
-      </div>
-    )
-  }
+  if (!risk.data) return null
 
-  const report = risk.data.value
   return (
     <div className="mt-4 space-y-4">
+      <Recommendation report={risk.data.value} />
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <Summary label="Confidence" value={formatPercent(report.confidence)} icon={Gauge} />
+        <Summary
+          label="Evidence coverage"
+          value={coverageLabel(risk.data.value.coverage.state)}
+          icon={Gauge}
+          bad={risk.data.value.coverage.state === "unavailable"}
+        />
         <Summary
           label="Observations"
-          value={report.observations?.toLocaleString() ?? "Not available"}
+          value={risk.data.value.coverage.observations.toLocaleString()}
           icon={Scale}
         />
+        <Summary label="Holdings" value={account.holdings.toLocaleString()} icon={ShieldCheck} />
         <Summary
-          label="Holdings"
-          value={account.holdingCount.toLocaleString()}
-          icon={ShieldCheck}
-        />
-        <Summary
-          label="Account data issues"
-          value={account.reconciliationDiscrepancies.toLocaleString()}
+          label="Portfolio data issues"
+          value={account.dataIssues.toLocaleString()}
           icon={ShieldAlert}
-          bad={account.reconciliationDiscrepancies > 0}
+          bad={account.dataIssues > 0}
         />
       </div>
       <div className="grid gap-4 xl:grid-cols-[1.35fr_1fr]">
-        <RiskMeasures report={report} />
-        <ScenarioPanel report={report} account={account} />
+        <RiskMeasures report={risk.data.value} />
+        <StressPanel report={risk.data.value} />
       </div>
-      <EvidencePanel report={report} result={risk.data} />
+      <EvidencePanel report={risk.data.value} result={risk.data} />
     </div>
   )
 }
 
-function RiskMeasures({ report }: { report: PortfolioRiskReport }) {
-  const values: RiskChartValue[] = [
-    report.valueAtRisk === undefined
-      ? null
-      : { label: "Value at risk", value: report.valueAtRisk, color: "var(--primary)" },
-    report.expectedShortfall === undefined
-      ? null
-      : { label: "Expected shortfall", value: report.expectedShortfall, color: "var(--warning)" },
-    report.annualizedVolatility === undefined
-      ? null
-      : { label: "Volatility", value: report.annualizedVolatility, color: "var(--success)" },
-  ].filter((value): value is RiskChartValue => value !== null)
+function Recommendation({ report }: { report: PortfolioRiskReport }) {
+  const recommendation = report.recommendation
+  return (
+    <section className="rounded-xl border-2 border-primary/35 bg-primary/[0.06] p-5">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <p className="text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+            Portfolio risk guidance
+          </p>
+          <h2 className="mt-2 text-2xl font-semibold">{actionLabel(recommendation.action)}</h2>
+          <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
+            {recommendation.summary}
+          </p>
+        </div>
+        <div className="rounded-lg border border-border bg-background/35 px-4 py-3 text-right">
+          <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Horizon</p>
+          <p className="mt-1 text-sm font-semibold">{recommendation.horizon}</p>
+        </div>
+      </div>
 
+      {recommendation.ranges.length > 0 ? (
+        <dl className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          {recommendation.ranges.map((range) => (
+            <Fact
+              key={range.label}
+              label={range.label}
+              value={`${formatMoney(range.lower)} to ${formatMoney(range.upper)}`}
+            />
+          ))}
+        </dl>
+      ) : null}
+
+      <div className="mt-5 grid gap-4 lg:grid-cols-2">
+        <TextList title="Why" items={recommendation.reasons} />
+        <TextList title="Main risks" items={recommendation.risks} />
+        <TextList title="Assumptions" items={recommendation.assumptions} />
+        <TextList title="What would invalidate this guidance" items={recommendation.invalidators} />
+      </div>
+
+      <div className="mt-5 rounded-lg border border-border bg-background/35 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <p className="text-sm font-semibold">
+            Uncertainty: {uncertaintyLabel(recommendation.uncertainty.level)}
+          </p>
+          <p className="text-xs text-muted-foreground">
+            {recommendation.validity.state === "available"
+              ? `Review by ${formatProductTimestamp(recommendation.validity.expiresAt)}`
+              : recommendation.validity.explanation}
+          </p>
+        </div>
+        <p className="mt-2 text-xs leading-5 text-muted-foreground">
+          {recommendation.uncertainty.explanation}
+        </p>
+        <dl className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <Fact
+            label="Out-of-sample evidence"
+            value={outOfSampleStateLabel(recommendation.uncertainty.outOfSampleEvidence)}
+          />
+          <Fact
+            label="Calibration"
+            value={calibrationStateLabel(recommendation.uncertainty.calibration)}
+          />
+          <Fact
+            label="Trading costs"
+            value={costStateLabel(recommendation.uncertainty.tradingCosts)}
+          />
+          <Fact
+            label="Point-in-time inputs"
+            value={pointInTimeLabel(recommendation.uncertainty.pointInTimeInputs)}
+          />
+        </dl>
+      </div>
+    </section>
+  )
+}
+
+function RiskMeasures({ report }: { report: PortfolioRiskReport }) {
   return (
     <Panel
       title="Measured risk"
-      subtitle="Estimated from the account&apos;s available return history."
+      subtitle={`Exact percentages for ${report.horizon}; unavailable measures remain unavailable.`}
     >
-      {values.length > 0 ? (
-        <RiskChart values={values} />
-      ) : (
-        <InlineEmpty
-          detail={
-            report.historyStatus
-              ? `Risk measures are unavailable: ${humanize(report.historyStatus)}.`
-              : "Historical risk measures are not available for this account."
-          }
-        />
-      )}
+      <div className="space-y-3">
+        {report.measures.map((measure) => (
+          <article key={measure.label} className="rounded-lg border border-border bg-background/35 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="text-sm font-semibold">{measure.label}</p>
+              <p className="text-lg font-semibold tabular-nums">
+                {measure.value ?? measureStatusLabel(measure.status)}
+              </p>
+            </div>
+            <p className="mt-2 text-xs leading-5 text-muted-foreground">{measure.explanation}</p>
+          </article>
+        ))}
+      </div>
     </Panel>
   )
 }
 
-function ScenarioPanel({
-  report,
-  account,
-}: {
-  report: PortfolioRiskReport
-  account: PortfolioAccountRiskSummary
-}) {
+function StressPanel({ report }: { report: PortfolioRiskReport }) {
   return (
-    <Panel title="Standard stress" subtitle="A fixed scenario, kept separate from forecasts.">
+    <Panel title="Stress check" subtitle="A downside scenario kept separate from forecasts.">
       <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
-        {scenarioName(report.scenario.id)}
+        {report.stress.label}
       </p>
-      <p className="mt-3 font-mono text-2xl font-semibold">
-        {report.scenario.impact
-          ? formatMoney(report.scenario.impact)
-          : report.scenario.status
-            ? humanize(report.scenario.status)
-            : "Not reported"}
+      <p className="mt-3 text-2xl font-semibold">
+        {report.stress.impact
+          ? formatMoney(report.stress.impact)
+          : stressStatusLabel(report.stress.status)}
       </p>
-      <dl className="mt-5 grid gap-3 border-t border-border/70 pt-4 sm:grid-cols-2 xl:grid-cols-1">
-        <Fact label="Account currency" value={account.currency} />
-        <Fact label="Confidence" value={formatPercent(report.confidence)} />
-        <Fact
-          label="Observations"
-          value={report.observations?.toLocaleString() ?? "Not available"}
-        />
-        <Fact
-          label="Tracking error"
-          value={report.trackingErrorStatus ? humanize(report.trackingErrorStatus) : "Not reported"}
-        />
-      </dl>
+      <p className="mt-3 text-xs leading-5 text-muted-foreground">
+        {report.stress.explanation}
+      </p>
+      <TextList title="Scenario assumptions" items={report.stress.assumptions} />
     </Panel>
   )
 }
@@ -459,27 +347,54 @@ function EvidencePanel({
   report: PortfolioRiskReport
   result: { completeness: string; returnedItems: number; availableItems: number }
 }) {
-  const limitations = [report.historyStatus, report.volatilityStatus]
-    .filter((value): value is string => Boolean(value))
-    .map(humanize)
   return (
     <section className="rounded-xl border border-border bg-card/35 p-4">
       <div className="flex gap-3">
         <CircleAlert className="mt-0.5 size-4 shrink-0 text-primary" aria-hidden="true" />
         <div>
-          <h2 className="text-sm font-semibold">Confidence and limitations</h2>
+          <h2 className="text-sm font-semibold">Coverage and timing</h2>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            Coverage: {humanize(result.completeness)}. Showing {result.returnedItems} of{" "}
-            {result.availableItems} available measures. Risk period ends{" "}
-            {timeFromNanos(report.effectiveAtUnixNanos)}; updated{" "}
-            {timeFromNanos(report.availableAtUnixNanos)}.
+            {report.coverage.explanation} Period: {report.coverage.period}. Risk period ends{" "}
+            {formatProductTimestamp(report.asOf)}; updated{" "}
+            {formatProductTimestamp(report.availableAt)}.
           </p>
-          {limitations.length > 0 ? (
-            <p className="mt-2 text-xs text-amber-200">Limitations: {limitations.join(" · ")}</p>
-          ) : null}
+          <p className="mt-2 text-[10px] text-muted-foreground">
+            Showing {result.returnedItems} of {result.availableItems} available risk results;{" "}
+            {result.completeness === "complete" ? "complete" : "partial"} coverage.
+          </p>
         </div>
       </div>
     </section>
+  )
+}
+
+function RiskBoundary() {
+  return (
+    <section className="mb-4 rounded-xl border border-border bg-card/35 p-4">
+      <div className="flex gap-3">
+        <ShieldAlert className="mt-0.5 size-4 shrink-0 text-primary" aria-hidden="true" />
+        <div>
+          <h2 className="text-sm font-semibold">Decision support, not trade approval</h2>
+          <p className="mt-1 max-w-4xl text-xs leading-5 text-muted-foreground">
+            This page explains portfolio-level action guidance and uncertainty. It cannot change a
+            portfolio, alter safeguards, start paper trading, or approve an order.
+          </p>
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function TextList({ title, items }: { title: string; items: string[] }) {
+  return (
+    <div className="rounded-lg border border-border bg-background/35 p-4">
+      <h3 className="text-xs font-semibold">{title}</h3>
+      <ul className="mt-2 space-y-2 text-xs leading-5 text-muted-foreground">
+        {items.map((item) => (
+          <li key={item}>• {item}</li>
+        ))}
+      </ul>
+    </div>
   )
 }
 
@@ -527,12 +442,12 @@ function PageFrame({ children, action }: { children: React.ReactNode; action?: R
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-            Market Squawk · Portfolio analytics
+            Market Squawk · Decision support
           </p>
-          <h1 className="mt-2 text-3xl font-semibold tracking-tight">Risk</h1>
+          <h1 className="mt-2 text-3xl font-semibold tracking-tight">Risk &amp; Guidance</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Review historical risk, stress scenarios, confidence, and limitations. These estimates
-            inform decisions but never approve or place a trade.
+            Understand what to do, over what horizon, why, what could go wrong, and how much
+            uncertainty remains before changing an investment plan.
           </p>
         </div>
         {action}
@@ -552,19 +467,11 @@ function EmptyState({ title, detail }: { title: string; detail: string }) {
   )
 }
 
-function InlineEmpty({ detail }: { detail: string }) {
-  return (
-    <div className="rounded-lg border border-dashed border-border p-5 text-sm text-muted-foreground">
-      {detail}
-    </div>
-  )
-}
-
 function Fact({ label, value }: { label: string; value: string }) {
   return (
     <div>
       <dt className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</dt>
-      <dd className="mt-1 font-mono text-xs">{value}</dd>
+      <dd className="mt-1 text-xs">{value}</dd>
     </div>
   )
 }
@@ -593,49 +500,122 @@ function RiskGridLoading() {
   )
 }
 
-function formatPercent(value: number) {
-  return new Intl.NumberFormat(undefined, {
-    style: "percent",
-    minimumFractionDigits: 1,
-    maximumFractionDigits: 2,
-  }).format(value)
+function parseSelectedIndex(value: string, length: number): number | null {
+  if (!/^\d+$/.test(value)) return null
+  const index = Number(value)
+  return Number.isSafeInteger(index) && index >= 0 && index < length ? index : null
 }
 
-function countBoundary(
-  value: { completeness: string; returnedItems: number; availableItems: number } | undefined,
-) {
-  return value
-    ? `${value.returnedItems} of ${value.availableItems} accounts (${humanize(value.completeness)} coverage)`
-    : "no account coverage"
-}
-
-function durationFromNanos(value: number) {
-  return value >= 1_000_000_000 ? `${value / 1_000_000_000}s` : `${value / 1_000_000}ms`
-}
-
-function formatBasisPoints(value: number) {
-  return formatPercent(value / 10_000)
-}
-
-function scenarioName(value: string) {
-  return value === "parallel_market_minus_10_percent"
-    ? "Market prices fall 10%"
-    : "Standard market stress"
-}
-
-function timeValue(value: string | number) {
-  if (typeof value === "string") return timeFromNanos(value)
-  const date = new Date(Math.trunc(value / 1_000_000))
-  return Number.isNaN(date.getTime()) ? value.toLocaleString() : date.toLocaleString()
-}
-
-function timeFromNanos(value: string | null | undefined) {
-  if (!value) return "not reported"
-  try {
-    const milliseconds = BigInt(value) / 1_000_000n
-    const date = new Date(Number(milliseconds))
-    return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
-  } catch {
-    return value
+function actionLabel(value: PortfolioRiskReport["recommendation"]["action"]): string {
+  switch (value) {
+    case "buy":
+      return "Buy"
+    case "add":
+      return "Add"
+    case "hold":
+      return "Hold"
+    case "trim":
+      return "Trim"
+    case "sell":
+      return "Sell"
+    case "abstain":
+      return "Wait — evidence is not strong enough"
   }
+}
+
+function uncertaintyLabel(
+  value: PortfolioRiskReport["recommendation"]["uncertainty"]["level"],
+): string {
+  switch (value) {
+    case "low":
+      return "Lower"
+    case "moderate":
+      return "Moderate"
+    case "high":
+      return "High"
+    case "unavailable":
+      return "Not established"
+  }
+}
+
+function coverageLabel(value: PortfolioRiskReport["coverage"]["state"]): string {
+  switch (value) {
+    case "complete":
+      return "Complete"
+    case "partial":
+      return "Partial"
+    case "unavailable":
+      return "Unavailable"
+  }
+}
+
+function measureStatusLabel(value: PortfolioRiskReport["measures"][number]["status"]): string {
+  switch (value) {
+    case "available":
+      return "Available"
+    case "insufficient_history":
+      return "Not enough history"
+    case "unavailable":
+      return "Unavailable"
+  }
+}
+
+function stressStatusLabel(value: PortfolioRiskReport["stress"]["status"]): string {
+  switch (value) {
+    case "available":
+      return "Available"
+    case "incomplete":
+      return "Incomplete"
+    case "unavailable":
+      return "Unavailable"
+  }
+}
+
+function outOfSampleStateLabel(value: "sufficient" | "limited" | "unavailable"): string {
+  switch (value) {
+    case "sufficient":
+      return "Enough evidence"
+    case "limited":
+      return "Limited"
+    case "unavailable":
+      return "Unavailable"
+  }
+}
+
+function calibrationStateLabel(value: "supported" | "limited" | "unavailable"): string {
+  switch (value) {
+    case "supported":
+      return "Supported by evidence"
+    case "limited":
+      return "Limited"
+    case "unavailable":
+      return "Unavailable"
+  }
+}
+
+function costStateLabel(value: "included" | "partial" | "unavailable"): string {
+  switch (value) {
+    case "included":
+      return "Included"
+    case "partial":
+      return "Partially included"
+    case "unavailable":
+      return "Unavailable"
+  }
+}
+
+function pointInTimeLabel(value: "supported" | "partial" | "unavailable"): string {
+  switch (value) {
+    case "supported":
+      return "Supported"
+    case "partial":
+      return "Partial"
+    case "unavailable":
+      return "Unavailable"
+  }
+}
+
+function formatProductTimestamp(value: string): string {
+  const date = new Date(value)
+  return Number.isNaN(date.valueOf()) ? "Unavailable" : date.toLocaleString()
 }

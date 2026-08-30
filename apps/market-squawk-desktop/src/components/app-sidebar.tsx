@@ -28,9 +28,13 @@ export function AppSidebar() {
   const product = useProduct()
   const navigationDisabled = product.status === "loading"
   const localStatus =
-    product.status === "ready" ? product.bootstrap.storage.label : product.status
+    product.status === "ready"
+      ? "Ready"
+      : product.status === "loading"
+        ? "Starting"
+        : "Unavailable"
   const localStatusColor =
-    product.status === "ready" && product.bootstrap.storage.state === "ready"
+    product.status === "ready"
       ? "bg-[var(--success)]"
       : product.status === "error"
         ? "bg-destructive"

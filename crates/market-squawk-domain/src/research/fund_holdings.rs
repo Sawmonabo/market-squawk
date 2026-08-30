@@ -117,28 +117,40 @@ pub struct FundReportedDecimal(String);
 impl FundReportedDecimal {
     /// Validates and preserves an exact fixed-point provider lexical value.
     pub fn try_from_str(value: &str) -> Result<Self, FundHoldingsError> {
-        let unsigned = value.strip_prefix('-').unwrap_or(value);
-        let mut parts = unsigned.split('.');
-        let integer = parts.next().unwrap_or_default();
-        let fraction = parts.next();
-        let valid = !value.is_empty()
-            && value.len() <= MAX_FUND_DECIMAL_BYTES
-            && !value.starts_with('+')
-            && parts.next().is_none()
-            && !integer.is_empty()
-            && integer.bytes().all(|byte| byte.is_ascii_digit())
-            && fraction.is_none_or(|digits| {
-                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-            });
-        if !valid {
-            return Err(FundHoldingsError::InvalidDecimal);
-        }
+        validate_reported_decimal(value)?;
         Ok(Self(value.to_owned()))
+    }
+
+    /// Validates and consumes an exact fixed-point value whose storage is already owned.
+    pub fn try_from_boxed_str(value: Box<str>) -> Result<Self, FundHoldingsError> {
+        validate_reported_decimal(&value)?;
+        Ok(Self(value.into_string()))
     }
 
     /// Returns the exact provider lexical value.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+fn validate_reported_decimal(value: &str) -> Result<(), FundHoldingsError> {
+    let unsigned = value.strip_prefix('-').unwrap_or(value);
+    let mut parts = unsigned.split('.');
+    let integer = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    let valid = !value.is_empty()
+        && value.len() <= MAX_FUND_DECIMAL_BYTES
+        && !value.starts_with('+')
+        && parts.next().is_none()
+        && !integer.is_empty()
+        && integer.bytes().all(|byte| byte.is_ascii_digit())
+        && fraction.is_none_or(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(FundHoldingsError::InvalidDecimal)
     }
 }
 

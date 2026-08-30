@@ -5,13 +5,11 @@ use serde_json::{Map, Value, json};
 use market_squawk_adapter_federal_reserve::{
     BOARD_DDP_SOURCE_ID, h15_treasury_constant_maturities_dashboard_series,
 };
-use market_squawk_decisions::{
-    RECOMMENDATION_TRACK_RECORD_MINIMUM_COMPLETED, RECOMMENDATION_TRACK_RECORD_MINIMUM_COVERAGE_PPM,
-};
+use market_squawk_decisions::RECOMMENDATION_TRACK_RECORD_MINIMUM_COMPLETED;
 use market_squawk_sources::FRED_ALFRED_API_SURFACE_ID;
 
 use super::super::research::{
-    MACRO_GET_CONTEXT, TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION,
+    MACRO_GET_CONTEXT, MAX_MARKET_HISTORY_BARS, TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION,
     TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION,
 };
 use super::{
@@ -165,16 +163,10 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         ]),
         "Market.GetComparisons" => market_comparison_rows(),
         "Market.GetUnifiedFeed" => unified_market_rows(),
-        "Market.GetOverview" | "Market.GetInstrument" => market_product_rows(),
-        "Market.SearchUniverse" => market_rows(&[
-            "referenceId",
-            "symbol",
-            "name",
-            "assetClass",
-            "isEtf",
-            "effectiveAt",
-            "availableAt",
-        ]),
+        "Market.GetOverview" => market_product_page(),
+        "Market.GetInstrument" => market_product_selection(),
+        "Market.GetHistory" => market_history_result(),
+        "Market.SearchUniverse" => market_search_page(),
         "Research.ListDatasets" => nullable(page(generation())),
         "Research.GetManifest" => generation(),
         "Research.GetHistory"
@@ -316,7 +308,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         "Portfolio.GetRecommendationSetup" => recommendation_setup_status(),
         "Portfolio.PreviewRecommendationSetup" => recommendation_setup_preview(),
         "Portfolio.CommitRecommendationSetup" => recommendation_setup_receipt(),
-        "Portfolio.ListAccounts" => nullable_rows(portfolio_account()),
+        "Portfolio.ListAccounts" => array(portfolio_account()),
         "Portfolio.ListRevisions" => nullable_rows(portfolio_snapshot()),
         "Portfolio.GetHoldings" => array(portfolio_holding()),
         "Portfolio.GetTransactions" => array(portfolio_transaction()),
@@ -464,17 +456,8 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         "Model.Predict" => model_output(false),
         "Model.StartTraining" => job_receipt(),
         "Model.StartPreparedForecast" => queued_product_start(),
-        "Model.GetForecastPreparation" => closed(
-            vec![
-                ("runtimeGenerationSha256", text()),
-                ("models", bounded_array(record(), 4_096)),
-            ],
-            &["runtimeGenerationSha256", "models"],
-        ),
-        "Model.PrepareForecast" => closed(
-            vec![("receipt", record()), ("preview", record())],
-            &["receipt", "preview"],
-        ),
+        "Model.GetForecastPreparation" => forecast_preparation_options(),
+        "Model.PrepareForecast" => forecast_preparation_preview(),
         "Model.GenerateForecast" | "Model.GetForecast" => product_forecast_detail(),
         "Model.SelectLatestValidForecast" => latest_valid_forecast(),
         "Model.ListForecasts" => product_forecast_page(),
@@ -492,11 +475,17 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 ("candidateId", text()),
                 ("screenRunId", text()),
                 ("instrumentId", uuid()),
-                ("selectedAt", timestamp()),
+                ("selectedAt", canonical_market_timestamp()),
                 ("requiredEvidence", bounded_array(text(), 4)),
                 ("portfolioImpactAvailable", boolean()),
-                ("forecastOptions", bounded_array(record(), 64)),
-                ("fairValueOptions", bounded_array(record(), 64)),
+                (
+                    "forecastOptions",
+                    bounded_array(dossier_forecast_option(), 64),
+                ),
+                (
+                    "fairValueOptions",
+                    bounded_array(dossier_fair_value_option(), 64),
+                ),
             ],
             &[
                 "candidateId",
@@ -519,8 +508,8 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 ("evidence", bounded_array(text(), 6)),
                 ("forecastSelector", nullable(text())),
                 ("fairValueSelector", nullable(text())),
-                ("assembledAt", timestamp()),
-                ("receiptExpiresAt", timestamp()),
+                ("assembledAt", canonical_market_timestamp()),
+                ("receiptExpiresAt", canonical_market_timestamp()),
             ],
             &[
                 "receiptId",
@@ -539,7 +528,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             ("id", text()),
             ("candidateId", text()),
             ("instrumentId", text()),
-            ("assembledAt", integer()),
+            ("assembledAt", canonical_market_timestamp()),
             ("evidence", record()),
             ("references", array(record())),
         ]),
@@ -547,11 +536,14 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             vec![
                 ("dossierId", text()),
                 ("instrumentId", uuid()),
-                ("assembledAt", timestamp()),
+                ("assembledAt", canonical_market_timestamp()),
                 ("forecastOptions", bounded_array(record(), 4_096)),
                 ("fairValueAvailable", boolean()),
                 ("portfolioAvailable", boolean()),
-                ("referenceMarks", bounded_array(record(), 4_096)),
+                (
+                    "referenceMarks",
+                    bounded_array(target_reference_mark_option(), 4_096),
+                ),
             ],
             &[
                 "dossierId",
@@ -566,14 +558,14 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         "Decision.PrepareTargetSet" => closed(
             vec![
                 ("receiptId", uuid()),
-                ("receiptExpiresAt", timestamp()),
+                ("receiptExpiresAt", canonical_market_timestamp()),
                 ("targetId", text()),
                 ("revision", unsigned()),
                 ("dossierId", text()),
                 ("instrumentId", uuid()),
                 ("intent", enumeration(&["buy", "sell", "hold"])),
                 ("referenceMark", record()),
-                ("referenceMarkObservedAt", timestamp()),
+                ("referenceMarkObservedAt", canonical_market_timestamp()),
                 ("referenceMarkQuality", text()),
                 ("referenceMarkSource", text()),
                 ("prices", record()),
@@ -582,10 +574,10 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                 ("thesis", text()),
                 ("risks", bounded_array(text(), 4_096)),
                 ("invalidationConditions", bounded_array(text(), 4_096)),
-                ("createdAt", timestamp()),
-                ("horizonAt", timestamp()),
-                ("expiresAt", timestamp()),
-                ("reviewDueAt", timestamp()),
+                ("createdAt", canonical_market_timestamp()),
+                ("horizonAt", canonical_market_timestamp()),
+                ("expiresAt", canonical_market_timestamp()),
+                ("reviewDueAt", canonical_market_timestamp()),
                 ("author", text()),
                 ("rulesetVersion", unsigned()),
                 ("forecastSelected", boolean()),
@@ -644,7 +636,7 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
                             ("id", text()),
                             ("screenId", text()),
                             ("screenRevision", unsigned()),
-                            ("asOf", timestamp()),
+                            ("asOf", canonical_market_timestamp()),
                             ("datasetIdentity", text()),
                             ("universeIdentity", text()),
                             ("candidateCount", unsigned()),
@@ -941,6 +933,8 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             &["revision", "digest", "acceptedAtUnixSeconds"],
         ),
         "FairValue.GetWorkspace" => fair_value_workspace(),
+        "FairValue.PreviewGovernanceAction" => fair_value_governance_preview_result(),
+        "FairValue.CommitGovernanceAction" => fair_value_governance_commit(),
         "FairValue.ListMeasurements" => closed(
             vec![("measurements", array(measurement()))],
             &["measurements"],
@@ -1009,54 +1003,25 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
             closed(vec![("marketAccess", record())], &["marketAccess"])
         }
         "Bot.GetStatus" => bot_status(),
-        "Bot.Start" => closed(
-            vec![
-                ("state", constant("running")),
-                ("strategyMode", enumeration(&["manual", "book_imbalance"])),
-            ],
-            &["state", "strategyMode"],
-        ),
-        "Bot.Stop" | "Risk.TriggerKillSwitch" => closed(
-            vec![
-                ("state", constant("stopped")),
-                ("shutdownComplete", boolean()),
-                ("reason", text()),
-            ],
-            &["state", "shutdownComplete", "reason"],
-        ),
+        "Bot.GetStartPreparation" => paper_start_preparation(),
+        "Bot.PrepareStart" => paper_start_preview(),
+        "Bot.Start" => paper_start_result(),
+        "Bot.Stop" | "Risk.TriggerKillSwitch" => paper_stop_result(),
         "Execution.GetOrders" => nullable_rows(paper_order()),
         "Execution.GetFills" => nullable_rows(paper_fill()),
         "Execution.GetManualPaperTargets" => closed(
             vec![("targets", bounded_array(manual_paper_target(), 100))],
             &["targets"],
         ),
+        "Execution.PrepareManualPaperDraft" => manual_paper_preview(),
         "Execution.SubmitManualPaperDraft" => closed(
-            vec![("accepted", constant_bool(true)), ("targetToken", uuid())],
-            &["accepted", "targetToken"],
-        ),
-        "Execution.Cancel" => closed(
             vec![
-                ("orderToken", uuid()),
-                (
-                    "status",
-                    enumeration(&["pending", "canceled", "already_terminal"]),
-                ),
-                ("observedAt", integer()),
-                ("cumulativeFilledLots", unsigned()),
-                ("averageFillPriceTicks", nullable(integer())),
-                ("maximumFillPriceTicks", nullable(integer())),
-                ("cumulativeFees", money()),
+                ("accepted", constant_bool(true)),
+                ("message", bounded_text(512)),
             ],
-            &[
-                "orderToken",
-                "status",
-                "observedAt",
-                "cumulativeFilledLots",
-                "averageFillPriceTicks",
-                "maximumFillPriceTicks",
-                "cumulativeFees",
-            ],
+            &["accepted", "message"],
         ),
+        "Execution.Cancel" => paper_cancel_result(),
         "Execution.Reconcile" => closed(
             vec![
                 ("observedAt", integer()),
@@ -1362,1292 +1327,502 @@ fn provider_credential_import_disposition() -> Value {
 }
 
 fn investment_analysis() -> Value {
-    closed(
-        vec![
-            ("analysisId", investment_analysis_sha256()),
-            (
-                "executionEligibility",
-                constant("research_only_execution_ineligible"),
-            ),
-            ("policy", investment_analysis_policy()),
-            ("evidence", investment_analysis_evidence()),
-            ("evidenceDigest", investment_analysis_sha256()),
-            ("publication", nullable(investment_analysis_publication())),
-            (
-                "projection",
-                nullable(investment_analysis_outcome_projection()),
-            ),
-            ("sizing", nullable(investment_analysis_sizing_projection())),
-            (
-                "realizedOutcome",
-                nullable(recommendation_outcome_current()),
-            ),
-            ("result", investment_analysis_result()),
-        ],
-        &[
-            "analysisId",
-            "executionEligibility",
-            "policy",
-            "evidence",
-            "evidenceDigest",
-            "publication",
-            "projection",
-            "sizing",
+    closed_complete(vec![
+        ("actionToken", investment_analysis_action_token()),
+        ("investment", investment_analysis_display()),
+        ("portfolioLabel", bounded_text(128)),
+        ("currency", investment_analysis_currency()),
+        ("recommendation", investment_analysis_recommendation()),
+        ("horizon", investment_analysis_horizon()),
+        ("priceSummary", investment_analysis_price_summary()),
+        (
+            "reasons",
+            bounded_nonempty_array(investment_analysis_product_text(), 32),
+        ),
+        (
+            "risks",
+            bounded_array(investment_analysis_product_text(), 32),
+        ),
+        (
+            "assumptions",
+            bounded_array(investment_analysis_product_text(), 32),
+        ),
+        (
+            "invalidators",
+            bounded_array(investment_analysis_product_text(), 32),
+        ),
+        ("evidenceSummary", investment_analysis_evidence_summary()),
+        (
+            "outcomeProjection",
+            nullable(investment_analysis_outcome_projection()),
+        ),
+        ("sizing", nullable(investment_analysis_sizing_projection())),
+        (
             "realizedOutcome",
-            "result",
-        ],
-    )
+            nullable(recommendation_outcome_current()),
+        ),
+        (
+            "trackRecordActionToken",
+            nullable(investment_analysis_action_token()),
+        ),
+    ])
 }
 
-fn investment_analysis_publication() -> Value {
-    closed(
-        vec![
-            ("publicationId", investment_analysis_sha256()),
-            ("publishedAt", integer()),
-            (
-                "executionEligibility",
-                constant("research_only_execution_ineligible"),
-            ),
-            (
-                "analyticalProfile",
-                investment_analysis_analytical_profile(),
-            ),
-            ("workflow", investment_analysis_workflow()),
-            (
-                "accountSetup",
-                closed(
-                    vec![
-                        ("accountId", uuid()),
-                        ("distinctFromAnalyticalProfile", constant_bool(true)),
-                    ],
-                    &["accountId", "distinctFromAnalyticalProfile"],
-                ),
-            ),
-            (
-                "outcomeProjectionDigest",
-                nullable(investment_analysis_sha256()),
-            ),
-            (
-                "sizingProjectionDigest",
-                nullable(investment_analysis_sha256()),
-            ),
-        ],
-        &[
-            "publicationId",
-            "publishedAt",
-            "executionEligibility",
-            "analyticalProfile",
-            "workflow",
-            "accountSetup",
-            "outcomeProjectionDigest",
-            "sizingProjectionDigest",
-        ],
-    )
+fn investment_analysis_action_token() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "not": {
+            "type": "string",
+            "const": "00000000-0000-0000-0000-000000000000",
+        },
+    })
 }
 
-fn investment_analysis_analytical_profile() -> Value {
-    closed(
-        vec![
-            ("profileId", bounded_text(256)),
-            ("revision", bounded_unsigned_range(1, u64::from(u32::MAX))),
-            ("contentDigest", investment_analysis_content_identity()),
-        ],
-        &["profileId", "revision", "contentDigest"],
-    )
+fn investment_analysis_display() -> Value {
+    closed_complete(vec![
+        ("symbol", nullable(bounded_text(64))),
+        ("name", nullable(investment_analysis_product_text())),
+    ])
 }
 
-fn investment_analysis_workflow() -> Value {
-    closed(
-        vec![
-            ("workflowId", bounded_text(256)),
-            ("revision", bounded_unsigned_range(1, u64::from(u32::MAX))),
-            ("contentDigest", investment_analysis_content_identity()),
-        ],
-        &["workflowId", "revision", "contentDigest"],
-    )
+fn investment_analysis_recommendation() -> Value {
+    one_of(vec![
+        closed_complete(vec![
+            ("kind", constant("action")),
+            ("action", investment_analysis_action()),
+            ("summary", investment_analysis_product_text()),
+        ]),
+        closed_complete(vec![
+            ("kind", constant("abstain")),
+            ("summary", investment_analysis_product_text()),
+        ]),
+        closed_complete(vec![
+            ("kind", constant("unavailable")),
+            ("summary", investment_analysis_product_text()),
+        ]),
+    ])
+}
+
+fn investment_analysis_horizon() -> Value {
+    closed_complete(vec![
+        ("informationCurrentThrough", canonical_market_timestamp()),
+        ("endsAt", canonical_market_timestamp()),
+        ("expiresAt", canonical_market_timestamp()),
+    ])
+}
+
+fn investment_analysis_price_summary() -> Value {
+    closed_complete(vec![
+        ("current", nullable(investment_analysis_money())),
+        ("fairValue", nullable(investment_analysis_money())),
+        ("scenarios", nullable(investment_analysis_scenario_ranges())),
+        (
+            "actionRanges",
+            nullable(investment_analysis_action_ranges()),
+        ),
+    ])
+}
+
+fn investment_analysis_scenario_ranges() -> Value {
+    closed_complete(vec![
+        ("endsAt", canonical_market_timestamp()),
+        ("downside", investment_analysis_price_range()),
+        ("base", investment_analysis_price_range()),
+        ("upside", investment_analysis_price_range()),
+    ])
+}
+
+fn investment_analysis_action_ranges() -> Value {
+    closed_complete(vec![
+        ("entry", investment_analysis_price_range()),
+        ("add", investment_analysis_price_range()),
+        ("trim", investment_analysis_price_range()),
+        ("exit", investment_analysis_price_range()),
+    ])
+}
+
+fn investment_analysis_price_range() -> Value {
+    closed_complete(vec![
+        ("lower", investment_analysis_money()),
+        ("upper", investment_analysis_money()),
+    ])
+}
+
+fn investment_analysis_money() -> Value {
+    closed_complete(vec![
+        ("amount", investment_analysis_positive_decimal()),
+        ("currency", investment_analysis_currency()),
+    ])
+}
+
+fn investment_analysis_evidence_summary() -> Value {
+    closed_complete(vec![
+        ("coverage", investment_analysis_coverage()),
+        ("calibration", investment_analysis_calibration()),
+        (
+            "outOfSample",
+            closed_complete(vec![
+                ("state", constant("not_established")),
+                ("summary", investment_analysis_product_text()),
+            ]),
+        ),
+        (
+            "historicalTest",
+            nullable(investment_analysis_historical_test()),
+        ),
+        ("costs", investment_analysis_cost_summary()),
+        ("uncertainty", investment_analysis_uncertainty()),
+    ])
+}
+
+fn investment_analysis_coverage() -> Value {
+    closed_complete(vec![
+        ("availableCount", bounded_unsigned(6)),
+        ("possibleCount", constant_unsigned(6)),
+        ("items", fixed_array(investment_analysis_coverage_item(), 6)),
+        ("summary", investment_analysis_product_text()),
+    ])
+}
+
+fn investment_analysis_coverage_item() -> Value {
+    closed_complete(vec![
+        (
+            "kind",
+            enumeration(&[
+                "current_market",
+                "forecast",
+                "valuation",
+                "historical_test",
+                "liquidity",
+                "portfolio_risk",
+            ]),
+        ),
+        ("state", enumeration(&["available", "unavailable"])),
+    ])
+}
+
+fn investment_analysis_calibration() -> Value {
+    one_of(vec![
+        closed_complete(vec![
+            ("state", constant("available")),
+            ("nominalCoveragePercent", investment_analysis_percentage()),
+            ("realizedCoveragePercent", investment_analysis_percentage()),
+            (
+                "completedOutcomes",
+                bounded_unsigned_range(1, u64::from(u32::MAX)),
+            ),
+            ("summary", investment_analysis_product_text()),
+        ]),
+        closed_complete(vec![
+            ("state", constant("unavailable")),
+            ("summary", investment_analysis_product_text()),
+        ]),
+    ])
+}
+
+fn investment_analysis_historical_test() -> Value {
+    closed_complete(vec![
+        ("netReturnPercent", canonical_decimal_text()),
+        ("maximumDrawdownPercent", investment_analysis_percentage()),
+        (
+            "observations",
+            bounded_unsigned_range(1, u64::from(u32::MAX)),
+        ),
+        ("trials", bounded_unsigned_range(1, u64::from(u32::MAX))),
+        ("stabilityPercent", investment_analysis_percentage()),
+        ("evaluatedThrough", canonical_market_timestamp()),
+        ("summary", investment_analysis_product_text()),
+    ])
+}
+
+fn investment_analysis_cost_summary() -> Value {
+    one_of(vec![
+        closed_complete(vec![
+            ("state", constant("modeled")),
+            ("feePercent", investment_analysis_percentage()),
+            ("slippagePercent", investment_analysis_percentage()),
+            (
+                "maximumRandomSlippagePercent",
+                investment_analysis_percentage(),
+            ),
+            ("summary", investment_analysis_product_text()),
+        ]),
+        closed_complete(vec![
+            ("state", constant("unavailable")),
+            ("summary", investment_analysis_product_text()),
+        ]),
+    ])
+}
+
+fn investment_analysis_uncertainty() -> Value {
+    one_of(vec![
+        closed_complete(vec![
+            ("state", constant("available")),
+            (
+                "evidenceReliabilityPercent",
+                investment_analysis_percentage(),
+            ),
+            (
+                "components",
+                fixed_array(investment_analysis_uncertainty_component(), 6),
+            ),
+            ("summary", investment_analysis_product_text()),
+        ]),
+        closed_complete(vec![
+            ("state", constant("unavailable")),
+            ("summary", investment_analysis_product_text()),
+        ]),
+    ])
+}
+
+fn investment_analysis_uncertainty_component() -> Value {
+    closed_complete(vec![
+        (
+            "kind",
+            enumeration(&[
+                "forecast_calibration",
+                "valuation_agreement",
+                "backtest_stability",
+                "market_integrity",
+                "liquidity_capacity",
+                "portfolio_risk_capacity",
+            ]),
+        ),
+        ("reliabilityPercent", investment_analysis_percentage()),
+    ])
 }
 
 fn investment_analysis_outcome_projection() -> Value {
-    closed(
-        vec![
-            ("resultDigest", investment_analysis_sha256()),
-            ("proposalId", investment_analysis_sha256()),
-            ("derivationDigest", investment_analysis_sha256()),
-            (
-                "authority",
-                constant("analysis_only_no_mutation_no_execution"),
-            ),
-            ("executionEligible", constant_bool(false)),
-            ("mark", investment_analysis_money()),
-            ("horizonAt", integer()),
-            ("downside", investment_analysis_gross_mark_relative_range()),
-            ("base", investment_analysis_gross_mark_relative_range()),
-            ("upside", investment_analysis_gross_mark_relative_range()),
-            (
-                "netPnl",
-                investment_analysis_unavailable_disclosure(
-                    "exact_forward_cost_evidence_not_supplied",
-                ),
-            ),
-            (
-                "benchmarkReturn",
-                investment_analysis_unavailable_disclosure(
-                    "exact_proposal_time_benchmark_evidence_not_supplied",
-                ),
-            ),
-            (
-                "afterTaxPnl",
-                investment_analysis_unavailable_disclosure("exact_tax_evidence_not_supplied"),
-            ),
-        ],
-        &[
-            "resultDigest",
-            "proposalId",
-            "derivationDigest",
-            "authority",
-            "executionEligible",
-            "mark",
-            "horizonAt",
-            "downside",
-            "base",
-            "upside",
-            "netPnl",
-            "benchmarkReturn",
-            "afterTaxPnl",
-        ],
-    )
+    closed_complete(vec![
+        ("startingPrice", investment_analysis_money()),
+        ("endsAt", canonical_market_timestamp()),
+        ("downside", investment_analysis_price_change_range()),
+        ("base", investment_analysis_price_change_range()),
+        ("upside", investment_analysis_price_change_range()),
+        (
+            "limitations",
+            bounded_nonempty_array(investment_analysis_product_text(), 8),
+        ),
+    ])
 }
 
-fn investment_analysis_gross_mark_relative_range() -> Value {
+fn investment_analysis_price_change_range() -> Value {
     closed(
         vec![
             ("priceRange", investment_analysis_price_range()),
             (
-                "grossReturnFromMark",
-                closed(
-                    vec![
-                        ("lowerNumerator", investment_analysis_money()),
-                        ("upperNumerator", investment_analysis_money()),
-                        ("denominator", investment_analysis_money()),
-                    ],
-                    &["lowerNumerator", "upperNumerator", "denominator"],
-                ),
+                "priceChangePercent",
+                closed_complete(vec![
+                    ("lower", canonical_decimal_text()),
+                    ("upper", canonical_decimal_text()),
+                ]),
             ),
         ],
-        &["priceRange", "grossReturnFromMark"],
+        &["priceRange"],
     )
 }
 
 fn investment_analysis_sizing_projection() -> Value {
-    closed(
-        vec![
-            ("resultDigest", investment_analysis_sha256()),
-            ("proposalId", investment_analysis_sha256()),
-            ("derivationDigest", investment_analysis_sha256()),
-            (
-                "authority",
-                constant("analysis_only_no_mutation_no_execution"),
-            ),
-            ("executionEligible", constant_bool(false)),
-            ("evaluatedAt", integer()),
-            ("currentLots", bounded_unsigned(i64::MAX as u64)),
-            ("hardFeasibleLots", investment_analysis_feasible_lots()),
-            ("preferredFeasibleLots", investment_analysis_feasible_lots()),
-            ("selectedTargetLots", null()),
-            ("orderQuantity", null()),
-        ],
-        &[
-            "resultDigest",
-            "proposalId",
-            "derivationDigest",
-            "authority",
-            "executionEligible",
-            "evaluatedAt",
-            "currentLots",
-            "hardFeasibleLots",
-            "preferredFeasibleLots",
-            "selectedTargetLots",
-            "orderQuantity",
-        ],
-    )
+    closed_complete(vec![
+        ("evaluatedAt", canonical_market_timestamp()),
+        ("currentLots", unsigned_integer_text()),
+        ("hardFeasibleLots", investment_analysis_feasible_lots()),
+        ("preferredFeasibleLots", investment_analysis_feasible_lots()),
+        ("summary", investment_analysis_product_text()),
+    ])
 }
 
 fn investment_analysis_feasible_lots() -> Value {
     one_of(vec![
-        closed(
-            vec![
-                ("kind", constant("available")),
-                ("lower", bounded_unsigned(i64::MAX as u64)),
-                ("upper", bounded_unsigned(i64::MAX as u64)),
-            ],
-            &["kind", "lower", "upper"],
-        ),
-        closed(
-            vec![
-                ("kind", constant("unavailable")),
-                (
-                    "reasons",
-                    bounded_nonempty_array(investment_analysis_sizing_unavailable_reason(), 8),
-                ),
-            ],
-            &["kind", "reasons"],
-        ),
-    ])
-}
-
-fn investment_analysis_sizing_unavailable_reason() -> Value {
-    enumeration(&[
-        "capacity_not_supplied",
-        "capacity_not_yet_available",
-        "capacity_expired",
-        "capacity_range_contains_no_lots",
-        "cash_reserve_exceeds_gross_liquidatable_value",
-        "no_hard_feasible_lot_intersection",
-        "preferred_weight_range_contains_no_lots",
-        "no_preferred_feasible_lot_intersection",
+        closed_complete(vec![
+            ("kind", constant("available")),
+            ("lower", positive_integer_text()),
+            ("upper", positive_integer_text()),
+        ]),
+        closed_complete(vec![
+            ("kind", constant("unavailable")),
+            (
+                "reasons",
+                bounded_nonempty_array(investment_analysis_product_text(), 8),
+            ),
+        ]),
     ])
 }
 
 fn recommendation_outcome_current() -> Value {
-    one_of(vec![
-        closed(
-            vec![
-                ("kind", constant("pending")),
-                (
-                    "reason",
-                    enumeration(&["awaiting_horizon", "awaiting_outcome_evidence"]),
-                ),
-                ("seriesId", investment_analysis_sha256()),
-                ("revision", bounded_unsigned_range(1, u64::from(u32::MAX))),
-                ("statusDigest", investment_analysis_sha256()),
-                ("evaluatedAt", integer()),
-                ("executionEligible", constant_bool(false)),
-            ],
-            &[
-                "kind",
-                "reason",
-                "seriesId",
-                "revision",
-                "statusDigest",
-                "evaluatedAt",
-                "executionEligible",
-            ],
-        ),
-        closed(
-            vec![
-                ("kind", constant("unavailable")),
-                (
-                    "reason",
-                    enumeration(&[
-                        "analysis_unavailable",
-                        "outcome_observation_unavailable",
-                        "ambiguous_outcome_observation",
-                        "incomplete_outcome_observation",
-                        "corporate_action_evidence_unavailable",
-                    ]),
-                ),
-                ("seriesId", investment_analysis_sha256()),
-                ("revision", bounded_unsigned_range(1, u64::from(u32::MAX))),
-                ("statusDigest", investment_analysis_sha256()),
-                ("evaluatedAt", integer()),
-                ("executionEligible", constant_bool(false)),
-            ],
-            &[
-                "kind",
-                "reason",
-                "seriesId",
-                "revision",
-                "statusDigest",
-                "evaluatedAt",
-                "executionEligible",
-            ],
-        ),
-        closed(
-            vec![
-                ("kind", constant("completed")),
-                ("metric", constant("gross_instrument_price_return")),
-                ("startMark", investment_analysis_money()),
-                ("endpointPrice", investment_analysis_money()),
-                ("grossPriceReturn", canonical_decimal_text()),
-                ("observedAt", integer()),
-                ("availableAt", integer()),
-                (
-                    "selectionReceiptIdentity",
-                    investment_analysis_content_identity(),
-                ),
-                (
-                    "selectedObservationIdentity",
-                    investment_analysis_content_identity(),
-                ),
-                (
-                    "corporateActionEvidenceIdentity",
-                    investment_analysis_content_identity(),
-                ),
-                (
-                    "netReturn",
-                    investment_analysis_unavailable_disclosure(
-                        "exact_realized_cost_evidence_not_supplied",
-                    ),
-                ),
-                (
-                    "benchmarkReturn",
-                    investment_analysis_unavailable_disclosure(
-                        "exact_benchmark_outcome_evidence_not_supplied",
-                    ),
-                ),
-                (
-                    "afterTaxReturn",
-                    investment_analysis_unavailable_disclosure("exact_tax_evidence_not_supplied"),
-                ),
-                (
-                    "settlement",
-                    investment_analysis_unavailable_disclosure(
-                        "no_execution_or_settlement_evidence",
-                    ),
-                ),
-                ("seriesId", investment_analysis_sha256()),
-                ("revision", bounded_unsigned_range(1, u64::from(u32::MAX))),
-                ("statusDigest", investment_analysis_sha256()),
-                ("evaluatedAt", integer()),
-                ("executionEligible", constant_bool(false)),
-            ],
-            &[
-                "kind",
-                "metric",
-                "startMark",
-                "endpointPrice",
-                "grossPriceReturn",
-                "observedAt",
-                "availableAt",
-                "selectionReceiptIdentity",
-                "selectedObservationIdentity",
-                "corporateActionEvidenceIdentity",
-                "netReturn",
-                "benchmarkReturn",
-                "afterTaxReturn",
-                "settlement",
-                "seriesId",
-                "revision",
-                "statusDigest",
-                "evaluatedAt",
-                "executionEligible",
-            ],
-        ),
+    closed_complete(vec![
+        ("evaluatedAt", canonical_market_timestamp()),
+        ("result", recommendation_outcome_result()),
     ])
 }
 
-fn investment_analysis_unavailable_disclosure(reason: &'static str) -> Value {
-    closed(
-        vec![
+fn recommendation_outcome_result() -> Value {
+    one_of(vec![
+        closed_complete(vec![
+            ("kind", constant("pending")),
+            ("summary", investment_analysis_product_text()),
+        ]),
+        closed_complete(vec![
             ("kind", constant("unavailable")),
-            ("reason", constant(reason)),
-        ],
-        &["kind", "reason"],
-    )
+            ("summary", investment_analysis_product_text()),
+        ]),
+        closed_complete(vec![
+            ("kind", constant("completed")),
+            ("metric", constant("gross_instrument_price_return")),
+            ("startMark", investment_analysis_money()),
+            ("endpointPrice", investment_analysis_money()),
+            ("grossPriceReturnPercent", canonical_decimal_text()),
+            ("observedAt", canonical_market_timestamp()),
+            ("availableAt", canonical_market_timestamp()),
+            (
+                "limitations",
+                bounded_nonempty_array(investment_analysis_product_text(), 8),
+            ),
+        ]),
+    ])
 }
 
 fn recommendation_track_record() -> Value {
-    closed(
-        vec![
-            (
-                "analyticalProfile",
-                investment_analysis_analytical_profile(),
-            ),
-            ("horizonNanos", bounded_integer_range(1, i64::MAX)),
-            ("evaluatedAt", integer()),
-            (
-                "analysisUnavailableCount",
-                bounded_unsigned(u64::from(u32::MAX)),
-            ),
-            (
-                "minimumCompletedSamples",
-                constant_unsigned(u64::from(RECOMMENDATION_TRACK_RECORD_MINIMUM_COMPLETED)),
-            ),
-            (
-                "minimumCoveragePpm",
-                constant_unsigned(u64::from(RECOMMENDATION_TRACK_RECORD_MINIMUM_COVERAGE_PPM)),
-            ),
-            (
-                "groups",
-                fixed_array(recommendation_track_record_group(), 6),
-            ),
-            ("forecastCalibrationIncluded", constant_bool(false)),
-            ("executionPerformanceIncluded", constant_bool(false)),
-        ],
-        &[
-            "analyticalProfile",
-            "horizonNanos",
-            "evaluatedAt",
-            "analysisUnavailableCount",
+    closed_complete(vec![
+        ("actionToken", investment_analysis_action_token()),
+        ("evaluatedAt", canonical_market_timestamp()),
+        (
+            "unavailableAnalysisCount",
+            bounded_unsigned(u64::from(u32::MAX)),
+        ),
+        (
             "minimumCompletedSamples",
-            "minimumCoveragePpm",
-            "groups",
-            "forecastCalibrationIncluded",
-            "executionPerformanceIncluded",
-        ],
-    )
+            constant_unsigned(u64::from(RECOMMENDATION_TRACK_RECORD_MINIMUM_COMPLETED)),
+        ),
+        ("minimumCoveragePercent", constant("80")),
+        ("groups", recommendation_track_record_groups()),
+        ("forecastCalibrationIncluded", constant_bool(false)),
+        ("executionResultsIncluded", constant_bool(false)),
+        ("summary", investment_analysis_product_text()),
+    ])
 }
 
-fn recommendation_track_record_group() -> Value {
-    closed(
-        vec![
-            (
-                "cohort",
-                enumeration(&["buy", "add", "hold", "trim", "sell", "no_action_control"]),
-            ),
-            ("publicationCount", bounded_unsigned(u64::from(u32::MAX))),
-            ("dueCount", bounded_unsigned(u64::from(u32::MAX))),
-            ("completedCount", bounded_unsigned(u64::from(u32::MAX))),
-            ("pendingCount", bounded_unsigned(u64::from(u32::MAX))),
-            ("unavailableCount", bounded_unsigned(u64::from(u32::MAX))),
-            ("coveragePpm", bounded_unsigned(1_000_000)),
-            ("performance", recommendation_track_record_performance()),
+fn recommendation_track_record_groups() -> Value {
+    json!({
+        "type": "array",
+        "minItems": 6,
+        "maxItems": 6,
+        "prefixItems": [
+            recommendation_track_record_group("buy"),
+            recommendation_track_record_group("add"),
+            recommendation_track_record_group("hold"),
+            recommendation_track_record_group("trim"),
+            recommendation_track_record_group("sell"),
+            recommendation_track_record_group("abstain"),
         ],
-        &[
-            "cohort",
-            "publicationCount",
-            "dueCount",
-            "completedCount",
-            "pendingCount",
-            "unavailableCount",
-            "coveragePpm",
-            "performance",
-        ],
-    )
+        "items": false,
+    })
+}
+
+fn recommendation_track_record_group(action: &'static str) -> Value {
+    closed_complete(vec![
+        ("action", constant(action)),
+        ("recommendationCount", bounded_unsigned(u64::from(u32::MAX))),
+        ("dueCount", bounded_unsigned(u64::from(u32::MAX))),
+        ("completedCount", bounded_unsigned(u64::from(u32::MAX))),
+        ("pendingCount", bounded_unsigned(u64::from(u32::MAX))),
+        ("unavailableCount", bounded_unsigned(u64::from(u32::MAX))),
+        ("coveragePercent", investment_analysis_percentage()),
+        ("performance", recommendation_track_record_performance()),
+    ])
 }
 
 fn recommendation_track_record_performance() -> Value {
     one_of(vec![
-        closed(
-            vec![
-                ("kind", constant("unavailable")),
-                ("reason", constant("no_due_outcomes")),
-            ],
-            &["kind", "reason"],
-        ),
-        closed(
-            vec![
-                ("kind", constant("unavailable")),
-                ("reason", constant("insufficient_completed_samples")),
-                (
-                    "required",
-                    constant_unsigned(u64::from(RECOMMENDATION_TRACK_RECORD_MINIMUM_COMPLETED)),
-                ),
-                ("actual", bounded_unsigned(u64::from(u32::MAX))),
-            ],
-            &["kind", "reason", "required", "actual"],
-        ),
-        closed(
-            vec![
-                ("kind", constant("unavailable")),
-                ("reason", constant("insufficient_coverage")),
-                (
-                    "requiredPpm",
-                    constant_unsigned(u64::from(RECOMMENDATION_TRACK_RECORD_MINIMUM_COVERAGE_PPM)),
-                ),
-                ("actualPpm", bounded_unsigned(1_000_000)),
-            ],
-            &["kind", "reason", "requiredPpm", "actualPpm"],
-        ),
-        closed(
-            vec![
-                ("kind", constant("available")),
-                ("metric", constant("mean_gross_instrument_price_return")),
-                ("meanGrossPriceReturn", canonical_decimal_text()),
-                ("positiveOutcomes", bounded_unsigned(u64::from(u32::MAX))),
-                ("zeroOutcomes", bounded_unsigned(u64::from(u32::MAX))),
-                ("negativeOutcomes", bounded_unsigned(u64::from(u32::MAX))),
-            ],
-            &[
-                "kind",
-                "metric",
-                "meanGrossPriceReturn",
-                "positiveOutcomes",
-                "zeroOutcomes",
-                "negativeOutcomes",
-            ],
-        ),
+        closed_complete(vec![
+            ("kind", constant("unavailable")),
+            ("summary", investment_analysis_product_text()),
+        ]),
+        closed_complete(vec![
+            ("kind", constant("unavailable")),
+            ("summary", investment_analysis_product_text()),
+            (
+                "required",
+                constant_unsigned(u64::from(RECOMMENDATION_TRACK_RECORD_MINIMUM_COMPLETED)),
+            ),
+            ("actual", bounded_unsigned(u64::from(u32::MAX))),
+        ]),
+        closed_complete(vec![
+            ("kind", constant("unavailable")),
+            ("summary", investment_analysis_product_text()),
+            ("requiredPercent", constant("80")),
+            ("actualPercent", investment_analysis_percentage()),
+        ]),
+        closed_complete(vec![
+            ("kind", constant("available")),
+            ("meanGrossPriceReturnPercent", canonical_decimal_text()),
+            ("positiveOutcomes", bounded_unsigned(u64::from(u32::MAX))),
+            ("unchangedOutcomes", bounded_unsigned(u64::from(u32::MAX))),
+            ("negativeOutcomes", bounded_unsigned(u64::from(u32::MAX))),
+            ("summary", investment_analysis_product_text()),
+        ]),
     ])
 }
 
 fn investment_analysis_page() -> Value {
-    closed(
-        vec![
-            ("completeness", enumeration(&["complete", "truncated"])),
-            ("returnedCount", bounded_unsigned(1_000)),
-            ("availableCount", bounded_unsigned(4_096)),
-            (
-                "nextAfterAnalysisId",
-                nullable(investment_analysis_sha256()),
-            ),
-            (
-                "analyses",
-                bounded_array(investment_analysis_locator(), 1_000),
-            ),
-        ],
-        &[
-            "completeness",
-            "returnedCount",
-            "availableCount",
-            "nextAfterAnalysisId",
+    closed_complete(vec![
+        ("completeness", enumeration(&["complete", "truncated"])),
+        ("returnedCount", bounded_unsigned(1_000)),
+        ("availableCount", bounded_unsigned(4_096)),
+        (
+            "nextAfterActionToken",
+            nullable(investment_analysis_action_token()),
+        ),
+        (
             "analyses",
-        ],
-    )
-}
-
-fn investment_analysis_policy() -> Value {
-    closed(
-        vec![
-            ("version", bounded_unsigned_range(1, u64::from(u32::MAX))),
-            ("digest", investment_analysis_sha256()),
-            (
-                "actionZoneSemanticsVersion",
-                bounded_unsigned_range(1, u64::from(u32::MAX)),
-            ),
-            ("horizonNanos", integer()),
-            ("proposalLifetimeNanos", integer()),
-            ("assumptions", fixed_array(bounded_text(4_096), 3)),
-            (
-                "invalidationConditions",
-                fixed_array(bounded_text(4_096), 3),
-            ),
-            ("limitations", fixed_array(bounded_text(4_096), 3)),
-        ],
-        &[
-            "version",
-            "digest",
-            "actionZoneSemanticsVersion",
-            "horizonNanos",
-            "proposalLifetimeNanos",
-            "assumptions",
-            "invalidationConditions",
-            "limitations",
-        ],
-    )
-}
-
-fn investment_analysis_evidence() -> Value {
-    closed(
-        vec![
-            ("instrumentId", uuid()),
-            ("currency", investment_analysis_currency()),
-            ("accountId", uuid()),
-            ("asOf", integer()),
-            ("market", nullable(investment_analysis_market_evidence())),
-            (
-                "priceForecast",
-                nullable(investment_analysis_forecast_evidence()),
-            ),
-            (
-                "valuation",
-                nullable(investment_analysis_valuation_evidence()),
-            ),
-            (
-                "backtest",
-                nullable(investment_analysis_backtest_evidence()),
-            ),
-            (
-                "liquidity",
-                nullable(investment_analysis_liquidity_evidence()),
-            ),
-            (
-                "portfolioRisk",
-                nullable(investment_analysis_portfolio_risk_evidence()),
-            ),
-        ],
-        &[
-            "instrumentId",
-            "currency",
-            "accountId",
-            "asOf",
-            "market",
-            "priceForecast",
-            "valuation",
-            "backtest",
-            "liquidity",
-            "portfolioRisk",
-        ],
-    )
-}
-
-fn investment_analysis_market_evidence() -> Value {
-    closed(
-        vec![
-            ("instrumentId", uuid()),
-            ("price", investment_analysis_money()),
-            ("quality", investment_analysis_data_quality()),
-            (
-                "priceKind",
-                enumeration(&["last_trade", "checked_bid_ask_midpoint"]),
-            ),
-            ("adjustmentBasis", constant("unadjusted_spot")),
-            (
-                "selectionReceiptIdentity",
-                investment_analysis_content_identity(),
-            ),
-            (
-                "selectedObservationIdentity",
-                investment_analysis_content_identity(),
-            ),
-            ("window", investment_analysis_evidence_window()),
-        ],
-        &[
-            "instrumentId",
-            "price",
-            "quality",
-            "priceKind",
-            "adjustmentBasis",
-            "selectionReceiptIdentity",
-            "selectedObservationIdentity",
-            "window",
-        ],
-    )
-}
-
-fn investment_analysis_forecast_evidence() -> Value {
-    closed(
-        vec![
-            ("instrumentId", uuid()),
-            ("cases", investment_analysis_price_cases()),
-            ("ranges", investment_analysis_forecast_ranges()),
-            ("horizonAt", integer()),
-            (
-                "expectedTerminal",
-                nullable(investment_analysis_expected_terminal()),
-            ),
-            ("vintageId", investment_analysis_sha256()),
-            (
-                "outputBindingIdentity",
-                investment_analysis_content_identity(),
-            ),
-            (
-                "calibrationIdentity",
-                investment_analysis_content_identity(),
-            ),
-            ("outcomeSetIdentity", investment_analysis_content_identity()),
-            (
-                "calibration",
-                closed(
-                    vec![
-                        ("nominalCoveragePpm", bounded_unsigned(1_000_000)),
-                        ("realizedCoveragePpm", bounded_unsigned(1_000_000)),
-                        (
-                            "completedOutcomes",
-                            bounded_unsigned_range(1, u64::from(u32::MAX)),
-                        ),
-                    ],
-                    &[
-                        "nominalCoveragePpm",
-                        "realizedCoveragePpm",
-                        "completedOutcomes",
-                    ],
-                ),
-            ),
-            ("window", investment_analysis_evidence_window()),
-        ],
-        &[
-            "instrumentId",
-            "cases",
-            "ranges",
-            "horizonAt",
-            "expectedTerminal",
-            "vintageId",
-            "outputBindingIdentity",
-            "calibrationIdentity",
-            "outcomeSetIdentity",
-            "calibration",
-            "window",
-        ],
-    )
-}
-
-fn investment_analysis_expected_terminal() -> Value {
-    closed(
-        vec![
-            ("statistic", constant("model_estimated_conditional_mean")),
-            ("price", investment_analysis_money()),
-            ("horizonAt", integer()),
-            ("statisticIdentity", investment_analysis_content_identity()),
-        ],
-        &["statistic", "price", "horizonAt", "statisticIdentity"],
-    )
-}
-
-fn investment_analysis_valuation_evidence() -> Value {
-    closed(
-        vec![
-            ("instrumentId", uuid()),
-            ("fairValue", investment_analysis_money()),
-            ("basis", constant("per_instrument_unit")),
-            ("horizonAt", integer()),
-            ("measurementId", investment_analysis_sha256()),
-            ("classificationDecisionId", investment_analysis_sha256()),
-            ("selectionReceiptHash", investment_analysis_sha256()),
-            ("window", investment_analysis_evidence_window()),
-        ],
-        &[
-            "instrumentId",
-            "fairValue",
-            "basis",
-            "horizonAt",
-            "measurementId",
-            "classificationDecisionId",
-            "selectionReceiptHash",
-            "window",
-        ],
-    )
-}
-
-fn investment_analysis_backtest_evidence() -> Value {
-    closed(
-        vec![
-            ("instrumentId", uuid()),
-            ("currency", investment_analysis_currency()),
-            ("outcomeHorizonNanos", integer()),
-            ("netReturnBasisPoints", integer()),
-            ("maxDrawdownBasisPoints", integer()),
-            ("feeBasisPoints", integer()),
-            ("slippageBasisPoints", integer()),
-            ("maximumRandomSlippageBasisPoints", integer()),
-            (
-                "observations",
-                bounded_unsigned_range(1, u64::from(u32::MAX)),
-            ),
-            ("trials", bounded_unsigned_range(1, u64::from(u32::MAX))),
-            ("stabilityPpm", bounded_unsigned(1_000_000)),
-            ("simulationCutoffAt", integer()),
-            ("datasetIdentity", investment_analysis_content_identity()),
-            ("commandIdentity", investment_analysis_content_identity()),
-            ("terminalIdentity", investment_analysis_content_identity()),
-            ("reportIdentity", investment_analysis_content_identity()),
-            ("cohortIdentity", investment_analysis_content_identity()),
-            ("costModelIdentity", investment_analysis_content_identity()),
-            ("window", investment_analysis_evidence_window()),
-        ],
-        &[
-            "instrumentId",
-            "currency",
-            "outcomeHorizonNanos",
-            "netReturnBasisPoints",
-            "maxDrawdownBasisPoints",
-            "feeBasisPoints",
-            "slippageBasisPoints",
-            "maximumRandomSlippageBasisPoints",
-            "observations",
-            "trials",
-            "stabilityPpm",
-            "simulationCutoffAt",
-            "datasetIdentity",
-            "commandIdentity",
-            "terminalIdentity",
-            "reportIdentity",
-            "cohortIdentity",
-            "costModelIdentity",
-            "window",
-        ],
-    )
-}
-
-fn investment_analysis_liquidity_evidence() -> Value {
-    closed(
-        vec![
-            ("instrumentId", uuid()),
-            ("currency", investment_analysis_currency()),
-            ("quotedSpreadBasisPoints", integer()),
-            ("capacityPpm", bounded_unsigned(1_000_000)),
-            ("quality", investment_analysis_data_quality()),
-            ("assessmentIdentity", investment_analysis_content_identity()),
-            ("window", investment_analysis_evidence_window()),
-        ],
-        &[
-            "instrumentId",
-            "currency",
-            "quotedSpreadBasisPoints",
-            "capacityPpm",
-            "quality",
-            "assessmentIdentity",
-            "window",
-        ],
-    )
-}
-
-fn investment_analysis_portfolio_risk_evidence() -> Value {
-    closed(
-        vec![
-            ("instrumentId", uuid()),
-            ("accountId", uuid()),
-            ("currency", investment_analysis_currency()),
-            ("portfolioRevision", investment_analysis_sha256()),
-            ("positionState", investment_analysis_position_state()),
-            ("riskCapacityPpm", bounded_unsigned(1_000_000)),
-            ("riskReportIdentity", investment_analysis_content_identity()),
-            ("window", investment_analysis_evidence_window()),
-        ],
-        &[
-            "instrumentId",
-            "accountId",
-            "currency",
-            "portfolioRevision",
-            "positionState",
-            "riskCapacityPpm",
-            "riskReportIdentity",
-            "window",
-        ],
-    )
-}
-
-fn investment_analysis_position_state() -> Value {
-    one_of(vec![
-        closed(vec![("kind", constant("no_position"))], &["kind"]),
-        closed(
-            vec![
-                ("kind", constant("position")),
-                ("addAllowed", boolean()),
-                ("trimAllowed", boolean()),
-                ("exitAllowed", boolean()),
-            ],
-            &["kind", "addAllowed", "trimAllowed", "exitAllowed"],
+            bounded_array(investment_analysis_locator(), 1_000),
         ),
     ])
-}
-
-fn investment_analysis_result() -> Value {
-    one_of(vec![
-        closed(
-            vec![
-                ("kind", constant("generated")),
-                ("proposalId", investment_analysis_sha256()),
-                ("derivationDigest", investment_analysis_sha256()),
-                ("action", investment_analysis_action()),
-                ("priceLadder", investment_analysis_price_ladder()),
-                (
-                    "actionZoneSemantics",
-                    investment_analysis_action_zone_semantics(),
-                ),
-                (
-                    "evidenceReliability",
-                    investment_analysis_evidence_reliability(),
-                ),
-                ("horizonAt", integer()),
-                ("expiresAt", integer()),
-            ],
-            &[
-                "kind",
-                "proposalId",
-                "derivationDigest",
-                "action",
-                "priceLadder",
-                "actionZoneSemantics",
-                "evidenceReliability",
-                "horizonAt",
-                "expiresAt",
-            ],
-        ),
-        closed(
-            vec![
-                ("kind", constant("no_action")),
-                ("proposalId", investment_analysis_sha256()),
-                ("derivationDigest", investment_analysis_sha256()),
-                ("reason", investment_analysis_no_action_reason()),
-                (
-                    "invalidators",
-                    fixed_array(investment_analysis_invalidator(), 1),
-                ),
-                (
-                    "evidenceReliability",
-                    investment_analysis_evidence_reliability(),
-                ),
-                ("horizonAt", integer()),
-                ("expiresAt", integer()),
-            ],
-            &[
-                "kind",
-                "proposalId",
-                "derivationDigest",
-                "reason",
-                "invalidators",
-                "evidenceReliability",
-                "horizonAt",
-                "expiresAt",
-            ],
-        ),
-        closed(
-            vec![
-                ("kind", constant("unavailable")),
-                ("reason", investment_analysis_unavailable_reason()),
-                ("horizonAt", integer()),
-                ("expiresAt", integer()),
-            ],
-            &["kind", "reason", "horizonAt", "expiresAt"],
-        ),
-    ])
-}
-
-fn investment_analysis_price_ladder() -> Value {
-    closed(
-        vec![
-            ("cases", investment_analysis_price_cases()),
-            (
-                "ranges",
-                closed(
-                    vec![
-                        ("downside", investment_analysis_price_range()),
-                        ("base", investment_analysis_price_range()),
-                        ("upside", investment_analysis_price_range()),
-                        ("entry", investment_analysis_price_range()),
-                        ("add", investment_analysis_price_range()),
-                        ("trim", investment_analysis_price_range()),
-                        ("exit", investment_analysis_price_range()),
-                    ],
-                    &["downside", "base", "upside", "entry", "add", "trim", "exit"],
-                ),
-            ),
-            ("addCase", investment_analysis_money()),
-        ],
-        &["cases", "ranges", "addCase"],
-    )
-}
-
-fn investment_analysis_action_zone_semantics() -> Value {
-    closed(
-        vec![
-            ("version", bounded_unsigned_range(1, u64::from(u32::MAX))),
-            ("referenceZone", nullable(investment_analysis_price_range())),
-            (
-                "triggerFloorExclusive",
-                nullable(investment_analysis_money()),
-            ),
-            (
-                "triggerFloorInclusive",
-                nullable(investment_analysis_money()),
-            ),
-            (
-                "triggerCeilingInclusive",
-                nullable(investment_analysis_money()),
-            ),
-        ],
-        &[
-            "version",
-            "referenceZone",
-            "triggerFloorExclusive",
-            "triggerFloorInclusive",
-            "triggerCeilingInclusive",
-        ],
-    )
-}
-
-fn investment_analysis_evidence_reliability() -> Value {
-    closed(
-        vec![
-            (
-                "meaning",
-                constant("policy_weighted_evidence_reliability_v1"),
-            ),
-            ("valuePpm", bounded_unsigned(1_000_000)),
-            (
-                "components",
-                fixed_array(
-                    closed(
-                        vec![
-                            (
-                                "kind",
-                                enumeration(&[
-                                    "forecast_calibration",
-                                    "valuation_agreement",
-                                    "backtest_stability",
-                                    "market_integrity",
-                                    "liquidity_capacity",
-                                    "portfolio_risk_capacity",
-                                ]),
-                            ),
-                            ("valuePpm", bounded_unsigned(1_000_000)),
-                            ("weightPpm", bounded_unsigned(1_000_000)),
-                        ],
-                        &["kind", "valuePpm", "weightPpm"],
-                    ),
-                    6,
-                ),
-            ),
-        ],
-        &["meaning", "valuePpm", "components"],
-    )
 }
 
 fn investment_analysis_locator() -> Value {
-    closed(
-        vec![
-            ("analysisId", investment_analysis_sha256()),
-            ("proposalId", nullable(investment_analysis_sha256())),
-            ("derivationDigest", nullable(investment_analysis_sha256())),
-            ("instrumentId", uuid()),
-            ("accountId", uuid()),
-            ("currency", investment_analysis_currency()),
-            ("asOf", integer()),
-            ("horizonAt", integer()),
-            ("expiresAt", integer()),
-            ("policyDigest", investment_analysis_sha256()),
-            ("evidenceDigest", investment_analysis_sha256()),
-            ("outcome", investment_analysis_locator_outcome()),
-        ],
-        &[
-            "analysisId",
-            "proposalId",
-            "derivationDigest",
-            "instrumentId",
-            "accountId",
-            "currency",
-            "asOf",
-            "horizonAt",
-            "expiresAt",
-            "policyDigest",
-            "evidenceDigest",
-            "outcome",
-        ],
-    )
-}
-
-fn investment_analysis_locator_outcome() -> Value {
-    one_of(vec![
-        closed(
-            vec![
-                ("kind", constant("generated")),
-                ("action", investment_analysis_action()),
-            ],
-            &["kind", "action"],
-        ),
-        closed(
-            vec![
-                ("kind", constant("no_action")),
-                ("reason", investment_analysis_no_action_reason()),
-            ],
-            &["kind", "reason"],
-        ),
-        closed(
-            vec![
-                ("kind", constant("unavailable")),
-                ("reason", investment_analysis_unavailable_reason()),
-            ],
-            &["kind", "reason"],
-        ),
+    closed_complete(vec![
+        ("actionToken", investment_analysis_action_token()),
+        ("investment", investment_analysis_display()),
+        ("portfolioLabel", bounded_text(128)),
+        ("currency", investment_analysis_currency()),
+        ("horizon", investment_analysis_horizon()),
+        ("recommendation", investment_analysis_recommendation()),
     ])
-}
-
-fn investment_analysis_unavailable_reason() -> Value {
-    one_of(vec![
-        investment_analysis_evidence_reason("missing_evidence"),
-        closed(
-            vec![
-                ("kind", constant("instrument_mismatch")),
-                ("evidence", investment_analysis_evidence_kind()),
-                ("expected", uuid()),
-                ("actual", uuid()),
-            ],
-            &["kind", "evidence", "expected", "actual"],
-        ),
-        closed(
-            vec![
-                ("kind", constant("currency_mismatch")),
-                ("evidence", investment_analysis_evidence_kind()),
-                ("expected", investment_analysis_currency()),
-                ("actual", investment_analysis_currency()),
-            ],
-            &["kind", "evidence", "expected", "actual"],
-        ),
-        closed(
-            vec![
-                ("kind", constant("account_mismatch")),
-                ("expected", uuid()),
-                ("actual", uuid()),
-            ],
-            &["kind", "expected", "actual"],
-        ),
-        investment_analysis_evidence_reason("not_available_at_cutoff"),
-        investment_analysis_evidence_reason("expired_evidence"),
-        investment_analysis_evidence_reason("stale_evidence"),
-        closed(
-            vec![
-                ("kind", constant("rejected_quality")),
-                ("evidence", investment_analysis_evidence_kind()),
-                ("quality", investment_analysis_data_quality()),
-            ],
-            &["kind", "evidence", "quality"],
-        ),
-        investment_analysis_horizon_reason("forecast_horizon_mismatch"),
-        investment_analysis_horizon_reason("valuation_horizon_mismatch"),
-        closed(
-            vec![
-                ("kind", constant("backtest_horizon_mismatch")),
-                ("expectedNanos", integer()),
-                ("actualNanos", integer()),
-            ],
-            &["kind", "expectedNanos", "actualNanos"],
-        ),
-        investment_analysis_count_reason("insufficient_forecast_outcomes"),
-        closed(
-            vec![
-                ("kind", constant("unsupported_forecast_coverage")),
-                ("minimumPpm", bounded_unsigned(1_000_000)),
-                ("maximumPpm", bounded_unsigned(1_000_000)),
-                ("actualPpm", bounded_unsigned(1_000_000)),
-            ],
-            &["kind", "minimumPpm", "maximumPpm", "actualPpm"],
-        ),
-        investment_analysis_count_reason("insufficient_backtest_observations"),
-        investment_analysis_count_reason("insufficient_backtest_trials"),
-        closed(
-            vec![("kind", constant("reserved_portfolio_revision"))],
-            &["kind"],
-        ),
-    ])
-}
-
-fn investment_analysis_evidence_reason(kind: &'static str) -> Value {
-    closed(
-        vec![
-            ("kind", constant(kind)),
-            ("evidence", investment_analysis_evidence_kind()),
-        ],
-        &["kind", "evidence"],
-    )
-}
-
-fn investment_analysis_horizon_reason(kind: &'static str) -> Value {
-    closed(
-        vec![
-            ("kind", constant(kind)),
-            ("expected", integer()),
-            ("actual", integer()),
-        ],
-        &["kind", "expected", "actual"],
-    )
-}
-
-fn investment_analysis_count_reason(kind: &'static str) -> Value {
-    closed(
-        vec![
-            ("kind", constant(kind)),
-            ("required", bounded_unsigned_range(1, u64::from(u32::MAX))),
-            ("actual", bounded_unsigned_range(1, u64::from(u32::MAX))),
-        ],
-        &["kind", "required", "actual"],
-    )
-}
-
-fn investment_analysis_price_cases() -> Value {
-    closed(
-        vec![
-            ("downside", investment_analysis_money()),
-            ("base", investment_analysis_money()),
-            ("upside", investment_analysis_money()),
-        ],
-        &["downside", "base", "upside"],
-    )
-}
-
-fn investment_analysis_forecast_ranges() -> Value {
-    closed(
-        vec![
-            ("downside", investment_analysis_price_range()),
-            ("base", investment_analysis_price_range()),
-            ("upside", investment_analysis_price_range()),
-        ],
-        &["downside", "base", "upside"],
-    )
-}
-
-fn investment_analysis_price_range() -> Value {
-    closed(
-        vec![
-            ("lower", investment_analysis_money()),
-            ("upper", investment_analysis_money()),
-        ],
-        &["lower", "upper"],
-    )
-}
-
-fn investment_analysis_money() -> Value {
-    closed(
-        vec![
-            ("amount", canonical_decimal_text()),
-            ("currency", investment_analysis_currency()),
-        ],
-        &["amount", "currency"],
-    )
-}
-
-fn investment_analysis_evidence_window() -> Value {
-    closed(
-        vec![
-            ("observedAt", integer()),
-            ("availableAt", integer()),
-            ("expiresAt", integer()),
-            ("contentIdentity", investment_analysis_content_identity()),
-        ],
-        &["observedAt", "availableAt", "expiresAt", "contentIdentity"],
-    )
-}
-
-fn investment_analysis_content_identity() -> Value {
-    closed(
-        vec![
-            ("algorithm", enumeration(&["sha256", "blake3"])),
-            ("digest", investment_analysis_sha256()),
-        ],
-        &["algorithm", "digest"],
-    )
 }
 
 fn investment_analysis_action() -> Value {
     enumeration(&["buy", "add", "hold", "trim", "sell"])
 }
 
-fn investment_analysis_no_action_reason() -> Value {
-    enumeration(&[
-        "conflicting_forecast_and_valuation",
-        "backtest_below_policy",
-        "liquidity_below_policy",
-        "portfolio_risk_below_policy",
-        "evidence_reliability_below_policy",
-        "position_state_not_actionable",
-        "generated_price_order_collapsed",
-    ])
+fn investment_analysis_product_text() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 2_048,
+        "pattern": "\\S",
+    })
 }
 
-fn investment_analysis_invalidator() -> Value {
-    enumeration(&[
-        "forecast_valuation_conflict",
-        "backtest_policy_breach",
-        "liquidity_policy_breach",
-        "portfolio_risk_policy_breach",
-        "evidence_reliability_policy_breach",
-        "position_state_incompatible",
-        "generated_price_order_collapsed",
-    ])
+fn investment_analysis_positive_decimal() -> Value {
+    json!({
+        "type": "string",
+        "pattern": "^(?:0|[1-9][0-9]*)(?:\\.[0-9]*[1-9])?$",
+        "not": {
+            "type": "string",
+            "const": "0",
+        },
+    })
 }
 
-fn investment_analysis_evidence_kind() -> Value {
-    enumeration(&[
-        "market",
-        "price_forecast",
-        "valuation",
-        "backtest",
-        "liquidity",
-        "portfolio_risk",
-    ])
-}
-
-fn investment_analysis_data_quality() -> Value {
-    enumeration(&[
-        "direct_verified",
-        "direct_unverified",
-        "official_delayed",
-        "aggregated",
-        "indicative",
-        "modeled",
-        "estimated",
-        "stale",
-        "quarantined",
-    ])
+fn investment_analysis_percentage() -> Value {
+    json!({
+        "type": "string",
+        "pattern": "^(?:(?:0|[1-9]|[1-9][0-9])(?:\\.[0-9]*[1-9])?|100)$",
+    })
 }
 
 fn investment_analysis_currency() -> Value {
@@ -2666,6 +1841,74 @@ fn investment_analysis_sha256() -> Value {
         "maxLength": 64,
         "pattern": "^[0-9a-f]{64}$"
     })
+}
+
+fn dossier_forecast_option() -> Value {
+    closed_complete(vec![
+        ("selector", bounded_text(256)),
+        ("modelId", bounded_text(256)),
+        ("bundleId", bounded_text(256)),
+        ("bundleVersion", positive_integer()),
+        ("observedThrough", canonical_market_timestamp()),
+        ("createdAt", canonical_market_timestamp()),
+        ("expiresAt", canonical_market_timestamp()),
+        (
+            "horizonPoints",
+            bounded_unsigned_range(1, u64::from(u16::MAX)),
+        ),
+        ("horizonStepNanos", positive_integer()),
+        ("calibrated", boolean()),
+        ("quality", constant("modeled")),
+    ])
+}
+
+fn dossier_fair_value_option() -> Value {
+    closed_complete(vec![
+        ("selector", bounded_text(256)),
+        ("accountId", bounded_text(256)),
+        (
+            "amount",
+            closed_complete(vec![
+                ("amount", canonical_decimal_text()),
+                ("currency", investment_analysis_currency()),
+                ("scale", bounded_unsigned(28)),
+                (
+                    "amountBasis",
+                    enumeration(&[
+                        "per_instrument_unit",
+                        "reporting_entity_total",
+                        "position_total",
+                    ]),
+                ),
+            ]),
+        ),
+        ("measurementAt", canonical_market_timestamp()),
+        ("preparedAt", canonical_market_timestamp()),
+        (
+            "method",
+            enumeration(&[
+                "quoted_market_price",
+                "market_approach",
+                "income_approach",
+                "cost_approach",
+            ]),
+        ),
+        (
+            "hierarchy",
+            enumeration(&["level_1", "level_2", "level_3", "unclassified"]),
+        ),
+        ("reasonCount", bounded_unsigned(10_000)),
+    ])
+}
+
+fn target_reference_mark_option() -> Value {
+    closed_complete(vec![
+        ("selector", uuid()),
+        ("price", investment_analysis_money()),
+        ("observedAt", canonical_market_timestamp()),
+        ("quality", market_quality()),
+        ("source", bounded_text(256)),
+    ])
 }
 
 fn source_coverage_rows() -> Value {
@@ -3042,54 +2285,221 @@ fn unified_market_rows() -> Value {
     ))
 }
 
-fn market_product_rows() -> Value {
-    nullable_rows(closed(
-        vec![
-            ("instrumentId", uuid()),
-            ("displaySymbol", nullable(bounded_text(512))),
-            ("name", nullable(bounded_text(512))),
-            ("assetClass", market_asset_class()),
-            ("currency", investment_analysis_currency()),
-            (
-                "availability",
-                enumeration(&[
-                    "live",
-                    "delayed",
-                    "end_of_day",
-                    "stored",
-                    "stale",
-                    "unavailable",
-                ]),
-            ),
-            (
-                "confidence",
-                enumeration(&["high", "moderate", "limited", "unavailable"]),
-            ),
-            ("currentPrice", nullable(market_product_current_price())),
-            ("quote", market_product_quote()),
-            ("marketState", market_product_state()),
-            ("observations", market_product_observations()),
-            ("depthSummary", market_product_depth_summary()),
-            ("depthDetails", nullable(market_product_depth_details())),
-            ("analysisUse", enumeration(&["current_only", "unavailable"])),
-        ],
-        &[
-            "instrumentId",
-            "displaySymbol",
-            "name",
-            "assetClass",
-            "currency",
+fn market_product_page() -> Value {
+    closed_complete(vec![
+        ("data", bounded_array(market_product_row(), 100)),
+        (
+            "page",
+            closed_complete(vec![
+                ("hasMore", boolean()),
+                ("nextPageToken", nullable(market_token("page"))),
+            ]),
+        ),
+    ])
+}
+
+fn market_product_selection() -> Value {
+    closed_complete(vec![
+        ("data", bounded_nonempty_array(market_product_row(), 1)),
+        (
+            "page",
+            closed_complete(vec![
+                ("hasMore", constant_bool(false)),
+                ("nextPageToken", json!({"type": "null"})),
+            ]),
+        ),
+    ])
+}
+
+fn market_history_result() -> Value {
+    closed_complete(vec![
+        (
+            "data",
+            nullable(closed_complete(vec![
+                ("historyToken", market_token("history")),
+                ("currency", investment_analysis_currency()),
+                (
+                    "bars",
+                    bounded_nonempty_array(market_product_history_bar(), 1_000),
+                ),
+                ("partial", boolean()),
+            ])),
+        ),
+        (
+            "unavailableReason",
+            nullable(enumeration(&[
+                "not_selected",
+                "not_available",
+                "temporarily_unavailable",
+            ])),
+        ),
+    ])
+}
+
+fn market_product_row() -> Value {
+    closed_complete(vec![
+        ("selectionToken", market_token("market")),
+        ("historyToken", nullable(market_token("history"))),
+        (
+            "identity",
+            closed_complete(vec![
+                ("symbol", nullable(bounded_text(64))),
+                ("name", nullable(bounded_text(256))),
+                ("assetClass", market_asset_class()),
+            ]),
+        ),
+        (
+            "price",
+            nullable(closed_complete(vec![
+                ("value", canonical_decimal_text()),
+                ("currency", investment_analysis_currency()),
+            ])),
+        ),
+        ("changePercent", nullable(canonical_decimal_text())),
+        ("asOf", nullable(canonical_market_timestamp())),
+        (
             "availability",
+            enumeration(&["current", "delayed", "previous_close", "unavailable"]),
+        ),
+    ])
+}
+
+fn market_search_page() -> Value {
+    closed_complete(vec![
+        (
+            "data",
+            bounded_array(
+                closed_complete(vec![
+                    ("selectionToken", market_token("market")),
+                    ("symbol", nullable(bounded_text(64))),
+                    ("name", nullable(bounded_text(256))),
+                    (
+                        "kind",
+                        enumeration(&[
+                            "stock",
+                            "fund",
+                            "bond",
+                            "option",
+                            "future",
+                            "currency",
+                            "crypto",
+                            "commodity",
+                            "index",
+                            "cash",
+                        ]),
+                    ),
+                ]),
+                100,
+            ),
+        ),
+        (
+            "page",
+            closed_complete(vec![
+                ("hasMore", boolean()),
+                ("nextPageToken", nullable(market_token("page"))),
+            ]),
+        ),
+    ])
+}
+
+fn market_token(prefix: &str) -> Value {
+    json!({"type":"string","minLength":prefix.len()+33,"maxLength":prefix.len()+87,"pattern":format!("^{prefix}_[A-Za-z0-9_-]{{32,86}}$")})
+}
+
+fn market_product_history_bar() -> Value {
+    closed_complete(vec![
+        ("startsAt", canonical_market_timestamp()),
+        ("endsAt", canonical_market_timestamp()),
+        ("open", canonical_decimal_text()),
+        ("high", canonical_decimal_text()),
+        ("low", canonical_decimal_text()),
+        ("close", canonical_decimal_text()),
+        ("volume", canonical_decimal_text()),
+    ])
+}
+
+fn market_history_series(kind: &'static str, reason: Option<&'static str>) -> Value {
+    let mut fields = vec![
+        ("kind", constant(kind)),
+        ("instrumentId", uuid()),
+        ("period", constant("daily")),
+        ("range", constant("latest_complete_window")),
+        ("session", constant("completed_trading_sessions")),
+        ("adjustment", constant("fully_adjusted")),
+        ("currency", investment_analysis_currency()),
+        ("coverage", market_history_coverage()),
+        ("quality", market_history_quality()),
+        (
+            "bars",
+            bounded_nonempty_array(
+                market_history_bar(),
+                usize::try_from(MAX_MARKET_HISTORY_BARS).unwrap_or(10_000),
+            ),
+        ),
+    ];
+    if let Some(reason) = reason {
+        fields.push(("reason", constant(reason)));
+    }
+    closed_complete(fields)
+}
+
+fn market_history_status(kind: &'static str, reasons: &[&str]) -> Value {
+    closed_complete(vec![
+        ("kind", constant(kind)),
+        ("instrumentId", uuid()),
+        ("period", constant("daily")),
+        ("range", constant("latest_complete_window")),
+        ("session", constant("completed_trading_sessions")),
+        ("adjustment", constant("fully_adjusted")),
+        ("reason", enumeration(reasons)),
+    ])
+}
+
+fn market_history_coverage() -> Value {
+    let maximum = u64::from(MAX_MARKET_HISTORY_BARS);
+    closed_complete(vec![
+        ("selectedStart", canonical_market_timestamp()),
+        ("selectedEndExclusive", canonical_market_timestamp()),
+        ("materializedStart", canonical_market_timestamp()),
+        ("materializedEndExclusive", canonical_market_timestamp()),
+        ("returnedStart", canonical_market_timestamp()),
+        ("returnedEndExclusive", canonical_market_timestamp()),
+        ("materializedBars", bounded_unsigned(maximum)),
+        ("returnedBars", bounded_unsigned(maximum)),
+    ])
+}
+
+fn market_history_quality() -> Value {
+    closed_complete(vec![
+        (
             "confidence",
-            "currentPrice",
-            "quote",
-            "marketState",
-            "observations",
-            "depthSummary",
-            "depthDetails",
-            "analysisUse",
-        ],
-    ))
+            enumeration(&["high", "moderate", "limited", "stale"]),
+        ),
+        ("completeTradingSessions", constant_bool(true)),
+        (
+            "use",
+            closed_complete(vec![
+                ("charts", constant_bool(true)),
+                ("currentResearch", constant_bool(true)),
+                ("pointInTimeBacktests", constant_bool(false)),
+                ("retrospectiveTraining", constant_bool(false)),
+            ]),
+        ),
+    ])
+}
+
+fn market_history_bar() -> Value {
+    closed_complete(vec![
+        ("periodStart", canonical_market_timestamp()),
+        ("periodEndExclusive", canonical_market_timestamp()),
+        ("open", canonical_decimal_text()),
+        ("high", canonical_decimal_text()),
+        ("low", canonical_decimal_text()),
+        ("close", canonical_decimal_text()),
+        ("volume", canonical_decimal_text()),
+        ("tradeCount", nullable(bounded_unsigned(u64::MAX))),
+        ("vwap", nullable(canonical_decimal_text())),
+    ])
 }
 
 fn market_product_current_price() -> Value {
@@ -3118,76 +2528,9 @@ fn market_product_quote() -> Value {
 
 fn market_product_state() -> Value {
     closed_complete(vec![
-        (
-            "timing",
-            nullable(enumeration(&[
-                "real_time",
-                "delayed",
-                "end_of_day",
-                "historical",
-                "stored",
-            ])),
-        ),
-        (
-            "quality",
-            enumeration(&[
-                "verified",
-                "direct",
-                "official_delayed",
-                "aggregated",
-                "indicative",
-                "modeled",
-                "estimated",
-                "stale",
-                "unavailable",
-            ]),
-        ),
-        (
-            "health",
-            enumeration(&["healthy", "degraded", "unavailable", "quarantined"]),
-        ),
-        (
-            "integrity",
-            enumeration(&[
-                "verified",
-                "unverified",
-                "not_applicable",
-                "failed",
-                "quarantined",
-                "unavailable",
-            ]),
-        ),
-        (
-            "coverage",
-            enumeration(&[
-                "broad",
-                "partial",
-                "single_market",
-                "benchmark",
-                "reference",
-                "account_owned",
-                "unavailable",
-            ]),
-        ),
-        (
-            "depth",
-            enumeration(&["top_of_book", "price_level", "order_level", "none"]),
-        ),
         ("freshness", enumeration(&["fresh", "stale", "unavailable"])),
-        ("observedAt", nullable(canonical_market_timestamp())),
         ("updatedAt", canonical_market_timestamp()),
         ("currentThrough", nullable(canonical_market_timestamp())),
-    ])
-}
-
-fn market_product_observations() -> Value {
-    closed_complete(vec![
-        ("admittedCount", bounded_unsigned(u64::from(u32::MAX))),
-        (
-            "independentCount",
-            nullable(bounded_unsigned(u64::from(u32::MAX))),
-        ),
-        ("agreement", constant("not_established")),
     ])
 }
 
@@ -4759,7 +4102,6 @@ fn canonical_decimal_text() -> Value {
 fn macro_context() -> Value {
     closed(
         vec![
-            ("schemaIdentity", constant("market-squawk-macro-context/v1")),
             (
                 "availability",
                 enumeration(&["available", "partial", "unavailable"]),
@@ -4770,7 +4112,6 @@ fn macro_context() -> Value {
             ("observations", fixed_array(macro_context_observation(), 12)),
         ],
         &[
-            "schemaIdentity",
             "availability",
             "selection",
             "confidence",
@@ -6796,13 +6137,11 @@ fn portfolio_snapshot() -> Value {
 
 fn portfolio_account() -> Value {
     closed_complete(vec![
-        ("accountId", text()),
+        ("accountToken", opaque_product_token()),
+        ("displayName", bounded_text(256)),
         ("currency", text()),
-        ("cashBalance", money()),
-        ("currentSnapshot", portfolio_snapshot()),
-        ("holdingCount", unsigned()),
-        ("transactionCount", unsigned()),
-        ("reconciliationDiscrepancies", unsigned()),
+        ("holdings", unsigned()),
+        ("dataIssues", unsigned()),
     ])
 }
 
@@ -7014,37 +6353,134 @@ fn portfolio_exposure_classification() -> Value {
 }
 
 fn portfolio_risk() -> Value {
-    let mut fields = portfolio_report_fields();
-    fields.extend([
-        ("confidence", number()),
-        ("scenario", portfolio_risk_scenario()),
-        ("historyStatus", text()),
-        ("valueAtRisk", number()),
-        ("expectedShortfall", number()),
-        ("observations", unsigned()),
-        ("annualizedVolatility", number()),
-        ("volatilityStatus", text()),
-        ("trackingErrorStatus", text()),
-    ]);
-    closed(
-        fields,
-        &[
-            "accountId",
-            "snapshotToken",
-            "effectiveAtUnixNanos",
-            "availableAtUnixNanos",
-            "dataConfidence",
-            "confidence",
-            "scenario",
-        ],
-    )
+    closed_complete(vec![
+        ("accountName", bounded_text(256)),
+        ("asOf", timestamp()),
+        ("availableAt", timestamp()),
+        ("horizon", bounded_text(160)),
+        ("coverage", portfolio_risk_coverage()),
+        ("measures", fixed_array(portfolio_risk_measure(), 3)),
+        ("stress", portfolio_risk_stress()),
+        ("recommendation", portfolio_risk_recommendation()),
+    ])
 }
 
-fn portfolio_risk_scenario() -> Value {
-    closed(
-        vec![("id", text()), ("status", text()), ("impact", money())],
-        &["id"],
-    )
+fn portfolio_risk_coverage() -> Value {
+    closed_complete(vec![
+        (
+            "state",
+            enumeration(&["complete", "partial", "unavailable"]),
+        ),
+        ("observations", unsigned()),
+        ("period", bounded_text(160)),
+        ("explanation", bounded_text(4_096)),
+    ])
+}
+
+fn portfolio_risk_measure() -> Value {
+    closed_complete(vec![
+        (
+            "label",
+            enumeration(&[
+                "Value at risk",
+                "Expected shortfall",
+                "Annualized volatility",
+            ]),
+        ),
+        ("value", nullable(percentage_text())),
+        (
+            "status",
+            enumeration(&["available", "insufficient_history", "unavailable"]),
+        ),
+        ("explanation", bounded_text(4_096)),
+    ])
+}
+
+fn portfolio_risk_stress() -> Value {
+    closed_complete(vec![
+        ("label", bounded_text(160)),
+        ("impact", nullable(money())),
+        (
+            "status",
+            enumeration(&["available", "incomplete", "unavailable"]),
+        ),
+        ("explanation", bounded_text(4_096)),
+        (
+            "assumptions",
+            bounded_nonempty_array(bounded_text(4_096), 12),
+        ),
+    ])
+}
+
+fn portfolio_risk_recommendation() -> Value {
+    closed_complete(vec![
+        (
+            "action",
+            enumeration(&["buy", "add", "hold", "trim", "sell", "abstain"]),
+        ),
+        ("horizon", bounded_text(160)),
+        ("summary", bounded_text(4_096)),
+        ("ranges", bounded_array(portfolio_risk_range(), 8)),
+        ("reasons", bounded_nonempty_array(bounded_text(4_096), 12)),
+        ("risks", bounded_nonempty_array(bounded_text(4_096), 12)),
+        (
+            "assumptions",
+            bounded_nonempty_array(bounded_text(4_096), 12),
+        ),
+        (
+            "invalidators",
+            bounded_nonempty_array(bounded_text(4_096), 12),
+        ),
+        ("validity", portfolio_recommendation_validity()),
+        ("uncertainty", portfolio_recommendation_uncertainty()),
+    ])
+}
+
+fn portfolio_risk_range() -> Value {
+    closed_complete(vec![
+        ("label", bounded_text(160)),
+        ("lower", money()),
+        ("upper", money()),
+    ])
+}
+
+fn portfolio_recommendation_validity() -> Value {
+    one_of(vec![
+        closed_complete(vec![
+            ("state", constant("available")),
+            ("expiresAt", timestamp()),
+        ]),
+        closed_complete(vec![
+            ("state", constant("unavailable")),
+            ("explanation", bounded_text(4_096)),
+        ]),
+    ])
+}
+
+fn portfolio_recommendation_uncertainty() -> Value {
+    closed_complete(vec![
+        (
+            "level",
+            enumeration(&["low", "moderate", "high", "unavailable"]),
+        ),
+        ("explanation", bounded_text(4_096)),
+        (
+            "outOfSampleEvidence",
+            enumeration(&["sufficient", "limited", "unavailable"]),
+        ),
+        (
+            "calibration",
+            enumeration(&["supported", "limited", "unavailable"]),
+        ),
+        (
+            "tradingCosts",
+            enumeration(&["included", "partial", "unavailable"]),
+        ),
+        (
+            "pointInTimeInputs",
+            enumeration(&["supported", "partial", "unavailable"]),
+        ),
+    ])
 }
 
 fn portfolio_attribution() -> Value {
@@ -7623,7 +7059,6 @@ fn model_activity() -> Value {
                 "state",
                 enumeration(&["queued", "running", "completed", "failed"]),
             ),
-            ("statusMessage", bounded_text(1_000)),
             ("progressPercent", nullable(canonical_decimal_text())),
             ("updatedAtUnixNanos", integer_text()),
         ],
@@ -7631,7 +7066,6 @@ fn model_activity() -> Value {
             "activityToken",
             "label",
             "state",
-            "statusMessage",
             "progressPercent",
             "updatedAtUnixNanos",
         ],
@@ -7652,27 +7086,84 @@ fn product_forecast_page() -> Value {
     )
 }
 
+fn product_forecast_investment() -> Value {
+    closed_complete(vec![
+        ("name", bounded_text(240)),
+        ("symbol", nullable(bounded_text(64))),
+        ("description", bounded_text(400)),
+    ])
+}
+
+fn product_forecast_target() -> Value {
+    closed_complete(vec![
+        ("label", bounded_text(200)),
+        ("meaning", bounded_text(1_000)),
+        (
+            "valueKind",
+            enumeration(&["market_price", "percentage_return", "probability"]),
+        ),
+        ("unitLabel", bounded_text(80)),
+        ("currencyCode", nullable(currency_code())),
+    ])
+}
+
+fn product_forecast_amount() -> Value {
+    closed_complete(vec![
+        ("exact", canonical_decimal_text()),
+        ("formatted", bounded_text(120)),
+    ])
+}
+
+fn product_forecast_model_evidence() -> Value {
+    closed_complete(vec![
+        ("modelToken", uuid()),
+        (
+            "overall",
+            enumeration(&["sufficient", "limited", "unavailable"]),
+        ),
+        (
+            "pitInputs",
+            enumeration(&["sufficient", "limited", "unavailable"]),
+        ),
+        (
+            "outOfSample",
+            enumeration(&["sufficient", "limited", "unavailable"]),
+        ),
+        (
+            "horizonAlignment",
+            enumeration(&["sufficient", "limited", "unavailable"]),
+        ),
+        (
+            "calibration",
+            enumeration(&["calibrated", "limited", "unavailable"]),
+        ),
+        ("interpretation", bounded_text(1_000)),
+    ])
+}
+
 fn product_forecast_summary() -> Value {
     closed(
         vec![
             ("forecastToken", uuid()),
-            ("investmentToken", uuid()),
+            ("investment", product_forecast_investment()),
+            ("target", product_forecast_target()),
+            ("modelEvidence", product_forecast_model_evidence()),
             ("observedThroughUnixNanos", integer_text()),
             ("createdAtUnixNanos", integer_text()),
             ("expiresAtUnixNanos", integer_text()),
             ("horizon", product_forecast_horizon()),
-            ("evidenceState", enumeration(&["calibrated", "limited"])),
             ("historicalObservationCount", unsigned()),
             ("limitations", bounded_array(bounded_text(4_096), 256)),
         ],
         &[
             "forecastToken",
-            "investmentToken",
+            "investment",
+            "target",
+            "modelEvidence",
             "observedThroughUnixNanos",
             "createdAtUnixNanos",
             "expiresAtUnixNanos",
             "horizon",
-            "evidenceState",
             "historicalObservationCount",
             "limitations",
         ],
@@ -7680,26 +7171,25 @@ fn product_forecast_summary() -> Value {
 }
 
 fn product_forecast_horizon() -> Value {
-    closed(
-        vec![
-            ("points", positive_integer()),
-            ("stepNanos", positive_integer_text()),
-        ],
-        &["points", "stepNanos"],
-    )
+    closed_complete(vec![
+        ("label", bounded_text(200)),
+        ("description", bounded_text(1_000)),
+        ("points", bounded_unsigned_range(1, 512)),
+    ])
 }
 
 fn product_forecast_detail() -> Value {
     closed(
         vec![
             ("forecastToken", uuid()),
-            ("investmentToken", uuid()),
+            ("investment", product_forecast_investment()),
+            ("target", product_forecast_target()),
+            ("modelEvidence", product_forecast_model_evidence()),
             ("observedThroughUnixNanos", integer_text()),
             ("availableAtUnixNanos", integer_text()),
             ("createdAtUnixNanos", integer_text()),
             ("expiresAtUnixNanos", integer_text()),
             ("horizon", product_forecast_horizon()),
-            ("evidenceState", enumeration(&["calibrated", "limited"])),
             (
                 "observedHistory",
                 bounded_array(product_forecast_observation(), 4_096),
@@ -7716,13 +7206,14 @@ fn product_forecast_detail() -> Value {
         ],
         &[
             "forecastToken",
-            "investmentToken",
+            "investment",
+            "target",
+            "modelEvidence",
             "observedThroughUnixNanos",
             "availableAtUnixNanos",
             "createdAtUnixNanos",
             "expiresAtUnixNanos",
             "horizon",
-            "evidenceState",
             "observedHistory",
             "estimates",
             "calibration",
@@ -7739,7 +7230,7 @@ fn product_forecast_observation() -> Value {
         vec![
             ("observedAtUnixNanos", integer_text()),
             ("availableAtUnixNanos", integer_text()),
-            ("value", canonical_decimal_text()),
+            ("value", product_forecast_amount()),
         ],
         &["observedAtUnixNanos", "availableAtUnixNanos", "value"],
     )
@@ -7749,7 +7240,7 @@ fn product_forecast_estimate() -> Value {
     closed(
         vec![
             ("targetAtUnixNanos", integer_text()),
-            ("central", canonical_decimal_text()),
+            ("central", product_forecast_amount()),
             ("ranges", nullable(product_forecast_ranges())),
         ],
         &["targetAtUnixNanos", "central", "ranges"],
@@ -7760,8 +7251,8 @@ fn product_forecast_ranges() -> Value {
     let range = || {
         closed(
             vec![
-                ("lower", canonical_decimal_text()),
-                ("upper", canonical_decimal_text()),
+                ("lower", product_forecast_amount()),
+                ("upper", product_forecast_amount()),
             ],
             &["lower", "upper"],
         )
@@ -7783,7 +7274,7 @@ fn product_forecast_calibration() -> Value {
                 fixed_array(
                     closed(
                         vec![
-                            ("targetCoveragePercent", canonical_decimal_text()),
+                            ("targetCoveragePercent", product_forecast_amount()),
                             ("realizedCovered", unsigned()),
                             ("realizedTotal", positive_integer()),
                         ],
@@ -7816,7 +7307,10 @@ fn product_forecast_monitoring() -> Value {
             ("observedCount", unsigned()),
             ("includedCount", unsigned()),
             ("truncated", boolean()),
-            ("meanAbsoluteError", nullable(canonical_decimal_text())),
+            (
+                "meanAbsoluteError",
+                nullable(product_forecast_rounded_amount()),
+            ),
             ("interpretation", bounded_text(2_000)),
         ],
         &[
@@ -7828,6 +7322,20 @@ fn product_forecast_monitoring() -> Value {
             "interpretation",
         ],
     )
+}
+
+fn product_forecast_rounded_amount() -> Value {
+    closed_complete(vec![
+        ("value", product_forecast_amount()),
+        (
+            "rounding",
+            closed_complete(vec![
+                ("state", enumeration(&["exact", "rounded"])),
+                ("decimalPlaces", bounded_unsigned_range(0, 18)),
+                ("mode", constant("half_even")),
+            ]),
+        ),
+    ])
 }
 
 fn product_forecast_outcomes() -> Value {
@@ -7842,9 +7350,9 @@ fn product_forecast_outcomes() -> Value {
                             ("targetAtUnixNanos", integer_text()),
                             ("observedAtUnixNanos", integer_text()),
                             ("availableAtUnixNanos", integer_text()),
-                            ("actual", canonical_decimal_text()),
-                            ("signedError", canonical_decimal_text()),
-                            ("absoluteError", canonical_decimal_text()),
+                            ("actual", product_forecast_amount()),
+                            ("signedError", product_forecast_amount()),
+                            ("absoluteError", product_forecast_amount()),
                         ],
                         &[
                             "targetAtUnixNanos",
@@ -7884,7 +7392,6 @@ fn backtest_activity() -> Value {
                 enumeration(&["queued", "running", "completed", "failed"]),
             ),
             ("progressPercent", nullable(canonical_decimal_text())),
-            ("statusMessage", bounded_text(500)),
         ],
         &[
             "backtestToken",
@@ -7893,7 +7400,6 @@ fn backtest_activity() -> Value {
             "updatedAt",
             "state",
             "progressPercent",
-            "statusMessage",
         ],
     )
 }
@@ -8546,60 +8052,144 @@ fn currency_code() -> Value {
     })
 }
 
+fn forecast_preparation_options() -> Value {
+    closed_complete(vec![(
+        "models",
+        bounded_array(forecast_preparation_model(true), 4_096),
+    )])
+}
+
+fn forecast_preparation_model(include_histories: bool) -> Value {
+    let mut fields = vec![
+        ("modelToken", uuid()),
+        ("name", bounded_text(200)),
+        ("objective", enumeration(&["numeric_outcome", "likelihood"])),
+        ("target", product_forecast_target()),
+        ("modelEvidence", product_forecast_model_evidence()),
+        ("intendedUse", bounded_text(4_096)),
+        ("limitations", bounded_array(bounded_text(4_096), 256)),
+        ("unavailableBehavior", constant("no_action")),
+    ];
+    if include_histories {
+        fields.push((
+            "histories",
+            bounded_nonempty_array(forecast_preparation_history(), 4_096),
+        ));
+    }
+    closed_complete(fields)
+}
+
+fn forecast_preparation_history() -> Value {
+    closed_complete(vec![
+        ("historyToken", uuid()),
+        ("label", bounded_text(200)),
+        (
+            "investments",
+            bounded_nonempty_array(forecast_preparation_investment(), 4_096),
+        ),
+        (
+            "horizons",
+            bounded_nonempty_array(forecast_preparation_horizon(true), 64),
+        ),
+    ])
+}
+
+fn forecast_preparation_investment() -> Value {
+    closed_complete(vec![
+        ("investmentToken", uuid()),
+        ("label", bounded_text(240)),
+        ("observedFromUnixNanos", integer_text()),
+        ("observedThroughUnixNanos", integer_text()),
+        ("availableAtUnixNanos", integer_text()),
+        ("observationCount", bounded_unsigned_range(1, 4_096)),
+    ])
+}
+
+fn forecast_preparation_horizon(include_token: bool) -> Value {
+    let mut fields = vec![
+        ("label", bounded_text(200)),
+        ("description", bounded_text(1_000)),
+    ];
+    if include_token {
+        fields.insert(0, ("horizonToken", uuid()));
+    }
+    closed_complete(fields)
+}
+
+fn forecast_preparation_preview() -> Value {
+    closed_complete(vec![
+        ("confirmationToken", uuid()),
+        ("expiresAtUnixNanos", integer_text()),
+        ("model", forecast_preparation_model(false)),
+        ("investmentToken", uuid()),
+        ("instrumentLabel", bounded_text(240)),
+        ("observedFromUnixNanos", integer_text()),
+        ("observedThroughUnixNanos", integer_text()),
+        ("availableAtUnixNanos", integer_text()),
+        ("observationCount", bounded_unsigned_range(1, 4_096)),
+        ("horizon", forecast_preparation_horizon(false)),
+        ("limitations", bounded_array(bounded_text(4_096), 256)),
+        ("analysisOnly", constant_bool(true)),
+    ])
+}
+
 fn backtest_preparation_options() -> Value {
     closed(
         vec![
             (
-                "datasets",
+                "histories",
                 bounded_array(
                     closed(
                         vec![
-                            ("id", bounded_text(256)),
-                            ("label", bounded_text(160)),
-                            ("immutableGeneration", bounded_text(64)),
-                            ("instrumentCount", unsigned()),
+                            ("historyToken", bounded_text(256)),
+                            ("label", bounded_text(200)),
+                            ("investmentCount", positive_integer()),
                             (
                                 "periods",
-                                bounded_array(
+                                bounded_nonempty_array(
                                     closed(
                                         vec![
-                                            ("id", bounded_text(256)),
-                                            ("label", bounded_text(256)),
+                                            ("periodToken", bounded_text(256)),
+                                            ("label", bounded_text(240)),
                                             ("startsAt", timestamp()),
                                             ("endsAt", timestamp()),
                                         ],
-                                        &["id", "label", "startsAt", "endsAt"],
+                                        &["periodToken", "label", "startsAt", "endsAt"],
                                     ),
-                                    2,
+                                    8,
                                 ),
                             ),
                         ],
-                        &[
-                            "id",
-                            "label",
-                            "immutableGeneration",
-                            "instrumentCount",
-                            "periods",
-                        ],
+                        &["historyToken", "label", "investmentCount", "periods"],
                     ),
                     4_096,
                 ),
             ),
-            ("strategies", bounded_array(backtest_named_option(), 16)),
-            ("costPolicies", bounded_array(backtest_named_option(), 16)),
-            ("seeds", bounded_array(backtest_named_option(), 16)),
-            ("portfolios", bounded_array(backtest_named_option(), 16)),
-            ("comparisons", bounded_array(backtest_named_option(), 16)),
-            ("defaultLimitPolicy", bounded_text(1_024)),
+            (
+                "methods",
+                bounded_nonempty_array(backtest_named_option(), 16),
+            ),
+            (
+                "costPlans",
+                bounded_nonempty_array(backtest_named_option(), 16),
+            ),
+            (
+                "portfolios",
+                bounded_nonempty_array(backtest_named_option(), 16),
+            ),
+            (
+                "comparisons",
+                bounded_nonempty_array(backtest_named_option(), 16),
+            ),
+            ("guidance", bounded_text(1_000)),
         ],
         &[
-            "datasets",
-            "strategies",
-            "costPolicies",
-            "seeds",
+            "histories",
+            "methods",
+            "costPlans",
             "portfolios",
             "comparisons",
-            "defaultLimitPolicy",
+            "guidance",
         ],
     )
 }
@@ -8607,49 +8197,66 @@ fn backtest_preparation_options() -> Value {
 fn backtest_named_option() -> Value {
     closed(
         vec![
-            ("id", bounded_text(256)),
-            ("label", bounded_text(256)),
-            ("description", bounded_text(1_024)),
+            ("token", bounded_text(256)),
+            ("label", bounded_text(200)),
+            ("description", bounded_text(1_000)),
         ],
-        &["id", "label", "description"],
+        &["token", "label", "description"],
     )
 }
 
 fn backtest_preparation_preview() -> Value {
     closed(
         vec![
-            (
-                "receipt",
-                closed(
-                    vec![("receiptId", uuid()), ("preparationDigest", sha256())],
-                    &["receiptId", "preparationDigest"],
-                ),
-            ),
+            ("confirmationToken", bounded_text(256)),
             ("expiresAt", timestamp()),
-            ("dataset", bounded_text(512)),
-            ("period", bounded_text(512)),
-            ("strategy", bounded_text(256)),
-            ("costPolicy", bounded_text(256)),
-            ("deterministicSeed", bounded_text(256)),
-            ("portfolio", bounded_text(256)),
-            ("comparison", bounded_text(256)),
-            ("evidence", bounded_array(bounded_text(2_048), 64)),
-            ("assumptions", bounded_array(bounded_text(2_048), 64)),
+            ("investmentUniverse", bounded_text(400)),
+            ("period", bounded_text(300)),
+            ("method", bounded_text(200)),
+            ("costs", backtest_cost_assumptions()),
+            ("portfolio", bounded_text(200)),
+            ("comparison", bounded_text(300)),
+            (
+                "pointInTimeEvidence",
+                enumeration(&["verified", "limited", "unavailable"]),
+            ),
+            ("outOfSamplePlan", bounded_text(1_000)),
+            ("evidence", bounded_nonempty_array(bounded_text(1_000), 16)),
+            (
+                "assumptions",
+                bounded_nonempty_array(bounded_text(1_000), 16),
+            ),
+            ("limitations", bounded_array(bounded_text(1_000), 32)),
+            ("analysisOnly", constant_bool(true)),
         ],
         &[
-            "receipt",
+            "confirmationToken",
             "expiresAt",
-            "dataset",
+            "investmentUniverse",
             "period",
-            "strategy",
-            "costPolicy",
-            "deterministicSeed",
+            "method",
+            "costs",
             "portfolio",
             "comparison",
+            "pointInTimeEvidence",
+            "outOfSamplePlan",
             "evidence",
             "assumptions",
+            "limitations",
+            "analysisOnly",
         ],
     )
+}
+
+fn backtest_cost_assumptions() -> Value {
+    closed_complete(vec![
+        ("fees", bounded_text(200)),
+        ("spread", bounded_text(200)),
+        ("slippage", bounded_text(200)),
+        ("latency", bounded_text(200)),
+        ("participationLimit", bounded_text(200)),
+        ("partialFills", bounded_text(200)),
+    ])
 }
 
 fn measurement() -> Value {
@@ -8660,6 +8267,54 @@ fn measurement() -> Value {
         ("instrumentId", text()),
         ("inputCount", unsigned()),
     ])
+}
+
+fn fair_value_governance_preview_result() -> Value {
+    closed_complete(vec![("preview", fair_value_governance_preview())])
+}
+
+fn fair_value_governance_preview() -> Value {
+    closed_complete(vec![
+        ("previewId", uuid()),
+        (
+            "requiredRoles",
+            fixed_array(fair_value_governance_role(), 1),
+        ),
+        ("distinctPrincipalCount", bounded_unsigned_range(1, 2)),
+        ("eligiblePrincipalIds", bounded_nonempty_array(uuid(), 64)),
+        ("expiresAt", timestamp()),
+        ("effects", fixed_array(fair_value_governance_effect(), 1)),
+    ])
+}
+
+fn fair_value_governance_commit() -> Value {
+    closed_complete(vec![
+        ("confirmationToken", bounded_text(256)),
+        ("previewId", uuid()),
+        ("committedAt", timestamp()),
+        ("effects", fixed_array(fair_value_governance_effect(), 1)),
+    ])
+}
+
+fn fair_value_governance_role() -> Value {
+    enumeration(&[
+        "fairValueApprover",
+        "fairValueOverrideApprover",
+        "fairValueRevoker",
+        "fairValueMarketAccessApprover",
+    ])
+}
+
+fn fair_value_governance_effect() -> Value {
+    closed_complete(vec![(
+        "kind",
+        enumeration(&[
+            "fairValueApproval",
+            "fairValueOverride",
+            "fairValueApprovalRevocation",
+            "fairValueMarketAccess",
+        ]),
+    )])
 }
 
 fn fair_value_workspace() -> Value {
@@ -9042,24 +8697,16 @@ fn money() -> Value {
 }
 
 fn manual_paper_target() -> Value {
-    closed(
-        vec![
-            ("targetToken", uuid()),
-            ("instrumentId", uuid()),
-            ("thesis", bounded_text(4_096)),
-            ("expiresAt", integer()),
-            ("reviewDueAt", integer()),
-            ("ladder", fixed_array(manual_paper_ladder_entry(), 10)),
-        ],
-        &[
-            "targetToken",
-            "instrumentId",
-            "thesis",
-            "expiresAt",
-            "reviewDueAt",
-            "ladder",
-        ],
-    )
+    closed_complete(vec![
+        ("targetToken", opaque_product_token()),
+        ("investment", product_investment()),
+        ("thesis", bounded_text(4_096)),
+        ("expiresAt", timestamp()),
+        ("reviewDueAt", timestamp()),
+        ("ladder", fixed_array(manual_paper_ladder_entry(), 10)),
+        ("sideChoices", bounded_nonempty_array(paper_choice(), 2)),
+        ("orderChoices", fixed_array(manual_paper_order_choice(), 4)),
+    ])
 }
 
 fn manual_paper_ladder_entry() -> Value {
@@ -9085,6 +8732,125 @@ fn manual_paper_ladder_entry() -> Value {
         ],
         &["level", "label", "value"],
     )
+}
+
+fn paper_choice() -> Value {
+    closed_complete(vec![
+        ("value", bounded_text(64)),
+        ("label", bounded_text(96)),
+        ("explanation", bounded_text(1_000)),
+    ])
+}
+
+fn manual_paper_order_choice() -> Value {
+    closed_complete(vec![
+        (
+            "value",
+            enumeration(&["market", "limit", "stop", "stop_limit"]),
+        ),
+        ("label", bounded_text(96)),
+        ("explanation", bounded_text(1_000)),
+        ("requiresLimitLevel", boolean()),
+        ("requiresStopLevel", boolean()),
+        (
+            "timeInForceChoices",
+            bounded_nonempty_array(paper_choice(), 4),
+        ),
+    ])
+}
+
+fn product_investment() -> Value {
+    closed(
+        vec![
+            ("name", bounded_text(256)),
+            ("symbol", nullable(bounded_text(64))),
+        ],
+        &["name", "symbol"],
+    )
+}
+
+fn paper_start_preparation() -> Value {
+    closed_complete(vec![
+        ("virtualCashChoices", fixed_array(paper_cash_choice(), 3)),
+        ("costChoices", fixed_array(paper_cost_choice(), 3)),
+        ("modeChoices", fixed_array(paper_mode_choice(), 2)),
+    ])
+}
+
+fn paper_cash_choice() -> Value {
+    closed_complete(vec![
+        ("choiceToken", opaque_product_token()),
+        ("label", bounded_text(96)),
+        ("amount", money()),
+        ("explanation", bounded_text(1_000)),
+    ])
+}
+
+fn paper_cost_choice() -> Value {
+    closed_complete(vec![
+        ("choiceToken", opaque_product_token()),
+        ("label", bounded_text(96)),
+        ("estimatedTradingCost", percentage_text()),
+        ("explanation", bounded_text(1_000)),
+    ])
+}
+
+fn paper_mode_choice() -> Value {
+    closed_complete(vec![
+        ("choiceToken", opaque_product_token()),
+        ("label", bounded_text(96)),
+        ("explanation", bounded_text(1_000)),
+    ])
+}
+
+fn paper_start_preview() -> Value {
+    closed_complete(vec![
+        ("confirmationToken", opaque_product_token()),
+        ("expiresAt", timestamp()),
+        ("virtualCash", money()),
+        ("estimatedTradingCost", percentage_text()),
+        ("modeLabel", bounded_text(96)),
+        ("safeguards", fixed_array(bounded_text(1_000), 3)),
+    ])
+}
+
+fn manual_paper_preview() -> Value {
+    closed_complete(vec![
+        ("confirmationToken", opaque_product_token()),
+        ("expiresAt", timestamp()),
+        ("investment", product_investment()),
+        ("direction", enumeration(&["Buy", "Sell"])),
+        (
+            "orderApproach",
+            enumeration(&["Market", "Limit", "Stop", "Stop limit"]),
+        ),
+        ("quantity", bounded_text(128)),
+        (
+            "duration",
+            enumeration(&[
+                "Today",
+                "Until cancelled",
+                "Fill now or cancel",
+                "All now or cancel",
+            ]),
+        ),
+        ("limitCondition", nullable(paper_price_condition())),
+        ("stopCondition", nullable(paper_price_condition())),
+        ("safeguards", manual_paper_safeguards()),
+        ("simulationWarning", bounded_text(1_000)),
+    ])
+}
+
+fn paper_price_condition() -> Value {
+    closed_complete(vec![("label", bounded_text(96)), ("value", money())])
+}
+
+fn manual_paper_safeguards() -> Value {
+    closed_complete(vec![
+        ("maximumOrderValue", money()),
+        ("maximumSlippage", percentage_text()),
+        ("shorting", enumeration(&["allowed", "disabled"])),
+    ])
 }
 
 fn job_view() -> Value {
@@ -9124,298 +8890,147 @@ fn job_view() -> Value {
 
 fn bot_status() -> Value {
     one_of(vec![
-        closed(
-            vec![
-                ("state", constant("stopped")),
-                ("lastShutdownComplete", nullable(boolean())),
-            ],
-            &["state", "lastShutdownComplete"],
-        ),
-        closed(vec![("state", constant("starting"))], &["state"]),
-        closed(vec![("state", constant("stopping"))], &["state"]),
-        closed(
-            vec![
-                ("state", constant("failed")),
-                ("requiresStop", constant_bool(true)),
-            ],
-            &["state", "requiresStop"],
-        ),
-        closed(
-            vec![
-                ("state", constant("failed")),
-                ("recoveryAction", constant("stop_before_restart")),
-                ("requiresStop", constant_bool(true)),
-            ],
-            &["state", "recoveryAction", "requiresStop"],
-        ),
-        closed(
-            vec![
-                ("state", constant("running")),
-                ("strategyMode", enumeration(&["manual", "book_imbalance"])),
-                ("complete", boolean()),
-                ("reconciliationRequired", boolean()),
-                ("financialReconciliationCurrent", boolean()),
-                ("orders", unsigned()),
-                ("fills", unsigned()),
-                ("positions", unsigned()),
-                (
-                    "accounts",
-                    paper_status_bounded_evidence(paper_status_account()),
-                ),
-                (
-                    "cash",
-                    paper_status_bounded_evidence(paper_status_cash_balance()),
-                ),
-                (
-                    "positionRecords",
-                    paper_status_bounded_evidence(paper_status_position()),
-                ),
-                ("simulation", paper_status_simulation()),
-                ("reconciliation", paper_status_reconciliation()),
-                ("riskLimits", paper_status_risk_limits()),
-                ("riskDecisions", paper_status_risk_decisions()),
-            ],
-            &[
-                "state",
-                "strategyMode",
-                "complete",
-                "reconciliationRequired",
-                "financialReconciliationCurrent",
-                "orders",
-                "fills",
-                "positions",
+        closed_complete(vec![
+            ("sessionAvailability", constant("ready")),
+            ("safeguards", constant("active")),
+        ]),
+        closed_complete(vec![
+            ("sessionAvailability", constant("unavailable")),
+            ("safeguards", enumeration(&["active", "action_needed"])),
+        ]),
+        closed_complete(vec![
+            ("sessionAvailability", constant("active")),
+            ("safeguards", enumeration(&["active", "action_needed"])),
+            ("modeLabel", bounded_text(96)),
+            ("accountUpdate", enumeration(&["complete", "incomplete"])),
+            (
                 "accounts",
-                "cash",
-                "positionRecords",
-                "simulation",
-                "reconciliation",
-                "riskLimits",
-                "riskDecisions",
-            ],
-        ),
+                paper_status_bounded_evidence(paper_status_account()),
+            ),
+            (
+                "positions",
+                paper_status_bounded_evidence(paper_status_position()),
+            ),
+            ("safety", paper_status_safety()),
+            (
+                "recentDecisions",
+                paper_status_bounded_evidence(paper_status_decision()),
+            ),
+            ("reconciliation", paper_status_reconciliation()),
+        ]),
+    ])
+}
+
+fn paper_start_result() -> Value {
+    closed_complete(vec![
+        ("sessionAvailability", constant("active")),
+        ("safeguards", constant("active")),
+        ("modeLabel", bounded_text(96)),
+        ("message", bounded_text(512)),
+    ])
+}
+
+fn paper_stop_result() -> Value {
+    closed_complete(vec![
+        ("sessionAvailability", constant("ready")),
+        ("safeguards", constant("active")),
+        ("message", bounded_text(512)),
     ])
 }
 
 fn paper_status_bounded_evidence(items: Value) -> Value {
     closed(
         vec![
-            ("rows", array(items)),
-            ("returnedItems", unsigned()),
-            ("availableItems", unsigned()),
+            ("rows", bounded_array(items, 100_000)),
+            ("returnedItems", bounded_unsigned(100_000)),
+            ("availableItems", bounded_unsigned(100_000)),
         ],
         &["rows", "returnedItems", "availableItems"],
     )
 }
 
 fn paper_status_account() -> Value {
-    closed(
-        vec![
-            ("accountId", uuid()),
-            ("eligible", boolean()),
-            ("currency", text()),
-            ("settledCapital", money()),
-            ("markedEquity", money()),
-            ("peakMarkedEquity", money()),
-            ("grossExposure", money()),
-            ("unrealizedPnl", money()),
-            ("realizedPnl", money()),
-            ("realizedLoss", money()),
-            ("drawdown", money()),
-        ],
-        &[
-            "accountId",
-            "eligible",
-            "currency",
-            "settledCapital",
-            "markedEquity",
-            "peakMarkedEquity",
-            "grossExposure",
-            "unrealizedPnl",
-            "realizedPnl",
-            "realizedLoss",
-            "drawdown",
-        ],
-    )
-}
-
-fn paper_status_cash_balance() -> Value {
-    closed(
-        vec![("accountId", uuid()), ("balance", money())],
-        &["accountId", "balance"],
-    )
+    closed_complete(vec![
+        ("displayName", bounded_text(256)),
+        ("eligible", boolean()),
+        ("settledCapital", money()),
+        ("markedEquity", money()),
+        ("peakMarkedEquity", money()),
+        ("grossExposure", money()),
+        ("unrealizedPnl", money()),
+        ("realizedPnl", money()),
+        ("maximumDrawdown", money()),
+    ])
 }
 
 fn paper_status_position() -> Value {
-    closed(
-        vec![
-            ("accountId", uuid()),
-            ("instrumentId", uuid()),
-            ("lots", integer()),
-            ("costBasis", money()),
-        ],
-        &["accountId", "instrumentId", "lots", "costBasis"],
-    )
+    closed_complete(vec![
+        ("accountName", bounded_text(256)),
+        ("investment", product_investment()),
+        ("quantity", bounded_text(128)),
+        ("costBasis", money()),
+    ])
 }
 
-fn paper_status_simulation() -> Value {
-    closed(
-        vec![
-            ("minimumLatencyNanos", paper_status_nonnegative_integer()),
-            ("maximumLatencyNanos", paper_status_nonnegative_integer()),
-            ("cancelLatencyNanos", paper_status_nonnegative_integer()),
-            ("maximumMarkAgeNanos", paper_status_positive_integer()),
-            (
-                "maximumParticipationBasisPoints",
-                bounded_unsigned_range(1, 10_000),
-            ),
-            ("impactBasisPointsPerLevel", bounded_unsigned(10_000)),
-            ("makerFeeBasisPoints", bounded_unsigned(10_000)),
-            ("takerFeeBasisPoints", bounded_unsigned(10_000)),
-            ("minimumFee", money()),
-            ("maximumFee", nullable(money())),
-        ],
-        &[
-            "minimumLatencyNanos",
-            "maximumLatencyNanos",
-            "cancelLatencyNanos",
-            "maximumMarkAgeNanos",
-            "maximumParticipationBasisPoints",
-            "impactBasisPointsPerLevel",
-            "makerFeeBasisPoints",
-            "takerFeeBasisPoints",
-            "minimumFee",
-            "maximumFee",
-        ],
-    )
+fn paper_status_safety() -> Value {
+    closed_complete(vec![
+        ("maximumOrderValue", money()),
+        ("maximumTotalExposure", money()),
+        ("maximumPosition", bounded_text(160)),
+        ("leverageLimit", percentage_text()),
+        ("minimumCapital", money()),
+        ("maximumLoss", money()),
+        ("maximumDrawdown", money()),
+        ("maximumFees", percentage_text()),
+        ("maximumPriceDeviation", percentage_text()),
+        ("maximumSlippage", percentage_text()),
+        ("orderPace", bounded_text(160)),
+        ("shorting", enumeration(&["allowed", "disabled"])),
+        ("emergencyStop", enumeration(&["engaged", "clear"])),
+        (
+            "eligibleInvestments",
+            paper_status_bounded_evidence(product_investment()),
+        ),
+    ])
 }
 
 fn paper_status_reconciliation() -> Value {
-    closed(
-        vec![
-            ("snapshotComplete", boolean()),
-            ("reconciliationRequired", boolean()),
-            ("financialReconciliationCurrent", boolean()),
-            ("activeOrderCount", unsigned()),
-            ("archivedOrderCount", unsigned()),
-            ("fillCount", unsigned()),
-            ("accountCount", unsigned()),
-            ("cashBalanceCount", unsigned()),
-            ("positionCount", unsigned()),
-        ],
-        &[
-            "snapshotComplete",
-            "reconciliationRequired",
-            "financialReconciliationCurrent",
-            "activeOrderCount",
-            "archivedOrderCount",
-            "fillCount",
-            "accountCount",
-            "cashBalanceCount",
-            "positionCount",
-        ],
-    )
+    closed_complete(vec![
+        (
+            "state",
+            enumeration(&["incomplete", "current", "action_needed"]),
+        ),
+        ("activeOrders", unsigned()),
+        ("completedOrders", unsigned()),
+        ("fills", unsigned()),
+        ("accounts", unsigned()),
+        ("positions", unsigned()),
+    ])
 }
 
-fn paper_status_risk_limits() -> Value {
-    closed(
-        vec![
-            ("currency", text()),
-            ("eligibleInstruments", paper_status_bounded_evidence(uuid())),
-            ("maximumPositionLots", paper_status_positive_integer()),
-            ("maximumOrderNotional", money()),
-            ("maximumGrossExposure", money()),
-            ("maximumLeverageBasisPoints", bounded_unsigned(1_000_000)),
-            ("minimumCapital", money()),
-            ("maximumLoss", money()),
-            ("maximumDrawdown", money()),
-            ("maximumFeeBasisPoints", bounded_unsigned(10_000)),
-            ("maximumPriceDeviationBasisPoints", bounded_unsigned(10_000)),
-            ("maximumSlippageBasisPoints", bounded_unsigned(10_000)),
-            (
-                "maximumOrdersPerWindow",
-                bounded_unsigned_range(1, u64::from(u32::MAX)),
-            ),
-            ("orderRateWindowNanos", paper_status_positive_integer()),
-            ("allowShort", boolean()),
-            ("killSwitch", boolean()),
-        ],
-        &[
-            "currency",
-            "eligibleInstruments",
-            "maximumPositionLots",
-            "maximumOrderNotional",
-            "maximumGrossExposure",
-            "maximumLeverageBasisPoints",
-            "minimumCapital",
-            "maximumLoss",
-            "maximumDrawdown",
-            "maximumFeeBasisPoints",
-            "maximumPriceDeviationBasisPoints",
-            "maximumSlippageBasisPoints",
-            "maximumOrdersPerWindow",
-            "orderRateWindowNanos",
-            "allowShort",
-            "killSwitch",
-        ],
-    )
-}
-
-fn paper_status_positive_integer() -> Value {
-    json!({"type": "integer", "minimum": 1, "maximum": i64::MAX})
-}
-
-fn paper_status_nonnegative_integer() -> Value {
-    json!({"type": "integer", "minimum": 0, "maximum": i64::MAX})
-}
-
-fn paper_status_risk_decisions() -> Value {
-    closed(
-        vec![
-            ("records", array(paper_status_risk_decision())),
-            ("returnedItems", unsigned()),
-            ("availableItems", unsigned()),
-        ],
-        &["records", "returnedItems", "availableItems"],
-    )
-}
-
-fn paper_status_risk_decision() -> Value {
-    closed(
-        vec![
-            (
-                "outcome",
-                enumeration(&[
-                    "declined",
-                    "approved",
-                    "accepted",
-                    "needs_review",
-                    "cancel_requested",
-                    "cancelled",
-                    "reconciled",
-                ]),
-            ),
-            ("orderToken", uuid()),
-            ("instrumentId", uuid()),
-            ("maximumPriceTicks", nullable(integer())),
-            ("marketObservedAt", integer()),
-            ("validUntil", integer()),
-            ("observedAt", integer()),
-            (
-                "reasons",
-                bounded_array(paper_status_execution_audit_reason(), 14),
-            ),
-        ],
-        &[
+fn paper_status_decision() -> Value {
+    closed_complete(vec![
+        (
             "outcome",
-            "orderToken",
-            "instrumentId",
-            "maximumPriceTicks",
-            "marketObservedAt",
-            "validUntil",
-            "observedAt",
+            enumeration(&[
+                "declined",
+                "approved",
+                "accepted",
+                "needs_review",
+                "cancel_requested",
+                "cancelled",
+                "reconciled",
+            ]),
+        ),
+        ("investment", product_investment()),
+        ("marketObservedAt", timestamp()),
+        ("validUntil", timestamp()),
+        ("observedAt", timestamp()),
+        (
             "reasons",
-        ],
-    )
+            bounded_array(paper_status_execution_audit_reason(), 14),
+        ),
+    ])
 }
 
 fn paper_status_execution_audit_reason() -> Value {
@@ -9439,44 +9054,58 @@ fn paper_status_execution_audit_reason() -> Value {
 
 fn paper_order() -> Value {
     closed_complete(vec![
-        ("orderToken", uuid()),
-        ("status", text()),
-        ("requestedLots", unsigned()),
-        ("filledLots", unsigned()),
-        ("averageFillPriceTicks", nullable(integer())),
-        ("maximumFillPriceTicks", nullable(integer())),
-        ("maximumExecutionPriceTicks", integer()),
-        ("side", enumeration(&["buy", "sell"])),
-        ("referencePriceTicks", integer()),
-        ("maximumSlippageBasisPoints", unsigned()),
-        ("cumulativeFees", money()),
-        ("acceptedAt", integer()),
-        ("eligibleAt", integer()),
-        ("expiresAt", integer()),
-        ("targetToken", nullable(uuid())),
-        ("observed", paper_observed_order()),
-    ])
-}
-
-fn paper_observed_order() -> Value {
-    closed_complete(vec![
-        ("firstFillAt", nullable(integer())),
-        ("firstFillAfterEligibilityNanos", nullable(integer())),
-        ("averageFillSlippageTicks", nullable(integer())),
-        ("averageFillSlippageBasisPoints", nullable(integer())),
+        ("actionToken", opaque_product_token()),
+        (
+            "state",
+            enumeration(&[
+                "waiting",
+                "accepted",
+                "partially_filled",
+                "filled",
+                "cancel_requested",
+                "cancelled",
+                "declined",
+                "expired",
+            ]),
+        ),
+        ("investment", product_investment()),
+        ("direction", enumeration(&["buy", "sell"])),
+        ("requestedQuantity", bounded_text(128)),
+        ("filledQuantity", bounded_text(128)),
+        ("averageFillPrice", nullable(money())),
+        ("maximumExecutionPrice", money()),
+        ("maximumSlippage", percentage_text()),
+        ("fees", money()),
+        ("acceptedAt", timestamp()),
+        ("expiresAt", timestamp()),
+        ("targetLinked", boolean()),
+        ("cancellationAvailable", boolean()),
     ])
 }
 
 fn paper_fill() -> Value {
     closed_complete(vec![
-        ("orderToken", uuid()),
-        ("eventAt", integer()),
-        ("quantityLots", unsigned()),
-        ("averagePriceTicks", integer()),
-        ("maximumPriceTicks", integer()),
+        ("investment", product_investment()),
+        ("quantity", bounded_text(128)),
+        ("averagePrice", money()),
+        ("maximumPrice", money()),
         ("notional", money()),
         ("fee", money()),
-        ("liquidity", text()),
+        ("occurredAt", timestamp()),
+    ])
+}
+
+fn paper_cancel_result() -> Value {
+    closed_complete(vec![
+        ("actionToken", opaque_product_token()),
+        (
+            "state",
+            enumeration(&["pending", "cancelled", "already_complete"]),
+        ),
+        ("observedAt", timestamp()),
+        ("filledQuantity", bounded_text(128)),
+        ("averageFillPrice", nullable(money())),
+        ("fees", money()),
     ])
 }
 
@@ -9651,6 +9280,24 @@ fn fixed_array(items: Value, length: usize) -> Value {
 
 fn text() -> Value {
     json!({"type": "string"})
+}
+
+fn percentage_text() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 2,
+        "maxLength": 64,
+        "pattern": r"^-?[0-9]+(?:\.[0-9]+)?%$"
+    })
+}
+
+fn opaque_product_token() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 16,
+        "maxLength": 512,
+        "pattern": "^[a-z][a-z0-9_]{15,511}$"
+    })
 }
 
 fn bounded_text(maximum: usize) -> Value {

@@ -87,7 +87,6 @@ const observationSchema = z
 
 export const macroContextSchema = z
   .object({
-    schemaIdentity: z.literal("market-squawk-macro-context/v1"),
     availability: z.enum(["available", "partial", "unavailable"]),
     selection: z
       .object({

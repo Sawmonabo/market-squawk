@@ -36,7 +36,6 @@ pub(crate) async fn dashboard_query(
     let generation = state.generation()?;
     let mut projection = DashboardProjection::None;
     let (operation, arguments) = match request {
-        DashboardQueryCommand::Overview => ("Analysis.GetDecisionOverview", Map::new()),
         DashboardQueryCommand::MacroContext {
             knowledge_cutoff,
             effective_date_cutoff,
@@ -57,14 +56,26 @@ pub(crate) async fn dashboard_query(
             insert_optional(&mut arguments, "categories", categories);
             ("Analysis.Lookup", arguments)
         }
-        DashboardQueryCommand::MarketOverview => ("Market.GetOverview", Map::new()),
-        DashboardQueryCommand::MarketUniverse { text } => {
+        DashboardQueryCommand::MarketOverview { page_token } => {
             let mut arguments = Map::new();
-            insert_optional(&mut arguments, "query", text);
+            insert_optional(&mut arguments, "pageToken", page_token);
+            ("Market.GetOverview", arguments)
+        }
+        DashboardQueryCommand::MarketUniverse { text, page_token } => {
+            let mut arguments = Map::new();
+            arguments.insert("query".to_owned(), json!(text));
+            insert_optional(&mut arguments, "pageToken", page_token);
             ("Market.SearchUniverse", arguments)
         }
-        DashboardQueryCommand::MarketInstrument { instrument_id } => {
-            ("Market.GetInstrument", instrument_arguments(instrument_id))
+        DashboardQueryCommand::MarketInstrument { selection_token } => {
+            let mut arguments = Map::new();
+            arguments.insert("selectionToken".to_owned(), json!(selection_token));
+            ("Market.GetInstrument", arguments)
+        }
+        DashboardQueryCommand::MarketHistory { history_token } => {
+            let mut arguments = Map::new();
+            arguments.insert("historyToken".to_owned(), json!(history_token));
+            ("Market.GetHistory", arguments)
         }
         DashboardQueryCommand::SourceStatus { source_ids } => {
             ("Source.GetStatus", source_arguments(source_ids))
@@ -123,9 +134,11 @@ pub(crate) async fn dashboard_query(
             "Source.ListObjects",
             source_discovery_arguments(provider, dataset),
         ),
-        DashboardQueryCommand::PortfolioAccounts { after_account_id } => {
+        DashboardQueryCommand::PortfolioAccounts {
+            after_account_token,
+        } => {
             let mut arguments = Map::new();
-            insert_optional(&mut arguments, "afterAccountId", after_account_id);
+            insert_optional(&mut arguments, "afterAccountToken", after_account_token);
             ("Portfolio.ListAccounts", arguments)
         }
         DashboardQueryCommand::PortfolioHoldings { account_id } => {
@@ -140,8 +153,10 @@ pub(crate) async fn dashboard_query(
         DashboardQueryCommand::PortfolioExposure { account_id } => {
             ("Portfolio.GetExposure", account_arguments(account_id))
         }
-        DashboardQueryCommand::PortfolioRisk { account_id } => {
-            ("Portfolio.GetRisk", account_arguments(account_id))
+        DashboardQueryCommand::PortfolioRisk { account_token } => {
+            let mut arguments = Map::new();
+            arguments.insert("accountToken".to_owned(), json!(account_token));
+            ("Portfolio.GetRisk", arguments)
         }
         DashboardQueryCommand::PortfolioRevisions {
             account_id,
@@ -207,14 +222,6 @@ pub(crate) async fn dashboard_query(
             arguments.insert("asOf".to_owned(), json!(as_of));
             ("Model.SelectLatestValidForecast", arguments)
         }
-        DashboardQueryCommand::ModelMetadata { model_id } => {
-            ("Model.GetMetadata", model_arguments(model_id))
-        }
-        DashboardQueryCommand::ModelPrediction { model_id, input } => {
-            let mut arguments = model_arguments(model_id);
-            arguments.insert("input".to_owned(), Value::Object(input));
-            ("Model.Predict", arguments)
-        }
         DashboardQueryCommand::Forecast { forecast_token } => {
             ("Model.GetForecast", forecast_arguments(forecast_token))
         }
@@ -265,45 +272,23 @@ pub(crate) async fn dashboard_query(
             arguments.insert("candidateId".to_owned(), json!(candidate_id));
             ("Decision.GetDossierPreparation", arguments)
         }
-        DashboardQueryCommand::DecisionInvestmentAnalysis { analysis_id } => {
+        DashboardQueryCommand::DecisionInvestmentAnalysis { action_token } => {
             let mut arguments = Map::new();
-            arguments.insert("analysisId".to_owned(), json!(analysis_id));
+            arguments.insert("actionToken".to_owned(), json!(action_token));
             ("Decision.GetInvestmentAnalysis", arguments)
         }
         DashboardQueryCommand::DecisionInvestmentAnalyses {
-            after_analysis_id,
+            after_action_token,
             limit,
         } => {
             let mut arguments = Map::new();
-            insert_optional(&mut arguments, "afterAnalysisId", after_analysis_id);
+            insert_optional(&mut arguments, "afterActionToken", after_action_token);
             arguments.insert("limit".to_owned(), json!(limit));
             ("Decision.ListInvestmentAnalyses", arguments)
         }
-        DashboardQueryCommand::DecisionRecommendationTrackRecord {
-            profile_id,
-            profile_revision,
-            profile_digest,
-            horizon_nanos,
-            evaluated_at_unix_nanos,
-        } => {
+        DashboardQueryCommand::DecisionRecommendationTrackRecord { action_token } => {
             let mut arguments = Map::new();
-            arguments.insert("profileId".to_owned(), json!(profile_id));
-            arguments.insert("profileRevision".to_owned(), json!(profile_revision));
-            arguments.insert("profileDigest".to_owned(), json!(profile_digest));
-            arguments.insert(
-                "horizonNanos".to_owned(),
-                json!(parse_positive_i64(
-                    horizon_nanos,
-                    "The recommendation horizon must be a positive canonical signed decimal.",
-                )?),
-            );
-            arguments.insert(
-                "evaluatedAtUnixNanos".to_owned(),
-                json!(parse_canonical_i64(
-                    evaluated_at_unix_nanos,
-                    "The recommendation evaluation time must be canonical signed Unix nanoseconds.",
-                )?),
-            );
+            arguments.insert("actionToken".to_owned(), json!(action_token));
             ("Decision.GetRecommendationTrackRecord", arguments)
         }
         DashboardQueryCommand::DecisionTargetPreparation { dossier_id } => {
@@ -735,9 +720,9 @@ fn project_feature_dataset_preview(
         .filter(|value| value.is_string() || value.is_number())
         .cloned()
         .ok_or_else(DesktopCommandError::internal)?;
-    let receipt_token = generation.register_research_preparation_receipt(receipt)?;
+    let confirmation_token = generation.register_research_preparation_receipt(receipt)?;
     let projected = json!({
-        "receiptToken": receipt_token,
+        "confirmationToken": confirmation_token,
         "intendedUse": required_string_value(data, "intendedUse")?,
         "examples": required_safe_web_count(data, "examples")?,
         "trainExamples": required_safe_web_count(data, "trainExamples")?,
@@ -1036,8 +1021,6 @@ fn project_product_metadata(result: &mut Value) -> Result<(), DesktopCommandErro
         ("completeness".to_owned(), json!(completeness)),
         ("returnedItems".to_owned(), json!(returned_items)),
         ("availableItems".to_owned(), json!(available_items)),
-        ("sourceCoverage".to_owned(), Value::Null),
-        ("dataQuality".to_owned(), json!({ "state": "available" })),
     ]);
     Ok(())
 }
@@ -1495,12 +1478,38 @@ pub(crate) async fn paper_control(
 ) -> Result<Value, DesktopCommandError> {
     let generation = state.generation()?;
     let (operation, arguments, authority) = match request {
+        PaperControlCommand::StartPreparation => (
+            "Bot.GetStartPreparation",
+            Map::new(),
+            InvocationAuthority::ReadOnly,
+        ),
+        PaperControlCommand::PrepareStart {
+            cash_choice,
+            cost_choice,
+            mode_choice,
+        } => {
+            let mut arguments = Map::new();
+            arguments.insert("cashChoice".to_owned(), json!(cash_choice));
+            arguments.insert("costChoice".to_owned(), json!(cost_choice));
+            arguments.insert("modeChoice".to_owned(), json!(mode_choice));
+            ("Bot.PrepareStart", arguments, InvocationAuthority::ReadOnly)
+        }
+        PaperControlCommand::Start { confirmation_token } => {
+            require_confirmation(confirmed)?;
+            let mut arguments = Map::new();
+            arguments.insert("confirmationToken".to_owned(), json!(confirmation_token));
+            (
+                "Bot.Start",
+                arguments,
+                InvocationAuthority::ExactConfirmed("Bot.Start"),
+            )
+        }
         PaperControlCommand::Targets => (
             "Execution.GetManualPaperTargets",
             Map::new(),
             InvocationAuthority::ReadOnly,
         ),
-        PaperControlCommand::Submit {
+        PaperControlCommand::PrepareManual {
             target_token,
             side,
             order_type,
@@ -1509,7 +1518,6 @@ pub(crate) async fn paper_control(
             stop_target_level,
             time_in_force,
         } => {
-            require_confirmation(confirmed)?;
             let mut arguments = Map::new();
             arguments.insert("targetToken".to_owned(), json!(target_token));
             arguments.insert("side".to_owned(), json!(side));
@@ -1519,25 +1527,19 @@ pub(crate) async fn paper_control(
             insert_optional(&mut arguments, "stopTargetLevel", stop_target_level);
             arguments.insert("timeInForce".to_owned(), json!(time_in_force));
             (
+                "Execution.PrepareManualPaperDraft",
+                arguments,
+                InvocationAuthority::ReadOnly,
+            )
+        }
+        PaperControlCommand::SubmitManual { confirmation_token } => {
+            require_confirmation(confirmed)?;
+            let mut arguments = Map::new();
+            arguments.insert("confirmationToken".to_owned(), json!(confirmation_token));
+            (
                 "Execution.SubmitManualPaperDraft",
                 arguments,
                 InvocationAuthority::RiskMediated("Execution.SubmitManualPaperDraft"),
-            )
-        }
-        PaperControlCommand::Start {
-            strategy_mode,
-            initial_cash,
-            fee_basis_points,
-        } => {
-            require_confirmation(confirmed)?;
-            let mut arguments = Map::new();
-            arguments.insert("strategyMode".to_owned(), json!(strategy_mode));
-            arguments.insert("initialCash".to_owned(), json!(initial_cash));
-            arguments.insert("feeBasisPoints".to_owned(), json!(fee_basis_points));
-            (
-                "Bot.Start",
-                arguments,
-                InvocationAuthority::ExactConfirmed("Bot.Start"),
             )
         }
         PaperControlCommand::Stop { reason } => {
@@ -1548,22 +1550,14 @@ pub(crate) async fn paper_control(
                 InvocationAuthority::ExactConfirmed("Bot.Stop"),
             )
         }
-        PaperControlCommand::Cancel { order_token } => {
+        PaperControlCommand::Cancel { action_token } => {
             require_confirmation(confirmed)?;
             let mut arguments = Map::new();
-            arguments.insert("orderToken".to_owned(), json!(order_token));
+            arguments.insert("actionToken".to_owned(), json!(action_token));
             (
                 "Execution.Cancel",
                 arguments,
                 InvocationAuthority::RiskMediated("Execution.Cancel"),
-            )
-        }
-        PaperControlCommand::Reconcile => {
-            require_confirmation(confirmed)?;
-            (
-                "Execution.Reconcile",
-                Map::new(),
-                InvocationAuthority::RiskMediated("Execution.Reconcile"),
             )
         }
         PaperControlCommand::TriggerKillSwitch { reason } => {
@@ -1630,9 +1624,9 @@ pub(crate) async fn analysis_control(
             project_feature_dataset_preview(&mut result, &generation)?;
             return Ok(result);
         }
-        AnalysisControlCommand::StartPreparedFeatureDataset { receipt } => {
+        AnalysisControlCommand::StartPreparedFeatureDataset { confirmation_token } => {
             require_confirmation(confirmed)?;
-            let authority = generation.consume_research_preparation_receipt(receipt)?;
+            let authority = generation.consume_research_preparation_receipt(confirmation_token)?;
             let mut arguments = Map::new();
             arguments.insert("receipt".to_owned(), authority);
             let mut result = invoke_narrow(
@@ -1658,9 +1652,9 @@ pub(crate) async fn analysis_control(
             arguments.insert("selection".to_owned(), Value::Object(selection));
             ("Analysis.PreviewBacktest", arguments, false)
         }
-        AnalysisControlCommand::StartPreparedBacktest { receipt } => {
+        AnalysisControlCommand::StartPreparedBacktest { confirmation_token } => {
             let mut arguments = Map::new();
-            arguments.insert("receipt".to_owned(), Value::Object(receipt));
+            arguments.insert("confirmationToken".to_owned(), json!(confirmation_token));
             ("Analysis.StartPreparedBacktest", arguments, true)
         }
         AnalysisControlCommand::FeatureDatasetOptions
@@ -1703,11 +1697,6 @@ pub(crate) async fn model_control(
 ) -> Result<Value, DesktopCommandError> {
     let generation = state.generation()?;
     let (operation, arguments, mutation) = match request {
-        ModelControlCommand::Evaluate { model_id, input } => {
-            let mut arguments = model_arguments(model_id);
-            arguments.insert("input".to_owned(), Value::Object(input));
-            ("Model.Evaluate", arguments, true)
-        }
         ModelControlCommand::StartTraining {
             config_ticket_id,
             authority_ticket_id,
@@ -1725,9 +1714,9 @@ pub(crate) async fn model_control(
             arguments.insert("selection".to_owned(), Value::Object(selection));
             ("Model.PrepareForecast", arguments, false)
         }
-        ModelControlCommand::StartPreparedForecast { receipt } => {
+        ModelControlCommand::StartPreparedForecast { confirmation_token } => {
             let mut arguments = Map::new();
-            arguments.insert("receipt".to_owned(), Value::Object(receipt));
+            arguments.insert("confirmationToken".to_owned(), json!(confirmation_token));
             ("Model.StartPreparedForecast", arguments, true)
         }
     };
@@ -2107,22 +2096,6 @@ fn operation_log_arguments(
 fn parse_unix_nanos(value: String) -> Result<i64, DesktopCommandError> {
     value.parse::<i64>().map_err(|_error| {
         DesktopCommandError::invalid_request("Log time filters must be signed Unix nanoseconds.")
-    })
-}
-
-fn parse_canonical_i64(value: String, message: &'static str) -> Result<i64, DesktopCommandError> {
-    value
-        .parse::<i64>()
-        .ok()
-        .filter(|parsed| parsed.to_string() == value)
-        .ok_or_else(|| DesktopCommandError::invalid_request(message))
-}
-
-fn parse_positive_i64(value: String, message: &'static str) -> Result<i64, DesktopCommandError> {
-    parse_canonical_i64(value, message).and_then(|parsed| {
-        (parsed > 0)
-            .then_some(parsed)
-            .ok_or_else(|| DesktopCommandError::invalid_request(message))
     })
 }
 

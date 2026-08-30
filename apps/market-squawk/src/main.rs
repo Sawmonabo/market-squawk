@@ -144,6 +144,7 @@ async fn run() -> Result<()> {
         | Command::Query { .. }
         | Command::Feature { .. }
         | Command::Model { .. }
+        | Command::Forecast { .. }
         | Command::Portfolio { .. }
         | Command::Backtest { .. }
         | Command::Bot { .. }

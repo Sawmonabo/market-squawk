@@ -1022,7 +1022,7 @@ impl InstalledGovernanceOperations {
                     }
                 }
                 .map_err(map_governance_service_error)?;
-                (json!({"preview": preview}), 1)
+                (json!({"preview": fair_value_preview_value(&preview)}), 1)
             }
             COMMIT_FAIR_VALUE_ACTION => {
                 let input: CommitInput = decode(arguments)?;
@@ -1031,7 +1031,7 @@ impl InstalledGovernanceOperations {
                     .commit_fair_value_action(request, now, observed_at)
                     .await
                     .map_err(map_governance_service_error)?;
-                (json!({"receipt": receipt.authorization()}), 1)
+                (fair_value_commit_value(&receipt), 1)
             }
             _ => return Err(ServiceError::NotFound),
         };
@@ -1108,8 +1108,35 @@ fn finish_result(
         ToolResultMetadata::complete_not_applicable(),
         context.limits(),
     )
-    .map(TypedToolResult::into_envelope)
+    .map(|result| {
+        result.into_envelope(market_squawk_services::ResultEnvelopeProjection::NativeEvidenceV1)
+    })
     .map_err(Into::into)
+}
+
+/// Projects a retained native fair-value action into the bounded ordinary review contract.
+///
+/// The canonical action digest remains solely in the governance authority. The opaque preview
+/// identifier is sufficient for native authentication and commit resolution.
+fn fair_value_preview_value(preview: &GovernanceActionPreview) -> Value {
+    json!({
+        "previewId": preview.preview_id(),
+        "requiredRoles": preview.required_roles(),
+        "distinctPrincipalCount": preview.distinct_principal_count(),
+        "eligiblePrincipalIds": preview.eligible_principal_ids(),
+        "expiresAt": preview.expires_at(),
+        "effects": preview.effects(),
+    })
+}
+
+/// Projects the durable fair-value mutation result without exposing either native receipt.
+fn fair_value_commit_value(receipt: &GovernedActionCommitReceipt) -> Value {
+    json!({
+        "confirmationToken": receipt.domain().domain_receipt_id(),
+        "previewId": receipt.authorization().preview_id(),
+        "committedAt": receipt.domain().committed_at(),
+        "effects": receipt.authorization().effects(),
+    })
 }
 
 impl fmt::Debug for InstalledGovernanceOperations {

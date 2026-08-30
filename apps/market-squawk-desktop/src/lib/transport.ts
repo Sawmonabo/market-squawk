@@ -7,18 +7,19 @@ import type {
   DesktopBootstrap,
   DesktopEvent,
   DesktopEventSubscriptionReceipt,
-  DesktopStartup,
+  DesktopSystemStartup,
   EncryptedFileFallback,
   InstallationControlResult,
   InputTicket,
   McpClientsStatus,
+  NativeEvidenceApplicationResult,
   ProviderActivation,
   ProviderBootstrap,
   ProviderSession,
 } from "@/lib/schemas"
 
 export type DesktopEventSubscriptionRequest = {
-  runtime: DesktopBootstrap["runtime"]
+  productSessionToken: DesktopBootstrap["productSessionToken"]
   afterSequence: DesktopEvent["sequence"]
 }
 
@@ -56,8 +57,7 @@ export const productLookupActions = {
 
 export const PRODUCT_LOOKUP_QUERY_MAXIMUM_CHARACTERS = 64
 
-export type DashboardQuery =
-  | { query: "overview" }
+export type ProductQuery =
   | {
       query: "macroContext"
       knowledgeCutoff?: string
@@ -68,15 +68,15 @@ export type DashboardQuery =
       text: string
       categories?: ProductLookupCategory[]
     }
-  | { query: "marketOverview" }
-  | { query: "marketUniverse"; text?: string }
+  | { query: "marketOverview"; pageToken?: string }
+  | { query: "marketUniverse"; text: string; pageToken?: string }
   | {
       query: "marketInstrument"
-      instrumentId: string
+      selectionToken: string
     }
   | {
-      query: "sourceStatus" | "sourceCoverage" | "sourceHealth"
-      sourceIds?: string[]
+      query: "marketHistory"
+      historyToken: string
     }
   | { query: "researchCollections"; afterCollection?: string }
   | {
@@ -86,27 +86,16 @@ export type DashboardQuery =
         | "researchCollectionAlternativeData"
       collection: string
     }
-  | { query: "researchActivities" }
-  | { query: "researchDatasets"; afterDataset?: string }
-  | {
-      query: "researchManifest" | "researchHistory" | "researchAlternativeData"
-      dataset: string
-    }
-  | {
-      query: "researchSourceObjects"
-      provider: string
-      dataset: string
-    }
-  | { query: "portfolioAccounts"; afterAccountId?: string }
+  | { query: "portfolioAccounts"; afterAccountToken?: string }
   | {
       query:
         | "portfolioHoldings"
         | "portfolioTransactions"
         | "portfolioPerformance"
         | "portfolioExposure"
-        | "portfolioRisk"
       accountId: string
     }
+  | { query: "portfolioRisk"; accountToken: string }
   | {
       query: "portfolioRevisions"
       accountId: string
@@ -116,6 +105,48 @@ export type DashboardQuery =
       query: "portfolioAttribution"
       accountId: string
       baselineSnapshotToken: string
+    }
+  | {
+      query: "portfolioCandidateImpact"
+      instrumentId: string
+      proposedQuantity: string
+      scenarioShock: string
+    }
+  | {
+      query:
+        | "forecasts"
+        | "paperStatus"
+        | "paperOrders"
+        | "paperFills"
+    }
+  | { query: "forecast" | "forecastOutcomes"; forecastToken: string }
+  | { query: "decisionScreens"; limit: number }
+  | { query: "decisionScreen"; screenId: string }
+  | { query: "decisionInvestmentAnalysis"; actionToken: string }
+  | {
+      query: "decisionInvestmentAnalyses"
+      afterActionToken?: string
+      limit: number
+    }
+  | {
+      query: "decisionRecommendationTrackRecord"
+      actionToken: string
+    }
+
+export type SystemQuery =
+  | {
+      query: "sourceStatus" | "sourceCoverage" | "sourceHealth"
+      sourceIds?: string[]
+    }
+  | { query: "researchDatasets"; afterDataset?: string }
+  | {
+      query: "researchManifest" | "researchHistory" | "researchAlternativeData"
+      dataset: string
+    }
+  | {
+      query: "researchSourceObjects"
+      provider: string
+      dataset: string
     }
   | {
       query: "portfolioScenario"
@@ -132,34 +163,12 @@ export type DashboardQuery =
       accountId: string
       proposal: Record<string, unknown>
     }
-  | {
-      query: "portfolioCandidateImpact"
-      instrumentId: string
-      proposedQuantity: string
-      scenarioShock: string
-    }
-  | {
-      query:
-        | "forecasts"
-        | "paperStatus"
-        | "paperOrders"
-        | "paperFills"
-    }
   | { query: "fairValueWorkspace"; measurementToken?: string; at: string }
-  | { query: "modelMetadata"; modelId: string }
   | {
       query: "latestValidForecast"
       instrumentId: string
       asOf: string
     }
-  | {
-      query: "modelPrediction"
-      modelId: string
-      input: Record<string, unknown>
-    }
-  | { query: "forecast" | "forecastOutcomes"; forecastToken: string }
-  | { query: "decisionScreens"; limit: number }
-  | { query: "decisionScreen"; screenId: string }
   | { query: "analysisFeatureDatasets"; dataset?: string; afterDataset?: string }
   | {
       query: "decisionScreenRuns"
@@ -175,20 +184,6 @@ export type DashboardQuery =
     }
   | { query: "decisionDossier"; dossierId: string }
   | { query: "decisionDossierPreparation"; candidateId: string }
-  | { query: "decisionInvestmentAnalysis"; analysisId: string }
-  | {
-      query: "decisionInvestmentAnalyses"
-      afterAnalysisId?: string
-      limit: number
-    }
-  | {
-      query: "decisionRecommendationTrackRecord"
-      profileId: string
-      profileRevision: number
-      profileDigest: string
-      horizonNanos: string
-      evaluatedAtUnixNanos: string
-    }
   | { query: "decisionTargetPreparation"; dossierId: string }
   | {
       query: "decisionTarget" | "decisionTargetStatus"
@@ -291,54 +286,23 @@ export type BacktestProductRequest =
   | { action: "get"; backtestToken: string }
 
 export interface ProductTransport {
-  bootstrap(): Promise<DesktopStartup>
-  bootstrapService(request: DesktopServiceBootstrapRequest): Promise<void>
-  reconnectService(
-    expectedRuntime: DesktopBootstrap["runtime"],
-  ): Promise<DesktopStartup>
-  installation(
-    request: InstallationControlRequest,
-    confirmed?: boolean,
-  ): Promise<InstallationControlResult>
-  query(request: DashboardQuery): Promise<ApplicationResult>
+  query(request: ProductQuery): Promise<ApplicationResult>
   modelProducts(request: ModelProductRequest): Promise<ApplicationResult>
   backtestProducts(request: BacktestProductRequest): Promise<ApplicationResult>
-  analyticalController(
-    request: AnalyticalControllerRequest,
-    confirmed?: boolean,
-  ): Promise<AnalyticalControllerResponse>
-  researchControl(
-    request: ResearchControlRequest,
-    confirmed?: boolean,
-  ): Promise<ApplicationResult>
   datasetPreparation(
-    request: unknown,
+    request: DatasetPreparationRequest,
     confirmed?: boolean,
   ): Promise<ApplicationResult>
   backtestPreparation(
-    request: unknown,
-    confirmed?: boolean,
-  ): Promise<ApplicationResult>
-  startBacktestFromFile(confirmed?: boolean): Promise<ApplicationResult | null>
-  modelControl(
-    request: ModelControlRequest,
+    request: BacktestPreparationRequest,
     confirmed?: boolean,
   ): Promise<ApplicationResult>
   forecastPreparation(
-    request: unknown,
+    request: ForecastPreparationRequest,
     confirmed?: boolean,
   ): Promise<ApplicationResult>
-  decisionControl(
-    request: DecisionControlRequest,
-    confirmed?: boolean,
-  ): Promise<ApplicationResult>
-  governanceQuery(request: GovernanceQueryRequest): Promise<ApplicationResult>
-  governanceControl(
-    request: GovernanceControlRequest,
-    confirmed?: boolean,
-  ): Promise<ApplicationResult>
-  fairValueControl(
-    request: FairValueControlRequest,
+  researchExport(
+    collectionToken: string,
     confirmed?: boolean,
   ): Promise<ApplicationResult>
   paperControl(
@@ -349,17 +313,95 @@ export interface ProductTransport {
     request: ManualPaperRequest,
     confirmed?: boolean,
   ): Promise<ApplicationResult>
-  jobControl(request: JobControlRequest, confirmed?: boolean): Promise<ApplicationResult>
+}
+
+export type DatasetPreparationRequest =
+  | { action: "options" }
+  | {
+      action: "preview"
+      choice: string
+      intendedUse: "local_analysis" | "train"
+    }
+  | { action: "start"; confirmationToken: string }
+
+export type BacktestPreparationRequest =
+  | { action: "options" }
+  | {
+      action: "preview"
+      selection: {
+        historyToken: string
+        periodToken: string
+        methodToken: string
+        costToken: string
+        portfolioToken: string
+        comparisonToken: string
+      }
+    }
+  | { action: "start"; confirmationToken: string }
+
+export type ForecastPreparationRequest =
+  | { action: "options" }
+  | {
+      action: "preview"
+      selection: {
+        modelToken: string
+        historyToken: string
+        investmentToken: string
+        horizonToken: string
+      }
+    }
+  | { action: "start"; confirmationToken: string }
+
+export interface SystemTransport {
+  bootstrap(): Promise<DesktopSystemStartup>
+  bootstrapService(request: DesktopServiceBootstrapRequest): Promise<void>
+  installation(
+    request: InstallationControlRequest,
+    confirmed?: boolean,
+  ): Promise<InstallationControlResult>
+  systemQuery(request: SystemQuery): Promise<NativeEvidenceApplicationResult>
+  analyticalController(
+    request: AnalyticalControllerRequest,
+    confirmed?: boolean,
+  ): Promise<AnalyticalControllerResponse>
+  researchControl(
+    request: ResearchControlRequest,
+    confirmed?: boolean,
+  ): Promise<NativeEvidenceApplicationResult>
+  startBacktestFromFile(confirmed?: boolean): Promise<ApplicationResult | null>
+  modelControl(
+    request: ModelControlRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+  decisionControl(
+    request: DecisionControlRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+  governanceQuery(
+    request: GovernanceQueryRequest,
+  ): Promise<NativeEvidenceApplicationResult>
+  governanceControl(
+    request: GovernanceControlRequest,
+    confirmed?: boolean,
+  ): Promise<NativeEvidenceApplicationResult>
+  fairValueControl(
+    request: FairValueControlRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+  jobControl(
+    request: JobControlRequest,
+    confirmed?: boolean,
+  ): Promise<NativeEvidenceApplicationResult>
   sourceControl(
     action: SourceLifecycleAction,
     request: SourceLifecycleRequest,
     confirmed?: boolean,
-  ): Promise<ApplicationResult>
+  ): Promise<NativeEvidenceApplicationResult>
   importProviderCredentialBundle(): Promise<unknown | null>
   operationsControl(
     request: OperationsControlRequest,
     confirmed?: boolean,
-  ): Promise<ApplicationResult>
+  ): Promise<NativeEvidenceApplicationResult>
   stageTrainingInput(kind: TrainingInputKind): Promise<InputTicket | null>
   mcpClients(): Promise<McpClientsStatus>
   mcpClientControl(
@@ -376,6 +418,11 @@ export interface ProductTransport {
   ): Promise<ProviderOnboardingResult<Request>>
   openOfficialProviderPage(providerId: string): Promise<void>
   openProtectedProviderSetup(providerId: string): Promise<void>
+}
+
+export interface DesktopTransport {
+  product: ProductTransport
+  system: SystemTransport
 }
 
 export type OperationLogSeverity = "trace" | "debug" | "info" | "warn" | "error"
@@ -459,20 +506,12 @@ export type ResearchControlRequest =
       dataset: string
       discoveryReceipt: string
     }
-  | { action: "startCollectionExport"; collection: string }
-  | { action: "cancelActivity" | "retryActivity"; activity: string }
 
-export type ModelControlRequest =
-  | {
-      action: "evaluate"
-      modelId: string
-      input: Record<string, unknown>
-    }
-  | {
-      action: "startTraining"
-      configTicketId: string
-      authorityTicketId: string
-    }
+export type ModelControlRequest = {
+  action: "startTraining"
+  configTicketId: string
+  authorityTicketId: string
+}
 
 export type GovernanceQueryRequest =
   | { query: "provisioningStatus" }
@@ -585,15 +624,16 @@ export type FairValueControlRequest =
     }
 
 export type PaperControlRequest =
+  | { action: "startPreparation" }
   | {
-      action: "start"
-      strategyMode: "manual" | "book_imbalance"
-      initialCash: string
-      feeBasisPoints: number
+      action: "prepareStart"
+      cashChoice: string
+      costChoice: string
+      modeChoice: string
     }
+  | { action: "start"; confirmationToken: string }
   | { action: "stop" | "triggerKillSwitch"; reason: string }
-  | { action: "cancel"; orderToken: string }
-  | { action: "reconcile" }
+  | { action: "cancel"; actionToken: string }
 
 export type ManualPaperTargetLevel =
   | "downside"
@@ -610,7 +650,7 @@ export type ManualPaperTargetLevel =
 export type ManualPaperRequest =
   | { action: "targets" }
   | {
-      action: "submit"
+      action: "prepareManual"
       targetToken: string
       side: "buy" | "sell"
       orderType: "market" | "limit" | "stop" | "stop_limit"
@@ -623,6 +663,7 @@ export type ManualPaperRequest =
         | "immediate_or_cancel"
         | "fill_or_kill"
     }
+  | { action: "submitManual"; confirmationToken: string }
 
 export type JobControlRequest =
   | { action: "list"; afterJobId?: string; limit: number }

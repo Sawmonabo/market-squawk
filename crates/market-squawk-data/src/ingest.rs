@@ -1921,6 +1921,14 @@ impl AnalyticalDataService {
         crate::OfficialOptionsReferenceReadCapability::new(Arc::clone(&self.authority), dataset)
     }
 
+    /// Returns provider- and dataset-neutral reads over the uniquely eligible current
+    /// OCC/Cboe reference generation.
+    pub fn official_options_reference_catalog_reader(
+        &self,
+    ) -> crate::OfficialOptionsReferenceCatalogReadCapability {
+        crate::OfficialOptionsReferenceCatalogReadCapability::new(Arc::clone(&self.authority))
+    }
+
     /// Executes one exact pinned query, reserving durable artifact authority only after the first
     /// bounded execution proves that the result crossed the inline threshold.
     ///

@@ -9,18 +9,24 @@ use market_squawk_services::ServiceError;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::provider_activation::PreparedMarketProviderConfiguration;
+use crate::provider_activation::{
+    PreparedMarketProviderConfiguration, PreparedSchwabMarketRuntimeStart,
+};
 
 /// Alpaca Basic account lifecycle surface.
 pub(crate) const ALPACA_BASIC_SURFACE_ID: &str = "alpaca.basic-market-data";
 /// Authenticated Kraken order-level lifecycle surface.
 pub(crate) const KRAKEN_LEVEL3_SURFACE_ID: &str = "kraken.spot-authenticated-level3-market-data";
+/// Owner-enabled Schwab read-only market-data lifecycle surface.
+pub(crate) const SCHWAB_MARKET_DATA_SURFACE_ID: &str =
+    market_squawk_sources::SCHWAB_MARKET_DATA_SURFACE_ID;
 
 /// Closed V1 account-backed market surface set.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum AccountMarketSurface {
     AlpacaBasic,
     KrakenLevel3,
+    SchwabMarketData,
 }
 
 impl AccountMarketSurface {
@@ -28,6 +34,7 @@ impl AccountMarketSurface {
         match self {
             Self::AlpacaBasic => ALPACA_BASIC_SURFACE_ID,
             Self::KrakenLevel3 => KRAKEN_LEVEL3_SURFACE_ID,
+            Self::SchwabMarketData => SCHWAB_MARKET_DATA_SURFACE_ID,
         }
     }
 
@@ -35,6 +42,7 @@ impl AccountMarketSurface {
         match surface_id {
             ALPACA_BASIC_SURFACE_ID => Some(Self::AlpacaBasic),
             KRAKEN_LEVEL3_SURFACE_ID => Some(Self::KrakenLevel3),
+            SCHWAB_MARKET_DATA_SURFACE_ID => Some(Self::SchwabMarketData),
             _ => None,
         }
     }
@@ -121,6 +129,22 @@ pub(crate) trait PreparedMarketProviderConfigurationResolver: Send + Sync + 'sta
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError>;
 }
 
+/// Installed authority that resolves the one-use Schwab start package without exposing OAuth
+/// tokens or forcing it through the cloneable generic provider-configuration path.
+#[async_trait]
+pub(crate) trait PreparedSchwabMarketRuntimeResolver: Send + Sync + 'static {
+    async fn resolve(
+        &self,
+        request: PreparedMarketProviderConfigurationRequest,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<PreparedSchwabMarketRuntimeStart, ServiceError>;
+
+    fn begin_shutdown(&self);
+
+    async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError>;
+}
+
 /// Revalidates a resolver result before any credential activation or child startup begins.
 pub(super) fn validate_resolved_configuration(
     request: PreparedMarketProviderConfigurationRequest,
@@ -140,6 +164,29 @@ pub(super) fn validate_resolved_configuration(
         || lease.public_configuration_digest() != request.expected_public_configuration_digest()
         || lease.runtime_evidence_digest() != request.expected_runtime_verification_receipt_digest()
         || lease.generation() != Some(request.expected_credential_generation())
+    {
+        return Err(ServiceError::InvalidRequest);
+    }
+    Ok(())
+}
+
+/// Revalidates the exact one-use Schwab package before the registry mints current-session
+/// authority or starts any child.
+pub(super) fn validate_resolved_schwab_configuration(
+    request: PreparedMarketProviderConfigurationRequest,
+    prepared: &PreparedSchwabMarketRuntimeStart,
+) -> Result<(), ServiceError> {
+    let lease = prepared.activation_lease();
+    let generation = prepared.generation();
+    if request.surface() != AccountMarketSurface::SchwabMarketData
+        || lease.surface_id().as_str() != request.surface().surface_id()
+        || lease.session_id() != request.onboarding_session_id()
+        || lease.public_configuration_digest() != request.expected_public_configuration_digest()
+        || lease.runtime_evidence_digest() != request.expected_runtime_verification_receipt_digest()
+        || lease.generation() != Some(request.expected_credential_generation())
+        || generation.session_id() != request.onboarding_session_id()
+        || generation.credential_generation() != Some(request.expected_credential_generation())
+        || generation.profile().as_str() != request.surface().surface_id()
     {
         return Err(ServiceError::InvalidRequest);
     }

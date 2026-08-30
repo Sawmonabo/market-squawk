@@ -25,7 +25,7 @@ const datasetPreparationOptionsSchema = z
 
 const datasetPreparationPreviewSchema = z
   .object({
-    receiptToken: z.string().uuid(),
+    confirmationToken: z.string().uuid(),
     intendedUse: preparationUseSchema,
     examples: z.number().int().min(3).max(2_048),
     trainExamples: z.number().int().positive().max(2_048),
@@ -48,12 +48,6 @@ const datasetPreparationPreviewSchema = z
         message: "The prepared dataset split does not match its example count.",
       })
     }
-    if (BigInt(preview.observedFrom) > BigInt(preview.observedThrough)) {
-      context.addIssue({
-        code: "custom",
-        message: "The prepared dataset time range is not ordered.",
-      })
-    }
   })
 
 export type DatasetPreparationUse = z.infer<typeof preparationUseSchema>
@@ -61,10 +55,11 @@ export type DatasetPreparationOptions = z.infer<
   typeof datasetPreparationOptionsSchema
 >
 export type DatasetPreparationOption = DatasetPreparationOptions["choices"][number]
-export type DatasetPreparationReceipt = string
 export type DatasetPreparationPreview = z.infer<
   typeof datasetPreparationPreviewSchema
 >
+export type DatasetPreparationConfirmation =
+  DatasetPreparationPreview["confirmationToken"]
 export type DatasetPreparationSelection = {
   choiceToken: string
   intendedUse: DatasetPreparationUse

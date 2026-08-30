@@ -94,6 +94,7 @@ pub use self::official_options_reference::{
     OfficialOptionsReferenceAliasResolutionInput, OfficialOptionsReferenceAliasResolutionState,
     OfficialOptionsReferenceAmbiguity, OfficialOptionsReferenceCanonicalCandidate,
     OfficialOptionsReferenceCanonicalMatchKind, OfficialOptionsReferenceCanonicalResolution,
+    OfficialOptionsReferenceCatalogReadCapability, OfficialOptionsReferenceCatalogResolution,
     OfficialOptionsReferenceCboeSeries, OfficialOptionsReferenceConflict,
     OfficialOptionsReferenceConflictInput, OfficialOptionsReferenceConflictKind,
     OfficialOptionsReferenceConflictSetDigestBuilder, OfficialOptionsReferenceConflictSetEvidence,

@@ -12,18 +12,6 @@ export function OverviewPage() {
   if (product.status === "loading") {
     return <OverviewLoading />
   }
-  if (product.availability === "degraded") {
-    return (
-      <div className="mx-auto w-full max-w-[1120px] p-5 lg:p-7">
-        <Alert>
-          <AlertTitle>Setup is waiting for you</AlertTitle>
-          <AlertDescription>
-            Complete the setup step shown above, then return here to continue.
-          </AlertDescription>
-        </Alert>
-      </div>
-    )
-  }
   if (product.status === "error") {
     return (
       <div className="mx-auto max-w-3xl p-8">
@@ -51,41 +39,30 @@ export function OverviewPage() {
             What needs your attention now?
           </h1>
           <p className="mt-3 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Review your account, saved investment analyses, work in progress,
-            and anything that needs setup. Markets, recommendations, and portfolio
-            tools remain in their dedicated workspaces.
+            Start with clear investment guidance, then check current prices,
+            uncertainty, and portfolio impact before deciding what to do.
           </p>
           <div className="mt-5 flex flex-wrap items-center gap-3">
-            <Button
-              type="button"
-              disabled
-              aria-describedby="find-opportunities-readiness"
-            >
-              <Sparkles aria-hidden="true" />
-              Find opportunities
+            <Button asChild>
+              <Link to="/opportunities">
+                <Sparkles aria-hidden="true" />
+                Review investment guidance
+              </Link>
             </Button>
             <Button asChild variant="outline">
-              <Link to="/opportunities">Review retained analyses</Link>
+              <Link to="/markets">Explore investments</Link>
             </Button>
           </div>
-          <p
-            id="find-opportunities-readiness"
-            role="status"
-            className="mt-3 max-w-3xl text-[11px] leading-5 text-muted-foreground"
-          >
-            Opportunity search is unavailable right now. You can still review
-            your existing analyses.
-          </p>
         </div>
         <section className="flex min-h-32 flex-col justify-between rounded-xl border border-border bg-card/45 p-4">
           <p className="font-mono text-[9px] uppercase tracking-widest text-muted-foreground">
-            Research workspace
+            Decision checklist
           </p>
           <div>
-            <p className="text-lg font-semibold">Ready for your next review</p>
+            <p className="text-lg font-semibold">Evidence before action</p>
             <p className="mt-2 text-xs leading-5 text-muted-foreground">
-              Start with saved analyses, then review opportunities as new
-              research becomes available.
+              Check the horizon, ranges, reasons, risks, assumptions, expiry,
+              invalidators, evidence coverage, and uncertainty together.
             </p>
           </div>
         </section>
@@ -93,21 +70,19 @@ export function OverviewPage() {
 
       <OverviewDashboard
         transport={product.transport}
-        scope={bootstrap.runtime}
-        bootstrap={bootstrap}
+        scope={bootstrap.productSessionToken}
       />
 
       <section className="rounded-xl border border-border bg-card/35 p-5">
         <h2 className="text-sm font-semibold">Setup and connections</h2>
         <p className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">
-          Manage data connections, credentials, and connection health in their dedicated settings
-          workspace. Home shows only the resulting investment and readiness summaries.
+          Manage setup and connectivity in Settings. Home shows only the resulting
+          investment guidance and availability.
         </p>
         <Button asChild className="mt-4" variant="outline">
           <Link to="/connections/sources">Manage connections</Link>
         </Button>
       </section>
-
     </div>
   )
 }

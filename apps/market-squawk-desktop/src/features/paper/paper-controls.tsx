@@ -1,6 +1,8 @@
 import * as React from "react"
-import { CircleAlert, OctagonX, Play, RefreshCw, Square } from "lucide-react"
+import { useMutation, useQuery } from "@tanstack/react-query"
+import { CircleAlert, OctagonX, Square } from "lucide-react"
 
+import { productKeys, type ProductScope } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -12,17 +14,23 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import type { PaperControlRequest } from "@/lib/transport"
+import { formatMoney } from "@/lib/formatters"
+import type { ProductTransport } from "@/lib/transport"
 
-import type { PaperStatus } from "./contracts"
+import {
+  parsePaperStartPreparation,
+  parsePaperStartPreview,
+  parsePaperStartResult,
+  type PaperControlIntent,
+  type PaperStartPreview,
+  type PaperStatus,
+} from "./contracts"
 
 const MAXIMUM_REASON_LENGTH = 200
 
 export interface PaperControlAvailability {
-  start: boolean
   stop: boolean
   cancel: boolean
-  reconcile: boolean
   killSwitch: boolean
 }
 
@@ -31,43 +39,52 @@ export function PaperControlPanel({
   availability,
   busy,
   onRequest,
+  transport,
+  scope,
+  startAvailable,
+  onStarted,
 }: {
   status: PaperStatus | undefined
   availability: PaperControlAvailability
   busy: boolean
-  onRequest: (request: PaperControlRequest) => void
+  onRequest: (request: PaperControlIntent) => void
+  transport: ProductTransport
+  scope: ProductScope
+  startAvailable: boolean
+  onStarted: (message: string) => Promise<unknown>
 }) {
   if (!status) {
     return (
-      <ControlFrame title="Paper controls">
+      <ControlFrame title="Paper session controls">
         <p className="text-sm text-muted-foreground">
-          Paper controls will be available after the current session finishes loading.
+          Controls will appear after the current paper status loads.
         </p>
       </ControlFrame>
     )
   }
-  if (status.state === "stopped") {
-    if (!availability.start) {
-      return (
-        <ControlFrame title="Paper controls">
-          <ControlUnavailable />
-        </ControlFrame>
-      )
-    }
-    return <StartPaperForm busy={busy} onRequest={onRequest} />
-  }
-  if (status.state === "stopping") {
+  if (status.sessionAvailability === "ready") {
     return (
-      <ControlFrame title="Paper session is stopping">
+      <StartPaperControls
+        transport={transport}
+        scope={scope}
+        enabled={startAvailable}
+        onStarted={onStarted}
+      />
+    )
+  }
+  if (status.sessionAvailability === "unavailable") {
+    return (
+      <ControlFrame title="Paper session controls">
         <p className="text-sm text-muted-foreground">
-          Market Squawk is completing shutdown and reconciliation.
+          {status.safeguards === "action_needed"
+            ? "Paper practice needs attention. Review Logs & Diagnostics."
+            : "Paper practice is temporarily unavailable. Try again shortly."}
         </p>
       </ControlFrame>
     )
   }
   return (
     <RunningPaperControls
-      status={status}
       availability={availability}
       busy={busy}
       onRequest={onRequest}
@@ -75,146 +92,231 @@ export function PaperControlPanel({
   )
 }
 
-function StartPaperForm({
-  busy,
-  onRequest,
+function StartPaperControls({
+  transport,
+  scope,
+  enabled,
+  onStarted,
 }: {
-  busy: boolean
-  onRequest: (request: PaperControlRequest) => void
+  transport: ProductTransport
+  scope: ProductScope
+  enabled: boolean
+  onStarted: (message: string) => Promise<unknown>
 }) {
-  const [strategyMode, setStrategyMode] = React.useState<"manual" | "book_imbalance">("manual")
-  const [initialCash, setInitialCash] = React.useState("100000")
-  const [feeBasisPoints, setFeeBasisPoints] = React.useState("5")
-  const cashValid = isExactPositiveDecimal(initialCash)
-  const fee = parseBasisPoints(feeBasisPoints)
-  const ready = cashValid && fee !== null && !busy
-
-  const submit = (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    if (!ready || fee === null) return
-    onRequest({
-      action: "start",
-      strategyMode,
-      initialCash,
-      feeBasisPoints: fee,
-    })
-  }
+  const [cashChoice, setCashChoice] = React.useState("")
+  const [costChoice, setCostChoice] = React.useState("")
+  const [modeChoice, setModeChoice] = React.useState("")
+  const [preview, setPreview] = React.useState<PaperStartPreview | null>(null)
+  const [startError, setStartError] = React.useState(false)
+  const options = useQuery({
+    queryKey: productKeys.operation(scope, "bot", "Bot.GetStartPreparation", {}),
+    enabled,
+    queryFn: async () =>
+      parsePaperStartPreparation(await transport.paperControl({ action: "startPreparation" })),
+  })
+  const prepare = useMutation({
+    mutationFn: async () =>
+      parsePaperStartPreview(
+        await transport.paperControl({
+          action: "prepareStart",
+          cashChoice,
+          costChoice,
+          modeChoice,
+        }),
+      ),
+    onSuccess: (value) => {
+      setStartError(false)
+      setPreview(value)
+    },
+  })
+  const start = useMutation({
+    mutationFn: async (confirmationToken: string) =>
+      parsePaperStartResult(
+        await transport.paperControl({ action: "start", confirmationToken }, true),
+      ),
+    onSuccess: async (message) => {
+      setPreview(null)
+      setStartError(false)
+      await onStarted(message)
+    },
+    onError: () => {
+      setPreview(null)
+      setStartError(true)
+    },
+  })
+  const choicesReady = cashChoice !== "" && costChoice !== "" && modeChoice !== ""
 
   return (
-    <ControlFrame title="Start a paper session">
-      <form className="grid gap-4 lg:grid-cols-2" onSubmit={submit}>
-        <div className="rounded-lg border border-border bg-background/35 p-3 text-xs leading-5 text-muted-foreground lg:col-span-2">
-          Market Squawk will use the strongest eligible live market data currently configured in
-          Connections. If none is ready, the session remains unavailable without starting a
-          simulation.
-        </div>
-        <Field label="Paper mode" htmlFor="paper-strategy-mode">
-          <select
-            id="paper-strategy-mode"
-            value={strategyMode}
-            onChange={(event) =>
-              setStrategyMode(event.target.value as "manual" | "book_imbalance")
-            }
-            className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <option value="manual">Controlled manual drafts (recommended)</option>
-            <option value="book_imbalance">Automated book-imbalance strategy</option>
-          </select>
-          <FieldMessage>
-            Automated mode is an explicit paper-only market-signal strategy. It does not convert an
-            investment recommendation into an order, and every draft still passes the safety checks.
-          </FieldMessage>
-        </Field>
-        <Field label="Virtual starting cash" htmlFor="paper-initial-cash">
-          <Input
-            id="paper-initial-cash"
-            value={initialCash}
-            onChange={(event) => setInitialCash(event.target.value)}
-            inputMode="decimal"
-            autoComplete="off"
-            aria-invalid={!cashValid}
-            placeholder="100000"
-          />
-          {!cashValid ? (
-            <FieldMessage>Enter a positive decimal without commas or scientific notation.</FieldMessage>
+    <ControlFrame title="Start paper practice">
+      {!enabled ? (
+        <ControlUnavailable />
+      ) : options.isLoading ? (
+        <p className="text-sm text-muted-foreground">Loading paper-session choices…</p>
+      ) : options.isError || !options.data ? (
+        <p className="text-sm text-muted-foreground">
+          Paper-session choices are unavailable. Try again shortly.
+        </p>
+      ) : (
+        <>
+          <p className="mb-4 text-sm leading-6 text-muted-foreground">
+            Choose the virtual cash, estimated trading cost, and practice mode. Nothing is selected
+            automatically, and starting a session does not place a virtual or brokerage order.
+          </p>
+          <div className="grid gap-4 lg:grid-cols-3">
+            <PreparedSelect
+              id="paper-cash-choice"
+              label="Virtual cash"
+              value={cashChoice}
+              onChange={setCashChoice}
+              choices={options.data.virtualCashChoices.map((choice) => ({
+                token: choice.choiceToken,
+                label: `${choice.label} · ${formatMoney(choice.amount)}`,
+              }))}
+            />
+            <PreparedSelect
+              id="paper-cost-choice"
+              label="Estimated trading cost"
+              value={costChoice}
+              onChange={setCostChoice}
+              choices={options.data.costChoices.map((choice) => ({
+                token: choice.choiceToken,
+                label: `${choice.label} · ${choice.estimatedTradingCost}`,
+              }))}
+            />
+            <PreparedSelect
+              id="paper-mode-choice"
+              label="Practice mode"
+              value={modeChoice}
+              onChange={setModeChoice}
+              choices={options.data.modeChoices.map((choice) => ({
+                token: choice.choiceToken,
+                label: choice.label,
+              }))}
+            />
+          </div>
+          <div className="mt-4 flex justify-end">
+            <Button
+              disabled={!choicesReady || prepare.isPending}
+              onClick={() => prepare.mutate()}
+            >
+              {prepare.isPending ? "Preparing…" : "Review session"}
+            </Button>
+          </div>
+          {prepare.isError ? (
+            <p className="mt-3 text-xs text-rose-200">
+              The session preview is unavailable. Review the choices and try again.
+            </p>
           ) : null}
-        </Field>
-        <Field label="Fee assumption (basis points)" htmlFor="paper-fee-bps">
-          <Input
-            id="paper-fee-bps"
-            value={feeBasisPoints}
-            onChange={(event) => setFeeBasisPoints(event.target.value)}
-            inputMode="numeric"
-            autoComplete="off"
-            aria-invalid={fee === null}
-            placeholder="5"
-          />
-          {fee === null ? (
-            <FieldMessage>Enter a whole number from 0 through 65,535.</FieldMessage>
+          {startError ? (
+            <p className="mt-3 text-xs text-rose-200">
+              That prepared confirmation is no longer usable. Review the session again before retrying.
+            </p>
           ) : null}
-        </Field>
-        <div className="lg:col-span-2">
-          <Button type="submit" disabled={!ready}>
-            <Play aria-hidden="true" />
-            Review and start
-          </Button>
-        </div>
-      </form>
+        </>
+      )}
+      <Dialog open={preview !== null} onOpenChange={(open) => !open && !start.isPending && setPreview(null)}>
+        <DialogContent showCloseButton={!start.isPending}>
+          <DialogHeader>
+            <DialogTitle>Start this paper session?</DialogTitle>
+            <DialogDescription>
+              Confirm the prepared virtual cash, trading-cost estimate, mode, and safeguards.
+            </DialogDescription>
+          </DialogHeader>
+          {preview ? (
+            <dl className="grid gap-3 sm:grid-cols-2">
+              <Fact label="Virtual cash" value={formatMoney(preview.virtualCash)} />
+              <Fact label="Estimated trading cost" value={preview.estimatedTradingCost} />
+              <Fact label="Practice mode" value={preview.modeLabel} />
+              <Fact label="Preview expires" value={new Date(preview.expiresAt).toLocaleString()} />
+              <div className="sm:col-span-2">
+                {preview.safeguards.map((safeguard) => (
+                  <p key={safeguard} className="mt-1 text-xs text-muted-foreground">{safeguard}</p>
+                ))}
+              </div>
+            </dl>
+          ) : null}
+          {start.isError ? <p className="text-xs text-rose-200">The session could not be started. Prepare it again and retry.</p> : null}
+          <DialogFooter>
+            <Button variant="ghost" disabled={start.isPending} onClick={() => setPreview(null)}>
+              Keep current state
+            </Button>
+            <Button
+              disabled={!preview || start.isPending}
+              onClick={() => preview && start.mutate(preview.confirmationToken)}
+            >
+              {start.isPending ? "Starting…" : "Start paper practice"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </ControlFrame>
   )
 }
 
+function PreparedSelect({
+  id,
+  label,
+  value,
+  onChange,
+  choices,
+}: {
+  id: string
+  label: string
+  value: string
+  onChange: (value: string) => void
+  choices: { token: string; label: string }[]
+}) {
+  return (
+    <Field label={label} htmlFor={id}>
+      <select
+        id={id}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+      >
+        <option value="">Select {label.toLowerCase()}</option>
+        {choices.map((choice) => (
+          <option key={choice.token} value={choice.token}>{choice.label}</option>
+        ))}
+      </select>
+    </Field>
+  )
+}
+
 function RunningPaperControls({
-  status,
   availability,
   busy,
   onRequest,
 }: {
-  status: Exclude<PaperStatus, { state: "stopped" | "stopping" }>
   availability: PaperControlAvailability
   busy: boolean
-  onRequest: (request: PaperControlRequest) => void
+  onRequest: (request: PaperControlIntent) => void
 }) {
   const [reason, setReason] = React.useState("")
   const normalizedReason = reason.trim()
   const reasonValid =
     normalizedReason.length >= 3 && normalizedReason.length <= MAXIMUM_REASON_LENGTH
-  const running = status.state === "running"
-  const actionAvailable =
-    availability.stop ||
-    (running && (availability.reconcile || availability.killSwitch))
 
   return (
     <ControlFrame title="Paper session controls">
-      {!actionAvailable ? <ControlUnavailable /> : null}
+      {!availability.stop && !availability.killSwitch ? (
+        <ControlUnavailable />
+      ) : null}
       <div className="grid gap-4 lg:grid-cols-[1fr_auto] lg:items-end">
-        <Field label="Reason for stop action" htmlFor="paper-stop-reason">
+        <Field label="Reason for stopping" htmlFor="paper-stop-reason">
           <Input
             id="paper-stop-reason"
             value={reason}
             onChange={(event) => setReason(event.target.value)}
             maxLength={MAXIMUM_REASON_LENGTH}
             aria-invalid={reason.length > 0 && !reasonValid}
-            placeholder="Explain why this paper session should stop"
+            placeholder="Why should this paper session stop?"
           />
           <FieldMessage>
-            Required for ordinary and emergency stop; 3–{MAXIMUM_REASON_LENGTH} characters.
+            Required for an ordinary or emergency stop; 3–{MAXIMUM_REASON_LENGTH} characters.
           </FieldMessage>
         </Field>
         <div className="flex flex-wrap gap-2">
-          {running &&
-          availability.reconcile &&
-          (status.reconciliationRequired || !status.financialReconciliationCurrent) ? (
-            <Button
-              type="button"
-              variant="outline"
-              disabled={busy}
-              onClick={() => onRequest({ action: "reconcile" })}
-            >
-              <RefreshCw aria-hidden="true" />
-              Reconcile
-            </Button>
-          ) : null}
           {availability.stop ? (
             <Button
               type="button"
@@ -223,10 +325,10 @@ function RunningPaperControls({
               onClick={() => onRequest({ action: "stop", reason: normalizedReason })}
             >
               <Square aria-hidden="true" />
-              Stop
+              Stop session
             </Button>
           ) : null}
-          {running && availability.killSwitch ? (
+          {availability.killSwitch ? (
             <Button
               type="button"
               variant="destructive"
@@ -252,14 +354,13 @@ export function PaperConfirmationDialog({
   onClose,
   onConfirm,
 }: {
-  request: PaperControlRequest | null
+  request: PaperControlIntent | null
   busy: boolean
   error: string | null
   onClose: () => void
   onConfirm: () => void
 }) {
-  const destructive =
-    request?.action === "stop" || request?.action === "triggerKillSwitch"
+  const destructive = request?.action === "stop" || request?.action === "triggerKillSwitch"
   return (
     <Dialog open={request !== null} onOpenChange={(open) => !open && !busy && onClose()}>
       <DialogContent showCloseButton={!busy}>
@@ -269,7 +370,9 @@ export function PaperConfirmationDialog({
             {request ? confirmationDescription(request) : "Review this action before continuing."}
           </DialogDescription>
         </DialogHeader>
-        {request ? <ConfirmationFacts request={request} /> : null}
+        {request?.action === "stop" || request?.action === "triggerKillSwitch" ? (
+          <Fact label="Reason" value={request.reason} />
+        ) : null}
         {error ? (
           <div className="flex gap-2 rounded-lg border border-rose-400/20 bg-rose-400/5 p-3 text-xs text-rose-100">
             <CircleAlert className="size-4 shrink-0" aria-hidden="true" />
@@ -294,25 +397,6 @@ export function PaperConfirmationDialog({
   )
 }
 
-function ConfirmationFacts({ request }: { request: PaperControlRequest }) {
-  if (request.action === "start") {
-    return (
-      <dl className="grid gap-3 rounded-lg border border-border bg-card/40 p-4 sm:grid-cols-2">
-        <Fact label="Paper mode" value={request.strategyMode} />
-        <Fact label="Virtual starting cash" value={request.initialCash} />
-        <Fact label="Fee basis points" value={request.feeBasisPoints.toLocaleString()} />
-      </dl>
-    )
-  }
-  if (request.action === "cancel") {
-    return <Fact label="Virtual order" value={request.orderToken} />
-  }
-  if (request.action === "stop" || request.action === "triggerKillSwitch") {
-    return <Fact label="Reason" value={request.reason} />
-  }
-  return null
-}
-
 function ControlFrame({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <section className="mt-4 rounded-xl border border-border bg-card/45 p-5">
@@ -324,9 +408,8 @@ function ControlFrame({ title, children }: { title: string; children: React.Reac
 
 function ControlUnavailable() {
   return (
-    <p className="rounded-lg border border-dashed border-border p-3 text-xs leading-5 text-muted-foreground">
-      This control is not available in the current setup. Review Connections or Updates &amp; Repair,
-      then try again.
+    <p className="mb-4 rounded-lg border border-dashed border-border p-3 text-xs leading-5 text-muted-foreground">
+      Session controls are unavailable. Review Connections or Updates &amp; Repair, then try again.
     </p>
   )
 }
@@ -354,81 +437,53 @@ function FieldMessage({ children }: { children: React.ReactNode }) {
 
 function Fact({ label, value }: { label: string; value: string }) {
   return (
-    <div className="min-w-0">
+    <dl className="rounded-lg border border-border bg-card/40 p-4">
       <dt className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</dt>
-      <dd className="mt-1 break-words font-mono text-xs">{value}</dd>
-    </div>
+      <dd className="mt-1 text-xs">{value}</dd>
+    </dl>
   )
 }
 
-function isExactPositiveDecimal(value: string) {
-  if (!/^(?:0|[1-9]\d{0,27})(?:\.\d{1,28})?$/.test(value)) return false
-  const digits = value.replace(".", "").replace(/^0+/, "")
-  return digits.length > 0 && digits.length <= 28
-}
-
-function parseBasisPoints(value: string) {
-  if (!/^\d{1,5}$/.test(value)) return null
-  const parsed = Number(value)
-  return Number.isSafeInteger(parsed) && parsed <= 65_535 ? parsed : null
-}
-
-function confirmationTitle(request: PaperControlRequest) {
+function confirmationTitle(request: PaperControlIntent) {
   switch (request.action) {
-    case "start":
-      return "Start this paper session?"
     case "stop":
       return "Stop this paper session?"
     case "cancel":
-      return "Request cancellation?"
-    case "reconcile":
-      return "Reconcile paper execution?"
+      return "Cancel this virtual order?"
     case "triggerKillSwitch":
-      return "Trigger the paper kill switch?"
+      return "Use the emergency stop?"
   }
 }
 
-function confirmationDescription(request: PaperControlRequest) {
+function confirmationDescription(request: PaperControlIntent) {
   switch (request.action) {
-    case "start":
-      return "Market Squawk will start a virtual session using the best eligible live market data. No brokerage order can be placed, and every virtual order must pass the safety checks."
     case "stop":
-      return "Market Squawk will finish shutdown and reconciliation before closing the paper session."
+      return "Market Squawk will stop the session after checking its virtual balances and orders."
     case "cancel":
-      return "Market Squawk will request cancellation for this virtual order. Existing fills remain recorded."
-    case "reconcile":
-      return "Market Squawk will check virtual orders, fills, balances, positions, and market data."
+      return "Market Squawk will request cancellation. Any virtual fills already completed remain recorded."
     case "triggerKillSwitch":
       return "This immediately stops only the current virtual paper session. It cannot instruct a brokerage account."
   }
 }
 
-function confirmationButton(request: PaperControlRequest) {
+function confirmationButton(request: PaperControlIntent) {
   switch (request.action) {
-    case "start":
-      return "Start paper session"
     case "stop":
       return "Stop paper session"
     case "cancel":
       return "Request cancellation"
-    case "reconcile":
-      return "Run reconciliation"
     case "triggerKillSwitch":
-      return "Trigger emergency stop"
+      return "Use emergency stop"
   }
 }
 
-export function paperActionCompleted(request: PaperControlRequest) {
+export function paperActionCompleted(request: PaperControlIntent) {
   switch (request.action) {
-    case "start":
-      return "The paper session started."
     case "stop":
-      return "The paper session stopped successfully."
+      return "The paper session stopped."
     case "cancel":
       return "The cancellation request was completed."
-    case "reconcile":
-      return "Paper balances, positions, orders, and fills were reconciled."
     case "triggerKillSwitch":
-      return "The paper kill switch stopped the current session."
+      return "The emergency stop ended the current paper session."
   }
 }

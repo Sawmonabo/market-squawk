@@ -10,6 +10,7 @@ use std::{
 };
 
 use market_squawk_domain::{EvidenceDigest, SourceIdentifier};
+use market_squawk_live::ShardKey;
 use market_squawk_platform::{AppConfig, CaptureProcessInfrastructure};
 use market_squawk_services::ServiceError;
 use market_squawk_sources::ProviderRateAuthority;
@@ -29,7 +30,8 @@ use crate::{
     provider_activation::{
         AlpacaBasicAccountActivation, PreparedAlpacaBasicMarketConfiguration,
         PreparedKrakenL3MarketConfiguration, PreparedMarketProviderConfiguration,
-        ProviderAccountRuntimeCurrentness, ProviderAdapterActivation,
+        PreparedSchwabMarketRuntimeStart, ProviderAccountRuntimeCurrentness,
+        ProviderAdapterActivation,
     },
 };
 
@@ -40,12 +42,16 @@ use super::{
     },
     configuration::{
         AccountMarketSurface, PreparedMarketProviderConfigurationRequest,
-        validate_resolved_configuration,
+        validate_resolved_configuration, validate_resolved_schwab_configuration,
     },
     display::DisplaySourceDescriptor,
     generation::MarketRuntimeGroupGeneration,
     kraken::KrakenSourceDescriptor,
+    schwab_current::{StartedSchwabCurrentRuntime, start_schwab_current_runtime},
+    schwab_sink::SchwabRestQuoteCurrentRuntime,
 };
+
+use crate::application::MarketEventDurableRead;
 
 /// Runtime evidence for an atomic account-backed group.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -120,6 +126,14 @@ pub(super) struct AccountMarketRuntimeGroup {
     lifecycle: CancellationToken,
     currentness_monitor: tokio::task::JoinHandle<()>,
     runtime: AccountMarketRuntime,
+    metadata: Arc<[market_squawk_sources::SourceMetadata]>,
+    routes: Arc<[ShardKey]>,
+    durable_reads: Vec<MarketEventDurableRead>,
+}
+
+pub(super) enum PreparedAccountMarketRuntimeStart {
+    Standard(PreparedMarketProviderConfiguration),
+    Schwab(PreparedSchwabMarketRuntimeStart),
 }
 
 #[derive(Clone, Copy)]
@@ -143,6 +157,9 @@ struct StartedAccountMarketRuntime {
     kraken_descriptor: Option<Arc<KrakenSourceDescriptor>>,
     currentness: ProviderAccountRuntimeCurrentness,
     currentness_mode: AccountCurrentnessMode,
+    metadata: Arc<[market_squawk_sources::SourceMetadata]>,
+    routes: Arc<[ShardKey]>,
+    durable_reads: Vec<MarketEventDurableRead>,
 }
 
 impl AccountMarketRuntimeGroup {
@@ -152,7 +169,7 @@ impl AccountMarketRuntimeGroup {
     )]
     pub(super) async fn start(
         request: PreparedMarketProviderConfigurationRequest,
-        prepared: PreparedMarketProviderConfiguration,
+        prepared: PreparedAccountMarketRuntimeStart,
         provider_activation: &ProviderAdapterActivation,
         app_config: AppConfig,
         provider_rate: ProviderRateAuthority,
@@ -164,14 +181,32 @@ impl AccountMarketRuntimeGroup {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Self, ServiceError> {
-        validate_resolved_configuration(request, &prepared)?;
+        match &prepared {
+            PreparedAccountMarketRuntimeStart::Standard(prepared) => {
+                validate_resolved_configuration(request, prepared)?;
+            }
+            PreparedAccountMarketRuntimeStart::Schwab(prepared) => {
+                validate_resolved_schwab_configuration(request, prepared)?;
+            }
+        }
         let cleanup_budget = app_config.source_shutdown();
         let runtime_incarnation = Uuid::new_v4();
-        let generation = MarketRuntimeGroupGeneration::try_from_prepared(
-            request,
-            &prepared,
-            runtime_incarnation,
-        )?;
+        let generation = match &prepared {
+            PreparedAccountMarketRuntimeStart::Standard(prepared) => {
+                MarketRuntimeGroupGeneration::try_from_prepared(
+                    request,
+                    prepared,
+                    runtime_incarnation,
+                )?
+            }
+            PreparedAccountMarketRuntimeStart::Schwab(prepared) => {
+                MarketRuntimeGroupGeneration::try_from_schwab(
+                    request,
+                    prepared,
+                    runtime_incarnation,
+                )?
+            }
+        };
         let evidence = MarketProviderGroupLifecycleEvidence {
             surface_id: SourceIdentifier::try_from(request.surface().surface_id())
                 .map_err(|_error| ServiceError::ResourceExhausted)?,
@@ -183,8 +218,13 @@ impl AccountMarketRuntimeGroup {
             group_generation: generation,
         };
         let activation_lease = match &prepared {
-            PreparedMarketProviderConfiguration::AlpacaBasic(prepared) => prepared.lease(),
-            PreparedMarketProviderConfiguration::KrakenLevel3(prepared) => prepared.lease(),
+            PreparedAccountMarketRuntimeStart::Standard(
+                PreparedMarketProviderConfiguration::AlpacaBasic(prepared),
+            ) => prepared.lease(),
+            PreparedAccountMarketRuntimeStart::Standard(
+                PreparedMarketProviderConfiguration::KrakenLevel3(prepared),
+            ) => prepared.lease(),
+            PreparedAccountMarketRuntimeStart::Schwab(prepared) => prepared.activation_lease(),
         }
         .clone();
         let verification_expires_at = activation_lease
@@ -203,7 +243,9 @@ impl AccountMarketRuntimeGroup {
         let provider_start: Pin<
             Box<dyn Future<Output = Result<StartedAccountMarketRuntime, ServiceError>> + Send + '_>,
         > = match prepared {
-            PreparedMarketProviderConfiguration::AlpacaBasic(prepared) => Box::pin(async move {
+            PreparedAccountMarketRuntimeStart::Standard(
+                PreparedMarketProviderConfiguration::AlpacaBasic(prepared),
+            ) => Box::pin(async move {
                 let (runtime, descriptors, currentness) = start_alpaca(
                     prepared,
                     generation,
@@ -224,9 +266,14 @@ impl AccountMarketRuntimeGroup {
                     kraken_descriptor: None,
                     currentness,
                     currentness_mode: AccountCurrentnessMode::PreparedOrActiveUntilAdmission,
+                    metadata: Arc::<[market_squawk_sources::SourceMetadata]>::from([]),
+                    routes: Arc::<[ShardKey]>::from([]),
+                    durable_reads: Vec::new(),
                 })
             }),
-            PreparedMarketProviderConfiguration::KrakenLevel3(prepared) => {
+            PreparedAccountMarketRuntimeStart::Standard(
+                PreparedMarketProviderConfiguration::KrakenLevel3(prepared),
+            ) => {
                 let descriptor = KrakenSourceDescriptor::try_from_prepared(&prepared)?;
                 Box::pin(async move {
                     let (runtime, currentness) = start_kraken(
@@ -247,9 +294,49 @@ impl AccountMarketRuntimeGroup {
                         kraken_descriptor: Some(descriptor),
                         currentness,
                         currentness_mode: AccountCurrentnessMode::ActiveOnly,
+                        metadata: Arc::<[market_squawk_sources::SourceMetadata]>::from([]),
+                        routes: Arc::<[ShardKey]>::from([]),
+                        durable_reads: Vec::new(),
                     })
                 })
             }
+            PreparedAccountMarketRuntimeStart::Schwab(prepared) => Box::pin(async move {
+                let started = start_schwab_current_runtime(
+                    prepared,
+                    app_config,
+                    provider_rate,
+                    capture_process,
+                    display_directory,
+                    limits.display_actor,
+                    read_admission,
+                    group_cancellation,
+                    deadline,
+                    cancellation,
+                )
+                .await?;
+                let StartedSchwabCurrentRuntime {
+                    runtime,
+                    currentness,
+                    descriptor,
+                    metadata,
+                    routes,
+                    durable_read,
+                    display_monitor,
+                } = started;
+                Ok(StartedAccountMarketRuntime {
+                    runtime: AccountMarketRuntime::Schwab(SchwabRuntimeGroup {
+                        current: runtime,
+                        display_monitor,
+                    }),
+                    descriptors: vec![descriptor].into_boxed_slice(),
+                    kraken_descriptor: None,
+                    currentness,
+                    currentness_mode: AccountCurrentnessMode::ActiveOnly,
+                    metadata,
+                    routes,
+                    durable_reads: vec![durable_read],
+                })
+            }),
         };
         let started = provider_start.await?;
         let finalization: Pin<Box<dyn Future<Output = Result<Self, ServiceError>> + Send + '_>> =
@@ -277,6 +364,9 @@ impl AccountMarketRuntimeGroup {
             kraken_descriptor,
             currentness,
             currentness_mode,
+            metadata,
+            routes,
+            durable_reads,
         } = started;
         if let Err(error) = ensure_before(deadline, cancellation) {
             cleanup_account_runtime(
@@ -365,6 +455,9 @@ impl AccountMarketRuntimeGroup {
             lifecycle: group_cancellation,
             currentness_monitor,
             runtime,
+            metadata,
+            routes,
+            durable_reads,
         })
     }
 
@@ -393,6 +486,18 @@ impl AccountMarketRuntimeGroup {
 
     pub(super) fn reads_are_admitted(&self) -> bool {
         self.read_admission.is_admitted()
+    }
+
+    pub(super) fn metadata(&self) -> Arc<[market_squawk_sources::SourceMetadata]> {
+        Arc::clone(&self.metadata)
+    }
+
+    pub(super) fn routes(&self) -> Arc<[ShardKey]> {
+        Arc::clone(&self.routes)
+    }
+
+    pub(super) fn durable_reads(&self) -> Vec<MarketEventDurableRead> {
+        self.durable_reads.clone()
     }
 
     pub(super) fn is_published_healthy(&self) -> bool {
@@ -504,7 +609,7 @@ impl AccountMarketRuntimeGroup {
         }
         match &self.runtime {
             AccountMarketRuntime::Alpaca(runtime) => runtime.historical_capability().map(Some),
-            AccountMarketRuntime::KrakenLevel3(_) => Ok(None),
+            AccountMarketRuntime::KrakenLevel3(_) | AccountMarketRuntime::Schwab(_) => Ok(None),
         }
     }
 
@@ -517,7 +622,7 @@ impl AccountMarketRuntimeGroup {
         }
         match &self.runtime {
             AccountMarketRuntime::Alpaca(runtime) => runtime.owns_historical_capability(capability),
-            AccountMarketRuntime::KrakenLevel3(_) => false,
+            AccountMarketRuntime::KrakenLevel3(_) | AccountMarketRuntime::Schwab(_) => false,
         }
     }
 
@@ -543,6 +648,9 @@ impl AccountMarketRuntimeGroup {
             lifecycle,
             currentness_monitor,
             runtime,
+            metadata: _,
+            routes: _,
+            durable_reads: _,
         } = self;
         read_admission.revoke();
         lifecycle.cancel();
@@ -575,6 +683,7 @@ impl fmt::Debug for AccountMarketRuntimeGroup {
 enum AccountMarketRuntime {
     Alpaca(AlpacaRuntimeGroup),
     KrakenLevel3(KrakenLevel3LiveRuntime),
+    Schwab(SchwabRuntimeGroup),
 }
 
 impl AccountMarketRuntime {
@@ -582,12 +691,14 @@ impl AccountMarketRuntime {
         match self {
             Self::Alpaca(runtime) => runtime.is_healthy(),
             Self::KrakenLevel3(runtime) => runtime.is_healthy(),
+            Self::Schwab(runtime) => runtime.is_healthy(),
         }
     }
 
     fn begin_shutdown(&self) {
-        if let Self::Alpaca(runtime) = self {
-            runtime.begin_shutdown();
+        match self {
+            Self::Alpaca(runtime) => runtime.begin_shutdown(),
+            Self::KrakenLevel3(_) | Self::Schwab(_) => {}
         }
     }
 
@@ -601,6 +712,58 @@ impl AccountMarketRuntime {
             Self::KrakenLevel3(runtime) => {
                 await_before(deadline, cancellation, runtime.shutdown()).await
             }
+            Self::Schwab(runtime) => runtime.shutdown_before(deadline, cancellation).await,
+        }
+    }
+}
+
+struct SchwabRuntimeGroup {
+    current: SchwabRestQuoteCurrentRuntime,
+    display_monitor: tokio::task::JoinHandle<()>,
+}
+
+impl SchwabRuntimeGroup {
+    fn is_healthy(&self) -> bool {
+        self.current.is_healthy() && !self.display_monitor.is_finished()
+    }
+
+    async fn shutdown_before(
+        self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        let Self {
+            current,
+            mut display_monitor,
+        } = self;
+        let monitor = tokio::select! {
+            biased;
+            result = &mut display_monitor => result.map_err(|error| {
+                tracing::error!(%error, "Schwab display monitor join failed");
+                ServiceError::Unavailable
+            }),
+            () = cancellation.cancelled() => {
+                display_monitor.abort();
+                let _ = display_monitor.await;
+                Err(ServiceError::Cancelled)
+            },
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                display_monitor.abort();
+                let _ = display_monitor.await;
+                Err(ServiceError::DeadlineExceeded)
+            }
+        };
+        let current = current
+            .shutdown(cancellation, deadline)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "Schwab current runtime shutdown failed");
+                ServiceError::Unavailable
+            });
+        match (monitor, current) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(_), Err(_)) => Err(ServiceError::Unavailable),
         }
     }
 }

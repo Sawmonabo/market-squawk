@@ -95,7 +95,7 @@ export const advancedNavigation: NavigationItem[] = [
     label: "Valuation & Targets",
     path: "/advanced/valuation-targets",
     icon: Landmark,
-    capabilities: ["fair_value_measurement", "fair_value_workspace"],
+    capabilities: ["decision_analysis_list", "decision_analysis"],
   },
   {
     label: "Risk & Recommendation Policy",

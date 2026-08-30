@@ -15,7 +15,7 @@ import {
   Wrench,
 } from "lucide-react"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { messageFrom, useSystem } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -27,10 +27,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { productCapabilitySet } from "@/lib/product-capabilities"
 import { formatTimestamp } from "@/lib/time"
-import type { InstallationStatus, ProductCapability } from "@/lib/schemas"
-import type { ProductTransport } from "@/lib/transport"
+import type { InstallationStatus } from "@/lib/schemas"
+import type { SystemTransport } from "@/lib/transport"
 import { cn } from "@/lib/utils"
 
 import {
@@ -61,22 +60,22 @@ const LIFECYCLE_CAPABILITIES = [
 ] as const
 
 export function LifecyclePage() {
-  const product = useProduct()
+  const system = useSystem()
 
-  if (product.status === "loading") return <LifecycleLoading />
-  if (product.status === "error") {
+  if (system.status === "loading") return <LifecycleLoading />
+  if (system.status !== "ready") {
     return (
       <LifecycleFrame>
-        <UnavailableState detail={product.error} />
+        <UnavailableState detail={system.status === "unavailable" ? system.error : "Finish secure storage setup in Settings before using program lifecycle controls."} />
       </LifecycleFrame>
     )
   }
 
   return (
     <ReadyLifecycle
-      transport={product.transport}
-      scope={product.bootstrap.runtime}
-      capabilities={productCapabilitySet(product.bootstrap)}
+      transport={system.transport}
+      scope={system.bootstrap.productSessionToken}
+      capabilities={new Set(system.bootstrap.capabilities)}
     />
   )
 }
@@ -86,9 +85,9 @@ function ReadyLifecycle({
   scope,
   capabilities,
 }: {
-  transport: ProductTransport
+  transport: SystemTransport
   scope: ProductScope
-  capabilities: ReadonlySet<ProductCapability>
+  capabilities: ReadonlySet<string>
 }) {
   const queryClient = useQueryClient()
   const [pending, setPending] = React.useState<PendingConfirmation | null>(null)
@@ -113,20 +112,20 @@ function ReadyLifecycle({
   const status = useQuery({
     queryKey: productKeys.operation(scope, "operations", "Operations.GetUpdateStatus", {}),
     enabled: supportsUpdateStatus,
-    queryFn: async () => parseUpdateStatus(await transport.query({ query: "operationUpdateStatus" })),
+    queryFn: async () => parseUpdateStatus(await transport.systemQuery({ query: "operationUpdateStatus" })),
     refetchInterval: 15_000,
   })
   const updatePreview = useQuery({
     queryKey: updatePreviewKey,
     enabled: false,
-    queryFn: async () => parseUpdatePreview(await transport.query({ query: "operationUpdatePreview" })),
+    queryFn: async () => parseUpdatePreview(await transport.systemQuery({ query: "operationUpdatePreview" })),
   })
   const rollbackPreview = useQuery({
     queryKey: rollbackPreviewKey,
     enabled: false,
     queryFn: async () =>
       parseProgramRollbackPreview(
-        await transport.query({ query: "operationProgramRollbackPreview" }),
+        await transport.systemQuery({ query: "operationProgramRollbackPreview" }),
       ),
   })
   const installation = useQuery({

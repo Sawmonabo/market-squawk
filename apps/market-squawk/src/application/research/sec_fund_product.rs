@@ -15,8 +15,10 @@ use market_squawk_data::{
     FundPointInTimeSelection, PinnedDataset,
 };
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, FundCurrencyAmount, FundEvidenceRecord, FundHoldingQuantity,
-    FundReportedDecimal, FundReportedValue, InstrumentId, SourceIdentifier, Timestamp,
+    CalendarDate, Currency, DigestAlgorithm, EvidenceDigest, FundAmendmentState, FundConflictState,
+    FundCurrencyAmount, FundEvidenceRecord, FundFilingIdentity, FundHoldingQuantity,
+    FundHoldingUnit, FundReportedDecimal, FundReportedValue, FundRevisionStatus, FundSourceFamily,
+    InstrumentId, SourceIdentifier, Timestamp,
 };
 use market_squawk_jobs::{JobGeneration, JobId};
 use market_squawk_platform::ResearchObjectAdmission;
@@ -24,6 +26,8 @@ use market_squawk_sources::LogicalPartitionSetAdmission;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+
+use crate::application::domain_support::try_boxed_product_text;
 
 use super::{SecFundPublicationReceipt, SecLiveFundRequest};
 
@@ -41,6 +45,8 @@ const SEC_FUND_MAXIMUM_ITEMS_PER_PARTITION: u32 = 10_000;
 const SEC_FUND_MAXIMUM_FRAME_BYTES: u64 = 4 * 1024 * 1024;
 const SEC_FUND_PARSE_POLICY: &str = "sec-bulk-parse-production-defaults.v1";
 const SEC_FUND_ADMISSION_DIGEST_DOMAIN: &[u8] = b"market-squawk/sec-fund-product-admission/v1";
+const SEC_FUND_MAXIMUM_DECIMAL_BYTES: usize = 128;
+const SEC_FUND_MAXIMUM_UNIT_BYTES: usize = 256;
 
 /// Only the SEC filing families admitted by the fund publication product boundary.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -601,10 +607,52 @@ pub(crate) struct FundResearchData {
     fund_instrument_id: InstrumentId,
     as_of: Timestamp,
     availability: FundResearchAvailability,
+    filing_state: Option<FundResearchFilingState>,
+    annual_information: Option<FundAnnualInformationData>,
     report_count: usize,
     share_class_count: usize,
-    holdings: Box<[FundHoldingData]>,
-    latest_known_at: Option<Timestamp>,
+    holdings: Vec<FundHoldingData>,
+}
+
+/// Closed, provider-neutral annual and share-class facts retained from canonical N-CEN rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FundAnnualInformationData {
+    reporting_period_less_than_twelve_months: FundReportedValue<bool>,
+    reporting_currency: FundReportedValue<Currency>,
+    monthly_average_net_assets: FundReportedValue<FundReportedDecimal>,
+    daily_average_net_assets: FundReportedValue<FundReportedDecimal>,
+    is_etf: FundReportedValue<bool>,
+    is_index: FundReportedValue<bool>,
+    collateral_required: FundReportedValue<bool>,
+    shares_per_creation_unit: FundReportedValue<FundReportedDecimal>,
+    shares_per_redemption_unit: FundReportedValue<FundReportedDecimal>,
+    in_kind: FundReportedValue<bool>,
+}
+
+#[derive(Default)]
+struct FundAnnualInformationAccumulator {
+    reporting_period_less_than_twelve_months: Option<FundReportedValue<bool>>,
+    reporting_currency: Option<FundReportedValue<Currency>>,
+    monthly_average_net_assets: Option<FundReportedValue<FundReportedDecimal>>,
+    daily_average_net_assets: Option<FundReportedValue<FundReportedDecimal>>,
+    is_etf: Option<FundReportedValue<bool>>,
+    is_index: Option<FundReportedValue<bool>>,
+    collateral_required: Option<FundReportedValue<bool>>,
+    shares_per_creation_unit: Option<FundReportedValue<FundReportedDecimal>>,
+    shares_per_redemption_unit: Option<FundReportedValue<FundReportedDecimal>>,
+    in_kind: Option<FundReportedValue<bool>>,
+}
+
+/// Provider-neutral chronology and closed revision state shared by every selected fund record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FundResearchFilingState {
+    report_period_end: FundReportedValue<CalendarDate>,
+    report_date: FundReportedValue<CalendarDate>,
+    filed_date: FundReportedValue<CalendarDate>,
+    accepted_at: FundReportedValue<Timestamp>,
+    available_at: Timestamp,
+    amendment: FundAmendmentState,
+    revision_status: FundRevisionStatus,
 }
 
 impl FundResearchData {
@@ -626,53 +674,133 @@ impl FundResearchData {
         let mut report_count = 0_usize;
         let mut share_class_count = 0_usize;
         let mut holdings = Vec::new();
-        let mut latest_known_at = None;
+        holdings
+            .try_reserve_exact(records.len())
+            .map_err(|_error| SecFundProductBoundaryError::ResourceExhausted)?;
+        let mut selected_filing: Option<&FundFilingIdentity> = None;
+        let mut filing_state = None;
+        let mut annual_information = FundAnnualInformationAccumulator::default();
         for record in records {
             let filing = fund_record_filing(record);
             if filing.fund().instrument_id() != fund_instrument_id {
                 return Err(SecFundProductBoundaryError::PublicationMismatch);
             }
-            if let Some(known_at) = filing
+            if selected_filing.is_some_and(|selected| selected != filing) {
+                return Err(SecFundProductBoundaryError::PublicationMismatch);
+            }
+            selected_filing = Some(filing);
+            let available_at = filing
                 .chronology()
                 .availability()
                 .conservative_available_at()
+                .ok_or(SecFundProductBoundaryError::PublicationMismatch)?;
+            if available_at > as_of
+                || filing.chronology().received_at() > as_of
+                || filing.chronology().ingested_at() > as_of
+                || filing.fund().available_at() > as_of
+                || filing.fund().observed_at() > as_of
             {
-                latest_known_at = Some(
-                    latest_known_at.map_or(known_at, |current: Timestamp| current.max(known_at)),
-                );
+                return Err(SecFundProductBoundaryError::PublicationMismatch);
+            }
+            if let Some(selected) = filing_state.as_ref() {
+                if !filing_state_matches(selected, filing, available_at) {
+                    return Err(SecFundProductBoundaryError::PublicationMismatch);
+                }
+            } else {
+                filing_state = Some(FundResearchFilingState {
+                    report_period_end: filing.chronology().report_period_end().clone(),
+                    report_date: filing.chronology().report_date().clone(),
+                    filed_date: filing.chronology().filed_date().clone(),
+                    accepted_at: filing.chronology().accepted_at().clone(),
+                    available_at,
+                    amendment: filing.revision().amendment(),
+                    revision_status: filing.revision().status(),
+                });
             }
             match record {
-                FundEvidenceRecord::Report(_) => {
+                FundEvidenceRecord::Report(report) => {
                     report_count = report_count
                         .checked_add(1)
                         .ok_or(SecFundProductBoundaryError::PublicationMismatch)?;
+                    if filing.family() == FundSourceFamily::Ncen {
+                        merge_copy_annual_value(
+                            &mut annual_information.reporting_period_less_than_twelve_months,
+                            report.attributes().report_period_less_than_twelve_months(),
+                        );
+                    }
                 }
-                FundEvidenceRecord::ShareClass(_) => {
+                FundEvidenceRecord::ShareClass(share_class) => {
                     share_class_count = share_class_count
                         .checked_add(1)
                         .ok_or(SecFundProductBoundaryError::PublicationMismatch)?;
+                    if filing.family() == FundSourceFamily::Ncen {
+                        let attributes = share_class.attributes();
+                        let mechanics = attributes.etf_mechanics();
+                        merge_copy_annual_value(
+                            &mut annual_information.reporting_currency,
+                            attributes.reporting_currency(),
+                        );
+                        merge_decimal_annual_value(
+                            &mut annual_information.monthly_average_net_assets,
+                            attributes.monthly_average_net_assets(),
+                        )?;
+                        merge_decimal_annual_value(
+                            &mut annual_information.daily_average_net_assets,
+                            attributes.daily_average_net_assets(),
+                        )?;
+                        merge_copy_annual_value(
+                            &mut annual_information.is_etf,
+                            attributes.is_etf(),
+                        );
+                        merge_copy_annual_value(
+                            &mut annual_information.is_index,
+                            attributes.is_index(),
+                        );
+                        merge_copy_annual_value(
+                            &mut annual_information.collateral_required,
+                            mechanics.collateral_required(),
+                        );
+                        merge_decimal_annual_value(
+                            &mut annual_information.shares_per_creation_unit,
+                            mechanics.shares_per_creation_unit(),
+                        )?;
+                        merge_decimal_annual_value(
+                            &mut annual_information.shares_per_redemption_unit,
+                            mechanics.shares_per_redemption_unit(),
+                        )?;
+                        merge_copy_annual_value(
+                            &mut annual_information.in_kind,
+                            mechanics.in_kind(),
+                        );
+                    }
                 }
                 FundEvidenceRecord::PortfolioHolding(holding) => {
                     holdings.push(FundHoldingData {
                         instrument_id: holding.held_security().instrument_id(),
-                        quantity: holding.attributes().quantity().clone(),
-                        value: holding.attributes().value().clone(),
-                        percentage_of_net_assets: holding
-                            .attributes()
-                            .percentage_of_net_assets()
-                            .clone(),
+                        quantity: try_copy_reported_quantity(holding.attributes().quantity())?,
+                        value: try_copy_reported_currency_amount(holding.attributes().value())?,
+                        percentage_of_net_assets: try_copy_reported_decimal(
+                            holding.attributes().percentage_of_net_assets(),
+                        )?,
                     });
                 }
             }
         }
+        if availability == FundResearchAvailability::Available && filing_state.is_none() {
+            return Err(SecFundProductBoundaryError::PublicationMismatch);
+        }
+        let annual_information = selected_filing
+            .filter(|filing| filing.family() == FundSourceFamily::Ncen)
+            .map(|_| annual_information.finish());
         Ok(Self {
             fund_instrument_id,
             as_of,
             availability,
+            filing_state,
+            annual_information,
             report_count,
             share_class_count,
-            holdings: holdings.into_boxed_slice(),
-            latest_known_at,
+            holdings,
         })
     }
 
@@ -685,6 +813,12 @@ impl FundResearchData {
     pub(crate) const fn availability(&self) -> FundResearchAvailability {
         self.availability
     }
+    pub(crate) const fn filing_state(&self) -> Option<&FundResearchFilingState> {
+        self.filing_state.as_ref()
+    }
+    pub(crate) const fn annual_information(&self) -> Option<&FundAnnualInformationData> {
+        self.annual_information.as_ref()
+    }
     pub(crate) const fn report_count(&self) -> usize {
         self.report_count
     }
@@ -695,7 +829,222 @@ impl FundResearchData {
         &self.holdings
     }
     pub(crate) const fn latest_known_at(&self) -> Option<Timestamp> {
-        self.latest_known_at
+        match &self.filing_state {
+            Some(state) => Some(state.available_at),
+            None => None,
+        }
+    }
+}
+
+impl FundAnnualInformationData {
+    pub(crate) const fn reporting_period_less_than_twelve_months(
+        &self,
+    ) -> &FundReportedValue<bool> {
+        &self.reporting_period_less_than_twelve_months
+    }
+    pub(crate) const fn reporting_currency(&self) -> &FundReportedValue<Currency> {
+        &self.reporting_currency
+    }
+    pub(crate) const fn monthly_average_net_assets(
+        &self,
+    ) -> &FundReportedValue<FundReportedDecimal> {
+        &self.monthly_average_net_assets
+    }
+    pub(crate) const fn daily_average_net_assets(&self) -> &FundReportedValue<FundReportedDecimal> {
+        &self.daily_average_net_assets
+    }
+    pub(crate) const fn is_etf(&self) -> &FundReportedValue<bool> {
+        &self.is_etf
+    }
+    pub(crate) const fn is_index(&self) -> &FundReportedValue<bool> {
+        &self.is_index
+    }
+    pub(crate) const fn collateral_required(&self) -> &FundReportedValue<bool> {
+        &self.collateral_required
+    }
+    pub(crate) const fn shares_per_creation_unit(&self) -> &FundReportedValue<FundReportedDecimal> {
+        &self.shares_per_creation_unit
+    }
+    pub(crate) const fn shares_per_redemption_unit(
+        &self,
+    ) -> &FundReportedValue<FundReportedDecimal> {
+        &self.shares_per_redemption_unit
+    }
+    pub(crate) const fn in_kind(&self) -> &FundReportedValue<bool> {
+        &self.in_kind
+    }
+}
+
+impl FundAnnualInformationAccumulator {
+    fn finish(self) -> FundAnnualInformationData {
+        FundAnnualInformationData {
+            reporting_period_less_than_twelve_months: unavailable_annual_value(
+                self.reporting_period_less_than_twelve_months,
+            ),
+            reporting_currency: unavailable_annual_value(self.reporting_currency),
+            monthly_average_net_assets: unavailable_annual_value(self.monthly_average_net_assets),
+            daily_average_net_assets: unavailable_annual_value(self.daily_average_net_assets),
+            is_etf: unavailable_annual_value(self.is_etf),
+            is_index: unavailable_annual_value(self.is_index),
+            collateral_required: unavailable_annual_value(self.collateral_required),
+            shares_per_creation_unit: unavailable_annual_value(self.shares_per_creation_unit),
+            shares_per_redemption_unit: unavailable_annual_value(self.shares_per_redemption_unit),
+            in_kind: unavailable_annual_value(self.in_kind),
+        }
+    }
+}
+
+fn merge_copy_annual_value<T: Copy + Eq>(
+    selected: &mut Option<FundReportedValue<T>>,
+    candidate: &FundReportedValue<T>,
+) {
+    match selected {
+        None => {
+            *selected = Some(match candidate {
+                FundReportedValue::Reported(value) => FundReportedValue::Reported(*value),
+                FundReportedValue::Missing(reason) => FundReportedValue::Missing(*reason),
+                FundReportedValue::Conflict(reason) => FundReportedValue::Conflict(*reason),
+            });
+        }
+        Some(current) if current != candidate => {
+            *current = FundReportedValue::Conflict(FundConflictState::CompetingSourceRows);
+        }
+        Some(_) => {}
+    }
+}
+
+fn merge_decimal_annual_value(
+    selected: &mut Option<FundReportedValue<FundReportedDecimal>>,
+    candidate: &FundReportedValue<FundReportedDecimal>,
+) -> Result<(), SecFundProductBoundaryError> {
+    match selected {
+        None => *selected = Some(try_copy_reported_decimal(candidate)?),
+        Some(current) if current != candidate => {
+            *current = FundReportedValue::Conflict(FundConflictState::CompetingSourceRows);
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+fn try_copy_reported_decimal(
+    value: &FundReportedValue<FundReportedDecimal>,
+) -> Result<FundReportedValue<FundReportedDecimal>, SecFundProductBoundaryError> {
+    try_copy_reported_value(value, try_copy_decimal)
+}
+
+fn try_copy_reported_quantity(
+    value: &FundReportedValue<FundHoldingQuantity>,
+) -> Result<FundReportedValue<FundHoldingQuantity>, SecFundProductBoundaryError> {
+    try_copy_reported_value(value, |quantity| {
+        Ok(FundHoldingQuantity::new(
+            try_copy_decimal(quantity.amount())?,
+            try_copy_holding_unit(quantity.unit())?,
+        ))
+    })
+}
+
+fn try_copy_reported_currency_amount(
+    value: &FundReportedValue<FundCurrencyAmount>,
+) -> Result<FundReportedValue<FundCurrencyAmount>, SecFundProductBoundaryError> {
+    try_copy_reported_value(value, |amount| {
+        Ok(FundCurrencyAmount::new(
+            try_copy_decimal(amount.amount())?,
+            amount.currency(),
+        ))
+    })
+}
+
+fn try_copy_reported_value<T, CopyValue>(
+    value: &FundReportedValue<T>,
+    copy_value: CopyValue,
+) -> Result<FundReportedValue<T>, SecFundProductBoundaryError>
+where
+    CopyValue: FnOnce(&T) -> Result<T, SecFundProductBoundaryError>,
+{
+    match value {
+        FundReportedValue::Reported(value) => copy_value(value).map(FundReportedValue::Reported),
+        FundReportedValue::Missing(reason) => Ok(FundReportedValue::Missing(*reason)),
+        FundReportedValue::Conflict(reason) => Ok(FundReportedValue::Conflict(*reason)),
+    }
+}
+
+fn try_copy_decimal(
+    value: &FundReportedDecimal,
+) -> Result<FundReportedDecimal, SecFundProductBoundaryError> {
+    let value = try_boxed_product_text(value.as_str(), SEC_FUND_MAXIMUM_DECIMAL_BYTES)
+        .map_err(|_error| SecFundProductBoundaryError::ResourceExhausted)?;
+    FundReportedDecimal::try_from_boxed_str(value)
+        .map_err(|_error| SecFundProductBoundaryError::PublicationMismatch)
+}
+
+fn try_copy_holding_unit(
+    unit: &FundHoldingUnit,
+) -> Result<FundHoldingUnit, SecFundProductBoundaryError> {
+    match unit {
+        FundHoldingUnit::Shares => Ok(FundHoldingUnit::Shares),
+        FundHoldingUnit::Principal => Ok(FundHoldingUnit::Principal),
+        FundHoldingUnit::Contracts => Ok(FundHoldingUnit::Contracts),
+        FundHoldingUnit::Currency(currency) => Ok(FundHoldingUnit::Currency(*currency)),
+        FundHoldingUnit::Other(identifier) => SourceIdentifier::try_from(try_copy_product_string(
+            identifier.as_str(),
+            SEC_FUND_MAXIMUM_UNIT_BYTES,
+        )?)
+        .map(FundHoldingUnit::Other)
+        .map_err(|_error| SecFundProductBoundaryError::ResourceExhausted),
+    }
+}
+
+fn try_copy_product_string(
+    value: &str,
+    maximum_bytes: usize,
+) -> Result<String, SecFundProductBoundaryError> {
+    try_boxed_product_text(value, maximum_bytes)
+        .map(String::from)
+        .map_err(|_error| SecFundProductBoundaryError::ResourceExhausted)
+}
+
+fn unavailable_annual_value<T>(value: Option<FundReportedValue<T>>) -> FundReportedValue<T> {
+    value.unwrap_or(FundReportedValue::Missing(
+        market_squawk_domain::FundMissingState::Unavailable,
+    ))
+}
+
+fn filing_state_matches(
+    selected: &FundResearchFilingState,
+    filing: &FundFilingIdentity,
+    available_at: Timestamp,
+) -> bool {
+    selected.report_period_end() == filing.chronology().report_period_end()
+        && selected.report_date() == filing.chronology().report_date()
+        && selected.filed_date() == filing.chronology().filed_date()
+        && selected.accepted_at() == filing.chronology().accepted_at()
+        && selected.available_at == available_at
+        && selected.amendment == filing.revision().amendment()
+        && selected.revision_status == filing.revision().status()
+}
+
+impl FundResearchFilingState {
+    pub(crate) const fn report_period_end(&self) -> &FundReportedValue<CalendarDate> {
+        &self.report_period_end
+    }
+    pub(crate) const fn report_date(&self) -> &FundReportedValue<CalendarDate> {
+        &self.report_date
+    }
+    pub(crate) const fn filed_date(&self) -> &FundReportedValue<CalendarDate> {
+        &self.filed_date
+    }
+    pub(crate) const fn accepted_at(&self) -> &FundReportedValue<Timestamp> {
+        &self.accepted_at
+    }
+    pub(crate) const fn available_at(&self) -> Timestamp {
+        self.available_at
+    }
+    pub(crate) const fn amendment(&self) -> FundAmendmentState {
+        self.amendment
+    }
+    pub(crate) const fn revision_status(&self) -> FundRevisionStatus {
+        self.revision_status
     }
 }
 
@@ -747,6 +1096,8 @@ pub(crate) enum SecFundProductBoundaryError {
     DeadlineUnavailable,
     #[error("SEC fund publication evidence does not match its admitted request")]
     PublicationMismatch,
+    #[error("SEC fund product projection exceeded its resource capacity")]
+    ResourceExhausted,
 }
 
 fn validate_family_scope(

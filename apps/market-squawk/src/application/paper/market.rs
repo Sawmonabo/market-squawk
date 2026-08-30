@@ -1,6 +1,8 @@
 //! Bounded current-state Market domain over the paper runtime's live owner.
 
 mod candidate;
+mod history;
+mod product;
 mod results;
 mod serialization;
 mod unified;
@@ -38,6 +40,7 @@ use crate::application::market_runtime::{
 };
 use crate::application::market_selection::{MarketOperation, MarketOperationSet};
 use crate::application::research::MarketEventPointInTimeReceipt;
+use crate::application::research::MarketHistoryReadCapability;
 use crate::application::{ApplicationDomainService, effective_service_limits};
 pub(super) use candidate::ProductionPortfolioCandidateResolutionFactory;
 use results::{
@@ -46,8 +49,8 @@ use results::{
 };
 use serialization::{source_coverage_value, timestamp_value};
 use unified::{
-    MarketSurfaceRightsPolicy, MarketSurfaceSelectionPolicy, build_market_instrument_result,
-    build_market_overview_result, build_unified_market_result, market_event_provenance,
+    MarketSurfaceRightsPolicy, MarketSurfaceSelectionPolicy, build_market_overview_result,
+    build_unified_market_result, market_event_provenance,
 };
 
 const MARKET_GET_SNAPSHOT: &str = "Market.GetSnapshot";
@@ -59,11 +62,11 @@ const MARKET_GET_COMPARISONS: &str = "Market.GetComparisons";
 const MARKET_GET_UNIFIED_FEED: &str = "Market.GetUnifiedFeed";
 const MARKET_GET_OVERVIEW: &str = "Market.GetOverview";
 const MARKET_GET_INSTRUMENT: &str = "Market.GetInstrument";
+const MARKET_GET_HISTORY: &str = "Market.GetHistory";
 const MARKET_SEARCH_UNIVERSE: &str = "Market.SearchUniverse";
 const MAXIMUM_UNIFIED_MARKET_INSTRUMENTS: usize = 4_096;
 const MAXIMUM_UNIFIED_DISPLAY_SOURCES_PER_INSTRUMENT: usize = 256;
 const MAXIMUM_UNIFIED_ORDER_SAMPLE: usize = 64;
-const MAXIMUM_REFERENCE_SEARCH_ROWS: usize = 100;
 const MAXIMUM_DURABLE_EVENT_CANDIDATES: usize = 32;
 const DURABLE_CURRENT_EVENT_KINDS: [LiveEventClass; 4] = [
     LiveEventClass::Trade,
@@ -505,6 +508,7 @@ pub(super) struct MarketDomainService {
     instrument_definitions: InstrumentDefinitionReadCapability,
     market_data_instruments: MarketDataInstrumentReadCapability,
     reference_search: Arc<dyn MarketReferenceSearchAuthority>,
+    market_history: MarketHistoryReadCapability,
 }
 
 impl MarketDomainService {
@@ -513,12 +517,14 @@ impl MarketDomainService {
         instrument_definitions: InstrumentDefinitionReadCapability,
         market_data_instruments: MarketDataInstrumentReadCapability,
         reference_search: Arc<dyn MarketReferenceSearchAuthority>,
+        market_history: MarketHistoryReadCapability,
     ) -> Self {
         Self {
             registry,
             instrument_definitions,
             market_data_instruments,
             reference_search,
+            market_history,
         }
     }
 }
@@ -548,26 +554,6 @@ impl ApplicationDomainService for MarketDomainService {
             return Err(ServiceError::Unavailable);
         }
         let limits = effective_service_limits(&request, &context)?;
-        if request.name() == MARKET_SEARCH_UNIVERSE {
-            let query = request
-                .arguments()
-                .get("query")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let maximum_rows = limits
-                .maximum_result_items()
-                .min(MAXIMUM_REFERENCE_SEARCH_ROWS);
-            let page = self
-                .reference_search
-                .search(
-                    query,
-                    maximum_rows,
-                    context.deadline(),
-                    context.cancellation(),
-                )
-                .await?;
-            return build_reference_search_result(page, limits, &context);
-        }
         let filters = MarketFilters::parse(&request)?;
         let reference_at = system_timestamp()?;
         let snapshots = self
@@ -627,22 +613,28 @@ impl ApplicationDomainService for MarketDomainService {
                 limits,
                 &context,
             ),
-            MARKET_GET_UNIFIED_FEED | MARKET_GET_OVERVIEW | MARKET_GET_INSTRUMENT => {
-                if request.name() == MARKET_GET_INSTRUMENT && filters.instruments.len() != 1 {
-                    return Err(ServiceError::InvalidRequest);
-                }
-                let durable_market =
-                    if matches!(request.name(), MARKET_GET_OVERVIEW | MARKET_GET_INSTRUMENT) {
-                        load_durable_market_evidence(
-                            self.registry.as_ref(),
-                            &filters,
-                            reference_at,
-                            &context,
-                        )
-                        .await?
-                    } else {
-                        DurableMarketEvidenceSet::default()
-                    };
+            MARKET_GET_UNIFIED_FEED
+            | MARKET_GET_OVERVIEW
+            | MARKET_GET_INSTRUMENT
+            | MARKET_GET_HISTORY
+            | MARKET_SEARCH_UNIVERSE => {
+                let durable_market = if matches!(
+                    request.name(),
+                    MARKET_GET_OVERVIEW
+                        | MARKET_GET_INSTRUMENT
+                        | MARKET_GET_HISTORY
+                        | MARKET_SEARCH_UNIVERSE
+                ) {
+                    load_durable_market_evidence(
+                        self.registry.as_ref(),
+                        &filters,
+                        reference_at,
+                        &context,
+                    )
+                    .await?
+                } else {
+                    DurableMarketEvidenceSet::default()
+                };
                 let display_instrument_ids =
                     load_display_instrument_ids(self.registry.as_ref(), &filters, &context).await?;
                 let market_instrument_ids =
@@ -699,6 +691,36 @@ impl ApplicationDomainService for MarketDomainService {
                     &display_snapshots,
                     &kraken_projection_refs,
                 );
+                let product_identities = if matches!(
+                    request.name(),
+                    MARKET_GET_OVERVIEW
+                        | MARKET_GET_INSTRUMENT
+                        | MARKET_GET_HISTORY
+                        | MARKET_SEARCH_UNIVERSE
+                ) {
+                    let mut product_definitions = Vec::new();
+                    product_definitions
+                        .try_reserve_exact(market_data_records.len())
+                        .map_err(|_error| ServiceError::ResourceExhausted)?;
+                    for record in &market_data_records {
+                        product_definitions.push(
+                            definitions
+                                .iter()
+                                .find(|definition| {
+                                    definition.instrument_id()
+                                        == record.definition().instrument_id()
+                                })
+                                .cloned()
+                                .ok_or(ServiceError::Unavailable)?,
+                        );
+                    }
+                    Some(product::product_market_identities(
+                        &product_definitions,
+                        &market_data_records,
+                    )?)
+                } else {
+                    None
+                };
                 match request.name() {
                     MARKET_GET_UNIFIED_FEED => build_unified_market_result(
                         &streams,
@@ -714,36 +736,114 @@ impl ApplicationDomainService for MarketDomainService {
                         limits,
                         &context,
                     ),
-                    MARKET_GET_OVERVIEW => build_market_overview_result(
-                        &streams,
-                        &filters,
-                        &definitions,
-                        &market_data_records,
-                        &display_snapshots,
-                        &kraken_projection_refs,
-                        &surface_policies,
-                        &order_level,
-                        &durable_market,
-                        reference_at,
-                        snapshots.failures().is_empty() && durable_market.complete_for(&streams),
-                        limits,
-                        &context,
-                    ),
-                    MARKET_GET_INSTRUMENT => build_market_instrument_result(
-                        &streams,
-                        &filters,
-                        &definitions,
-                        &market_data_records,
-                        &display_snapshots,
-                        &kraken_projection_refs,
-                        &surface_policies,
-                        &order_level,
-                        &durable_market,
-                        reference_at,
-                        snapshots.failures().is_empty() && durable_market.complete_for(&streams),
-                        limits,
-                        &context,
-                    ),
+                    MARKET_GET_OVERVIEW | MARKET_GET_INSTRUMENT => {
+                        let identities = product_identities
+                            .as_deref()
+                            .ok_or(ServiceError::Internal)?;
+                        let selection_token = request
+                            .arguments()
+                            .get("selectionToken")
+                            .and_then(Value::as_str);
+                        let page_selection = if request.name() == MARKET_GET_INSTRUMENT {
+                            let instrument_id = product::resolve_selection_token(
+                                identities,
+                                selection_token.ok_or(ServiceError::InvalidRequest)?,
+                            )?;
+                            let identity = identities
+                                .iter()
+                                .find(|identity| identity.instrument_id() == instrument_id)
+                                .ok_or(ServiceError::InvalidResult)?;
+                            product::select_product_page(
+                                std::slice::from_ref(identity),
+                                None,
+                                1,
+                                None,
+                            )?
+                        } else {
+                            product::select_product_page(
+                                identities,
+                                request.arguments().get("query").and_then(Value::as_str),
+                                limits
+                                    .maximum_result_items()
+                                    .min(product::MAXIMUM_PRODUCT_MARKET_ROWS),
+                                request.arguments().get("pageToken").and_then(Value::as_str),
+                            )?
+                        };
+                        let mut selected_instruments = Vec::new();
+                        selected_instruments
+                            .try_reserve_exact(page_selection.instrument_ids().len())
+                            .map_err(|_error| ServiceError::ResourceExhausted)?;
+                        selected_instruments.extend_from_slice(page_selection.instrument_ids());
+                        let page_filters = MarketFilters {
+                            instruments: selected_instruments,
+                            sources: Vec::new(),
+                            time_range: None,
+                        };
+                        let native = build_market_overview_result(
+                            &streams,
+                            &page_filters,
+                            &definitions,
+                            &market_data_records,
+                            &display_snapshots,
+                            &kraken_projection_refs,
+                            &surface_policies,
+                            &order_level,
+                            &durable_market,
+                            reference_at,
+                            snapshots.failures().is_empty()
+                                && durable_market.complete_for(&streams),
+                            limits,
+                            &context,
+                        )?;
+                        let native_rows = native
+                            .structured_content()
+                            .as_array()
+                            .ok_or(ServiceError::Unavailable)?;
+                        let available = page_selection.available();
+                        let has_more = page_selection.has_more();
+                        let content =
+                            product::project_product_page(identities, page_selection, native_rows)?;
+                        product::product_result(content, available, has_more, limits)
+                    }
+                    MARKET_SEARCH_UNIVERSE => {
+                        let query = request
+                            .arguments()
+                            .get("query")
+                            .and_then(Value::as_str)
+                            .ok_or(ServiceError::InvalidRequest)?;
+                        let (content, available, has_more) = product::product_search_page(
+                            product_identities
+                                .as_deref()
+                                .ok_or(ServiceError::Internal)?,
+                            query,
+                            limits
+                                .maximum_result_items()
+                                .min(product::MAXIMUM_PRODUCT_MARKET_ROWS),
+                            request.arguments().get("pageToken").and_then(Value::as_str),
+                        )?;
+                        product::product_result(content, available, has_more, limits)
+                    }
+                    MARKET_GET_HISTORY => {
+                        let token = request
+                            .arguments()
+                            .get("historyToken")
+                            .and_then(Value::as_str)
+                            .ok_or(ServiceError::InvalidRequest)?;
+                        let instrument_id = product::resolve_history_token(
+                            product_identities
+                                .as_deref()
+                                .ok_or(ServiceError::Internal)?,
+                            token,
+                        )?;
+                        history::build_product_market_history_result(
+                            &self.market_history,
+                            instrument_id,
+                            token,
+                            limits,
+                            &context,
+                        )
+                        .await
+                    }
                     _ => Err(ServiceError::NotFound),
                 }
             }

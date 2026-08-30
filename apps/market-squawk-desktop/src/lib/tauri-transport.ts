@@ -5,17 +5,18 @@ import {
   applicationResultSchema,
   desktopEventSchema,
   desktopEventSubscriptionReceiptSchema,
-  desktopStartupSchema,
+  desktopSystemStartupSchema,
   encryptedFileFallbackSchema,
   installationControlResultSchema,
   inputTicketSchema,
   mcpClientsStatusSchema,
+  nativeEvidenceApplicationResultSchema,
   providerActivationSchema,
   providerBootstrapSchema,
   providerSessionSchema,
 } from "@/lib/schemas"
 import type {
-  DashboardQuery,
+  DesktopTransport,
   DecisionControlRequest,
   FairValueControlRequest,
   GovernanceControlRequest,
@@ -27,39 +28,80 @@ import type {
   ManualPaperRequest,
   OperationsControlRequest,
   PaperControlRequest,
+  ProductQuery,
   ProductTransport,
   ProviderOnboardingRequest,
   ProviderOnboardingResult,
   ResearchControlRequest,
   SourceLifecycleAction,
   SourceLifecycleRequest,
+  SystemQuery,
+  SystemTransport,
   TrainingInputKind,
 } from "@/lib/transport"
 
-export function createProductTransport(): ProductTransport {
-  if (!isTauri()) {
-    return new UnavailableBrowserTransport()
+export function createDesktopTransport(): DesktopTransport {
+  const bridge = isTauri()
+    ? new TauriTransport()
+    : new UnavailableBrowserTransport()
+  return {
+    product: productPort(bridge),
+    system: systemPort(bridge),
   }
-  return new TauriTransport()
 }
 
-class TauriTransport implements ProductTransport {
+function productPort(transport: ProductTransport): ProductTransport {
+  return Object.freeze({
+    query: transport.query.bind(transport),
+    modelProducts: transport.modelProducts.bind(transport),
+    backtestProducts: transport.backtestProducts.bind(transport),
+    datasetPreparation: transport.datasetPreparation.bind(transport),
+    backtestPreparation: transport.backtestPreparation.bind(transport),
+    forecastPreparation: transport.forecastPreparation.bind(transport),
+    researchExport: transport.researchExport.bind(transport),
+    paperControl: transport.paperControl.bind(transport),
+    manualPaper: transport.manualPaper.bind(transport),
+  })
+}
+
+function systemPort(transport: SystemTransport): SystemTransport {
+  return Object.freeze({
+    bootstrap: transport.bootstrap.bind(transport),
+    bootstrapService: transport.bootstrapService.bind(transport),
+    installation: transport.installation.bind(transport),
+    systemQuery: transport.systemQuery.bind(transport),
+    analyticalController: transport.analyticalController.bind(transport),
+    researchControl: transport.researchControl.bind(transport),
+    startBacktestFromFile: transport.startBacktestFromFile.bind(transport),
+    modelControl: transport.modelControl.bind(transport),
+    decisionControl: transport.decisionControl.bind(transport),
+    governanceQuery: transport.governanceQuery.bind(transport),
+    governanceControl: transport.governanceControl.bind(transport),
+    fairValueControl: transport.fairValueControl.bind(transport),
+    jobControl: transport.jobControl.bind(transport),
+    sourceControl: transport.sourceControl.bind(transport),
+    importProviderCredentialBundle:
+      transport.importProviderCredentialBundle.bind(transport),
+    operationsControl: transport.operationsControl.bind(transport),
+    stageTrainingInput: transport.stageTrainingInput.bind(transport),
+    mcpClients: transport.mcpClients.bind(transport),
+    mcpClientControl: transport.mcpClientControl.bind(transport),
+    subscribe: transport.subscribe.bind(transport),
+    onboard: transport.onboard.bind(transport),
+    openOfficialProviderPage: transport.openOfficialProviderPage.bind(transport),
+    openProtectedProviderSetup:
+      transport.openProtectedProviderSetup.bind(transport),
+  })
+}
+
+class TauriTransport implements ProductTransport, SystemTransport {
   async bootstrap() {
     const value = await invoke("desktop_bootstrap")
-    return desktopStartupSchema.parse(value)
+    return desktopSystemStartupSchema.parse(value)
   }
 
-  async bootstrapService(request: Parameters<ProductTransport["bootstrapService"]>[0]) {
+  async bootstrapService(request: Parameters<SystemTransport["bootstrapService"]>[0]) {
     await invoke("desktop_service_bootstrap", { request })
-  }
-
-  async reconnectService(
-    expectedRuntime: Parameters<ProductTransport["reconnectService"]>[0],
-  ) {
-    const value = await invoke("desktop_service_reconnect", {
-      request: { expectedRuntime },
-    })
-    return desktopStartupSchema.parse(value)
   }
 
   async installation(request: InstallationControlRequest, confirmed = false) {
@@ -70,9 +112,14 @@ class TauriTransport implements ProductTransport {
     return installationControlResultSchema.parse(value)
   }
 
-  async query(request: DashboardQuery) {
+  async query(request: ProductQuery) {
     const value = await invoke("dashboard_query", { request })
     return applicationResultSchema.parse(value)
+  }
+
+  async systemQuery(request: SystemQuery) {
+    const value = await invoke("dashboard_query", { request })
+    return nativeEvidenceApplicationResultSchema.parse(value)
   }
 
   async modelProducts(request: Parameters<ProductTransport["modelProducts"]>[0]) {
@@ -88,7 +135,7 @@ class TauriTransport implements ProductTransport {
   }
 
   async analyticalController(
-    request: Parameters<ProductTransport["analyticalController"]>[0],
+    request: Parameters<SystemTransport["analyticalController"]>[0],
     confirmed = false,
   ) {
     const value = await invoke("analytical_controller", { request, confirmed })
@@ -97,6 +144,17 @@ class TauriTransport implements ProductTransport {
 
   async researchControl(request: ResearchControlRequest, confirmed = false) {
     const value = await invoke("research_control", { request, confirmed })
+    return nativeEvidenceApplicationResultSchema.parse(value)
+  }
+
+  async researchExport(collectionToken: string, confirmed = false) {
+    const value = await invoke("research_control", {
+      request: {
+        action: "startCollectionExport",
+        collection: collectionToken,
+      },
+      confirmed,
+    })
     return applicationResultSchema.parse(value)
   }
 
@@ -153,12 +211,12 @@ class TauriTransport implements ProductTransport {
 
   async governanceQuery(request: GovernanceQueryRequest) {
     const value = await invoke("governance_query", { request })
-    return applicationResultSchema.parse(value)
+    return nativeEvidenceApplicationResultSchema.parse(value)
   }
 
   async governanceControl(request: GovernanceControlRequest, confirmed = false) {
     const value = await invoke("governance_control", { request, confirmed })
-    return applicationResultSchema.parse(value)
+    return nativeEvidenceApplicationResultSchema.parse(value)
   }
 
   async fairValueControl(request: FairValueControlRequest, confirmed = false) {
@@ -178,7 +236,7 @@ class TauriTransport implements ProductTransport {
 
   async jobControl(request: JobControlRequest, confirmed = false) {
     const value = await invoke("job_control", { request, confirmed })
-    return applicationResultSchema.parse(value)
+    return nativeEvidenceApplicationResultSchema.parse(value)
   }
 
   async sourceControl(
@@ -187,7 +245,7 @@ class TauriTransport implements ProductTransport {
     confirmed = false,
   ) {
     const value = await invoke("source_control", { action, request, confirmed })
-    return applicationResultSchema.parse(value)
+    return nativeEvidenceApplicationResultSchema.parse(value)
   }
 
   async importProviderCredentialBundle() {
@@ -198,7 +256,7 @@ class TauriTransport implements ProductTransport {
 
   async operationsControl(request: OperationsControlRequest, confirmed = false) {
     const value = await invoke("operations_control", { request, confirmed })
-    return applicationResultSchema.parse(value)
+    return nativeEvidenceApplicationResultSchema.parse(value)
   }
 
   async stageTrainingInput(kind: TrainingInputKind) {
@@ -217,9 +275,9 @@ class TauriTransport implements ProductTransport {
   }
 
   async subscribe(
-    request: Parameters<ProductTransport["subscribe"]>[0],
-    onEvent: Parameters<ProductTransport["subscribe"]>[1],
-    onProtocolError: Parameters<ProductTransport["subscribe"]>[2],
+    request: Parameters<SystemTransport["subscribe"]>[0],
+    onEvent: Parameters<SystemTransport["subscribe"]>[1],
+    onProtocolError: Parameters<SystemTransport["subscribe"]>[2],
   ) {
     let active = true
     const channel = new Channel<unknown>((value) => {
@@ -313,7 +371,7 @@ function parseProviderResult<Request extends ProviderOnboardingRequest>(
   return parsed as ProviderOnboardingResult<Request>
 }
 
-class UnavailableBrowserTransport implements ProductTransport {
+class UnavailableBrowserTransport implements ProductTransport, SystemTransport {
   bootstrap(): Promise<never> {
     return Promise.reject(
       new Error(
@@ -326,15 +384,15 @@ class UnavailableBrowserTransport implements ProductTransport {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
-  reconnectService(): Promise<never> {
-    return Promise.reject(new Error("The local application is not connected."))
-  }
-
   installation(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
   query(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  systemQuery(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 
@@ -371,6 +429,10 @@ class UnavailableBrowserTransport implements ProductTransport {
   }
 
   forecastPreparation(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  researchExport(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 

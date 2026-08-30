@@ -784,8 +784,8 @@ impl CostAdjustedPitBacktestEvidence {
     ///
     /// # Errors
     ///
-    /// Rejects negative drawdown or modeled cost assumptions, invalid stability, or a simulation
-    /// cutoff later than the evidence publication time.
+    /// Rejects drawdown outside zero through one hundred percent, invalid modeled cost
+    /// assumptions or stability, or a simulation cutoff later than the evidence publication time.
     #[allow(
         clippy::too_many_arguments,
         reason = "PIT dataset, command, terminal, report, cohort, and cost authorities remain explicit"
@@ -815,7 +815,7 @@ impl CostAdjustedPitBacktestEvidence {
         if outcome_horizon_nanos <= 0 || simulation_cutoff_at > window.available_at() {
             return Err(InvestmentProposalError::InvalidTimeOrder);
         }
-        if max_drawdown.get().is_negative()
+        if !(0..=10_000).contains(&max_drawdown.get())
             || [
                 fee_basis_points,
                 slippage_basis_points,

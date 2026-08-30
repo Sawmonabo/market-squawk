@@ -5,6 +5,51 @@ import type { ApplicationResult } from "@/lib/schemas"
 
 const exactDecimalSchema = z.string().regex(/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/)
 
+const displayValueSchema = z
+  .object({
+    exact: exactDecimalSchema,
+    formatted: z.string().min(1).max(120),
+  })
+  .strict()
+
+const investmentDisplaySchema = z
+  .object({
+    name: z.string().min(1).max(240),
+    symbol: z.string().min(1).max(64).nullable(),
+    description: z.string().min(1).max(400),
+  })
+  .strict()
+
+export const forecastTargetSchema = z
+  .object({
+    label: z.string().min(1).max(200),
+    meaning: z.string().min(1).max(1_000),
+    valueKind: z.enum(["market_price", "percentage_return", "probability"]),
+    unitLabel: z.string().min(1).max(80),
+    currencyCode: z.string().regex(/^[A-Z]{3}$/).nullable(),
+  })
+  .strict()
+
+const productForecastHorizonSchema = z
+  .object({
+    label: z.string().min(1).max(200),
+    description: z.string().min(1).max(1_000),
+    points: z.number().int().positive().max(512),
+  })
+  .strict()
+
+export const forecastModelEvidenceSchema = z
+  .object({
+    modelToken: z.string().uuid(),
+    overall: z.enum(["sufficient", "limited", "unavailable"]),
+    pitInputs: z.enum(["sufficient", "limited", "unavailable"]),
+    outOfSample: z.enum(["sufficient", "limited", "unavailable"]),
+    horizonAlignment: z.enum(["sufficient", "limited", "unavailable"]),
+    calibration: z.enum(["calibrated", "limited", "unavailable"]),
+    interpretation: z.string().min(1).max(1_000),
+  })
+  .strict()
+
 const modelEvidenceSchema = z
   .object({
     modelToken: z.string().uuid(),
@@ -61,7 +106,6 @@ const modelActivitySchema = z
     activityToken: z.string().uuid(),
     label: z.string().min(1).max(240),
     state: z.enum(["queued", "running", "completed", "failed"]),
-    statusMessage: z.string().min(1).max(1_000),
     progressPercent: exactDecimalSchema.nullable(),
     updatedAtUnixNanos: losslessIntegerSchema,
   })
@@ -71,22 +115,16 @@ const modelActivityPageSchema = z
   .object({ activities: z.array(modelActivitySchema).max(1_024) })
   .strict()
 
-const forecastEvidenceStateSchema = z.enum(["calibrated", "limited"])
-
 export const forecastSummarySchema = z
   .object({
     forecastToken: z.string().uuid(),
-    investmentToken: z.string().uuid(),
+    investment: investmentDisplaySchema,
+    target: forecastTargetSchema,
+    modelEvidence: forecastModelEvidenceSchema,
     observedThroughUnixNanos: losslessIntegerSchema,
     createdAtUnixNanos: losslessIntegerSchema,
     expiresAtUnixNanos: losslessIntegerSchema,
-    horizon: z
-      .object({
-        points: z.number().int().positive().max(512),
-        stepNanos: losslessIntegerSchema,
-      })
-      .strict(),
-    evidenceState: forecastEvidenceStateSchema,
+    horizon: productForecastHorizonSchema,
     historicalObservationCount: z.number().int().nonnegative().max(4_096),
     limitations: z.array(z.string().min(1).max(4_096)).max(256),
   })
@@ -101,13 +139,13 @@ const forecastPageSchema = z
   .strict()
 
 const forecastRangeSchema = z
-  .object({ lower: exactDecimalSchema, upper: exactDecimalSchema })
+  .object({ lower: displayValueSchema, upper: displayValueSchema })
   .strict()
 
 const forecastPointSchema = z
   .object({
     targetAtUnixNanos: losslessIntegerSchema,
-    central: exactDecimalSchema,
+    central: displayValueSchema,
     ranges: z
       .object({
         likely: forecastRangeSchema,
@@ -123,7 +161,7 @@ const observedHistoryPointSchema = z
   .object({
     observedAtUnixNanos: losslessIntegerSchema,
     availableAtUnixNanos: losslessIntegerSchema,
-    value: exactDecimalSchema,
+    value: displayValueSchema,
   })
   .strict()
 
@@ -133,7 +171,19 @@ const driftMonitoringSchema = z
     observedCount: z.number().int().nonnegative(),
     includedCount: z.number().int().nonnegative(),
     truncated: z.boolean(),
-    meanAbsoluteError: exactDecimalSchema.nullable(),
+    meanAbsoluteError: z
+      .object({
+        value: displayValueSchema,
+        rounding: z
+          .object({
+            state: z.enum(["exact", "rounded"]),
+            decimalPlaces: z.number().int().nonnegative().max(18),
+            mode: z.literal("half_even"),
+          })
+          .strict(),
+      })
+      .strict()
+      .nullable(),
     interpretation: z.string().min(1).max(2_000),
   })
   .strict()
@@ -147,7 +197,7 @@ const calibrationSchema = z
       .array(
         z
           .object({
-            targetCoveragePercent: exactDecimalSchema,
+            targetCoveragePercent: displayValueSchema,
             realizedCovered: z.number().int().nonnegative(),
             realizedTotal: z.number().int().positive(),
           })
@@ -162,18 +212,14 @@ const calibrationSchema = z
 export const forecastVintageSchema = z
   .object({
     forecastToken: z.string().uuid(),
-    investmentToken: z.string().uuid(),
+    investment: investmentDisplaySchema,
+    target: forecastTargetSchema,
+    modelEvidence: forecastModelEvidenceSchema,
     observedThroughUnixNanos: losslessIntegerSchema,
     availableAtUnixNanos: losslessIntegerSchema,
     createdAtUnixNanos: losslessIntegerSchema,
     expiresAtUnixNanos: losslessIntegerSchema,
-    horizon: z
-      .object({
-        points: z.number().int().positive().max(512),
-        stepNanos: losslessIntegerSchema,
-      })
-      .strict(),
-    evidenceState: forecastEvidenceStateSchema,
+    horizon: productForecastHorizonSchema,
     observedHistory: z.array(observedHistoryPointSchema).max(4_096),
     estimates: z.array(forecastPointSchema).min(1).max(512),
     calibration: calibrationSchema.nullable(),
@@ -189,9 +235,9 @@ const forecastOutcomeSchema = z
     targetAtUnixNanos: losslessIntegerSchema,
     observedAtUnixNanos: losslessIntegerSchema,
     availableAtUnixNanos: losslessIntegerSchema,
-    actual: exactDecimalSchema,
-    signedError: exactDecimalSchema,
-    absoluteError: exactDecimalSchema,
+    actual: displayValueSchema,
+    signedError: displayValueSchema,
+    absoluteError: displayValueSchema,
   })
   .strict()
 

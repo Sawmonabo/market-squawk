@@ -8,13 +8,13 @@ import {
   SidebarInset,
   SidebarProvider,
 } from "@/components/ui/sidebar"
-import type { ProductTransport } from "@/lib/transport"
+import type { DesktopTransport } from "@/lib/transport"
 
 import { ProductProvider } from "./product-context"
 import { createProductQueryClient } from "./query-client"
 import { AppRoutes } from "./routes"
 
-export function App({ transport }: { transport: ProductTransport }) {
+export function App({ transport }: { transport: DesktopTransport }) {
   const [queryClient] = React.useState(createProductQueryClient)
   return (
     <QueryClientProvider client={queryClient}>

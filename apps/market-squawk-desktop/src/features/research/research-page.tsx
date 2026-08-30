@@ -1,18 +1,6 @@
 import * as React from "react"
-import {
-  useInfiniteQuery,
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query"
-import {
-  Activity,
-  AlertCircle,
-  Database,
-  RefreshCw,
-  Rows3,
-  Search,
-} from "lucide-react"
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query"
+import { AlertCircle, Database, RefreshCw, Rows3, Search } from "lucide-react"
 import { Link } from "react-router-dom"
 
 import { productKeys } from "@/app/query-client"
@@ -22,20 +10,13 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { MacroContext } from "@/features/macro"
-import {
-  hasProductCapability,
-  productCapabilitySet,
-} from "@/lib/product-capabilities"
+import { hasProductCapability } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import { DatasetBuilder } from "./dataset-builder"
 import { DatasetEvidence } from "./dataset-evidence"
-import {
-  parseResearchCollectionPage,
-  parseResearchActivities,
-  type ResearchActivity,
-} from "./research-contracts"
+import { parseResearchCollectionPage } from "./research-contracts"
 
 export function ResearchPage() {
   const product = useProduct()
@@ -86,17 +67,11 @@ function ResearchWorkspace({
   transport: ProductTransport
 }) {
   const queryClient = useQueryClient()
-  const capabilities = productCapabilitySet(bootstrap)
-  const activitiesAvailable = capabilities.has("job_list")
   const [filter, setFilter] = React.useState("")
   const [selectedId, setSelectedId] = React.useState<string | null>(null)
   const collectionKey = [
-    ...productKeys.domain(bootstrap.runtime, "research"),
+    ...productKeys.domain(bootstrap.productSessionToken, "research"),
     "collections",
-  ] as const
-  const activityKey = [
-    ...productKeys.domain(bootstrap.runtime, "research"),
-    "research-activity",
   ] as const
   const collections = useInfiniteQuery({
     queryKey: collectionKey,
@@ -110,32 +85,6 @@ function ResearchWorkspace({
       ),
     getNextPageParam: (page) =>
       page.hasMore ? (page.nextCollection ?? undefined) : undefined,
-  })
-  const activities = useQuery({
-    queryKey: activityKey,
-    queryFn: async () =>
-      parseResearchActivities(
-        await transport.query({ query: "researchActivities" }),
-      ),
-    enabled: activitiesAvailable,
-    refetchInterval: activitiesAvailable ? 5_000 : false,
-  })
-  const activityMutation = useMutation({
-    mutationFn: ({
-      activity,
-      action,
-    }: {
-      activity: string
-      action: "cancel" | "retry"
-    }) =>
-      transport.researchControl(
-        {
-          action: action === "cancel" ? "cancelActivity" : "retryActivity",
-          activity,
-        },
-        true,
-      ),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: activityKey }),
   })
 
   const allCollections = collections.data?.pages.flatMap((page) => page.items) ?? []
@@ -155,14 +104,7 @@ function ResearchWorkspace({
     (total, collection) => total + collection.rowCount,
     0,
   )
-  const activeActivities = (activities.data ?? []).filter((activity) =>
-    ["queued", "preparing", "running", "awaiting_confirmation", "recovering"].includes(
-      activity.state,
-    ),
-  ).length
-  const refreshing =
-    collections.isFetching ||
-    (activitiesAvailable && activities.isFetching)
+  const refreshing = collections.isFetching
 
   return (
     <ResearchFrame>
@@ -174,15 +116,14 @@ function ResearchWorkspace({
           <h1 className="mt-2 text-3xl font-semibold tracking-tight">Research</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
             Prepare dated information, review its history and limitations, and use it in analysis
-            or model work. Connections manages where information comes from; Operations &amp; Jobs
-            shows technical activity.
+            or model work. Connections manages information access; Operations &amp; Jobs tracks
+            longer work.
           </p>
         </div>
         <Button
           variant="outline"
           onClick={() => {
             void collections.refetch()
-            if (activitiesAvailable) void activities.refetch()
           }}
           disabled={refreshing}
         >
@@ -202,10 +143,7 @@ function ResearchWorkspace({
         bootstrap={bootstrap}
         transport={transport}
         onStarted={async () => {
-          await Promise.all([
-            queryClient.invalidateQueries({ queryKey: activityKey }),
-            queryClient.invalidateQueries({ queryKey: collectionKey }),
-          ])
+          await queryClient.invalidateQueries({ queryKey: collectionKey })
         }}
       />
 
@@ -216,32 +154,13 @@ function ResearchWorkspace({
       ) : allCollections.length === 0 ? (
         <>
           <EmptyResearch />
-          <div className="mt-4">
-            <ResearchActivity
-              activities={activities.data ?? []}
-              available={activitiesAvailable}
-              loading={activitiesAvailable && activities.isPending}
-              failed={activitiesAvailable && activities.isError}
-              pendingActivity={
-                activityMutation.isPending
-                  ? activityMutation.variables.activity
-                  : null
-              }
-              mutationFailed={activityMutation.isError}
-              act={(activity, action) =>
-                activityMutation.mutate({
-                  activity: activity.activityToken,
-                  action,
-                })
-              }
-            />
-          </div>
+          <ResearchOperationsLink />
         </>
       ) : (
         <>
           <section
             aria-label="Loaded research facts"
-            className="mt-5 grid overflow-hidden rounded-xl border border-border bg-card/50 sm:grid-cols-3"
+            className="mt-5 grid overflow-hidden rounded-xl border border-border bg-card/50 sm:grid-cols-2"
           >
             <ResearchFact
               icon={Database}
@@ -252,17 +171,6 @@ function ResearchWorkspace({
               icon={Rows3}
               label="Research observations"
               value={formatCount(totalRows)}
-            />
-            <ResearchFact
-              icon={Activity}
-              label="Work in progress"
-              value={
-                !activitiesAvailable || activities.isError
-                  ? "Unavailable"
-                  : activities.isPending
-                    ? "Loading…"
-                    : formatCount(activeActivities)
-              }
             />
           </section>
 
@@ -346,24 +254,7 @@ function ResearchWorkspace({
                   transport={transport}
                 />
               ) : null}
-              <ResearchActivity
-                activities={activities.data ?? []}
-                available={activitiesAvailable}
-                loading={activitiesAvailable && activities.isPending}
-                failed={activitiesAvailable && activities.isError}
-                pendingActivity={
-                  activityMutation.isPending
-                    ? activityMutation.variables.activity
-                    : null
-                }
-                mutationFailed={activityMutation.isError}
-                act={(activity, action) =>
-                  activityMutation.mutate({
-                    activity: activity.activityToken,
-                    action,
-                  })
-                }
-              />
+              <ResearchOperationsLink />
             </div>
           </div>
         </>
@@ -372,133 +263,22 @@ function ResearchWorkspace({
   )
 }
 
-function ResearchActivity({
-  activities,
-  available,
-  loading,
-  failed,
-  pendingActivity,
-  mutationFailed,
-  act,
-}: {
-  activities: ResearchActivity[]
-  available: boolean
-  loading: boolean
-  failed: boolean
-  pendingActivity: string | null
-  mutationFailed: boolean
-  act: (activity: ResearchActivity, action: "cancel" | "retry") => void
-}) {
+function ResearchOperationsLink() {
   return (
-    <section className="rounded-xl border border-border bg-card/35 p-5">
+    <section className="mt-4 rounded-xl border border-border bg-card/35 p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <Activity className="size-4 text-primary" aria-hidden="true" />
-          <div>
-            <h2 className="text-sm font-semibold">Background activity</h2>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Longer tasks continue if this window closes.
-            </p>
-          </div>
+        <div>
+          <h2 className="text-sm font-semibold">Research work</h2>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+            Longer preparations and exports continue if this window closes.
+          </p>
         </div>
         <Button asChild size="xs" variant="outline">
-          <Link to="/system/operations-jobs">See all activity</Link>
+          <Link to="/system/operations-jobs">Open Operations &amp; Jobs</Link>
         </Button>
       </div>
-      {!available ? (
-        <p className="mt-4 text-xs leading-5 text-muted-foreground">
-          Background activity is unavailable in this workspace.
-        </p>
-      ) : loading ? (
-        <Skeleton className="mt-4 h-20 rounded-lg" />
-      ) : failed ? (
-        <p className="mt-4 text-xs leading-5 text-destructive">
-          Current research activity could not be loaded.
-        </p>
-      ) : activities.length ? (
-        <ul className="mt-4 space-y-2">
-          {activities.slice(0, 5).map((activity) => (
-            <li
-              key={activity.activityToken}
-              className="rounded-lg border border-border bg-background/40 p-3"
-            >
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <p className="truncate text-xs font-medium">{activity.label}</p>
-                <EvidenceBadge>{activityStateLabel(activity.state)}</EvidenceBadge>
-              </div>
-              {activity.totalUnits !== null && activity.completedUnits !== null ? (
-                <div className="mt-3">
-                  <div className="h-1.5 overflow-hidden rounded-full bg-muted">
-                    <div
-                      className="h-full rounded-full bg-primary"
-                      style={{
-                        width: `${Math.min(100, (activity.completedUnits / Math.max(1, activity.totalUnits)) * 100)}%`,
-                      }}
-                    />
-                  </div>
-                  <p className="mt-1 text-[10px] text-muted-foreground">
-                    {formatCount(activity.completedUnits)} of {formatCount(activity.totalUnits)}
-                  </p>
-                </div>
-              ) : null}
-              <ActivityAction
-                activity={activity}
-                pending={pendingActivity === activity.activityToken}
-                act={act}
-              />
-            </li>
-          ))}
-        </ul>
-      ) : (
-        <p className="mt-4 text-xs leading-5 text-muted-foreground">
-          Nothing is running right now.
-        </p>
-      )}
-      {mutationFailed ? (
-        <p className="mt-3 text-xs leading-5 text-destructive">
-          That activity could not be changed. Refresh and try again.
-        </p>
-      ) : null}
     </section>
   )
-}
-
-function ActivityAction({
-  activity,
-  pending,
-  act,
-}: {
-  activity: ResearchActivity
-  pending: boolean
-  act: (activity: ResearchActivity, action: "cancel" | "retry") => void
-}) {
-  if (activity.canRetry) {
-    return (
-      <Button
-        className="mt-3"
-        size="xs"
-        variant="outline"
-        disabled={pending}
-        onClick={() => act(activity, "retry")}
-      >
-        Retry
-      </Button>
-    )
-  }
-  if (activity.canCancel) {
-    return (
-      <Button
-        className="mt-3"
-        size="xs"
-        variant="outline"
-        disabled={pending}
-        onClick={() => act(activity, "cancel")}
-      >
-        Cancel
-      </Button>
-    )
-  }
-  return null
 }
 
 function EmptyResearch() {
@@ -569,14 +349,6 @@ function ResearchFact({
   )
 }
 
-function EvidenceBadge({ children }: { children: React.ReactNode }) {
-  return (
-    <span className="rounded-full border border-primary/30 bg-primary/10 px-2.5 py-1 text-[10px] font-medium text-primary">
-      {children}
-    </span>
-  )
-}
-
 function ResearchFrame({ children }: { children: React.ReactNode }) {
   return <main className="mx-auto w-full max-w-[1240px] p-5 lg:p-7">{children}</main>
 }
@@ -606,15 +378,4 @@ function ResearchContentLoading() {
 
 function formatCount(value: number) {
   return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value)
-}
-
-function activityStateLabel(state: string) {
-  if (["queued", "preparing", "recovering"].includes(state)) return "Getting ready"
-  if (state === "running") return "In progress"
-  if (state === "awaiting_confirmation") return "Needs review"
-  if (state === "cancelling") return "Stopping"
-  if (state === "completed") return "Complete"
-  if (["failed", "interrupted"].includes(state)) return "Needs attention"
-  if (state === "cancelled") return "Stopped"
-  return "Status unavailable"
 }

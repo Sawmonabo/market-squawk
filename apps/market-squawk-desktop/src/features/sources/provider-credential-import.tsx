@@ -5,7 +5,7 @@ import { z } from "zod"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { humanize } from "@/lib/formatters"
-import type { ProductTransport } from "@/lib/transport"
+import type { SystemTransport } from "@/lib/transport"
 
 const providerOrder = [
   "schwab",
@@ -68,7 +68,7 @@ export function ProviderCredentialImport({
   onAttempted,
 }: {
   available: boolean
-  transport: ProductTransport
+  transport: SystemTransport
   onAttempted: () => void
 }) {
   const [pending, setPending] = React.useState(false)

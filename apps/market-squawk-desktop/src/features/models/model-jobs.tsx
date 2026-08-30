@@ -59,15 +59,12 @@ export function ModelJobActivity({
                         {activity.label}
                       </p>
                       <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                        {activity.statusMessage}
+                        {activityStateDescription(activity.state)}
                       </p>
                     </div>
                   </div>
                   <span className="rounded-full border border-border px-2 py-0.5 text-[10px] uppercase tracking-wider text-muted-foreground">
-                    {activity.state === "running"
-                      ? "In progress"
-                      : activity.state.charAt(0).toUpperCase() +
-                        activity.state.slice(1)}
+                    {activityStateLabel(activity.state)}
                   </span>
                 </div>
                 {activity.progressPercent ? (
@@ -89,4 +86,30 @@ export function ModelJobActivity({
 
 function Message({ text }: { text: string }) {
   return <p className="mt-4 text-sm leading-6 text-muted-foreground">{text}</p>
+}
+
+function activityStateLabel(state: ModelActivity["state"]): string {
+  switch (state) {
+    case "queued":
+      return "Waiting to start"
+    case "running":
+      return "In progress"
+    case "completed":
+      return "Completed"
+    case "failed":
+      return "Could not complete"
+  }
+}
+
+function activityStateDescription(state: ModelActivity["state"]): string {
+  switch (state) {
+    case "queued":
+      return "This research is waiting to start."
+    case "running":
+      return "Market Squawk is preparing this research."
+    case "completed":
+      return "This research is ready to review."
+    case "failed":
+      return "This research could not be completed."
+  }
 }

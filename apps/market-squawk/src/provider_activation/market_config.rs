@@ -514,6 +514,7 @@ enum MarketInstrumentSymbolAuthority {
     AcceptedProviderIdentity {
         provider_identity: ProviderIdentityRecord,
         reference: MarketInstrumentReferenceBinding,
+        canonical_market_data_definition: Option<MarketDataInstrumentRecord>,
     },
     KrakenConfiguredProvisional {
         provider_symbol: ProviderInstrumentId,
@@ -540,6 +541,54 @@ impl MarketInstrumentBinding {
         provider_identity: ProviderIdentityRecord,
         reference: MarketInstrumentReferenceBinding,
     ) -> Result<Self, MarketProviderConfigurationError> {
+        Self::try_new_with_optional_market_data_definition(
+            priority,
+            definition,
+            provider_identity,
+            reference,
+            None,
+        )
+    }
+
+    /// Binds the strict execution definition to one exact canonical market-data record.
+    ///
+    /// This construction path is reserved for a runtime that packages strict normalization and
+    /// display selection together. It retains the complete immutable market-data record so the
+    /// package boundary can require the same reference evidence, effective interval, and
+    /// whole-definition digest as its display binding.
+    pub(crate) fn try_new_with_market_data_definition(
+        priority: MarketSubscriptionPriority,
+        definition: InstrumentDefinition,
+        provider_identity: ProviderIdentityRecord,
+        reference: MarketInstrumentReferenceBinding,
+        market_data_definition: MarketDataInstrumentRecord,
+    ) -> Result<Self, MarketProviderConfigurationError> {
+        if !execution_definition_matches_market_data_definition(
+            &definition,
+            &market_data_definition,
+        ) {
+            return Err(MarketProviderConfigurationError::AuthorityRequired {
+                instrument: Some(definition.instrument_id()),
+                requirement:
+                    MarketConfigAuthorityRequirement::MarketDataInstrumentDefinitionReadCapability,
+            });
+        }
+        Self::try_new_with_optional_market_data_definition(
+            priority,
+            definition,
+            provider_identity,
+            reference,
+            Some(market_data_definition),
+        )
+    }
+
+    fn try_new_with_optional_market_data_definition(
+        priority: MarketSubscriptionPriority,
+        definition: InstrumentDefinition,
+        provider_identity: ProviderIdentityRecord,
+        reference: MarketInstrumentReferenceBinding,
+        canonical_market_data_definition: Option<MarketDataInstrumentRecord>,
+    ) -> Result<Self, MarketProviderConfigurationError> {
         if provider_identity.instrument_id() != definition.instrument_id()
             || !definition
                 .provider_identities()
@@ -558,6 +607,7 @@ impl MarketInstrumentBinding {
             symbol_authority: MarketInstrumentSymbolAuthority::AcceptedProviderIdentity {
                 provider_identity,
                 reference,
+                canonical_market_data_definition,
             },
         })
     }
@@ -634,6 +684,19 @@ impl MarketInstrumentBinding {
         }
     }
 
+    /// Returns the exact canonical market-data record retained by a joined strict/display route.
+    pub(crate) const fn canonical_market_data_definition(
+        &self,
+    ) -> Option<&MarketDataInstrumentRecord> {
+        match &self.symbol_authority {
+            MarketInstrumentSymbolAuthority::AcceptedProviderIdentity {
+                canonical_market_data_definition,
+                ..
+            } => canonical_market_data_definition.as_ref(),
+            MarketInstrumentSymbolAuthority::KrakenConfiguredProvisional { .. } => None,
+        }
+    }
+
     /// Returns the stable instrument ID supplied by the canonical definition.
     pub const fn instrument_id(&self) -> InstrumentId {
         self.definition.instrument_id()
@@ -663,6 +726,30 @@ impl MarketInstrumentBinding {
             MarketInstrumentSymbolAuthority::KrakenConfiguredProvisional { .. }
         )
     }
+}
+
+fn execution_definition_matches_market_data_definition(
+    execution: &InstrumentDefinition,
+    market_data_record: &MarketDataInstrumentRecord,
+) -> bool {
+    let market_data = market_data_record.definition();
+    let revision_digest = market_data_record.revision_digest();
+    revision_digest.algorithm() == DigestAlgorithm::Sha256
+        && revision_digest.bytes() != [0; 32]
+        && execution.instrument_id() == market_data.instrument_id()
+        && execution.asset_class() == market_data.asset_class()
+        && execution.quote_currency() == market_data.quote_currency()
+        && execution.provider_identity_conflicts().is_empty()
+        && exact_members(execution.venue_mappings(), market_data.venue_mappings())
+        && exact_members(
+            execution.provider_identities(),
+            market_data.provider_identities(),
+        )
+        && exact_members(execution.identifiers(), market_data.identifiers())
+}
+
+fn exact_members<T: Eq>(left: &[T], right: &[T]) -> bool {
+    left.len() == right.len() && left.iter().all(|member| right.contains(member))
 }
 
 /// Non-empty, deterministically ordered, bounded subscription inputs.
@@ -1754,7 +1841,18 @@ struct BindingEvidenceWire<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     reference: Option<ReferenceEvidenceWire<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    canonical_market_data_definition: Option<CanonicalMarketDataDefinitionEvidenceWire<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     kraken_configured_provisional: Option<KrakenConfiguredProvisionalSymbolEvidenceWire<'a>>,
+}
+
+#[derive(Serialize)]
+struct CanonicalMarketDataDefinitionEvidenceWire<'a> {
+    reference_evidence: &'a RevisionBoundPayloadEvidence,
+    effective_interval: EffectiveInterval,
+    revision_digest: EvidenceDigest,
+    revision_sequence: u32,
+    published_at: Timestamp,
 }
 
 #[derive(Serialize)]
@@ -1810,11 +1908,17 @@ enum ReferenceEvidenceWire<'a> {
 
 impl<'a> From<&'a MarketInstrumentBinding> for BindingEvidenceWire<'a> {
     fn from(binding: &'a MarketInstrumentBinding) -> Self {
-        let (provider_identity, reference, kraken_configured_provisional) =
+        let (
+            provider_identity,
+            reference,
+            canonical_market_data_definition,
+            kraken_configured_provisional,
+        ) =
             match &binding.symbol_authority {
             MarketInstrumentSymbolAuthority::AcceptedProviderIdentity {
                 provider_identity,
                 reference,
+                canonical_market_data_definition,
             } => {
                 let reference = match reference {
                     MarketInstrumentReferenceBinding::NasdaqListing(listing) => {
@@ -1824,16 +1928,35 @@ impl<'a> From<&'a MarketInstrumentBinding> for BindingEvidenceWire<'a> {
                         ReferenceEvidenceWire::AssignedExternalIdentifier { record }
                     }
                 };
-                (Some(provider_identity), Some(reference), None)
+                let canonical_market_data_definition = canonical_market_data_definition
+                    .as_ref()
+                    .map(|record| CanonicalMarketDataDefinitionEvidenceWire {
+                        reference_evidence: record.definition().reference_evidence(),
+                        effective_interval: record.definition().effective_interval(),
+                        revision_digest: record.revision_digest(),
+                        revision_sequence: record.revision_sequence(),
+                        published_at: record.published_at(),
+                    });
+                (
+                    Some(provider_identity),
+                    Some(reference),
+                    canonical_market_data_definition,
+                    None,
+                )
             }
             MarketInstrumentSymbolAuthority::KrakenConfiguredProvisional { provider_symbol } => {
-                (None, None, Some(KrakenConfiguredProvisionalSymbolEvidenceWire {
-                    provider_symbol,
-                    venue: KRAKEN_VENUE,
-                    evidence_revision: KRAKEN_CONFIGURED_SYMBOL_EVIDENCE_REVISION,
-                    runtime_qualification:
-                        KrakenRuntimeSymbolQualificationWire::SubscriptionAcknowledgementAndChecksumValidSnapshot,
-                }))
+                (
+                    None,
+                    None,
+                    None,
+                    Some(KrakenConfiguredProvisionalSymbolEvidenceWire {
+                        provider_symbol,
+                        venue: KRAKEN_VENUE,
+                        evidence_revision: KRAKEN_CONFIGURED_SYMBOL_EVIDENCE_REVISION,
+                        runtime_qualification:
+                            KrakenRuntimeSymbolQualificationWire::SubscriptionAcknowledgementAndChecksumValidSnapshot,
+                    }),
+                )
             }
         };
         Self {
@@ -1841,6 +1964,7 @@ impl<'a> From<&'a MarketInstrumentBinding> for BindingEvidenceWire<'a> {
             definition: binding.definition(),
             provider_identity,
             reference,
+            canonical_market_data_definition,
             kraken_configured_provisional,
         }
     }

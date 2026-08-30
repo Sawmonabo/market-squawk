@@ -37,6 +37,32 @@ impl ReadScope {
             .ok_or(PortfolioApplicationServiceError::InvalidRequest)?
             .parse()
             .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
+        Self::from_request_with_account(request, application_limits, account_id)
+    }
+
+    pub(super) fn from_product_request(
+        image: &PortfolioReadImage,
+        request: &TypedToolRequest,
+        application_limits: PortfolioApplicationLimits,
+    ) -> Result<Self, PortfolioApplicationServiceError> {
+        let account_token = request
+            .arguments()
+            .get("accountToken")
+            .and_then(Value::as_str)
+            .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
+        if request.arguments().contains_key("instrumentIds") {
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
+        }
+        let catalog = super::product::account_catalog(image)?;
+        let account_id = super::product::resolve_account_token(&catalog, account_token)?;
+        Self::from_request_with_account(request, application_limits, account_id)
+    }
+
+    fn from_request_with_account(
+        request: &TypedToolRequest,
+        application_limits: PortfolioApplicationLimits,
+        account_id: AccountId,
+    ) -> Result<Self, PortfolioApplicationServiceError> {
         let instruments = request
             .arguments()
             .get("instrumentIds")
@@ -110,7 +136,11 @@ pub(super) fn call(
         "Portfolio.ListRevisions" => return list_revisions(image, request, context, limits),
         _ => {}
     }
-    let scope = ReadScope::from_request(request, limits)?;
+    let scope = if request.name() == "Portfolio.GetRisk" {
+        ReadScope::from_product_request(image, request, limits)?
+    } else {
+        ReadScope::from_request(request, limits)?
+    };
     let revision = select_revision(image, &scope)?;
     match request.name() {
         "Portfolio.GetHoldings" => holdings(revision, &scope, context),
@@ -135,20 +165,25 @@ fn list_accounts(
     application_limits: PortfolioApplicationLimits,
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
     let (maximum_items, maximum_bytes) = read_result_limits(request, application_limits)?;
+    let catalog = super::product::account_catalog(image)?;
     let after_account = request
         .arguments()
-        .get("afterAccountId")
+        .get("afterAccountToken")
         .and_then(Value::as_str)
-        .map(str::parse::<AccountId>)
-        .transpose()
-        .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
-    let rows = image
-        .accounts
+        .map(|token| super::product::resolve_account_token(&catalog, token))
+        .transpose()?;
+    let rows = catalog
         .iter()
-        .filter(|(account_id, _)| after_account.is_none_or(|after| **account_id > after))
-        .filter_map(|(_, history)| history.revisions.last())
-        .map(account_summary)
-        .collect::<Vec<_>>();
+        .filter(|binding| after_account.is_none_or(|after| binding.account_id() > after))
+        .map(|binding| {
+            let revision = image
+                .accounts
+                .get(&binding.account_id())
+                .and_then(|history| history.revisions.last())
+                .ok_or(PortfolioApplicationServiceError::CorruptPublication)?;
+            account_summary(binding, revision)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     portfolio_page(
         rows,
         maximum_items,
@@ -206,16 +241,20 @@ fn list_revisions(
     )
 }
 
-fn account_summary(revision: &PublishedRevision) -> Value {
-    json!({
-        "accountId": revision.account.account_id().to_string(),
+fn account_summary(
+    binding: &super::product::ProductAccountBinding,
+    revision: &PublishedRevision,
+) -> Result<Value, PortfolioApplicationServiceError> {
+    if binding.account_id() != revision.account.account_id() {
+        return Err(PortfolioApplicationServiceError::CorruptPublication);
+    }
+    Ok(json!({
+        "accountToken": binding.token(),
+        "displayName": binding.display_name(),
         "currency": revision.account.currency().as_str(),
-        "cashBalance": money_value(revision.account.cash_balance()),
-        "currentSnapshot": revision_summary(revision),
-        "holdingCount": revision.holdings.len(),
-        "transactionCount": revision.transactions.len(),
-        "reconciliationDiscrepancies": revision.discrepancies.len(),
-    })
+        "holdings": revision.holdings.len(),
+        "dataIssues": revision.discrepancies.len(),
+    }))
 }
 
 fn revision_summary(revision: &PublishedRevision) -> Value {
@@ -280,11 +319,7 @@ fn portfolio_page(
         }
         .map_err(|_| PortfolioApplicationServiceError::Publication)?;
         match TypedToolResult::try_new(
-            if count == 0 {
-                Value::Null
-            } else {
-                Value::Array(rows[..count].to_vec())
-            },
+            Value::Array(rows[..count].to_vec()),
             count,
             metadata,
             limits,
@@ -452,6 +487,15 @@ pub(super) fn report_result(
             Value::String(snapshot_token(revision)),
         );
     }
+    data_result(value, 1, 1, revision, scope, context)
+}
+
+pub(super) fn product_report_result(
+    value: Value,
+    revision: &PublishedRevision,
+    scope: &ReadScope,
+    context: &RequestContext,
+) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
     data_result(value, 1, 1, revision, scope, context)
 }
 

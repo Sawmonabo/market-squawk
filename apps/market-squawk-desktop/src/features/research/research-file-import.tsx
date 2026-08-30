@@ -29,7 +29,7 @@ import {
   parseResearchFileDiscard,
   parseResearchFilePreview,
   type ResearchFilePreview,
-} from "./research-contracts"
+} from "@/features/sources/research-system-contracts"
 
 type ResearchFileFormat = ResearchFilePreview["format"]
 type ImportActivity = "preview" | "commit" | "discard" | null

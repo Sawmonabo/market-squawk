@@ -949,6 +949,11 @@ impl AnalyticalFundNavReadRequest {
         self.revision_mode
     }
 
+    /// Returns the exact caller-selected response ceiling retained by this request.
+    pub const fn limit(&self) -> AnalyticalFundNavReadLimit {
+        self.limit
+    }
+
     fn sql(&self) -> String {
         let mut filters = vec![
             "observation_kind = 'fund_nav'".to_owned(),
@@ -1713,12 +1718,21 @@ impl CompleteMarketBarHistoryReadReceipt {
 /// Typed NAV history plus non-forgeable evidence for its exact manifest-pinned query.
 #[derive(Debug)]
 pub struct AnalyticalFundNavOutput {
+    request: AnalyticalFundNavReadRequest,
     source_id: SourceId,
     output: PinnedQueryOutput,
     observations: Box<[FundNavObservation]>,
+    candidate_count: usize,
+    selected_count: usize,
+    returned_count: usize,
 }
 
 impl AnalyticalFundNavOutput {
+    /// Returns the complete exact-manifest request that produced this output.
+    pub const fn request(&self) -> &AnalyticalFundNavReadRequest {
+        &self.request
+    }
+
     /// Returns the source-rights namespace that owns the queried generation.
     pub const fn source_id(&self) -> &SourceId {
         &self.source_id
@@ -1732,6 +1746,29 @@ impl AnalyticalFundNavOutput {
     /// Returns NAV observations in canonical family/revision order under the requested PIT mode.
     pub fn observations(&self) -> &[FundNavObservation] {
         &self.observations
+    }
+
+    /// Returns the exact number of typed PIT-eligible candidates admitted before selection.
+    ///
+    /// A successful output also proves the sentinel-bounded candidate query did not overflow its
+    /// hard ceiling; overflow returns an error instead of this output type.
+    pub const fn candidate_count(&self) -> usize {
+        self.candidate_count
+    }
+
+    /// Returns the exact number of observations selected by the requested PIT revision mode.
+    pub const fn selected_count(&self) -> usize {
+        self.selected_count
+    }
+
+    /// Returns the exact number of selected observations returned under the request limit.
+    pub const fn returned_count(&self) -> usize {
+        self.returned_count
+    }
+
+    /// Returns whether every selected observation crossed the bounded response.
+    pub const fn selection_complete(&self) -> bool {
+        self.selected_count == self.returned_count
     }
 }
 
@@ -2391,12 +2428,16 @@ impl AnalyticalReadCapability {
             }
             result = execution.as_mut() => result?,
         };
-        let observations =
+        let decoded =
             decode_fund_nav_history(&output, &request, &source_id, deadline, &cancellation).await?;
         Ok(AnalyticalFundNavOutput {
+            request,
             source_id,
             output,
-            observations,
+            observations: decoded.observations,
+            candidate_count: decoded.candidate_count,
+            selected_count: decoded.selected_count,
+            returned_count: decoded.returned_count,
         })
     }
 
@@ -3254,13 +3295,23 @@ fn hash_research_period(hash: &mut Sha256, period: &ResearchPeriod) {
     hash_str(hash, period.code().as_str());
 }
 
+struct DecodedFundNavHistory {
+    observations: Box<[FundNavObservation]>,
+    candidate_count: usize,
+    selected_count: usize,
+    returned_count: usize,
+}
+
 async fn decode_fund_nav_history(
     output: &PinnedQueryOutput,
     request: &AnalyticalFundNavReadRequest,
     source_id: &SourceId,
     deadline: Instant,
     cancellation: &CancellationToken,
-) -> Result<Box<[FundNavObservation]>, AnalyticalReadError> {
+) -> Result<DecodedFundNavHistory, AnalyticalReadError> {
+    if output.manifest() != request.manifest() {
+        return Err(AnalyticalReadError::InvalidFundNavResult);
+    }
     let crate::QueryResult::Inline { batches, .. } = output.result() else {
         return Err(AnalyticalReadError::FundNavResultRequiresInline);
     };
@@ -3349,6 +3400,10 @@ async fn decode_fund_nav_history(
         .select(&pit_request, &candidates, cancellation, deadline)
         .await
         .map_err(|_| AnalyticalReadError::InvalidFundNavResult)?;
+    let selected_count = selection.records().len();
+    if selected_count > candidates.len() {
+        return Err(AnalyticalReadError::InvalidFundNavResult);
+    }
     let result_limit = usize::try_from(request.limit.get())
         .map_err(|_| AnalyticalReadError::InvalidFundNavResult)?;
     let mut observations = Vec::new();
@@ -3361,7 +3416,16 @@ async fn decode_fund_nav_history(
         };
         observations.push(nav.clone());
     }
-    Ok(observations.into_boxed_slice())
+    let returned_count = observations.len();
+    if returned_count > selected_count {
+        return Err(AnalyticalReadError::InvalidFundNavResult);
+    }
+    Ok(DecodedFundNavHistory {
+        observations: observations.into_boxed_slice(),
+        candidate_count: candidates.len(),
+        selected_count,
+        returned_count,
+    })
 }
 
 fn decode_complete_market_bar_history_object(

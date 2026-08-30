@@ -55,7 +55,7 @@ export function LookupPage() {
         <section className="rounded-xl border border-border bg-card/35 p-5" aria-label="Workspace lookup">
           <LookupSurface
             transport={product.transport}
-            scope={product.bootstrap.runtime}
+            scope={product.bootstrap.productSessionToken}
             autoFocus
           />
         </section>

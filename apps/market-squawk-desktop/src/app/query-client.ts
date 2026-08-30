@@ -2,17 +2,11 @@ import { QueryClient } from "@tanstack/react-query"
 
 import type { DesktopBootstrap } from "@/lib/schemas"
 
-export type ProductScope = DesktopBootstrap["runtime"]
+export type ProductScope = DesktopBootstrap["productSessionToken"]
 
 export const productKeys = {
   bootstrap: ["market-squawk", "bootstrap"] as const,
-  root: (scope: ProductScope) =>
-    [
-      "market-squawk",
-      scope.installationId,
-      scope.workspaceId,
-      scope.serviceGeneration,
-    ] as const,
+  root: (scope: ProductScope) => ["market-squawk", scope] as const,
   domain: (scope: ProductScope, domain: string) =>
     [...productKeys.root(scope), "domain", domain] as const,
   operation: (
@@ -27,11 +21,11 @@ export function createProductQueryClient() {
   return new QueryClient({
     defaultOptions: {
       queries: {
-        staleTime: 15_000,
+        staleTime: Number.POSITIVE_INFINITY,
         gcTime: 5 * 60_000,
-        retry: 1,
-        refetchOnWindowFocus: true,
-        refetchOnReconnect: true,
+        retry: false,
+        refetchOnWindowFocus: false,
+        refetchOnReconnect: false,
       },
       mutations: { retry: false },
     },

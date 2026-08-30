@@ -66,6 +66,7 @@ const MAX_OCC_SYMBOL_BYTES: usize = 32;
 const MAX_OCC_SYMBOL_NAME_BYTES: usize = 512;
 const MAX_EXCHANGE_CODES_BYTES: usize = 32;
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
+const MAX_CURRENT_REFERENCE_DATASET_CANDIDATES: usize = 64;
 const MAX_GENERATIONS: u32 = 16_384;
 const SQLITE_PROGRESS_OPERATIONS: i32 = 1_000;
 
@@ -2354,6 +2355,51 @@ pub struct OfficialOptionsReferenceSearchPage {
     has_more: bool,
 }
 
+/// Provider-neutral outcome of resolving through the current durable reference catalog.
+///
+/// Dataset identities never cross this boundary. An unavailable or structurally ambiguous
+/// reference catalog is a bounded quality limitation for canonical option observations, not a
+/// reason to suppress those observations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OfficialOptionsReferenceCatalogResolution {
+    /// No uniquely eligible immutable reference dataset is currently readable.
+    Unavailable,
+    /// More than one eligible dataset exists, or the bounded discovery scan could not prove
+    /// uniqueness. No dataset is selected as a winner.
+    Ambiguous {
+        /// Eligible datasets observed inside the bounded scan.
+        eligible_dataset_count: u16,
+        /// Whether additional catalog candidates existed beyond the discovery bound.
+        has_more: bool,
+    },
+    /// Exactly one eligible dataset was selected and queried at the requested cutoff.
+    Selected(OfficialOptionsReferenceIdentityResolution),
+}
+
+impl OfficialOptionsReferenceCatalogResolution {
+    pub const fn eligible_dataset_count(&self) -> u16 {
+        match self {
+            Self::Unavailable => 0,
+            Self::Ambiguous {
+                eligible_dataset_count,
+                ..
+            } => *eligible_dataset_count,
+            Self::Selected(_) => 1,
+        }
+    }
+
+    pub const fn has_more(&self) -> bool {
+        matches!(self, Self::Ambiguous { has_more: true, .. })
+    }
+
+    pub const fn selected(&self) -> Option<&OfficialOptionsReferenceIdentityResolution> {
+        match self {
+            Self::Selected(resolution) => Some(resolution),
+            Self::Unavailable | Self::Ambiguous { .. } => None,
+        }
+    }
+}
+
 impl OfficialOptionsReferenceSearchPage {
     pub const fn generation(&self) -> Option<&OfficialOptionsReferenceGenerationReceipt> {
         self.generation.as_ref()
@@ -2656,6 +2702,94 @@ impl OfficialOptionsReferenceReadCapability {
             deadline,
             cancellation,
         )
+    }
+}
+
+/// Cloneable least-authority reader that dynamically selects the uniquely eligible current
+/// official reference dataset without accepting a provider or dataset route from its caller.
+#[derive(Clone)]
+pub struct OfficialOptionsReferenceCatalogReadCapability {
+    authority: Arc<Mutex<CatalogAuthority>>,
+}
+
+impl fmt::Debug for OfficialOptionsReferenceCatalogReadCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OfficialOptionsReferenceCatalogReadCapability")
+            .field(
+                "authority",
+                &"[SEALED OFFICIAL OPTIONS REFERENCE CATALOG READ AUTHORITY]",
+            )
+            .finish()
+    }
+}
+
+impl OfficialOptionsReferenceCatalogReadCapability {
+    pub(crate) fn new(authority: Arc<Mutex<CatalogAuthority>>) -> Self {
+        Self { authority }
+    }
+
+    /// Selects a unique readable immutable dataset and resolves one exact identity atomically.
+    ///
+    /// `Current` is frozen to one trusted catalog timestamp before dataset discovery, so a
+    /// publication committed concurrently after that cutoff cannot change the second-stage read.
+    /// Missing, expired, and ambiguous catalog routes are returned as closed product-neutral
+    /// dispositions rather than provider errors or arbitrary winners.
+    pub fn resolve(
+        &self,
+        selection: OfficialOptionsReferenceGenerationSelection,
+        query: OfficialOptionsReferenceIdentityQuery,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<OfficialOptionsReferenceCatalogResolution, OfficialOptionsReferenceError> {
+        query.validate()?;
+        check_operation(deadline, cancellation)?;
+        let authority = self
+            .authority
+            .try_lock()
+            .map_err(|_| OfficialOptionsReferenceError::AuthorityUnavailable)?;
+        let connection = &authority.catalog().connection;
+        install_progress_handler(connection, deadline, cancellation)?;
+        let discovery = (|| {
+            let now = trusted_read_now(connection)?;
+            let selection = freeze_generation_selection(selection, now)?;
+            select_current_reference_dataset(connection, selection, now)
+                .map(|dataset| (dataset, selection))
+        })();
+        clear_progress_handler(connection)?;
+        let (discovery, selection) = classify_operation(discovery, deadline, cancellation)?;
+        let dataset = match discovery {
+            CurrentReferenceDatasetSelection::Unavailable => {
+                return Ok(OfficialOptionsReferenceCatalogResolution::Unavailable);
+            }
+            CurrentReferenceDatasetSelection::Ambiguous {
+                eligible_dataset_count,
+                has_more,
+            } => {
+                return Ok(OfficialOptionsReferenceCatalogResolution::Ambiguous {
+                    eligible_dataset_count,
+                    has_more,
+                });
+            }
+            CurrentReferenceDatasetSelection::Unique(dataset) => dataset,
+        };
+        match resolve_identity(
+            authority,
+            &dataset,
+            selection,
+            query,
+            deadline,
+            cancellation,
+        ) {
+            Ok(resolution) => Ok(OfficialOptionsReferenceCatalogResolution::Selected(
+                resolution,
+            )),
+            Err(
+                OfficialOptionsReferenceError::SourceUnavailable
+                | OfficialOptionsReferenceError::RightsUnavailable,
+            ) => Ok(OfficialOptionsReferenceCatalogResolution::Unavailable),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -4412,6 +4546,16 @@ struct SelectedGeneration {
     effective_at: Timestamp,
 }
 
+#[derive(Debug)]
+enum CurrentReferenceDatasetSelection {
+    Unavailable,
+    Unique(SourceIdentifier),
+    Ambiguous {
+        eligible_dataset_count: u16,
+        has_more: bool,
+    },
+}
+
 fn trusted_read_now(connection: &Connection) -> Result<Timestamp, OfficialOptionsReferenceError> {
     let wall_now = now_timestamp()?;
     let durable: i64 = connection.query_row(
@@ -4426,13 +4570,30 @@ fn trusted_read_now(connection: &Connection) -> Result<Timestamp, OfficialOption
     }
 }
 
-fn select_generation(
-    connection: &Connection,
-    dataset: &SourceIdentifier,
+fn freeze_generation_selection(
     selection: OfficialOptionsReferenceGenerationSelection,
     now: Timestamp,
-) -> Result<Option<SelectedGeneration>, OfficialOptionsReferenceError> {
-    let (knowledge_at, effective_at, exact_digest) = match selection {
+) -> Result<OfficialOptionsReferenceGenerationSelection, OfficialOptionsReferenceError> {
+    let (knowledge_at, effective_at, exact_digest) =
+        generation_selection_coordinates(selection, now)?;
+    Ok(match exact_digest {
+        Some(generation_digest) => OfficialOptionsReferenceGenerationSelection::Exact {
+            generation_digest,
+            knowledge_at,
+            effective_at,
+        },
+        None => OfficialOptionsReferenceGenerationSelection::AsOf {
+            knowledge_at,
+            effective_at,
+        },
+    })
+}
+
+fn generation_selection_coordinates(
+    selection: OfficialOptionsReferenceGenerationSelection,
+    now: Timestamp,
+) -> Result<(Timestamp, Timestamp, Option<EvidenceDigest>), OfficialOptionsReferenceError> {
+    let coordinates = match selection {
         OfficialOptionsReferenceGenerationSelection::Current => (now, now, None),
         OfficialOptionsReferenceGenerationSelection::AsOf {
             knowledge_at,
@@ -4447,9 +4608,103 @@ fn select_generation(
             (knowledge_at, effective_at, Some(generation_digest))
         }
     };
-    if knowledge_at > now || effective_at > knowledge_at {
+    if coordinates.0 > now || coordinates.1 > coordinates.0 {
         return Err(OfficialOptionsReferenceError::InvalidInput);
     }
+    Ok(coordinates)
+}
+
+fn select_current_reference_dataset(
+    connection: &Connection,
+    selection: OfficialOptionsReferenceGenerationSelection,
+    now: Timestamp,
+) -> Result<CurrentReferenceDatasetSelection, OfficialOptionsReferenceError> {
+    let (knowledge_at, _effective_at, exact_digest) =
+        generation_selection_coordinates(selection, now)?;
+    let exact_digest = exact_digest.map(|digest| digest.bytes().to_vec());
+    let mut statement = connection.prepare(
+        "WITH candidates AS (
+             SELECT dataset_id, generation_digest,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY dataset_id ORDER BY generation_sequence DESC
+                    ) AS dataset_rank
+             FROM official_options_reference_generations
+             WHERE published_at_ns<=?1
+               AND (?2 IS NULL OR generation_digest=?2)
+         )
+         SELECT dataset_id, generation_digest
+         FROM candidates WHERE dataset_rank=1
+         ORDER BY dataset_id
+         LIMIT ?3",
+    )?;
+    let scan_limit = MAX_CURRENT_REFERENCE_DATASET_CANDIDATES
+        .checked_add(1)
+        .ok_or(OfficialOptionsReferenceError::CapacityExceeded)?;
+    let mut rows = statement.query(params![
+        knowledge_at.unix_nanos(),
+        exact_digest.as_deref(),
+        to_i64(scan_limit)?,
+    ])?;
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(scan_limit)
+        .map_err(|_| OfficialOptionsReferenceError::CapacityExceeded)?;
+    while let Some(row) = rows.next()? {
+        candidates.push((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?));
+    }
+    drop(rows);
+    drop(statement);
+
+    let has_more = candidates.len() > MAX_CURRENT_REFERENCE_DATASET_CANDIDATES;
+    candidates.truncate(MAX_CURRENT_REFERENCE_DATASET_CANDIDATES);
+    let mut unique = None;
+    let mut eligible_dataset_count = 0_u16;
+    for (dataset, generation_digest) in candidates {
+        let dataset = parse_source_identifier(dataset)?;
+        let generation_digest = evidence_from_database(generation_digest)?;
+        let generation = load_generation_receipt(connection, &dataset, generation_digest)?
+            .ok_or(OfficialOptionsReferenceError::CorruptCatalog)?;
+        if generation.dataset != dataset
+            || generation.generation_digest != generation_digest
+            || generation.published_at > knowledge_at
+        {
+            return Err(OfficialOptionsReferenceError::CorruptCatalog);
+        }
+        match require_generation_read_authority(connection, &generation, now) {
+            Ok(()) => {}
+            Err(
+                OfficialOptionsReferenceError::SourceUnavailable
+                | OfficialOptionsReferenceError::RightsUnavailable,
+            ) => continue,
+            Err(error) => return Err(error),
+        }
+        eligible_dataset_count = eligible_dataset_count
+            .checked_add(1)
+            .ok_or(OfficialOptionsReferenceError::CapacityExceeded)?;
+        if unique.is_none() {
+            unique = Some(dataset);
+        }
+    }
+    if has_more || eligible_dataset_count > 1 {
+        return Ok(CurrentReferenceDatasetSelection::Ambiguous {
+            eligible_dataset_count,
+            has_more,
+        });
+    }
+    Ok(match unique {
+        Some(dataset) => CurrentReferenceDatasetSelection::Unique(dataset),
+        None => CurrentReferenceDatasetSelection::Unavailable,
+    })
+}
+
+fn select_generation(
+    connection: &Connection,
+    dataset: &SourceIdentifier,
+    selection: OfficialOptionsReferenceGenerationSelection,
+    now: Timestamp,
+) -> Result<Option<SelectedGeneration>, OfficialOptionsReferenceError> {
+    let (knowledge_at, effective_at, exact_digest) =
+        generation_selection_coordinates(selection, now)?;
     let digest_bytes: Option<Vec<u8>> = if let Some(exact) = exact_digest {
         connection
             .query_row(

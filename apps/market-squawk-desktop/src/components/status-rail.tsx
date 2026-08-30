@@ -1,13 +1,7 @@
 import * as React from "react"
 
-import type { ProductScope } from "@/app/query-client"
 import { useProduct } from "@/app/product-context"
 import { GlobalLookup } from "@/features/lookup/global-lookup"
-import {
-  isActiveResearchActivity,
-  useHomeStatusQueries,
-} from "@/features/overview/use-overview"
-import type { ProductTransport } from "@/lib/transport"
 
 export function StatusRail() {
   const product = useProduct()
@@ -28,56 +22,16 @@ export function StatusRail() {
         }
         ready={product.status === "ready"}
       />
-      {product.status === "ready" ? (
-        <>
-          <ReadyStatusRail
-            transport={product.transport}
-            scope={product.bootstrap.runtime}
-          />
-        </>
-      ) : null}
       <div className="ml-auto flex items-center gap-2">
         {product.status === "ready" ? (
           <GlobalLookup
             transport={product.transport}
-            scope={product.bootstrap.runtime}
+            scope={product.bootstrap.productSessionToken}
           />
         ) : null}
         <CurrentClock />
       </div>
     </section>
-  )
-}
-
-function ReadyStatusRail({
-  transport,
-  scope,
-}: {
-  transport: ProductTransport
-  scope: ProductScope
-}) {
-  const status = useHomeStatusQueries(transport, scope)
-  const activeAnalyses =
-    status.activities.status === "ready"
-      ? status.activities.data.filter(isActiveResearchActivity).length
-      : null
-  return (
-    <>
-      <StatusFact
-        label="Markets"
-        value={status.markets.status === "ready" ? String(status.markets.data?.length ?? 0) : statusLabel(status.markets.status)}
-        ready={status.markets.status === "ready" && (status.markets.data?.length ?? 0) > 0}
-      />
-      <StatusFact
-        label="Analysis"
-        value={
-          activeAnalyses === null
-            ? statusLabel(status.activities.status)
-            : `${activeAnalyses} active`
-        }
-        ready={status.activities.status === "ready"}
-      />
-    </>
   )
 }
 
@@ -97,10 +51,6 @@ function CurrentClock() {
       }).format(now)}
     </time>
   )
-}
-
-function statusLabel(status: "loading" | "ready" | "unavailable") {
-  return status === "loading" ? "Checking" : status === "ready" ? "Ready" : "Unavailable"
 }
 
 function StatusFact({

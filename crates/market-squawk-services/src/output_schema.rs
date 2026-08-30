@@ -2,7 +2,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::ToolArtifactPolicy;
+use crate::{ResultEnvelopeProjection, ToolArtifactPolicy};
 
 const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 const UPPERCASE_CURRENCY_PATTERN: &str = "^[A-Z]{3}$";
@@ -16,6 +16,7 @@ const POSITIVE_INTEGER_PATTERN: &str = "^[1-9][0-9]*$";
 const UNSIGNED_INTEGER_PATTERN: &str = "^(?:0|[1-9][0-9]*)$";
 const INTEGER_PATTERN: &str = "^(?:0|-?[1-9][0-9]*)$";
 const MEDIA_TYPE_PATTERN: &str = "^[A-Za-z0-9/.+\\-]+$";
+const MAXIMUM_POSITIONAL_ITEMS: usize = 256;
 
 pub(crate) fn validate_data_schema(schema: &Value) -> bool {
     schema_definition_is_supported(schema, true)
@@ -28,10 +29,25 @@ pub(crate) fn validate_data(schema: &Value, value: &Value) -> bool {
 pub(crate) fn output_schema(
     data_schema: &Value,
     artifact_policy: ToolArtifactPolicy,
+    projection: ResultEnvelopeProjection,
 ) -> Map<String, Value> {
-    let mut variants = vec![inline_envelope_schema(data_schema.clone())];
-    if matches!(artifact_policy, ToolArtifactPolicy::OpaqueOnOverflow) {
-        variants.push(artifact_envelope_schema());
+    let inline = inline_envelope_schema(data_schema.clone(), projection);
+    if matches!(projection, ResultEnvelopeProjection::ProductV1) {
+        let Value::Object(mut schema) = inline else {
+            unreachable!("the code-owned inline envelope is always an object")
+        };
+        schema.insert(
+            "$schema".to_owned(),
+            Value::String(JSON_SCHEMA_DIALECT.to_owned()),
+        );
+        return schema;
+    }
+
+    let mut variants = vec![inline];
+    if matches!(projection, ResultEnvelopeProjection::NativeEvidenceV1)
+        && matches!(artifact_policy, ToolArtifactPolicy::OpaqueOnOverflow)
+    {
+        variants.push(artifact_envelope_schema(projection));
     }
     Map::from_iter([
         (
@@ -43,14 +59,17 @@ pub(crate) fn output_schema(
     ])
 }
 
-fn inline_envelope_schema(data_schema: Value) -> Value {
+fn inline_envelope_schema(data_schema: Value, projection: ResultEnvelopeProjection) -> Value {
     closed_object(
-        [("data", data_schema), ("metadata", metadata_schema())],
+        [
+            ("data", data_schema),
+            ("metadata", metadata_schema(projection)),
+        ],
         &["data", "metadata"],
     )
 }
 
-fn artifact_envelope_schema() -> Value {
+fn artifact_envelope_schema(projection: ResultEnvelopeProjection) -> Value {
     closed_object(
         [
             (
@@ -68,32 +87,45 @@ fn artifact_envelope_schema() -> Value {
                     &["id", "sha256", "byteCount", "mediaType"],
                 ),
             ),
-            ("metadata", metadata_schema()),
+            ("metadata", metadata_schema(projection)),
         ],
         &["artifact", "metadata"],
     )
 }
 
-fn metadata_schema() -> Value {
-    closed_object(
-        [
-            (
+fn metadata_schema(projection: ResultEnvelopeProjection) -> Value {
+    match projection {
+        ResultEnvelopeProjection::ProductV1 => closed_object(
+            [
+                (
+                    "completeness",
+                    json!({"type": "string", "enum": ["complete", "truncated"]}),
+                ),
+                ("returnedItems", json!({"type": "integer", "minimum": 0})),
+                ("availableItems", json!({"type": "integer", "minimum": 0})),
+            ],
+            &["completeness", "returnedItems", "availableItems"],
+        ),
+        ResultEnvelopeProjection::NativeEvidenceV1 => closed_object(
+            [
+                (
+                    "completeness",
+                    json!({"type": "string", "enum": ["complete", "truncated"]}),
+                ),
+                ("returnedItems", json!({"type": "integer", "minimum": 0})),
+                ("availableItems", json!({"type": "integer", "minimum": 0})),
+                ("sourceCoverage", evidence_schema()),
+                ("dataQuality", evidence_schema()),
+            ],
+            &[
                 "completeness",
-                json!({"type": "string", "enum": ["complete", "truncated"]}),
-            ),
-            ("returnedItems", json!({"type": "integer", "minimum": 0})),
-            ("availableItems", json!({"type": "integer", "minimum": 0})),
-            ("sourceCoverage", evidence_schema()),
-            ("dataQuality", evidence_schema()),
-        ],
-        &[
-            "completeness",
-            "returnedItems",
-            "availableItems",
-            "sourceCoverage",
-            "dataQuality",
-        ],
-    )
+                "returnedItems",
+                "availableItems",
+                "sourceCoverage",
+                "dataQuality",
+            ],
+        ),
+    }
 }
 
 fn evidence_schema() -> Value {
@@ -163,6 +195,7 @@ fn schema_definition_is_supported(schema: &Value, root: bool) -> bool {
                 | "required"
                 | "additionalProperties"
                 | "items"
+                | "prefixItems"
                 | "const"
                 | "enum"
                 | "minimum"
@@ -184,9 +217,7 @@ fn schema_definition_is_supported(schema: &Value, root: bool) -> bool {
 
     let type_is_supported = match schema_type {
         "object" => object_schema_is_supported(schema, root),
-        "array" => schema
-            .get("items")
-            .is_some_and(|items| schema_definition_is_supported(items, false)),
+        "array" => array_schema_is_supported(schema),
         "string" | "integer" | "number" | "boolean" | "null" => true,
         _ => false,
     };
@@ -207,6 +238,32 @@ fn schema_definition_is_supported(schema: &Value, root: bool) -> bool {
         && schema
             .get("not")
             .is_none_or(|negated| schema_definition_is_supported(negated, false))
+}
+
+fn array_schema_is_supported(schema: &Map<String, Value>) -> bool {
+    let minimum = schema.get("minItems").and_then(Value::as_u64);
+    let maximum = schema.get("maxItems").and_then(Value::as_u64);
+    if minimum.zip(maximum).is_some_and(|(min, max)| min > max) {
+        return false;
+    }
+
+    match schema.get("prefixItems") {
+        None => schema
+            .get("items")
+            .is_some_and(|items| schema_definition_is_supported(items, false)),
+        Some(Value::Array(prefix_items)) => {
+            let positional_count = prefix_items.len();
+            positional_count > 0
+                && positional_count <= MAXIMUM_POSITIONAL_ITEMS
+                && prefix_items
+                    .iter()
+                    .all(|item| schema_definition_is_supported(item, false))
+                && schema.get("items") == Some(&Value::Bool(false))
+                && minimum == u64::try_from(positional_count).ok()
+                && maximum == u64::try_from(positional_count).ok()
+        }
+        Some(_) => false,
+    }
 }
 
 fn string_pattern_is_supported(schema: &Map<String, Value>, schema_type: &str) -> bool {
@@ -333,20 +390,38 @@ fn validate_instance(schema: &Value, value: &Value) -> bool {
         Some("number") => {
             value.is_number() && bounded_number(value, schema.get("minimum"), schema.get("maximum"))
         }
-        Some("array") => value.as_array().is_some_and(|values| {
-            bounded_length(
-                values.len() as u64,
-                schema.get("minItems"),
-                schema.get("maxItems"),
-            ) && schema
-                .get("items")
-                .is_some_and(|items| values.iter().all(|value| validate_instance(items, value)))
-        }),
+        Some("array") => value
+            .as_array()
+            .is_some_and(|values| validate_array_instance(schema, values)),
         Some("object") => value
             .as_object()
             .is_some_and(|value| validate_object_instance(schema, value)),
         _ => false,
     }
+}
+
+fn validate_array_instance(schema: &Map<String, Value>, values: &[Value]) -> bool {
+    if !bounded_length(
+        values.len() as u64,
+        schema.get("minItems"),
+        schema.get("maxItems"),
+    ) {
+        return false;
+    }
+    let Some(prefix_items) = schema.get("prefixItems") else {
+        return schema
+            .get("items")
+            .is_some_and(|items| values.iter().all(|value| validate_instance(items, value)));
+    };
+    let Some(prefix_items) = prefix_items.as_array() else {
+        return false;
+    };
+    values.len() == prefix_items.len()
+        && values
+            .iter()
+            .zip(prefix_items)
+            .all(|(value, schema)| validate_instance(schema, value))
+        && schema.get("items") == Some(&Value::Bool(false))
 }
 
 fn string_pattern_matches(pattern: Option<&Value>, value: &str) -> bool {

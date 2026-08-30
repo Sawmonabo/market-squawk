@@ -9,7 +9,7 @@ import {
 } from "lucide-react"
 import { useSearchParams } from "react-router-dom"
 
-import { useProduct } from "@/app/product-context"
+import { useProduct, useSystem } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -24,15 +24,14 @@ import {
   parseInvestmentAnalysisPage,
   parseRecommendationTrackRecord,
   parseSavedScreenProduct,
-  recommendationTrackRecordRequestForAnalysis,
   type InvestmentAnalysisLocator,
 } from "./contracts"
 import {
   analysisOutcomeTone,
+  BriefError,
   BriefLoading,
   InvestmentBrief,
   locatorOutcomeLabel,
-  type TrackRecordPresentation,
 } from "./investment-brief"
 import { formatUnixNanos } from "./format"
 
@@ -47,9 +46,10 @@ export function OpportunitiesReadExperience({
   scope: ProductScope
   readAvailable: boolean
 }) {
-  const [selectedAnalysisId, setSelectedAnalysisId] = useState<string | null>(null)
+  const [selectedActionToken, setSelectedActionToken] = useState<string | null>(null)
   const [searchParams] = useSearchParams()
   const product = useProduct()
+  const system = useSystem()
   const requestedScreenValue = searchParams.get("screenId")
   const requestedScreenId = admittedSavedScreenId(requestedScreenValue)
   const screenReadAvailable =
@@ -74,10 +74,7 @@ export function OpportunitiesReadExperience({
       requestedScreenId !== null &&
       screenReadAvailable,
   })
-  const controller = useAnalyticalControllerStatus(transport, scope)
-  const trackRecordOperationAvailable =
-    product.status === "ready" &&
-    hasProductCapability(product.bootstrap, "decision_recommendation_history")
+  const controller = useAnalyticalControllerStatus(system.transport, scope)
   const analyses = useInfiniteQuery({
     queryKey: productKeys.operation(
       scope,
@@ -88,20 +85,21 @@ export function OpportunitiesReadExperience({
     initialPageParam: undefined as string | undefined,
     queryFn: async ({ pageParam }) => {
       const request = {
-        ...(pageParam ? { afterAnalysisId: pageParam } : {}),
+        ...(pageParam ? { afterActionToken: pageParam } : {}),
         limit: ANALYSIS_PAGE_LIMIT,
       }
       return parseInvestmentAnalysisPage(
         await transport.query({
           query: "decisionInvestmentAnalyses",
-          ...request,
+          ...(pageParam ? { afterActionToken: pageParam } : {}),
+          limit: request.limit,
         }),
         request,
       )
     },
     getNextPageParam: (page) =>
       page.completeness === "truncated"
-        ? (page.nextAfterAnalysisId ?? undefined)
+        ? (page.nextAfterActionToken ?? undefined)
         : undefined,
     enabled: readAvailable,
   })
@@ -110,104 +108,61 @@ export function OpportunitiesReadExperience({
     [analyses.data],
   )
   const repeatedIdentity =
-    new Set(history.map((analysis) => analysis.analysisId)).size !== history.length
+    new Set(history.map((analysis) => analysis.actionToken)).size !== history.length
   const selectedIsRetained =
-    selectedAnalysisId !== null &&
-    history.some((analysis) => analysis.analysisId === selectedAnalysisId)
+    selectedActionToken !== null &&
+    history.some((analysis) => analysis.actionToken === selectedActionToken)
   const selected = useQuery({
     queryKey: productKeys.operation(
       scope,
       "decision",
       "Decision.GetInvestmentAnalysis",
-      { analysisId: selectedAnalysisId },
+      { actionToken: selectedActionToken },
     ),
     queryFn: async () => {
-      const analysisId = selectedAnalysisId
-      if (analysisId === null) {
+      const actionToken = selectedActionToken
+      if (actionToken === null) {
         throw new Error("Select a saved analysis before opening its brief.")
       }
       return parseInvestmentAnalysis(
         await transport.query({
           query: "decisionInvestmentAnalysis",
-          analysisId,
+          actionToken,
         }),
-        analysisId,
+        actionToken,
       )
     },
     enabled: readAvailable && selectedIsRetained && !repeatedIdentity,
   })
-  const trackRecordRequestAvailability = useMemo(() => {
-    if (!selected.data || selected.dataUpdatedAt <= 0) return null
-    const evaluatedAtUnixNanos = (
-      BigInt(selected.dataUpdatedAt) * 1_000_000n
-    ).toString()
-    return recommendationTrackRecordRequestForAnalysis(
-      selected.data,
-      evaluatedAtUnixNanos,
-    )
-  }, [selected.data, selected.dataUpdatedAt])
-  const trackRecordRequest =
-    trackRecordRequestAvailability?.kind === "available"
-      ? trackRecordRequestAvailability.request
-      : null
+  const trackRecordAvailable =
+    product.status === "ready" &&
+    hasProductCapability(product.bootstrap, "decision_recommendation_history")
+  const trackRecordActionToken = selected.data?.trackRecordActionToken ?? null
   const trackRecord = useQuery({
     queryKey: productKeys.operation(
       scope,
       "decision",
       "Decision.GetRecommendationTrackRecord",
-      trackRecordRequest ?? {
-        unavailable:
-          trackRecordRequestAvailability?.kind === "unavailable"
-            ? trackRecordRequestAvailability.reason
-            : "analysis_not_loaded",
-      },
+      { actionToken: trackRecordActionToken },
     ),
     queryFn: async () => {
-      const request = trackRecordRequest
-      if (!request) {
-        throw new Error("A comparable track record is not available for this analysis.")
+      const actionToken = trackRecordActionToken
+      if (actionToken === null) {
+        throw new Error("Comparable history is unavailable for this saved analysis.")
       }
       return parseRecommendationTrackRecord(
         await transport.query({
           query: "decisionRecommendationTrackRecord",
-          ...request,
+          actionToken,
         }),
-        request,
+        actionToken,
       )
     },
     enabled:
-      readAvailable &&
-      selectedIsRetained &&
-      !repeatedIdentity &&
-      trackRecordOperationAvailable &&
-      trackRecordRequest !== null,
+      trackRecordAvailable &&
+      trackRecordActionToken !== null &&
+      !repeatedIdentity,
   })
-  const trackRecordPresentation: TrackRecordPresentation =
-    !trackRecordOperationAvailable
-      ? {
-          state: "unavailable",
-          detail:
-            "Recommendation history is not available in this installation.",
-        }
-      : trackRecordRequestAvailability?.kind === "unavailable"
-        ? {
-            state: "unavailable",
-            detail: trackRecordUnavailableDetail(
-              trackRecordRequestAvailability.reason,
-            ),
-          }
-        : trackRecord.isPending
-          ? { state: "loading" }
-          : trackRecord.isError
-            ? {
-                state: "error",
-                detail:
-                  "Recommendation history could not be retrieved. Retry, and check Logs if the problem continues.",
-                onRetry: () => void trackRecord.refetch(),
-              }
-            : trackRecord.data
-              ? { state: "ready", value: trackRecord.data }
-              : { state: "loading" }
 
   return (
     <>
@@ -243,10 +198,10 @@ export function OpportunitiesReadExperience({
             className="mt-2 text-xs leading-5 text-muted-foreground"
           >
             {controller.data
-              ? `${controller.data.activeProfile.displayName} is active, but the required analysis inputs are not ready. This control starts no work.`
+              ? `${controller.data.activeProfile.displayName} is active. Opportunity finding will be available when the required research is ready.`
               : controller.isError
-                ? "Analysis readiness could not be checked. See Logs for details. This control starts no work."
-                : "Checking whether the analysis workflow is ready. This control starts no work."}
+                ? "Analysis readiness could not be checked. Try again later."
+                : "Checking whether opportunity finding is ready."}
           </p>
         </div>
       </header>
@@ -267,8 +222,7 @@ export function OpportunitiesReadExperience({
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Investment-analysis history is unavailable</AlertTitle>
           <AlertDescription>
-            This installation cannot open saved investment analyses. Update or repair Market
-            Squawk before using this page.
+            Saved investment analyses cannot be opened right now. Try again later.
           </AlertDescription>
         </Alert>
       ) : (
@@ -305,7 +259,7 @@ export function OpportunitiesReadExperience({
             <HistoryLoading />
           ) : analyses.isError && history.length === 0 ? (
             <HistoryError
-              detail="Saved analyses could not be retrieved. Retry, and check Logs if the problem continues."
+              detail="Saved analyses could not be retrieved. Try again."
               onRetry={() => void analyses.refetch()}
             />
           ) : repeatedIdentity ? (
@@ -328,17 +282,17 @@ export function OpportunitiesReadExperience({
               <div className="mt-3 grid gap-3 xl:grid-cols-2">
                 {history.map((analysis) => (
                   <AnalysisHistoryCard
-                    key={analysis.analysisId}
+                    key={analysis.actionToken}
                     analysis={analysis}
-                    selected={analysis.analysisId === selectedAnalysisId}
-                    onSelect={() => setSelectedAnalysisId(analysis.analysisId)}
+                    selected={analysis.actionToken === selectedActionToken}
+                    onSelect={() => setSelectedActionToken(analysis.actionToken)}
                   />
                 ))}
               </div>
 
               {analyses.isError ? (
                 <HistoryError
-                  detail="More saved analyses could not be retrieved. Retry, and check Logs if the problem continues."
+                  detail="More saved analyses could not be retrieved. Try again."
                   onRetry={() => void analyses.refetch()}
                 />
               ) : null}
@@ -372,29 +326,28 @@ export function OpportunitiesReadExperience({
           ) : selected.isPending ? (
             <BriefLoading />
           ) : selected.isError ? (
-            <Alert variant="destructive">
-              <CircleAlert aria-hidden="true" />
-              <AlertTitle>The Investment Brief could not be loaded</AlertTitle>
-              <AlertDescription>
-                The selected analysis could not be retrieved. Retry, and check Logs if the problem
-                continues.
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="mt-2"
-                  onClick={() => void selected.refetch()}
-                >
-                  Retry analysis
-                </Button>
-              </AlertDescription>
-            </Alert>
+            <BriefError onRetry={() => void selected.refetch()} />
           ) : (
             <InvestmentBrief
               analysis={selected.data}
-              trackRecord={trackRecordPresentation}
+              trackRecord={trackRecord.data ?? null}
+              trackRecordPending={
+                trackRecordAvailable &&
+                trackRecordActionToken !== null &&
+                trackRecord.isPending
+              }
+              trackRecordUnavailable={
+                !trackRecordAvailable ||
+                trackRecordActionToken === null ||
+                trackRecord.isError
+              }
               refreshing={selected.isFetching || trackRecord.isFetching}
-              onRefresh={() => void selected.refetch()}
+              onRefresh={() => {
+                void selected.refetch()
+                if (trackRecordActionToken !== null && trackRecordAvailable) {
+                  void trackRecord.refetch()
+                }
+              }}
             />
           )}
         </div>
@@ -438,7 +391,7 @@ function SelectedSavedScreen({
         <CircleAlert aria-hidden="true" />
         <AlertTitle>Saved screen could not be opened</AlertTitle>
         <AlertDescription>
-          Try again. If the problem continues, check Logs.
+          Try again later.
           <Button type="button" variant="outline" size="sm" className="mt-2" onClick={onRetry}>
             Try again
           </Button>
@@ -462,22 +415,6 @@ function SelectedSavedScreen({
   )
 }
 
-function trackRecordUnavailableDetail(
-  reason:
-    | "analysis_not_published"
-    | "profile_digest_algorithm_unsupported"
-    | "profile_identifier_unsupported",
-): string {
-  switch (reason) {
-    case "analysis_not_published":
-      return "A comparable recommendation history is not available for this analysis yet."
-    case "profile_digest_algorithm_unsupported":
-      return "This analysis cannot be compared with the current recommendation history."
-    case "profile_identifier_unsupported":
-      return "This analysis cannot be compared with the current recommendation history."
-  }
-}
-
 function AnalysisHistoryCard({
   analysis,
   selected,
@@ -487,7 +424,7 @@ function AnalysisHistoryCard({
   selected: boolean
   onSelect: () => void
 }) {
-  const tone = analysisOutcomeTone(analysis.outcome.kind)
+  const tone = analysisOutcomeTone(analysis.recommendation)
   const toneClass =
     tone === "good"
       ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-200"
@@ -511,24 +448,33 @@ function AnalysisHistoryCard({
           <p className="font-mono text-[9px] uppercase tracking-[0.14em] text-muted-foreground">
             Investment analysis
           </p>
-          <p className="mt-2 break-all text-sm font-semibold">{analysis.instrumentId}</p>
+          <p className="mt-2 text-sm font-semibold">
+            {analysis.investment.symbol ?? analysis.investment.name ?? "Investment brief"}
+          </p>
           <p className="mt-1 text-xs text-muted-foreground">
-            {analysis.currency} · account {analysis.accountId}
+            {[analysis.investment.name, analysis.portfolioLabel, analysis.currency]
+              .filter(Boolean)
+              .join(" · ")}
           </p>
         </div>
         <span className={`shrink-0 rounded-full border px-2 py-1 text-[10px] ${toneClass}`}>
-          {analysis.outcome.kind === "generated"
-            ? "Generated"
-            : analysis.outcome.kind === "no_action"
-              ? "No action"
+          {analysis.recommendation.kind === "action"
+            ? "Action"
+            : analysis.recommendation.kind === "abstain"
+              ? "Abstain"
               : "Unavailable"}
         </span>
       </div>
-      <p className="mt-4 text-xs font-medium">{locatorOutcomeLabel(analysis.outcome)}</p>
+      <p className="mt-4 text-xs font-medium">
+        {locatorOutcomeLabel(analysis.recommendation)}
+      </p>
       <dl className="mt-4 grid gap-3 border-t border-border/70 pt-3 sm:grid-cols-3">
-        <CardFact label="Information current through" value={formatUnixNanos(analysis.asOf)} />
-        <CardFact label="Horizon" value={formatUnixNanos(analysis.horizonAt)} />
-        <CardFact label="Expires" value={formatUnixNanos(analysis.expiresAt)} />
+        <CardFact
+          label="Information current through"
+          value={formatUnixNanos(analysis.horizon.informationCurrentThrough)}
+        />
+        <CardFact label="Horizon" value={formatUnixNanos(analysis.horizon.endsAt)} />
+        <CardFact label="Expires" value={formatUnixNanos(analysis.horizon.expiresAt)} />
       </dl>
       <div className="mt-4 flex items-center justify-end gap-1 text-xs font-medium text-primary">
         Open brief
@@ -552,8 +498,7 @@ function EmptyHistory() {
     <div className="mt-5 rounded-xl border border-dashed border-border bg-card/30 p-6">
       <p className="text-sm font-semibold">No saved investment analyses</p>
       <p className="mt-2 max-w-2xl text-xs leading-5 text-muted-foreground">
-        No Generated, No action, or Unavailable result has been stored. This does not mean a
-        search ran and found nothing; the guided finding workflow is not available from this page.
+        No saved action, abstain, or unavailable analysis is ready to review yet.
       </p>
     </div>
   )

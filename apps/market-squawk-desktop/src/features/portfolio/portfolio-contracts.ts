@@ -3,329 +3,346 @@ import { z } from "zod"
 import { applicationResultSchema, type ApplicationResult } from "@/lib/schemas"
 
 const exactDecimalSchema = z.string().regex(/^-?\d+(?:\.\d+)?$/)
-const identitySchema = z.string().min(1)
-const tokenSchema = z.string().uuid()
-const timeSchema = z.string().regex(/^-?\d+$/)
-const confidenceSchema = z.enum(["limited", "moderate", "strong"])
+const productTextSchema = z.string().trim().min(1).max(512)
+const productNameSchema = z.string().trim().min(1).max(160)
+const productSymbolSchema = z.string().trim().min(1).max(32)
+const currencySchema = z.string().regex(/^[A-Z]{3}$/)
+const productTimeSchema = z.string().datetime({ offset: true })
 
-export const moneySchema = z.object({
-  amount: exactDecimalSchema,
-  currency: z.string().regex(/^[A-Z]{3}$/),
-}).strict()
+export const portfolioActionTokenSchema = z
+  .string()
+  .min(16)
+  .max(192)
+  .regex(/^[A-Za-z0-9_-]+$/)
 
-export const portfolioSnapshotSchema = z.object({
-  snapshotToken: tokenSchema,
-  effectiveAtUnixNanos: timeSchema,
-  availableAtUnixNanos: timeSchema.nullable(),
-  holdingCount: z.number().int().nonnegative(),
-  transactionCount: z.number().int().nonnegative(),
-  dataIssueCount: z.number().int().nonnegative(),
-  dataState: z.enum(["ready", "needs_review"]),
-}).strict()
+export const moneySchema = z
+  .object({ amount: exactDecimalSchema, currency: currencySchema })
+  .strict()
 
-export const portfolioRevisionSchema = portfolioSnapshotSchema
+export const percentageSchema = z
+  .object({
+    exact: exactDecimalSchema,
+    display: z.string().trim().min(1).max(32),
+  })
+  .strict()
 
-export const portfolioAccountSchema = z.object({
-  accountId: identitySchema,
-  currency: z.string().regex(/^[A-Z]{3}$/),
-  cashBalance: moneySchema,
-  currentSnapshot: portfolioSnapshotSchema,
-  holdingCount: z.number().int().nonnegative(),
-  transactionCount: z.number().int().nonnegative(),
-  reconciliationDiscrepancies: z.number().int().nonnegative(),
-}).strict()
+export const investmentDisplaySchema = z
+  .object({
+    name: productNameSchema,
+    symbol: productSymbolSchema.nullable(),
+    typeLabel: productNameSchema,
+  })
+  .strict()
 
-const lotMethodSchema = z.enum([
-  "First in, first out",
-  "Last in, first out",
-  "Average cost",
-  "Specific lots",
-])
+const reviewStateSchema = z
+  .object({
+    tone: z.enum(["ready", "attention", "unavailable"]),
+    label: productNameSchema,
+    explanation: productTextSchema,
+  })
+  .strict()
+
+export const portfolioAccountSchema = z
+  .object({
+    accountToken: portfolioActionTokenSchema,
+    portfolioName: productNameSchema,
+    accountName: productNameSchema,
+    accountTypeLabel: productNameSchema,
+    reportingCurrency: currencySchema,
+    updatedAt: productTimeSchema,
+    preparedAt: productTimeSchema.nullable(),
+    currentValue: moneySchema.nullable(),
+    cashBalance: moneySchema,
+    returnSinceStart: percentageSchema.nullable(),
+    positionCount: z.number().int().nonnegative(),
+    transactionCount: z.number().int().nonnegative(),
+    reviewFindingCount: z.number().int().nonnegative(),
+    reviewState: reviewStateSchema,
+  })
+  .strict()
+
+const costBasisChoiceSchema = z
+  .object({
+    choiceToken: portfolioActionTokenSchema,
+    label: productNameSchema,
+    amount: moneySchema.nullable(),
+    explanation: productTextSchema,
+  })
+  .strict()
 
 const costBasisSchema = z.discriminatedUnion("state", [
-  z.object({
-    state: z.literal("available"),
-    amount: moneySchema,
-    method: lotMethodSchema,
-  }).strict(),
-  z.object({ state: z.literal("not_available") }).strict(),
-  z.object({
-    state: z.literal("needs_review"),
-    choices: z.array(moneySchema),
-    method: lotMethodSchema,
-  }).strict(),
+  z
+    .object({
+      state: z.literal("available"),
+      amount: moneySchema,
+      methodLabel: productNameSchema,
+    })
+    .strict(),
+  z
+    .object({
+      state: z.literal("not_available"),
+      explanation: productTextSchema,
+    })
+    .strict(),
+  z
+    .object({
+      state: z.literal("needs_review"),
+      explanation: productTextSchema,
+      choices: z.array(costBasisChoiceSchema).max(24),
+    })
+    .strict(),
 ])
 
-const priceStateSchema = z.object({
-  asOfUnixNanos: timeSchema,
-  state: z.enum(["reported", "current", "stale", "not_available"]),
-  confidence: confidenceSchema,
-  explanation: z.string().min(1),
-}).strict()
+const priceSummarySchema = z
+  .object({
+    updatedAt: productTimeSchema.nullable(),
+    label: productNameSchema,
+    explanation: productTextSchema,
+  })
+  .strict()
 
-export const holdingSchema = z.object({
-  accountId: identitySchema,
-  snapshotToken: tokenSchema,
-  instrumentId: identitySchema,
-  currency: z.string().regex(/^[A-Z]{3}$/),
-  quantity: exactDecimalSchema,
-  lotSize: exactDecimalSchema,
-  marketValue: moneySchema,
-  asOfUnixNanos: timeSchema,
-  costBasis: costBasisSchema,
-  price: priceStateSchema,
-}).strict()
+export const holdingSchema = z
+  .object({
+    positionActionToken: portfolioActionTokenSchema,
+    investment: investmentDisplaySchema,
+    quantity: exactDecimalSchema,
+    quantityLabel: productNameSchema,
+    marketValue: moneySchema,
+    price: priceSummarySchema,
+    costBasis: costBasisSchema,
+  })
+  .strict()
 
-export const portfolioTransactionSchema = z.object({
-  transactionToken: tokenSchema,
-  accountId: identitySchema,
-  snapshotToken: tokenSchema,
-  instrumentId: identitySchema.nullable(),
-  category: z.enum(["trade", "cash_transfer", "income", "fee", "corporate_action"]),
-  amount: moneySchema,
-  quantity: exactDecimalSchema.nullable(),
-  occurredAtUnixNanos: timeSchema,
-  lotMethod: lotMethodSchema.nullable(),
-}).strict()
+export const portfolioTransactionSchema = z
+  .object({
+    transactionActionToken: portfolioActionTokenSchema,
+    categoryLabel: productNameSchema,
+    investment: investmentDisplaySchema.nullable(),
+    amount: moneySchema,
+    quantity: exactDecimalSchema.nullable(),
+    quantityLabel: productNameSchema.nullable(),
+    occurredAt: productTimeSchema,
+  })
+  .strict()
 
-const reportBase = z.object({
-  accountId: identitySchema,
-  snapshotToken: tokenSchema,
-  effectiveAtUnixNanos: timeSchema,
-  availableAtUnixNanos: timeSchema.nullable(),
-  dataConfidence: confidenceSchema,
-}).strict()
+export const portfolioRevisionChoiceSchema = z
+  .object({
+    comparisonActionToken: portfolioActionTokenSchema,
+    label: productNameSchema,
+    effectiveAt: productTimeSchema,
+    positionCount: z.number().int().nonnegative(),
+  })
+  .strict()
 
-const contributionSchema = z.object({
-  instrumentId: identitySchema,
-  amount: moneySchema,
-}).strict()
+const contributionSchema = z
+  .object({
+    contributionActionToken: portfolioActionTokenSchema,
+    investment: investmentDisplaySchema,
+    amount: moneySchema,
+  })
+  .strict()
 
-const evaluatedScenarioSchema = z.object({
-  id: identitySchema,
-  composition: z.enum(["additive", "compounded"]),
-  contributions: z.array(contributionSchema),
-  total: moneySchema,
-}).strict()
+export const portfolioAttributionSchema = z
+  .object({
+    comparisonLabel: productNameSchema,
+    comparisonPeriod: productTextSchema,
+    totalChange: moneySchema,
+    contributions: z.array(contributionSchema).max(500),
+    explanation: productTextSchema,
+    uncertainty: productTextSchema,
+  })
+  .strict()
 
-export const portfolioAttributionSchema = reportBase.extend({
-  baselineSnapshotToken: tokenSchema,
-  baselineEffectiveAtUnixNanos: timeSchema,
-  baselineAvailableAtUnixNanos: timeSchema.nullable(),
-  contributions: z.array(contributionSchema),
-  total: moneySchema,
-  explanation: z.string().min(1),
-}).strict()
-
-export const portfolioScenarioResultSchema = reportBase.extend({
-  scenario: evaluatedScenarioSchema,
-}).strict()
-
-export const portfolioScenarioBatchResultSchema = reportBase.extend({
-  scenarios: z.array(evaluatedScenarioSchema),
-}).strict()
-
-export const portfolioRebalanceSchema = reportBase.extend({
-  trades: z.array(z.object({
-    instrumentId: identitySchema,
-    valueChange: moneySchema,
-  }).strict()),
-  projectedCash: moneySchema,
-  turnover: exactDecimalSchema,
-  constrained: z.boolean(),
-}).strict()
-
-const candidateCostSchema = z.discriminatedUnion("state", [
+const measuredAmountSchema = z.discriminatedUnion("state", [
   z.object({ state: z.literal("available"), amount: moneySchema }).strict(),
-  z.object({ state: z.literal("not_available") }).strict(),
+  z.object({ state: z.literal("unavailable"), explanation: productTextSchema }).strict(),
 ])
 
-export const portfolioCandidateImpactSchema = z.object({
-  accountId: identitySchema,
-  instrumentId: identitySchema,
-  positionState: z.enum(["new", "existing"]),
-  currentQuantity: exactDecimalSchema,
-  proposedQuantity: exactDecimalSchema,
-  currentMarketValue: moneySchema,
-  proposedMarketValue: moneySchema,
-  capitalChange: moneySchema,
-  portfolioValue: moneySchema,
-  instrumentTerms: z.object({
-    priceTick: exactDecimalSchema,
-    lotSize: exactDecimalSchema,
-    quoteCurrency: z.string().regex(/^[A-Z]{3}$/),
-    contractMultiplier: exactDecimalSchema,
-  }).strict(),
-  costs: z.object({
-    fees: candidateCostSchema,
-    slippage: candidateCostSchema,
-  }).strict(),
-  concentration: z.object({
-    current: exactDecimalSchema,
-    proposed: exactDecimalSchema,
-    change: exactDecimalSchema,
-  }).strict(),
-  scenario: z.object({
-    shock: exactDecimalSchema,
-    currentImpact: moneySchema,
-    proposedImpact: moneySchema,
-    marginalImpact: moneySchema,
-  }).strict(),
-  price: z.object({
+const reconciliationDetailSchema = z
+  .object({
+    findingActionToken: portfolioActionTokenSchema,
+    label: productNameSchema,
+    supplied: moneySchema,
+    calculated: moneySchema,
+    tolerance: moneySchema,
+    explanation: productTextSchema,
+  })
+  .strict()
+
+const accountingSummarySchema = z
+  .object({
+    cash: moneySchema,
+    cashUpdatedAt: productTimeSchema,
+    reportedMarketValue: moneySchema,
+    unrealizedGain: measuredAmountSchema,
+    realizedGain: measuredAmountSchema,
+    income: measuredAmountSchema,
+    fees: measuredAmountSchema,
+    reconciliationLabel: productNameSchema,
+    reconciliationExplanation: productTextSchema,
+    reconciliationFindings: z.array(reconciliationDetailSchema).max(100),
+  })
+  .strict()
+
+export const performanceSchema = z
+  .object({
+    currentValue: moneySchema,
+    timeWeightedReturn: percentageSchema.nullable(),
+    moneyWeightedReturn: percentageSchema.nullable(),
+    comparablePeriods: z.number().int().nonnegative().nullable(),
+    coverageExplanation: productTextSchema,
+    accounting: accountingSummarySchema.nullable(),
+  })
+  .strict()
+
+const exposureRowSchema = z
+  .object({ label: productNameSchema, amount: moneySchema })
+  .strict()
+
+export const exposureSchema = z
+  .object({
+    byInvestment: z.array(exposureRowSchema).max(500),
+    byCurrency: z.array(exposureRowSchema).max(64),
+    bySector: z.array(exposureRowSchema).max(128),
+    byFactor: z.array(exposureRowSchema).max(128),
+    net: moneySchema.nullable(),
+    gross: moneySchema.nullable(),
+    coverageExplanation: productTextSchema,
+  })
+  .strict()
+
+const riskMetricSchema = z
+  .object({
+    label: productNameSchema,
+    value: z.string().trim().min(1).max(64),
+    explanation: productTextSchema,
+  })
+  .strict()
+
+const riskStressSummarySchema = z
+  .object({
+    title: productNameSchema,
+    assumption: productTextSchema,
+    impact: moneySchema.nullable(),
+    result: productTextSchema,
+    uncertainty: productTextSchema,
+  })
+  .strict()
+
+export const riskSchema = z
+  .object({
+    metrics: z.array(riskMetricSchema).min(1).max(12),
+    stress: riskStressSummarySchema.nullable(),
+    coverageExplanation: productTextSchema,
+  })
+  .strict()
+
+const preparedDecisionSchema = z
+  .object({
+    actionToken: portfolioActionTokenSchema,
+    title: productNameSchema,
+    action: productNameSchema,
+    horizon: productNameSchema,
+    range: productTextSchema,
+    reasons: z.array(productTextSchema).min(1).max(8),
+    risks: z.array(productTextSchema).min(1).max(8),
+    assumptions: z.array(productTextSchema).min(1).max(8),
+    expiresAt: productTimeSchema,
+    invalidators: z.array(productTextSchema).min(1).max(8),
+    uncertainty: productTextSchema,
+  })
+  .strict()
+
+export const stressChoiceSchema = preparedDecisionSchema
+  .extend({ result: productTextSchema, estimatedImpact: moneySchema.nullable() })
+  .strict()
+
+export const positionChoiceSchema = preparedDecisionSchema
+  .extend({ investment: investmentDisplaySchema })
+  .strict()
+
+export const rebalanceChoiceSchema = preparedDecisionSchema
+  .extend({
+    estimatedTurnover: percentageSchema.nullable(),
+    estimatedCosts: moneySchema.nullable(),
+  })
+  .strict()
+
+const importPositionChoiceSchema = z
+  .object({
+    choiceToken: portfolioActionTokenSchema,
+    label: productNameSchema,
+    explanation: productTextSchema,
+  })
+  .strict()
+
+const portfolioImportInterpretationChoiceSchema = z
+  .object({
+    choiceToken: portfolioActionTokenSchema,
+    label: productNameSchema,
+    explanation: productTextSchema,
+    positionChoices: z.array(importPositionChoiceSchema).max(100),
+    positionSelectionRequired: z.boolean(),
+  })
+  .strict()
+
+const portfolioImportTransactionSchema = z
+  .object({
+    transactionActionToken: portfolioActionTokenSchema,
+    categoryLabel: productNameSchema,
+    investment: investmentDisplaySchema.nullable(),
     amount: moneySchema,
-    asOfUnixNanos: timeSchema,
-    state: z.literal("current"),
-    method: z.enum(["Last trade", "Bid-ask midpoint"]),
-    confidence: confidenceSchema,
-  }).strict(),
-  missingInformation: z.array(z.string().min(1)),
-  riskAssessment: z.object({
-    state: z.literal("incomplete"),
-    evaluatedAtUnixNanos: timeSchema,
-    checksCompleted: z.number().int().nonnegative(),
-    checksUnavailable: z.number().int().nonnegative(),
-  }).strict(),
-  updatedAtUnixNanos: timeSchema,
-  analysisOnly: z.literal(true),
-}).strict()
+    quantityLabel: productNameSchema.nullable(),
+    occurredAt: productTimeSchema,
+    interpretationRequired: z.boolean(),
+    interpretationChoices: z.array(portfolioImportInterpretationChoiceSchema).max(24),
+  })
+  .strict()
 
-const reconciliationDetailSchema = z.object({
-  field: z.enum(["cash", "market_value", "cost_basis"]),
-  supplied: moneySchema,
-  calculated: moneySchema,
-  currency: z.string().regex(/^[A-Z]{3}$/),
-  tolerance: z.object({
-    kind: z.literal("absolute"),
-    amount: moneySchema,
-  }).strict(),
-}).strict()
+const portfolioImportPreviewSchema = z
+  .object({
+    reviewActionToken: portfolioActionTokenSchema,
+    accountToken: portfolioActionTokenSchema,
+    portfolioName: productNameSchema,
+    stateLabel: productNameSchema,
+    recordCount: z.number().int().nonnegative(),
+    transactionCount: z.number().int().nonnegative(),
+    reviewFindingCount: z.number().int().nonnegative(),
+    transactions: z.array(portfolioImportTransactionSchema).max(5_000),
+    saveAllowed: z.boolean(),
+    saveExplanation: productTextSchema,
+  })
+  .strict()
 
-const measuredAccountingSchema = z.object({
-  status: z.enum(["available", "partial", "not_available"]),
-  amount: moneySchema.optional(),
-}).strict()
-
-const accountingEvidenceSchema = z.object({
-  cash: z.object({
-    amount: moneySchema,
-    observedAtUnixNanos: timeSchema,
-    status: z.literal("available"),
-  }).strict(),
-  reportedMarketValue: moneySchema,
-  unrealizedGain: measuredAccountingSchema,
-  realizedGain: measuredAccountingSchema,
-  income: measuredAccountingSchema,
-  fees: measuredAccountingSchema,
-  reconciliation: z.object({
-    status: z.enum(["clear", "needs_review"]),
-    discrepancies: z.array(reconciliationDetailSchema),
-  }).strict(),
-}).strict()
-
-export const performanceSchema = reportBase.extend({
-  currentValue: moneySchema,
-  historyStatus: z.string().min(1).optional(),
-  timeWeightedReturn: exactDecimalSchema.optional(),
-  moneyWeightedReturn: exactDecimalSchema.optional(),
-  periods: z.number().int().nonnegative().optional(),
-  accountingEvidence: accountingEvidenceSchema.optional(),
-}).strict()
-
-const exposureRowSchema = z.object({ amount: moneySchema }).strict()
-
-export const exposureSchema = reportBase.extend({
-  instrument: z.array(exposureRowSchema.extend({ instrumentId: identitySchema }).strict()),
-  currency: z.array(exposureRowSchema.extend({
-    currency: z.string().regex(/^[A-Z]{3}$/),
-  }).strict()),
-  sector: z.array(exposureRowSchema.extend({ classification: identitySchema }).strict()),
-  factor: z.array(exposureRowSchema.extend({ classification: identitySchema }).strict()),
-  net: moneySchema.optional(),
-  gross: moneySchema.optional(),
-  calculationStatus: z.string().min(1).optional(),
-  classificationStatus: z.string().min(1).optional(),
-}).strict()
-
-const riskScenarioSchema = z.object({
-  id: identitySchema,
-  status: z.string().min(1).optional(),
-  impact: moneySchema.optional(),
-}).strict()
-
-export const riskSchema = reportBase.extend({
-  confidence: z.number().min(0).max(1),
-  scenario: riskScenarioSchema,
-  historyStatus: z.string().min(1).optional(),
-  valueAtRisk: z.number().nonnegative().optional(),
-  expectedShortfall: z.number().nonnegative().optional(),
-  observations: z.number().int().nonnegative().optional(),
-  annualizedVolatility: z.number().nonnegative().optional(),
-  volatilityStatus: z.string().min(1).optional(),
-  trackingErrorStatus: z.string().min(1).optional(),
-}).strict()
-
-export interface ResultEvidence {
-  state: "complete" | "partial"
-  returnedItems: number
-  availableItems: number
-  confidence: "limited" | "moderate" | "strong"
-}
-
-export interface PortfolioResult<T> {
-  value: T
-  evidence: ResultEvidence
-}
+const portfolioImportCommitSchema = z
+  .object({
+    accepted: z.literal(true),
+    portfolioName: productNameSchema,
+    message: productTextSchema,
+  })
+  .strict()
 
 export type PortfolioAccount = z.infer<typeof portfolioAccountSchema>
-export type PortfolioRevision = z.infer<typeof portfolioRevisionSchema>
 export type PortfolioHolding = z.infer<typeof holdingSchema>
 export type PortfolioTransaction = z.infer<typeof portfolioTransactionSchema>
+export type PortfolioRevisionChoice = z.infer<typeof portfolioRevisionChoiceSchema>
 export type PortfolioPerformance = z.infer<typeof performanceSchema>
 export type PortfolioExposure = z.infer<typeof exposureSchema>
 export type PortfolioRisk = z.infer<typeof riskSchema>
 export type PortfolioAttribution = z.infer<typeof portfolioAttributionSchema>
-export type PortfolioScenarioResult = z.infer<typeof portfolioScenarioResultSchema>
-export type PortfolioScenarioBatchResult = z.infer<typeof portfolioScenarioBatchResultSchema>
-export type PortfolioRebalance = z.infer<typeof portfolioRebalanceSchema>
-export type PortfolioCandidateImpact = z.infer<typeof portfolioCandidateImpactSchema>
-export type Money = z.infer<typeof moneySchema>
-
-const portfolioImportTransactionSchema = z.object({
-  recordToken: tokenSchema,
-  category: z.enum(["trade", "cash_transfer", "income", "fee", "corporate_action"]),
-  amount: moneySchema,
-  quantity: exactDecimalSchema.nullable(),
-  occurredAtUnixNanos: timeSchema,
-  interpretationOptions: z.array(z.object({
-    value: identitySchema,
-    label: identitySchema,
-    requiresLotSelection: z.boolean(),
-  }).strict()),
-  eligibleLotCount: z.number().int().nonnegative(),
-}).strict()
-
-const portfolioImportPreviewSchema = z.object({
-  reviewToken: tokenSchema,
-  accountId: identitySchema,
-  state: z.enum(["ready", "already_saved"]),
-  recordCount: z.number().int().nonnegative(),
-  transactionCount: z.number().int().nonnegative(),
-  dataIssueCount: z.number().int().nonnegative(),
-  transactions: z.array(portfolioImportTransactionSchema),
-  requiresCorporateActionReview: z.boolean(),
-}).strict()
-
-const portfolioImportCommitSchema = z.object({ accepted: z.literal(true) }).strict()
-
+export type PortfolioStressChoice = z.infer<typeof stressChoiceSchema>
+export type PortfolioPositionChoice = z.infer<typeof positionChoiceSchema>
+export type PortfolioRebalanceChoice = z.infer<typeof rebalanceChoiceSchema>
 export type PortfolioImportPreview = z.infer<typeof portfolioImportPreviewSchema>
 export type PortfolioImportTransaction = z.infer<typeof portfolioImportTransactionSchema>
 export type PortfolioImportCommit = z.infer<typeof portfolioImportCommitSchema>
+export type Money = z.infer<typeof moneySchema>
 
 export function parsePortfolioImportPreview(value: unknown): PortfolioImportPreview {
   const parsed = applicationResultSchema
     .extend({ data: portfolioImportPreviewSchema })
     .safeParse(value)
-  if (!parsed.success) {
+  if (!parsed.success || parsed.data.metadata.completeness !== "complete") {
     throw new Error("The import review could not be displayed safely.")
   }
   return parsed.data.data
@@ -335,7 +352,7 @@ export function parsePortfolioImportCommit(value: unknown): PortfolioImportCommi
   const parsed = applicationResultSchema
     .extend({ data: portfolioImportCommitSchema })
     .safeParse(value)
-  if (!parsed.success) {
+  if (!parsed.success || parsed.data.metadata.completeness !== "complete") {
     throw new Error("The account update could not be confirmed safely.")
   }
   return parsed.data.data
@@ -345,22 +362,18 @@ export function parsePortfolioResult<Schema extends z.ZodType>(
   result: ApplicationResult,
   schema: Schema,
   emptyValue?: z.input<Schema>,
-): PortfolioResult<z.infer<Schema>> {
+): z.infer<Schema> {
+  if (
+    result.metadata.completeness !== "complete" ||
+    result.metadata.returnedItems !== result.metadata.availableItems
+  ) {
+    throw new Error("Portfolio information is incomplete.")
+  }
   const parsed = schema.safeParse(
     result.data === null && emptyValue !== undefined ? emptyValue : result.data,
   )
   if (!parsed.success) {
     throw new Error("Portfolio information could not be displayed safely.")
   }
-  const quality = z.object({ confidence: confidenceSchema }).passthrough()
-    .safeParse(result.metadata.dataQuality)
-  return {
-    value: parsed.data,
-    evidence: {
-      state: result.metadata.completeness === "complete" ? "complete" : "partial",
-      returnedItems: result.metadata.returnedItems,
-      availableItems: result.metadata.availableItems,
-      confidence: quality.success ? quality.data.confidence : "limited",
-    },
-  }
+  return parsed.data
 }

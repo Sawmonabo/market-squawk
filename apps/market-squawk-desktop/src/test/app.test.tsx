@@ -1,5 +1,4 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react"
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import userEvent from "@testing-library/user-event"
 import { MemoryRouter } from "react-router-dom"
 import { describe, expect, it } from "vitest"
@@ -8,29 +7,32 @@ import { App } from "@/app/app"
 import type { AnalyticalControllerStatus } from "@/features/advanced/analytical-profile-contracts"
 import { lookupRoute } from "@/features/lookup/lookup-surface"
 import { lookupResultSchema } from "@/features/lookup/schemas"
-import type {
-  PortfolioAccount,
-  PortfolioHolding,
-} from "@/features/portfolio/portfolio-contracts"
+import type { MarketProductRow } from "@/features/markets/market-product"
+import type { PortfolioPositionChoice } from "@/features/portfolio/portfolio-contracts"
 import { PortfolioPlanning } from "@/features/portfolio/portfolio-planning"
-import type { ApplicationResult, DesktopBootstrap } from "@/lib/schemas"
+import {
+  type ApplicationResult,
+  type DesktopSystemBootstrap,
+  type NativeEvidenceApplicationResult,
+} from "@/lib/schemas"
 import {
   productLookupActions,
   productLookupCategory,
+  type DesktopTransport,
   type ProductTransport,
+  type SystemTransport,
 } from "@/lib/transport"
 
-const blockedBootstrap: DesktopBootstrap = {
+const TEST_WORKSPACE_ID = "55e7626c-81c8-4e78-8aa6-45a1d9c2949a"
+const TEST_SERVICE_GENERATION = 1
+
+const blockedBootstrap: DesktopSystemBootstrap = {
   contractVersion: "market-squawk-desktop-v1",
   applicationVersion: "1.0.0",
   buildProfile: "development",
   platform: "macos",
   dataRoot: ".market-squawk",
-  runtime: {
-    installationId: "7e8299e7-9757-4441-926f-d0b22c767a65",
-    workspaceId: "55e7626c-81c8-4e78-8aa6-45a1d9c2949a",
-    serviceGeneration: 1,
-  },
+  productSessionToken: "7e8299e7-9757-4441-926f-d0b22c767a65",
   storage: {
     state: "ready",
     label: "Ready",
@@ -57,7 +59,7 @@ const blockedBootstrap: DesktopBootstrap = {
 
 function transport(
   bootstrap = blockedBootstrap,
-  onboard: ProductTransport["onboard"] = async () => {
+  onboard: SystemTransport["onboard"] = async () => {
     throw new Error("Provider onboarding is not configured for this test.")
   },
   query: ProductTransport["query"] = async () => ({
@@ -66,28 +68,31 @@ function transport(
       completeness: "complete",
       returnedItems: 0,
       availableItems: 0,
-      sourceCoverage: { status: "not_applicable" },
-      dataQuality: { status: "not_applicable" },
     },
   }),
-): ProductTransport {
+): DesktopTransport {
   const productResult = (data: unknown): ApplicationResult => ({
     data,
     metadata: {
       completeness: "complete",
       returnedItems: 0,
       availableItems: 0,
-      sourceCoverage: { status: "not_applicable" },
-      dataQuality: { status: "not_applicable" },
     },
   })
-  return {
+  const systemResult = (data: unknown): NativeEvidenceApplicationResult => ({
+    data,
+    metadata: {
+      completeness: "complete",
+      returnedItems: 0,
+      availableItems: 0,
+      sourceCoverage: null,
+      dataQuality: null,
+    },
+  })
+  const bridge: ProductTransport & SystemTransport = {
     bootstrap: async () => bootstrap,
     bootstrapService: async () => {
       throw new Error("Service bootstrap is not configured for this test.")
-    },
-    reconnectService: async () => {
-      throw new Error("Service reconnect is not configured for this test.")
     },
     installation: async () => ({
       action: "status",
@@ -104,6 +109,7 @@ function transport(
       restartRequired: false,
     }),
     query,
+    systemQuery: async () => systemResult(null),
     modelProducts: async (request) =>
       productResult(request.action === "list" ? { models: [] } : { activities: [] }),
     backtestProducts: async (request) => {
@@ -113,38 +119,40 @@ function transport(
       return productResult({ activities: [] })
     },
     analyticalController: async () =>
-      analyticalControllerStatus(bootstrap.runtime.workspaceId),
+      analyticalControllerStatus(TEST_WORKSPACE_ID),
     researchControl: async () =>
-      query({ query: "researchCollections" }),
+      systemResult(null),
+    researchExport: async () =>
+      productResult(null),
     datasetPreparation: async () =>
-      query({ query: "analysisFeatureDatasets" }),
+      productResult(null),
     backtestPreparation: async () =>
-      query({ query: "jobs", limit: 25 }),
+      productResult(null),
     startBacktestFromFile: async () =>
-      query({ query: "jobs", limit: 25 }),
+      productResult(null),
     modelControl: async () =>
-      query({ query: "jobs", limit: 25 }),
+      productResult(null),
     forecastPreparation: async () =>
-      query({ query: "jobs", limit: 25 }),
+      productResult(null),
     decisionControl: async () =>
-      query({ query: "decisionScreens", limit: 25 }),
+      productResult(null),
     governanceQuery: async () =>
-      query({ query: "decisionScreens", limit: 25 }),
+      systemResult(null),
     governanceControl: async () =>
-      query({ query: "decisionScreens", limit: 25 }),
+      systemResult(null),
     fairValueControl: async () =>
-      query({ query: "fairValueWorkspace", at: new Date().toISOString() }),
+      productResult(null),
     paperControl: async () =>
       query({ query: "paperStatus" }),
     manualPaper: async () =>
       query({ query: "paperStatus" }),
     jobControl: async (request) =>
-      query({ query: "jobs", limit: "limit" in request ? request.limit : 25 }),
+      systemResult({ request }),
     sourceControl: async (_action, _request) =>
-      query({ query: "sourceStatus" }),
+      systemResult(null),
     importProviderCredentialBundle: async () => null,
     operationsControl: async () =>
-      query({ query: "operationUpdateStatus" }),
+      systemResult(null),
     stageTrainingInput: async () => null,
     mcpClients: async () => {
       const claudeService = {
@@ -181,8 +189,8 @@ function transport(
       return {
         serviceReady: true,
         sharedEndpointReady: true,
-        workspaceId: bootstrap.runtime.workspaceId,
-        serviceGeneration: bootstrap.runtime.serviceGeneration,
+        workspaceId: TEST_WORKSPACE_ID,
+        serviceGeneration: TEST_SERVICE_GENERATION,
         protocolVersion: "2025-11-25",
         transport: "stdio_relay",
         runtime: {
@@ -238,7 +246,7 @@ function transport(
     subscribe: async (request) => ({
       receipt: {
         subscriptionId: "f49e02f6-8c47-43a5-bb33-030e8e0d12bb",
-        runtime: request.runtime,
+        productSessionToken: request.productSessionToken,
         sequence: request.afterSequence,
         resumed: request.afterSequence !== "0",
       },
@@ -248,6 +256,43 @@ function transport(
     openOfficialProviderPage: async () => undefined,
     openProtectedProviderSetup: async () => undefined,
   }
+  const product: ProductTransport = {
+    query: bridge.query,
+    modelProducts: bridge.modelProducts,
+    backtestProducts: bridge.backtestProducts,
+    datasetPreparation: bridge.datasetPreparation,
+    backtestPreparation: bridge.backtestPreparation,
+    forecastPreparation: bridge.forecastPreparation,
+    researchExport: bridge.researchExport,
+    paperControl: bridge.paperControl,
+    manualPaper: bridge.manualPaper,
+  }
+  const system: SystemTransport = {
+    bootstrap: bridge.bootstrap,
+    bootstrapService: bridge.bootstrapService,
+    installation: bridge.installation,
+    systemQuery: bridge.systemQuery,
+    analyticalController: bridge.analyticalController,
+    researchControl: bridge.researchControl,
+    startBacktestFromFile: bridge.startBacktestFromFile,
+    modelControl: bridge.modelControl,
+    decisionControl: bridge.decisionControl,
+    governanceQuery: bridge.governanceQuery,
+    governanceControl: bridge.governanceControl,
+    fairValueControl: bridge.fairValueControl,
+    jobControl: bridge.jobControl,
+    sourceControl: bridge.sourceControl,
+    importProviderCredentialBundle: bridge.importProviderCredentialBundle,
+    operationsControl: bridge.operationsControl,
+    stageTrainingInput: bridge.stageTrainingInput,
+    mcpClients: bridge.mcpClients,
+    mcpClientControl: bridge.mcpClientControl,
+    subscribe: bridge.subscribe,
+    onboard: bridge.onboard,
+    openOfficialProviderPage: bridge.openOfficialProviderPage,
+    openProtectedProviderSetup: bridge.openProtectedProviderSetup,
+  }
+  return { product, system }
 }
 
 function analyticalControllerStatus(workspaceId: string): AnalyticalControllerStatus {
@@ -321,121 +366,48 @@ const emptyRowsResult: ApplicationResult = {
     completeness: "complete",
     returnedItems: 0,
     availableItems: 0,
-    sourceCoverage: { status: "not_applicable" },
-    dataQuality: { status: "not_applicable" },
   },
 }
 
-const marketInstrumentId = "7e8299e7-9757-4441-926f-d0b22c767a65"
+const marketSelectionToken = "market_0123456789abcdef0123456789abcdef"
 const marketObservedAt = "2026-08-09T14:30:00.000000000Z"
-const marketUpdatedAt = "2026-08-09T14:30:00.011000000Z"
 
 const marketOverviewRow = {
-  instrumentId: marketInstrumentId,
-  displaySymbol: "BTC-USD",
-  name: "Bitcoin",
-  assetClass: "crypto",
-  currency: "USD",
-  availability: "live",
-  confidence: "moderate",
-  currentPrice: {
+  selectionToken: marketSelectionToken,
+  historyToken: null,
+  identity: {
+    symbol: "BTC-USD",
+    name: "Bitcoin",
+    assetClass: "crypto",
+  },
+  price: {
     value: "68000.15",
     currency: "USD",
-    basis: "bid_ask_midpoint",
-    observedAt: marketObservedAt,
-    currentThrough: marketObservedAt,
   },
-  quote: {
-    bidPrice: "68000.1",
-    bidSize: "0.25",
-    askPrice: "68000.2",
-    askSize: "0.3",
-    midPrice: "68000.15",
-    lastPrice: null,
-    lastSize: null,
-    quoteObservedAt: marketObservedAt,
-    lastObservedAt: null,
-  },
-  marketState: {
-    timing: "real_time",
-    quality: "direct",
-    health: "healthy",
-    integrity: "verified",
-    coverage: "single_market",
-    depth: "order_level",
-    freshness: "fresh",
-    observedAt: marketObservedAt,
-    updatedAt: marketUpdatedAt,
-    currentThrough: marketObservedAt,
-  },
-  observations: {
-    admittedCount: 2,
-    independentCount: null,
-    agreement: "not_established",
-  },
-  depthSummary: {
-    kind: "order_level",
-    bidLevels: 1,
-    askLevels: 1,
-    individualOrderCount: 2,
-    truncated: false,
-  },
-  depthDetails: null,
-  analysisUse: "current_only",
-}
+  changePercent: "1.25",
+  asOf: marketObservedAt,
+  availability: "current",
+} satisfies MarketProductRow
 
-function marketResult(
-  row: typeof marketOverviewRow | (Omit<typeof marketOverviewRow, "depthDetails"> & {
-    depthDetails: {
-      kind: "order_level"
-      bids: Array<{ price: string; quantity: string }>
-      asks: Array<{ price: string; quantity: string }>
-      individualOrders: {
-        bidOrders: Array<{ price: string; quantity: string }>
-        askOrders: Array<{ price: string; quantity: string }>
-        totalCount: number
-        returnedCount: number
-        truncated: boolean
-      }
-    }
-  }),
-): ApplicationResult {
+function marketResult(row: MarketProductRow): ApplicationResult {
   return {
-    data: [row],
+    data: {
+      data: [row],
+      page: {
+        hasMore: false,
+        nextPageToken: null,
+      },
+    },
     metadata: {
       completeness: "complete",
       returnedItems: 1,
       availableItems: 1,
-      sourceCoverage: {
-        availability: "available",
-        complete: true,
-        returnedInstrumentCount: 1,
-        observationCount: 2,
-      },
-      dataQuality: {
-        referenceAt: marketUpdatedAt,
-        observationCount: 2,
-      },
     },
   }
 }
 
 const marketOverviewResult = marketResult(marketOverviewRow)
-const marketInstrumentResult = marketResult({
-  ...marketOverviewRow,
-  depthDetails: {
-    kind: "order_level",
-    bids: [{ price: "68000.1", quantity: "0.25" }],
-    asks: [{ price: "68000.2", quantity: "0.3" }],
-    individualOrders: {
-      bidOrders: [{ price: "68000.1", quantity: "0.25" }],
-      askOrders: [{ price: "68000.2", quantity: "0.3" }],
-      totalCount: 2,
-      returnedCount: 2,
-      truncated: false,
-    },
-  },
-})
+const marketInstrumentResult = marketResult(marketOverviewRow)
 
 const macroKnowledgeCutoff = "2026-08-28T14:30:00Z"
 const macroEffectiveDateCutoff = "2026-08-27"
@@ -509,113 +481,27 @@ function macroContextResult(cutoffs = {
       completeness: "complete",
       returnedItems: 12,
       availableItems: 12,
-      sourceCoverage: { status: "complete" },
-      dataQuality: { status: "current" },
     },
   }
 }
 
-const portfolioAccountId = "55e7626c-81c8-4e78-8aa6-45a1d9c2949a"
-const heldInstrumentId = "7e8299e7-9757-4441-926f-d0b22c767a65"
-const candidateInstrumentId = "0467d4c9-befd-5b7d-b4b5-99b673662c86"
-const portfolioSnapshotToken = "f311efc6-a85b-4f3d-a8c4-dc65f67b52b7"
-const portfolioAccount: PortfolioAccount = {
-  accountId: portfolioAccountId,
-  currency: "USD",
-  cashBalance: { amount: "1000", currency: "USD" },
-  currentSnapshot: {
-    snapshotToken: portfolioSnapshotToken,
-    effectiveAtUnixNanos: "1800000000000000000",
-    availableAtUnixNanos: "1800000001000000000",
-    holdingCount: 1,
-    transactionCount: 1,
-    dataIssueCount: 0,
-    dataState: "ready",
+const portfolioPositionChoice: PortfolioPositionChoice = {
+  actionToken: "position_choice_add_three_shares",
+  title: "Add three shares",
+  action: "Review adding three shares",
+  horizon: "Next 30 days",
+  range: "Two to three shares",
+  reasons: ["The position remains within the prepared concentration range."],
+  risks: ["The investment may fall before the review expires."],
+  assumptions: ["The available cash balance remains unchanged."],
+  expiresAt: "2026-09-01T14:30:00Z",
+  invalidators: ["The prepared risk review changes."],
+  uncertainty: "Price and portfolio conditions may change before action.",
+  investment: {
+    name: "Example Company",
+    symbol: "EXM",
+    typeLabel: "Stock",
   },
-  holdingCount: 1,
-  transactionCount: 1,
-  reconciliationDiscrepancies: 0,
-}
-const portfolioHolding: PortfolioHolding = {
-  accountId: portfolioAccountId,
-  snapshotToken: portfolioSnapshotToken,
-  instrumentId: heldInstrumentId,
-  currency: "USD",
-  quantity: "10",
-  lotSize: "1",
-  marketValue: { amount: "1000", currency: "USD" },
-  asOfUnixNanos: "1800000000000000000",
-  costBasis: { state: "not_available" },
-  price: {
-    asOfUnixNanos: "1800000000000000000",
-    state: "reported",
-    confidence: "moderate",
-    explanation: "Reported with the portfolio snapshot.",
-  },
-}
-
-function candidateImpactResult(instrumentId: string): ApplicationResult {
-  return {
-    data: {
-      accountId: portfolioAccountId,
-      instrumentId,
-      positionState: "new",
-      currentQuantity: "0",
-      proposedQuantity: "3",
-      currentMarketValue: { amount: "0", currency: "USD" },
-      proposedMarketValue: { amount: "300", currency: "USD" },
-      capitalChange: { amount: "300", currency: "USD" },
-      portfolioValue: { amount: "2500", currency: "USD" },
-      instrumentTerms: {
-        priceTick: "0.01",
-        lotSize: "1",
-        quoteCurrency: "USD",
-        contractMultiplier: "1",
-      },
-      costs: {
-        fees: { state: "not_available" },
-        slippage: { state: "not_available" },
-      },
-      concentration: { current: "0", proposed: "0.12", change: "0.12" },
-      scenario: {
-        shock: "-0.1",
-        currentImpact: { amount: "0", currency: "USD" },
-        proposedImpact: { amount: "-30", currency: "USD" },
-        marginalImpact: { amount: "-30", currency: "USD" },
-      },
-      price: {
-        amount: { amount: "100", currency: "USD" },
-        asOfUnixNanos: "1800000002000000000",
-        state: "current",
-        method: "Last trade",
-        confidence: "moderate",
-      },
-      missingInformation: [
-        "Settlement-backed sizing",
-        "Liquidity",
-        "Estimated fees",
-        "Estimated slippage",
-      ],
-      riskAssessment: {
-        state: "incomplete",
-        evaluatedAtUnixNanos: "1800000002000000002",
-        checksCompleted: 5,
-        checksUnavailable: 0,
-      },
-      updatedAtUnixNanos: "1800000002000000002",
-      analysisOnly: true,
-    },
-    metadata: {
-      completeness: "complete",
-      returnedItems: 1,
-      availableItems: 1,
-      sourceCoverage: {
-        status: "complete",
-        providers: ["owned-portfolio-import", "selected-market-source"],
-      },
-      dataQuality: { status: "direct_verified" },
-    },
-  }
 }
 
 describe("Market Squawk desktop boundary", () => {
@@ -693,8 +579,6 @@ describe("Market Squawk desktop boundary", () => {
                     completeness: "complete",
                     returnedItems: 1,
                     availableItems: 1,
-                    sourceCoverage: { status: "not_applicable" },
-                    dataQuality: { status: "not_applicable" },
                   },
                 }
               }
@@ -705,8 +589,6 @@ describe("Market Squawk desktop boundary", () => {
                     completeness: "complete",
                     returnedItems: 0,
                     availableItems: 0,
-                    sourceCoverage: { status: "not_applicable" },
-                    dataQuality: { status: "not_applicable" },
                   },
                 }
               }
@@ -726,10 +608,10 @@ describe("Market Squawk desktop boundary", () => {
     )
   })
 
-  it("renders one provider-neutral market journey with current price and depth", async () => {
+  it("renders one provider-neutral market journey with current price and explicit selection", async () => {
     const user = userEvent.setup()
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
-    const readyBootstrap: DesktopBootstrap = {
+    const readyBootstrap: DesktopSystemBootstrap = {
       ...blockedBootstrap,
       capabilities: ["market_overview", "market_instrument"],
     }
@@ -747,30 +629,27 @@ describe("Market Squawk desktop boundary", () => {
     )
 
     expect(await screen.findByRole("heading", { name: "Markets" })).toBeTruthy()
-    const marketHeading = await screen.findByRole("heading", { name: "BTC-USD" })
+    const marketHeading = await screen.findByRole("heading", { name: "Bitcoin" })
     const marketCard = marketHeading.closest("button")
     expect(marketCard).toBeInstanceOf(HTMLButtonElement)
     if (!(marketCard instanceof HTMLButtonElement)) {
       throw new Error("The market card is absent")
     }
 
-    expect(within(marketCard).getByText("Bitcoin")).toBeTruthy()
-    expect(within(marketCard).getByText("Live")).toBeTruthy()
     expect(within(marketCard).getByText("68000.15 USD")).toBeTruthy()
-    expect(within(marketCard).getByText("Individual orders")).toBeTruthy()
+    expect(
+      issuedQueries.filter((request) => request.query === "marketInstrument"),
+    ).toHaveLength(0)
 
     await user.click(marketCard)
-    expect(await screen.findByRole("heading", { name: "Market depth" })).toBeTruthy()
-    expect(screen.getByText("Buy interest")).toBeTruthy()
-    expect(screen.getByText("Sell interest")).toBeTruthy()
-    expect(screen.getByText("2 individual orders are available.")).toBeTruthy()
     await waitFor(() => {
       expect(
         issuedQueries.filter((request) => request.query === "marketInstrument"),
       ).toEqual([
-        { query: "marketInstrument", instrumentId: marketInstrumentId },
+        { query: "marketInstrument", selectionToken: marketSelectionToken },
       ])
     })
+    expect(screen.getAllByRole("heading", { name: "Bitcoin" })).toHaveLength(2)
     expect(
       issuedQueries.some((request) => request.query === "marketOverview"),
     ).toBe(true)
@@ -790,14 +669,14 @@ describe("Market Squawk desktop boundary", () => {
 
     const renderedText = document.body.textContent ?? ""
     expect(renderedText).not.toMatch(/kraken|coinbase|websocket-v2/i)
-    expect(renderedText).not.toContain(marketInstrumentId)
+    expect(renderedText).not.toContain(marketSelectionToken)
     expect(renderedText).not.toMatch(/\bticks?\b|\blots?\b/i)
   })
 
   it("renders one provider-neutral economic context with paired date cutoffs", async () => {
     const user = userEvent.setup()
     const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
-    const readyBootstrap: DesktopBootstrap = {
+    const readyBootstrap: DesktopSystemBootstrap = {
       ...blockedBootstrap,
       capabilities: ["research_dataset_list", "macro_context"],
     }
@@ -814,7 +693,7 @@ describe("Market Squawk desktop boundary", () => {
                   request.effectiveDateCutoff ?? macroEffectiveDateCutoff,
               })
             }
-            if (request.query === "researchCollections" || request.query === "jobs") {
+            if (request.query === "researchCollections") {
               return emptyRowsResult
             }
             throw new Error(`Unexpected research query: ${request.query}`)
@@ -866,94 +745,68 @@ describe("Market Squawk desktop boundary", () => {
     )
   })
 
-  it("keeps candidate impact server-resolved and visibly analysis-only", async () => {
+  it("keeps portfolio planning explicit and analysis-only", async () => {
     const user = userEvent.setup()
-    const issuedQueries: Parameters<ProductTransport["query"]>[0][] = []
-    const readyBootstrap: DesktopBootstrap = {
-      ...blockedBootstrap,
-      capabilities: ["portfolio_candidate_impact"],
-    }
-    const candidateTransport = transport(
-      readyBootstrap,
-      undefined,
-      async (request) => {
-        issuedQueries.push(request)
-        if (request.query === "portfolioCandidateImpact") {
-          return candidateImpactResult(request.instrumentId)
-        }
-        throw new Error(`Unexpected candidate query: ${request.query}`)
-      },
-    )
-    const queryClient = new QueryClient({
-      defaultOptions: {
-        queries: { retry: false },
-        mutations: { retry: false },
-      },
-    })
     render(
-      <QueryClientProvider client={queryClient}>
-        <PortfolioPlanning
-          account={portfolioAccount}
-          holdings={[portfolioHolding]}
-          bootstrap={readyBootstrap}
-          transport={candidateTransport}
-        />
-      </QueryClientProvider>,
+      <PortfolioPlanning
+        positionChoices={[portfolioPositionChoice]}
+        rebalanceChoices={null}
+      />,
     )
 
-    const instrument = screen.getByLabelText("Instrument ID")
-    await user.clear(instrument)
-    await user.type(instrument, candidateInstrumentId)
-    const quantity = screen.getByLabelText(/^Proposed quantity/)
-    await user.clear(quantity)
-    await user.type(quantity, "3")
-    await user.click(screen.getByRole("button", { name: "Compare impact" }))
+    const choice = screen.getByLabelText("Position choice")
+    expect(choice).toBeInstanceOf(HTMLSelectElement)
+    if (!(choice instanceof HTMLSelectElement)) {
+      throw new Error("The position choice control is absent")
+    }
+    expect(choice.value).toBe("")
+    expect(screen.queryByText("Review adding three shares")).toBeNull()
 
-    expect(await screen.findByText("Risk review remains incomplete")).toBeTruthy()
-    expect(issuedQueries).toEqual([
-      {
-        query: "portfolioCandidateImpact",
-        instrumentId: candidateInstrumentId,
-        proposedQuantity: "3",
-        scenarioShock: "-0.1",
-      },
-    ])
-    expect(screen.getByText("New position")).toBeTruthy()
-    expect(screen.getAllByText("USD 300")).toHaveLength(2)
-    expect(screen.getByText("Settlement-backed sizing is unavailable.")).toBeTruthy()
-    expect(screen.getAllByText("Unavailable")).toHaveLength(2)
+    await user.selectOptions(choice, portfolioPositionChoice.actionToken)
+
+    expect(screen.getByText("Review adding three shares")).toBeTruthy()
+    expect(screen.getByText("Next 30 days")).toBeTruthy()
+    expect(screen.getByText("Two to three shares")).toBeTruthy()
     expect(
       screen.getByText(
-        "Analysis only. No portfolio mutation, risk reservation, approval, or order was created.",
+        /Planning cannot place an order, and no choice is selected automatically\./,
       ),
     ).toBeTruthy()
-    expect(screen.queryByText("Projected cash")).toBeNull()
+    expect(
+      screen.getByText(
+        "No complete rebalance choices are available. Market Squawk will not assume allocation targets, turnover, cash, costs, or concentration limits.",
+      ),
+    ).toBeTruthy()
   })
 
   it("keeps fallback bootstrap native and enters the ready workspace only after reconnect", async () => {
     const user = userEvent.setup()
     let ready = false
     let submittedUnlock: string | null = null
+    const baseTransport = transport()
     const bootstrapTransport = {
-      ...transport(),
-      bootstrap: async () =>
-        ready
-          ? blockedBootstrap
-          : {
-              status: "bootstrap_required" as const,
-              requirement: "encrypted_fallback_locked" as const,
-            },
-      bootstrapService: async (request: {
-        action: "unlock_encrypted_fallback"
-        unlock: string
-      }) => {
-        submittedUnlock = request.unlock
-        ready = true
+      product: baseTransport.product,
+      system: {
+        ...baseTransport.system,
+        bootstrap: async () =>
+          ready
+            ? blockedBootstrap
+            : {
+                status: "bootstrap_required" as const,
+                requirement: "encrypted_fallback_locked" as const,
+              },
+        bootstrapService: async (request) => {
+          if (request.action !== "unlock_encrypted_fallback") {
+            throw new Error("Expected the encrypted fallback unlock request.")
+          }
+          submittedUnlock = request.unlock
+          ready = true
+        },
       },
-    } satisfies ProductTransport
+    } satisfies DesktopTransport
 
     render(
-      <MemoryRouter initialEntries={["/home"]}>
+      <MemoryRouter initialEntries={["/system/settings"]}>
         <App transport={bootstrapTransport} />
       </MemoryRouter>,
     )
@@ -964,14 +817,15 @@ describe("Market Squawk desktop boundary", () => {
 
     expect((field as HTMLInputElement).value).toBe("")
     expect(submittedUnlock).toBe("process-local-test-unlock")
-    expect(
-      await screen.findByRole("heading", { name: "What needs your attention now?" }),
-    ).toBeTruthy()
+    await waitFor(() => {
+      expect(screen.queryByLabelText("Local security password")).toBeNull()
+    })
+    expect(screen.getByRole("heading", { name: "Settings" })).toBeTruthy()
   })
 
   it("keeps provider plumbing behind Connections", async () => {
     const providerSentinel = "Privileged provider sentinel"
-    const onboardingRequests: Parameters<ProductTransport["onboard"]>[0][] = []
+    const onboardingRequests: Parameters<SystemTransport["onboard"]>[0][] = []
     const boundaryTransport = transport(
       blockedBootstrap,
       (async (request) => {
@@ -1005,7 +859,7 @@ describe("Market Squawk desktop boundary", () => {
             coverage: false,
           },
         }
-      }) as ProductTransport["onboard"],
+      }) as SystemTransport["onboard"],
     )
 
     render(
@@ -1051,18 +905,18 @@ describe("Market Squawk desktop boundary", () => {
     expect(onboardingRequests).toEqual([{ action: "bootstrap" }])
   })
 
-  it("never promotes an unverified backend state to installation readiness", async () => {
+  it("keeps installation evidence out of the ordinary workspace", async () => {
     render(
       <MemoryRouter initialEntries={["/home"]}>
         <App transport={transport()} />
       </MemoryRouter>,
     )
 
-    expect((await screen.findAllByText("Not verified")).length).toBeGreaterThan(0)
     expect(
-      screen.getByRole("heading", { name: "What needs your attention now?" }),
+      await screen.findByRole("heading", { name: "What needs your attention now?" }),
     ).toBeTruthy()
     expect(screen.queryByText("Installation verified")).toBeNull()
-    expect(screen.getByText("No signed installation receipt was admitted.")).toBeTruthy()
+    expect(screen.queryByText("Not verified")).toBeNull()
+    expect(screen.queryByText("No signed installation receipt was admitted.")).toBeNull()
   })
 })

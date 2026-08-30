@@ -4,10 +4,11 @@ import type { ApplicationResult } from "@/lib/schemas"
 
 const timestampSchema = z.string().datetime({ offset: true })
 const exactDecimalSchema = z.string().regex(/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/)
+const opaqueTokenSchema = z.string().min(1).max(256)
 
 const namedChoiceSchema = z
   .object({
-    token: z.string().uuid(),
+    token: opaqueTokenSchema,
     label: z.string().min(1).max(200),
     description: z.string().min(1).max(1_000),
   })
@@ -15,7 +16,7 @@ const namedChoiceSchema = z
 
 const periodChoiceSchema = z
   .object({
-    periodToken: z.string().uuid(),
+    periodToken: opaqueTokenSchema,
     label: z.string().min(1).max(240),
     startsAt: timestampSchema,
     endsAt: timestampSchema,
@@ -29,7 +30,7 @@ const periodChoiceSchema = z
 
 const historyChoiceSchema = z
   .object({
-    historyToken: z.string().uuid(),
+    historyToken: opaqueTokenSchema,
     label: z.string().min(1).max(200),
     investmentCount: z.number().int().positive(),
     periods: z.array(periodChoiceSchema).min(1).max(8),
@@ -62,7 +63,7 @@ const evidenceStateSchema = z.enum(["verified", "limited", "unavailable"])
 
 const backtestPreparationPreviewSchema = z
   .object({
-    confirmationToken: z.string().uuid(),
+    confirmationToken: opaqueTokenSchema,
     expiresAt: timestampSchema,
     investmentUniverse: z.string().min(1).max(400),
     period: z.string().min(1).max(300),
@@ -85,13 +86,12 @@ const backtestStartResultSchema = z
 
 const backtestActivitySchema = z
   .object({
-    backtestToken: z.string().uuid(),
+    backtestToken: opaqueTokenSchema,
     label: z.string().min(1).max(240),
     startedAt: timestampSchema,
     updatedAt: timestampSchema,
     state: z.enum(["queued", "running", "completed", "failed"]),
     progressPercent: exactDecimalSchema.nullable(),
-    statusMessage: z.string().min(1).max(500),
   })
   .strict()
 
@@ -169,7 +169,7 @@ const comparisonEvidenceSchema = z
 const completedBacktestSchema = z
   .object({
     state: z.literal("completed"),
-    backtestToken: z.string().uuid(),
+    backtestToken: opaqueTokenSchema,
     label: z.string().min(1).max(240),
     completedAt: timestampSchema,
     expiresAt: timestampSchema.nullable(),
@@ -200,7 +200,7 @@ const completedBacktestSchema = z
 const unavailableBacktestSchema = z
   .object({
     state: z.literal("unavailable"),
-    backtestToken: z.string().uuid(),
+    backtestToken: opaqueTokenSchema,
     label: z.string().min(1).max(240),
     reason: z.string().min(1).max(2_000),
     limitations: z.array(z.string().min(1).max(2_000)).max(64),

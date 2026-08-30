@@ -36,7 +36,7 @@ export function DatasetEvidence({
   const queryClient = useQueryClient()
   const collectionToken = collection.collectionToken
   const detailKey = [
-    ...productKeys.domain(bootstrap.runtime, "research"),
+    ...productKeys.domain(bootstrap.productSessionToken, "research"),
     "collection",
     collectionToken,
   ] as const
@@ -75,14 +75,11 @@ export function DatasetEvidence({
   const exportJob = useMutation({
     mutationFn: async () =>
       parseResearchActionAccepted(
-        await transport.researchControl(
-          { action: "startCollectionExport", collection: collectionToken },
-          true,
-        ),
+        await transport.researchExport(collectionToken, true),
       ),
     onSuccess: () =>
       queryClient.invalidateQueries({
-        queryKey: productKeys.domain(bootstrap.runtime, "job"),
+        queryKey: productKeys.domain(bootstrap.productSessionToken, "job"),
       }),
   })
   const exact = detail.data ?? collection
