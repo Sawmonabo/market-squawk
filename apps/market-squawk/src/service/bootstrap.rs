@@ -35,8 +35,9 @@ const BOOTSTRAP_DIRECTORY: &str = "boot";
 const METADATA_FILE: &str = "state";
 const METADATA_TEMP_FILE: &str = ".state.tmp";
 const METADATA_MAGIC: &[u8; 4] = b"MSQM";
-const PREFACE: &[u8; 8] = b"MSQB\0\x01\0\0";
-const PROTOCOL_VERSION: u16 = 1;
+const PREFACE: &[u8; 8] = b"MSQB\0\x02\0\0";
+const REQUEST_COMMIT: &[u8; 8] = b"MSQBCMIT";
+const PROTOCOL_VERSION: u16 = 2;
 const MAXIMUM_FRAME_BYTES: usize = 64 * 1024;
 const MAXIMUM_UNLOCK_BYTES: usize = 4 * 1024;
 const MAXIMUM_CREDENTIAL_BYTES: usize = 4 * 1024;
@@ -299,15 +300,14 @@ async fn request_exact_at_root(
         let frame = encode_request(metadata, command)?;
         write_frame(&mut stream, &frame).await?;
         drop(frame);
-        stream
-            .shutdown()
-            .await
-            .map_err(|_error| InstalledServiceError::BootstrapUnavailable)?;
+        stream.write_all(REQUEST_COMMIT).await?;
+        platform::finish_request(&mut stream).await?;
         let response = read_frame(&mut stream)
             .await
             .map_err(|_error| InstalledServiceError::BootstrapUnavailable)?;
         let status = decode_response(&response, metadata)?;
         require_no_trailing_data(&mut stream).await?;
+        platform::complete_response_read(&mut stream).await?;
         Ok(status)
     })
     .await
@@ -324,6 +324,11 @@ async fn serve_connection(
     let frame = read_frame(&mut stream).await?;
     let request = decode_request(&frame, metadata)?;
     drop(frame);
+    let mut commit = [0_u8; REQUEST_COMMIT.len()];
+    stream.read_exact(&mut commit).await?;
+    if commit != *REQUEST_COMMIT {
+        return Err(InstalledServiceError::BootstrapProtocol);
+    }
     require_no_trailing_data(&mut stream).await?;
     if Instant::now() >= request.deadline {
         return Err(InstalledServiceError::BootstrapDeadline);
@@ -371,6 +376,7 @@ async fn serve_connection(
     };
     let response = encode_response(metadata, code);
     write_frame(&mut stream, &response).await?;
+    platform::complete_response_write(&mut stream).await?;
     // Returning immediately after the acknowledged frame keeps credential handoff and connection
     // close in the same poll; there is no cancellation point where the client can observe
     // acceptance after the server has dropped the accepted credential.

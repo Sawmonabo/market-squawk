@@ -14,6 +14,7 @@ use interprocess::local_socket::{
 use interprocess::os::unix::local_socket::ListenerOptionsExt as _;
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncReadExt as _;
+use tokio::io::AsyncWriteExt as _;
 
 use crate::service::InstalledServiceError;
 
@@ -99,6 +100,29 @@ pub(super) async fn authenticate_preface(stream: &mut Stream) -> Result<(), Inst
     } else {
         Err(InstalledServiceError::BootstrapProtocol)
     }
+}
+
+pub(super) async fn finish_request(stream: &mut Stream) -> Result<(), InstalledServiceError> {
+    // interprocess 2.4.3 makes shutdown on its local-socket enum a no-op. Dispatch directly to
+    // Tokio's UnixStream so the service can prove the exact request frame ended at write EOF.
+    let LocalSocketStream::UdSocket(inner) = stream;
+    inner
+        .inner_mut()
+        .shutdown()
+        .await
+        .map_err(|_error| InstalledServiceError::BootstrapUnavailable)
+}
+
+pub(super) async fn complete_response_read(
+    _stream: &mut Stream,
+) -> Result<(), InstalledServiceError> {
+    Ok(())
+}
+
+pub(super) async fn complete_response_write(
+    _stream: &mut Stream,
+) -> Result<(), InstalledServiceError> {
+    Ok(())
 }
 
 fn prepare_private_root(root: &Path) -> Result<(), InstalledServiceError> {
