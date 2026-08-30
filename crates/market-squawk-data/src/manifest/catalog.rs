@@ -156,6 +156,19 @@ pub(crate) struct CatalogGenerationPage {
     pub(crate) has_more: bool,
 }
 
+/// Provider captures owned by the ingest run that created one exact generation.
+///
+/// This is deliberately distinct from the generation's cumulative provider lineage. The input
+/// digests retain the creating run's ordinal order, and the anchor ordinal identifies the one
+/// canonical object appended by that run.
+#[derive(Debug)]
+pub(crate) struct CatalogGenerationOwnedProviderCaptures {
+    pub(crate) pinned: PinnedDataset,
+    pub(crate) source_id: SourceId,
+    pub(crate) anchor_object_ordinal: usize,
+    pub(crate) binding_digests: Vec<EvidenceDigest>,
+}
+
 #[derive(Debug)]
 pub(crate) struct CatalogFeatureDataset {
     pub(crate) pinned: PinnedDataset,
@@ -525,6 +538,10 @@ impl AnalyticalManifestCatalog {
         Ok(publications)
     }
 
+    /// Lists the generation's complete cumulative provider lineage in canonical digest order.
+    ///
+    /// This includes inherited ancestor bindings and must not be used to reconstruct the creating
+    /// run's publication group. Use [`Self::generation_owned_provider_captures`] for that purpose.
     pub(crate) fn provider_capture_binding_digests(
         &self,
         manifest: &DatasetManifestRef,
@@ -578,6 +595,105 @@ impl AnalyticalManifestCatalog {
             ));
         }
         Ok(digests)
+    }
+
+    /// Resolves only the provider captures directly owned by one exact ingest generation.
+    ///
+    /// Unlike [`Self::provider_capture_binding_digests`], this excludes inherited lineage and
+    /// preserves the creating ingest run's input order.
+    pub(crate) fn generation_owned_provider_captures(
+        &self,
+        manifest: &DatasetManifestRef,
+    ) -> Result<CatalogGenerationOwnedProviderCaptures, ManifestCatalogError> {
+        let connection = self.lock()?;
+        let pinned = load_pinned(&connection, manifest, self.max_objects_per_generation)?;
+        if pinned.generation_kind() != GenerationKind::Ingest {
+            return Err(ManifestCatalogError::GenerationConflict);
+        }
+        let (generation_sequence, run_id, source_id, anchor_object_ordinal): (
+            i64,
+            String,
+            String,
+            i64,
+        ) = connection
+            .query_row(
+                "SELECT generation.generation_sequence, source_input.run_id,
+                        source_input.source_id, object.ordinal
+                 FROM analytical_generations AS generation
+                 JOIN analytical_generation_source_inputs AS source_input
+                   ON source_input.generation_sequence=generation.generation_sequence
+                 JOIN dataset_manifests AS anchor
+                   ON anchor.manifest_id=generation.anchor_manifest_id
+                 JOIN analytical_generation_objects AS object
+                   ON object.dataset_id=generation.dataset_id
+                  AND object.manifest_version=generation.manifest_version
+                  AND object.artifact_id=anchor.artifact_id
+                 WHERE generation.dataset_id=?1 AND generation.manifest_version=?2
+                   AND generation.schema_name=?3 AND generation.schema_version=?4
+                   AND generation.schema_fingerprint=?5 AND generation.content_hash=?6
+                   AND generation.generation_kind='ingest'",
+                params![
+                    manifest.dataset_id().as_str(),
+                    to_i64(manifest.manifest_version())?,
+                    manifest.schema().name(),
+                    i64::from(manifest.schema().version().get()),
+                    manifest.schema().fingerprint().as_slice(),
+                    manifest.content_hash().bytes(),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?
+            .ok_or(ManifestCatalogError::GenerationConflict)?;
+        if generation_sequence <= 0 {
+            return Err(ManifestCatalogError::CorruptCatalog);
+        }
+        let run_id = Uuid::parse_str(&run_id).map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+        let source_id = SourceId::try_from(source_id.as_str())
+            .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+        let anchor_object_ordinal = usize::try_from(anchor_object_ordinal)
+            .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+        let anchor_object = pinned
+            .objects()
+            .get(anchor_object_ordinal)
+            .ok_or(ManifestCatalogError::CorruptCatalog)?;
+        let retained = ordered_provider_macro_plan_inputs(&connection, run_id)?;
+        if retained.is_empty() {
+            return Err(ManifestCatalogError::GenerationConflict);
+        }
+        let admitted_inputs: i64 = connection.query_row(
+            "SELECT COUNT(*)
+             FROM ingest_run_provider_capture_bindings AS run_input
+             JOIN analytical_generation_provider_capture_bindings AS generation_input
+               ON generation_input.generation_sequence=?1
+              AND generation_input.run_id=run_input.run_id
+              AND generation_input.binding_digest=run_input.binding_digest
+              AND generation_input.source_id=run_input.source_id
+             WHERE run_input.run_id=?2 AND run_input.source_id=?3",
+            params![generation_sequence, run_id.to_string(), source_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if usize::try_from(admitted_inputs).ok() != Some(retained.len()) {
+            return Err(ManifestCatalogError::CorruptCatalog);
+        }
+        let retained_rows = retained.iter().try_fold(0_u64, |total, (_, rows)| {
+            total
+                .checked_add(u64::try_from(*rows).map_err(|_| ManifestCatalogError::CountOverflow)?)
+                .ok_or(ManifestCatalogError::CountOverflow)
+        })?;
+        if retained_rows != anchor_object.object().row_count() {
+            return Err(ManifestCatalogError::CorruptCatalog);
+        }
+        let mut binding_digests = Vec::new();
+        binding_digests
+            .try_reserve_exact(retained.len())
+            .map_err(|_| ManifestCatalogError::CountOverflow)?;
+        binding_digests.extend(retained.into_iter().map(|(digest, _)| digest));
+        Ok(CatalogGenerationOwnedProviderCaptures {
+            pinned,
+            source_id,
+            anchor_object_ordinal,
+            binding_digests,
+        })
     }
 
     /// Rejects an append that would mix analytical row schemas before object publication.

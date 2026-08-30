@@ -2497,6 +2497,60 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     assert_eq!(short_after_compaction.bars().len(), 1);
     drop(short_after_compaction);
 
+    let short_first_lineage = service.provider_capture_binding_digests(short.manifest())?;
+    assert_eq!(short_first_lineage.len(), 1);
+    let short_append = publish_complete_history_fixture(
+        &service,
+        &source,
+        &capture_store,
+        complete_history_capture_fixture(
+            instrument_id,
+            definition_digest,
+            "alpaca-aapl-iex-daily-adjusted-history-short-v1",
+            COMPLETE_HISTORY_REQUEST_END_NS,
+            COMPLETE_HISTORY_REQUEST_END_NS + 2 * COMPLETE_HISTORY_DAY_NS,
+            &[COMPLETE_HISTORY_REQUEST_END_NS + COMPLETE_HISTORY_DAY_NS],
+            COMPLETE_HISTORY_NEWER_RECEIVED_AT_NS + COMPLETE_HISTORY_DAY_NS,
+            4,
+        )?,
+        "alpaca:paper-iex:complete-daily-history:aapl:short:append:v1",
+    )
+    .await?;
+    let short_cumulative_lineage =
+        service.provider_capture_binding_digests(short_append.manifest())?;
+    assert_eq!(short_cumulative_lineage.len(), 2);
+    assert!(
+        short_first_lineage
+            .iter()
+            .all(|digest| short_cumulative_lineage.contains(digest))
+    );
+    let short_owned = service
+        .generation_owned_provider_capture_evidence(short_append.manifest(), &capture_store)?;
+    let short_direct_digests = short_owned
+        .bindings()
+        .iter()
+        .map(|binding| binding.binding_digest())
+        .collect::<Vec<_>>();
+    assert_eq!(short_direct_digests.len(), 1);
+    assert!(short_cumulative_lineage.contains(&short_direct_digests[0]));
+    assert!(!short_first_lineage.contains(&short_direct_digests[0]));
+    assert_eq!(
+        short_owned.anchor_object(),
+        short_append
+            .pinned()
+            .objects()
+            .last()
+            .ok_or("missing appended history object")?
+    );
+    assert_eq!(
+        short_owned.anchor_object().object().row_count(),
+        u64::try_from(short_owned.bindings()[0].record_count())?
+    );
+    let short_append_manifest = short_append.manifest().clone();
+    let expected_short_owned = short_owned.clone();
+    drop(short_owned);
+    drop(short_append);
+
     assert!(
         service
             .analytical_reader()
@@ -2567,6 +2621,11 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
     );
     assert_eq!(replayed.bars(), newer_expected_bars);
     drop(replayed);
+    assert_eq!(
+        restarted
+            .generation_owned_provider_capture_evidence(&short_append_manifest, &capture_store,)?,
+        expected_short_owned
+    );
 
     let ambiguity = rusqlite::Connection::open(location.path())?;
     ambiguity.execute_batch("DROP TRIGGER market_bar_history_publications_immutable_update;")?;
@@ -3398,7 +3457,7 @@ fn complete_history_capture_fixture(
     Ok(CompleteHistoryCaptureFixture {
         batch,
         capture_material,
-        revision_plan: ExtractionRevisionPlan::try_new(revision_evidence)?,
+        revision_plan: ExtractionRevisionPlan::try_new_with_native_lineage(revision_evidence)?,
         native_rows,
         received_at: bar_received_at,
     })

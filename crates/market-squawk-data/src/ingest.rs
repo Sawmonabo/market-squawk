@@ -23,8 +23,7 @@ use market_squawk_sources::{
     ExtractionRevisionPlan, LogicalItemRange, LogicalObjectRole, LogicalPartitionFamily,
     MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, MAX_PROVIDER_CAPTURE_PAGES, ObservedRevisionAuthority,
     ObservedRevisionError, OptionMarketBatchKind, ProviderCaptureError,
-    ProviderCaptureTerminalDisposition, ProviderLogicalTerminalReceipt,
-    ProviderNativeLineageImplementation, SealedProviderCaptureBinding,
+    ProviderLogicalTerminalReceipt, SealedProviderCaptureBinding,
     SealedProviderLogicalPublicationBinding, SealedProviderOptionMarketBinding,
     SealedProviderPublicationBinding, SourceClass, SourceMetadata, SourceObjectCaptureIdentity,
 };
@@ -75,6 +74,8 @@ const SEC_FUND_NATIVE_SCHEMA_DOMAIN: &[u8] = b"market-squawk/sec-fund/provider-n
 const SEC_FUND_ROW_MAP_SCHEMA_DOMAIN: &[u8] = b"market-squawk/sec-fund/canonical-row-map/v1";
 const PROVIDER_MACRO_PLAN_PUBLICATION_DOMAIN: &[u8] =
     b"market-squawk/provider-macro-plan-publication/v1";
+const PROVIDER_MACRO_PLAN_REQUEST_SET_DOMAIN: &[u8] =
+    b"market-squawk/provider-macro-plan-request-set/v1";
 
 struct ProviderCaptureRecoveryControl<'a> {
     cancellation: &'a CancellationToken,
@@ -297,18 +298,11 @@ impl ProviderMacroPlanChunkInput {
         require_provider_macro_digest(candidate_digest)?;
         require_provider_macro_digest(source_generation_digest)?;
         sealed_capture.validate()?;
-        let native_implementation = sealed_capture.native_lineage().schema().implementation();
         if total_chunks == 0
             || chunk_index >= total_chunks
             || sealed_capture.record_count() == 0
             || revisions.len() != sealed_capture.record_count()
             || !revisions.native_lineage_required()
-            || !revisions.is_locally_observed()
-            || !matches!(
-                native_implementation,
-                ProviderNativeLineageImplementation::BlsTimeseriesV1
-                    | ProviderNativeLineageImplementation::BeaRegionalV1
-            )
         {
             return Err(IngestError::InvalidProviderMacroPlan);
         }
@@ -351,7 +345,6 @@ pub struct ProviderMacroPlanPublicationInput {
     provider_dataset: SourceIdentifier,
     request_set_identity: EvidenceDigest,
     source_generation_digest: EvidenceDigest,
-    sealed_capture_receipt_digest: EvidenceDigest,
     total_rows: u64,
     chunks: Box<[ProviderMacroPlanChunkInput]>,
 }
@@ -373,22 +366,15 @@ impl ProviderMacroPlanPublicationInput {
         let first = chunks
             .first()
             .ok_or(IngestError::InvalidProviderMacroPlan)?;
-        let root_capture = first.sealed_capture.capture_evidence();
-        let source_id = root_capture.source_id().clone();
-        let metadata_revision = root_capture.metadata_revision().clone();
-        let provider_dataset = root_capture.dataset().clone();
-        let request_set_identity = root_capture.request_set_identity();
+        let first_capture = first.sealed_capture.capture_evidence();
+        let source_id = first_capture.source_id().clone();
+        let metadata_revision = first_capture.metadata_revision().clone();
+        let provider_dataset = first_capture.dataset().clone();
         let source_generation_digest = first.source_generation_digest;
-        let sealed_capture_receipt_digest = first.sealed_capture.sealed_capture_receipt_digest();
         let semantics_schema = first.semantics.schema.clone();
         let schema_requirement_digest = first.semantics.schema_requirement_digest;
-        let native_implementation = first
-            .sealed_capture
-            .native_lineage()
-            .schema()
-            .implementation();
+        let native_schema = first.sealed_capture.native_lineage().schema();
 
-        validate_provider_macro_capture_shape(root_capture, total_chunks, native_implementation)?;
         let mut total_rows = 0_u64;
         let mut total_semantics_bytes = 0_u64;
         for (expected_index, chunk) in chunks.iter().enumerate() {
@@ -396,28 +382,24 @@ impl ProviderMacroPlanPublicationInput {
                 u16::try_from(expected_index).map_err(|_| IngestError::InvalidProviderMacroPlan)?;
             chunk.sealed_capture.validate()?;
             let capture = chunk.sealed_capture.capture_evidence();
-            validate_provider_macro_capture_shape(capture, total_chunks, native_implementation)?;
             if chunk.chunk_index != expected_index
                 || chunk.total_chunks != total_chunks
-                || capture != root_capture
+                || capture.source_id() != &source_id
+                || capture.metadata_revision() != &metadata_revision
+                || capture.dataset() != &provider_dataset
                 || chunk.source_generation_digest != source_generation_digest
-                || chunk.sealed_capture.sealed_capture_receipt_digest()
-                    != sealed_capture_receipt_digest
                 || chunk.semantics.schema != semantics_schema
                 || chunk.semantics.schema_requirement_digest != schema_requirement_digest
-                || chunk
-                    .sealed_capture
-                    .native_lineage()
-                    .schema()
-                    .implementation()
-                    != native_implementation
+                || chunk.sealed_capture.native_lineage().schema() != native_schema
                 || chunks[..expected_index as usize]
                     .iter()
                     .any(|prior| prior.candidate_digest == chunk.candidate_digest)
+                || chunks[..expected_index as usize].iter().any(|prior| {
+                    prior.sealed_capture.evidence_digest() == chunk.sealed_capture.evidence_digest()
+                })
             {
                 return Err(IngestError::InvalidProviderMacroPlan);
             }
-            validate_provider_macro_component(chunk, total_chunks, native_implementation)?;
             total_rows = total_rows
                 .checked_add(
                     u64::try_from(chunk.sealed_capture.record_count())
@@ -437,6 +419,7 @@ impl ProviderMacroPlanPublicationInput {
         {
             return Err(IngestError::InvalidProviderMacroPlan);
         }
+        let request_set_identity = provider_macro_plan_request_set_identity(&chunks)?;
         let publication_digest = provider_macro_plan_publication_digest(
             &analytical_dataset,
             completion_digest,
@@ -452,7 +435,6 @@ impl ProviderMacroPlanPublicationInput {
             provider_dataset,
             request_set_identity,
             source_generation_digest,
-            sealed_capture_receipt_digest,
             total_rows,
             chunks: chunks.into_boxed_slice(),
         })
@@ -501,11 +483,6 @@ impl ProviderMacroPlanPublicationInput {
     /// Returns the source/configuration/credential generation shared by every chunk.
     pub const fn source_generation_digest(&self) -> EvidenceDigest {
         self.source_generation_digest
-    }
-
-    /// Returns the physical receipt identity shared by every component binding.
-    pub const fn sealed_capture_receipt_digest(&self) -> EvidenceDigest {
-        self.sealed_capture_receipt_digest
     }
 }
 
@@ -781,169 +758,6 @@ fn validate_provider_macro_chunk_rows(
     Ok(())
 }
 
-fn validate_provider_macro_capture_shape(
-    capture: &market_squawk_sources::ProviderCaptureSetReceipt,
-    total_chunks: u16,
-    native_implementation: ProviderNativeLineageImplementation,
-) -> Result<(), IngestError> {
-    match native_implementation {
-        ProviderNativeLineageImplementation::BlsTimeseriesV1 => {
-            validate_bls_provider_macro_capture_shape(capture, total_chunks)
-        }
-        ProviderNativeLineageImplementation::BeaRegionalV1 => {
-            validate_bea_provider_macro_capture_shape(capture, total_chunks)
-        }
-        _ => Err(IngestError::InvalidProviderMacroPlan),
-    }
-}
-
-fn validate_bls_provider_macro_capture_shape(
-    capture: &market_squawk_sources::ProviderCaptureSetReceipt,
-    total_chunks: u16,
-) -> Result<(), IngestError> {
-    let expected = usize::from(total_chunks);
-    let valid =
-        if total_chunks == 1 {
-            capture.terminal() == ProviderCaptureTerminalDisposition::StandaloneResponse
-                && capture.pages().len() == 1
-                && capture.request_graph_components().is_empty()
-                && capture.semantic_binding().is_none()
-        } else {
-            capture.terminal() == ProviderCaptureTerminalDisposition::CompleteRequestGraph
-                && capture.pages().len() == expected
-                && capture.request_graph_components().len() == expected
-                && capture.semantic_binding().is_none()
-                && capture.request_graph_components().iter().enumerate().all(
-                    |(index, component)| {
-                        usize::from(component.ordinal()) == index
-                            && usize::from(component.first_page_ordinal()) == index
-                            && component.page_count().get() == 1
-                            && component.terminal()
-                                == ProviderCaptureTerminalDisposition::StandaloneResponse
-                    },
-                )
-        };
-    if valid {
-        Ok(())
-    } else {
-        Err(IngestError::InvalidProviderMacroPlan)
-    }
-}
-
-fn validate_bea_provider_macro_capture_shape(
-    capture: &market_squawk_sources::ProviderCaptureSetReceipt,
-    total_chunks: u16,
-) -> Result<(), IngestError> {
-    let components = capture.request_graph_components();
-    let valid = total_chunks == 1
-        && capture.terminal() == ProviderCaptureTerminalDisposition::CompleteRequestGraph
-        && capture.semantic_binding().is_none()
-        && components.len() >= 2
-        && capture.pages().len() == components.len()
-        && components.iter().enumerate().all(|(index, component)| {
-            usize::from(component.ordinal()) == index
-                && usize::from(component.first_page_ordinal()) == index
-                && component.page_count().get() == 1
-                && component.terminal() == ProviderCaptureTerminalDisposition::StandaloneResponse
-        });
-    if valid {
-        Ok(())
-    } else {
-        Err(IngestError::InvalidProviderMacroPlan)
-    }
-}
-
-fn validate_provider_macro_component(
-    chunk: &ProviderMacroPlanChunkInput,
-    total_chunks: u16,
-    native_implementation: ProviderNativeLineageImplementation,
-) -> Result<(), IngestError> {
-    match native_implementation {
-        ProviderNativeLineageImplementation::BlsTimeseriesV1 => {
-            validate_bls_provider_macro_component(chunk, total_chunks)
-        }
-        ProviderNativeLineageImplementation::BeaRegionalV1 => {
-            validate_bea_provider_macro_component(chunk, total_chunks)
-        }
-        _ => Err(IngestError::InvalidProviderMacroPlan),
-    }
-}
-
-fn validate_bls_provider_macro_component(
-    chunk: &ProviderMacroPlanChunkInput,
-    total_chunks: u16,
-) -> Result<(), IngestError> {
-    let expected_page = chunk.chunk_index;
-    let capture = chunk.sealed_capture.capture_evidence();
-    let exact_scope = if total_chunks == 1 {
-        chunk.sealed_capture.component_ordinal().is_none()
-    } else {
-        let component = capture
-            .request_graph_components()
-            .get(usize::from(chunk.chunk_index))
-            .ok_or(IngestError::InvalidProviderMacroPlan)?;
-        chunk.sealed_capture.component_ordinal() == Some(chunk.chunk_index)
-            && component.dataset() == capture.dataset()
-            && component.ordinal() == chunk.chunk_index
-    };
-    if !exact_scope
-        || chunk.sealed_capture.persisted_segment_receipt(0).is_none()
-        || chunk.sealed_capture.persisted_segment_receipt(1).is_some()
-        || chunk.sealed_capture.row_frames().iter().any(|frame| {
-            frame.capture_page_ordinal() != expected_page
-                || frame.segment_ordinal() != 0
-                || frame.physical_frame_ordinal() != u32::from(expected_page)
-        })
-    {
-        return Err(IngestError::InvalidProviderMacroPlan);
-    }
-    Ok(())
-}
-
-fn validate_bea_provider_macro_component(
-    chunk: &ProviderMacroPlanChunkInput,
-    total_chunks: u16,
-) -> Result<(), IngestError> {
-    let capture = chunk.sealed_capture.capture_evidence();
-    let components = capture.request_graph_components();
-    let data_component = components
-        .last()
-        .ok_or(IngestError::InvalidProviderMacroPlan)?;
-    let data_page_ordinal = data_component.first_page_ordinal();
-    let data_page = capture
-        .pages()
-        .get(usize::from(data_page_ordinal))
-        .ok_or(IngestError::InvalidProviderMacroPlan)?;
-    let expected_data_component_ordinal = u16::try_from(components.len().saturating_sub(1))
-        .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
-    if total_chunks != 1
-        || chunk.chunk_index != 0
-        || chunk.total_chunks != 1
-        || chunk.sealed_capture.component_ordinal().is_some()
-        || data_component.ordinal() != expected_data_component_ordinal
-        || data_component.page_count().get() != 1
-        || data_component.content_digest()
-            != chunk
-                .sealed_capture
-                .batch()
-                .request()
-                .object()
-                .evidence()
-                .content_digest()
-        || chunk.sealed_capture.persisted_segment_receipt(0).is_none()
-        || chunk.sealed_capture.persisted_segment_receipt(1).is_some()
-        || chunk.sealed_capture.row_frames().iter().any(|frame| {
-            frame.capture_page_ordinal() != data_page_ordinal
-                || frame.segment_ordinal() != 0
-                || frame.physical_frame_ordinal() != u32::from(data_page_ordinal)
-                || frame.page_body_digest() != data_page.body_digest()
-        })
-    {
-        return Err(IngestError::InvalidProviderMacroPlan);
-    }
-    Ok(())
-}
-
 fn provider_macro_plan_publication_digest(
     analytical_dataset: &DatasetId,
     completion_digest: EvidenceDigest,
@@ -954,6 +768,7 @@ fn provider_macro_plan_publication_digest(
         .first()
         .ok_or(IngestError::InvalidProviderMacroPlan)?;
     let capture = first.sealed_capture.capture_evidence();
+    let request_set_identity = provider_macro_plan_request_set_identity(chunks)?;
     let mut digest = Sha256::new();
     digest.update(PROVIDER_MACRO_PLAN_PUBLICATION_DOMAIN);
     provider_macro_hash_text(&mut digest, analytical_dataset.as_str())?;
@@ -964,13 +779,7 @@ fn provider_macro_plan_publication_digest(
         capture.metadata_revision().as_source_identifier().as_str(),
     )?;
     provider_macro_hash_text(&mut digest, capture.dataset().as_str())?;
-    provider_macro_hash_evidence(&mut digest, capture.request_set_identity());
-    provider_macro_hash_evidence(&mut digest, capture.content_digest());
-    provider_macro_hash_evidence(&mut digest, capture.observation_digest());
-    provider_macro_hash_evidence(
-        &mut digest,
-        first.sealed_capture.sealed_capture_receipt_digest(),
-    );
+    provider_macro_hash_evidence(&mut digest, request_set_identity);
     digest.update(
         u16::try_from(chunks.len())
             .map_err(|_| IngestError::InvalidProviderMacroPlan)?
@@ -978,6 +787,7 @@ fn provider_macro_plan_publication_digest(
     );
     digest.update(total_rows.to_be_bytes());
     for chunk in chunks {
+        let capture = chunk.sealed_capture.capture_evidence();
         digest.update(chunk.chunk_index.to_be_bytes());
         digest.update(chunk.total_chunks.to_be_bytes());
         digest.update(
@@ -987,6 +797,13 @@ fn provider_macro_plan_publication_digest(
         );
         provider_macro_hash_evidence(&mut digest, chunk.candidate_digest);
         provider_macro_hash_evidence(&mut digest, chunk.source_generation_digest);
+        provider_macro_hash_evidence(&mut digest, capture.request_set_identity());
+        provider_macro_hash_evidence(&mut digest, capture.content_digest());
+        provider_macro_hash_evidence(&mut digest, capture.observation_digest());
+        provider_macro_hash_evidence(
+            &mut digest,
+            chunk.sealed_capture.sealed_capture_receipt_digest(),
+        );
         provider_macro_hash_evidence(
             &mut digest,
             chunk.sealed_capture.evidence_digest().evidence(),
@@ -1003,6 +820,33 @@ fn provider_macro_plan_publication_digest(
         provider_macro_hash_evidence(&mut digest, chunk.semantics.schema_requirement_digest);
         provider_macro_hash_evidence(&mut digest, chunk.semantics.semantic_digest);
         provider_macro_hash_evidence(&mut digest, chunk.semantics.payload_content_digest);
+    }
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
+}
+
+fn provider_macro_plan_request_set_identity(
+    chunks: &[ProviderMacroPlanChunkInput],
+) -> Result<EvidenceDigest, IngestError> {
+    let mut digest = Sha256::new();
+    digest.update(PROVIDER_MACRO_PLAN_REQUEST_SET_DOMAIN);
+    digest.update(
+        u16::try_from(chunks.len())
+            .map_err(|_| IngestError::InvalidProviderMacroPlan)?
+            .to_be_bytes(),
+    );
+    for chunk in chunks {
+        let capture = chunk.sealed_capture.capture_evidence();
+        digest.update(chunk.chunk_index.to_be_bytes());
+        provider_macro_hash_evidence(&mut digest, capture.request_set_identity());
+        provider_macro_hash_evidence(&mut digest, capture.content_digest());
+        provider_macro_hash_evidence(&mut digest, capture.observation_digest());
+        provider_macro_hash_evidence(
+            &mut digest,
+            chunk.sealed_capture.sealed_capture_receipt_digest(),
+        );
     }
     Ok(EvidenceDigest::new(
         DigestAlgorithm::Sha256,
@@ -1351,6 +1195,54 @@ pub struct AnalyticalDataService {
     manifests: Arc<AnalyticalManifestCatalog>,
     objects: Arc<ParquetObjectStore>,
     operation_gate: AnalyticalOperationGate,
+}
+
+/// Exact provider evidence owned by the ingest run that created one immutable generation.
+///
+/// The bindings retain the run's publication order and exclude inherited provider lineage. The
+/// anchor object is the sole canonical object appended by that same run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenerationOwnedProviderCaptureEvidence {
+    pinned: PinnedDataset,
+    source_id: SourceId,
+    anchor_object_ordinal: usize,
+    bindings: Box<[crate::PersistedProviderCaptureBindingEvidence]>,
+}
+
+impl GenerationOwnedProviderCaptureEvidence {
+    /// Returns the exact immutable generation.
+    pub const fn pinned(&self) -> &PinnedDataset {
+        &self.pinned
+    }
+
+    /// Returns the source that owned the creating ingest run.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the canonical object appended by the creating ingest run.
+    pub fn anchor_object(&self) -> &crate::PinnedManifestObject {
+        &self.pinned.objects()[self.anchor_object_ordinal]
+    }
+
+    /// Returns the creating run's physically verified bindings in retained input order.
+    pub fn bindings(&self) -> &[crate::PersistedProviderCaptureBindingEvidence] {
+        &self.bindings
+    }
+}
+
+fn verify_persisted_provider_capture_binding(
+    evidence: &crate::PersistedProviderCaptureBindingEvidence,
+    store: &market_squawk_platform::SealedResearchJournalStore,
+) -> Result<(), IngestError> {
+    evidence.verify_integrity()?;
+    for physical in evidence.physical_claims() {
+        let verified = store.open_verified_claim(physical.claim())?;
+        if verified.receipt().claim() != physical.claim() {
+            return Err(IngestError::ProviderCaptureRequired);
+        }
+    }
+    Ok(())
 }
 
 /// Least-authority factory for one exact listing-reference source.
@@ -2203,7 +2095,10 @@ impl AnalyticalDataService {
             .map_err(|_| IngestError::ProviderCaptureRecoveryWorkerUnavailable)?
     }
 
-    /// Lists every bounded provider-binding digest retained by one exact generation.
+    /// Lists the exact generation's bounded cumulative provider lineage.
+    ///
+    /// The result includes inherited ancestor bindings in canonical digest order. It is suitable
+    /// for lineage traversal, not for reconstructing the publication owned by this generation.
     pub fn provider_capture_binding_digests(
         &self,
         manifest: &DatasetManifestRef,
@@ -2228,15 +2123,65 @@ impl AnalyticalDataService {
             .lock_authority()?
             .provider_capture_binding_evidence(binding_digest)?
             .ok_or(IngestError::ProviderCaptureRequired)?;
-        evidence.verify_integrity()?;
-        for physical in evidence.physical_claims() {
-            let verified = store.open_verified_claim(physical.claim())?;
-            if verified.receipt().claim() != physical.claim() {
-                return Err(IngestError::ProviderCaptureRequired);
-            }
-            drop(verified);
-        }
+        verify_persisted_provider_capture_binding(&evidence, store)?;
         Ok(evidence)
+    }
+
+    /// Reopens every provider binding directly owned by one exact ingest generation.
+    ///
+    /// This operation verifies the complete ordered group and every sealed physical claim before
+    /// returning it. Inherited provider lineage is intentionally excluded.
+    pub fn generation_owned_provider_capture_evidence(
+        &self,
+        manifest: &DatasetManifestRef,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+    ) -> Result<GenerationOwnedProviderCaptureEvidence, IngestError> {
+        let owned = self
+            .manifests
+            .generation_owned_provider_captures(manifest)?;
+        let mut bindings = Vec::new();
+        bindings
+            .try_reserve_exact(owned.binding_digests.len())
+            .map_err(|_| IngestError::ProviderCaptureRequired)?;
+        {
+            let authority = self.lock_authority()?;
+            for binding_digest in owned.binding_digests {
+                let evidence = authority
+                    .provider_capture_binding_evidence(binding_digest)?
+                    .ok_or(IngestError::ProviderCaptureRequired)?;
+                if evidence.binding_digest() != binding_digest
+                    || evidence.capture().source_id() != &owned.source_id
+                {
+                    return Err(IngestError::ProviderCaptureRequired);
+                }
+                bindings.push(evidence);
+            }
+        }
+        for evidence in &bindings {
+            verify_persisted_provider_capture_binding(evidence, store)?;
+        }
+        let canonical_rows = bindings.iter().try_fold(0_u64, |total, binding| {
+            total
+                .checked_add(
+                    u64::try_from(binding.record_count())
+                        .map_err(|_| IngestError::ProviderCaptureRequired)?,
+                )
+                .ok_or(IngestError::ProviderCaptureRequired)
+        })?;
+        if bindings.is_empty()
+            || canonical_rows
+                != owned.pinned.objects()[owned.anchor_object_ordinal]
+                    .object()
+                    .row_count()
+        {
+            return Err(IngestError::ProviderCaptureRequired);
+        }
+        Ok(GenerationOwnedProviderCaptureEvidence {
+            pinned: owned.pinned,
+            source_id: owned.source_id,
+            anchor_object_ordinal: owned.anchor_object_ordinal,
+            bindings: bindings.into_boxed_slice(),
+        })
     }
 
     /// Lists every bounded, kind-qualified market-event publication retained by one generation.
@@ -3220,7 +3165,6 @@ impl AnalyticalDataService {
             provider_dataset,
             request_set_identity,
             source_generation_digest,
-            sealed_capture_receipt_digest: _,
             total_rows,
             chunks,
         } = input;

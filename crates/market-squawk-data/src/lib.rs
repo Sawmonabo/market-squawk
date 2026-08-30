@@ -151,14 +151,15 @@ pub use fund_holdings::{
     MAX_FUND_HOLDINGS_BATCH_RECORDS, MAX_FUND_HOLDINGS_RETAINED_BYTES,
 };
 pub use ingest::{
-    AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError,
-    IngestPrecommitAuthority, ListingReferenceAdmissionCapability,
-    PendingProviderMacroPlanPublication, PinnedArtifactQueryRequest, ProviderMacroPlanChunkInput,
-    ProviderMacroPlanPublicationInput, ProviderMacroPlanPublicationReceipt,
-    ProviderMacroPlanRestartSelector, ProviderMacroPlanSemantics,
-    ProviderMarketEventPublicationKind, ProviderMarketEventPublicationSelector,
-    ProviderOptionMarketPublicationSelector, ProviderPublicationInput, QueryArtifactPublication,
-    ResearchIngestService, extraction_batch_digest, extraction_provider_payload_digest,
+    AnalyticalDataService, CommittedDataset, CompactionRequest,
+    GenerationOwnedProviderCaptureEvidence, IngestError, IngestPrecommitAuthority,
+    ListingReferenceAdmissionCapability, PendingProviderMacroPlanPublication,
+    PinnedArtifactQueryRequest, ProviderMacroPlanChunkInput, ProviderMacroPlanPublicationInput,
+    ProviderMacroPlanPublicationReceipt, ProviderMacroPlanRestartSelector,
+    ProviderMacroPlanSemantics, ProviderMarketEventPublicationKind,
+    ProviderMarketEventPublicationSelector, ProviderOptionMarketPublicationSelector,
+    ProviderPublicationInput, QueryArtifactPublication, ResearchIngestService,
+    extraction_batch_digest, extraction_provider_payload_digest,
     provider_market_event_publication_digest, provider_option_market_publication_digest,
 };
 pub use manifest::{
