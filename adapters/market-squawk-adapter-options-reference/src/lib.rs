@@ -18,9 +18,9 @@ mod publication;
 mod transport;
 
 pub use cboe::{
-    CboeAllSeriesCsvSchema, CboeAllSeriesParseReceipt, CboeAllSeriesParser, CboeListingEvidence,
-    CboeParseError, CboeSeriesReference, CboeSeriesStatus, CboeSymbolId, CboeVenue,
-    CBOE_ALL_SERIES_MAX_BYTES, CBOE_ALL_SERIES_MAX_RECORDS,
+    CBOE_ALL_SERIES_MAX_BYTES, CBOE_ALL_SERIES_MAX_RECORDS, CboeAllSeriesCsvSchema,
+    CboeAllSeriesParseReceipt, CboeAllSeriesParser, CboeListingEvidence, CboeParseError,
+    CboeSeriesReference, CboeSeriesStatus, CboeSymbolId, CboeVenue,
 };
 pub use export::{
     OptionsReferenceAliasDisposition, OptionsReferenceCurrentnessDisposition,
@@ -35,11 +35,11 @@ pub use identity::{
     OptionIdentityError, OptionStrike,
 };
 pub use occ::{
+    OCC_DLP_MAX_BYTES, OCC_DLP_MAX_RECORDS, OCC_MEMO_MAX_BYTES, OCC_MEMO_MAX_RECORDS,
     OccDlpParseReceipt, OccDlpParser, OccDlpPresence, OccDlpProductReference, OccDlpSchema,
     OccExchangeCode, OccExchangeListingEvidence, OccMemoCategory, OccMemoCsvSchema,
     OccMemoDiscovery, OccMemoInterpretation, OccMemoParseReceipt, OccMemoParser, OccParseError,
-    OccPositionLimit, OccProductType, OCC_DLP_MAX_BYTES, OCC_DLP_MAX_RECORDS, OCC_MEMO_MAX_BYTES,
-    OCC_MEMO_MAX_RECORDS,
+    OccPositionLimit, OccProductType,
 };
 pub use publication::{
     CompletedModifiedReferencePublicationCapture, HttpLastModifiedEvidence, ObjectClockEvidence,
@@ -52,22 +52,21 @@ pub use publication::{
     ReferenceTransportEvidence,
 };
 pub use transport::{
-    options_reference_application_budget_policy, options_reference_endpoint_policy,
-    options_reference_provider_rate_declaration, CboeSchemaFreeze, ConditionalCacheRequest,
-    HttpCacheEvidence, OfficialPublicationPlan, OfficialPublicationPolicy,
-    OfficialReferenceRequest, OfficialReferenceStreamingClient, PendingReferenceTypedHandoff,
-    PendingUninterpretedMemoHandoff, ReferenceCancellation, ReferenceFetchControl,
-    ReferenceHeaderValue, ReferenceHttpReceipt, ReferenceNotModifiedReceipt,
-    ReferenceTransportError, ReferenceTypedHandoff, ReferenceUninterpretedMemoHandoff,
-    RetryAfterEvidence, SelectedReferenceDecoder, StreamedReferenceObject,
-    StreamingReferenceFetchOutcome, StrictReferenceParseReceipt,
-    StrictUninterpretedMemoDocumentReceipt, CBOE_OPTIONS_REFERENCE_PROVIDER_ID,
-    CBOE_OPTIONS_REFERENCE_SOURCE_ID, OCC_MEMO_DOCUMENT_MAX_BYTES,
+    CBOE_OPTIONS_REFERENCE_PROVIDER_ID, CBOE_OPTIONS_REFERENCE_SOURCE_ID, CboeSchemaFreeze,
+    ConditionalCacheRequest, HttpCacheEvidence, OCC_MEMO_DOCUMENT_MAX_BYTES,
     OCC_OPTIONS_REFERENCE_PROVIDER_ID, OCC_OPTIONS_REFERENCE_SOURCE_ID,
     OPTIONS_REFERENCE_APPLICATION_MAX_CONCURRENT,
     OPTIONS_REFERENCE_APPLICATION_REQUESTS_PER_MINUTE, OPTIONS_REFERENCE_APPLICATION_WINDOW_NANOS,
     OPTIONS_REFERENCE_MINIMUM_CONNECT_TIMEOUT_NANOS, OPTIONS_REFERENCE_MINIMUM_READ_TIMEOUT_NANOS,
-    OPTIONS_REFERENCE_MINIMUM_TOTAL_TIMEOUT_NANOS,
+    OPTIONS_REFERENCE_MINIMUM_TOTAL_TIMEOUT_NANOS, OfficialPublicationPlan,
+    OfficialPublicationPolicy, OfficialReferenceRequest, OfficialReferenceStreamingClient,
+    PendingReferenceTypedHandoff, PendingUninterpretedMemoHandoff, ReferenceCancellation,
+    ReferenceFetchControl, ReferenceHeaderValue, ReferenceHttpReceipt, ReferenceNotModifiedReceipt,
+    ReferenceTransportError, ReferenceTypedHandoff, ReferenceUninterpretedMemoHandoff,
+    RetryAfterEvidence, SelectedReferenceDecoder, StreamedReferenceObject,
+    StreamingReferenceFetchOutcome, StrictReferenceParseReceipt,
+    StrictUninterpretedMemoDocumentReceipt, options_reference_application_budget_policy,
+    options_reference_endpoint_policy, options_reference_provider_rate_declaration,
 };
 
 #[cfg(all(test, unix))]
@@ -156,8 +155,8 @@ mod tests {
     }
 
     #[test]
-    fn current_cboe_identity_keeps_underlying_and_matching_unit_provider_native(
-    ) -> Result<(), Box<dyn Error>> {
+    fn current_cboe_identity_keeps_underlying_and_matching_unit_provider_native()
+    -> Result<(), Box<dyn Error>> {
         let bytes = b"Cboe Symbol,OSI Symbol,Underlying,Matching Unit,Closing Only\n000u56,ZVZZT 990101C00005000,SPY,25,False\n";
         let context = object_context(
             ReferenceSurface::CboeAllSeries {
@@ -195,8 +194,8 @@ mod tests {
     }
 
     #[test]
-    fn occ_selected_daily_and_xml_are_distinct_wires_with_equal_semantics(
-    ) -> Result<(), Box<dyn Error>> {
+    fn occ_selected_daily_and_xml_are_distinct_wires_with_equal_semantics()
+    -> Result<(), Box<dyn Error>> {
         let name = "American Airlines Group Inc";
         let selected = format!(
             "{:<6}\t{:<6}\t{:<50}\tABCIPX\t25000000\tEF\t\r\n",
@@ -311,8 +310,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[cfg(unix)]
-    async fn official_source_mock_proves_raw_reopen_and_conflict_preserving_typed_handoff(
-    ) -> Result<(), Box<dyn Error>> {
+    async fn official_source_mock_proves_raw_reopen_and_conflict_preserving_typed_handoff()
+    -> Result<(), Box<dyn Error>> {
         let cboe_bytes = b"Cboe Symbol,OSI Symbol,Underlying,Matching Unit,Closing Only\n000u56,ZVZZT 990101C00005000,SPY,25,False\n000u57,ZVZZT 990101C00005000,SPY,25,False\n";
         let occ_bytes = format!(
             "{:<6}\t{:<6}\t{:<50}\tABCIPX\t25000000\tEF\t\r\n",

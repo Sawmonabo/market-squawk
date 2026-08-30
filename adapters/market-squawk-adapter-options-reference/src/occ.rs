@@ -8,21 +8,21 @@ use csv::{ReaderBuilder, StringRecord};
 use market_squawk_domain::{
     CalendarDate, DigestAlgorithm, EvidenceDigest, ProviderInstrumentId, SourceIdentifier,
 };
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 use serde::{
-    de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor},
     Deserialize, Serialize,
+    de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor},
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    export::{visit_occ_alias_assertions, ReferenceAliasAssertionSetEvidence},
-    payload::{BoundedTokenReader, ExactPayloadReader},
-    publication::StrictReferenceRowSetDigestBuilder,
     PageTerminalState, ReferenceObjectContext, ReferencePageReceipt, ReferenceProvider,
     ReferenceSurface,
+    export::{ReferenceAliasAssertionSetEvidence, visit_occ_alias_assertions},
+    payload::{BoundedTokenReader, ExactPayloadReader},
+    publication::StrictReferenceRowSetDigestBuilder,
 };
 
 /// Application maximum for one OCC DLP text object.

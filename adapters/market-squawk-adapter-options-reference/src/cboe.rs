@@ -8,11 +8,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    export::{visit_cboe_alias_assertions, ReferenceAliasAssertionSetEvidence},
-    payload::{BoundedTokenReader, ExactPayloadReader},
-    publication::StrictReferenceRowSetDigestBuilder,
     OptionContractIdentity, PageTerminalState, ReferenceObjectContext, ReferencePageReceipt,
     ReferenceProvider, ReferenceSurface,
+    export::{ReferenceAliasAssertionSetEvidence, visit_cboe_alias_assertions},
+    payload::{BoundedTokenReader, ExactPayloadReader},
+    publication::StrictReferenceRowSetDigestBuilder,
 };
 
 /// Application maximum for one Cboe `All Series` source object.

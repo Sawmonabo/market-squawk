@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{export::ReferenceAliasAssertionSetEvidence, CboeVenue};
+use crate::{CboeVenue, export::ReferenceAliasAssertionSetEvidence};
 
 const MAX_PUBLICATION_SURFACES: usize = 64;
 const MAX_PUBLICATION_PAGES: u32 = 10_000;
