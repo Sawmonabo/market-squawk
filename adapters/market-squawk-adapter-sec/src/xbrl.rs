@@ -1,5 +1,6 @@
 //! Bounded namespace-authoritative parser for XBRL and Inline XBRL occurrences.
 
+mod acquisition;
 mod model;
 mod normalize;
 mod support;
@@ -23,12 +24,13 @@ use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
+pub(crate) use acquisition::{SecTaxonomyAcquisitionRequest, SecTaxonomyClosure};
+pub(crate) use model::{
+    MAX_TAXONOMY_ARTIFACT_BYTES, SecPendingValidatedXbrlTaxonomySet, SecValidatedXbrlTaxonomySet,
+    SecXbrlTaxonomyArtifact, SecXbrlTaxonomyReference, SecXbrlTaxonomyRegistry,
+};
 pub use model::{
     ParsedXbrlDocument, XbrlDocumentContext, XbrlNonnumericOccurrence, XbrlNumericFact,
-};
-pub(crate) use model::{
-    SecPendingValidatedXbrlTaxonomySet, SecValidatedXbrlTaxonomySet, SecXbrlTaxonomyArtifact,
-    SecXbrlTaxonomyReference, SecXbrlTaxonomyRegistry,
 };
 use normalize::NormalizedDraft;
 pub use support::SecXbrlError;

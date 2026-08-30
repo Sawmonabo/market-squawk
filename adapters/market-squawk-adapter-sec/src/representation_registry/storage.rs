@@ -111,7 +111,7 @@ pub(super) fn load_latest(
     for name in staging {
         directory.remove_file(name)?;
     }
-    let mut latest: Option<(u64, BTreeMap<String, SecRepresentation>)> = None;
+    let mut latest: Option<(u64, BTreeMap<(SourceId, String), SecRepresentation>)> = None;
     for name in committed {
         let (name_generation, expected_digest) = parse_snapshot_name(&name)?;
         let bytes = read_bounded_regular(directory, &name, limits.max_snapshot_bytes)?;
@@ -130,7 +130,13 @@ pub(super) fn load_latest(
         for representation in wire.entries.0 {
             let representation = representation.validate(limits)?;
             if entries
-                .insert(representation.locator.clone(), representation)
+                .insert(
+                    (
+                        representation.source_id.clone(),
+                        representation.locator.clone(),
+                    ),
+                    representation,
+                )
                 .is_some()
             {
                 return Err(SecRepresentationError::DuplicateLocator);

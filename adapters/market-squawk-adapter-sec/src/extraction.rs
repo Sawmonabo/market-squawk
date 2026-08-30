@@ -41,8 +41,9 @@ use crate::{
     CompanyFactOccurrence, RawEvidenceStore, RetrievedCompanyFacts, RetrievedSecBytes,
     RetrievedSubmissions, SecClientError, SecCompositeBounds, SecEdgarSource, SecFiling,
     SecNormalizationError, SecObjectLocator, SecParserError, SecParserLimits, SecRepresentation,
-    SecResearchDataset, SecResearchDatasetKind, normalize_company_facts_with_cancellation,
-    normalize_filings_with_cancellation, reconcile_submissions_with_cancellation,
+    SecRepresentationRegistry, SecResearchDataset, SecResearchDatasetKind,
+    normalize_company_facts_with_cancellation, normalize_filings_with_cancellation,
+    reconcile_submissions_with_cancellation,
 };
 
 const RESEARCH_RECORD_SCHEMA: &str = "market-squawk-research-v3";
@@ -315,65 +316,19 @@ impl SecEdgarSource {
         taxonomy_artifacts: Vec<RetrievedSecBytes>,
         cancellation: &CancellationToken,
     ) -> Result<SecFilingXbrlCaptureHandoff, SecClientError> {
-        let raw_store = self.raw_store();
-        let identities = self.identity_registry();
-        let source_id = self.metadata().source_id().clone();
-        let metadata_revision = self.metadata().revision().clone();
-        let filing = SecFilingXbrlCoordinates::from_captured_current_submissions(
-            &submissions,
-            accession,
-            &raw_store,
-            &source_id,
-            &metadata_revision,
+        prepare_filing_xbrl_capture_from_state(
+            self.raw_store(),
+            self.representation_registry(),
+            self.identity_registry(),
+            self.metadata().source_id().clone(),
+            self.metadata().revision().clone(),
             self.parser_limits(),
-            cancellation,
-        )?;
-        let locator = SecObjectLocator::filing_document(
-            filing.cik(),
-            filing.accession().as_str(),
-            filing.document().as_str(),
-        )?;
-        let filing_representation = self
-            .retained_representation(&locator)?
-            .ok_or(SecClientError::InvalidCompositeRepresentation)?;
-        validate_captured_filing_document(
-            &filing,
-            &filing_document,
-            &filing_representation,
-            &raw_store,
-            &source_id,
-            &metadata_revision,
-            cancellation,
-        )?;
-        let taxonomy = SecXbrlTaxonomyRegistry::code_owned().try_admit_captured(
-            Arc::clone(&raw_store),
-            &source_id,
-            &metadata_revision,
-            &filing_document,
-            taxonomy_artifacts,
-            self.parser_limits(),
-            cancellation,
-        )?;
-        let dataset =
-            SecResearchDataset::filing_xbrl(filing.clone(), taxonomy.validated().clone())?;
-        let pending = SecPendingFilingXbrlAdmission {
-            dataset,
-            filing,
             submissions,
+            accession,
             filing_document,
-            filing_representation,
-            taxonomy,
-            raw_store,
-            identities,
-            source_id,
-            metadata_revision,
-            parser_limits: self.parser_limits(),
-        };
-        let (pending, capture_material) = pending.into_sealing_parts(cancellation)?;
-        Ok(SecFilingXbrlCaptureHandoff {
-            pending,
-            capture_material,
-        })
+            taxonomy_artifacts,
+            cancellation,
+        )
     }
 
     /// Discovers one SEC source object together with every exact HTTP body required for raw
@@ -581,6 +536,79 @@ impl SecEdgarSource {
             }
         })
     }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "captured filing, source authority, parser bounds, and exact taxonomy bodies remain explicit"
+)]
+pub(crate) fn prepare_filing_xbrl_capture_from_state(
+    raw_store: Arc<RawEvidenceStore>,
+    representation_registry: Arc<SecRepresentationRegistry>,
+    identities: Arc<ProviderIdentityRegistry>,
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    parser_limits: SecParserLimits,
+    submissions: RetrievedSubmissions,
+    accession: &str,
+    filing_document: RetrievedSecBytes,
+    taxonomy_artifacts: Vec<RetrievedSecBytes>,
+    cancellation: &CancellationToken,
+) -> Result<SecFilingXbrlCaptureHandoff, SecClientError> {
+    let filing = SecFilingXbrlCoordinates::from_captured_current_submissions(
+        &submissions,
+        accession,
+        &raw_store,
+        &source_id,
+        &metadata_revision,
+        parser_limits,
+        cancellation,
+    )?;
+    let locator = SecObjectLocator::filing_document(
+        filing.cik(),
+        filing.accession().as_str(),
+        filing.document().as_str(),
+    )?;
+    let filing_representation = representation_registry
+        .representation_for_source(&source_id, locator.url())?
+        .ok_or(SecClientError::InvalidCompositeRepresentation)?;
+    validate_captured_filing_document(
+        &filing,
+        &filing_document,
+        &filing_representation,
+        &raw_store,
+        &source_id,
+        &metadata_revision,
+        cancellation,
+    )?;
+    let taxonomy = SecXbrlTaxonomyRegistry::code_owned().try_admit_captured(
+        Arc::clone(&raw_store),
+        &source_id,
+        &metadata_revision,
+        &filing_document,
+        taxonomy_artifacts,
+        parser_limits,
+        cancellation,
+    )?;
+    let dataset = SecResearchDataset::filing_xbrl(filing.clone(), taxonomy.validated().clone())?;
+    let pending = SecPendingFilingXbrlAdmission {
+        dataset,
+        filing,
+        submissions,
+        filing_document,
+        filing_representation,
+        taxonomy,
+        raw_store,
+        identities,
+        source_id,
+        metadata_revision,
+        parser_limits,
+    };
+    let (pending, capture_material) = pending.into_sealing_parts(cancellation)?;
+    Ok(SecFilingXbrlCaptureHandoff {
+        pending,
+        capture_material,
+    })
 }
 
 impl ExtractionSource for SecEdgarSource {

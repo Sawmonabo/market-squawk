@@ -1,6 +1,7 @@
 //! Registered, allowlisted, budgeted SEC HTTP retrieval.
 
 mod contracts;
+mod taxonomy;
 
 pub use contracts::{
     RetrievedCompanyFacts, RetrievedSecBytes, RetrievedSubmissions, RetrievedXbrlDocument,
@@ -67,6 +68,7 @@ pub struct SecEdgarSource {
     blocking_admission: Arc<Semaphore>,
     extraction_health: Mutex<SecExtractionHealth>,
     parser_limits: SecParserLimits,
+    taxonomy_clients: taxonomy::TaxonomyClientSet,
 }
 
 impl SecEdgarSource {
@@ -140,6 +142,7 @@ impl SecEdgarSource {
             endpoint_policy.authorize_request(required.url())?;
         }
         let _consumed_provider_identity = tls_provider.provider_id();
+        let taxonomy_clients = taxonomy::TaxonomyClientSet::try_new(&contact)?;
         let bounds = endpoint_policy.request_bounds();
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -165,6 +168,7 @@ impl SecEdgarSource {
                 http_status: None,
             }),
             parser_limits,
+            taxonomy_clients,
         })
     }
 
@@ -1061,7 +1065,8 @@ impl SecEdgarSource {
                 retrieved_from_representation(
                     bytes,
                     retained,
-                    &self.metadata,
+                    self.metadata.source_id(),
+                    self.metadata.revision(),
                     request_identity,
                     response_status,
                     body_received_at,
@@ -1210,6 +1215,10 @@ impl SecEdgarSource {
 
     pub(crate) fn raw_store(&self) -> Arc<RawEvidenceStore> {
         Arc::clone(&self.raw_store)
+    }
+
+    pub(crate) fn representation_registry(&self) -> Arc<SecRepresentationRegistry> {
+        Arc::clone(&self.representation_registry)
     }
 
     pub(crate) fn retained_representation(
@@ -1390,14 +1399,18 @@ fn response_validators(
     SecHttpValidators::try_new(etag, last_modified).map_err(Into::into)
 }
 
-fn retrieved_from_representation(
+pub(crate) fn retrieved_from_representation(
     bytes: Vec<u8>,
     representation: SecRepresentation,
-    metadata: &SourceMetadata,
+    source_id: &SourceId,
+    metadata_revision: &market_squawk_domain::MetadataRevision,
     request_identity: EvidenceDigest,
     http_status: u16,
     body_received_at: market_squawk_domain::Timestamp,
 ) -> Result<RetrievedSecBytes, SecClientError> {
+    if representation.source_id() != source_id {
+        return Err(SecClientError::InvalidCaptureMaterial);
+    }
     let body_bytes = u64::try_from(bytes.len()).map_err(|_| SecClientError::ResponseTooLarge)?;
     let page = ProviderCapturePageReceipt::try_new(
         0,
@@ -1411,8 +1424,8 @@ fn retrieved_from_representation(
     )?;
     let dataset = SourceIdentifier::try_from(representation.locator())?;
     let capture_receipt = ProviderCaptureSetReceipt::try_new(
-        metadata.source_id().clone(),
-        metadata.revision().clone(),
+        source_id.clone(),
+        metadata_revision.clone(),
         dataset,
         request_identity,
         ProviderCaptureTerminalDisposition::StandaloneResponse,

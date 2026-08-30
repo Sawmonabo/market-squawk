@@ -29,11 +29,11 @@ use crate::{RawEvidenceStore, RetrievedSecBytes, SecParserLimits};
 const TAXONOMY_REGISTRY_RULESET: &str = "sec-xbrl-taxonomy-registry-v1";
 const TAXONOMY_LOCATOR_MAPPING_RULESET: &str = "sec-xbrl-logical-http-to-https-v1";
 const TAXONOMY_CATALOG_RELEASE: &str = "sec-xbrl-taxonomy-catalog-2026-08-30";
-const MAX_TAXONOMY_ARTIFACTS: usize = 64;
-const MAX_TAXONOMY_REFERENCES: usize = 256;
-const MAX_TAXONOMY_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_TAXONOMY_SET_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_TAXONOMY_GRAPH_SCAN_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_TAXONOMY_ARTIFACTS: usize = 64;
+pub(crate) const MAX_TAXONOMY_REFERENCES: usize = 256;
+pub(crate) const MAX_TAXONOMY_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_TAXONOMY_SET_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_TAXONOMY_GRAPH_SCAN_BYTES: u64 = 128 * 1024 * 1024;
 const EARLIEST_SEC_TAXONOMY_YEAR: u16 = 2005;
 const EARLIEST_FASB_TAXONOMY_YEAR: u16 = 2011;
 const EARLIEST_LEGACY_XBRL_US_GAAP_YEAR: u16 = 2009;
@@ -207,12 +207,38 @@ impl SecXbrlTaxonomyReference {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SecXbrlTaxonomyArtifactRequest {
+pub(crate) struct SecXbrlTaxonomyArtifactRequest {
     logical_locator: SourceIdentifier,
     physical_locator: SourceIdentifier,
     kind: SecXbrlTaxonomyArtifactKind,
     pinned_release: SourceIdentifier,
     origin: SecXbrlTaxonomyOrigin,
+}
+
+impl SecXbrlTaxonomyArtifactRequest {
+    pub(crate) const fn logical_locator(&self) -> &SourceIdentifier {
+        &self.logical_locator
+    }
+
+    pub(crate) const fn physical_locator(&self) -> &SourceIdentifier {
+        &self.physical_locator
+    }
+
+    pub(crate) fn authority(&self) -> Result<FilingTaxonomySourceAuthority, SecXbrlError> {
+        resolve_filing_taxonomy_authority(FilingTaxonomyLocator::new(
+            self.logical_locator.as_str(),
+            self.physical_locator.as_str(),
+        ))
+        .map(|resolved| resolved.authority())
+        .map_err(|_| SecXbrlError::InvalidTaxonomySet)
+    }
+
+    pub(crate) fn same_physical_contract(&self, other: &Self) -> bool {
+        self.physical_locator == other.physical_locator
+            && self.kind == other.kind
+            && self.pinned_release == other.pinned_release
+            && self.origin == other.origin
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1107,6 +1133,62 @@ fn taxonomy_artifact_request(
         )?,
         origin,
     })
+}
+
+pub(crate) fn filing_taxonomy_seed_requests(
+    filing_document: &RetrievedSecBytes,
+    parser_limits: SecParserLimits,
+    cancellation: &CancellationToken,
+) -> Result<Vec<SecXbrlTaxonomyArtifactRequest>, SecXbrlError> {
+    let filing_locator = filing_document
+        .locator()
+        .ok_or(SecXbrlError::InvalidTaxonomySet)?;
+    validate_filing_document_locator(filing_locator)?;
+    let scan = scan_taxonomy_references(
+        filing_document.bytes(),
+        TaxonomyXmlExpectation::Filing,
+        filing_locator,
+        filing_locator,
+        parser_limits,
+        cancellation,
+    )?;
+    requests_from_references(filing_locator, scan.references)
+}
+
+pub(crate) fn taxonomy_request_dependencies(
+    filing_locator: &str,
+    request: &SecXbrlTaxonomyArtifactRequest,
+    bytes: &[u8],
+    parser_limits: SecParserLimits,
+    cancellation: &CancellationToken,
+) -> Result<Vec<SecXbrlTaxonomyArtifactRequest>, SecXbrlError> {
+    let scan = scan_taxonomy_references(
+        bytes,
+        match request.kind {
+            SecXbrlTaxonomyArtifactKind::Schema => TaxonomyXmlExpectation::Schema,
+            SecXbrlTaxonomyArtifactKind::Linkbase => TaxonomyXmlExpectation::Linkbase,
+        },
+        request.logical_locator.as_str(),
+        filing_locator,
+        parser_limits,
+        cancellation,
+    )?;
+    validate_pinned_namespace(request, scan.target_namespace.as_ref())?;
+    requests_from_references(filing_locator, scan.references)
+}
+
+fn requests_from_references(
+    filing_locator: &str,
+    references: Vec<SecXbrlTaxonomyReference>,
+) -> Result<Vec<SecXbrlTaxonomyArtifactRequest>, SecXbrlError> {
+    let mut requests = Vec::new();
+    requests
+        .try_reserve_exact(references.len())
+        .map_err(|_| SecXbrlError::RetainedOutputLimitExceeded)?;
+    for reference in &references {
+        requests.push(taxonomy_artifact_request(filing_locator, reference)?);
+    }
+    Ok(requests)
 }
 
 #[derive(Clone, Copy)]
@@ -2096,6 +2178,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::xbrl::SecTaxonomyClosure;
 
     fn captured_artifact(
         store: &RawEvidenceStore,
@@ -2234,17 +2317,51 @@ mod tests {
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         assert!(matches!(
-            SecXbrlTaxonomyRegistry::code_owned().try_admit_captured(
-                Arc::clone(&store),
-                &sec_source,
-                &sec_revision,
+            SecTaxonomyClosure::try_start(
                 &filing,
-                artifacts.clone(),
+                sec_source.clone(),
+                sec_revision.clone(),
                 SecParserLimits::production_defaults(),
                 &cancelled,
             ),
             Err(SecXbrlError::Cancelled)
         ));
+
+        let mut captured_by_locator = artifacts
+            .into_iter()
+            .map(|artifact| {
+                Ok((
+                    artifact
+                        .locator()
+                        .ok_or(SecXbrlError::InvalidTaxonomySet)?
+                        .to_owned(),
+                    artifact,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, SecXbrlError>>()?;
+        let mut closure = SecTaxonomyClosure::try_start(
+            &filing,
+            sec_source.clone(),
+            sec_revision.clone(),
+            SecParserLimits::production_defaults(),
+            &CancellationToken::new(),
+        )?;
+        let acquisition_cancellation = CancellationToken::new();
+        while let Some(request) = closure.next_request(&acquisition_cancellation)? {
+            let artifact = captured_by_locator
+                .remove(request.physical_locator())
+                .ok_or(SecXbrlError::InvalidTaxonomySet)?;
+            assert_eq!(
+                artifact
+                    .capture_receipt()
+                    .ok_or(SecXbrlError::InvalidTaxonomySet)?
+                    .source_id(),
+                &request.authority()?.canonical_source_id()?
+            );
+            closure.accept_captured(request, artifact, &acquisition_cancellation)?;
+        }
+        assert!(captured_by_locator.is_empty());
+        let artifacts = closure.finish(&acquisition_cancellation)?;
 
         let admitted = SecXbrlTaxonomyRegistry::code_owned().try_admit_captured(
             store,
