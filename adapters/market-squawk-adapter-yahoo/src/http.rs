@@ -1264,7 +1264,7 @@ impl YahooHttpSession {
                     )
                     .await?;
                 if wire_indicates_rate_limit(&bootstrap) {
-                    return Err(self.record_429(bootstrap, permit, attempts)?);
+                    return Err(self.record_provider_backoff(bootstrap, permit, attempts)?);
                 }
                 if !bootstrap.is_success() {
                     let status = bootstrap.status;
@@ -1369,7 +1369,7 @@ impl YahooHttpSession {
         attempts: &mut Vec<YahooHttpAttemptReceipt>,
     ) -> Result<(), YahooHttpFailureKind> {
         if wire_indicates_rate_limit(&wire) {
-            return Err(self.record_429(wire, permit, attempts)?);
+            return Err(self.record_provider_backoff(wire, permit, attempts)?);
         }
         // The pinned cookie bootstrap and consent submit/copy paths validate the following crumb,
         // not these intermediate statuses. A completed non-429 response is therefore progress.
@@ -1383,7 +1383,7 @@ impl YahooHttpSession {
         attempts: &mut Vec<YahooHttpAttemptReceipt>,
     ) -> Result<Zeroizing<String>, YahooHttpFailureKind> {
         if wire_indicates_rate_limit(&wire) {
-            return Err(self.record_429(wire, permit, attempts)?);
+            return Err(self.record_provider_backoff(wire, permit, attempts)?);
         }
         let crumb = std::str::from_utf8(&wire.bytes)
             .ok()
@@ -1457,7 +1457,7 @@ impl YahooHttpSession {
             .map_err(DataFailure::Terminal)?;
         if wire_indicates_rate_limit(&wire) {
             return Err(DataFailure::Terminal(
-                self.record_429(wire, permit, attempts)
+                self.record_provider_backoff(wire, permit, attempts)
                     .unwrap_or(YahooHttpFailureKind::AdmissionUnavailable),
             ));
         }
@@ -1583,7 +1583,7 @@ impl YahooHttpSession {
                 latency_ms: duration_ms(started.elapsed()),
                 observation_units,
             };
-            return Err(self.record_429(wire, permit, attempts)?);
+            return Err(self.record_provider_backoff(wire, permit, attempts)?);
         }
         if response
             .headers()
@@ -1789,13 +1789,14 @@ impl YahooHttpSession {
         )
     }
 
-    fn record_429(
+    fn record_provider_backoff(
         &self,
         wire: WireResponse,
         permit: &mut AttemptPermit,
         attempts: &mut Vec<YahooHttpAttemptReceipt>,
     ) -> Result<YahooHttpFailureKind, YahooHttpFailureKind> {
         let retry_after = wire.retry_after;
+        let status = wire.status;
         let completed_at = wire.completed_at_unix_ms;
         let units = wire.observation_units;
         self.record_wire(
@@ -1805,7 +1806,10 @@ impl YahooHttpSession {
             0,
             units,
             0,
-            AttemptDisposition::Http429 { retry_after },
+            AttemptDisposition::ProviderBackoff {
+                status,
+                retry_after,
+            },
         )?;
         let retry_at_unix_ms = self
             .inner
@@ -2639,6 +2643,7 @@ fn bytes_contain_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool 
 
 fn wire_indicates_rate_limit(wire: &WireResponse) -> bool {
     wire.status == 429
+        || (wire.status == 503 && wire.retry_after.is_some())
         || [
             b"too many requests".as_slice(),
             b"rate limit".as_slice(),

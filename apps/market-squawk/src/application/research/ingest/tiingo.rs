@@ -29,7 +29,11 @@ use market_squawk_sources::{
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use super::ResearchRightsAuthority;
+use super::{ProductionResearchIngestCoordinator, ResearchRightsAuthority};
+use crate::provider_activation::tiingo::{
+    TiingoCanonicalFamily, TiingoLatestOperationOutcome, TiingoProductError,
+    TiingoRestartCoordinates, TiingoRestartOutcome, TiingoRestartRequest, TiingoUnavailableReason,
+};
 use crate::{ResearchIngestRequest, ResearchService, ResearchServiceError};
 
 /// Fixed typed operation for exact-manifest Tiingo mutual-fund NAV reads.
@@ -39,49 +43,6 @@ pub(crate) const TIINGO_FUND_NAV_POINT_IN_TIME_OPERATION: &str =
 /// Fixed typed operation for exact-manifest Tiingo equity/ETF EOD bar reads.
 pub(crate) const TIINGO_EOD_MARKET_BAR_POINT_IN_TIME_OPERATION: &str =
     "Markets.GetTiingoEodMarketBarsPointInTime";
-
-/// Optional Tiingo application composition without a fake enabled-but-unusable state.
-#[derive(Debug)]
-pub(crate) enum TiingoLatestApplicationState {
-    /// The exact source, rights, raw store, and analytical authority are composed.
-    Enabled(TiingoLatestApplicationClosure),
-    /// Tiingo is intentionally disabled before any provider request is admitted.
-    Unavailable(TiingoLatestUnavailableDto),
-}
-
-impl TiingoLatestApplicationState {
-    /// Constructs the pre-acquisition disabled state. No pending capture is accepted or dropped.
-    pub(crate) fn disabled() -> Self {
-        Self::Unavailable(TiingoLatestUnavailableDto::disabled())
-    }
-
-    /// Enables Tiingo only when source metadata and persistence rights name one current source.
-    pub(crate) fn try_enabled(
-        research: Arc<ResearchService>,
-        source: SourceMetadata,
-        rights: ResearchRightsAuthority,
-        source_registered_at: Timestamp,
-    ) -> Result<Self, TiingoLatestApplicationError> {
-        TiingoLatestApplicationClosure::try_new(research, source, rights, source_registered_at)
-            .map(Self::Enabled)
-    }
-
-    /// Returns the enabled producer-to-consumer closure, when configured.
-    pub(crate) const fn enabled(&self) -> Option<&TiingoLatestApplicationClosure> {
-        match self {
-            Self::Enabled(value) => Some(value),
-            Self::Unavailable(_) => None,
-        }
-    }
-
-    /// Returns the exact typed disabled result, when acquisition is not admitted.
-    pub(crate) const fn unavailable(&self) -> Option<&TiingoLatestUnavailableDto> {
-        match self {
-            Self::Unavailable(value) => Some(value),
-            Self::Enabled(_) => None,
-        }
-    }
-}
 
 /// Application-owned Tiingo physical sealing and immutable analytical publication boundary.
 pub(crate) struct TiingoLatestApplicationClosure {
@@ -139,7 +100,6 @@ impl TiingoLatestApplicationClosure {
         analytical_dataset: DatasetId,
         observed_at: Timestamp,
         ingested_at: Timestamp,
-        canonical_published_at: Timestamp,
         precommit_authority: Arc<dyn IngestPrecommitAuthority>,
         cancellation: CancellationToken,
         deadline: Instant,
@@ -148,6 +108,7 @@ impl TiingoLatestApplicationClosure {
         let sealed = self
             .seal_latest(pending, seal_request, &cancellation, deadline)
             .await?;
+        let canonical_published_at = super::system_timestamp()?;
         match sealed.try_into_fund_nav(
             context,
             contract,
@@ -665,6 +626,271 @@ impl TiingoEodRestartReceipt {
     pub(crate) const fn bars(&self) -> &AnalyticalMarketBarOutput {
         &self.bars
     }
+}
+
+impl ProductionResearchIngestCoordinator {
+    /// Seals and publishes a latest Tiingo mutual-fund response only as canonical FundNav.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact source, graph, NAV identity, clocks, and precommit authority remain explicit"
+    )]
+    pub(crate) async fn publish_tiingo_fund_nav(
+        &self,
+        source: SourceMetadata,
+        rights: ResearchRightsAuthority,
+        source_registered_at: Timestamp,
+        pending: TiingoPendingLatestPublication,
+        seal_request: ProviderCaptureSealRequest,
+        context: TiingoFundContext,
+        contract: TiingoFundNavContractEvidence,
+        extraction_request: ExtractionRequest,
+        analytical_dataset: DatasetId,
+        observed_at: Timestamp,
+        ingested_at: Timestamp,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<TiingoLatestOperationOutcome, TiingoProductError> {
+        let closure = TiingoLatestApplicationClosure::try_new(
+            Arc::clone(&self.research),
+            source,
+            rights,
+            source_registered_at,
+        )
+        .map_err(|_error| TiingoProductError::Application)?;
+        let outcome = closure
+            .seal_and_publish_fund_nav(
+                pending,
+                seal_request,
+                context,
+                &contract,
+                extraction_request,
+                analytical_dataset,
+                observed_at,
+                ingested_at,
+                precommit_authority,
+                cancellation,
+                deadline,
+            )
+            .await
+            .map_err(|_error| TiingoProductError::Application)?;
+        match outcome {
+            TiingoFundNavApplicationOutcome::Published(receipt) => {
+                let TiingoFundNavPublicationReceipt {
+                    committed,
+                    restart,
+                    provider_dataset,
+                } = receipt;
+                let records = usize::try_from(committed.pinned().plan().row_count())
+                    .map_err(|_| TiingoProductError::Application)?;
+                Ok(TiingoLatestOperationOutcome::Published {
+                    family: TiingoCanonicalFamily::FundNav,
+                    restart: tiingo_restart_coordinates(
+                        TiingoCanonicalFamily::FundNav,
+                        restart.binding,
+                    ),
+                    provider_dataset,
+                    records,
+                })
+            }
+            TiingoFundNavApplicationOutcome::Unavailable(unavailable) => {
+                tiingo_unavailable(TiingoCanonicalFamily::FundNav, unavailable)
+            }
+        }
+    }
+
+    /// Seals and publishes a latest Tiingo equity/ETF response only as EOD MarketBar rows.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact source, graph, EOD identity, clocks, and precommit authority remain explicit"
+    )]
+    pub(crate) async fn publish_tiingo_eod(
+        &self,
+        source: SourceMetadata,
+        rights: ResearchRightsAuthority,
+        source_registered_at: Timestamp,
+        pending: TiingoPendingLatestPublication,
+        seal_request: ProviderCaptureSealRequest,
+        instrument: TiingoEodInstrumentAuthority,
+        contract: TiingoEodContractEvidence,
+        bar_time_authority: Arc<dyn TiingoEodBarTimeAuthority>,
+        extraction_request: ExtractionRequest,
+        analytical_dataset: DatasetId,
+        observed_at: Timestamp,
+        ingested_at: Timestamp,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<TiingoLatestOperationOutcome, TiingoProductError> {
+        let closure = TiingoLatestApplicationClosure::try_new(
+            Arc::clone(&self.research),
+            source,
+            rights,
+            source_registered_at,
+        )
+        .map_err(|_error| TiingoProductError::Application)?;
+        let outcome = closure
+            .seal_and_publish_eod(
+                pending,
+                seal_request,
+                &instrument,
+                &contract,
+                bar_time_authority.as_ref(),
+                extraction_request,
+                analytical_dataset,
+                observed_at,
+                ingested_at,
+                precommit_authority,
+                cancellation,
+                deadline,
+            )
+            .await
+            .map_err(|_error| TiingoProductError::Application)?;
+        match outcome {
+            TiingoEodApplicationOutcome::Published(receipt) => {
+                let TiingoEodPublicationReceipt {
+                    committed,
+                    restart,
+                    provider_dataset,
+                } = receipt;
+                let records = usize::try_from(committed.pinned().plan().row_count())
+                    .map_err(|_| TiingoProductError::Application)?;
+                Ok(TiingoLatestOperationOutcome::Published {
+                    family: TiingoCanonicalFamily::EodMarketBar,
+                    restart: tiingo_restart_coordinates(
+                        TiingoCanonicalFamily::EodMarketBar,
+                        restart.binding,
+                    ),
+                    provider_dataset,
+                    records,
+                })
+            }
+            TiingoEodApplicationOutcome::Unavailable(unavailable) => {
+                tiingo_unavailable(TiingoCanonicalFamily::EodMarketBar, unavailable)
+            }
+        }
+    }
+
+    /// Revalidates and reopens one exact immutable Tiingo NAV/EOD generation after restart.
+    pub(crate) async fn reopen_tiingo_publication(
+        &self,
+        coordinates: TiingoRestartCoordinates,
+        request: TiingoRestartRequest,
+        cancellation: CancellationToken,
+    ) -> Result<TiingoRestartOutcome, TiingoProductError> {
+        let TiingoRestartCoordinates {
+            family,
+            manifest,
+            binding_digest,
+            source_id,
+            expected_record_count,
+            native_schema_version,
+            native_schema_fingerprint,
+        } = coordinates;
+        let binding = TiingoLatestRestartBinding {
+            manifest,
+            binding_digest,
+            source_id,
+            expected_record_count,
+            native_schema_version,
+            native_schema_fingerprint,
+        };
+        match (family, request) {
+            (
+                TiingoCanonicalFamily::FundNav,
+                TiingoRestartRequest::FundNav {
+                    request,
+                    limits,
+                    deadline,
+                },
+            ) => {
+                let receipt = TiingoFundNavRestartSelector { binding }
+                    .reopen(
+                        self.research.as_ref(),
+                        request,
+                        limits,
+                        deadline,
+                        cancellation,
+                    )
+                    .await
+                    .map_err(|_error| TiingoProductError::Application)?;
+                Ok(TiingoRestartOutcome::FundNav {
+                    evidence: receipt.evidence,
+                    nav: receipt.nav,
+                })
+            }
+            (
+                TiingoCanonicalFamily::EodMarketBar,
+                TiingoRestartRequest::Eod {
+                    request,
+                    limits,
+                    deadline,
+                },
+            ) => {
+                let receipt = TiingoEodRestartSelector { binding }
+                    .reopen(
+                        self.research.as_ref(),
+                        request,
+                        limits,
+                        deadline,
+                        cancellation,
+                    )
+                    .await
+                    .map_err(|_error| TiingoProductError::Application)?;
+                Ok(TiingoRestartOutcome::Eod {
+                    evidence: receipt.evidence,
+                    bars: receipt.bars,
+                })
+            }
+            _ => Err(TiingoProductError::InvalidOperation),
+        }
+    }
+}
+
+fn tiingo_restart_coordinates(
+    family: TiingoCanonicalFamily,
+    binding: TiingoLatestRestartBinding,
+) -> TiingoRestartCoordinates {
+    TiingoRestartCoordinates {
+        family,
+        manifest: binding.manifest,
+        binding_digest: binding.binding_digest,
+        source_id: binding.source_id,
+        expected_record_count: binding.expected_record_count,
+        native_schema_version: binding.native_schema_version,
+        native_schema_fingerprint: binding.native_schema_fingerprint,
+    }
+}
+
+fn tiingo_unavailable(
+    family: TiingoCanonicalFamily,
+    unavailable: TiingoLatestUnavailableDto,
+) -> Result<TiingoLatestOperationOutcome, TiingoProductError> {
+    let reason = match unavailable.reason() {
+        TiingoLatestApplicationUnavailableReason::UnsupportedMetadataCoverage => {
+            TiingoUnavailableReason::UnsupportedMetadataCoverage
+        }
+        TiingoLatestApplicationUnavailableReason::EmptyLatestResponse => {
+            TiingoUnavailableReason::EmptyLatestResponse
+        }
+        TiingoLatestApplicationUnavailableReason::NoCompleteEodSurface => {
+            TiingoUnavailableReason::NoCompleteEodSurface
+        }
+        TiingoLatestApplicationUnavailableReason::Disabled => {
+            return Err(TiingoProductError::Application);
+        }
+    };
+    let sealed_capture_receipt = unavailable
+        .sealed_capture()
+        .ok_or(TiingoProductError::Application)?
+        .receipt_digest();
+    Ok(TiingoLatestOperationOutcome::Unavailable {
+        family,
+        reason,
+        sealed_capture_receipt,
+        returned_rows: unavailable.returned_rows(),
+        surface_gaps: unavailable.surface_gaps(),
+    })
 }
 
 /// Failure before or during Tiingo sealing, publication, or exact-manifest PIT restart.

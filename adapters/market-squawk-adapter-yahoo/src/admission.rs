@@ -7,29 +7,41 @@ use crate::{YahooAdapterError, YahooHttpRequest};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AdmissionPolicy {
-    /// Application-owned recovery delay when the response supplies no usable Retry-After value.
-    pub circuit_cooldown_ms: u64,
+    /// Application-owned base recovery delay when no usable provider instruction exists.
+    pub fallback_cooldown_ms: u64,
+    /// Inclusive upper bound for the per-opening fallback jitter added to the base delay.
+    pub fallback_max_jitter_ms: u64,
     /// Application-owned count of consecutive transport/schema failures that opens the circuit.
     pub repeated_failure_threshold: u32,
 }
 
 impl AdmissionPolicy {
     pub fn new(
-        circuit_cooldown_ms: u64,
+        fallback_cooldown_ms: u64,
+        fallback_max_jitter_ms: u64,
         repeated_failure_threshold: u32,
     ) -> Result<Self, YahooAdapterError> {
-        if circuit_cooldown_ms == 0 {
+        if fallback_cooldown_ms == 0 {
             return Err(YahooAdapterError::ZeroApplicationBound {
-                name: "circuit_cooldown_ms",
+                name: "fallback_cooldown_ms",
             });
         }
+        if fallback_max_jitter_ms == 0 {
+            return Err(YahooAdapterError::ZeroApplicationBound {
+                name: "fallback_max_jitter_ms",
+            });
+        }
+        fallback_cooldown_ms
+            .checked_add(fallback_max_jitter_ms)
+            .ok_or(YahooAdapterError::InvalidFallbackCooldown)?;
         if repeated_failure_threshold == 0 {
             return Err(YahooAdapterError::ZeroApplicationBound {
                 name: "repeated_failure_threshold",
             });
         }
         Ok(Self {
-            circuit_cooldown_ms,
+            fallback_cooldown_ms,
+            fallback_max_jitter_ms,
             repeated_failure_threshold,
         })
     }
@@ -54,7 +66,8 @@ pub enum AttemptKind {
 pub enum AttemptDisposition {
     Success,
     Partial,
-    Http429 {
+    ProviderBackoff {
+        status: u16,
         retry_after: Option<YahooRetryAfterDirective>,
     },
     TransportFailure,
@@ -105,6 +118,7 @@ pub struct AdmissionSnapshot {
     pub latency_ms_total: u64,
     pub maximum_observed_response_bytes: usize,
     pub maximum_observed_latency_ms: u64,
+    pub provider_backoff_total: u64,
     pub http_429_total: u64,
     pub transport_failures_total: u64,
     pub schema_failures_total: u64,
@@ -193,6 +207,7 @@ impl YahooAdmission {
             latency_ms_total: 0,
             maximum_observed_response_bytes: 0,
             maximum_observed_latency_ms: 0,
+            provider_backoff_total: 0,
             http_429_total: 0,
             transport_failures_total: 0,
             schema_failures_total: 0,
@@ -519,8 +534,15 @@ fn record_actual_attempt(
             false
         }
         AttemptDisposition::Partial => active.half_open_probe,
-        AttemptDisposition::Http429 { retry_after } => {
-            state.snapshot.http_429_total = checked_add(state.snapshot.http_429_total, 1)?;
+        AttemptDisposition::ProviderBackoff {
+            status,
+            retry_after,
+        } => {
+            state.snapshot.provider_backoff_total =
+                checked_add(state.snapshot.provider_backoff_total, 1)?;
+            if status == 429 {
+                state.snapshot.http_429_total = checked_add(state.snapshot.http_429_total, 1)?;
+            }
             open_circuit(state, completed_at_unix_ms, retry_after);
             false
         }
@@ -537,12 +559,16 @@ fn record_actual_attempt(
         AttemptDisposition::Cancelled => {
             state.snapshot.cancelled_attempts_total =
                 checked_add(state.snapshot.cancelled_attempts_total, 1)?;
-            increment_failure(state)?
+            // Caller revocation is not provider-health evidence and must not open the adaptive
+            // provider circuit.
+            false
         }
         AttemptDisposition::DeadlineExceeded => {
             state.snapshot.deadline_exceeded_attempts_total =
                 checked_add(state.snapshot.deadline_exceeded_attempts_total, 1)?;
-            increment_failure(state)?
+            // The application deadline is a local work bound, not proof of provider throttling or
+            // schema/transport failure.
+            false
         }
     };
     if reopen {
@@ -568,7 +594,12 @@ fn finish_operation(
             state.circuit = CircuitState::Closed;
             state.snapshot.consecutive_failures = 0;
         } else {
-            open_circuit(state, completed_at_unix_ms, None);
+            // A half-open operation can end without new provider-failure evidence (for example,
+            // caller cancellation or a local deadline). Preserve the single-probe gate, but make
+            // the next explicit demand eligible immediately instead of inventing a cooldown.
+            state.circuit = CircuitState::Open {
+                retry_at_unix_ms: completed_at_unix_ms,
+            };
         }
     }
     state.active = None;
@@ -613,9 +644,32 @@ fn open_circuit(
         Some(YahooRetryAfterDirective::HttpDate { .. }) | None => None,
     };
     state.circuit = CircuitState::Open {
-        retry_at_unix_ms: provider_retry_at
-            .unwrap_or_else(|| add_millis(now_unix_ms, state.policy.circuit_cooldown_ms)),
+        // A valid provider instruction is exact and is never lengthened by local policy. Only an
+        // absent, malformed, or already-expired instruction uses the conservative bounded jitter.
+        retry_at_unix_ms: provider_retry_at.unwrap_or_else(|| {
+            add_millis(
+                now_unix_ms,
+                fallback_cooldown_with_jitter(state, now_unix_ms),
+            )
+        }),
     };
+}
+
+fn fallback_cooldown_with_jitter(state: &AdmissionState, now_unix_ms: i64) -> u64 {
+    let mut sample = u64::from_ne_bytes(now_unix_ms.to_ne_bytes())
+        ^ state.snapshot.actual_http_attempts_total.rotate_left(17)
+        ^ state
+            .snapshot
+            .logical_primary_operations_total
+            .rotate_left(41);
+    // SplitMix64 provides a well-distributed, dependency-free process/time sample. This is load
+    // spreading, not security randomness; the chosen absolute retry coordinate is persisted.
+    sample = sample.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    sample = (sample ^ (sample >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    sample = (sample ^ (sample >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    sample ^= sample >> 31;
+    let jitter = sample % state.policy.fallback_max_jitter_ms.saturating_add(1);
+    state.policy.fallback_cooldown_ms.saturating_add(jitter)
 }
 
 fn add_millis(now_unix_ms: i64, delay_ms: u64) -> i64 {
@@ -648,7 +702,7 @@ fn validate_restored_snapshot(
         .checked_add(snapshot.missing_units_total)
         .ok_or(AdmissionRejection::InvalidPersistedState)?;
     let classified_attempts = snapshot
-        .http_429_total
+        .provider_backoff_total
         .checked_add(snapshot.transport_failures_total)
         .and_then(|value| value.checked_add(snapshot.schema_failures_total))
         .and_then(|value| value.checked_add(snapshot.cancelled_attempts_total))
@@ -661,6 +715,7 @@ fn validate_restored_snapshot(
             > usize::try_from(snapshot.response_bytes_total).unwrap_or(usize::MAX)
         || snapshot.maximum_observed_latency_ms > snapshot.latency_ms_total
         || classified_attempts > snapshot.actual_http_attempts_total
+        || snapshot.http_429_total > snapshot.provider_backoff_total
         || (matches!(snapshot.circuit, CircuitSnapshot::Closed)
             && snapshot.consecutive_failures >= policy.repeated_failure_threshold)
     {

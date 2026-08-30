@@ -16,8 +16,8 @@ use market_squawk_sources::{
     BudgetReservationDecision, BudgetScope, BudgetUnavailableReason, BudgetWindowSemantics,
     MonotonicInstant, ProviderBudgetPolicy, ProviderBudgetWindow, ProviderCaptureError,
     ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
-    ProviderCaptureTerminalDisposition, ProviderRateAuthority, ProviderRateDeclaration,
-    SharedProviderBudget, apply_http_retry_after,
+    ProviderCaptureTerminalDisposition, ProviderRateAuthority, ProviderRateAvailability,
+    ProviderRateDeclaration, SharedProviderBudget, apply_http_retry_after,
 };
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER};
 use sha2::{Digest as _, Sha256};
@@ -461,6 +461,14 @@ impl fmt::Debug for TiingoHttpSource {
 }
 
 impl TiingoHttpSource {
+    /// Returns sanitized shared provider/account availability without reserving or charging a
+    /// request and without exposing the credential, client, declaration, or durable store.
+    pub fn provider_rate_availability(
+        &self,
+    ) -> Result<ProviderRateAvailability, BudgetUnavailableReason> {
+        self.budget.provider_rate_availability()
+    }
+
     /// Opens a hardened transport behind the shared generic budget and Tiingo extension.
     ///
     /// Both capabilities must be backed by the same product-wide provider/account SQLite root,
@@ -2452,12 +2460,15 @@ mod tests {
             let captured = source
                 .fetch_history_page(&history_plan, &history_checkpoint, deadline, &cancellation)
                 .await?;
-            let sealed_capture = captured
-                .capture_material(
-                    Uuid::from_u128(10 + u128::try_from(page_index)?),
-                    Uuid::from_u128(3),
-                )?
-                .seal(&store)?;
+            let material = captured.capture_material(
+                Uuid::from_u128(10 + u128::try_from(page_index)?),
+                Uuid::from_u128(3),
+            )?;
+            let (expectation, seal_request) = material.into_whole_seal_parts();
+            let token = expectation
+                .try_rejoin(seal_request.seal(&store)?)?
+                .try_into_whole()?;
+            let sealed_capture = token.persisted_receipt().clone();
             let sealed_page = TiingoSealedHistoryPage::try_new(
                 &expected_request,
                 captured.decoded(),

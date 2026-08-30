@@ -37,13 +37,18 @@ use market_squawk_sources::{
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use super::ResearchRightsAuthority;
+use super::{ProductionResearchIngestCoordinator, ResearchRightsAuthority};
+use crate::provider_activation::yahoo::{
+    YahooApplicationPublicationRequest, YahooProductError, YahooPublicationSummary,
+    YahooRestartCoordinates, YahooRestartOutcome, YahooRestartRequest,
+};
 use crate::{ResearchIngestRequest, ResearchService, ResearchServiceError};
 
 /// One closed application request paired with the authority required by its publication family.
 ///
-/// Canonical publication always carries a caller-supplied precommit authority. Hint requests carry
-/// no such authority because they do not enter an immutable canonical generation.
+/// Canonical publication always carries the coordinator-owned exact-generation precommit
+/// authority. Hint requests carry no such authority because they do not enter an immutable
+/// canonical generation.
 #[derive(Debug)]
 pub(crate) enum YahooEnrichmentPublicationRequest {
     Historical {
@@ -137,11 +142,9 @@ impl YahooEnrichmentPublicationClosure {
         &self,
         pending: YahooPendingPublication,
         request: YahooEnrichmentPublicationRequest,
-        observed_at: Timestamp,
         cancellation: CancellationToken,
         deadline: Instant,
     ) -> Result<YahooEnrichmentApplicationOutcome, YahooEnrichmentPublicationError> {
-        self.validate_current_authority(observed_at)?;
         if let Some(precommit) = request.precommit_authority() {
             precommit.validate_precommit()?;
         }
@@ -151,6 +154,8 @@ impl YahooEnrichmentPublicationClosure {
             .seal_provider_capture(seal_request, &cancellation, deadline)
             .await?;
         let sealed = rejoin.try_rejoin(sealed)?;
+        let observed_at = timestamp_from_unix_millis(sealed.raw_receipt().available_at_unix_ms)?;
+        self.validate_current_authority(observed_at)?;
         self.validate_sealed_response(&sealed, observed_at)?;
         let family = sealed.family();
 
@@ -1035,6 +1040,256 @@ impl YahooOptionRestartReceipt {
 
     pub(crate) const fn batch(&self) -> &ProviderOptionMarketArrowBatch {
         &self.batch
+    }
+}
+
+impl ProductionResearchIngestCoordinator {
+    /// Composes the provider-activation lane into the sole raw sealer and analytical publisher.
+    /// The activation boundary never receives the research store or writer capability.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "source, rights, one-use response, clocks, and cancellation remain explicit"
+    )]
+    pub(crate) async fn publish_yahoo_enrichment(
+        &self,
+        source: SourceMetadata,
+        rights: ResearchRightsAuthority,
+        source_registered_at: Timestamp,
+        pending: YahooPendingPublication,
+        request: YahooApplicationPublicationRequest,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<YahooPublicationSummary, YahooProductError> {
+        let publication = match request {
+            YahooApplicationPublicationRequest::Historical {
+                canonical,
+                analytical_dataset,
+            } => YahooEnrichmentPublicationRequest::Historical {
+                canonical,
+                analytical_dataset,
+                precommit_authority: Arc::clone(&precommit_authority),
+            },
+            YahooApplicationPublicationRequest::Quotes {
+                canonical,
+                analytical_dataset,
+                idempotency_key,
+            } => YahooEnrichmentPublicationRequest::Quotes {
+                canonical,
+                analytical_dataset,
+                idempotency_key,
+                precommit_authority: Arc::clone(&precommit_authority),
+            },
+            YahooApplicationPublicationRequest::Options {
+                canonical,
+                analytical_dataset,
+                idempotency_key,
+            } => YahooEnrichmentPublicationRequest::Options {
+                canonical,
+                analytical_dataset,
+                idempotency_key,
+                precommit_authority,
+            },
+            YahooApplicationPublicationRequest::ProviderHint => {
+                YahooEnrichmentPublicationRequest::ProviderHint
+            }
+        };
+        let closure = YahooEnrichmentPublicationClosure::try_new(
+            Arc::clone(&self.research),
+            source,
+            rights,
+            source_registered_at,
+        )
+        .map_err(|_error| YahooProductError::Application)?;
+        let outcome = closure
+            .seal_and_publish(pending, publication, cancellation, deadline)
+            .await
+            .map_err(|_error| YahooProductError::Application)?;
+        let summary = match outcome {
+            YahooEnrichmentApplicationOutcome::Historical(receipt) => {
+                let YahooHistoricalPublicationReceipt {
+                    committed,
+                    restart,
+                    binding_digest: _,
+                    provider_dataset,
+                } = receipt;
+                let records = usize::try_from(committed.pinned().plan().row_count())
+                    .map_err(|_| YahooProductError::Application)?;
+                YahooPublicationSummary::Published {
+                    restart: YahooRestartCoordinates::Historical {
+                        manifest: restart.manifest,
+                        binding_digest: restart.binding_digest,
+                        source_id: restart.source_id,
+                        expected_record_count: restart.expected_record_count,
+                    },
+                    provider_dataset,
+                    records,
+                }
+            }
+            YahooEnrichmentApplicationOutcome::Quotes(YahooQuoteApplicationOutcome::Published(
+                receipt,
+            )) => {
+                let YahooQuotePublicationReceipt {
+                    committed: _,
+                    restart,
+                    sealed_receipt_digest: _,
+                    provider_dataset,
+                    event_count,
+                    abstentions: _,
+                } = receipt;
+                YahooPublicationSummary::Published {
+                    restart: YahooRestartCoordinates::Quotes {
+                        manifest: restart.manifest,
+                        publication_digest: restart.publication_digest,
+                        source_id: restart.source_id,
+                        expected_event_count: restart.expected_event_count,
+                    },
+                    provider_dataset,
+                    records: event_count,
+                }
+            }
+            YahooEnrichmentApplicationOutcome::Quotes(
+                YahooQuoteApplicationOutcome::SealedRaw {
+                    response,
+                    abstentions,
+                },
+            ) => YahooPublicationSummary::SealedUnavailable {
+                sealed_capture_receipt: response.sealed_capture_receipt().receipt_digest(),
+                abstentions: abstentions.len(),
+            },
+            YahooEnrichmentApplicationOutcome::Options(
+                YahooOptionApplicationOutcome::Published(receipt),
+            ) => {
+                let YahooOptionPublicationReceipt {
+                    committed: _,
+                    restart,
+                    binding_digest: _,
+                    provider_dataset,
+                    revision_plan,
+                    abstentions: _,
+                } = receipt;
+                let records = revision_plan.len();
+                YahooPublicationSummary::Published {
+                    restart: YahooRestartCoordinates::Options {
+                        manifest: restart.manifest,
+                        publication_digest: restart.publication_digest,
+                        publication_kind: restart.publication_kind,
+                        source_id: restart.source_id,
+                        expected_option_row_count: restart.expected_option_row_count,
+                    },
+                    provider_dataset,
+                    records,
+                }
+            }
+            YahooEnrichmentApplicationOutcome::Options(
+                YahooOptionApplicationOutcome::SealedRaw {
+                    response,
+                    abstentions,
+                },
+            ) => YahooPublicationSummary::SealedUnavailable {
+                sealed_capture_receipt: response.sealed_capture_receipt().receipt_digest(),
+                abstentions: abstentions.len(),
+            },
+            YahooEnrichmentApplicationOutcome::ProviderHint(hint) => {
+                YahooPublicationSummary::ProviderHint {
+                    sealed_capture_receipt: hint.sealed_capture_receipt().receipt_digest(),
+                }
+            }
+        };
+        Ok(summary)
+    }
+
+    /// Revalidates and reopens one exact immutable Yahoo generation after process restart.
+    pub(crate) async fn reopen_yahoo_publication(
+        &self,
+        coordinates: YahooRestartCoordinates,
+        request: YahooRestartRequest,
+        cancellation: CancellationToken,
+    ) -> Result<YahooRestartOutcome, YahooProductError> {
+        match (coordinates, request) {
+            (
+                YahooRestartCoordinates::Historical {
+                    manifest,
+                    binding_digest,
+                    source_id,
+                    expected_record_count,
+                },
+                YahooRestartRequest::Historical {
+                    request,
+                    limits,
+                    deadline,
+                },
+            ) => {
+                let receipt = YahooHistoricalRestartSelector {
+                    manifest,
+                    binding_digest,
+                    source_id,
+                    expected_record_count,
+                }
+                .reopen(
+                    self.research.as_ref(),
+                    request,
+                    limits,
+                    deadline,
+                    cancellation,
+                )
+                .await
+                .map_err(|_error| YahooProductError::Application)?;
+                Ok(YahooRestartOutcome::Historical {
+                    evidence: receipt.evidence,
+                    bars: receipt.bars,
+                })
+            }
+            (
+                YahooRestartCoordinates::Quotes {
+                    manifest,
+                    publication_digest,
+                    source_id,
+                    expected_event_count,
+                },
+                YahooRestartRequest::Quotes,
+            ) => {
+                let receipt = YahooMarketEventRestartSelector {
+                    manifest,
+                    publication_digest,
+                    source_id,
+                    expected_event_count,
+                }
+                .reopen(self.research.as_ref(), cancellation)
+                .await
+                .map_err(|_error| YahooProductError::Application)?;
+                Ok(YahooRestartOutcome::Quotes {
+                    evidence: receipt.evidence,
+                    events: receipt.events,
+                })
+            }
+            (
+                YahooRestartCoordinates::Options {
+                    manifest,
+                    publication_digest,
+                    publication_kind,
+                    source_id,
+                    expected_option_row_count,
+                },
+                YahooRestartRequest::Options,
+            ) => {
+                let receipt = YahooOptionRestartSelector {
+                    manifest,
+                    publication_digest,
+                    publication_kind,
+                    source_id,
+                    expected_option_row_count,
+                }
+                .reopen(self.research.as_ref(), cancellation)
+                .await
+                .map_err(|_error| YahooProductError::Application)?;
+                Ok(YahooRestartOutcome::Options {
+                    evidence: receipt.evidence,
+                    batch: receipt.batch,
+                })
+            }
+            _ => Err(YahooProductError::InvalidOperation),
+        }
     }
 }
 

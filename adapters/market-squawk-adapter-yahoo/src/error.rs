@@ -25,6 +25,8 @@ pub enum YahooAdapterError {
         actual: usize,
         maximum: usize,
     },
+    #[error("Yahoo fallback cooldown plus jitter exceeds its integer bound")]
+    InvalidFallbackCooldown,
     #[error("locale value is empty or contains an unsafe character")]
     InvalidLocale,
     #[error("search text is empty")]

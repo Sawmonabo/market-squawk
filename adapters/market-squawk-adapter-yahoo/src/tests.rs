@@ -73,7 +73,7 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
         max_cache_bytes: 128 * 1_024,
         max_redirects: 3,
         max_attempt_receipts: 8,
-        admission_policy: AdmissionPolicy::new(1_000, 3)?,
+        admission_policy: AdmissionPolicy::new(1_000, 250, 3)?,
     };
     let state_root = std::env::temp_dir().join(format!(
         "market-squawk-yahoo-durable-test-{}",
@@ -358,7 +358,7 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
     assert_eq!(snapshot.missing_units_total, 1);
     assert_eq!(snapshot.http_429_total, 1);
 
-    let absolute_retry = YahooAdmission::new(AdmissionPolicy::new(9_000, 3)?);
+    let absolute_retry = YahooAdmission::new(AdmissionPolicy::new(9_000, 1_000, 3)?);
     let absolute_permit = match absolute_retry.admit(
         &plan.requests[0],
         "absolute-retry-after",
@@ -375,7 +375,8 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
             returned_records: 0,
             response_bytes: 0,
             latency_ms: 1,
-            disposition: AttemptDisposition::Http429 {
+            disposition: AttemptDisposition::ProviderBackoff {
+                status: 429,
                 retry_after: Some(YahooRetryAfterDirective::HttpDate {
                     retry_at_unix_ms: 50_000,
                 }),
@@ -390,7 +391,7 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
         }
     );
 
-    let expired_retry = YahooAdmission::new(AdmissionPolicy::new(9_000, 3)?);
+    let expired_retry = YahooAdmission::new(AdmissionPolicy::new(9_000, 1_000, 3)?);
     let expired_permit = match expired_retry.admit(
         &plan.requests[0],
         "expired-retry-after",
@@ -407,7 +408,8 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
             returned_records: 0,
             response_bytes: 0,
             latency_ms: 1,
-            disposition: AttemptDisposition::Http429 {
+            disposition: AttemptDisposition::ProviderBackoff {
+                status: 429,
                 retry_after: Some(YahooRetryAfterDirective::HttpDate {
                     retry_at_unix_ms: 19_999,
                 }),
@@ -415,12 +417,10 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
         },
         20_000,
     )?;
-    assert_eq!(
-        expired_retry.snapshot()?.circuit,
-        CircuitSnapshot::Open {
-            retry_at_unix_ms: 29_000
-        }
-    );
+    let CircuitSnapshot::Open { retry_at_unix_ms } = expired_retry.snapshot()?.circuit else {
+        return Err("expired provider instruction must use the bounded fallback circuit".into());
+    };
+    assert!((29_000..=30_000).contains(&retry_at_unix_ms));
 
     let attempt_bounded = YahooHttpSession::new_for_test_with_durable(
         YahooHttpSessionConfig {
@@ -470,7 +470,7 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
 
     let fallback_session = YahooHttpSession::new_for_test_with_durable(
         YahooHttpSessionConfig {
-            admission_policy: AdmissionPolicy::new(1_000, 3)?,
+            admission_policy: AdmissionPolicy::new(1_000, 250, 3)?,
             ..config
         },
         Url::parse("http://yahoo-fallback.test/")?,
@@ -555,7 +555,7 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
         same_url_different_semantics.requests[0].target()
     );
     assert_ne!(first_identity, second_identity);
-    let identity_admission = YahooAdmission::new(AdmissionPolicy::new(1_000, 3)?);
+    let identity_admission = YahooAdmission::new(AdmissionPolicy::new(1_000, 250, 3)?);
     let first_permit = match identity_admission.admit(
         &plan.requests[0],
         &first_identity,

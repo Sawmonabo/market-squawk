@@ -144,7 +144,12 @@ fn seal_response(
         DateTime::<Utc>::from_timestamp_nanos(evidence.received_at().unix_nanos()),
         Bytes::copy_from_slice(body),
     )?;
-    Ok(ProviderCaptureMaterial::try_new(receipt, vec![record])?.seal(store)?)
+    let material = ProviderCaptureMaterial::try_new(receipt, vec![record])?;
+    let (expectation, seal_request) = material.into_whole_seal_parts();
+    let token = expectation
+        .try_rejoin(seal_request.seal(store)?)?
+        .try_into_whole()?;
+    Ok(token.persisted_receipt().clone())
 }
 
 fn completed_single_page_history(

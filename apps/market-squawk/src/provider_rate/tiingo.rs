@@ -45,6 +45,7 @@ struct DurableTiingoState {
     source_contract_revision: String,
     native_contract_revision: String,
     entitlement_generation: String,
+    entitlement_generation_number: u64,
     installed_at: Timestamp,
     authority_evidence_sha256: [u8; 32],
     quota: TiingoQuotaSnapshot,
@@ -111,6 +112,17 @@ pub(crate) struct DurableTiingoProviderAuthority {
     transition_gate: Mutex<()>,
     installed: Mutex<Option<InstalledTiingoAuthority>>,
     pending: Mutex<Option<PendingTiingoPermit>>,
+}
+
+/// Sanitized Tiingo-extension state used by product status without exposing counters or paths.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DurableTiingoStatus {
+    pub(crate) monthly_unique_symbols_exhausted: bool,
+    pub(crate) monthly_bandwidth_exhausted: bool,
+    pub(crate) monthly_overage_until: Option<Timestamp>,
+    pub(crate) monthly_resets_at: Timestamp,
+    pub(crate) last_provider_rate_limit_observed_at: Option<Timestamp>,
+    pub(crate) provider_retry_after_was_present: bool,
 }
 
 impl DurableTiingoProviderAuthority {
@@ -209,6 +221,41 @@ impl DurableTiingoProviderAuthority {
             state.installed_at,
         )
     }
+
+    /// Reads bounded monthly and provider-refusal state without reserving or changing quota.
+    pub(crate) fn status(&self) -> Result<DurableTiingoStatus, TiingoProviderAuthorityError> {
+        let _transition = self
+            .transition_gate
+            .lock()
+            .map_err(|_| TiingoProviderAuthorityError::Corrupt)?;
+        let installed = self.installed()?;
+        let (_stored, state) = self
+            .load_state()?
+            .ok_or(TiingoProviderAuthorityError::Conflict)?;
+        validate_state_for_installation(&state, &installed)?;
+        let now = self
+            .provider_rate
+            .extension_clock_timestamp()
+            .map_err(map_store_error)?;
+        let month_is_current = now < state.quota.windows().month_resets_at();
+        let last_rate_limit = state.last_rate_limit.as_ref();
+        Ok(DurableTiingoStatus {
+            monthly_unique_symbols_exhausted: month_is_current
+                && state.quota.unique_symbols_this_month().len()
+                    >= usize::try_from(TIINGO_APPLICATION_UNIQUE_SYMBOLS_PER_MONTH)
+                        .map_err(|_| TiingoProviderAuthorityError::Corrupt)?,
+            monthly_bandwidth_exhausted: month_is_current
+                && state.quota.response_bytes_this_month() >= TIINGO_APPLICATION_BYTES_PER_MONTH,
+            monthly_overage_until: state
+                .quota_overage_until
+                .filter(|until| month_is_current && now < *until),
+            monthly_resets_at: state.quota.windows().month_resets_at(),
+            last_provider_rate_limit_observed_at: last_rate_limit
+                .map(|rate_limit| rate_limit.observed_at),
+            provider_retry_after_was_present: last_rate_limit
+                .is_some_and(|rate_limit| rate_limit.retry_after.is_some()),
+        })
+    }
 }
 
 impl fmt::Debug for DurableTiingoProviderAuthority {
@@ -239,7 +286,7 @@ impl TiingoProviderAuthority for DurableTiingoProviderAuthority {
             return Err(TiingoProviderAuthorityError::Conflict);
         }
 
-        let (stored, mut state) = match self.load_state()? {
+        let (mut stored, mut state) = match self.load_state()? {
             Some((stored, state)) => (stored, state),
             None => {
                 let admitted_at = self
@@ -259,7 +306,23 @@ impl TiingoProviderAuthority for DurableTiingoProviderAuthority {
                 (stored, state)
             }
         };
-        validate_state_for_requirements(&state, requirements, &self.extension_key)?;
+        let requested_generation =
+            entitlement_generation_number(requirements.entitlement_generation().as_str())?;
+        if state.entitlement_generation_number != requested_generation {
+            if requested_generation <= state.entitlement_generation_number {
+                return Err(TiingoProviderAuthorityError::Conflict);
+            }
+            let admitted_at = self
+                .provider_rate
+                .extension_clock_timestamp()
+                .map_err(map_store_error)?;
+            let rotation =
+                TiingoInstallationRotation::from_requirements(requirements, &self.extension_key);
+            rotate_installation(&mut state, &rotation, admitted_at)?;
+            stored = self.replace_state(Some(stored.revision()), &state)?;
+        } else {
+            validate_state_for_requirements(&state, requirements, &self.extension_key)?;
+        }
 
         let mut quota = TiingoQuotaLedger::try_restore(state.quota.clone())
             .map_err(|_| TiingoProviderAuthorityError::Corrupt)?;
@@ -283,11 +346,14 @@ impl TiingoProviderAuthority for DurableTiingoProviderAuthority {
             .installed
             .lock()
             .map_err(|_| TiingoProviderAuthorityError::Corrupt)?;
-        if installed
-            .as_ref()
-            .is_some_and(|current| current != &admitted)
+        if let Some(current) = installed.as_ref()
+            && current != &admitted
         {
-            return Err(TiingoProviderAuthorityError::Conflict);
+            let current_generation =
+                entitlement_generation_number(&current.entitlement_generation)?;
+            if state.entitlement_generation_number <= current_generation {
+                return Err(TiingoProviderAuthorityError::Conflict);
+            }
         }
         *installed = Some(admitted);
         Ok(installation)
@@ -719,6 +785,9 @@ fn initial_state(
             .to_owned(),
         native_contract_revision: requirements.native_contract_revision().as_str().to_owned(),
         entitlement_generation: requirements.entitlement_generation().as_str().to_owned(),
+        entitlement_generation_number: entitlement_generation_number(
+            requirements.entitlement_generation().as_str(),
+        )?,
         installed_at,
         authority_evidence_sha256: requirements_evidence(requirements, key).bytes(),
         quota: TiingoQuotaLedger::new(windows).snapshot().clone(),
@@ -730,6 +799,62 @@ fn initial_state(
     };
     validate_state(&state)?;
     Ok(state)
+}
+
+/// Rebinds an exact successor credential generation without resetting provider/account usage.
+///
+/// A token replacement changes entitlement and publication authority, not Tiingo's hourly, daily,
+/// monthly, bandwidth, refusal, or schema history. An in-progress history graph is generation-
+/// qualified and cannot cross the cutover, so only that graph is discarded. Crash-retained quota
+/// reservations remain present and are reconciled by the ordinary startup path immediately after
+/// this transition.
+struct TiingoInstallationRotation<'a> {
+    source_id: &'a str,
+    source_contract_revision: &'a str,
+    native_contract_revision: &'a str,
+    entitlement_generation: &'a str,
+    authority_evidence_sha256: [u8; 32],
+}
+
+impl<'a> TiingoInstallationRotation<'a> {
+    fn from_requirements(
+        requirements: &'a TiingoProviderAuthorityRequirements,
+        key: &ProviderRateExtensionKey,
+    ) -> Self {
+        Self {
+            source_id: requirements.source_id().as_str(),
+            source_contract_revision: requirements
+                .source_contract_revision()
+                .as_source_identifier()
+                .as_str(),
+            native_contract_revision: requirements.native_contract_revision().as_str(),
+            entitlement_generation: requirements.entitlement_generation().as_str(),
+            authority_evidence_sha256: requirements_evidence(requirements, key).bytes(),
+        }
+    }
+}
+
+fn rotate_installation(
+    state: &mut DurableTiingoState,
+    rotation: &TiingoInstallationRotation<'_>,
+    admitted_at: Timestamp,
+) -> Result<(), TiingoProviderAuthorityError> {
+    if admitted_at < state.installed_at
+        || state.source_id != rotation.source_id
+        || state.native_contract_revision != rotation.native_contract_revision
+    {
+        return Err(TiingoProviderAuthorityError::Conflict);
+    }
+    let requested_generation = entitlement_generation_number(rotation.entitlement_generation)?;
+    if requested_generation <= state.entitlement_generation_number {
+        return Err(TiingoProviderAuthorityError::Conflict);
+    }
+    state.source_contract_revision = rotation.source_contract_revision.to_owned();
+    state.entitlement_generation = rotation.entitlement_generation.to_owned();
+    state.entitlement_generation_number = requested_generation;
+    state.authority_evidence_sha256 = rotation.authority_evidence_sha256;
+    state.history = None;
+    validate_state(state)
 }
 
 fn validate_requirements(
@@ -773,6 +898,8 @@ fn validate_state_for_requirements(
                 .as_str()
         || state.native_contract_revision != requirements.native_contract_revision().as_str()
         || state.entitlement_generation != requirements.entitlement_generation().as_str()
+        || state.entitlement_generation_number
+            != entitlement_generation_number(requirements.entitlement_generation().as_str())?
         || state.authority_evidence_sha256 != requirements_evidence(requirements, key).bytes()
     {
         return Err(TiingoProviderAuthorityError::Conflict);
@@ -789,6 +916,8 @@ fn validate_state_for_installation(
         || state.source_contract_revision != installed.source_contract_revision
         || state.native_contract_revision != installed.native_contract_revision
         || state.entitlement_generation != installed.entitlement_generation
+        || state.entitlement_generation_number
+            != entitlement_generation_number(&installed.entitlement_generation)?
         || state.installed_at != installed.installation.admitted_at()
         || sha256_evidence(state.authority_evidence_sha256)?
             != installed.installation.authority_evidence()
@@ -804,6 +933,8 @@ fn validate_state(state: &DurableTiingoState) -> Result<(), TiingoProviderAuthor
         || state.source_contract_revision.is_empty()
         || state.native_contract_revision.is_empty()
         || state.entitlement_generation.is_empty()
+        || entitlement_generation_number(&state.entitlement_generation)?
+            != state.entitlement_generation_number
         || state.installed_at.unix_nanos() < 0
         || state.authority_evidence_sha256 == [0; 32]
         || state
@@ -988,6 +1119,20 @@ fn identifier(value: &str) -> Result<SourceIdentifier, TiingoProviderAuthorityEr
     SourceIdentifier::try_from(value).map_err(|_| TiingoProviderAuthorityError::Corrupt)
 }
 
+fn entitlement_generation_number(value: &str) -> Result<u64, TiingoProviderAuthorityError> {
+    const PREFIX: &str = "tiingo-entitlement-generation-";
+    let suffix = value
+        .strip_prefix(PREFIX)
+        .ok_or(TiingoProviderAuthorityError::Corrupt)?;
+    let generation = suffix
+        .parse::<u64>()
+        .map_err(|_| TiingoProviderAuthorityError::Corrupt)?;
+    if generation == 0 || generation.to_string() != suffix {
+        return Err(TiingoProviderAuthorityError::Corrupt);
+    }
+    Ok(generation)
+}
+
 fn sha256_evidence(bytes: [u8; 32]) -> Result<EvidenceDigest, TiingoProviderAuthorityError> {
     if bytes == [0; 32] {
         return Err(TiingoProviderAuthorityError::Corrupt);
@@ -1047,5 +1192,84 @@ fn schema_reason_from_id(
         7 => Ok(TiingoSchemaChangeReason::RowLimitExceeded),
         8 => Ok(TiingoSchemaChangeReason::SymbolMismatch),
         _ => Err(TiingoProviderAuthorityError::Corrupt),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+    use std::num::NonZeroU64;
+
+    use market_squawk_adapter_tiingo::{TiingoQuotaLedger, TiingoQuotaWindows, TiingoTicker};
+    use market_squawk_domain::Timestamp;
+
+    use super::{
+        DurableRateLimit, DurableSchemaChange, DurableTiingoState, STATE_SCHEMA_VERSION,
+        TiingoInstallationRotation, decode_state, encode_state, rotate_installation,
+    };
+
+    #[test]
+    fn credential_rotation_preserves_persisted_provider_usage() -> Result<(), Box<dyn Error>> {
+        let observed_at = Timestamp::from_unix_nanos(100);
+        let windows = TiingoQuotaWindows::try_new(
+            observed_at,
+            Timestamp::from_unix_nanos(200),
+            Timestamp::from_unix_nanos(300),
+            Timestamp::from_unix_nanos(400),
+        )?;
+        let mut state = DurableTiingoState {
+            schema_version: STATE_SCHEMA_VERSION,
+            source_id: "tiingo-starter".to_owned(),
+            source_contract_revision: "tiingo-source-v1".to_owned(),
+            native_contract_revision: "tiingo-daily-native-v1".to_owned(),
+            entitlement_generation: "tiingo-entitlement-generation-11".to_owned(),
+            entitlement_generation_number: 11,
+            installed_at: observed_at,
+            authority_evidence_sha256: [1; 32],
+            quota: TiingoQuotaLedger::new(windows).snapshot().clone(),
+            quota_overage_until: None,
+            history: None,
+            schema_change: None,
+            last_rate_limit: None,
+            next_permit: 0,
+        };
+        let mut quota = TiingoQuotaLedger::try_restore(state.quota.clone())?;
+        let ticker = TiingoTicker::try_new("VTSAX")?;
+        let Ok(permit) = quota.reserve(ticker.clone(), NonZeroU64::new(128).ok_or("nonzero")?)?
+        else {
+            return Err("focused Tiingo request must be admitted".into());
+        };
+        quota.commit_response(&permit, &ticker, 64)?;
+        state.quota = quota.snapshot().clone();
+        state.schema_change = Some(DurableSchemaChange {
+            endpoint: 2,
+            reason: 5,
+            response_sha256: [7; 32],
+            observed_at: Timestamp::from_unix_nanos(110),
+        });
+        state.last_rate_limit = Some(DurableRateLimit {
+            retry_after: Some(b"120".to_vec()),
+            jitter_sample_basis_points: 500,
+            observed_at: Timestamp::from_unix_nanos(120),
+        });
+        let quota_before = state.quota.clone();
+        let schema_before = state.schema_change.clone();
+        let refusal_before = state.last_rate_limit.clone();
+
+        let rotation = TiingoInstallationRotation {
+            source_id: "tiingo-starter",
+            source_contract_revision: "tiingo-source-v2",
+            native_contract_revision: "tiingo-daily-native-v1",
+            entitlement_generation: "tiingo-entitlement-generation-13",
+            authority_evidence_sha256: [9; 32],
+        };
+        rotate_installation(&mut state, &rotation, Timestamp::from_unix_nanos(150))?;
+        let restored = decode_state(&encode_state(&state)?)?;
+        assert_eq!(restored.quota, quota_before);
+        assert_eq!(restored.schema_change, schema_before);
+        assert_eq!(restored.last_rate_limit, refusal_before);
+        assert_eq!(restored.entitlement_generation_number, 13);
+        assert!(restored.history.is_none());
+        Ok(())
     }
 }
