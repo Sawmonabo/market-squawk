@@ -31,6 +31,8 @@ pub enum SourceClass {
     OfficialAgency,
     /// Regulatory filing repository.
     RegulatoryFiling,
+    /// Network publisher of technical, schema, or taxonomy standards.
+    StandardsPublisher,
     /// User-controlled local file or database export.
     LocalFile,
     /// User-controlled portfolio or transaction export.
