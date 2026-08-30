@@ -57,7 +57,7 @@ use crate::{
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationMode, DataUseOperation, DiscoveryRequest,
     ExtractionRequest, ExtractionSource, FRED_ALFRED_API_SURFACE_ID, ProviderRateAuthority,
-    ProviderRateDeclaration, SourceMetadata, SourceMetadataProvider,
+    ProviderRateDeclaration, SEC_EDGAR_PROFILE_ID, SourceMetadata, SourceMetadataProvider,
 };
 use specs::BlsAdapterConfiguration;
 
@@ -115,7 +115,6 @@ pub(crate) use yahoo::{
 
 const COINBASE_SURFACE: &str = "coinbase.public-market-data";
 const KRAKEN_SURFACE: &str = "kraken.spot-public-market-data";
-const SEC_SURFACE: &str = "sec.edgar-public";
 const BLS_PUBLIC_SURFACE: &str = "bls.v1-unregistered";
 const BLS_REGISTERED_SURFACE: &str = "bls.v2-registered";
 const TREASURY_XML_SURFACE: &str = "treasury.daily-rates-xml";
@@ -813,7 +812,7 @@ impl ProviderAdapterActivation {
         expected: &ResearchProviderRuntimeGeneration,
     ) -> Result<(), ProviderAdapterActivationError> {
         let _onboarding_authority = self.onboarding.acquire_runtime_mutation_authority().await;
-        if expected.profile().as_str() == SEC_SURFACE {
+        if expected.profile().as_str() == SEC_EDGAR_PROFILE_ID {
             self.research_mutation
                 .revoke_sec_provider_generation_and_release(expected)
                 .await?;
@@ -1539,7 +1538,7 @@ impl ProviderAdapterActivation {
         lease: ProviderActivationLease,
         spec: SecAdapterActivation,
     ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
-        require_surface(&lease, SEC_SURFACE)?;
+        require_surface(&lease, SEC_EDGAR_PROFILE_ID)?;
         let organization = lease
             .public_configuration()
             .get("organization")

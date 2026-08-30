@@ -58,9 +58,9 @@ use market_squawk_sources::{
     ProbeTransport, ProfileReleaseState, ProviderOnboardingProfile, ProviderProfileError,
     ProviderProfileRegistry, ProviderPublicConfiguration, ProviderRateAuthority,
     ProviderRateDeclaration, RuntimeVerificationEvidence,
-    SCHWAB_MARKET_DATA_SURFACE_ID as SOURCES_SCHWAB_SURFACE_ID, SchwabMarketDataDoctorObservation,
-    SecretStoreClearOutcome, TREASURY_DAILY_RATES_PROBE_YEAR, built_in_provider_profiles,
-    install_ring_tls_provider,
+    SCHWAB_MARKET_DATA_SURFACE_ID as SOURCES_SCHWAB_SURFACE_ID, SEC_EDGAR_PROFILE_ID,
+    SchwabMarketDataDoctorObservation, SecretStoreClearOutcome, TREASURY_DAILY_RATES_PROBE_YEAR,
+    built_in_provider_profiles, install_ring_tls_provider,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -1284,7 +1284,7 @@ impl ProviderOnboardingService {
                 if profile.capability().setup_mode()
                     == market_squawk_sources::SetupMode::NoCredential =>
             {
-                let declared_user_agent = if profile.id() == "sec.edgar-public" {
+                let declared_user_agent = if profile.id() == SEC_EDGAR_PROFILE_ID {
                     request.declared_user_agent()
                 } else {
                     None
@@ -3501,7 +3501,7 @@ fn provider_public_configuration(
     request: &StartOnboardingRequest,
 ) -> Result<ProviderPublicConfiguration, ProviderOnboardingError> {
     let fields = match profile.id() {
-        "sec.edgar-public" => BTreeMap::from([
+        SEC_EDGAR_PROFILE_ID => BTreeMap::from([
             (
                 "administrative_email".to_owned(),
                 request
@@ -3534,7 +3534,7 @@ fn validate_recovered_public_configuration(
     configuration: &ProviderPublicConfiguration,
 ) -> Result<(), ProviderOnboardingError> {
     let exact = match profile.id() {
-        "sec.edgar-public" => {
+        SEC_EDGAR_PROFILE_ID => {
             configuration.iter().len() == 2
                 && configuration
                     .get("organization")
@@ -3670,7 +3670,7 @@ fn validate_probe_semantics(profile_id: &str, body: &[u8]) -> Result<(), Provide
         "kraken.spot-authenticated-level3-market-data" => {
             kraken_key_info_is_least_authority(&value)
         }
-        "sec.edgar-public" => value.get("cik").is_some() && value.get("filings").is_some(),
+        SEC_EDGAR_PROFILE_ID => value.get("cik").is_some() && value.get("filings").is_some(),
         "bls.v1-unregistered" | "bls.v2-registered" => {
             value.get("status").and_then(serde_json::Value::as_str) == Some("REQUEST_SUCCEEDED")
                 && value.get("Results").is_some()
@@ -4247,7 +4247,7 @@ mod tests {
             )?;
         let profiles = built_in_provider_profiles()?;
         let sec = profiles
-            .get("sec.edgar-public")
+            .get(SEC_EDGAR_PROFILE_ID)
             .ok_or("SEC onboarding profile is missing")?;
         let historical = sec
             .capability_history()

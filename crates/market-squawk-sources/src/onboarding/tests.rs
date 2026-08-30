@@ -100,7 +100,7 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
     );
     for (profile_id, evidence_source, evidence_digest) in [
         (
-            "sec.edgar-public",
+            SEC_EDGAR_PROFILE_ID,
             "MSQ-SEC-EDGAR-PUBLIC-API-AUTHORITY-2026-07-26",
             EvidenceDigest::new(
                 DigestAlgorithm::Sha256,
@@ -1302,7 +1302,7 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
     );
 
     let sec = profiles
-        .get("sec.edgar-public")
+        .get(SEC_EDGAR_PROFILE_ID)
         .ok_or("missing SEC profile")?;
     let bls_public = profiles
         .get("bls.v1-unregistered")
@@ -1406,7 +1406,7 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
         let evidence = authority.revision_evidence()?;
         assert_eq!(
             evidence.payload_evidence().content_digest(),
-            authority.descriptor_evidence_digest()
+            authority.descriptor_evidence_digest()?
         );
         assert_eq!(
             evidence.metadata_revision(),
@@ -1444,7 +1444,7 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
         descriptor_identities.push((
             authority.source_id(),
             authority.rate_scope(),
-            authority.descriptor_evidence_digest(),
+            authority.descriptor_evidence_digest()?,
             authority
                 .metadata_revision()?
                 .as_source_identifier()
@@ -1460,6 +1460,16 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
             assert_ne!(identity.3, other.3);
         }
     }
+    let activation_evidence = EvidenceDigest::new(DigestAlgorithm::Sha256, [0xa5; 32]);
+    let activated_sec = SEC_EDGAR_AUTHORITY.activation_revision_evidence(activation_evidence)?;
+    assert_eq!(
+        activated_sec,
+        SEC_EDGAR_AUTHORITY.activation_revision_evidence(activation_evidence)?
+    );
+    assert_ne!(
+        activated_sec.payload_evidence().content_digest(),
+        SEC_EDGAR_AUTHORITY.descriptor_evidence_digest()?
+    );
 
     let locator_cases = [
         (
@@ -1512,6 +1522,10 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
             "https://xbrl.fasb.org/us-gaap/2025/us-gaap-2025.xsd",
         )),
         Err(FilingTaxonomyAuthorityLookupError::UnsupportedLogicalLocator)
+    ));
+    assert!(matches!(
+        route_filing_taxonomy_physical_locator("https://xbrl.fasb.org/reference/non-taxonomy.html"),
+        Err(FilingTaxonomyAuthorityLookupError::UnsupportedPhysicalLocator)
     ));
     assert!(
         bls_public

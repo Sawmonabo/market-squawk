@@ -11,7 +11,7 @@ use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier};
 use market_squawk_platform::{
     LocalAuthorityStateStore, LocalAuthorityStateStoreError, SecretGeneration,
 };
-use market_squawk_sources::{AuthoritativeSourceRegistry, RegistryError};
+use market_squawk_sources::{AuthoritativeSourceRegistry, RegistryError, SEC_EDGAR_PROFILE_ID};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -45,7 +45,7 @@ const MAXIMUM_BACKUP_EVIDENCE_OBJECT_BYTES: u64 = 1024 * 1024;
 const RESTORED_REQUIREMENT_SCHEMA_VERSION: u16 = 1;
 
 pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 10] = [
-    "sec.edgar-public",
+    SEC_EDGAR_PROFILE_ID,
     "bls.v1-unregistered",
     "bls.v2-registered",
     "treasury.daily-rates-xml",
@@ -57,7 +57,7 @@ pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 10] = [
     "tiingo.starter-eod-nav",
 ];
 pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 11] = [
-    "sec.edgar-public",
+    SEC_EDGAR_PROFILE_ID,
     "bls.v1-unregistered",
     "bls.v2-registered",
     "treasury.daily-rates-xml",
@@ -84,7 +84,7 @@ const SERIALIZED_LIFECYCLE_SURFACES: [&str; 17] = [
     "coinbase.public-market-data",
     COINBASE_DIRECT_LIVE_SURFACE,
     "kraken.spot-public-market-data",
-    "sec.edgar-public",
+    SEC_EDGAR_PROFILE_ID,
     "bls.v1-unregistered",
     "bls.v2-registered",
     "treasury.daily-rates-xml",
@@ -1824,7 +1824,7 @@ struct QuarantineWire {
 
 fn surface_key(surface_id: &str) -> Result<&'static str, DurableProviderActivationStateError> {
     match surface_id {
-        "sec.edgar-public" => Ok("sec"),
+        SEC_EDGAR_PROFILE_ID => Ok("sec"),
         "bls.v1-unregistered" => Ok("bls-public"),
         "bls.v2-registered" => Ok("bls-registered"),
         "treasury.daily-rates-xml" => Ok("treasury-daily-rates"),

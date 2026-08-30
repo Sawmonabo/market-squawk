@@ -16,7 +16,7 @@ use market_squawk_domain::{
     AvailabilityEvidence, CalendarDate, DataQuality, DigestAlgorithm, MacroObservation,
     PayloadReference, ResearchObservation, SourceIdentifier,
 };
-use market_squawk_sources::DataUseOperation;
+use market_squawk_sources::{DataUseOperation, SEC_EDGAR_PROFILE_ID};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
@@ -27,7 +27,7 @@ const REQUIRED_PROVIDER_SURFACES: [&str; 8] = [
     "coinbase.public-market-data",
     "coinbase.exchange-direct-market-data",
     "kraken.spot-public-market-data",
-    "sec.edgar-public",
+    SEC_EDGAR_PROFILE_ID,
     "fred-alfred.api-v1-v2",
     "bls.v1-unregistered",
     "treasury.daily-rates-xml",
@@ -353,7 +353,7 @@ fn validate_provider_surface_runtime(surface_id: &str, surface: &Value) -> Resul
                 bail!("Coinbase Direct evidence omitted verified action authority");
             }
         }
-        "sec.edgar-public"
+        SEC_EDGAR_PROFILE_ID
         | "fred-alfred.api-v1-v2"
         | "bls.v1-unregistered"
         | "bls.v2-registered"
@@ -418,7 +418,7 @@ fn validate_provider_surface_runtime(surface_id: &str, surface: &Value) -> Resul
                 validate_fred_publications(runtime)?;
             } else if matches!(surface_id, "bls.v1-unregistered" | "bls.v2-registered") {
                 validate_bls_publication(runtime, surface_id)?;
-            } else if surface_id == "sec.edgar-public" {
+            } else if surface_id == SEC_EDGAR_PROFILE_ID {
                 validate_sec_publications(runtime)?;
             }
         }
@@ -979,7 +979,7 @@ fn validate_sec_publications(runtime: &Value) -> Result<()> {
         {
             bail!("SEC filings and Company Facts publications are not distinct");
         }
-        validate_research_publication(publication, "sec.edgar-public", false)?;
+        validate_research_publication(publication, SEC_EDGAR_PROFILE_ID, false)?;
     }
     if families.len() != 2
         || provider_datasets.len() != 2

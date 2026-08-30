@@ -21,6 +21,9 @@ const MINUTE_NANOS: u64 = 60 * SECOND_NANOS;
 const MEBIBYTE: u64 = 1024 * 1024;
 const DESCRIPTOR_EVIDENCE_DOMAIN: &[u8] =
     b"market-squawk/sec-filing-source-authority-descriptor/v1";
+const ACTIVATION_EVIDENCE_DOMAIN: &[u8] =
+    b"market-squawk/sec-filing-source-authority-activation/v1";
+const TAXONOMY_FILE_SUFFIXES: &[&str] = &[".xsd", ".xml"];
 
 /// Stable SEC onboarding surface. Dependency authorities are intentionally not onboarding
 /// surfaces.
@@ -79,25 +82,140 @@ const SEC_EDGAR_ENDPOINTS: &[EndpointAuthority] = &[
     },
 ];
 
+const SEC_EDGAR_TAXONOMY_ENDPOINTS: &[EndpointAuthority] = &[
+    EndpointAuthority {
+        base_url: "https://www.sec.gov/Archives/edgar/data",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://xbrl.sec.gov/dei",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://xbrl.sec.gov/country",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://xbrl.sec.gov/currency",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://xbrl.sec.gov/exch",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://xbrl.sec.gov/invest",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://xbrl.sec.gov/rr",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://xbrl.sec.gov/cef",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://xbrl.sec.gov/ecd",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://xbrl.sec.gov/oef",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://xbrl.sec.gov/vip",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://xbrl.sec.gov/rxp",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://xbrl.sec.gov/sic",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://xbrl.sec.gov/state",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://xbrl.sec.gov/stpr",
+        path_scope: PathScope::Descendants,
+    },
+];
+
 const FASB_XBRL_TAXONOMY_ENDPOINTS: &[EndpointAuthority] = &[EndpointAuthority {
-    base_url: "https://xbrl.fasb.org/",
+    base_url: "https://xbrl.fasb.org/us-gaap",
     path_scope: PathScope::Descendants,
 }];
 
 const XBRL_US_LEGACY_TAXONOMY_ENDPOINTS: &[EndpointAuthority] = &[EndpointAuthority {
-    base_url: "https://taxonomies.xbrl.us/",
+    base_url: "https://taxonomies.xbrl.us/us-gaap",
     path_scope: PathScope::Descendants,
 }];
 
-const XBRL_INTERNATIONAL_STANDARDS_ENDPOINTS: &[EndpointAuthority] = &[EndpointAuthority {
-    base_url: "https://www.xbrl.org/",
-    path_scope: PathScope::Descendants,
-}];
+const XBRL_INTERNATIONAL_STANDARDS_ENDPOINTS: &[EndpointAuthority] = &[
+    EndpointAuthority {
+        base_url: "https://www.xbrl.org/2003",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://www.xbrl.org/2005",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://www.xbrl.org/2006",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://www.xbrl.org/2008",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://www.xbrl.org/2013",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://www.xbrl.org/2014",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://www.xbrl.org/2016",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://www.xbrl.org/2017",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://www.xbrl.org/2021",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://www.xbrl.org/2023",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://www.xbrl.org/lrr",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://www.xbrl.org/dtr",
+        path_scope: PathScope::Descendants,
+    },
+];
 
-const W3C_XML_SCHEMA_STANDARDS_ENDPOINTS: &[EndpointAuthority] = &[EndpointAuthority {
-    base_url: "https://www.w3.org/",
-    path_scope: PathScope::Descendants,
-}];
+const W3C_XML_SCHEMA_STANDARDS_ENDPOINTS: &[EndpointAuthority] = &[
+    EndpointAuthority {
+        base_url: "https://www.w3.org/1999",
+        path_scope: PathScope::Descendants,
+    },
+    EndpointAuthority {
+        base_url: "https://www.w3.org/2001",
+        path_scope: PathScope::Descendants,
+    },
+];
 
 /// Request identity that must be selected with the same authority as the endpoint and budget.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -124,6 +242,7 @@ pub struct FilingTaxonomySourceAuthority {
     rate_scope: &'static str,
     rate_policy_id: &'static str,
     endpoints: &'static [EndpointAuthority],
+    taxonomy_endpoints: &'static [EndpointAuthority],
     request_header_class: FilingTaxonomyRequestHeaderClass,
     requests_per_second: u32,
     max_concurrent: u16,
@@ -160,24 +279,7 @@ impl FilingTaxonomySourceAuthority {
 
     /// Builds the bounded HTTPS-only endpoint policy for this exact publisher.
     pub fn endpoint_policy(self) -> Result<EndpointPolicy, FilingTaxonomyAuthorityContractError> {
-        let rules = self
-            .endpoints
-            .iter()
-            .map(|authority| {
-                ApiEndpointRule::try_new(authority.base_url, authority.path_scope, Vec::new(), 1, 1)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidEndpointPolicy)?;
-        let request_bounds = HttpRequestBounds::try_new(
-            nonzero_u64(5 * SECOND_NANOS)?,
-            nonzero_u64(30 * SECOND_NANOS)?,
-            nonzero_u64(self.total_timeout_nanos)?,
-            0,
-            nonzero_u64(self.max_response_bytes)?,
-        )
-        .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidEndpointPolicy)?;
-        EndpointPolicy::try_from_api_rules(rules, request_bounds)
-            .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidEndpointPolicy)
+        self.policy_for_endpoints(self.endpoints)
     }
 
     /// Builds the code-owned application ceiling for this exact rate scope.
@@ -204,11 +306,19 @@ impl FilingTaxonomySourceAuthority {
     }
 
     /// Returns deterministic evidence for the complete code-owned authority descriptor.
-    pub fn descriptor_evidence_digest(self) -> EvidenceDigest {
+    pub fn descriptor_evidence_digest(
+        self,
+    ) -> Result<EvidenceDigest, FilingTaxonomyAuthorityContractError> {
+        let endpoint_policy = serde_json::to_vec(&self.endpoint_policy()?)
+            .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidDescriptorEvidence)?;
+        let taxonomy_policy =
+            serde_json::to_vec(&self.policy_for_endpoints(self.taxonomy_endpoints)?)
+                .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidDescriptorEvidence)?;
+        let budget_policy = serde_json::to_vec(&self.budget_policy()?)
+            .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidDescriptorEvidence)?;
         let mut hasher = Sha256::new();
         hash_field(&mut hasher, b"domain", DESCRIPTOR_EVIDENCE_DOMAIN);
         hash_field(&mut hasher, b"source-id", self.source_id.as_bytes());
-        hash_field(&mut hasher, b"rate-scope", self.rate_scope.as_bytes());
         hash_field(
             &mut hasher,
             b"rate-policy-id",
@@ -219,61 +329,92 @@ impl FilingTaxonomySourceAuthority {
             b"request-header-class",
             self.request_header_class.evidence_label().as_bytes(),
         );
-        hash_u64(&mut hasher, b"endpoint-count", self.endpoints.len() as u64);
-        for endpoint in self.endpoints {
-            hash_field(&mut hasher, b"endpoint-base", endpoint.base_url.as_bytes());
-            hash_field(
-                &mut hasher,
-                b"endpoint-path-scope",
-                path_scope_evidence_label(endpoint.path_scope).as_bytes(),
-            );
+        hash_field(&mut hasher, b"endpoint-policy", &endpoint_policy);
+        hash_field(&mut hasher, b"taxonomy-route-policy", &taxonomy_policy);
+        hash_field(&mut hasher, b"budget-policy", &budget_policy);
+        for suffix in TAXONOMY_FILE_SUFFIXES {
+            hash_field(&mut hasher, b"taxonomy-file-suffix", suffix.as_bytes());
         }
-        hash_u64(
-            &mut hasher,
-            b"requests-per-second",
-            u64::from(self.requests_per_second),
-        );
-        hash_u64(
-            &mut hasher,
-            b"max-concurrent",
-            u64::from(self.max_concurrent),
-        );
-        hash_u64(&mut hasher, b"connect-timeout-nanos", 5 * SECOND_NANOS);
-        hash_u64(&mut hasher, b"read-timeout-nanos", 30 * SECOND_NANOS);
-        hash_u64(
-            &mut hasher,
-            b"total-timeout-nanos",
-            self.total_timeout_nanos,
-        );
-        hash_u64(&mut hasher, b"max-redirects", 0);
-        hash_u64(&mut hasher, b"max-response-bytes", self.max_response_bytes);
-        EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
+        Ok(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            hasher.finalize().into(),
+        ))
     }
 
     /// Returns the deterministic metadata revision derived from the exact descriptor evidence.
     pub fn metadata_revision(
         self,
     ) -> Result<MetadataRevision, FilingTaxonomyAuthorityContractError> {
-        let digest = self.descriptor_evidence_digest();
-        let mut revision = String::with_capacity(74);
-        revision.push_str("authority-");
-        for byte in digest.bytes() {
-            write!(&mut revision, "{byte:02x}")
-                .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidDescriptorIdentity)?;
-        }
-        let revision = SourceIdentifier::try_from(revision)
-            .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidDescriptorIdentity)?;
-        Ok(MetadataRevision::new(revision))
+        metadata_revision_from_digest("authority-", self.descriptor_evidence_digest()?)
     }
 
     /// Atomically binds the code-owned metadata revision to its exact descriptor digest.
     pub fn revision_evidence(
         self,
     ) -> Result<RevisionBoundPayloadEvidence, FilingTaxonomyAuthorityContractError> {
+        let digest = self.descriptor_evidence_digest()?;
         Ok(RevisionBoundPayloadEvidence::new(
-            self.metadata_revision()?,
-            ExactPayloadEvidence::from_content_digest(self.descriptor_evidence_digest()),
+            metadata_revision_from_digest("authority-", digest)?,
+            ExactPayloadEvidence::from_content_digest(digest),
         ))
+    }
+
+    /// Binds one activation receipt to the complete code-owned descriptor for runtime metadata.
+    pub fn activation_revision_evidence(
+        self,
+        activation_evidence: EvidenceDigest,
+    ) -> Result<RevisionBoundPayloadEvidence, FilingTaxonomyAuthorityContractError> {
+        let descriptor_evidence = self.descriptor_evidence_digest()?;
+        let mut hasher = Sha256::new();
+        hash_field(&mut hasher, b"domain", ACTIVATION_EVIDENCE_DOMAIN);
+        hash_digest(&mut hasher, b"activation-evidence", activation_evidence);
+        hash_digest(&mut hasher, b"authority-descriptor", descriptor_evidence);
+        let combined = EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into());
+        Ok(RevisionBoundPayloadEvidence::new(
+            metadata_revision_from_digest("activation-authority-", combined)?,
+            ExactPayloadEvidence::from_content_digest(combined),
+        ))
+    }
+
+    fn policy_for_endpoints(
+        self,
+        endpoints: &[EndpointAuthority],
+    ) -> Result<EndpointPolicy, FilingTaxonomyAuthorityContractError> {
+        let rules = endpoints
+            .iter()
+            .map(|authority| {
+                ApiEndpointRule::try_new(authority.base_url, authority.path_scope, Vec::new(), 1, 1)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidEndpointPolicy)?;
+        let request_bounds = HttpRequestBounds::try_new(
+            nonzero_u64(5 * SECOND_NANOS)?,
+            nonzero_u64(30 * SECOND_NANOS)?,
+            nonzero_u64(self.total_timeout_nanos)?,
+            0,
+            nonzero_u64(self.max_response_bytes)?,
+        )
+        .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidEndpointPolicy)?;
+        EndpointPolicy::try_from_api_rules(rules, request_bounds)
+            .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidEndpointPolicy)
+    }
+
+    fn authorize_taxonomy_physical_locator(
+        self,
+        physical_locator: &str,
+        physical: &Url,
+    ) -> Result<(), FilingTaxonomyAuthorityLookupError> {
+        if !TAXONOMY_FILE_SUFFIXES
+            .iter()
+            .any(|suffix| physical.path().ends_with(suffix))
+        {
+            return Err(FilingTaxonomyAuthorityLookupError::UnsupportedPhysicalLocator);
+        }
+        self.policy_for_endpoints(self.taxonomy_endpoints)
+            .map_err(|_| FilingTaxonomyAuthorityLookupError::InvalidAuthorityContract)?
+            .authorize_request(physical_locator)
+            .map_err(|_| FilingTaxonomyAuthorityLookupError::UnsupportedPhysicalLocator)?;
+        Ok(())
     }
 }
 
@@ -283,6 +424,7 @@ pub const SEC_EDGAR_AUTHORITY: FilingTaxonomySourceAuthority = FilingTaxonomySou
     rate_scope: SEC_EDGAR_RATE_SCOPE,
     rate_policy_id: "sec.edgar-public.aggregate-rate-policy.v1",
     endpoints: SEC_EDGAR_ENDPOINTS,
+    taxonomy_endpoints: SEC_EDGAR_TAXONOMY_ENDPOINTS,
     request_header_class: FilingTaxonomyRequestHeaderClass::SecIdentifyingContact,
     requests_per_second: 2,
     max_concurrent: 1,
@@ -297,6 +439,7 @@ pub const FASB_XBRL_TAXONOMY_AUTHORITY: FilingTaxonomySourceAuthority =
         rate_scope: FASB_XBRL_TAXONOMY_RATE_SCOPE,
         rate_policy_id: "fasb.xbrl-taxonomy-public.rate-policy.v1",
         endpoints: FASB_XBRL_TAXONOMY_ENDPOINTS,
+        taxonomy_endpoints: FASB_XBRL_TAXONOMY_ENDPOINTS,
         request_header_class: FilingTaxonomyRequestHeaderClass::ProductOnlyNoSecContact,
         requests_per_second: 1,
         max_concurrent: 1,
@@ -311,6 +454,7 @@ pub const XBRL_US_LEGACY_TAXONOMY_AUTHORITY: FilingTaxonomySourceAuthority =
         rate_scope: XBRL_US_LEGACY_TAXONOMY_RATE_SCOPE,
         rate_policy_id: "xbrl-us.legacy-taxonomy-public.rate-policy.v1",
         endpoints: XBRL_US_LEGACY_TAXONOMY_ENDPOINTS,
+        taxonomy_endpoints: XBRL_US_LEGACY_TAXONOMY_ENDPOINTS,
         request_header_class: FilingTaxonomyRequestHeaderClass::ProductOnlyNoSecContact,
         requests_per_second: 1,
         max_concurrent: 1,
@@ -325,6 +469,7 @@ pub const XBRL_INTERNATIONAL_STANDARDS_AUTHORITY: FilingTaxonomySourceAuthority 
         rate_scope: XBRL_INTERNATIONAL_STANDARDS_RATE_SCOPE,
         rate_policy_id: "xbrl-international.taxonomy-standards-public.rate-policy.v1",
         endpoints: XBRL_INTERNATIONAL_STANDARDS_ENDPOINTS,
+        taxonomy_endpoints: XBRL_INTERNATIONAL_STANDARDS_ENDPOINTS,
         request_header_class: FilingTaxonomyRequestHeaderClass::ProductOnlyNoSecContact,
         requests_per_second: 1,
         max_concurrent: 1,
@@ -339,6 +484,7 @@ pub const W3C_XML_SCHEMA_STANDARDS_AUTHORITY: FilingTaxonomySourceAuthority =
         rate_scope: W3C_XML_SCHEMA_STANDARDS_RATE_SCOPE,
         rate_policy_id: "w3c.xml-schema-standards-public.rate-policy.v1",
         endpoints: W3C_XML_SCHEMA_STANDARDS_ENDPOINTS,
+        taxonomy_endpoints: W3C_XML_SCHEMA_STANDARDS_ENDPOINTS,
         request_header_class: FilingTaxonomyRequestHeaderClass::ProductOnlyNoSecContact,
         requests_per_second: 1,
         max_concurrent: 1,
@@ -411,11 +557,7 @@ pub fn route_filing_taxonomy_physical_locator(
 ) -> Result<FilingTaxonomySourceAuthority, FilingTaxonomyAuthorityLookupError> {
     let physical = validate_physical_locator(physical_locator)?;
     let authority = authority_for_physical_host(physical.host_str())?;
-    authority
-        .endpoint_policy()
-        .map_err(|_| FilingTaxonomyAuthorityLookupError::InvalidAuthorityContract)?
-        .authorize_request(physical_locator)
-        .map_err(|_| FilingTaxonomyAuthorityLookupError::UnsupportedPhysicalLocator)?;
+    authority.authorize_taxonomy_physical_locator(physical_locator, &physical)?;
     Ok(authority)
 }
 
@@ -449,6 +591,9 @@ pub enum FilingTaxonomyAuthorityContractError {
     /// A code-owned source, budget, or revision identity is invalid.
     #[error("code-owned filing taxonomy authority identity is invalid")]
     InvalidDescriptorIdentity,
+    /// A code-owned authority could not serialize its exact policies for descriptor evidence.
+    #[error("code-owned filing taxonomy authority evidence is invalid")]
+    InvalidDescriptorEvidence,
     /// A code-owned endpoint or request-bound policy is invalid.
     #[error("code-owned filing taxonomy endpoint policy is invalid")]
     InvalidEndpointPolicy,
@@ -546,13 +691,6 @@ fn has_explicit_port(locator: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn path_scope_evidence_label(scope: PathScope) -> &'static str {
-    match scope {
-        PathScope::Exact => "exact",
-        PathScope::Descendants => "descendants",
-    }
-}
-
 fn hash_field(hasher: &mut Sha256, label: &[u8], value: &[u8]) {
     hasher.update((label.len() as u64).to_be_bytes());
     hasher.update(label);
@@ -560,8 +698,28 @@ fn hash_field(hasher: &mut Sha256, label: &[u8], value: &[u8]) {
     hasher.update(value);
 }
 
-fn hash_u64(hasher: &mut Sha256, label: &[u8], value: u64) {
-    hash_field(hasher, label, &value.to_be_bytes());
+fn hash_digest(hasher: &mut Sha256, label: &[u8], digest: EvidenceDigest) {
+    let algorithm = match digest.algorithm() {
+        DigestAlgorithm::Sha256 => b"sha256".as_slice(),
+        DigestAlgorithm::Blake3 => b"blake3".as_slice(),
+    };
+    hash_field(hasher, b"digest-algorithm", algorithm);
+    hash_field(hasher, label, &digest.bytes());
+}
+
+fn metadata_revision_from_digest(
+    prefix: &str,
+    digest: EvidenceDigest,
+) -> Result<MetadataRevision, FilingTaxonomyAuthorityContractError> {
+    let mut revision = String::with_capacity(prefix.len().saturating_add(64));
+    revision.push_str(prefix);
+    for byte in digest.bytes() {
+        write!(&mut revision, "{byte:02x}")
+            .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidDescriptorIdentity)?;
+    }
+    let revision = SourceIdentifier::try_from(revision)
+        .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidDescriptorIdentity)?;
+    Ok(MetadataRevision::new(revision))
 }
 
 fn nonzero_u64(value: u64) -> Result<NonZeroU64, FilingTaxonomyAuthorityContractError> {

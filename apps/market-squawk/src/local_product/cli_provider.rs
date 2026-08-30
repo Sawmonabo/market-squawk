@@ -114,7 +114,6 @@ const FRED_CAPABILITY_REVISION: u64 = 4;
 const SECOND_NANOS: u64 = 1_000_000_000;
 const MINUTE_NANOS: u64 = 60 * SECOND_NANOS;
 const DAY_NANOS: u64 = 86_400 * SECOND_NANOS;
-const SEC_SURFACE: &str = SEC_EDGAR_PROFILE_ID;
 const SEC_IDENTITY_NAMESPACE_V1: &str =
     "https://market-squawk.local/identity/sec-cik-instrument/v1";
 const BLS_PUBLIC_SURFACE: &str = "bls.v1-unregistered";
@@ -2656,6 +2655,9 @@ fn build_research_activation(
                 lease,
                 activation_evidence,
                 SEC_EDGAR_AUTHORITY
+                    .activation_revision_evidence(activation_evidence)
+                    .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+                SEC_EDGAR_AUTHORITY
                     .canonical_source_id()
                     .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
                 SEC_EDGAR_AUTHORITY.rate_scope(),
@@ -2977,7 +2979,7 @@ struct SecIdentityMappingRequest {
 impl ProviderRequest {
     const fn surface(&self) -> ProviderSurface {
         match self {
-            Self::Sec { .. } => ProviderSurface::Exact(SEC_SURFACE),
+            Self::Sec { .. } => ProviderSurface::Exact(SEC_EDGAR_PROFILE_ID),
             Self::Bls { .. } => ProviderSurface::Either(BLS_PUBLIC_SURFACE, BLS_REGISTERED_SURFACE),
             Self::TreasuryFiscal { .. } => ProviderSurface::Exact(TREASURY_FISCAL_SURFACE),
             Self::TreasuryDailyRates { .. } => ProviderSurface::Exact(TREASURY_XML_SURFACE),
@@ -3095,7 +3097,7 @@ fn portal_provider_request(
             ))
         }
         ProviderPortalActivationRequest::Sec { cik } => {
-            require_surface(lease, ProviderSurface::Exact(SEC_SURFACE))?;
+            require_surface(lease, ProviderSurface::Exact(SEC_EDGAR_PROFILE_ID))?;
             Ok((
                 ProviderRequest::Sec {
                     identities: vec![SecIdentityMappingRequest {
@@ -4401,9 +4403,11 @@ fn metadata(
     budget: ProviderBudgetPolicy,
 ) -> Result<SourceMetadata, CliProviderActivationError> {
     let source_id = source_id(source_tag, lease.surface_id())?;
+    let revision_evidence = activation_revision_evidence(evidence)?;
     metadata_with_source_id(
         lease,
         evidence,
+        revision_evidence,
         source_id,
         provider,
         source_class,
@@ -4416,6 +4420,23 @@ fn metadata(
     )
 }
 
+fn activation_revision_evidence(
+    evidence: EvidenceDigest,
+) -> Result<RevisionBoundPayloadEvidence, CliProviderActivationError> {
+    let digest = lower_hex(&evidence.bytes());
+    let short = digest
+        .get(..24)
+        .ok_or(CliProviderActivationError::InvalidMetadata)?;
+    let revision = MetadataRevision::new(
+        SourceIdentifier::try_from(format!("activation-{short}"))
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+    );
+    Ok(RevisionBoundPayloadEvidence::new(
+        revision,
+        ExactPayloadEvidence::from_content_digest(evidence),
+    ))
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "every parameter is an independent source-metadata authority dimension"
@@ -4423,6 +4444,7 @@ fn metadata(
 fn metadata_with_source_id(
     lease: &ProviderActivationLease,
     evidence: EvidenceDigest,
+    revision_evidence: RevisionBoundPayloadEvidence,
     source_id: SourceId,
     provider: &str,
     source_class: SourceClass,
@@ -4433,14 +4455,6 @@ fn metadata_with_source_id(
     network: EndpointPolicy,
     budget: ProviderBudgetPolicy,
 ) -> Result<SourceMetadata, CliProviderActivationError> {
-    let digest = lower_hex(&evidence.bytes());
-    let short = digest
-        .get(..24)
-        .ok_or(CliProviderActivationError::InvalidMetadata)?;
-    let revision = MetadataRevision::new(
-        SourceIdentifier::try_from(format!("activation-{short}"))
-            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
-    );
     let provider = SourceIdentifier::try_from(provider)
         .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
     let basis = match authorization_mode {
@@ -4457,7 +4471,7 @@ fn metadata_with_source_id(
     SourceMetadata::try_new(SourceMetadataInput::new(
         SchemaVersion::CURRENT,
         source_id,
-        RevisionBoundPayloadEvidence::new(revision, exact.clone()),
+        revision_evidence,
         source_class,
         provider,
         AuthorizationGrant::new(
@@ -5040,6 +5054,7 @@ fn federal_reserve_board_metadata(
     metadata_with_source_id(
         lease,
         evidence,
+        activation_revision_evidence(evidence)?,
         source_id,
         "federal-reserve-board",
         SourceClass::OfficialAgency,
@@ -6220,7 +6235,7 @@ mod tests {
             ),
             ("organization".to_owned(), "Market Squawk".to_owned()),
         ]))?;
-        prepared_lease(product, SEC_SURFACE, operation, configuration).await
+        prepared_lease(product, SEC_EDGAR_PROFILE_ID, operation, configuration).await
     }
 
     async fn prepared_anonymous_lease(

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use market_squawk_platform::SecretValue;
-use market_squawk_sources::ProfileReleaseState;
+use market_squawk_sources::{ProfileReleaseState, SEC_EDGAR_PROFILE_ID};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -79,7 +79,7 @@ const FRED_ALFRED_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     release_state: ProfileReleaseState::RightsLimited,
 };
 const SEC_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
-    surface_id: "sec.edgar-public",
+    surface_id: SEC_EDGAR_PROFILE_ID,
     capability_revision: 4,
     release_state: ProfileReleaseState::Available,
 };
