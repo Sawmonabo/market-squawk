@@ -87,7 +87,7 @@ The current `SourceMetadata` schema version is `1`. Its object is closed and con
 | `schema_version` | Supported `SchemaVersion`; unsupported versions are rejected |
 | `source_id` | Exact internal `SourceId` |
 | `revision_evidence` | Atomic metadata-revision and exact-payload evidence |
-| `source_class` | `exchange`, `broker`, `official_agency`, `regulatory_filing`, `local_file`, `portfolio_export`, `licensed_dataset`, or `on_chain` |
+| `source_class` | `exchange`, `broker`, `official_agency`, `regulatory_filing`, `standards_publisher`, `local_file`, `portfolio_export`, `licensed_dataset`, or `on_chain` |
 | `provider` | Bounded provider `SourceIdentifier` used in metadata and diagnostics |
 | `authorization` | Closed `AuthorizationGrant` |
 | `coverage` | Closed `SourceCoverage` declaration |
@@ -107,9 +107,10 @@ half-open effective interval `[start, end)`. Modes are:
 - `user_owned_local` for user-owned local input requiring no provider network access.
 
 Local-file and portfolio-export metadata must use `user_owned_local`, deny all network access, and
-have no provider budget. Remote exchange, broker, official-agency, regulatory-filing, and on-chain
-metadata must carry an endpoint allowlist and a shared provider budget. A budget's provider and
-account qualification must match the provider and authorization evidence.
+have no provider budget. Remote exchange, broker, official-agency, regulatory-filing,
+`StandardsPublisher`, and on-chain metadata must carry an endpoint allowlist and a shared provider
+budget. A budget's provider and account qualification must match the provider and authorization
+evidence.
 
 `FreshnessPolicy` has five nanosecond fields:
 `max_connection_idle_nanos`, `max_transport_age_nanos`, `max_source_age_nanos`,
