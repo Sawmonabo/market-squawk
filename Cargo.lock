@@ -4510,6 +4510,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures-util",
+ "market-squawk-data",
  "market-squawk-domain",
  "market-squawk-platform",
  "market-squawk-sources",

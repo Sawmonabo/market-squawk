@@ -8,19 +8,20 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
+use market_squawk_data::SqliteProviderRateStore;
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
     DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
     ResearchObservation, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId,
     SourceIdentifier, Timestamp,
 };
-use market_squawk_platform::LocalPaths;
+use market_squawk_platform::{LocalAuthorityStateStore, LocalPaths};
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, CoverageDomain,
     DiscoveryRequest, EndpointPolicy, ExtractionRequest, FreshnessPolicy, HistoricalCapability,
-    HttpRequestBounds, NetworkAccessPolicy, SourceCapabilities, SourceClass, SourceCoverage,
-    SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
+    HttpRequestBounds, NetworkAccessPolicy, ProviderRateAuthority, SourceCapabilities, SourceClass,
+    SourceCoverage, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
 };
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -159,9 +160,24 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
         Ok(_) => return Err("credential-bearing malformed fields must fail closed".into()),
         Err(error) => error,
     };
-    assert!(matches!(malformed_error, crate::BeaError::InvalidJson));
+    assert!(matches!(
+        malformed_error,
+        crate::BeaError::RequestEchoMismatch
+    ));
     assert!(!format!("{malformed_error}").contains(USER_ID));
     assert!(!format!("{malformed_error:?}").contains(USER_ID));
+    let escaped_echo = String::from_utf8(upstream_responses[0].to_vec())?
+        .replace(USER_ID, escaped_user_id.as_str());
+    let escaped_page = crate::parse_metadata_page(
+        escaped_echo.as_bytes(),
+        &malformed_request,
+        &user_id,
+        BeaParseLimits::production_defaults(),
+    )?;
+    assert_ne!(
+        escaped_page.receipt().upstream_response_digest(),
+        escaped_page.receipt().response_digest()
+    );
     let malicious_header = format!("{}?UserID={USER_ID}", crate::BEA_API_ENDPOINT);
     let mut malicious_response = BeaHttpResponse {
         status: 200,
@@ -203,13 +219,27 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
         digest_evidence(b"bea-test-credential-generation-v1"),
         transport.clone(),
     )?;
+    let temporary = TemporaryDirectory::new();
+    let paths = LocalPaths::prepare(temporary.path())?;
+    let authority_store = LocalAuthorityStateStore::try_open(
+        paths.control_root()?.root().join("bea-source-authority"),
+    )?;
+    let provider_rate =
+        ProviderRateAuthority::try_new(Arc::new(SqliteProviderRateStore::try_open(
+            paths
+                .control_root()?
+                .root()
+                .join("provider-rate-authority.sqlite3"),
+        )?))?;
     let mut registry =
-        AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
+        AuthoritativeSourceRegistry::try_new_durable_with_authorization_subject_resolver_and_provider_rate(
+            authority_store,
             Arc::new(TestSubjectResolver {
                 subject: market_squawk_sources::ProviderRateDeclaration::governed_provider_subject(
                     &SourceIdentifier::try_from("bea")?,
                 )?,
             }),
+            provider_rate,
         )?;
     let registered = registry.register(metadata, now)?;
     let authority = registry.extraction_authority(&registered, &source)?;
@@ -285,8 +315,6 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     assert!(!format!("{run:?}").contains(USER_ID));
     assert!(!format!("{run:?}").contains(crate::BEA_API_ENDPOINT));
     let (pending_doctor, doctor_seal_request) = run.into_sealing_parts()?;
-    let temporary = TemporaryDirectory::new();
-    let paths = LocalPaths::prepare(temporary.path())?;
     let store = paths.sealed_research_journal_store()?;
     let admission = Arc::new(
         pending_doctor.try_rejoin(source.source_binding(), doctor_seal_request.seal(&store)?)?,
@@ -441,6 +469,7 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             .map_err(|_| "poisoned scripted response queue")?
             .is_empty()
     );
+    registry.shutdown()?;
     Ok(())
 }
 

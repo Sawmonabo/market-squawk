@@ -396,7 +396,7 @@ fn sanitize_borrowed_response(
     sanitize_response_body(BeaSensitiveBody::from_vec(owned), request, user_id, limits)
 }
 
-/// Replaces the sole literal `UserID` before structurally validating the sanitized response.
+/// Replaces the sole decoded `UserID` before structurally validating the sanitized response.
 pub(crate) fn sanitize_response_body(
     body: BeaSensitiveBody,
     request: &BeaRequest,
@@ -409,21 +409,15 @@ pub(crate) fn sanitize_response_body(
     let mut original = body.into_zeroizing();
     let upstream_digest = Sha256::digest(original.as_slice()).into();
     let secret = user_id.expose_secret().as_bytes();
-    if original
-        .windows(BEA_REDACTED_USER_ID.len())
-        .any(|candidate| candidate == BEA_REDACTED_USER_ID)
-    {
+    if find_json_string_sequence(original.as_slice(), BEA_REDACTED_USER_ID)?.is_some() {
         return Err(BeaError::RequestEchoMismatch);
     }
-    let mut matches = original
-        .windows(secret.len())
-        .enumerate()
-        .filter_map(|(offset, candidate)| (candidate == secret).then_some(offset));
-    let offset = matches.next().ok_or(BeaError::RequestEchoMismatch)?;
-    if matches.next().is_some() {
+    let occurrence = find_json_string_sequence(original.as_slice(), secret)?
+        .ok_or(BeaError::RequestEchoMismatch)?;
+    if occurrence.multiple {
         return Err(BeaError::RequestEchoMismatch);
     }
-    original[offset..offset + secret.len()].copy_from_slice(BEA_REDACTED_USER_ID);
+    redact_json_string_sequence(original.as_mut_slice(), occurrence.offset, secret)?;
     let mut wire: EnvelopeWire =
         serde_json::from_slice(original.as_slice()).map_err(|_| BeaError::InvalidJson)?;
     if wire.bea_api.request.request_parameters.len() > 64 {
@@ -455,6 +449,141 @@ pub(crate) fn sanitize_response_body(
         sanitized,
         upstream_digest,
     ))
+}
+
+#[derive(Clone, Copy)]
+struct JsonStringSequenceOccurrence {
+    offset: usize,
+    multiple: bool,
+}
+
+/// Finds a decoded ASCII sequence without allocating any decoded JSON string.
+///
+/// BEA normally echoes `UserID` as literal unreserved ASCII, but JSON permits the same value to
+/// arrive through `\u00XX` escapes. A general-purpose parser would allocate that decoded secret
+/// before the adapter could redact it. This lexical pass recognizes literal, escaped, and mixed
+/// spellings inside JSON strings, so every complete credential copy is rejected or overwritten
+/// while the response is still held only by zeroizing storage.
+fn find_json_string_sequence(
+    body: &[u8],
+    sequence: &[u8],
+) -> Result<Option<JsonStringSequenceOccurrence>, BeaError> {
+    if sequence.is_empty() || !sequence.is_ascii() {
+        return Err(BeaError::InvalidJson);
+    }
+    let mut index = 0_usize;
+    let mut in_string = false;
+    let mut occurrence: Option<JsonStringSequenceOccurrence> = None;
+    while index < body.len() {
+        if !in_string {
+            if body[index] == b'"' {
+                in_string = true;
+            }
+            index = index.checked_add(1).ok_or(BeaError::InvalidJson)?;
+            continue;
+        }
+        if body[index] == b'"' {
+            in_string = false;
+            index = index.checked_add(1).ok_or(BeaError::InvalidJson)?;
+            continue;
+        }
+        let (decoded, next) = json_string_ascii_unit(body, index)?;
+        if decoded == Some(sequence[0])
+            && json_string_sequence_end(body, index, sequence)?.is_some()
+        {
+            if let Some(found) = occurrence.as_mut() {
+                found.multiple = true;
+            } else {
+                occurrence = Some(JsonStringSequenceOccurrence {
+                    offset: index,
+                    multiple: false,
+                });
+            }
+        }
+        // Advance by one decoded unit so overlapping occurrences cannot evade the count.
+        index = next;
+    }
+    if in_string {
+        return Err(BeaError::InvalidJson);
+    }
+    Ok(occurrence)
+}
+
+fn json_string_sequence_end(
+    body: &[u8],
+    mut index: usize,
+    sequence: &[u8],
+) -> Result<Option<usize>, BeaError> {
+    for expected in sequence {
+        if body.get(index) == Some(&b'"') {
+            return Ok(None);
+        }
+        let (decoded, next) = json_string_ascii_unit(body, index)?;
+        if decoded != Some(*expected) {
+            return Ok(None);
+        }
+        index = next;
+    }
+    Ok(Some(index))
+}
+
+fn json_string_ascii_unit(body: &[u8], index: usize) -> Result<(Option<u8>, usize), BeaError> {
+    let byte = *body.get(index).ok_or(BeaError::InvalidJson)?;
+    if byte == b'"' || byte < 0x20 {
+        return Err(BeaError::InvalidJson);
+    }
+    if byte != b'\\' {
+        return Ok((byte.is_ascii().then_some(byte), index + 1));
+    }
+    let escape = *body.get(index + 1).ok_or(BeaError::InvalidJson)?;
+    if escape != b'u' {
+        let decoded = match escape {
+            b'"' => Some(b'"'),
+            b'\\' => Some(b'\\'),
+            b'/' => Some(b'/'),
+            b'b' | b'f' | b'n' | b'r' | b't' => None,
+            _ => return Err(BeaError::InvalidJson),
+        };
+        return Ok((decoded, index + 2));
+    }
+    let digits = body
+        .get(index + 2..index + 6)
+        .ok_or(BeaError::InvalidJson)?;
+    let codepoint = digits.iter().try_fold(0_u16, |value, digit| {
+        hex_digit(*digit)
+            .map(|digit| (value << 4) | u16::from(digit))
+            .ok_or(BeaError::InvalidJson)
+    })?;
+    Ok((u8::try_from(codepoint).ok().filter(u8::is_ascii), index + 6))
+}
+
+fn redact_json_string_sequence(
+    body: &mut [u8],
+    mut index: usize,
+    sequence: &[u8],
+) -> Result<(), BeaError> {
+    for expected in sequence {
+        let (decoded, next) = json_string_ascii_unit(body, index)?;
+        if decoded != Some(*expected) {
+            return Err(BeaError::RequestEchoMismatch);
+        }
+        if body[index] == b'\\' {
+            body[index + 2..index + 6].copy_from_slice(b"002a");
+        } else {
+            body[index] = b'*';
+        }
+        index = next;
+    }
+    Ok(())
+}
+
+fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Removes every decoded result-field occurrence before rejecting an unexpected credential echo.

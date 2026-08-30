@@ -28,5 +28,8 @@ url.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+market-squawk-data.workspace = true
+
 [lints]
 workspace = true
