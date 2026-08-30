@@ -22,7 +22,7 @@ use crate::contracts::{
 use crate::manifest::{
     AdmittedRelease, MAXIMUM_ARCHIVE_BYTES, MAXIMUM_MANIFEST_BYTES, ManifestError, ReleaseManifest,
 };
-use crate::platform::ProgramName;
+use crate::platform::{NativeTrustMode, ProgramName};
 use crate::service_registration::{
     RegistrationSpec, ServiceRegistrationError, activate_and_verify as activate_registration,
     remove_owned as remove_owned_registration,
@@ -351,6 +351,28 @@ pub fn active_release_root(root: &Path) -> Result<PathBuf, InstallError> {
     let active = store.version_path(&state.active);
     verify_installed_tree(&active, &state.active.components)?;
     Ok(active)
+}
+
+/// Returns the native publisher-trust mode from the exact retained active release.
+///
+/// The active tree, stable entrypoints, selector, and sealed cached manifest are revalidated while
+/// the installer lock is held. A caller must separately establish that its running executable
+/// belongs to this installation before treating the result as process authority.
+///
+/// # Errors
+///
+/// Fails when the installation is absent, targets another platform, or any retained release
+/// evidence is inconsistent.
+pub fn active_native_trust_mode(root: &Path) -> Result<NativeTrustMode, InstallError> {
+    let store = InstallStore::open_existing(root)?.ok_or(InstallError::NotInstalled)?;
+    recover_pending_activation(&store)?;
+    let state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
+    if state.active.target != crate::platform::SupportedTarget::current()? {
+        return Err(InstallError::CorruptInstallation);
+    }
+    verify_installed_tree(&store.version_path(&state.active), &state.active.components)?;
+    verify_stable_programs(&store, &state)?;
+    Ok(read_cached_manifest(&store, &state.active)?.native_trust_mode())
 }
 
 /// Resolves the active release root for a verified installed program path.
@@ -1235,15 +1257,30 @@ fn read_cached_release(
     store: &InstallStore,
     version: &StoredVersion,
 ) -> Result<AdmittedRelease, InstallError> {
+    let release = read_cached_manifest(store, version)?;
     let directory = store.release_path(&version.manifest_sha256);
-    let bytes = read_bounded_file(
-        &directory.join(CACHED_MANIFEST_FILE),
-        MAXIMUM_MANIFEST_BYTES,
-    )?;
-    if sha256_file(
-        &directory.join(CACHED_MANIFEST_FILE),
-        MAXIMUM_MANIFEST_BYTES as u64,
-    )? != version.manifest_sha256.as_ref()
+    verify_cached_release(&directory, &release)?;
+    Ok(release)
+}
+
+fn read_cached_manifest(
+    store: &InstallStore,
+    version: &StoredVersion,
+) -> Result<AdmittedRelease, InstallError> {
+    let directory = store.release_path(&version.manifest_sha256);
+    let metadata = fs::symlink_metadata(&directory).map_err(|source| InstallError::Io {
+        operation: "inspect retained release directory",
+        source,
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(InstallError::CorruptInstallation);
+    }
+    verify_cache_directory_sealed(&directory)?;
+    let manifest_path = directory.join(CACHED_MANIFEST_FILE);
+    verify_cache_file_sealed(&manifest_path)?;
+    let bytes = read_bounded_file(&manifest_path, MAXIMUM_MANIFEST_BYTES)?;
+    if sha256_file(&manifest_path, MAXIMUM_MANIFEST_BYTES as u64)?
+        != version.manifest_sha256.as_ref()
     {
         return Err(InstallError::CorruptInstallation);
     }
@@ -1255,7 +1292,6 @@ fn read_cached_release(
     {
         return Err(InstallError::CorruptInstallation);
     }
-    verify_cached_release(&directory, &release)?;
     Ok(release)
 }
 

@@ -15,15 +15,20 @@ use clap::Parser;
 use market_squawk::{
     AppConfig,
     service::{
-        EphemeralVerificationRoot, InstalledService, InstalledServiceLogging,
-        InstalledServiceRunOutcome, TerminalLogFormat,
+        EphemeralVerificationRoot, InstalledSecretBackendPolicy, InstalledService,
+        InstalledServiceLogging, InstalledServiceRunOutcome, TerminalLogFormat,
+        complete_foreground_keyring_bootstrap_at_installation_root,
     },
     termination::TerminationSignals,
 };
 use market_squawk_installer::default_installation_data_root;
+#[cfg(target_os = "macos")]
+use market_squawk_installer::{
+    NativeTrustMode, ProgramName, active_native_trust_mode, installation_root_for_installed_program,
+};
 use market_squawk_platform::{ConfigOverrides, ConfigSources};
 use market_squawk_runtime::{
-    ServiceStartupEvidenceWriter, ServiceStartupPhase, ServiceStartupState,
+    InstallationId, ServiceStartupEvidenceWriter, ServiceStartupPhase, ServiceStartupState,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -55,6 +60,15 @@ struct ServiceArguments {
     /// Render local tracing as JSON.
     #[arg(long)]
     json_logs: bool,
+    /// Complete one exact foreground credential handoff, then exit.
+    #[arg(long, hide = true)]
+    foreground_keyring_broker: bool,
+    /// Exact installation identity captured from the short-lived bootstrap channel.
+    #[arg(long, hide = true, requires = "foreground_keyring_broker")]
+    bootstrap_installation_id: Option<uuid::Uuid>,
+    /// Exact anti-replay generation captured from the short-lived bootstrap channel.
+    #[arg(long, hide = true, requires = "foreground_keyring_broker")]
+    bootstrap_generation: Option<u64>,
 }
 
 fn main() -> ExitCode {
@@ -99,6 +113,13 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
         .installation_data_root
         .clone()
         .map_or_else(default_installation_data_root, Ok)?;
+    if arguments.foreground_keyring_broker {
+        return run_foreground_keyring_broker(&arguments, &installation_data_root)
+            .await
+            .map(|()| InstalledServiceRunOutcome::Stopped)
+            .map_err(|_error| anyhow::anyhow!("secure startup could not be completed"));
+    }
+    let secret_backend_policy = installed_secret_backend_policy()?;
     let ephemeral_verification_root = if arguments.ephemeral_verification_credentials {
         Some(EphemeralVerificationRoot::try_new(&installation_data_root)?)
     } else {
@@ -164,6 +185,7 @@ async fn run() -> Result<InstalledServiceRunOutcome> {
         logging.store(),
         &installation_data_root,
         ephemeral_verification_root,
+        secret_backend_policy,
         startup.as_ref(),
     )
     .await;
@@ -193,6 +215,7 @@ async fn run_installed_service(
     logs: std::sync::Arc<market_squawk::application::logs::StructuredLogStore>,
     installation_data_root: &Path,
     ephemeral_verification_root: Option<EphemeralVerificationRoot>,
+    secret_backend_policy: InstalledSecretBackendPolicy,
     startup: Option<&ServiceStartupEvidenceWriter>,
 ) -> Result<InstalledServiceRunOutcome> {
     publish_startup(
@@ -218,6 +241,7 @@ async fn run_installed_service(
                     config,
                     ephemeral_root,
                     logs,
+                    secret_backend_policy,
                 )
                 .await
             }
@@ -226,6 +250,7 @@ async fn run_installed_service(
                     config,
                     installation_data_root,
                     logs,
+                    secret_backend_policy,
                 )
                     .await
             }
@@ -303,6 +328,59 @@ async fn run_installed_service(
             Ok(outcome)
         }
         Err(error) => fail_startup(startup, ServiceStartupPhase::Serving, error),
+    }
+}
+
+async fn run_foreground_keyring_broker(
+    arguments: &ServiceArguments,
+    installation_data_root: &Path,
+) -> Result<()> {
+    if installed_secret_backend_policy()? != InstalledSecretBackendPolicy::PlatformKeyring
+        || arguments.ephemeral_verification_credentials
+        || arguments.data_dir.is_some()
+        || arguments.config.is_some()
+        || arguments.training_release_root.is_some()
+        || arguments.json_logs
+    {
+        anyhow::bail!("invalid secure-startup broker invocation");
+    }
+    let installation_id = arguments
+        .bootstrap_installation_id
+        .ok_or_else(|| anyhow::anyhow!("missing secure-startup identity"))?;
+    let installation_id = InstallationId::try_from_uuid(installation_id)?;
+    let generation = arguments
+        .bootstrap_generation
+        .filter(|generation| *generation != 0)
+        .ok_or_else(|| anyhow::anyhow!("missing secure-startup generation"))?;
+    complete_foreground_keyring_bootstrap_at_installation_root(
+        installation_data_root,
+        installation_id,
+        generation,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+fn installed_secret_backend_policy() -> Result<InstalledSecretBackendPolicy> {
+    #[cfg(target_os = "macos")]
+    {
+        let executable = std::env::current_exe()?;
+        let Some(root) =
+            installation_root_for_installed_program(&executable, ProgramName::Service)?
+        else {
+            return Ok(InstalledSecretBackendPolicy::EncryptedFileOnly);
+        };
+        return Ok(
+            if active_native_trust_mode(&root)? == NativeTrustMode::DeveloperIdSignedAndNotarized {
+                InstalledSecretBackendPolicy::PlatformKeyring
+            } else {
+                InstalledSecretBackendPolicy::EncryptedFileOnly
+            },
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(InstalledSecretBackendPolicy::PlatformKeyring)
     }
 }
 

@@ -32,6 +32,7 @@ mod workspace_selector;
 
 use std::{
     path::{Path, PathBuf},
+    process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -126,10 +127,21 @@ const GRACEFUL_REQUEST_DRAIN: Duration = Duration::from_secs(5);
 const FORCED_REQUEST_DRAIN: Duration = Duration::from_secs(2);
 const JOB_RUNNER_DRAIN: Duration = Duration::from_secs(15);
 const EPHEMERAL_CREDENTIAL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+const FOREGROUND_KEYRING_BROKER_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const FOREGROUND_KEYRING_BROKER_KILL_TIMEOUT: Duration = Duration::from_secs(5);
 const MCP_CLIENT_REQUESTS: usize = 4;
 const TAURI_ORIGINS: [&str; 2] = ["tauri://localhost", "http://tauri.localhost"];
 
 pub use runtime::SystemProcessIdentityVerifier;
+
+/// Fixed secret-backend selection established before installed-service composition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstalledSecretBackendPolicy {
+    /// Admit the platform keyring, with encrypted-file fallback when the platform is unavailable.
+    PlatformKeyring,
+    /// Admit only the explicitly unlocked encrypted-file store.
+    EncryptedFileOnly,
+}
 
 /// One fresh, absolute, non-default installation root authorized for destructive verification
 /// credential cleanup.
@@ -256,32 +268,6 @@ impl InstalledServiceConnector {
         bootstrap::unlock(&self.paths, captured_status, unlock).await
     }
 
-    /// Supplies the exact protected runtime credential from this foreground native owner.
-    pub async fn bootstrap_foreground_keyring(
-        &self,
-        captured_status: InstalledServiceBootstrapStatus,
-    ) -> Result<InstalledServiceBootstrapStatus, InstalledServiceError> {
-        if captured_status.state() != InstalledServiceBootstrapState::Required
-            || captured_status.requirement()
-                != Some(BootstrapRequirement::ForegroundKeyringCredential)
-            || captured_status.generation() == 0
-        {
-            return Err(InstalledServiceError::BootstrapRejected);
-        }
-        let installation_id = runtime::installation_id(&self.paths)?
-            .ok_or(InstalledServiceError::InvalidRuntimeState)?;
-        if captured_status.installation_id() != installation_id {
-            return Err(InstalledServiceError::BootstrapRejected);
-        }
-        let secret_store = runtime_secret_store(&self.paths)?;
-        let foreground = runtime::prepare_foreground_runtime_credential(
-            &self.paths,
-            secret_store.as_ref(),
-            installation_id,
-        )?;
-        bootstrap::provide_foreground_credential(&self.paths, captured_status, foreground).await
-    }
-
     /// Applies one explicit native Schwab callback-trust action to this installation.
     pub async fn schwab_oauth_installation_trust(
         &self,
@@ -317,6 +303,92 @@ impl InstalledServiceConnector {
         )
         .map_err(|_error| InstalledServiceError::InvalidComposition)?;
         Ok(Arc::new(transport))
+    }
+}
+
+/// Completes one exact foreground keyring handoff from the installed service executable.
+///
+/// This hidden process boundary exists for the service binary's bounded one-shot broker mode.
+/// Native launchers supply only the secret-free anti-replay identity captured from bootstrap
+/// status; the service process remains the sole reader of the protected credential.
+#[doc(hidden)]
+pub async fn complete_foreground_keyring_bootstrap_at_installation_root(
+    installation_root: impl AsRef<Path>,
+    expected_installation_id: InstallationId,
+    expected_generation: u64,
+) -> Result<(), InstalledServiceError> {
+    if expected_generation == 0 {
+        return Err(InstalledServiceError::BootstrapRejected);
+    }
+    let paths = prepare_installation_paths(installation_root.as_ref())?;
+    let captured_status = bootstrap::status(&paths).await?;
+    if captured_status.state() != InstalledServiceBootstrapState::Required
+        || captured_status.requirement() != Some(BootstrapRequirement::ForegroundKeyringCredential)
+        || captured_status.installation_id() != expected_installation_id
+        || captured_status.generation() != expected_generation
+    {
+        return Err(InstalledServiceError::BootstrapRejected);
+    }
+    let installation_id =
+        runtime::installation_id(&paths)?.ok_or(InstalledServiceError::InvalidRuntimeState)?;
+    if installation_id != expected_installation_id {
+        return Err(InstalledServiceError::BootstrapRejected);
+    }
+    let secret_store = runtime_secret_store(&paths, InstalledSecretBackendPolicy::PlatformKeyring)?;
+    let foreground = runtime::prepare_foreground_runtime_credential(
+        &paths,
+        secret_store.as_ref(),
+        installation_id,
+    )?;
+    let status =
+        bootstrap::provide_foreground_credential(&paths, captured_status, foreground).await?;
+    if status.state() != InstalledServiceBootstrapState::Retrying || status.requirement().is_some()
+    {
+        return Err(InstalledServiceError::BootstrapRejected);
+    }
+    Ok(())
+}
+
+/// Launches and bounds the exact installed service sibling's one-shot foreground broker.
+#[doc(hidden)]
+pub async fn launch_foreground_keyring_broker(
+    installation_root: impl AsRef<Path>,
+    captured_status: InstalledServiceBootstrapStatus,
+) -> Result<(), InstalledServiceError> {
+    if captured_status.state() != InstalledServiceBootstrapState::Required
+        || captured_status.requirement() != Some(BootstrapRequirement::ForegroundKeyringCredential)
+        || captured_status.generation() == 0
+    {
+        return Err(InstalledServiceError::BootstrapRejected);
+    }
+    let program = crate::verified_installed_service_program()
+        .map_err(|_error| InstalledServiceError::InvalidComposition)?;
+    let mut command = tokio::process::Command::new(program);
+    command
+        .env_remove("MARKET_SQUAWK_DEVELOPMENT_SERVICE_PROGRAM")
+        .env_remove("MARKET_SQUAWK_DEVELOPMENT_MCP_RELAY_PROGRAM")
+        .arg("--foreground-keyring-broker")
+        .arg("--installation-data-root")
+        .arg(installation_root.as_ref())
+        .arg("--bootstrap-installation-id")
+        .arg(captured_status.installation_id().as_uuid().to_string())
+        .arg("--bootstrap-generation")
+        .arg(captured_status.generation().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn()?;
+    match tokio::time::timeout(FOREGROUND_KEYRING_BROKER_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(_status)) => Err(InstalledServiceError::BootstrapRejected),
+        Ok(Err(error)) => Err(error.into()),
+        Err(_elapsed) => {
+            child.start_kill()?;
+            let _reaped =
+                tokio::time::timeout(FOREGROUND_KEYRING_BROKER_KILL_TIMEOUT, child.wait()).await;
+            Err(InstalledServiceError::BootstrapDeadline)
+        }
     }
 }
 
@@ -371,7 +443,13 @@ impl InstalledService {
     ) -> Result<Self, InstalledServiceError> {
         let installation_paths = prepare_installation_paths(installation_root.as_ref())?;
         let logs = logging::open_log_store(&installation_paths)?;
-        Self::start_with_logging_store_at_prepared_root(config, installation_paths, logs).await
+        Self::start_with_logging_store_at_prepared_root(
+            config,
+            installation_paths,
+            logs,
+            InstalledSecretBackendPolicy::PlatformKeyring,
+        )
+        .await
     }
 
     /// Composes the installed service over the process-owned structured-log store.
@@ -380,7 +458,13 @@ impl InstalledService {
         logs: Arc<crate::application::logs::StructuredLogStore>,
     ) -> Result<Self, InstalledServiceError> {
         let installation_paths = LocalPaths::prepare(default_installation_data_root()?)?;
-        Self::start_with_logging_store_at_prepared_root(config, installation_paths, logs).await
+        Self::start_with_logging_store_at_prepared_root(
+            config,
+            installation_paths,
+            logs,
+            InstalledSecretBackendPolicy::PlatformKeyring,
+        )
+        .await
     }
 
     /// Composes the service with process-owned logging at an explicit installation root.
@@ -388,18 +472,26 @@ impl InstalledService {
         config: AppConfig,
         installation_root: impl AsRef<Path>,
         logs: Arc<crate::application::logs::StructuredLogStore>,
+        secret_backend_policy: InstalledSecretBackendPolicy,
     ) -> Result<Self, InstalledServiceError> {
         let installation_paths = prepare_installation_paths(installation_root.as_ref())?;
-        Self::start_with_logging_store_at_prepared_root(config, installation_paths, logs).await
+        Self::start_with_logging_store_at_prepared_root(
+            config,
+            installation_paths,
+            logs,
+            secret_backend_policy,
+        )
+        .await
     }
 
     async fn start_with_logging_store_at_prepared_root(
         config: AppConfig,
         installation_paths: LocalPaths,
         logs: Arc<crate::application::logs::StructuredLogStore>,
+        secret_backend_policy: InstalledSecretBackendPolicy,
     ) -> Result<Self, InstalledServiceError> {
         let workspace_paths = LocalPaths::prepare(config.data_dir())?;
-        let secret_store = runtime_secret_store(&installation_paths)?;
+        let secret_store = runtime_secret_store(&installation_paths, secret_backend_policy)?;
         Self::start_prepared(
             config,
             installation_paths,
@@ -407,6 +499,7 @@ impl InstalledService {
             secret_store,
             logs,
             false,
+            secret_backend_policy,
         )
         .await
     }
@@ -430,6 +523,7 @@ impl InstalledService {
             secret_store,
             logs,
             false,
+            InstalledSecretBackendPolicy::PlatformKeyring,
         )
         .await
     }
@@ -455,6 +549,7 @@ impl InstalledService {
             workspace_paths,
             secret_store,
             logs,
+            InstalledSecretBackendPolicy::PlatformKeyring,
             board_fixture,
         )
         .await
@@ -467,10 +562,11 @@ impl InstalledService {
         config: AppConfig,
         installation_root: EphemeralVerificationRoot,
         logs: Arc<crate::application::logs::StructuredLogStore>,
+        secret_backend_policy: InstalledSecretBackendPolicy,
     ) -> Result<Self, InstalledServiceError> {
         let installation_paths = prepare_installation_paths(installation_root.as_path())?;
         let workspace_paths = LocalPaths::prepare(config.data_dir())?;
-        let secret_store = runtime_secret_store(&installation_paths)?;
+        let secret_store = runtime_secret_store(&installation_paths, secret_backend_policy)?;
         Self::start_prepared(
             config,
             installation_paths,
@@ -478,6 +574,7 @@ impl InstalledService {
             secret_store,
             logs,
             true,
+            secret_backend_policy,
         )
         .await
     }
@@ -489,6 +586,7 @@ impl InstalledService {
         secret_store: Arc<dyn SecretStore>,
         logs: Arc<crate::application::logs::StructuredLogStore>,
         ephemeral_verification_credentials: bool,
+        secret_backend_policy: InstalledSecretBackendPolicy,
     ) -> Result<Self, InstalledServiceError> {
         Self::start_prepared_inner(
             config,
@@ -497,6 +595,7 @@ impl InstalledService {
             secret_store,
             logs,
             ephemeral_verification_credentials,
+            secret_backend_policy,
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
             None,
         )
@@ -510,6 +609,7 @@ impl InstalledService {
         legacy_workspace_paths: LocalPaths,
         secret_store: Arc<dyn SecretStore>,
         logs: Arc<crate::application::logs::StructuredLogStore>,
+        secret_backend_policy: InstalledSecretBackendPolicy,
         board_fixture: BoardInstalledFixtureBundle,
     ) -> Result<Self, InstalledServiceError> {
         Self::start_prepared_inner(
@@ -519,6 +619,7 @@ impl InstalledService {
             secret_store,
             logs,
             false,
+            secret_backend_policy,
             Some(board_fixture),
         )
         .await
@@ -531,6 +632,7 @@ impl InstalledService {
         secret_store: Arc<dyn SecretStore>,
         logs: Arc<crate::application::logs::StructuredLogStore>,
         ephemeral_verification_credentials: bool,
+        secret_backend_policy: InstalledSecretBackendPolicy,
         #[cfg(all(feature = "board-installed-fixture", debug_assertions))] board_fixture: Option<
             BoardInstalledFixtureBundle,
         >,
@@ -620,6 +722,7 @@ impl InstalledService {
                     &selected_workspace_guard,
                     &installation_paths,
                     installation_id,
+                    secret_backend_policy,
                     fixture,
                 )?,
                 None => LocalProduct::try_new_at_selected_workspace(
@@ -627,6 +730,7 @@ impl InstalledService {
                     &selected_workspace_guard,
                     &installation_paths,
                     installation_id,
+                    secret_backend_policy,
                 )?,
             };
             #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
@@ -635,6 +739,7 @@ impl InstalledService {
                 &selected_workspace_guard,
                 &installation_paths,
                 installation_id,
+                secret_backend_policy,
             )?;
             let provider_capture_recovery = CancellationToken::new();
             let research = product.research();
@@ -1351,15 +1456,22 @@ async fn shutdown_application(application: Arc<crate::application::Application>)
     report.is_complete()
 }
 
-fn runtime_secret_store(paths: &LocalPaths) -> Result<Arc<dyn SecretStore>, InstalledServiceError> {
+fn runtime_secret_store(
+    paths: &LocalPaths,
+    policy: InstalledSecretBackendPolicy,
+) -> Result<Arc<dyn SecretStore>, InstalledServiceError> {
     let namespace = runtime_secret_namespace(paths)?;
-    Ok(Arc::new(
-        PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
-            &namespace,
-            paths.control_root()?.root().join(RUNTIME_SECRET_DIRECTORY),
-        )
-        .map_err(|_error| InstalledServiceError::SecretStore)?,
-    ))
+    let root = paths.control_root()?.root().join(RUNTIME_SECRET_DIRECTORY);
+    let store = match policy {
+        InstalledSecretBackendPolicy::PlatformKeyring => {
+            PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(&namespace, root)
+        }
+        InstalledSecretBackendPolicy::EncryptedFileOnly => {
+            PreferredSecretStore::try_new_with_locked_encrypted_file(root)
+        }
+    }
+    .map_err(|_error| InstalledServiceError::SecretStore)?;
+    Ok(Arc::new(store))
 }
 
 fn canonical_candidate(path: &Path) -> Result<PathBuf, InstalledServiceError> {

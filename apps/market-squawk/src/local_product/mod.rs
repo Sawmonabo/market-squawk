@@ -139,6 +139,7 @@ use crate::provider_onboarding::{
     SchwabOAuthRuntime, SchwabOAuthRuntimeConfiguration,
 };
 use crate::provider_rate::open_provider_rate_authority;
+use crate::service::InstalledSecretBackendPolicy;
 use crate::{
     AppConfig, PortfolioApplicationLimits, PortfolioApplicationService,
     PortfolioApplicationServiceError, ProviderAdapterActivation, ProviderOnboardingError,
@@ -541,6 +542,7 @@ impl LocalProduct {
         selected_workspace: &InstalledServiceSelectedWorkspaceGuard,
         installation_paths: &LocalPaths,
         installation_id: InstallationId,
+        secret_backend_policy: InstalledSecretBackendPolicy,
     ) -> Result<Self, LocalProductError> {
         Self::try_new_with_paths_and_prepublished_research_sources(
             config,
@@ -551,6 +553,7 @@ impl LocalProduct {
                 paths: installation_paths.clone(),
                 installation_id,
             }),
+            secret_backend_policy,
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
             None,
         )
@@ -562,6 +565,7 @@ impl LocalProduct {
         selected_workspace: &InstalledServiceSelectedWorkspaceGuard,
         installation_paths: &LocalPaths,
         installation_id: InstallationId,
+        secret_backend_policy: InstalledSecretBackendPolicy,
         board_fixture: BoardInstalledFixtureBundle,
     ) -> Result<Self, LocalProductError> {
         Self::try_new_with_paths_and_prepublished_research_sources(
@@ -573,6 +577,7 @@ impl LocalProduct {
                 paths: installation_paths.clone(),
                 installation_id,
             }),
+            secret_backend_policy,
             Some(board_fixture),
         )
     }
@@ -600,6 +605,7 @@ impl LocalProduct {
             registrations,
             SourceAuthorityStartupPolicy::RejectUncleanPredecessor,
             None,
+            InstalledSecretBackendPolicy::PlatformKeyring,
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
             None,
         )
@@ -611,6 +617,7 @@ impl LocalProduct {
         registrations: I,
         source_authority_startup_policy: SourceAuthorityStartupPolicy<'_>,
         schwab_oauth_installation: Option<SchwabOAuthInstallationContext>,
+        secret_backend_policy: InstalledSecretBackendPolicy,
         #[cfg(all(feature = "board-installed-fixture", debug_assertions))] board_fixture: Option<
             BoardInstalledFixtureBundle,
         >,
@@ -707,12 +714,18 @@ impl LocalProduct {
                 registrations,
             )?;
 
-        let secrets = Arc::new(
-            PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
-                "market-squawk",
-                paths.control_root()?.root().join(PROVIDER_SECRET_DIRECTORY),
-            )?,
-        );
+        let provider_secret_root = paths.control_root()?.root().join(PROVIDER_SECRET_DIRECTORY);
+        let secrets = Arc::new(match secret_backend_policy {
+            InstalledSecretBackendPolicy::PlatformKeyring => {
+                PreferredSecretStore::try_new_with_locked_encrypted_file_fallback(
+                    "market-squawk",
+                    provider_secret_root,
+                )?
+            }
+            InstalledSecretBackendPolicy::EncryptedFileOnly => {
+                PreferredSecretStore::try_new_with_locked_encrypted_file(provider_secret_root)?
+            }
+        });
         let provider_activation_state =
             DurableProviderActivationState::new(paths.control_root()?.root().to_path_buf());
         let runtime_admissions = provider_activation_state.startup_runtime_admissions()?;

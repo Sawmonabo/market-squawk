@@ -14,7 +14,7 @@ use market_squawk::{
     SchwabOAuthInstallationTrustState,
     service::{
         BootstrapRequirement, InstalledServiceBootstrapState, InstalledServiceBootstrapStatus,
-        InstalledServiceConnector, InstalledServiceError,
+        InstalledServiceConnector, InstalledServiceError, launch_foreground_keyring_broker,
     },
     verified_installed_service_program,
 };
@@ -271,26 +271,28 @@ pub(crate) async fn complete_bootstrap(
         .requirement()
         .ok_or(DesktopServiceError::InvalidBootstrap)?;
     let action = admit_bootstrap_action(requirement, action)?;
-    let status = match action {
+    match action {
         DesktopBootstrapAction::Unlock(unlock) => {
-            bootstrap
+            let status = bootstrap
                 .authority
                 .connector
                 .bootstrap_unlock(bootstrap.status, unlock)
                 .await
+                .map_err(|_error| DesktopServiceError::InvalidBootstrap)?;
+            if status.state() != InstalledServiceBootstrapState::Retrying
+                || status.requirement().is_some()
+            {
+                return Err(DesktopServiceError::InvalidBootstrap);
+            }
         }
         DesktopBootstrapAction::CompleteForegroundKeyring => {
-            bootstrap
-                .authority
-                .connector
-                .bootstrap_foreground_keyring(bootstrap.status)
-                .await
+            launch_foreground_keyring_broker(
+                &bootstrap.authority.launch.installation_data_root,
+                bootstrap.status,
+            )
+            .await
+            .map_err(|_error| DesktopServiceError::InvalidBootstrap)?;
         }
-    }
-    .map_err(|_error| DesktopServiceError::InvalidBootstrap)?;
-    if status.state() != InstalledServiceBootstrapState::Retrying || status.requirement().is_some()
-    {
-        return Err(DesktopServiceError::InvalidBootstrap);
     }
     connect_until_ready(&bootstrap.authority, FOREGROUND_BOOTSTRAP_TIMEOUT).await
 }

@@ -17,9 +17,10 @@ pub use self::contracts::{
     RepairRequest, RollbackRequest, UninstallReceipt, UninstallRequest, UpdateRequest,
 };
 pub use self::lifecycle::{
-    InstallActivationRecoveryFailure, InstallError, active_program_path, active_release_root,
-    active_release_root_for_installed_program, install, installation_root_for_installed_program,
-    program_install_snapshot, repair, rollback, stable_program_path, status, uninstall, update,
+    InstallActivationRecoveryFailure, InstallError, active_native_trust_mode, active_program_path,
+    active_release_root, active_release_root_for_installed_program, install,
+    installation_root_for_installed_program, program_install_snapshot, repair, rollback,
+    stable_program_path, status, uninstall, update,
 };
 pub use self::manifest::{
     AdmittedRelease, ComponentRole, MAXIMUM_MANIFEST_BYTES, ManifestError, ReleaseManifest,

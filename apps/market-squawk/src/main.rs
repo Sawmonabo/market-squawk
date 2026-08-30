@@ -24,7 +24,7 @@ use market_squawk::{
     local_product::{execute_installed_cli_command, verified_installed_service_program},
     release::execute_release_command,
     replay::replay_coinbase_journal,
-    service::InstalledServiceConnector,
+    service::{InstalledServiceConnector, launch_foreground_keyring_broker},
     source::{MarketSource, coinbase::CoinbaseSource, mock::MockSource},
     source_supervisor::{
         SourceShutdownError, SourceShutdownOutcome, SourceSupervisor, SupervisedSourceTask,
@@ -34,7 +34,9 @@ use market_squawk::{
 use market_squawk_domain::{
     CaptureAuthorityIdentity, ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier,
 };
-use market_squawk_installer::{ProgramName, active_release_root_for_installed_program};
+use market_squawk_installer::{
+    ProgramName, active_release_root_for_installed_program, default_installation_data_root,
+};
 use market_squawk_mcp::{McpLimitSpec, McpLimits, McpStdioRelay};
 use market_squawk_platform::{
     CaptureChannelLimits, CaptureProcessInfrastructureLimits, CaptureShutdownStatus,
@@ -413,16 +415,20 @@ async fn run_service_command(
         } => {
             let connector = installed_service_connector(config, installation_data_root)?;
             let captured_status = connector.bootstrap_status().await?;
-            let status = if complete_foreground_keyring {
-                connector
-                    .bootstrap_foreground_keyring(captured_status)
-                    .await?
+            let value = if complete_foreground_keyring {
+                let installation_root = installation_data_root
+                    .map(Path::to_path_buf)
+                    .map_or_else(default_installation_data_root, Ok)?;
+                launch_foreground_keyring_broker(installation_root, captured_status).await?;
+                serde_json::json!({"status": "accepted"})
             } else {
-                connector
-                    .bootstrap_unlock(captured_status, read_bootstrap_unlock(stdin)?)
-                    .await?
+                serde_json::to_value(
+                    connector
+                        .bootstrap_unlock(captured_status, read_bootstrap_unlock(stdin)?)
+                        .await?,
+                )?
             };
-            ("secure startup was accepted", serde_json::to_value(status)?)
+            ("secure startup was accepted", value)
         }
     };
     emit_result(output, summary, &value)
