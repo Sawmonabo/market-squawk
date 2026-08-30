@@ -16,10 +16,10 @@ use crate::planning::{
 };
 use crate::receipt::{CaptureChronologyDisposition, CaptureError, PcapMaterializationReceipt};
 
-// This provider envelope v3 embeds and revalidates the immutable cold-plan envelope v2 and its
+// This provider envelope v4 embeds and revalidates the immutable cold-plan envelope v2 and its
 // decoder-contract-bound `market-squawk/iex-hist-cold-plan/v4` identity. Greenfield state rejects
 // every older local envelope.
-const DURABLE_SCHEMA_VERSION: u16 = 3;
+const DURABLE_SCHEMA_VERSION: u16 = 4;
 const MAX_DURABLE_CHECKPOINT_BYTES: usize = 256 * 1024;
 
 /// Minimal crash-safe state-store seam implemented by the shared application control plane.
@@ -46,13 +46,303 @@ pub enum IexHistCheckpointStoreError {
     Conflict,
 }
 
+/// Exact shared-store coordinates proving the selected descriptor's catalog parent was sealed.
+///
+/// This evidence is minted only while joining an [`crate::CatalogFetch`] to the shared physical
+/// receipt. Durable selected-job state retains and revalidates every coordinate on restart.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IexHistCatalogPhysicalSealEvidence {
+    catalog_observation_receipt_sha256: Sha256Digest,
+    storage_root_sha256: Sha256Digest,
+    object_sha256: Sha256Digest,
+    object_bytes: u64,
+    physical_receipt_sha256: Sha256Digest,
+    seal_sha256: Sha256Digest,
+}
+
+impl IexHistCatalogPhysicalSealEvidence {
+    #[must_use]
+    pub const fn catalog_observation_receipt_sha256(self) -> Sha256Digest {
+        self.catalog_observation_receipt_sha256
+    }
+
+    #[must_use]
+    /// Returns the exact shared durable-volume identity.
+    pub const fn storage_root_sha256(self) -> Sha256Digest {
+        self.storage_root_sha256
+    }
+
+    #[must_use]
+    pub const fn object_sha256(self) -> Sha256Digest {
+        self.object_sha256
+    }
+
+    #[must_use]
+    pub const fn object_bytes(self) -> u64 {
+        self.object_bytes
+    }
+
+    #[must_use]
+    pub const fn physical_receipt_sha256(self) -> Sha256Digest {
+        self.physical_receipt_sha256
+    }
+
+    #[must_use]
+    pub const fn seal_sha256(self) -> Sha256Digest {
+        self.seal_sha256
+    }
+
+    pub(crate) fn from_joined_receipt(
+        catalog_observation_receipt_sha256: Sha256Digest,
+        storage_root_sha256: Sha256Digest,
+        object_sha256: Sha256Digest,
+        object_bytes: u64,
+        physical_receipt_sha256: Sha256Digest,
+    ) -> Self {
+        let seal_sha256 = catalog_physical_seal_identity(
+            catalog_observation_receipt_sha256,
+            storage_root_sha256,
+            object_sha256,
+            object_bytes,
+            physical_receipt_sha256,
+        );
+        Self {
+            catalog_observation_receipt_sha256,
+            storage_root_sha256,
+            object_sha256,
+            object_bytes,
+            physical_receipt_sha256,
+            seal_sha256,
+        }
+    }
+
+    fn validate_against(&self, plan: &ColdJobPlan) -> Result<(), IexHistCheckpointError> {
+        let selected = plan.selected_file();
+        let observation = selected.catalog_observation();
+        if self.catalog_observation_receipt_sha256 != observation.receipt_sha256()
+            || self.storage_root_sha256 != observation.attempt().storage_root_sha256()
+            || self.object_sha256 != selected.catalog_sha256()
+            || self.object_bytes != selected.catalog_bytes()
+            || self.object_bytes == 0
+            || self
+                .physical_receipt_sha256
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+            || self.seal_sha256
+                != catalog_physical_seal_identity(
+                    self.catalog_observation_receipt_sha256,
+                    self.storage_root_sha256,
+                    self.object_sha256,
+                    self.object_bytes,
+                    self.physical_receipt_sha256,
+                )
+        {
+            return Err(IexHistCheckpointError::InvalidCatalogPhysicalSeal);
+        }
+        Ok(())
+    }
+}
+
+/// Restart-safe coordinates for both complete raw artifacts in the shared content-addressed
+/// store.
+///
+/// The generic live store receipts remain linear values carried into publication. This copyable
+/// evidence is the durable join key that lets the shared store reopen those exact objects after a
+/// process restart; it never grants publication authority by itself.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IexHistCapturePhysicalSealEvidence {
+    storage_root_sha256: Sha256Digest,
+    provider_object_sha256: Sha256Digest,
+    provider_object_bytes: u64,
+    provider_object_physical_receipt_sha256: Sha256Digest,
+    expanded_pcap_sha256: Sha256Digest,
+    expanded_pcap_bytes: u64,
+    expanded_pcap_physical_receipt_sha256: Sha256Digest,
+    materialization_receipt_sha256: Sha256Digest,
+    seal_sha256: Sha256Digest,
+}
+
+impl IexHistCapturePhysicalSealEvidence {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the physical join commits both raw objects and their exact shared-store receipts"
+    )]
+    pub(crate) fn try_from_joined_receipts(
+        plan: &ColdJobPlan,
+        materialization: &PcapMaterializationReceipt,
+        storage_root_sha256: Sha256Digest,
+        provider_object_sha256: Sha256Digest,
+        provider_object_bytes: u64,
+        provider_object_physical_receipt_sha256: Sha256Digest,
+        expanded_pcap_sha256: Sha256Digest,
+        expanded_pcap_bytes: u64,
+        expanded_pcap_physical_receipt_sha256: Sha256Digest,
+    ) -> Result<Self, CaptureError> {
+        let materialization_receipt_sha256 = materialization.receipt_sha256();
+        let seal_sha256 = capture_physical_seal_identity(
+            materialization_receipt_sha256,
+            storage_root_sha256,
+            provider_object_sha256,
+            provider_object_bytes,
+            provider_object_physical_receipt_sha256,
+            expanded_pcap_sha256,
+            expanded_pcap_bytes,
+            expanded_pcap_physical_receipt_sha256,
+        );
+        let evidence = Self {
+            storage_root_sha256,
+            provider_object_sha256,
+            provider_object_bytes,
+            provider_object_physical_receipt_sha256,
+            expanded_pcap_sha256,
+            expanded_pcap_bytes,
+            expanded_pcap_physical_receipt_sha256,
+            materialization_receipt_sha256,
+            seal_sha256,
+        };
+        evidence.validate_against(plan, materialization)?;
+        Ok(evidence)
+    }
+
+    /// Revalidates both durable raw-object coordinates against the immutable selected-file plan.
+    pub fn validate_against(
+        self,
+        plan: &ColdJobPlan,
+        materialization: &PcapMaterializationReceipt,
+    ) -> Result<(), CaptureError> {
+        materialization.validate_against(plan)?;
+        if self.storage_root_sha256 != materialization.attempt().storage_root_sha256()
+            || self.provider_object_sha256 != materialization.compressed_sha256()
+            || self.provider_object_bytes != materialization.compressed_bytes()
+            || self.expanded_pcap_sha256 != materialization.pcap_sha256()
+            || self.expanded_pcap_bytes != materialization.pcap_bytes()
+            || self.materialization_receipt_sha256 != materialization.receipt_sha256()
+            || !nonzero_digest(self.provider_object_physical_receipt_sha256)
+            || !nonzero_digest(self.expanded_pcap_physical_receipt_sha256)
+            || capture_physical_seal_identity(
+                self.materialization_receipt_sha256,
+                self.storage_root_sha256,
+                self.provider_object_sha256,
+                self.provider_object_bytes,
+                self.provider_object_physical_receipt_sha256,
+                self.expanded_pcap_sha256,
+                self.expanded_pcap_bytes,
+                self.expanded_pcap_physical_receipt_sha256,
+            ) != self.seal_sha256
+        {
+            return Err(CaptureError::ReceiptIdentityMismatch);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn storage_root_sha256(self) -> Sha256Digest {
+        self.storage_root_sha256
+    }
+
+    #[must_use]
+    /// Returns the complete provider-object content digest.
+    pub const fn provider_object_sha256(self) -> Sha256Digest {
+        self.provider_object_sha256
+    }
+
+    #[must_use]
+    /// Returns the complete provider-object byte length.
+    pub const fn provider_object_bytes(self) -> u64 {
+        self.provider_object_bytes
+    }
+
+    #[must_use]
+    /// Returns the shared store's physical receipt for the complete provider object.
+    pub const fn provider_object_physical_receipt_sha256(self) -> Sha256Digest {
+        self.provider_object_physical_receipt_sha256
+    }
+
+    #[must_use]
+    /// Returns the expanded PCAP content digest.
+    pub const fn expanded_pcap_sha256(self) -> Sha256Digest {
+        self.expanded_pcap_sha256
+    }
+
+    #[must_use]
+    /// Returns the expanded PCAP byte length.
+    pub const fn expanded_pcap_bytes(self) -> u64 {
+        self.expanded_pcap_bytes
+    }
+
+    #[must_use]
+    /// Returns the shared store's physical receipt for the expanded PCAP.
+    pub const fn expanded_pcap_physical_receipt_sha256(self) -> Sha256Digest {
+        self.expanded_pcap_physical_receipt_sha256
+    }
+
+    #[must_use]
+    /// Returns the exact materialization receipt joined to both raw objects.
+    pub const fn materialization_receipt_sha256(self) -> Sha256Digest {
+        self.materialization_receipt_sha256
+    }
+
+    #[must_use]
+    /// Returns the joined identity of the materialization and both shared raw objects.
+    pub const fn seal_sha256(self) -> Sha256Digest {
+        self.seal_sha256
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the seal identity intentionally commits both exact physical raw objects"
+)]
+fn capture_physical_seal_identity(
+    materialization_receipt_sha256: Sha256Digest,
+    storage_root_sha256: Sha256Digest,
+    provider_object_sha256: Sha256Digest,
+    provider_object_bytes: u64,
+    provider_object_physical_receipt_sha256: Sha256Digest,
+    expanded_pcap_sha256: Sha256Digest,
+    expanded_pcap_bytes: u64,
+    expanded_pcap_physical_receipt_sha256: Sha256Digest,
+) -> Sha256Digest {
+    crate::catalog::digest_fields(&[
+        b"market-squawk/iex-hist-complete-physical-seal/v1",
+        materialization_receipt_sha256.as_bytes(),
+        storage_root_sha256.as_bytes(),
+        provider_object_sha256.as_bytes(),
+        &provider_object_bytes.to_le_bytes(),
+        provider_object_physical_receipt_sha256.as_bytes(),
+        expanded_pcap_sha256.as_bytes(),
+        &expanded_pcap_bytes.to_le_bytes(),
+        expanded_pcap_physical_receipt_sha256.as_bytes(),
+    ])
+}
+
+pub(crate) fn catalog_physical_seal_identity(
+    catalog_observation_receipt_sha256: Sha256Digest,
+    storage_root_sha256: Sha256Digest,
+    object_sha256: Sha256Digest,
+    object_bytes: u64,
+    physical_receipt_sha256: Sha256Digest,
+) -> Sha256Digest {
+    crate::catalog::digest_fields(&[
+        b"market-squawk/iex-hist-catalog-physical-seal/v1",
+        catalog_observation_receipt_sha256.as_bytes(),
+        storage_root_sha256.as_bytes(),
+        object_sha256.as_bytes(),
+        &object_bytes.to_le_bytes(),
+        physical_receipt_sha256.as_bytes(),
+    ])
+}
+
 /// Latest provider-local evidence phase for one immutable selected-file plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IexHistJobPhase {
     /// The complete immutable plan is restorable; no capture evidence is retained.
     Planned,
-    /// Complete transport/materialization evidence is retained, but no durable object is claimed.
+    /// Complete transport evidence and both exact shared raw-object receipts are retained.
     CaptureEvidence,
     /// Terminal transactional decode evidence is retained, but no analytical generation exists.
     DecodeEvidence,
@@ -68,9 +358,9 @@ pub enum IexHistJobPhase {
 pub enum IexHistRecoveryAction {
     /// Acquire a new attempt and repeat the selected-file transfer from byte zero.
     RestartWholeFileTransfer,
-    /// Root may adopt only after independently reverifying an opaque durable artifact; otherwise
-    /// the transfer must restart from byte zero.
-    RequireSharedArtifactAdoptionOrRestartWholeFile,
+    /// Reopen and reverify both exact shared raw objects; restart the selected file only if either
+    /// object is unavailable or fails its persisted content/receipt identity.
+    ReopenSharedSealedCaptureOrRestartWholeFile,
     /// Terminal evidence must be reviewed under the recorded reactivation requirement.
     AwaitReactivation,
 }
@@ -290,16 +580,24 @@ impl<S> std::fmt::Debug for IexHistDurableJob<S> {
 
 impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
     /// Creates a checkpoint or independently restores its complete immutable plan.
-    pub fn try_open(plan: &ColdJobPlan, store: S) -> Result<Self, IexHistCheckpointError> {
+    pub fn try_open(
+        plan: &ColdJobPlan,
+        catalog_physical_seal: IexHistCatalogPhysicalSealEvidence,
+        store: S,
+    ) -> Result<Self, IexHistCheckpointError> {
+        catalog_physical_seal.validate_against(plan)?;
         let loaded = store.load()?;
         if let Some(payload) = loaded {
             let value = Self::decode_existing(store, payload)?;
             if value.plan.plan_sha256() != plan.plan_sha256() {
                 return Err(IexHistCheckpointError::PlanMismatch);
             }
+            if value.envelope.catalog_physical_seal != catalog_physical_seal {
+                return Err(IexHistCheckpointError::InvalidCatalogPhysicalSeal);
+            }
             return Ok(value);
         }
-        Self::create(plan, store)
+        Self::create(plan, catalog_physical_seal, store)
     }
 
     /// Restores from the closed durable envelope without an original in-memory plan.
@@ -308,7 +606,12 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
         Self::decode_existing(store, payload)
     }
 
-    fn create(plan: &ColdJobPlan, store: S) -> Result<Self, IexHistCheckpointError> {
+    fn create(
+        plan: &ColdJobPlan,
+        catalog_physical_seal: IexHistCatalogPhysicalSealEvidence,
+        store: S,
+    ) -> Result<Self, IexHistCheckpointError> {
+        catalog_physical_seal.validate_against(plan)?;
         let plan_envelope = plan.durable_envelope()?;
         let mut envelope = DurableEnvelope {
             schema_version: DURABLE_SCHEMA_VERSION,
@@ -316,6 +619,7 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
             plan_sha256: plan.plan_sha256(),
             decode_contract_sha256: plan.decode_contract().contract_sha256(),
             plan_envelope,
+            catalog_physical_seal,
             phase: DurablePhase::Planned,
             envelope_sha256: Sha256Digest::of(b"pending-envelope-identity"),
         };
@@ -353,6 +657,12 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
         &self.plan
     }
 
+    /// Returns the shared physical catalog coordinates revalidated with the restored plan.
+    #[must_use]
+    pub const fn catalog_physical_seal(&self) -> &IexHistCatalogPhysicalSealEvidence {
+        &self.envelope.catalog_physical_seal
+    }
+
     /// Returns the monotonically increasing durable state version.
     #[must_use]
     pub const fn state_version(&self) -> u64 {
@@ -379,7 +689,7 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
         match &self.envelope.phase {
             DurablePhase::Planned => IexHistRecoveryAction::RestartWholeFileTransfer,
             DurablePhase::CaptureEvidence { .. } | DurablePhase::DecodeEvidence { .. } => {
-                IexHistRecoveryAction::RequireSharedArtifactAdoptionOrRestartWholeFile
+                IexHistRecoveryAction::ReopenSharedSealedCaptureOrRestartWholeFile
             }
             DurablePhase::Terminal { .. } => IexHistRecoveryAction::AwaitReactivation,
         }
@@ -389,6 +699,12 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
     #[must_use]
     pub fn capture_evidence(&self) -> Option<&PcapMaterializationReceipt> {
         phase_capture(&self.envelope.phase)
+    }
+
+    /// Returns the exact shared-store coordinates for both complete raw capture artifacts.
+    #[must_use]
+    pub fn capture_physical_seal_evidence(&self) -> Option<&IexHistCapturePhysicalSealEvidence> {
+        phase_capture_physical_seal(&self.envelope.phase)
     }
 
     /// Returns retained transactional decode evidence; it is not a publication receipt.
@@ -424,10 +740,12 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
         &mut self,
         plan: &ColdJobPlan,
         capture: PcapMaterializationReceipt,
+        physical_seal: IexHistCapturePhysicalSealEvidence,
         observed_clock: IexHistTrustedClockReading,
     ) -> Result<(), IexHistCheckpointError> {
         self.validate_plan(plan)?;
         capture.validate_against(plan)?;
+        physical_seal.validate_against(plan, &capture)?;
         if let CaptureChronologyDisposition::Quarantined(_) = capture.chronology_disposition() {
             return self.commit_terminal(
                 observed_clock,
@@ -437,19 +755,25 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
                 IexHistTerminalCoordinate::try_new(None, None, None)?,
                 Some(capture.attempt().attempt_sha256()),
                 IexHistRetryDisposition::Never,
-                Some(capture),
+                Some((capture, physical_seal)),
             );
         }
         match &self.envelope.phase {
             DurablePhase::Planned => self.commit_phase(DurablePhase::CaptureEvidence {
                 capture: Box::new(capture),
+                physical_seal,
             }),
-            DurablePhase::CaptureEvidence { capture: current } if current.as_ref() == &capture => {
-                Ok(())
-            }
+            DurablePhase::CaptureEvidence {
+                capture: current,
+                physical_seal: current_seal,
+            } if current.as_ref() == &capture && current_seal == &physical_seal => Ok(()),
             DurablePhase::DecodeEvidence {
                 capture: current, ..
-            } if current.as_ref() == &capture => Ok(()),
+            } if current.as_ref() == &capture
+                && self.capture_physical_seal_evidence() == Some(&physical_seal) =>
+            {
+                Ok(())
+            }
             DurablePhase::Terminal { .. }
             | DurablePhase::CaptureEvidence { .. }
             | DurablePhase::DecodeEvidence { .. } => Err(IexHistCheckpointError::InvalidTransition),
@@ -470,15 +794,18 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
         }
         decode.validate_against(plan, capture, decode.decode_attempt_evidence)?;
         match &self.envelope.phase {
-            DurablePhase::CaptureEvidence { capture: current } if current.as_ref() == capture => {
-                self.commit_phase(DurablePhase::DecodeEvidence {
-                    capture: Box::new(capture.clone()),
-                    decode: Box::new(decode),
-                })
-            }
+            DurablePhase::CaptureEvidence {
+                capture: current,
+                physical_seal,
+            } if current.as_ref() == capture => self.commit_phase(DurablePhase::DecodeEvidence {
+                capture: Box::new(capture.clone()),
+                physical_seal: *physical_seal,
+                decode: Box::new(decode),
+            }),
             DurablePhase::DecodeEvidence {
                 capture: current,
                 decode: existing,
+                ..
             } if current.as_ref() == capture && existing.as_ref() == &decode => Ok(()),
             DurablePhase::Planned
             | DurablePhase::CaptureEvidence { .. }
@@ -529,25 +856,37 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
         coordinate: IexHistTerminalCoordinate,
         attempt_sha256: Option<Sha256Digest>,
         retry: IexHistRetryDisposition,
-        replacement_capture: Option<PcapMaterializationReceipt>,
+        replacement_capture: Option<(
+            PcapMaterializationReceipt,
+            IexHistCapturePhysicalSealEvidence,
+        )>,
     ) -> Result<(), IexHistCheckpointError> {
         let prior = match &self.envelope.phase {
             DurablePhase::Planned => DurableNonTerminalPhase::Planned,
-            DurablePhase::CaptureEvidence { capture } => DurableNonTerminalPhase::CaptureEvidence {
+            DurablePhase::CaptureEvidence {
+                capture,
+                physical_seal,
+            } => DurableNonTerminalPhase::CaptureEvidence {
                 capture: capture.clone(),
+                physical_seal: *physical_seal,
             },
-            DurablePhase::DecodeEvidence { capture, decode } => {
-                DurableNonTerminalPhase::DecodeEvidence {
-                    capture: capture.clone(),
-                    decode: decode.clone(),
-                }
-            }
+            DurablePhase::DecodeEvidence {
+                capture,
+                physical_seal,
+                decode,
+            } => DurableNonTerminalPhase::DecodeEvidence {
+                capture: capture.clone(),
+                physical_seal: *physical_seal,
+                decode: decode.clone(),
+            },
             DurablePhase::Terminal { .. } => return Err(IexHistCheckpointError::InvalidTransition),
         };
-        let prior =
-            replacement_capture.map_or(prior, |capture| DurableNonTerminalPhase::CaptureEvidence {
+        let prior = replacement_capture.map_or(prior, |(capture, physical_seal)| {
+            DurableNonTerminalPhase::CaptureEvidence {
                 capture: Box::new(capture),
-            });
+                physical_seal,
+            }
+        });
         let prior_evidence_sha256 = nonterminal_identity(&prior);
         let observed_clock = DurableClockEvidence::from_trusted(observed_clock);
         let reactivation = match disposition {
@@ -608,6 +947,7 @@ impl<S: IexHistCheckpointStore> IexHistDurableJob<S> {
             plan_sha256: self.envelope.plan_sha256,
             decode_contract_sha256: self.envelope.decode_contract_sha256,
             plan_envelope: self.envelope.plan_envelope.clone(),
+            catalog_physical_seal: self.envelope.catalog_physical_seal,
             phase,
             envelope_sha256: Sha256Digest::of(b"pending-envelope-identity"),
         };
@@ -630,6 +970,7 @@ struct DurableEnvelope {
     plan_sha256: Sha256Digest,
     decode_contract_sha256: Sha256Digest,
     plan_envelope: Vec<u8>,
+    catalog_physical_seal: IexHistCatalogPhysicalSealEvidence,
     phase: DurablePhase,
     envelope_sha256: Sha256Digest,
 }
@@ -645,6 +986,7 @@ impl DurableEnvelope {
         {
             return Err(IexHistCheckpointError::InvalidState);
         }
+        self.catalog_physical_seal.validate_against(plan)?;
         validate_phase(plan, &self.phase)
     }
 }
@@ -655,9 +997,11 @@ enum DurablePhase {
     Planned,
     CaptureEvidence {
         capture: Box<PcapMaterializationReceipt>,
+        physical_seal: IexHistCapturePhysicalSealEvidence,
     },
     DecodeEvidence {
         capture: Box<PcapMaterializationReceipt>,
+        physical_seal: IexHistCapturePhysicalSealEvidence,
         decode: Box<DecodeSummary>,
     },
     Terminal {
@@ -672,9 +1016,11 @@ enum DurableNonTerminalPhase {
     Planned,
     CaptureEvidence {
         capture: Box<PcapMaterializationReceipt>,
+        physical_seal: IexHistCapturePhysicalSealEvidence,
     },
     DecodeEvidence {
         capture: Box<PcapMaterializationReceipt>,
+        physical_seal: IexHistCapturePhysicalSealEvidence,
         decode: Box<DecodeSummary>,
     },
 }
@@ -750,15 +1096,24 @@ impl IexHistTerminalEvidence {
 fn validate_phase(plan: &ColdJobPlan, phase: &DurablePhase) -> Result<(), IexHistCheckpointError> {
     match phase {
         DurablePhase::Planned => Ok(()),
-        DurablePhase::CaptureEvidence { capture } => {
+        DurablePhase::CaptureEvidence {
+            capture,
+            physical_seal,
+        } => {
             capture.validate_against(plan)?;
+            physical_seal.validate_against(plan, capture)?;
             if capture.chronology_disposition() != CaptureChronologyDisposition::Admitted {
                 return Err(IexHistCheckpointError::InvalidState);
             }
             Ok(())
         }
-        DurablePhase::DecodeEvidence { capture, decode } => {
+        DurablePhase::DecodeEvidence {
+            capture,
+            physical_seal,
+            decode,
+        } => {
             capture.validate_against(plan)?;
+            physical_seal.validate_against(plan, capture)?;
             if capture.chronology_disposition() != CaptureChronologyDisposition::Admitted {
                 return Err(IexHistCheckpointError::InvalidState);
             }
@@ -784,11 +1139,22 @@ fn validate_nonterminal(
 ) -> Result<(), IexHistCheckpointError> {
     match phase {
         DurableNonTerminalPhase::Planned => Ok(()),
-        DurableNonTerminalPhase::CaptureEvidence { capture } => {
-            capture.validate_against(plan).map_err(Into::into)
-        }
-        DurableNonTerminalPhase::DecodeEvidence { capture, decode } => {
+        DurableNonTerminalPhase::CaptureEvidence {
+            capture,
+            physical_seal,
+        } => {
             capture.validate_against(plan)?;
+            physical_seal
+                .validate_against(plan, capture)
+                .map_err(Into::into)
+        }
+        DurableNonTerminalPhase::DecodeEvidence {
+            capture,
+            physical_seal,
+            decode,
+        } => {
+            capture.validate_against(plan)?;
+            physical_seal.validate_against(plan, capture)?;
             if capture.chronology_disposition() != CaptureChronologyDisposition::Admitted {
                 return Err(IexHistCheckpointError::InvalidState);
             }
@@ -800,11 +1166,26 @@ fn validate_nonterminal(
 
 fn phase_capture(phase: &DurablePhase) -> Option<&PcapMaterializationReceipt> {
     match phase {
-        DurablePhase::CaptureEvidence { capture }
+        DurablePhase::CaptureEvidence { capture, .. }
         | DurablePhase::DecodeEvidence { capture, .. } => Some(capture.as_ref()),
         DurablePhase::Terminal { prior, .. } => match prior.as_ref() {
-            DurableNonTerminalPhase::CaptureEvidence { capture }
+            DurableNonTerminalPhase::CaptureEvidence { capture, .. }
             | DurableNonTerminalPhase::DecodeEvidence { capture, .. } => Some(capture.as_ref()),
+            DurableNonTerminalPhase::Planned => None,
+        },
+        DurablePhase::Planned => None,
+    }
+}
+
+fn phase_capture_physical_seal(
+    phase: &DurablePhase,
+) -> Option<&IexHistCapturePhysicalSealEvidence> {
+    match phase {
+        DurablePhase::CaptureEvidence { physical_seal, .. }
+        | DurablePhase::DecodeEvidence { physical_seal, .. } => Some(physical_seal),
+        DurablePhase::Terminal { prior, .. } => match prior.as_ref() {
+            DurableNonTerminalPhase::CaptureEvidence { physical_seal, .. }
+            | DurableNonTerminalPhase::DecodeEvidence { physical_seal, .. } => Some(physical_seal),
             DurableNonTerminalPhase::Planned => None,
         },
         DurablePhase::Planned => None,
@@ -814,7 +1195,7 @@ fn phase_capture(phase: &DurablePhase) -> Option<&PcapMaterializationReceipt> {
 fn phase_attempt_sha256(phase: &DurablePhase) -> Option<Sha256Digest> {
     match phase {
         DurablePhase::Planned => None,
-        DurablePhase::CaptureEvidence { capture } => Some(capture.attempt().attempt_sha256()),
+        DurablePhase::CaptureEvidence { capture, .. } => Some(capture.attempt().attempt_sha256()),
         DurablePhase::DecodeEvidence { decode, .. } => Some(decode.decode_attempt_sha256),
         DurablePhase::Terminal { prior, .. } => nonterminal_attempt_sha256(prior),
     }
@@ -823,7 +1204,7 @@ fn phase_attempt_sha256(phase: &DurablePhase) -> Option<Sha256Digest> {
 fn nonterminal_attempt_sha256(phase: &DurableNonTerminalPhase) -> Option<Sha256Digest> {
     match phase {
         DurableNonTerminalPhase::Planned => None,
-        DurableNonTerminalPhase::CaptureEvidence { capture } => {
+        DurableNonTerminalPhase::CaptureEvidence { capture, .. } => {
             Some(capture.attempt().attempt_sha256())
         }
         DurableNonTerminalPhase::DecodeEvidence { decode, .. } => {
@@ -837,21 +1218,28 @@ fn nonterminal_identity(phase: &DurableNonTerminalPhase) -> Sha256Digest {
         DurableNonTerminalPhase::Planned => {
             crate::catalog::digest_fields(&[b"market-squawk/iex-hist-durable-prior/v2", b"planned"])
         }
-        DurableNonTerminalPhase::CaptureEvidence { capture } => crate::catalog::digest_fields(&[
+        DurableNonTerminalPhase::CaptureEvidence {
+            capture,
+            physical_seal,
+        } => crate::catalog::digest_fields(&[
             b"market-squawk/iex-hist-durable-prior/v2",
             b"capture_evidence",
             capture.receipt_sha256().as_bytes(),
+            physical_seal.seal_sha256.as_bytes(),
         ]),
-        DurableNonTerminalPhase::DecodeEvidence { capture, decode } => {
-            crate::catalog::digest_fields(&[
-                b"market-squawk/iex-hist-durable-prior/v2",
-                b"decode_evidence",
-                capture.receipt_sha256().as_bytes(),
-                decode.decoder_contract_sha256.as_bytes(),
-                decode.decode_attempt_evidence_sha256.as_bytes(),
-                decode.summary_sha256().as_bytes(),
-            ])
-        }
+        DurableNonTerminalPhase::DecodeEvidence {
+            capture,
+            physical_seal,
+            decode,
+        } => crate::catalog::digest_fields(&[
+            b"market-squawk/iex-hist-durable-prior/v2",
+            b"decode_evidence",
+            capture.receipt_sha256().as_bytes(),
+            physical_seal.seal_sha256.as_bytes(),
+            decode.decoder_contract_sha256.as_bytes(),
+            decode.decode_attempt_evidence_sha256.as_bytes(),
+            decode.summary_sha256().as_bytes(),
+        ]),
     }
 }
 
@@ -902,17 +1290,31 @@ fn terminal_identity(
 fn envelope_identity(envelope: &DurableEnvelope) -> Result<Sha256Digest, IexHistCheckpointError> {
     let phase_identity = match &envelope.phase {
         DurablePhase::Planned => Sha256Digest::of(b"planned"),
-        DurablePhase::CaptureEvidence { capture } => capture.receipt_sha256(),
-        DurablePhase::DecodeEvidence { decode, .. } => decode.summary_sha256(),
+        DurablePhase::CaptureEvidence {
+            capture,
+            physical_seal,
+        } => crate::catalog::digest_fields(&[
+            capture.receipt_sha256().as_bytes(),
+            physical_seal.seal_sha256.as_bytes(),
+        ]),
+        DurablePhase::DecodeEvidence {
+            decode,
+            physical_seal,
+            ..
+        } => crate::catalog::digest_fields(&[
+            decode.summary_sha256().as_bytes(),
+            physical_seal.seal_sha256.as_bytes(),
+        ]),
         DurablePhase::Terminal { terminal, .. } => terminal.evidence_sha256,
     };
     Ok(crate::catalog::digest_fields(&[
-        b"market-squawk/iex-hist-durable-envelope/v3",
+        b"market-squawk/iex-hist-durable-envelope/v4",
         &envelope.schema_version.to_le_bytes(),
         &envelope.state_version.to_le_bytes(),
         envelope.plan_sha256.as_bytes(),
         envelope.decode_contract_sha256.as_bytes(),
         Sha256Digest::of(&envelope.plan_envelope).as_bytes(),
+        envelope.catalog_physical_seal.seal_sha256.as_bytes(),
         phase_identity.as_bytes(),
     ]))
 }
@@ -946,6 +1348,9 @@ pub enum IexHistCheckpointError {
     /// The caller supplied a different immutable plan.
     #[error("IEX HIST durable checkpoint plan does not match")]
     PlanMismatch,
+    /// Catalog storage root, object receipt, or joined seal does not match the selected plan.
+    #[error("IEX HIST durable catalog physical seal is invalid")]
+    InvalidCatalogPhysicalSeal,
     /// State version, plan envelope, phase evidence, or payload bounds were invalid.
     #[error("IEX HIST durable checkpoint state is invalid")]
     InvalidState,

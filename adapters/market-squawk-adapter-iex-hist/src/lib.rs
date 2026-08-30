@@ -29,8 +29,9 @@ pub use decode::{
     IexHistVenueTradeBar, PcapStreamDecoder,
 };
 pub use durable::{
-    IexHistCheckpointError, IexHistCheckpointStore, IexHistCheckpointStoreError, IexHistDurableJob,
-    IexHistJobPhase, IexHistReactivationRequirement, IexHistRecoveryAction, IexHistResumeClaim,
+    IexHistCapturePhysicalSealEvidence, IexHistCatalogPhysicalSealEvidence, IexHistCheckpointError,
+    IexHistCheckpointStore, IexHistCheckpointStoreError, IexHistDurableJob, IexHistJobPhase,
+    IexHistReactivationRequirement, IexHistRecoveryAction, IexHistResumeClaim,
     IexHistResumeClaimError, IexHistRetryDisposition, IexHistTerminalCoordinate,
     IexHistTerminalDisposition, IexHistTerminalError, IexHistTerminalEvidence,
     IexHistTerminalPhase,
@@ -56,13 +57,15 @@ pub use receipt::{
     CaptureChronologyDisposition, CaptureClockAnomaly, CaptureError, PcapMaterializationReceipt,
 };
 pub use transport::{
-    CatalogFetch, DecodedIexCapture, IEX_HIST_CATALOG_URL, IexHistAdoptedResume,
-    IexHistColdTransport, IexHistDownloadOutcome, IexHistPendingResume,
-    IexHistResumeAdoptionBindingError, IexHistResumeAdoptionError, IexHistResumeAdoptionReceipt,
-    IexHistResumeAdoptionRequest, IexHistResumeCandidate, IexHistResumeCause,
-    IexHistResumePhysicalAdopter, IexHistResumeTelemetryEvidence, IexHistSharedPhysicalSealReceipt,
-    IexHistTransportConfig, IexHistTransportError, MaterializedIexCapture, RetryObservation,
-    RetryPolicy, StagedCaptureFiles, TransportErrorKind, TransportTelemetry,
+    CatalogFetch, IEX_HIST_CATALOG_URL, IexHistAdoptedResume, IexHistColdTransport,
+    IexHistCompletePhysicalSeal, IexHistCompleteSealError, IexHistDecodedSealedCapture,
+    IexHistDownloadOutcome, IexHistPendingResume, IexHistResumeAdoptionBindingError,
+    IexHistResumeAdoptionError, IexHistResumeAdoptionReceipt, IexHistResumeAdoptionRequest,
+    IexHistResumeCandidate, IexHistResumeCause, IexHistResumePhysicalAdopter,
+    IexHistResumeTelemetryEvidence, IexHistSealedCatalog, IexHistSealedMaterializedCapture,
+    IexHistSharedPhysicalSealReceipt, IexHistTransportConfig, IexHistTransportError,
+    MaterializedIexCapture, RetryObservation, RetryPolicy, StagedCaptureFiles, TransportErrorKind,
+    TransportTelemetry,
 };
 
 #[cfg(test)]

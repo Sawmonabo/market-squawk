@@ -20,11 +20,15 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::catalog::{Catalog, CatalogError, CatalogTransportMetadata, MAX_CATALOG_BYTES};
+use crate::catalog::{
+    Catalog, CatalogError, CatalogReceipt, CatalogTransportMetadata, MAX_CATALOG_BYTES,
+};
 use crate::decode::{
     DecodeActuals, DecodeError, DecodeFailure, DecodeSummary, IexEventSink, PcapStreamDecoder,
 };
-use crate::durable::IexHistResumeClaim;
+use crate::durable::{
+    IexHistCapturePhysicalSealEvidence, IexHistCatalogPhysicalSealEvidence, IexHistResumeClaim,
+};
 use crate::model::{PcapObjectEncoding, Sha256Digest};
 use crate::planning::{
     ColdJobPlan, IexHistCapacityAuthority, IexHistCapacityCategory, IexHistCapacityError,
@@ -158,7 +162,8 @@ pub struct RetryObservation {
     pub status: u16,
     /// Provider `Retry-After` interpretation, when present.
     pub provider_retry_after_ms: Option<u64>,
-    /// Application wait actually applied after capping to policy/deadline.
+    /// Full provider delay or bounded application backoff selected for this retry. When that
+    /// delay cannot fit the admitted deadline, the operation stops without an early retry.
     pub applied_wait_ms: u64,
 }
 
@@ -340,10 +345,41 @@ pub struct CatalogFetch {
 }
 
 impl CatalogFetch {
-    /// Returns the admitted catalog generation.
+    #[cfg(test)]
+    pub(crate) fn from_test_response(
+        catalog: Catalog,
+        exact_body: &[u8],
+        mut capacity_permit: IexHistExecutionPermit,
+    ) -> Result<Self, IexHistTransportError> {
+        let mut telemetry = TransportTelemetry::new();
+        telemetry
+            .begin_attempt()
+            .and_then(|_| telemetry.record_status(200))
+            .and_then(|_| telemetry.add_response_bytes(exact_body.len()))
+            .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
+        capacity_permit
+            .record_usage(
+                IexHistCapacityCategory::NetworkResponse,
+                telemetry.response_bytes,
+            )
+            .map_err(|error| {
+                IexHistTransportError::new(
+                    TransportErrorKind::CapacityAuthority(error),
+                    telemetry.clone(),
+                )
+            })?;
+        Ok(Self {
+            catalog,
+            exact_body: Bytes::copy_from_slice(exact_body),
+            telemetry,
+            capacity_permit,
+        })
+    }
+
+    /// Returns content/clock/attempt evidence without exposing descriptor-selection authority.
     #[must_use]
-    pub const fn catalog(&self) -> &Catalog {
-        &self.catalog
+    pub const fn receipt(&self) -> &CatalogReceipt {
+        self.catalog.receipt()
     }
 
     /// Returns request and byte telemetry.
@@ -352,21 +388,128 @@ impl CatalogFetch {
         &self.telemetry
     }
 
-    /// Returns the exact bounded response body for optional caller-owned raw-evidence sealing.
+    /// Returns the exact bounded response body for mandatory common raw-evidence sealing.
     #[must_use]
     pub fn exact_body(&self) -> &[u8] {
         &self.exact_body
     }
 
-    /// Consumes the result into the catalog, exact body, and telemetry.
+    /// Rejoins the exact bounded JSON body to its shared content-addressed raw-object receipt.
+    ///
+    /// Success records exact durable catalog bytes and settles the catalog-only reservation as
+    /// complete. A parsed but unsealed response never becomes descriptor-selection authority.
+    pub fn try_bind_physical_seal<R>(
+        self,
+        physical: R,
+    ) -> Result<IexHistSealedCatalog<R>, IexHistCompleteSealError>
+    where
+        R: IexHistSharedPhysicalSealReceipt,
+    {
+        let Self {
+            catalog,
+            exact_body,
+            telemetry,
+            mut capacity_permit,
+        } = self;
+        let receipt = catalog.receipt();
+        let storage_root_sha256 = receipt.observation.attempt().storage_root_sha256();
+        let valid = !exact_body.is_empty()
+            && u64::try_from(exact_body.len()).ok() == Some(receipt.body_bytes)
+            && Sha256Digest::of(&exact_body) == receipt.body_sha256
+            && physical.storage_root_sha256() == storage_root_sha256
+            && physical.object_sha256() == receipt.body_sha256
+            && physical.object_bytes() == receipt.body_bytes
+            && nonzero_sha256(physical.physical_receipt_sha256());
+        if !valid {
+            return Err(IexHistCompleteSealError::InvalidPhysicalReceipt {
+                settlement_error: capacity_permit
+                    .settle(crate::planning::IexHistCapacityDisposition::Quarantined(
+                        crate::planning::IexHistTerminalReason::DownstreamIntegrityFault,
+                    ))
+                    .err(),
+            });
+        }
+        if let Err(error) = capacity_permit
+            .record_usage(IexHistCapacityCategory::DurableCatalog, receipt.body_bytes)
+        {
+            return Err(IexHistCompleteSealError::Capacity {
+                error,
+                settlement_error: capacity_permit
+                    .settle(crate::planning::IexHistCapacityDisposition::Failed)
+                    .err(),
+            });
+        }
+        if let Err(error) =
+            capacity_permit.settle(crate::planning::IexHistCapacityDisposition::Completed)
+        {
+            return Err(IexHistCompleteSealError::Capacity {
+                error,
+                settlement_error: None,
+            });
+        }
+        let physical_evidence = IexHistCatalogPhysicalSealEvidence::from_joined_receipt(
+            receipt.observation.receipt_sha256(),
+            physical.storage_root_sha256(),
+            physical.object_sha256(),
+            physical.object_bytes(),
+            physical.physical_receipt_sha256(),
+        );
+        Ok(IexHistSealedCatalog {
+            catalog,
+            telemetry,
+            physical,
+            physical_evidence,
+        })
+    }
+}
+
+/// Parsed catalog generation backed by one exact shared raw-object receipt.
+pub struct IexHistSealedCatalog<R> {
+    catalog: Catalog,
+    telemetry: TransportTelemetry,
+    physical: R,
+    physical_evidence: IexHistCatalogPhysicalSealEvidence,
+}
+
+impl<R> fmt::Debug for IexHistSealedCatalog<R> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IexHistSealedCatalog")
+            .field("catalog_sha256", &self.catalog.receipt().body_sha256)
+            .field("seal_sha256", &self.physical_evidence.seal_sha256())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R> IexHistSealedCatalog<R> {
+    /// Returns the catalog admitted for exact descriptor selection.
     #[must_use]
-    pub fn into_parts(self) -> (Catalog, Bytes, TransportTelemetry, IexHistExecutionPermit) {
-        (
-            self.catalog,
-            self.exact_body,
-            self.telemetry,
-            self.capacity_permit,
-        )
+    pub const fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    /// Returns bounded fetch telemetry retained beside the sealed generation.
+    #[must_use]
+    pub const fn telemetry(&self) -> &TransportTelemetry {
+        &self.telemetry
+    }
+
+    /// Returns the shared physical raw-object receipt.
+    #[must_use]
+    pub const fn physical(&self) -> &R {
+        &self.physical
+    }
+
+    /// Returns the join between provider observation and shared physical evidence.
+    #[must_use]
+    pub const fn seal_sha256(&self) -> Sha256Digest {
+        self.physical_evidence.seal_sha256()
+    }
+
+    /// Returns the durable catalog storage-root, object-receipt, and joined-seal coordinates.
+    #[must_use]
+    pub const fn physical_evidence(&self) -> IexHistCatalogPhysicalSealEvidence {
+        self.physical_evidence
     }
 }
 
@@ -1004,28 +1147,304 @@ impl MaterializedIexCapture {
         &self.telemetry
     }
 
-    /// Consumes the outcome and transfers temporary-file ownership to the caller.
+    /// Reopens the exact provider object for shared content-addressed sealing without releasing
+    /// materialization or capacity authority.
+    pub fn reopen_provider_object(&self) -> std::io::Result<File> {
+        self.staged_files.reopen_provider_object()
+    }
+
+    /// Reopens the exact expanded PCAP for shared content-addressed sealing without releasing
+    /// materialization or capacity authority.
+    pub fn reopen_pcap(&self) -> std::io::Result<File> {
+        self.staged_files.reopen_pcap()
+    }
+
+    /// Rejoins both complete raw objects to non-forgeable shared-store receipts without releasing
+    /// the selected-file lease.
+    ///
+    /// The same permit that admitted network, temporary, durable, expansion, decoded, Arrow,
+    /// Parquet, and manifest capacity remains inside the returned value. Decode therefore cannot
+    /// reacquire a second transfer slot or run from an unsealed temporary PCAP.
+    pub fn try_bind_complete_physical_seal<R>(
+        self,
+        plan: &ColdJobPlan,
+        provider_object: R,
+        expanded_pcap: R,
+    ) -> Result<IexHistSealedMaterializedCapture<R>, IexHistCompleteSealError>
+    where
+        R: IexHistSharedPhysicalSealReceipt,
+    {
+        let Self {
+            materialization,
+            telemetry,
+            staged_files,
+            mut capacity_permit,
+        } = self;
+        let storage_root_sha256 = materialization.attempt().storage_root_sha256();
+        let valid = materialization.validate_against(plan).is_ok()
+            && provider_object.storage_root_sha256() == storage_root_sha256
+            && expanded_pcap.storage_root_sha256() == storage_root_sha256
+            && provider_object.object_sha256() == materialization.compressed_sha256()
+            && provider_object.object_bytes() == materialization.compressed_bytes()
+            && expanded_pcap.object_sha256() == materialization.pcap_sha256()
+            && expanded_pcap.object_bytes() == materialization.pcap_bytes()
+            && nonzero_sha256(provider_object.physical_receipt_sha256())
+            && nonzero_sha256(expanded_pcap.physical_receipt_sha256());
+        if !valid {
+            return Err(IexHistCompleteSealError::InvalidPhysicalReceipt {
+                settlement_error: capacity_permit
+                    .settle(crate::planning::IexHistCapacityDisposition::Quarantined(
+                        crate::planning::IexHistTerminalReason::DownstreamIntegrityFault,
+                    ))
+                    .err(),
+            });
+        }
+        let durable_compressed = match materialization.object_encoding() {
+            PcapObjectEncoding::Gzip => materialization.compressed_bytes(),
+            PcapObjectEncoding::Identity => 0,
+        };
+        if let Err(error) = capacity_permit.record_usage(
+            IexHistCapacityCategory::DurableCompressed,
+            durable_compressed,
+        ) {
+            return Err(IexHistCompleteSealError::Capacity {
+                error,
+                settlement_error: capacity_permit
+                    .settle(crate::planning::IexHistCapacityDisposition::Failed)
+                    .err(),
+            });
+        }
+        if let Err(error) = capacity_permit.record_usage(
+            IexHistCapacityCategory::DurablePcap,
+            materialization.pcap_bytes(),
+        ) {
+            return Err(IexHistCompleteSealError::Capacity {
+                error,
+                settlement_error: capacity_permit
+                    .settle(crate::planning::IexHistCapacityDisposition::Failed)
+                    .err(),
+            });
+        }
+        let evidence = match IexHistCapturePhysicalSealEvidence::try_from_joined_receipts(
+            plan,
+            &materialization,
+            provider_object.storage_root_sha256(),
+            provider_object.object_sha256(),
+            provider_object.object_bytes(),
+            provider_object.physical_receipt_sha256(),
+            expanded_pcap.object_sha256(),
+            expanded_pcap.object_bytes(),
+            expanded_pcap.physical_receipt_sha256(),
+        ) {
+            Ok(evidence) => evidence,
+            Err(_) => {
+                return Err(IexHistCompleteSealError::InvalidPhysicalReceipt {
+                    settlement_error: capacity_permit
+                        .settle(crate::planning::IexHistCapacityDisposition::Quarantined(
+                            crate::planning::IexHistTerminalReason::DownstreamIntegrityFault,
+                        ))
+                        .err(),
+                });
+            }
+        };
+        Ok(IexHistSealedMaterializedCapture {
+            plan: plan.clone(),
+            materialization,
+            telemetry,
+            staged_files,
+            capacity_permit,
+            physical: IexHistCompletePhysicalSeal {
+                provider_object,
+                expanded_pcap,
+                evidence,
+            },
+        })
+    }
+}
+
+/// Both complete raw artifacts rejoined to the exact shared durable volume.
+pub struct IexHistCompletePhysicalSeal<R> {
+    provider_object: R,
+    expanded_pcap: R,
+    evidence: IexHistCapturePhysicalSealEvidence,
+}
+
+impl<R> fmt::Debug for IexHistCompletePhysicalSeal<R> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IexHistCompletePhysicalSeal")
+            .field("seal_sha256", &self.evidence.seal_sha256())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R> IexHistCompletePhysicalSeal<R> {
+    /// Returns the shared provider-object receipt.
+    #[must_use]
+    pub const fn provider_object(&self) -> &R {
+        &self.provider_object
+    }
+
+    /// Returns the shared expanded-PCAP receipt.
+    #[must_use]
+    pub const fn expanded_pcap(&self) -> &R {
+        &self.expanded_pcap
+    }
+
+    /// Returns the binding of capture evidence to both shared physical receipts.
+    #[must_use]
+    pub const fn seal_sha256(&self) -> Sha256Digest {
+        self.evidence.seal_sha256()
+    }
+
+    /// Returns restart-safe shared-store coordinates for both complete raw artifacts.
+    #[must_use]
+    pub const fn evidence(&self) -> IexHistCapturePhysicalSealEvidence {
+        self.evidence
+    }
+}
+
+/// Complete raw evidence retaining the original one-transfer capacity authority until decode.
+pub struct IexHistSealedMaterializedCapture<R> {
+    plan: ColdJobPlan,
+    materialization: PcapMaterializationReceipt,
+    telemetry: TransportTelemetry,
+    staged_files: StagedCaptureFiles,
+    capacity_permit: IexHistExecutionPermit,
+    physical: IexHistCompletePhysicalSeal<R>,
+}
+
+impl<R> fmt::Debug for IexHistSealedMaterializedCapture<R> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IexHistSealedMaterializedCapture")
+            .field("plan_sha256", &self.plan.plan_sha256())
+            .field(
+                "capture_receipt_sha256",
+                &self.materialization.receipt_sha256(),
+            )
+            .field("physical_seal_sha256", &self.physical.seal_sha256())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R> IexHistSealedMaterializedCapture<R> {
+    /// Returns the exact cold-job plan bound before physical adoption.
+    #[must_use]
+    pub const fn plan(&self) -> &ColdJobPlan {
+        &self.plan
+    }
+
+    /// Returns the exact provider-object/PCAP materialization evidence.
+    #[must_use]
+    pub const fn materialization(&self) -> &PcapMaterializationReceipt {
+        &self.materialization
+    }
+
+    /// Returns both shared physical receipts and their joined identity.
+    #[must_use]
+    pub const fn physical(&self) -> &IexHistCompletePhysicalSeal<R> {
+        &self.physical
+    }
+}
+
+/// Complete typed decode retaining the raw receipts and original selected-file permit for the
+/// sole downstream canonical publication transaction.
+pub struct IexHistDecodedSealedCapture<S, R> {
+    plan: ColdJobPlan,
+    materialization: PcapMaterializationReceipt,
+    decoded: DecodedIexCapture<S>,
+    physical: IexHistCompletePhysicalSeal<R>,
+}
+
+impl<S, R> fmt::Debug for IexHistDecodedSealedCapture<S, R> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IexHistDecodedSealedCapture")
+            .field("plan_sha256", &self.plan.plan_sha256())
+            .field(
+                "capture_receipt_sha256",
+                &self.materialization.receipt_sha256(),
+            )
+            .field("summary_sha256", &self.decoded.summary.summary_sha256())
+            .field("physical_seal_sha256", &self.physical.seal_sha256())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S, R> IexHistDecodedSealedCapture<S, R> {
+    /// Returns the exact admitted cold-job plan retained from physical sealing through decode.
+    #[must_use]
+    pub const fn plan(&self) -> &ColdJobPlan {
+        &self.plan
+    }
+
+    /// Returns the exact provider-object/PCAP materialization parent of the decode.
+    #[must_use]
+    pub const fn materialization(&self) -> &PcapMaterializationReceipt {
+        &self.materialization
+    }
+
+    /// Returns the terminal decode summary.
+    #[must_use]
+    pub const fn summary(&self) -> &DecodeSummary {
+        self.decoded.summary()
+    }
+
+    /// Returns both sealed raw receipts retained for atomic canonical publication.
+    #[must_use]
+    pub const fn physical(&self) -> &IexHistCompletePhysicalSeal<R> {
+        &self.physical
+    }
+
+    /// Consumes the result into decode output, capacity authority, and exact raw receipts.
     #[must_use]
     pub fn into_parts(
         self,
     ) -> (
+        ColdJobPlan,
         PcapMaterializationReceipt,
+        DecodeSummary,
+        S,
         TransportTelemetry,
-        StagedCaptureFiles,
         IexHistExecutionPermit,
+        IexHistCompletePhysicalSeal<R>,
     ) {
+        let (summary, sink, telemetry, permit) = self.decoded.into_parts();
         (
+            self.plan,
             self.materialization,
-            self.telemetry,
-            self.staged_files,
-            self.capacity_permit,
+            summary,
+            sink,
+            telemetry,
+            permit,
+            self.physical,
         )
     }
 }
 
+/// Rejection while joining complete materialization to the shared raw-object authority.
+#[derive(Debug, Error)]
+pub enum IexHistCompleteSealError {
+    /// One or both shared receipts did not match the exact admitted job, bytes, or durable volume.
+    #[error("IEX HIST complete raw physical receipts do not match the admitted materialization")]
+    InvalidPhysicalReceipt {
+        /// Secondary failure while quarantining and releasing the retained selected-file lease.
+        settlement_error: Option<IexHistCapacityError>,
+    },
+    /// Exact durable-byte accounting could not be retained under the original reservation.
+    #[error("IEX HIST complete raw physical bytes exceed or conflict with reserved capacity")]
+    Capacity {
+        /// Original durable-byte accounting failure.
+        error: IexHistCapacityError,
+        /// Secondary failure while releasing the retained selected-file lease as failed.
+        settlement_error: Option<IexHistCapacityError>,
+    },
+}
+
 /// Complete decode result that retains reservation ownership for the downstream handoff.
 #[derive(Debug)]
-pub struct DecodedIexCapture<S> {
+pub(crate) struct DecodedIexCapture<S> {
     summary: DecodeSummary,
     sink: S,
     telemetry: TransportTelemetry,
@@ -1034,15 +1453,13 @@ pub struct DecodedIexCapture<S> {
 
 impl<S> DecodedIexCapture<S> {
     #[must_use]
-    pub const fn summary(&self) -> &DecodeSummary {
+    pub(crate) const fn summary(&self) -> &DecodeSummary {
         &self.summary
     }
     #[must_use]
-    pub const fn telemetry(&self) -> &TransportTelemetry {
-        &self.telemetry
-    }
-    #[must_use]
-    pub fn into_parts(self) -> (DecodeSummary, S, TransportTelemetry, IexHistExecutionPermit) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (DecodeSummary, S, TransportTelemetry, IexHistExecutionPermit) {
         (
             self.summary,
             self.sink,
@@ -1183,8 +1600,7 @@ impl IexHistColdTransport {
                     let provider_wait = parse_retry_after(response.headers(), retry_clock)
                         .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
                     let wait = provider_wait
-                        .unwrap_or_else(|| self.config.retry_policy.wait_for_attempt(attempt))
-                        .min(self.config.retry_policy.max_delay);
+                        .unwrap_or_else(|| self.config.retry_policy.wait_for_attempt(attempt));
                     telemetry
                         .record_retry(RetryObservation {
                             attempt,
@@ -1193,6 +1609,15 @@ impl IexHistColdTransport {
                             applied_wait_ms: duration_millis(wait),
                         })
                         .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
+                    if provider_wait.is_some() && !deadline.admits_wait(wait) {
+                        return Err(IexHistTransportError::new(
+                            TransportErrorKind::ProviderRetryDeferredPastDeadline {
+                                status,
+                                retry_after_ms: duration_millis(wait),
+                            },
+                            telemetry.clone(),
+                        ));
+                    }
                     wait_retry(wait, deadline, cancellation)
                         .await
                         .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
@@ -1481,8 +1906,7 @@ impl IexHistColdTransport {
                 let provider_wait = parse_retry_after(response.headers(), retry_clock)
                     .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
                 let wait = provider_wait
-                    .unwrap_or_else(|| self.config.retry_policy.wait_for_attempt(attempt))
-                    .min(self.config.retry_policy.max_delay);
+                    .unwrap_or_else(|| self.config.retry_policy.wait_for_attempt(attempt));
                 telemetry
                     .record_retry(RetryObservation {
                         attempt,
@@ -1491,6 +1915,15 @@ impl IexHistColdTransport {
                         applied_wait_ms: duration_millis(wait),
                     })
                     .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
+                if provider_wait.is_some() && !deadline.admits_wait(wait) {
+                    return Err(IexHistTransportError::new(
+                        TransportErrorKind::ProviderRetryDeferredPastDeadline {
+                            status,
+                            retry_after_ms: duration_millis(wait),
+                        },
+                        telemetry.clone(),
+                    ));
+                }
                 wait_retry(wait, deadline, cancellation)
                     .await
                     .map_err(|kind| IexHistTransportError::new(kind, telemetry.clone()))?;
@@ -1522,60 +1955,65 @@ impl IexHistColdTransport {
         }
     }
 
-    /// Re-reads and decodes one application-sealed complete PCAP from byte zero.
+    /// Decodes only after both complete raw artifacts have rejoined the original admitted lease.
     ///
-    /// The caller supplies an already opened controlled object rather than a path. The decoder
-    /// independently rechecks its exact byte count and SHA-256 against the acquisition receipt.
-    /// The decoder owns `sink`: failure aborts its staged transaction, while success returns the
-    /// committed sink with the exact [`DecodeSummary`].
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the decode authority boundary carries its exact plan, capture, file, authority, deadline, cancellation, and sink"
-    )]
-    pub async fn decode_sealed_pcap<S: IexEventSink>(
+    /// This is the production complete-file path. It consumes the materialization permit instead
+    /// of acquiring a second provider slot, independently reopens and re-hashes the PCAP, and
+    /// carries both shared raw receipts beside the committed typed sink for one downstream atomic
+    /// canonical publication.
+    pub async fn decode_rejoined_sealed_pcap<S, R>(
         &self,
-        plan: &ColdJobPlan,
-        capture: &PcapMaterializationReceipt,
-        pcap: File,
-        capacity_authority: &dyn IexHistCapacityAuthority,
-        deadline_unix_nanos: i64,
+        sealed: IexHistSealedMaterializedCapture<R>,
         cancellation: &CancellationToken,
         sink: S,
-    ) -> Result<DecodedIexCapture<S>, IexHistTransportError> {
-        let authority_free_reserve_bytes = capacity_authority
-            .required_free_reserve_bytes()
-            .map_err(|error| {
-                IexHistTransportError::new(
-                    TransportErrorKind::CapacityAuthority(error),
-                    TransportTelemetry::new(),
-                )
-            })?;
-        let request = IexHistCapacityRequest::selected_file(
+    ) -> Result<IexHistDecodedSealedCapture<S, R>, IexHistTransportError>
+    where
+        S: IexEventSink,
+        R: IexHistSharedPhysicalSealReceipt,
+    {
+        let IexHistSealedMaterializedCapture {
             plan,
-            deadline_unix_nanos,
-            authority_free_reserve_bytes,
-        )
-        .map_err(|error| {
-            IexHistTransportError::new(
-                TransportErrorKind::CapacityAuthority(error),
-                TransportTelemetry::new(),
-            )
-        })?;
-        let capacity_permit =
-            IexHistExecutionPermit::acquire(capacity_authority, request, Some(plan)).map_err(
-                |error| {
-                    IexHistTransportError::new(
-                        TransportErrorKind::CapacityAuthority(error),
-                        TransportTelemetry::new(),
-                    )
-                },
-            )?;
-        let deadline = Deadline::from_permit(&capacity_permit)
-            .map_err(|kind| IexHistTransportError::new(kind, TransportTelemetry::new()))?;
-        let telemetry = TransportTelemetry::new();
-        decode_sealed_pcap_file(
-            plan,
-            capture,
+            materialization,
+            telemetry,
+            staged_files,
+            capacity_permit,
+            physical,
+        } = sealed;
+        if materialization.validate_against(&plan).is_err()
+            || physical
+                .evidence
+                .validate_against(&plan, &materialization)
+                .is_err()
+        {
+            let _ =
+                capacity_permit.settle(crate::planning::IexHistCapacityDisposition::Quarantined(
+                    crate::planning::IexHistTerminalReason::DownstreamIntegrityFault,
+                ));
+            return Err(IexHistTransportError::new(
+                TransportErrorKind::Capture(CaptureError::ReceiptIdentityMismatch),
+                telemetry,
+            ));
+        }
+        let pcap = match staged_files.reopen_pcap() {
+            Ok(pcap) => pcap,
+            Err(_) => {
+                let _ = capacity_permit.settle(crate::planning::IexHistCapacityDisposition::Failed);
+                return Err(IexHistTransportError::new(
+                    TransportErrorKind::StagingIo,
+                    telemetry,
+                ));
+            }
+        };
+        let deadline = match Deadline::from_permit(&capacity_permit) {
+            Ok(deadline) => deadline,
+            Err(kind) => {
+                let _ = capacity_permit.settle(crate::planning::IexHistCapacityDisposition::Failed);
+                return Err(IexHistTransportError::new(kind, telemetry));
+            }
+        };
+        let decoded = decode_sealed_pcap_file(
+            &plan,
+            &materialization,
             pcap,
             deadline,
             cancellation,
@@ -1583,7 +2021,13 @@ impl IexHistColdTransport {
             telemetry,
             capacity_permit,
         )
-        .await
+        .await?;
+        Ok(IexHistDecodedSealedCapture {
+            plan,
+            materialization,
+            decoded,
+            physical,
+        })
     }
 }
 
@@ -2366,6 +2810,7 @@ fn terminal_disposition(kind: &TransportErrorKind) -> crate::planning::IexHistCa
         | TransportErrorKind::DeadlineExceeded
         | TransportErrorKind::Network
         | TransportErrorKind::RetryExhausted { .. }
+        | TransportErrorKind::ProviderRetryDeferredPastDeadline { .. }
         | TransportErrorKind::Capacity
         | TransportErrorKind::CapacityAuthority(
             IexHistCapacityError::Busy | IexHistCapacityError::InsufficientCapacity,
@@ -2599,6 +3044,12 @@ impl Deadline {
             .ok_or(TransportErrorKind::DeadlineExceeded)?;
         Ok(Self { instant })
     }
+
+    fn admits_wait(self, wait: Duration) -> bool {
+        Instant::now()
+            .checked_add(wait)
+            .is_some_and(|instant| instant < self.instant)
+    }
 }
 
 fn singleton_header(
@@ -2761,6 +3212,16 @@ pub enum TransportErrorKind {
         /// Last retryable response status.
         status: u16,
     },
+    /// The provider's complete Retry-After delay cannot fit the admitted job deadline.
+    #[error(
+        "IEX HIST deferred retry after status {status} for {retry_after_ms} ms beyond the admitted deadline"
+    )]
+    ProviderRetryDeferredPastDeadline {
+        /// Retryable response status that carried the provider delay.
+        status: u16,
+        /// Full parsed provider delay; it was not capped or shortened.
+        retry_after_ms: u64,
+    },
     /// Response header or final URL did not match the selected contract.
     #[error("IEX HIST response metadata is invalid")]
     InvalidResponseMetadata,
@@ -2913,30 +3374,6 @@ pub(crate) async fn resume_mock_stream(
         telemetry,
         capacity_permit,
         Some((adoption, provider_object)),
-    )
-    .await
-}
-
-#[cfg(test)]
-pub(crate) async fn decode_mock_pcap<S: IexEventSink>(
-    plan: &ColdJobPlan,
-    capture: &PcapMaterializationReceipt,
-    pcap: File,
-    capacity_permit: IexHistExecutionPermit,
-    cancellation: &CancellationToken,
-    sink: S,
-) -> Result<DecodedIexCapture<S>, IexHistTransportError> {
-    let deadline = Deadline::from_permit(&capacity_permit)
-        .map_err(|kind| IexHistTransportError::new(kind, TransportTelemetry::new()))?;
-    decode_sealed_pcap_file(
-        plan,
-        capture,
-        pcap,
-        deadline,
-        cancellation,
-        sink,
-        TransportTelemetry::new(),
-        capacity_permit,
     )
     .await
 }

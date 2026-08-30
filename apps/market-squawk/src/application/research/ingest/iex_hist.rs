@@ -1,30 +1,47 @@
 //! Application-owned explicit IEX HIST research-job composition.
 //!
-//! This leaf deliberately stops at the exact boundary the current shared layer can support. It
-//! admits only one operator- or research-selected feed/date object on the adapter's cold lane,
-//! preserves the adapter's durable capacity/checkpoint authorities, and exposes one-use physical
-//! sealing handoffs. It cannot report product availability: the repository does not yet provide a
-//! non-forgeable complete-artifact seal for the catalog/provider object/expanded PCAP, an
-//! IEX-native canonical mapping keyed by [`market_squawk_domain::InstrumentId`], or an immutable generation plus
-//! point-in-time/restart selector.
+//! This leaf admits only one operator- or research-selected feed/date object on the adapter's cold
+//! lane, preserves the adapter's durable capacity/checkpoint authorities, requires common-store
+//! seals for the catalog/provider object/expanded PCAP, and carries a continuity-complete typed
+//! decode into an atomic common-publication contract and exact manifest-pinned restart reader. It
+//! cannot report product availability until shared composition supplies IEX-native lineage and a
+//! date-effective canonical [`market_squawk_domain::InstrumentId`] mapping.
 //!
 //! Nothing in this module schedules an archive, treats IEX venue history as live data, or upgrades
 //! it to SIP, NBBO, consolidated, or market-wide evidence.
 
-use std::sync::Arc;
+use std::{fs::File, sync::Arc, time::Instant};
 
+use async_trait::async_trait;
 use market_squawk_adapter_iex_hist::{
-    ByteAdmissionLimits, Catalog, CatalogError, CatalogFetch, ColdJobPlan, ColdJobTrigger,
-    DecodeLimits, DecodeSummary, ExactFileRequest, FeedKind, FeedVersion, IexHistCapacityAuthority,
-    IexHistCheckpointError, IexHistCheckpointStore, IexHistColdTransport,
-    IexHistDplcDistributionAuthority, IexHistDurableJob, IexHistJobPhase, IexHistPlanner,
-    IexHistRecoveryAction, IexHistTerminalEvidence, IexHistTransportError, MaterializedIexCapture,
-    PcapMaterializationReceipt, PcapObjectEncoding, PlanError, ScheduleLane, Sha256Digest,
-    TradeDate, TransportVersion,
+    ByteAdmissionLimits, CatalogError, CatalogFetch, ColdJobPlan, ColdJobTrigger, DecodeLimits,
+    DecodeSummary, ExactFileRequest, FeedKind, FeedVersion, IexEventSink, IexHistBarInterval,
+    IexHistCapacityAuthority, IexHistCapacityCategory, IexHistCapacityDisposition,
+    IexHistCapacityError, IexHistCatalogPhysicalSealEvidence, IexHistCheckpointError,
+    IexHistCheckpointStore, IexHistColdTransport, IexHistCompletePhysicalSeal,
+    IexHistCompleteSealError, IexHistDecodedSealedCapture, IexHistDerivedBarError,
+    IexHistDerivedBarsHandoff, IexHistDownloadOutcome, IexHistDplcDistributionAuthority,
+    IexHistDurableJob, IexHistExecutionPermit, IexHistJobPhase, IexHistPlanner,
+    IexHistRecoveryAction, IexHistResumeCandidate, IexHistSealedCatalog,
+    IexHistSealedMaterializedCapture, IexHistSharedPhysicalSealReceipt, IexHistTerminalEvidence,
+    IexHistTerminalReason, IexHistTransportError, IexHistTrustedClockReading,
+    IexHistTypedHandoffBuilder, MaterializedIexCapture, PcapMaterializationReceipt,
+    PcapObjectEncoding, PlanError, ScheduleLane, Sha256Digest, TradeDate, TransportTelemetry,
+    TransportVersion,
 };
-use market_squawk_domain::Timestamp;
+use market_squawk_data::{
+    AnalyticalMarketBarOutput, AnalyticalMarketBarReadLimit, AnalyticalMarketBarReadRequest,
+    AnalyticalReadError, DatasetId, DatasetManifestRef, DatasetSchemaRegistry,
+    MarketBarEffectiveRange, QueryLimits,
+};
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, InstrumentId, SourceId, Timestamp, VenueId,
+};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+
+use crate::ResearchService;
 
 /// IEX HIST has one code-owned scheduling classification.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -113,7 +130,7 @@ pub(crate) struct IexHistCatalogSealHandoff {
 
 impl IexHistCatalogSealHandoff {
     fn try_new(fetch: CatalogFetch) -> Result<Self, IexHistApplicationError> {
-        let receipt = fetch.catalog().receipt();
+        let receipt = fetch.receipt();
         let received_at =
             Timestamp::from_unix_nanos(receipt.observation.retrieved_clock().unix_nanos());
         let requirement = IexHistPhysicalSealRequirement {
@@ -132,10 +149,6 @@ impl IexHistCatalogSealHandoff {
         Ok(Self { fetch, requirement })
     }
 
-    pub(crate) const fn catalog(&self) -> &Catalog {
-        self.fetch.catalog()
-    }
-
     pub(crate) fn exact_body(&self) -> &[u8] {
         self.fetch.exact_body()
     }
@@ -144,33 +157,43 @@ impl IexHistCatalogSealHandoff {
         &self.requirement
     }
 
-    /// Releases the complete one-use adapter handoff only to the future shared physical-seal
-    /// integration owner. That owner must seal the exact body before settling its retained permit.
-    pub(crate) fn into_shared_sealer_handoff(self) -> CatalogFetch {
+    /// Rejoins the common-store receipt and settles catalog capacity before descriptor selection
+    /// authority becomes available.
+    pub(crate) fn try_rejoin<R>(
+        self,
+        physical: R,
+    ) -> Result<IexHistSealedCatalog<R>, IexHistApplicationError>
+    where
+        R: IexHistSharedPhysicalSealReceipt,
+    {
         self.fetch
+            .try_bind_physical_seal(physical)
+            .map_err(Into::into)
     }
 }
 
-/// One exact selected-file candidate. It is not execution authority: the parent catalog still has
-/// to cross the shared physical-seal boundary before the plan may be opened as a durable job.
-#[derive(Clone, Debug)]
-pub(crate) struct IexHistExactJobPreview {
+/// One exact selected-file authority inseparable from its physically sealed catalog generation.
+///
+/// Opening the durable checkpoint consumes this value, so no public application path can discard
+/// the catalog seal and continue with a naked plan.
+#[derive(Debug)]
+pub(crate) struct IexHistExactJobPreview<R> {
     plan: ColdJobPlan,
+    sealed_catalog: IexHistSealedCatalog<R>,
 }
 
-impl IexHistExactJobPreview {
+impl<R> IexHistExactJobPreview<R> {
     pub(crate) const fn plan(&self) -> &ColdJobPlan {
         &self.plan
     }
 
-    pub(crate) fn status(&self) -> Result<IexHistSelectionStatus, IexHistApplicationError> {
-        IexHistSelectionStatus::from_plan(&self.plan)
+    /// Retains the exact catalog raw-object receipt that selected this descriptor.
+    pub(crate) const fn sealed_catalog(&self) -> &IexHistSealedCatalog<R> {
+        &self.sealed_catalog
     }
 
-    /// Transfers the exact immutable plan to the shared catalog-seal integration owner. This leaf
-    /// intentionally has no method that turns the preview directly into a runnable job.
-    pub(crate) fn into_plan_for_sealed_catalog(self) -> ColdJobPlan {
-        self.plan
+    pub(crate) fn status(&self) -> Result<IexHistSelectionStatus, IexHistApplicationError> {
+        IexHistSelectionStatus::from_plan(&self.plan)
     }
 }
 
@@ -186,8 +209,10 @@ pub(crate) struct IexHistCaptureSealHandoff {
 
 impl IexHistCaptureSealHandoff {
     pub(crate) fn try_new(
+        plan: &ColdJobPlan,
         capture: Box<MaterializedIexCapture>,
     ) -> Result<Self, IexHistApplicationError> {
+        validate_application_plan(plan)?;
         let receipt = capture.materialization();
         let completed_at = Timestamp::from_unix_nanos(receipt.completed_at_unix_nanos());
         let provider_object = IexHistPhysicalSealRequirement {
@@ -228,9 +253,36 @@ impl IexHistCaptureSealHandoff {
         &self.requirements
     }
 
-    /// Releases the one-use files and permit only to the future shared complete-artifact sealer.
-    pub(crate) fn into_shared_sealer_handoff(self) -> Box<MaterializedIexCapture> {
+    /// Reopens the exact provider object for the common content-addressed sealer while this
+    /// handoff retains the materialization permit.
+    pub(crate) fn reopen_provider_object(&self) -> std::io::Result<File> {
+        self.capture.reopen_provider_object()
+    }
+
+    /// Reopens the exact expanded PCAP for the common content-addressed sealer while this handoff
+    /// retains the materialization permit.
+    pub(crate) fn reopen_expanded_pcap(&self) -> std::io::Result<File> {
+        self.capture.reopen_pcap()
+    }
+
+    /// Rejoins both common-store receipts to the exact materialization while retaining the
+    /// original one-transfer lease for decode and publication.
+    pub(crate) fn try_rejoin<R, S: IexHistCheckpointStore>(
+        self,
+        job: &IexHistDurableJob<S>,
+        provider_object: R,
+        expanded_pcap: R,
+    ) -> Result<IexHistSealedMaterializedCapture<R>, IexHistApplicationError>
+    where
+        R: IexHistSharedPhysicalSealReceipt,
+    {
+        validate_application_plan(job.plan())?;
+        if !catalog_seal_matches_plan(*job.catalog_physical_seal(), job.plan()) {
+            return Err(IexHistApplicationError::InvalidPhysicalHandoff);
+        }
         self.capture
+            .try_bind_complete_physical_seal(job.plan(), provider_object, expanded_pcap)
+            .map_err(Into::into)
     }
 }
 
@@ -318,16 +370,16 @@ impl IexHistResearchJobLeaf {
         IexHistCatalogSealHandoff::try_new(fetch)
     }
 
-    /// Produces a non-runnable preview for exactly one descriptor in one exact catalog generation.
+    /// Selects exactly one descriptor while retaining its sealed catalog as one-use job authority.
     /// The adapter enforces cold-only, one transfer, no automatic catch-up, T+1/window admission,
     /// and complete network/temp/durable/Arrow/Parquet/manifest/free-reserve accounting.
-    pub(crate) fn preview_exact_job(
+    pub(crate) fn preview_exact_job<R>(
         &self,
-        catalog: &Catalog,
+        catalog: IexHistSealedCatalog<R>,
         request: IexHistExplicitJobRequest,
         dplc_distribution: Option<&dyn IexHistDplcDistributionAuthority>,
-    ) -> Result<IexHistExactJobPreview, IexHistApplicationError> {
-        let selected = catalog.select(&request.selection)?;
+    ) -> Result<IexHistExactJobPreview<R>, IexHistApplicationError> {
+        let selected = catalog.catalog().select(&request.selection)?;
         let plan = IexHistPlanner::plan(
             selected,
             request.authority.into(),
@@ -336,18 +388,26 @@ impl IexHistResearchJobLeaf {
             dplc_distribution,
         )?;
         validate_application_plan(&plan)?;
-        Ok(IexHistExactJobPreview { plan })
+        Ok(IexHistExactJobPreview {
+            plan,
+            sealed_catalog: catalog,
+        })
     }
 
     /// Opens or restores the adapter's provider-local durable checkpoint after the shared catalog
     /// sealer has accepted the exact parent bytes. No parallel checkpoint store is introduced.
-    pub(crate) fn open_checkpoint<S: IexHistCheckpointStore>(
+    pub(crate) fn open_checkpoint<R, S: IexHistCheckpointStore>(
         &self,
-        sealed_catalog_plan: &ColdJobPlan,
+        selected_job: IexHistExactJobPreview<R>,
         store: S,
     ) -> Result<IexHistDurableJob<S>, IexHistApplicationError> {
-        validate_application_plan(sealed_catalog_plan)?;
-        IexHistDurableJob::try_open(sealed_catalog_plan, store).map_err(Into::into)
+        let IexHistExactJobPreview {
+            plan,
+            sealed_catalog,
+        } = selected_job;
+        validate_application_plan(&plan)?;
+        IexHistDurableJob::try_open(&plan, sealed_catalog.physical_evidence(), store)
+            .map_err(Into::into)
     }
 
     /// Reopens the adapter's complete plan and evidence from the existing durable checkpoint seam.
@@ -358,6 +418,49 @@ impl IexHistResearchJobLeaf {
         let job = IexHistDurableJob::restore(store)?;
         validate_application_plan(job.plan())?;
         Ok(job)
+    }
+
+    /// Executes one exact selected file only from a sealed-catalog-bound durable job.
+    pub(crate) async fn download_selected<S: IexHistCheckpointStore>(
+        &self,
+        job: &IexHistDurableJob<S>,
+        capacity: &dyn IexHistCapacityAuthority,
+        deadline_unix_nanos: i64,
+        cancellation: &CancellationToken,
+    ) -> Result<IexHistDownloadOutcome, IexHistApplicationError> {
+        validate_application_plan(job.plan())?;
+        if !catalog_seal_matches_plan(*job.catalog_physical_seal(), job.plan()) {
+            return Err(IexHistApplicationError::InvalidPhysicalHandoff);
+        }
+        self.transport
+            .download_materialize(job.plan(), capacity, deadline_unix_nanos, cancellation)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Revalidates and resumes one shared-store-adopted exact prefix for the same durable job.
+    pub(crate) async fn resume_selected<S: IexHistCheckpointStore>(
+        &self,
+        job: &IexHistDurableJob<S>,
+        capacity: &dyn IexHistCapacityAuthority,
+        deadline_unix_nanos: i64,
+        cancellation: &CancellationToken,
+        candidate: IexHistResumeCandidate,
+    ) -> Result<IexHistDownloadOutcome, IexHistApplicationError> {
+        validate_application_plan(job.plan())?;
+        if !catalog_seal_matches_plan(*job.catalog_physical_seal(), job.plan()) {
+            return Err(IexHistApplicationError::InvalidPhysicalHandoff);
+        }
+        self.transport
+            .resume_materialize(
+                job.plan(),
+                capacity,
+                deadline_unix_nanos,
+                cancellation,
+                candidate,
+            )
+            .await
+            .map_err(Into::into)
     }
 
     /// Builds a truthful application status without promoting provider-local capture/decode
@@ -371,11 +474,96 @@ impl IexHistResearchJobLeaf {
 
     /// Converts a materialized adapter result into the complete shared-sealer handoff. No method
     /// here can decode from an unsealed temporary file or settle publication as complete.
-    pub(crate) fn require_capture_seal(
+    pub(crate) fn require_capture_seal<S: IexHistCheckpointStore>(
         &self,
+        job: &IexHistDurableJob<S>,
         capture: Box<MaterializedIexCapture>,
     ) -> Result<IexHistCaptureSealHandoff, IexHistApplicationError> {
-        IexHistCaptureSealHandoff::try_new(capture)
+        if !catalog_seal_matches_plan(*job.catalog_physical_seal(), job.plan()) {
+            return Err(IexHistApplicationError::InvalidPhysicalHandoff);
+        }
+        IexHistCaptureSealHandoff::try_new(job.plan(), capture)
+    }
+
+    /// Records a complete shared-sealed capture before any decode is allowed.
+    pub(crate) fn record_sealed_capture<S: IexHistCheckpointStore, R>(
+        &self,
+        job: &mut IexHistDurableJob<S>,
+        sealed: &IexHistSealedMaterializedCapture<R>,
+        observed_clock: IexHistTrustedClockReading,
+    ) -> Result<(), IexHistApplicationError> {
+        if sealed.plan().plan_sha256() != job.plan().plan_sha256()
+            || !catalog_seal_matches_plan(*job.catalog_physical_seal(), job.plan())
+        {
+            return Err(IexHistApplicationError::InvalidPhysicalHandoff);
+        }
+        let plan = job.plan().clone();
+        job.record_capture(
+            &plan,
+            sealed.materialization().clone(),
+            sealed.physical().evidence(),
+            observed_clock,
+        )?;
+        Ok(())
+    }
+
+    /// Decodes only a complete raw rejoin, preserving one selected-file capacity lease from
+    /// acquisition through the typed publication handoff.
+    async fn decode_sealed_capture<S, R>(
+        &self,
+        sealed: IexHistSealedMaterializedCapture<R>,
+        cancellation: &CancellationToken,
+        sink: S,
+    ) -> Result<IexHistDecodedSealedCapture<S, R>, IexHistApplicationError>
+    where
+        S: IexEventSink,
+        R: IexHistSharedPhysicalSealReceipt,
+    {
+        self.transport
+            .decode_rejoined_sealed_pcap(sealed, cancellation, sink)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Performs the sole production IEX bar decode and retains the original selected-file lease
+    /// for the shared canonical publication transaction.
+    ///
+    /// The typed builder commits only after whole-file continuity succeeds. The derived handoff
+    /// then applies the adapter's exact trade/trade-break calculation without inventing session,
+    /// consolidated-market, adjustment, or canonical-instrument semantics.
+    pub(crate) async fn prepare_trade_bar_publication<S: IexHistCheckpointStore, R>(
+        &self,
+        job: &mut IexHistDurableJob<S>,
+        sealed: IexHistSealedMaterializedCapture<R>,
+        interval: IexHistBarInterval,
+        source_id: SourceId,
+        analytical_dataset: DatasetId,
+        cancellation: &CancellationToken,
+    ) -> Result<IexHistCanonicalPublicationHandoff<R>, IexHistApplicationError>
+    where
+        R: IexHistSharedPhysicalSealReceipt,
+    {
+        if sealed.plan().plan_sha256() != job.plan().plan_sha256()
+            || job.capture_evidence() != Some(sealed.materialization())
+            || !catalog_seal_matches_plan(*job.catalog_physical_seal(), job.plan())
+        {
+            return Err(IexHistApplicationError::InvalidPhysicalHandoff);
+        }
+        let builder = IexHistTypedHandoffBuilder::try_new(sealed.plan(), sealed.materialization())?;
+        let decoded = self
+            .decode_sealed_capture(sealed, cancellation, builder)
+            .await?;
+        let plan = decoded.plan().clone();
+        let materialization = decoded.materialization().clone();
+        let summary = decoded.summary().clone();
+        job.record_decoded(&plan, &materialization, summary)?;
+        IexHistCanonicalPublicationHandoff::try_from_decoded(
+            decoded,
+            *job.catalog_physical_seal(),
+            interval,
+            source_id,
+            analytical_dataset,
+        )
     }
 
     /// The current product boundary is deliberately closed. Product availability can be added only
@@ -383,6 +571,1126 @@ impl IexHistResearchJobLeaf {
     pub(crate) const fn publication_availability(&self) -> IexHistPublicationAvailability {
         IexHistPublicationAvailability::Unavailable(IexHistPublicationBlockers::current())
     }
+}
+
+/// Linear publication candidate that still owns the selected-file capacity lease.
+///
+/// It contains no storage implementation. A shared publication authority may inspect the exact
+/// sealed raw parents and provider-native bars, but only this value can account publication bytes
+/// and settle the original admission as complete.
+pub(crate) struct IexHistCanonicalPublicationHandoff<R> {
+    source_id: SourceId,
+    analytical_dataset: DatasetId,
+    plan: ColdJobPlan,
+    catalog_physical_seal: IexHistCatalogPhysicalSealEvidence,
+    materialization: PcapMaterializationReceipt,
+    summary: DecodeSummary,
+    derived: IexHistDerivedBarsHandoff,
+    telemetry: TransportTelemetry,
+    capacity_permit: IexHistExecutionPermit,
+    physical: IexHistCompletePhysicalSeal<R>,
+}
+
+impl<R> std::fmt::Debug for IexHistCanonicalPublicationHandoff<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IexHistCanonicalPublicationHandoff")
+            .field("source_id", &self.source_id)
+            .field("analytical_dataset", &self.analytical_dataset)
+            .field("plan_sha256", &self.plan.plan_sha256())
+            .field(
+                "capture_receipt_sha256",
+                &self.materialization.receipt_sha256(),
+            )
+            .field("decode_summary_sha256", &self.summary.summary_sha256())
+            .field("derived_handoff_sha256", &self.derived.handoff_sha256())
+            .field("bar_count", &self.derived.bars().len())
+            .field("physical_seal_sha256", &self.physical.seal_sha256())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R> IexHistCanonicalPublicationHandoff<R> {
+    fn try_from_decoded(
+        decoded: IexHistDecodedSealedCapture<IexHistTypedHandoffBuilder, R>,
+        catalog_physical_seal: IexHistCatalogPhysicalSealEvidence,
+        interval: IexHistBarInterval,
+        source_id: SourceId,
+        analytical_dataset: DatasetId,
+    ) -> Result<Self, IexHistApplicationError> {
+        let (plan, materialization, summary, builder, telemetry, capacity_permit, physical) =
+            decoded.into_parts();
+        if !catalog_seal_matches_plan(catalog_physical_seal, &plan) {
+            let settlement_error = capacity_permit
+                .settle(IexHistCapacityDisposition::Quarantined(
+                    IexHistTerminalReason::DownstreamIntegrityFault,
+                ))
+                .err();
+            return Err(IexHistApplicationError::DerivedPreparation {
+                error: IexHistDerivedPreparationError::InvalidHandoff,
+                settlement_error,
+            });
+        }
+        let typed = match builder.try_into_handoff(summary.clone()) {
+            Ok(typed) => typed,
+            Err(error) => {
+                let settlement_error = capacity_permit
+                    .settle(IexHistCapacityDisposition::Quarantined(
+                        IexHistTerminalReason::DownstreamIntegrityFault,
+                    ))
+                    .err();
+                return Err(IexHistApplicationError::DerivedPreparation {
+                    error: IexHistDerivedPreparationError::Decode(error),
+                    settlement_error,
+                });
+            }
+        };
+        let derived = match typed.try_into_derived_bars(interval) {
+            Ok(derived) => derived,
+            Err(error) => {
+                let disposition = if matches!(error, IexHistDerivedBarError::Capacity) {
+                    IexHistCapacityDisposition::Failed
+                } else {
+                    IexHistCapacityDisposition::Quarantined(
+                        IexHistTerminalReason::DownstreamIntegrityFault,
+                    )
+                };
+                let settlement_error = capacity_permit.settle(disposition).err();
+                return Err(IexHistApplicationError::DerivedPreparation {
+                    error: IexHistDerivedPreparationError::Bars(error),
+                    settlement_error,
+                });
+            }
+        };
+        if derived.bars().is_empty() {
+            let settlement_error = capacity_permit
+                .settle(IexHistCapacityDisposition::Failed)
+                .err();
+            return Err(IexHistApplicationError::DerivedPreparation {
+                error: IexHistDerivedPreparationError::NoEligibleTrades,
+                settlement_error,
+            });
+        }
+        if derived.source().plan().plan_sha256() != plan.plan_sha256()
+            || derived.source().capture().receipt_sha256() != materialization.receipt_sha256()
+            || derived.source().summary().summary_sha256() != summary.summary_sha256()
+        {
+            let settlement_error = capacity_permit
+                .settle(IexHistCapacityDisposition::Quarantined(
+                    IexHistTerminalReason::DownstreamIntegrityFault,
+                ))
+                .err();
+            return Err(IexHistApplicationError::DerivedPreparation {
+                error: IexHistDerivedPreparationError::InvalidHandoff,
+                settlement_error,
+            });
+        }
+        Ok(Self {
+            source_id,
+            analytical_dataset,
+            plan,
+            catalog_physical_seal,
+            materialization,
+            summary,
+            derived,
+            telemetry,
+            capacity_permit,
+            physical,
+        })
+    }
+
+    pub(crate) const fn analytical_dataset(&self) -> &DatasetId {
+        &self.analytical_dataset
+    }
+
+    pub(crate) const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    pub(crate) const fn plan(&self) -> &ColdJobPlan {
+        &self.plan
+    }
+
+    pub(crate) const fn materialization(&self) -> &PcapMaterializationReceipt {
+        &self.materialization
+    }
+
+    pub(crate) const fn summary(&self) -> &DecodeSummary {
+        &self.summary
+    }
+
+    pub(crate) const fn derived(&self) -> &IexHistDerivedBarsHandoff {
+        &self.derived
+    }
+
+    pub(crate) const fn physical(&self) -> &IexHistCompletePhysicalSeal<R> {
+        &self.physical
+    }
+
+    fn publication_input(&self) -> IexHistCanonicalPublicationInput<'_, R> {
+        IexHistCanonicalPublicationInput {
+            source_id: &self.source_id,
+            analytical_dataset: &self.analytical_dataset,
+            plan: &self.plan,
+            catalog_physical_seal: self.catalog_physical_seal,
+            materialization: &self.materialization,
+            summary: &self.summary,
+            derived: &self.derived,
+            physical: &self.physical,
+        }
+    }
+
+    /// Invokes the existing shared publisher, validates its immutable receipt, accounts exact
+    /// actual bytes, and only then releases the original selected-file lease as complete.
+    pub(crate) async fn publish<A>(
+        self,
+        authority: &A,
+        cancellation: CancellationToken,
+    ) -> Result<IexHistPublishedBars<R>, IexHistPublicationError<A::Error>>
+    where
+        R: IexHistSharedPhysicalSealReceipt + Send + Sync,
+        A: IexHistCanonicalPublicationAuthority<R>,
+    {
+        let receipt = match authority
+            .publish(self.publication_input(), cancellation)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let settlement_error = self
+                    .capacity_permit
+                    .settle(IexHistCapacityDisposition::Failed)
+                    .err();
+                return Err(IexHistPublicationError::Authority {
+                    error,
+                    settlement_error,
+                });
+            }
+        };
+        if !receipt.validates_against(&self) {
+            let settlement_error = self
+                .capacity_permit
+                .settle(IexHistCapacityDisposition::Quarantined(
+                    IexHistTerminalReason::DownstreamIntegrityFault,
+                ))
+                .err();
+            return Err(IexHistPublicationError::InvalidReceipt {
+                receipt: Box::new(receipt),
+                settlement_error,
+            });
+        }
+        let Self {
+            source_id: _,
+            plan,
+            catalog_physical_seal,
+            materialization,
+            summary,
+            telemetry,
+            mut capacity_permit,
+            physical,
+            analytical_dataset: _,
+            derived: _,
+        } = self;
+        for (category, bytes) in [
+            (IexHistCapacityCategory::CanonicalArrow, receipt.arrow_bytes),
+            (
+                IexHistCapacityCategory::ImmutableParquet,
+                receipt.parquet_bytes,
+            ),
+            (
+                IexHistCapacityCategory::ManifestAndAtomicOverhead,
+                receipt.manifest_and_atomic_bytes,
+            ),
+        ] {
+            if let Err(error) = capacity_permit.record_usage(category, bytes) {
+                let settlement_error = capacity_permit
+                    .settle(IexHistCapacityDisposition::Quarantined(
+                        IexHistTerminalReason::ResourceLimitExceeded,
+                    ))
+                    .err();
+                return Err(IexHistPublicationError::CapacityAfterCommit {
+                    error,
+                    receipt: Box::new(receipt),
+                    settlement_error,
+                });
+            }
+        }
+        if let Err(error) = capacity_permit.settle(IexHistCapacityDisposition::Completed) {
+            return Err(IexHistPublicationError::SettlementAfterCommit {
+                error,
+                receipt: Box::new(receipt),
+            });
+        }
+        Ok(IexHistPublishedBars {
+            plan,
+            catalog_physical_seal,
+            materialization,
+            summary,
+            telemetry,
+            physical,
+            receipt,
+        })
+    }
+}
+
+/// Borrowed, permit-free view supplied to the shared publication authority.
+///
+/// Keeping the lease out of this view prevents the shared publisher from independently settling
+/// or duplicating the selected-file admission.
+#[derive(Clone, Copy)]
+pub(crate) struct IexHistCanonicalPublicationInput<'a, R> {
+    source_id: &'a SourceId,
+    analytical_dataset: &'a DatasetId,
+    plan: &'a ColdJobPlan,
+    catalog_physical_seal: IexHistCatalogPhysicalSealEvidence,
+    materialization: &'a PcapMaterializationReceipt,
+    summary: &'a DecodeSummary,
+    derived: &'a IexHistDerivedBarsHandoff,
+    physical: &'a IexHistCompletePhysicalSeal<R>,
+}
+
+impl<'a, R> IexHistCanonicalPublicationInput<'a, R> {
+    pub(crate) const fn source_id(self) -> &'a SourceId {
+        self.source_id
+    }
+
+    pub(crate) const fn analytical_dataset(self) -> &'a DatasetId {
+        self.analytical_dataset
+    }
+
+    pub(crate) const fn plan(self) -> &'a ColdJobPlan {
+        self.plan
+    }
+
+    pub(crate) const fn catalog_physical_seal(self) -> IexHistCatalogPhysicalSealEvidence {
+        self.catalog_physical_seal
+    }
+
+    pub(crate) const fn materialization(self) -> &'a PcapMaterializationReceipt {
+        self.materialization
+    }
+
+    pub(crate) const fn summary(self) -> &'a DecodeSummary {
+        self.summary
+    }
+
+    pub(crate) const fn derived(self) -> &'a IexHistDerivedBarsHandoff {
+        self.derived
+    }
+
+    pub(crate) const fn canonical_feed_identifier(self) -> &'static str {
+        canonical_feed_identifier(self.plan.selected_file().feed())
+    }
+
+    pub(crate) const fn canonical_interval_identifier(self) -> &'static str {
+        canonical_interval_identifier(self.derived.interval())
+    }
+
+    pub(crate) const fn physical(self) -> &'a IexHistCompletePhysicalSeal<R> {
+        self.physical
+    }
+}
+
+/// Shared-authority seam for the existing raw/native/canonical publication transaction.
+///
+/// Implementations must use the common provider-capture store, Arrow converter, Parquet store,
+/// manifest catalog, rights decision, and precommit authority. Returning `Ok` means the immutable
+/// manifest and every exact raw/native parent are already durably committed; an implementation
+/// must never substitute provider text for a date-effective canonical `InstrumentId`.
+#[async_trait]
+pub(crate) trait IexHistCanonicalPublicationAuthority<R>: Send + Sync
+where
+    R: IexHistSharedPhysicalSealReceipt + Send + Sync,
+{
+    type Error: Send;
+
+    async fn publish(
+        &self,
+        input: IexHistCanonicalPublicationInput<'_, R>,
+        cancellation: CancellationToken,
+    ) -> Result<IexHistImmutablePublicationReceipt, Self::Error>;
+}
+
+/// One source symbol's verified date-effective canonical identity and exact published row count.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IexHistPublishedInstrument {
+    symbol: String,
+    instrument_id: InstrumentId,
+    bar_count: u64,
+    first_effective_at: Timestamp,
+    last_effective_at: Timestamp,
+    mapping_evidence: EvidenceDigest,
+}
+
+impl IexHistPublishedInstrument {
+    pub(crate) fn try_new(
+        symbol: impl Into<String>,
+        instrument_id: InstrumentId,
+        bar_count: u64,
+        first_effective_at: Timestamp,
+        last_effective_at: Timestamp,
+        mapping_evidence: EvidenceDigest,
+    ) -> Result<Self, IexHistApplicationError> {
+        let symbol = symbol.into();
+        if symbol.is_empty()
+            || symbol.len() > 64
+            || bar_count == 0
+            || first_effective_at > last_effective_at
+            || !valid_sha256_evidence(mapping_evidence)
+        {
+            return Err(IexHistApplicationError::InvalidCanonicalPublicationReceipt);
+        }
+        Ok(Self {
+            symbol,
+            instrument_id,
+            bar_count,
+            first_effective_at,
+            last_effective_at,
+            mapping_evidence,
+        })
+    }
+
+    pub(crate) fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    pub(crate) const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    pub(crate) const fn bar_count(&self) -> u64 {
+        self.bar_count
+    }
+
+    pub(crate) const fn effective_range(&self) -> (Timestamp, Timestamp) {
+        (self.first_effective_at, self.last_effective_at)
+    }
+
+    pub(crate) const fn mapping_evidence(&self) -> EvidenceDigest {
+        self.mapping_evidence
+    }
+}
+
+/// Immutable shared-publication receipt bound to every IEX cold-job parent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IexHistImmutablePublicationReceipt {
+    manifest: DatasetManifestRef,
+    source_id: SourceId,
+    venue_id: VenueId,
+    trade_date: TradeDate,
+    feed: FeedKind,
+    feed_version: FeedVersion,
+    transport_version: TransportVersion,
+    interval: IexHistBarInterval,
+    plan_sha256: Sha256Digest,
+    catalog_seal_sha256: Sha256Digest,
+    capture_receipt_sha256: Sha256Digest,
+    physical_seal_sha256: Sha256Digest,
+    decode_summary_sha256: Sha256Digest,
+    provider_content_sha256: Sha256Digest,
+    derived_handoff_sha256: Sha256Digest,
+    mapping_set_sha256: EvidenceDigest,
+    persisted_binding_sha256: EvidenceDigest,
+    canonical_content_sha256: EvidenceDigest,
+    locally_available_at: Timestamp,
+    row_count: u64,
+    instruments: Box<[IexHistPublishedInstrument]>,
+    arrow_bytes: u64,
+    parquet_bytes: u64,
+    manifest_and_atomic_bytes: u64,
+    receipt_sha256: EvidenceDigest,
+}
+
+impl IexHistImmutablePublicationReceipt {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared receipt commits every immutable manifest, parent, clock, and byte coordinate"
+    )]
+    pub(crate) fn try_new(
+        manifest: DatasetManifestRef,
+        source_id: SourceId,
+        venue_id: VenueId,
+        trade_date: TradeDate,
+        feed: FeedKind,
+        feed_version: FeedVersion,
+        transport_version: TransportVersion,
+        interval: IexHistBarInterval,
+        plan_sha256: Sha256Digest,
+        catalog_seal_sha256: Sha256Digest,
+        capture_receipt_sha256: Sha256Digest,
+        physical_seal_sha256: Sha256Digest,
+        decode_summary_sha256: Sha256Digest,
+        provider_content_sha256: Sha256Digest,
+        derived_handoff_sha256: Sha256Digest,
+        mapping_set_sha256: EvidenceDigest,
+        persisted_binding_sha256: EvidenceDigest,
+        canonical_content_sha256: EvidenceDigest,
+        locally_available_at: Timestamp,
+        row_count: u64,
+        instruments: Vec<IexHistPublishedInstrument>,
+        arrow_bytes: u64,
+        parquet_bytes: u64,
+        manifest_and_atomic_bytes: u64,
+    ) -> Result<Self, IexHistApplicationError> {
+        let canonical = DatasetSchemaRegistry::local()
+            .canonical_research_observations()
+            .map_err(|_| IexHistApplicationError::InvalidCanonicalPublicationReceipt)?;
+        if manifest.schema() != &canonical
+            || venue_id.as_str() != "iex"
+            || row_count == 0
+            || instruments.is_empty()
+            || arrow_bytes == 0
+            || parquet_bytes == 0
+            || manifest_and_atomic_bytes == 0
+            || !valid_sha256_evidence(mapping_set_sha256)
+            || !valid_sha256_evidence(persisted_binding_sha256)
+            || !valid_sha256_evidence(canonical_content_sha256)
+            || manifest.content_hash().bytes() != canonical_content_sha256.bytes()
+            || !valid_iex_sha256(plan_sha256)
+            || !valid_iex_sha256(catalog_seal_sha256)
+            || !valid_iex_sha256(capture_receipt_sha256)
+            || !valid_iex_sha256(physical_seal_sha256)
+            || !valid_iex_sha256(decode_summary_sha256)
+            || !valid_iex_sha256(provider_content_sha256)
+            || !valid_iex_sha256(derived_handoff_sha256)
+            || instruments.iter().any(|entry| entry.bar_count == 0)
+            || instruments.windows(2).any(|pair| {
+                pair[0].symbol >= pair[1].symbol || pair[0].instrument_id == pair[1].instrument_id
+            })
+            || instruments.iter().enumerate().any(|(index, entry)| {
+                instruments[index + 1..]
+                    .iter()
+                    .any(|later| later.instrument_id == entry.instrument_id)
+            })
+            || instruments
+                .iter()
+                .try_fold(0_u64, |total, entry| total.checked_add(entry.bar_count))
+                != Some(row_count)
+        {
+            return Err(IexHistApplicationError::InvalidCanonicalPublicationReceipt);
+        }
+        let instruments = instruments.into_boxed_slice();
+        let receipt_sha256 = publication_receipt_identity(
+            &manifest,
+            &source_id,
+            &venue_id,
+            trade_date,
+            feed,
+            feed_version,
+            transport_version,
+            interval,
+            plan_sha256,
+            catalog_seal_sha256,
+            capture_receipt_sha256,
+            physical_seal_sha256,
+            decode_summary_sha256,
+            provider_content_sha256,
+            derived_handoff_sha256,
+            mapping_set_sha256,
+            persisted_binding_sha256,
+            canonical_content_sha256,
+            locally_available_at,
+            row_count,
+            &instruments,
+            arrow_bytes,
+            parquet_bytes,
+            manifest_and_atomic_bytes,
+        );
+        Ok(Self {
+            manifest,
+            source_id,
+            venue_id,
+            trade_date,
+            feed,
+            feed_version,
+            transport_version,
+            interval,
+            plan_sha256,
+            catalog_seal_sha256,
+            capture_receipt_sha256,
+            physical_seal_sha256,
+            decode_summary_sha256,
+            provider_content_sha256,
+            derived_handoff_sha256,
+            mapping_set_sha256,
+            persisted_binding_sha256,
+            canonical_content_sha256,
+            locally_available_at,
+            row_count,
+            instruments,
+            arrow_bytes,
+            parquet_bytes,
+            manifest_and_atomic_bytes,
+            receipt_sha256,
+        })
+    }
+
+    fn validates_against<R>(&self, handoff: &IexHistCanonicalPublicationHandoff<R>) -> bool {
+        let selected = handoff.plan.selected_file();
+        let bars = handoff.derived.bars();
+        let latest_completed_at = bars
+            .iter()
+            .map(|bar| bar.bucket_end_unix_nanos())
+            .max()
+            .map(Timestamp::from_unix_nanos);
+        self.manifest.dataset_id() == &handoff.analytical_dataset
+            && self.source_id == handoff.source_id
+            && self.trade_date == selected.trade_date()
+            && self.feed == selected.feed()
+            && self.feed_version == selected.feed_version()
+            && self.transport_version == selected.transport_version()
+            && self.interval == handoff.derived.interval()
+            && self.plan_sha256 == handoff.plan.plan_sha256()
+            && self.catalog_seal_sha256 == handoff.plan_catalog_seal_sha256()
+            && self.capture_receipt_sha256 == handoff.materialization.receipt_sha256()
+            && self.physical_seal_sha256 == handoff.physical.seal_sha256()
+            && self.decode_summary_sha256 == handoff.summary.summary_sha256()
+            && self.provider_content_sha256 == handoff.derived.provider_content_sha256()
+            && self.derived_handoff_sha256 == handoff.derived.handoff_sha256()
+            && u64::try_from(bars.len()).ok() == Some(self.row_count)
+            && self.locally_available_at
+                >= Timestamp::from_unix_nanos(handoff.materialization.completed_at_unix_nanos())
+            && latest_completed_at
+                .is_some_and(|completed_at| self.locally_available_at >= completed_at)
+            && self.instruments.iter().all(|entry| {
+                let first = bars.iter().find(|bar| bar.symbol() == entry.symbol);
+                let last = bars.iter().rev().find(|bar| bar.symbol() == entry.symbol);
+                let count = bars
+                    .iter()
+                    .filter(|bar| bar.symbol() == entry.symbol)
+                    .count();
+                u64::try_from(count).ok() == Some(entry.bar_count)
+                    && first.is_some_and(|bar| {
+                        bar.bucket_start_unix_nanos() == entry.first_effective_at.unix_nanos()
+                    })
+                    && last.is_some_and(|bar| {
+                        bar.bucket_start_unix_nanos() == entry.last_effective_at.unix_nanos()
+                    })
+            })
+            && bars.iter().all(|bar| {
+                self.instruments
+                    .iter()
+                    .any(|entry| entry.symbol == bar.symbol())
+            })
+            && publication_receipt_identity(
+                &self.manifest,
+                &self.source_id,
+                &self.venue_id,
+                self.trade_date,
+                self.feed,
+                self.feed_version,
+                self.transport_version,
+                self.interval,
+                self.plan_sha256,
+                self.catalog_seal_sha256,
+                self.capture_receipt_sha256,
+                self.physical_seal_sha256,
+                self.decode_summary_sha256,
+                self.provider_content_sha256,
+                self.derived_handoff_sha256,
+                self.mapping_set_sha256,
+                self.persisted_binding_sha256,
+                self.canonical_content_sha256,
+                self.locally_available_at,
+                self.row_count,
+                &self.instruments,
+                self.arrow_bytes,
+                self.parquet_bytes,
+                self.manifest_and_atomic_bytes,
+            ) == self.receipt_sha256
+    }
+
+    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
+    }
+
+    pub(crate) const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    pub(crate) const fn venue_id(&self) -> &VenueId {
+        &self.venue_id
+    }
+
+    pub(crate) const fn locally_available_at(&self) -> Timestamp {
+        self.locally_available_at
+    }
+
+    pub(crate) const fn row_count(&self) -> u64 {
+        self.row_count
+    }
+
+    pub(crate) const fn instruments(&self) -> &[IexHistPublishedInstrument] {
+        &self.instruments
+    }
+
+    pub(crate) const fn receipt_sha256(&self) -> EvidenceDigest {
+        self.receipt_sha256
+    }
+}
+
+impl<R> IexHistCanonicalPublicationHandoff<R> {
+    fn plan_catalog_seal_sha256(&self) -> Sha256Digest {
+        self.catalog_physical_seal.seal_sha256()
+    }
+}
+
+fn catalog_seal_matches_plan(seal: IexHistCatalogPhysicalSealEvidence, plan: &ColdJobPlan) -> bool {
+    let selected = plan.selected_file();
+    let observation = selected.catalog_observation();
+    seal.catalog_observation_receipt_sha256() == observation.receipt_sha256()
+        && seal.storage_root_sha256() == observation.attempt().storage_root_sha256()
+        && seal.object_sha256() == selected.catalog_sha256()
+        && seal.object_bytes() == selected.catalog_bytes()
+        && seal.object_bytes() != 0
+        && seal
+            .physical_receipt_sha256()
+            .as_bytes()
+            .iter()
+            .any(|byte| *byte != 0)
+}
+
+/// Completed immutable IEX bar generation retaining its exact sealed raw parents.
+pub(crate) struct IexHistPublishedBars<R> {
+    plan: ColdJobPlan,
+    catalog_physical_seal: IexHistCatalogPhysicalSealEvidence,
+    materialization: PcapMaterializationReceipt,
+    summary: DecodeSummary,
+    telemetry: TransportTelemetry,
+    physical: IexHistCompletePhysicalSeal<R>,
+    receipt: IexHistImmutablePublicationReceipt,
+}
+
+impl<R> std::fmt::Debug for IexHistPublishedBars<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IexHistPublishedBars")
+            .field("manifest", self.receipt.manifest())
+            .field("receipt_sha256", &self.receipt.receipt_sha256())
+            .field("plan_sha256", &self.plan.plan_sha256())
+            .field("physical_seal_sha256", &self.physical.seal_sha256())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R> IexHistPublishedBars<R> {
+    pub(crate) const fn receipt(&self) -> &IexHistImmutablePublicationReceipt {
+        &self.receipt
+    }
+
+    pub(crate) const fn plan(&self) -> &ColdJobPlan {
+        &self.plan
+    }
+
+    pub(crate) const fn materialization(&self) -> &PcapMaterializationReceipt {
+        &self.materialization
+    }
+
+    pub(crate) const fn catalog_physical_seal(&self) -> IexHistCatalogPhysicalSealEvidence {
+        self.catalog_physical_seal
+    }
+
+    pub(crate) const fn summary(&self) -> &DecodeSummary {
+        &self.summary
+    }
+
+    pub(crate) const fn telemetry(&self) -> &TransportTelemetry {
+        &self.telemetry
+    }
+
+    pub(crate) const fn physical(&self) -> &IexHistCompletePhysicalSeal<R> {
+        &self.physical
+    }
+
+    pub(crate) fn restart_selector(&self) -> IexHistRestartSelector {
+        IexHistRestartSelector {
+            publication: self.receipt.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum IexHistDerivedPreparationError {
+    Decode(market_squawk_adapter_iex_hist::DecodeError),
+    Bars(IexHistDerivedBarError),
+    NoEligibleTrades,
+    InvalidHandoff,
+}
+
+/// Publication failure distinguishes a precommit refusal from a committed receipt failure.
+#[derive(Debug)]
+pub(crate) enum IexHistPublicationError<E> {
+    Authority {
+        error: E,
+        settlement_error: Option<IexHistCapacityError>,
+    },
+    InvalidReceipt {
+        receipt: Box<IexHistImmutablePublicationReceipt>,
+        settlement_error: Option<IexHistCapacityError>,
+    },
+    CapacityAfterCommit {
+        error: IexHistCapacityError,
+        receipt: Box<IexHistImmutablePublicationReceipt>,
+        settlement_error: Option<IexHistCapacityError>,
+    },
+    SettlementAfterCommit {
+        error: IexHistCapacityError,
+        receipt: Box<IexHistImmutablePublicationReceipt>,
+    },
+}
+
+fn valid_sha256_evidence(value: EvidenceDigest) -> bool {
+    value.algorithm() == DigestAlgorithm::Sha256 && value.bytes().iter().any(|byte| *byte != 0)
+}
+
+fn valid_iex_sha256(value: Sha256Digest) -> bool {
+    value.as_bytes().iter().any(|byte| *byte != 0)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "publication identity intentionally commits every immutable parent and actual-byte field"
+)]
+fn publication_receipt_identity(
+    manifest: &DatasetManifestRef,
+    source_id: &SourceId,
+    venue_id: &VenueId,
+    trade_date: TradeDate,
+    feed: FeedKind,
+    feed_version: FeedVersion,
+    transport_version: TransportVersion,
+    interval: IexHistBarInterval,
+    plan_sha256: Sha256Digest,
+    catalog_seal_sha256: Sha256Digest,
+    capture_receipt_sha256: Sha256Digest,
+    physical_seal_sha256: Sha256Digest,
+    decode_summary_sha256: Sha256Digest,
+    provider_content_sha256: Sha256Digest,
+    derived_handoff_sha256: Sha256Digest,
+    mapping_set_sha256: EvidenceDigest,
+    persisted_binding_sha256: EvidenceDigest,
+    canonical_content_sha256: EvidenceDigest,
+    locally_available_at: Timestamp,
+    row_count: u64,
+    instruments: &[IexHistPublishedInstrument],
+    arrow_bytes: u64,
+    parquet_bytes: u64,
+    manifest_and_atomic_bytes: u64,
+) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/iex-hist-canonical-publication/v1");
+    hash.update(manifest.dataset_id().as_str().as_bytes());
+    hash.update(manifest.manifest_version().to_le_bytes());
+    hash.update(manifest.schema().name().as_bytes());
+    hash.update(manifest.schema_version().get().to_le_bytes());
+    hash.update(manifest.schema().fingerprint());
+    hash.update(manifest.content_hash().bytes());
+    hash.update(source_id.to_string().as_bytes());
+    hash.update(venue_id.to_string().as_bytes());
+    hash.update(trade_date.compact().as_bytes());
+    hash.update([feed_identity_tag(feed)]);
+    hash.update([feed_version_identity_tag(feed_version)]);
+    hash.update([transport_version_identity_tag(transport_version)]);
+    hash.update([bar_interval_identity_tag(interval)]);
+    for digest in [
+        plan_sha256,
+        catalog_seal_sha256,
+        capture_receipt_sha256,
+        physical_seal_sha256,
+        decode_summary_sha256,
+        provider_content_sha256,
+        derived_handoff_sha256,
+    ] {
+        hash.update(digest.as_bytes());
+    }
+    hash.update(mapping_set_sha256.bytes());
+    hash.update(persisted_binding_sha256.bytes());
+    hash.update(canonical_content_sha256.bytes());
+    hash.update(locally_available_at.unix_nanos().to_le_bytes());
+    hash.update(row_count.to_le_bytes());
+    hash.update(
+        u64::try_from(instruments.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    for instrument in instruments {
+        hash.update(instrument.symbol.as_bytes());
+        hash.update(instrument.instrument_id.as_uuid().as_bytes());
+        hash.update(instrument.bar_count.to_le_bytes());
+        hash.update(instrument.first_effective_at.unix_nanos().to_le_bytes());
+        hash.update(instrument.last_effective_at.unix_nanos().to_le_bytes());
+        hash.update(instrument.mapping_evidence.bytes());
+    }
+    hash.update(arrow_bytes.to_le_bytes());
+    hash.update(parquet_bytes.to_le_bytes());
+    hash.update(manifest_and_atomic_bytes.to_le_bytes());
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+const fn feed_identity_tag(value: FeedKind) -> u8 {
+    match value {
+        FeedKind::Tops => 1,
+        FeedKind::Deep => 2,
+        FeedKind::DeepPlusDpls => 3,
+        FeedKind::DeepPlusDplc => 4,
+    }
+}
+
+const fn canonical_feed_identifier(value: FeedKind) -> &'static str {
+    match value {
+        FeedKind::Tops => "iex-hist-tops",
+        FeedKind::Deep => "iex-hist-deep",
+        FeedKind::DeepPlusDpls => "iex-hist-dpls",
+        FeedKind::DeepPlusDplc => "iex-hist-dplc",
+    }
+}
+
+const fn canonical_interval_identifier(value: IexHistBarInterval) -> &'static str {
+    match value {
+        IexHistBarInterval::OneMinute => "one_minute_utc",
+    }
+}
+
+const fn feed_version_identity_tag(value: FeedVersion) -> u8 {
+    match value {
+        FeedVersion::Tops1_6 => 1,
+        FeedVersion::Deep1_0 => 2,
+        FeedVersion::DeepPlusDpls1_0 => 3,
+        FeedVersion::DeepPlusDplc1 => 4,
+    }
+}
+
+const fn transport_version_identity_tag(value: TransportVersion) -> u8 {
+    match value {
+        TransportVersion::IexTp1 => 1,
+    }
+}
+
+const fn bar_interval_identity_tag(value: IexHistBarInterval) -> u8 {
+    match value {
+        IexHistBarInterval::OneMinute => 1,
+    }
+}
+
+/// Catalog evidence proving restart reopened the exact IEX raw/native parent binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IexHistRestartLineageEvidence {
+    manifest: DatasetManifestRef,
+    publication_receipt_sha256: EvidenceDigest,
+    persisted_binding_sha256: EvidenceDigest,
+    source_id: SourceId,
+    venue_id: VenueId,
+    catalog_seal_sha256: Sha256Digest,
+    physical_seal_sha256: Sha256Digest,
+    plan_sha256: Sha256Digest,
+    capture_receipt_sha256: Sha256Digest,
+    decode_summary_sha256: Sha256Digest,
+    provider_content_sha256: Sha256Digest,
+    derived_handoff_sha256: Sha256Digest,
+    mapping_set_sha256: EvidenceDigest,
+    canonical_content_sha256: EvidenceDigest,
+    locally_available_at: Timestamp,
+    row_count: u64,
+}
+
+impl IexHistRestartLineageEvidence {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "restart evidence commits every catalog-revalidated IEX lineage coordinate"
+    )]
+    pub(crate) fn try_new(
+        manifest: DatasetManifestRef,
+        publication_receipt_sha256: EvidenceDigest,
+        persisted_binding_sha256: EvidenceDigest,
+        source_id: SourceId,
+        venue_id: VenueId,
+        catalog_seal_sha256: Sha256Digest,
+        physical_seal_sha256: Sha256Digest,
+        plan_sha256: Sha256Digest,
+        capture_receipt_sha256: Sha256Digest,
+        decode_summary_sha256: Sha256Digest,
+        provider_content_sha256: Sha256Digest,
+        derived_handoff_sha256: Sha256Digest,
+        mapping_set_sha256: EvidenceDigest,
+        canonical_content_sha256: EvidenceDigest,
+        locally_available_at: Timestamp,
+        row_count: u64,
+    ) -> Result<Self, IexHistApplicationError> {
+        if row_count == 0
+            || !valid_sha256_evidence(publication_receipt_sha256)
+            || !valid_sha256_evidence(persisted_binding_sha256)
+            || !valid_sha256_evidence(mapping_set_sha256)
+            || !valid_sha256_evidence(canonical_content_sha256)
+            || manifest.content_hash().bytes() != canonical_content_sha256.bytes()
+            || venue_id.as_str() != "iex"
+            || !valid_iex_sha256(catalog_seal_sha256)
+            || !valid_iex_sha256(physical_seal_sha256)
+            || !valid_iex_sha256(plan_sha256)
+            || !valid_iex_sha256(capture_receipt_sha256)
+            || !valid_iex_sha256(decode_summary_sha256)
+            || !valid_iex_sha256(provider_content_sha256)
+            || !valid_iex_sha256(derived_handoff_sha256)
+        {
+            return Err(IexHistApplicationError::InvalidCanonicalPublicationReceipt);
+        }
+        Ok(Self {
+            manifest,
+            publication_receipt_sha256,
+            persisted_binding_sha256,
+            source_id,
+            venue_id,
+            catalog_seal_sha256,
+            physical_seal_sha256,
+            plan_sha256,
+            capture_receipt_sha256,
+            decode_summary_sha256,
+            provider_content_sha256,
+            derived_handoff_sha256,
+            mapping_set_sha256,
+            canonical_content_sha256,
+            locally_available_at,
+            row_count,
+        })
+    }
+}
+
+/// Shared catalog authority needed to prove restart lineage independently of local coordinates.
+pub(crate) trait IexHistRestartLineageAuthority {
+    type Error;
+
+    fn revalidate(
+        &self,
+        selector: &IexHistRestartSelector,
+    ) -> Result<IexHistRestartLineageEvidence, Self::Error>;
+}
+
+/// Exact immutable manifest and raw/native coordinates for restart-safe PIT reads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IexHistRestartSelector {
+    publication: IexHistImmutablePublicationReceipt,
+}
+
+impl IexHistRestartSelector {
+    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
+        self.publication.manifest()
+    }
+
+    pub(crate) const fn publication_receipt_sha256(&self) -> EvidenceDigest {
+        self.publication.receipt_sha256()
+    }
+
+    /// Revalidates the persisted raw/native parent, then runs the existing exact-manifest typed
+    /// market-bar reader for one admitted canonical instrument and knowledge cutoff.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "identity, PIT range, query ceilings, cancellation, and deadline stay explicit"
+    )]
+    pub(crate) async fn reopen<A: IexHistRestartLineageAuthority>(
+        &self,
+        authority: &A,
+        research: &ResearchService,
+        instrument_id: InstrumentId,
+        knowledge_cutoff: Timestamp,
+        read_limit: AnalyticalMarketBarReadLimit,
+        query_limits: QueryLimits,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<IexHistRestartReceipt, IexHistRestartError<A::Error>> {
+        if knowledge_cutoff < self.publication.locally_available_at {
+            return Err(IexHistRestartError::NotYetAvailable);
+        }
+        let instrument = self
+            .publication
+            .instruments
+            .iter()
+            .find(|entry| entry.instrument_id == instrument_id)
+            .ok_or(IexHistRestartError::InstrumentNotPublished)?;
+        let expected_rows = instrument.bar_count;
+        let effective_range = MarketBarEffectiveRange::try_new(
+            instrument.first_effective_at,
+            instrument.last_effective_at,
+        )
+        .map_err(IexHistRestartError::Analytical)?;
+        let lineage = authority
+            .revalidate(self)
+            .map_err(IexHistRestartError::Authority)?;
+        if !self.validates_restart_lineage(&lineage) {
+            return Err(IexHistRestartError::LineageMismatch);
+        }
+        let request = AnalyticalMarketBarReadRequest::try_new(
+            self.publication.manifest.clone(),
+            instrument_id,
+            knowledge_cutoff,
+            Some(effective_range),
+            read_limit,
+        )
+        .map_err(IexHistRestartError::Analytical)?;
+        let bars = research
+            .analytical_reader()
+            .read_market_bars(request, query_limits, deadline, cancellation)
+            .await
+            .map_err(IexHistRestartError::Analytical)?;
+        if bars.source_id() != &self.publication.source_id
+            || bars.output().manifest() != &self.publication.manifest
+            || u64::try_from(bars.bars().len()).ok() != Some(expected_rows)
+            || bars.bars().iter().any(|bar| {
+                bar.context().provenance().venue_id() != Some(&self.publication.venue_id)
+                    || bar.feed().as_str() != canonical_feed_identifier(self.publication.feed)
+                    || bar.interval().as_str()
+                        != canonical_interval_identifier(self.publication.interval)
+            })
+        {
+            return Err(IexHistRestartError::TypedReadMismatch);
+        }
+        Ok(IexHistRestartReceipt { lineage, bars })
+    }
+
+    fn validates_restart_lineage(&self, evidence: &IexHistRestartLineageEvidence) -> bool {
+        evidence.manifest == self.publication.manifest
+            && evidence.publication_receipt_sha256 == self.publication.receipt_sha256
+            && evidence.persisted_binding_sha256 == self.publication.persisted_binding_sha256
+            && evidence.source_id == self.publication.source_id
+            && evidence.venue_id == self.publication.venue_id
+            && evidence.catalog_seal_sha256 == self.publication.catalog_seal_sha256
+            && evidence.physical_seal_sha256 == self.publication.physical_seal_sha256
+            && evidence.plan_sha256 == self.publication.plan_sha256
+            && evidence.capture_receipt_sha256 == self.publication.capture_receipt_sha256
+            && evidence.decode_summary_sha256 == self.publication.decode_summary_sha256
+            && evidence.provider_content_sha256 == self.publication.provider_content_sha256
+            && evidence.derived_handoff_sha256 == self.publication.derived_handoff_sha256
+            && evidence.mapping_set_sha256 == self.publication.mapping_set_sha256
+            && evidence.canonical_content_sha256 == self.publication.canonical_content_sha256
+            && evidence.locally_available_at == self.publication.locally_available_at
+            && evidence.row_count == self.publication.row_count
+    }
+}
+
+/// Raw/native restart evidence plus the exact manifest-pinned typed bar result.
+#[derive(Debug)]
+pub(crate) struct IexHistRestartReceipt {
+    lineage: IexHistRestartLineageEvidence,
+    bars: AnalyticalMarketBarOutput,
+}
+
+impl IexHistRestartReceipt {
+    pub(crate) const fn lineage(&self) -> &IexHistRestartLineageEvidence {
+        &self.lineage
+    }
+
+    pub(crate) const fn bars(&self) -> &AnalyticalMarketBarOutput {
+        &self.bars
+    }
+}
+
+/// Exact restart/PIT failure; pre-availability absence is distinct from integrity failure.
+#[derive(Debug)]
+pub(crate) enum IexHistRestartError<E> {
+    Authority(E),
+    NotYetAvailable,
+    InstrumentNotPublished,
+    LineageMismatch,
+    TypedReadMismatch,
+    Analytical(AnalyticalReadError),
 }
 
 fn validate_application_plan(plan: &ColdJobPlan) -> Result<(), IexHistApplicationError> {
@@ -666,19 +1974,16 @@ pub(crate) enum IexHistPublicationAvailability {
 /// Exact release-owned dependencies that must all be closed before availability exists.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IexHistPublicationBlockers {
-    blockers: [IexHistPublicationBlocker; 6],
+    blockers: [IexHistPublicationBlocker; 3],
 }
 
 impl IexHistPublicationBlockers {
     const fn current() -> Self {
         Self {
             blockers: [
-                IexHistPublicationBlocker::CompleteRawPhysicalSealReceipt,
                 IexHistPublicationBlocker::IexNativeLineageSchema,
                 IexHistPublicationBlocker::InstrumentIdCanonicalMapper,
                 IexHistPublicationBlocker::ImmutableCanonicalGenerationPublisher,
-                IexHistPublicationBlocker::ManifestBoundPointInTimeSelector,
-                IexHistPublicationBlocker::RestartVerifiedTypedRead,
             ],
         }
     }
@@ -691,9 +1996,6 @@ impl IexHistPublicationBlockers {
 /// One exact shared application/data dependency, with no permissions or entitlement inference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IexHistPublicationBlocker {
-    /// Shared storage must seal catalog, provider object, and expanded PCAP and return one
-    /// non-forgeable joined receipt; the adapter's resumable-prefix receipt alone is insufficient.
-    CompleteRawPhysicalSealReceipt,
     /// Shared provider-native lineage does not yet admit the IEX HIST decoder schema.
     IexNativeLineageSchema,
     /// Every provider symbol must resolve to a date-effective internal InstrumentId; ticker-only
@@ -701,10 +2003,6 @@ pub(crate) enum IexHistPublicationBlocker {
     InstrumentIdCanonicalMapper,
     /// No IEX-qualified Arrow-to-immutable-Parquet publisher exists.
     ImmutableCanonicalGenerationPublisher,
-    /// No selector can choose an exact IEX generation by internal identity and PIT cutoff.
-    ManifestBoundPointInTimeSelector,
-    /// No typed read reopens and revalidates that exact manifest after process restart.
-    RestartVerifiedTypedRead,
 }
 
 /// Closed application-leaf failure.
@@ -714,12 +2012,23 @@ pub(crate) enum IexHistApplicationError {
     InvalidApplicationPlan,
     #[error("IEX HIST physical-seal handoff does not match exact adapter evidence")]
     InvalidPhysicalHandoff,
+    #[error("IEX HIST canonical publication receipt is invalid")]
+    InvalidCanonicalPublicationReceipt,
+    #[error("IEX HIST derived-bar preparation failed")]
+    DerivedPreparation {
+        error: IexHistDerivedPreparationError,
+        settlement_error: Option<IexHistCapacityError>,
+    },
+    #[error(transparent)]
+    Decode(#[from] market_squawk_adapter_iex_hist::DecodeError),
     #[error(transparent)]
     Catalog(#[from] CatalogError),
     #[error(transparent)]
     Plan(#[from] PlanError),
     #[error(transparent)]
     Checkpoint(#[from] IexHistCheckpointError),
+    #[error(transparent)]
+    CompleteSeal(#[from] IexHistCompleteSealError),
     #[error(transparent)]
     Transport(#[from] IexHistTransportError),
 }

@@ -16,19 +16,20 @@ use crate::catalog::CatalogTransportMetadata;
 use crate::receipt::CaptureResponseMetadata;
 use crate::transport::{MockStreamChunk, materialize_mock_stream, resume_mock_stream};
 use crate::{
-    ByteAdmissionLimits, CaptureChronologyDisposition, CaptureError, Catalog, ColdJobPlan,
-    ColdJobTrigger, DecodeLimits, ExactFileRequest, FeedKind, FeedVersion, IexEvent,
+    ByteAdmissionLimits, CaptureChronologyDisposition, CaptureError, Catalog, CatalogFetch,
+    ColdJobPlan, ColdJobTrigger, DecodeLimits, ExactFileRequest, FeedKind, FeedVersion, IexEvent,
     IexHistAuthorityClockSample, IexHistBarInterval, IexHistCapacityAuthority,
-    IexHistCapacityDisposition, IexHistCapacityError, IexHistCapacityFootprint,
-    IexHistCapacityLease, IexHistCapacityRequest, IexHistCapacitySettlement,
-    IexHistCheckpointStore, IexHistCheckpointStoreError, IexHistDownloadOutcome, IexHistDurableJob,
+    IexHistCapacityCategory, IexHistCapacityDisposition, IexHistCapacityError,
+    IexHistCapacityFootprint, IexHistCapacityLease, IexHistCapacityRequest,
+    IexHistCapacitySettlement, IexHistCheckpointStore, IexHistCheckpointStoreError,
+    IexHistColdTransport, IexHistCompleteSealError, IexHistDownloadOutcome, IexHistDurableJob,
     IexHistJobPhase, IexHistPlanner, IexHistReactivationRequirement, IexHistRecoveryAction,
     IexHistResumeAdoptionRequest, IexHistResumeCandidate, IexHistResumeCause,
     IexHistResumePhysicalAdopter, IexHistRetryDisposition, IexHistSharedPhysicalSealReceipt,
     IexHistTerminalCoordinate, IexHistTerminalDisposition, IexHistTerminalError,
-    IexHistTerminalPhase, IexHistTrustedClockReading, IexHistTypedHandoffBuilder,
-    PcapObjectEncoding, ResumePolicy, ScheduleLane, Sha256Digest, TradeDate, TransportErrorKind,
-    TransportVersion,
+    IexHistTerminalPhase, IexHistTransportConfig, IexHistTrustedClockReading,
+    IexHistTypedHandoffBuilder, PcapObjectEncoding, ResumePolicy, ScheduleLane, Sha256Digest,
+    TradeDate, TransportErrorKind, TransportVersion,
 };
 
 const OBSERVED_ON: &str = "20260811";
@@ -45,11 +46,73 @@ async fn selected_feed_date_resumes_decodes_and_hands_off_native_bars() {
     let gzip = stored_gzip(&pcap);
     let staging = tempfile::tempdir().unwrap();
     let authority = MemoryCapacityAuthority::new(staging.path());
-    let catalog = parse_catalog(
-        &catalog_body(u64::try_from(gzip.len()).unwrap()),
-        &authority,
+    let exact_catalog_body = catalog_body(u64::try_from(gzip.len()).unwrap());
+    let wrong_catalog_seal = parse_catalog_fetch(&exact_catalog_body, &authority)
+        .try_bind_physical_seal(complete_physical_receipt(
+            b"wrong-catalog-json",
+            Sha256Digest::of(b"wrong-catalog-json"),
+            u64::try_from(exact_catalog_body.len()).unwrap(),
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        wrong_catalog_seal,
+        IexHistCompleteSealError::InvalidPhysicalReceipt { .. }
+    ));
+    assert!(matches!(
+        authority
+            .settlements
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .disposition(),
+        IexHistCapacityDisposition::Quarantined(_)
+    ));
+    let missing_catalog_seal = parse_catalog_fetch(&exact_catalog_body, &authority);
+    assert_eq!(missing_catalog_seal.exact_body(), exact_catalog_body);
+    drop(missing_catalog_seal);
+    assert_eq!(
+        authority
+            .settlements
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .disposition(),
+        IexHistCapacityDisposition::Interrupted
     );
-    let selected = catalog
+    let sealed_catalog = parse_catalog_fetch(&exact_catalog_body, &authority)
+        .try_bind_physical_seal(complete_physical_receipt(
+            b"catalog-json",
+            Sha256Digest::of(&exact_catalog_body),
+            u64::try_from(exact_catalog_body.len()).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        authority
+            .settlements
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .disposition(),
+        IexHistCapacityDisposition::Completed
+    );
+    let catalog_physical_seal = sealed_catalog.physical_evidence();
+    assert_eq!(
+        catalog_physical_seal.object_sha256(),
+        Sha256Digest::of(&exact_catalog_body)
+    );
+    assert_eq!(
+        catalog_physical_seal.storage_root_sha256(),
+        Sha256Digest::of(b"fixture-storage-root")
+    );
+    assert_eq!(
+        catalog_physical_seal.seal_sha256(),
+        sealed_catalog.seal_sha256()
+    );
+    let selected = sealed_catalog
+        .catalog()
         .select(&ExactFileRequest {
             trade_date: TradeDate::parse(TRADE_DATE).unwrap(),
             feed: FeedKind::Tops,
@@ -167,7 +230,7 @@ async fn selected_feed_date_resumes_decodes_and_hands_off_native_bars() {
         materialized.telemetry().staged_provider_object_bytes(),
         u64::try_from(gzip.len()).unwrap()
     );
-    let (capture, _, files, materialize_permit) = materialized.into_parts();
+    let capture = materialized.materialization().clone();
     assert_eq!(
         capture.chronology_disposition(),
         CaptureChronologyDisposition::Admitted
@@ -185,38 +248,84 @@ async fn selected_feed_date_resumes_decodes_and_hands_off_native_bars() {
     assert_eq!(capture.response_content_length(), suffix_bytes);
     assert_eq!(capture.compressed_sha256(), Sha256Digest::of(&gzip));
     assert_eq!(capture.pcap_sha256(), Sha256Digest::of(&pcap));
-    drop(materialize_permit);
+    let provider_object_receipt = complete_physical_receipt(
+        b"provider-object",
+        capture.compressed_sha256(),
+        capture.compressed_bytes(),
+    );
+    let pcap_receipt = complete_physical_receipt(
+        b"expanded-pcap",
+        capture.pcap_sha256(),
+        capture.pcap_bytes(),
+    );
+    let sealed = materialized
+        .try_bind_complete_physical_seal(&plan, provider_object_receipt, pcap_receipt)
+        .unwrap();
+    assert_eq!(sealed.materialization(), &capture);
+    assert_ne!(
+        sealed
+            .physical()
+            .provider_object()
+            .physical_receipt_sha256(),
+        sealed.physical().expanded_pcap().physical_receipt_sha256()
+    );
 
     let store = MemoryCheckpointStore::default();
-    let mut durable = IexHistDurableJob::try_open(&plan, store.clone()).unwrap();
+    let mut durable =
+        IexHistDurableJob::try_open(&plan, catalog_physical_seal, store.clone()).unwrap();
     assert_eq!(durable.phase(), IexHistJobPhase::Planned);
+    assert_eq!(durable.catalog_physical_seal(), &catalog_physical_seal);
     durable
-        .record_capture(&plan, capture.clone(), trusted_clock(AUTHORITY_NOW + 3))
+        .record_capture(
+            &plan,
+            capture.clone(),
+            sealed.physical().evidence(),
+            trusted_clock(AUTHORITY_NOW + 3),
+        )
         .unwrap();
     drop(durable);
     let mut durable = IexHistDurableJob::restore(store.clone()).unwrap();
     assert_eq!(durable.phase(), IexHistJobPhase::CaptureEvidence);
+    assert_eq!(durable.catalog_physical_seal(), &catalog_physical_seal);
     assert_eq!(
         durable.recovery_action(),
-        IexHistRecoveryAction::RequireSharedArtifactAdoptionOrRestartWholeFile
+        IexHistRecoveryAction::ReopenSharedSealedCaptureOrRestartWholeFile
     );
     assert_eq!(durable.capture_evidence(), Some(&capture));
+    assert_eq!(
+        durable.capture_physical_seal_evidence(),
+        Some(&sealed.physical().evidence())
+    );
 
-    let decoded = crate::transport::decode_mock_pcap(
-        &plan,
-        &capture,
-        files.reopen_pcap().unwrap(),
-        acquire_permit(&plan, &authority, ATTEMPT_DEADLINE + 3),
-        &CancellationToken::new(),
-        IexHistTypedHandoffBuilder::try_new(&plan, &capture).unwrap(),
-    )
-    .await
-    .unwrap();
-    let (summary, builder, telemetry, decode_permit) = decoded.into_parts();
+    let transport = IexHistColdTransport::try_new(IexHistTransportConfig::default()).unwrap();
+    let decoded = transport
+        .decode_rejoined_sealed_pcap(
+            sealed,
+            &CancellationToken::new(),
+            IexHistTypedHandoffBuilder::try_new(&plan, &capture).unwrap(),
+        )
+        .await
+        .unwrap();
+    let (decoded_plan, decoded_capture, summary, builder, telemetry, decode_permit, physical) =
+        decoded.into_parts();
+    assert_eq!(decoded_plan, plan);
+    assert_eq!(decoded_capture, capture);
     assert_eq!(summary.messages, 6);
+    assert_eq!(
+        summary.decode_attempt_sha256,
+        capture.attempt().attempt_sha256()
+    );
     assert_eq!(
         telemetry.staged_decoded_event_batch_bytes(),
         summary.decoded_event_batch_bytes
+    );
+    assert_eq!(
+        physical.provider_object().object_sha256(),
+        capture.compressed_sha256()
+    );
+    assert_eq!(
+        physical.expanded_pcap().object_sha256(),
+        capture.pcap_sha256()
     );
     let durable_summary = summary.clone();
     let handoff = builder.try_into_handoff(summary).unwrap();
@@ -306,13 +415,30 @@ async fn selected_feed_date_resumes_decodes_and_hands_off_native_bars() {
     );
     drop(decode_permit);
 
-    assert!(
-        authority
-            .settlements
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|settlement| settlement.disposition() != IexHistCapacityDisposition::Completed)
+    let settlements = authority.settlements.lock().unwrap();
+    assert!(settlements.iter().any(|settlement| {
+        matches!(
+            settlement.disposition(),
+            IexHistCapacityDisposition::Quarantined(_)
+        )
+    }));
+    assert!(settlements.iter().any(|settlement| {
+        settlement.disposition() == IexHistCapacityDisposition::Interrupted
+            && settlement
+                .usage()
+                .bytes(IexHistCapacityCategory::DurableCatalog)
+                == 0
+    }));
+    let completed = settlements
+        .iter()
+        .filter(|settlement| settlement.disposition() == IexHistCapacityDisposition::Completed)
+        .collect::<Vec<_>>();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(
+        completed[0]
+            .usage()
+            .bytes(IexHistCapacityCategory::DurableCatalog),
+        u64::try_from(exact_catalog_body.len()).unwrap()
     );
 }
 
@@ -375,6 +501,53 @@ impl IexHistSharedPhysicalSealReceipt for PhysicalPrefixFixtureReceipt {
 
     fn physical_receipt_sha256(&self) -> Sha256Digest {
         self.physical_receipt_sha256
+    }
+}
+
+#[derive(Debug)]
+struct CompletePhysicalFixtureReceipt {
+    storage_root_sha256: Sha256Digest,
+    object_sha256: Sha256Digest,
+    object_bytes: u64,
+    physical_receipt_sha256: Sha256Digest,
+}
+
+impl IexHistSharedPhysicalSealReceipt for CompletePhysicalFixtureReceipt {
+    fn storage_root_sha256(&self) -> Sha256Digest {
+        self.storage_root_sha256
+    }
+
+    fn object_sha256(&self) -> Sha256Digest {
+        self.object_sha256
+    }
+
+    fn object_bytes(&self) -> u64 {
+        self.object_bytes
+    }
+
+    fn physical_receipt_sha256(&self) -> Sha256Digest {
+        self.physical_receipt_sha256
+    }
+}
+
+fn complete_physical_receipt(
+    role: &[u8],
+    object_sha256: Sha256Digest,
+    object_bytes: u64,
+) -> CompletePhysicalFixtureReceipt {
+    let storage_root_sha256 = Sha256Digest::of(b"fixture-storage-root");
+    let physical_receipt_sha256 = crate::catalog::digest_fields(&[
+        b"fixture-shared-complete-physical-receipt",
+        role,
+        storage_root_sha256.as_bytes(),
+        object_sha256.as_bytes(),
+        &object_bytes.to_le_bytes(),
+    ]);
+    CompletePhysicalFixtureReceipt {
+        storage_root_sha256,
+        object_sha256,
+        object_bytes,
+        physical_receipt_sha256,
     }
 }
 
@@ -555,7 +728,7 @@ fn authority_clock(unix_nanos: i64) -> IexHistAuthorityClockSample {
     }
 }
 
-fn parse_catalog(body: &[u8], authority: &MemoryCapacityAuthority) -> Catalog {
+fn parse_catalog_fetch(body: &[u8], authority: &MemoryCapacityAuthority) -> CatalogFetch {
     let body_bytes = u64::try_from(body.len()).unwrap();
     let footprint = IexHistCapacityFootprint::catalog(body_bytes, 1_024, 1_024).unwrap();
     let request = IexHistCapacityRequest::catalog(footprint, ATTEMPT_DEADLINE).unwrap();
@@ -572,8 +745,7 @@ fn parse_catalog(body: &[u8], authority: &MemoryCapacityAuthority) -> Catalog {
         },
     )
     .unwrap();
-    drop(permit);
-    catalog
+    CatalogFetch::from_test_response(catalog, body, permit).unwrap()
 }
 
 fn plan(selected: crate::SelectedFileReceipt, max_pcap_bytes: u64) -> ColdJobPlan {
