@@ -27,7 +27,9 @@ use market_squawk_adapter_fred::{
     FredRightsArtifact, FredRightsPolicy, FredSeriesRightsEvidence, FredSeriesRightsGrant,
     FredServicePermissionChannel, FredServicePermissionEvidence, FredServicePermissionReview,
     FredSource, FredTermsDocumentBytes, FredTermsDocumentRole, MAX_FRED_SERVICE_PERMISSION_BYTES,
-    MAX_FRED_TERMS_DOCUMENT_BYTES, Sha256Digest, fred_series_endpoint_rule,
+    MAX_FRED_TERMS_DOCUMENT_BYTES, Sha256Digest, fred_observations_endpoint_rule,
+    fred_release_observations_v2_endpoint_rule, fred_series_endpoint_rule,
+    fred_vintage_dates_endpoint_rule,
 };
 use market_squawk_adapter_schwab::OAuthLoopbackError;
 use market_squawk_adapter_sec::{
@@ -4788,22 +4790,13 @@ fn nonzero_u64(value: u64) -> Result<NonZeroU64, CliProviderActivationError> {
 fn fred_budget(
     lease: &ProviderActivationLease,
 ) -> Result<ProviderBudgetPolicy, CliProviderActivationError> {
-    // Match the capability-level conservative ceiling for the combined v1/v2 surface. The
-    // retained official two-per-second evidence is v2-specific, not a claimed v1 provider limit.
-    let windows = [
-        ProviderBudgetWindow::try_new(
-            NonZeroU32::new(2).ok_or(CliProviderActivationError::InvalidMetadata)?,
-            nonzero_u64(SECOND_NANOS)?,
-            BudgetWindowSemantics::Sliding,
-        )
-        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
-        ProviderBudgetWindow::try_new(
-            NonZeroU32::new(120).ok_or(CliProviderActivationError::InvalidMetadata)?,
-            nonzero_u64(MINUTE_NANOS)?,
-            BudgetWindowSemantics::Sliding,
-        )
-        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
-    ];
+    // One account-scoped lane governs every v1 and v2 endpoint on this source metadata.
+    let windows = [ProviderBudgetWindow::try_new(
+        NonZeroU32::new(1).ok_or(CliProviderActivationError::InvalidMetadata)?,
+        nonzero_u64(SECOND_NANOS)?,
+        BudgetWindowSemantics::Sliding,
+    )
+    .map_err(|_| CliProviderActivationError::InvalidMetadata)?];
     ProviderBudgetPolicy::try_new_conjunctive(
         BudgetScope::with_authorization_account(
             SourceIdentifier::try_from("fred")
@@ -4811,7 +4804,7 @@ fn fred_budget(
             authorization_subject(lease)?,
         ),
         &windows,
-        NonZeroU16::new(2).ok_or(CliProviderActivationError::InvalidMetadata)?,
+        NonZeroU16::new(1).ok_or(CliProviderActivationError::InvalidMetadata)?,
         backoff()?,
     )
     .map_err(|_| CliProviderActivationError::InvalidMetadata)
@@ -5093,41 +5086,16 @@ fn without_query(url: &str) -> Result<&str, CliProviderActivationError> {
 }
 
 fn fred_network_policy() -> Result<EndpointPolicy, CliProviderActivationError> {
-    let rules = [
-        ("api_key", QuerySensitivity::Secret, 32),
-        ("series_id", QuerySensitivity::Public, 120),
-        ("realtime_start", QuerySensitivity::Public, 10),
-        ("realtime_end", QuerySensitivity::Public, 10),
-        ("limit", QuerySensitivity::Public, 6),
-        ("offset", QuerySensitivity::Public, 20),
-        ("sort_order", QuerySensitivity::Public, 4),
-        ("output_type", QuerySensitivity::Public, 1),
-        ("file_type", QuerySensitivity::Public, 4),
-    ]
-    .into_iter()
-    .map(|(key, sensitivity, maximum)| {
-        QueryParameterRule::try_new(
-            SourceIdentifier::try_from(key)
-                .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
-            maximum,
-            false,
-            sensitivity,
-        )
-        .map_err(|_| CliProviderActivationError::InvalidMetadata)
-    })
-    .collect::<Result<Vec<_>, _>>()?;
-    let observations = ApiEndpointRule::try_new(
-        "https://api.stlouisfed.org/fred/series/observations",
-        PathScope::Exact,
-        rules,
-        10,
-        1_024,
-    )
-    .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
-    let series =
-        fred_series_endpoint_rule().map_err(|_| CliProviderActivationError::InvalidMetadata)?;
     EndpointPolicy::try_from_api_rules(
-        vec![observations, series],
+        vec![
+            fred_observations_endpoint_rule(),
+            fred_series_endpoint_rule(),
+            fred_vintage_dates_endpoint_rule(),
+            fred_release_observations_v2_endpoint_rule(),
+        ]
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
         request_bounds(64 * 1024 * 1024)?,
     )
     .map_err(|_| CliProviderActivationError::InvalidMetadata)

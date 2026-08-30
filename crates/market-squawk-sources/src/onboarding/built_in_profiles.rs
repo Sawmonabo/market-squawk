@@ -1703,28 +1703,19 @@ fn fred_budget(
     backoff: BackoffPolicy,
     account: &str,
 ) -> Result<ProviderBudgetPolicy, ProviderProfileError> {
-    // The one-second window is Market Squawk's conservative ceiling for the combined v1/v2
-    // profile. The retained official evidence is specific to v2, so it is not represented as a
-    // provider-published v1 limit.
-    let windows = [
-        ProviderBudgetWindow::try_new(
-            NonZeroU32::new(2).ok_or(ProviderProfileError::InvalidProfile)?,
-            nonzero_u64(SECOND_NANOS)?,
-            BudgetWindowSemantics::Sliding,
-        )?,
-        ProviderBudgetWindow::try_new(
-            NonZeroU32::new(120).ok_or(ProviderProfileError::InvalidProfile)?,
-            nonzero_u64(MINUTE_NANOS)?,
-            BudgetWindowSemantics::Sliding,
-        )?,
-    ];
+    // One account-scoped lane governs the combined v1/v2 surface.
+    let windows = [ProviderBudgetWindow::try_new(
+        NonZeroU32::new(1).ok_or(ProviderProfileError::InvalidProfile)?,
+        nonzero_u64(SECOND_NANOS)?,
+        BudgetWindowSemantics::Sliding,
+    )?];
     Ok(ProviderBudgetPolicy::try_new_conjunctive(
         BudgetScope::with_authorization_account(
             SourceIdentifier::try_from("fred")?,
             SourceIdentifier::try_from(account)?,
         ),
         &windows,
-        NonZeroU16::new(2).ok_or(ProviderProfileError::InvalidProfile)?,
+        NonZeroU16::new(1).ok_or(ProviderProfileError::InvalidProfile)?,
         backoff,
     )?)
 }

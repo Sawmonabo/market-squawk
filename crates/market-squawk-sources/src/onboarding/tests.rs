@@ -1287,19 +1287,14 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
         .rate_policy()
         .enforcement_policy()
         .ok_or("FRED/ALFRED omitted rate enforcement")?;
-    assert_eq!(fred_budget.window_count(), 2);
+    assert_eq!(fred_budget.window_count(), 1);
     assert_eq!(
         fred_budget
             .window(0)
             .map(|window| (window.requests_per_window(), window.window_nanos())),
-        Some((2, 1_000_000_000))
+        Some((1, 1_000_000_000))
     );
-    assert_eq!(
-        fred_budget
-            .window(1)
-            .map(|window| (window.requests_per_window(), window.window_nanos())),
-        Some((120, 60_000_000_000))
-    );
+    assert_eq!(fred_budget.max_concurrent(), 1);
 
     let sec = profiles
         .get(SEC_EDGAR_PROFILE_ID)

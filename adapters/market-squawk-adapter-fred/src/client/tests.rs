@@ -11,14 +11,14 @@ use market_squawk_domain::{
     SequenceCapability, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    ApiEndpointRule, AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
+    AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy, BudgetScope,
     CURRENT_RESEARCH_RECORD_SCHEMA, CoverageDomain, EndpointPolicy, ExtractionAuthority,
     ExtractionRequest, ExtractionSource, FreshnessPolicy, HistoricalCapability,
-    NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderNativeLineageImplementation,
-    QueryParameterRule, QuerySensitivity, SourceCapabilities, SourceClass, SourceCoverage,
-    SourceError, SourceMetadata, SourceMetadataInput, SourceMetadataProvider, SourceObject,
-    SourceProtocolProfile, payload_matches_exact_evidence,
+    NetworkAccessPolicy, ProviderBudgetPolicy, ProviderNativeLineageImplementation,
+    SourceCapabilities, SourceClass, SourceCoverage, SourceError, SourceMetadata,
+    SourceMetadataInput, SourceMetadataProvider, SourceObject, SourceProtocolProfile,
+    payload_matches_exact_evidence,
 };
 use sha2::Digest;
 use tokio_util::sync::CancellationToken;
@@ -32,7 +32,8 @@ use crate::{
 use super::http::collect_bounded_stream;
 use super::{
     FredApiKey, FredDataset, FredHttpRequest, FredHttpResponse, FredSource, FredSourceError,
-    FredTransport, fred_series_endpoint_rule, system_timestamp,
+    FredTransport, fred_observations_endpoint_rule, fred_release_observations_v2_endpoint_rule,
+    fred_series_endpoint_rule, fred_vintage_dates_endpoint_rule, system_timestamp,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -810,33 +811,13 @@ fn metadata(now: Timestamp, authorization_subject: SourceIdentifier) -> TestResu
         evidence.clone(),
         effective,
     );
-    let query_rules = [
-        ("api_key", QuerySensitivity::Secret, 32),
-        ("series_id", QuerySensitivity::Public, 120),
-        ("realtime_start", QuerySensitivity::Public, 10),
-        ("realtime_end", QuerySensitivity::Public, 10),
-        ("limit", QuerySensitivity::Public, 6),
-        ("offset", QuerySensitivity::Public, 20),
-        ("sort_order", QuerySensitivity::Public, 4),
-        ("output_type", QuerySensitivity::Public, 1),
-        ("file_type", QuerySensitivity::Public, 4),
-    ]
-    .into_iter()
-    .map(|(key, sensitivity, max)| {
-        QueryParameterRule::try_new(SourceIdentifier::try_from(key)?, max, false, sensitivity)
-            .map_err(Into::into)
-    })
-    .collect::<TestResult<Vec<_>>>()?;
-    let observations_endpoint = ApiEndpointRule::try_new(
-        "https://api.stlouisfed.org/fred/series/observations",
-        PathScope::Exact,
-        query_rules,
-        10,
-        1024,
-    )?;
-    let series_endpoint = fred_series_endpoint_rule()?;
     let network = EndpointPolicy::try_from_api_rules(
-        vec![observations_endpoint, series_endpoint],
+        vec![
+            fred_observations_endpoint_rule()?,
+            fred_series_endpoint_rule()?,
+            fred_vintage_dates_endpoint_rule()?,
+            fred_release_observations_v2_endpoint_rule()?,
+        ],
         market_squawk_sources::HttpRequestBounds::default(),
     )?;
     let budget = ProviderBudgetPolicy::try_new(
@@ -844,9 +825,9 @@ fn metadata(now: Timestamp, authorization_subject: SourceIdentifier) -> TestResu
             provider.clone(),
             basis.as_source_identifier().clone(),
         ),
-        NonZeroU32::new(120).ok_or("nonzero request budget")?,
-        NonZeroU64::new(60_000_000_000).ok_or("nonzero request window")?,
-        NonZeroU16::new(2).ok_or("nonzero concurrency")?,
+        NonZeroU32::new(1).ok_or("nonzero request budget")?,
+        NonZeroU64::new(1_000_000_000).ok_or("nonzero request window")?,
+        NonZeroU16::new(1).ok_or("nonzero concurrency")?,
         BackoffPolicy::try_new(
             NonZeroU64::new(1_000_000).ok_or("nonzero backoff")?,
             NonZeroU64::new(60_000_000_000).ok_or("nonzero max backoff")?,
