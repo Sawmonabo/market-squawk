@@ -1,11 +1,16 @@
 //! Durable runner adapters for application-owned research publications.
 
-use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use async_trait::async_trait;
 use market_squawk_data::{
-    DatasetBuildError, DatasetBuildPrecommitAuthority, DatasetBuildRequest, IngestError,
-    IngestPrecommitAuthority,
+    DatasetBuildError, DatasetBuildPrecommitAuthority, DatasetBuildRequest,
+    FeatureDatasetProductionPublisher, IngestError, IngestPrecommitAuthority,
 };
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_jobs::{
@@ -23,8 +28,8 @@ use thiserror::Error;
 use crate::{
     ResearchService, ResearchServiceError,
     application::{
-        ApplicationDomainService, ResearchIngestCommitAuthority, ResearchIngestCoordinator,
-        job::JobAdmission,
+        ApplicationDomainService, FeatureDatasetProductionFinalizer, PreparedFeatureDatasetBuild,
+        ResearchIngestCommitAuthority, ResearchIngestCoordinator, job::JobAdmission,
     },
 };
 
@@ -40,6 +45,7 @@ const PHASE_ONE_INPUT_AUTHORITY: &str = "research.phase-one-derived-generation-r
 const RESEARCH_PHASE_ONE_RESULT_AUTHORITY: &str = "research.phase-one-derived-generation.v1";
 const ANALYSIS_PHASE_ONE_FEATURE_RESULT_AUTHORITY: &str =
     "analysis.phase-one-feature-derived-generation.v1";
+const FEATURE_DATASET_ATTESTATION_CURRENTNESS_WINDOW: Duration = Duration::from_secs(5 * 60);
 const EXPORT_OPERATION: &str = "Research.GetHistory";
 const EXPORT_KIND: &str = "research.dataset-export.v1";
 const EXPORT_AUTHORITY: &str = "research.controlled-export.v1";
@@ -336,8 +342,9 @@ impl PhaseOneDerivedGenerationKind {
 
 /// Durable phase-one derived-generation runner over the sole analytical catalog authority.
 ///
-/// Successful jobs publish immutable analytical generations and controlled result artifacts. They
-/// do not mint product receipts, issuer authority, model authority, or execution authority.
+/// Successful jobs publish immutable analytical generations and controlled result artifacts. A
+/// guided Analysis admission also consumes its one-use finalizer through the composition-owned
+/// publisher before terminal completion; the ordinary phase-one operation remains unadmitted.
 pub struct PhaseOneDerivedGenerationJobRunner {
     generation_kind: PhaseOneDerivedGenerationKind,
     kind: SourceIdentifier,
@@ -345,10 +352,39 @@ pub struct PhaseOneDerivedGenerationJobRunner {
     result_authority: SourceIdentifier,
     authority_digest: EvidenceDigest,
     research: Arc<ResearchService>,
+    production_publisher: Option<Arc<FeatureDatasetProductionPublisher>>,
     artifacts: Arc<dyn ArtifactRepository>,
-    pending: std::sync::Mutex<BTreeMap<SourceIdentifier, DatasetBuildRequest>>,
+    pending: std::sync::Mutex<BTreeMap<SourceIdentifier, PhaseOneDerivedGenerationAdmission>>,
     maximum_pending: usize,
     run_timeout: Duration,
+}
+
+enum PhaseOneDerivedGenerationAdmission {
+    Unprepared(DatasetBuildRequest),
+    Prepared {
+        request: DatasetBuildRequest,
+        finalizer: FeatureDatasetProductionFinalizer,
+    },
+}
+
+impl PhaseOneDerivedGenerationAdmission {
+    const fn request(&self) -> &DatasetBuildRequest {
+        match self {
+            Self::Unprepared(request) | Self::Prepared { request, .. } => request,
+        }
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        DatasetBuildRequest,
+        Option<FeatureDatasetProductionFinalizer>,
+    ) {
+        match self {
+            Self::Unprepared(request) => (request, None),
+            Self::Prepared { request, finalizer } => (request, Some(finalizer)),
+        }
+    }
 }
 
 impl PhaseOneDerivedGenerationJobRunner {
@@ -362,6 +398,7 @@ impl PhaseOneDerivedGenerationJobRunner {
         Self::try_new(
             PhaseOneDerivedGenerationKind::ResearchDataset,
             research,
+            None,
             artifacts,
             maximum_pending,
             run_timeout,
@@ -371,6 +408,7 @@ impl PhaseOneDerivedGenerationJobRunner {
     /// Creates the phase-one runner currently reached through `Analysis.StartFeatureDatasetBuild`.
     pub fn try_new_analysis_feature(
         research: Arc<ResearchService>,
+        production_publisher: Arc<FeatureDatasetProductionPublisher>,
         artifacts: Arc<dyn ArtifactRepository>,
         maximum_pending: usize,
         run_timeout: Duration,
@@ -378,6 +416,7 @@ impl PhaseOneDerivedGenerationJobRunner {
         Self::try_new(
             PhaseOneDerivedGenerationKind::AnalysisFeature,
             research,
+            Some(production_publisher),
             artifacts,
             maximum_pending,
             run_timeout,
@@ -387,6 +426,7 @@ impl PhaseOneDerivedGenerationJobRunner {
     fn try_new(
         generation_kind: PhaseOneDerivedGenerationKind,
         research: Arc<ResearchService>,
+        production_publisher: Option<Arc<FeatureDatasetProductionPublisher>>,
         artifacts: Arc<dyn ArtifactRepository>,
         maximum_pending: usize,
         run_timeout: Duration,
@@ -395,6 +435,14 @@ impl PhaseOneDerivedGenerationJobRunner {
             || maximum_pending > 4_096
             || run_timeout.is_zero()
             || run_timeout > Duration::from_secs(24 * 60 * 60)
+            || matches!(
+                generation_kind,
+                PhaseOneDerivedGenerationKind::ResearchDataset
+            ) && production_publisher.is_some()
+            || matches!(
+                generation_kind,
+                PhaseOneDerivedGenerationKind::AnalysisFeature
+            ) && production_publisher.is_none()
         {
             return Err(ResearchJobRunnerError::InvalidLimits);
         }
@@ -406,6 +454,7 @@ impl PhaseOneDerivedGenerationJobRunner {
             authority_digest: namespace_digest(generation_kind.result_authority()),
             result_authority,
             research,
+            production_publisher,
             artifacts,
             pending: std::sync::Mutex::new(BTreeMap::new()),
             maximum_pending,
@@ -419,6 +468,38 @@ impl PhaseOneDerivedGenerationJobRunner {
         request: DatasetBuildRequest,
         captured_at: Timestamp,
     ) -> Result<JobAdmission, ResearchJobRunnerError> {
+        self.admit_request(
+            PhaseOneDerivedGenerationAdmission::Unprepared(request),
+            captured_at,
+        )
+    }
+
+    /// Registers one guided product build with its non-cloneable post-build finalizer.
+    pub(crate) fn admit_prepared(
+        &self,
+        prepared: PreparedFeatureDatasetBuild,
+        captured_at: Timestamp,
+    ) -> Result<JobAdmission, ResearchJobRunnerError> {
+        if !matches!(
+            self.generation_kind,
+            PhaseOneDerivedGenerationKind::AnalysisFeature
+        ) || self.production_publisher.is_none()
+        {
+            return Err(ResearchJobRunnerError::InvalidRequest);
+        }
+        let (request, finalizer) = prepared.into_parts();
+        self.admit_request(
+            PhaseOneDerivedGenerationAdmission::Prepared { request, finalizer },
+            captured_at,
+        )
+    }
+
+    fn admit_request(
+        &self,
+        admission: PhaseOneDerivedGenerationAdmission,
+        captured_at: Timestamp,
+    ) -> Result<JobAdmission, ResearchJobRunnerError> {
+        let request = admission.request();
         let digest = EvidenceDigest::new(
             DigestAlgorithm::Sha256,
             request.build_spec_digest().digest().bytes(),
@@ -437,7 +518,7 @@ impl PhaseOneDerivedGenerationJobRunner {
                 return Err(ResearchJobRunnerError::Capacity);
             }
             None => {
-                pending.insert(identity.clone(), request);
+                pending.insert(identity.clone(), admission);
             }
         }
         Ok(JobAdmission::new(
@@ -466,7 +547,10 @@ impl PhaseOneDerivedGenerationJobRunner {
         Ok(())
     }
 
-    fn take_request(&self, context: &JobRunContext) -> Result<DatasetBuildRequest, JobRunError> {
+    fn take_request(
+        &self,
+        context: &JobRunContext,
+    ) -> Result<PhaseOneDerivedGenerationAdmission, JobRunError> {
         let spec = context.snapshot().spec();
         if spec.kind() != &self.kind
             || spec.input().authority() != &self.input_authority
@@ -475,7 +559,7 @@ impl PhaseOneDerivedGenerationJobRunner {
         {
             return Err(JobRunError::Recovery);
         }
-        let request = self
+        let admission = self
             .pending
             .lock()
             .map_err(|_error| JobRunError::Recovery)?
@@ -483,12 +567,12 @@ impl PhaseOneDerivedGenerationJobRunner {
             .ok_or(JobRunError::Recovery)?;
         let digest = EvidenceDigest::new(
             DigestAlgorithm::Sha256,
-            request.build_spec_digest().digest().bytes(),
+            admission.request().build_spec_digest().digest().bytes(),
         );
         if digest != spec.input().digest() {
             return Err(JobRunError::Recovery);
         }
-        Ok(request)
+        Ok(admission)
     }
 }
 
@@ -502,7 +586,8 @@ impl JobRunner for PhaseOneDerivedGenerationJobRunner {
         if context.cancellation().is_cancelled() {
             return Err(JobRunError::Cancelled);
         }
-        let request = self.take_request(&context)?;
+        let admission = self.take_request(&context)?;
+        let (request, finalizer) = admission.into_parts();
         let progress = JobProgress::try_new(
             identifier("building-phase-one-derived-generation")
                 .map_err(|_error| JobRunError::Recovery)?,
@@ -521,21 +606,30 @@ impl JobRunner for PhaseOneDerivedGenerationJobRunner {
             .ok_or(JobRunError::Recovery)?;
         let cancellation = context.cancellation().child_token();
         let slot = Arc::new(JobTerminalCommitSlot::new(&context, progressed.sequence()));
-        let precommit: Arc<dyn DatasetBuildPrecommitAuthority> =
-            Arc::new(JobPhaseOneDerivedGenerationCommitAuthority {
-                slot: Arc::clone(&slot),
-            });
-        let dataset = match tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            self.research
-                .build_phase_one_derived_generation_with_precommit_authority(
-                    request,
-                    cancellation.clone(),
-                    precommit,
-                ),
-        )
-        .await
-        {
+        let dataset_result = if finalizer.is_some() {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.research
+                    .build_phase_one_derived_generation(request.clone(), cancellation.clone()),
+            )
+            .await
+        } else {
+            let precommit: Arc<dyn DatasetBuildPrecommitAuthority> =
+                Arc::new(JobPhaseOneDerivedGenerationCommitAuthority {
+                    slot: Arc::clone(&slot),
+                });
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.research
+                    .build_phase_one_derived_generation_with_precommit_authority(
+                        request.clone(),
+                        cancellation.clone(),
+                        precommit,
+                    ),
+            )
+            .await
+        };
+        let dataset = match dataset_result {
             Ok(result) => result.map_err(map_phase_one_derived_generation_error)?,
             Err(_elapsed) => {
                 cancellation.cancel();
@@ -544,6 +638,29 @@ impl JobRunner for PhaseOneDerivedGenerationJobRunner {
                     true,
                 ));
             }
+        };
+        let product_admission = if let Some(finalizer) = finalizer {
+            let publisher = self
+                .production_publisher
+                .as_deref()
+                .ok_or(JobRunError::Recovery)?;
+            let (attested_at, currentness_expires_at) = post_build_attestation_window()?;
+            finalizer
+                .publish(
+                    &self.research,
+                    publisher,
+                    &request,
+                    &dataset,
+                    attested_at,
+                    currentness_expires_at,
+                    &cancellation,
+                )
+                .map_err(|_error| {
+                    failed("feature-dataset-production-finalization-failed", false)
+                })?;
+            "admitted_by_product_recipe_at_completion"
+        } else {
+            "not_admitted_by_phase_one_operation_at_completion"
         };
         let published = slot.take_published().or_else(|_error| {
             context
@@ -562,12 +679,9 @@ impl JobRunner for PhaseOneDerivedGenerationJobRunner {
             .python_export()
             .map_err(|error| map_phase_one_derived_generation_error(error.into()))?
             .content_hash();
-        // This immutable result records only that this phase-one operation did not issue product
-        // admission before publishing the result. Any receipt-backed product admission is a
-        // separate Analysis.GetFeatureDatasets authority.
         let result_bytes = serde_json::to_vec(&serde_json::json!({
             "publicationStage": "phase_one_derived_generation",
-            "productAdmission": "not_admitted_by_phase_one_operation_at_completion",
+            "productAdmission": product_admission,
             "manifest": {
                 "dataset": manifest.dataset_id().as_str(),
                 "version": manifest.manifest_version(),
@@ -945,6 +1059,21 @@ fn map_phase_one_derived_generation_error(error: ResearchServiceError) -> JobRun
             failed("phase-one-derived-generation-authority-unavailable", true)
         }
     }
+}
+
+fn post_build_attestation_window() -> Result<(Timestamp, Timestamp), JobRunError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_error| JobRunError::Recovery)?;
+    let unix_nanos = i64::try_from(elapsed.as_nanos()).map_err(|_error| JobRunError::Recovery)?;
+    let attested_at = Timestamp::from_unix_nanos(unix_nanos);
+    let currentness_nanos =
+        i64::try_from(FEATURE_DATASET_ATTESTATION_CURRENTNESS_WINDOW.as_nanos())
+            .map_err(|_error| JobRunError::Recovery)?;
+    let currentness_expires_at = attested_at
+        .checked_add_nanos(currentness_nanos)
+        .map_err(|_error| JobRunError::Recovery)?;
+    Ok((attested_at, currentness_expires_at))
 }
 
 pub(super) fn failed(diagnostic: &str, retryable: bool) -> JobRunError {

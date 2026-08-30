@@ -1788,26 +1788,19 @@ impl AnalyticalDataService {
         manifests: AnalyticalManifestCatalog,
         artifact_root: market_squawk_platform::ArtifactRoot,
         object_config: ObjectStoreConfig,
-    ) -> Result<(Self, crate::OnboardingCatalogCapability), IngestError> {
+    ) -> Result<
+        (
+            crate::FeatureDatasetProductionComposition,
+            crate::OnboardingCatalogCapability,
+        ),
+        IngestError,
+    > {
         let service = Self::initialize(authority, manifests, artifact_root, object_config)?;
         let capability = crate::OnboardingCatalogCapability::new(Arc::clone(&service.authority));
-        Ok((service, capability))
-    }
-
-    /// Initializes one analytical service while consuming the exclusive pre-service catalog
-    /// authority to issue the sole closed feature-dataset production publisher.
-    ///
-    /// The publisher is returned separately and cannot be recovered from the service or its public
-    /// dataset builder. The catalog's process-local single-writer guard makes possession of the
-    /// consumed [`CatalogAuthority`] the one-time composition capability.
-    pub fn initialize_with_feature_dataset_production(
-        authority: CatalogAuthority,
-        manifests: AnalyticalManifestCatalog,
-        artifact_root: market_squawk_platform::ArtifactRoot,
-        object_config: ObjectStoreConfig,
-    ) -> Result<crate::FeatureDatasetProductionComposition, IngestError> {
-        Self::initialize(authority, manifests, artifact_root, object_config)
-            .map(crate::FeatureDatasetProductionComposition::new)
+        Ok((
+            crate::FeatureDatasetProductionComposition::new(service),
+            capability,
+        ))
     }
 
     /// Explicitly verifies and migrates an exact version-3/version-4 catalog and v1 root pair.
@@ -1851,24 +1844,19 @@ impl AnalyticalDataService {
         manifests: AnalyticalManifestCatalog,
         artifact_root: market_squawk_platform::ArtifactRoot,
         object_config: ObjectStoreConfig,
-    ) -> Result<(Self, crate::OnboardingCatalogCapability), IngestError> {
+    ) -> Result<
+        (
+            crate::FeatureDatasetProductionComposition,
+            crate::OnboardingCatalogCapability,
+        ),
+        IngestError,
+    > {
         let service = Self::open(authority, manifests, artifact_root, object_config)?;
         let capability = crate::OnboardingCatalogCapability::new(Arc::clone(&service.authority));
-        Ok((service, capability))
-    }
-
-    /// Opens one bound analytical service and transfers the sole session-bound feature-dataset
-    /// publisher to root composition.
-    ///
-    /// No publisher getter exists after this one-time authority-consuming operation.
-    pub fn open_with_feature_dataset_production(
-        authority: CatalogAuthority,
-        manifests: AnalyticalManifestCatalog,
-        artifact_root: market_squawk_platform::ArtifactRoot,
-        object_config: ObjectStoreConfig,
-    ) -> Result<crate::FeatureDatasetProductionComposition, IngestError> {
-        Self::open(authority, manifests, artifact_root, object_config)
-            .map(crate::FeatureDatasetProductionComposition::new)
+        Ok((
+            crate::FeatureDatasetProductionComposition::new(service),
+            capability,
+        ))
     }
 
     pub(crate) fn from_active_parts(

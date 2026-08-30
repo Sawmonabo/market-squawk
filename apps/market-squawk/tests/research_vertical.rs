@@ -421,7 +421,7 @@ async fn registered_provider_discovery_returns_exact_ingestible_object_and_right
         CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
     )?;
     let objects = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
-    let (research, onboarding) =
+    let (research, onboarding, _publisher) =
         ResearchService::open_or_initialize_with_provider_onboarding_service(
             &paths,
             catalog,
@@ -1322,7 +1322,7 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
     let objects = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
     let provider_rate =
         provider_rate_authority(&directory.path().join("portal-provider-rate.sqlite3"))?;
-    let (fallback_research, fallback_service) =
+    let (fallback_research, fallback_service, _publisher) =
         ResearchService::open_or_initialize_with_provider_onboarding_service(
             &paths,
             catalog.clone(),
@@ -1395,7 +1395,7 @@ async fn provider_portal_rejects_csrf_and_keeps_imported_secrets_write_only()
         directory.path().join("provider-secrets"),
         SecretValue::new("test vault unlock".to_owned())?,
     )?);
-    let (_research, service) =
+    let (_research, service, _publisher) =
         ResearchService::open_or_initialize_with_provider_onboarding_service(
             &paths,
             catalog,

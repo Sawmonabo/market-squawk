@@ -17,7 +17,7 @@ use market_squawk_adapter_schwab::{
 };
 use market_squawk_data::IngestError;
 use market_squawk_domain::{
-    DataQuality, DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp,
+    CoverageDelay, DataQuality, DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::SecretGeneration;
 use market_squawk_sources::{
@@ -383,6 +383,7 @@ pub(crate) struct SchwabMarketDoctorFamilyProbeEvidence {
     latency_nanos: u64,
     observed_at: Timestamp,
     service: Option<Box<str>>,
+    quote_delay: Option<CoverageDelay>,
     declared_limitation_sha256: Option<EvidenceDigest>,
     rate_observation: SchwabMarketDoctorRateObservation,
 }
@@ -407,6 +408,7 @@ pub(crate) struct SchwabMarketDoctorFamilyProbeInput {
     pub latency_nanos: u64,
     pub observed_at: Timestamp,
     pub service: Option<Box<str>>,
+    pub quote_delay: Option<CoverageDelay>,
     pub declared_limitation_sha256: Option<EvidenceDigest>,
     pub rate_observation: SchwabMarketDoctorRateObservation,
 }
@@ -438,6 +440,12 @@ impl SchwabMarketDoctorFamilyProbeEvidence {
             || input.rate_observation.status() != input.status
             || input.rate_observation.observed_at() != input.observed_at
             || input.service.as_deref() != expected_service
+            || matches!(input.quote_delay, Some(CoverageDelay::Delayed(0)))
+            || input.quote_delay.is_some()
+                && (input.family != SchwabMarketDataFamily::Quotes
+                    || !input.status.accepted()
+                    || input.returned_items == 0
+                    || input.provider_records == 0)
             || matches!(input.disposition, RuntimeCapabilityDisposition::NotProbed)
         {
             return Err(SchwabMarketDataDoctorError::InvalidProbeEvidence);
@@ -483,6 +491,7 @@ impl SchwabMarketDoctorFamilyProbeEvidence {
             latency_nanos: input.latency_nanos,
             observed_at: input.observed_at,
             service: input.service,
+            quote_delay: input.quote_delay,
             declared_limitation_sha256: input.declared_limitation_sha256,
             rate_observation: input.rate_observation,
         })
@@ -490,6 +499,10 @@ impl SchwabMarketDoctorFamilyProbeEvidence {
 
     pub(crate) const fn family(&self) -> SchwabMarketDataFamily {
         self.family
+    }
+
+    pub(crate) const fn quote_delay(&self) -> Option<CoverageDelay> {
+        self.quote_delay
     }
 
     fn observation_sha256(&self) -> Result<EvidenceDigest, SchwabMarketDataDoctorError> {
@@ -734,6 +747,10 @@ impl SchwabMarketDataDoctorExecutor {
             refresh_authorized_at,
             refresh_expires_at,
             user_preference,
+            quote_delay: detailed
+                .iter()
+                .find(|evidence| evidence.family() == SchwabMarketDataFamily::Quotes)
+                .and_then(SchwabMarketDoctorFamilyProbeEvidence::quote_delay),
             families: families.into_boxed_slice(),
             completed_at,
         };

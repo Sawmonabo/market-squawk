@@ -254,6 +254,14 @@ fn encode_component(hash: &mut Sha256, component: &FeatureLabelComponentInput) {
     hash.update([component.spec().corporate_actions().tag()]);
     put_str(hash, component.spec().name());
     hash.update(component.spec().version().get().to_be_bytes());
+    encode_temporal(hash, component.selection_effective_cutoff());
+    match component.label_selection_effective_cutoff() {
+        Some(label) => {
+            hash.update([1]);
+            encode_temporal(hash, label);
+        }
+        None => hash.update([0]),
+    }
     match component.value() {
         ComponentValue::Float {
             value,

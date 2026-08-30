@@ -26,7 +26,8 @@ mod training_protocol;
 pub use admission::{
     BundleAuthorityDocument, MAX_BUNDLE_AUTHORITY_BYTES, ModelAdmissionError,
     ProductionFeatureRegistry, PythonDatasetAdmissionAuthority, ValidatedModelCandidate,
-    recover_model_candidate, verify_model_candidate,
+    has_price_return_macro_context_feature_order_v1, recover_model_candidate,
+    verify_model_candidate,
 };
 #[cfg(feature = "release-evidence")]
 pub use bundle::benchmark_support::{

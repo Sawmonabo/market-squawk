@@ -1,10 +1,51 @@
 # Market Squawk Delivery Ledger
 
-Last updated: 2026-08-12
+Last updated: 2026-08-30
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
 evidence; it does not replace the README capability truth or the canonical release plan.
+
+## Current execution handoff — 2026-08-30
+
+This section supersedes older active-state statements below. Historical release and audit records
+remain unchanged as locators.
+
+- Frozen and pushed feature checkpoint:
+  `a66970fc337ee0c30db2429081ddb0ee5f98294c` on
+  `feature/v1-installed-product-experience`. No release-branch or mainline merge, public release,
+  package publication, or CI/CD dispatch occurred.
+- Accepted focused evidence at that unchanged checkpoint:
+  application library compilation, Desktop TypeScript compilation, diff integrity, and the exact
+  installed-service single-authority journey shared by native and MCP clients. These are integration
+  proofs, not the final release gate.
+- Integrated provider/data outcomes include the existing durable Federal Reserve Board H.15
+  vertical plus durable provider leaves for FRED/ALFRED, Treasury fiscal and daily rates, BEA, BLS,
+  Census, EIA, Alpaca history, Nasdaq reference, OCC/Cboe reference, SEC filings/fundamentals/funds,
+  Yahoo, Tiingo, IEX HIST, Coinbase/Kraken public data, and the Coinbase Direct production join.
+  H.15 remains the only source currently counted as a complete installed live-to-restart product
+  vertical; the other entries are not represented as fully composed merely because their durable
+  leaves exist.
+- The ordinary Desktop product boundary is provider-neutral. Provider names, source/runtime state,
+  retry details, manifests, digests, and configuration evidence remain confined to Connections,
+  Settings, Logs, and Diagnostics. Forecasts and backtests now use opaque product tokens and expose
+  financial meaning, point-in-time/out-of-sample evidence, costs, uncertainty, limitations, expiry,
+  invalidators, and honest unavailable/no-action states.
+- Active Wave C uses disjoint ownership for: the single V1 macro-enriched feature recipe; neutral
+  reference/fundamental/fund reads; neutral options and history reads; Schwab current quote runtime;
+  Schwab history/options adapter mapping; credential/live-evidence verification; and one serialized
+  ordinary CLI/MCP visibility policy. Shared contracts, application composition, Tauri registration,
+  and Desktop transport remain serialized integration hotspots.
+- Remaining terminal path:
+  neutral consumer composition -> features/forecasts/valuation/backtests -> recommendations and
+  portfolio/risk/paper -> fully wired Desktop/CLI/MCP -> installed live restart journey -> one final
+  unchanged release gate.
+- The main worktree was clean immediately after pushing `a66970fc`. Seven older auxiliary worktrees
+  remain preserved because each contains unique uncommitted state: `alpaca-history-shutdown` (17
+  paths), `common-seal-root-integration` (255), `crypto-canonical-data` (24),
+  `fred-shared-integration` (41), `postqualified-live-export` (5), `sec-product-handoff` (28), and
+  `source-current-integration` (57). They must not be force-removed; each will be reconciled or
+  preserved before cleanup.
 
 ## Active installed-product V1 execution
 

@@ -230,7 +230,7 @@ pub(super) async fn prepare(
     .map_err(|_error| ScreenWorkflowError::Capacity)?;
     let evidence = reader
         .forecast_dataset_evidence(
-            FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
+            FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1,
             request.dataset_manifest(),
             request.as_of(),
             limits,

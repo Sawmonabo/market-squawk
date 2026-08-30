@@ -15,23 +15,24 @@ use std::time::{Duration, Instant};
 
 use market_squawk_adapter_schwab::{
     AccessTokenAdmission, ChainRequest, ConnectionGeneration, ExpirationChainRequest,
-    InstrumentProjection, MarketDataService, MarketId, MoverFrequency, MoverSort, ParseBounds,
-    PriceHistoryFrequency, PriceHistoryFrequencyType, PriceHistoryPeriodType, PriceHistoryRequest,
-    ProductionSchwabStreamerConnector, ProviderIdentifier, QuoteField, QuoteRequest,
-    RawRestResponseReceipt, ReadOnlyRequest, ReadOnlyRoute, RequestAdmission, RestExecutionOutcome,
-    RestItemAccounting, RestTransportBounds, SchwabAccessTokenSource, SchwabAdapterError,
-    SchwabCaptureCoordinates, SchwabRestExecutor, SchwabRestFamily, SchwabRestFamilyDoctorInput,
-    SchwabSealedRawRestCapture, SchwabSealedRestResponse, SchwabSealedStreamerCapture,
-    SchwabStreamerConnectionControl, SchwabStreamerConnectionControlSource,
-    SchwabStreamerConnector, SchwabStreamerExecutor, SchwabStreamerFamilyDoctorAccumulator,
-    SchwabStreamerFamilyDoctorHandoff, SchwabTransportError, SchwabTransportTelemetry,
-    SchwabUserPreferenceEvidence, SchwabVerticalError, StreamerAdmission, StreamerCaptureSink,
-    StreamerCaptureSinkError, StreamerMicrobatch, StreamerSubscription, StreamerTransportBounds,
-    TokenAuthorityError, build_instrument_search_request, build_market_hours_request,
-    build_movers_request,
+    InstrumentProjection, MarketDataService, MarketId, MoverFrequency, MoverSort, NativeField,
+    ParseBounds, PriceHistoryFrequency, PriceHistoryFrequencyType, PriceHistoryPeriodType,
+    PriceHistoryRequest, ProductionSchwabStreamerConnector, ProviderIdentifier, QuoteField,
+    QuoteRequest, RawRestResponseReceipt, ReadOnlyRequest, ReadOnlyRoute, RequestAdmission,
+    RestExecutionOutcome, RestItemAccounting, RestTransportBounds, SchwabAccessTokenSource,
+    SchwabAdapterError, SchwabCaptureCoordinates, SchwabRestExecutor, SchwabRestFamily,
+    SchwabRestFamilyDoctorInput, SchwabRestPayload, SchwabSealedRawRestCapture,
+    SchwabSealedRestResponse, SchwabSealedStreamerCapture, SchwabStreamerConnectionControl,
+    SchwabStreamerConnectionControlSource, SchwabStreamerConnector, SchwabStreamerExecutor,
+    SchwabStreamerFamilyDoctorAccumulator, SchwabStreamerFamilyDoctorHandoff, SchwabTransportError,
+    SchwabTransportTelemetry, SchwabUserPreferenceEvidence, SchwabVerticalError, StreamerAdmission,
+    StreamerCaptureSink, StreamerCaptureSinkError, StreamerMicrobatch, StreamerSubscription,
+    StreamerTransportBounds, TokenAuthorityError, build_instrument_search_request,
+    build_market_hours_request, build_movers_request,
 };
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
+    CoverageDelay, DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier,
+    Timestamp,
 };
 use market_squawk_platform::LocalAuthorityStateStore;
 use market_squawk_sources::{RuntimeCapabilityDisposition, SchwabMarketDataFamily};
@@ -607,6 +608,7 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
                     )
                     .map_err(|_| SchwabMarketDataDoctorError::InvalidProbeEvidence)?;
                 }
+                let quote_delay = quote_delay_qualification(family, &response)?;
                 let pending = response
                     .into_pending_capture(probe.coordinates.clone(), Uuid::new_v4())
                     .map_err(map_transport_error)?;
@@ -622,7 +624,14 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
                         .ok_or(SchwabMarketDataDoctorError::InvalidProbeEvidence)?;
                     *self.streamer_option_contract.lock().await = Some(selected);
                 }
-                accepted_rest_evidence(family, token_generation, receipt, accounting, sealed)
+                accepted_rest_evidence(
+                    family,
+                    token_generation,
+                    receipt,
+                    accounting,
+                    sealed,
+                    quote_delay,
+                )
             }
             RestExecutionOutcome::ProviderRejected(capture) => {
                 rejected_rest_evidence(
@@ -1195,12 +1204,32 @@ fn setup_required(
     ))
 }
 
+fn quote_delay_qualification(
+    family: SchwabMarketDataFamily,
+    response: &market_squawk_adapter_schwab::ExecutedRestResponse,
+) -> Result<Option<CoverageDelay>, SchwabMarketDataDoctorError> {
+    if family != SchwabMarketDataFamily::Quotes {
+        return Ok(None);
+    }
+    let SchwabRestPayload::Quotes(parsed) = response.payload() else {
+        return Err(SchwabMarketDataDoctorError::InvalidProbeEvidence);
+    };
+    let [quote] = parsed.value().quotes() else {
+        return Ok(None);
+    };
+    Ok(match quote.realtime() {
+        NativeField::Value(true) => Some(CoverageDelay::RealTime),
+        NativeField::Value(false) | NativeField::Absent | NativeField::Null => None,
+    })
+}
+
 fn accepted_rest_evidence(
     family: SchwabMarketDataFamily,
     token_generation: u64,
     receipt: RawRestResponseReceipt,
     accounting: RestItemAccounting,
     sealed: SchwabSealedRestResponse,
+    quote_delay: Option<CoverageDelay>,
 ) -> Result<SchwabMarketDoctorFamilyProbeEvidence, SchwabMarketDataDoctorError> {
     if !sealed_rest_family_matches(family, sealed.family())
         || sealed.receipt() != &receipt
@@ -1225,6 +1254,7 @@ fn accepted_rest_evidence(
         &receipt,
         accounting,
         sealed.persisted_receipt().receipt_digest(),
+        quote_delay,
         limitation,
         b"typed-accepted",
     )
@@ -1264,6 +1294,7 @@ async fn rejected_rest_evidence(
         accounting,
         sealed.persisted_receipt().receipt_digest(),
         None,
+        None,
         reason,
     )
 }
@@ -1290,6 +1321,7 @@ fn rest_probe_evidence(
     receipt: &RawRestResponseReceipt,
     accounting: RestItemAccounting,
     sealed_capture_receipt_sha256: EvidenceDigest,
+    quote_delay: Option<CoverageDelay>,
     declared_limitation_sha256: Option<EvidenceDigest>,
     outcome: &[u8],
 ) -> Result<SchwabMarketDoctorFamilyProbeEvidence, SchwabMarketDataDoctorError> {
@@ -1330,6 +1362,7 @@ fn rest_probe_evidence(
         latency_nanos: millis_to_nanos(receipt.latency_ms())?,
         observed_at,
         service: None,
+        quote_delay,
         declared_limitation_sha256,
         rate_observation,
     })
@@ -1435,6 +1468,7 @@ fn successful_streamer_handoff_evidence(
             )?,
             observed_at,
             service: Some(service.as_str().into()),
+            quote_delay: None,
             declared_limitation_sha256: None,
             rate_observation,
         })?;
@@ -1495,6 +1529,7 @@ fn rejected_streamer_capture_evidence(
             )?,
             observed_at,
             service: Some(service.as_str().into()),
+            quote_delay: None,
             declared_limitation_sha256: None,
             rate_observation,
         })?;

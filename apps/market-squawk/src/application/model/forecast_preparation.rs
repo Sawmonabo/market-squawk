@@ -12,7 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use market_squawk_data::{DatasetManifestRef, ForecastDatasetEvidenceFence, Sha256Digest};
-use market_squawk_domain::{DataQuality, InstrumentId, ModelId, SourceId, Timestamp};
+use market_squawk_domain::{CalendarDate, DataQuality, InstrumentId, ModelId, SourceId, Timestamp};
 use market_squawk_modeling::{
     BundleId, ForecastHorizon, ForecastObservedPoint, ForecastRequest, ModelFeatureValue,
     ModelFormat, ModelInput, ModelMetadata, ModelOutputSemantics, TrainingDatasetIdentity,
@@ -654,6 +654,8 @@ pub(crate) struct ForecastEvidenceMaterializationRequest {
     selection: ForecastPreparationSelection,
     pairing: ForecastDatasetPairingReceipt,
     authority_generation_sha256: Sha256Digest,
+    knowledge_cutoff: Timestamp,
+    macro_effective_date_cutoff: CalendarDate,
 }
 
 /// Exact label-free current-PIT generation/query fence used to construct the serving feature at
@@ -761,6 +763,14 @@ impl ForecastEvidenceMaterializationRequest {
 
     pub(crate) const fn pairing(&self) -> &ForecastDatasetPairingReceipt {
         &self.pairing
+    }
+
+    pub(crate) const fn knowledge_cutoff(&self) -> Timestamp {
+        self.knowledge_cutoff
+    }
+
+    pub(crate) const fn macro_effective_date_cutoff(&self) -> CalendarDate {
+        self.macro_effective_date_cutoff
     }
 }
 
@@ -1425,11 +1435,17 @@ impl ForecastPreparationAuthority {
         if instrument.observed_points.get() < policy.minimum_observed_points.get() {
             return Err(ForecastPreparationError::IncompatibleSelection);
         }
+        let knowledge_cutoff = wall_now()?;
+        let macro_effective_date_cutoff = knowledge_cutoff
+            .utc_calendar_date()
+            .map_err(|_| ForecastPreparationError::TimeUnavailable)?;
         let materialization = ForecastEvidenceMaterializationRequest {
             model: model.clone(),
             selection: selection.clone(),
             pairing: option.pairing.clone(),
             authority_generation_sha256: catalog.authority_generation_sha256,
+            knowledge_cutoff,
+            macro_effective_date_cutoff,
         };
         let evidence = self
             .evidence
@@ -1653,6 +1669,8 @@ fn validate_prepared_evidence(
         || evidence.request.selection != expected.selection
         || evidence.request.pairing != expected.pairing
         || evidence.request.authority_generation_sha256 != expected.authority_generation_sha256
+        || evidence.request.knowledge_cutoff != expected.knowledge_cutoff
+        || evidence.request.macro_effective_date_cutoff != expected.macro_effective_date_cutoff
         || evidence.evidence_sha256
             != evidence_digest(
                 &evidence.request,
@@ -1840,6 +1858,12 @@ fn evidence_digest(
     digest.update(b"market-squawk/forecast-preparation-evidence/v1\0");
     digest.update(request.model.runtime_generation_sha256.bytes());
     digest.update(request.authority_generation_sha256.bytes());
+    digest.update(request.knowledge_cutoff.unix_nanos().to_be_bytes());
+    digest.update(request.macro_effective_date_cutoff.year().to_be_bytes());
+    digest.update([
+        request.macro_effective_date_cutoff.month(),
+        request.macro_effective_date_cutoff.day(),
+    ]);
     digest.update(selection.model_id.as_uuid().as_bytes());
     hash_bytes(&mut digest, selection.bundle_id.as_str().as_bytes())?;
     digest.update(selection.bundle_version.get().to_be_bytes());

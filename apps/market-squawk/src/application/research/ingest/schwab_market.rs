@@ -56,6 +56,7 @@ use crate::{ResearchIngestRequest, ResearchService, ResearchServiceError};
 
 const NANOS_PER_MILLISECOND: u64 = 1_000_000;
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
+pub(super) const SCHWAB_MARKET_EVENT_ANALYTICAL_DATASET: &str = "market_squawk.market_events";
 
 /// Exact-generation runtime authority required by every Schwab publication.
 ///
@@ -291,7 +292,11 @@ impl SchwabRestQuoteGenerationAuthority {
         Arc::new(SchwabMarketPublicationClosure::try_new(
             research, generation, rights, doctor, admission,
         )?)
-        .bind_rest_quote_sink(operation_timeout)
+        .bind_rest_quote_sink(
+            operation_timeout,
+            DatasetId::try_from(SCHWAB_MARKET_EVENT_ANALYTICAL_DATASET)
+                .map_err(|_error| SchwabMarketPublicationError::AuthorityInvalid)?,
+        )
     }
 }
 
@@ -339,17 +344,22 @@ impl SchwabMarketPublicationClosure {
     /// Derives the sole quote sink authority from one exactly scoped research generation.
     ///
     /// Quote production is intentionally unavailable for source-wide or multi-subject rights.
-    /// The activation owner must bind this runtime generation to exactly one provider dataset;
-    /// that subject also deterministically names the immutable analytical dataset.
+    /// The activation owner must bind this runtime generation to exactly one provider capture
+    /// dataset. Canonical observations publish separately into the one explicit neutral market
+    /// event dataset; provider capture identity never names the analytical dataset.
     pub(crate) fn bind_rest_quote_sink(
         self: &Arc<Self>,
         operation_timeout: Duration,
+        analytical_dataset: DatasetId,
     ) -> Result<Arc<SchwabRestQuoteGenerationAuthority>, SchwabMarketPublicationError> {
         let subjects = self
             .generation
             .rights_exact_subjects()
             .ok_or(SchwabMarketPublicationError::AuthorityInvalid)?;
-        if subjects.len() != 1 || operation_timeout.is_zero() {
+        if subjects.len() != 1
+            || operation_timeout.is_zero()
+            || analytical_dataset.as_str() != SCHWAB_MARKET_EVENT_ANALYTICAL_DATASET
+        {
             return Err(SchwabMarketPublicationError::AuthorityInvalid);
         }
         let provider_dataset = subjects
@@ -359,8 +369,6 @@ impl SchwabMarketPublicationClosure {
             .ok_or(SchwabMarketPublicationError::AuthorityInvalid)?;
         self.rights
             .validate_subject(Some(&provider_dataset))
-            .map_err(|_error| SchwabMarketPublicationError::AuthorityInvalid)?;
-        let analytical_dataset = DatasetId::try_from(provider_dataset.as_str())
             .map_err(|_error| SchwabMarketPublicationError::AuthorityInvalid)?;
         let session_id = self.generation.session_id();
         let session_identifier = SourceIdentifier::try_from(session_id.to_string().as_str())

@@ -514,12 +514,13 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
     let capability = onboarding_capability()?;
     let requested = AuthoritySet::try_new(vec![SourceIdentifier::try_from("account.read")?])?;
     let object_config = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
-    let (analytical, catalog) = AnalyticalDataService::initialize_with_provider_onboarding(
+    let (composition, catalog) = AnalyticalDataService::initialize_with_provider_onboarding(
         CatalogAuthority::open(config.clone())?,
         AnalyticalManifestCatalog::open(paths.catalog()?, 8)?,
         paths.artifacts()?.clone(),
         object_config,
     )?;
+    let (analytical, _publisher) = composition.into_parts();
     assert_eq!(
         catalog.register_provider_capability(&capability)?,
         CapabilityRegistrationOutcome::Inserted
@@ -700,12 +701,13 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
     assert_eq!((legacy_sessions, legacy_events), (3, 7));
     drop(legacy);
 
-    let (migrated_analytical, migrated) = AnalyticalDataService::open_with_provider_onboarding(
+    let (composition, migrated) = AnalyticalDataService::open_with_provider_onboarding(
         CatalogAuthority::open(config.clone())?,
         AnalyticalManifestCatalog::open(paths.catalog()?, 8)?,
         paths.artifacts()?.clone(),
         object_config,
     )?;
+    let (migrated_analytical, _publisher) = composition.into_parts();
     assert_eq!(migrated.health()?.applied_migrations(), 22);
     let resumed = migrated.resume_provider_onboarding(reservation.session_id())?;
     assert_eq!(resumed.lifecycle().state(), OnboardingState::ActiveScoped);
@@ -777,12 +779,13 @@ fn onboarding_catalog_replays_exact_non_secret_generation_authority() -> TestRes
     drop(migrated);
     drop(migrated_analytical);
 
-    let (_reopened_analytical, reopened) = AnalyticalDataService::open_with_provider_onboarding(
+    let (composition, reopened) = AnalyticalDataService::open_with_provider_onboarding(
         CatalogAuthority::open(config)?,
         AnalyticalManifestCatalog::open(paths.catalog()?, 8)?,
         paths.artifacts()?.clone(),
         object_config,
     )?;
+    let (_reopened_analytical, _publisher) = composition.into_parts();
     assert_eq!(reopened.health()?.applied_migrations(), 22);
     assert_eq!(
         reopened

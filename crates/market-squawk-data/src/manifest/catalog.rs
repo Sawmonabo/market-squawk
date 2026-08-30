@@ -25,10 +25,13 @@ use uuid::Uuid;
 
 use super::market_history::{
     CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,
-    CompleteMarketBarHistorySelection, generation_market_bar_history_candidate_matches,
+    CompleteMarketBarHistorySelection, LatestCanonicalMarketBarHistoryWindowRequest,
+    LatestCanonicalMarketBarHistoryWindowSelection,
+    generation_market_bar_history_candidate_matches,
     generation_market_bar_history_inputs_match_manifest,
-    insert_generation_market_bar_history_inputs, select_canonical_market_bar_history,
-    select_complete_market_bar_history,
+    insert_generation_market_bar_history_inputs, propagate_generation_market_bar_history_inputs,
+    select_canonical_market_bar_history, select_complete_market_bar_history,
+    select_latest_canonical_market_bar_history_window,
 };
 use super::{
     DatasetBuildSpecDigest, DatasetId, DatasetManifestRef, DerivedGenerationCommitAuthority,
@@ -1251,6 +1254,7 @@ impl AnalyticalManifestCatalog {
                 && pinned.parents.as_ref() == requested_parents
                 && generation_capture_inputs_match_manifest(&transaction, &existing)?
                 && generation_publication_inputs_match_manifest(&transaction, &existing)?
+                && generation_market_bar_history_inputs_match_manifest(&transaction, &existing)?
             {
                 transaction.commit()?;
                 return Ok(existing);
@@ -1315,6 +1319,7 @@ impl AnalyticalManifestCatalog {
         }
         propagate_generation_provider_capture_bindings(&transaction, generation_sequence)?;
         propagate_generation_provider_publication_bindings(&transaction, generation_sequence)?;
+        propagate_generation_market_bar_history_inputs(&transaction, generation_sequence)?;
         let manifest = DatasetManifestRef::try_new_with_schema(
             plan.dataset_id.clone(),
             version,
@@ -1355,6 +1360,43 @@ impl AnalyticalManifestCatalog {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
             match select_complete_market_bar_history(
+                &transaction,
+                self.max_objects_per_generation,
+                request,
+                deadline,
+                cancellation,
+            ) {
+                Ok(selection) => {
+                    transaction.commit()?;
+                    Ok(selection)
+                }
+                Err(error) => Err(error),
+            }
+        })();
+        connection.progress_handler::<fn() -> bool>(0, None)?;
+        result.map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
+    }
+
+    /// Selects the latest complete provider-neutral history window known at one cutoff.
+    ///
+    /// The result carries an opaque exact immutable request for the existing canonical reader.
+    pub fn select_latest_canonical_market_bar_history_window(
+        &self,
+        request: &LatestCanonicalMarketBarHistoryWindowRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<LatestCanonicalMarketBarHistoryWindowSelection>, ManifestCatalogError> {
+        check_read_operation(deadline, cancellation)?;
+        let mut connection = self.lock()?;
+        let token = cancellation.clone();
+        connection.progress_handler(
+            SQLITE_PROGRESS_OPERATIONS,
+            Some(move || token.is_cancelled() || Instant::now() >= deadline),
+        )?;
+        let result = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            match select_latest_canonical_market_bar_history_window(
                 &transaction,
                 self.max_objects_per_generation,
                 request,

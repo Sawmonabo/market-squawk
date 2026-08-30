@@ -202,13 +202,13 @@ async fn market(
     command: MarketCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
-        MarketCommand::UnifiedFeed => {
+        MarketCommand::Overview => {
             invoke(
                 authority,
-                "Market.GetUnifiedFeed",
+                "Market.GetOverview",
                 &mut Map::new(),
                 None,
-                "unified market feed read",
+                "market overview read",
             )
             .await
         }

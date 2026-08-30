@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use crate::transport::{SchwabRestPayload, SchwabSealedRestResponse};
 use crate::{ParseBounds, SchwabAdapterError};
 
-use super::native::{NativeNumber, take_object, validate_unique_top_level_keys};
+use super::native::{NativeNumber, take_object};
 use super::{
     NativeField, NativeFieldEntry, NativeScalar, ParseContext, ParsedNative, ProviderIdentifier,
     parse_json_payload,
@@ -250,7 +250,6 @@ pub fn parse_quote_response(
     bounds: ParseBounds,
 ) -> Result<ParsedNative<QuoteResponse>, SchwabAdapterError> {
     let (value, digest, mut context) = parse_json_payload(bytes, bounds)?;
-    validate_unique_top_level_keys(bytes)?;
     let object = take_object(value)?;
     let mut quotes = Vec::new();
     for (key, value) in object {

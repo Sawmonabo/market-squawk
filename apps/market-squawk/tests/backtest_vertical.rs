@@ -911,10 +911,14 @@ fn fixture_dataset_example(
             } else {
                 feature_selector.clone()
             };
+            let label_effective_cutoff = (spec.kind() == ComponentKind::Label)
+                .then(|| ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(50)));
             Ok(FeatureLabelComponentInput::try_new(
                 spec,
                 ComponentValue::decimal(Decimal::from(value), None, None)?,
                 vec![ComponentSelector::new(selector)],
+                ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(cutoff_at)),
+                label_effective_cutoff,
                 ComponentAdjustmentEvidence::NotApplicable,
             )?)
         })

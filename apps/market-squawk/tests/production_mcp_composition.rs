@@ -15,12 +15,9 @@ use chrono::{Datelike as _, NaiveDate};
 use futures_util::FutureExt as _;
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 use market_squawk::BoardInstalledFixtureBundle;
-use market_squawk::{
-    application::application_capabilities,
-    service::{
-        BootstrapRequirement, InstalledService, InstalledServiceBootstrapState,
-        InstalledServiceConnector, InstalledServiceError, InstalledServiceRunOutcome,
-    },
+use market_squawk::service::{
+    BootstrapRequirement, InstalledService, InstalledServiceBootstrapState,
+    InstalledServiceConnector, InstalledServiceError, InstalledServiceRunOutcome,
 };
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 use market_squawk_adapter_federal_reserve::{
@@ -1231,35 +1228,6 @@ fn real_alpaca_market_observation(data: &Value) -> TestResult<RealAlpacaMarketOb
         available: true,
         stable_identity,
     })
-}
-
-fn assert_real_alpaca_mcp_market(result: &Value, expected: &RealAlpacaEvidence) -> TestResult {
-    let data = &result["data"];
-    let rows = data
-        .as_array()
-        .context("MCP Alpaca Market read omitted the canonical row proven by the native read")?;
-    if rows.len() != 1 {
-        anyhow::bail!(
-            "MCP Alpaca Market exact-instrument read returned {} rows instead of the canonical {} row",
-            rows.len(),
-            REAL_ALPACA_OVERVIEW_SYMBOL,
-        );
-    }
-    let observed = real_alpaca_market_observation(data)?;
-    assert_eq!(observed.instrument_id, expected.instrument_id);
-    if observed.available && expected.market_available {
-        assert_eq!(observed.source_id, expected.source_id);
-        assert!(
-            observed
-                .connection_generation
-                .context("MCP available Alpaca market omitted its connection generation")?
-                >= expected
-                    .connection_generation
-                    .context("native available Alpaca market omitted its connection generation")?
-        );
-    }
-    assert_eq!(observed.stable_identity, expected.stable_market_identity);
-    Ok(())
 }
 
 fn exactly_one_value<'a>(
@@ -2780,13 +2748,20 @@ async fn exercise_installed_relay_with_gate(
                 .ok_or_else(|| anyhow::anyhow!("installed relay tool omitted its name"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let capabilities = application_capabilities()?;
-    let expected = capabilities
-        .tools()
-        .iter()
-        .map(|tool| tool.name())
-        .collect::<Vec<_>>();
-    assert_eq!(names, expected);
+    assert!(names.contains(&"Analysis.Lookup"));
+    assert!(names.contains(&"Market.GetOverview"));
+    assert!(names.contains(&"Model.ListProductActivity"));
+    assert!(names.iter().all(|name| {
+        !name.starts_with("Source.")
+            && !name.starts_with("Job.")
+            && !name.starts_with("Operations.")
+            && !name.starts_with("Setup.")
+            && !name.starts_with("Research.")
+            && !name.starts_with("Fundamental.")
+    }));
+    assert!(!names.contains(&"Market.GetUnifiedFeed"));
+    assert!(!names.contains(&"Macro.GetDashboard"));
+    assert!(!names.contains(&"Analysis.ReadArtifact"));
     write_message(
         &mut peer_writer,
         json!({
@@ -2800,10 +2775,8 @@ async fn exercise_installed_relay_with_gate(
         .await
         .context("read installed relay Job.List response")?;
     assert!(
-        jobs["result"]["structuredContent"]["data"]["jobs"]
-            .as_array()
-            .is_some(),
-        "installed MCP did not dispatch the non-core Job.List authority: {jobs}"
+        jobs["error"].is_object(),
+        "installed MCP accepted hidden Job.List authority: {jobs}"
     );
     if let Some(real_alpaca) = real_alpaca {
         write_message(
@@ -2811,10 +2784,10 @@ async fn exercise_installed_relay_with_gate(
             json!({
                 "jsonrpc":"2.0","id":"installed-real-alpaca-market","method":"tools/call",
                 "params":{
-                    "name":"Market.GetUnifiedFeed",
-                    "arguments":real_alpaca_market_arguments(std::slice::from_ref(
-                        &real_alpaca.instrument_id,
-                    ))
+                    "name":"Market.GetOverview",
+                    "arguments":{
+                        "resultLimits":{"maximumItems":32,"maximumBytes":1_048_576}
+                    }
                 }
             }),
         )
@@ -2823,8 +2796,14 @@ async fn exercise_installed_relay_with_gate(
         let market = read_message(&mut peer_reader)
             .await
             .context("read installed relay real Alpaca Market response")?;
-        assert_real_alpaca_mcp_market(&market["result"]["structuredContent"], real_alpaca)
-            .context("verify installed MCP real Alpaca Market evidence")?;
+        let rows = market["result"]["structuredContent"]["data"]
+            .as_array()
+            .context("MCP market overview omitted its product rows")?;
+        assert!(
+            rows.iter()
+                .any(|row| row["instrumentId"] == real_alpaca.instrument_id),
+            "MCP market overview omitted the native-read investment: {market}"
+        );
     }
     write_message(
         &mut peer_writer,

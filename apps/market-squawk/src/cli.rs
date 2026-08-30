@@ -14,7 +14,7 @@ use uuid::Uuid;
 #[command(version)]
 pub struct Cli {
     /// Local Market Squawk data root.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub data_dir: Option<PathBuf>,
 
     /// Explicit installed-service authority root for isolated verification.
@@ -22,15 +22,21 @@ pub struct Cli {
     pub installation_data_root: Option<PathBuf>,
 
     /// Explicit local configuration file.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub config: Option<PathBuf>,
 
     /// Local tracing filter.
-    #[arg(long, env = "MARKET_SQUAWK_LOG", default_value = "info", global = true)]
+    #[arg(
+        long,
+        env = "MARKET_SQUAWK_LOG",
+        default_value = "info",
+        global = true,
+        hide = true
+    )]
     pub log: String,
 
     /// Render local tracing as JSON.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub json_logs: bool,
 
     /// Render command results for people or structured consumers.
@@ -38,23 +44,23 @@ pub struct Cli {
     pub output: OutputFormat,
 
     /// Source-task cancellation deadline in milliseconds.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub source_shutdown_ms: Option<u64>,
 
     /// Absolute installed Python training-release root used to verify admitted models.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub training_release_root: Option<PathBuf>,
 
     /// Fixed raw-capture queue depth.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub capture_queue_capacity: Option<usize>,
 
     /// Unified per-channel capture memory ceiling in bytes.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub capture_memory_ceiling_bytes: Option<usize>,
 
     /// Process-wide capture destination-registry memory ceiling in bytes.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub capture_destination_registry_memory_ceiling_bytes: Option<usize>,
 
     /// Selected operation.
@@ -75,9 +81,11 @@ pub enum OutputFormat {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Initialize controlled local state.
+    #[command(hide = true)]
     Init,
 
     /// Inspect and validate effective configuration.
+    #[command(hide = true)]
     Config {
         /// Configuration operation.
         #[command(subcommand)]
@@ -85,6 +93,7 @@ pub enum Command {
     },
 
     /// Register, inspect, and configure provider sources.
+    #[command(hide = true)]
     Source {
         /// Source operation.
         #[command(subcommand)]
@@ -99,9 +108,11 @@ pub enum Command {
     },
 
     /// Capture direct Coinbase Exchange data into the local journal.
+    #[command(hide = true)]
     Capture(CaptureArguments),
 
     /// Ingest user-authorized local or provider data.
+    #[command(hide = true)]
     Ingest {
         /// Ingestion operation.
         #[command(subcommand)]
@@ -109,6 +120,7 @@ pub enum Command {
     },
 
     /// Build and inspect immutable analytical datasets.
+    #[command(hide = true)]
     Dataset {
         /// Dataset operation.
         #[command(subcommand)]
@@ -116,6 +128,7 @@ pub enum Command {
     },
 
     /// Query controlled analytical datasets.
+    #[command(hide = true)]
     Query {
         /// Query operation.
         #[command(subcommand)]
@@ -123,6 +136,7 @@ pub enum Command {
     },
 
     /// Inspect and build registered features.
+    #[command(hide = true)]
     Feature {
         /// Feature operation.
         #[command(subcommand)]
@@ -172,6 +186,7 @@ pub enum Command {
     },
 
     /// Inspect or start the shared installed application service.
+    #[command(hide = true)]
     Service {
         /// Installed-service operation.
         #[command(subcommand)]
@@ -179,6 +194,7 @@ pub enum Command {
     },
 
     /// Inspect and control durable work owned by the installed service.
+    #[command(hide = true)]
     Job {
         /// Durable-job operation.
         #[command(subcommand)]
@@ -186,6 +202,7 @@ pub enum Command {
     },
 
     /// Back up, restore, update, inspect logs, and manage typed product settings.
+    #[command(hide = true)]
     Operations {
         /// Installed-product operation.
         #[command(subcommand)]
@@ -193,6 +210,7 @@ pub enum Command {
     },
 
     /// Inspect, preview, and accept the guided first-run setup plan.
+    #[command(hide = true)]
     Setup {
         /// Guided setup operation.
         #[command(subcommand)]
@@ -200,6 +218,7 @@ pub enum Command {
     },
 
     /// Produce and close exact-head release evidence.
+    #[command(hide = true)]
     Release {
         /// Release operation.
         #[command(subcommand)]
@@ -207,6 +226,7 @@ pub enum Command {
     },
 
     /// Run the local stdio MCP server.
+    #[command(hide = true)]
     Mcp {
         /// MCP operation.
         #[command(subcommand)]
@@ -214,6 +234,7 @@ pub enum Command {
     },
 
     /// Report bounded local readiness, configuration provenance, and release blockers.
+    #[command(hide = true)]
     Doctor,
 
     /// Run a deterministic diagnostic feed.
@@ -322,8 +343,8 @@ pub enum SourceCommand {
 /// Unified market-data operation.
 #[derive(Debug, Subcommand)]
 pub enum MarketCommand {
-    /// Return one source-preserving bounded view per exact instrument.
-    UnifiedFeed,
+    /// Return provider-neutral current-market summaries selected by Market Squawk.
+    Overview,
 }
 
 /// Direct capture arguments.

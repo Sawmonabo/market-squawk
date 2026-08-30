@@ -98,7 +98,7 @@ impl PythonDatasetAdmissionAuthority {
         let selection = verify_python_dataset(
             local_root,
             self.export_sha256,
-            FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnTrainingV1,
+            FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1,
             self.as_of,
             limits,
             deadline,
@@ -259,6 +259,7 @@ pub fn verify_model_candidate(
         &expectations,
         feature_registry.feature_registry(),
     )?;
+    verify_feature_order(bundle.metadata())?;
     Ok(ValidatedModelCandidate {
         bundle,
         authority,
@@ -295,11 +296,43 @@ pub fn recover_model_candidate(
         &expectations,
         feature_registry.feature_registry(),
     )?;
+    verify_feature_order(bundle.metadata())?;
     Ok(ValidatedModelCandidate {
         bundle,
         authority,
         dataset,
     })
+}
+
+/// Returns whether model metadata names the single admitted V1 coefficient vector exactly.
+#[must_use]
+pub fn has_price_return_macro_context_feature_order_v1(metadata: &crate::ModelMetadata) -> bool {
+    let contract =
+        FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1;
+    let macros = contract.macro_components();
+    let Some((price_return, retained_macros)) = metadata.features().split_first() else {
+        return false;
+    };
+    price_return.key().name() == "research.price-return"
+        && price_return.key().version() == NonZeroU32::MIN
+        && retained_macros.len() == macros.len()
+        && retained_macros
+            .iter()
+            .zip(macros)
+            .enumerate()
+            .all(|(position, (binding, expected))| {
+                usize::from(expected.position()) == position
+                    && binding.key().name() == expected.component_name()
+                    && binding.key().version() == NonZeroU32::MIN
+            })
+}
+
+fn verify_feature_order(metadata: &crate::ModelMetadata) -> Result<(), ModelAdmissionError> {
+    if has_price_return_macro_context_feature_order_v1(metadata) {
+        Ok(())
+    } else {
+        Err(ModelAdmissionError::InvalidAuthority)
+    }
 }
 
 fn authority(

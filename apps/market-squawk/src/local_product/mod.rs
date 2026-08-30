@@ -30,7 +30,10 @@ use market_squawk_analytics::{
     MissingValuePolicy, ShockComposition, VarianceConvention, WeightPolicy,
 };
 use market_squawk_backtesting::{ExperimentLimits, ExperimentLimitsInput};
-use market_squawk_data::{CatalogConfig, CatalogLimit, CatalogResultLimits, ObjectStoreConfig};
+use market_squawk_data::{
+    CatalogConfig, CatalogLimit, CatalogResultLimits, FeatureDatasetProductionPublisher,
+    ObjectStoreConfig,
+};
 use market_squawk_decisions::DecisionRepositoryLimits;
 use market_squawk_domain::{InstrumentDefinition, RoundingPolicy, SourceIdentifier, Timestamp};
 use market_squawk_mcp::{McpLimitSpec, McpLimits, validate_service_capabilities};
@@ -103,10 +106,12 @@ use crate::application::model::{
 };
 use crate::application::settings::SettingsSeed;
 use crate::application::{
-    Application, ApplicationCompositionError, ApplicationDomainService, FairValueDomainService,
-    FairValueInputAuthorityError, FairValueInputAuthorityLimits,
-    FairValueProducerSelectionAuthority, FredLatestKnownOperation, LiveFairValueObservationBuffer,
-    LiveFairValueObservationBufferError, MarketReferenceSearchAuthority, MarketRuntimeRegistry,
+    Application, ApplicationCompositionError, ApplicationDomainService,
+    CompanyResearchReadCapability, FairValueDomainService, FairValueInputAuthorityError,
+    FairValueInputAuthorityLimits, FairValueProducerSelectionAuthority, FredLatestKnownOperation,
+    InstrumentContextReadCapability, LiveFairValueObservationBuffer,
+    LiveFairValueObservationBufferError, MacroContextReadCapability, MarketHistoryReadCapability,
+    MarketReferenceSearchAuthority, MarketRuntimeRegistry, OptionsContextReadCapability,
     PaperApplicationServices, PaperRuntimeActivityAuthority, PortfolioCandidateResolutionFactory,
     PrepublishedResearchSourceRegistration, ProductionFairValueInputAuthority,
     ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,
@@ -313,6 +318,7 @@ pub struct LocalProduct {
     artifacts: Arc<ControlledArtifactRepository>,
     application: Arc<Application>,
     research: Arc<ResearchService>,
+    feature_dataset_production_publisher: Arc<FeatureDatasetProductionPublisher>,
     company_security_resolution: Arc<CompanySecurityResolutionAuthority>,
     research_ingest: Arc<ProductionResearchIngestCoordinator>,
     source_lifecycle: Arc<ProductionSourceLifecycleAuthority>,
@@ -327,6 +333,7 @@ pub struct LocalProduct {
     decisions: Arc<DecisionApplication>,
     decision_governance: Arc<dyn DecisionGovernanceActionFactory>,
     fair_value_governance: Arc<dyn FairValueGovernanceActionFactory>,
+    research_services: Arc<ResearchApplicationServices>,
     research_domain: Arc<dyn ApplicationDomainService>,
     analysis_domain: Arc<dyn ApplicationDomainService>,
     model_domain: Arc<dyn ApplicationDomainService>,
@@ -608,8 +615,10 @@ impl LocalProduct {
     where
         I: IntoIterator<Item = PrepublishedResearchSourceRegistration>,
     {
-        let (research, onboarding_catalog) = open_research(&paths)?;
+        let (research, onboarding_catalog, feature_dataset_production_publisher) =
+            open_research(&paths)?;
         let research = Arc::new(research);
+        let feature_dataset_production_publisher = Arc::new(feature_dataset_production_publisher);
         let company_security_resolution = Arc::new(CompanySecurityResolutionAuthority::new(
             research.company_identities(),
             research.market_data_instruments(),
@@ -840,7 +849,7 @@ impl LocalProduct {
         ));
         let provider_portal_activation: Arc<dyn crate::ProviderPortalActivationAuthority> =
             portal_activation.clone();
-        let reference_search: Arc<dyn MarketReferenceSearchAuthority> = nasdaq_reference;
+        let reference_search: Arc<dyn MarketReferenceSearchAuthority> = nasdaq_reference.clone();
         let paper = PaperApplicationServices::new(
             config.clone(),
             Arc::clone(&decisions),
@@ -933,12 +942,15 @@ impl LocalProduct {
             | DurableActivationRecipeState::Cutover(_)
             | DurableActivationRecipeState::Quarantined(_) => None,
         };
-        let research_domains = Arc::new(ResearchApplicationServices::new_with_artifacts_and_fred(
-            Arc::clone(&research),
-            Arc::clone(&research_ingest) as Arc<_>,
-            Arc::clone(&artifact_repository),
-            fred_latest_known,
-        ));
+        let research_domains = Arc::new(
+            ResearchApplicationServices::new_with_artifacts_and_composed_reads(
+                Arc::clone(&research),
+                Arc::clone(&research_ingest) as Arc<_>,
+                Arc::clone(&artifact_repository),
+                nasdaq_reference.listing_reference_reader(),
+                fred_latest_known,
+            ),
+        );
         if treasury_fiscal_datasets.is_some() {
             research_domains
                 .configure_treasury_fiscal_unavailable()
@@ -1139,6 +1151,7 @@ impl LocalProduct {
             artifacts,
             application,
             research,
+            feature_dataset_production_publisher,
             company_security_resolution,
             research_ingest,
             source_lifecycle,
@@ -1153,6 +1166,7 @@ impl LocalProduct {
             decisions,
             decision_governance,
             fair_value_governance,
+            research_services: Arc::clone(&research_domains),
             research_domain: research_domains.research(),
             analysis_domain: analysis,
             model_domain: model,
@@ -1212,6 +1226,40 @@ impl LocalProduct {
     /// Returns the analytical publication and point-in-time read authority.
     pub fn research(&self) -> Arc<ResearchService> {
         Arc::clone(&self.research)
+    }
+
+    /// Returns the single catalog-session production publisher retained by root composition.
+    pub(crate) fn feature_dataset_production_publisher(
+        &self,
+    ) -> Arc<FeatureDatasetProductionPublisher> {
+        Arc::clone(&self.feature_dataset_production_publisher)
+    }
+
+    /// Returns canonical investment identity joined to the durable official listing directory.
+    pub(crate) fn instrument_context_read_capability(
+        &self,
+    ) -> Option<InstrumentContextReadCapability> {
+        self.research_services.instrument_context_read_capability()
+    }
+
+    /// Returns canonical company and fund research over the rich local data store.
+    pub(crate) fn company_research_read_capability(&self) -> CompanyResearchReadCapability {
+        self.research_services.company_research_read_capability()
+    }
+
+    /// Returns provider-neutral option context with truthful setup/availability state.
+    pub(crate) fn options_context_read_capability(&self) -> OptionsContextReadCapability {
+        self.research_services.options_context_read_capability()
+    }
+
+    /// Returns provider-neutral canonical market history.
+    pub(crate) fn market_history_read_capability(&self) -> MarketHistoryReadCapability {
+        self.research_services.market_history_read_capability()
+    }
+
+    /// Returns the exact provider-neutral Macro context used by analytical consumers.
+    pub(crate) fn macro_context_read_capability(&self) -> MacroContextReadCapability {
+        self.research_services.macro_context_read_capability()
     }
 
     /// Returns the explicit, evidence-bound company/security resolution workflow.
@@ -1468,6 +1516,7 @@ fn open_research(
     (
         ResearchService,
         market_squawk_data::OnboardingCatalogCapability,
+        FeatureDatasetProductionPublisher,
     ),
     LocalProductError,
 > {

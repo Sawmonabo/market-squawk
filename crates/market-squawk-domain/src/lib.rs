@@ -11,6 +11,7 @@ mod financial;
 mod identifiers;
 mod identity;
 mod instrument;
+mod macro_feature;
 mod market;
 mod option_market;
 mod order;
@@ -90,6 +91,9 @@ pub use instrument::{
     ProviderIdentityKey, ProviderIdentityLocator, ProviderIdentityRecord,
     ProviderIdentityRecordInput, ProviderIdentityRegistry, ProviderIdentitySupersession,
     SymbolIdentityRecord, TradingStatus, VenueMapping,
+};
+pub use macro_feature::{
+    FeatureDatasetMacroComponentDescriptor, feature_dataset_macro_components_v1,
 };
 pub use market::{
     AggressorSide, AuctionEvent, AuctionPhase, BookChange, BookDeltaEvent, BookLevel,

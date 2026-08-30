@@ -2,7 +2,6 @@
 
 use std::{sync::Arc, time::Instant};
 
-use market_squawk_data::DatasetBuildRequest;
 use market_squawk_services::RequestOrigin;
 use tokio_util::sync::CancellationToken;
 
@@ -11,6 +10,7 @@ use crate::{
     application::{
         DatasetPreparationAuthority, DatasetPreparationError, DatasetPreparationOptions,
         DatasetPreparationPreview, DatasetPreparationPreviewRequest, DatasetPreparationReceipt,
+        MacroContextReadCapability, PreparedFeatureDatasetBuild,
         lifecycle::WorkspaceRuntimeIdentity,
     },
 };
@@ -22,9 +22,12 @@ pub(super) struct InstalledResearchDatasetPreparation {
 }
 
 impl InstalledResearchDatasetPreparation {
-    pub(super) fn new(research: Arc<ResearchService>) -> Self {
+    pub(super) fn new(
+        research: Arc<ResearchService>,
+        macro_context: MacroContextReadCapability,
+    ) -> Self {
         Self {
-            authority: Arc::new(DatasetPreparationAuthority::new(research)),
+            authority: Arc::new(DatasetPreparationAuthority::new(research, macro_context)),
         }
     }
 
@@ -51,7 +54,7 @@ impl InstalledResearchDatasetPreparation {
         now: Instant,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<DatasetBuildRequest, DatasetPreparationError> {
+    ) -> Result<PreparedFeatureDatasetBuild, DatasetPreparationError> {
         self.authority
             .consume(receipt, origin, workspace, now, deadline, cancellation)
     }

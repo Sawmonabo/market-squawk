@@ -150,7 +150,7 @@ pub(super) async fn measure(
         || service
             .analytical_reader()
             .feature_dataset(
-                crate::FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
+                crate::FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1,
                 built.manifest().dataset_id(),
                 std::time::Instant::now() + Duration::from_secs(240),
                 &cancellation,
@@ -233,6 +233,8 @@ fn build_request(
             series: SourceIdentifier::try_from("CPI")?,
             effective: ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
         })],
+        ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(80)),
+        None,
         ComponentAdjustmentEvidence::NotApplicable,
     )?;
     let label_input = FeatureLabelComponentInput::try_new(
@@ -247,6 +249,10 @@ fn build_request(
             series: SourceIdentifier::try_from("GDP")?,
             effective: ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
         })],
+        ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(80)),
+        Some(ResearchTemporalCoordinate::exact(
+            Timestamp::from_unix_nanos(100),
+        )),
         ComponentAdjustmentEvidence::NotApplicable,
     )?;
     let mut examples = Vec::new();

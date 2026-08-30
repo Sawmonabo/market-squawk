@@ -10,6 +10,11 @@ use super::catalog::{
 };
 use super::identity::{output_reservation_digest_parts, research_use_mask, to_i64, to_i64_usize};
 use super::{DerivedPublicationInput, DerivedRetentionOperation};
+use crate::manifest::{
+    ManifestCatalogError, propagate_generation_market_bar_history_inputs,
+    propagate_generation_provider_capture_bindings,
+    propagate_generation_provider_publication_bindings,
+};
 use crate::{DatasetId, DatasetManifestRef, DatasetSchemaRegistry, GenerationParentRelation};
 
 pub(super) fn publish(
@@ -116,6 +121,13 @@ pub(super) fn publish(
             ],
         )?;
     }
+    let generation_sequence_i64 = to_i64(generation_sequence)?;
+    propagate_generation_provider_capture_bindings(transaction, generation_sequence_i64)
+        .map_err(map_manifest_lineage_error)?;
+    propagate_generation_provider_publication_bindings(transaction, generation_sequence_i64)
+        .map_err(map_manifest_lineage_error)?;
+    propagate_generation_market_bar_history_inputs(transaction, generation_sequence_i64)
+        .map_err(map_manifest_lineage_error)?;
     for (ordinal, object) in input.objects().iter().enumerate() {
         transaction.execute(
             "INSERT INTO derived_output_group_members
@@ -506,6 +518,16 @@ fn positive_u64(value: i64) -> Result<u64, ResearchUseCatalogError> {
         .ok()
         .filter(|value| *value > 0)
         .ok_or(ResearchUseCatalogError::CorruptCatalog)
+}
+
+fn map_manifest_lineage_error(error: ManifestCatalogError) -> ResearchUseCatalogError {
+    match error {
+        ManifestCatalogError::Sqlite(error) => ResearchUseCatalogError::Sqlite(error),
+        ManifestCatalogError::CaptureInputLimitExceeded { .. }
+        | ManifestCatalogError::MarketBarHistoryInputLimitExceeded { .. }
+        | ManifestCatalogError::CountOverflow => ResearchUseCatalogError::LimitExceeded,
+        _ => ResearchUseCatalogError::CorruptCatalog,
+    }
 }
 
 fn encode_hex(bytes: [u8; 32]) -> String {

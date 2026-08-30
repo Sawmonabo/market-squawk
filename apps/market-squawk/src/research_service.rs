@@ -8,12 +8,12 @@ use market_squawk_data::{
     CatalogConfig, CatalogLimit, CommittedDataset, CompanyIdentityReadCapability,
     CompanySecurityIdentityReadCapability, CompanySecurityLinkPublicationCapability,
     DatasetBuildError, DatasetBuildPrecommitAuthority, DatasetBuildRequest, DatasetBuilder,
-    DatasetId, FairValueCatalogCapability, FeatureLabelDataset, IngestError, IngestIdentity,
-    IngestPrecommitAuthority, InstrumentDefinitionReadCapability, ManifestCatalogError,
-    MarketDataInstrumentReadCapability, MarketDataInstrumentSynchronizationCapability,
-    ObjectStoreConfig, OnboardingCatalogCapability, ProviderPublicationInput,
-    ResearchIngestService, RightsDecisionInput, RightsError, SourceOperation,
-    extraction_provider_payload_digest,
+    DatasetId, FairValueCatalogCapability, FeatureDatasetProductionPublisher, FeatureLabelDataset,
+    IngestError, IngestIdentity, IngestPrecommitAuthority, InstrumentDefinitionReadCapability,
+    ManifestCatalogError, MarketDataInstrumentReadCapability,
+    MarketDataInstrumentSynchronizationCapability, ObjectStoreConfig, OnboardingCatalogCapability,
+    ProviderPublicationInput, ResearchIngestService, RightsDecisionInput, RightsError,
+    SourceOperation, extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
     CompanyIdentityObservation, DigestAlgorithm, ExactPayloadEvidence, InstrumentDefinition,
@@ -346,22 +346,30 @@ impl ResearchService {
         objects: ObjectStoreConfig,
         secrets: Arc<S>,
         provider_rate: ProviderRateAuthority,
-    ) -> Result<(Self, ProviderOnboardingService), ResearchServiceError>
+    ) -> Result<
+        (
+            Self,
+            ProviderOnboardingService,
+            FeatureDatasetProductionPublisher,
+        ),
+        ResearchServiceError,
+    >
     where
         S: SecretStore + 'static,
     {
-        let (research, onboarding_catalog) = Self::open_or_initialize_with_provider_onboarding(
-            paths,
-            catalog,
-            max_objects_per_generation,
-            objects,
-        )?;
+        let (research, onboarding_catalog, publisher) =
+            Self::open_or_initialize_with_provider_onboarding(
+                paths,
+                catalog,
+                max_objects_per_generation,
+                objects,
+            )?;
         let onboarding = ProviderOnboardingService::try_new_with_provider_rate(
             onboarding_catalog,
             secrets,
             provider_rate,
         )?;
-        Ok((research, onboarding))
+        Ok((research, onboarding, publisher))
     }
 
     /// Internal installed-composition boundary for the restricted onboarding facade.
@@ -373,7 +381,14 @@ impl ResearchService {
         catalog: CatalogConfig,
         max_objects_per_generation: usize,
         objects: ObjectStoreConfig,
-    ) -> Result<(Self, OnboardingCatalogCapability), ResearchServiceError> {
+    ) -> Result<
+        (
+            Self,
+            OnboardingCatalogCapability,
+            FeatureDatasetProductionPublisher,
+        ),
+        ResearchServiceError,
+    > {
         match Self::open_provider_onboarding_composition(
             paths,
             catalog.clone(),
@@ -398,19 +413,27 @@ impl ResearchService {
         catalog: CatalogConfig,
         max_objects_per_generation: usize,
         objects: ObjectStoreConfig,
-    ) -> Result<(Self, OnboardingCatalogCapability), ResearchServiceError> {
+    ) -> Result<
+        (
+            Self,
+            OnboardingCatalogCapability,
+            FeatureDatasetProductionPublisher,
+        ),
+        ResearchServiceError,
+    > {
         let authority = CatalogAuthority::open(catalog)?;
         let manifests =
             AnalyticalManifestCatalog::open(paths.catalog()?, max_objects_per_generation)?;
-        let (analytical, onboarding_catalog) =
+        let (analytical_composition, onboarding_catalog) =
             AnalyticalDataService::initialize_with_provider_onboarding(
                 authority,
                 manifests,
                 paths.artifacts()?.clone(),
                 objects,
             )?;
+        let (analytical, publisher) = analytical_composition.into_parts();
         let service = Self::from_analytical(paths, analytical)?;
-        Ok((service, onboarding_catalog))
+        Ok((service, onboarding_catalog, publisher))
     }
 
     /// Reopens an already bound catalog and artifact root without implicit migration.
@@ -433,19 +456,27 @@ impl ResearchService {
         catalog: CatalogConfig,
         max_objects_per_generation: usize,
         objects: ObjectStoreConfig,
-    ) -> Result<(Self, OnboardingCatalogCapability), ResearchServiceError> {
+    ) -> Result<
+        (
+            Self,
+            OnboardingCatalogCapability,
+            FeatureDatasetProductionPublisher,
+        ),
+        ResearchServiceError,
+    > {
         let authority = CatalogAuthority::open(catalog)?;
         let manifests =
             AnalyticalManifestCatalog::open(paths.catalog()?, max_objects_per_generation)?;
-        let (analytical, onboarding_catalog) =
+        let (analytical_composition, onboarding_catalog) =
             AnalyticalDataService::open_with_provider_onboarding(
                 authority,
                 manifests,
                 paths.artifacts()?.clone(),
                 objects,
             )?;
+        let (analytical, publisher) = analytical_composition.into_parts();
         let service = Self::from_analytical(paths, analytical)?;
-        Ok((service, onboarding_catalog))
+        Ok((service, onboarding_catalog, publisher))
     }
 
     fn from_analytical(

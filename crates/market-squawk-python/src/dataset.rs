@@ -107,7 +107,7 @@ fn open_dataset_admission(
         verify_python_dataset(
             &operator_root,
             export_sha256,
-            FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnTrainingV1,
+            FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1,
             Timestamp::from_unix_nanos(as_of_unix_nanos),
             limits,
             deadline,

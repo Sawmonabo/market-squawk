@@ -23,6 +23,7 @@ use market_squawk_adapter_schwab::{
     SchwabRestQuotePublicationRequest, SchwabRestQuoteRecordRequest,
     SchwabSealedRestQuotePublication, SchwabSealedRestResponse, SchwabTransportTelemetry,
 };
+use market_squawk_data::ProviderMarketEventPublicationKind;
 use market_squawk_domain::{
     CanonicalStateDigest, CanonicalizationRule, ConnectionGeneration, CoverageStatus, DataQuality,
     DecodedLiveProvenanceInput, DigestAlgorithm, EvidenceDigest, LiveEventClass,
@@ -44,8 +45,11 @@ use super::schwab::{
     SchwabRestQuotePublicationReceipt, SchwabRestQuoteRuntimeBounds, SchwabRestQuoteRuntimeError,
     SchwabRestQuoteSinkError, SchwabRestQuoteSourceEvidence,
 };
+use crate::application::research::{
+    MarketEventPublicationReceipt, MarketEventSealedReceiptEvidence,
+};
 use crate::application::{
-    SchwabMarketPublicationError, SchwabRestQuoteGenerationAuthority,
+    MarketEventDurableReadWriter, SchwabMarketPublicationError, SchwabRestQuoteGenerationAuthority,
     SchwabRestQuotePostSealFailure, SchwabRestQuoteSourceHealthOutcome,
 };
 use crate::live_source::{
@@ -74,6 +78,7 @@ pub(crate) struct SchwabRestQuoteCurrentRuntimeInput {
     bounds: SchwabRestQuoteRuntimeBounds,
     telemetry: SchwabTransportTelemetry,
     durable: Arc<SchwabRestQuoteGenerationAuthority>,
+    durable_writer: MarketEventDurableReadWriter,
     current: SchwabRestQuoteCurrentSessionInput,
     request_timeout: Duration,
     poll_interval: Duration,
@@ -93,6 +98,7 @@ impl SchwabRestQuoteCurrentRuntimeInput {
         bounds: SchwabRestQuoteRuntimeBounds,
         telemetry: SchwabTransportTelemetry,
         durable: Arc<SchwabRestQuoteGenerationAuthority>,
+        durable_writer: MarketEventDurableReadWriter,
         current: SchwabRestQuoteCurrentSessionInput,
         request_timeout: Duration,
         poll_interval: Duration,
@@ -106,6 +112,7 @@ impl SchwabRestQuoteCurrentRuntimeInput {
             bounds,
             telemetry,
             durable,
+            durable_writer,
             current,
             request_timeout,
             poll_interval,
@@ -145,6 +152,7 @@ impl SchwabRestQuoteCurrentRuntime {
             bounds,
             telemetry,
             durable,
+            durable_writer,
             current,
             request_timeout,
             poll_interval,
@@ -217,10 +225,12 @@ impl SchwabRestQuoteCurrentRuntime {
             }
         };
         let current_sink: Arc<dyn SchwabRestQuoteCurrentBridge> = current_bridge.clone();
-        let sink: Arc<dyn SchwabRestQuoteEventSink> = Arc::new(SchwabRestQuoteSealFirstSink::new(
-            Arc::clone(&durable),
-            current_sink,
-        ));
+        let sink: Arc<dyn SchwabRestQuoteEventSink> =
+            Arc::new(SchwabRestQuoteSealFirstSink::production(
+                Arc::clone(&durable),
+                durable_writer,
+                current_sink,
+            ));
         let producer = match SchwabRestQuoteProducer::try_production(
             activation,
             &provider_rate,
@@ -589,7 +599,14 @@ fn with_cleanup(
 /// Application-owned consumer for one exact Schwab research generation.
 pub(crate) struct SchwabRestQuoteSealFirstSink {
     authority: Arc<SchwabRestQuoteGenerationAuthority>,
+    durable_read: SchwabRestQuoteDurableReadInstall,
     current: Arc<dyn SchwabRestQuoteCurrentBridge>,
+}
+
+enum SchwabRestQuoteDurableReadInstall {
+    Required(MarketEventDurableReadWriter),
+    #[cfg(test)]
+    AuthorityBoundaryOnly,
 }
 
 impl std::fmt::Debug for SchwabRestQuoteSealFirstSink {
@@ -597,17 +614,35 @@ impl std::fmt::Debug for SchwabRestQuoteSealFirstSink {
         formatter
             .debug_struct("SchwabRestQuoteSealFirstSink")
             .field("authority", &self.authority)
+            .field("durable_read", &"[SOURCE-BOUND PIT INSTALL]")
             .field("current", &"[GENERATION-BOUND CURRENT AUTHORITY]")
             .finish()
     }
 }
 
 impl SchwabRestQuoteSealFirstSink {
+    fn production(
+        authority: Arc<SchwabRestQuoteGenerationAuthority>,
+        durable_writer: MarketEventDurableReadWriter,
+        current: Arc<dyn SchwabRestQuoteCurrentBridge>,
+    ) -> Self {
+        Self {
+            authority,
+            durable_read: SchwabRestQuoteDurableReadInstall::Required(durable_writer),
+            current,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         authority: Arc<SchwabRestQuoteGenerationAuthority>,
         current: Arc<dyn SchwabRestQuoteCurrentBridge>,
     ) -> Self {
-        Self { authority, current }
+        Self {
+            authority,
+            durable_read: SchwabRestQuoteDurableReadInstall::AuthorityBoundaryOnly,
+            current,
+        }
     }
 
     async fn publish_batch(
@@ -859,12 +894,48 @@ impl SchwabRestQuoteSealFirstSink {
             || generation.provider_dataset() != self.authority.provider_dataset()
             || generation.event_count() != expected_count
             || generation.oauth_generation() != oauth.generation()
+            || generation.restart_selector().manifest() != generation.committed().manifest()
+            || generation.restart_selector().publication_digest() != expected_digest
+            || generation.restart_selector().publication_kind()
+                != ProviderMarketEventPublicationKind::ResponseMarketEvent
         {
             return self.accepted_failure(
                 payload_digest,
                 Some(sealed_receipt_digest),
                 SchwabRestQuoteSinkError::InvalidReceipt,
             );
+        }
+        let durable_receipt = match MarketEventPublicationReceipt::try_new(
+            generation.restart_selector().manifest().clone(),
+            generation.restart_selector().publication_digest(),
+            generation.restart_selector().publication_kind(),
+            ProviderNativeLineageImplementation::SchwabRestMarketDataV1,
+            self.authority.metadata().source_id().clone(),
+            generation.provider_dataset().clone(),
+            MarketEventSealedReceiptEvidence::Single(generation.sealed_receipt_digest()),
+            generation.event_count(),
+        ) {
+            Ok(receipt) => receipt,
+            Err(_error) => {
+                return self.accepted_failure(
+                    payload_digest,
+                    Some(sealed_receipt_digest),
+                    SchwabRestQuoteSinkError::InvalidReceipt,
+                );
+            }
+        };
+        match &self.durable_read {
+            SchwabRestQuoteDurableReadInstall::Required(writer) => {
+                if writer.retain(durable_receipt).await.is_err() {
+                    return self.accepted_failure(
+                        payload_digest,
+                        Some(sealed_receipt_digest),
+                        SchwabRestQuoteSinkError::Unavailable,
+                    );
+                }
+            }
+            #[cfg(test)]
+            SchwabRestQuoteDurableReadInstall::AuthorityBoundaryOnly => {}
         }
         let current = match current_evidence {
             Ok(current_evidence) => {

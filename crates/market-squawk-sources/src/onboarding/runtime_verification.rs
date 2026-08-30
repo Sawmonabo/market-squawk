@@ -1,7 +1,8 @@
 //! Closed, durable runtime-verification evidence for provider onboarding.
 
 use market_squawk_domain::{
-    CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp,
+    CalendarDate, CoverageDelay, DataQuality, DigestAlgorithm, EvidenceDigest, SourceIdentifier,
+    Timestamp,
 };
 use market_squawk_platform::SecretGeneration;
 use rust_decimal::Decimal;
@@ -54,7 +55,7 @@ const ALPACA_DOCTOR_BATCH_SYMBOLS: [&str; ALPACA_DOCTOR_BATCH_REQUESTED as usize
     "LOW", "MA", "MCD", "META", "MRK", "MS", "MSFT", "NFLX", "NVDA", "ORCL", "PEP", "PG",
 ];
 const SCHWAB_MARKET_DATA_DOCTOR_IMPLEMENTATION_REVISION: &str =
-    "market-squawk.schwab-market-data-doctor-implementation.v1";
+    "market-squawk.schwab-market-data-doctor-implementation.v2";
 const SCHWAB_MARKET_DATA_DOCTOR_CONTRACT_DOMAIN: &[u8] =
     b"market-squawk/schwab-market-data-doctor-contract/v1\0";
 const SCHWAB_MARKET_DATA_PROVIDER_OBSERVATION_ORIGIN: &str =
@@ -982,6 +983,11 @@ pub struct SchwabMarketDataDoctorObservation {
     pub refresh_authorized_at: Timestamp,
     pub refresh_expires_at: Timestamp,
     pub user_preference: SchwabUserPreferenceDoctorEvidence,
+    /// Exact quote-delivery qualification from the sealed quote probe.
+    ///
+    /// `None` means the provider response did not establish either real-time delivery or a
+    /// positive numeric delay and therefore cannot admit the current-quote source.
+    pub quote_delay: Option<CoverageDelay>,
     /// Every closed family appears exactly once in canonical enum order.
     pub families: Box<[SchwabMarketDataFamilyEvidence]>,
     pub completed_at: Timestamp,
@@ -1003,6 +1009,11 @@ impl SchwabMarketDataDoctorObservation {
     /// Returns the trusted completion time after every included probe.
     pub const fn completed_at(&self) -> Timestamp {
         self.completed_at
+    }
+
+    /// Returns the provider-qualified quote delay, or `None` when timing remained unknown.
+    pub const fn quote_delay(&self) -> Option<CoverageDelay> {
+        self.quote_delay
     }
 
     fn validate(&self) -> Result<(), RuntimeVerificationEvidenceError> {
@@ -1034,6 +1045,9 @@ impl SchwabMarketDataDoctorObservation {
             return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
         }
         self.user_preference.validate()?;
+        if matches!(self.quote_delay, Some(CoverageDelay::Delayed(0))) {
+            return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
+        }
         for (evidence, expected) in self.families.iter().zip(SCHWAB_MARKET_DATA_FAMILIES) {
             if evidence.family != expected
                 || evidence
@@ -1043,6 +1057,14 @@ impl SchwabMarketDataDoctorObservation {
                 return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
             }
             evidence.validate()?;
+        }
+        let quote = self
+            .families
+            .iter()
+            .find(|evidence| evidence.family == SchwabMarketDataFamily::Quotes)
+            .ok_or(RuntimeVerificationEvidenceError::InvalidEvidence)?;
+        if self.quote_delay.is_some() && !quote.admits_source_start() {
+            return Err(RuntimeVerificationEvidenceError::InvalidEvidence);
         }
         Ok(())
     }
@@ -1168,6 +1190,11 @@ impl SchwabMarketDataDoctorReceiptV1 {
         &self.input.observation
     }
 
+    /// Returns exact quote-delivery timing retained from the sealed provider response.
+    pub const fn quote_delay(&self) -> Option<CoverageDelay> {
+        self.input.observation.quote_delay()
+    }
+
     pub fn canonical_json(&self) -> Result<Vec<u8>, RuntimeVerificationEvidenceError> {
         let bytes = serde_json::to_vec(self)
             .map_err(|_| RuntimeVerificationEvidenceError::Serialization)?;
@@ -1182,11 +1209,14 @@ impl SchwabMarketDataDoctorReceiptV1 {
     }
 
     pub fn admits_source_start(&self) -> bool {
-        self.input
-            .observation
-            .families
-            .iter()
-            .any(SchwabMarketDataFamilyEvidence::admits_source_start)
+        self.quote_delay().is_some()
+            && self
+                .input
+                .observation
+                .families
+                .iter()
+                .find(|evidence| evidence.family == SchwabMarketDataFamily::Quotes)
+                .is_some_and(SchwabMarketDataFamilyEvidence::admits_source_start)
     }
 
     pub(crate) fn revalidate(&self) -> Result<(), RuntimeVerificationEvidenceError> {

@@ -136,6 +136,7 @@ pub use provider_runtime::ResearchProviderRuntimeGeneration;
 pub(crate) use provider_runtime::{
     CryptoMarketPublicationAuthority, ResearchProviderPublicationOperation,
     ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
+    SchwabRestQuotePublicationPackage,
 };
 use provider_runtime::{ResearchProviderAdmission, ResearchProviderPublicationLease};
 pub(crate) use schwab_market::{

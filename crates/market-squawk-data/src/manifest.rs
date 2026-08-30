@@ -23,13 +23,17 @@ pub use self::catalog::{
 };
 pub(crate) use self::catalog::{
     CatalogFeatureDataset, CatalogFeatureDatasetPage, CatalogFeatureDatasetSelection,
-    CatalogGenerationPage,
+    CatalogGenerationPage, propagate_generation_provider_capture_bindings,
+    propagate_generation_provider_publication_bindings,
 };
-pub(crate) use self::market_history::MarketBarHistoryPublicationCandidate;
 pub use self::market_history::{
     CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,
-    CompleteMarketBarHistorySelection, MarketBarHistoryPublicationReceipt,
+    CompleteMarketBarHistorySelection, LatestCanonicalMarketBarHistoryWindowRequest,
+    LatestCanonicalMarketBarHistoryWindowSelection, MarketBarHistoryPublicationReceipt,
     MarketHistorySelectionPolicy,
+};
+pub(crate) use self::market_history::{
+    MarketBarHistoryPublicationCandidate, propagate_generation_market_bar_history_inputs,
 };
 
 /// Fixed maximum number of exact input generations retained by one derived generation.

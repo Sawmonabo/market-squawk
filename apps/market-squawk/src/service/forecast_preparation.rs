@@ -59,6 +59,7 @@ impl InstalledForecastPreparation {
                     .map_err(|_error| ServiceError::Unavailable)?;
                 let evidence = Arc::new(AnalyticalForecastEvidenceReader::new(
                     product.research().analytical_reader(),
+                    Some(product.macro_context_read_capability()),
                 ));
                 ForecastPreparationAuthority::try_new(
                     model_runtime,

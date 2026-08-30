@@ -1,7 +1,6 @@
 //! Authority-derived dataset preparation and one-use build-admission receipts.
 
 use std::{
-    cmp::Ordering,
     collections::BTreeMap,
     fmt,
     num::{NonZeroU32, NonZeroUsize},
@@ -9,31 +8,42 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chrono::{DateTime, Datelike, Utc};
 use market_squawk_data::{
-    AnalyticalGeneration, AnalyticalObservationReadRequest, AnalyticalObservationTemplate,
-    AnalyticalReadCapability, AnalyticalReadLimit, ChronologicalSplitPolicy,
-    ComponentAdjustmentEvidence, ComponentKind, ComponentScope, ComponentSelector, ComponentValue,
-    CorporateActionAdjustment, CorporateActionLimits, CorporateActionPolicy,
-    CorporateActionSensitivity, DatasetBuildInputs, DatasetBuildLimits, DatasetBuildPolicy,
-    DatasetBuildRequest, DatasetExample, DatasetId, DatasetManifestRef, DatasetOutputAuthorization,
-    DatasetSchemaRegistry, FeatureLabelComponentInput, FeatureLabelComponentSpec,
-    MissingValuePolicy, ObservationFamilyKey, PointInTimeCandidate, PointInTimeLimits,
-    PointInTimePolicy, PointInTimeRevisionMode, PointInTimeService, QueryLimits, QueryResult,
+    AdjustmentStep, AnalyticalGeneration, AnalyticalObservationReadRequest,
+    AnalyticalObservationTemplate, AnalyticalReadCapability, AnalyticalReadLimit,
+    ChronologicalSplitPolicy, ComponentAdjustmentEvidence, ComponentKind, ComponentScope,
+    ComponentSelector, ComponentValue, CorporateActionAdjustment, CorporateActionLimits,
+    CorporateActionPlan, CorporateActionPolicy, CorporateActionRecord, CorporateActionSensitivity,
+    DatasetBuildInputs, DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildRequest,
+    DatasetExample, DatasetId, DatasetManifestRef, DatasetOutputAuthorization,
+    DatasetSchemaRegistry, FEATURE_LABEL_RETURN_UNIT, FeatureDatasetProductContract,
+    FeatureDatasetProductionError, FeatureDatasetProductionProofV1,
+    FeatureDatasetProductionPublication, FeatureDatasetProductionPublisher,
+    FeatureLabelComponentInput, FeatureLabelComponentSpec, FeatureLabelDataset, MissingValuePolicy,
+    ObservationFamilyKey, PointInTimeCandidate, PointInTimeLimits, PointInTimePolicy,
+    PointInTimeRequest, PointInTimeRevisionMode, PointInTimeService, QueryLimits, QueryResult,
     ResearchArrowBatch, ResearchUse, ResearchUseLimits, RightsBasis, Sha256Digest, UniverseId,
     UniverseLimits, UniverseMembership,
 };
 use market_squawk_domain::{
-    AlternativeDataObservation, DigestAlgorithm, EvidenceDigest, InstrumentId, ResearchObservation,
-    ResearchTemporalCoordinate, SourceId, SourceIdentifier, Timestamp,
-    UniverseMembershipObservation,
+    BarTimestampBasis, CalendarDate, DigestAlgorithm, EvidenceDigest, InstrumentId,
+    MarketBarAdjustment, MarketBarObservation, MarketBarSessionEvidence, ProviderInstrumentId,
+    ResearchObservation, ResearchTemporalCoordinate, SourceId, SourceIdentifier, Timestamp,
+    UniverseMembershipObservation, VenueId,
 };
 use market_squawk_services::{RequestOrigin, ServiceError};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::{
+    macro_context::MacroContextReadCapability,
+    macro_features::{MacroFeatureVector, read_macro_feature_vector},
+};
 use crate::{ResearchService, application::lifecycle::WorkspaceRuntimeIdentity};
 
 const MAXIMUM_GENERATIONS: usize = 64;
@@ -47,6 +57,7 @@ const RECEIPT_LIFETIME: Duration = Duration::from_secs(15 * 60);
 const QUERY_DURATION: Duration = Duration::from_secs(20);
 const BUILD_DURATION: Duration = Duration::from_secs(120);
 const DERIVED_RIGHTS_REFERENCE: &str = "https://market-squawk.local/derived-dataset-policy/v1";
+const SPLIT_RETURN_KERNEL_REVISION: &str = "market-squawk/split-adjusted-price-return-kernel/v1";
 
 /// Closed downstream purpose offered by guided dataset preparation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -199,6 +210,7 @@ struct PreparedOption {
     summary: DatasetPreparationOption,
     parents: Box<[DatasetManifestRef]>,
     variants: Box<[PreparedVariant]>,
+    production: PreparedProductionEvidence,
     split_counts: [usize; 3],
 }
 
@@ -234,9 +246,104 @@ struct StoredPreparation {
     use_case: DatasetPreparationUse,
     request: DatasetBuildRequest,
     parents: Box<[DatasetManifestRef]>,
+    production: PreparedProductionEvidence,
     expires_at: Instant,
     expires_at_wall: Timestamp,
     retained_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedProductionEvidence {
+    universe_membership_content: EvidenceDigest,
+    universe_membership_audit: EvidenceDigest,
+    instrument_population_query: EvidenceDigest,
+    instrument_population_receipt: EvidenceDigest,
+    completed_session_request: EvidenceDigest,
+    completed_session_receipt: EvidenceDigest,
+    feature_point_in_time_content: EvidenceDigest,
+    feature_point_in_time_audit: EvidenceDigest,
+    macro_context_evidence: EvidenceDigest,
+    macro_parent_manifests: Box<[DatasetManifestRef]>,
+    label_point_in_time_content: EvidenceDigest,
+    label_point_in_time_audit: EvidenceDigest,
+    return_kernel_output: EvidenceDigest,
+}
+
+/// Exact phase-one request paired with a one-use product-finalization handoff.
+pub(crate) struct PreparedFeatureDatasetBuild {
+    request: DatasetBuildRequest,
+    finalizer: FeatureDatasetProductionFinalizer,
+}
+
+impl PreparedFeatureDatasetBuild {
+    /// Separates the existing phase-one build input from the sole post-build finalizer.
+    pub(crate) fn into_parts(self) -> (DatasetBuildRequest, FeatureDatasetProductionFinalizer) {
+        (self.request, self.finalizer)
+    }
+}
+
+/// One-use evidence handoff to the composition-owned sole production publisher.
+pub(crate) struct FeatureDatasetProductionFinalizer {
+    contract: FeatureDatasetProductContract,
+    build_spec: Sha256Digest,
+    evidence: PreparedProductionEvidence,
+}
+
+impl FeatureDatasetProductionFinalizer {
+    /// Finalizes the unchanged phase-one result without creating or retaining publisher authority.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "publication authority and currentness coordinates remain explicit"
+    )]
+    pub(crate) fn publish(
+        self,
+        research: &ResearchService,
+        publisher: &FeatureDatasetProductionPublisher,
+        request: &DatasetBuildRequest,
+        dataset: &FeatureLabelDataset,
+        attested_at: Timestamp,
+        currentness_expires_at: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<FeatureDatasetProductionPublication, FeatureDatasetProductionError> {
+        if request.build_spec_digest().digest() != self.build_spec {
+            return Err(FeatureDatasetProductionError::InvalidProof);
+        }
+        let currentness = evidence_digest(
+            b"market-squawk/completed-session-currentness/v1",
+            &[
+                EvidencePart::Timestamp(attested_at),
+                EvidencePart::Timestamp(currentness_expires_at),
+                EvidencePart::Digest(self.evidence.completed_session_receipt),
+            ],
+        );
+        let proof = FeatureDatasetProductionProofV1::try_from_request_evidence(
+            request,
+            self.evidence.universe_membership_content,
+            self.evidence.universe_membership_audit,
+            self.evidence.instrument_population_query,
+            self.evidence.instrument_population_receipt,
+            self.evidence.completed_session_request,
+            self.evidence.completed_session_receipt,
+            currentness,
+            self.evidence.feature_point_in_time_content,
+            self.evidence.feature_point_in_time_audit,
+            self.evidence.macro_context_evidence,
+            self.evidence.macro_parent_manifests.into_vec(),
+            self.evidence.label_point_in_time_content,
+            self.evidence.label_point_in_time_audit,
+            self.evidence.return_kernel_output,
+            attested_at,
+            currentness_expires_at,
+        )?;
+        publisher.publish(
+            research.analytical(),
+            self.contract,
+            request,
+            dataset,
+            proof,
+            cancellation,
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -318,16 +425,21 @@ impl ReceiptRegistry {
 pub(crate) struct DatasetPreparationAuthority {
     research: Arc<ResearchService>,
     reader: AnalyticalReadCapability,
+    macro_context: MacroContextReadCapability,
     receipts: Mutex<ReceiptRegistry>,
 }
 
 impl DatasetPreparationAuthority {
     #[must_use]
-    pub(crate) fn new(research: Arc<ResearchService>) -> Self {
+    pub(crate) fn new(
+        research: Arc<ResearchService>,
+        macro_context: MacroContextReadCapability,
+    ) -> Self {
         let reader = research.analytical_reader();
         Self {
             research,
             reader,
+            macro_context,
             receipts: Mutex::new(ReceiptRegistry::default()),
         }
     }
@@ -421,6 +533,7 @@ impl DatasetPreparationAuthority {
                     use_case: selection.intended_use,
                     request: variant.request.clone(),
                     parents: option.parents.clone(),
+                    production: option.production.clone(),
                     expires_at,
                     expires_at_wall,
                     retained_bytes,
@@ -452,7 +565,7 @@ impl DatasetPreparationAuthority {
     }
 
     /// Consumes once, revalidates every immutable parent and rights fence, and returns the exact
-    /// request accepted by the existing dataset runner.
+    /// request and one-use finalization handoff accepted by the existing dataset runner.
     pub(crate) fn consume(
         &self,
         receipt: DatasetPreparationReceipt,
@@ -461,7 +574,7 @@ impl DatasetPreparationAuthority {
         now: Instant,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<DatasetBuildRequest, DatasetPreparationError> {
+    ) -> Result<PreparedFeatureDatasetBuild, DatasetPreparationError> {
         ensure_origin(origin, workspace)?;
         let stored = self
             .receipts
@@ -496,7 +609,23 @@ impl DatasetPreparationAuthority {
             .dataset_builder()
             .validate_request_authority(&stored.request, cancellation)
             .map_err(|_| DatasetPreparationError::Authority)?;
-        Ok(stored.request)
+        let contract = match stored.use_case {
+            DatasetPreparationUse::LocalAnalysis => {
+                FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1
+            }
+            DatasetPreparationUse::Train => {
+                FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1
+            }
+        };
+        let build_spec = stored.request.build_spec_digest().digest();
+        Ok(PreparedFeatureDatasetBuild {
+            request: stored.request,
+            finalizer: FeatureDatasetProductionFinalizer {
+                contract,
+                build_spec,
+                evidence: stored.production,
+            },
+        })
     }
 
     async fn catalog(
@@ -517,7 +646,7 @@ impl DatasetPreparationAuthority {
         let canonical = DatasetSchemaRegistry::local()
             .canonical_research_observations()
             .map_err(|_| DatasetPreparationError::Unavailable)?;
-        let mut options = Vec::new();
+        let mut generations = Vec::new();
         for generation in page
             .generations()
             .iter()
@@ -527,7 +656,23 @@ impl DatasetPreparationAuthority {
             let observations = self
                 .observations(generation, deadline, cancellation.child_token())
                 .await?;
-            derive_generation_options(self, generation, observations, &mut options, &cancellation)?;
+            generations.push((generation.clone(), observations));
+        }
+        let support = CanonicalSupport::from_generations(&generations)?;
+        let mut macro_cache = BTreeMap::new();
+        let mut options = Vec::new();
+        for (generation, observations) in &generations {
+            derive_generation_options(
+                self,
+                generation,
+                observations,
+                &support,
+                &mut macro_cache,
+                &mut options,
+                deadline,
+                &cancellation,
+            )
+            .await?;
             if options.len() > MAXIMUM_OPTIONS {
                 return Err(DatasetPreparationError::Capacity);
             }
@@ -611,6 +756,7 @@ impl fmt::Debug for DatasetPreparationAuthority {
             .debug_struct("DatasetPreparationAuthority")
             .field("research", &"[RESEARCH AUTHORITY]")
             .field("reader", &self.reader)
+            .field("macro_context", &"[NEUTRAL MACRO READ CAPABILITY]")
             .field("receipts", &"[PROCESS-LOCAL ONE-USE RECEIPTS]")
             .finish()
     }
@@ -664,42 +810,119 @@ pub(crate) enum DatasetPreparationError {
 }
 
 #[derive(Clone)]
-struct SeriesPoint {
-    observation: AlternativeDataObservation,
-    effective: ResearchTemporalCoordinate,
+struct CanonicalMembership {
+    observation: UniverseMembershipObservation,
+    manifest: DatasetManifestRef,
+}
+
+struct CanonicalSupport {
+    memberships: Box<[CanonicalMembership]>,
+    actions: Box<[PointInTimeCandidate]>,
+}
+
+impl CanonicalSupport {
+    fn from_generations(
+        generations: &[(AnalyticalGeneration, Vec<ResearchObservation>)],
+    ) -> Result<Self, DatasetPreparationError> {
+        let mut memberships = Vec::new();
+        let mut actions = Vec::new();
+        for (generation, observations) in generations {
+            for observation in observations {
+                match observation {
+                    ResearchObservation::UniverseMembership(observation) => {
+                        memberships.push(CanonicalMembership {
+                            observation: observation.clone(),
+                            manifest: generation.manifest().clone(),
+                        });
+                    }
+                    ResearchObservation::CorporateAction(observation) => {
+                        actions.push(PointInTimeCandidate::new(
+                            ResearchObservation::CorporateAction(observation.clone()),
+                            generation.manifest().clone(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if memberships.len() > MAXIMUM_GENERATIONS * MAXIMUM_OBSERVATIONS_PER_GENERATION
+            || actions.len() > MAXIMUM_GENERATIONS * MAXIMUM_OBSERVATIONS_PER_GENERATION
+        {
+            return Err(DatasetPreparationError::Capacity);
+        }
+        Ok(Self {
+            memberships: memberships.into_boxed_slice(),
+            actions: actions.into_boxed_slice(),
+        })
+    }
+
+    fn actions_for(&self, instrument_id: InstrumentId) -> Vec<PointInTimeCandidate> {
+        self.actions
+            .iter()
+            .filter(|candidate| {
+                let ResearchObservation::CorporateAction(observation) = candidate.observation()
+                else {
+                    return false;
+                };
+                observation.context().provenance().instrument_id() == Some(instrument_id)
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct MarketSeriesKey {
+    instrument_id: InstrumentId,
+    source_id: SourceId,
+    venue_id: VenueId,
+    provider_instrument_id: ProviderInstrumentId,
+    feed: SourceIdentifier,
+    interval: SourceIdentifier,
+    timestamp_basis: BarTimestampBasis,
+    session: MarketBarSessionEvidence,
+    currency: market_squawk_domain::Currency,
+}
+
+#[derive(Clone)]
+struct MarketSeriesPoint {
+    observation: MarketBarObservation,
+    effective: Timestamp,
     available_at: Timestamp,
 }
 
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
-struct SeriesKey {
-    instrument_id: InstrumentId,
-    source_id: SourceId,
-    dataset: SourceIdentifier,
-    field: SourceIdentifier,
-    unit: Option<SourceIdentifier>,
+struct MarketSeries {
+    key: MarketSeriesKey,
+    identity: Sha256Digest,
+    points: Vec<MarketSeriesPoint>,
 }
 
-fn derive_generation_options(
+async fn derive_generation_options(
     authority: &DatasetPreparationAuthority,
     generation: &AnalyticalGeneration,
-    observations: Vec<ResearchObservation>,
+    observations: &[ResearchObservation],
+    support: &CanonicalSupport,
+    macro_cache: &mut BTreeMap<(Timestamp, CalendarDate), MacroFeatureVector>,
     output: &mut Vec<PreparedOption>,
+    deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<(), DatasetPreparationError> {
-    let memberships = observations
-        .iter()
-        .filter_map(|observation| match observation {
-            ResearchObservation::UniverseMembership(value) => Some(value.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let mut series: BTreeMap<SeriesKey, Vec<SeriesPoint>> = BTreeMap::new();
+    let mut series: BTreeMap<Sha256Digest, MarketSeries> = BTreeMap::new();
     for observation in observations {
-        let ResearchObservation::AlternativeData(value) = observation else {
+        let ResearchObservation::MarketBar(value) = observation else {
             continue;
         };
+        if value.adjustment() != MarketBarAdjustment::Raw {
+            continue;
+        }
         let context = value.context();
         let Some(instrument_id) = context.provenance().instrument_id() else {
+            continue;
+        };
+        let Some(venue_id) = context.provenance().venue_id().cloned() else {
+            continue;
+        };
+        let Some(effective) = context.time().effective().exact_timestamp() else {
             continue;
         };
         let Some(available_at) = context
@@ -709,24 +932,41 @@ fn derive_generation_options(
         else {
             continue;
         };
-        let key = SeriesKey {
+        if available_at < value.completed_at() {
+            return Err(DatasetPreparationError::InvalidEvidence);
+        }
+        let key = MarketSeriesKey {
             instrument_id,
             source_id: context.provenance().source_id().clone(),
-            dataset: value.dataset().clone(),
-            field: value.field().clone(),
-            unit: value.unit().cloned(),
+            venue_id,
+            provider_instrument_id: value.provider_instrument_id().clone(),
+            feed: value.feed().clone(),
+            interval: value.interval().clone(),
+            timestamp_basis: value.time_semantics().timestamp_basis(),
+            session: value.time_semantics().session().clone(),
+            currency: value.currency(),
         };
-        series.entry(key).or_default().push(SeriesPoint {
-            effective: context.time().effective().clone(),
+        let identity = market_series_identity(generation.manifest(), &key);
+        let retained = series.entry(identity).or_insert_with(|| MarketSeries {
+            key: key.clone(),
+            identity,
+            points: Vec::new(),
+        });
+        if retained.key != key {
+            return Err(DatasetPreparationError::InvalidEvidence);
+        }
+        retained.points.push(MarketSeriesPoint {
+            effective,
             available_at,
-            observation: value,
+            observation: value.clone(),
         });
     }
-    for (key, mut points) in series {
+    for (_, mut series) in series {
+        check_control(deadline, cancellation)?;
+        let points = &mut series.points;
         points.sort_by(|left, right| {
             left.effective
-                .partial_cmp(&right.effective)
-                .unwrap_or(Ordering::Equal)
+                .cmp(&right.effective)
                 .then_with(|| left.available_at.cmp(&right.available_at))
                 .then_with(|| {
                     left.observation
@@ -738,49 +978,80 @@ fn derive_generation_options(
                 })
         });
         let mut canonical = Vec::new();
-        for point in points {
+        for point in points.drain(..) {
             if canonical
                 .last()
-                .is_some_and(|previous: &SeriesPoint| previous.effective == point.effective)
+                .is_some_and(|previous: &MarketSeriesPoint| previous.effective == point.effective)
             {
-                continue;
+                let _ = canonical.pop();
             }
             canonical.push(point);
         }
-        if canonical.len() < 6
+        if canonical.len() < 9
             || canonical.windows(2).any(|pair| {
-                !matches!(
-                    pair[1].effective.partial_cmp(&pair[0].effective),
-                    Some(Ordering::Greater)
-                ) || pair[1].available_at <= pair[0].available_at
+                pair[1].effective <= pair[0].effective
+                    || pair[1].available_at <= pair[0].available_at
             })
         {
             continue;
         }
-        canonical.truncate(MAXIMUM_EXAMPLES.saturating_mul(2));
+        canonical.truncate(MAXIMUM_EXAMPLES.saturating_mul(3));
         if let Some(option) = build_option(
             authority,
             generation,
-            &memberships,
-            key,
+            support,
+            macro_cache,
+            series.key,
+            series.identity,
             &canonical,
+            deadline,
             cancellation,
-        )? {
+        )
+        .await?
+        {
             output.push(option);
         }
     }
     Ok(())
 }
 
-fn build_option(
+async fn build_option(
     authority: &DatasetPreparationAuthority,
     generation: &AnalyticalGeneration,
-    memberships: &[UniverseMembershipObservation],
-    key: SeriesKey,
-    points: &[SeriesPoint],
+    support: &CanonicalSupport,
+    macro_cache: &mut BTreeMap<(Timestamp, CalendarDate), MacroFeatureVector>,
+    key: MarketSeriesKey,
+    option_identity: Sha256Digest,
+    points: &[MarketSeriesPoint],
+    deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<Option<PreparedOption>, DatasetPreparationError> {
-    let example_count = points.len() / 2;
+    let mut horizons: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    for (chunk_index, triple) in points.chunks_exact(3).enumerate() {
+        let horizon = triple[2]
+            .effective
+            .unix_nanos()
+            .checked_sub(triple[1].effective.unix_nanos())
+            .and_then(|value| u64::try_from(value).ok());
+        let Some(horizon) = horizon.filter(|value| *value > 0) else {
+            continue;
+        };
+        horizons.entry(horizon).or_default().push(chunk_index * 3);
+    }
+    let selected = horizons
+        .into_iter()
+        .fold(None, |selected, candidate| match selected {
+            None => Some(candidate),
+            Some(current) if candidate.1.len() > current.1.len() => Some(candidate),
+            Some(current) if candidate.1.len() == current.1.len() && candidate.0 < current.0 => {
+                Some(candidate)
+            }
+            Some(current) => Some(current),
+        });
+    let Some((_fixed_horizon_nanos, starts)) = selected else {
+        return Ok(None);
+    };
+    let example_count = starts.len();
     if example_count < 3 {
         return Ok(None);
     }
@@ -792,12 +1063,13 @@ fn build_option(
     if train_count == 0 || validation_count == 0 || test_count == 0 {
         return Ok(None);
     }
-    let option_identity = series_identity(generation.manifest(), &key);
+    let contract =
+        FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1;
     let feature_spec = FeatureLabelComponentSpec::try_new(
         ComponentKind::Feature,
         ComponentScope::Instrument,
         CorporateActionSensitivity::RequiresAdjustment,
-        component_name("feature", &key.field, option_identity),
+        contract.feature_component_name(),
         NonZeroU32::MIN,
     )
     .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
@@ -805,29 +1077,130 @@ fn build_option(
         ComponentKind::Label,
         ComponentScope::Instrument,
         CorporateActionSensitivity::RequiresAdjustment,
-        component_name("label", &key.field, option_identity),
+        contract.label_component_name(),
         NonZeroU32::MIN,
     )
     .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
+    let point_in_time_policy =
+        PointInTimePolicy::try_new(NonZeroU32::MIN, PointInTimeRevisionMode::LatestKnown)
+            .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
+    let corporate_action_policy =
+        CorporateActionPolicy::new(CorporateActionAdjustment::SplitAdjusted, NonZeroU32::MIN);
+    let action_candidates = support.actions_for(key.instrument_id);
+    let mut macro_parents = Vec::new();
+    let mut all_parents = vec![generation.manifest().clone()];
+    for candidate in &action_candidates {
+        push_parent(&mut all_parents, candidate.source_manifest())?;
+    }
     let mut examples = Vec::with_capacity(example_count);
-    for (index, pair) in points.chunks_exact(2).enumerate() {
-        let feature = &pair[0];
-        let label = &pair[1];
+    let mut macro_evidence = Vec::with_capacity(example_count);
+    let mut feature_content = Vec::with_capacity(example_count);
+    let mut feature_audit = Vec::with_capacity(example_count);
+    let mut label_content = Vec::with_capacity(example_count);
+    let mut label_audit = Vec::with_capacity(example_count);
+    let mut session_evidence = Vec::with_capacity(example_count);
+    let mut return_evidence = Vec::with_capacity(example_count);
+    for (index, start) in starts.into_iter().enumerate() {
+        check_control(deadline, cancellation)?;
+        let triple = points
+            .get(start..start + 3)
+            .ok_or(DatasetPreparationError::InvalidEvidence)?;
+        let prior = &triple[0];
+        let current = &triple[1];
+        let terminal = &triple[2];
+        let effective_date = timestamp_calendar_date(current.effective)?;
+        let cache_key = (current.available_at, effective_date);
+        if !macro_cache.contains_key(&cache_key) {
+            let vector = read_macro_feature_vector(
+                &authority.macro_context,
+                current.available_at,
+                effective_date,
+                deadline,
+                cancellation.child_token(),
+            )
+            .await
+            .map_err(|_| DatasetPreparationError::Unavailable)?;
+            macro_cache.insert(cache_key, vector);
+        }
+        let macro_vector = macro_cache
+            .get(&cache_key)
+            .cloned()
+            .ok_or(DatasetPreparationError::Unavailable)?;
+        for parent in macro_vector.parent_manifests() {
+            push_parent(&mut macro_parents, parent)?;
+            push_parent(&mut all_parents, parent)?;
+        }
+
+        let feature_plan = action_plan(
+            &action_candidates,
+            point_in_time_policy,
+            corporate_action_policy,
+            current.available_at,
+            ResearchTemporalCoordinate::exact(current.effective),
+            None,
+            deadline,
+            cancellation,
+        )
+        .await?;
+        let label_plan = action_plan(
+            &action_candidates,
+            point_in_time_policy,
+            corporate_action_policy,
+            terminal.available_at,
+            ResearchTemporalCoordinate::exact(current.effective),
+            Some(ResearchTemporalCoordinate::exact(terminal.effective)),
+            deadline,
+            cancellation,
+        )
+        .await?;
+        let feature_return = split_adjusted_return(prior, current, &feature_plan)?;
+        let label_return = split_adjusted_return(current, terminal, &label_plan)?;
+        let feature_adjustment = adjustment_evidence(&feature_plan)?;
+        let label_adjustment = adjustment_evidence(&label_plan)?;
+        let feature_input = return_component(
+            feature_spec.clone(),
+            feature_return,
+            vec![market_bar_family(prior)?, market_bar_family(current)?],
+            ResearchTemporalCoordinate::exact(current.effective),
+            None,
+            feature_adjustment,
+        )?;
+        let label_input = return_component(
+            label_spec.clone(),
+            label_return,
+            vec![market_bar_family(terminal)?],
+            ResearchTemporalCoordinate::exact(current.effective),
+            Some(ResearchTemporalCoordinate::exact(terminal.effective)),
+            label_adjustment,
+        )?;
+        let mut components = Vec::with_capacity(contract.macro_components().len() + 2);
+        components.push(feature_input.clone());
+        components.extend(macro_vector.components().iter().cloned());
+        components.push(label_input.clone());
         examples.push(
             DatasetExample::try_new_with_temporal_cutoffs(
-                format!("guided-{}-{index:05}", short_hex(option_identity)),
+                format!("product-{}-{index:05}", short_hex(option_identity)),
                 key.instrument_id,
-                feature.available_at,
-                label.available_at,
-                feature.effective.clone(),
-                label.effective.clone(),
-                vec![
-                    component_input(feature_spec.clone(), feature)?,
-                    component_input(label_spec.clone(), label)?,
-                ],
+                current.available_at,
+                terminal.available_at,
+                ResearchTemporalCoordinate::exact(current.effective),
+                ResearchTemporalCoordinate::exact(terminal.effective),
+                components,
             )
             .map_err(|_| DatasetPreparationError::InvalidEvidence)?,
         );
+        macro_evidence.push(macro_vector.evidence_digest());
+        feature_content.push(component_content_evidence(&feature_input));
+        feature_audit.push(plan_audit_evidence(&feature_plan));
+        label_content.push(component_content_evidence(&label_input));
+        label_audit.push(plan_audit_evidence(&label_plan));
+        session_evidence.push(completed_session_evidence(current, terminal));
+        return_evidence.push(return_kernel_evidence(
+            feature_return,
+            label_return,
+            &feature_plan,
+            &label_plan,
+        ));
     }
     let train_end = examples[train_count - 1].label_cutoff_at();
     let validation_end = examples[train_count + validation_count - 1].label_cutoff_at();
@@ -840,32 +1213,48 @@ fn build_option(
         .map(DatasetExample::cutoff_at)
         .ok_or(DatasetPreparationError::InvalidEvidence)?;
     let membership = membership_evidence(
-        generation.manifest(),
-        memberships,
+        &support.memberships,
         key.instrument_id,
         first_cutoff,
         test_end,
         cancellation,
     )?;
-    let Some((universe_id, membership)) = membership else {
+    let Some(membership) = membership else {
         return Ok(None);
     };
+    push_parent(&mut all_parents, &membership.manifest)?;
+    let universe_id = membership.universe_id.clone();
+    let membership_value = membership.value.clone();
+    let mut component_specs = Vec::with_capacity(contract.macro_components().len() + 2);
+    component_specs.push(feature_spec);
+    for descriptor in contract.macro_components() {
+        component_specs.push(
+            FeatureLabelComponentSpec::try_new(
+                ComponentKind::Feature,
+                ComponentScope::Global,
+                CorporateActionSensitivity::NotApplicable,
+                descriptor.component_name(),
+                NonZeroU32::MIN,
+            )
+            .map_err(|_| DatasetPreparationError::InvalidEvidence)?,
+        );
+    }
+    component_specs.push(label_spec);
     let inputs = DatasetBuildInputs::try_new(
-        vec![generation.manifest().clone()],
+        all_parents.clone(),
         universe_id,
-        vec![membership],
-        vec![feature_spec, label_spec],
+        vec![membership_value],
+        component_specs,
         examples,
     )
     .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
     let policy = DatasetBuildPolicy::new(
         ChronologicalSplitPolicy::try_new(train_end, validation_end, test_end)
             .map_err(|_| DatasetPreparationError::InvalidEvidence)?,
-        PointInTimePolicy::try_new(NonZeroU32::MIN, PointInTimeRevisionMode::LatestKnown)
-            .map_err(|_| DatasetPreparationError::InvalidEvidence)?,
-        CorporateActionPolicy::new(CorporateActionAdjustment::Raw, NonZeroU32::MIN),
+        point_in_time_policy,
+        corporate_action_policy,
         MissingValuePolicy::Reject,
-        SourceIdentifier::try_from("guided-dataset-preparation-v1")
+        SourceIdentifier::try_from(contract.implementation_revision())
             .map_err(|_| DatasetPreparationError::InvalidEvidence)?,
     );
     let mut variants = Vec::new();
@@ -893,70 +1282,370 @@ fn build_option(
     if variants.is_empty() {
         return Ok(None);
     }
-    let option_id = format!("dataset-{}", short_hex(option_identity));
-    let observed_from = points
-        .first()
-        .map(|point| point.available_at)
-        .ok_or(DatasetPreparationError::InvalidEvidence)?;
-    let observed_through = points
-        .get(example_count * 2 - 1)
-        .map(|point| point.available_at)
-        .ok_or(DatasetPreparationError::InvalidEvidence)?;
+    let option_id = format!("market-research-{}", short_hex(option_identity));
+    let observed_from = first_cutoff;
+    let observed_through = test_end;
     Ok(Some(PreparedOption {
         summary: DatasetPreparationOption {
             id: option_id,
-            label: format!("{} · {}", key.dataset.as_str(), key.field.as_str()),
-            source_dataset: generation.manifest().dataset_id().as_str().to_owned(),
+            label: "Price returns with economic context".to_owned(),
+            source_dataset: "Canonical market history".to_owned(),
             immutable_generation: generation.manifest().manifest_version(),
             instrument_id: key.instrument_id,
-            observed_points: example_count * 2,
+            observed_points: example_count * 3,
             examples: example_count,
             observed_from,
             observed_through,
             available_uses: variants.iter().map(|variant| variant.use_case).collect(),
         },
-        parents: vec![generation.manifest().clone()].into_boxed_slice(),
+        parents: all_parents.into_boxed_slice(),
         variants: variants.into_boxed_slice(),
+        production: PreparedProductionEvidence {
+            universe_membership_content: membership.content,
+            universe_membership_audit: membership.audit,
+            instrument_population_query: instrument_population_query_evidence(
+                key.instrument_id,
+                first_cutoff,
+                test_end,
+            ),
+            instrument_population_receipt: membership.receipt,
+            completed_session_request: aggregate_evidence(
+                b"market-squawk/completed-session-request-set/v1",
+                &session_evidence,
+            ),
+            completed_session_receipt: aggregate_evidence(
+                b"market-squawk/completed-session-receipt-set/v1",
+                &session_evidence,
+            ),
+            feature_point_in_time_content: aggregate_evidence(
+                b"market-squawk/feature-pit-content-set/v1",
+                &feature_content,
+            ),
+            feature_point_in_time_audit: aggregate_evidence(
+                b"market-squawk/feature-pit-audit-set/v1",
+                &feature_audit,
+            ),
+            macro_context_evidence: aggregate_evidence(
+                b"market-squawk/macro-context-evidence-set/v1",
+                &macro_evidence,
+            ),
+            macro_parent_manifests: macro_parents.into_boxed_slice(),
+            label_point_in_time_content: aggregate_evidence(
+                b"market-squawk/label-pit-content-set/v1",
+                &label_content,
+            ),
+            label_point_in_time_audit: aggregate_evidence(
+                b"market-squawk/label-pit-audit-set/v1",
+                &label_audit,
+            ),
+            return_kernel_output: aggregate_evidence(
+                b"market-squawk/return-kernel-output-set/v1",
+                &return_evidence,
+            ),
+        },
         split_counts: [train_count, validation_count, test_count],
     }))
 }
 
-fn component_input(
+fn return_component(
     spec: FeatureLabelComponentSpec,
-    point: &SeriesPoint,
+    value: Decimal,
+    families: Vec<ObservationFamilyKey>,
+    selection_effective_cutoff: ResearchTemporalCoordinate,
+    label_selection_effective_cutoff: Option<ResearchTemporalCoordinate>,
+    adjustment: ComponentAdjustmentEvidence,
 ) -> Result<FeatureLabelComponentInput, DatasetPreparationError> {
-    let context = point.observation.context();
-    let family = ObservationFamilyKey::AlternativeData {
-        source_id: context.provenance().source_id().clone(),
-        instrument_id: context.provenance().instrument_id(),
-        source_record: context.provenance().source_identifier().clone(),
-        dataset: point.observation.dataset().clone(),
-        field: point.observation.field().clone(),
-        effective: point.effective.clone(),
-    };
+    let unit = SourceIdentifier::try_from(FEATURE_LABEL_RETURN_UNIT)
+        .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
     FeatureLabelComponentInput::try_new(
         spec,
-        ComponentValue::decimal(
-            point.observation.value(),
-            point.observation.unit().cloned(),
-            None,
-        )
-        .map_err(|_| DatasetPreparationError::InvalidEvidence)?,
-        vec![ComponentSelector::new(family)],
-        ComponentAdjustmentEvidence::Raw,
+        ComponentValue::decimal(value.normalize(), Some(unit), None)
+            .map_err(|_| DatasetPreparationError::InvalidEvidence)?,
+        families.into_iter().map(ComponentSelector::new).collect(),
+        selection_effective_cutoff,
+        label_selection_effective_cutoff,
+        adjustment,
     )
     .map_err(|_| DatasetPreparationError::InvalidEvidence)
 }
 
+fn market_bar_family(
+    point: &MarketSeriesPoint,
+) -> Result<ObservationFamilyKey, DatasetPreparationError> {
+    let bar = &point.observation;
+    let provenance = bar.context().provenance();
+    Ok(ObservationFamilyKey::MarketBar {
+        source_id: provenance.source_id().clone(),
+        instrument_id: provenance
+            .instrument_id()
+            .ok_or(DatasetPreparationError::InvalidEvidence)?,
+        venue_id: provenance
+            .venue_id()
+            .cloned()
+            .ok_or(DatasetPreparationError::InvalidEvidence)?,
+        provider_instrument_id: bar.provider_instrument_id().clone(),
+        feed: bar.feed().clone(),
+        interval: bar.interval().clone(),
+        adjustment: bar.adjustment(),
+        timestamp_basis: bar.time_semantics().timestamp_basis(),
+        session: bar.time_semantics().session().clone(),
+        effective: ResearchTemporalCoordinate::exact(point.effective),
+    })
+}
+
+async fn action_plan(
+    candidates: &[PointInTimeCandidate],
+    point_in_time_policy: PointInTimePolicy,
+    corporate_action_policy: CorporateActionPolicy,
+    knowledge_cutoff: Timestamp,
+    effective_cutoff: ResearchTemporalCoordinate,
+    label_cutoff: Option<ResearchTemporalCoordinate>,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<CorporateActionPlan, DatasetPreparationError> {
+    let candidate_limit = candidates.len().max(1);
+    if candidate_limit > MAXIMUM_OBSERVATIONS_PER_GENERATION {
+        return Err(DatasetPreparationError::Capacity);
+    }
+    let point_in_time_limits = PointInTimeLimits::try_new(
+        candidate_limit,
+        candidate_limit,
+        candidate_limit.min(256),
+        candidate_limit,
+        64 * 1024 * 1024,
+    )
+    .map_err(|_| DatasetPreparationError::Capacity)?;
+    let request = PointInTimeRequest::try_new(
+        point_in_time_policy,
+        knowledge_cutoff,
+        None,
+        effective_cutoff,
+        label_cutoff,
+        point_in_time_limits,
+    )
+    .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
+    let selection = PointInTimeService::new()
+        .select(&request, candidates, cancellation, deadline)
+        .await
+        .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
+    let mut records = Vec::new();
+    for record in selection.records() {
+        let ResearchObservation::CorporateAction(observation) = record.candidate().observation()
+        else {
+            return Err(DatasetPreparationError::InvalidEvidence);
+        };
+        records.push(CorporateActionRecord::new(
+            observation.clone(),
+            record.candidate().source_manifest().clone(),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, record.evidence_identity().bytes()),
+        ));
+    }
+    let action_limit =
+        NonZeroUsize::new(records.len().max(1)).ok_or(DatasetPreparationError::Capacity)?;
+    let limits = CorporateActionLimits::try_new(
+        action_limit,
+        NonZeroUsize::new(4 * 1024 * 1024).ok_or(DatasetPreparationError::Capacity)?,
+    )
+    .map_err(|_| DatasetPreparationError::Capacity)?;
+    CorporateActionPlan::try_build(
+        corporate_action_policy,
+        knowledge_cutoff,
+        knowledge_cutoff,
+        records,
+        limits,
+    )
+    .map_err(|_| DatasetPreparationError::InvalidEvidence)
+}
+
+fn adjustment_evidence(
+    plan: &CorporateActionPlan,
+) -> Result<ComponentAdjustmentEvidence, DatasetPreparationError> {
+    if !plan.conflicts().is_empty()
+        || plan
+            .steps()
+            .iter()
+            .any(|step| !matches!(step, AdjustmentStep::Split { .. }))
+    {
+        return Err(DatasetPreparationError::InvalidEvidence);
+    }
+    let implementation = EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        Sha256::digest(SPLIT_RETURN_KERNEL_REVISION.as_bytes()).into(),
+    );
+    ComponentAdjustmentEvidence::try_applied(
+        plan.policy(),
+        plan.content_hash(),
+        plan.audit_hash(),
+        implementation,
+    )
+    .map_err(|_| DatasetPreparationError::InvalidEvidence)
+}
+
+fn split_adjusted_return(
+    left: &MarketSeriesPoint,
+    right: &MarketSeriesPoint,
+    plan: &CorporateActionPlan,
+) -> Result<Decimal, DatasetPreparationError> {
+    let left = split_adjusted_close(left, plan)?;
+    let right = split_adjusted_close(right, plan)?;
+    right
+        .checked_div(left)
+        .and_then(|ratio| ratio.checked_sub(Decimal::ONE))
+        .map(|value| value.normalize())
+        .ok_or(DatasetPreparationError::InvalidEvidence)
+}
+
+fn split_adjusted_close(
+    point: &MarketSeriesPoint,
+    plan: &CorporateActionPlan,
+) -> Result<Decimal, DatasetPreparationError> {
+    let mut adjusted = point.observation.close().amount();
+    for step in plan.steps() {
+        let AdjustmentStep::Split {
+            admitted_index,
+            price_factor,
+            ..
+        } = step
+        else {
+            return Err(DatasetPreparationError::InvalidEvidence);
+        };
+        let action = plan
+            .admitted()
+            .get(*admitted_index)
+            .ok_or(DatasetPreparationError::InvalidEvidence)?;
+        let effective = action
+            .observation()
+            .context()
+            .time()
+            .effective()
+            .exact_timestamp()
+            .ok_or(DatasetPreparationError::InvalidEvidence)?;
+        if point.effective < effective {
+            adjusted = adjusted
+                .checked_mul(Decimal::from(price_factor.numerator().get()))
+                .and_then(|value| {
+                    value.checked_div(Decimal::from(price_factor.denominator().get()))
+                })
+                .ok_or(DatasetPreparationError::InvalidEvidence)?;
+        }
+    }
+    Ok(adjusted.normalize())
+}
+
+fn component_content_evidence(component: &FeatureLabelComponentInput) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/product-component-content/v1");
+    update_text(&mut hash, component.spec().name());
+    hash_coordinate(&mut hash, component.selection_effective_cutoff());
+    if let Some(label) = component.label_selection_effective_cutoff() {
+        hash.update([1]);
+        hash_coordinate(&mut hash, label);
+    } else {
+        hash.update([0]);
+    }
+    hash.update((component.selectors().len() as u64).to_be_bytes());
+    for selector in component.selectors() {
+        hash.update(selector.identity().bytes());
+    }
+    match component.value() {
+        ComponentValue::Decimal {
+            value,
+            unit,
+            currency,
+        } => {
+            hash.update([1]);
+            update_text(&mut hash, &value.normalize().to_string());
+            update_text(
+                &mut hash,
+                unit.as_ref().map_or("", SourceIdentifier::as_str),
+            );
+            update_text(
+                &mut hash,
+                currency
+                    .as_ref()
+                    .map_or("", market_squawk_domain::Currency::as_str),
+            );
+        }
+        ComponentValue::Float { value, .. } => {
+            hash.update([2]);
+            hash.update(value.to_bits().to_be_bytes());
+        }
+        ComponentValue::Missing { reason } => {
+            hash.update([3]);
+            update_text(&mut hash, reason.as_str());
+        }
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+fn plan_audit_evidence(plan: &CorporateActionPlan) -> EvidenceDigest {
+    evidence_digest(
+        b"market-squawk/split-plan-pit-audit/v1",
+        &[
+            EvidencePart::Sha256(plan.content_hash()),
+            EvidencePart::Sha256(plan.audit_hash()),
+            EvidencePart::Timestamp(plan.knowledge_cutoff()),
+            EvidencePart::Timestamp(plan.valuation_cutoff()),
+        ],
+    )
+}
+
+fn completed_session_evidence(
+    current: &MarketSeriesPoint,
+    terminal: &MarketSeriesPoint,
+) -> EvidenceDigest {
+    let session = current.observation.time_semantics().session();
+    evidence_digest(
+        b"market-squawk/completed-market-session/v1",
+        &[
+            EvidencePart::Timestamp(current.observation.completed_at()),
+            EvidencePart::Timestamp(terminal.observation.completed_at()),
+            EvidencePart::Text(session.ruleset().as_str()),
+            EvidencePart::Digest(session.evidence()),
+        ],
+    )
+}
+
+fn return_kernel_evidence(
+    feature_return: Decimal,
+    label_return: Decimal,
+    feature_plan: &CorporateActionPlan,
+    label_plan: &CorporateActionPlan,
+) -> EvidenceDigest {
+    let feature_return = feature_return.normalize().to_string();
+    let label_return = label_return.normalize().to_string();
+    evidence_digest(
+        b"market-squawk/split-adjusted-return-output/v1",
+        &[
+            EvidencePart::Text(SPLIT_RETURN_KERNEL_REVISION),
+            EvidencePart::Text(&feature_return),
+            EvidencePart::Text(&label_return),
+            EvidencePart::Sha256(feature_plan.content_hash()),
+            EvidencePart::Sha256(feature_plan.audit_hash()),
+            EvidencePart::Sha256(label_plan.content_hash()),
+            EvidencePart::Sha256(label_plan.audit_hash()),
+        ],
+    )
+}
+
+struct MembershipSelection {
+    universe_id: UniverseId,
+    value: UniverseMembership,
+    manifest: DatasetManifestRef,
+    content: EvidenceDigest,
+    audit: EvidenceDigest,
+    receipt: EvidenceDigest,
+}
+
 fn membership_evidence(
-    manifest: &DatasetManifestRef,
-    memberships: &[UniverseMembershipObservation],
+    memberships: &[CanonicalMembership],
     instrument_id: InstrumentId,
     first_cutoff: Timestamp,
     final_cutoff: Timestamp,
     cancellation: &CancellationToken,
-) -> Result<Option<(UniverseId, UniverseMembership)>, DatasetPreparationError> {
-    for observed in memberships {
+) -> Result<Option<MembershipSelection>, DatasetPreparationError> {
+    for retained in memberships {
+        let observed = &retained.observation;
         let context = observed.context();
         let provenance = context.provenance();
         if provenance.instrument_id() != Some(instrument_id)
@@ -980,21 +1669,51 @@ fn membership_evidence(
             .ok_or(DatasetPreparationError::Capacity)?;
         let candidate = PointInTimeCandidate::new(
             ResearchObservation::UniverseMembership(observed.clone()),
-            manifest.clone(),
+            retained.manifest.clone(),
         );
         let identity = PointInTimeService::new()
             .payload_identity(&candidate, cancellation, identity_deadline)
             .map_err(|_| DatasetPreparationError::InvalidEvidence)?;
-        return Ok(Some((
-            universe,
-            UniverseMembership::new(
-                instrument_id,
-                observed.effective_interval(),
-                provenance.availability().clone(),
-                manifest.clone(),
-                EvidenceDigest::new(DigestAlgorithm::Sha256, identity.bytes()),
-            ),
-        )));
+        let identity = EvidenceDigest::new(DigestAlgorithm::Sha256, identity.bytes());
+        let value = UniverseMembership::new(
+            instrument_id,
+            observed.effective_interval(),
+            provenance.availability().clone(),
+            retained.manifest.clone(),
+            identity,
+        );
+        let content = evidence_digest(
+            b"market-squawk/universe-membership-content/v1",
+            &[
+                EvidencePart::Manifest(&retained.manifest),
+                EvidencePart::Digest(identity),
+                EvidencePart::Timestamp(observed.effective_interval().starts_at()),
+            ],
+        );
+        let audit = evidence_digest(
+            b"market-squawk/universe-membership-audit/v1",
+            &[
+                EvidencePart::Digest(content),
+                EvidencePart::Timestamp(first_cutoff),
+                EvidencePart::Timestamp(final_cutoff),
+            ],
+        );
+        let receipt = evidence_digest(
+            b"market-squawk/instrument-population-receipt/v1",
+            &[
+                EvidencePart::Digest(content),
+                EvidencePart::Digest(audit),
+                EvidencePart::Bytes(instrument_id.as_uuid().as_bytes()),
+            ],
+        );
+        return Ok(Some(MembershipSelection {
+            universe_id: universe,
+            value,
+            manifest: retained.manifest.clone(),
+            content,
+            audit,
+            receipt,
+        }));
     }
     Ok(None)
 }
@@ -1015,8 +1734,14 @@ fn dataset_request(
         }
     );
     let authorization = derived_authorization(identity, use_case)?;
+    let parent_count = inputs.parents().len();
+    let component_count = inputs.component_specs().len();
+    let max_input_rows = parent_count
+        .checked_mul(MAXIMUM_OBSERVATIONS_PER_GENERATION)
+        .filter(|rows| *rows <= 1_000_000)
+        .ok_or(DatasetPreparationError::Capacity)?;
     let output_rows = examples
-        .checked_mul(2)
+        .checked_mul(component_count)
         .ok_or(DatasetPreparationError::Capacity)?;
     DatasetBuildRequest::try_new(
         DatasetId::try_from(output_id.as_str())
@@ -1025,7 +1750,7 @@ fn dataset_request(
         policy,
         use_case.domain(),
         ResearchUseLimits::try_new(
-            4,
+            parent_count,
             16_384,
             65_536,
             4_096,
@@ -1036,24 +1761,25 @@ fn dataset_request(
         .map_err(|_| DatasetPreparationError::Capacity)?,
         authorization,
         DatasetBuildLimits::try_new(
-            MAXIMUM_OBSERVATIONS_PER_GENERATION,
+            max_input_rows,
             examples,
-            2,
+            component_count,
             output_rows,
             128 * 1024 * 1024,
             BUILD_DURATION,
             PointInTimeLimits::try_new(
-                MAXIMUM_OBSERVATIONS_PER_GENERATION,
-                MAXIMUM_OBSERVATIONS_PER_GENERATION,
+                max_input_rows,
+                max_input_rows,
                 256,
-                MAXIMUM_OBSERVATIONS_PER_GENERATION,
+                max_input_rows,
                 64 * 1024 * 1024,
             )
             .map_err(|_| DatasetPreparationError::Capacity)?,
             UniverseLimits::try_new(64, 4 * 1024 * 1024)
                 .map_err(|_| DatasetPreparationError::Capacity)?,
             CorporateActionLimits::try_new(
-                NonZeroUsize::new(64).ok_or(DatasetPreparationError::Capacity)?,
+                NonZeroUsize::new(MAXIMUM_OBSERVATIONS_PER_GENERATION)
+                    .ok_or(DatasetPreparationError::Capacity)?,
                 NonZeroUsize::new(4 * 1024 * 1024).ok_or(DatasetPreparationError::Capacity)?,
             )
             .map_err(|_| DatasetPreparationError::Capacity)?,
@@ -1086,37 +1812,163 @@ fn derived_authorization(
     .map_err(|_| DatasetPreparationError::InvalidEvidence)
 }
 
-fn series_identity(manifest: &DatasetManifestRef, key: &SeriesKey) -> Sha256Digest {
+fn market_series_identity(manifest: &DatasetManifestRef, key: &MarketSeriesKey) -> Sha256Digest {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/guided-dataset-series/v1");
+    digest.update(b"market-squawk/product-market-bar-series/v1");
     digest.update(manifest.content_hash().bytes());
     digest.update(key.instrument_id.as_uuid().as_bytes());
     update_text(&mut digest, key.source_id.as_str());
-    update_text(&mut digest, key.dataset.as_str());
-    update_text(&mut digest, key.field.as_str());
-    update_text(
-        &mut digest,
-        key.unit.as_ref().map_or("", SourceIdentifier::as_str),
-    );
+    update_text(&mut digest, key.venue_id.as_str());
+    update_text(&mut digest, key.provider_instrument_id.as_str());
+    update_text(&mut digest, key.feed.as_str());
+    update_text(&mut digest, key.interval.as_str());
+    digest.update([match key.timestamp_basis {
+        BarTimestampBasis::PeriodStart => 1,
+        BarTimestampBasis::PeriodEnd => 2,
+    }]);
+    digest.update([match key.session.kind() {
+        market_squawk_domain::MarketBarSessionKind::Regular => 1,
+        market_squawk_domain::MarketBarSessionKind::Extended => 2,
+        market_squawk_domain::MarketBarSessionKind::Continuous => 3,
+        market_squawk_domain::MarketBarSessionKind::ProviderDefined => 4,
+    }]);
+    update_text(&mut digest, key.session.ruleset().as_str());
+    digest.update([digest_algorithm_tag(key.session.evidence().algorithm())]);
+    digest.update(key.session.evidence().bytes());
+    update_text(&mut digest, key.currency.as_str());
     Sha256Digest::new(digest.finalize().into())
 }
 
-fn component_name(prefix: &str, field: &SourceIdentifier, identity: Sha256Digest) -> String {
-    let mut name = String::with_capacity(prefix.len() + field.as_str().len() + 18);
-    name.push_str(prefix);
-    name.push('-');
-    for byte in field.as_str().bytes().take(192) {
-        name.push(
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
-                char::from(byte)
+fn push_parent(
+    parents: &mut Vec<DatasetManifestRef>,
+    candidate: &DatasetManifestRef,
+) -> Result<(), DatasetPreparationError> {
+    for retained in parents.iter() {
+        if retained.dataset_id() == candidate.dataset_id()
+            && retained.manifest_version() == candidate.manifest_version()
+        {
+            return if retained == candidate {
+                Ok(())
             } else {
-                '_'
-            },
-        );
+                Err(DatasetPreparationError::InvalidEvidence)
+            };
+        }
     }
-    name.push('-');
-    name.push_str(&short_hex(identity));
-    name
+    parents.push(candidate.clone());
+    Ok(())
+}
+
+fn timestamp_calendar_date(timestamp: Timestamp) -> Result<CalendarDate, DatasetPreparationError> {
+    let date = DateTime::<Utc>::from_timestamp_nanos(timestamp.unix_nanos()).date_naive();
+    CalendarDate::new(
+        u16::try_from(date.year()).map_err(|_| DatasetPreparationError::InvalidEvidence)?,
+        u8::try_from(date.month()).map_err(|_| DatasetPreparationError::InvalidEvidence)?,
+        u8::try_from(date.day()).map_err(|_| DatasetPreparationError::InvalidEvidence)?,
+    )
+    .map_err(|_| DatasetPreparationError::InvalidEvidence)
+}
+
+fn instrument_population_query_evidence(
+    instrument_id: InstrumentId,
+    first_cutoff: Timestamp,
+    final_cutoff: Timestamp,
+) -> EvidenceDigest {
+    evidence_digest(
+        b"market-squawk/instrument-population-query/v1",
+        &[
+            EvidencePart::Bytes(instrument_id.as_uuid().as_bytes()),
+            EvidencePart::Timestamp(first_cutoff),
+            EvidencePart::Timestamp(final_cutoff),
+        ],
+    )
+}
+
+fn aggregate_evidence(domain: &'static [u8], evidence: &[EvidenceDigest]) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update((domain.len() as u64).to_be_bytes());
+    hash.update(domain);
+    hash.update((evidence.len() as u64).to_be_bytes());
+    for retained in evidence {
+        hash.update([digest_algorithm_tag(retained.algorithm())]);
+        hash.update(retained.bytes());
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+enum EvidencePart<'value> {
+    Bytes(&'value [u8]),
+    Text(&'value str),
+    Timestamp(Timestamp),
+    Digest(EvidenceDigest),
+    Sha256(Sha256Digest),
+    Manifest(&'value DatasetManifestRef),
+}
+
+fn evidence_digest(domain: &'static [u8], parts: &[EvidencePart<'_>]) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update((domain.len() as u64).to_be_bytes());
+    hash.update(domain);
+    hash.update((parts.len() as u64).to_be_bytes());
+    for part in parts {
+        match part {
+            EvidencePart::Bytes(value) => {
+                hash.update([1]);
+                hash.update((value.len() as u64).to_be_bytes());
+                hash.update(value);
+            }
+            EvidencePart::Text(value) => {
+                hash.update([2]);
+                update_text(&mut hash, value);
+            }
+            EvidencePart::Timestamp(value) => {
+                hash.update([3]);
+                hash.update(value.unix_nanos().to_be_bytes());
+            }
+            EvidencePart::Digest(value) => {
+                hash.update([4, digest_algorithm_tag(value.algorithm())]);
+                hash.update(value.bytes());
+            }
+            EvidencePart::Sha256(value) => {
+                hash.update([5]);
+                hash.update(value.bytes());
+            }
+            EvidencePart::Manifest(value) => {
+                hash.update([6]);
+                hash_manifest(&mut hash, value);
+            }
+        }
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+fn hash_manifest(hash: &mut Sha256, manifest: &DatasetManifestRef) {
+    update_text(hash, manifest.dataset_id().as_str());
+    hash.update(manifest.manifest_version().to_be_bytes());
+    update_text(hash, manifest.schema().name());
+    hash.update(manifest.schema().version().get().to_be_bytes());
+    hash.update(manifest.schema().fingerprint());
+    hash.update(manifest.content_hash().bytes());
+}
+
+fn hash_coordinate(hash: &mut Sha256, coordinate: &ResearchTemporalCoordinate) {
+    if let Some(timestamp) = coordinate.exact_timestamp() {
+        hash.update([1]);
+        hash.update(timestamp.unix_nanos().to_be_bytes());
+    } else if let Some(date) = coordinate.calendar_date_value() {
+        hash.update([2]);
+        update_text(hash, &date.to_string());
+    } else if let Some(period) = coordinate.source_period_value() {
+        hash.update([3]);
+        update_text(hash, period.scheme().as_str());
+        update_text(hash, period.code().as_str());
+    }
+}
+
+const fn digest_algorithm_tag(algorithm: DigestAlgorithm) -> u8 {
+    match algorithm {
+        DigestAlgorithm::Sha256 => 1,
+        DigestAlgorithm::Blake3 => 2,
+    }
 }
 
 fn catalog_digest(options: &[PreparedOption]) -> Sha256Digest {

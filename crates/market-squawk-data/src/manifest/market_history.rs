@@ -1,6 +1,6 @@
 //! Durable, completeness-bound market-bar history publication and restart selection.
 
-use std::time::Instant;
+use std::{fmt, time::Instant};
 
 use market_squawk_domain::{
     AssetClass, AvailabilityEvidence as ResearchAvailabilityEvidence, BarTimestampBasis, Currency,
@@ -49,6 +49,8 @@ const ALPACA_HISTORY_CURRENCY: &str = "USD";
 const ALPACA_HISTORY_SELECTION_POLICY_VERSION: u16 = 1;
 const ALPACA_HISTORY_POLICY_DOMAIN: &[u8] = b"market-squawk/alpaca-history-selection-policy/v1";
 const ALPACA_HISTORY_SELECTION_DOMAIN: &[u8] = b"market-squawk/alpaca-history-selection/v1";
+const LATEST_CANONICAL_HISTORY_WINDOW_SELECTION_DOMAIN: &[u8] =
+    b"market-squawk/latest-canonical-market-bar-history-window-selection/v1";
 
 /// Opaque, versioned policy for canonical durable market-history selection.
 ///
@@ -73,6 +75,51 @@ impl MarketHistorySelectionPolicy {
 
     const fn is_supported(self) -> bool {
         self.version == ALPACA_HISTORY_SELECTION_POLICY_VERSION
+    }
+}
+
+/// Provider-neutral request for the latest complete durable history window known at one cutoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LatestCanonicalMarketBarHistoryWindowRequest {
+    instrument_id: InstrumentId,
+    selection_policy: MarketHistorySelectionPolicy,
+    knowledge_cutoff: Timestamp,
+}
+
+impl LatestCanonicalMarketBarHistoryWindowRequest {
+    /// Constructs one latest-window lookup under the code-owned daily adjusted policy.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unsupported policy version.
+    pub fn try_new(
+        instrument_id: InstrumentId,
+        selection_policy: MarketHistorySelectionPolicy,
+        knowledge_cutoff: Timestamp,
+    ) -> Result<Self, ManifestCatalogError> {
+        if !selection_policy.is_supported() {
+            return Err(ManifestCatalogError::MarketBarHistoryMismatch);
+        }
+        Ok(Self {
+            instrument_id,
+            selection_policy,
+            knowledge_cutoff,
+        })
+    }
+
+    /// Returns the canonical instrument coordinate.
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the sole code-owned, versioned selection policy.
+    pub const fn selection_policy(self) -> MarketHistorySelectionPolicy {
+        self.selection_policy
+    }
+
+    /// Returns the inclusive trusted internal knowledge cutoff.
+    pub const fn knowledge_cutoff(self) -> Timestamp {
+        self.knowledge_cutoff
     }
 }
 
@@ -475,6 +522,64 @@ impl CanonicalMarketBarHistoryRequest {
     /// Returns the optional exact immutable generation pin used for replay or tests.
     pub const fn exact_manifest(&self) -> Option<&DatasetManifestRef> {
         self.exact_manifest.as_ref()
+    }
+}
+
+/// Opaque catalog selection that hands the exact immutable request to the existing reader.
+#[derive(Clone, Eq, PartialEq)]
+pub struct LatestCanonicalMarketBarHistoryWindowSelection {
+    exact_request: CanonicalMarketBarHistoryRequest,
+    lookup_digest: Sha256Digest,
+}
+
+impl LatestCanonicalMarketBarHistoryWindowSelection {
+    /// Returns the canonical instrument coordinate.
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.exact_request.instrument_id()
+    }
+
+    /// Returns the exact selected provider-neutral financial window.
+    pub const fn requested_range(&self) -> (Timestamp, Timestamp) {
+        self.exact_request.requested_range()
+    }
+
+    /// Returns the code-owned policy that selected this window.
+    pub const fn selection_policy(&self) -> MarketHistorySelectionPolicy {
+        self.exact_request.selection_policy()
+    }
+
+    /// Returns the inclusive trusted knowledge cutoff used by selection.
+    pub const fn knowledge_cutoff(&self) -> Timestamp {
+        self.exact_request.knowledge_cutoff()
+    }
+
+    /// Returns the digest binding the policy, cutoff, complete window, and immutable evidence.
+    pub const fn lookup_digest(&self) -> Sha256Digest {
+        self.lookup_digest
+    }
+
+    /// Returns the exact internally manifest-pinned request for the existing durable reader.
+    pub const fn exact_request(&self) -> &CanonicalMarketBarHistoryRequest {
+        &self.exact_request
+    }
+
+    /// Transfers the exact internally manifest-pinned request to the existing durable reader.
+    pub fn into_exact_request(self) -> CanonicalMarketBarHistoryRequest {
+        self.exact_request
+    }
+}
+
+impl fmt::Debug for LatestCanonicalMarketBarHistoryWindowSelection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LatestCanonicalMarketBarHistoryWindowSelection")
+            .field("instrument_id", &self.instrument_id())
+            .field("requested_range", &self.requested_range())
+            .field("policy_version", &self.selection_policy().version())
+            .field("knowledge_cutoff", &self.knowledge_cutoff())
+            .field("lookup_digest", &self.lookup_digest)
+            .field("immutable_generation", &"[OPAQUE]")
+            .finish()
     }
 }
 
@@ -1318,6 +1423,42 @@ fn history_selection_digest(
     nonzero_sha256(hash.finalize().into())
 }
 
+fn latest_canonical_history_window_selection_digest(
+    request: &LatestCanonicalMarketBarHistoryWindowRequest,
+    candidate: LatestCanonicalMarketBarHistoryWindowCandidate,
+    selection: &CompleteMarketBarHistorySelection,
+) -> Result<Sha256Digest, ManifestCatalogError> {
+    let manifest = selection.pinned().manifest();
+    let receipt = selection.receipt();
+    let mut hash = Sha256::new();
+    hash.update(LATEST_CANONICAL_HISTORY_WINDOW_SELECTION_DOMAIN);
+    hash.update(selection.policy_digest().bytes());
+    hash_text(&mut hash, &request.instrument_id().to_string());
+    hash.update(request.selection_policy().version().to_be_bytes());
+    hash.update(request.knowledge_cutoff().unix_nanos().to_be_bytes());
+    let (requested_start, requested_end) = candidate.requested_range();
+    hash.update(requested_start.unix_nanos().to_be_bytes());
+    hash.update(requested_end.unix_nanos().to_be_bytes());
+    let (coverage_first, coverage_last, coverage_last_complete) = candidate.coverage();
+    hash.update(coverage_first.unix_nanos().to_be_bytes());
+    hash.update(coverage_last.unix_nanos().to_be_bytes());
+    hash.update(coverage_last_complete.unix_nanos().to_be_bytes());
+    hash.update(
+        u64::try_from(candidate.expected_bar_count)
+            .map_err(|_| ManifestCatalogError::CountOverflow)?
+            .to_be_bytes(),
+    );
+    hash_text(&mut hash, manifest.dataset_id().as_str());
+    hash.update(manifest.manifest_version().to_be_bytes());
+    hash_text(&mut hash, manifest.schema().name());
+    hash.update(manifest.schema_version().get().to_be_bytes());
+    hash.update(manifest.schema().fingerprint());
+    hash.update(manifest.content_hash().bytes());
+    hash.update(receipt.receipt_digest().bytes());
+    hash.update(selection.selection_digest().bytes());
+    nonzero_sha256(hash.finalize().into())
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the transaction binds run, artifact, manifest, schema, and typed history evidence"
@@ -1349,7 +1490,7 @@ pub(super) fn insert_generation_market_bar_history_inputs(
          JOIN analytical_generation_market_bar_history_inputs AS parent_input
            ON parent_input.generation_sequence=edge.parent_generation_sequence
          WHERE child.generation_sequence=?1
-           AND child.generation_kind IN ('ingest', 'compaction')",
+           AND child.generation_kind IN ('ingest', 'compaction', 'derived')",
         [generation_sequence],
         |row| row.get(0),
     )?;
@@ -1394,6 +1535,24 @@ pub(super) fn insert_generation_market_bar_history_inputs(
         )?;
     }
 
+    propagate_generation_market_bar_history_inputs(transaction, generation_sequence)
+}
+
+pub(crate) fn propagate_generation_market_bar_history_inputs(
+    transaction: &Transaction<'_>,
+    generation_sequence: i64,
+) -> Result<(), ManifestCatalogError> {
+    if generation_sequence <= 0 {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
+    let kind: String = transaction.query_row(
+        "SELECT generation_kind FROM analytical_generations WHERE generation_sequence=?1",
+        [generation_sequence],
+        |row| row.get(0),
+    )?;
+    if !matches!(kind.as_str(), "ingest" | "compaction" | "derived") {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
     let inserted = transaction.execute(
         "INSERT INTO analytical_generation_market_bar_history_inputs
          (generation_sequence, input_ordinal, publication_receipt_digest)
@@ -1406,7 +1565,7 @@ pub(super) fn insert_generation_market_bar_history_inputs(
              JOIN analytical_generation_market_bar_history_inputs AS parent_input
                ON parent_input.generation_sequence=edge.parent_generation_sequence
              WHERE child.generation_sequence=?1
-               AND child.generation_kind IN ('ingest', 'compaction')
+               AND child.generation_kind IN ('ingest', 'compaction', 'derived')
              UNION
              SELECT publication.publication_receipt_digest
              FROM market_bar_history_publications AS publication
@@ -1434,7 +1593,7 @@ pub(super) fn insert_generation_market_bar_history_inputs(
              JOIN analytical_generation_market_bar_history_inputs AS parent_input
                ON parent_input.generation_sequence=edge.parent_generation_sequence
              WHERE child.generation_sequence=?1
-               AND child.generation_kind IN ('ingest', 'compaction')
+               AND child.generation_kind IN ('ingest', 'compaction', 'derived')
              UNION
              SELECT publication.publication_receipt_digest
              FROM market_bar_history_publications AS publication
@@ -1789,7 +1948,7 @@ pub(super) fn generation_market_bar_history_inputs_match_manifest(
              JOIN analytical_generation_market_bar_history_inputs AS parent_input
                ON parent_input.generation_sequence=edge.parent_generation_sequence
              WHERE child.generation_sequence=?1
-               AND child.generation_kind IN ('ingest', 'compaction')
+               AND child.generation_kind IN ('ingest', 'compaction', 'derived')
              UNION
              SELECT publication.publication_receipt_digest
              FROM market_bar_history_publications AS publication
@@ -1836,7 +1995,7 @@ pub(super) fn generation_market_bar_history_inputs_match_manifest(
              JOIN analytical_generation_market_bar_history_inputs AS parent_input
                ON parent_input.generation_sequence=edge.parent_generation_sequence
              WHERE child.generation_sequence=?1
-               AND child.generation_kind IN ('ingest', 'compaction')
+               AND child.generation_kind IN ('ingest', 'compaction', 'derived')
              UNION
              SELECT publication.publication_receipt_digest
              FROM market_bar_history_publications AS publication
@@ -2230,6 +2389,253 @@ fn resolve_canonical_market_bar_history_series(
         ),
     }?;
     Ok(Some(resolved))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LatestCanonicalMarketBarHistoryWindowCandidate {
+    requested_start: Timestamp,
+    requested_end: Timestamp,
+    coverage_first: Timestamp,
+    coverage_last: Timestamp,
+    coverage_last_complete: Timestamp,
+    expected_bar_count: usize,
+}
+
+impl LatestCanonicalMarketBarHistoryWindowCandidate {
+    fn try_new(
+        requested_start_ns: i64,
+        requested_end_ns: i64,
+        coverage_first_ns: i64,
+        coverage_last_ns: i64,
+        coverage_last_complete_ns: i64,
+        expected_bar_count: i64,
+        knowledge_cutoff: Timestamp,
+    ) -> Result<Self, ManifestCatalogError> {
+        let requested_start = Timestamp::from_unix_nanos(requested_start_ns);
+        let requested_end = Timestamp::from_unix_nanos(requested_end_ns);
+        let coverage_first = Timestamp::from_unix_nanos(coverage_first_ns);
+        let coverage_last = Timestamp::from_unix_nanos(coverage_last_ns);
+        let coverage_last_complete = Timestamp::from_unix_nanos(coverage_last_complete_ns);
+        let expected_bar_count = usize::try_from(expected_bar_count)
+            .ok()
+            .filter(|count| *count > 0 && *count <= MAX_COMPLETE_MARKET_BAR_HISTORY_TIMESTAMPS)
+            .ok_or(ManifestCatalogError::CorruptCatalog)?;
+        if requested_start >= requested_end
+            || requested_end > knowledge_cutoff
+            || coverage_first < requested_start
+            || coverage_last < coverage_first
+            || coverage_last > requested_end
+            || coverage_last_complete < coverage_last
+            || coverage_last_complete > requested_end
+            || coverage_last_complete > knowledge_cutoff
+        {
+            return Err(ManifestCatalogError::CorruptCatalog);
+        }
+        Ok(Self {
+            requested_start,
+            requested_end,
+            coverage_first,
+            coverage_last,
+            coverage_last_complete,
+            expected_bar_count,
+        })
+    }
+
+    const fn requested_range(self) -> (Timestamp, Timestamp) {
+        (self.requested_start, self.requested_end)
+    }
+
+    const fn coverage(self) -> (Timestamp, Timestamp, Timestamp) {
+        (
+            self.coverage_first,
+            self.coverage_last,
+            self.coverage_last_complete,
+        )
+    }
+
+    const fn has_same_selection_rank(self, other: Self) -> bool {
+        self.coverage_last_complete.unix_nanos() == other.coverage_last_complete.unix_nanos()
+            && self.requested_end.unix_nanos() == other.requested_end.unix_nanos()
+            && self.expected_bar_count == other.expected_bar_count
+            && self.requested_start.unix_nanos() == other.requested_start.unix_nanos()
+    }
+}
+
+pub(super) fn select_latest_canonical_market_bar_history_window(
+    connection: &Connection,
+    max_objects: usize,
+    request: &LatestCanonicalMarketBarHistoryWindowRequest,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Option<LatestCanonicalMarketBarHistoryWindowSelection>, ManifestCatalogError> {
+    check_operation(deadline, cancellation)?;
+    if !request.selection_policy().is_supported() {
+        return Err(ManifestCatalogError::MarketBarHistoryMismatch);
+    }
+    let canonical_schema = DatasetSchemaRegistry::local().canonical_research_observations()?;
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT
+                publication.requested_start_ns,
+                publication.requested_end_ns,
+                publication.coverage_first_ns,
+                publication.coverage_last_ns,
+                publication.coverage_last_complete_ns,
+                publication.expected_bar_count
+         FROM analytical_generations AS selected_generation
+         JOIN dataset_manifests AS selected_manifest
+           ON selected_manifest.manifest_id=selected_generation.anchor_manifest_id
+         JOIN artifacts AS selected_artifact
+           ON selected_artifact.artifact_id=selected_manifest.artifact_id
+         JOIN ingest_runs AS selected_run
+           ON selected_run.run_id=selected_artifact.run_id
+         JOIN analytical_generation_market_bar_history_inputs AS history_input
+           ON history_input.generation_sequence=selected_generation.generation_sequence
+         JOIN market_bar_history_publications AS publication
+           USING (publication_receipt_digest)
+         JOIN ingest_runs AS origin_run
+           ON origin_run.run_id=publication.origin_run_id
+         JOIN provider_capture_bindings AS binding
+           ON binding.binding_digest=publication.binding_digest
+         JOIN provider_raw_observations AS capture
+           ON capture.capture_observation_digest=binding.capture_observation_digest
+         JOIN analytical_generation_provider_capture_bindings AS selected_capture
+           ON selected_capture.generation_sequence=selected_generation.generation_sequence
+          AND selected_capture.binding_digest=publication.binding_digest
+         WHERE publication.instrument_id=?1
+           AND selected_generation.schema_name=?3
+           AND selected_generation.schema_version=?4
+           AND selected_generation.schema_fingerprint=?5
+           AND publication.source_id='alpaca-basic-iex-market-data'
+           AND publication.venue_id='iex'
+           AND publication.feed='iex'
+           AND publication.bar_interval='1Day'
+           AND publication.adjustment='all'
+           AND publication.timestamp_basis='period_start'
+           AND publication.session_kind='provider_defined'
+           AND publication.session_ruleset='alpaca-v3-iex-utc-range-returned-dates-v2'
+           AND publication.graph_purpose='alpaca-iex-historical-bars-and-calendar/v1'
+           AND publication.asset_class IN ('equity', 'fund')
+           AND publication.currency='USD'
+           AND publication.requested_end_ns<=?2
+           AND publication.coverage_last_complete_ns<=?2
+           AND publication.expected_bar_count=publication.returned_bar_count
+           AND selected_generation.created_at_ns<=?2
+           AND selected_manifest.created_at_ns<=?2
+           AND selected_artifact.created_at_ns<=?2
+           AND selected_run.state='succeeded'
+           AND selected_run.operation='persist'
+           AND selected_run.source_id=publication.source_id
+           AND selected_run.requested_at_ns<=?2
+           AND selected_run.completed_at_ns<=?2
+           AND origin_run.state='succeeded'
+           AND origin_run.operation='persist'
+           AND origin_run.source_id=publication.source_id
+           AND origin_run.requested_at_ns<=?2
+           AND origin_run.completed_at_ns<=?2
+           AND capture.recorded_at_ns<=?2
+           AND publication.capture_recorded_at_ns<=?2
+           AND publication.max_available_at_ns<=?2
+           AND publication.max_received_at_ns<=?2
+           AND publication.max_ingested_at_ns<=?2
+           AND publication.published_at_ns<=?2
+           AND publication.admission_class='current_research_only'
+           AND publication.current_research_eligible=1
+           AND publication.point_in_time_eligible=0
+           AND publication.backtest_eligible=0
+           AND publication.retrospective_training_eligible=0
+         ORDER BY publication.coverage_last_complete_ns DESC,
+                  publication.requested_end_ns DESC,
+                  publication.expected_bar_count DESC,
+                  publication.requested_start_ns ASC,
+                  publication.coverage_first_ns ASC,
+                  publication.coverage_last_ns DESC
+         LIMIT 2",
+    )?;
+    let rows = statement.query_map(
+        params![
+            request.instrument_id().to_string(),
+            request.knowledge_cutoff().unix_nanos(),
+            canonical_schema.name(),
+            i64::from(canonical_schema.version().get()),
+            canonical_schema.fingerprint().as_slice(),
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        },
+    )?;
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(2)
+        .map_err(|_| ManifestCatalogError::CountOverflow)?;
+    for row in rows {
+        check_operation(deadline, cancellation)?;
+        let (start, end, first, last, last_complete, count) = row?;
+        candidates.push(LatestCanonicalMarketBarHistoryWindowCandidate::try_new(
+            start,
+            end,
+            first,
+            last,
+            last_complete,
+            count,
+            request.knowledge_cutoff(),
+        )?);
+    }
+    drop(statement);
+    if candidates
+        .get(1)
+        .is_some_and(|other| candidates[0].has_same_selection_rank(*other))
+    {
+        return Err(ManifestCatalogError::MarketBarHistoryMismatch);
+    }
+    let Some(candidate) = candidates.into_iter().next() else {
+        return Ok(None);
+    };
+    let (requested_start, requested_end) = candidate.requested_range();
+    let canonical_request = CanonicalMarketBarHistoryRequest::try_latest(
+        request.instrument_id(),
+        requested_start,
+        requested_end,
+        request.selection_policy(),
+        request.knowledge_cutoff(),
+    )?;
+    check_operation(deadline, cancellation)?;
+    let validated = select_canonical_market_bar_history(
+        connection,
+        max_objects,
+        &canonical_request,
+        deadline,
+        cancellation,
+    )?
+    .ok_or(ManifestCatalogError::CorruptCatalog)?;
+    let receipt = validated.receipt();
+    if receipt.instrument_id() != request.instrument_id()
+        || receipt.requested_range() != candidate.requested_range()
+        || receipt.coverage() != candidate.coverage()
+        || receipt.bar_count() != candidate.expected_bar_count
+    {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
+    let exact_request = CanonicalMarketBarHistoryRequest::try_exact(
+        request.instrument_id(),
+        requested_start,
+        requested_end,
+        request.selection_policy(),
+        request.knowledge_cutoff(),
+        validated.pinned().manifest().clone(),
+    )?;
+    let lookup_digest =
+        latest_canonical_history_window_selection_digest(request, candidate, &validated)?;
+    Ok(Some(LatestCanonicalMarketBarHistoryWindowSelection {
+        exact_request,
+        lookup_digest,
+    }))
 }
 
 pub(super) fn select_canonical_market_bar_history(

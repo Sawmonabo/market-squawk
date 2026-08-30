@@ -4,25 +4,27 @@
 use std::{
     fmt,
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use market_squawk_data::{
     AnalyticalFeatureDataset, AnalyticalMarketBarReadLimit, AnalyticalMarketBarReadRequest,
-    AnalyticalReadCapability, AnalyticalReadLimit, DatasetId, DatasetManifestRef, DatasetSplit,
-    FeatureDatasetProductContract, ForecastDatasetEvidence, ForecastDatasetReadLimits,
-    ForecastFeatureRow, ForecastFeatureValue, GenerationParentRelation, MarketBarEffectiveRange,
-    QueryLimits, Sha256Digest,
+    AnalyticalReadCapability, AnalyticalReadLimit, ComponentAdjustmentEvidence, ComponentKind,
+    ComponentScope, ComponentValue, CorporateActionSensitivity, DatasetId, DatasetManifestRef,
+    DatasetSplit, FeatureDatasetProductContract, ForecastDatasetEvidence,
+    ForecastDatasetReadLimits, ForecastFeatureRow, ForecastFeatureValue, GenerationParentRelation,
+    MarketBarEffectiveRange, ObservationFamilyKey, QueryLimits, Sha256Digest,
 };
 use market_squawk_domain::{
-    DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentId, MarketBarAdjustment,
-    MarketBarObservation, Timestamp,
+    CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentId, MarketBarAdjustment,
+    MarketBarObservation, ResearchTemporalCoordinate, Timestamp,
 };
 use market_squawk_modeling::{
     ForecastMeasurement, ForecastObservedPoint, ForecastTargetMeaning, ForecastValue,
-    ModelMetadata, TrainingDatasetIdentity,
+    ModelMetadata, TrainingDatasetIdentity, has_price_return_macro_context_feature_order_v1,
 };
+use market_squawk_services::ServiceError;
 use rust_decimal::{Decimal, prelude::ToPrimitive as _};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -33,6 +35,9 @@ use crate::application::model::forecast_preparation::{
     ForecastEvidenceReadError, ForecastEvidenceReader, ForecastEvidenceRevalidation,
     ForecastInstrumentAvailability, ForecastServingInputFence, PreparedForecastEvidence,
 };
+
+use super::macro_context::MacroContextReadCapability;
+use super::macro_features::{MacroFeatureVector, read_macro_feature_vector};
 
 const DATASET_PAGE: usize = 64;
 const MAX_DATASETS: usize = 4_096;
@@ -51,11 +56,18 @@ const SERVING_LOOKBACK_NANOS: i64 = 10 * 366 * 24 * 60 * 60 * 1_000_000_000;
 #[derive(Clone)]
 pub(crate) struct AnalyticalForecastEvidenceReader {
     analytical: AnalyticalReadCapability,
+    macro_context: Option<MacroContextReadCapability>,
 }
 
 impl AnalyticalForecastEvidenceReader {
-    pub(crate) const fn new(analytical: AnalyticalReadCapability) -> Self {
-        Self { analytical }
+    pub(crate) const fn new(
+        analytical: AnalyticalReadCapability,
+        macro_context: Option<MacroContextReadCapability>,
+    ) -> Self {
+        Self {
+            analytical,
+            macro_context,
+        }
     }
 
     async fn exact_training(
@@ -68,7 +80,7 @@ impl AnalyticalForecastEvidenceReader {
         let evidence = match self
             .analytical
             .forecast_dataset_evidence(
-                FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnTrainingV1,
+                FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1,
                 identity.manifest(),
                 identity.selection_as_of(),
                 evidence_limits()?,
@@ -87,7 +99,7 @@ impl AnalyticalForecastEvidenceReader {
         let generation = dataset.generation();
         let fence = evidence.fence();
         if dataset.product_contract()
-            != FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnTrainingV1
+            != FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1
             || generation.manifest() != identity.manifest()
             || generation.build_spec_digest() != Some(identity.build_spec_digest())
             || dataset.universe_digest() != identity.universe_digest()
@@ -114,7 +126,7 @@ impl AnalyticalForecastEvidenceReader {
         match self
             .analytical
             .forecast_dataset_evidence(
-                FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
+                FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1,
                 manifest,
                 as_of,
                 evidence_limits()?,
@@ -143,7 +155,7 @@ impl AnalyticalForecastEvidenceReader {
             let page = self
                 .analytical
                 .feature_datasets(
-                    FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
+                    FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1,
                     after.as_ref(),
                     limit,
                     deadline,
@@ -361,6 +373,7 @@ impl ForecastEvidenceReader for AnalyticalForecastEvidenceReader {
             request,
             &analysis,
             &self.analytical,
+            self.macro_context.as_ref(),
             None,
             deadline,
             cancellation,
@@ -399,6 +412,7 @@ impl ForecastEvidenceReader for AnalyticalForecastEvidenceReader {
             request,
             &analysis,
             &self.analytical,
+            self.macro_context.as_ref(),
             Some(expected.serving_input()),
             deadline,
             cancellation,
@@ -437,7 +451,7 @@ fn pairable_summary(
     let training_generation = training_dataset.generation();
     let analysis_generation = analysis.generation();
     analysis.product_contract()
-        == FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1
+        == FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1
         && analysis_generation.build_spec_digest().is_some()
         && analysis_generation.build_spec_digest() != training_generation.build_spec_digest()
         && analysis_generation.manifest() != training_generation.manifest()
@@ -456,6 +470,7 @@ fn pair(
     analysis: &ForecastDatasetEvidence,
 ) -> Result<ForecastDatasetPairingReceipt, ForecastEvidenceReadError> {
     if !pairable_summary(training, analysis.dataset())
+        || training.fence().catalog_identity() != analysis.fence().catalog_identity()
         || training.fence().as_of() != analysis.fence().as_of()
         || training.fence().as_of() != metadata.dataset().selection_as_of()
     {
@@ -521,6 +536,7 @@ fn shared_compatibility_digest(
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/forecast-training-analysis-compatibility/v1\0");
     digest.update(fixed_horizon_nanos.get().to_be_bytes());
+    hash_admitted_feature_order(&mut digest)?;
     digest.update(dataset.policy_digest().bytes());
     digest.update(dataset.universe_digest().bytes());
     hash_bytes(&mut digest, dataset.universe_id().as_str().as_bytes())?;
@@ -560,6 +576,26 @@ fn shared_compatibility_digest(
         digest.update(row.bytes());
     }
     Ok(Sha256Digest::new(digest.finalize().into()))
+}
+
+fn hash_admitted_feature_order(digest: &mut Sha256) -> Result<(), ForecastEvidenceReadError> {
+    hash_bytes(digest, b"research.price-return")?;
+    let contract =
+        FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1;
+    digest.update(
+        u64::try_from(contract.macro_components().len())
+            .map_err(|_| ForecastEvidenceReadError::Capacity)?
+            .to_be_bytes(),
+    );
+    for (position, component) in contract.macro_components().iter().enumerate() {
+        if usize::from(component.position()) != position {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        digest.update([component.position()]);
+        hash_bytes(digest, component.component_name().as_bytes())?;
+        hash_bytes(digest, component.unit().as_bytes())?;
+    }
+    Ok(())
 }
 
 fn shared_row_digest(row: &ForecastFeatureRow) -> Result<Sha256Digest, ForecastEvidenceReadError> {
@@ -717,6 +753,7 @@ async fn materialize(
     request: ForecastEvidenceMaterializationRequest,
     evidence: &ForecastDatasetEvidence,
     analytical: &AnalyticalReadCapability,
+    macro_context: Option<&MacroContextReadCapability>,
     expected_serving: Option<&ForecastServingInputFence>,
     deadline: Instant,
     cancellation: CancellationToken,
@@ -730,9 +767,7 @@ async fn materialize(
         || request.selection().horizon().points() != NonZeroU16::MIN
         || request.selection().horizon().step_nanos() != horizon
         || request.pairing().fixed_horizon_nanos() != horizon
-        || metadata.features().len() != 1
-        || metadata.features()[0].key().name() != "research.price-return"
-        || metadata.features()[0].key().version().get() != 1
+        || !has_price_return_macro_context_feature_order_v1(metadata)
     {
         return Err(ForecastEvidenceReadError::Unavailable);
     }
@@ -752,15 +787,30 @@ async fn materialize(
         historical_target,
         historical_oos.split(),
     )?;
+    let knowledge_cutoff = request.knowledge_cutoff();
+    let effective_date_cutoff = request.macro_effective_date_cutoff();
     let serving = serving_materialization(
         analytical,
         evidence,
         instrument,
+        knowledge_cutoff,
         expected_serving,
         deadline,
-        cancellation,
+        cancellation.child_token(),
     )
     .await?;
+    let macro_context = macro_context.ok_or(ForecastEvidenceReadError::Unavailable)?;
+    let macro_features = read_macro_feature_vector(
+        macro_context,
+        knowledge_cutoff,
+        effective_date_cutoff,
+        deadline,
+        cancellation.child_token(),
+    )
+    .await
+    .map_err(map_macro_feature_error)?;
+    let (serving, input) =
+        enrich_serving_materialization(serving, macro_features, effective_date_cutoff)?;
     PreparedForecastEvidence::try_new(
         request,
         serving.fence,
@@ -768,8 +818,157 @@ async fn materialize(
         serving.available_at,
         serving.decimal_scale,
         serving.observed_history,
-        vec![vec![serving.current_return].into_boxed_slice()],
+        vec![input],
     )
+}
+
+fn enrich_serving_materialization(
+    mut serving: ServingMaterialization,
+    macro_features: MacroFeatureVector,
+    effective_date_cutoff: CalendarDate,
+) -> Result<(ServingMaterialization, Box<[f64]>), ForecastEvidenceReadError> {
+    if macro_features.knowledge_cutoff() != serving.fence.knowledge_cutoff()
+        || macro_features.effective_date_cutoff() != effective_date_cutoff
+        || macro_features.parent_manifests().is_empty()
+        || macro_features.evidence_digest().algorithm() != DigestAlgorithm::Sha256
+        || macro_features.evidence_digest().bytes() == [0; 32]
+    {
+        return Err(ForecastEvidenceReadError::InvalidEvidence);
+    }
+
+    let descriptors =
+        FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1
+            .macro_components();
+    if macro_features.components().len() != descriptors.len()
+        || macro_features.component_cutoffs().count() != descriptors.len()
+    {
+        return Err(ForecastEvidenceReadError::InvalidEvidence);
+    }
+
+    let mut input = Vec::new();
+    input
+        .try_reserve_exact(descriptors.len() + 1)
+        .map_err(|_| ForecastEvidenceReadError::Capacity)?;
+    input.push(serving.current_return);
+
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/forecast-serving-price-macro-vector/v1\0");
+    digest.update(serving.fence.feature_sha256().bytes());
+    digest.update(macro_features.evidence_digest().bytes());
+    digest.update(macro_features.knowledge_cutoff().unix_nanos().to_be_bytes());
+    digest.update(effective_date_cutoff.year().to_be_bytes());
+    digest.update([effective_date_cutoff.month(), effective_date_cutoff.day()]);
+    digest.update(
+        u64::try_from(macro_features.parent_manifests().len())
+            .map_err(|_| ForecastEvidenceReadError::Capacity)?
+            .to_be_bytes(),
+    );
+    for parent in macro_features.parent_manifests() {
+        hash_manifest(&mut digest, parent)?;
+    }
+
+    for (position, (component, descriptor)) in macro_features
+        .components()
+        .iter()
+        .zip(descriptors)
+        .enumerate()
+    {
+        let specification = component.spec();
+        if usize::from(descriptor.position()) != position
+            || specification.kind() != ComponentKind::Feature
+            || specification.scope() != ComponentScope::Global
+            || specification.corporate_actions() != CorporateActionSensitivity::NotApplicable
+            || specification.name() != descriptor.component_name()
+            || specification.version() != std::num::NonZeroU32::MIN
+            || component.label_selection_effective_cutoff().is_some()
+            || component.adjustment() != &ComponentAdjustmentEvidence::NotApplicable
+            || component.selectors().len() != 1
+        {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        let selector = component
+            .selectors()
+            .first()
+            .ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
+        let ObservationFamilyKey::Macro { effective, .. } = selector.family() else {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        };
+        if effective != component.selection_effective_cutoff() {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        let ComponentValue::Decimal {
+            value,
+            unit: Some(unit),
+            currency: None,
+        } = component.value()
+        else {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        };
+        if unit.as_str() != descriptor.unit() {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        let finite_value = value
+            .to_f64()
+            .filter(|value| value.is_finite())
+            .ok_or(ForecastEvidenceReadError::InvalidEvidence)?;
+        input.push(finite_value);
+
+        digest.update([descriptor.position()]);
+        hash_bytes(&mut digest, descriptor.component_name().as_bytes())?;
+        hash_bytes(&mut digest, descriptor.unit().as_bytes())?;
+        digest.update(selector.identity().bytes());
+        hash_temporal_coordinate(&mut digest, effective)?;
+        digest.update(value.mantissa().to_be_bytes());
+        digest.update(value.scale().to_be_bytes());
+    }
+
+    let composite_feature_sha256 = Sha256Digest::new(digest.finalize().into());
+    let composite_fence = ForecastServingInputFence::try_new(
+        serving.fence.manifest().clone(),
+        serving.fence.source_id().clone(),
+        serving.fence.object_graph_sha256(),
+        serving.fence.selection_sha256(),
+        serving.fence.result_sha256(),
+        serving.fence.knowledge_cutoff(),
+        serving.fence.prior_observed_at(),
+        serving.fence.observed_through(),
+        composite_feature_sha256,
+    )?;
+    serving.available_at = serving.available_at.max(macro_features.knowledge_cutoff());
+    serving.fence = composite_fence;
+    Ok((serving, input.into_boxed_slice()))
+}
+
+fn hash_temporal_coordinate(
+    digest: &mut Sha256,
+    coordinate: &ResearchTemporalCoordinate,
+) -> Result<(), ForecastEvidenceReadError> {
+    if let Some(timestamp) = coordinate.exact_timestamp() {
+        digest.update([1]);
+        digest.update(timestamp.unix_nanos().to_be_bytes());
+    } else if let Some(date) = coordinate.calendar_date_value() {
+        digest.update([2]);
+        digest.update(date.year().to_be_bytes());
+        digest.update([date.month(), date.day()]);
+    } else {
+        return Err(ForecastEvidenceReadError::InvalidEvidence);
+    }
+    Ok(())
+}
+
+const fn map_macro_feature_error(error: ServiceError) -> ForecastEvidenceReadError {
+    match error {
+        ServiceError::Cancelled => ForecastEvidenceReadError::Cancelled,
+        ServiceError::DeadlineExceeded => ForecastEvidenceReadError::DeadlineExceeded,
+        ServiceError::ResourceExhausted => ForecastEvidenceReadError::Capacity,
+        ServiceError::InvalidResult | ServiceError::InvalidRequest => {
+            ForecastEvidenceReadError::InvalidEvidence
+        }
+        ServiceError::NotFound
+        | ServiceError::Unauthorized
+        | ServiceError::Unavailable
+        | ServiceError::Internal => ForecastEvidenceReadError::Unavailable,
+    }
 }
 
 struct ServingMaterialization {
@@ -785,15 +984,15 @@ async fn serving_materialization(
     analytical: &AnalyticalReadCapability,
     evidence: &ForecastDatasetEvidence,
     instrument: InstrumentId,
+    knowledge_cutoff: Timestamp,
     expected: Option<&ForecastServingInputFence>,
     deadline: Instant,
     cancellation: CancellationToken,
 ) -> Result<ServingMaterialization, ForecastEvidenceReadError> {
     check_control(deadline, &cancellation)?;
-    let knowledge_cutoff = match expected {
-        Some(expected) => expected.knowledge_cutoff(),
-        None => wall_now()?,
-    };
+    if expected.is_some_and(|expected| expected.knowledge_cutoff() != knowledge_cutoff) {
+        return Err(ForecastEvidenceReadError::InvalidEvidence);
+    }
     let start = knowledge_cutoff
         .checked_sub_nanos(SERVING_LOOKBACK_NANOS)
         .map_err(|_| ForecastEvidenceReadError::Unavailable)?;
@@ -1060,16 +1259,6 @@ fn sha256_evidence(value: EvidenceDigest) -> Result<Sha256Digest, ForecastEviden
         return Err(ForecastEvidenceReadError::InvalidEvidence);
     }
     Ok(Sha256Digest::new(value.bytes()))
-}
-
-fn wall_now() -> Result<Timestamp, ForecastEvidenceReadError> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| ForecastEvidenceReadError::Unavailable)?
-        .as_nanos();
-    i64::try_from(nanos)
-        .map(Timestamp::from_unix_nanos)
-        .map_err(|_| ForecastEvidenceReadError::Unavailable)
 }
 
 fn model_label(row: &ForecastFeatureRow, metadata: &ModelMetadata) -> bool {

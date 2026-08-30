@@ -287,6 +287,8 @@ struct ComponentInputDto {
     spec: ComponentSpecDto,
     value: ComponentValueDto,
     selectors: Vec<ObservationFamilyDto>,
+    selection_effective_cutoff: TemporalCoordinateDto,
+    label_selection_effective_cutoff: Option<TemporalCoordinateDto>,
     adjustment: AdjustmentEvidenceDto,
 }
 
@@ -300,6 +302,10 @@ impl ComponentInputDto {
                 .map(ObservationFamilyDto::into_domain)
                 .map(|result| result.map(ComponentSelector::new))
                 .collect::<Result<Vec<_>, _>>()?,
+            self.selection_effective_cutoff.into_domain()?,
+            self.label_selection_effective_cutoff
+                .map(TemporalCoordinateDto::into_domain)
+                .transpose()?,
             self.adjustment.into_domain()?,
         )
         .map_err(|_| CliDatasetError::InvalidRequest)

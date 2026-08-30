@@ -29,8 +29,8 @@ use market_squawk_data::{
     DatasetSchemaRegistry, FEATURE_LABEL_RETURN_UNIT, FeatureDatasetProductContract,
     FeatureDatasetProductionError, FeatureDatasetProductionProofV1,
     FeatureDatasetProductionPublicationDisposition, FeatureDatasetProductionPublisher,
-    FeatureLabelComponentInput, FeatureLabelComponentSpec, FeatureLabelDataset,
-    ForecastDatasetReadLimits, FundNavDateRange, IngestError, IngestIdentity, ManifestCatalogError,
+    FeatureLabelComponentInput, FeatureLabelComponentSpec, ForecastDatasetReadLimits,
+    FundNavDateRange, IngestError, IngestIdentity, ManifestCatalogError,
     MarketDataInstrumentSynchronization, MarketHistorySelectionPolicy, MissingValuePolicy,
     ObjectStoreConfig, ObservationFamilyKey, ParquetStoreError, PointInTimeLimits,
     PointInTimePolicy, PointInTimeRevisionMode, ProviderMarketEventPublicationKind,
@@ -61,7 +61,7 @@ use market_squawk_domain::{
     ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
     RevisionBoundPayloadEvidence, RevisionNumber, RuleVersion, SchemaVersion, SequenceCapability,
     SourceId, SourceIdentifier, Timestamp, TradeEvent, UniverseMembershipObservation, VenueId,
-    VenueMapping, VenueSymbol,
+    VenueMapping, VenueSymbol, feature_dataset_macro_components_v1,
 };
 use market_squawk_platform::{
     LocalPaths, RawCaptureRecord, ResearchObjectControl, ResearchObjectControlError,
@@ -1309,6 +1309,8 @@ fn dataset_inputs_reject_a_transaction_from_another_instrument() -> TestResult {
             account_id: SourceIdentifier::try_from("taxable-account")?,
             source_record_id: SourceIdentifier::try_from("broker-transaction-1")?,
         })],
+        ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(80)),
+        None,
         ComponentAdjustmentEvidence::NotApplicable,
     )?;
     let example = market_squawk_data::DatasetExample::try_new(
@@ -1394,6 +1396,8 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
             series: SourceIdentifier::try_from("CPI")?,
             effective: ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
         })],
+        ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(80)),
+        None,
         ComponentAdjustmentEvidence::NotApplicable,
     )?;
     let observed_label = FeatureLabelComponentInput::try_new(
@@ -1408,6 +1412,10 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
             series: SourceIdentifier::try_from("GDP")?,
             effective: ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
         })],
+        ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(80)),
+        Some(ResearchTemporalCoordinate::exact(
+            Timestamp::from_unix_nanos(100),
+        )),
         ComponentAdjustmentEvidence::NotApplicable,
     )?;
     let cutoff = Timestamp::from_unix_nanos(80);
@@ -1585,7 +1593,7 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
     assert!(
         reader
             .feature_dataset(
-                FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
+                FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1,
                 built.manifest().dataset_id(),
                 deadline,
                 &cancellation,
@@ -1670,7 +1678,7 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
         "a phase-one analytical generation must not claim product admission"
     );
     let feature_page = reader.feature_datasets(
-        FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
+        FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1,
         None,
         AnalyticalReadLimit::try_new(8)?,
         deadline,
@@ -1681,8 +1689,9 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
     assert!(feature_page.datasets().is_empty());
     assert!(feature_page.overlapping_legacy_dataset_ids().is_empty());
 
+    let macro_parent = source.manifest().clone();
     let production_request = closed_price_return_request(
-        source.manifest().clone(),
+        macro_parent.clone(),
         market_bars.manifest().clone(),
         instrument,
         research_limits,
@@ -1692,8 +1701,9 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
         .dataset_builder()
         .build(production_request.clone(), CancellationToken::new())
         .await?;
+    let production_row_limit = usize::try_from(production_dataset.pinned().plan().row_count())?;
     let production_contract =
-        FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1;
+        FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1;
     assert!(
         reader
             .feature_dataset(
@@ -1714,7 +1724,13 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
         production_contract,
         &production_request,
         &production_dataset,
-        closed_price_return_proof(&production_dataset, attested_at, currentness_expires_at, 96)?,
+        closed_price_return_proof(
+            &production_request,
+            macro_parent.clone(),
+            attested_at,
+            currentness_expires_at,
+            96,
+        )?,
         &CancellationToken::new(),
     )?;
     assert_eq!(
@@ -1749,7 +1765,7 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
     assert!(
         reader
             .feature_dataset(
-                FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnTrainingV1,
+                FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1,
                 production_dataset.manifest().dataset_id(),
                 deadline,
                 &cancellation,
@@ -1762,7 +1778,13 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
         production_contract,
         &production_request,
         &production_dataset,
-        closed_price_return_proof(&production_dataset, attested_at, currentness_expires_at, 96)?,
+        closed_price_return_proof(
+            &production_request,
+            macro_parent.clone(),
+            attested_at,
+            currentness_expires_at,
+            96,
+        )?,
         &CancellationToken::new(),
     )?;
     assert_eq!(
@@ -1778,7 +1800,13 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
         production_contract,
         &production_request,
         &production_dataset,
-        closed_price_return_proof(&production_dataset, attested_at, currentness_expires_at, 97)?,
+        closed_price_return_proof(
+            &production_request,
+            macro_parent.clone(),
+            attested_at,
+            currentness_expires_at,
+            97,
+        )?,
         &CancellationToken::new(),
     );
     assert!(matches!(
@@ -1813,7 +1841,13 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
         production_contract,
         &successor_request,
         &successor_dataset,
-        closed_price_return_proof(&successor_dataset, attested_at, currentness_expires_at, 98)?,
+        closed_price_return_proof(
+            &successor_request,
+            macro_parent.clone(),
+            attested_at,
+            currentness_expires_at,
+            98,
+        )?,
         &CancellationToken::new(),
     )?;
     assert_eq!(
@@ -1892,12 +1926,13 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
     drop(publisher);
     drop(service);
 
-    let reopened_composition = AnalyticalDataService::open_with_feature_dataset_production(
-        CatalogAuthority::open(catalog_config)?,
-        AnalyticalManifestCatalog::open(&location, 8)?,
-        paths.artifacts()?.clone(),
-        store_config,
-    )?;
+    let (reopened_composition, _onboarding_catalog) =
+        AnalyticalDataService::open_with_provider_onboarding(
+            CatalogAuthority::open(catalog_config)?,
+            AnalyticalManifestCatalog::open(&location, 8)?,
+            paths.artifacts()?.clone(),
+            store_config,
+        )?;
     let (reopened, reopened_publisher) = reopened_composition.into_parts();
     let reopened_reader = reopened.analytical_reader();
     let reopened_phase_one = reopened_reader
@@ -1912,7 +1947,7 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
     assert!(
         reopened_reader
             .feature_dataset(
-                FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
+                FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1,
                 built.manifest().dataset_id(),
                 Instant::now() + Duration::from_secs(30),
                 &CancellationToken::new(),
@@ -1939,7 +1974,7 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
             production_contract,
             production_dataset.manifest(),
             Timestamp::from_unix_nanos(200),
-            ForecastDatasetReadLimits::try_new(8, 1024 * 1024)?,
+            ForecastDatasetReadLimits::try_new(production_row_limit, 1024 * 1024)?,
             Instant::now() + Duration::from_secs(30),
             CancellationToken::new(),
         )
@@ -1988,7 +2023,13 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
         production_contract,
         &production_request,
         &production_dataset,
-        closed_price_return_proof(&production_dataset, attested_at, currentness_expires_at, 96)?,
+        closed_price_return_proof(
+            &production_request,
+            macro_parent,
+            attested_at,
+            currentness_expires_at,
+            96,
+        )?,
         &CancellationToken::new(),
     )?;
     assert_eq!(
@@ -1997,7 +2038,7 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
     );
     assert_eq!(restart_replay.receipt().receipt_sha256(), receipt_sha256);
     let training_products = reopened_reader.feature_datasets(
-        FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnTrainingV1,
+        FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1,
         None,
         AnalyticalReadLimit::try_new(1)?,
         Instant::now() + Duration::from_secs(30),
@@ -2023,7 +2064,7 @@ async fn point_in_time_builder_publishes_one_authorized_queryable_phase_one_gene
             production_contract,
             production_dataset.manifest(),
             Timestamp::from_unix_nanos(200),
-            ForecastDatasetReadLimits::try_new(8, 1024 * 1024)?,
+            ForecastDatasetReadLimits::try_new(production_row_limit, 1024 * 1024)?,
             Instant::now() + Duration::from_secs(30),
             CancellationToken::new(),
         )
@@ -3143,8 +3184,8 @@ async fn initialized_service_with_universe(
         &membership_rights,
     )?;
 
-    let market_batch = closed_price_return_market_bar_batch()?;
-    let market_payload = extraction_provider_payload_digest(&market_batch);
+    let market_fixture = closed_price_return_market_bar_fixture()?;
+    let market_payload = extraction_provider_payload_digest(&market_fixture.batch);
     let market_rights = authority.admit_source_rights(RightsDecisionInput {
         source_id: market_source.source_id().clone(),
         payload_digest: market_payload,
@@ -3170,12 +3211,13 @@ async fn initialized_service_with_universe(
         &market_rights,
     )?;
 
-    let composition = AnalyticalDataService::initialize_with_feature_dataset_production(
-        authority,
-        AnalyticalManifestCatalog::open(&location, 8)?,
-        paths.artifacts()?.clone(),
-        store_config,
-    )?;
+    let (composition, _onboarding_catalog) =
+        AnalyticalDataService::initialize_with_provider_onboarding(
+            authority,
+            AnalyticalManifestCatalog::open(&location, 8)?,
+            paths.artifacts()?.clone(),
+            store_config,
+        )?;
     let (service, publisher) = composition.into_parts();
     let membership_dataset =
         DatasetId::try_from(membership_batch.request().object().dataset().as_str())?;
@@ -3187,13 +3229,37 @@ async fn initialized_service_with_universe(
             CancellationToken::new(),
         )
         .await?;
+    let ClosedPriceReturnMarketBarFixture {
+        batch: market_batch,
+        capture_material,
+        revision_plan,
+        native_rows,
+    } = market_fixture;
     let market_dataset = DatasetId::try_from(market_batch.request().object().dataset().as_str())?;
+    let raw_store = paths.sealed_research_journal_store()?;
+    let (expectation, request) = capture_material.into_whole_seal_parts();
+    let token = expectation
+        .try_rejoin(request.seal(&raw_store)?)?
+        .try_into_whole()?;
+    let mut native = ProviderNativeLineageBatchBuilder::try_new(
+        ProviderNativeLineageImplementation::AlpacaHistoricalBarV1,
+        &market_batch,
+    )?;
+    for row in &native_rows {
+        native.try_push(row)?;
+    }
+    let native = native.finish()?;
+    let binding = SealedProviderCaptureBinding::try_whole(
+        token,
+        market_batch,
+        native,
+        vec![0; native_rows.len()],
+    )?;
     let market_bars = service
-        .ingest_with_revision_plan(
+        .ingest_provider_publication(
             market_reservation,
             market_dataset,
-            market_batch,
-            closed_price_return_market_bar_revision_plan()?,
+            ProviderPublicationInput::try_new(binding, revision_plan)?,
             CancellationToken::new(),
         )
         .await?;
@@ -3261,22 +3327,71 @@ fn extraction_batch() -> Result<ExtractionBatch, Box<dyn Error>> {
     extraction_batch_with_membership(false)
 }
 
-fn closed_price_return_market_bar_batch() -> Result<ExtractionBatch, Box<dyn Error>> {
+struct ClosedPriceReturnMarketBarFixture {
+    batch: ExtractionBatch,
+    capture_material: ProviderCaptureMaterial,
+    revision_plan: ExtractionRevisionPlan,
+    native_rows: Vec<serde_json::Value>,
+}
+
+fn closed_price_return_market_bar_fixture()
+-> Result<ClosedPriceReturnMarketBarFixture, Box<dyn Error>> {
+    let source_id = SourceId::try_from("alpaca-historical-fixture")?;
+    let metadata_revision = MetadataRevision::new(SourceIdentifier::try_from("alpaca-revision-1")?);
+    let dataset = SourceIdentifier::try_from("alpaca-iex-bars-closed-price-return-fixture")?;
+    let received_at = Timestamp::from_unix_nanos(110);
+    let body = Bytes::from_static(
+        br#"{"bars":[{"symbol":"AAPL","t":80,"c":10000},{"symbol":"AAPL","t":90,"c":10000},{"symbol":"AAPL","t":100,"c":10000}],"next_page_token":null}"#,
+    );
+    let body_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&body).into());
+    let capture = ProviderCaptureSetReceipt::try_new(
+        source_id.clone(),
+        metadata_revision.clone(),
+        dataset.clone(),
+        digest(54),
+        ProviderCaptureTerminalDisposition::ExhaustedWithoutNextPage,
+        vec![ProviderCapturePageReceipt::try_new(
+            0,
+            digest(55),
+            None,
+            None,
+            200,
+            u64::try_from(body.len())?,
+            body_digest,
+            received_at,
+        )?],
+    )?;
+    let capture_material = ProviderCaptureMaterial::try_new(
+        capture,
+        vec![RawCaptureRecord::try_new_live(
+            Uuid::from_u128(9_001),
+            Arc::from(source_id.as_str()),
+            Uuid::from_u128(9_002),
+            Some(0),
+            None,
+            DateTime::<Utc>::from_timestamp_nanos(received_at.unix_nanos()),
+            body,
+        )?],
+    )?;
     let discovery = DiscoveryRequest::try_new(
         SourceIdentifier::try_from("alpaca-iex-bars-closed-price-return-fixture")?,
         None,
         NonZeroU16::MIN,
         Timestamp::from_unix_nanos(1_000),
     )?;
-    let object = SourceObject::try_new(
-        SourceId::try_from("alpaca-historical-fixture")?,
-        MetadataRevision::new(SourceIdentifier::try_from("alpaca-revision-1")?),
+    let object = SourceObject::try_new_with_capture_identity(
+        source_id,
+        metadata_revision,
         &discovery,
         SourceIdentifier::try_from("alpaca-iex-bars:closed-price-return-fixture")?,
         SourceIdentifier::try_from("application-json")?,
-        ExactPayloadEvidence::from_content_digest(digest(54)),
+        ExactPayloadEvidence::from_content_digest(capture_material.receipt().content_digest()),
+        SourceObjectCaptureIdentity::try_from_capture(capture_material.receipt())?,
         EffectiveInterval::new(Timestamp::from_unix_nanos(80), None)?,
         None,
+        SourceAvailabilityEvidence::LocalFirstObserved {
+            observed_at: received_at,
+        },
         Some(4096),
     )?;
     let request = ExtractionRequest::try_new(
@@ -3287,8 +3402,10 @@ fn closed_price_return_market_bar_batch() -> Result<ExtractionBatch, Box<dyn Err
     )?;
     let instrument = dataset_membership_instrument()?;
     let mut records = Vec::new();
+    let mut native_rows = Vec::new();
     records.try_reserve_exact(3)?;
-    for (effective, available, close_cents, source_record, revision) in [
+    native_rows.try_reserve_exact(3)?;
+    for (ordinal, (effective, available, close_cents, source_record, revision)) in [
         (
             80_i64,
             85_i64,
@@ -3310,7 +3427,10 @@ fn closed_price_return_market_bar_batch() -> Result<ExtractionBatch, Box<dyn Err
             "closed-bar-100",
             "closed-bar-100-v1",
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let observation = market_bar_observation(
             instrument,
             "AAPL",
@@ -3336,8 +3456,25 @@ fn closed_price_return_market_bar_batch() -> Result<ExtractionBatch, Box<dyn Err
             None,
             payload.into(),
         )?);
+        native_rows.push(serde_json::json!({
+            "symbol": "AAPL",
+            "timestamp_ns": effective,
+            "close_cents": close_cents,
+            "source_version": revision,
+            "feed": "iex",
+            "timeframe": "1Day",
+            "adjustment": "all",
+            "provider_row_ordinal": ordinal,
+        }));
     }
-    Ok(ExtractionBatch::try_new(&request, records)?)
+    let batch = ExtractionBatch::try_new(&request, records)?
+        .try_bind_provider_capture(capture_material.receipt())?;
+    Ok(ClosedPriceReturnMarketBarFixture {
+        batch,
+        capture_material,
+        revision_plan: closed_price_return_market_bar_revision_plan()?,
+        native_rows,
+    })
 }
 
 fn closed_price_return_market_bar_revision_plan() -> Result<ExtractionRevisionPlan, Box<dyn Error>>
@@ -3359,7 +3496,9 @@ fn closed_price_return_market_bar_revision_plan() -> Result<ExtractionRevisionPl
         .map_err(Into::into)
     })
     .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-    Ok(ExtractionRevisionPlan::try_new(evidence)?)
+    Ok(ExtractionRevisionPlan::try_new_with_native_lineage(
+        evidence,
+    )?)
 }
 
 struct SecResearchCaptureFixture {
@@ -4692,8 +4831,8 @@ fn closed_price_return_request(
     )?;
     let feature_plan = CorporateActionPlan::try_build(
         adjustment_policy,
-        Timestamp::from_unix_nanos(95),
-        Timestamp::from_unix_nanos(95),
+        Timestamp::from_unix_nanos(100),
+        Timestamp::from_unix_nanos(100),
         Vec::new(),
         action_limits,
     )?;
@@ -4712,6 +4851,8 @@ fn closed_price_return_request(
             ComponentSelector::new(closed_price_return_market_bar_family(instrument, 80)?),
             ComponentSelector::new(closed_price_return_market_bar_family(instrument, 90)?),
         ],
+        ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
+        None,
         ComponentAdjustmentEvidence::try_applied(
             adjustment_policy,
             feature_plan.content_hash(),
@@ -4725,6 +4866,10 @@ fn closed_price_return_request(
         vec![ComponentSelector::new(
             closed_price_return_market_bar_family(instrument, 100)?,
         )],
+        ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
+        Some(ResearchTemporalCoordinate::exact(
+            Timestamp::from_unix_nanos(100),
+        )),
         ComponentAdjustmentEvidence::try_applied(
             adjustment_policy,
             label_plan.content_hash(),
@@ -4732,18 +4877,53 @@ fn closed_price_return_request(
             digest(84),
         )?,
     )?;
+    let mut component_specs = vec![feature.clone()];
+    let mut macro_inputs = Vec::new();
+    macro_inputs.try_reserve_exact(feature_dataset_macro_components_v1().len())?;
+    for descriptor in feature_dataset_macro_components_v1() {
+        let specification = FeatureLabelComponentSpec::try_new(
+            ComponentKind::Feature,
+            ComponentScope::Global,
+            CorporateActionSensitivity::NotApplicable,
+            descriptor.component_name(),
+            NonZeroU32::MIN,
+        )?;
+        macro_inputs.push(FeatureLabelComponentInput::try_new(
+            specification.clone(),
+            ComponentValue::decimal(
+                Decimal::new(i64::from(descriptor.position()) + 1, 2),
+                Some(SourceIdentifier::try_from(descriptor.unit())?),
+                None,
+            )?,
+            vec![ComponentSelector::new(ObservationFamilyKey::Macro {
+                source_id: SourceId::try_from("fred-local-fixture")?,
+                series: SourceIdentifier::try_from("GDP")?,
+                effective: ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
+            })],
+            ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
+            None,
+            ComponentAdjustmentEvidence::NotApplicable,
+        )?);
+        component_specs.push(specification);
+    }
+    component_specs.push(label.clone());
     let membership_evidence =
         CanonicalObservationPayload::try_from_observation(&universe_membership_observation()?)?
             .identity();
+    let mut components = Vec::new();
+    components.try_reserve_exact(macro_inputs.len() + 2)?;
+    components.push(feature_input);
+    components.extend(macro_inputs);
+    components.push(label_input);
     let mut examples = vec![
         market_squawk_data::DatasetExample::try_new_with_temporal_cutoffs(
             "aapl-price-return-example-1",
             instrument,
-            Timestamp::from_unix_nanos(95),
+            Timestamp::from_unix_nanos(100),
             Timestamp::from_unix_nanos(110),
             ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
             ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(100)),
-            vec![feature_input.clone(), label_input.clone()],
+            components.clone(),
         )?,
     ];
     if include_successor_example {
@@ -4751,11 +4931,11 @@ fn closed_price_return_request(
             market_squawk_data::DatasetExample::try_new_with_temporal_cutoffs(
                 "aapl-price-return-example-2",
                 instrument,
-                Timestamp::from_unix_nanos(95),
+                Timestamp::from_unix_nanos(100),
                 Timestamp::from_unix_nanos(110),
                 ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(90)),
                 ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(100)),
-                vec![feature_input, label_input],
+                components,
             )?,
         );
     }
@@ -4772,7 +4952,7 @@ fn closed_price_return_request(
             membership_parent,
             membership_evidence,
         )],
-        vec![feature, label],
+        component_specs,
         examples,
     )?;
     let policy = DatasetBuildPolicy::new(
@@ -4784,12 +4964,12 @@ fn closed_price_return_request(
         PointInTimePolicy::try_new(NonZeroU32::MIN, PointInTimeRevisionMode::LatestKnown)?,
         adjustment_policy,
         MissingValuePolicy::Reject,
-        SourceIdentifier::try_from("price-return-fixed-horizon-forward-return-v1")?,
+        SourceIdentifier::try_from("price-return-macro-context-fixed-horizon-forward-return-v1")?,
     );
     let limits = DatasetBuildLimits::try_new(
         128,
         8,
-        8,
+        feature_dataset_macro_components_v1().len() + 2,
         64,
         4 * 1024 * 1024,
         Duration::from_secs(5),
@@ -4832,23 +5012,14 @@ fn closed_price_return_market_bar_family(
 }
 
 fn closed_price_return_proof(
-    dataset: &FeatureLabelDataset,
+    request: &DatasetBuildRequest,
+    macro_parent: DatasetManifestRef,
     attested_at: Timestamp,
     currentness_expires_at: Timestamp,
     return_kernel_digest_byte: u8,
 ) -> Result<FeatureDatasetProductionProofV1, Box<dyn Error>> {
-    let split_counts = dataset.split_counts();
-    let example_count = split_counts
-        .train_examples()
-        .checked_add(split_counts.validation_examples())
-        .and_then(|value| value.checked_add(split_counts.test_examples()))
-        .and_then(|value| u32::try_from(value).ok())
-        .and_then(NonZeroU32::new)
-        .ok_or("nonzero bounded example count")?;
-    Ok(FeatureDatasetProductionProofV1::try_new(
-        dataset.build_spec_digest(),
-        dataset.policy_digest(),
-        dataset.universe_digest(),
+    Ok(FeatureDatasetProductionProofV1::try_from_request_evidence(
+        request,
         digest(85),
         digest(86),
         digest(87),
@@ -4859,11 +5030,10 @@ fn closed_price_return_proof(
         digest(92),
         digest(93),
         digest(94),
+        vec![macro_parent],
         digest(95),
+        digest(96),
         digest(return_kernel_digest_byte),
-        NonZeroU64::new(10).ok_or("nonzero return horizon")?,
-        NonZeroU32::MIN,
-        example_count,
         attested_at,
         currentness_expires_at,
     )?)

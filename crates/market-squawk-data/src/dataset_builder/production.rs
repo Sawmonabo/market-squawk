@@ -4,10 +4,12 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
 
+pub use market_squawk_domain::FeatureDatasetMacroComponentDescriptor;
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, MarketBarAdjustment, ResearchTemporalCoordinate,
-    SourceIdentifier, Timestamp,
+    SourceIdentifier, Timestamp, feature_dataset_macro_components_v1,
 };
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -21,28 +23,28 @@ use super::{
     FeatureLabelDataset, FeatureLabelMeasurement, MissingValuePolicy,
 };
 use crate::{
-    AnalyticalDataService, CorporateActionAdjustment, DatasetBuildSpecDigest, ObservationFamilyKey,
-    ResearchUse, Sha256Digest,
+    AnalyticalDataService, CorporateActionAdjustment, DatasetBuildSpecDigest, DatasetManifestRef,
+    DerivedGenerationParents, ObservationFamilyKey, ResearchUse, Sha256Digest,
 };
 
-/// Exact product contract for the first code-owned price-return recipe.
+/// Exact product contract for the code-owned price-return and Macro-context recipe.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum FeatureDatasetProductContract {
-    /// Feature and forward-return rows admitted only for local analysis and inference.
-    PriceReturnFixedHorizonForwardReturnAnalysisV1,
-    /// The same closed row recipe admitted only for model training.
-    PriceReturnFixedHorizonForwardReturnTrainingV1,
+    /// Price-return, neutral Macro, and forward-return rows for local analysis and inference.
+    PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1,
+    /// The same closed Macro-enriched row recipe admitted only for model training.
+    PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1,
 }
 
 impl FeatureDatasetProductContract {
     /// Returns the stable exact contract identity persisted with every admission.
     pub const fn identity(self) -> &'static str {
         match self {
-            Self::PriceReturnFixedHorizonForwardReturnAnalysisV1 => {
-                "market-squawk.feature-dataset.price-return-fixed-horizon-forward-return.analysis/v1"
+            Self::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1 => {
+                "market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.analysis/v1"
             }
-            Self::PriceReturnFixedHorizonForwardReturnTrainingV1 => {
-                "market-squawk.feature-dataset.price-return-fixed-horizon-forward-return.training/v1"
+            Self::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1 => {
+                "market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.training/v1"
             }
         }
     }
@@ -50,18 +52,43 @@ impl FeatureDatasetProductContract {
     /// Returns the sole independently authorized research use admitted by this contract.
     pub const fn required_use(self) -> ResearchUse {
         match self {
-            Self::PriceReturnFixedHorizonForwardReturnAnalysisV1 => ResearchUse::LocalAnalysis,
-            Self::PriceReturnFixedHorizonForwardReturnTrainingV1 => ResearchUse::Train,
+            Self::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1 => {
+                ResearchUse::LocalAnalysis
+            }
+            Self::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1 => ResearchUse::Train,
         }
+    }
+
+    /// Returns the exact provider-neutral Macro component contract in economic curve order.
+    ///
+    /// This is the sole code-owned mapping shared by current Macro selection, immutable feature
+    /// preparation, training, inference, and product-consumer validation.
+    pub const fn macro_components(self) -> &'static [FeatureDatasetMacroComponentDescriptor] {
+        feature_dataset_macro_components_v1()
+    }
+
+    /// Returns the exact instrument feature name admitted by the V1 recipe.
+    pub const fn feature_component_name(self) -> &'static str {
+        FEATURE_COMPONENT_NAME
+    }
+
+    /// Returns the exact forward-return label name admitted by the V1 recipe.
+    pub const fn label_component_name(self) -> &'static str {
+        LABEL_COMPONENT_NAME
+    }
+
+    /// Returns the exact producer implementation revision admitted by the V1 recipe.
+    pub const fn implementation_revision(self) -> &'static str {
+        RECIPE_IMPLEMENTATION_REVISION
     }
 
     pub(crate) fn from_identity(value: &str) -> Option<Self> {
         match value {
-            "market-squawk.feature-dataset.price-return-fixed-horizon-forward-return.analysis/v1" => {
-                Some(Self::PriceReturnFixedHorizonForwardReturnAnalysisV1)
+            "market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.analysis/v1" => {
+                Some(Self::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1)
             }
-            "market-squawk.feature-dataset.price-return-fixed-horizon-forward-return.training/v1" => {
-                Some(Self::PriceReturnFixedHorizonForwardReturnTrainingV1)
+            "market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.training/v1" => {
+                Some(Self::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1)
             }
             _ => None,
         }
@@ -87,6 +114,9 @@ pub struct FeatureDatasetProductionProofV1 {
     completed_session_currentness: EvidenceDigest,
     feature_point_in_time_content: EvidenceDigest,
     feature_point_in_time_audit: EvidenceDigest,
+    macro_context_evidence: EvidenceDigest,
+    macro_parent_manifests: DerivedGenerationParents,
+    macro_parent_set: EvidenceDigest,
     label_point_in_time_content: EvidenceDigest,
     label_point_in_time_audit: EvidenceDigest,
     return_kernel_output: EvidenceDigest,
@@ -98,6 +128,89 @@ pub struct FeatureDatasetProductionProofV1 {
 }
 
 impl FeatureDatasetProductionProofV1 {
+    /// Derives request-owned identities and cardinalities while accepting only exact external
+    /// evidence produced by the application recipe.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "independent authority and derivation evidence remains explicitly typed"
+    )]
+    pub fn try_from_request_evidence(
+        request: &DatasetBuildRequest,
+        universe_membership_content: EvidenceDigest,
+        universe_membership_audit: EvidenceDigest,
+        instrument_population_query: EvidenceDigest,
+        instrument_population_receipt: EvidenceDigest,
+        completed_session_request: EvidenceDigest,
+        completed_session_receipt: EvidenceDigest,
+        completed_session_currentness: EvidenceDigest,
+        feature_point_in_time_content: EvidenceDigest,
+        feature_point_in_time_audit: EvidenceDigest,
+        macro_context_evidence: EvidenceDigest,
+        macro_parent_manifests: Vec<DatasetManifestRef>,
+        label_point_in_time_content: EvidenceDigest,
+        label_point_in_time_audit: EvidenceDigest,
+        return_kernel_output: EvidenceDigest,
+        attested_at: Timestamp,
+        currentness_expires_at: Timestamp,
+    ) -> Result<Self, FeatureDatasetProductionError> {
+        let first = request
+            .inputs()
+            .examples()
+            .first()
+            .ok_or(FeatureDatasetProductionError::InvalidProof)?;
+        let retained_fixed_horizon_nanos =
+            fixed_horizon_nanos(first.effective_cutoff(), first.label_effective_cutoff())?;
+        if request.inputs().examples().iter().any(|example| {
+            match fixed_horizon_nanos(example.effective_cutoff(), example.label_effective_cutoff())
+            {
+                Ok(value) => value != retained_fixed_horizon_nanos,
+                Err(_) => true,
+            }
+        }) {
+            return Err(FeatureDatasetProductionError::InvalidProof);
+        }
+        let mut instruments = request
+            .inputs()
+            .examples()
+            .iter()
+            .map(super::DatasetExample::instrument_id)
+            .collect::<Vec<_>>();
+        instruments.sort_unstable();
+        instruments.dedup();
+        let instrument_count = u32::try_from(instruments.len())
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or(FeatureDatasetProductionError::InvalidProof)?;
+        let example_count = u32::try_from(request.inputs().examples().len())
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or(FeatureDatasetProductionError::InvalidProof)?;
+        Self::try_new(
+            request.build_spec_digest(),
+            request.policy_digest(),
+            request.universe_digest(),
+            universe_membership_content,
+            universe_membership_audit,
+            instrument_population_query,
+            instrument_population_receipt,
+            completed_session_request,
+            completed_session_receipt,
+            completed_session_currentness,
+            feature_point_in_time_content,
+            feature_point_in_time_audit,
+            macro_context_evidence,
+            macro_parent_manifests,
+            label_point_in_time_content,
+            label_point_in_time_audit,
+            return_kernel_output,
+            retained_fixed_horizon_nanos,
+            instrument_count,
+            example_count,
+            attested_at,
+            currentness_expires_at,
+        )
+    }
+
     /// Constructs a bounded proof with no caller-selected producer, kind, schema, or revision.
     #[allow(
         clippy::too_many_arguments,
@@ -116,6 +229,8 @@ impl FeatureDatasetProductionProofV1 {
         completed_session_currentness: EvidenceDigest,
         feature_point_in_time_content: EvidenceDigest,
         feature_point_in_time_audit: EvidenceDigest,
+        macro_context_evidence: EvidenceDigest,
+        macro_parent_manifests: Vec<DatasetManifestRef>,
         label_point_in_time_content: EvidenceDigest,
         label_point_in_time_audit: EvidenceDigest,
         return_kernel_output: EvidenceDigest,
@@ -135,12 +250,17 @@ impl FeatureDatasetProductionProofV1 {
             completed_session_currentness,
             feature_point_in_time_content,
             feature_point_in_time_audit,
+            macro_context_evidence,
             label_point_in_time_content,
             label_point_in_time_audit,
             return_kernel_output,
         ] {
             require_evidence(evidence)?;
         }
+        let macro_parent_manifests = DerivedGenerationParents::try_new(macro_parent_manifests)
+            .map_err(|_| FeatureDatasetProductionError::InvalidProof)?;
+        let macro_parent_set = macro_parent_set_digest(macro_parent_manifests.as_slice());
+        require_evidence(macro_parent_set)?;
         if build_spec.digest().bytes() == [0; 32]
             || policy.bytes() == [0; 32]
             || universe.bytes() == [0; 32]
@@ -161,6 +281,9 @@ impl FeatureDatasetProductionProofV1 {
             completed_session_currentness,
             feature_point_in_time_content,
             feature_point_in_time_audit,
+            macro_context_evidence,
+            macro_parent_manifests,
+            macro_parent_set,
             label_point_in_time_content,
             label_point_in_time_audit,
             return_kernel_output,
@@ -331,18 +454,20 @@ pub enum FeatureDatasetProductionError {
 
 const FEATURE_COMPONENT_NAME: &str = "research.price-return";
 const LABEL_COMPONENT_NAME: &str = "research.fixed-horizon-forward-return";
-const RECIPE_IMPLEMENTATION_REVISION: &str = "price-return-fixed-horizon-forward-return-v1";
+const RECIPE_IMPLEMENTATION_REVISION: &str =
+    "price-return-macro-context-fixed-horizon-forward-return-v1";
 const PRODUCER_ID: &str = "market-squawk-application-feature-dataset-producer";
-
 fn validate_closed_recipe(
     contract: FeatureDatasetProductContract,
     request: &DatasetBuildRequest,
     dataset: &FeatureLabelDataset,
     proof: &FeatureDatasetProductionProofV1,
 ) -> Result<(), FeatureDatasetProductionError> {
-    let feature = expected_component(ComponentKind::Feature, FEATURE_COMPONENT_NAME)?;
-    let label = expected_component(ComponentKind::Label, LABEL_COMPONENT_NAME)?;
-    let expected_specs = [feature, label];
+    let expected_specs = expected_components()?;
+    let label = expected_specs
+        .iter()
+        .find(|spec| spec.name() == LABEL_COMPONENT_NAME)
+        .ok_or(FeatureDatasetProductionError::ContractMismatch)?;
     let expected_policy = crate::CorporateActionPolicy::new(
         CorporateActionAdjustment::SplitAdjusted,
         NonZeroU32::MIN,
@@ -352,8 +477,8 @@ fn validate_closed_recipe(
     // accepting provider-adjusted families would make that basis ambiguous and risk applying it
     // twice.
     if request.intended_use() != contract.required_use()
-        || request.inputs().component_specs() != expected_specs
-        || dataset.component_specs.as_ref() != expected_specs
+        || request.inputs().component_specs() != expected_specs.as_slice()
+        || dataset.component_specs.as_ref() != expected_specs.as_slice()
         || request.policy().corporate_actions() != expected_policy
         || request.policy().missing_values() != MissingValuePolicy::Reject
         || request.policy().implementation_revision().as_str() != RECIPE_IMPLEMENTATION_REVISION
@@ -363,10 +488,15 @@ fn validate_closed_recipe(
         || proof.policy != dataset.policy_digest()
         || proof.universe != request.universe_digest()
         || proof.universe != dataset.universe_digest()
+        || proof
+            .macro_parent_manifests
+            .as_slice()
+            .iter()
+            .any(|parent| !request.inputs().parents().contains(parent))
         || usize::try_from(proof.example_count.get()).ok()
             != Some(request.inputs().examples().len())
         || dataset.label_measurements().len() != 1
-        || dataset.label_measurements()[0].label() != &expected_specs[1]
+        || dataset.label_measurements()[0].label() != label
         || dataset.label_measurements()[0].measurement() != FeatureLabelMeasurement::Return
         || dataset.label_measurements()[0].fixed_horizon_nanos() != Some(proof.fixed_horizon_nanos)
     {
@@ -399,16 +529,47 @@ fn validate_closed_recipe(
 
 fn expected_component(
     kind: ComponentKind,
+    scope: ComponentScope,
+    corporate_actions: CorporateActionSensitivity,
     name: &str,
 ) -> Result<FeatureLabelComponentSpec, FeatureDatasetProductionError> {
-    FeatureLabelComponentSpec::try_new(
-        kind,
+    FeatureLabelComponentSpec::try_new(kind, scope, corporate_actions, name, NonZeroU32::MIN)
+        .map_err(|_| FeatureDatasetProductionError::ContractMismatch)
+}
+
+fn expected_components() -> Result<Vec<FeatureLabelComponentSpec>, FeatureDatasetProductionError> {
+    let mut components = Vec::new();
+    components
+        .try_reserve_exact(feature_dataset_macro_components_v1().len() + 2)
+        .map_err(|_| FeatureDatasetProductionError::InvalidProof)?;
+    components.push(expected_component(
+        ComponentKind::Feature,
         ComponentScope::Instrument,
         CorporateActionSensitivity::RequiresAdjustment,
-        name,
-        NonZeroU32::MIN,
-    )
-    .map_err(|_| FeatureDatasetProductionError::ContractMismatch)
+        FEATURE_COMPONENT_NAME,
+    )?);
+    for (position, definition) in feature_dataset_macro_components_v1().iter().enumerate() {
+        if usize::from(definition.position()) != position {
+            return Err(FeatureDatasetProductionError::ContractMismatch);
+        }
+        components.push(expected_component(
+            ComponentKind::Feature,
+            ComponentScope::Global,
+            CorporateActionSensitivity::NotApplicable,
+            definition.component_name(),
+        )?);
+    }
+    components.push(expected_component(
+        ComponentKind::Label,
+        ComponentScope::Instrument,
+        CorporateActionSensitivity::RequiresAdjustment,
+        LABEL_COMPONENT_NAME,
+    )?);
+    components.sort_unstable();
+    if components.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(FeatureDatasetProductionError::ContractMismatch);
+    }
+    Ok(components)
 }
 
 fn validate_example(
@@ -416,13 +577,19 @@ fn validate_example(
     expected_policy: crate::CorporateActionPolicy,
     expected_horizon_nanos: NonZeroU64,
 ) -> Result<(), FeatureDatasetProductionError> {
-    let [feature, label] = example.components() else {
-        return Err(FeatureDatasetProductionError::ContractMismatch);
-    };
+    let feature = component_by_name(example, FEATURE_COMPONENT_NAME)?;
+    let label = component_by_name(example, LABEL_COMPONENT_NAME)?;
     validate_return_value(feature.value())?;
     validate_return_value(label.value())?;
     validate_adjustment(feature.adjustment(), expected_policy)?;
     validate_adjustment(label.adjustment(), expected_policy)?;
+    if feature.selection_effective_cutoff() != example.effective_cutoff()
+        || feature.label_selection_effective_cutoff().is_some()
+        || label.selection_effective_cutoff() != example.effective_cutoff()
+        || label.label_selection_effective_cutoff() != Some(example.label_effective_cutoff())
+    {
+        return Err(FeatureDatasetProductionError::ContractMismatch);
+    }
     let [feature_left, feature_right] = feature.selectors() else {
         return Err(FeatureDatasetProductionError::ContractMismatch);
     };
@@ -432,12 +599,60 @@ fn validate_example(
     let feature_current = current_and_prior(
         feature_left.family(),
         feature_right.family(),
-        example.effective_cutoff(),
+        feature.selection_effective_cutoff(),
     )?;
-    if market_bar_effective(label_terminal.family())? != example.label_effective_cutoff()
+    if market_bar_effective(label_terminal.family())?
+        != label
+            .label_selection_effective_cutoff()
+            .ok_or(FeatureDatasetProductionError::ContractMismatch)?
         || !same_market_bar_series(feature_current, label_terminal.family())
         || fixed_horizon_nanos(example.effective_cutoff(), example.label_effective_cutoff())?
             != expected_horizon_nanos
+    {
+        return Err(FeatureDatasetProductionError::ContractMismatch);
+    }
+    for definition in feature_dataset_macro_components_v1() {
+        let component = component_by_name(example, definition.component_name())?;
+        validate_macro_component(component, *definition)?;
+    }
+    Ok(())
+}
+
+fn component_by_name<'example>(
+    example: &'example super::DatasetExample,
+    name: &str,
+) -> Result<&'example super::FeatureLabelComponentInput, FeatureDatasetProductionError> {
+    let mut matching = example
+        .components()
+        .iter()
+        .filter(|component| component.spec().name() == name);
+    let component = matching
+        .next()
+        .ok_or(FeatureDatasetProductionError::ContractMismatch)?;
+    if matching.next().is_some() {
+        return Err(FeatureDatasetProductionError::ContractMismatch);
+    }
+    Ok(component)
+}
+
+fn validate_macro_component(
+    component: &super::FeatureLabelComponentInput,
+    definition: FeatureDatasetMacroComponentDescriptor,
+) -> Result<(), FeatureDatasetProductionError> {
+    let ComponentValue::Decimal { unit, currency, .. } = component.value() else {
+        return Err(FeatureDatasetProductionError::ContractMismatch);
+    };
+    let [selector] = component.selectors() else {
+        return Err(FeatureDatasetProductionError::ContractMismatch);
+    };
+    let ObservationFamilyKey::Macro { effective, .. } = selector.family() else {
+        return Err(FeatureDatasetProductionError::ContractMismatch);
+    };
+    if effective != component.selection_effective_cutoff()
+        || component.label_selection_effective_cutoff().is_some()
+        || component.adjustment() != &ComponentAdjustmentEvidence::NotApplicable
+        || unit.as_ref().map(SourceIdentifier::as_str) != Some(definition.unit())
+        || currency.is_some()
     {
         return Err(FeatureDatasetProductionError::ContractMismatch);
     }
@@ -585,12 +800,32 @@ fn same_market_bar_series(left: &ObservationFamilyKey, right: &ObservationFamily
     }
 }
 
+fn macro_parent_set_digest(parents: &[DatasetManifestRef]) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/macro-context-parent-set/v1");
+    hash.update((parents.len() as u128).to_be_bytes());
+    for parent in parents {
+        hash_text(&mut hash, parent.dataset_id().as_str());
+        hash.update(parent.manifest_version().to_be_bytes());
+        hash_text(&mut hash, parent.schema().name());
+        hash.update(parent.schema().version().get().to_be_bytes());
+        hash.update(parent.schema().fingerprint());
+        hash.update(parent.content_hash().bytes());
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+fn hash_text(hash: &mut Sha256, value: &str) {
+    hash.update((value.len() as u128).to_be_bytes());
+    hash.update(value.as_bytes());
+}
+
 fn producer_evidence(
     proof: FeatureDatasetProductionProofV1,
 ) -> Result<FeatureDatasetProductionEvidenceV1, FeatureDatasetProductionError> {
     let mut bindings = Vec::new();
     bindings
-        .try_reserve_exact(12)
+        .try_reserve_exact(14)
         .map_err(|_| FeatureDatasetProductionError::InvalidProof)?;
     for (kind, evidence) in [
         (
@@ -620,6 +855,8 @@ fn producer_evidence(
             "feature-point-in-time-audit",
             proof.feature_point_in_time_audit,
         ),
+        ("macro-context-evidence", proof.macro_context_evidence),
+        ("macro-context-parent-set", proof.macro_parent_set),
         (
             "label-point-in-time-content",
             proof.label_point_in_time_content,

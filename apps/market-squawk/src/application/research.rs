@@ -24,8 +24,8 @@ use market_squawk_data::{
     AnalyticalMacroSeriesAllowlist, AnalyticalObservationReadRequest,
     AnalyticalObservationTemplate, AnalyticalReadCapability, AnalyticalReadError,
     AnalyticalReadLimit, DatasetId, DatasetManifestRef, GenerationKind, GenerationParentRelation,
-    IngestPrecommitAuthority, ManifestCatalogError, PinnedArtifactQueryRequest, PinnedQueryOutput,
-    QueryError, QueryLimits, QueryResult,
+    IngestPrecommitAuthority, ListingReferenceReadCapability, ManifestCatalogError,
+    PinnedArtifactQueryRequest, PinnedQueryOutput, QueryError, QueryLimits, QueryResult,
 };
 use market_squawk_domain::{
     CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentId, MacroObservation,
@@ -41,20 +41,26 @@ use serde_json::{Value, json};
 use super::{ApplicationDomainService, domain_support::DomainLifecycle, effective_service_limits};
 use crate::ResearchService;
 
+mod company_research;
 mod dataset_preparation;
 mod forecast_evidence;
 mod fred;
 mod ingest;
+mod instrument_context;
 mod macro_context;
+mod macro_features;
+mod market_history;
+mod options_context;
 mod sec_fund_job;
 mod sec_fund_product;
 mod sec_fundamentals;
 mod treasury;
 
+pub(crate) use company_research::CompanyResearchReadCapability;
 pub(crate) use dataset_preparation::{
     DatasetPreparationAuthority, DatasetPreparationError, DatasetPreparationOptions,
     DatasetPreparationPreview, DatasetPreparationPreviewRequest, DatasetPreparationReceipt,
-    DatasetPreparationSelection,
+    DatasetPreparationSelection, FeatureDatasetProductionFinalizer, PreparedFeatureDatasetBuild,
 };
 pub(crate) use forecast_evidence::AnalyticalForecastEvidenceReader;
 pub(crate) use fred::{
@@ -86,10 +92,11 @@ pub(crate) use ingest::{
     MarketEventSealedReceiptEvidence, ResearchProviderPublicationOperation,
     ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
     SchwabMarketPublicationError, SchwabRestQuoteGenerationAuthority,
-    SchwabRestQuotePostSealFailure, SchwabRestQuoteSourceHealthOutcome, SecFundPublicationReceipt,
-    SecLiveFundApplicationError, SecLiveFundRequest, SecLiveFundSource,
-    TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION, TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION,
-    TreasuryApplicationClosure, TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
+    SchwabRestQuotePostSealFailure, SchwabRestQuotePublicationPackage,
+    SchwabRestQuoteSourceHealthOutcome, SecFundPublicationReceipt, SecLiveFundApplicationError,
+    SecLiveFundRequest, SecLiveFundSource, TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION,
+    TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION, TreasuryApplicationClosure,
+    TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
 };
 pub use ingest::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,
@@ -98,7 +105,16 @@ pub use ingest::{
     ResearchSourceDiscovery, ResearchSourceDiscoveryObject, ResearchSourceDiscoveryRights,
     ResearchSourceObjectListing,
 };
-pub(crate) use macro_context::{MACRO_GET_CONTEXT, MacroContextOperation};
+pub(crate) use instrument_context::InstrumentContextReadCapability;
+pub(crate) use macro_context::{
+    MACRO_GET_CONTEXT, MacroContextOperation, MacroContextReadCapability,
+};
+pub(crate) use macro_features::{MacroFeatureVector, read_macro_feature_vector};
+pub(crate) use market_history::MarketHistoryReadCapability;
+pub(crate) use options_context::{
+    OptionsContextReadCapability, OptionsObservationReadAvailability,
+    OptionsReferenceReadAvailability,
+};
 pub(crate) use sec_fund_job::{
     SecFundJobCommitAuthority, SecFundJobExecutionError, SecFundJobRunner, SecFundJobRunnerError,
 };
@@ -250,6 +266,7 @@ impl ResearchApplicationServices {
             service,
             ingest,
             None,
+            None,
             FredLatestKnownOperation::setup_required(),
             TreasuryLatestKnownOperation::fiscal_setup_required(),
             TreasuryLatestKnownOperation::daily_setup_required(),
@@ -267,23 +284,26 @@ impl ResearchApplicationServices {
             service,
             ingest,
             Some(artifacts),
+            None,
             FredLatestKnownOperation::setup_required(),
             TreasuryLatestKnownOperation::fiscal_setup_required(),
             TreasuryLatestKnownOperation::daily_setup_required(),
         )
     }
 
-    /// Binds the public application path to artifacts and an exact startup-composed FRED read.
-    pub(crate) fn new_with_artifacts_and_fred(
+    /// Binds artifacts and exact startup-composed canonical research reads.
+    pub(crate) fn new_with_artifacts_and_composed_reads(
         service: Arc<ResearchService>,
         ingest: Arc<dyn ResearchIngestCoordinator>,
         artifacts: Arc<dyn ArtifactRepository>,
+        listing_reference: Option<ListingReferenceReadCapability>,
         fred_latest_known: FredLatestKnownOperation,
     ) -> Self {
         Self::compose(
             service,
             ingest,
             Some(artifacts),
+            listing_reference,
             fred_latest_known,
             TreasuryLatestKnownOperation::fiscal_setup_required(),
             TreasuryLatestKnownOperation::daily_setup_required(),
@@ -294,6 +314,7 @@ impl ResearchApplicationServices {
         service: Arc<ResearchService>,
         ingest: Arc<dyn ResearchIngestCoordinator>,
         artifacts: Option<Arc<dyn ArtifactRepository>>,
+        listing_reference: Option<ListingReferenceReadCapability>,
         fred_latest_known: FredLatestKnownOperation,
         treasury_fiscal_latest_known: TreasuryLatestKnownOperation,
         treasury_daily_latest_known: TreasuryLatestKnownOperation,
@@ -305,14 +326,25 @@ impl ResearchApplicationServices {
             treasury_fiscal_latest_known.clone(),
             treasury_daily_latest_known.clone(),
         );
+        let company_research = CompanyResearchReadCapability::new(Arc::clone(&service));
+        let options_context = OptionsContextReadCapability::new(
+            Arc::clone(&service),
+            OptionsReferenceReadAvailability::Unavailable,
+            OptionsObservationReadAvailability::SetupRequired,
+        );
+        let market_history = MarketHistoryReadCapability::new(reader.clone());
         Self {
             controller: Arc::new(ResearchController {
                 authority: service,
                 reader,
                 ingest,
                 artifacts,
+                listing_reference,
+                company_research,
                 fred_latest_known,
                 macro_context,
+                options_context,
+                market_history,
                 treasury_fiscal_latest_known,
                 treasury_daily_latest_known,
                 lifecycle: DomainLifecycle::new(),
@@ -342,10 +374,39 @@ impl ResearchApplicationServices {
     }
 
     /// Returns the provider-neutral point-in-time Macro read for analytical consumers.
-    pub(crate) fn macro_context_read_capability(
-        &self,
-    ) -> macro_context::MacroContextReadCapability {
+    pub(crate) fn macro_context_read_capability(&self) -> MacroContextReadCapability {
         self.controller.macro_context.read_capability()
+    }
+
+    /// Returns the canonical identity join only when an official-directory reader was composed.
+    pub(crate) fn instrument_context_read_capability(
+        &self,
+    ) -> Option<InstrumentContextReadCapability> {
+        self.controller
+            .listing_reference
+            .as_ref()
+            .cloned()
+            .map(|listings| {
+                InstrumentContextReadCapability::new(
+                    self.controller.authority.market_data_instruments(),
+                    listings,
+                )
+            })
+    }
+
+    /// Returns canonical company and fund research reads over the rich local store.
+    pub(crate) fn company_research_read_capability(&self) -> CompanyResearchReadCapability {
+        self.controller.company_research.clone()
+    }
+
+    /// Returns provider-neutral option context with truthful startup availability.
+    pub(crate) fn options_context_read_capability(&self) -> OptionsContextReadCapability {
+        self.controller.options_context.clone()
+    }
+
+    /// Returns canonical, provider-neutral market-bar history reads.
+    pub(crate) fn market_history_read_capability(&self) -> MarketHistoryReadCapability {
+        self.controller.market_history.clone()
     }
 
     /// Reads bounded, manifest-pinned Fund NAV history through the application lifecycle.
@@ -621,8 +682,12 @@ struct ResearchController {
     reader: AnalyticalReadCapability,
     ingest: Arc<dyn ResearchIngestCoordinator>,
     artifacts: Option<Arc<dyn ArtifactRepository>>,
+    listing_reference: Option<ListingReferenceReadCapability>,
+    company_research: CompanyResearchReadCapability,
     fred_latest_known: FredLatestKnownOperation,
     macro_context: MacroContextOperation,
+    options_context: OptionsContextReadCapability,
+    market_history: MarketHistoryReadCapability,
     treasury_fiscal_latest_known: TreasuryLatestKnownOperation,
     treasury_daily_latest_known: TreasuryLatestKnownOperation,
     lifecycle: Arc<DomainLifecycle>,
@@ -858,8 +923,18 @@ impl fmt::Debug for ResearchController {
                 "artifacts",
                 &self.artifacts.as_ref().map(|_| "[OPAQUE REPOSITORY]"),
             )
+            .field(
+                "listing_reference",
+                &self
+                    .listing_reference
+                    .as_ref()
+                    .map(|_| "[OFFICIAL DIRECTORY READ AUTHORITY]"),
+            )
+            .field("company_research", &self.company_research)
             .field("fred_latest_known", &self.fred_latest_known)
             .field("macro_context", &self.macro_context)
+            .field("options_context", &self.options_context)
+            .field("market_history", &self.market_history)
             .field("lifecycle", &self.lifecycle)
             .finish()
     }

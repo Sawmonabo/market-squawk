@@ -208,6 +208,8 @@ impl InstalledBacktestPreparation {
         let evidence_limits =
             ForecastDatasetReadLimits::try_new(MAXIMUM_ROWS_PER_DATASET, MAXIMUM_BYTES_PER_DATASET)
                 .map_err(|_error| ServiceError::Unavailable)?;
+        let selection_cutoff =
+            super::runtime::current_timestamp().map_err(|_error| ServiceError::Unavailable)?;
         let mut after: Option<DatasetId> = None;
         let mut datasets = Vec::new();
         loop {
@@ -215,7 +217,7 @@ impl InstalledBacktestPreparation {
             let page = self
                 .analytical
                 .feature_datasets(
-                    FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
+                    FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1,
                     after.as_ref(),
                     page_limit,
                     context.deadline(),
@@ -234,9 +236,9 @@ impl InstalledBacktestPreparation {
                 let evidence = self
                     .analytical
                     .forecast_dataset_evidence(
-                        FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
+                        FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1,
                         generation.manifest(),
-                        Timestamp::from_unix_nanos(i64::MAX),
+                        selection_cutoff,
                         evidence_limits,
                         context.deadline(),
                         context.cancellation().clone(),

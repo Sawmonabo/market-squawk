@@ -375,7 +375,7 @@ impl AnalysisDomainService {
         );
         let page = reader
             .feature_dataset_snapshot(
-                FeatureDatasetProductContract::PriceReturnFixedHorizonForwardReturnAnalysisV1,
+                FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1,
                 selection,
                 &[],
                 limit,

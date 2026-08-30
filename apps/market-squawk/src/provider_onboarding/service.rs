@@ -4233,17 +4233,18 @@ mod tests {
     fn startup_reconciles_every_page_of_recognized_historical_sessions() -> TestResult {
         let directory = tempfile::tempdir()?;
         let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
-        let (_research, catalog) = ResearchService::open_or_initialize_with_provider_onboarding(
-            &paths,
-            CatalogConfig::try_new(
-                paths.catalog()?.clone(),
-                Duration::from_millis(750),
-                CatalogLimit::new(64)?,
-                CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
-            )?,
-            8,
-            ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?,
-        )?;
+        let (_research, catalog, _publisher) =
+            ResearchService::open_or_initialize_with_provider_onboarding(
+                &paths,
+                CatalogConfig::try_new(
+                    paths.catalog()?.clone(),
+                    Duration::from_millis(750),
+                    CatalogLimit::new(64)?,
+                    CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+                )?,
+                8,
+                ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?,
+            )?;
         let profiles = built_in_provider_profiles()?;
         let sec = profiles
             .get("sec.edgar-public")

@@ -214,6 +214,11 @@ impl NasdaqReferenceUniverseService {
         self.source.metadata()
     }
 
+    /// Returns the least-authority immutable directory reader when durable composition exists.
+    pub(crate) fn listing_reference_reader(&self) -> Option<ListingReferenceReadCapability> {
+        self.durable.as_ref().map(|durable| durable.reader.clone())
+    }
+
     async fn snapshot(
         &self,
         deadline: Instant,

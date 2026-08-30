@@ -66,6 +66,7 @@ const RESEARCH_INGEST_RESULT_AUTHORITY: &str = "research.dataset-publication.v1"
 /// Sole transport-neutral installed-service composition.
 pub(super) struct InstalledToolServices {
     application: Arc<Application>,
+    product_capabilities: ServiceCapabilities,
     jobs: InstalledJobOperations,
     runners: Arc<InstalledJobRunners>,
     inputs: Arc<InputStager>,
@@ -170,13 +171,20 @@ impl InstalledToolServices {
             Arc::clone(runners.recovery()),
             Arc::clone(runners.update()),
         );
+        let product_capabilities = application
+            .product_capabilities()
+            .map_err(|_error| ServiceError::Internal)?;
         Ok(Self {
             application: Arc::clone(&application),
+            product_capabilities,
             jobs: InstalledJobOperations::new(jobs),
             runners,
             inputs: Arc::clone(&inputs),
             runtime,
-            dataset_preparation: InstalledResearchDatasetPreparation::new(product.research()),
+            dataset_preparation: InstalledResearchDatasetPreparation::new(
+                product.research(),
+                product.macro_context_read_capability(),
+            ),
             backtest_preparation: InstalledBacktestPreparation::try_new(
                 product.research().analytical_reader(),
                 product.backtests(),
@@ -211,6 +219,11 @@ impl InstalledToolServices {
         context: &RequestContext,
     ) -> Result<(), ServiceError> {
         self.portfolio_import.recover_promoting(context)
+    }
+
+    /// Complete authority registry for native management and product presentations.
+    pub(super) fn capabilities(&self) -> ServiceCapabilities {
+        self.application.capabilities()
     }
 
     pub(super) async fn recover_promoting_research_file_imports(
@@ -341,7 +354,7 @@ impl InstalledToolServices {
                 let origin = context.origin().ok_or(ServiceError::Unauthorized)?;
                 let workspace = WorkspaceRuntimeIdentity::try_from_runtime(self.runtime)
                     .map_err(|_error| ServiceError::Unavailable)?;
-                let build = self
+                let prepared = self
                     .dataset_preparation
                     .consume(
                         input.receipt,
@@ -355,7 +368,7 @@ impl InstalledToolServices {
                 let admission = self
                     .runners
                     .analysis_phase_one_feature_derived_generation()
-                    .admit(build, captured_at)
+                    .admit_prepared(prepared, captured_at)
                     .map_err(map_research_admission)?;
                 (
                     admission,
@@ -789,7 +802,7 @@ impl std::fmt::Debug for InstalledToolServices {
 #[async_trait]
 impl ToolServices for InstalledToolServices {
     fn capabilities(&self) -> ServiceCapabilities {
-        self.application.capabilities()
+        self.product_capabilities.clone()
     }
 
     async fn call(

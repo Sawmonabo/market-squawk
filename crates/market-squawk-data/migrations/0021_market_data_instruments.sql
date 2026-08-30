@@ -2539,7 +2539,7 @@ AND NOT EXISTS (
       ON capture_input.generation_sequence = NEW.generation_sequence
      AND capture_input.binding_digest = publication.binding_digest
     WHERE child.generation_sequence = NEW.generation_sequence
-      AND child.generation_kind IN ('ingest', 'compaction')
+      AND child.generation_kind IN ('ingest', 'compaction', 'derived')
       AND parent_input.publication_receipt_digest = NEW.publication_receipt_digest
 )
 BEGIN

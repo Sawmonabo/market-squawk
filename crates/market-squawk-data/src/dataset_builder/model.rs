@@ -441,18 +441,38 @@ pub struct FeatureLabelComponentInput {
     spec: FeatureLabelComponentSpec,
     value: ComponentValue,
     selectors: Box<[ComponentSelector]>,
+    selection_effective_cutoff: ResearchTemporalCoordinate,
+    label_selection_effective_cutoff: Option<ResearchTemporalCoordinate>,
     adjustment: ComponentAdjustmentEvidence,
 }
 
 impl FeatureLabelComponentInput {
-    /// Constructs one selector-bound component value.
+    /// Constructs one selector-bound component value with its native-precision PIT window.
+    ///
+    /// Feature components select through `selection_effective_cutoff` and must not supply a label
+    /// boundary. Label components select the open-closed interval from
+    /// `selection_effective_cutoff` through `label_selection_effective_cutoff`. Cross-precision
+    /// bounds are rejected rather than coerced to a fabricated timestamp.
     pub fn try_new(
         spec: FeatureLabelComponentSpec,
         value: ComponentValue,
         mut selectors: Vec<ComponentSelector>,
+        selection_effective_cutoff: ResearchTemporalCoordinate,
+        label_selection_effective_cutoff: Option<ResearchTemporalCoordinate>,
         adjustment: ComponentAdjustmentEvidence,
     ) -> Result<Self, DatasetBuildError> {
-        if selectors.is_empty() || selectors.len() > MAX_COMPONENT_SELECTORS {
+        let temporal_window_valid = match (spec.kind, &label_selection_effective_cutoff) {
+            (ComponentKind::Feature, None) => true,
+            (ComponentKind::Label, Some(label)) => matches!(
+                label.partial_cmp(&selection_effective_cutoff),
+                Some(Ordering::Greater)
+            ),
+            (ComponentKind::Feature, Some(_)) | (ComponentKind::Label, None) => false,
+        };
+        if !temporal_window_valid
+            || selectors.is_empty()
+            || selectors.len() > MAX_COMPONENT_SELECTORS
+        {
             return Err(DatasetBuildError::InvalidRequest);
         }
         selectors.sort_unstable_by_key(ComponentSelector::identity);
@@ -466,6 +486,8 @@ impl FeatureLabelComponentInput {
             spec,
             value,
             selectors: selectors.into_boxed_slice(),
+            selection_effective_cutoff,
+            label_selection_effective_cutoff,
             adjustment,
         })
     }
@@ -483,6 +505,16 @@ impl FeatureLabelComponentInput {
     /// Returns canonical, duplicate-free natural-family selectors.
     pub fn selectors(&self) -> &[ComponentSelector] {
         &self.selectors
+    }
+
+    /// Returns the inclusive native-precision feature boundary or label-window lower boundary.
+    pub const fn selection_effective_cutoff(&self) -> &ResearchTemporalCoordinate {
+        &self.selection_effective_cutoff
+    }
+
+    /// Returns the inclusive native-precision label-window upper boundary only for labels.
+    pub const fn label_selection_effective_cutoff(&self) -> Option<&ResearchTemporalCoordinate> {
+        self.label_selection_effective_cutoff.as_ref()
     }
 
     /// Returns exact producer evidence for this value's corporate-action treatment.
@@ -1309,6 +1341,21 @@ fn request_retained_bytes(inputs: &DatasetBuildInputs) -> Result<usize, DatasetB
         for component in &example.components {
             retained = retained
                 .checked_add(component.spec.name.len())
+                .and_then(|bytes| {
+                    coordinate_dynamic_bytes(&component.selection_effective_cutoff)
+                        .ok()
+                        .and_then(|coordinate| bytes.checked_add(coordinate))
+                })
+                .and_then(|bytes| {
+                    component.label_selection_effective_cutoff.as_ref().map_or(
+                        Some(bytes),
+                        |coordinate| {
+                            coordinate_dynamic_bytes(coordinate)
+                                .ok()
+                                .and_then(|coordinate| bytes.checked_add(coordinate))
+                        },
+                    )
+                })
                 .and_then(|bytes| {
                     bytes.checked_add(component_value_dynamic_bytes(&component.value))
                 })

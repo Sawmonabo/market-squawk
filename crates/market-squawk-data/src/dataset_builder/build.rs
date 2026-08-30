@@ -53,6 +53,24 @@ struct OutputRow<'request> {
     lineage: Sha256Digest,
 }
 
+struct ComponentWindowSelection<'candidate> {
+    kind: ComponentKind,
+    knowledge_cutoff: Timestamp,
+    effective_cutoff: ResearchTemporalCoordinate,
+    label_effective_cutoff: Option<ResearchTemporalCoordinate>,
+    selection: PointInTimeSelection<'candidate>,
+    action_plan: CorporateActionPlan,
+}
+
+impl ComponentWindowSelection<'_> {
+    fn matches(&self, example: &DatasetExample, component: &FeatureLabelComponentInput) -> bool {
+        self.kind == component.spec().kind()
+            && self.knowledge_cutoff == component_knowledge_cutoff(example, component)
+            && &self.effective_cutoff == component.selection_effective_cutoff()
+            && self.label_effective_cutoff.as_ref() == component.label_selection_effective_cutoff()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct BuildRetainedBudget {
     limit: usize,
@@ -513,30 +531,6 @@ async fn prepare_rows<'request>(
             .split()
             .split_for(example.cutoff_at())
             .ok_or(DatasetBuildError::TemporalLeakage)?;
-        let feature_request = point_in_time_request(
-            request,
-            example.cutoff_at(),
-            example.effective_cutoff().clone(),
-            None,
-            budget.remaining()?,
-        )?;
-        let features = selector
-            .select(&feature_request, candidates, cancellation, deadline)
-            .await
-            .map_err(|_| DatasetBuildError::PointInTime)?;
-        budget.charge(features.retained_bytes())?;
-        let label_request = point_in_time_request(
-            request,
-            example.label_cutoff_at(),
-            example.effective_cutoff().clone(),
-            Some(example.label_effective_cutoff().clone()),
-            budget.remaining()?,
-        )?;
-        let labels = selector
-            .select(&label_request, candidates, cancellation, deadline)
-            .await
-            .map_err(|_| DatasetBuildError::PointInTime)?;
-        budget.charge(labels.retained_bytes())?;
         let universe_request = point_in_time_request(
             request,
             example.cutoff_at(),
@@ -560,14 +554,57 @@ async fn prepare_rows<'request>(
         if !universe.contains(example.instrument_id()) {
             return Err(DatasetBuildError::InstrumentOutsideUniverse);
         }
-        let feature_actions =
-            action_plan_from_selection(request, example, &features, false, budget.remaining()?)?;
-        budget.charge(feature_actions.retained_bytes())?;
-        let label_actions =
-            action_plan_from_selection(request, example, &labels, true, budget.remaining()?)?;
-        budget.charge(label_actions.retained_bytes())?;
-        if !feature_actions.conflicts().is_empty() || !label_actions.conflicts().is_empty() {
-            return Err(DatasetBuildError::UnresolvedCorporateAction);
+
+        let window_bytes = example
+            .components()
+            .len()
+            .checked_mul(size_of::<ComponentWindowSelection<'_>>())
+            .ok_or(DatasetBuildError::LimitExceeded)?;
+        budget.charge(window_bytes)?;
+        let mut windows = Vec::new();
+        windows
+            .try_reserve_exact(example.components().len())
+            .map_err(|_| DatasetBuildError::LimitExceeded)?;
+        for component in example.components() {
+            if windows
+                .iter()
+                .any(|window: &ComponentWindowSelection<'_>| window.matches(example, component))
+            {
+                continue;
+            }
+            let knowledge_cutoff = component_knowledge_cutoff(example, component);
+            let component_request = point_in_time_request(
+                request,
+                knowledge_cutoff,
+                component.selection_effective_cutoff().clone(),
+                component.label_selection_effective_cutoff().cloned(),
+                budget.remaining()?,
+            )?;
+            let selection = selector
+                .select(&component_request, candidates, cancellation, deadline)
+                .await
+                .map_err(|_| DatasetBuildError::PointInTime)?;
+            budget.charge(selection.retained_bytes())?;
+            let label = component.spec().kind() == ComponentKind::Label;
+            let action_plan = action_plan_from_selection(
+                request,
+                example,
+                &selection,
+                label,
+                budget.remaining()?,
+            )?;
+            budget.charge(action_plan.retained_bytes())?;
+            if !action_plan.conflicts().is_empty() {
+                return Err(DatasetBuildError::UnresolvedCorporateAction);
+            }
+            windows.push(ComponentWindowSelection {
+                kind: component.spec().kind(),
+                knowledge_cutoff,
+                effective_cutoff: component.selection_effective_cutoff().clone(),
+                label_effective_cutoff: component.label_selection_effective_cutoff().cloned(),
+                selection,
+                action_plan,
+            });
         }
         let mut example_rows = Vec::new();
         let example_row_bytes = example
@@ -581,13 +618,18 @@ async fn prepare_rows<'request>(
             .map_err(|_| DatasetBuildError::LimitExceeded)?;
         let mut drop_example = false;
         for component in example.components() {
-            let (selection, action_plan) = match component.spec().kind() {
-                ComponentKind::Feature => (&features, &feature_actions),
-                ComponentKind::Label => (&labels, &label_actions),
-            };
+            let mut matching_windows = windows
+                .iter()
+                .filter(|window| window.matches(example, component));
+            let window = matching_windows
+                .next()
+                .ok_or(DatasetBuildError::InvalidRequest)?;
+            if matching_windows.next().is_some() {
+                return Err(DatasetBuildError::InvalidRequest);
+            }
             validate_component_adjustment(
                 component,
-                action_plan,
+                &window.action_plan,
                 request.policy().corporate_actions(),
             )?;
             let evidence_bytes = component
@@ -596,7 +638,7 @@ async fn prepare_rows<'request>(
                 .checked_mul(size_of::<Sha256Digest>())
                 .ok_or(DatasetBuildError::LimitExceeded)?;
             budget.charge(evidence_bytes)?;
-            let evidence = resolve_component_evidence(component, selection)?;
+            let evidence = resolve_component_evidence(component, &window.selection)?;
             if component.value().is_missing() {
                 match request.policy().missing_values() {
                     MissingValuePolicy::Reject => {
@@ -611,13 +653,13 @@ async fn prepare_rows<'request>(
                 example,
                 split,
                 component,
-                selection.content_identity(),
-                selection.audit_identity(),
+                window.selection.content_identity(),
+                window.selection.audit_identity(),
                 &evidence,
                 universe.content_hash(),
                 universe.audit_hash(),
-                action_plan.content_hash(),
-                action_plan.audit_hash(),
+                window.action_plan.content_hash(),
+                window.action_plan.audit_hash(),
             );
             budget.release(evidence_bytes)?;
             example_rows.push(OutputRow {
@@ -635,17 +677,28 @@ async fn prepare_rows<'request>(
             return Err(DatasetBuildError::LimitExceeded);
         }
         budget.release(example_row_bytes)?;
-        budget.release(label_actions.retained_bytes())?;
-        budget.release(feature_actions.retained_bytes())?;
+        for window in &windows {
+            budget.release(window.action_plan.retained_bytes())?;
+            budget.release(window.selection.retained_bytes())?;
+        }
+        budget.release(window_bytes)?;
         budget.release(universe.retained_bytes())?;
         budget.release(universe_evidence.retained_bytes())?;
-        budget.release(labels.retained_bytes())?;
-        budget.release(features.retained_bytes())?;
     }
     if rows.is_empty() {
         return Err(DatasetBuildError::EmptyDataset);
     }
     Ok(PreparedRows { rows, split_counts })
+}
+
+fn component_knowledge_cutoff(
+    example: &DatasetExample,
+    component: &FeatureLabelComponentInput,
+) -> Timestamp {
+    match component.spec().kind() {
+        ComponentKind::Feature => example.cutoff_at(),
+        ComponentKind::Label => example.label_cutoff_at(),
+    }
 }
 
 fn validated_universe_memberships(

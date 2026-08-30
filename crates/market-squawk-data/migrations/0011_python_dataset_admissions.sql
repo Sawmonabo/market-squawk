@@ -38,8 +38,8 @@ CREATE TABLE feature_dataset_production_admissions (
     ),
     product_contract TEXT NOT NULL CHECK (
         product_contract IN (
-            'market-squawk.feature-dataset.price-return-fixed-horizon-forward-return.analysis/v1',
-            'market-squawk.feature-dataset.price-return-fixed-horizon-forward-return.training/v1'
+            'market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.analysis/v1',
+            'market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.training/v1'
         )
     ),
     export_sha256 BLOB NOT NULL UNIQUE CHECK (
@@ -88,11 +88,11 @@ CREATE TABLE feature_dataset_production_admissions (
     CHECK (
         (
             product_contract =
-                'market-squawk.feature-dataset.price-return-fixed-horizon-forward-return.analysis/v1'
+                'market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.analysis/v1'
             AND research_use = 'local_analysis'
         ) OR (
             product_contract =
-                'market-squawk.feature-dataset.price-return-fixed-horizon-forward-return.training/v1'
+                'market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.training/v1'
             AND research_use = 'train'
         )
     ),

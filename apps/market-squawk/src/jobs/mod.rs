@@ -102,6 +102,7 @@ impl InstalledJobRunners {
         let analysis_phase_one_feature_derived_generation = Arc::new(
             PhaseOneDerivedGenerationJobRunner::try_new_analysis_feature(
                 product.research(),
+                product.feature_dataset_production_publisher(),
                 Arc::clone(&artifacts),
                 RUNNER_PENDING_CAPACITY,
                 RUNNER_DEADLINE,

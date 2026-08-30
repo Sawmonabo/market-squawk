@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, fmt};
 
-use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 use sha2::{Digest as _, Sha256};
 
@@ -287,6 +287,7 @@ pub(crate) fn parse_json_payload(
     if bytes.is_empty() || bytes.len() > bounds.max_response_bytes() {
         return Err(SchwabAdapterError::BoundsExceeded);
     }
+    validate_unique_object_keys(bytes)?;
     let value: Value =
         serde_json::from_slice(bytes).map_err(|_| SchwabAdapterError::SchemaViolation)?;
     let mut nodes = 0usize;
@@ -298,26 +299,62 @@ pub(crate) fn parse_json_payload(
     ))
 }
 
-/// Rejects duplicate keys in a provider response whose top-level object is semantically keyed.
+/// Rejects duplicate keys at every object depth before `serde_json::Value` can collapse them.
 ///
-/// `serde_json::Value` necessarily collapses duplicate object keys, so keyed response families
-/// must perform this streaming pass over the exact bytes before treating the materialized map as
-/// unambiguous provider evidence.
-pub(crate) fn validate_unique_top_level_keys(bytes: &[u8]) -> Result<(), SchwabAdapterError> {
+/// Provider-native option contracts and historical candles are nested keyed objects. Treating a
+/// duplicate nested identity, clock, or value field as canonical evidence would silently select
+/// one of two conflicting provider values, so the streaming validation covers the whole document.
+fn validate_unique_object_keys(bytes: &[u8]) -> Result<(), SchwabAdapterError> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    TopLevelUniqueKeys
+    UniqueJsonValue
         .deserialize(&mut deserializer)
         .and_then(|()| deserializer.end())
         .map_err(|_| SchwabAdapterError::SchemaViolation)
 }
 
-struct TopLevelUniqueKeys;
+struct UniqueJsonValue;
 
-impl<'de> Visitor<'de> for TopLevelUniqueKeys {
+impl<'de> Visitor<'de> for UniqueJsonValue {
     type Value = ();
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON object with unique top-level keys")
+        formatter.write_str("JSON with unique keys in every object")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element_seed(UniqueJsonValue)?.is_some() {}
+        Ok(())
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -327,22 +364,22 @@ impl<'de> Visitor<'de> for TopLevelUniqueKeys {
         let mut keys = BTreeSet::new();
         while let Some(key) = map.next_key::<String>()? {
             if !keys.insert(key) {
-                return Err(serde::de::Error::custom("duplicate top-level object key"));
+                return Err(serde::de::Error::custom("duplicate object key"));
             }
-            map.next_value::<IgnoredAny>()?;
+            map.next_value_seed(UniqueJsonValue)?;
         }
         Ok(())
     }
 }
 
-impl<'de> DeserializeSeed<'de> for TopLevelUniqueKeys {
+impl<'de> DeserializeSeed<'de> for UniqueJsonValue {
     type Value = ();
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_map(self)
+        deserializer.deserialize_any(self)
     }
 }
 

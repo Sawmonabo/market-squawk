@@ -25,6 +25,121 @@ use crate::provider_activation::FRED_ALFRED_READ_OPERATION;
 /// Exact contract version shared by CLI and MCP for the first local release.
 pub const APPLICATION_CONTRACT_VERSION: &str = "1";
 
+/// Presentation visibility for one existing application operation.
+///
+/// Operations are management-only unless this policy explicitly admits their provider-neutral
+/// product contract. That default keeps new registrations out of ordinary MCP discovery until
+/// their product DTO and language have been reviewed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OperationVisibility {
+    Product,
+    Management,
+}
+
+pub(crate) fn operation_visibility(name: &str) -> OperationVisibility {
+    if matches!(
+        name,
+        "Market.GetOverview"
+            | "Market.GetInstrument"
+            | "Market.SearchUniverse"
+            | MACRO_GET_CONTEXT
+            | "Portfolio.Import"
+            | "Portfolio.PreviewStagedImport"
+            | "Portfolio.ApproveStagedImport"
+            | "Portfolio.CommitStagedImport"
+            | "Portfolio.DiscardStagedImport"
+            | "Portfolio.GetRecommendationSetup"
+            | "Portfolio.PreviewRecommendationSetup"
+            | "Portfolio.CommitRecommendationSetup"
+            | "Portfolio.ListAccounts"
+            | "Portfolio.ListRevisions"
+            | "Portfolio.GetHoldings"
+            | "Portfolio.GetTransactions"
+            | "Portfolio.GetPerformance"
+            | "Portfolio.GetExposure"
+            | "Portfolio.GetRisk"
+            | "Portfolio.GetAttribution"
+            | "Portfolio.EvaluateScenario"
+            | "Portfolio.EvaluateScenarioBatch"
+            | "Portfolio.ProposeRebalance"
+            | "Portfolio.EvaluateCandidateImpact"
+            | "Analysis.Lookup"
+            | "Analysis.GetReturns"
+            | "Analysis.GetFactors"
+            | "Analysis.GetValuation"
+            | "Analysis.GetScenarios"
+            | "Analysis.StartScenarioBatch"
+            | "Analysis.ListProductBacktests"
+            | "Analysis.GetProductBacktest"
+            | "Analysis.GetBacktestPreparation"
+            | "Analysis.PreviewBacktest"
+            | "Analysis.StartPreparedBacktest"
+            | "Model.ListBundles"
+            | "Model.GetMetadata"
+            | "Model.Evaluate"
+            | "Model.Predict"
+            | "Model.StartTraining"
+            | "Model.GetForecastPreparation"
+            | "Model.PrepareForecast"
+            | "Model.StartPreparedForecast"
+            | "Model.ListForecasts"
+            | "Model.GetForecast"
+            | "Model.GetForecastOutcomes"
+            | "Model.SelectLatestValidForecast"
+            | "Model.ListProductActivity"
+            | "Decision.SaveScreen"
+            | "Decision.RunScreen"
+            | "Decision.ListScreens"
+            | "Decision.GetScreen"
+            | "Decision.ListScreenRuns"
+            | "Decision.GetCandidates"
+            | "Decision.GetDossier"
+            | "Decision.ListCandidateDossiers"
+            | "Decision.GetDossierPreparation"
+            | "Decision.PrepareDossier"
+            | "Decision.CreateDossier"
+            | "Decision.GetTargetPreparation"
+            | "Decision.PrepareTargetSet"
+            | "Decision.CreateTargetSet"
+            | "Decision.GetTargetSet"
+            | "Decision.ListTargetSets"
+            | "Decision.ListTargetIndex"
+            | "Decision.ReviewTargetSet"
+            | "Decision.ReevaluateTargetSet"
+            | "Decision.GetTargetSetStatus"
+            | "Decision.GetInvestmentAnalysis"
+            | "Decision.ListInvestmentAnalyses"
+            | "Decision.GetRecommendationTrackRecord"
+            | "FairValue.GetWorkspace"
+            | "FairValue.ListMeasurements"
+            | "FairValue.GetClassification"
+            | "FairValue.Explain"
+            | "FairValue.GetEvidence"
+            | "FairValue.GetApprovalStatus"
+            | "FairValue.Measure"
+            | "FairValue.Classify"
+            | "FairValue.Approve"
+            | "FairValue.ProposeOverride"
+            | "FairValue.RevokeApproval"
+            | "FairValue.ApproveMarketAccess"
+            | "FairValue.GetMarketAccess"
+            | "Bot.GetStatus"
+            | "Bot.Start"
+            | "Bot.Stop"
+            | "Execution.GetOrders"
+            | "Execution.GetFills"
+            | "Execution.GetManualPaperTargets"
+            | "Execution.SubmitManualPaperDraft"
+            | "Execution.Cancel"
+            | "Execution.Reconcile"
+            | "Risk.TriggerKillSwitch"
+    ) {
+        OperationVisibility::Product
+    } else {
+        OperationVisibility::Management
+    }
+}
+
 pub(crate) const PRODUCT_LOOKUP_CATEGORIES: &[&str] = &[
     "company",
     "investment",
@@ -2215,6 +2330,30 @@ pub fn application_capabilities() -> Result<ServiceCapabilities, ServiceCapabili
         descriptors.push(descriptor_for(*spec)?);
     }
     ServiceCapabilities::try_new(descriptors)
+}
+
+impl super::Application {
+    /// Returns the provider-neutral product projection used by ordinary MCP discovery.
+    pub(crate) fn product_capabilities(
+        &self,
+    ) -> Result<ServiceCapabilities, ServiceCapabilityError> {
+        let mut descriptors = Vec::new();
+        descriptors
+            .try_reserve_exact(self.capabilities.tools().len())
+            .map_err(|_| ServiceCapabilityError::TooManyTools {
+                maximum: self.capabilities.tools().len(),
+            })?;
+        descriptors.extend(
+            self.capabilities
+                .tools()
+                .iter()
+                .filter(|descriptor| {
+                    operation_visibility(descriptor.name()) == OperationVisibility::Product
+                })
+                .cloned(),
+        );
+        ServiceCapabilities::try_new(descriptors)
+    }
 }
 
 /// Builds the terminal forecast descriptor held only by the one-use preparation authority and job

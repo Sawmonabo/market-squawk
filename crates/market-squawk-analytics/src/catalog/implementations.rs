@@ -2,6 +2,8 @@
 
 use std::num::NonZeroU32;
 
+use market_squawk_domain::feature_dataset_macro_components_v1;
+
 use super::{KnownFeatureImplementation, RequiredLiveFeature};
 use crate::metadata::digest::implementation_digest_for_identity;
 use crate::{FeatureImplementationDigest, FeatureKey, FeatureMetadata, FeatureMetadataError};
@@ -146,19 +148,23 @@ impl KnownFeatureImplementation {
                     | "fundamentals.free-cash-flow-yield"
                     | "fundamentals.earnings-surprise"
             ),
-            Self::BatchMacro => matches!(
-                key.name(),
-                "macro.surprise"
-                    | "macro.yield-curve-short-rate"
-                    | "macro.yield-curve-middle-rate"
-                    | "macro.yield-curve-long-rate"
-                    | "macro.yield-curve-slope"
-                    | "macro.yield-curve-curvature"
-                    | "macro.rate-change-average-parallel-shift"
-                    | "macro.rate-change-slope"
-                    | "macro.rate-change-short"
-                    | "macro.rate-change-long"
-            ),
+            Self::BatchMacro => {
+                matches!(
+                    key.name(),
+                    "macro.surprise"
+                        | "macro.yield-curve-short-rate"
+                        | "macro.yield-curve-middle-rate"
+                        | "macro.yield-curve-long-rate"
+                        | "macro.yield-curve-slope"
+                        | "macro.yield-curve-curvature"
+                        | "macro.rate-change-average-parallel-shift"
+                        | "macro.rate-change-slope"
+                        | "macro.rate-change-short"
+                        | "macro.rate-change-long"
+                ) || feature_dataset_macro_components_v1()
+                    .iter()
+                    .any(|descriptor| descriptor.component_name() == key.name())
+            }
             Self::BatchPortfolioScenarios => matches!(
                 key.name(),
                 "portfolio.net-exposure"

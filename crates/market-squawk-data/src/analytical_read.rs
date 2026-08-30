@@ -39,9 +39,10 @@ use crate::{
     AnalyticalManifestCatalog, CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,
     CompleteMarketBarHistorySelection, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,
     DatasetSchemaRegistry, DatasetSplitCounts, FeatureDatasetProductContract, GenerationKind,
-    GenerationParent, ManifestCatalogError, ParquetObjectStore, PinnedDataset,
-    PinnedFeatureMonetaryValue, PinnedMonetaryValue, PinnedQueryOutput, QueryError, QueryLimits,
-    QueryRequest, ResearchArrowBatch, ResearchQueryEngine, Sha256Digest, UniverseId,
+    GenerationParent, LatestCanonicalMarketBarHistoryWindowRequest,
+    LatestCanonicalMarketBarHistoryWindowSelection, ManifestCatalogError, ParquetObjectStore,
+    PinnedDataset, PinnedFeatureMonetaryValue, PinnedMonetaryValue, PinnedQueryOutput, QueryError,
+    QueryLimits, QueryRequest, ResearchArrowBatch, ResearchQueryEngine, Sha256Digest, UniverseId,
 };
 use crate::{
     PointInTimeCandidate, PointInTimeLimits, PointInTimePolicy, PointInTimeRequest,
@@ -2173,6 +2174,22 @@ impl AnalyticalReadCapability {
             output,
             bars,
         })
+    }
+
+    /// Selects the latest complete canonical daily history window known at one cutoff.
+    ///
+    /// The result contains the exact internally manifest-pinned request accepted by
+    /// [`Self::read_canonical_market_bar_history`]. No provider coordinate is accepted or
+    /// returned by this lookup.
+    pub fn select_latest_canonical_market_bar_history_window(
+        &self,
+        request: LatestCanonicalMarketBarHistoryWindowRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<LatestCanonicalMarketBarHistoryWindowSelection>, AnalyticalReadError> {
+        self.manifests
+            .select_latest_canonical_market_bar_history_window(&request, deadline, cancellation)
+            .map_err(Into::into)
     }
 
     /// Resolves and reads canonical durable daily history without provider coordinates or mapping.

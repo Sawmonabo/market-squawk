@@ -43,10 +43,10 @@ pub use model::{
     MissingValuePolicy,
 };
 pub use production::{
-    FeatureDatasetProductContract, FeatureDatasetProductionComposition,
-    FeatureDatasetProductionError, FeatureDatasetProductionProofV1,
-    FeatureDatasetProductionPublication, FeatureDatasetProductionPublicationDisposition,
-    FeatureDatasetProductionPublisher,
+    FeatureDatasetMacroComponentDescriptor, FeatureDatasetProductContract,
+    FeatureDatasetProductionComposition, FeatureDatasetProductionError,
+    FeatureDatasetProductionProofV1, FeatureDatasetProductionPublication,
+    FeatureDatasetProductionPublicationDisposition, FeatureDatasetProductionPublisher,
 };
 
 /// Process-local authority that must remain live through derived-generation publication.

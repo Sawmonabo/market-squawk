@@ -355,7 +355,10 @@ impl SchwabSealedRestResponse {
         {
             return Err(SchwabRestOptionPublicationError::InvalidEvidence);
         }
-        if row_count == 0 && provider_records != 0 {
+        // Canonical option publication is atomic for the exact sealed response. If any returned
+        // provider row cannot be mapped, keep the complete response as sealed raw evidence rather
+        // than emitting a canonical subset that could be mistaken for the requested chain.
+        if !dispositions.is_empty() {
             return Ok(SchwabRestOptionPublicationOutcome::SealedRaw(Box::new(
                 SchwabSealedRawRestOptionPublication {
                     response: self,
