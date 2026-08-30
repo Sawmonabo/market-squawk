@@ -17,12 +17,13 @@ use market_squawk_sources::{
 
 use crate::config::ALPACA_PROVIDER;
 use crate::{
-    ALPACA_BASIC_EQUITY_SYMBOL_LIMIT, ALPACA_HISTORICAL_EXCLUSION_NANOS, AlpacaAdjustment,
-    AlpacaCredentials, AlpacaHistoricalBarTimeAuthority, AlpacaHistoricalBarTimeRequest,
-    AlpacaHistoricalEquityConfig, AlpacaHistoricalEquityDatasetPlan,
-    AlpacaHistoricalEquityPreflightPlan, AlpacaHistoricalLookback, AlpacaHistoricalSeriesSemantics,
-    AlpacaIexDecoder, AlpacaIexLiveConfig, AlpacaInstrumentMapping, AlpacaOptionMapping,
-    AlpacaOptionsDecoder, AlpacaOptionsLiveConfig, AlpacaTimeframe, AlpacaTransportLimits,
+    ALPACA_APPLICATION_MAX_REQUESTS_PER_MINUTE, ALPACA_BASIC_EQUITY_SYMBOL_LIMIT,
+    ALPACA_HISTORICAL_EXCLUSION_NANOS, AlpacaAdjustment, AlpacaCredentials,
+    AlpacaHistoricalBarTimeAuthority, AlpacaHistoricalBarTimeRequest, AlpacaHistoricalEquityConfig,
+    AlpacaHistoricalEquityDatasetPlan, AlpacaHistoricalEquityPreflightPlan,
+    AlpacaHistoricalLookback, AlpacaHistoricalSeriesSemantics, AlpacaIexDecoder,
+    AlpacaIexLiveConfig, AlpacaInstrumentMapping, AlpacaOptionMapping, AlpacaOptionsDecoder,
+    AlpacaOptionsLiveConfig, AlpacaTimeframe, AlpacaTransportLimits,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -203,6 +204,56 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
     assert_eq!(first_analytical_dataset.as_str().len(), 92);
     assert!(!first_analytical_dataset.as_str().contains("AAPL"));
 
+    let changed_calendar_session = MarketBarSessionEvidence::try_new(
+        MarketBarSessionKind::Regular,
+        identifier("iex-regular-session-rules-2024")?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [11; 32]),
+    )?;
+    let changed_calendar_history = AlpacaHistoricalEquityConfig::try_new(
+        SourceId::try_from("alpaca-basic-history-test")?,
+        revision("alpaca-basic-history-test-v1", 8)?,
+        authorization.clone(),
+        evidence(9),
+        effective,
+        vec![AlpacaHistoricalEquityDatasetPlan::bind_preflight(
+            AlpacaHistoricalEquityPreflightPlan::try_new(
+                AlpacaInstrumentMapping::try_new(
+                    "AAPL".to_owned(),
+                    instrument(1)?,
+                    AssetClass::Equity,
+                )?,
+                AlpacaTimeframe::day(),
+                Timestamp::from_unix_nanos(1_735_690_500_000_000_000),
+                AlpacaHistoricalLookback::try_from_days(366)?,
+                AlpacaAdjustment::All,
+            )?,
+            AlpacaHistoricalSeriesSemantics::new(
+                BarTimestampBasis::PeriodStart,
+                changed_calendar_session,
+            ),
+        )],
+        freshness()?,
+        budget(&authorization)?,
+        HttpRequestBounds::default(),
+    )?;
+    let changed_provider_dataset = changed_calendar_history
+        .provider_dataset_identifiers()
+        .next()
+        .ok_or("changed calendar dataset must exist")?;
+    assert!(
+        !provider_datasets.contains(&changed_provider_dataset),
+        "exact calendar evidence must change the provider dataset identity"
+    );
+    let changed_analytical_dataset = changed_calendar_history
+        .dataset(changed_provider_dataset)
+        .ok_or("changed calendar dataset must remain registered")?
+        .analytical_dataset_identifier(
+            changed_calendar_history.metadata(),
+            &provider_instrument,
+            currency,
+        )?;
+    assert_ne!(first_analytical_dataset, changed_analytical_dataset);
+
     let provider_timestamp = Timestamp::from_unix_nanos(1_704_067_200_000_000_000);
     let semantics = BarTimeSemantics::try_new(
         provider_timestamp,
@@ -283,7 +334,8 @@ fn freshness() -> TestResult<FreshnessPolicy> {
 fn budget(authorization: &AuthorizationGrant) -> TestResult<ProviderBudgetPolicy> {
     Ok(ProviderBudgetPolicy::try_new(
         BudgetScope::for_authorization(identifier(ALPACA_PROVIDER)?, authorization)?,
-        NonZeroU32::new(200).ok_or("request count must be nonzero")?,
+        NonZeroU32::new(ALPACA_APPLICATION_MAX_REQUESTS_PER_MINUTE)
+            .ok_or("request count must be nonzero")?,
         NonZeroU64::new(60_000_000_000).ok_or("request window must be nonzero")?,
         NonZeroU16::new(2).ok_or("concurrency must be nonzero")?,
         BackoffPolicy::try_new(

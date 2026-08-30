@@ -1220,6 +1220,7 @@ fn hash_session_coordinates(hash: &mut Sha256, session: &MarketBarSessionEvidenc
         market_squawk_domain::MarketBarSessionKind::ProviderDefined => 4,
     }]);
     hash_str(hash, session.ruleset().as_str());
+    hash_evidence(hash, session.evidence());
 }
 
 fn hash_str(hash: &mut Sha256, value: &str) {
