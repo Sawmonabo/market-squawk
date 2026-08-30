@@ -9,7 +9,7 @@ use market_squawk_domain::{
     FilingObservation, FundamentalAmendmentStatus, FundamentalCadence, FundamentalConsolidation,
     FundamentalDimensionContext, FundamentalFactContext, FundamentalFactContextInput,
     FundamentalObservation, FundamentalPeriod, FundamentalRestatementStatus,
-    FundamentalRevisionOrder, InstrumentId, PayloadHash, PayloadReference,
+    FundamentalRevisionOrder, InstrumentId, MetadataRevision, PayloadHash, PayloadReference,
     ProviderIdentityRegistry, ProviderInstrumentId, ResearchContext, ResearchObservation,
     ResearchProvenance, ResearchProvenanceInput, ResearchTemporalCoordinate, ResearchTime,
     RevisionNumber, SchemaVersion, SourceId, SourceIdentifier, Timestamp, XbrlPeriod,
@@ -25,7 +25,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::product::SecFilingXbrlCoordinates;
-use crate::xbrl::SecValidatedXbrlTaxonomySet;
+use crate::xbrl::{SecValidatedXbrlTaxonomySet, SecXbrlTaxonomyArtifact, SecXbrlTaxonomyReference};
 use crate::{
     CompanyFactOccurrence, ParsedXbrlDocument, RetrievedCompanyFacts, RetrievedSubmissions,
     SecFiling, SecResearchDataset, SecResearchDatasetKind, XbrlNonnumericOccurrence,
@@ -36,7 +36,7 @@ const SEC_XBRL_SOURCE_RECORD_PREFIX: &str = "sec.xbrl.fact.sha256.";
 
 /// Mandatory typed provider-native handoff for nil and nonnumeric filing occurrences.
 #[derive(Debug, Eq, PartialEq)]
-pub struct SecXbrlNativeLineage {
+pub(crate) struct SecXbrlNativeLineage {
     dataset: SourceIdentifier,
     filing: SecFilingXbrlCoordinates,
     taxonomy: SecValidatedXbrlTaxonomySet,
@@ -50,41 +50,6 @@ pub struct SecXbrlNativeLineage {
 }
 
 impl SecXbrlNativeLineage {
-    /// Returns the exact accession/document/taxonomy-bound dataset identity.
-    pub const fn dataset(&self) -> &SourceIdentifier {
-        &self.dataset
-    }
-
-    /// Returns exact filing coordinates retained independently of canonical numeric facts.
-    pub const fn filing(&self) -> &SecFilingXbrlCoordinates {
-        &self.filing
-    }
-
-    /// Returns the same validated taxonomy-set capability used by the strict parser.
-    pub const fn taxonomy(&self) -> &SecValidatedXbrlTaxonomySet {
-        &self.taxonomy
-    }
-
-    /// Returns the conservative availability evidence used by canonical numeric facts.
-    pub const fn availability(&self) -> &AvailabilityEvidence {
-        &self.availability
-    }
-
-    /// Returns when the exact document first reached this process.
-    pub const fn received_at(&self) -> Timestamp {
-        self.received_at
-    }
-
-    /// Returns when this typed lineage handoff was produced.
-    pub const fn ingested_at(&self) -> Timestamp {
-        self.ingested_at
-    }
-
-    /// Returns every bounded nil or nonnumeric occurrence in exact parser order.
-    pub fn nonnumeric_occurrences(&self) -> &[XbrlNonnumericOccurrence] {
-        &self.nonnumeric_occurrences
-    }
-
     /// Converts this complete filing handoff into the shared bounded native-lineage contract.
     ///
     /// Each numeric row carries the exact canonical XBRL observation JSON because that canonical
@@ -113,7 +78,18 @@ impl SecXbrlNativeLineage {
                 version: self.taxonomy.version(),
                 artifact_set: self.taxonomy.artifact_set(),
                 fingerprint: self.taxonomy.fingerprint(),
+                graph_evidence: self.taxonomy.graph_evidence(),
+                mapping_ruleset: self.taxonomy.mapping_ruleset(),
+                catalog_release: self.taxonomy.catalog_release(),
+                physical_bytes: self.taxonomy.physical_bytes(),
+                scanned_bytes: self.taxonomy.scanned_bytes(),
+                references: SecXbrlTaxonomyReferencesV1(self.taxonomy.references()),
+                artifacts: SecXbrlTaxonomyArtifactsV1(self.taxonomy.artifacts()),
             },
+            availability: &self.availability,
+            received_at: self.received_at,
+            ingested_at: self.ingested_at,
+            total_retained_bytes: self.total_retained_bytes,
             nonnumeric_occurrences: SecXbrlNonnumericOccurrencesV1(&self.nonnumeric_occurrences),
         })?;
         for (occurrence_id, record) in self.numeric_occurrence_ids.iter().zip(batch.records()) {
@@ -131,11 +107,6 @@ impl SecXbrlNativeLineage {
         }
         native_lineage.finish()
     }
-
-    /// Returns the checked conservative deep-retained size of this complete native handoff.
-    pub const fn total_retained_bytes(&self) -> u64 {
-        self.total_retained_bytes
-    }
 }
 
 #[derive(Serialize)]
@@ -146,6 +117,10 @@ struct SecFilingXbrlNativeBatchV1<'a> {
     dataset: &'a SourceIdentifier,
     filing: SecFilingXbrlCoordinatesV1<'a>,
     taxonomy: SecXbrlTaxonomyV1<'a>,
+    availability: &'a AvailabilityEvidence,
+    received_at: Timestamp,
+    ingested_at: Timestamp,
+    total_retained_bytes: u64,
     nonnumeric_occurrences: SecXbrlNonnumericOccurrencesV1<'a>,
 }
 
@@ -187,6 +162,91 @@ struct SecXbrlTaxonomyV1<'a> {
     version: &'a SourceIdentifier,
     artifact_set: EvidenceDigest,
     fingerprint: EvidenceDigest,
+    graph_evidence: EvidenceDigest,
+    mapping_ruleset: &'a SourceIdentifier,
+    catalog_release: &'a SourceIdentifier,
+    physical_bytes: u64,
+    scanned_bytes: u64,
+    references: SecXbrlTaxonomyReferencesV1<'a>,
+    artifacts: SecXbrlTaxonomyArtifactsV1<'a>,
+}
+
+struct SecXbrlTaxonomyReferencesV1<'a>(&'a [SecXbrlTaxonomyReference]);
+
+impl Serialize for SecXbrlTaxonomyReferencesV1<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for reference in self.0 {
+            sequence.serialize_element(&SecXbrlTaxonomyReferenceV1 {
+                parent_logical_locator: reference.parent_logical_locator(),
+                target_logical_locator: reference.target_logical_locator(),
+                target_physical_locator: reference.target_physical_locator(),
+                fragment: reference.fragment(),
+                role: reference.role(),
+                origin: reference.origin().as_str(),
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecXbrlTaxonomyReferenceV1<'a> {
+    parent_logical_locator: &'a SourceIdentifier,
+    target_logical_locator: &'a SourceIdentifier,
+    target_physical_locator: &'a SourceIdentifier,
+    fragment: Option<&'a SourceIdentifier>,
+    role: &'static str,
+    origin: &'static str,
+}
+
+struct SecXbrlTaxonomyArtifactsV1<'a>(&'a [SecXbrlTaxonomyArtifact]);
+
+impl Serialize for SecXbrlTaxonomyArtifactsV1<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for artifact in self.0 {
+            sequence.serialize_element(&SecXbrlTaxonomyArtifactV1 {
+                physical_locator: artifact.physical_locator(),
+                logical_locators: artifact.logical_locators(),
+                kind: artifact.kind().as_str(),
+                pinned_release: artifact.pinned_release(),
+                origin: artifact.origin().as_str(),
+                source_id: artifact.source_id(),
+                metadata_revision: artifact.metadata_revision(),
+                target_namespace: artifact.target_namespace(),
+                response_evidence: artifact.evidence(),
+                response_bytes: artifact.size_bytes(),
+                first_observed_at: artifact.first_observed_at(),
+                retrieval_revision: artifact.retrieval_revision(),
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecXbrlTaxonomyArtifactV1<'a> {
+    physical_locator: &'a SourceIdentifier,
+    logical_locators: &'a [SourceIdentifier],
+    kind: &'static str,
+    pinned_release: &'a SourceIdentifier,
+    origin: &'static str,
+    source_id: &'a SourceId,
+    metadata_revision: &'a MetadataRevision,
+    target_namespace: Option<&'a SourceIdentifier>,
+    response_evidence: EvidenceDigest,
+    response_bytes: u64,
+    first_observed_at: Timestamp,
+    retrieval_revision: u64,
 }
 
 #[derive(Serialize)]
@@ -338,10 +398,6 @@ impl SecFilingXbrlNormalization {
                 evidence,
             )?,
         )))
-    }
-
-    pub(crate) const fn native_lineage_retained_bytes(&self) -> u64 {
-        self.native_lineage_retained_bytes
     }
 
     /// Consumes the mandatory native family after every numeric fact was streamed.
@@ -552,13 +608,19 @@ fn checked_native_lineage_retained_bytes(
         AvailabilityEvidence::Inferred { method, .. } => method.retained_bytes(),
         AvailabilityEvidence::LocalFirstObserved { .. } | AvailabilityEvidence::Unknown => 0,
     };
+    let filing_dynamic = filing
+        .checked_dynamic_retained_bytes()
+        .ok_or(SecNormalizationError::AllocationFailed)?;
+    let taxonomy_dynamic = taxonomy
+        .checked_dynamic_retained_bytes()
+        .ok_or(SecNormalizationError::AllocationFailed)?;
     let retained = size_of::<SecXbrlNativeLineage>()
         .checked_add(parser_retained_output_upper_bound)
         .and_then(|bytes| bytes.checked_add(numeric_occurrence_id_bytes))
         .and_then(|bytes| bytes.checked_add(nonnumeric_slot_bytes))
         .and_then(|bytes| bytes.checked_add(dataset.retained_bytes()))
-        .and_then(|bytes| bytes.checked_add(filing.checked_dynamic_retained_bytes()?))
-        .and_then(|bytes| bytes.checked_add(taxonomy.checked_dynamic_retained_bytes()?))
+        .and_then(|bytes| bytes.checked_add(filing_dynamic))
+        .and_then(|bytes| bytes.checked_add(taxonomy_dynamic))
         .and_then(|bytes| bytes.checked_add(availability_dynamic))
         .ok_or(SecNormalizationError::AllocationFailed)?;
     u64::try_from(retained).map_err(|_| SecNormalizationError::AllocationFailed)

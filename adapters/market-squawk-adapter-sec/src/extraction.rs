@@ -349,7 +349,9 @@ impl SecEdgarSource {
             Arc::clone(&raw_store),
             &source_id,
             &metadata_revision,
+            &filing_document,
             taxonomy_artifacts,
+            self.parser_limits(),
             cancellation,
         )?;
         let dataset =

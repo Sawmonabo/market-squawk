@@ -23,10 +23,12 @@ use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) use model::SecPendingValidatedXbrlTaxonomySet;
 pub use model::{
-    ParsedXbrlDocument, SecValidatedXbrlTaxonomySet, SecXbrlTaxonomyRegistry, XbrlDocumentContext,
-    XbrlNonnumericOccurrence, XbrlNumericFact,
+    ParsedXbrlDocument, XbrlDocumentContext, XbrlNonnumericOccurrence, XbrlNumericFact,
+};
+pub(crate) use model::{
+    SecPendingValidatedXbrlTaxonomySet, SecValidatedXbrlTaxonomySet, SecXbrlTaxonomyArtifact,
+    SecXbrlTaxonomyReference, SecXbrlTaxonomyRegistry,
 };
 use normalize::NormalizedDraft;
 pub use support::SecXbrlError;

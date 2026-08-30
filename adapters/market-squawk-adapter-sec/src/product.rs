@@ -321,7 +321,7 @@ impl SecResearchDataset {
     }
 
     /// Selects one exact filing document under a registry-minted taxonomy set.
-    pub fn filing_xbrl(
+    pub(crate) fn filing_xbrl(
         filing: SecFilingXbrlCoordinates,
         taxonomy: SecValidatedXbrlTaxonomySet,
     ) -> Result<Self, SecClientError> {
@@ -426,7 +426,7 @@ impl SecResearchDataset {
     }
 
     /// Returns the registry-minted taxonomy set only for a filing-XBRL selection.
-    pub const fn xbrl_taxonomy(&self) -> Option<&SecValidatedXbrlTaxonomySet> {
+    pub(crate) const fn xbrl_taxonomy(&self) -> Option<&SecValidatedXbrlTaxonomySet> {
         self.xbrl_taxonomy.as_ref()
     }
 
