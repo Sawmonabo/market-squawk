@@ -1566,7 +1566,7 @@ impl YahooHttpSession {
             .and_then(|value| value.to_str().ok())
             .and_then(parse_retry_after);
         let final_url = response.url().clone();
-        if status == 429 {
+        if response_requires_immediate_backoff(status, retry_after) {
             let completed_at_unix_ms =
                 wall_time_ms().map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
             let wire = WireResponse {
@@ -1717,10 +1717,18 @@ impl YahooHttpSession {
             .responses
             .pop_front()
             .ok_or(YahooHttpFailureKind::Network)?;
-        if response.status != 429 && response.body.len() > spec.maximum_bytes {
+        let immediate_backoff =
+            response_requires_immediate_backoff(response.status, response.retry_after);
+        if !immediate_backoff && response.body.len() > spec.maximum_bytes {
             return Err(YahooHttpFailureKind::ResponseTooLarge);
         }
-        let bytes = response.body;
+        // Match production: a provider backoff is decided from status and headers without reading
+        // or retaining a possibly large error representation.
+        let bytes = if immediate_backoff {
+            Bytes::new()
+        } else {
+            response.body
+        };
         Ok(WireResponse {
             kind: spec.kind,
             target: spec.target,
@@ -2642,8 +2650,7 @@ fn bytes_contain_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool 
 }
 
 fn wire_indicates_rate_limit(wire: &WireResponse) -> bool {
-    wire.status == 429
-        || (wire.status == 503 && wire.retry_after.is_some())
+    response_requires_immediate_backoff(wire.status, wire.retry_after)
         || [
             b"too many requests".as_slice(),
             b"rate limit".as_slice(),
@@ -2653,6 +2660,13 @@ fn wire_indicates_rate_limit(wire: &WireResponse) -> bool {
         ]
         .iter()
         .any(|needle| bytes_contain_ascii_case_insensitive(&wire.bytes, needle))
+}
+
+const fn response_requires_immediate_backoff(
+    status: u16,
+    retry_after: Option<YahooRetryAfterDirective>,
+) -> bool {
+    status == 429 || (status == 503 && retry_after.is_some())
 }
 
 fn parse_consent_fields(

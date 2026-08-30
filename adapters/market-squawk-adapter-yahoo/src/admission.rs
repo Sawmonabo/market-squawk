@@ -5,6 +5,12 @@ use thiserror::Error;
 
 use crate::{YahooAdapterError, YahooHttpRequest};
 
+/// Caps provider-silent recovery at eight times the configured base cooldown.
+///
+/// Yahoo publishes no Finance API quota contract, so this is an application safety bound rather
+/// than a claimed provider window. A successful observation resets the exponent immediately.
+const MAX_FALLBACK_BACKOFF_EXPONENT: u32 = 3;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AdmissionPolicy {
     /// Application-owned base recovery delay when no usable provider instruction exists.
@@ -32,7 +38,8 @@ impl AdmissionPolicy {
             });
         }
         fallback_cooldown_ms
-            .checked_add(fallback_max_jitter_ms)
+            .checked_mul(1_u64 << MAX_FALLBACK_BACKOFF_EXPONENT)
+            .and_then(|maximum| maximum.checked_add(fallback_max_jitter_ms))
             .ok_or(YahooAdapterError::InvalidFallbackCooldown)?;
         if repeated_failure_threshold == 0 {
             return Err(YahooAdapterError::ZeroApplicationBound {
@@ -127,6 +134,8 @@ pub struct AdmissionSnapshot {
     pub cache_hits_total: u64,
     pub coalesced_callers_total: u64,
     pub consecutive_failures: u32,
+    /// Current bounded exponential step used only when no usable provider retry time exists.
+    pub fallback_backoff_exponent: u32,
     pub active_request_key: Option<String>,
     pub circuit: CircuitSnapshot,
 }
@@ -216,6 +225,7 @@ impl YahooAdmission {
             cache_hits_total: 0,
             coalesced_callers_total: 0,
             consecutive_failures: 0,
+            fallback_backoff_exponent: 0,
             active_request_key: None,
             circuit: CircuitSnapshot::Closed,
         };
@@ -530,6 +540,7 @@ fn record_actual_attempt(
             // restores provider health.
             if attempt_carries_observation_units(kind) {
                 state.snapshot.consecutive_failures = 0;
+                state.snapshot.fallback_backoff_exponent = 0;
             }
             false
         }
@@ -643,15 +654,20 @@ fn open_circuit(
         }
         Some(YahooRetryAfterDirective::HttpDate { .. }) | None => None,
     };
+    let retry_at_unix_ms = provider_retry_at.unwrap_or_else(|| {
+        let cooldown = fallback_cooldown_with_jitter(state, now_unix_ms);
+        state.snapshot.fallback_backoff_exponent = state
+            .snapshot
+            .fallback_backoff_exponent
+            .saturating_add(1)
+            .min(MAX_FALLBACK_BACKOFF_EXPONENT);
+        add_millis(now_unix_ms, cooldown)
+    });
     state.circuit = CircuitState::Open {
         // A valid provider instruction is exact and is never lengthened by local policy. Only an
-        // absent, malformed, or already-expired instruction uses the conservative bounded jitter.
-        retry_at_unix_ms: provider_retry_at.unwrap_or_else(|| {
-            add_millis(
-                now_unix_ms,
-                fallback_cooldown_with_jitter(state, now_unix_ms),
-            )
-        }),
+        // absent, malformed, or already-expired instruction advances the bounded adaptive
+        // fallback. The next successful provider observation resets that fallback immediately.
+        retry_at_unix_ms,
     };
 }
 
@@ -669,7 +685,16 @@ fn fallback_cooldown_with_jitter(state: &AdmissionState, now_unix_ms: i64) -> u6
     sample = (sample ^ (sample >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     sample ^= sample >> 31;
     let jitter = sample % state.policy.fallback_max_jitter_ms.saturating_add(1);
-    state.policy.fallback_cooldown_ms.saturating_add(jitter)
+    let multiplier = 1_u64
+        << state
+            .snapshot
+            .fallback_backoff_exponent
+            .min(MAX_FALLBACK_BACKOFF_EXPONENT);
+    state
+        .policy
+        .fallback_cooldown_ms
+        .saturating_mul(multiplier)
+        .saturating_add(jitter)
 }
 
 fn add_millis(now_unix_ms: i64, delay_ms: u64) -> i64 {
@@ -716,6 +741,9 @@ fn validate_restored_snapshot(
         || snapshot.maximum_observed_latency_ms > snapshot.latency_ms_total
         || classified_attempts > snapshot.actual_http_attempts_total
         || snapshot.http_429_total > snapshot.provider_backoff_total
+        || snapshot.fallback_backoff_exponent > MAX_FALLBACK_BACKOFF_EXPONENT
+        || (matches!(snapshot.circuit, CircuitSnapshot::Closed)
+            && snapshot.fallback_backoff_exponent != 0)
         || (matches!(snapshot.circuit, CircuitSnapshot::Closed)
             && snapshot.consecutive_failures >= policy.repeated_failure_threshold)
     {

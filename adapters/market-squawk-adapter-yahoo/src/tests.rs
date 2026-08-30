@@ -294,12 +294,19 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
         .execute(plan.requests[1].clone(), limits, &cancellation)
         .await
         .expect_err("second ticker must exercise the mock 429");
-    assert!(matches!(
-        second.kind,
-        YahooHttpFailureKind::CircuitOpen { .. }
-    ));
+    let YahooHttpFailureKind::CircuitOpen { retry_at_unix_ms } = &second.kind else {
+        return Err("429 with Retry-After must open the exact provider circuit".into());
+    };
     assert_eq!(second.attempts.len(), 1);
     assert_eq!(second.attempts[0].status, Some(429));
+    assert_eq!(second.attempts[0].response_bytes, 0);
+    assert_eq!(
+        *retry_at_unix_ms,
+        second.attempts[0]
+            .completed_at_unix_ms
+            .checked_add(2_000)
+            .ok_or("retry coordinate overflow")?
+    );
     let rejected = session
         .execute(plan.requests[0].clone(), limits, &cancellation)
         .await
@@ -421,6 +428,41 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
         return Err("expired provider instruction must use the bounded fallback circuit".into());
     };
     assert!((29_000..=30_000).contains(&retry_at_unix_ms));
+    assert_eq!(expired_retry.snapshot()?.fallback_backoff_exponent, 1);
+    let mut second_fallback_permit = match expired_retry.admit(
+        &plan.requests[0],
+        "expired-retry-after",
+        AttemptKind::Primary,
+        retry_at_unix_ms,
+    )? {
+        AdmissionDecision::Execute(permit) => permit,
+        _ => return Err("expired fallback deadline must admit one half-open probe".into()),
+    };
+    second_fallback_permit.record_actual_attempt(
+        AttemptKind::HalfOpenProbe,
+        AttemptOutcome {
+            returned_units: 0,
+            missing_units: 1,
+            returned_records: 0,
+            response_bytes: 0,
+            latency_ms: 1,
+            disposition: AttemptDisposition::ProviderBackoff {
+                status: 429,
+                retry_after: None,
+            },
+        },
+        retry_at_unix_ms + 1,
+    )?;
+    second_fallback_permit.finish(false, retry_at_unix_ms + 1)?;
+    let second_fallback = expired_retry.snapshot()?;
+    let CircuitSnapshot::Open {
+        retry_at_unix_ms: second_retry_at,
+    } = second_fallback.circuit
+    else {
+        return Err("a repeated provider-silent backoff must keep the circuit open".into());
+    };
+    assert!(((retry_at_unix_ms + 18_001)..=(retry_at_unix_ms + 19_001)).contains(&second_retry_at));
+    assert_eq!(second_fallback.fallback_backoff_exponent, 2);
 
     let attempt_bounded = YahooHttpSession::new_for_test_with_durable(
         YahooHttpSessionConfig {

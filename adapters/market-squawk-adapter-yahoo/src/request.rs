@@ -252,7 +252,11 @@ impl LookupKind {
     }
 }
 
-/// Exact effective provider request. Cookies, crumbs, fallback, and retries belong to transport.
+/// Exact effective provider request.
+///
+/// Cookie/crumb establishment and one bounded cookie-strategy fallback belong to transport.
+/// Automatic retries are prohibited; a provider backoff ends the operation and gates later
+/// explicit demand through the shared admission circuit.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct YahooHttpRequest {
