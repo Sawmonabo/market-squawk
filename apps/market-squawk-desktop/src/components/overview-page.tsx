@@ -5,7 +5,6 @@ import { useProduct } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
-import { SquawkSignal } from "@/components/squawk-signal"
 import { OverviewDashboard } from "@/features/overview/overview-dashboard"
 
 export function OverviewPage() {
@@ -17,10 +16,9 @@ export function OverviewPage() {
     return (
       <div className="mx-auto w-full max-w-[1120px] p-5 lg:p-7">
         <Alert>
-          <AlertTitle>Secure setup is waiting for you</AlertTitle>
+          <AlertTitle>Setup is waiting for you</AlertTitle>
           <AlertDescription>
-            Complete the recovery action in the shared banner to unlock secure
-            storage. More detail is available in Logs &amp; Diagnostics.
+            Complete the setup step shown above, then return here to continue.
           </AlertDescription>
         </Alert>
       </div>
@@ -30,9 +28,9 @@ export function OverviewPage() {
     return (
       <div className="mx-auto max-w-3xl p-8">
         <Alert variant="destructive">
-          <AlertTitle>Local application unavailable</AlertTitle>
+          <AlertTitle>Investment workspace unavailable</AlertTitle>
           <AlertDescription>
-            Try again or review Logs &amp; Diagnostics for details.
+            Your investment workspace cannot be shown right now. Try again.
           </AlertDescription>
         </Alert>
         <Button className="mt-4" onClick={product.refresh}>
@@ -53,9 +51,9 @@ export function OverviewPage() {
             What needs your attention now?
           </h1>
           <p className="mt-3 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Review your exact account context, retained investment analyses, work
-            in progress, and setup gaps. Full market, recommendation, portfolio,
-            and system workspaces remain on their owning pages.
+            Review your account, saved investment analyses, work in progress,
+            and anything that needs setup. Markets, recommendations, and portfolio
+            tools remain in their dedicated workspaces.
           </p>
           <div className="mt-5 flex flex-wrap items-center gap-3">
             <Button
@@ -75,11 +73,22 @@ export function OverviewPage() {
             role="status"
             className="mt-3 max-w-3xl text-[11px] leading-5 text-muted-foreground"
           >
-            Opportunity search is not available in this build yet. You can
-            still review your existing analyses.
+            Opportunity search is unavailable right now. You can still review
+            your existing analyses.
           </p>
         </div>
-        <SquawkSignal status={bootstrap.storage.label} />
+        <section className="flex min-h-32 flex-col justify-between rounded-xl border border-border bg-card/45 p-4">
+          <p className="font-mono text-[9px] uppercase tracking-widest text-muted-foreground">
+            Research workspace
+          </p>
+          <div>
+            <p className="text-lg font-semibold">Ready for your next review</p>
+            <p className="mt-2 text-xs leading-5 text-muted-foreground">
+              Start with saved analyses, then review opportunities as new
+              research becomes available.
+            </p>
+          </div>
+        </section>
       </section>
 
       <OverviewDashboard
