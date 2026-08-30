@@ -10,7 +10,9 @@ use market_squawk_adapter_alpaca::{
 use market_squawk_adapter_coinbase::{
     CoinbaseExchangeDecoder, CoinbaseExchangeSource, CoinbaseMarketDecodeOutcome,
 };
-use market_squawk_adapter_kraken::{KrakenMarketDecoder, KrakenSource};
+use market_squawk_adapter_kraken::{
+    KrakenConfig, KrakenMarketDecodeHandoff, KrakenMarketDecoder, KrakenSource,
+};
 use market_squawk_sources::{
     DecodeInternalError, DecodeOutcome, LiveMarketSource, LiveSourceGeneration, MarketDecoder,
     RawMarketSink, SourceError, SourceMetadata, SourceMetadataProvider, ValidatedRawMarketFrame,
@@ -364,7 +366,10 @@ impl ProductionConnectorProfile {
             Self::Coinbase(profile) => {
                 Ok(ProductionMarketDecoder::Coinbase(profile.decoder().clone()))
             }
-            Self::Kraken(profile) => Ok(ProductionMarketDecoder::Kraken(profile.decoder()?)),
+            Self::Kraken(profile) => Ok(ProductionMarketDecoder::Kraken {
+                decoder: profile.decoder()?,
+                publication_config: profile.publication_config(),
+            }),
             Self::AlpacaIex { config, .. } => Ok(ProductionMarketDecoder::AlpacaIex(
                 AlpacaIexDecoder::try_new(config)?,
             )),
@@ -413,7 +418,10 @@ impl ProductionConnectorProfile {
 #[derive(Debug)]
 pub(super) enum ProductionMarketDecoder {
     Coinbase(CoinbaseExchangeDecoder),
-    Kraken(KrakenMarketDecoder),
+    Kraken {
+        decoder: KrakenMarketDecoder,
+        publication_config: KrakenConfig,
+    },
     AlpacaIex(AlpacaIexDecoder),
     AlpacaOptions(AlpacaOptionsDecoder),
 }
@@ -422,7 +430,7 @@ impl SourceMetadataProvider for ProductionMarketDecoder {
     fn metadata(&self) -> &SourceMetadata {
         match self {
             Self::Coinbase(decoder) => decoder.metadata(),
-            Self::Kraken(decoder) => decoder.metadata(),
+            Self::Kraken { decoder, .. } => decoder.metadata(),
             Self::AlpacaIex(decoder) => decoder.metadata(),
             Self::AlpacaOptions(decoder) => decoder.metadata(),
         }
@@ -431,6 +439,10 @@ impl SourceMetadataProvider for ProductionMarketDecoder {
 
 pub(super) enum ProductionDecodeOutcome {
     Coinbase(CoinbaseMarketDecodeOutcome),
+    Kraken {
+        handoff: KrakenMarketDecodeHandoff,
+        publication_config: KrakenConfig,
+    },
     Standard(DecodeOutcome),
 }
 
@@ -443,7 +455,15 @@ impl ProductionMarketDecoder {
             Self::Coinbase(decoder) => decoder
                 .decode_market_handoff(frame)
                 .map(ProductionDecodeOutcome::Coinbase),
-            Self::Kraken(decoder) => decoder.decode(frame).map(ProductionDecodeOutcome::Standard),
+            Self::Kraken {
+                decoder,
+                publication_config,
+            } => decoder.decode_publication_handoff(frame).map(|handoff| {
+                ProductionDecodeOutcome::Kraken {
+                    handoff,
+                    publication_config: publication_config.clone(),
+                }
+            }),
             Self::AlpacaIex(decoder) => {
                 decoder.decode(frame).map(ProductionDecodeOutcome::Standard)
             }

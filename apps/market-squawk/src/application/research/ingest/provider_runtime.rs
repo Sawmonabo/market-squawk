@@ -2,20 +2,23 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Instant;
 
 use futures_util::future::BoxFuture;
 use market_squawk_adapter_schwab::SchwabOAuthAuthorityReceipt;
-use market_squawk_data::{IngestError, IngestPrecommitAuthority, SourceOperation};
+use market_squawk_data::{DatasetId, IngestError, IngestPrecommitAuthority, SourceOperation};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_platform::{SecretGeneration, SecretRef};
 use market_squawk_sources::{ProviderCapabilityRevision, SourceMetadata};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
+    CryptoMarketDurableRead, CryptoMarketDurableReadWriter, CryptoMarketPublicationClosure,
     ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,
     ResearchIngestCompositionError, ResearchRightsAuthority,
 };
@@ -365,6 +368,125 @@ impl IngestPrecommitAuthority for ResearchProviderPublicationLease {
     fn validate_precommit(&self) -> Result<(), IngestError> {
         ResearchProviderPublicationLease::validate_precommit(self)
             .map_err(|_error| IngestError::PublicationAuthorityRevoked)
+    }
+}
+
+/// Coordinator-owned exact-generation authority spanning specialized provider network, raw seal,
+/// and final analytical commit without exposing the registry or publication lease separately.
+pub(crate) struct ResearchProviderPublicationOperation {
+    generation: ResearchProviderRuntimeGeneration,
+    source: SourceMetadata,
+    rights: ResearchRightsAuthority,
+    source_registered_at: Timestamp,
+    publication: Arc<ResearchProviderPublicationLease>,
+    cancellation: CancellationToken,
+    watcher: JoinHandle<()>,
+}
+
+/// Application-minted, exact-generation authority for one crypto canonical-publication lane.
+///
+/// All fields remain private so callers can retain and use the authority but cannot substitute a
+/// source, dataset, rights grant, publication lease, or research service.
+pub(crate) struct CryptoMarketPublicationAuthority {
+    operation: ResearchProviderPublicationOperation,
+    publication: Arc<CryptoMarketPublicationClosure>,
+    analytical_dataset: DatasetId,
+    precommit: Arc<dyn IngestPrecommitAuthority>,
+}
+
+impl CryptoMarketPublicationAuthority {
+    pub(crate) const fn generation(&self) -> &ResearchProviderRuntimeGeneration {
+        self.operation.generation()
+    }
+
+    pub(crate) fn publication(&self) -> Arc<CryptoMarketPublicationClosure> {
+        self.publication.clone()
+    }
+
+    pub(crate) const fn analytical_dataset(&self) -> &DatasetId {
+        &self.analytical_dataset
+    }
+
+    pub(crate) fn precommit_authority(&self) -> Arc<dyn IngestPrecommitAuthority> {
+        self.precommit.clone()
+    }
+
+    /// Mints the sole source- and dataset-bound durable-read handoff for this runtime generation.
+    pub(crate) fn durable_read_capability(
+        &self,
+    ) -> (CryptoMarketDurableReadWriter, CryptoMarketDurableRead) {
+        let point_in_time = self
+            .publication
+            .point_in_time_selector(self.analytical_dataset.clone());
+        CryptoMarketDurableRead::channel(point_in_time)
+    }
+
+    pub(crate) const fn cancellation(&self) -> &CancellationToken {
+        self.operation.cancellation()
+    }
+
+    pub(crate) fn validate_precommit(&self) -> Result<(), ResearchIngestCompositionError> {
+        self.operation.validate_precommit()
+    }
+}
+
+impl std::fmt::Debug for CryptoMarketPublicationAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CryptoMarketPublicationAuthority")
+            .field("generation", self.operation.generation())
+            .field("analytical_dataset", &self.analytical_dataset)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResearchProviderPublicationOperation {
+    pub(crate) const fn generation(&self) -> &ResearchProviderRuntimeGeneration {
+        &self.generation
+    }
+
+    pub(crate) const fn source(&self) -> &SourceMetadata {
+        &self.source
+    }
+
+    pub(crate) const fn rights(&self) -> &ResearchRightsAuthority {
+        &self.rights
+    }
+
+    pub(crate) const fn source_registered_at(&self) -> Timestamp {
+        self.source_registered_at
+    }
+
+    pub(crate) const fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    pub(crate) fn precommit_authority(&self) -> Arc<dyn IngestPrecommitAuthority> {
+        self.publication.clone()
+    }
+
+    pub(crate) fn validate_precommit(&self) -> Result<(), ResearchIngestCompositionError> {
+        if self.cancellation.is_cancelled() {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        self.publication.validate_precommit()
+    }
+}
+
+impl Drop for ResearchProviderPublicationOperation {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.watcher.abort();
+    }
+}
+
+impl std::fmt::Debug for ResearchProviderPublicationOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResearchProviderPublicationOperation")
+            .field("generation", &self.generation)
+            .field("source_id", self.source.source_id())
+            .finish_non_exhaustive()
     }
 }
 
@@ -837,6 +959,7 @@ impl CommittedResearchProviderReplacement {
         let super::CoordinatorAuthority {
             registry,
             sources,
+            publication_sources: _,
             pending_replacements,
             selections: _,
             alpaca_historical: _,
@@ -1018,6 +1141,103 @@ impl ResearchProviderRuntimeMutationAuthority {
     }
 
     /// Registers one provider adapter bound to an exact onboarding/runtime generation.
+    pub(crate) fn register_provider_publication_generation(
+        &self,
+        generation: ResearchProviderRuntimeGeneration,
+        rights: ResearchRightsAuthority,
+    ) -> Result<ResearchProviderRuntimeGeneration, ResearchIngestCompositionError> {
+        if self.coordinator.lifecycle.shutdown_token().is_cancelled()
+            || generation.metadata().source_id() != rights.source_id()
+            || rights != generation.rights
+        {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration);
+        }
+        let profile = generation.profile().clone();
+        let registered_at = super::system_timestamp()
+            .map_err(|_error| ResearchIngestCompositionError::TrustedTimeUnavailable)?;
+        if !generation.metadata().is_effective_at(registered_at) {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration);
+        }
+        let mut authority = self
+            .coordinator
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        if self.coordinator.lifecycle.shutdown_token().is_cancelled()
+            || authority.registry.is_none()
+            || authority.sources.contains_key(&profile)
+            || authority.pending_replacements.contains_key(&profile)
+        {
+            return Err(ResearchIngestCompositionError::DuplicateProfile);
+        }
+        let super::CoordinatorAuthority {
+            registry,
+            sources: _,
+            publication_sources,
+            pending_replacements: _,
+            selections: _,
+            alpaca_historical: _,
+        } = &mut *authority;
+        if let Some(current) = publication_sources.get_mut(&profile) {
+            if current.generation == generation {
+                if current.metadata != *generation.metadata()
+                    || current.rights != rights
+                    || current.registration.source_id() != generation.metadata().source_id()
+                    || current.registration.revision() != generation.metadata().revision()
+                    || (!current.admission.revocation_drained()
+                        && current.admission.ensure_live().is_err())
+                {
+                    return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+                }
+                if current.admission.revocation_drained() {
+                    current.admission = ResearchProviderAdmission::new(Some(&generation))?;
+                }
+                return Ok(generation);
+            }
+            if !current.admission.revocation_drained()
+                || !generation.is_exact_successor_of(&current.generation)?
+            {
+                return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+            }
+            if current.metadata != *generation.metadata() {
+                current.registration = Box::new(
+                    registry
+                        .as_mut()
+                        .ok_or(ResearchIngestCompositionError::ShuttingDown)?
+                        .replace_metadata(
+                            current.registration.as_ref(),
+                            generation.metadata().clone(),
+                            registered_at,
+                        )?,
+                );
+            }
+            current.metadata = generation.metadata().clone();
+            current.registered_at = registered_at;
+            current.rights = rights;
+            current.generation = generation.clone();
+            current.admission = ResearchProviderAdmission::new(Some(&generation))?;
+            return Ok(generation);
+        }
+        let registration = registry
+            .as_mut()
+            .ok_or(ResearchIngestCompositionError::ShuttingDown)?
+            .register_or_resume_exact(generation.metadata().clone(), registered_at)?;
+        let admission = ResearchProviderAdmission::new(Some(&generation))?;
+        publication_sources.insert(
+            profile,
+            super::RegisteredPublicationSource {
+                metadata: generation.metadata().clone(),
+                registered_at,
+                registration: Box::new(registration),
+                rights,
+                generation: generation.clone(),
+                admission,
+            },
+        );
+        Ok(generation)
+    }
+
+    /// Registers one provider adapter bound to an exact onboarding/runtime generation.
     pub(crate) fn register_provider_source<S>(
         &self,
         generation: ResearchProviderRuntimeGeneration,
@@ -1043,6 +1263,126 @@ impl ResearchProviderRuntimeMutationAuthority {
 }
 
 impl ProductionResearchIngestCoordinator {
+    /// Acquires the sole non-forgeable crypto canonical-publication authority for one exact active
+    /// runtime generation.
+    pub(crate) async fn acquire_crypto_market_publication_authority(
+        &self,
+        generation: &ResearchProviderRuntimeGeneration,
+        caller: CancellationToken,
+        deadline: Instant,
+        analytical_dataset: DatasetId,
+    ) -> Result<CryptoMarketPublicationAuthority, ResearchIngestCompositionError> {
+        if analytical_dataset.as_str() != "market_squawk.market_events" {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration);
+        }
+        let operation = self
+            .acquire_provider_publication_operation(generation, caller, deadline)
+            .await?;
+        let publication = Arc::new(
+            CryptoMarketPublicationClosure::try_new(
+                self.research.clone(),
+                operation.source().clone(),
+                operation.rights().clone(),
+                operation.source_registered_at(),
+            )
+            .map_err(|_error| ResearchIngestCompositionError::InvalidRuntimeGeneration)?,
+        );
+        let precommit = operation.precommit_authority();
+        let authority = CryptoMarketPublicationAuthority {
+            operation,
+            publication,
+            analytical_dataset,
+            precommit,
+        };
+        authority.validate_precommit()?;
+        Ok(authority)
+    }
+
+    /// Acquires one exact specialized-provider admission and retains its cancellation and
+    /// publication lease across network, raw sealing, and final commit.
+    pub(crate) async fn acquire_provider_publication_operation(
+        &self,
+        generation: &ResearchProviderRuntimeGeneration,
+        caller: CancellationToken,
+        deadline: Instant,
+    ) -> Result<ResearchProviderPublicationOperation, ResearchIngestCompositionError> {
+        if self.lifecycle.shutdown_token().is_cancelled() || caller.is_cancelled() {
+            return Err(ResearchIngestCompositionError::ShuttingDown);
+        }
+        let generation_digest = generation.generation_digest()?;
+        let (source, rights, source_registered_at, admission) = {
+            let authority = self
+                .authority
+                .lock()
+                .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+            let current = authority
+                .publication_sources
+                .get(generation.profile())
+                .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+            if current.generation != *generation
+                || current.metadata != *generation.metadata()
+                || current.rights != generation.rights
+                || current.registration.source_id() != generation.metadata().source_id()
+                || current.registration.revision() != generation.metadata().revision()
+                || current.admission.generation_digest != Some(generation_digest)
+            {
+                return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+            }
+            current.admission.ensure_live()?;
+            (
+                current.metadata.clone(),
+                current.rights.clone(),
+                current.registered_at,
+                current.admission.clone(),
+            )
+        };
+        let cancellation = CancellationToken::new();
+        let signal = cancellation.clone();
+        let shutdown = self.lifecycle.shutdown_token().clone();
+        let revoked = admission.cancellation().clone();
+        let watched_caller = caller.clone();
+        let watched_shutdown = shutdown.clone();
+        let watched_revoked = revoked.clone();
+        let watcher = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                () = watched_caller.cancelled() => signal.cancel(),
+                () = watched_shutdown.cancelled() => signal.cancel(),
+                () = watched_revoked.cancelled() => signal.cancel(),
+                () = tokio::time::sleep_until(deadline.into()) => signal.cancel(),
+            }
+        });
+        let lease = admission.acquire_publication_lease();
+        tokio::pin!(lease);
+        let publication = tokio::select! {
+            biased;
+            () = caller.cancelled() => Err(ResearchIngestCompositionError::StaleRuntimeGeneration),
+            () = shutdown.cancelled() => Err(ResearchIngestCompositionError::ShuttingDown),
+            () = revoked.cancelled() => Err(ResearchIngestCompositionError::StaleRuntimeGeneration),
+            () = tokio::time::sleep_until(deadline.into()) => Err(ResearchIngestCompositionError::StaleRuntimeGeneration),
+            result = lease.as_mut() => result,
+        };
+        let publication = match publication {
+            Ok(publication) => Arc::new(publication),
+            Err(error) => {
+                cancellation.cancel();
+                watcher.abort();
+                return Err(error);
+            }
+        };
+        let operation = ResearchProviderPublicationOperation {
+            generation: generation.clone(),
+            source,
+            rights,
+            source_registered_at,
+            publication,
+            cancellation,
+            watcher,
+        };
+        operation.validate_precommit()?;
+        Ok(operation)
+    }
+
     /// Returns one coherent, nonblocking count of callable provider runtime generations.
     pub fn active_provider_runtime_count(&self) -> Result<usize, ResearchIngestCompositionError> {
         if self.lifecycle.shutdown_token().is_cancelled() {
@@ -1052,11 +1392,23 @@ impl ProductionResearchIngestCoordinator {
             .authority
             .try_lock()
             .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
-        authority
+        let extraction = authority
             .sources
             .values()
             .try_fold(0_usize, |count, source| {
                 if source.generation.is_some() && source.admission.ensure_live().is_ok() {
+                    count
+                        .checked_add(1)
+                        .ok_or(ResearchIngestCompositionError::AuthorityUnavailable)
+                } else {
+                    Ok(count)
+                }
+            })?;
+        authority
+            .publication_sources
+            .values()
+            .try_fold(extraction, |count, source| {
+                if source.admission.ensure_live().is_ok() {
                     count
                         .checked_add(1)
                         .ok_or(ResearchIngestCompositionError::AuthorityUnavailable)
@@ -1078,17 +1430,23 @@ impl ProductionResearchIngestCoordinator {
             .authority
             .lock()
             .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
-        let Some(source) = authority.sources.get(profile) else {
+        if let Some(source) = authority.sources.get(profile) {
+            if source.admission.ensure_live().is_err() {
+                return Ok(None);
+            }
+            return source
+                .generation
+                .clone()
+                .map(Some)
+                .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable);
+        }
+        let Some(source) = authority.publication_sources.get(profile) else {
             return Ok(None);
         };
         if source.admission.ensure_live().is_err() {
             return Ok(None);
         }
-        source
-            .generation
-            .clone()
-            .map(Some)
-            .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)
+        Ok(Some(source.generation.clone()))
     }
 }
 
@@ -1250,17 +1608,25 @@ impl ResearchProviderRuntimeMutationAuthority {
                 .authority
                 .lock()
                 .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
-            let current = authority
-                .sources
-                .get(profile)
-                .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
-            if current.generation.as_ref() != Some(expected) {
-                return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+            if let Some(current) = authority.publication_sources.get(profile) {
+                if &current.generation != expected {
+                    return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+                }
+                current.admission.revoke();
+                current.admission.clone()
+            } else {
+                let current = authority
+                    .sources
+                    .get(profile)
+                    .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+                if current.generation.as_ref() != Some(expected) {
+                    return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+                }
+                current.admission.revoke();
+                let admission = current.admission.clone();
+                authority.selections.revoke_profile(profile);
+                admission
             }
-            current.admission.revoke();
-            let admission = current.admission.clone();
-            authority.selections.revoke_profile(profile);
-            admission
         };
         admission.revoke_and_drain().await;
         Ok(())

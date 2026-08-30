@@ -112,6 +112,136 @@ impl KrakenMarketDecoder {
     pub const fn state(&self) -> KrakenDecoderState {
         self.decoder.state()
     }
+
+    /// Decodes one stateful Kraken frame exactly once while retaining both application outputs.
+    ///
+    /// The generic outcome continues into the existing live-state pipeline. A successful Kraken
+    /// classification is retained separately so the capture owner can consume it with the exact
+    /// same frame and provider-event capture material to construct a pending durable publication.
+    /// Decoder failures and non-text frames have no typed publication input and remain live-only
+    /// quarantine or recovery outcomes.
+    pub fn decode_publication_handoff(
+        &mut self,
+        frame: &ValidatedRawMarketFrame<'_>,
+    ) -> Result<KrakenMarketDecodeHandoff, DecodeInternalError> {
+        let SourceProtocolProfile::Live(profile) = self.metadata.protocol_profile() else {
+            return Err(DecodeInternalError::InvariantViolation);
+        };
+        let evidence = DecoderEvidence::from_validated_frame(frame, profile.decoder_rule().clone());
+        if frame.frame().transport() != TransportFrameKind::Text {
+            return Ok(KrakenMarketDecodeHandoff::live_only(
+                DecodeOutcome::Quarantine(DecodedQuarantineAction::new(
+                    evidence,
+                    QuarantineReason::SchemaViolation,
+                    None,
+                )),
+            ));
+        }
+        match self.decoder.decode_payload(frame.frame().payload()) {
+            Ok(KrakenDecodeOutcome::Market(observations)) => {
+                let publication_observations = observations.clone();
+                match DecodedProviderBatch::try_new(evidence.clone(), observations) {
+                    Ok(batch) => {
+                        let retained_bytes =
+                            batch.retained_bytes().map_err(|error| match error {
+                                DecodeError::RetainedSizeOverflow => {
+                                    DecodeInternalError::RetainedSizeOverflow
+                                }
+                                _ => DecodeInternalError::InvariantViolation,
+                            })?;
+                        Ok(KrakenMarketDecodeHandoff::publishable(
+                            DecodeOutcome::Data(batch),
+                            KrakenPublicationDecodeOutcome::market(
+                                publication_observations,
+                                retained_bytes,
+                            ),
+                        ))
+                    }
+                    Err(error) => {
+                        self.decoder.state = KrakenDecoderState::Quarantined;
+                        Ok(KrakenMarketDecodeHandoff::live_only(
+                            decode_failure_outcome(error, evidence)?,
+                        ))
+                    }
+                }
+            }
+            Ok(KrakenDecodeOutcome::Control(control)) => {
+                Ok(KrakenMarketDecodeHandoff::publishable(
+                    control_outcome(control, evidence)?,
+                    KrakenPublicationDecodeOutcome::control(control),
+                ))
+            }
+            Err(error) => Ok(KrakenMarketDecodeHandoff::live_only(
+                decode_failure_outcome(error, evidence)?,
+            )),
+        }
+    }
+}
+
+/// One-use result of a single stateful Kraken decode.
+///
+/// A typed publication input is present only when the provider message classified successfully.
+/// It carries no capture or publication authority by itself; the capture owner must consume it
+/// with the exact validated frame and sealed-provider capture material.
+#[derive(Debug)]
+pub struct KrakenMarketDecodeHandoff {
+    live: DecodeOutcome,
+    publication: Option<KrakenPublicationDecodeOutcome>,
+}
+
+impl KrakenMarketDecodeHandoff {
+    fn publishable(live: DecodeOutcome, publication: KrakenPublicationDecodeOutcome) -> Self {
+        Self {
+            live,
+            publication: Some(publication),
+        }
+    }
+
+    fn live_only(live: DecodeOutcome) -> Self {
+        Self {
+            live,
+            publication: None,
+        }
+    }
+
+    /// Consumes the handoff into the generic live result and optional exact publication input.
+    pub fn into_parts(self) -> (DecodeOutcome, Option<KrakenPublicationDecodeOutcome>) {
+        (self.live, self.publication)
+    }
+
+    fn into_live_outcome(self) -> DecodeOutcome {
+        self.live
+    }
+}
+
+/// One-use typed publication input with the common decoder's exact retained-byte charge.
+///
+/// The memory charge is derived before the generic and publication observation graphs separate,
+/// avoiding a second provider-specific retained-size implementation.
+#[derive(Debug)]
+pub struct KrakenPublicationDecodeOutcome {
+    outcome: KrakenDecodeOutcome,
+    decoded_retained_bytes: usize,
+}
+
+impl KrakenPublicationDecodeOutcome {
+    fn market(observations: Vec<ProviderNormalizedObservation>, retained_bytes: usize) -> Self {
+        Self {
+            outcome: KrakenDecodeOutcome::Market(observations),
+            decoded_retained_bytes: retained_bytes,
+        }
+    }
+
+    fn control(control: KrakenControl) -> Self {
+        Self {
+            outcome: KrakenDecodeOutcome::Control(control),
+            decoded_retained_bytes: 0,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (KrakenDecodeOutcome, usize) {
+        (self.outcome, self.decoded_retained_bytes)
+    }
 }
 
 impl SourceMetadataProvider for KrakenMarketDecoder {
@@ -125,27 +255,8 @@ impl MarketDecoder for KrakenMarketDecoder {
         &mut self,
         frame: &ValidatedRawMarketFrame<'_>,
     ) -> Result<DecodeOutcome, DecodeInternalError> {
-        let SourceProtocolProfile::Live(profile) = self.metadata.protocol_profile() else {
-            return Err(DecodeInternalError::InvariantViolation);
-        };
-        let evidence = DecoderEvidence::from_validated_frame(frame, profile.decoder_rule().clone());
-        if frame.frame().transport() != TransportFrameKind::Text {
-            return Ok(DecodeOutcome::Quarantine(DecodedQuarantineAction::new(
-                evidence,
-                QuarantineReason::SchemaViolation,
-                None,
-            )));
-        }
-        match self.decoder.decode_payload(frame.frame().payload()) {
-            Ok(KrakenDecodeOutcome::Market(observations)) => {
-                match DecodedProviderBatch::try_new(evidence.clone(), observations) {
-                    Ok(batch) => Ok(DecodeOutcome::Data(batch)),
-                    Err(error) => decode_failure_outcome(error, evidence),
-                }
-            }
-            Ok(KrakenDecodeOutcome::Control(control)) => control_outcome(control, evidence),
-            Err(error) => decode_failure_outcome(error, evidence),
-        }
+        self.decode_publication_handoff(frame)
+            .map(KrakenMarketDecodeHandoff::into_live_outcome)
     }
 }
 

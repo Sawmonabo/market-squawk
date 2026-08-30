@@ -64,7 +64,7 @@ use self::{
 use super::live_fair_value::{LiveFairValueExportDrains, LiveFairValueObservationBuffer};
 use super::{
     AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
-    AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
+    AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority, CryptoMarketDurableRead,
 };
 use crate::{
     AppConfig, CoinbaseDirectLiveRuntime, ProductionLiveSourceRuntime, ProductionSourceProvider,
@@ -665,7 +665,10 @@ impl MarketRuntimeRegistry {
             .await?;
         let runtime_cancellation = self.lifecycle.child_token();
         let entry = match surface {
-            MarketSurface::Public(provider_kind) => {
+            MarketSurface::Public {
+                provider: provider_kind,
+                session_id,
+            } => {
                 let composition = local_live_market_with_provider_rate(
                     self.config.clone(),
                     provider_kind,
@@ -683,6 +686,57 @@ impl MarketRuntimeRegistry {
                     );
                     ServiceError::Unavailable
                 })?;
+                let activation_lease = self
+                    .provider_activation
+                    .activate_public_live_metadata(session_id, provider_kind, metadata.as_ref())
+                    .map_err(|error| {
+                        tracing::error!(provider = ?provider_kind, %error, "public market activation binding failed");
+                        ServiceError::Unavailable
+                    })?;
+                if activation_lease.session_id() != session_id
+                    || activation_lease.surface_id() != provider
+                {
+                    return Err(ServiceError::Unavailable);
+                }
+                let publication_cancellation = CancellationToken::new();
+                let publication_package = match provider_kind {
+                    ProductionSourceProvider::Coinbase => {
+                        let source = metadata.first().ok_or(ServiceError::Unavailable)?;
+                        if metadata.len() != 1 {
+                            return Err(ServiceError::Unavailable);
+                        }
+                        await_before(
+                            deadline,
+                            cancellation,
+                            self.provider_activation
+                                .acquire_coinbase_market_publication_package(
+                                    &activation_lease,
+                                    source,
+                                    publication_cancellation.clone(),
+                                ),
+                        )
+                        .await?
+                    }
+                    ProductionSourceProvider::Kraken => {
+                        let book = metadata.first().ok_or(ServiceError::Unavailable)?;
+                        let trades = metadata.get(1).ok_or(ServiceError::Unavailable)?;
+                        if metadata.len() != 2 {
+                            return Err(ServiceError::Unavailable);
+                        }
+                        await_before(
+                            deadline,
+                            cancellation,
+                            self.provider_activation
+                                .acquire_kraken_market_publication_package(
+                                    &activation_lease,
+                                    book,
+                                    trades,
+                                    publication_cancellation.clone(),
+                                ),
+                        )
+                        .await?
+                    }
+                };
                 let route_keys = clone_route_keys(composition.live_routes())?;
                 let topology =
                     MarketRuntimeTopology::try_new(provider, Arc::clone(&metadata), route_keys)?;
@@ -702,8 +756,12 @@ impl MarketRuntimeRegistry {
                 let started = await_before(
                     deadline,
                     cancellation,
-                    composition
-                        .start_with_qualified_market_exports(exports, runtime_cancellation.clone()),
+                    composition.start_with_qualified_market_exports_and_crypto_publication(
+                        exports,
+                        publication_package,
+                        publication_cancellation,
+                        runtime_cancellation.clone(),
+                    ),
                 )
                 .await;
                 let runtime = match started {
@@ -718,7 +776,7 @@ impl MarketRuntimeRegistry {
                 };
                 MarketRuntimeEntry {
                     surface_id: provider.clone(),
-                    onboarding_session_id: None,
+                    onboarding_session_id: Some(session_id),
                     metadata,
                     topology: Some(topology),
                     cancellation: runtime_cancellation,
@@ -1434,6 +1492,39 @@ impl MarketRuntimeRegistry {
             }
         }
         Ok(MarketRuntimeSnapshotBatch { sources, failures })
+    }
+
+    /// Clones the bounded source-bound durable reads consumed by the internal neutral selector.
+    /// Provider identities and runtime metadata never cross this capability boundary.
+    pub(crate) async fn crypto_market_durable_reads(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<CryptoMarketDurableRead>, ServiceError> {
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        let reads = {
+            let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
+            let count = entries
+                .iter()
+                .filter(|entry| entry.is_published_healthy())
+                .try_fold(0_usize, |count, entry| {
+                    count.checked_add(entry.runtime.crypto_market_durable_read_count())
+                })
+                .ok_or(ServiceError::ResourceExhausted)?;
+            let mut reads = Vec::new();
+            reads
+                .try_reserve_exact(count)
+                .map_err(|_error| ServiceError::ResourceExhausted)?;
+            for entry in entries.iter().filter(|entry| entry.is_published_healthy()) {
+                entry.runtime.append_crypto_market_durable_reads(&mut reads);
+            }
+            if reads.len() != count {
+                return Err(ServiceError::Unavailable);
+            }
+            reads
+        };
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        Ok(reads)
     }
 
     /// Reads every account-backed display source for one instrument in exact actor-key order.
@@ -2170,8 +2261,13 @@ impl Drop for MarketRuntimeRegistry {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MarketSurface {
-    Public(ProductionSourceProvider),
-    CoinbaseDirect { session_id: uuid::Uuid },
+    Public {
+        provider: ProductionSourceProvider,
+        session_id: uuid::Uuid,
+    },
+    CoinbaseDirect {
+        session_id: uuid::Uuid,
+    },
 }
 
 impl MarketSurface {
@@ -2180,12 +2276,18 @@ impl MarketSurface {
         onboarding_session_id: Option<uuid::Uuid>,
     ) -> Result<Self, ServiceError> {
         match provider.as_str() {
-            COINBASE_PUBLIC_SURFACE_ID if onboarding_session_id.is_none() => {
-                Ok(Self::Public(ProductionSourceProvider::Coinbase))
-            }
-            KRAKEN_PUBLIC_SURFACE_ID if onboarding_session_id.is_none() => {
-                Ok(Self::Public(ProductionSourceProvider::Kraken))
-            }
+            COINBASE_PUBLIC_SURFACE_ID => onboarding_session_id
+                .map(|session_id| Self::Public {
+                    provider: ProductionSourceProvider::Coinbase,
+                    session_id,
+                })
+                .ok_or(ServiceError::InvalidRequest),
+            KRAKEN_PUBLIC_SURFACE_ID => onboarding_session_id
+                .map(|session_id| Self::Public {
+                    provider: ProductionSourceProvider::Kraken,
+                    session_id,
+                })
+                .ok_or(ServiceError::InvalidRequest),
             COINBASE_DIRECT_SURFACE_ID => onboarding_session_id
                 .map(|session_id| Self::CoinbaseDirect { session_id })
                 .ok_or(ServiceError::InvalidRequest),
@@ -2195,7 +2297,7 @@ impl MarketSurface {
 
     const fn onboarding_session_id(self) -> Option<uuid::Uuid> {
         match self {
-            Self::Public(_) => None,
+            Self::Public { session_id, .. } => Some(session_id),
             Self::CoinbaseDirect { session_id } => Some(session_id),
         }
     }
@@ -2316,6 +2418,19 @@ impl MarketRuntime {
             Self::Public(runtime) => Ok(runtime.snapshots()),
             Self::CoinbaseDirect(runtime) => Ok(runtime.snapshots()),
             Self::Account(_) => Err(ServiceError::InvalidRequest),
+        }
+    }
+
+    fn crypto_market_durable_read_count(&self) -> usize {
+        match self {
+            Self::Public(runtime) => runtime.crypto_market_durable_read_count(),
+            Self::CoinbaseDirect(_) | Self::Account(_) => 0,
+        }
+    }
+
+    fn append_crypto_market_durable_reads(&self, destination: &mut Vec<CryptoMarketDurableRead>) {
+        if let Self::Public(runtime) = self {
+            runtime.append_crypto_market_durable_reads(destination);
         }
     }
 

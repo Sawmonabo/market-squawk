@@ -6,22 +6,29 @@
 //! validates their source, venue, product, channel, generation, clocks, payload, and raw coordinate
 //! before minting a common durable publication binding.
 
-use std::collections::BTreeSet;
 use std::io::Read as _;
+use std::{
+    collections::BTreeSet,
+    mem::{size_of, size_of_val},
+};
 
 use bytes::Bytes;
 use market_squawk_domain::{
-    DataQuality, EvidenceDigest, LiveEventClass, LiveProvenance, MarketDepth, MarketEvent,
-    MetadataRevision, ProviderChannel, SourceId, SourceIdentifier, Timestamp,
+    ConnectionGeneration, DataQuality, EvidenceDigest, LiveEventClass, LiveProvenance, MarketDepth,
+    MarketEvent, MetadataRevision, ProviderChannel, SourceId, SourceIdentifier, Timestamp,
 };
+use market_squawk_live::CommittedResearchMarketObservation;
 use market_squawk_sources::{
     DecodedProviderBatch, HttpCaptureMethod, MAX_PROVIDER_CAPTURE_PAGE_BYTES,
-    ProviderCaptureTerminalDisposition, ProviderEventMicrobatchToken, ProviderMarketEventBatch,
-    ProviderMarketEventNativeLineageBatch, ProviderNativeLineageImplementation,
-    ProviderOrderChangeReason, ProviderOrderEventKind, ProviderPublicationBindingKind,
-    ProviderSequenceEvidence, ProviderTimestampEvidence, ProviderWholeCaptureToken,
+    ProviderCaptureSealRequest, ProviderCaptureTerminalDisposition,
+    ProviderEventMicrobatchMaterial, ProviderEventMicrobatchSealExpectation,
+    ProviderEventMicrobatchToken, ProviderMarketEventBatch, ProviderMarketEventNativeLineageBatch,
+    ProviderNativeLineageImplementation, ProviderObservationPayload, ProviderOrderChangeReason,
+    ProviderOrderEventKind, ProviderPublicationBindingKind, ProviderSequenceEvidence,
+    ProviderTimestampEvidence, ProviderWholeCaptureToken, SealedProviderCaptureMaterial,
     SealedProviderCompositeResponseEventBinding, SealedProviderEventMicrobatchBinding,
-    SealedProviderPublicationBinding, SealedProviderResponseMarketEventBinding,
+    SealedProviderEventMicrobatchReceipt, SealedProviderPublicationBinding,
+    SealedProviderResponseMarketEventBinding, TransportFrameKind, ValidatedRawMarketFrame,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -167,11 +174,11 @@ pub struct CoinbaseEventMicrobatchSealMaterial {
 }
 
 impl CoinbaseEventMicrobatchSealMaterial {
-    pub const fn source_id(&self) -> &SourceId {
+    pub fn source_id(&self) -> &SourceId {
         &self.source_id
     }
 
-    pub const fn metadata_revision(&self) -> &MetadataRevision {
+    pub fn metadata_revision(&self) -> &MetadataRevision {
         &self.metadata_revision
     }
 
@@ -387,6 +394,7 @@ pub enum CoinbaseMarketNonPublicationReason {
     CanonicalQualificationUnavailable,
     InstrumentDefinitionUnavailable,
     LiveGenerationUnavailable,
+    ApplicationBackpressure,
 }
 
 /// Qualification decision supplied only by the owning live/application layer.
@@ -432,15 +440,266 @@ pub struct CoinbaseMarketSealRejoin {
     physical_connection_id: [u8; 16],
     physical_event_ids: Box<[[u8; 16]]>,
     raw: CoinbasePublicationRawEvidence,
+    public_state: CoinbasePublicPublicationState,
 }
 
 #[derive(Debug)]
 enum CoinbasePublicationRawEvidence {
-    AdvancedTrade,
+    AdvancedTrade {
+        source_sequence: Option<u64>,
+        exchange_at: Option<Timestamp>,
+    },
     ExchangeDirect {
         snapshot: CoinbaseDirectSnapshotPublicationEvidence,
         replay: Box<[CoinbaseDirectReplayPublicationEvidence]>,
     },
+}
+
+#[derive(Debug)]
+enum CoinbasePublicPublicationState {
+    NotApplicable,
+    AwaitingSeal {
+        expectation: ProviderEventMicrobatchSealExpectation,
+        frame_id: market_squawk_sources::FrameId,
+        available_at: Timestamp,
+        decoded_retained_bytes: usize,
+    },
+    Sealed {
+        token: ProviderEventMicrobatchToken,
+        frame_id: market_squawk_sources::FrameId,
+        available_at: Timestamp,
+        decoded_retained_bytes: usize,
+    },
+}
+
+impl CoinbaseMarketSealRejoin {
+    /// Rejoins the one-use common physical seal for a public Advanced Trade frame.
+    pub fn try_rejoin_public_seal(
+        mut self,
+        sealed: SealedProviderCaptureMaterial,
+    ) -> Result<Self, CoinbaseMarketPublicationError> {
+        let state = std::mem::replace(
+            &mut self.public_state,
+            CoinbasePublicPublicationState::NotApplicable,
+        );
+        let CoinbasePublicPublicationState::AwaitingSeal {
+            expectation,
+            frame_id,
+            available_at,
+            decoded_retained_bytes,
+        } = state
+        else {
+            return Err(CoinbaseMarketPublicationError::ProfileMismatch);
+        };
+        let token = expectation.try_rejoin(sealed)?;
+        let CoinbasePublicationRawEvidence::AdvancedTrade {
+            source_sequence,
+            exchange_at,
+        } = &self.raw
+        else {
+            return Err(CoinbaseMarketPublicationError::ProfileMismatch);
+        };
+        validate_event_token(
+            &token,
+            self.typed_batch.evidence().binding().source_id(),
+            self.typed_batch.evidence().binding().metadata_revision(),
+            &self.dataset,
+            &self.stream_identity,
+            self.physical_connection_id,
+            &self.physical_event_ids,
+            &[ExpectedFrame {
+                sequence: *source_sequence,
+                exchange_at: *exchange_at,
+                received_at: self.typed_batch.evidence().received_at(),
+                payload_digest: self.typed_batch.evidence().payload_digest(),
+            }],
+        )?;
+        self.public_state = CoinbasePublicPublicationState::Sealed {
+            token,
+            frame_id,
+            available_at,
+            decoded_retained_bytes,
+        };
+        Ok(self)
+    }
+
+    /// Returns the exact registered source identity retained by the decoder and raw receipt.
+    pub fn source_id(&self) -> &SourceId {
+        self.typed_batch.evidence().binding().source_id()
+    }
+
+    /// Returns the exact metadata interpretation revision retained by decoder evidence.
+    pub fn metadata_revision(&self) -> &MetadataRevision {
+        self.typed_batch.evidence().binding().metadata_revision()
+    }
+
+    /// Returns the exact source connection generation that produced the physical frame.
+    pub fn connection_generation(&self) -> ConnectionGeneration {
+        self.typed_batch
+            .evidence()
+            .binding()
+            .connection_generation()
+    }
+
+    /// Returns the nonzero generation-local physical frame identity.
+    pub fn frame_id(
+        &self,
+    ) -> Result<market_squawk_sources::FrameId, CoinbaseMarketPublicationError> {
+        match &self.public_state {
+            CoinbasePublicPublicationState::Sealed { frame_id, .. } => Ok(*frame_id),
+            CoinbasePublicPublicationState::NotApplicable
+            | CoinbasePublicPublicationState::AwaitingSeal { .. } => {
+                Err(CoinbaseMarketPublicationError::ProfileMismatch)
+            }
+        }
+    }
+
+    /// Returns SHA-256 of the exact provider frame retained by raw capture.
+    pub const fn raw_payload_digest(&self) -> EvidenceDigest {
+        self.typed_batch.evidence().payload_digest()
+    }
+
+    /// Returns the number of provider observations that must rejoin this exact frame.
+    pub fn expected_row_count(&self) -> usize {
+        self.typed_batch.observations().len()
+    }
+
+    /// Returns persisted logical and immutable physical raw receipt evidence.
+    pub fn persisted_receipt(
+        &self,
+    ) -> Result<&SealedProviderEventMicrobatchReceipt, CoinbaseMarketPublicationError> {
+        match &self.public_state {
+            CoinbasePublicPublicationState::Sealed { token, .. } => Ok(token.persisted_receipt()),
+            CoinbasePublicPublicationState::NotApplicable
+            | CoinbasePublicPublicationState::AwaitingSeal { .. } => {
+                Err(CoinbaseMarketPublicationError::ProfileMismatch)
+            }
+        }
+    }
+
+    /// Returns a checked conservative charge for the sealed continuation retained in rendezvous.
+    pub fn conservative_retained_bytes(&self) -> Option<usize> {
+        let (decoded_retained_bytes, receipt) = match &self.public_state {
+            CoinbasePublicPublicationState::Sealed {
+                token,
+                decoded_retained_bytes,
+                ..
+            } => (*decoded_retained_bytes, token.persisted_receipt()),
+            CoinbasePublicPublicationState::NotApplicable
+            | CoinbasePublicPublicationState::AwaitingSeal { .. } => return None,
+        };
+        let event_ids = size_of::<[u8; 16]>().checked_mul(self.physical_event_ids.len())?;
+        let capture = receipt.capture();
+        let receipt_bytes = capture
+            .source_id()
+            .retained_bytes()
+            .checked_add(
+                capture
+                    .metadata_revision()
+                    .as_source_identifier()
+                    .retained_bytes(),
+            )?
+            .checked_add(capture.dataset().retained_bytes())?
+            .checked_add(capture.stream_identity().retained_bytes())?
+            .checked_add(size_of_val(capture.frames()))?
+            .checked_add(receipt.segment().relative_reference().len())?
+            .checked_add(size_of_val(receipt.segment().frames()))?;
+        size_of::<Self>()
+            .checked_add(decoded_retained_bytes)?
+            .checked_add(event_ids)?
+            .checked_add(receipt_bytes)?
+            .checked_add(self.dataset.retained_bytes())?
+            .checked_add(self.stream_identity.retained_bytes())?
+            .checked_add(
+                self.expected_channel
+                    .as_source_identifier()
+                    .retained_bytes(),
+            )?
+            .checked_add(
+                self.evidence
+                    .product()
+                    .as_source_identifier()
+                    .retained_bytes(),
+            )?
+            .checked_add(self.evidence.venue().retained_bytes())
+    }
+
+    /// Consumes the sealed frame and exact post-commit live rows into the common immutable
+    /// provider-event binding. No caller-constructed `MarketEvent` is accepted at this boundary.
+    pub fn try_publish_committed(
+        mut self,
+        committed: Vec<CommittedResearchMarketObservation>,
+    ) -> Result<SealedProviderPublicationBinding, CoinbaseMarketPublicationError> {
+        let state = std::mem::replace(
+            &mut self.public_state,
+            CoinbasePublicPublicationState::NotApplicable,
+        );
+        let CoinbasePublicPublicationState::Sealed {
+            token,
+            frame_id,
+            available_at,
+            ..
+        } = state
+        else {
+            return Err(CoinbaseMarketPublicationError::ProfileMismatch);
+        };
+        let expected = self.typed_batch.observations().len();
+        if expected == 0 || committed.len() != expected {
+            return Err(CoinbaseMarketPublicationError::CanonicalAlignmentMismatch);
+        }
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(expected)
+            .map_err(|_| CoinbaseMarketPublicationError::Allocation)?;
+        for (wire_ordinal, committed) in committed.into_iter().enumerate() {
+            validate_committed_public_row(
+                &committed,
+                &self,
+                frame_id,
+                available_at,
+                wire_ordinal,
+                expected,
+            )?;
+            let ordinal = u16::try_from(wire_ordinal)
+                .map_err(|_| CoinbaseMarketPublicationError::CanonicalAlignmentMismatch)?;
+            rows.push(CoinbaseQualifiedPublicRow::new(
+                ordinal,
+                committed.into_parts().event,
+            ));
+        }
+        let tokens = CoinbaseMarketSealedTokens::AdvancedTrade(token);
+        self.validate_tokens(&tokens)?;
+        match self.publish_qualified(
+            tokens,
+            CoinbaseQualifiedMarketPublication::AdvancedTrade {
+                rows,
+                omissions: Vec::new(),
+            },
+            Some(frame_id),
+        )? {
+            CoinbaseSealedMarketPublication::Published(binding) => Ok(binding),
+            CoinbaseSealedMarketPublication::SealedRaw(_) => {
+                Err(CoinbaseMarketPublicationError::CanonicalAlignmentMismatch)
+            }
+        }
+    }
+
+    /// Consumes an already sealed public frame into an explicit raw-only terminal disposition.
+    pub fn into_sealed_raw(
+        mut self,
+        reason: CoinbaseMarketNonPublicationReason,
+    ) -> Result<CoinbaseSealedRawMarketPublication, CoinbaseMarketPublicationError> {
+        let state = std::mem::replace(
+            &mut self.public_state,
+            CoinbasePublicPublicationState::NotApplicable,
+        );
+        let CoinbasePublicPublicationState::Sealed { token, .. } = state else {
+            return Err(CoinbaseMarketPublicationError::ProfileMismatch);
+        };
+        Ok(CoinbaseSealedRawMarketPublication {
+            tokens: CoinbaseMarketSealedTokens::AdvancedTrade(token),
+            reason,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -462,6 +721,68 @@ struct CoinbaseDirectReplayPublicationEvidence {
 }
 
 impl CoinbaseMarketHandoff {
+    /// Splits one public Advanced Trade handoff into the generic live batch and a one-use durable
+    /// publication continuation over the exact capture-owned physical frame.
+    ///
+    /// The cloned provider-normalized graph is bounded by the common decoder limit and remains
+    /// inside the publication continuation. Canonical events are accepted later only from the
+    /// live runtime's non-constructible post-commit export for this exact [`FrameId`](market_squawk_sources::FrameId).
+    pub fn into_pending_publication(
+        self,
+        frame: &ValidatedRawMarketFrame<'_>,
+        capture: ProviderEventMicrobatchMaterial,
+        available_at: Timestamp,
+    ) -> Result<
+        (
+            DecodedProviderBatch,
+            CoinbaseMarketSealRejoin,
+            ProviderCaptureSealRequest,
+        ),
+        CoinbaseMarketPublicationError,
+    > {
+        validate_public_capture(&self, frame, &capture, available_at)?;
+        let decoded_retained_bytes = self
+            .typed_batch()
+            .retained_bytes()
+            .map_err(|_| CoinbaseMarketPublicationError::Allocation)?;
+        let publication_batch = self.typed_batch().clone();
+        let frame_id = frame.frame().frame_id();
+        let receipt = capture.receipt();
+        let [physical] = receipt.frames() else {
+            return Err(CoinbaseMarketPublicationError::RawEvidenceMismatch);
+        };
+        let dataset = receipt.dataset().clone();
+        let stream_identity = receipt.stream_identity().clone();
+        let physical_connection_id = physical.connection_id();
+        let physical_event_ids = vec![physical.event_id()].into_boxed_slice();
+        let (evidence, raw, live_batch) = self.into_parts();
+        let CoinbaseMarketRawLineage::AdvancedTrade(_payload) = raw else {
+            return Err(CoinbaseMarketPublicationError::ProfileMismatch);
+        };
+        let expected_channel = expected_provider_channel(evidence.feed())?;
+        let (expectation, seal_request) = capture.into_sealing_parts();
+        let rejoin = CoinbaseMarketSealRejoin {
+            evidence,
+            typed_batch: publication_batch,
+            expected_channel,
+            dataset,
+            stream_identity,
+            physical_connection_id,
+            physical_event_ids,
+            raw: CoinbasePublicationRawEvidence::AdvancedTrade {
+                source_sequence: None,
+                exchange_at: None,
+            },
+            public_state: CoinbasePublicPublicationState::AwaitingSeal {
+                expectation,
+                frame_id,
+                available_at,
+                decoded_retained_bytes,
+            },
+        };
+        Ok((live_batch, rejoin, seal_request))
+    }
+
     /// Consumes exact provider lineage into application-owned seal material plus opaque rejoin.
     pub fn into_publication_seal_handoff(
         self,
@@ -506,6 +827,8 @@ impl CoinbaseMarketHandoff {
                     stream_identity: stream_identity.clone(),
                     frames: vec![frame].into_boxed_slice(),
                 };
+                let source_sequence = Some(evidence.continuity().terminal());
+                let exchange_at = Some(evidence.provider_published_at());
                 Ok((
                     CoinbaseMarketSealRejoin {
                         evidence,
@@ -515,7 +838,11 @@ impl CoinbaseMarketHandoff {
                         stream_identity,
                         physical_connection_id: connection_id,
                         physical_event_ids: event_ids.into_boxed_slice(),
-                        raw: CoinbasePublicationRawEvidence::AdvancedTrade,
+                        raw: CoinbasePublicationRawEvidence::AdvancedTrade {
+                            source_sequence,
+                            exchange_at,
+                        },
+                        public_state: CoinbasePublicPublicationState::NotApplicable,
                     },
                     CoinbaseMarketSealMaterial::AdvancedTrade(material),
                 ))
@@ -654,6 +981,7 @@ impl CoinbaseMarketHandoff {
                             snapshot: snapshot_evidence,
                             replay: replay_evidence.into_boxed_slice(),
                         },
+                        public_state: CoinbasePublicPublicationState::NotApplicable,
                     },
                     CoinbaseMarketSealMaterial::ExchangeDirect {
                         snapshot: snapshot_material,
@@ -681,7 +1009,7 @@ impl CoinbaseMarketSealRejoin {
                 ))
             }
             CoinbaseMarketQualificationOutcome::Qualified(qualified) => {
-                self.publish_qualified(tokens, qualified)
+                self.publish_qualified(tokens, qualified, None)
             }
         }
     }
@@ -692,7 +1020,10 @@ impl CoinbaseMarketSealRejoin {
     ) -> Result<(), CoinbaseMarketPublicationError> {
         match (&self.raw, tokens) {
             (
-                CoinbasePublicationRawEvidence::AdvancedTrade,
+                CoinbasePublicationRawEvidence::AdvancedTrade {
+                    source_sequence,
+                    exchange_at,
+                },
                 CoinbaseMarketSealedTokens::AdvancedTrade(token),
             ) => validate_event_token(
                 token,
@@ -703,8 +1034,8 @@ impl CoinbaseMarketSealRejoin {
                 self.physical_connection_id,
                 &self.physical_event_ids,
                 &[ExpectedFrame {
-                    sequence: Some(self.evidence.continuity().terminal()),
-                    exchange_at: Some(self.evidence.provider_published_at()),
+                    sequence: *source_sequence,
+                    exchange_at: *exchange_at,
                     received_at: self.typed_batch.evidence().received_at(),
                     payload_digest: self.typed_batch.evidence().payload_digest(),
                 }],
@@ -754,16 +1085,19 @@ impl CoinbaseMarketSealRejoin {
         self,
         tokens: CoinbaseMarketSealedTokens,
         qualified: CoinbaseQualifiedMarketPublication,
+        physical_frame_id: Option<market_squawk_sources::FrameId>,
     ) -> Result<CoinbaseSealedMarketPublication, CoinbaseMarketPublicationError> {
         match (&self.raw, tokens, qualified) {
             (
-                CoinbasePublicationRawEvidence::AdvancedTrade,
+                CoinbasePublicationRawEvidence::AdvancedTrade { .. },
                 CoinbaseMarketSealedTokens::AdvancedTrade(token),
                 CoinbaseQualifiedMarketPublication::AdvancedTrade { rows, omissions },
             ) => {
                 let (events, native, ordinals) = self.public_rows(rows, omissions)?;
-                let sidecar =
-                    self.encode_batch_sidecar(ProviderPublicationBindingKind::EventMicrobatch)?;
+                let sidecar = self.encode_batch_sidecar(
+                    ProviderPublicationBindingKind::EventMicrobatch,
+                    physical_frame_id,
+                )?;
                 let batch = ProviderMarketEventBatch::try_new(
                     self.typed_batch.evidence().binding().source_id().clone(),
                     self.typed_batch
@@ -814,6 +1148,7 @@ impl CoinbaseMarketSealRejoin {
                     vec![encode_snapshot_native(&snapshot, &self.evidence)?],
                     Some(self.encode_batch_sidecar(
                         ProviderPublicationBindingKind::CompositeResponseEvent,
+                        None,
                     )?),
                 )?;
                 let response_binding = SealedProviderResponseMarketEventBinding::try_new(
@@ -916,12 +1251,23 @@ impl CoinbaseMarketSealRejoin {
         let mut events = Vec::new();
         let mut native = Vec::new();
         let mut ordinals = Vec::new();
+        events
+            .try_reserve_exact(rows.len())
+            .map_err(|_| CoinbaseMarketPublicationError::Allocation)?;
+        native
+            .try_reserve_exact(rows.len())
+            .map_err(|_| CoinbaseMarketPublicationError::Allocation)?;
+        ordinals
+            .try_reserve_exact(rows.len())
+            .map_err(|_| CoinbaseMarketPublicationError::Allocation)?;
         for row in rows {
             let index = usize::from(row.replay_frame_ordinal);
             let frame = replay
                 .get(index)
                 .ok_or(CoinbaseMarketPublicationError::CanonicalAlignmentMismatch)?;
-            covered.insert(row.replay_frame_ordinal);
+            if !covered.insert(row.replay_frame_ordinal) {
+                return Err(CoinbaseMarketPublicationError::CanonicalAlignmentMismatch);
+            }
             validate_direct_replay_event(&row.event, frame, self)?;
             native.push(encode_direct_native_row(
                 frame,
@@ -947,6 +1293,7 @@ impl CoinbaseMarketSealRejoin {
     fn encode_batch_sidecar(
         &self,
         kind: ProviderPublicationBindingKind,
+        physical_frame_id: Option<market_squawk_sources::FrameId>,
     ) -> Result<Bytes, CoinbaseMarketPublicationError> {
         #[derive(Serialize)]
         struct Sidecar<'a> {
@@ -965,6 +1312,7 @@ impl CoinbaseMarketSealRejoin {
             continuity_snapshot: Option<u64>,
             continuity_terminal: u64,
             source_generation: u64,
+            generation_frame_ordinal: Option<u64>,
             provider_published_at: i64,
             snapshot_provider_at: Option<i64>,
         }
@@ -998,6 +1346,7 @@ impl CoinbaseMarketSealRejoin {
                 .binding()
                 .connection_generation()
                 .get(),
+            generation_frame_ordinal: physical_frame_id.map(|frame_id| frame_id.get()),
             provider_published_at: self.evidence.provider_published_at().unix_nanos(),
             snapshot_provider_at: self
                 .evidence
@@ -1014,6 +1363,64 @@ struct ExpectedFrame {
     exchange_at: Option<Timestamp>,
     received_at: Timestamp,
     payload_digest: EvidenceDigest,
+}
+
+fn validate_public_capture(
+    handoff: &CoinbaseMarketHandoff,
+    validated: &ValidatedRawMarketFrame<'_>,
+    capture: &ProviderEventMicrobatchMaterial,
+    available_at: Timestamp,
+) -> Result<(), CoinbaseMarketPublicationError> {
+    if handoff.evidence().feed() != CoinbaseMarketFeed::AdvancedTradePublic
+        || !matches!(
+            handoff.raw_lineage(),
+            CoinbaseMarketRawLineage::AdvancedTrade(_)
+        )
+    {
+        return Err(CoinbaseMarketPublicationError::ProfileMismatch);
+    }
+    let frame = validated.frame();
+    let receipt = capture.receipt();
+    let [physical] = receipt.frames() else {
+        return Err(CoinbaseMarketPublicationError::RawEvidenceMismatch);
+    };
+    let [record] = capture.records() else {
+        return Err(CoinbaseMarketPublicationError::RawEvidenceMismatch);
+    };
+    let decoder = handoff.typed_batch().evidence();
+    let binding = decoder.binding();
+    let payload_bytes = u64::try_from(frame.payload().len())
+        .map_err(|_| CoinbaseMarketPublicationError::RawEvidenceMismatch)?;
+    if frame.transport() != TransportFrameKind::Text
+        || frame.source_id() != binding.source_id()
+        || frame.metadata_revision() != binding.metadata_revision()
+        || frame.session_id() != binding.session_id()
+        || frame.connection_generation() != binding.connection_generation()
+        || frame.frame_id() != decoder.frame_id()
+        || frame.received_at() != decoder.received_at()
+        || frame.payload() != handoff.raw_payload().as_bytes()
+        || handoff.raw_payload_digest() != decoder.payload_digest()
+        || receipt.source_id() != frame.source_id()
+        || receipt.metadata_revision() != frame.metadata_revision()
+        || physical.ordinal() != 0
+        || physical.event_id() == [0; 16]
+        || physical.connection_id() == [0; 16]
+        || physical.source_sequence().is_some()
+        || physical.exchange_at().is_some()
+        || physical.received_at() != frame.received_at()
+        || physical.payload_bytes() != payload_bytes
+        || physical.payload_digest() != decoder.payload_digest()
+        || record.source() != frame.source_id().as_str()
+        || record.source_sequence().is_some()
+        || record.exchange_at().is_some()
+        || record.payload() != frame.payload()
+        || *record.event_id().as_bytes() != physical.event_id()
+        || *record.connection_id().as_bytes() != physical.connection_id()
+        || available_at < frame.received_at()
+    {
+        return Err(CoinbaseMarketPublicationError::RawEvidenceMismatch);
+    }
+    Ok(())
 }
 
 fn validate_event_token(
@@ -1123,6 +1530,64 @@ fn validate_public_event(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "committed physical, wire, canonical, and clock coordinates remain explicit"
+)]
+fn validate_committed_public_row(
+    committed: &CommittedResearchMarketObservation,
+    handoff: &CoinbaseMarketSealRejoin,
+    frame_id: market_squawk_sources::FrameId,
+    available_at: Timestamp,
+    wire_ordinal: usize,
+    row_count: usize,
+) -> Result<(), CoinbaseMarketPublicationError> {
+    let observation = handoff
+        .typed_batch
+        .observations()
+        .get(wire_ordinal)
+        .ok_or(CoinbaseMarketPublicationError::CanonicalAlignmentMismatch)?;
+    let event = committed.event();
+    let provenance = event_provenance(event);
+    validate_public_event(event, observation, handoff)?;
+    if committed.qualification().recorded_quality() != DataQuality::DirectUnverified
+        || committed.qualification().binding() != provenance.binding()
+        || committed.connection_generation()
+            != handoff
+                .typed_batch
+                .evidence()
+                .binding()
+                .connection_generation()
+        || committed.frame_id() != frame_id
+        || committed.wire_ordinal() != wire_ordinal
+        || committed.row_count() != row_count
+        || provenance.available_at() < available_at
+        || !stable_public_trade_identity_matches(observation, committed)
+    {
+        return Err(CoinbaseMarketPublicationError::CanonicalAlignmentMismatch);
+    }
+    Ok(())
+}
+
+fn stable_public_trade_identity_matches(
+    observation: &market_squawk_sources::ProviderNormalizedObservation,
+    committed: &CommittedResearchMarketObservation,
+) -> bool {
+    match observation.payload() {
+        ProviderObservationPayload::Trade { trade_id, .. } => {
+            committed.stable_trade_id() == Some(trade_id)
+        }
+        ProviderObservationPayload::BookSnapshot(_) | ProviderObservationPayload::BookDelta(_) => {
+            committed.stable_trade_id().is_none()
+        }
+        ProviderObservationPayload::Quote { .. }
+        | ProviderObservationPayload::Auction { .. }
+        | ProviderObservationPayload::TradingHalt { .. }
+        | ProviderObservationPayload::InstrumentStatus { .. }
+        | ProviderObservationPayload::CorporateAction { .. } => false,
+    }
+}
+
 fn validate_direct_snapshot_event(
     event: &MarketEvent,
     handoff: &CoinbaseMarketSealRejoin,
@@ -1155,9 +1620,26 @@ fn validate_direct_replay_event(
     handoff: &CoinbaseMarketSealRejoin,
 ) -> Result<(), CoinbaseMarketPublicationError> {
     let provenance = event_provenance(event);
+    let event_class = event_class_of(event);
+    let expected_sequence = match event_class {
+        LiveEventClass::BookSnapshot | LiveEventClass::BookDelta => Some(frame.sequence),
+        LiveEventClass::Trade
+        | LiveEventClass::Quote
+        | LiveEventClass::Auction
+        | LiveEventClass::TradingHalt
+        | LiveEventClass::InstrumentStatus
+        | LiveEventClass::CorporateAction => None,
+    };
     if provenance.source_id() != handoff.typed_batch.evidence().binding().source_id()
         || provenance.binding().metadata_revision()
             != handoff.typed_batch.evidence().binding().metadata_revision()
+        || provenance.binding().session_id()
+            != handoff
+                .typed_batch
+                .evidence()
+                .binding()
+                .session_id()
+                .as_source_identifier()
         || provenance.binding().provider_product() != handoff.evidence.product()
         || provenance.binding().provider_channel() != &handoff.expected_channel
         || provenance.binding().venue_id() != handoff.evidence.venue()
@@ -1168,10 +1650,16 @@ fn validate_direct_replay_event(
                 .evidence()
                 .binding()
                 .connection_generation()
+        || provenance.binding().event_class() != event_class
         || provenance.binding().payload_digest() != frame.payload_digest
         || provenance.received_at() != frame.received_at
         || provenance.source_timestamp() != Some(frame.provider_timestamp)
-        || canonical_sequence(event).is_some_and(|sequence| sequence != frame.sequence)
+        || provenance.recorded_quality() != DataQuality::DirectUnverified
+        || provenance.execution_eligibility()
+            != market_squawk_domain::ExecutionEligibility::Ineligible
+        || provenance.available_at() < provenance.received_at()
+        || provenance.ingested_at() < provenance.available_at()
+        || canonical_sequence(event) != expected_sequence
     {
         return Err(CoinbaseMarketPublicationError::CanonicalAlignmentMismatch);
     }
@@ -1209,8 +1697,11 @@ fn validate_common_event(
         || provenance.source_timestamp() != source_timestamp
         || event_class_of(event) != event_class
         || event_depth(event) != depth
-        || (handoff.evidence.feed() == CoinbaseMarketFeed::AdvancedTradePublic
-            && provenance.recorded_quality() == DataQuality::DirectVerified)
+        || provenance.recorded_quality() != DataQuality::DirectUnverified
+        || provenance.execution_eligibility()
+            != market_squawk_domain::ExecutionEligibility::Ineligible
+        || provenance.available_at() < provenance.received_at()
+        || provenance.ingested_at() < provenance.available_at()
     {
         return Err(CoinbaseMarketPublicationError::CanonicalAlignmentMismatch);
     }

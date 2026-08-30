@@ -1,5 +1,12 @@
 //! Validated platform-to-provider production composition.
 
+#[path = "coinbase_publication_supervisor.rs"]
+mod coinbase_publication_supervisor;
+#[path = "kraken_publication_supervisor.rs"]
+mod kraken_publication_supervisor;
+#[path = "live_runtime.rs"]
+mod live_runtime;
+
 use market_squawk_adapter_coinbase::{
     CoinbaseChannel, CoinbaseConfigError, CoinbaseExchangeConfig, CoinbaseExchangeDecoder,
     CoinbaseExchangeSource, CoinbaseTransportLimits,
@@ -10,7 +17,7 @@ use market_squawk_domain::{
 };
 use market_squawk_live::{
     LiveRouteConfig, LiveRuntimeConfig, LiveSnapshotReader, RouteActionHook,
-    RouteQualifiedMarketExport, ShardKey,
+    RouteCommittedResearchMarketExport, RouteQualifiedMarketExport, ShardKey,
 };
 use market_squawk_platform::{
     AppConfig, CaptureProcessInfrastructure, CaptureProcessInfrastructureLimits,
@@ -26,7 +33,8 @@ use market_squawk_sources::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    num::{NonZeroU16, NonZeroU32, NonZeroU64},
+    error::Error as StdError,
+    num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -41,9 +49,20 @@ use super::kraken::{
     KrakenPublicChannel, KrakenPublicCurrentnessObserver, KrakenPublicSupervisorSet,
     KrakenPublicSupervisorSetError, ProductionKrakenProfileError, ProductionKrakenProfileSet,
 };
+use super::kraken_publication::{
+    KrakenCapturedPublicationIngress, KrakenCapturedPublicationReceiver,
+};
 use super::provider::{ProductionProviderError, ProductionSourceProfile, ProductionSourceProvider};
 use super::route_actor::RouteBufferLimits;
+use super::sink::{
+    CoinbaseCapturedPublicationIngress, CoinbaseCapturedPublicationReceiver,
+    ProductionCapturedPublicationIngress,
+};
 use super::supervisor::{ProductionSourceSupervisor, ProductionSupervisorError};
+use crate::provider_activation::CryptoMarketPublicationPackage;
+use coinbase_publication_supervisor::CoinbasePublicationSupervisor;
+use kraken_publication_supervisor::KrakenPublicationSupervisor;
+use live_runtime::ProductionLiveRuntimeOwner;
 
 const SOURCE_ID: &str = "coinbase-exchange-public";
 const PROVISIONAL_METADATA_REVISION: &str = "coinbase-advanced-trade-v1-provisional";
@@ -61,6 +80,91 @@ const BACKOFF_JITTER_BASIS_POINTS: u16 = 2_000;
 const MAX_CLOCK_SKEW_NANOS: u64 = 1_000_000_000;
 const PRE_ACKNOWLEDGEMENT_DATA_MESSAGE_CAPACITY: usize = 64;
 const PRE_ACKNOWLEDGEMENT_DATA_BYTE_CAPACITY: usize = 32 * 1024 * 1024;
+const CRYPTO_PUBLICATION_CHANNEL_CAPACITY: usize = 4;
+const CRYPTO_PUBLICATION_RETAINED_FRAMES: usize = 8;
+
+struct CryptoPublicationStartup {
+    package: CryptoMarketPublicationPackage,
+    cancellation: CancellationToken,
+    captured: CryptoCapturedPublicationStartup,
+    committed_receivers: Vec<market_squawk_live::CommittedResearchMarketObservationReceiver>,
+    maximum_inflight: NonZeroUsize,
+    limits: crate::application::CryptoPublicationRendezvousLimits,
+}
+
+enum CryptoCapturedPublicationStartup {
+    Coinbase {
+        ingress: CoinbaseCapturedPublicationIngress,
+        receiver: CoinbaseCapturedPublicationReceiver,
+    },
+    Kraken {
+        book_ingress: KrakenCapturedPublicationIngress,
+        book_receiver: KrakenCapturedPublicationReceiver,
+        trade_ingress: KrakenCapturedPublicationIngress,
+        trade_receiver: KrakenCapturedPublicationReceiver,
+    },
+}
+
+enum CryptoPublicationIngresses {
+    Coinbase(ProductionCapturedPublicationIngress),
+    Kraken {
+        book: ProductionCapturedPublicationIngress,
+        trades: ProductionCapturedPublicationIngress,
+    },
+}
+
+#[derive(Debug)]
+enum CryptoPublicationSupervisor {
+    Coinbase(CoinbasePublicationSupervisor),
+    Kraken(KrakenPublicationSupervisor),
+}
+
+impl CryptoPublicationSupervisor {
+    fn is_healthy(&self) -> bool {
+        match self {
+            Self::Coinbase(supervisor) => supervisor.is_healthy(),
+            Self::Kraken(supervisor) => supervisor.is_healthy(),
+        }
+    }
+
+    fn durable_read_count(&self) -> usize {
+        match self {
+            Self::Coinbase(supervisor) => supervisor.durable_read_count(),
+            Self::Kraken(supervisor) => supervisor.durable_read_count(),
+        }
+    }
+
+    fn append_durable_reads(
+        &self,
+        destination: &mut Vec<crate::application::CryptoMarketDurableRead>,
+    ) {
+        match self {
+            Self::Coinbase(supervisor) => supervisor.append_durable_reads(destination),
+            Self::Kraken(supervisor) => supervisor.append_durable_reads(destination),
+        }
+    }
+
+    async fn shutdown(self, deadline: Instant) -> Result<(), ProductionLiveSourceRuntimeError> {
+        match self {
+            Self::Coinbase(supervisor) => supervisor
+                .shutdown(deadline)
+                .await
+                .map_err(crypto_publication_error),
+            Self::Kraken(supervisor) => supervisor
+                .shutdown(deadline)
+                .await
+                .map_err(crypto_publication_error),
+        }
+    }
+}
+
+fn crypto_publication_error(
+    source: impl StdError + Send + Sync + 'static,
+) -> ProductionLiveSourceRuntimeError {
+    ProductionLiveSourceRuntimeError::CryptoPublication {
+        source: Box::new(source),
+    }
+}
 
 /// Validated, connector-sealed production Coinbase composition.
 ///
@@ -95,6 +199,10 @@ impl ProductionSourceInstallation {
         }
     }
 
+    const fn is_kraken(&self) -> bool {
+        matches!(self, Self::Kraken { .. })
+    }
+
     #[cfg(all(test, debug_assertions))]
     fn with_local_kraken_endpoint_for_test(
         self,
@@ -108,6 +216,61 @@ impl ProductionSourceInstallation {
             trades: trades.with_local_kraken_endpoint_for_test(endpoint)?,
         })
     }
+}
+
+fn validate_crypto_publication_topology(
+    installation: &ProductionSourceInstallation,
+    package: &CryptoMarketPublicationPackage,
+) -> Result<(), ProductionLiveSourceRuntimeError> {
+    if matches!(
+        (installation, package),
+        (
+            ProductionSourceInstallation::Single(_),
+            CryptoMarketPublicationPackage::Coinbase(_)
+        ) | (
+            ProductionSourceInstallation::Kraken { .. },
+            CryptoMarketPublicationPackage::Kraken(_)
+        )
+    ) {
+        Ok(())
+    } else {
+        Err(ProductionLiveSourceRuntimeError::CryptoPublicationAuthorityMismatch)
+    }
+}
+
+fn committed_research_exports(
+    routes: &[LiveRouteConfig],
+    capacity: NonZeroUsize,
+    maximum_retained_bytes: NonZeroUsize,
+) -> Result<
+    (
+        Vec<RouteCommittedResearchMarketExport>,
+        Vec<market_squawk_live::CommittedResearchMarketObservationReceiver>,
+    ),
+    ProductionLiveSourceRuntimeError,
+> {
+    if routes.is_empty() {
+        return Err(ProductionLiveSourceRuntimeError::CryptoPublicationBounds);
+    }
+    let mut exports = Vec::new();
+    let mut receivers = Vec::new();
+    exports
+        .try_reserve_exact(routes.len())
+        .map_err(|_| ProductionLiveSourceRuntimeError::CryptoPublicationBounds)?;
+    receivers
+        .try_reserve_exact(routes.len())
+        .map_err(|_| ProductionLiveSourceRuntimeError::CryptoPublicationBounds)?;
+    for route in routes {
+        let (export, receiver) = RouteCommittedResearchMarketExport::try_new(
+            route.route().clone(),
+            capacity.get(),
+            maximum_retained_bytes.get(),
+        )
+        .map_err(|_| ProductionLiveSourceRuntimeError::CryptoPublicationBounds)?;
+        exports.push(export);
+        receivers.push(receiver);
+    }
+    Ok((exports, receivers))
 }
 
 impl ProductionLiveSourceComposition {
@@ -292,11 +455,12 @@ impl ProductionLiveSourceComposition {
             ))?;
         let live = LiveRuntimeComposition::start(runtime_config, self.routes.clone()).await?;
         self.start_on_live_runtime(
-            live,
+            ProductionLiveRuntimeOwner::standard(live),
             route_buffer_limits,
             paths,
             capture_process,
             cancellation,
+            None,
         )
         .await
     }
@@ -333,11 +497,12 @@ impl ProductionLiveSourceComposition {
         )
         .await?;
         self.start_on_live_runtime(
-            live,
+            ProductionLiveRuntimeOwner::standard(live),
             route_buffer_limits,
             paths,
             capture_process,
             cancellation,
+            None,
         )
         .await
     }
@@ -378,11 +543,12 @@ impl ProductionLiveSourceComposition {
         )
         .await?;
         self.start_on_live_runtime(
-            live,
+            ProductionLiveRuntimeOwner::standard(live),
             route_buffer_limits,
             paths,
             capture_process,
             cancellation,
+            None,
         )
         .await
     }
@@ -416,22 +582,105 @@ impl ProductionLiveSourceComposition {
         )
         .await?;
         self.start_on_live_runtime(
+            ProductionLiveRuntimeOwner::standard(live),
+            route_buffer_limits,
+            paths,
+            capture_process,
+            cancellation,
+            None,
+        )
+        .await
+    }
+
+    /// Starts a public crypto runtime with exact captured-frame handoffs and one independently
+    /// bounded committed-research export for every configured route.
+    pub(crate) async fn start_with_qualified_market_exports_and_crypto_publication(
+        self,
+        runtime_config: LiveRuntimeConfig,
+        qualified_market_exports: Vec<RouteQualifiedMarketExport>,
+        package: CryptoMarketPublicationPackage,
+        publication_cancellation: CancellationToken,
+        cancellation: CancellationToken,
+    ) -> Result<ProductionLiveSourceRuntime, ProductionLiveSourceRuntimeError> {
+        validate_crypto_publication_topology(&self.installation, &package)?;
+        self.validate_qualified_market_export_routes(&qualified_market_exports)?;
+        let route_buffer_limits = RouteBufferLimits::new(
+            runtime_config.mailbox_count_per_shard(),
+            runtime_config.maximum_message_bytes(),
+        );
+        let capacity = NonZeroUsize::new(CRYPTO_PUBLICATION_CHANNEL_CAPACITY)
+            .ok_or(ProductionLiveSourceRuntimeError::CryptoPublicationBounds)?;
+        let maximum_message_bytes =
+            usize::try_from(runtime_config.maximum_message_bytes().get())
+                .map_err(|_| ProductionLiveSourceRuntimeError::CryptoPublicationBounds)?;
+        let maximum_retained_bytes = maximum_message_bytes
+            .checked_mul(CRYPTO_PUBLICATION_RETAINED_FRAMES)
+            .and_then(NonZeroUsize::new)
+            .ok_or(ProductionLiveSourceRuntimeError::CryptoPublicationBounds)?;
+        let (committed_exports, committed_receivers) =
+            committed_research_exports(&self.routes, capacity, maximum_retained_bytes)?;
+        let captured = match &package {
+            CryptoMarketPublicationPackage::Coinbase(_) => {
+                let (ingress, receiver) = CoinbaseCapturedPublicationIngress::try_channel(capacity);
+                CryptoCapturedPublicationStartup::Coinbase { ingress, receiver }
+            }
+            CryptoMarketPublicationPackage::Kraken(_) => {
+                let (book_ingress, book_receiver) =
+                    KrakenCapturedPublicationIngress::try_channel(capacity);
+                let (trade_ingress, trade_receiver) =
+                    KrakenCapturedPublicationIngress::try_channel(capacity);
+                CryptoCapturedPublicationStartup::Kraken {
+                    book_ingress,
+                    book_receiver,
+                    trade_ingress,
+                    trade_receiver,
+                }
+            }
+        };
+        let limits = crate::application::CryptoPublicationRendezvousLimits::new(
+            capacity,
+            maximum_retained_bytes,
+            self.config.source_shutdown(),
+        );
+        let paths = LocalPaths::prepare(self.config.data_dir())?;
+        let capture_process =
+            initialize_capture_process_infrastructure(CaptureProcessInfrastructureLimits::new(
+                self.config
+                    .capture_destination_registry_memory_ceiling_bytes(),
+            ))?;
+        let live = ProductionLiveRuntimeOwner::start_with_research_exports(
+            runtime_config,
+            self.routes.clone(),
+            qualified_market_exports,
+            committed_exports,
+        )
+        .await?;
+        self.start_on_live_runtime(
             live,
             route_buffer_limits,
             paths,
             capture_process,
             cancellation,
+            Some(CryptoPublicationStartup {
+                package,
+                cancellation: publication_cancellation,
+                captured,
+                committed_receivers,
+                maximum_inflight: capacity,
+                limits,
+            }),
         )
         .await
     }
 
     async fn start_on_live_runtime(
         self,
-        live: LiveRuntimeComposition,
+        live: ProductionLiveRuntimeOwner,
         route_buffer_limits: RouteBufferLimits,
         paths: LocalPaths,
         capture_process: CaptureProcessInfrastructure,
         cancellation: CancellationToken,
+        crypto_publication: Option<CryptoPublicationStartup>,
     ) -> Result<ProductionLiveSourceRuntime, ProductionLiveSourceRuntimeError> {
         let Self {
             config,
@@ -445,9 +694,86 @@ impl ProductionLiveSourceComposition {
             .collect::<Vec<_>>();
         let source_shutdown = config.source_shutdown();
         let ingress = live.production_ingress();
+        let (mut publication, publication_ingresses) = match crypto_publication {
+            None => (None, None),
+            Some(startup) => {
+                let CryptoPublicationStartup {
+                    package,
+                    cancellation,
+                    captured,
+                    committed_receivers,
+                    maximum_inflight,
+                    limits,
+                } = startup;
+                let started = match (package, captured) {
+                    (
+                        CryptoMarketPublicationPackage::Coinbase(package),
+                        CryptoCapturedPublicationStartup::Coinbase { ingress, receiver },
+                    ) => CoinbasePublicationSupervisor::start(
+                        package,
+                        receiver,
+                        committed_receivers,
+                        maximum_inflight,
+                        limits,
+                        cancellation,
+                    )
+                    .map(|supervisor| {
+                        (
+                            CryptoPublicationSupervisor::Coinbase(supervisor),
+                            CryptoPublicationIngresses::Coinbase(
+                                ProductionCapturedPublicationIngress::Coinbase(ingress),
+                            ),
+                        )
+                    })
+                    .map_err(crypto_publication_error),
+                    (
+                        CryptoMarketPublicationPackage::Kraken(package),
+                        CryptoCapturedPublicationStartup::Kraken {
+                            book_ingress,
+                            book_receiver,
+                            trade_ingress,
+                            trade_receiver,
+                        },
+                    ) => KrakenPublicationSupervisor::start(
+                        package,
+                        book_receiver,
+                        trade_receiver,
+                        committed_receivers,
+                        maximum_inflight,
+                        limits,
+                        cancellation,
+                    )
+                    .map(|supervisor| {
+                        (
+                            CryptoPublicationSupervisor::Kraken(supervisor),
+                            CryptoPublicationIngresses::Kraken {
+                                book: ProductionCapturedPublicationIngress::Kraken(book_ingress),
+                                trades: ProductionCapturedPublicationIngress::Kraken(trade_ingress),
+                            },
+                        )
+                    })
+                    .map_err(crypto_publication_error),
+                    _ => Err(ProductionLiveSourceRuntimeError::CryptoPublicationAuthorityMismatch),
+                };
+                match started {
+                    Ok((supervisor, ingresses)) => (Some(supervisor), Some(ingresses)),
+                    Err(startup) => {
+                        return match live.shutdown().await {
+                            Ok(()) => Err(startup),
+                            Err(rollback) => {
+                                Err(ProductionLiveSourceRuntimeError::SourceStartupRollback {
+                                    startup: Box::new(startup),
+                                    rollback,
+                                })
+                            }
+                        };
+                    }
+                }
+            }
+        };
         let owner = match installation {
             ProductionSourceInstallation::Single(profile) => {
-                match ProductionSourceSupervisor::try_new_with_provider_rate(
+                let supervisor = ProductionSourceSupervisor::try_new_with_provider_rate(
                     &config,
                     profile,
                     paths,
@@ -456,49 +782,73 @@ impl ProductionLiveSourceComposition {
                     routes,
                     route_buffer_limits,
                     provider_rate,
-                ) {
+                );
+                let supervisor = match (supervisor, publication_ingresses) {
+                    (Ok(supervisor), None) => Ok(supervisor),
+                    (Ok(supervisor), Some(CryptoPublicationIngresses::Coinbase(ingress))) => {
+                        Ok(supervisor.with_publication(ingress))
+                    }
+                    (Ok(_), Some(CryptoPublicationIngresses::Kraken { .. })) => {
+                        Err(ProductionLiveSourceRuntimeError::CryptoPublicationAuthorityMismatch)
+                    }
+                    (Err(error), _) => Err(ProductionLiveSourceRuntimeError::Supervisor(error)),
+                };
+                match supervisor {
                     Ok(supervisor) => {
                         ProductionSupervisorOwner::start_single(supervisor, cancellation).await
                     }
-                    Err(error) => Err(ProductionLiveSourceRuntimeError::Supervisor(error)),
+                    Err(error) => Err(error),
                 }
             }
-            ProductionSourceInstallation::Kraken { book, trades } => {
-                match KrakenPublicCurrentnessObserver::try_new(
-                    live.snapshots(),
-                    &routes,
-                    book.metadata().source_id().clone(),
-                    trades.metadata().source_id().clone(),
-                ) {
-                    Err(error) => Err(map_kraken_supervisor_error(error)),
-                    Ok(currentness) => {
-                        let book_supervisor =
-                            ProductionSourceSupervisor::try_new_with_provider_rate(
-                                &config,
-                                book,
-                                paths.clone(),
-                                capture_process,
-                                ingress.clone(),
-                                routes.clone(),
-                                route_buffer_limits,
-                                provider_rate.clone(),
-                            )
-                            .map_err(ProductionLiveSourceRuntimeError::Supervisor);
-                        match book_supervisor {
-                            Err(error) => Err(error),
-                            Ok(book_supervisor) => {
-                                let trade_supervisor =
-                                    ProductionSourceSupervisor::try_new_with_provider_rate(
-                                        &config,
-                                        trades,
-                                        paths,
-                                        capture_process,
-                                        ingress,
-                                        routes,
-                                        route_buffer_limits,
-                                        provider_rate,
-                                    );
-                                match trade_supervisor {
+            ProductionSourceInstallation::Kraken { book, trades } => match publication_ingresses {
+                None | Some(CryptoPublicationIngresses::Coinbase(_)) => {
+                    Err(ProductionLiveSourceRuntimeError::CryptoPublicationAuthorityMismatch)
+                }
+                Some(CryptoPublicationIngresses::Kraken {
+                    book: book_publication,
+                    trades: trade_publication,
+                }) => {
+                    match KrakenPublicCurrentnessObserver::try_new(
+                        live.snapshots(),
+                        &routes,
+                        book.metadata().source_id().clone(),
+                        trades.metadata().source_id().clone(),
+                    ) {
+                        Err(error) => Err(map_kraken_supervisor_error(error)),
+                        Ok(currentness) => {
+                            let book_supervisor =
+                                ProductionSourceSupervisor::try_new_with_provider_rate(
+                                    &config,
+                                    book,
+                                    paths.clone(),
+                                    capture_process,
+                                    ingress.clone(),
+                                    routes.clone(),
+                                    route_buffer_limits,
+                                    provider_rate.clone(),
+                                )
+                                .map(|supervisor| supervisor.with_publication(book_publication))
+                                .map_err(ProductionLiveSourceRuntimeError::Supervisor);
+                            match book_supervisor {
+                                Err(error) => Err(error),
+                                Ok(book_supervisor) => {
+                                    let trade_supervisor =
+                                        ProductionSourceSupervisor::try_new_with_provider_rate(
+                                            &config,
+                                            trades,
+                                            paths,
+                                            capture_process,
+                                            ingress,
+                                            routes,
+                                            route_buffer_limits,
+                                            provider_rate,
+                                        )
+                                        .map(
+                                            |supervisor| {
+                                                supervisor.with_publication(trade_publication)
+                                            },
+                                        );
+                                    match trade_supervisor {
                                     Ok(trade_supervisor) => KrakenPublicSupervisorSet::start(
                                         book_supervisor,
                                         trade_supervisor,
@@ -521,26 +871,78 @@ impl ProductionLiveSourceComposition {
                                         ),
                                     },
                                 }
+                                }
                             }
                         }
                     }
                 }
-            }
+            },
         };
         let owner = match owner {
             Ok(owner) => owner,
             Err(startup) => {
-                return match live.shutdown().await {
-                    Ok(_shutdown) => Err(startup),
-                    Err(rollback) => Err(ProductionLiveSourceRuntimeError::SourceStartupRollback {
-                        startup: Box::new(startup),
-                        rollback,
-                    }),
+                let deadline = Instant::now()
+                    .checked_add(source_shutdown)
+                    .unwrap_or_else(Instant::now);
+                let publication_rollback = match publication.take() {
+                    Some(publication) => publication.shutdown(deadline).await.err(),
+                    None => None,
+                };
+                let live_rollback = live.shutdown().await.err();
+                return match (publication_rollback, live_rollback) {
+                    (None, None) => Err(startup),
+                    (None, Some(rollback)) => {
+                        Err(ProductionLiveSourceRuntimeError::SourceStartupRollback {
+                            startup: Box::new(startup),
+                            rollback,
+                        })
+                    }
+                    (Some(publication), None) => Err(
+                        ProductionLiveSourceRuntimeError::CryptoPublicationStartupRollback {
+                            startup: Box::new(startup),
+                            publication: Box::new(publication),
+                        },
+                    ),
+                    (Some(publication), Some(live)) => Err(
+                        ProductionLiveSourceRuntimeError::SourceStartupRollbackFailures {
+                            startup: Box::new(startup),
+                            publication: Box::new(publication),
+                            live,
+                        },
+                    ),
                 };
             }
         };
+        if publication
+            .as_ref()
+            .is_some_and(|publication| !publication.is_healthy())
+        {
+            let startup = ProductionLiveSourceRuntimeError::CryptoPublicationExitedBeforeStartup;
+            let deadline = Instant::now()
+                .checked_add(source_shutdown)
+                .unwrap_or_else(Instant::now);
+            let supervisor = owner.shutdown(source_shutdown).await.err().map(Box::new);
+            let publication = match publication.take() {
+                Some(publication) => publication.shutdown(deadline).await.err(),
+                None => None,
+            };
+            let live = live.shutdown().await.err();
+            return if supervisor.is_none() && publication.is_none() && live.is_none() {
+                Err(startup)
+            } else {
+                Err(
+                    ProductionLiveSourceRuntimeError::StartupRollbackFailureSet {
+                        startup: Box::new(startup),
+                        supervisor,
+                        publication: publication.map(Box::new),
+                        live,
+                    },
+                )
+            };
+        }
         Ok(ProductionLiveSourceRuntime {
             supervisor: owner,
+            publication,
             live,
             source_shutdown,
         })
@@ -691,7 +1093,8 @@ const fn kraken_channel_name(channel: KrakenPublicChannel) -> &'static str {
 pub struct ProductionLiveSourceRuntime {
     // Declared first so owner drop cancels every source before the live runtime is dropped.
     supervisor: ProductionSupervisorOwner,
-    live: LiveRuntimeComposition,
+    publication: Option<CryptoPublicationSupervisor>,
+    live: ProductionLiveRuntimeOwner,
     source_shutdown: Duration,
 }
 
@@ -700,11 +1103,32 @@ impl ProductionLiveSourceRuntime {
     #[must_use]
     pub fn is_healthy(&self) -> bool {
         self.supervisor.is_healthy()
+            && self
+                .publication
+                .as_ref()
+                .is_none_or(CryptoPublicationSupervisor::is_healthy)
     }
 
     /// Returns authority-free immutable snapshot access.
     pub fn snapshots(&self) -> LiveSnapshotReader {
         self.live.snapshots()
+    }
+
+    pub(crate) fn crypto_market_durable_read_count(&self) -> usize {
+        self.publication
+            .as_ref()
+            .map_or(0, CryptoPublicationSupervisor::durable_read_count)
+    }
+
+    /// Appends source-bound durable reads for internal provider-neutral selection. The caller
+    /// reserves the exact closed topology before taking the runtime registry lock.
+    pub(crate) fn append_crypto_market_durable_reads(
+        &self,
+        destination: &mut Vec<crate::application::CryptoMarketDurableRead>,
+    ) {
+        if let Some(publication) = self.publication.as_ref() {
+            publication.append_durable_reads(destination);
+        }
     }
 
     /// Installs one complete disabled action-hook group without reconnecting the source.
@@ -742,19 +1166,31 @@ impl ProductionLiveSourceRuntime {
     pub async fn shutdown(self) -> Result<(), ProductionLiveSourceRuntimeError> {
         let Self {
             supervisor,
+            publication,
             live,
             source_shutdown,
         } = self;
         let supervisor_result = supervisor.shutdown(source_shutdown).await.err();
+        let publication_result = match publication {
+            Some(publication) => {
+                let deadline = Instant::now()
+                    .checked_add(source_shutdown)
+                    .ok_or(ProductionLiveSourceRuntimeError::SupervisorShutdownDeadline)?;
+                publication.shutdown(deadline).await.err()
+            }
+            None => None,
+        };
         let live_result = live.shutdown().await;
-        match (supervisor_result, live_result) {
-            (None, Ok(_shutdown)) => Ok(()),
-            (Some(error), Ok(_shutdown)) => Err(error),
-            (None, Err(error)) => Err(ProductionLiveSourceRuntimeError::LiveRuntime(error)),
-            (Some(supervisor), Err(live)) => {
-                Err(ProductionLiveSourceRuntimeError::ShutdownFailures {
-                    supervisor: Box::new(supervisor),
-                    live,
+        match (supervisor_result, publication_result, live_result) {
+            (None, None, Ok(())) => Ok(()),
+            (Some(error), None, Ok(())) => Err(error),
+            (None, Some(error), Ok(())) => Err(error),
+            (None, None, Err(error)) => Err(ProductionLiveSourceRuntimeError::LiveRuntime(error)),
+            (supervisor, publication, live) => {
+                Err(ProductionLiveSourceRuntimeError::ShutdownFailureSet {
+                    supervisor: supervisor.map(Box::new),
+                    publication: publication.map(Box::new),
+                    live: live.err(),
                 })
             }
         }
@@ -1223,6 +1659,17 @@ pub enum ProductionLiveSourceRuntimeError {
     QualifiedMarketExportRouteSetMismatch,
     #[error("qualified-market exports contain duplicate ownership for route {route:?}")]
     DuplicateQualifiedMarketExportRoute { route: ShardKey },
+    #[error("public crypto durable publication does not match its exact source topology")]
+    CryptoPublicationAuthorityMismatch,
+    #[error("public crypto durable-publication bounds are invalid")]
+    CryptoPublicationBounds,
+    #[error("public crypto publication worker exited before source startup completed")]
+    CryptoPublicationExitedBeforeStartup,
+    #[error("public crypto publication failed")]
+    CryptoPublication {
+        #[source]
+        source: Box<dyn StdError + Send + Sync>,
+    },
     #[error(transparent)]
     LiveRuntime(#[from] LiveRuntimeCompositionError),
     #[error(transparent)]
@@ -1271,9 +1718,36 @@ pub enum ProductionLiveSourceRuntimeError {
         startup: Box<ProductionLiveSourceRuntimeError>,
         rollback: LiveRuntimeCompositionError,
     },
+    #[error("source startup failed and crypto publication rollback also failed")]
+    CryptoPublicationStartupRollback {
+        #[source]
+        startup: Box<ProductionLiveSourceRuntimeError>,
+        publication: Box<ProductionLiveSourceRuntimeError>,
+    },
+    #[error("source startup plus crypto publication and live-runtime rollback all failed")]
+    SourceStartupRollbackFailures {
+        #[source]
+        startup: Box<ProductionLiveSourceRuntimeError>,
+        publication: Box<ProductionLiveSourceRuntimeError>,
+        live: LiveRuntimeCompositionError,
+    },
+    #[error("source startup failed and one or more rollback barriers also failed")]
+    StartupRollbackFailureSet {
+        #[source]
+        startup: Box<ProductionLiveSourceRuntimeError>,
+        supervisor: Option<Box<ProductionLiveSourceRuntimeError>>,
+        publication: Option<Box<ProductionLiveSourceRuntimeError>>,
+        live: Option<LiveRuntimeCompositionError>,
+    },
     #[error("source supervisor and live runtime both failed during shutdown")]
     ShutdownFailures {
         supervisor: Box<ProductionLiveSourceRuntimeError>,
         live: LiveRuntimeCompositionError,
+    },
+    #[error("multiple production source shutdown barriers failed")]
+    ShutdownFailureSet {
+        supervisor: Option<Box<ProductionLiveSourceRuntimeError>>,
+        publication: Option<Box<ProductionLiveSourceRuntimeError>>,
+        live: Option<LiveRuntimeCompositionError>,
     },
 }

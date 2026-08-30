@@ -67,11 +67,14 @@ pub(crate) use paper::{
 pub(crate) use research::{
     AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
     AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
-    AnalyticalForecastEvidenceReader, DatasetPreparationAuthority, DatasetPreparationError,
+    AnalyticalForecastEvidenceReader, CoinbaseMarketApplicationOutcome, CryptoCommittedRowIngress,
+    CryptoMarketDurableRead, CryptoMarketDurableReadWriter, CryptoMarketPublicationAuthority,
+    CryptoMarketPublicationError, CryptoPendingFrameIngress, CryptoPublicationRendezvousLimits,
+    DatasetPreparationAuthority, DatasetPreparationError,
     DatasetPreparationOptions, DatasetPreparationPreview, DatasetPreparationPreviewRequest,
     DatasetPreparationReceipt, DatasetPreparationSelection, FredLatestKnownOperation,
-    FredPublishedGenerationHandoff, TreasuryApplicationClosure, TreasuryLatestKnownOperation,
-    TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
+    FredPublishedGenerationHandoff, KrakenMarketApplicationOutcome, TreasuryApplicationClosure,
+    TreasuryLatestKnownOperation, TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
     ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
 };
 pub use research::{

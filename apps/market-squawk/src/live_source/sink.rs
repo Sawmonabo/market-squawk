@@ -1,5 +1,8 @@
 //! Capture-first Coinbase sink and bounded live-route activation.
 
+#[path = "coinbase_publication.rs"]
+mod coinbase_publication;
+
 use std::{
     collections::{HashMap, VecDeque},
     mem::size_of,
@@ -7,18 +10,22 @@ use std::{
 };
 
 use super::{
+    composition::system_timestamp,
     display_market::{
         DisplayMarketIngress, DisplayMarketRouteIdentity, DisplayMarketTerminalFailure,
     },
+    kraken_publication::KrakenCapturedPublicationIngress,
     provider::{ProductionDecodeOutcome, ProductionMarketDecoder, StartupReadinessPolicy},
     route_actor::{RouteActivationBinding, RouteActivationPublisher},
     subscription_state::{
         GenerationIdentity, SubscriptionFailure, SubscriptionPhase, SubscriptionStateMachine,
     },
 };
-use market_squawk_adapter_coinbase::{
-    CoinbaseMarketDecodeOutcome, CoinbaseMarketFeed, CoinbaseMarketRawLineage,
+pub(super) use coinbase_publication::{
+    CoinbaseCapturedPublicationIngress, CoinbaseCapturedPublicationInput,
+    CoinbaseCapturedPublicationReceiver,
 };
+use market_squawk_adapter_coinbase::CoinbaseMarketDecodeOutcome;
 use market_squawk_domain::{ExactPayloadEvidence, StreamIntegrityState, Timestamp};
 use market_squawk_live::{LiveIngressBindError, LiveIngressError, LiveRuntimeIngress, ShardKey};
 use market_squawk_platform::{CapturePublishError, RawCapturePublisher};
@@ -74,6 +81,23 @@ pub(super) struct ProductionDisplayMarketSinkInput<'a> {
     pub(super) startup_readiness_policy: StartupReadinessPolicy,
 }
 
+/// Closed durable-publication route installed for one exact production source generation.
+///
+/// Provider-specific continuations remain adapter-owned, while absence and topology selection are
+/// represented once at the shared capture-first sink boundary.
+#[derive(Clone, Debug)]
+pub(super) enum ProductionCapturedPublicationIngress {
+    None,
+    Coinbase(CoinbaseCapturedPublicationIngress),
+    Kraken(KrakenCapturedPublicationIngress),
+}
+
+impl ProductionCapturedPublicationIngress {
+    pub(super) const fn none() -> Self {
+        Self::None
+    }
+}
+
 /// Exact capture/session/health/live-route bridge used directly by the Coinbase reader.
 #[derive(Debug)]
 pub(super) struct ProductionRawMarketSink<'a> {
@@ -82,6 +106,7 @@ pub(super) struct ProductionRawMarketSink<'a> {
     session: &'a CurrentSourceSession,
     health_reporter: CurrentHealthReporter,
     decoder: Option<ProductionMarketDecoder>,
+    publication: ProductionCapturedPublicationIngress,
     metadata: SourceMetadata,
     generation: GenerationIdentity,
     subscription: SubscriptionStateMachine,
@@ -104,6 +129,13 @@ impl<'a> ProductionRawMarketSink<'a> {
     pub(super) fn try_new(
         input: ProductionRawMarketSinkInput<'a>,
     ) -> Result<Self, ProductionSinkConstructionError> {
+        Self::try_new_with_publication(input, ProductionCapturedPublicationIngress::none())
+    }
+
+    pub(super) fn try_new_with_publication(
+        input: ProductionRawMarketSinkInput<'a>,
+        publication: ProductionCapturedPublicationIngress,
+    ) -> Result<Self, ProductionSinkConstructionError> {
         let metadata = input.decoder.metadata().clone();
         let output = QualifiedSourceOutput::Live(QualifiedLiveOutput::try_new(
             input.live_ingress,
@@ -115,6 +147,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             input.session,
             input.health_reporter,
             Some(input.decoder),
+            publication,
             metadata,
             input.subscription,
             output,
@@ -144,6 +177,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             input.session,
             input.health_reporter,
             None,
+            ProductionCapturedPublicationIngress::none(),
             input.metadata,
             input.subscription,
             output,
@@ -167,6 +201,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             input.session,
             input.health_reporter,
             Some(input.decoder),
+            ProductionCapturedPublicationIngress::none(),
             metadata,
             input.subscription,
             output,
@@ -193,6 +228,7 @@ impl<'a> ProductionRawMarketSink<'a> {
         session: &'a CurrentSourceSession,
         health_reporter: CurrentHealthReporter,
         decoder: Option<ProductionMarketDecoder>,
+        publication: ProductionCapturedPublicationIngress,
         metadata: SourceMetadata,
         subscription: SubscriptionStateMachine,
         output: QualifiedSourceOutput,
@@ -206,6 +242,7 @@ impl<'a> ProductionRawMarketSink<'a> {
             session,
             health_reporter,
             decoder,
+            publication,
             metadata,
             generation: GenerationIdentity::from_session(session),
             subscription,
@@ -233,6 +270,17 @@ impl<'a> ProductionRawMarketSink<'a> {
         self.startup_ready
     }
 
+    pub(super) fn install_startup_readiness(
+        &mut self,
+        readiness: oneshot::Sender<()>,
+    ) -> Result<(), ProductionSinkConstructionError> {
+        if self.startup_readiness.is_some() || self.startup_ready {
+            return Err(ProductionSinkConstructionError::DuplicateStartupReadiness);
+        }
+        self.startup_readiness = Some(readiness);
+        Ok(())
+    }
+
     pub(super) fn record_display_terminal_failure(
         &mut self,
         failure: DisplayMarketTerminalFailure,
@@ -242,7 +290,7 @@ impl<'a> ProductionRawMarketSink<'a> {
     }
 
     fn process_frame(&mut self, frame: RawMarketFrame) -> Result<(), ProductionSinkFailure> {
-        let receipt = self.capture_frame(&frame)?;
+        let mut receipt = self.capture_frame(&frame)?;
         let validated_frame = self
             .session
             .validate_live_frame(&frame)
@@ -254,38 +302,78 @@ impl<'a> ProductionRawMarketSink<'a> {
             .decode(&validated_frame)
             .map_err(ProductionSinkFailure::Decode)?;
         match outcome {
+            ProductionDecodeOutcome::Kraken {
+                handoff,
+                publication_config,
+            } => {
+                let (outcome, publication) = handoff.into_parts();
+                if let Some(publication) = publication {
+                    let live = publication_config
+                        .metadata()
+                        .coverage()
+                        .live()
+                        .ok_or(ProductionSinkFailure::KrakenPublicationMaterial)?;
+                    let material = receipt
+                        .try_issue_provider_event_microbatch_material(
+                            &frame,
+                            live.provider_product().as_source_identifier().clone(),
+                            live.provider_channel().as_source_identifier().clone(),
+                        )
+                        .map_err(|_| ProductionSinkFailure::KrakenPublicationMaterial)?;
+                    let available_at = system_timestamp()
+                        .map_err(|_| ProductionSinkFailure::KrakenPublicationMaterial)?;
+                    let pending = publication
+                        .into_pending_publication(
+                            &validated_frame,
+                            material,
+                            &publication_config,
+                            available_at,
+                        )
+                        .map_err(|_| ProductionSinkFailure::KrakenPublicationMaterial)?;
+                    let ProductionCapturedPublicationIngress::Kraken(publication) =
+                        &self.publication
+                    else {
+                        return Err(ProductionSinkFailure::PublicationTopologyMismatch);
+                    };
+                    publication
+                        .try_submit(pending, available_at)
+                        .map_err(|_| ProductionSinkFailure::PublicationBackpressure)?;
+                }
+                self.process_captured_outcome(outcome, receipt)
+            }
             ProductionDecodeOutcome::Standard(outcome)
             | ProductionDecodeOutcome::Coinbase(CoinbaseMarketDecodeOutcome::Other(outcome)) => {
                 self.process_captured_outcome(outcome, receipt)
             }
             ProductionDecodeOutcome::Coinbase(CoinbaseMarketDecodeOutcome::Market(handoff)) => {
-                self.process_coinbase_handoff(handoff, receipt)
+                let live = self
+                    .metadata
+                    .coverage()
+                    .live()
+                    .ok_or(ProductionSinkFailure::CoinbasePublicationMaterial)?;
+                let material = receipt
+                    .try_issue_provider_event_microbatch_material(
+                        &frame,
+                        live.provider_product().as_source_identifier().clone(),
+                        live.provider_channel().as_source_identifier().clone(),
+                    )
+                    .map_err(|_| ProductionSinkFailure::CoinbasePublicationMaterial)?;
+                let available_at = system_timestamp()
+                    .map_err(|_| ProductionSinkFailure::CoinbasePublicationMaterial)?;
+                let (batch, rejoin, seal_request) = handoff
+                    .into_pending_publication(&validated_frame, material, available_at)
+                    .map_err(|_| ProductionSinkFailure::CoinbasePublicationMaterial)?;
+                let ProductionCapturedPublicationIngress::Coinbase(publication) =
+                    &self.publication
+                else {
+                    return Err(ProductionSinkFailure::PublicationTopologyMismatch);
+                };
+                publication
+                    .try_submit(rejoin, seal_request, available_at)
+                    .map_err(|_| ProductionSinkFailure::PublicationBackpressure)?;
+                self.process_captured_outcome(DecodeOutcome::Data(batch), receipt)
             }
         }
-    }
-
-    fn process_coinbase_handoff(
-        &mut self,
-        handoff: market_squawk_adapter_coinbase::CoinbaseMarketHandoff,
-        receipt: market_squawk_sources::CaptureAdmissionReceipt,
-    ) -> Result<(), ProductionSinkFailure> {
-        if handoff.evidence().feed() != CoinbaseMarketFeed::AdvancedTradePublic {
-            return Err(ProductionSinkFailure::Decode(
-                DecodeInternalError::InvariantViolation,
-            ));
-        }
-        let (_evidence, raw_lineage, batch) = handoff.into_parts();
-        let CoinbaseMarketRawLineage::AdvancedTrade(payload) = raw_lineage else {
-            return Err(ProductionSinkFailure::Decode(
-                DecodeInternalError::InvariantViolation,
-            ));
-        };
-        if payload.as_bytes().len() != batch.evidence().frame_bytes() {
-            return Err(ProductionSinkFailure::Decode(
-                DecodeInternalError::InvariantViolation,
-            ));
-        }
-        self.process_captured_outcome(DecodeOutcome::Data(batch), receipt)
     }
 
     /// Captures and validates one adapter-predecoded frame without decoding it a second time.
@@ -1130,6 +1218,14 @@ pub enum ProductionSinkFailure {
     StartupObserverDropped,
     #[error("active provider request budget was bound more than once")]
     DuplicateActiveRequestBudget,
+    #[error("exact Coinbase capture material could not be issued")]
+    CoinbasePublicationMaterial,
+    #[error("exact Kraken capture material could not be issued")]
+    KrakenPublicationMaterial,
+    #[error("durable-publication ingress does not match the decoded source topology")]
+    PublicationTopologyMismatch,
+    #[error("bounded durable-publication ingress is unavailable")]
+    PublicationBackpressure,
 }
 
 impl ProductionSinkFailure {
@@ -1174,7 +1270,11 @@ impl ProductionSinkFailure {
             | Self::HealthRevisionExhausted
             | Self::HealthDeadlineRange
             | Self::StartupObserverDropped
-            | Self::DuplicateActiveRequestBudget => false,
+            | Self::DuplicateActiveRequestBudget
+            | Self::CoinbasePublicationMaterial
+            | Self::KrakenPublicationMaterial
+            | Self::PublicationTopologyMismatch
+            | Self::PublicationBackpressure => false,
             Self::DisplayIngress | Self::DisplayTerminal => true,
         }
     }
@@ -1220,7 +1320,11 @@ impl ProductionSinkFailure {
             | Self::HealthRevisionExhausted
             | Self::HealthDeadlineRange
             | Self::StartupObserverDropped
-            | Self::DuplicateActiveRequestBudget => SinkError::CaptureIncomplete,
+            | Self::DuplicateActiveRequestBudget
+            | Self::CoinbasePublicationMaterial
+            | Self::KrakenPublicationMaterial
+            | Self::PublicationTopologyMismatch
+            | Self::PublicationBackpressure => SinkError::CaptureIncomplete,
         }
     }
 }
@@ -1237,4 +1341,6 @@ pub enum ProductionSinkConstructionError {
     DisplayGenerationMismatch,
     #[error("display-market ingress timeout must be non-zero")]
     InvalidDisplayIngressTimeout,
+    #[error("production sink startup-readiness authority is already installed")]
+    DuplicateStartupReadiness,
 }

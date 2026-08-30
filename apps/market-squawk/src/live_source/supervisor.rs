@@ -38,8 +38,9 @@ use super::{
     provider::{ProductionLiveSource, ProductionProviderError, ProductionSourceProfile},
     route_actor::{RouteActorWorker, RouteBufferLimits, spawn_route_activation},
     sink::{
-        ProductionDisplayMarketSinkInput, ProductionRawMarketSink, ProductionRawMarketSinkInput,
-        ProductionSinkConstructionError, ProductionSinkFailure,
+        ProductionCapturedPublicationIngress, ProductionDisplayMarketSinkInput,
+        ProductionRawMarketSink, ProductionRawMarketSinkInput, ProductionSinkConstructionError,
+        ProductionSinkFailure,
     },
     subscription_state::{
         GenerationIdentity, SubscriptionConstructionError, SubscriptionLimits,
@@ -84,6 +85,7 @@ impl ProductionGenerationOutcome {
 pub(super) struct ProductionSourceSupervisor {
     config: AppConfig,
     profile: ProductionSourceProfile,
+    publication: ProductionCapturedPublicationIngress,
     registry: Option<AuthoritativeSourceRegistry>,
     registered: RegisteredSource,
     backoff: ProviderBackoffAuthority,
@@ -249,6 +251,7 @@ impl ProductionSourceSupervisor {
         Ok(Self {
             config: config.clone(),
             profile,
+            publication: ProductionCapturedPublicationIngress::none(),
             registry: Some(registry),
             registered,
             backoff,
@@ -256,6 +259,14 @@ impl ProductionSourceSupervisor {
             capture_process,
             output,
         })
+    }
+
+    pub(super) fn with_publication(
+        mut self,
+        publication: ProductionCapturedPublicationIngress,
+    ) -> Self {
+        self.publication = publication;
+        self
     }
 
     async fn run_one_generation(
@@ -425,12 +436,14 @@ impl ProductionSourceSupervisor {
                         live_ingress: ingress,
                         routes: route_publishers,
                     };
-                    match startup.take() {
-                        Some(readiness) => ProductionRawMarketSink::try_new_with_startup_readiness(
-                            input, readiness,
-                        )?,
-                        None => ProductionRawMarketSink::try_new(input)?,
+                    let mut sink = ProductionRawMarketSink::try_new_with_publication(
+                        input,
+                        self.publication.clone(),
+                    )?;
+                    if let Some(readiness) = startup.take() {
+                        sink.install_startup_readiness(readiness)?;
                     }
+                    sink
                 }
                 PreparedGenerationOutput::Display { display_ingresses } => {
                     let input = ProductionDisplayMarketSinkInput {

@@ -18,6 +18,7 @@ use std::{
     fmt,
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -39,7 +40,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::application::{
-    ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,
+    CryptoMarketPublicationAuthority, ManagedResearchExtractionSource,
+    ProductionResearchIngestCoordinator,
     ResearchProviderRuntimeGeneration, ResearchProviderRuntimeMutationAuthority,
     ResearchProviderRuntimeReplacement, ResearchRightsAuthority,
 };
@@ -109,6 +111,67 @@ const FEDERAL_RESERVE_BOARD_SURFACE: &str = "federal-reserve-board.data-download
 const LOCAL_FILES_SURFACE: &str = "local.files";
 const PORTFOLIO_SURFACE: &str = "local.portfolio-imports";
 const MAXIMUM_EPHEMERAL_DISCOVERY_PAGES: u16 = 64;
+const KRAKEN_BOOK_SOURCE_ID: &str = "kraken-public-book-v2";
+const KRAKEN_TRADE_SOURCE_ID: &str = "kraken-public-trades-v2";
+const CRYPTO_MARKET_ANALYTICAL_DATASET: &str = "market_squawk.market_events";
+// Public authority is revoked by the exact runtime cancellation and generation admission. The
+// monotonic deadline is only a fail-closed process-lifetime ceiling required by the shared
+// publication-operation API; per-frame rights and metadata validity are checked at observation.
+const CRYPTO_PUBLICATION_PROCESS_LIFETIME: Duration = Duration::from_secs(3_153_600_000);
+
+/// Exact research authority retained for one public Coinbase runtime incarnation.
+pub(crate) struct CoinbaseMarketPublicationPackage {
+    market: Arc<CryptoMarketPublicationAuthority>,
+}
+
+/// Closed exact-authority topology for the selected public crypto runtime.
+#[derive(Debug)]
+pub(crate) enum CryptoMarketPublicationPackage {
+    Coinbase(CoinbaseMarketPublicationPackage),
+    Kraken(KrakenMarketPublicationPackage),
+}
+
+impl CoinbaseMarketPublicationPackage {
+    pub(crate) fn into_authority(self) -> Arc<CryptoMarketPublicationAuthority> {
+        self.market
+    }
+}
+
+impl fmt::Debug for CoinbaseMarketPublicationPackage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CoinbaseMarketPublicationPackage")
+            .field("market", self.market.generation())
+            .finish()
+    }
+}
+
+/// Exact book/trade research authorities retained for one public Kraken runtime incarnation.
+pub(crate) struct KrakenMarketPublicationPackage {
+    book: Arc<CryptoMarketPublicationAuthority>,
+    trades: Arc<CryptoMarketPublicationAuthority>,
+}
+
+impl KrakenMarketPublicationPackage {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Arc<CryptoMarketPublicationAuthority>,
+        Arc<CryptoMarketPublicationAuthority>,
+    ) {
+        (self.book, self.trades)
+    }
+}
+
+impl fmt::Debug for KrakenMarketPublicationPackage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KrakenMarketPublicationPackage")
+            .field("book", self.book.generation())
+            .field("trades", self.trades.generation())
+            .finish()
+    }
+}
 
 /// One verified provider page returned without durable research publication.
 #[derive(Clone, Debug)]
@@ -176,6 +239,133 @@ impl AccountMarketRuntimeMutationAuthority<'_> {
 }
 
 impl ProviderAdapterActivation {
+    pub(crate) fn activate_public_live_metadata(
+        &self,
+        session_id: Uuid,
+        provider: ProductionSourceProvider,
+        metadata_set: &[SourceMetadata],
+    ) -> Result<ProviderActivationLease, ProviderAdapterActivationError> {
+        let lease = self.onboarding.activation_lease(session_id)?;
+        let expected_surface = match provider {
+            ProductionSourceProvider::Coinbase => COINBASE_SURFACE,
+            ProductionSourceProvider::Kraken => KRAKEN_SURFACE,
+        };
+        if lease.surface_id().as_str() != expected_surface {
+            return Err(ProviderAdapterActivationError::SurfaceMismatch);
+        }
+        for metadata in metadata_set {
+            let (generation, rights) = public_live_runtime_generation(&lease, metadata)?;
+            self.research_mutation
+                .register_provider_publication_generation(generation, rights)?;
+        }
+        Ok(lease)
+    }
+
+    /// Acquires the exact publication generation for one public Coinbase runtime.
+    pub(crate) async fn acquire_coinbase_market_publication_package(
+        &self,
+        lease: &ProviderActivationLease,
+        metadata: &SourceMetadata,
+        publication_cancellation: CancellationToken,
+    ) -> Result<CryptoMarketPublicationPackage, ProviderAdapterActivationError> {
+        if publication_cancellation.is_cancelled()
+            || lease.surface_id().as_str() != COINBASE_SURFACE
+        {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        let deadline = Instant::now()
+            .checked_add(CRYPTO_PUBLICATION_PROCESS_LIFETIME)
+            .ok_or(ProviderAdapterActivationError::SourceBinding)?;
+        let dataset = market_squawk_data::DatasetId::try_from(CRYPTO_MARKET_ANALYTICAL_DATASET)
+            .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+        let market = self
+            .acquire_public_crypto_market_authority(
+                lease,
+                metadata,
+                publication_cancellation,
+                deadline,
+                dataset,
+            )
+            .await?;
+        Ok(CryptoMarketPublicationPackage::Coinbase(
+            CoinbaseMarketPublicationPackage { market },
+        ))
+    }
+
+    /// Acquires the exact registered book and trade publication generations for one runtime.
+    pub(crate) async fn acquire_kraken_market_publication_package(
+        &self,
+        lease: &ProviderActivationLease,
+        book_metadata: &SourceMetadata,
+        trade_metadata: &SourceMetadata,
+        publication_cancellation: CancellationToken,
+    ) -> Result<CryptoMarketPublicationPackage, ProviderAdapterActivationError> {
+        if publication_cancellation.is_cancelled()
+            || lease.surface_id().as_str() != KRAKEN_SURFACE
+            || book_metadata.source_id().as_str() != KRAKEN_BOOK_SOURCE_ID
+            || trade_metadata.source_id().as_str() != KRAKEN_TRADE_SOURCE_ID
+            || book_metadata == trade_metadata
+        {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        let deadline = Instant::now()
+            .checked_add(CRYPTO_PUBLICATION_PROCESS_LIFETIME)
+            .ok_or(ProviderAdapterActivationError::SourceBinding)?;
+        let dataset = market_squawk_data::DatasetId::try_from(CRYPTO_MARKET_ANALYTICAL_DATASET)
+            .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+        let book = self
+            .acquire_public_crypto_market_authority(
+                lease,
+                book_metadata,
+                publication_cancellation.clone(),
+                deadline,
+                dataset.clone(),
+            )
+            .await?;
+        let trades = self
+            .acquire_public_crypto_market_authority(
+                lease,
+                trade_metadata,
+                publication_cancellation,
+                deadline,
+                dataset,
+            )
+            .await?;
+        Ok(CryptoMarketPublicationPackage::Kraken(
+            KrakenMarketPublicationPackage { book, trades },
+        ))
+    }
+
+    async fn acquire_public_crypto_market_authority(
+        &self,
+        lease: &ProviderActivationLease,
+        metadata: &SourceMetadata,
+        publication_cancellation: CancellationToken,
+        deadline: Instant,
+        dataset: market_squawk_data::DatasetId,
+    ) -> Result<Arc<CryptoMarketPublicationAuthority>, ProviderAdapterActivationError> {
+        let profile = SourceIdentifier::try_from(metadata.source_id().as_str())
+            .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+        let (expected, _rights) = public_live_runtime_generation(lease, metadata)?;
+        let generation = self
+            .research
+            .provider_runtime_generation(&profile)?
+            .ok_or(ProviderAdapterActivationError::SourceBinding)?;
+        if generation != expected {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        Ok(Arc::new(
+            self.research
+                .acquire_crypto_market_publication_authority(
+                    &generation,
+                    publication_cancellation,
+                    deadline,
+                    dataset,
+                )
+                .await?,
+        ))
+    }
+
     pub(crate) async fn acquire_account_market_runtime_mutation_authority(
         &self,
     ) -> AccountMarketRuntimeMutationAuthority<'_> {
@@ -1394,6 +1584,29 @@ fn runtime_lease_is_current(
         Err(ProviderOnboardingError::ActivationUnavailable) => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+fn public_live_runtime_generation(
+    lease: &ProviderActivationLease,
+    metadata: &SourceMetadata,
+) -> Result<
+    (ResearchProviderRuntimeGeneration, ResearchRightsAuthority),
+    ProviderAdapterActivationError,
+> {
+    let rights = provider_research_rights(lease, metadata.source_id())?;
+    let generation = ResearchProviderRuntimeGeneration::try_new(
+        SourceIdentifier::try_from(metadata.source_id().as_str())
+            .map_err(|_| ProviderAdapterActivationError::SourceBinding)?,
+        lease.session_id(),
+        lease.capability_revision(),
+        lease.capability_digest(),
+        lease.generation(),
+        lease.secret_reference().cloned(),
+        lease.authority_effective_at(),
+        metadata.clone(),
+        rights.clone(),
+    )?;
+    Ok((generation, rights))
 }
 
 fn provider_research_rights(

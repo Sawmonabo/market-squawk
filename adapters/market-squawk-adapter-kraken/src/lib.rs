@@ -10,7 +10,8 @@ mod session;
 
 pub use config::{KrakenChannel, KrakenConfig, KrakenConfigError, KrakenDepth};
 pub use decoder::{
-    KrakenControl, KrakenDecodeOutcome, KrakenDecoder, KrakenDecoderState, KrakenMarketDecoder,
+    KrakenControl, KrakenDecodeOutcome, KrakenDecoder, KrakenDecoderState,
+    KrakenMarketDecodeHandoff, KrakenMarketDecoder, KrakenPublicationDecodeOutcome,
     KrakenSubscription,
 };
 pub use level3::{
@@ -26,8 +27,9 @@ pub use level3::{
 pub use publication::{
     KrakenNonMarketReason, KrakenPendingPublication, KrakenPublicationAbstention,
     KrakenPublicationError, KrakenPublicationEvidence, KrakenPublicationSealRejoin,
-    KrakenPublicationUnavailable, KrakenSealedMarketPublicationMaterial,
-    KrakenSealedNonMarketPublication, KrakenSealedPublication,
+    KrakenPublicationUnavailable, KrakenQualifiedMarketPublication,
+    KrakenSealedMarketPublicationMaterial, KrakenSealedNonMarketPublication,
+    KrakenSealedPublication,
 };
 pub use qualification::{
     KRAKEN_BOOK_SEQUENCE_RULE, KRAKEN_QUALIFICATION_POLICY_DIGEST,

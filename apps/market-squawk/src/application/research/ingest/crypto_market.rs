@@ -1,10 +1,9 @@
 //! Application-owned sealing and immutable publication for selected crypto market venues.
 //!
-//! Coinbase Advanced Trade and Coinbase Exchange Direct enter the common provider-event spine
-//! only after the owning live layer supplies already-qualified canonical events. Kraken Spot is
-//! sealed here, but its current adapter export stops at provider-normalized observations; those
-//! observations therefore remain an explicit sealed-raw unavailable result until the live plane
-//! exports qualified `DirectUnverified` events without erasing snapshot/delta semantics.
+//! Coinbase Advanced Trade, Coinbase Exchange Direct, and Kraken Spot enter the common
+//! provider-event spine only after the owning live layer supplies already-qualified canonical
+//! events. Raw capture, native semantics, venue identity, clocks, quality, and source generation
+//! remain attached through publication and point-in-time restart reads.
 
 use std::{fmt, sync::Arc, time::Instant};
 
@@ -12,17 +11,19 @@ use chrono::{DateTime, Utc};
 use market_squawk_adapter_coinbase::{
     CoinbaseDirectSnapshotSealMaterial, CoinbaseEventMicrobatchSealMaterial, CoinbaseMarketFeed,
     CoinbaseMarketHandoff, CoinbaseMarketPublicationContext, CoinbaseMarketPublicationError,
-    CoinbaseMarketQualificationOutcome, CoinbaseMarketSealMaterial, CoinbaseMarketSealedTokens,
-    CoinbaseSealedMarketPublication, CoinbaseSealedRawMarketPublication,
+    CoinbaseMarketQualificationOutcome, CoinbaseMarketSealMaterial, CoinbaseMarketSealRejoin,
+    CoinbaseMarketSealedTokens, CoinbaseSealedMarketPublication,
+    CoinbaseSealedRawMarketPublication,
 };
 use market_squawk_adapter_kraken::{
     KrakenPendingPublication, KrakenPublicationError, KrakenPublicationEvidence,
-    KrakenPublicationUnavailable, KrakenSealedMarketPublicationMaterial,
-    KrakenSealedNonMarketPublication, KrakenSealedPublication,
+    KrakenPublicationUnavailable, KrakenQualifiedMarketPublication,
+    KrakenSealedMarketPublicationMaterial, KrakenSealedNonMarketPublication,
+    KrakenSealedPublication,
 };
 use market_squawk_data::{
-    CommittedDataset, DatasetId, DatasetManifestRef, IngestError, IngestIdentity,
-    IngestPrecommitAuthority, PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
+    DatasetId, DatasetManifestRef, IngestError, IngestIdentity, IngestPrecommitAuthority,
+    PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
     ProviderMarketEventEffectiveTimeBasis, ProviderMarketEventPointInTimeRequest,
     ProviderMarketEventPointInTimeSelection, ProviderMarketEventPublicationKind,
     ProviderMarketEventSelectionError, RightsError, SourceOperation,
@@ -36,14 +37,22 @@ use market_squawk_platform::{RawCaptureRecord, RawCaptureRecordError};
 use market_squawk_services::ServiceError;
 use market_squawk_sources::{
     InstrumentCoverageMembership, ProviderCaptureError, ProviderCaptureMaterial,
-    ProviderCapturePageReceipt, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    ProviderEventMicrobatchMaterial, ProviderNativeLineageImplementation,
-    ProviderPublicationBindingKind, SealedProviderEventMicrobatchReceipt,
-    SealedProviderPublicationBinding, SourceClass, SourceMetadata,
+    ProviderCapturePageReceipt, ProviderCaptureSealRequest, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, ProviderEventMicrobatchMaterial,
+    ProviderNativeLineageImplementation, ProviderPublicationBindingKind,
+    SealedProviderEventMicrobatchReceipt, SealedProviderPublicationBinding, SourceClass,
+    SourceMetadata,
 };
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+mod kraken_rendezvous;
+
+pub(crate) use kraken_rendezvous::{
+    CryptoCommittedRowIngress, CryptoPendingFrameIngress, CryptoPublicationRendezvousLimits,
+};
 
 use super::ResearchRightsAuthority;
 use crate::{ResearchService, ResearchServiceError};
@@ -62,35 +71,33 @@ pub(crate) enum CryptoMarketSurface {
 }
 
 impl CryptoMarketSurface {
-    const fn native_implementation(self) -> Option<ProviderNativeLineageImplementation> {
+    const fn native_implementation(self) -> ProviderNativeLineageImplementation {
         match self {
             Self::CoinbaseAdvancedTrade => {
-                Some(ProviderNativeLineageImplementation::CoinbaseAdvancedTradeV1)
+                ProviderNativeLineageImplementation::CoinbaseAdvancedTradeV1
             }
             Self::CoinbaseExchangeDirect => {
-                Some(ProviderNativeLineageImplementation::CoinbaseExchangeDirectV1)
+                ProviderNativeLineageImplementation::CoinbaseExchangeDirectV1
             }
-            Self::KrakenSpot => None,
+            Self::KrakenSpot => ProviderNativeLineageImplementation::KrakenSpotV1,
         }
     }
 
-    const fn persisted_native_implementation(self) -> Option<&'static str> {
+    const fn persisted_native_implementation(self) -> &'static str {
         match self {
-            Self::CoinbaseAdvancedTrade => Some(COINBASE_ADVANCED_NATIVE_IMPLEMENTATION),
-            Self::CoinbaseExchangeDirect => Some(COINBASE_DIRECT_NATIVE_IMPLEMENTATION),
-            Self::KrakenSpot => None,
+            Self::CoinbaseAdvancedTrade => COINBASE_ADVANCED_NATIVE_IMPLEMENTATION,
+            Self::CoinbaseExchangeDirect => COINBASE_DIRECT_NATIVE_IMPLEMENTATION,
+            Self::KrakenSpot => "kraken_spot_v1",
         }
     }
 
-    const fn publication_kind(self) -> Option<ProviderMarketEventPublicationKind> {
+    const fn publication_kind(self) -> ProviderMarketEventPublicationKind {
         match self {
-            Self::CoinbaseAdvancedTrade => {
-                Some(ProviderMarketEventPublicationKind::EventMicrobatch)
-            }
+            Self::CoinbaseAdvancedTrade => ProviderMarketEventPublicationKind::EventMicrobatch,
             Self::CoinbaseExchangeDirect => {
-                Some(ProviderMarketEventPublicationKind::CompositeResponseEvent)
+                ProviderMarketEventPublicationKind::CompositeResponseEvent
             }
-            Self::KrakenSpot => None,
+            Self::KrakenSpot => ProviderMarketEventPublicationKind::EventMicrobatch,
         }
     }
 }
@@ -139,9 +146,9 @@ impl CryptoMarketPublicationClosure {
         })
     }
 
-    /// Seals one exact Coinbase raw handoff and publishes only adapter-validated, caller-supplied
-    /// qualified events. Public Advanced Trade and authenticated Exchange Direct remain distinct
-    /// publication kinds and never become a consolidated or cross-venue quote.
+    /// Seals one exact Coinbase Exchange Direct handoff and publishes only adapter-validated,
+    /// caller-supplied qualified events. Public Advanced Trade must use the capture-owned physical
+    /// frame plus post-commit live-row path below; it cannot enter through this legacy UUID seam.
     #[allow(
         clippy::too_many_arguments,
         reason = "raw context, qualification, immutable target, authority, and deadline remain exact"
@@ -161,7 +168,9 @@ impl CryptoMarketPublicationClosure {
         self.validate_current_authority(observed_at)?;
         precommit_authority.validate_precommit()?;
         let surface = match handoff.evidence().feed() {
-            CoinbaseMarketFeed::AdvancedTradePublic => CryptoMarketSurface::CoinbaseAdvancedTrade,
+            CoinbaseMarketFeed::AdvancedTradePublic => {
+                return Err(CryptoMarketPublicationError::FamilyMismatch);
+            }
             CoinbaseMarketFeed::ExchangeDirectFull => CryptoMarketSurface::CoinbaseExchangeDirect,
         };
         let decoder_binding = handoff.typed_batch().evidence().binding();
@@ -169,12 +178,6 @@ impl CryptoMarketPublicationClosure {
             decoder_binding.source_id(),
             decoder_binding.metadata_revision(),
         )?;
-        if surface == CryptoMarketSurface::CoinbaseAdvancedTrade
-            && self.source.quality_ceiling() == DataQuality::DirectVerified
-        {
-            return Err(CryptoMarketPublicationError::AuthorityInvalid);
-        }
-
         let (rejoin, material) = handoff.into_publication_seal_handoff(context)?;
         let tokens = self
             .seal_coinbase_material(
@@ -190,7 +193,7 @@ impl CryptoMarketPublicationClosure {
                 Ok(CoinbaseMarketApplicationOutcome::SealedRaw(raw))
             }
             CoinbaseSealedMarketPublication::Published(binding) => {
-                let prepared = self.validate_coinbase_binding(&binding, surface)?;
+                let prepared = self.validate_publication_binding(&binding, surface)?;
                 let publication_digest = provider_market_event_publication_digest(&binding)?;
                 if publication_digest != prepared.publication_digest
                     || publication_digest.algorithm() != DigestAlgorithm::Sha256
@@ -219,6 +222,7 @@ impl CryptoMarketPublicationClosure {
                     .await?;
                 Ok(CoinbaseMarketApplicationOutcome::Published(
                     CryptoMarketEventPublicationReceipt {
+                        manifest: committed.manifest().clone(),
                         restart: CryptoMarketEventRestartSelector {
                             manifest: committed.manifest().clone(),
                             publication_digest,
@@ -227,7 +231,6 @@ impl CryptoMarketPublicationClosure {
                             source_id: self.source.source_id().clone(),
                             expected_event_count: prepared.event_count,
                         },
-                        committed,
                         surface,
                         provider_dataset: prepared.provider_dataset,
                         sealed_receipts: prepared.sealed_receipts,
@@ -238,9 +241,101 @@ impl CryptoMarketPublicationClosure {
         }
     }
 
-    /// Physically seals one exact Kraken frame. The current public adapter has no already-qualified
-    /// canonical output, so market observations are retained as an explicit sealed-raw unavailable
-    /// state rather than upgraded to `DirectVerified` or flattened across snapshot/delta classes.
+    /// Physically seals one exact public Advanced Trade frame while retaining the adapter's opaque
+    /// continuation for its post-commit live-row join.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "raw seal, exact source authority, cancellation, and deadline remain explicit"
+    )]
+    pub(crate) async fn seal_coinbase_public(
+        &self,
+        rejoin: CoinbaseMarketSealRejoin,
+        seal_request: ProviderCaptureSealRequest,
+        observed_at: Timestamp,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<CoinbaseMarketSealRejoin, CryptoMarketPublicationError> {
+        self.validate_current_authority(observed_at)?;
+        if self.source.quality_ceiling() == DataQuality::DirectVerified {
+            return Err(CryptoMarketPublicationError::AuthorityInvalid);
+        }
+        self.validate_source_binding(rejoin.source_id(), rejoin.metadata_revision())?;
+        precommit_authority.validate_precommit()?;
+        let sealed = self
+            .research
+            .seal_provider_capture(seal_request, &cancellation, deadline)
+            .await?;
+        precommit_authority.validate_precommit()?;
+        let sealed = rejoin.try_rejoin_public_seal(sealed)?;
+        let receipt = sealed.persisted_receipt()?;
+        self.validate_source_binding(
+            receipt.capture().source_id(),
+            receipt.capture().metadata_revision(),
+        )?;
+        Ok(sealed)
+    }
+
+    async fn publish_coinbase_public_joined(
+        &self,
+        material: CoinbaseMarketSealRejoin,
+        rows: Vec<market_squawk_live::CommittedResearchMarketObservation>,
+        analytical_dataset: DatasetId,
+        idempotency_key: String,
+        observed_at: Timestamp,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+        cancellation: CancellationToken,
+    ) -> Result<CoinbaseMarketApplicationOutcome, CryptoMarketPublicationError> {
+        self.validate_current_authority(observed_at)?;
+        self.validate_source_binding(material.source_id(), material.metadata_revision())?;
+        precommit_authority.validate_precommit()?;
+        let binding = material.try_publish_committed(rows)?;
+        let prepared = self
+            .validate_publication_binding(&binding, CryptoMarketSurface::CoinbaseAdvancedTrade)?;
+        let publication_digest = provider_market_event_publication_digest(&binding)?;
+        if publication_digest != prepared.publication_digest {
+            return Err(CryptoMarketPublicationError::FamilyMismatch);
+        }
+        let reservation = self
+            .reserve_publication(
+                publication_digest,
+                idempotency_key,
+                observed_at,
+                &cancellation,
+            )
+            .await?;
+        let committed = self
+            .research
+            .analytical()
+            .ingest_provider_market_events(
+                reservation,
+                analytical_dataset,
+                binding,
+                cancellation,
+                precommit_authority,
+            )
+            .await?;
+        Ok(CoinbaseMarketApplicationOutcome::Published(
+            CryptoMarketEventPublicationReceipt {
+                manifest: committed.manifest().clone(),
+                restart: CryptoMarketEventRestartSelector {
+                    manifest: committed.manifest().clone(),
+                    publication_digest,
+                    publication_kind: prepared.publication_kind,
+                    surface: CryptoMarketSurface::CoinbaseAdvancedTrade,
+                    source_id: self.source.source_id().clone(),
+                    expected_event_count: prepared.event_count,
+                },
+                surface: CryptoMarketSurface::CoinbaseAdvancedTrade,
+                provider_dataset: prepared.provider_dataset,
+                sealed_receipts: prepared.sealed_receipts,
+                event_count: prepared.event_count,
+            },
+        ))
+    }
+
+    /// Physically seals one exact Kraken frame. Market observations remain non-canonical until the
+    /// bounded publication rendezvous rejoins the same frame with instrument-owned committed rows.
     pub(crate) async fn seal_kraken(
         &self,
         pending: KrakenPendingPublication,
@@ -294,9 +389,72 @@ impl CryptoMarketPublicationClosure {
         }
     }
 
+    async fn publish_kraken_joined(
+        &self,
+        material: KrakenSealedMarketPublicationMaterial,
+        rows: Vec<market_squawk_live::CommittedResearchMarketObservation>,
+        analytical_dataset: DatasetId,
+        idempotency_key: String,
+        observed_at: Timestamp,
+        precommit_authority: Arc<dyn IngestPrecommitAuthority>,
+        cancellation: CancellationToken,
+    ) -> Result<KrakenMarketApplicationOutcome, CryptoMarketPublicationError> {
+        self.validate_current_authority(observed_at)?;
+        self.validate_kraken_sealed(
+            material.evidence(),
+            material.persisted_receipt(),
+            observed_at,
+        )?;
+        precommit_authority.validate_precommit()?;
+        let binding =
+            material.try_publish_qualified(KrakenQualifiedMarketPublication::try_new(rows)?)?;
+        let prepared =
+            self.validate_publication_binding(&binding, CryptoMarketSurface::KrakenSpot)?;
+        let publication_digest = provider_market_event_publication_digest(&binding)?;
+        if publication_digest != prepared.publication_digest {
+            return Err(CryptoMarketPublicationError::FamilyMismatch);
+        }
+        let reservation = self
+            .reserve_publication(
+                publication_digest,
+                idempotency_key,
+                observed_at,
+                &cancellation,
+            )
+            .await?;
+        let committed = self
+            .research
+            .analytical()
+            .ingest_provider_market_events(
+                reservation,
+                analytical_dataset,
+                binding,
+                cancellation,
+                precommit_authority,
+            )
+            .await?;
+        Ok(KrakenMarketApplicationOutcome::Published(
+            CryptoMarketEventPublicationReceipt {
+                manifest: committed.manifest().clone(),
+                restart: CryptoMarketEventRestartSelector {
+                    manifest: committed.manifest().clone(),
+                    publication_digest,
+                    publication_kind: prepared.publication_kind,
+                    surface: CryptoMarketSurface::KrakenSpot,
+                    source_id: self.source.source_id().clone(),
+                    expected_event_count: prepared.event_count,
+                },
+                surface: CryptoMarketSurface::KrakenSpot,
+                provider_dataset: prepared.provider_dataset,
+                sealed_receipts: prepared.sealed_receipts,
+                event_count: prepared.event_count,
+            },
+        ))
+    }
+
     /// Binds provider-event point-in-time reads to this exact registered crypto source and one
     /// canonical analytical dataset. Source ranking remains outside this publication closure.
-    pub(crate) fn point_in_time_selector(
+    pub(super) fn point_in_time_selector(
         &self,
         analytical_dataset: DatasetId,
     ) -> CryptoMarketPointInTimeSelector {
@@ -438,21 +596,21 @@ impl CryptoMarketPublicationClosure {
             .map_err(Into::into)
     }
 
-    fn validate_coinbase_binding(
+    fn validate_publication_binding(
         &self,
         binding: &SealedProviderPublicationBinding,
         surface: CryptoMarketSurface,
     ) -> Result<PreparedCryptoPublication, CryptoMarketPublicationError> {
-        let expected_implementation = surface
-            .native_implementation()
-            .ok_or(CryptoMarketPublicationError::FamilyMismatch)?;
-        let expected_kind = surface
-            .publication_kind()
-            .ok_or(CryptoMarketPublicationError::FamilyMismatch)?;
+        let expected_implementation = surface.native_implementation();
+        let expected_kind = surface.publication_kind();
         let publication_digest = provider_market_event_publication_digest(binding)?;
         let (provider_dataset, sealed_receipts, event_count) = match (surface, binding) {
             (
                 CryptoMarketSurface::CoinbaseAdvancedTrade,
+                SealedProviderPublicationBinding::EventMicrobatch(event),
+            )
+            | (
+                CryptoMarketSurface::KrakenSpot,
                 SealedProviderPublicationBinding::EventMicrobatch(event),
             ) => {
                 event.validate()?;
@@ -709,6 +867,89 @@ impl CryptoMarketPointInTimeSelector {
     }
 }
 
+/// Bounded internal handoff from one live crypto source into provider-neutral market selection.
+///
+/// The current-process receipt is an optimization and diagnostic coordinate only. An empty value
+/// after restart does not override the durable catalog, which remains authoritative through the
+/// source-bound point-in-time selector.
+#[derive(Clone, Debug)]
+pub(crate) struct CryptoMarketDurableRead {
+    point_in_time: CryptoMarketPointInTimeSelector,
+    latest: Arc<Mutex<Option<Arc<CryptoMarketEventPublicationReceipt>>>>,
+}
+
+impl CryptoMarketDurableRead {
+    pub(super) fn channel(
+        point_in_time: CryptoMarketPointInTimeSelector,
+    ) -> (CryptoMarketDurableReadWriter, Self) {
+        let latest = Arc::new(Mutex::new(None));
+        let writer = CryptoMarketDurableReadWriter {
+            analytical_dataset: point_in_time.analytical_dataset.clone(),
+            source_surface: point_in_time.source_surface.clone(),
+            latest: Arc::clone(&latest),
+        };
+        (
+            writer,
+            Self {
+                point_in_time,
+                latest,
+            },
+        )
+    }
+
+    pub(crate) const fn point_in_time_selector(&self) -> &CryptoMarketPointInTimeSelector {
+        &self.point_in_time
+    }
+
+    pub(crate) async fn latest_publication(
+        &self,
+    ) -> Option<Arc<CryptoMarketEventPublicationReceipt>> {
+        self.latest.lock().await.clone()
+    }
+}
+
+/// Sole writer for the compact latest-publication coordinate retained by one runtime lane.
+#[derive(Clone, Debug)]
+pub(crate) struct CryptoMarketDurableReadWriter {
+    analytical_dataset: DatasetId,
+    source_surface: SourceId,
+    latest: Arc<Mutex<Option<Arc<CryptoMarketEventPublicationReceipt>>>>,
+}
+
+impl CryptoMarketDurableReadWriter {
+    /// Retains only a monotonic latest immutable generation. Out-of-order completion cannot move
+    /// the runtime backward; a conflicting identity at one generation is terminal.
+    pub(crate) async fn retain(
+        &self,
+        receipt: CryptoMarketEventPublicationReceipt,
+    ) -> Result<bool, CryptoMarketPublicationError> {
+        if receipt.manifest.dataset_id() != &self.analytical_dataset
+            || receipt.restart.manifest() != &receipt.manifest
+            || &receipt.restart.source_id != &self.source_surface
+        {
+            return Err(CryptoMarketPublicationError::AuthorityInvalid);
+        }
+
+        let candidate_version = receipt.manifest.manifest_version();
+        let mut latest = self.latest.lock().await;
+        match latest.as_ref() {
+            None => {
+                *latest = Some(Arc::new(receipt));
+                Ok(true)
+            }
+            Some(current) => match candidate_version.cmp(&current.manifest.manifest_version()) {
+                std::cmp::Ordering::Greater => {
+                    *latest = Some(Arc::new(receipt));
+                    Ok(true)
+                }
+                std::cmp::Ordering::Less => Ok(false),
+                std::cmp::Ordering::Equal if current.as_ref() == &receipt => Ok(false),
+                std::cmp::Ordering::Equal => Err(CryptoMarketPublicationError::DurableReadConflict),
+            },
+        }
+    }
+}
+
 /// Exact source-separated PIT selection with enough semantic state for verified restart replay.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CryptoMarketPointInTimeReceipt {
@@ -771,9 +1012,11 @@ pub(crate) enum CoinbaseMarketApplicationOutcome {
     SealedRaw(CoinbaseSealedRawMarketPublication),
 }
 
-/// Kraken application result. The current bridge deliberately has no published-market variant.
+/// Kraken application result across raw sealing and joined canonical publication.
 #[derive(Debug)]
 pub(crate) enum KrakenMarketApplicationOutcome {
+    /// Exact sealed material and committed live rows were published through the common spine.
+    Published(CryptoMarketEventPublicationReceipt),
     /// Market observations retain exact snapshot/delta and native semantics while canonical
     /// qualification remains unavailable.
     CanonicalUnavailable(KrakenSealedRawCanonicalUnavailable),
@@ -796,9 +1039,14 @@ impl KrakenSealedRawCanonicalUnavailable {
     pub(crate) const fn reason(&self) -> KrakenPublicationUnavailable {
         self.reason
     }
+
+    /// Transfers the exact sealed frame into the bounded qualification rendezvous.
+    pub(crate) fn into_material(self) -> KrakenSealedMarketPublicationMaterial {
+        self.material
+    }
 }
 
-/// Exact immutable raw receipt identities for one Coinbase publication kind.
+/// Exact immutable raw receipt identities for one crypto publication kind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CryptoMarketSealedReceiptEvidence {
     EventMicrobatch(EvidenceDigest),
@@ -827,10 +1075,14 @@ struct PreparedCryptoPublication {
     event_count: usize,
 }
 
-/// Successful Coinbase immutable publication and its exact restart coordinate.
-#[derive(Debug)]
+/// Successful venue-qualified crypto publication and its exact restart coordinate.
+///
+/// This receipt intentionally retains only compact immutable identities. The catalog owns the
+/// cumulative pinned generation graph; a continuously running source must not retain that graph
+/// once publication commits.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CryptoMarketEventPublicationReceipt {
-    committed: CommittedDataset,
+    manifest: DatasetManifestRef,
     restart: CryptoMarketEventRestartSelector,
     surface: CryptoMarketSurface,
     provider_dataset: SourceIdentifier,
@@ -839,8 +1091,8 @@ pub(crate) struct CryptoMarketEventPublicationReceipt {
 }
 
 impl CryptoMarketEventPublicationReceipt {
-    pub(crate) const fn committed(&self) -> &CommittedDataset {
-        &self.committed
+    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
     }
 
     pub(crate) const fn restart_selector(&self) -> &CryptoMarketEventRestartSelector {
@@ -864,7 +1116,7 @@ impl CryptoMarketEventPublicationReceipt {
     }
 }
 
-/// Exact manifest/digest/kind selector for one venue-qualified Coinbase publication.
+/// Exact manifest/digest/kind selector for one venue-qualified crypto publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CryptoMarketEventRestartSelector {
     manifest: DatasetManifestRef,
@@ -958,13 +1210,14 @@ fn validate_restart_evidence(
     {
         return Err(CryptoMarketPublicationError::RestartInvalid);
     }
-    let expected_implementation = expected
-        .surface
-        .persisted_native_implementation()
-        .ok_or(CryptoMarketPublicationError::RestartInvalid)?;
+    let expected_implementation = expected.surface.persisted_native_implementation();
     let (source_id, event_count, native_matches) = match (expected.surface, evidence) {
         (
             CryptoMarketSurface::CoinbaseAdvancedTrade,
+            PersistedProviderPublicationEvidence::EventMicrobatch(event),
+        )
+        | (
+            CryptoMarketSurface::KrakenSpot,
             PersistedProviderPublicationEvidence::EventMicrobatch(event),
         ) => (
             event.capture().source_id(),
@@ -1014,6 +1267,10 @@ pub(crate) enum CryptoMarketPublicationError {
     RestartInvalid,
     #[error("the crypto point-in-time selection escaped its exact dataset or source surface")]
     PointInTimeInvalid,
+    #[error("the bounded crypto publication rendezvous rejected or expired exact material")]
+    RendezvousUnavailable,
+    #[error("one crypto generation has conflicting durable publication identities")]
+    DurableReadConflict,
     #[error(transparent)]
     Coinbase(#[from] CoinbaseMarketPublicationError),
     #[error(transparent)]
@@ -1032,4 +1289,84 @@ pub(crate) enum CryptoMarketPublicationError {
     Rights(#[from] RightsError),
     #[error(transparent)]
     Service(#[from] ServiceError),
+}
+
+#[cfg(test)]
+mod tests {
+    use market_squawk_data::{DatasetSchemaRegistry, Sha256Digest};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn durable_read_rejects_reversed_and_conflicting_generation() {
+        let dataset = DatasetId::try_from("market_squawk.market_events").expect("valid dataset");
+        let source = SourceId::try_from("crypto-test-source").expect("valid source");
+        let latest = Arc::new(Mutex::new(None));
+        let writer = CryptoMarketDurableReadWriter {
+            analytical_dataset: dataset.clone(),
+            source_surface: source.clone(),
+            latest: Arc::clone(&latest),
+        };
+
+        assert!(
+            writer
+                .retain(receipt(dataset.clone(), source.clone(), 2, 2))
+                .await
+                .expect("newer generation retained")
+        );
+        assert!(
+            !writer
+                .retain(receipt(dataset.clone(), source.clone(), 1, 1))
+                .await
+                .expect("older completion ignored")
+        );
+        assert_eq!(
+            latest
+                .lock()
+                .await
+                .as_ref()
+                .expect("latest receipt")
+                .manifest()
+                .manifest_version(),
+            2
+        );
+        assert!(matches!(
+            writer.retain(receipt(dataset, source, 2, 3)).await,
+            Err(CryptoMarketPublicationError::DurableReadConflict)
+        ));
+    }
+
+    fn receipt(
+        dataset: DatasetId,
+        source_id: SourceId,
+        manifest_version: u64,
+        marker: u8,
+    ) -> CryptoMarketEventPublicationReceipt {
+        let manifest = DatasetManifestRef::try_new_with_schema(
+            dataset,
+            manifest_version,
+            DatasetSchemaRegistry::local()
+                .canonical_research_observations()
+                .expect("canonical schema"),
+            Sha256Digest::new([marker; 32]),
+        )
+        .expect("valid manifest");
+        let publication_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, [marker; 32]);
+        CryptoMarketEventPublicationReceipt {
+            manifest: manifest.clone(),
+            restart: CryptoMarketEventRestartSelector {
+                manifest,
+                publication_digest,
+                publication_kind: ProviderMarketEventPublicationKind::EventMicrobatch,
+                surface: CryptoMarketSurface::KrakenSpot,
+                source_id,
+                expected_event_count: 1,
+            },
+            surface: CryptoMarketSurface::KrakenSpot,
+            provider_dataset: SourceIdentifier::try_from("crypto-test-events")
+                .expect("valid provider dataset"),
+            sealed_receipts: CryptoMarketSealedReceiptEvidence::EventMicrobatch(publication_digest),
+            event_count: 1,
+        }
+    }
 }

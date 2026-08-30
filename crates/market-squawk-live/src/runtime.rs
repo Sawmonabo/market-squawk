@@ -30,8 +30,8 @@ pub use config::{
     LiveRuntimeConfigInput, MAX_SNAPSHOT_EVENT_TRIGGER_OVERSHOOT,
 };
 pub use lifecycle::{
-    LiveRuntime, LiveRuntimeReplaceError, LiveRuntimeShutdown, LiveRuntimeStartError,
-    ShardShutdownOutcome, ShardShutdownStatus,
+    LiveRuntime, LiveRuntimeExportPlan, LiveRuntimeReplaceError, LiveRuntimeShutdown,
+    LiveRuntimeStartError, ShardShutdownOutcome, ShardShutdownStatus,
 };
 
 fn system_timestamp() -> Result<Timestamp, ()> {

@@ -6,7 +6,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use market_squawk_domain::{
     CapturePayload, CapturePayloadError, CaptureRetainedComponent, CaptureRetainedSizeError,
-    MAX_COMPATIBILITY_CAPTURE_PAYLOAD_BYTES, MAX_LIVE_CAPTURE_PAYLOAD_BYTES,
+    MAX_COMPATIBILITY_CAPTURE_PAYLOAD_BYTES, MAX_LIVE_CAPTURE_PAYLOAD_BYTES, RawCaptureFrameView,
     checked_arc_str_allocation_bytes,
 };
 use serde::{
@@ -287,6 +287,53 @@ impl RawCaptureRecord {
             received_at,
             payload,
         )
+    }
+
+    /// Converts one exact normalized capture frame without copying or decoding its payload.
+    ///
+    /// This low-level bridge does not establish admission authority. Its caller must own the
+    /// nonnil event and connection identities. Source identity, receive time, and payload are
+    /// always taken from `frame`; provider sequence and exchange time remain absent because the
+    /// raw transport frame does not own either fact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RawCaptureRecordError`] when identities, source identity, receive time, retained
+    /// size, or exact payload-allocation preservation are invalid.
+    pub fn try_from_exact_capture_frame<Frame>(
+        event_id: Uuid,
+        connection_id: Uuid,
+        frame: &Frame,
+    ) -> Result<Self, RawCaptureRecordError>
+    where
+        Frame: RawCaptureFrameView,
+    {
+        if frame.payload() != frame.capture_payload().as_bytes() {
+            return Err(RawCaptureRecordError::InvalidPayloadSharing);
+        }
+        let nanos = frame.received_at().unix_nanos();
+        let seconds = nanos.div_euclid(1_000_000_000);
+        let subsecond = u32::try_from(nanos.rem_euclid(1_000_000_000))
+            .map_err(|_error| RawCaptureRecordError::InvalidReceivedAt)?;
+        let received_at = DateTime::from_timestamp(seconds, subsecond)
+            .ok_or(RawCaptureRecordError::InvalidReceivedAt)?;
+        let record = Self::try_new_live_payload(
+            event_id,
+            Arc::from(frame.source_id().as_str()),
+            connection_id,
+            None,
+            None,
+            received_at,
+            frame.capture_payload().clone(),
+        )?;
+        if !frame
+            .capture_payload()
+            .shares_allocation_with(record.capture_payload())
+        {
+            return Err(RawCaptureRecordError::InvalidPayloadSharing);
+        }
+        let _complete_retained_bytes = record.checked_retained_bytes()?;
+        Ok(record)
     }
 
     pub(crate) fn try_new_live_payload(

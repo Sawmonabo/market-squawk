@@ -14,7 +14,7 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     CurrentDecodedProviderBatch, CurrentObservationIter, CurrentProviderObservation,
-    CurrentStreamKey,
+    CurrentStreamKey, FrameId,
 };
 #[path = "processor/error.rs"]
 mod error;
@@ -96,11 +96,18 @@ pub(crate) struct CurrentBatchCursor {
     admission: GenerationAdmission,
 }
 
+impl CurrentBatchCursor {
+    pub(crate) fn remaining_len(&self) -> usize {
+        self.observations.len()
+    }
+}
+
 /// Canonical event, audit assessment, and optional current-state authority seed.
 #[derive(Debug)]
 pub(crate) struct AppliedLiveObservation {
     pub(crate) stream: CurrentStreamKey,
     pub(crate) generation: ConnectionGeneration,
+    pub(crate) frame_id: FrameId,
     pub(crate) event: MarketEvent,
     pub(crate) assessment: QualificationAssessment,
     pub(crate) binding_digest: [u8; 32],
@@ -260,6 +267,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
         let Some(current) = cursor.observations.next() else {
             return Ok(None);
         };
+        let frame_id = current.frame_evidence().frame_id();
         let now = self.clock.now()?;
         self.validate_observation(&current, cursor, now.wall())?;
         let key = current.stream_key().clone();
@@ -355,6 +363,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
         Ok(Some(AppliedLiveObservation {
             stream: key,
             generation: cursor.admission.source().binding().connection_generation(),
+            frame_id,
             event: qualified.event,
             assessment: qualified.assessment,
             binding_digest: qualified.binding_digest,

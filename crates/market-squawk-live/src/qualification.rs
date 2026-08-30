@@ -8,20 +8,20 @@
 use market_squawk_domain::{
     AssessmentValidity, BindingError, BookIntegrity, BookLevel, BookStateBinding, BoundAssessment,
     CanonicalStateDigest, CanonicalizationRule, CaptureIntegrityState, ChecksumCapability,
-    ChecksumEvidence, ClassificationError, CoverageError, CoverageScope, CoverageStatus,
-    DataQuality, DigestAlgorithm, EvidenceDigest, InitializedSnapshot, InstrumentExecutionTerms,
-    InstrumentId, IntegrityAssessmentSet, IntegrityCapabilities, LiveEvidenceBinding,
-    LiveProvenance, LiveTimingAssessment, LiveTimingPolicy, MarketAssessmentSet, MarketEvent,
-    MarketEventError, MarketEventTiming, PayloadHash, PayloadReference, PrecisionIntegrity,
-    PriceTicks, ProvenanceError, QualificationAssessment, QualificationAssessmentId,
-    QualificationAssessmentInput, QualificationError, QuantityLots, RecordedLiveProvenanceInput,
-    RuleVersion, SequenceCapability, SequenceEvidence, SnapshotEvidence, SourceAuthorization,
-    SourceCoverageRecord, SourceId, SourceIdentifier, SourcePolicyAssessment, StreamIntegrityState,
-    Timestamp, TradingStatus, VenueId,
+    ChecksumEvidence, ClassificationError, ConnectionGeneration, CoverageError, CoverageScope,
+    CoverageStatus, DataQuality, DigestAlgorithm, EvidenceDigest, InitializedSnapshot,
+    InstrumentExecutionTerms, InstrumentId, IntegrityAssessmentSet, IntegrityCapabilities,
+    LiveEvidenceBinding, LiveProvenance, LiveTimingAssessment, LiveTimingPolicy,
+    MarketAssessmentSet, MarketEvent, MarketEventError, MarketEventTiming, PayloadHash,
+    PayloadReference, PrecisionIntegrity, PriceTicks, ProvenanceError, QualificationAssessment,
+    QualificationAssessmentId, QualificationAssessmentInput, QualificationError, QuantityLots,
+    RecordedLiveProvenanceInput, RuleVersion, SequenceCapability, SequenceEvidence,
+    SnapshotEvidence, SourceAuthorization, SourceCoverageRecord, SourceId, SourceIdentifier,
+    SourcePolicyAssessment, StreamIntegrityState, Timestamp, TradingStatus, VenueId,
 };
 use market_squawk_sources::{
     AuthorizationHealth, ChecksumValidationProfile, CoverageHealth, CurrentProviderObservation,
-    ProviderTimestampEvidence, SequenceValidationProfile,
+    FrameId, ProviderTimestampEvidence, SequenceValidationProfile,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -93,6 +93,131 @@ pub struct CommittedQualifiedMarketObservation {
     execution_terms: InstrumentExecutionTerms,
     stable_trade_id: Option<SourceIdentifier>,
     price: QualifiedMarketPrice,
+}
+
+/// Non-executable owned export of one post-commit, directly unverified market observation.
+///
+/// Only the instrument-owned runtime can construct this value. It retains the complete canonical
+/// event and qualification assessment but carries no execution authority, action gate, or price
+/// eligibility projection.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CommittedResearchMarketObservation {
+    event: MarketEvent,
+    assessment: QualificationAssessment,
+    binding_digest: [u8; 32],
+    committed_state_revision: u64,
+    generation: ConnectionGeneration,
+    frame_id: FrameId,
+    wire_ordinal: usize,
+    row_count: usize,
+    stable_trade_id: Option<SourceIdentifier>,
+}
+
+impl CommittedResearchMarketObservation {
+    pub(crate) fn from_committed(
+        event: MarketEvent,
+        assessment: QualificationAssessment,
+        binding_digest: [u8; 32],
+        committed_state_revision: u64,
+        generation: ConnectionGeneration,
+        frame_id: FrameId,
+        wire_ordinal: usize,
+        row_count: usize,
+        stable_trade_id: Option<SourceIdentifier>,
+    ) -> Option<Self> {
+        let provenance = event_provenance(&event);
+        if assessment.recorded_quality() != DataQuality::DirectUnverified
+            || provenance.binding() != assessment.binding()
+            || provenance.connection_generation() != generation
+            || row_count == 0
+            || wire_ordinal >= row_count
+        {
+            return None;
+        }
+        Some(Self {
+            event,
+            assessment,
+            binding_digest,
+            committed_state_revision,
+            generation,
+            frame_id,
+            wire_ordinal,
+            row_count,
+            stable_trade_id,
+        })
+    }
+
+    /// Returns the committed canonical event without granting execution authority.
+    pub const fn event(&self) -> &MarketEvent {
+        &self.event
+    }
+
+    /// Returns the complete qualification assessment retained at commit.
+    pub const fn qualification(&self) -> &QualificationAssessment {
+        &self.assessment
+    }
+
+    /// Returns the exact qualification binding digest.
+    pub const fn binding_digest(&self) -> [u8; 32] {
+        self.binding_digest
+    }
+
+    /// Returns the instrument-owned state revision committed with this event.
+    pub const fn committed_state_revision(&self) -> u64 {
+        self.committed_state_revision
+    }
+
+    /// Returns the exact source connection generation.
+    pub const fn connection_generation(&self) -> ConnectionGeneration {
+        self.generation
+    }
+
+    /// Returns the generation-local physical frame identity.
+    pub const fn frame_id(&self) -> FrameId {
+        self.frame_id
+    }
+
+    pub const fn wire_ordinal(&self) -> usize {
+        self.wire_ordinal
+    }
+
+    pub const fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    /// Returns the provider's stable economic trade identity when supplied.
+    pub const fn stable_trade_id(&self) -> Option<&SourceIdentifier> {
+        self.stable_trade_id.as_ref()
+    }
+
+    /// Consumes the one-use carrier into complete publication evidence.
+    pub fn into_parts(self) -> CommittedResearchMarketObservationParts {
+        CommittedResearchMarketObservationParts {
+            event: self.event,
+            assessment: self.assessment,
+            binding_digest: self.binding_digest,
+            committed_state_revision: self.committed_state_revision,
+            generation: self.generation,
+            frame_id: self.frame_id,
+            wire_ordinal: self.wire_ordinal,
+            row_count: self.row_count,
+            stable_trade_id: self.stable_trade_id,
+        }
+    }
+}
+
+/// Owned parts of one consumed research-only committed observation.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CommittedResearchMarketObservationParts {
+    pub event: MarketEvent,
+    pub assessment: QualificationAssessment,
+    pub binding_digest: [u8; 32],
+    pub committed_state_revision: u64,
+    pub generation: ConnectionGeneration,
+    pub frame_id: FrameId,
+    pub wire_ordinal: usize,
+    pub row_count: usize,
+    pub stable_trade_id: Option<SourceIdentifier>,
 }
 
 impl CommittedQualifiedMarketObservation {

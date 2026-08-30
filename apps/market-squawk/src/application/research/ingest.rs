@@ -81,11 +81,13 @@ pub(crate) use bls::{
     BlsWholePlanApplicationHandoff,
 };
 pub(crate) use crypto_market::{
-    CoinbaseMarketApplicationOutcome, CryptoMarketEventPublicationReceipt,
+    CoinbaseMarketApplicationOutcome, CryptoCommittedRowIngress, CryptoMarketDurableRead,
+    CryptoMarketDurableReadWriter, CryptoMarketEventPublicationReceipt,
     CryptoMarketEventRestartReceipt, CryptoMarketEventRestartSelector,
     CryptoMarketPointInTimeReceipt, CryptoMarketPointInTimeSelector,
     CryptoMarketPublicationClosure, CryptoMarketPublicationError,
-    CryptoMarketSealedReceiptEvidence, CryptoMarketSurface, KrakenMarketApplicationOutcome,
+    CryptoMarketSealedReceiptEvidence, CryptoMarketSurface, CryptoPendingFrameIngress,
+    CryptoPublicationRendezvousLimits, KrakenMarketApplicationOutcome,
     KrakenSealedRawCanonicalUnavailable,
 };
 pub(crate) use fred::{FredProductionPublicationError, FredPublishedGenerationHandoff};
@@ -107,7 +109,8 @@ pub(crate) use sec_fund::{
 pub use provider_runtime::ResearchProviderRuntimeGeneration;
 use provider_runtime::{ResearchProviderAdmission, ResearchProviderPublicationLease};
 pub(crate) use provider_runtime::{
-    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
+    CryptoMarketPublicationAuthority, ResearchProviderRuntimeMutationAuthority,
+    ResearchProviderRuntimeReplacement,
 };
 use selection::{PreparedRetainedSelection, RetainedDiscoverySelections};
 pub use selection::{
@@ -972,9 +975,19 @@ struct RegisteredExtractionSource {
     admission: ResearchProviderAdmission,
 }
 
+struct RegisteredPublicationSource {
+    metadata: SourceMetadata,
+    registered_at: Timestamp,
+    registration: Box<RegisteredSource>,
+    rights: ResearchRightsAuthority,
+    generation: ResearchProviderRuntimeGeneration,
+    admission: ResearchProviderAdmission,
+}
+
 struct CoordinatorAuthority {
     registry: Option<AuthoritativeSourceRegistry>,
     sources: BTreeMap<SourceIdentifier, RegisteredExtractionSource>,
+    publication_sources: BTreeMap<SourceIdentifier, RegisteredPublicationSource>,
     pending_replacements: BTreeMap<SourceIdentifier, Uuid>,
     selections: RetainedDiscoverySelections,
     alpaca_historical: alpaca_historical::AlpacaHistoricalSourceSlot,
@@ -1003,6 +1016,7 @@ impl ProductionResearchIngestCoordinator {
             authority: Arc::new(Mutex::new(CoordinatorAuthority {
                 registry: Some(registry),
                 sources: BTreeMap::new(),
+                publication_sources: BTreeMap::new(),
                 pending_replacements: BTreeMap::new(),
                 selections: RetainedDiscoverySelections::new(),
                 alpaca_historical: alpaca_historical::AlpacaHistoricalSourceSlot::absent(),
@@ -1161,7 +1175,9 @@ impl ProductionResearchIngestCoordinator {
         if self.lifecycle.shutdown_token().is_cancelled() || authority.registry.is_none() {
             return Err(ResearchIngestCompositionError::ShuttingDown);
         }
-        if authority.sources.contains_key(&profile) {
+        if authority.sources.contains_key(&profile)
+            || authority.publication_sources.contains_key(&profile)
+        {
             return Err(ResearchIngestCompositionError::DuplicateProfile);
         }
         let registration = authority

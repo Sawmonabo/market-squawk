@@ -269,6 +269,8 @@ impl ShardActor {
                     return Err(error.into());
                 }
             };
+            let row_count = cursor.remaining_len();
+            let mut wire_ordinal = 0usize;
             loop {
                 let applied = match owner
                     .processor
@@ -281,8 +283,15 @@ impl ShardActor {
                         return Err(error.into());
                     }
                 };
-                let disposition =
-                    process_applied_observation(&key, owner, applied, _retained_bytes)?;
+                let disposition = process_applied_observation(
+                    &key,
+                    owner,
+                    applied,
+                    _retained_bytes,
+                    wire_ordinal,
+                    row_count,
+                )?;
+                wire_ordinal = wire_ordinal.saturating_add(1);
                 feature_unavailable |= disposition.feature_unavailable;
                 action_failed |= disposition.action_failed;
                 qualified_market_export_dropped |= disposition.qualified_market_export_dropped;
@@ -319,6 +328,8 @@ fn process_applied_observation(
     owner: &mut RouteOwner,
     applied: AppliedLiveObservation,
     conservative_retained_bytes: u32,
+    wire_ordinal: usize,
+    row_count: usize,
 ) -> Result<AppliedObservationDisposition, ActorError> {
     if let Some(authority) = applied.authority.as_ref() {
         owner.processor.validate_applied_current(authority)?;
@@ -331,6 +342,7 @@ fn process_applied_observation(
             features,
             action_hook: _,
             qualified_market_export: _,
+            committed_research_export: _,
             generations: _,
             cross_venue_publisher: _,
             cross_venue_reader: _,
@@ -443,24 +455,55 @@ fn process_applied_observation(
             }
         }
     }
-    let qualified_market_export_dropped =
-        if let Some(exporter) = owner.qualified_market_export.as_ref() {
-            let observation = crate::CommittedQualifiedMarketObservation::from_committed(
-                applied.event,
-                applied.assessment,
-                applied.binding_digest,
-                applied.committed_state_revision,
-                owner.processor.execution_terms(),
-                applied.stable_trade_id,
-            );
-            observation.is_some_and(|observation| {
-                exporter
-                    .try_export(observation, conservative_retained_bytes)
-                    .is_err()
-            })
-        } else {
-            false
-        };
+    let (qualified_market_export_dropped, committed_research_export_dropped) = match quality {
+        market_squawk_domain::DataQuality::DirectVerified => {
+            let dropped = if let Some(exporter) = owner.qualified_market_export.as_ref() {
+                let observation = crate::CommittedQualifiedMarketObservation::from_committed(
+                    applied.event,
+                    applied.assessment,
+                    applied.binding_digest,
+                    applied.committed_state_revision,
+                    owner.processor.execution_terms(),
+                    applied.stable_trade_id,
+                );
+                observation.is_some_and(|observation| {
+                    exporter
+                        .try_export(observation, conservative_retained_bytes)
+                        .is_err()
+                })
+            } else {
+                false
+            };
+            (dropped, false)
+        }
+        market_squawk_domain::DataQuality::DirectUnverified => {
+            let dropped = if let Some(exporter) = owner.committed_research_export.as_ref() {
+                let observation = crate::CommittedResearchMarketObservation::from_committed(
+                    applied.event,
+                    applied.assessment,
+                    applied.binding_digest,
+                    applied.committed_state_revision,
+                    applied.generation,
+                    applied.frame_id,
+                    wire_ordinal,
+                    row_count,
+                    applied.stable_trade_id,
+                );
+                observation.is_none_or(|observation| {
+                    exporter
+                        .try_export(observation, conservative_retained_bytes)
+                        .is_err()
+                })
+            } else {
+                false
+            };
+            (false, dropped)
+        }
+        _ => (false, false),
+    };
+    if committed_research_export_dropped {
+        return Err(ActorError::CommittedResearchMarketExportUnavailable);
+    }
     Ok(AppliedObservationDisposition {
         feature_unavailable: unavailable,
         action_failed,

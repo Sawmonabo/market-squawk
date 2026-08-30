@@ -735,6 +735,24 @@ impl ProductionSourceLifecycleAuthority {
                         .activation_lease(session_id)
                         .or_else(|_| self.onboarding.prepared_activation_lease(session_id))
                         .ok()
+                })
+                .or_else(|| {
+                    is_session_backed_live_surface(command.provider().as_str())
+                        .then(|| {
+                            self.onboarding
+                                .current_runtime_activation_target(command.provider())
+                                .ok()
+                                .flatten()
+                                .and_then(|(session_id, digest)| {
+                                    self.onboarding.activation_lease(session_id).ok().filter(
+                                        |lease| {
+                                            lease.surface_id() == command.provider()
+                                                && lease.public_configuration_digest() == digest
+                                        },
+                                    )
+                                })
+                        })
+                        .flatten()
                 }),
             None => None,
         };
@@ -1767,7 +1785,8 @@ fn validate_account_group_evidence(
 }
 
 fn is_session_backed_live_surface(surface_id: &str) -> bool {
-    surface_id == COINBASE_DIRECT_LIVE_SURFACE
+    PUBLIC_LIVE_SURFACES.contains(&surface_id)
+        || surface_id == COINBASE_DIRECT_LIVE_SURFACE
         || ProviderMarketAccount::from_surface_id(surface_id).is_some()
 }
 

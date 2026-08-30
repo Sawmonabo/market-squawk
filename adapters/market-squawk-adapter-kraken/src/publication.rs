@@ -1,30 +1,35 @@
 //! Seal-first Kraken Spot public market-data publication material.
 //!
-//! This module deliberately stops below canonical live qualification. Kraken decoding produces
-//! provider-normalized observations, while instrument-owned state in `market-squawk-live` owns
-//! checksum/state qualification and canonical market-event construction. Until that live plane
-//! exports recorded `DirectUnverified` events, this module retains narrow sealed qualification
-//! material and never constructs or accepts caller-made canonical events.
+//! Kraken decoding produces provider-normalized observations, while instrument-owned state in
+//! `market-squawk-live` owns checksum/state qualification and canonical market-event construction.
+//! This module rejoins the exact sealed frame only with the live plane's one-use committed research
+//! observations and then constructs the common provider-event publication binding.
+
+use std::mem::size_of;
 
 use bytes::Bytes;
 use market_squawk_domain::{
-    ConnectionGeneration, DataQuality, EvidenceDigest, InstrumentId, LiveEventClass, MarketDepth,
-    MetadataRevision, SourceId, SourceIdentifier, Timestamp, VenueId,
+    ConnectionGeneration, DataQuality, EvidenceDigest, InstrumentId, LiveEventClass,
+    LiveProvenance, MarketDepth, MarketEvent, MetadataRevision, SourceId, SourceIdentifier,
+    Timestamp, VenueId,
 };
+use market_squawk_live::CommittedResearchMarketObservation;
 use market_squawk_sources::{
     ProviderCaptureError, ProviderCaptureSealRequest, ProviderEventMicrobatchMaterial,
-    ProviderEventMicrobatchSealExpectation, ProviderEventMicrobatchToken,
-    ProviderNativeLineageImplementation, ProviderNormalizedObservation, ProviderObservationPayload,
-    ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderTimestampEvidence,
-    SealedProviderCaptureMaterial, SealedProviderEventMicrobatchReceipt, SourceMetadataProvider,
-    TransportFrameKind, ValidatedRawMarketFrame,
+    ProviderEventMicrobatchSealExpectation, ProviderEventMicrobatchToken, ProviderMarketEventBatch,
+    ProviderMarketEventNativeLineageBatch, ProviderNativeLineageImplementation,
+    ProviderNormalizedObservation, ProviderObservationPayload, ProviderSequenceEvidence,
+    ProviderSnapshotEvidence, ProviderTimestampEvidence, SealedProviderCaptureMaterial,
+    SealedProviderEventMicrobatchBinding, SealedProviderEventMicrobatchReceipt,
+    SealedProviderPublicationBinding, SourceMetadataProvider, TransportFrameKind,
+    ValidatedRawMarketFrame,
 };
 use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
     KrakenChannel, KrakenConfig, KrakenControl, KrakenDecodeOutcome, KrakenDepth,
-    KrakenSubscription,
+    KrakenPublicationDecodeOutcome, KrakenSubscription,
 };
 
 const KRAKEN_VENUE: &str = "kraken";
@@ -184,7 +189,10 @@ impl KrakenPublicationEvidence {
 
 #[derive(Debug)]
 enum PendingDisposition {
-    Market(Vec<ProviderNormalizedObservation>),
+    Market {
+        observations: Vec<ProviderNormalizedObservation>,
+        decoded_retained_bytes: usize,
+    },
     Abstained(KrakenPublicationAbstention),
     Unavailable(KrakenPublicationUnavailable),
 }
@@ -248,7 +256,7 @@ impl KrakenPendingPublication {
     }
 }
 
-impl KrakenDecodeOutcome {
+impl KrakenPublicationDecodeOutcome {
     /// Consumes one decoded Kraken frame and its exact application capture material into the sole
     /// seal request and a provider-typed rejoin continuation.
     pub fn into_pending_publication(
@@ -258,9 +266,13 @@ impl KrakenDecodeOutcome {
         config: &KrakenConfig,
         available_at: Timestamp,
     ) -> Result<KrakenPendingPublication, KrakenPublicationError> {
-        let disposition = match self {
-            Self::Market(observations) => PendingDisposition::Market(observations),
-            Self::Control(control) => match control {
+        let (outcome, decoded_retained_bytes) = self.into_parts();
+        let disposition = match outcome {
+            KrakenDecodeOutcome::Market(observations) => PendingDisposition::Market {
+                observations,
+                decoded_retained_bytes,
+            },
+            KrakenDecodeOutcome::Control(control) => match control {
                 KrakenControl::Heartbeat => {
                     PendingDisposition::Abstained(KrakenPublicationAbstention::Heartbeat)
                 }
@@ -307,12 +319,16 @@ impl KrakenPublicationSealRejoin {
     ) -> Result<KrakenSealedPublication, KrakenPublicationError> {
         let token = self.expectation.try_rejoin(sealed)?;
         let publication = match self.disposition {
-            PendingDisposition::Market(observations) => {
+            PendingDisposition::Market {
+                observations,
+                decoded_retained_bytes,
+            } => {
                 let (native_rows, native_sidecar) = native_material(&observations, &self.evidence)?;
                 KrakenSealedPublication::Market(KrakenSealedMarketPublicationMaterial {
                     token,
                     evidence: self.evidence,
                     observations,
+                    decoded_retained_bytes,
                     native_rows,
                     native_sidecar,
                 })
@@ -387,8 +403,27 @@ pub struct KrakenSealedMarketPublicationMaterial {
     token: ProviderEventMicrobatchToken,
     evidence: KrakenPublicationEvidence,
     observations: Vec<ProviderNormalizedObservation>,
+    decoded_retained_bytes: usize,
     native_rows: Box<[Bytes]>,
     native_sidecar: Bytes,
+}
+
+/// One-use committed canonical rows supplied only by the instrument-owned live runtime.
+#[derive(Debug)]
+pub struct KrakenQualifiedMarketPublication {
+    rows: Vec<CommittedResearchMarketObservation>,
+}
+
+impl KrakenQualifiedMarketPublication {
+    /// Retains committed rows in exact provider wire order without cloning qualification authority.
+    pub fn try_new(
+        rows: Vec<CommittedResearchMarketObservation>,
+    ) -> Result<Self, KrakenPublicationError> {
+        if rows.is_empty() {
+            return Err(KrakenPublicationError::InvalidQualifiedPublication);
+        }
+        Ok(Self { rows })
+    }
 }
 
 impl KrakenSealedMarketPublicationMaterial {
@@ -424,8 +459,100 @@ impl KrakenSealedMarketPublicationMaterial {
         self.token.persisted_receipt()
     }
 
+    /// Returns a conservative checked memory charge for one retained sealed-frame handoff.
+    ///
+    /// The common decoder supplies the exact closed decoded-graph charge. Provider-native rows,
+    /// sidecar bytes, and application evidence retained after sealing are added here.
+    pub fn conservative_retained_bytes(&self) -> Option<usize> {
+        let native_slots = size_of::<Bytes>().checked_mul(self.native_rows.len())?;
+        let native_bytes = self
+            .native_rows
+            .iter()
+            .try_fold(self.native_sidecar.len(), |total, row| {
+                total.checked_add(row.len())
+            })?;
+        let evidence_strings = [
+            self.evidence.source_id.retained_bytes(),
+            self.evidence
+                .metadata_revision
+                .as_source_identifier()
+                .retained_bytes(),
+            self.evidence.dataset.retained_bytes(),
+            self.evidence.stream_identity.retained_bytes(),
+            self.evidence.provider_product.retained_bytes(),
+            self.evidence.feed.retained_bytes(),
+            self.evidence.venue.retained_bytes(),
+            self.evidence.provider_symbol.capacity(),
+            self.evidence.session_id.retained_bytes(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)?;
+        size_of::<Self>()
+            .checked_add(self.decoded_retained_bytes)?
+            .checked_add(native_slots)?
+            .checked_add(native_bytes)?
+            .checked_add(evidence_strings)
+    }
+
+    /// Consumes sealed Kraken material and committed live rows into the common durable binding.
+    ///
+    /// Rows remain single-venue Kraken evidence. This join neither combines venues nor grants
+    /// execution authority.
+    pub fn try_publish_qualified(
+        self,
+        qualified: KrakenQualifiedMarketPublication,
+    ) -> Result<SealedProviderPublicationBinding, KrakenPublicationError> {
+        if qualified.rows.len() != self.observations.len()
+            || self.native_rows.len() != self.observations.len()
+        {
+            return Err(KrakenPublicationError::InvalidQualifiedPublication);
+        }
+        let mut events = Vec::new();
+        events
+            .try_reserve_exact(qualified.rows.len())
+            .map_err(|_| KrakenPublicationError::Allocation)?;
+        let row_count = qualified.rows.len();
+        for (wire_ordinal, (normalized, committed)) in
+            self.observations.iter().zip(qualified.rows).enumerate()
+        {
+            validate_committed_row(
+                normalized,
+                &committed,
+                &self.evidence,
+                wire_ordinal,
+                row_count,
+            )?;
+            events.push(committed.into_parts().event);
+        }
+        let batch = ProviderMarketEventBatch::try_new(
+            self.evidence.source_id.clone(),
+            self.evidence.metadata_revision.clone(),
+            self.evidence.dataset.clone(),
+            events,
+        )?;
+        let native = ProviderMarketEventNativeLineageBatch::try_new(
+            ProviderNativeLineageImplementation::KrakenSpotV1,
+            &batch,
+            self.native_rows.into_vec(),
+            Some(self.native_sidecar),
+        )?;
+        let mut row_frame_ordinals = Vec::new();
+        row_frame_ordinals
+            .try_reserve_exact(batch.events().len())
+            .map_err(|_| KrakenPublicationError::Allocation)?;
+        row_frame_ordinals.resize(batch.events().len(), 0);
+        let binding = SealedProviderEventMicrobatchBinding::try_new(
+            self.token,
+            batch,
+            native,
+            row_frame_ordinals,
+        )?;
+        binding.validate()?;
+        Ok(binding.into())
+    }
+
     /// Consumes a sealed market frame into an explicit unavailable state without minting a
-    /// canonical row. This is the truthful current path while live canonical export is absent.
+    /// canonical row.
     pub fn into_unavailable(
         self,
         reason: KrakenPublicationUnavailable,
@@ -435,6 +562,112 @@ impl KrakenSealedMarketPublicationMaterial {
             evidence: self.evidence,
             reason: KrakenNonMarketReason::Unavailable(reason),
         }
+    }
+}
+
+fn validate_committed_row(
+    normalized: &ProviderNormalizedObservation,
+    committed: &CommittedResearchMarketObservation,
+    evidence: &KrakenPublicationEvidence,
+    wire_ordinal: usize,
+    row_count: usize,
+) -> Result<(), KrakenPublicationError> {
+    let event = committed.event();
+    let provenance = event_provenance(event);
+    let binding = committed.qualification().binding();
+    let source_timestamp = observation_timestamp(normalized);
+    if committed.qualification().recorded_quality() != DataQuality::DirectUnverified
+        || provenance.recorded_quality() != DataQuality::DirectUnverified
+        || provenance.execution_eligibility()
+            != market_squawk_domain::ExecutionEligibility::Ineligible
+        || committed.wire_ordinal() != wire_ordinal
+        || committed.row_count() != row_count
+        || provenance.source_id() != &evidence.source_id
+        || provenance.connection_generation() != evidence.connection_generation
+        || binding.source_id() != &evidence.source_id
+        || binding.session_id() != &evidence.session_id
+        || binding.metadata_revision() != &evidence.metadata_revision
+        || binding.provider_product().as_source_identifier() != &evidence.provider_product
+        || binding.provider_channel().as_source_identifier() != &evidence.feed
+        || binding.venue_id() != &evidence.venue
+        || binding.instrument_id() != evidence.instrument_id
+        || binding.connection_generation() != evidence.connection_generation
+        || committed.connection_generation() != evidence.connection_generation
+        || committed.frame_id().get() != evidence.generation_frame_ordinal
+        || binding.payload_digest() != evidence.raw_payload_digest
+        || binding.source_identifier() != normalized.source_identifier()
+        || binding.event_class() != normalized.event_class()
+        || provenance.source_identifier() != normalized.source_identifier()
+        || provenance.source_timestamp() != source_timestamp
+        || provenance.received_at() != evidence.received_at
+        || provenance.available_at() < evidence.available_at
+        || provenance.ingested_at() < provenance.available_at()
+        || normalized.venue() != &evidence.venue
+        || normalized.instrument() != evidence.instrument_id
+        || event_class(event) != normalized.event_class()
+        || event_depth(event) != normalized.depth()
+        || event_sequence(event).is_some()
+        || !stable_trade_identity_matches(normalized, committed)
+    {
+        return Err(KrakenPublicationError::InvalidQualifiedPublication);
+    }
+    Ok(())
+}
+
+fn stable_trade_identity_matches(
+    normalized: &ProviderNormalizedObservation,
+    committed: &CommittedResearchMarketObservation,
+) -> bool {
+    match normalized.payload() {
+        ProviderObservationPayload::Trade { trade_id, .. } => {
+            committed.stable_trade_id() == Some(trade_id)
+        }
+        ProviderObservationPayload::BookSnapshot(_) | ProviderObservationPayload::BookDelta(_) => {
+            committed.stable_trade_id().is_none()
+        }
+        _ => false,
+    }
+}
+
+fn event_provenance(event: &MarketEvent) -> &LiveProvenance {
+    match event {
+        MarketEvent::Trade(value) => value.provenance(),
+        MarketEvent::Quote(value) => value.provenance(),
+        MarketEvent::BookSnapshot(value) => value.provenance(),
+        MarketEvent::BookDelta(value) => value.provenance(),
+        MarketEvent::Auction(value) => value.provenance(),
+        MarketEvent::TradingHalt(value) => value.provenance(),
+        MarketEvent::InstrumentStatus(value) => value.provenance(),
+        MarketEvent::CorporateAction(value) => value.provenance(),
+    }
+}
+
+fn event_class(event: &MarketEvent) -> LiveEventClass {
+    match event {
+        MarketEvent::Trade(_) => LiveEventClass::Trade,
+        MarketEvent::Quote(_) => LiveEventClass::Quote,
+        MarketEvent::BookSnapshot(_) => LiveEventClass::BookSnapshot,
+        MarketEvent::BookDelta(_) => LiveEventClass::BookDelta,
+        MarketEvent::Auction(_) => LiveEventClass::Auction,
+        MarketEvent::TradingHalt(_) => LiveEventClass::TradingHalt,
+        MarketEvent::InstrumentStatus(_) => LiveEventClass::InstrumentStatus,
+        MarketEvent::CorporateAction(_) => LiveEventClass::CorporateAction,
+    }
+}
+
+fn event_depth(event: &MarketEvent) -> Option<MarketDepth> {
+    match event {
+        MarketEvent::BookSnapshot(value) => Some(value.depth()),
+        MarketEvent::BookDelta(value) => Some(value.depth()),
+        _ => None,
+    }
+}
+
+fn event_sequence(event: &MarketEvent) -> Option<market_squawk_domain::SequenceNumber> {
+    match event {
+        MarketEvent::BookSnapshot(value) => value.sequence(),
+        MarketEvent::BookDelta(value) => value.sequence(),
+        _ => None,
     }
 }
 
@@ -515,7 +748,7 @@ fn validate_disposition(
     disposition: &PendingDisposition,
     config: &KrakenConfig,
 ) -> Result<(), KrakenPublicationError> {
-    let PendingDisposition::Market(observations) = disposition else {
+    let PendingDisposition::Market { observations, .. } = disposition else {
         return Ok(());
     };
     if observations.is_empty() {
@@ -819,6 +1052,12 @@ pub enum KrakenPublicationError {
     /// Bounded provider-native semantics could not be encoded.
     #[error("Kraken native lineage encoding failed")]
     NativeEncoding,
+    /// Committed live rows did not match the sealed Kraken frame exactly.
+    #[error("Kraken committed canonical publication is inconsistent")]
+    InvalidQualifiedPublication,
+    /// A bounded publication allocation failed.
+    #[error("Kraken canonical publication allocation failed")]
+    Allocation,
     /// The shared consuming raw/publication binding rejected the handoff.
     #[error("Kraken common publication binding failed")]
     Capture(#[from] ProviderCaptureError),

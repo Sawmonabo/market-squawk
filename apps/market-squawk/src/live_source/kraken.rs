@@ -105,6 +105,10 @@ impl ProductionKrakenProfileSet {
 }
 
 impl ProductionKrakenProfile {
+    pub(super) fn publication_config(&self) -> KrakenConfig {
+        self.adapter_config.clone()
+    }
+
     pub(super) fn try_from_at(
         config: &KrakenSourceConfig,
         at: Timestamp,

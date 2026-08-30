@@ -53,6 +53,7 @@ use super::{
     ProductionPaperBotComposition, ProductionPaperBotExecutionConfig, ProductionPaperBotRoute,
 };
 use crate::live_source::order_level::OrderLevelDirectory;
+use crate::provider_activation::CryptoMarketPublicationPackage;
 use crate::provider_rate::open_provider_rate_authority;
 use crate::{
     AppConfig, CoinbaseDirectAccountActivation, CoinbaseDirectAdapterActivation,
@@ -271,6 +272,24 @@ impl ProductionLiveMarketComposition {
     ) -> Result<ProductionLiveSourceRuntime, ProductionLiveSourceRuntimeError> {
         self.source
             .start_with_qualified_market_exports(self.runtime_config, exports, cancellation)
+            .await
+    }
+
+    pub(crate) async fn start_with_qualified_market_exports_and_crypto_publication(
+        self,
+        exports: Vec<RouteQualifiedMarketExport>,
+        package: CryptoMarketPublicationPackage,
+        publication_cancellation: CancellationToken,
+        cancellation: CancellationToken,
+    ) -> Result<ProductionLiveSourceRuntime, ProductionLiveSourceRuntimeError> {
+        self.source
+            .start_with_qualified_market_exports_and_crypto_publication(
+                self.runtime_config,
+                exports,
+                package,
+                publication_cancellation,
+                cancellation,
+            )
             .await
     }
 }

@@ -40,6 +40,7 @@ struct RouteOwner {
     features: RouteFeatureState,
     action_hook: Option<crate::RouteActionHook>,
     qualified_market_export: Option<crate::RouteQualifiedMarketExport>,
+    committed_research_export: Option<crate::RouteCommittedResearchMarketExport>,
     cross_venue_publisher: Option<CrossVenueRoutePublisher>,
     cross_venue_reader: Option<CrossVenueRuntimeReader>,
 }
@@ -55,6 +56,7 @@ pub(crate) struct ShardActorInput {
     pub(crate) routes: Vec<LiveRouteConfig>,
     pub(crate) action_hooks: Vec<crate::RouteActionHook>,
     pub(crate) qualified_market_exports: Vec<crate::RouteQualifiedMarketExport>,
+    pub(crate) committed_research_market_exports: Vec<crate::RouteCommittedResearchMarketExport>,
     pub(crate) maximum_action_hook_bytes_per_route: usize,
     pub(crate) maximum_sources_per_route: usize,
     pub(crate) maximum_streams_per_route: usize,
@@ -227,6 +229,19 @@ impl ShardActor {
                 return Err(ActorError::DuplicateQualifiedMarketExport);
             }
         }
+        let mut committed_research_market_exports = HashMap::new();
+        committed_research_market_exports
+            .try_reserve(input.committed_research_market_exports.len())
+            .map_err(|_| ActorError::Allocation)?;
+        for exporter in input.committed_research_market_exports {
+            let route = exporter.route().clone();
+            if committed_research_market_exports
+                .insert(route, exporter)
+                .is_some()
+            {
+                return Err(ActorError::DuplicateCommittedResearchMarketExport);
+            }
+        }
         for route in input.routes {
             let cross_venue = input.cross_venue.route(route.route());
             let generations =
@@ -246,6 +261,7 @@ impl ShardActor {
             let route_key = route.route().clone();
             let action_hook = action_hooks.remove(&route_key);
             let qualified_market_export = qualified_market_exports.remove(&route_key);
+            let committed_research_export = committed_research_market_exports.remove(&route_key);
             if routes
                 .insert(
                     route_key.clone(),
@@ -255,6 +271,7 @@ impl ShardActor {
                         features,
                         action_hook,
                         qualified_market_export,
+                        committed_research_export,
                         cross_venue_publisher: cross_venue
                             .as_ref()
                             .map(|(publisher, _)| publisher.clone()),
@@ -271,6 +288,9 @@ impl ShardActor {
         }
         if !qualified_market_exports.is_empty() {
             return Err(ActorError::UnknownQualifiedMarketExport);
+        }
+        if !committed_research_market_exports.is_empty() {
+            return Err(ActorError::UnknownCommittedResearchMarketExport);
         }
         let book_scratch = BookProcessingScratch::try_new(input.maximum_book_items_per_message)
             .map_err(|_| ActorError::Allocation)?;
@@ -433,6 +453,12 @@ pub(crate) enum ActorError {
     UnknownQualifiedMarketExport,
     #[error("actor lost a required qualified-market export")]
     QualifiedMarketExportUnavailable,
+    #[error("actor received duplicate committed research-market export ownership")]
+    DuplicateCommittedResearchMarketExport,
+    #[error("actor received committed research-market export ownership for an unknown route")]
+    UnknownCommittedResearchMarketExport,
+    #[error("actor lost a required committed research-market export")]
+    CommittedResearchMarketExportUnavailable,
     #[error("actor received a command for an unknown route")]
     UnknownRoute,
     #[error("actor received a command whose generation is no longer current")]
@@ -471,6 +497,9 @@ impl ActorError {
             | Self::DuplicateQualifiedMarketExport
             | Self::UnknownQualifiedMarketExport
             | Self::QualifiedMarketExportUnavailable
+            | Self::DuplicateCommittedResearchMarketExport
+            | Self::UnknownCommittedResearchMarketExport
+            | Self::CommittedResearchMarketExportUnavailable
             | Self::UnknownRoute
             | Self::RuntimeClosed
             | Self::ShardClosed

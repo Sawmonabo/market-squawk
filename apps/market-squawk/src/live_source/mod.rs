@@ -6,6 +6,7 @@ pub(crate) mod display_market;
 mod instruments;
 mod kraken;
 mod kraken_level3;
+mod kraken_publication;
 pub(crate) mod order_level;
 mod provider;
 #[cfg(feature = "release-evidence")]

@@ -3,6 +3,7 @@
 mod action;
 mod authority;
 mod book;
+mod committed_research_export;
 mod cross_venue;
 mod features;
 mod integrity;
@@ -30,6 +31,10 @@ pub use authority::{
     AuthorityError, ConsumedLiveAuthority, ConsumedLiveEvidence, LiveExecutionCapability,
 };
 pub use book::{BookError, BookSide, DepthLimit, LevelUpdate, MAX_BOOK_MESSAGE_ITEMS, ScaledBook};
+pub use committed_research_export::{
+    CommittedResearchMarketExportError, CommittedResearchMarketObservationLease,
+    CommittedResearchMarketObservationReceiver, RouteCommittedResearchMarketExport,
+};
 pub use cross_venue::{
     CrossVenueFeatureError, CrossVenueFeatureHub, CrossVenueFeatureSnapshot, CrossVenueUpdate,
     CrossVenueVenueSnapshot,
@@ -54,7 +59,10 @@ pub use order_level::{
     PriceLevelProjection, SequencedProviderConversionError, UnknownOrderDisposition,
     provider_order, provider_snapshot_orders, sequenced_provider_event,
 };
-pub use qualification::{CommittedQualifiedMarketObservation, QualifiedMarketPrice};
+pub use qualification::{
+    CommittedQualifiedMarketObservation, CommittedResearchMarketObservation,
+    CommittedResearchMarketObservationParts, QualifiedMarketPrice,
+};
 pub use qualified_export::{
     QualifiedMarketExportError, QualifiedMarketObservationLease,
     QualifiedMarketObservationReceiver, RouteQualifiedMarketExport,
@@ -62,10 +70,10 @@ pub use qualified_export::{
 pub use runtime::{
     BoundShardIngress, DormantRouteIngress, LiveIngressBindError, LiveIngressError,
     LiveIngressRevokeError, LiveRouteConfig, LiveRouteConfigInput, LiveRuntime, LiveRuntimeConfig,
-    LiveRuntimeConfigError, LiveRuntimeConfigInput, LiveRuntimeHealthEvent, LiveRuntimeHealthKind,
-    LiveRuntimeIngress, LiveRuntimeReplaceError, LiveRuntimeShutdown, LiveRuntimeStartError,
-    MAX_SNAPSHOT_EVENT_TRIGGER_OVERSHOOT, RegistrationFailure, ShardShutdownOutcome,
-    ShardShutdownStatus,
+    LiveRuntimeConfigError, LiveRuntimeConfigInput, LiveRuntimeExportPlan, LiveRuntimeHealthEvent,
+    LiveRuntimeHealthKind, LiveRuntimeIngress, LiveRuntimeReplaceError, LiveRuntimeShutdown,
+    LiveRuntimeStartError, MAX_SNAPSHOT_EVENT_TRIGGER_OVERSHOOT, RegistrationFailure,
+    ShardShutdownOutcome, ShardShutdownStatus,
 };
 pub use sharding::{
     ShardCount, ShardId, ShardKey, ShardRouter, ShardRoutingError, ShardRoutingVersion,
