@@ -2619,12 +2619,13 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     use super::{
-        CalibrationRecord, ControlledArtifactRecord, ForecastAnalysisEvidenceRecord,
+        BundleId, CalibrationRecord, ControlledArtifactRecord, ForecastAnalysisEvidenceRecord,
         ForecastAnalysisManifestRecord, ForecastAnalysisSchemaRecord, ForecastEstimatorRecord,
-        ForecastIndex, ForecastMeasurementRecord, ForecastOutputBindingRecord,
-        ForecastOutputLabelRecord, ForecastPayloadRecord, ForecastServingEvidenceRecord,
-        ForecastTargetRecord, IntervalRecord, OUTPUT_BINDING_SCHEMA_VERSION, PointRecord,
-        VintageRecord, hex,
+        ForecastIndex, ForecastMeasurementRecord, ForecastModelEvidenceRecord,
+        ForecastOutputBindingRecord, ForecastOutputLabelRecord, ForecastPayloadRecord,
+        ForecastProductIdentityRecord, ForecastServingEvidenceRecord, ForecastTargetRecord,
+        IntervalRecord, ModelId, OUTPUT_BINDING_SCHEMA_VERSION, PointRecord, VintageRecord, hex,
+        opaque_product_token,
     };
     use crate::application::model::forecast::{
         FORECAST_PAYLOAD_SCHEMA_VERSION, ForecastApplicationError, ForecastSelectionQualification,

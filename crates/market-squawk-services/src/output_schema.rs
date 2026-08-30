@@ -12,6 +12,11 @@ const NANOSECOND_UTC_TIMESTAMP_PATTERN: &str =
     "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{9}Z$";
 const CALENDAR_DATE_PATTERN: &str = "^[0-9]{4}-[0-9]{2}-[0-9]{2}$";
 const CANONICAL_DECIMAL_PATTERN: &str = "^-?(?:0|[1-9][0-9]*)(?:\\.[0-9]*[1-9])?$";
+const NON_WHITESPACE_PATTERN: &str = "\\S";
+const POSITIVE_DECIMAL_PATTERN: &str = "^(?:0|[1-9][0-9]*)(?:\\.[0-9]*[1-9])?$";
+const PERCENTAGE_PATTERN: &str = "^(?:(?:0|[1-9]|[1-9][0-9])(?:\\.[0-9]*[1-9])?|100)$";
+const FORMATTED_PERCENTAGE_PATTERN: &str = "^-?[0-9]+(?:\\.[0-9]+)?%$";
+const OPAQUE_PRODUCT_TOKEN_PATTERN: &str = "^[a-z][a-z0-9_]{15,511}$";
 const POSITIVE_INTEGER_PATTERN: &str = "^[1-9][0-9]*$";
 const UNSIGNED_INTEGER_PATTERN: &str = "^(?:0|[1-9][0-9]*)$";
 const INTEGER_PATTERN: &str = "^(?:0|-?[1-9][0-9]*)$";
@@ -277,6 +282,11 @@ fn string_pattern_is_supported(schema: &Map<String, Value>, schema_type: &str) -
                 | NANOSECOND_UTC_TIMESTAMP_PATTERN
                 | CALENDAR_DATE_PATTERN
                 | CANONICAL_DECIMAL_PATTERN
+                | NON_WHITESPACE_PATTERN
+                | POSITIVE_DECIMAL_PATTERN
+                | PERCENTAGE_PATTERN
+                | FORMATTED_PERCENTAGE_PATTERN
+                | OPAQUE_PRODUCT_TOKEN_PATTERN
                 | POSITIVE_INTEGER_PATTERN
                 | UNSIGNED_INTEGER_PATTERN
                 | INTEGER_PATTERN
@@ -435,6 +445,13 @@ fn string_pattern_matches(pattern: Option<&Value>, value: &str) -> bool {
         Some(NANOSECOND_UTC_TIMESTAMP_PATTERN) => nanosecond_utc_timestamp_matches(value),
         Some(CALENDAR_DATE_PATTERN) => calendar_date_matches(value),
         Some(CANONICAL_DECIMAL_PATTERN) => canonical_decimal_matches(value),
+        Some(NON_WHITESPACE_PATTERN) => value.chars().any(|character| !character.is_whitespace()),
+        Some(POSITIVE_DECIMAL_PATTERN) => {
+            canonical_decimal_matches(value) && !value.starts_with('-') && value != "0"
+        }
+        Some(PERCENTAGE_PATTERN) => percentage_matches(value),
+        Some(FORMATTED_PERCENTAGE_PATTERN) => formatted_percentage_matches(value),
+        Some(OPAQUE_PRODUCT_TOKEN_PATTERN) => opaque_product_token_matches(value),
         Some(POSITIVE_INTEGER_PATTERN) => positive_integer_matches(value),
         Some(UNSIGNED_INTEGER_PATTERN) => value == "0" || positive_integer_matches(value),
         Some(INTEGER_PATTERN) => integer_matches(value),
@@ -492,6 +509,45 @@ fn canonical_decimal_matches(value: &str) -> bool {
         !fraction.is_empty()
             && fraction.bytes().all(|byte| byte.is_ascii_digit())
             && !fraction.ends_with('0')
+    })
+}
+
+fn percentage_matches(value: &str) -> bool {
+    if !canonical_decimal_matches(value) || value.starts_with('-') {
+        return false;
+    }
+    let mut components = value.split('.');
+    let Some(integer) = components.next().and_then(|value| value.parse::<u8>().ok()) else {
+        return false;
+    };
+    let has_fraction = components.next().is_some();
+    components.next().is_none() && (integer < 100 || (integer == 100 && !has_fraction))
+}
+
+fn formatted_percentage_matches(value: &str) -> bool {
+    let Some(value) = value.strip_suffix('%') else {
+        return false;
+    };
+    let value = value.strip_prefix('-').unwrap_or(value);
+    let mut components = value.split('.');
+    let Some(integer) = components.next() else {
+        return false;
+    };
+    let fraction = components.next();
+    components.next().is_none()
+        && !integer.is_empty()
+        && integer.bytes().all(|byte| byte.is_ascii_digit())
+        && fraction.is_none_or(|fraction| {
+            !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn opaque_product_token_matches(value: &str) -> bool {
+    value.as_bytes().split_first().is_some_and(|(first, rest)| {
+        first.is_ascii_lowercase()
+            && rest
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
     })
 }
 
@@ -573,8 +629,10 @@ fn bounded_number(value: &Value, minimum: Option<&Value>, maximum: Option<&Value
 #[cfg(test)]
 mod tests {
     use super::{
-        CALENDAR_DATE_PATTERN, CANONICAL_DECIMAL_PATTERN, INTEGER_PATTERN,
-        LOWERCASE_SHA256_PATTERN, UNSIGNED_INTEGER_PATTERN, validate_data, validate_data_schema,
+        CALENDAR_DATE_PATTERN, CANONICAL_DECIMAL_PATTERN, FORMATTED_PERCENTAGE_PATTERN,
+        INTEGER_PATTERN, LOWERCASE_SHA256_PATTERN, NON_WHITESPACE_PATTERN,
+        OPAQUE_PRODUCT_TOKEN_PATTERN, PERCENTAGE_PATTERN, POSITIVE_DECIMAL_PATTERN,
+        UNSIGNED_INTEGER_PATTERN, validate_data, validate_data_schema,
     };
     use serde_json::json;
 
@@ -658,6 +716,23 @@ mod tests {
         assert!(validate_data_schema(&decimal_schema));
         assert!(validate_data(&decimal_schema, &json!("-12.34")));
         assert!(!validate_data(&decimal_schema, &json!("01.0")));
+
+        for (pattern, accepted, rejected) in [
+            (NON_WHITESPACE_PATTERN, "Investment", "   "),
+            (POSITIVE_DECIMAL_PATTERN, "0.25", "-0.25"),
+            (PERCENTAGE_PATTERN, "99.9", "100.1"),
+            (FORMATTED_PERCENTAGE_PATTERN, "-1.50%", "1.%"),
+            (
+                OPAQUE_PRODUCT_TOKEN_PATTERN,
+                "selection_token_1",
+                "Selection-token-1",
+            ),
+        ] {
+            let schema = json!({"type": "string", "pattern": pattern});
+            assert!(validate_data_schema(&schema));
+            assert!(validate_data(&schema, &json!(accepted)));
+            assert!(!validate_data(&schema, &json!(rejected)));
+        }
 
         let unsigned_schema = json!({"type": "string", "pattern": UNSIGNED_INTEGER_PATTERN});
         assert!(validate_data_schema(&unsigned_schema));

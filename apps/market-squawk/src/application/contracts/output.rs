@@ -1371,9 +1371,7 @@ fn investment_analysis() -> Value {
 fn investment_analysis_action_token() -> Value {
     json!({
         "type": "string",
-        "minLength": 36,
-        "maxLength": 36,
-        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "format": "uuid",
         "not": {
             "type": "string",
             "const": "00000000-0000-0000-0000-000000000000",
@@ -2403,7 +2401,11 @@ fn market_search_page() -> Value {
 }
 
 fn market_token(prefix: &str) -> Value {
-    json!({"type":"string","minLength":prefix.len()+33,"maxLength":prefix.len()+87,"pattern":format!("^{prefix}_[A-Za-z0-9_-]{{32,86}}$")})
+    json!({
+        "type": "string",
+        "minLength": prefix.len() + 33,
+        "maxLength": prefix.len() + 87,
+    })
 }
 
 fn market_product_history_bar() -> Value {
