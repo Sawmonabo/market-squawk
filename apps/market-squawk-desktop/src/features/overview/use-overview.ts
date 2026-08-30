@@ -1,13 +1,14 @@
 import { useQuery } from "@tanstack/react-query"
-import type { z } from "zod"
 
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { marketOverviewRows } from "@/features/markets/market-product"
 import { parseInvestmentAnalysisPage } from "@/features/opportunities/contracts"
+import {
+  parseResearchActivities,
+  type ResearchActivity,
+} from "@/features/research/research-contracts"
 import type { ApplicationResult } from "@/lib/schemas"
 import type { DashboardQuery, ProductTransport } from "@/lib/transport"
-
-import { jobListSchema } from "./schemas"
 
 export type ReadState<T> =
   | { status: "loading"; data: null; message: null }
@@ -15,11 +16,22 @@ export type ReadState<T> =
   | { status: "unavailable"; data: null; message: string }
 
 const MARKET_INPUT = { query: "marketOverview" } as const
-const JOB_INPUT = { query: "jobs", limit: 24 } as const
+const ACTIVITY_INPUT = { query: "researchActivities" } as const
 const ANALYSIS_INPUT = {
   query: "decisionInvestmentAnalyses",
   limit: 12,
 } as const
+
+export function isActiveResearchActivity(activity: ResearchActivity) {
+  return [
+    "queued",
+    "preparing",
+    "running",
+    "awaiting_confirmation",
+    "cancelling",
+    "recovering",
+  ].includes(activity.state)
+}
 
 export function useOverviewQueries(
   transport: ProductTransport,
@@ -35,17 +47,17 @@ export function useOverviewQueries(
       parseInvestmentAnalysisPage(result, { limit: ANALYSIS_INPUT.limit }),
   )
   const markets = useMarketOverviewQuery(transport, scope)
-  const jobs = useJobListQuery(transport, scope)
-  return { analyses, markets, jobs }
+  const activities = useResearchActivityQuery(transport, scope)
+  return { activities, analyses, markets }
 }
 
-export function useOperationalQueries(
+export function useHomeStatusQueries(
   transport: ProductTransport,
   scope: ProductScope,
 ) {
   return {
+    activities: useResearchActivityQuery(transport, scope),
     markets: useMarketOverviewQuery(transport, scope),
-    jobs: useJobListQuery(transport, scope),
   }
 }
 
@@ -63,40 +75,17 @@ function useMarketOverviewQuery(
   )
 }
 
-function useJobListQuery(transport: ProductTransport, scope: ProductScope) {
-  return useProductQuery(
-    transport,
-    scope,
-    "job",
-    "list",
-    JOB_INPUT,
-    jobListSchema,
-  )
-}
-
-function useProductQuery<Schema extends z.ZodType>(
+function useResearchActivityQuery(
   transport: ProductTransport,
   scope: ProductScope,
-  domain: string,
-  operation: string,
-  input: DashboardQuery,
-  schema: Schema,
-): ReadState<z.infer<Schema>> {
+) {
   return useParsedProductQuery(
     transport,
     scope,
-    domain,
-    operation,
-    input,
-    (result) => {
-      const parsed = parseApplicationData(result, schema)
-      if (!parsed.success) {
-        throw new Error(
-          "This information is unavailable right now.",
-        )
-      }
-      return parsed.data
-    },
+    "research",
+    "activity",
+    ACTIVITY_INPUT,
+    parseResearchActivities,
   )
 }
 
@@ -132,11 +121,4 @@ function useParsedProductQuery<Result>(
       message: "This information is unavailable right now.",
     }
   }
-}
-
-function parseApplicationData<Schema extends z.ZodType>(
-  result: ApplicationResult,
-  schema: Schema,
-) {
-  return schema.safeParse(result.data)
 }

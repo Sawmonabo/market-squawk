@@ -19,6 +19,7 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import type { InvestmentAnalysisPage } from "@/features/opportunities/contracts"
 import type { MarketProductRow } from "@/features/markets/market-product"
+import type { ResearchActivity } from "@/features/research/research-contracts"
 import {
   formatPercent,
   formatTimestamp,
@@ -37,8 +38,11 @@ import { formatMoney, humanize } from "@/lib/formatters"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
-import type { OverviewJob } from "./schemas"
-import { type ReadState, useOverviewQueries } from "./use-overview"
+import {
+  isActiveResearchActivity,
+  type ReadState,
+  useOverviewQueries,
+} from "./use-overview"
 
 type OverviewQueries = ReturnType<typeof useOverviewQueries>
 type PortfolioAccountsRead = ReturnType<typeof usePortfolioAccounts>
@@ -54,11 +58,9 @@ export function OverviewDashboard({
 }) {
   const queries = useOverviewQueries(transport, scope)
   const accounts = usePortfolioAccounts(transport, bootstrap)
-  const analysisJobs =
-    queries.jobs.status === "ready"
-      ? queries.jobs.data.jobs.filter(
-          (job) => !isTerminal(job.state) && isAnalysisJob(job.kind),
-        )
+  const activeActivities =
+    queries.activities.status === "ready"
+      ? queries.activities.data.filter(isActiveResearchActivity)
       : []
 
   return (
@@ -82,16 +84,14 @@ export function OverviewDashboard({
           icon={Gauge}
           label="Running analyses"
           value={
-            queries.jobs.status === "ready"
-              ? analysisJobs.length.toLocaleString()
+            queries.activities.status === "ready"
+              ? activeActivities.length.toLocaleString()
               : "Unavailable"
           }
-          state={queries.jobs.status}
+          state={queries.activities.status}
           detail={
-            queries.jobs.status === "ready"
-              ? queries.jobs.data.next
-                ? "More active work may be available in Operations & Jobs."
-                : "Current research, forecasting, and decision work."
+            queries.activities.status === "ready"
+              ? "Current research, forecasting, and investment analysis in progress."
               : "Analysis status is unavailable."
           }
         />
@@ -119,7 +119,10 @@ export function OverviewDashboard({
       </section>
 
       <section className="grid gap-4 xl:grid-cols-2">
-        <RunningAnalysisPanel jobs={queries.jobs} analysisJobs={analysisJobs} />
+        <RunningAnalysisPanel
+          activities={queries.activities}
+          activeActivities={activeActivities}
+        />
         <SetupGuidance
           accounts={accounts}
           markets={queries.markets}
@@ -185,9 +188,7 @@ function PortfolioSummary({
     return (
       <PortfolioUnavailable
         title="Portfolio accounts could not be read"
-        detail={
-          "Portfolio accounts could not be loaded. Try again or review Logs & Diagnostics."
-        }
+        detail="Portfolio accounts could not be loaded. Refresh Home and try again."
       />
     )
   }
@@ -276,18 +277,18 @@ function SelectedPortfolioSummary({
   const performance = details.performance.data?.value ?? null
   const exposure = details.exposure.data?.value ?? null
   const risk = details.risk.data?.value ?? null
-  const expectedRevisionId = account.currentRevision.revisionId
+  const expectedSnapshotToken = account.currentSnapshot.snapshotToken
   const changedWhileReading =
     holdings?.some(
       (holding) =>
-        holding.account_id !== account.accountId ||
-        holding.revisionId !== expectedRevisionId,
+        holding.accountId !== account.accountId ||
+        holding.snapshotToken !== expectedSnapshotToken,
     ) === true ||
     [performance, exposure, risk].some(
       (detail) =>
         detail !== null &&
         (detail.accountId !== account.accountId ||
-          detail.revisionId !== expectedRevisionId),
+          detail.snapshotToken !== expectedSnapshotToken),
     )
 
   if (changedWhileReading) {
@@ -318,8 +319,7 @@ function SelectedPortfolioSummary({
     <div className="mt-4">
       {failures.length > 0 ? (
         <p className="mb-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-[11px] leading-5 text-destructive">
-          Some portfolio details could not be loaded. Try refreshing this page. If the problem
-          continues, review Logs &amp; Diagnostics.
+          Some portfolio details could not be loaded. Refresh Home and try again.
         </p>
       ) : null}
 
@@ -392,7 +392,7 @@ function SelectedPortfolioSummary({
           />
           <EvidenceFact
             label="Last updated"
-            value={formatTimestamp(account.currentRevision.effectiveAtUnixNanos)}
+            value={formatTimestamp(account.currentSnapshot.effectiveAtUnixNanos)}
           />
         </dl>
       </details>
@@ -432,7 +432,7 @@ function RecommendationSummary({
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Saved analyses are unavailable</AlertTitle>
           <AlertDescription>
-            Try again or review Logs &amp; Diagnostics for details.
+            Refresh Home and try again.
           </AlertDescription>
         </Alert>
       ) : analyses.data.availableCount === 0 ? (
@@ -497,11 +497,11 @@ function RecommendationFacts({ page }: { page: InvestmentAnalysisPage }) {
 }
 
 function RunningAnalysisPanel({
-  jobs,
-  analysisJobs,
+  activities,
+  activeActivities,
 }: {
-  jobs: OverviewQueries["jobs"]
-  analysisJobs: OverviewJob[]
+  activities: OverviewQueries["activities"]
+  activeActivities: ResearchActivity[]
 }) {
   return (
     <section
@@ -520,17 +520,17 @@ function RunningAnalysisPanel({
         <Clock3 className="size-5 text-primary" aria-hidden="true" />
       </div>
 
-      {jobs.status === "loading" ? (
+      {activities.status === "loading" ? (
         <Skeleton className="mt-5 h-32 rounded-lg" />
-      ) : jobs.status === "unavailable" ? (
+      ) : activities.status === "unavailable" ? (
         <Alert className="mt-5">
           <CircleAlert aria-hidden="true" />
-          <AlertTitle>Job status is unavailable</AlertTitle>
+          <AlertTitle>Analysis activity is unavailable</AlertTitle>
           <AlertDescription>
-            Try again or review Logs &amp; Diagnostics for details.
+            Refresh Home and try again.
           </AlertDescription>
         </Alert>
-      ) : analysisJobs.length === 0 ? (
+      ) : activeActivities.length === 0 ? (
         <div className="mt-5 rounded-lg border border-dashed border-border p-5">
           <p className="text-xs font-medium">
             No analysis is running
@@ -541,29 +541,32 @@ function RunningAnalysisPanel({
         </div>
       ) : (
         <ul className="mt-5 divide-y divide-border">
-          {analysisJobs.slice(0, 4).map((job) => (
-            <li key={job.jobId} className="py-3 first:pt-0 last:pb-0">
+          {activeActivities.slice(0, 4).map((activity) => (
+            <li
+              key={activity.activityToken}
+              className="py-3 first:pt-0 last:pb-0"
+            >
               <div className="flex items-baseline justify-between gap-3">
-                <p className="truncate text-xs font-medium" title={job.kind}>
-                  {humanize(job.kind)}
+                <p className="truncate text-xs font-medium" title={activity.label}>
+                  {activity.label}
                 </p>
                 <span className="font-mono text-[9px] uppercase tracking-wider text-primary">
-                  {humanize(job.state)}
+                  {activityStateLabel(activity.state)}
                 </span>
               </div>
-              <p className="mt-1 text-[10px] leading-4 text-muted-foreground">
-                {job.phase ? humanize(job.phase) : "No phase reported"}
-                {job.completedUnits !== null && job.completedUnits !== undefined
-                  ? ` · ${job.completedUnits.toLocaleString()} completed${job.totalUnits !== null && job.totalUnits !== undefined ? ` of ${job.totalUnits.toLocaleString()}` : ""}`
-                  : ""}
-              </p>
+              {activity.completedUnits !== null && activity.totalUnits !== null ? (
+                <p className="mt-1 text-[10px] leading-4 text-muted-foreground">
+                  {activity.completedUnits.toLocaleString()} of{" "}
+                  {activity.totalUnits.toLocaleString()} complete
+                </p>
+              ) : null}
             </li>
           ))}
         </ul>
       )}
 
       <Button asChild className="mt-4" size="sm" variant="outline">
-        <Link to="/system/operations-jobs">Open Operations &amp; Jobs</Link>
+        <Link to="/opportunities">Review investment analyses</Link>
       </Button>
     </section>
   )
@@ -641,17 +644,17 @@ function SetupGuidance({
             detail={
               markets.status === "unavailable"
                 ? "Current market information is unavailable. Review your connections to restore coverage."
-                : "No current prices are available. Review Connections & Sources to restore coverage."
+                : "No current prices are available. Review your connections to restore coverage."
             }
             path="/connections/sources"
-            linkLabel="Open Connections & Sources"
+            linkLabel="Open Connections"
           />
         ) : null}
         {analyses.status === "unavailable" ? (
           <GuidanceItem
             icon={ShieldAlert}
-            title="Investment-analysis history needs repair"
-            detail="Saved analyses are unavailable. Try again or review Logs & Diagnostics."
+            title="Saved analyses are unavailable"
+            detail="Refresh Home and try again."
             path="/opportunities"
             linkLabel="Open Opportunities"
           />
@@ -789,7 +792,7 @@ function EvidencePanel({
         <div className="rounded-lg border border-border bg-background/35 p-4">
           <p className="text-xs font-medium">Not available right now</p>
           <p className="mt-1 text-[11px] leading-5 text-muted-foreground">
-            Try again or review Logs &amp; Diagnostics for details.
+            Refresh Home and try again.
           </p>
         </div>
       ) : null}
@@ -913,12 +916,12 @@ function factFromPerformance(
   if (loading) {
     return {
       value: "Loading…",
-      detail: "Reading the selected account revision.",
+      detail: "Reading the selected account.",
     }
   }
   return {
     value: "Not available",
-    detail: "No current-value result was returned for this account revision.",
+    detail: "No current value is available for this account.",
   }
 }
 
@@ -984,12 +987,27 @@ function marketAvailabilityLabel(market: MarketProductRow) {
   return humanize(market.availability)
 }
 
-function isAnalysisJob(kind: string) {
-  return ["analysis.", "decision.", "model.", "research."].some((prefix) =>
-    kind.startsWith(prefix),
-  )
-}
-
-function isTerminal(state: string) {
-  return ["completed", "failed", "cancelled", "interrupted"].includes(state)
+function activityStateLabel(state: ResearchActivity["state"]) {
+  switch (state) {
+    case "queued":
+      return "Waiting"
+    case "preparing":
+      return "Preparing"
+    case "running":
+      return "In progress"
+    case "awaiting_confirmation":
+      return "Needs confirmation"
+    case "cancelling":
+      return "Stopping"
+    case "recovering":
+      return "Resuming"
+    case "completed":
+      return "Completed"
+    case "failed":
+      return "Needs attention"
+    case "cancelled":
+      return "Stopped"
+    case "interrupted":
+      return "Interrupted"
+  }
 }

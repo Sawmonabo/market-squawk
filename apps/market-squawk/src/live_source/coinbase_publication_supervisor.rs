@@ -9,9 +9,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::application::{
-    CoinbaseMarketApplicationOutcome, CryptoCommittedRowIngress, CryptoMarketDurableReadWriter,
-    CryptoMarketPublicationAuthority, CryptoMarketPublicationError, CryptoPendingFrameIngress,
-    CryptoPublicationRendezvousLimits,
+    CoinbaseMarketApplicationOutcome, CryptoCommittedRowIngress, CryptoMarketPublicationAuthority,
+    CryptoMarketPublicationError, CryptoPendingFrameIngress, CryptoPublicationRendezvousLimits,
+    MarketEventDurableReadWriter, MarketEventReadError,
 };
 use crate::provider_activation::CoinbaseMarketPublicationPackage;
 
@@ -19,7 +19,7 @@ use super::super::sink::{CoinbaseCapturedPublicationInput, CoinbaseCapturedPubli
 
 /// Sole application-owned lifecycle for one Coinbase Advanced Trade public generation.
 #[derive(Debug)]
-pub(super) struct CoinbasePublicationSupervisor {
+pub(in crate::live_source) struct CoinbasePublicationSupervisor {
     cancellation: CancellationToken,
     expiry: Option<JoinHandle<()>>,
     raw: Option<JoinHandle<Result<(), CoinbasePublicationSupervisorError>>>,
@@ -32,7 +32,7 @@ impl CoinbasePublicationSupervisor {
         clippy::too_many_arguments,
         reason = "the exact source authority and independently bounded handoffs remain explicit"
     )]
-    pub(super) fn start(
+    pub(in crate::live_source) fn start(
         package: CoinbaseMarketPublicationPackage,
         mut raw_frames: CoinbaseCapturedPublicationReceiver,
         committed_rows: Vec<CommittedResearchMarketObservationReceiver>,
@@ -99,7 +99,7 @@ impl CoinbasePublicationSupervisor {
         })
     }
 
-    pub(super) fn is_healthy(&self) -> bool {
+    pub(in crate::live_source) fn is_healthy(&self) -> bool {
         !self.cancellation.is_cancelled()
             && self.expiry.as_ref().is_some_and(|task| !task.is_finished())
             && self.raw.as_ref().is_some_and(|task| !task.is_finished())
@@ -108,7 +108,7 @@ impl CoinbasePublicationSupervisor {
             && self.authority.is_some()
     }
 
-    pub(super) async fn shutdown(
+    pub(in crate::live_source) async fn shutdown(
         mut self,
         deadline: Instant,
     ) -> Result<(), CoinbasePublicationSupervisorError> {
@@ -185,7 +185,7 @@ async fn run_raw_worker(
     authority: Arc<CryptoMarketPublicationAuthority>,
     maximum_inflight: NonZeroUsize,
     limits: CryptoPublicationRendezvousLimits,
-    durable_writer: CryptoMarketDurableReadWriter,
+    durable_writer: MarketEventDurableReadWriter,
     cancellation: CancellationToken,
 ) -> Result<(), CoinbasePublicationSupervisorError> {
     let mut open = true;
@@ -224,40 +224,107 @@ async fn publish_raw(
     pending: CryptoPendingFrameIngress,
     authority: Arc<CryptoMarketPublicationAuthority>,
     limits: CryptoPublicationRendezvousLimits,
-    durable_writer: CryptoMarketDurableReadWriter,
+    durable_writer: MarketEventDurableReadWriter,
     cancellation: CancellationToken,
 ) -> Result<(), CoinbasePublicationSupervisorError> {
     authority.validate_precommit()?;
-    let deadline = Instant::now()
-        .checked_add(limits.frame_timeout())
-        .ok_or(CoinbasePublicationSupervisorError::DeadlineRange)?;
-    let (rejoin, seal_request, observed_at) = input.into_parts();
     let publication = authority.publication();
-    let material = publication
-        .seal_coinbase_public(
+    let outcome = match input {
+        CoinbaseCapturedPublicationInput::Public {
             rejoin,
             seal_request,
             observed_at,
-            authority.precommit_authority(),
-            cancellation,
-            deadline,
-        )
-        .await?;
-    let idempotency = coinbase_idempotency_key(&material)?;
-    let outcome = pending
-        .publish_coinbase_when_committed(
-            publication.as_ref(),
-            material,
-            authority.analytical_dataset().clone(),
-            idempotency,
+        } => {
+            let deadline = Instant::now()
+                .checked_add(limits.frame_timeout())
+                .ok_or(CoinbasePublicationSupervisorError::DeadlineRange)?;
+            let material = publication
+                .seal_coinbase_public(
+                    rejoin,
+                    seal_request,
+                    observed_at,
+                    authority.precommit_authority(),
+                    cancellation,
+                    deadline,
+                )
+                .await?;
+            let idempotency = coinbase_idempotency_key(&material)?;
+            pending
+                .publish_coinbase_when_committed(
+                    publication.as_ref(),
+                    material,
+                    authority.analytical_dataset().clone(),
+                    idempotency,
+                    observed_at,
+                    authority.precommit_authority(),
+                )
+                .await?
+        }
+        CoinbaseCapturedPublicationInput::Direct {
+            handoff,
+            context,
             observed_at,
-            authority.precommit_authority(),
-        )
-        .await?;
+        } => {
+            let idempotency = coinbase_direct_idempotency_key(&handoff)?;
+            pending
+                .publish_coinbase_direct_when_committed(
+                    publication.as_ref(),
+                    handoff,
+                    context,
+                    authority.analytical_dataset().clone(),
+                    idempotency,
+                    observed_at,
+                    authority.precommit_authority(),
+                )
+                .await?
+        }
+    };
     if let CoinbaseMarketApplicationOutcome::Published(receipt) = outcome {
         durable_writer.retain(receipt).await?;
     }
     Ok(())
+}
+
+fn coinbase_direct_idempotency_key(
+    handoff: &market_squawk_adapter_coinbase::CoinbaseMarketHandoff,
+) -> Result<String, CryptoMarketPublicationError> {
+    let market_squawk_adapter_coinbase::CoinbaseMarketRawLineage::DirectInitial(lineage) =
+        handoff.raw_lineage()
+    else {
+        return Err(CryptoMarketPublicationError::FamilyMismatch);
+    };
+    let snapshot = lineage.snapshot().receipt();
+    let terminal = lineage
+        .replay()
+        .last()
+        .ok_or(CryptoMarketPublicationError::FamilyMismatch)?;
+    let source = handoff
+        .typed_batch()
+        .evidence()
+        .binding()
+        .source_id()
+        .as_str();
+    let generation = handoff
+        .typed_batch()
+        .evidence()
+        .binding()
+        .connection_generation()
+        .get();
+    let mut key = String::with_capacity(35 + source.len() + 20 + 64 + 20 + 64);
+    key.push_str("coinbase-direct-response-event-v1-");
+    key.push_str(source);
+    key.push('-');
+    key.push_str(&generation.to_string());
+    key.push('-');
+    append_hex(&mut key, snapshot.body_digest().bytes());
+    key.push('-');
+    key.push_str(&terminal.sequence().get().to_string());
+    key.push('-');
+    append_hex(
+        &mut key,
+        terminal.decoder_evidence().payload_digest().bytes(),
+    );
+    Ok(key)
 }
 
 async fn run_committed_worker(
@@ -311,7 +378,7 @@ fn append_hex<const N: usize>(output: &mut String, bytes: [u8; N]) {
 }
 
 #[derive(Debug, Error)]
-pub(super) enum CoinbasePublicationSupervisorError {
+pub(in crate::live_source) enum CoinbasePublicationSupervisorError {
     #[error("Coinbase publication startup was cancelled")]
     Cancelled,
     #[error("Coinbase publication worker ownership is unavailable")]
@@ -330,6 +397,8 @@ pub(super) enum CoinbasePublicationSupervisorError {
     Task(tokio::task::JoinError),
     #[error(transparent)]
     Publication(#[from] CryptoMarketPublicationError),
+    #[error(transparent)]
+    DurableRead(#[from] MarketEventReadError),
     #[error(transparent)]
     Ingest(#[from] market_squawk_data::IngestError),
     #[error(transparent)]

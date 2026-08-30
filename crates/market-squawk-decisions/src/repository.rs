@@ -201,6 +201,44 @@ pub struct ScreenRunIndexEntry {
     candidate_count: usize,
 }
 
+/// Bounded deterministic page of current saved-screen revisions.
+///
+/// Each stable [`ScreenId`] occurs at most once and resolves to its highest retained immutable
+/// revision. Ordering and continuation are both by stable screen identity; revision append order
+/// never becomes presentation authority.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CurrentScreenPage {
+    screens: Vec<SavedScreen>,
+    available: usize,
+    has_more: bool,
+}
+
+impl CurrentScreenPage {
+    /// Current saved-screen heads ordered by stable screen identity.
+    #[must_use]
+    pub fn screens(&self) -> &[SavedScreen] {
+        &self.screens
+    }
+
+    /// Whether another current stable screen identity follows this page.
+    #[must_use]
+    pub const fn has_more(&self) -> bool {
+        self.has_more
+    }
+
+    /// Number of current stable screen identities available after the supplied cursor.
+    #[must_use]
+    pub const fn available_count(&self) -> usize {
+        self.available
+    }
+
+    /// Consumes the page into its bounded current-screen projection.
+    #[must_use]
+    pub fn into_screens(self) -> Vec<SavedScreen> {
+        self.screens
+    }
+}
+
 impl ScreenRunIndexEntry {
     fn new(run: ScreenRun, candidate_count: usize) -> Self {
         Self {
@@ -1242,6 +1280,68 @@ impl DecisionRepository {
     pub fn screen(&self, id: &ScreenId, revision: RevisionNumber) -> Option<&SavedScreen> {
         self.screens()
             .find(|screen| screen.revision().id() == id && screen.revision().revision() == revision)
+    }
+
+    /// Finds the highest retained immutable revision for one stable saved-screen identity.
+    pub fn current_screen(&self, id: &ScreenId) -> Option<&SavedScreen> {
+        self.screens()
+            .filter(|screen| screen.revision().id() == id)
+            .max_by_key(|screen| screen.revision().revision().get())
+    }
+
+    /// Lists current saved-screen heads after an optional exact stable identity.
+    ///
+    /// The repository owns head selection, stable ordering, cursor validity, and completeness.
+    /// Callers therefore never infer currentness from revision append order or duplicate the
+    /// repository's configured retention ceiling.
+    pub fn list_current_screens_after(
+        &self,
+        after: Option<&ScreenId>,
+        maximum: usize,
+    ) -> Result<CurrentScreenPage, DecisionRepositoryError> {
+        if maximum == 0 {
+            return Err(DecisionRepositoryError::InvalidLimits);
+        }
+
+        let mut current: Vec<&SavedScreen> = Vec::new();
+        current
+            .try_reserve_exact(self.screen_count())
+            .map_err(|_error| DecisionRepositoryError::Allocation)?;
+        current.extend(self.screens());
+        current.sort_unstable_by(|left, right| {
+            left.revision()
+                .id()
+                .cmp(right.revision().id())
+                .then_with(|| {
+                    right
+                        .revision()
+                        .revision()
+                        .get()
+                        .cmp(&left.revision().revision().get())
+                })
+        });
+        current.dedup_by(|left, right| left.revision().id() == right.revision().id());
+
+        let start = match after {
+            None => 0,
+            Some(after) => current
+                .binary_search_by(|screen| screen.revision().id().cmp(after))
+                .map_err(|_error| DecisionRepositoryError::NotFound)?
+                .checked_add(1)
+                .ok_or(DecisionRepositoryError::Capacity)?,
+        };
+        let available = current.len().saturating_sub(start);
+        let count = available.min(maximum);
+        let mut screens = Vec::new();
+        screens
+            .try_reserve_exact(count)
+            .map_err(|_error| DecisionRepositoryError::Allocation)?;
+        screens.extend(current.into_iter().skip(start).take(maximum).cloned());
+        Ok(CurrentScreenPage {
+            screens,
+            available,
+            has_more: available > maximum,
+        })
     }
 
     /// Finds one exact screen execution.

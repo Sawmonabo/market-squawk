@@ -519,6 +519,17 @@ pub enum ProviderRateReservationDecision {
     Unavailable(BudgetUnavailableReason),
 }
 
+/// Sanitized read-only availability of one exact registered provider-rate declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderRateAvailability {
+    /// The persisted provider/account state would not block a new reservation now.
+    Available,
+    /// The persisted provider/account state blocks admission until this inclusive wall clock.
+    WaitUntil(Timestamp),
+    /// Admission requires an external state change and has no truthful retry coordinate.
+    Unavailable(BudgetUnavailableReason),
+}
+
 /// Durable aggregate dispatch result for one previously reserved request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderRateDispatchDecision {
@@ -616,6 +627,19 @@ pub trait ProviderRateStore: std::fmt::Debug + Send + Sync {
         registration: ProviderRateRegistration,
         now: Timestamp,
     ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError>;
+
+    /// Reads current admission state without reserving concurrency, charging a request window, or
+    /// changing retained provider-rate state.
+    fn inspect_availability(
+        &self,
+        _run_id: ProviderRateRunId,
+        _registration: ProviderRateRegistration,
+        _now: Timestamp,
+    ) -> Result<ProviderRateAvailability, ProviderRateStoreError> {
+        Ok(ProviderRateAvailability::Unavailable(
+            BudgetUnavailableReason::PersistenceUnavailable,
+        ))
+    }
 
     /// Atomically charges every request window for one exact reserved request at dispatch.
     fn commit_dispatch(
@@ -1179,6 +1203,17 @@ impl ProviderRateBinding {
             .serialized_timed_store_operation(|store, run_id, now| {
                 store.try_reserve(run_id, self.registration, now)
             })
+            .map_err(map_store_runtime_error)
+    }
+
+    pub(in crate::policy) fn inspect_availability(
+        &self,
+    ) -> Result<ProviderRateAvailability, BudgetUnavailableReason> {
+        self.authority
+            .serialized_timed_store_operation(|store, run_id, now| {
+                store.inspect_availability(run_id, self.registration, now)
+            })
+            .map(|(_observation, availability)| availability)
             .map_err(map_store_runtime_error)
     }
 

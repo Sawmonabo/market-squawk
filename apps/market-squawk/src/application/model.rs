@@ -23,6 +23,7 @@ use market_squawk_services::{
     ArtifactError, ArtifactReadContext, ArtifactReference, RequestContext, ServiceDomain,
     ServiceError, ToolResultMetadata, TypedToolRequest, TypedToolResult,
 };
+use rust_decimal::{Decimal, prelude::FromPrimitive as _};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
@@ -30,7 +31,11 @@ use thiserror::Error;
 
 use super::{
     ApplicationDomainService,
-    domain_support::{DomainLifecycle, admitted_result_limits, encode_hex, ensure_request_live},
+    domain_support::{
+        DomainLifecycle, admitted_result_limits, encode_hex, ensure_request_live,
+        opaque_product_token,
+    },
+    job::{JobView, product_activity_state, product_progress_percent},
 };
 
 pub mod backup;
@@ -47,6 +52,7 @@ use read_image::{ModelReadImage, ModelReadImageState};
 
 const GET_METADATA: &str = "Model.GetMetadata";
 const LIST_BUNDLES: &str = "Model.ListBundles";
+pub(crate) const LIST_PRODUCT_ACTIVITY: &str = "Model.ListProductActivity";
 const EVALUATE: &str = "Model.Evaluate";
 const PREDICT: &str = "Model.Predict";
 const MAXIMUM_EVALUATION_RECORDS: usize = 100_000;
@@ -174,15 +180,25 @@ impl ModelDomainService {
             .backends
             .iter()
             .take(limits.maximum_result_items())
-            .map(|backend| bundle_summary(backend.metadata()))
-            .collect::<Vec<_>>();
+            .map(|backend| {
+                image
+                    .registry
+                    .get(
+                        backend.metadata().bundle_id(),
+                        backend.metadata().bundle_version(),
+                    )
+                    .map_err(|_| ServiceError::Unavailable)?
+                    .ok_or(ServiceError::Unavailable)
+                    .and_then(|bundle| product_model_evidence(&bundle))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let metadata = if bundles.len() < available {
             ToolResultMetadata::try_truncated_not_applicable(available)?
         } else {
             ToolResultMetadata::complete_not_applicable()
         };
         let item_count = bundles.len();
-        TypedToolResult::try_new(json!({"bundles": bundles}), item_count, metadata, limits)
+        TypedToolResult::try_new(json!({"models": bundles}), item_count, metadata, limits)
             .map_err(Into::into)
     }
 
@@ -850,6 +866,190 @@ fn model_coordinate(metadata: &ModelMetadata) -> (String, String, u64) {
         metadata.bundle_id().as_str().to_owned(),
         metadata.bundle_version().get(),
     )
+}
+
+fn product_model_evidence(bundle: &ModelBundle) -> Result<Value, ServiceError> {
+    let metadata = bundle.metadata();
+    let training = serde_json::from_slice::<TrainingRunEvidenceWire>(bundle.training_run_bytes())
+        .map_err(|_error| ServiceError::InvalidResult)?;
+    let split_counts = &training.trial.split_counts;
+    let forecast = training.trial.forecast.as_ref();
+    let out_of_sample_observations = split_counts.test;
+    let rolling_out_of_sample_folds = forecast.map_or(0, |evidence| evidence.rolling_splits);
+    let evaluated_horizons = forecast.map_or(0, |evidence| evidence.horizons.len());
+    let point_in_time_bound =
+        metadata.dataset().selection_as_of() >= metadata.training_period().end();
+    let forecast_evidence_complete =
+        forecast.is_none() || (rolling_out_of_sample_folds > 0 && evaluated_horizons > 0);
+    let evidence_state = if split_counts.validation > 0
+        && out_of_sample_observations > 0
+        && !metadata.validation_metrics().is_empty()
+        && point_in_time_bound
+        && forecast_evidence_complete
+    {
+        "sufficient"
+    } else if split_counts.train > 0 {
+        "limited"
+    } else {
+        "unavailable"
+    };
+    let mut limitations = metadata
+        .limitations()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if out_of_sample_observations == 0 {
+        limitations.push(
+            "No held-out observations are retained, so the model cannot support an investment action."
+                .to_owned(),
+        );
+    }
+    if !point_in_time_bound {
+        limitations.push(
+            "The retained training evidence does not prove a point-in-time cutoff after the observation window."
+                .to_owned(),
+        );
+    }
+    if !forecast_evidence_complete {
+        limitations.push(
+            "Rolling out-of-sample evidence is incomplete for the evaluated forecast horizons."
+                .to_owned(),
+        );
+    }
+    let validation = metadata
+        .validation_metrics()
+        .iter()
+        .map(|metric| {
+            Ok(json!({
+                "label": validation_metric_label(metric.name()),
+                "value": finite_decimal(metric.value())?,
+                "interpretation": validation_metric_interpretation(metric.name()),
+            }))
+        })
+        .collect::<Result<Vec<_>, ServiceError>>()?;
+    let coverage = vec![
+        json!({
+            "label": "Point-in-time training cutoff",
+            "state": if point_in_time_bound { "evaluated" } else { "unavailable" },
+            "interpretation": if point_in_time_bound {
+                "The retained selection cutoff is at or after the complete training observation window."
+            } else {
+                "The retained bundle does not prove a usable point-in-time training cutoff."
+            }
+        }),
+        json!({
+            "label": "Held-out evaluation",
+            "state": if out_of_sample_observations > 0 { "evaluated" } else { "unavailable" },
+            "interpretation": if out_of_sample_observations > 0 {
+                "The admitted training run retains observations that were not used to fit the model."
+            } else {
+                "No held-out observations are retained for this model."
+            }
+        }),
+        json!({
+            "label": "Horizon-aligned rolling evaluation",
+            "state": if forecast.is_none() {
+                "limited"
+            } else if forecast_evidence_complete {
+                "evaluated"
+            } else {
+                "unavailable"
+            },
+            "interpretation": if forecast.is_none() {
+                "This model is not admitted as a forecast model, so no forecast-horizon evaluation is claimed."
+            } else if forecast_evidence_complete {
+                "The admitted training run retains rolling evaluation folds for its forecast horizons."
+            } else {
+                "The forecast bundle does not retain complete rolling horizon evidence."
+            }
+        }),
+    ];
+    Ok(json!({
+        "modelToken": opaque_product_token(
+            b"market-squawk/product-model/v1\0",
+            &[
+                metadata.model_id().as_uuid().as_bytes(),
+                metadata.bundle_id().as_str().as_bytes(),
+                &metadata.bundle_version().get().to_be_bytes(),
+            ],
+        ),
+        "label": metadata.label().name(),
+        "objective": match metadata.output_semantics() {
+            market_squawk_modeling::ModelOutputSemantics::Regression => "numeric_outcome",
+            market_squawk_modeling::ModelOutputSemantics::BinaryProbability => "likelihood",
+        },
+        "intendedUse": metadata.intended_use(),
+        "evidenceState": evidence_state,
+        "training": {
+            "observedFromUnixNanos": metadata.training_period().start().unix_nanos().to_string(),
+            "observedThroughUnixNanos": metadata.training_period().end().unix_nanos().to_string(),
+            "availableAtUnixNanos": metadata.dataset().selection_as_of().unix_nanos().to_string(),
+            "trainingObservations": split_counts.train,
+            "validationObservations": split_counts.validation,
+            "outOfSampleObservations": out_of_sample_observations,
+            "rollingOutOfSampleFolds": rolling_out_of_sample_folds,
+            "evaluatedHorizons": evaluated_horizons,
+        },
+        "validation": validation,
+        "coverage": coverage,
+        "limitations": limitations,
+        "unavailableBehavior": "no_action",
+        "analysisOnly": true,
+    }))
+}
+
+pub(crate) fn product_model_activity(view: &JobView) -> Option<Value> {
+    let label = match view.kind().as_str() {
+        "model.training.v1" => "Model training",
+        "model.forecast-generation.v1" => "Forecast generation",
+        _ => return None,
+    };
+    let (state, status_message) = product_activity_state(view);
+    let job_id = view.job_id().as_uuid();
+    let generation = view.generation().get().to_be_bytes();
+    Some(json!({
+        "activityToken": opaque_product_token(
+            b"market-squawk/product-model-activity/v1\0",
+            &[job_id.as_bytes(), &generation],
+        ),
+        "label": label,
+        "state": state,
+        "statusMessage": status_message,
+        "progressPercent": product_progress_percent(view),
+        "updatedAtUnixNanos": view.updated_at().unix_nanos().to_string(),
+    }))
+}
+
+fn finite_decimal(value: f64) -> Result<String, ServiceError> {
+    Decimal::from_f64_retain(value)
+        .map(|value| value.normalize().to_string())
+        .ok_or(ServiceError::InvalidResult)
+}
+
+const fn validation_metric_label(name: ValidationMetricName) -> &'static str {
+    match name {
+        ValidationMetricName::MeanSquaredError => "Mean squared error",
+        ValidationMetricName::Accuracy => "Accuracy",
+        ValidationMetricName::LogLoss => "Log loss",
+        ValidationMetricName::AreaUnderRoc => "Area under ROC curve",
+    }
+}
+
+const fn validation_metric_interpretation(name: ValidationMetricName) -> &'static str {
+    match name {
+        ValidationMetricName::MeanSquaredError => {
+            "Average squared validation error; lower values are better within the same target scale."
+        }
+        ValidationMetricName::Accuracy => {
+            "Share of validation classifications that matched the observed class."
+        }
+        ValidationMetricName::LogLoss => {
+            "Probability error that penalizes confident wrong classifications; lower values are better."
+        }
+        ValidationMetricName::AreaUnderRoc => {
+            "Validation ranking discrimination across decision thresholds; it is not profit confidence."
+        }
+    }
 }
 
 fn bundle_coordinate(metadata: &ModelMetadata) -> (&str, u64) {

@@ -10,9 +10,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     application::{
-        CryptoCommittedRowIngress, CryptoMarketDurableReadWriter, CryptoMarketPublicationAuthority,
-        CryptoMarketPublicationError, CryptoPendingFrameIngress, CryptoPublicationRendezvousLimits,
-        KrakenMarketApplicationOutcome,
+        CryptoCommittedRowIngress, CryptoMarketPublicationAuthority, CryptoMarketPublicationError,
+        CryptoPendingFrameIngress, CryptoPublicationRendezvousLimits,
+        KrakenMarketApplicationOutcome, MarketEventDurableReadWriter, MarketEventReadError,
     },
     provider_activation::KrakenMarketPublicationPackage,
 };
@@ -199,8 +199,8 @@ async fn run_raw_worker(
     trades: Arc<CryptoMarketPublicationAuthority>,
     maximum_inflight: NonZeroUsize,
     limits: CryptoPublicationRendezvousLimits,
-    book_durable_writer: CryptoMarketDurableReadWriter,
-    trade_durable_writer: CryptoMarketDurableReadWriter,
+    book_durable_writer: MarketEventDurableReadWriter,
+    trade_durable_writer: MarketEventDurableReadWriter,
     cancellation: CancellationToken,
 ) -> Result<(), KrakenPublicationSupervisorError> {
     let mut book_open = true;
@@ -255,7 +255,7 @@ async fn publish_raw(
     pending: CryptoPendingFrameIngress,
     authority: Arc<CryptoMarketPublicationAuthority>,
     limits: CryptoPublicationRendezvousLimits,
-    durable_writer: CryptoMarketDurableReadWriter,
+    durable_writer: MarketEventDurableReadWriter,
     cancellation: CancellationToken,
 ) -> Result<(), KrakenPublicationSupervisorError> {
     authority.validate_precommit()?;
@@ -362,6 +362,8 @@ pub(super) enum KrakenPublicationSupervisorError {
     Task(tokio::task::JoinError),
     #[error(transparent)]
     Publication(#[from] CryptoMarketPublicationError),
+    #[error(transparent)]
+    DurableRead(#[from] MarketEventReadError),
     #[error(transparent)]
     Authority(#[from] crate::application::ResearchIngestCompositionError),
 }

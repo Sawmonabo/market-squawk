@@ -208,9 +208,9 @@ pub enum Command {
 
     /// Run the local stdio MCP server.
     Mcp {
-        /// MCP operation. Omitting it retains the v0.1 `mcp` compatibility form.
+        /// MCP operation.
         #[command(subcommand)]
-        command: Option<McpCommand>,
+        command: McpCommand,
     },
 
     /// Report bounded local readiness, configuration provenance, and release blockers.
@@ -219,10 +219,6 @@ pub enum Command {
     /// Run a deterministic diagnostic feed.
     #[command(hide = true)]
     Mock(MockArguments),
-
-    /// Run the v0.1 paper-bot compatibility command.
-    #[command(hide = true)]
-    PaperBot(PaperBotArguments),
 
     /// Validate the v0.1 immutable diagnostic journal.
     #[command(hide = true)]
@@ -493,8 +489,10 @@ pub enum FeatureCommand {
 /// Model-registry and inference operation.
 #[derive(Debug, Subcommand)]
 pub enum ModelCommand {
-    /// List admitted immutable model bundles.
+    /// List model evidence and its usable analytical limits.
     List,
+    /// List current model-training and forecasting activity.
+    Activity,
     /// Admit one verified immutable model bundle through a closed request file.
     Admit {
         /// Confined JSON admission request file.
@@ -577,10 +575,12 @@ pub enum BacktestCommand {
         #[arg(long)]
         confirm: bool,
     },
-    /// Inspect one immutable experiment result.
+    /// List backtest activity and available results.
+    List,
+    /// Inspect one completed backtest result.
     Show {
-        /// Experiment or run identity.
-        run: String,
+        /// Opaque backtest result token returned by `backtest list`.
+        backtest_token: uuid::Uuid,
     },
 }
 
@@ -1458,15 +1458,9 @@ pub struct MockArguments {
     pub paper_bot: bool,
 }
 
-/// Production paper-composition arguments.
+/// Controlled paper-run arguments.
 #[derive(Debug, Args)]
 pub struct PaperBotArguments {
-    /// Configured direct source.
-    #[arg(long, value_enum, default_value_t = ProductionSourceArgument::Coinbase)]
-    pub provider: ProductionSourceArgument,
-    /// Exact active provider-onboarding session; required only for Coinbase Direct.
-    #[arg(long, required_if_eq("provider", "coinbase-direct"))]
-    pub provider_session_id: Option<Uuid>,
     /// Stop after this many seconds; omit to run until interrupted.
     #[arg(long)]
     pub seconds: Option<u64>,
@@ -1505,15 +1499,4 @@ impl From<JournalFormatArgument> for JournalFileFormat {
             JournalFormatArgument::Legacy => Self::Legacy,
         }
     }
-}
-
-/// Direct source selectable by controlled local paper operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum ProductionSourceArgument {
-    /// Coinbase Exchange.
-    Coinbase,
-    /// Authenticated Coinbase Exchange Direct Market Data.
-    CoinbaseDirect,
-    /// Kraken book-v2.
-    Kraken,
 }

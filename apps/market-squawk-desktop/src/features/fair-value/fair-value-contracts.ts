@@ -2,14 +2,14 @@ import { z } from "zod"
 
 import type { ApplicationResult } from "@/lib/schemas"
 
-const digestSchema = z.string().regex(/^[0-9a-f]{64}$/)
-const identifierSchema = z.string().min(1)
-
+const uuidSchema = z.string().uuid()
+const identifierSchema = z.string().min(1).max(256)
+const timestampSchema = z.string().datetime({ offset: true })
 const amountSchema = z
   .object({
     amount: z.string().regex(/^-?\d+(?:\.\d+)?$/),
     currency: z.string().regex(/^[A-Z]{3}$/),
-    scale: z.number().int().nonnegative(),
+    scale: z.number().int().min(0).max(28),
     amountBasis: z.enum([
       "per_instrument_unit",
       "reporting_entity_total",
@@ -17,201 +17,114 @@ const amountSchema = z
     ]),
   })
   .strict()
-
-const hierarchySchema = z.enum([
-  "level_1",
-  "level_2",
-  "level_3",
-  "unclassified",
-])
-
-const dataQualitySchema = z.enum([
-  "direct_verified",
-  "direct_unverified",
-  "official_delayed",
-  "aggregated",
-  "indicative",
-  "modeled",
-  "estimated",
-  "stale",
-  "quarantined",
-])
-
-const marketDepthSchema = z.enum([
-  "top_of_book",
-  "price_level",
-  "order_level",
-])
-
-const classificationSchema = z.object({
-  decisionId: digestSchema,
-  measurementId: digestSchema,
-  evidenceHash: digestSchema,
-  rulesetVersion: z.number().int().positive(),
-  rulesetHash: digestSchema,
-  hierarchy: hierarchySchema,
-  basis: z.discriminatedUnion("kind", [
-    z.object({ kind: z.literal("rules") }),
-    z.object({
-      kind: z.literal("override"),
-      baseDecisionId: digestSchema,
-      overrideId: digestSchema,
-    }),
-  ]),
-  truthTableItemCount: z.number().int().nonnegative(),
-  reasonCount: z.number().int().nonnegative(),
-})
-
-const predicateSchema = z.object({
-  inputId: digestSchema,
-  predicate: z.string().min(1),
-  passed: z.boolean(),
-})
-
-const reasonSchema = z.object({
-  inputId: digestSchema.nullable(),
-  code: z.string().min(1),
-})
-
-const marketAccessSchema = z.object({
-  assessmentId: digestSchema,
-  accountId: identifierSchema,
-  venueId: identifierSchema,
-  instrumentId: identifierSchema,
-  conclusion: z.enum(["accessible", "inaccessible", "not_assessed"]),
-  effectiveFrom: identifierSchema,
-  effectiveUntil: identifierSchema,
-  rationale: z.string(),
-  preparedBy: identifierSchema,
-  preparedAt: identifierSchema,
-  approvedBy: identifierSchema,
-  approvedAt: identifierSchema,
-  supersedes: digestSchema.nullable(),
-})
-
-const evidenceOriginSchema = z
+const hierarchySchema = z.enum(["level_1", "level_2", "level_3", "unclassified"])
+const classificationSchema = z
   .object({
-    kind: z.enum(["live", "research", "analytics", "portfolio"]),
-    venueId: identifierSchema.optional(),
-    datasetId: identifierSchema.optional(),
-    row: z.number().int().nonnegative().optional(),
-    revision: z.union([z.string(), z.number().int().nonnegative()]).optional(),
+    classificationToken: uuidSchema,
+    hierarchy: hierarchySchema,
+    basis: z.object({ kind: z.enum(["rules", "override"]) }).strict(),
+    checkCount: z.number().int().nonnegative(),
+    reasonCount: z.number().int().nonnegative(),
   })
-  .loose()
-
-const inputEvidenceSchema = z.object({
-  evidenceHash: digestSchema,
-  sourceId: identifierSchema,
-  sourceIdentifier: identifierSchema,
-  origin: evidenceOriginSchema,
-  sourceTimestamp: identifierSchema.nullable(),
-  effectiveAt: identifierSchema.nullable(),
-  publishedAt: identifierSchema.nullable(),
-  availableAt: identifierSchema.nullable(),
-  receivedAt: identifierSchema.nullable(),
-  qualificationEvaluatedAt: identifierSchema.nullable(),
-  qualificationValidUntil: identifierSchema.nullable(),
-  ingestedAt: identifierSchema,
-  verification: z.enum(["verified", "unverified"]),
-})
-
-const valuationInputSchema = z.object({
-  inputId: digestSchema,
-  subjectInstrumentId: identifierSchema,
-  referenceInstrumentId: identifierSchema,
-  relationship: z.enum(["identical", "similar", "proxy"]),
-  amount: amountSchema,
-  significance: z.enum(["significant", "not_significant"]),
-  observability: z.enum(["quoted_price", "observable", "unobservable"]),
-  adjustment: z.enum(["none", "observable", "unobservable"]),
-  marketActivity: z.enum(["active", "inactive", "not_assessed"]),
-  marketAccess: z.enum(["accessible", "inaccessible", "not_assessed"]),
-  marketAccessAssessment: marketAccessSchema.nullable(),
-  dataQuality: dataQualitySchema,
-  marketDepth: marketDepthSchema.optional(),
-  evidence: inputEvidenceSchema,
-})
-
-const revocationSchema = z.object({
-  revocationId: digestSchema,
-  approvalId: digestSchema,
-  revokedBy: identifierSchema,
-  revokedAt: identifierSchema,
-  reason: z.string().min(1),
-})
-
-const approvalSchema = z.object({
-  approvalId: digestSchema,
-  decisionId: digestSchema,
-  measurementId: digestSchema,
-  overrideId: digestSchema.nullable(),
-  approvedBy: identifierSchema,
-  approvedAt: identifierSchema,
-  expiresAt: identifierSchema,
-  status: z.enum(["not_yet_effective", "active", "expired", "revoked"]),
-  revocation: revocationSchema.nullable(),
-})
-
-const auditSubjectSchema = z.discriminatedUnion("kind", [
-  z.object({
-    kind: z.literal("classified"),
-    measurementId: digestSchema,
-    decisionId: digestSchema,
-  }),
-  z.object({
-    kind: z.literal("override_proposed"),
-    overrideId: digestSchema,
-    decisionId: digestSchema,
-  }),
-  z.object({
-    kind: z.literal("approved"),
-    approvalId: digestSchema,
-    decisionId: digestSchema,
-  }),
-  z.object({
-    kind: z.literal("revoked"),
-    revocationId: digestSchema,
-    approvalId: digestSchema,
-  }),
-  z.object({
-    kind: z.literal("market_access_approved"),
-    assessmentId: digestSchema,
-  }),
-])
-
-const auditEventSchema = z.object({
-  auditEventId: digestSchema,
-  sequence: z.number().int().positive(),
-  previousEventId: digestSchema.nullable(),
-  subject: auditSubjectSchema,
-  actor: identifierSchema,
-  businessAt: identifierSchema,
-  occurredAt: identifierSchema,
-})
-
-const explanationSchema = z.object({
-  truthTable: z.array(predicateSchema),
-  reasons: z.array(reasonSchema),
-})
-
-const evidenceBundleSchema = z.object({
-  inputs: z.array(valuationInputSchema),
-})
-
-const approvalBundleSchema = z.object({
-  at: identifierSchema.optional(),
-  approvals: z.array(approvalSchema),
-})
-
-const measurementSchema = z
+  .strict()
+const marketAccessAssessmentSchema = z
   .object({
-    measurementId: digestSchema,
-    evidenceHash: digestSchema,
-    accountId: identifierSchema,
-    instrumentId: identifierSchema,
+    conclusion: z.enum(["accessible", "inaccessible", "not_assessed"]),
+    effectiveFrom: timestampSchema,
+    effectiveUntil: timestampSchema,
+    rationale: z.string().max(4_096),
+    preparedBy: identifierSchema,
+    preparedAt: timestampSchema,
+    approvedBy: identifierSchema,
+    approvedAt: timestampSchema,
+  })
+  .strict()
+const inputSchema = z
+  .object({
+    inputToken: uuidSchema,
+    marketInputToken: uuidSchema.nullable(),
+    referenceInstrumentId: uuidSchema,
+    relationship: z.enum(["identical", "similar", "proxy"]),
     amount: amountSchema,
-    measurementAt: identifierSchema,
-    preparedAt: identifierSchema,
+    significance: z.enum(["significant", "not_significant"]),
+    observability: z.enum(["quoted_price", "observable", "unobservable"]),
+    adjustment: z.enum(["none", "observable", "unobservable"]),
+    marketActivity: z.enum(["active", "inactive", "not_assessed"]),
+    marketAccess: z.enum(["accessible", "inaccessible", "not_assessed"]),
+    marketAccessAssessment: marketAccessAssessmentSchema.nullable(),
+    dataQuality: z.enum([
+      "direct_verified",
+      "direct_unverified",
+      "official_delayed",
+      "aggregated",
+      "indicative",
+      "modeled",
+      "estimated",
+      "stale",
+      "quarantined",
+    ]),
+    useAssessment: z
+      .object({
+        relationship: z.enum(["identical", "similar", "proxy"]),
+        observability: z.enum(["quoted_price", "observable", "unobservable"]),
+        adjustment: z.enum(["none", "observable", "unobservable"]),
+        rationale: z.string().max(4_096),
+        assessedBy: identifierSchema,
+        assessedAt: timestampSchema,
+      })
+      .strict()
+      .nullable(),
+    evidence: z
+      .object({
+        kind: z.enum(["market_observation", "published_research", "analysis", "portfolio"]),
+        label: z.string().min(1).max(128),
+        observedAt: timestampSchema.nullable(),
+        effectiveAt: timestampSchema.nullable(),
+        publishedAt: timestampSchema.nullable(),
+        availableAt: timestampSchema.nullable(),
+        receivedAt: timestampSchema.nullable(),
+        validUntil: timestampSchema.nullable(),
+        recordedAt: timestampSchema,
+        verification: z.enum(["verified", "unverified"]),
+      })
+      .strict(),
+  })
+  .strict()
+const approvalSchema = z
+  .object({
+    approvalToken: uuidSchema,
+    approvedBy: identifierSchema,
+    approvedAt: timestampSchema,
+    expiresAt: timestampSchema,
+    status: z.enum(["not_yet_effective", "active", "expired", "revoked"]),
+    revocation: z
+      .object({
+        revokedBy: identifierSchema,
+        revokedAt: timestampSchema,
+        reason: z.string().min(1).max(4_096),
+      })
+      .strict()
+      .nullable(),
+  })
+  .strict()
+const explanationSchema = z
+  .object({
+    checks: z.array(
+      z.object({ inputToken: uuidSchema, check: identifierSchema, passed: z.boolean() }).strict(),
+    ),
+    reasons: z.array(
+      z.object({ inputToken: uuidSchema.nullable(), reason: identifierSchema }).strict(),
+    ),
+  })
+  .strict()
+const measurementSummarySchema = z
+  .object({
+    measurementToken: uuidSchema,
+    accountId: uuidSchema,
+    instrumentId: uuidSchema,
+    amount: amountSchema,
+    measurementAt: timestampSchema,
+    preparedAt: timestampSchema,
     preparedBy: identifierSchema,
     method: z.enum([
       "quoted_market_price",
@@ -220,140 +133,92 @@ const measurementSchema = z
       "cost_approach",
     ]),
     inputCount: z.number().int().positive(),
-    classification: classificationSchema.optional(),
-    explanation: explanationSchema.optional(),
-    evidence: evidenceBundleSchema.optional(),
-    approvalStatus: approvalBundleSchema.optional(),
-    marketAccess: z.array(marketAccessSchema).optional(),
-    auditEvents: z.array(auditEventSchema).optional(),
+    classification: classificationSchema.nullable(),
   })
-  .loose()
-
-const measurementPageSchema = z.object({
-  measurements: z.array(measurementSchema),
-})
-
-const classificationResultSchema = z.object({
-  measurement: measurementSchema,
-  classification: classificationSchema,
-})
-
-const explanationResultSchema = z.object({
-  classification: classificationSchema,
-  truthTable: z.array(predicateSchema),
-  reasons: z.array(reasonSchema),
-})
-
-const evidenceResultSchema = z.object({
-  measurementId: digestSchema,
-  evidenceHash: digestSchema,
-  inputs: z.array(valuationInputSchema),
-})
-
-const approvalResultSchema = z.object({
-  measurementId: digestSchema,
-  at: identifierSchema,
+  .strict()
+const measurementDetailSchema = measurementSummarySchema.extend({
+  inputs: z.array(inputSchema),
+  explanation: explanationSchema.nullable(),
   approvals: z.array(approvalSchema),
 })
+export const fairValueMeasurementSchema = measurementDetailSchema
+const workspaceSchema = z
+  .object({
+    measurements: z.array(measurementSummarySchema),
+    selectedMeasurement: measurementDetailSchema.nullable(),
+  })
+  .strict()
 
-const auditCursorSchema = z.object({
-  sequence: z.number().int().positive(),
-  eventId: digestSchema,
-})
-
-const auditPageSchema = z.object({
-  events: z.array(auditEventSchema),
-  totalEventCount: z.number().int().nonnegative(),
-  nextCursor: auditCursorSchema.nullable(),
-})
-
-const marketAccessResultSchema = z.object({
-  marketAccess: marketAccessSchema,
-})
-
-const classificationControlResultSchema = z.object({
-  classification: classificationSchema,
-  classificationReplay: z.boolean(),
-})
-
-const governancePrincipalSchema = z.object({
-  principalId: identifierSchema,
-  displayName: z.string().min(1),
-  roles: z.array(z.string().min(1)).min(1),
-})
-
-const governancePreviewSchema = z.object({
-  previewId: identifierSchema,
-  digest: digestSchema,
-  requiredRoles: z.array(z.string().min(1)).min(1),
-  distinctPrincipalCount: z.number().int().positive(),
-  eligiblePrincipalIds: z.array(identifierSchema).min(1),
-  expiresAt: identifierSchema,
-  effects: z.array(z.object({ kind: z.string().min(1) })).min(1),
-})
-
-const governanceAuthorizationSchema = z.object({
-  authorizationHandle: identifierSchema,
-  previewId: identifierSchema,
-  principalId: identifierSchema,
-  expiresAt: identifierSchema,
-})
-
+const governancePrincipalSchema = z
+  .object({
+    principalId: uuidSchema,
+    displayName: z.string().min(1),
+    roles: z.array(z.string().min(1)).min(1),
+  })
+  .strict()
+const governancePreviewSchema = z
+  .object({
+    previewId: uuidSchema,
+    digest: z.string().regex(/^[0-9a-f]{64}$/),
+    requiredRoles: z.array(z.string().min(1)).min(1),
+    distinctPrincipalCount: z.number().int().positive(),
+    eligiblePrincipalIds: z.array(uuidSchema).min(1),
+    expiresAt: timestampSchema,
+    effects: z.array(z.object({ kind: z.string().min(1) })).min(1),
+  })
+  .strict()
+const governanceAuthorizationSchema = z
+  .object({
+    authorizationHandle: uuidSchema,
+    previewId: uuidSchema,
+    principalId: uuidSchema,
+    expiresAt: timestampSchema,
+  })
+  .strict()
 const governanceCommitSchema = z.object({
   receipt: z.object({
-    receiptId: identifierSchema,
-    previewId: identifierSchema,
-    digest: digestSchema,
-    committedAt: identifierSchema,
-    authorizedPrincipals: z
-      .array(z.object({ principalId: identifierSchema, roles: z.array(z.string().min(1)).min(1) }))
-      .min(1),
-    effects: z.array(z.object({ kind: z.string().min(1) })).min(1),
+    receiptId: uuidSchema,
+    previewId: uuidSchema,
+    digest: z.string().regex(/^[0-9a-f]{64}$/),
+    committedAt: timestampSchema,
+    authorizedPrincipals: z.array(
+      z.object({ principalId: uuidSchema, roles: z.array(z.string().min(1)).min(1) }),
+    ),
+    effects: z.array(z.object({ kind: z.string().min(1) })),
   }),
 })
 
 export type FairValueApproval = z.infer<typeof approvalSchema>
-export type FairValueAuditEvent = z.infer<typeof auditEventSchema>
-export type FairValueAuditCursor = z.infer<typeof auditCursorSchema>
 export type FairValueClassification = z.infer<typeof classificationSchema>
 export type FairValueHierarchy = z.infer<typeof hierarchySchema>
-export type FairValueInput = z.infer<typeof valuationInputSchema>
-export type FairValueMarketAccess = z.infer<typeof marketAccessSchema>
-export type FairValueMeasurement = z.infer<typeof measurementSchema>
-export type FairValueReason = z.infer<typeof reasonSchema>
+export type FairValueInput = z.infer<typeof inputSchema>
+export type FairValueMarketAccess = z.infer<typeof marketAccessAssessmentSchema>
+export type FairValueMeasurement = z.infer<typeof measurementDetailSchema>
+export type FairValueMeasurementSummary = z.infer<typeof measurementSummarySchema>
 export type GovernanceActionPreview = z.infer<typeof governancePreviewSchema>
 export type GovernanceAuthorization = z.infer<typeof governanceAuthorizationSchema>
 export type GovernanceCommit = z.infer<typeof governanceCommitSchema>["receipt"]
 export type GovernancePrincipal = z.infer<typeof governancePrincipalSchema>
 
-/// Typed proposal sent exactly once to the service for canonical preview. Actor, action time,
-/// roles, approval evidence, and immutable audit identities are deliberately absent: the service
-/// derives them from admitted principals and the retained fair-value records.
 export type FairValueGovernanceProposal =
   | {
       kind: "approve"
-      measurementId: string
-      decisionId: string
+      measurementToken: string
+      classificationToken: string
       expiresAt: string
     }
   | {
       kind: "override"
-      measurementId: string
-      decisionId: string
+      measurementToken: string
+      classificationToken: string
       requestedHierarchy: "level_2" | "level_3"
       justification: string
       expiresAt: string
     }
-  | {
-      kind: "revoke"
-      approvalId: string
-      reason: string
-    }
+  | { kind: "revoke"; approvalToken: string; reason: string }
   | {
       kind: "market_access"
-      accountId: string
-      venueId: string
-      instrumentId: string
+      marketInputToken: string
       conclusion: "accessible" | "inaccessible"
       effectiveFrom: string
       effectiveUntil: string
@@ -361,199 +226,45 @@ export type FairValueGovernanceProposal =
     }
 
 export interface FairValueWorkspace {
-  measurements: FairValueMeasurement[]
+  measurements: FairValueMeasurementSummary[]
+  selectedMeasurement: FairValueMeasurement | null
   completeness: string
   returnedItems: number
   availableItems: number
 }
 
-export interface FairValueExplanation {
-  classification: FairValueClassification
-  truthTable: z.infer<typeof predicateSchema>[]
-  reasons: FairValueReason[]
-  completeness: string
-  returnedItems: number
-  availableItems: number
-}
-
-export interface FairValueEvidenceBundle {
-  evidenceHash: string
-  inputs: FairValueInput[]
-  completeness: string
-  returnedItems: number
-  availableItems: number
-}
-
-export interface FairValueApprovalBundle {
-  at: string
-  approvals: FairValueApproval[]
-  completeness: string
-  returnedItems: number
-  availableItems: number
-}
-
-export interface FairValueAuditPage {
-  events: FairValueAuditEvent[]
-  totalEventCount: number
-  nextCursor: FairValueAuditCursor | null
-  completeness: string
-  returnedItems: number
-  availableItems: number
-}
-
-export function parseFairValueWorkspace(
-  result: ApplicationResult,
-): FairValueWorkspace {
-  const page = measurementPageSchema.safeParse(result.data)
-  if (!page.success) {
-    throw new Error(
-      "The installed service returned an unsupported fair-value response.",
-    )
+export function parseFairValueWorkspace(result: ApplicationResult): FairValueWorkspace {
+  const parsed = workspaceSchema.safeParse(result.data)
+  if (!parsed.success) {
+    throw new Error("The installed service returned an unsupported fair-value workspace.")
   }
   return {
-    measurements: page.data.measurements,
+    ...parsed.data,
     completeness: result.metadata.completeness,
     returnedItems: result.metadata.returnedItems,
     availableItems: result.metadata.availableItems,
   }
 }
 
-export function parseFairValueClassification(
-  result: ApplicationResult,
-  expectedMeasurement: FairValueMeasurement,
-): FairValueClassification {
-  const parsed = classificationResultSchema.safeParse(result.data)
-  if (
-    !parsed.success ||
-    parsed.data.measurement.measurementId !== expectedMeasurement.measurementId ||
-    parsed.data.measurement.evidenceHash !== expectedMeasurement.evidenceHash ||
-    parsed.data.classification.measurementId !== expectedMeasurement.measurementId ||
-    parsed.data.classification.evidenceHash !== expectedMeasurement.evidenceHash
-  ) {
-    throw unsupportedDetail("classification")
-  }
-  return parsed.data.classification
-}
-
-export function parseFairValueExplanation(
-  result: ApplicationResult,
-  expectedMeasurement: FairValueMeasurement,
-): FairValueExplanation {
-  const parsed = explanationResultSchema.safeParse(result.data)
-  if (
-    !parsed.success ||
-    parsed.data.classification.measurementId !== expectedMeasurement.measurementId ||
-    parsed.data.classification.evidenceHash !== expectedMeasurement.evidenceHash
-  ) {
-    throw unsupportedDetail("classification explanation")
-  }
-  return withMetadata(parsed.data, result)
-}
-
-export function parseFairValueEvidence(
-  result: ApplicationResult,
-  expectedMeasurement: FairValueMeasurement,
-): FairValueEvidenceBundle {
-  const parsed = evidenceResultSchema.safeParse(result.data)
-  if (
-    !parsed.success ||
-    parsed.data.measurementId !== expectedMeasurement.measurementId ||
-    parsed.data.evidenceHash !== expectedMeasurement.evidenceHash
-  ) {
-    throw unsupportedDetail("evidence")
-  }
-  return withMetadata(
-    { evidenceHash: parsed.data.evidenceHash, inputs: parsed.data.inputs },
-    result,
-  )
-}
-
-export function parseFairValueApprovals(
-  result: ApplicationResult,
-  expectedMeasurementId: string,
-): FairValueApprovalBundle {
-  const parsed = approvalResultSchema.safeParse(result.data)
-  if (
-    !parsed.success ||
-    parsed.data.measurementId !== expectedMeasurementId ||
-    parsed.data.approvals.some(
-      (approval) => approval.measurementId !== expectedMeasurementId,
-    )
-  ) {
-    throw unsupportedDetail("approval status")
-  }
-  return withMetadata(
-    { at: parsed.data.at, approvals: parsed.data.approvals },
-    result,
-  )
-}
-
-export function parseFairValueAuditPage(
-  result: ApplicationResult,
-): FairValueAuditPage {
-  const parsed = auditPageSchema.safeParse(result.data)
-  if (!parsed.success) throw unsupportedDetail("audit history")
-  return withMetadata(parsed.data, result)
-}
-
-export function parseFairValueMarketAccess(
-  result: ApplicationResult,
-  expectedAssessmentId: string,
-): FairValueMarketAccess {
-  const parsed = marketAccessResultSchema.safeParse(result.data)
-  if (
-    !parsed.success ||
-    parsed.data.marketAccess.assessmentId !== expectedAssessmentId
-  ) {
-    throw unsupportedDetail("market-access assessment")
-  }
-  return parsed.data.marketAccess
-}
-
-export function parseFairValueClassificationControl(
-  result: ApplicationResult,
-  expectedMeasurement: FairValueMeasurement,
-): { classification: FairValueClassification; replay: boolean } {
-  const parsed = classificationControlResultSchema.safeParse(result.data)
-  if (
-    !parsed.success ||
-    parsed.data.classification.measurementId !== expectedMeasurement.measurementId ||
-    parsed.data.classification.evidenceHash !== expectedMeasurement.evidenceHash
-  ) {
-    throw unsupportedDetail("classification result")
-  }
-  return {
-    classification: parsed.data.classification,
-    replay: parsed.data.classificationReplay,
-  }
-}
-
-export function parseGovernancePrincipals(result: ApplicationResult): GovernancePrincipal[] {
-  const parsed = z
-    .object({
-      principals: z.array(governancePrincipalSchema),
-      nextAfter: identifierSchema.nullable(),
-    })
-    .safeParse(result.data)
-  if (!parsed.success) throw unsupportedDetail("governance principal")
+export function parseGovernancePrincipals(result: ApplicationResult) {
+  const parsed = z.object({ principals: z.array(governancePrincipalSchema) }).safeParse(result.data)
+  if (!parsed.success) throw new Error("Eligible reviewers could not be read.")
   return parsed.data.principals
 }
 
-export function parseFairValueGovernancePreview(
-  result: ApplicationResult,
-): GovernanceActionPreview {
+export function parseFairValueGovernancePreview(result: ApplicationResult) {
   const parsed = z.object({ preview: governancePreviewSchema }).safeParse(result.data)
-  if (!parsed.success) throw unsupportedDetail("governance preview")
+  if (!parsed.success) throw new Error("The governance review could not be prepared.")
   return parsed.data.preview
 }
 
 export function parseGovernanceAuthorization(
   result: ApplicationResult,
   expectedPreviewId: string,
-): GovernanceAuthorization {
+) {
   const parsed = z.object({ authorization: governanceAuthorizationSchema }).safeParse(result.data)
   if (!parsed.success || parsed.data.authorization.previewId !== expectedPreviewId) {
-    throw unsupportedDetail("governance authorization")
+    throw new Error("The reviewer authorization did not match this proposal.")
   }
   return parsed.data.authorization
 }
@@ -561,32 +272,10 @@ export function parseGovernanceAuthorization(
 export function parseFairValueGovernanceCommit(
   result: ApplicationResult,
   expectedPreviewId: string,
-): GovernanceCommit {
+) {
   const parsed = governanceCommitSchema.safeParse(result.data)
   if (!parsed.success || parsed.data.receipt.previewId !== expectedPreviewId) {
-    throw unsupportedDetail("governance commit")
+    throw new Error("The recorded action did not match this proposal.")
   }
   return parsed.data.receipt
-}
-
-function withMetadata<Value extends object>(
-  value: Value,
-  result: ApplicationResult,
-): Value & {
-  completeness: string
-  returnedItems: number
-  availableItems: number
-} {
-  return {
-    ...value,
-    completeness: result.metadata.completeness,
-    returnedItems: result.metadata.returnedItems,
-    availableItems: result.metadata.availableItems,
-  }
-}
-
-function unsupportedDetail(section: string) {
-  return new Error(
-    `The installed service returned unsupported fair-value ${section} data.`,
-  )
 }

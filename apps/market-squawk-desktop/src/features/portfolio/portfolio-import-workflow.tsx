@@ -18,6 +18,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 
 import {
@@ -31,7 +32,7 @@ const accountUuidPattern =
 const nilUuid = "00000000-0000-0000-0000-000000000000"
 
 type PortfolioImportInterpretation = {
-  recordId: string
+  recordToken: string
   interpretation: string
   rationale: string
   selectedLotIndexes: number[]
@@ -48,18 +49,12 @@ export function PortfolioImportWorkflow({
   selectedAccountId: string | null
   onCommitted: () => void | Promise<unknown>
 }) {
-  const operationNames = new Set(
-    bootstrap.operations.map((operation) => operation.name),
-  )
-  const requiredOperations = [
-    "Portfolio.PreviewStagedImport",
-    "Portfolio.ApproveStagedImport",
-    "Portfolio.CommitStagedImport",
-    "Portfolio.DiscardStagedImport",
-  ]
-  const missingOperations = requiredOperations.filter(
-    (operation) => !operationNames.has(operation),
-  )
+  const capabilities = productCapabilitySet(bootstrap)
+  const importAvailable =
+    capabilities.has("portfolio_import_preview") &&
+    capabilities.has("portfolio_import_approve") &&
+    capabilities.has("portfolio_import_commit") &&
+    capabilities.has("portfolio_import_discard")
   const [accountId, setAccountId] = React.useState(selectedAccountId ?? "")
   const [preview, setPreview] = React.useState<PortfolioImportPreview | null>(null)
   const [interpretations, setInterpretations] = React.useState<
@@ -97,25 +92,25 @@ export function PortfolioImportWorkflow({
       })
       if (value === null) return
       const next = parsePortfolioImportPreview(value)
-      if (next.preview.accountId !== requestedAccount) {
+      if (next.accountId !== requestedAccount) {
         throw new Error(
           "The preview does not match the selected portfolio account.",
         )
       }
       setPreview(next)
       setInterpretations(
-        next.preview.transactions
+        next.transactions
           .filter((transaction) =>
-            ["trade", "income"].includes(transaction.classification),
+            ["trade", "income"].includes(transaction.category),
           )
           .map((transaction) => {
-            const [onlyInterpretation] = transaction.allowedInterpretations
+            const [onlyInterpretation] = transaction.interpretationOptions
             const exactlyOneInterpretation =
-              transaction.allowedInterpretations.length === 1 &&
+              transaction.interpretationOptions.length === 1 &&
               onlyInterpretation !== undefined
             return {
-              recordId: transaction.recordId,
-              interpretation: exactlyOneInterpretation ? onlyInterpretation : "",
+              recordToken: transaction.recordToken,
+              interpretation: exactlyOneInterpretation ? onlyInterpretation.value : "",
               rationale: exactlyOneInterpretation
                 ? "Confirmed the only available interpretation after reviewing this transaction."
                 : "",
@@ -136,17 +131,11 @@ export function PortfolioImportWorkflow({
     setActivity("commit")
     try {
       const value = await invoke<unknown>("commit_portfolio_import", {
-        previewId: preview.previewId,
-        previewDigest: preview.digest,
+        reviewToken: preview.reviewToken,
         interpretations,
         confirmed: true,
       })
       const committed = parsePortfolioImportCommit(value)
-      if (committed.previewId !== preview.previewId) {
-        throw new Error(
-          "The import confirmation did not match the portfolio file being reviewed.",
-        )
-      }
       setReceipt(committed)
       setPreview(null)
       setInterpretations([])
@@ -166,7 +155,7 @@ export function PortfolioImportWorkflow({
     setActivity("discard")
     try {
       await invoke<unknown>("discard_portfolio_import", {
-        previewId: preview.previewId,
+        reviewToken: preview.reviewToken,
         confirmed: true,
       })
       setPreview(null)
@@ -180,17 +169,17 @@ export function PortfolioImportWorkflow({
   }
 
   const updateInterpretation = (
-    recordId: string,
+    recordToken: string,
     update: (current: PortfolioImportInterpretation) => PortfolioImportInterpretation,
   ) => {
     setInterpretations((current) =>
-      current.map((entry) => (entry.recordId === recordId ? update(entry) : entry)),
+      current.map((entry) => (entry.recordToken === recordToken ? update(entry) : entry)),
     )
   }
 
   const ready = preview ? interpretationsReady(preview, interpretations) : false
   const corporateActionBlocked =
-    preview?.preview.resolutionRequirements.requiresServerHeldCorporateActionPlan ?? false
+    preview?.requiresCorporateActionReview ?? false
 
   return (
     <section className="mt-5 rounded-xl border border-border bg-card/45 p-5">
@@ -213,7 +202,7 @@ export function PortfolioImportWorkflow({
             onClick={() => void beginPreview()}
             disabled={
               activity !== null ||
-              missingOperations.length > 0 ||
+              !importAvailable ||
               !isTauri() ||
               !accountIdValid
             }
@@ -224,7 +213,7 @@ export function PortfolioImportWorkflow({
         ) : null}
       </div>
 
-      {missingOperations.length > 0 ? (
+      {!importAvailable ? (
         <Alert className="mt-4">
           <AlertCircle aria-hidden="true" />
           <AlertTitle>Protected import is unavailable</AlertTitle>
@@ -285,26 +274,26 @@ export function PortfolioImportWorkflow({
       {preview ? (
         <div className="mt-5 space-y-4 border-t border-border pt-5">
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            <ImportFact label="Account" value={preview.preview.accountId} />
+            <ImportFact label="Account" value={preview.accountId} />
             <ImportFact
               label="Imported records"
-              value={preview.preview.rawRecords.length.toLocaleString()}
+              value={preview.recordCount.toLocaleString()}
             />
             <ImportFact
               label="Transactions"
-              value={preview.preview.transactions.length.toLocaleString()}
+              value={preview.transactionCount.toLocaleString()}
             />
             <ImportFact
               label="Reconciliation breaks"
-              value={preview.preview.reconciliationDiscrepancies.length.toLocaleString()}
+              value={preview.dataIssueCount.toLocaleString()}
             />
           </div>
-          {preview.preview.reconciliationDiscrepancies.length > 0 ? (
+          {preview.dataIssueCount > 0 ? (
             <Alert>
               <AlertCircle aria-hidden="true" />
               <AlertTitle>Reconciliation breaks remain visible</AlertTitle>
               <AlertDescription>
-                The preview contains {preview.preview.reconciliationDiscrepancies.length.toLocaleString()} differences in reported totals. It will not be shown as reconciled until they are resolved.
+                The review contains {preview.dataIssueCount.toLocaleString()} differences in reported totals. It will not be shown as reconciled until they are resolved.
               </AlertDescription>
             </Alert>
           ) : null}
@@ -326,19 +315,19 @@ export function PortfolioImportWorkflow({
             </p>
           </div>
           <div className="max-h-[32rem] space-y-3 overflow-y-auto pr-1">
-            {preview.preview.transactions.map((transaction) => {
+            {preview.transactions.map((transaction) => {
               const interpretation = interpretations.find(
-                (entry) => entry.recordId === transaction.recordId,
+                (entry) => entry.recordToken === transaction.recordToken,
               )
               return (
                 <div
-                  key={transaction.recordId}
+                  key={transaction.recordToken}
                   className="rounded-lg border border-border bg-background/25 p-4"
                 >
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div>
                       <p className="text-sm font-semibold">
-                        {transaction.classification.replaceAll("_", " ")} · {transaction.amount.value} {transaction.amount.currency}
+                        {transaction.category.replaceAll("_", " ")} · {transaction.amount.amount} {transaction.amount.currency}
                       </p>
                     </div>
                   </div>
@@ -349,7 +338,7 @@ export function PortfolioImportWorkflow({
                         <select
                           value={interpretation.interpretation}
                           onChange={(event) =>
-                            updateInterpretation(transaction.recordId, (current) => ({
+                            updateInterpretation(transaction.recordToken, (current) => ({
                               ...current,
                               interpretation: event.target.value,
                               rationale: "",
@@ -359,9 +348,9 @@ export function PortfolioImportWorkflow({
                           className="h-9 rounded-md border border-input bg-background px-3 outline-none focus-visible:ring-2 focus-visible:ring-ring"
                         >
                           <option value="" disabled>Select an interpretation</option>
-                          {transaction.allowedInterpretations.map((option) => (
-                            <option key={option} value={option}>
-                              {option.replaceAll("_", " ")}
+                          {transaction.interpretationOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
                             </option>
                           ))}
                         </select>
@@ -371,15 +360,15 @@ export function PortfolioImportWorkflow({
                           <legend className="px-1 text-xs font-semibold">
                             Eligible opening lots
                           </legend>
-                          {transaction.eligibleOpeningLotIds.length ? (
+                          {transaction.eligibleLotCount > 0 ? (
                             <div className="grid gap-2">
-                              {transaction.eligibleOpeningLotIds.map((lotId, index) => (
-                                <label key={lotId} className="flex items-center gap-2 text-xs">
+                              {Array.from({ length: transaction.eligibleLotCount }, (_, index) => (
+                                <label key={index} className="flex items-center gap-2 text-xs">
                                   <input
                                     type="checkbox"
                                     checked={interpretation.selectedLotIndexes.includes(index)}
                                     onChange={(event) =>
-                                      updateInterpretation(transaction.recordId, (current) => ({
+                                      updateInterpretation(transaction.recordToken, (current) => ({
                                         ...current,
                                         selectedLotIndexes: event.target.checked
                                           ? [...current.selectedLotIndexes, index].sort(
@@ -407,7 +396,7 @@ export function PortfolioImportWorkflow({
                         <textarea
                           value={interpretation.rationale}
                           onChange={(event) =>
-                            updateInterpretation(transaction.recordId, (current) => ({
+                            updateInterpretation(transaction.recordToken, (current) => ({
                               ...current,
                               rationale: event.target.value,
                             }))
@@ -436,14 +425,14 @@ export function PortfolioImportWorkflow({
               disabled={activity !== null}
             >
               <Trash2 aria-hidden="true" />
-              {activity === "discard" ? "Discarding…" : "Discard preview"}
+              {activity === "discard" ? "Discarding…" : "Discard review"}
             </Button>
             <Button
               onClick={() => setConfirmationOpen(true)}
               disabled={!ready || corporateActionBlocked || activity !== null}
             >
               <ShieldCheck aria-hidden="true" />
-              Review and commit
+              Review and save
             </Button>
           </div>
         </div>
@@ -464,9 +453,9 @@ export function PortfolioImportWorkflow({
           </DialogHeader>
           {preview ? (
             <div className="rounded-lg border border-border bg-card/40 p-3 text-xs leading-5">
-              <p><span className="font-semibold">Transactions:</span> {preview.preview.transactions.length.toLocaleString()}</p>
+              <p><span className="font-semibold">Transactions:</span> {preview.transactionCount.toLocaleString()}</p>
               <p><span className="font-semibold">Interpretations:</span> {interpretations.length.toLocaleString()}</p>
-              <p><span className="font-semibold">Reconciliation breaks:</span> {preview.preview.reconciliationDiscrepancies.length.toLocaleString()}</p>
+              <p><span className="font-semibold">Reconciliation breaks:</span> {preview.dataIssueCount.toLocaleString()}</p>
             </div>
           ) : null}
           <DialogFooter>
@@ -494,20 +483,22 @@ function interpretationsReady(
   preview: PortfolioImportPreview,
   interpretations: PortfolioImportInterpretation[],
 ) {
-  if (preview.preview.resolutionRequirements.requiresServerHeldCorporateActionPlan) {
+  if (preview.requiresCorporateActionReview) {
     return false
   }
-  const resolvable = preview.preview.transactions.filter((transaction) =>
-    ["trade", "income"].includes(transaction.classification),
+  const resolvable = preview.transactions.filter((transaction) =>
+    ["trade", "income"].includes(transaction.category),
   )
   if (resolvable.length !== interpretations.length) return false
   return resolvable.every((transaction) => {
     const selected = interpretations.find(
-      (interpretation) => interpretation.recordId === transaction.recordId,
+      (interpretation) => interpretation.recordToken === transaction.recordToken,
     )
     return Boolean(
       selected &&
-        transaction.allowedInterpretations.includes(selected.interpretation) &&
+        transaction.interpretationOptions.some(
+          (option) => option.value === selected.interpretation,
+        ) &&
         selected.rationale.trim() !== "" &&
         selected.rationale.length <= 4096 &&
         (!requiresSelectedLots(selected.interpretation) ||
@@ -516,7 +507,7 @@ function interpretationsReady(
               (index) =>
                 Number.isInteger(index) &&
                 index >= 0 &&
-                index < transaction.eligibleOpeningLotIds.length,
+                index < transaction.eligibleLotCount,
             )))
     )
   })

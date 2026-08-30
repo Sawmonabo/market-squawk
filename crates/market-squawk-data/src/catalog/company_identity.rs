@@ -2,10 +2,13 @@
 
 use std::time::Instant;
 
-use market_squawk_domain::{CompanyIdentityObservation, Timestamp};
+use market_squawk_domain::{
+    CompanyIdentityObservation, DigestAlgorithm, EvidenceDigest, Timestamp,
+};
 use rusqlite::{OptionalExtension as _, Transaction, params};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use super::storage::{ResultBudget, append_audit, parse_digest, sha256};
 use super::{Catalog, CatalogError, CatalogLimit, IngestReservation};
@@ -115,6 +118,69 @@ pub struct CompanyIdentitySearchPage {
     has_more: bool,
 }
 
+/// One exact immutable company observation and its durable publication coordinates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompanyIdentityExactRecord {
+    observation: CompanyIdentityObservation,
+    observation_digest: EvidenceDigest,
+    run_id: Uuid,
+    manifest_id: Uuid,
+    artifact_id: Uuid,
+    artifact_relative_reference: Box<str>,
+    artifact_content_digest: EvidenceDigest,
+    artifact_size_bytes: u64,
+    manifest_content_digest: EvidenceDigest,
+    completed_at: Timestamp,
+    provider_binding_digest: Option<EvidenceDigest>,
+}
+
+impl CompanyIdentityExactRecord {
+    /// Returns the digest-verified company observation.
+    pub const fn observation(&self) -> &CompanyIdentityObservation {
+        &self.observation
+    }
+    /// Returns the exact retained observation digest used to select this record.
+    pub const fn observation_digest(&self) -> EvidenceDigest {
+        self.observation_digest
+    }
+    /// Returns the successful ingest run that atomically published the observation.
+    pub const fn run_id(&self) -> Uuid {
+        self.run_id
+    }
+    /// Returns the exact control-catalog manifest anchored by the run artifact.
+    pub const fn manifest_id(&self) -> Uuid {
+        self.manifest_id
+    }
+    /// Returns the immutable artifact published by the owning run.
+    pub const fn artifact_id(&self) -> Uuid {
+        self.artifact_id
+    }
+    /// Returns the controlled object reference retained by the artifact.
+    pub fn artifact_relative_reference(&self) -> &str {
+        &self.artifact_relative_reference
+    }
+    /// Returns the exact immutable artifact content digest.
+    pub const fn artifact_content_digest(&self) -> EvidenceDigest {
+        self.artifact_content_digest
+    }
+    /// Returns the exact immutable artifact bytes.
+    pub const fn artifact_size_bytes(&self) -> u64 {
+        self.artifact_size_bytes
+    }
+    /// Returns the exact control-manifest content digest.
+    pub const fn manifest_content_digest(&self) -> EvidenceDigest {
+        self.manifest_content_digest
+    }
+    /// Returns when the owning ingest became durably successful.
+    pub const fn completed_at(&self) -> Timestamp {
+        self.completed_at
+    }
+    /// Returns the direct provider-capture binding retained by the owning run, when present.
+    pub const fn provider_binding_digest(&self) -> Option<EvidenceDigest> {
+        self.provider_binding_digest
+    }
+}
+
 impl CompanyIdentitySearchPage {
     /// Returns deterministic current company matches.
     pub fn matches(&self) -> &[CompanyIdentitySearchMatch] {
@@ -127,6 +193,137 @@ impl CompanyIdentitySearchPage {
 }
 
 impl Catalog {
+    /// Reads one exact company observation by its retained canonical SHA-256 digest.
+    pub fn exact_company_identity_by_digest(
+        &self,
+        digest: EvidenceDigest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<CompanyIdentityExactRecord>, CatalogError> {
+        if digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32] {
+            return Err(CatalogError::InvalidRecord);
+        }
+        check_search(deadline, cancellation)?;
+        let token = cancellation.clone();
+        self.connection.progress_handler(
+            SQLITE_PROGRESS_OPERATIONS,
+            Some(move || token.is_cancelled() || Instant::now() >= deadline),
+        )?;
+        let result = (|| {
+            let row = self
+                .connection
+                .query_row(EXACT_COMPANY_IDENTITY_SQL, params![digest.bytes()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, Vec<u8>>(13)?,
+                        row.get::<_, i64>(14)?,
+                        row.get::<_, i64>(15)?,
+                        row.get::<_, Vec<u8>>(16)?,
+                        row.get::<_, Option<Vec<u8>>>(17)?,
+                        row.get::<_, i64>(18)?,
+                        row.get::<_, i64>(19)?,
+                    ))
+                })
+                .optional()?;
+            let Some((
+                json,
+                record_digest,
+                run_id,
+                manifest_id,
+                source_id,
+                provider_company_id,
+                source_surface,
+                available_at,
+                received_at,
+                ingested_at,
+                artifact_id,
+                relative_reference,
+                artifact_algorithm,
+                artifact_digest,
+                artifact_size,
+                manifest_algorithm,
+                manifest_digest,
+                binding_digest,
+                binding_count,
+                completed_at,
+            )) = row
+            else {
+                return Ok(None);
+            };
+            check_search(deadline, cancellation)?;
+            let mut budget = ResultBudget::new(self.result_bytes);
+            budget.charge([
+                run_id.len(),
+                manifest_id.len(),
+                source_id.len(),
+                provider_company_id.len(),
+                source_surface.len(),
+                artifact_id.len(),
+                relative_reference.len(),
+                artifact_digest.len(),
+                manifest_digest.len(),
+                binding_digest.as_ref().map_or(0, Vec::len),
+            ])?;
+            let observation: CompanyIdentityObservation =
+                super::records::deserialize_verified(&json, &record_digest, &mut budget)?;
+            let observation_digest = parse_digest(1, &record_digest)?;
+            let run_id = Uuid::parse_str(&run_id).map_err(|_| CatalogError::CorruptCatalog)?;
+            let manifest_id =
+                Uuid::parse_str(&manifest_id).map_err(|_| CatalogError::CorruptCatalog)?;
+            let artifact_id =
+                Uuid::parse_str(&artifact_id).map_err(|_| CatalogError::CorruptCatalog)?;
+            let artifact_size_bytes =
+                u64::try_from(artifact_size).map_err(|_| CatalogError::CorruptCatalog)?;
+            let provider_binding_digest = match (binding_count, binding_digest) {
+                (0, None) => None,
+                (1, Some(value)) => Some(parse_digest(1, &value)?),
+                _ => return Err(CatalogError::ProviderCaptureConflict),
+            };
+            if observation_digest != digest
+                || observation.source_id().as_str() != source_id
+                || observation.provider_company_id().as_str() != provider_company_id
+                || observation.surface().database_name() != source_surface
+                || observation.received_at().unix_nanos() != received_at
+                || observation
+                    .availability()
+                    .conservative_available_at()
+                    .map(Timestamp::unix_nanos)
+                    != available_at
+                || observation.ingested_at().unix_nanos() != ingested_at
+                || artifact_size_bytes == 0
+            {
+                return Err(CatalogError::CorruptCatalog);
+            }
+            Ok(Some(CompanyIdentityExactRecord {
+                observation,
+                observation_digest,
+                run_id,
+                manifest_id,
+                artifact_id,
+                artifact_relative_reference: relative_reference.into_boxed_str(),
+                artifact_content_digest: parse_digest(artifact_algorithm, &artifact_digest)?,
+                artifact_size_bytes,
+                manifest_content_digest: parse_digest(manifest_algorithm, &manifest_digest)?,
+                completed_at: Timestamp::from_unix_nanos(completed_at),
+                provider_binding_digest,
+            }))
+        })();
+        self.connection.progress_handler::<fn() -> bool>(0, None)?;
+        result.map_err(|error| classify_search_error(error, deadline, cancellation))
+    }
+
     /// Searches current successful company-identity observations without granting instrument use.
     pub fn search_company_identities(
         &self,
@@ -633,4 +830,35 @@ ORDER BY CASE
     ELSE 2
 END, ordinal
 LIMIT ?3
+"#;
+
+const EXACT_COMPANY_IDENTITY_SQL: &str = r#"
+SELECT observations.record_json, observations.record_digest, observations.run_id,
+       observations.manifest_id, observations.source_id,
+       observations.provider_company_id, observations.source_surface,
+       observations.available_at_ns, observations.received_at_ns,
+       observations.ingested_at_ns, artifacts.artifact_id,
+       artifacts.relative_reference, artifacts.content_algorithm,
+       artifacts.content_digest, artifacts.size_bytes,
+       manifests.content_algorithm, manifests.content_digest,
+       (
+           SELECT binding.binding_digest
+           FROM ingest_run_provider_capture_bindings AS binding
+           WHERE binding.run_id=observations.run_id
+           ORDER BY binding.input_ordinal
+           LIMIT 1
+       ),
+       (
+           SELECT COUNT(*)
+           FROM ingest_run_provider_capture_bindings AS binding
+           WHERE binding.run_id=observations.run_id
+       ),
+       runs.completed_at_ns
+FROM company_identity_observations AS observations
+JOIN ingest_runs AS runs ON runs.run_id=observations.run_id
+JOIN artifacts ON artifacts.run_id=observations.run_id
+JOIN dataset_manifests AS manifests
+  ON manifests.manifest_id=observations.manifest_id
+ AND manifests.artifact_id=artifacts.artifact_id
+WHERE observations.record_digest=?1 AND runs.state='succeeded'
 "#;

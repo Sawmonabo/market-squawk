@@ -29,6 +29,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { groupDecimal, humanize } from "@/lib/formatters"
+import { hasProductCapability } from "@/lib/product-capabilities"
 import { formatTimestamp } from "@/lib/time"
 import type { OperationLogFilter, ProductTransport } from "@/lib/transport"
 import { cn } from "@/lib/utils"
@@ -55,10 +56,9 @@ export function LogsPage() {
     return <LogsUnavailable detail={product.error} />
   }
 
-  const operations = new Set(product.bootstrap.operations.map((operation) => operation.name))
-  if (!operations.has("Operations.QueryLogs")) {
+  if (!hasProductCapability(product.bootstrap, "operations_log_query")) {
     return (
-      <LogsUnavailable detail="The installed service did not advertise the closed Operations.QueryLogs capability." />
+      <LogsUnavailable detail="Log browsing is not available in this installation." />
     )
   }
 
@@ -66,7 +66,7 @@ export function LogsPage() {
     <LogsWorkspace
       transport={product.transport}
       scope={product.bootstrap.runtime}
-      exportAvailable={operations.has("Operations.ExportLogs")}
+      exportAvailable={hasProductCapability(product.bootstrap, "operations_log_export")}
     />
   )
 }

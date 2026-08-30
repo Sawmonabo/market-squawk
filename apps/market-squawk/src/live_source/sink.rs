@@ -34,9 +34,10 @@ use market_squawk_sources::{
     CaptureGenerationCapabilities, ConnectionLiveness, ControlFrameKind,
     CurrentDecodedProviderBatch, CurrentDecodedProviderBatches, CurrentHealthRecording,
     CurrentHealthReporter, CurrentSourceSession, DecodeInternalError, DecodeOutcome,
-    FreshnessPolicy, ProviderTimestampEvidence, QuarantineReason, RawMarketFrame, RawMarketSink,
-    RegistryError, ResynchronizationReason, SinkError, SourceHealthError, SourceHealthSnapshot,
-    SourceMetadata, SourceMetadataProvider, ValidatedSessionDecodeOutcome,
+    FreshnessPolicy, NormalizedHttpResponseBatch, ProviderTimestampEvidence, QuarantineReason,
+    RawMarketFrame, RawMarketSink, RegistryError, ResynchronizationReason, SinkError,
+    SourceHealthError, SourceHealthSnapshot, SourceMetadata, SourceMetadataProvider,
+    ValidatedSessionDecodeOutcome,
 };
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -363,8 +364,7 @@ impl<'a> ProductionRawMarketSink<'a> {
                 let (batch, rejoin, seal_request) = handoff
                     .into_pending_publication(&validated_frame, material, available_at)
                     .map_err(|_| ProductionSinkFailure::CoinbasePublicationMaterial)?;
-                let ProductionCapturedPublicationIngress::Coinbase(publication) =
-                    &self.publication
+                let ProductionCapturedPublicationIngress::Coinbase(publication) = &self.publication
                 else {
                     return Err(ProductionSinkFailure::PublicationTopologyMismatch);
                 };
@@ -406,6 +406,19 @@ impl<'a> ProductionRawMarketSink<'a> {
             return Err(failure.as_sink_error());
         }
         self.process_captured_outcome(outcome, receipt)
+            .map_err(|failure| self.fail(failure))
+    }
+
+    /// Qualifies one complete bounded HTTP response through the same current live-route output as
+    /// captured frame batches, without inventing decoder-frame evidence.
+    pub(super) fn try_process_http_response_batch(
+        &mut self,
+        batch: NormalizedHttpResponseBatch,
+    ) -> Result<(), SinkError> {
+        if let Some(failure) = self.terminal {
+            return Err(failure.as_sink_error());
+        }
+        self.process_http_response_batch(batch)
             .map_err(|failure| self.fail(failure))
     }
 
@@ -458,6 +471,68 @@ impl<'a> ProductionRawMarketSink<'a> {
                 Err(ProductionSinkFailure::Quarantine(quarantine.reason()))
             }
         }
+    }
+
+    fn process_http_response_batch(
+        &mut self,
+        batch: NormalizedHttpResponseBatch,
+    ) -> Result<(), ProductionSinkFailure> {
+        self.output.poll_failures()?;
+        let received_at = batch.receipt().received_at();
+        let latest_source_at = batch
+            .observations()
+            .iter()
+            .filter_map(|observation| match observation.timestamp() {
+                ProviderTimestampEvidence::Provided { value, .. } => Some(*value),
+                ProviderTimestampEvidence::AuthoritativelyAbsent(_) => None,
+            })
+            .max();
+        self.registry
+            .validate_session(self.session, received_at)
+            .map_err(ProductionSinkFailure::Registry)?;
+        self.subscription
+            .observe_data(&self.generation, Instant::now())
+            .map_err(ProductionSinkFailure::Subscription)?;
+        self.last_transport_at = Some(received_at);
+        self.last_market_at = Some(received_at);
+        if let Some(source_at) = latest_source_at {
+            self.last_source_at = Some(
+                self.last_source_at
+                    .map_or(source_at, |previous| previous.max(source_at)),
+            );
+        }
+        let requires_rebind = self
+            .health_rebind_at
+            .is_none_or(|deadline| received_at >= deadline);
+        if requires_rebind {
+            match self.record_health(received_at)? {
+                CurrentHealthRecording::Qualified => {}
+                CurrentHealthRecording::Unqualified(cause) if cause.is_freshness_only() => {
+                    return Err(ProductionSinkFailure::Registry(
+                        RegistryError::HealthNotQualified,
+                    ));
+                }
+                CurrentHealthRecording::Unqualified(_cause) => {
+                    return Err(ProductionSinkFailure::Registry(
+                        RegistryError::HealthNotQualified,
+                    ));
+                }
+            }
+        }
+        let current = self
+            .registry
+            .validate_current_authority(self.session)
+            .map_err(ProductionSinkFailure::Registry)?;
+        let batches = current
+            .validate_http_response_batch_owned(batch)
+            .map_err(ProductionSinkFailure::Registry)?;
+        let valid_until = self.output.try_publish(batches, received_at)?;
+        if requires_rebind {
+            self.health_rebind_at = Some(rebind_at(received_at, self.metadata.freshness_policy())?);
+            self.health_valid_until = Some(valid_until);
+        }
+        self.publish_startup_readiness()?;
+        Ok(())
     }
 
     fn process_control(

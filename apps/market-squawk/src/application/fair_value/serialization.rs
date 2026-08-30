@@ -1,10 +1,7 @@
 //! Stable bounded JSON views of immutable fair-value records.
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use market_squawk_data::DatasetManifestRef;
-use market_squawk_domain::{
-    DataQuality, DigestAlgorithm, EvidenceDigest, FairValueHierarchy, Timestamp,
-};
+use market_squawk_domain::{DataQuality, FairValueHierarchy, Timestamp};
 use market_squawk_valuation::{
     ApprovalRevocation, ApprovalStatus, ClassificationDecision, DecisionBasis, DecisionReason,
     DecisionReasonCode, EvidenceOrigin, EvidenceVerification, FairValueEvidence,
@@ -13,8 +10,6 @@ use market_squawk_valuation::{
     ValuationApproval, ValuationInput, ValuationMeasurement, ValuationMethod,
 };
 use serde_json::{Value, json};
-
-use super::super::domain_support::encode_hex;
 
 pub(super) fn measurement_value(measurement: &ValuationMeasurement) -> Value {
     json!({
@@ -79,8 +74,6 @@ pub(super) fn evidence_value(input: &ValuationInput) -> Value {
         "dataQuality": quality_name(input.data_quality()),
         "useAssessment": input.use_assessment().map(|assessment| {
             json!({
-                "assessmentHash": assessment.hash().to_string(),
-                "subjectInstrumentId": assessment.subject_instrument_id().to_string(),
                 "relationship": relation_name(assessment.relationship()),
                 "observability": observability_name(assessment.observability()),
                 "adjustment": adjustment_name(assessment.adjustment()),
@@ -126,10 +119,6 @@ pub(super) fn timestamp_value(timestamp: Timestamp) -> String {
 
 fn fair_value_evidence_value(evidence: &FairValueEvidence) -> Value {
     json!({
-        "evidenceHash": evidence.hash().to_string(),
-        "sourceId": evidence.source_id().as_str(),
-        "sourceIdentifier": evidence.source_identifier().as_str(),
-        "payloadDigest": digest_value(evidence.payload_digest()),
         "origin": origin_value(evidence.origin()),
         "sourceTimestamp": evidence.source_timestamp().map(timestamp_value),
         "effectiveAt": evidence.effective_at().map(timestamp_value),
@@ -152,76 +141,22 @@ fn fair_value_evidence_value(evidence: &FairValueEvidence) -> Value {
 
 fn origin_value(origin: &EvidenceOrigin) -> Value {
     match origin {
-        EvidenceOrigin::Market {
-            venue_id,
-            assessment_id,
-            binding_digest,
-            canonical_state_digest,
-            committed_state_revision,
-            definition_revision,
-            activity_policy_hash,
-            activity_set_hash,
-        } => json!({
+        EvidenceOrigin::Market { venue_id, .. } => json!({
             "kind": "live",
+            "label": "Current market",
             "venueId": venue_id.as_str(),
-            "assessmentId": assessment_id.as_str(),
-            "bindingDigest": encode_hex(*binding_digest),
-            "canonicalStateDigest": digest_value(*canonical_state_digest),
-            "committedStateRevision": committed_state_revision,
-            "definitionRevision": definition_revision,
-            "activityPolicyHash": encode_hex(*activity_policy_hash),
-            "activitySetHash": encode_hex(*activity_set_hash)
         }),
-        EvidenceOrigin::Research {
-            manifest,
-            object_graph_digest,
-            query_identity,
-            result_digest,
-            row,
-            revision,
-        } => json!({
+        EvidenceOrigin::Research { .. } => json!({
             "kind": "research",
-            "manifest": manifest_value(manifest),
-            "objectGraphDigest": digest_value(*object_graph_digest),
-            "queryIdentity": digest_value(*query_identity),
-            "resultDigest": digest_value(*result_digest),
-            "row": row,
-            "revision": revision
+            "label": "Published research",
         }),
-        EvidenceOrigin::Analytics {
-            feature_key,
-            semantic_digest,
-            manifest,
-            object_graph_digest,
-            query_identity,
-            result_digest,
-            row,
-            revision,
-        } => json!({
+        EvidenceOrigin::Analytics { .. } => json!({
             "kind": "analytics",
-            "feature": {
-                "name": feature_key.name(),
-                "version": feature_key.version().get(),
-                "semanticDigest": encode_hex(*semantic_digest)
-            },
-            "manifest": manifest_value(manifest),
-            "objectGraphDigest": digest_value(*object_graph_digest),
-            "queryIdentity": digest_value(*query_identity),
-            "resultDigest": digest_value(*result_digest),
-            "row": row,
-            "revision": revision
+            "label": "Analytical estimate",
         }),
-        EvidenceOrigin::Portfolio {
-            revision,
-            account_id,
-            position_quantity,
-            point_in_time_digest,
-        } => json!({
+        EvidenceOrigin::Portfolio { .. } => json!({
             "kind": "portfolio",
-            "revision": encode_hex(*revision),
-            "accountId": account_id.to_string(),
-            "positionQuantity": position_quantity.to_string(),
-            "pointInTimeDigest": encode_hex(*point_in_time_digest)
+            "label": "Portfolio position",
         }),
     }
 }
@@ -242,34 +177,10 @@ pub(super) fn market_access_assessment_value(
         "preparedAt": timestamp_value(assessment.prepared_at()),
         "approvedBy": assessment.approved_by().as_str(),
         "approvedAt": timestamp_value(assessment.approved_at()),
-        "supersedes": assessment.supersedes().map(|value| value.to_string())
     })
 }
 
-fn manifest_value(manifest: &DatasetManifestRef) -> Value {
-    json!({
-        "datasetId": manifest.dataset_id().as_str(),
-        "manifestVersion": manifest.manifest_version(),
-        "schema": {
-            "name": manifest.schema().name(),
-            "version": manifest.schema_version().get(),
-            "fingerprint": encode_hex(manifest.schema().fingerprint())
-        },
-        "contentHash": encode_hex(manifest.content_hash().bytes())
-    })
-}
-
-fn digest_value(digest: EvidenceDigest) -> Value {
-    json!({
-        "algorithm": match digest.algorithm() {
-            DigestAlgorithm::Sha256 => "sha256",
-            DigestAlgorithm::Blake3 => "blake3"
-        },
-        "digest": encode_hex(digest.bytes())
-    })
-}
-
-fn amount_value(amount: ValuationAmount) -> Value {
+pub(super) fn amount_value(amount: ValuationAmount) -> Value {
     json!({
         "amount": amount.money().amount().to_string(),
         "currency": amount.money().currency().as_str(),
@@ -280,6 +191,13 @@ fn amount_value(amount: ValuationAmount) -> Value {
             ValuationAmountBasis::PositionTotal => "position_total",
         }
     })
+}
+
+pub(super) fn product_basis_value(basis: DecisionBasis) -> Value {
+    match basis {
+        DecisionBasis::Rules => json!({"kind": "rules"}),
+        DecisionBasis::Override { .. } => json!({"kind": "override"}),
+    }
 }
 
 fn basis_value(basis: DecisionBasis) -> Value {
@@ -296,7 +214,7 @@ fn basis_value(basis: DecisionBasis) -> Value {
     }
 }
 
-const fn hierarchy_name(value: FairValueHierarchy) -> &'static str {
+pub(super) const fn hierarchy_name(value: FairValueHierarchy) -> &'static str {
     match value {
         FairValueHierarchy::Level1 => "level_1",
         FairValueHierarchy::Level2 => "level_2",
@@ -305,7 +223,7 @@ const fn hierarchy_name(value: FairValueHierarchy) -> &'static str {
     }
 }
 
-const fn method_name(value: ValuationMethod) -> &'static str {
+pub(super) const fn method_name(value: ValuationMethod) -> &'static str {
     match value {
         ValuationMethod::QuotedMarketPrice => "quoted_market_price",
         ValuationMethod::MarketApproach => "market_approach",
@@ -314,7 +232,7 @@ const fn method_name(value: ValuationMethod) -> &'static str {
     }
 }
 
-const fn relation_name(value: InputInstrumentRelation) -> &'static str {
+pub(super) const fn relation_name(value: InputInstrumentRelation) -> &'static str {
     match value {
         InputInstrumentRelation::Identical => "identical",
         InputInstrumentRelation::Similar => "similar",
@@ -322,14 +240,14 @@ const fn relation_name(value: InputInstrumentRelation) -> &'static str {
     }
 }
 
-const fn significance_name(value: InputSignificance) -> &'static str {
+pub(super) const fn significance_name(value: InputSignificance) -> &'static str {
     match value {
         InputSignificance::Significant => "significant",
         InputSignificance::NotSignificant => "not_significant",
     }
 }
 
-const fn observability_name(value: InputObservability) -> &'static str {
+pub(super) const fn observability_name(value: InputObservability) -> &'static str {
     match value {
         InputObservability::QuotedPrice => "quoted_price",
         InputObservability::Observable => "observable",
@@ -337,7 +255,7 @@ const fn observability_name(value: InputObservability) -> &'static str {
     }
 }
 
-const fn adjustment_name(value: PriceAdjustment) -> &'static str {
+pub(super) const fn adjustment_name(value: PriceAdjustment) -> &'static str {
     match value {
         PriceAdjustment::None => "none",
         PriceAdjustment::Observable => "observable",
@@ -345,7 +263,7 @@ const fn adjustment_name(value: PriceAdjustment) -> &'static str {
     }
 }
 
-const fn activity_name(value: MarketActivity) -> &'static str {
+pub(super) const fn activity_name(value: MarketActivity) -> &'static str {
     match value {
         MarketActivity::Active => "active",
         MarketActivity::Inactive => "inactive",
@@ -353,7 +271,7 @@ const fn activity_name(value: MarketActivity) -> &'static str {
     }
 }
 
-const fn access_name(value: MarketAccess) -> &'static str {
+pub(super) const fn access_name(value: MarketAccess) -> &'static str {
     match value {
         MarketAccess::Accessible => "accessible",
         MarketAccess::Inaccessible => "inaccessible",
@@ -361,7 +279,7 @@ const fn access_name(value: MarketAccess) -> &'static str {
     }
 }
 
-const fn quality_name(value: DataQuality) -> &'static str {
+pub(super) const fn quality_name(value: DataQuality) -> &'static str {
     match value {
         DataQuality::DirectVerified => "direct_verified",
         DataQuality::DirectUnverified => "direct_unverified",
@@ -375,7 +293,7 @@ const fn quality_name(value: DataQuality) -> &'static str {
     }
 }
 
-const fn approval_status_name(value: ApprovalStatus) -> &'static str {
+pub(super) const fn approval_status_name(value: ApprovalStatus) -> &'static str {
     match value {
         ApprovalStatus::NotYetEffective => "not_yet_effective",
         ApprovalStatus::Active => "active",
@@ -384,7 +302,7 @@ const fn approval_status_name(value: ApprovalStatus) -> &'static str {
     }
 }
 
-const fn predicate_name(value: Predicate) -> &'static str {
+pub(super) const fn predicate_name(value: Predicate) -> &'static str {
     match value {
         Predicate::SignificantInput => "significant_input",
         Predicate::SubjectInstrumentMatches => "subject_instrument_matches",
@@ -404,7 +322,7 @@ const fn predicate_name(value: Predicate) -> &'static str {
     }
 }
 
-const fn reason_name(value: DecisionReasonCode) -> &'static str {
+pub(super) const fn reason_name(value: DecisionReasonCode) -> &'static str {
     match value {
         DecisionReasonCode::NoSignificantInput => "no_significant_input",
         DecisionReasonCode::NotIdenticalInstrument => "not_identical_instrument",

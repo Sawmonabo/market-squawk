@@ -75,6 +75,18 @@ class TauriTransport implements ProductTransport {
     return applicationResultSchema.parse(value)
   }
 
+  async modelProducts(request: Parameters<ProductTransport["modelProducts"]>[0]) {
+    const value = await invoke("model_products", { request })
+    return applicationResultSchema.parse(value)
+  }
+
+  async backtestProducts(
+    request: Parameters<ProductTransport["backtestProducts"]>[0],
+  ) {
+    const value = await invoke("backtest_products", { request })
+    return applicationResultSchema.parse(value)
+  }
+
   async analyticalController(
     request: Parameters<ProductTransport["analyticalController"]>[0],
     confirmed = false,
@@ -305,7 +317,7 @@ class UnavailableBrowserTransport implements ProductTransport {
   bootstrap(): Promise<never> {
     return Promise.reject(
       new Error(
-        "Open this interface through the Market Squawk desktop application. Use the protected provider portal for browser fallback.",
+        "Open this workspace through the Market Squawk desktop application.",
       ),
     )
   }
@@ -323,6 +335,14 @@ class UnavailableBrowserTransport implements ProductTransport {
   }
 
   query(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  modelProducts(): Promise<never> {
+    return Promise.reject(new Error("The local application is not connected."))
+  }
+
+  backtestProducts(): Promise<never> {
     return Promise.reject(new Error("The local application is not connected."))
   }
 

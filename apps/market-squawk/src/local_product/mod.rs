@@ -126,8 +126,9 @@ use crate::provider_activation::{
 };
 use crate::provider_onboarding::{
     InstallationSchwabOAuthBrowser, InstallationSchwabOAuthIdentity,
-    InstallationSchwabOAuthTlsAcceptor, SchwabOAuthMarketDrain, SchwabOAuthMarketDrainError,
-    SchwabOAuthMarketDrainFuture, SchwabOAuthRuntime, SchwabOAuthRuntimeConfiguration,
+    InstallationSchwabOAuthTlsAcceptor, SchwabMarketDoctorRuntimeCoordinator,
+    SchwabOAuthMarketDrain, SchwabOAuthMarketDrainError, SchwabOAuthMarketDrainFuture,
+    SchwabOAuthRuntime, SchwabOAuthRuntimeConfiguration,
 };
 use crate::provider_rate::open_provider_rate_authority;
 use crate::{
@@ -730,6 +731,7 @@ impl LocalProduct {
                 provider_runtime_mutation,
                 config.clone(),
                 provider_rate.clone(),
+                paths.control_root()?.root().to_path_buf(),
                 fixture.production_source_factory(),
             ),
             None => ProviderAdapterActivation::new(
@@ -738,6 +740,7 @@ impl LocalProduct {
                 provider_runtime_mutation,
                 config.clone(),
                 provider_rate.clone(),
+                paths.control_root()?.root().to_path_buf(),
             ),
         });
         #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
@@ -747,6 +750,7 @@ impl LocalProduct {
             provider_runtime_mutation,
             config.clone(),
             provider_rate.clone(),
+            paths.control_root()?.root().to_path_buf(),
         ));
         cli_provider::restore_research_providers(
             &paths,
@@ -789,6 +793,18 @@ impl LocalProduct {
         )?;
         let schwab_market_drain = Arc::new(RegistryBackedSchwabMarketDrain::default());
         schwab_market_drain.bind(&market_runtime)?;
+        let schwab_market_doctor = schwab_oauth_installation
+            .as_ref()
+            .map(|_installation| {
+                SchwabMarketDoctorRuntimeCoordinator::try_production(
+                    Arc::clone(&onboarding),
+                    Arc::clone(&research),
+                    paths.control_root()?.root(),
+                )
+                .map(Arc::new)
+                .map_err(|_error| LocalProductError::ProviderVerification)
+            })
+            .transpose()?;
         let schwab_oauth_factory: Option<SchwabOAuthRuntimeFactory> = schwab_oauth_installation
             .map(|installation| {
                 let workspace_paths = paths.clone();
@@ -820,6 +836,7 @@ impl LocalProduct {
             Arc::clone(&provider_activation),
             provider_activation_state.clone(),
             schwab_oauth_factory,
+            schwab_market_doctor,
         ));
         let provider_portal_activation: Arc<dyn crate::ProviderPortalActivationAuthority> =
             portal_activation.clone();
@@ -1210,6 +1227,20 @@ impl LocalProduct {
     /// Returns activation authority for onboarding-ready adapters.
     pub fn provider_activation(&self) -> Arc<ProviderAdapterActivation> {
         Arc::clone(&self.provider_activation)
+    }
+
+    /// Executes one bounded SEC fund capture and durable publication through the activated source.
+    pub(crate) async fn execute_sec_fund_operation(
+        &self,
+        request: crate::application::SecLiveFundRequest,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<
+        crate::application::SecFundPublicationReceipt,
+        crate::provider_activation::SecFundProductError,
+    > {
+        self.provider_activation
+            .execute_sec_fund_operation(request, cancellation)
+            .await
     }
 
     /// Returns provider onboarding authority for explicit CLI adapter activation boundaries.
@@ -1705,6 +1736,9 @@ pub enum LocalProductError {
     /// Provider onboarding construction failed.
     #[error(transparent)]
     Onboarding(#[from] ProviderOnboardingError),
+    /// A protected provider verification runtime could not be constructed.
+    #[error("provider verification composition failed")]
+    ProviderVerification,
     /// Restart recovery of a durable research-provider activation failed.
     #[error(transparent)]
     ProviderActivationRecovery(#[from] CliProviderActivationError),

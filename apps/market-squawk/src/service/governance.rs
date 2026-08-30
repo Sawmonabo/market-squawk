@@ -928,15 +928,15 @@ impl InstalledGovernanceOperations {
                 let input: FairValuePreviewInput = decode(arguments)?;
                 let preview = match input.proposal {
                     FairValueProposalInput::Approve {
-                        measurement_id,
-                        decision_id,
+                        measurement_token,
+                        classification_token,
                         expires_at,
                     } => {
                         actions
                             .preview_fair_value_approval(
                                 FairValueApprovalProposal::try_new(
-                                    measurement_id,
-                                    decision_id,
+                                    measurement_token,
+                                    classification_token,
                                     expires_at,
                                 )
                                 .map_err(|_| ServiceError::InvalidRequest)?,
@@ -947,8 +947,8 @@ impl InstalledGovernanceOperations {
                             .await
                     }
                     FairValueProposalInput::Override {
-                        measurement_id,
-                        decision_id,
+                        measurement_token,
+                        classification_token,
                         requested_hierarchy,
                         justification,
                         expires_at,
@@ -956,8 +956,8 @@ impl InstalledGovernanceOperations {
                         actions
                             .preview_fair_value_override(
                                 FairValueOverrideProposal::try_new(
-                                    measurement_id,
-                                    decision_id,
+                                    measurement_token,
+                                    classification_token,
                                     match requested_hierarchy {
                                         FairValueHierarchyInput::Level2 => {
                                             FairValueRequestedHierarchy::Level2
@@ -977,12 +977,12 @@ impl InstalledGovernanceOperations {
                             .await
                     }
                     FairValueProposalInput::Revoke {
-                        approval_id,
+                        approval_token,
                         reason,
                     } => {
                         actions
                             .preview_fair_value_revocation(
-                                FairValueRevocationProposal::try_new(approval_id, reason)
+                                FairValueRevocationProposal::try_new(approval_token, reason)
                                     .map_err(|_| ServiceError::InvalidRequest)?,
                                 binding,
                                 now,
@@ -991,9 +991,7 @@ impl InstalledGovernanceOperations {
                             .await
                     }
                     FairValueProposalInput::MarketAccess {
-                        account_id,
-                        venue_id,
-                        instrument_id,
+                        market_input_token,
                         conclusion,
                         effective_from,
                         effective_until,
@@ -1002,9 +1000,7 @@ impl InstalledGovernanceOperations {
                         actions
                             .preview_fair_value_market_access(
                                 FairValueMarketAccessProposal::try_new(
-                                    account_id,
-                                    venue_id,
-                                    instrument_id,
+                                    market_input_token,
                                     match conclusion {
                                         MarketAccessConclusionInput::Accessible => {
                                             FairValueMarketAccessConclusion::Accessible
@@ -1202,25 +1198,23 @@ struct FairValuePreviewInput {
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "kind")]
 enum FairValueProposalInput {
     Approve {
-        measurement_id: String,
-        decision_id: String,
+        measurement_token: String,
+        classification_token: String,
         expires_at: String,
     },
     Override {
-        measurement_id: String,
-        decision_id: String,
+        measurement_token: String,
+        classification_token: String,
         requested_hierarchy: FairValueHierarchyInput,
         justification: String,
         expires_at: String,
     },
     Revoke {
-        approval_id: String,
+        approval_token: String,
         reason: String,
     },
     MarketAccess {
-        account_id: String,
-        venue_id: String,
-        instrument_id: String,
+        market_input_token: String,
         conclusion: MarketAccessConclusionInput,
         effective_from: String,
         effective_until: String,

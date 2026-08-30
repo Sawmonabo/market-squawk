@@ -27,29 +27,34 @@ export type DesktopEventSubscription = {
   unsubscribe: () => Promise<void>
 }
 
-export type SetupGoal =
-  | "everything_recommended"
-  | "explore_public_markets"
-  | "research_investments"
-  | "manage_portfolio"
-  | "build_and_evaluate_models"
-  | "practice_paper_execution"
-  | "use_claude_code"
-  | "use_codex"
+export const productLookupCategories = [
+  "company",
+  "investment",
+  "investment_target",
+  "model",
+  "portfolio",
+  "research",
+  "saved_screen",
+] as const
 
-export type SetupStarterPlan =
-  | "everything_recommended"
-  | "public_markets"
-  | "research"
-  | "portfolio"
-  | "models"
-  | "paper_practice"
-  | "ai_clients"
+export type ProductLookupCategory = (typeof productLookupCategories)[number]
 
-export type SetupPlanSelection = {
-  goals: SetupGoal[]
-  starterPlan: SetupStarterPlan
-}
+export const productLookupCategory = {
+  company: productLookupCategories[0],
+  investment: productLookupCategories[1],
+  investmentTarget: productLookupCategories[2],
+  model: productLookupCategories[3],
+  portfolio: productLookupCategories[4],
+  research: productLookupCategories[5],
+  savedScreen: productLookupCategories[6],
+} as const
+
+export const productLookupActions = {
+  openInvestment: "open_investment",
+  openSavedScreen: "open_saved_screen",
+} as const
+
+export const PRODUCT_LOOKUP_QUERY_MAXIMUM_CHARACTERS = 64
 
 export type DashboardQuery =
   | { query: "overview" }
@@ -58,7 +63,11 @@ export type DashboardQuery =
       knowledgeCutoff?: string
       effectiveDateCutoff?: string
     }
-  | { query: "lookup"; text: string; categories?: string[] }
+  | {
+      query: "lookup"
+      text: string
+      categories?: ProductLookupCategory[]
+    }
   | { query: "marketOverview" }
   | { query: "marketUniverse"; text?: string }
   | {
@@ -69,6 +78,15 @@ export type DashboardQuery =
       query: "sourceStatus" | "sourceCoverage" | "sourceHealth"
       sourceIds?: string[]
     }
+  | { query: "researchCollections"; afterCollection?: string }
+  | {
+      query:
+        | "researchCollection"
+        | "researchCollectionHistory"
+        | "researchCollectionAlternativeData"
+      collection: string
+    }
+  | { query: "researchActivities" }
   | { query: "researchDatasets"; afterDataset?: string }
   | {
       query: "researchManifest" | "researchHistory" | "researchAlternativeData"
@@ -92,12 +110,12 @@ export type DashboardQuery =
   | {
       query: "portfolioRevisions"
       accountId: string
-      afterRevisionId?: string
+      afterSnapshotToken?: string
     }
   | {
       query: "portfolioAttribution"
       accountId: string
-      baselineRevisionId: string
+      baselineSnapshotToken: string
     }
   | {
       query: "portfolioScenario"
@@ -122,13 +140,12 @@ export type DashboardQuery =
     }
   | {
       query:
-        | "modelBundles"
         | "forecasts"
         | "paperStatus"
         | "paperOrders"
         | "paperFills"
-        | "fairValueMeasurements"
     }
+  | { query: "fairValueWorkspace"; measurementToken?: string; at: string }
   | { query: "modelMetadata"; modelId: string }
   | {
       query: "latestValidForecast"
@@ -140,8 +157,9 @@ export type DashboardQuery =
       modelId: string
       input: Record<string, unknown>
     }
-  | { query: "forecast" | "forecastOutcomes"; vintageId: string }
+  | { query: "forecast" | "forecastOutcomes"; forecastToken: string }
   | { query: "decisionScreens"; limit: number }
+  | { query: "decisionScreen"; screenId: string }
   | { query: "analysisFeatureDatasets"; dataset?: string; afterDataset?: string }
   | {
       query: "decisionScreenRuns"
@@ -179,25 +197,6 @@ export type DashboardQuery =
     }
   | { query: "decisionTargets"; targetId: string }
   | { query: "decisionTargetIndex"; afterTargetId?: string; limit: number }
-  | {
-      query:
-        | "fairValueClassification"
-        | "fairValueExplanation"
-        | "fairValueEvidence"
-      measurementId: string
-    }
-  | {
-      query: "fairValueApprovalStatus"
-      measurementId: string
-      at: string
-    }
-  | {
-      query: "fairValueAudit"
-      after?: Record<string, unknown>
-      limit: number
-    }
-  | { query: "fairValueMarketAccess"; assessmentId: string }
-  | { query: "backtest"; runId: string }
   | {
       query: "analysisArtifact"
       artifactId: string
@@ -239,12 +238,6 @@ export type DashboardQuery =
       query: "operationSettingsRollbackPreview"
       expectedRevision: string
       targetRevision: string
-    }
-  | { query: "setupPlanStatus" }
-  | {
-      query: "setupPlanPreview"
-      expectedRevision: string
-      selection: SetupPlanSelection
     }
 
 export type InstallationControlRequest =
@@ -289,6 +282,14 @@ export type ProviderOnboardingResult<
       ? ProviderActivation
       : ProviderSession
 
+export type ModelProductRequest =
+  | { action: "list" }
+  | { action: "activity" }
+
+export type BacktestProductRequest =
+  | { action: "list" }
+  | { action: "get"; backtestToken: string }
+
 export interface ProductTransport {
   bootstrap(): Promise<DesktopStartup>
   bootstrapService(request: DesktopServiceBootstrapRequest): Promise<void>
@@ -300,6 +301,8 @@ export interface ProductTransport {
     confirmed?: boolean,
   ): Promise<InstallationControlResult>
   query(request: DashboardQuery): Promise<ApplicationResult>
+  modelProducts(request: ModelProductRequest): Promise<ApplicationResult>
+  backtestProducts(request: BacktestProductRequest): Promise<ApplicationResult>
   analyticalController(
     request: AnalyticalControllerRequest,
     confirmed?: boolean,
@@ -432,11 +435,6 @@ export type OperationsControlRequest =
   | ({ action: "startProgramRollback" } & PreviewReference)
   | ({ action: "applySettingsChange" } & PreviewReference)
   | ({ action: "rollbackSettings" } & PreviewReference)
-  | {
-      action: "applySetupPlan"
-      previewId: string
-      previewSha256: string
-    }
 
 export type TrainingInputKind = "configuration" | "model_authority"
 
@@ -461,7 +459,8 @@ export type ResearchControlRequest =
       dataset: string
       discoveryReceipt: string
     }
-  | { action: "startExport"; dataset: string }
+  | { action: "startCollectionExport"; collection: string }
+  | { action: "cancelActivity" | "retryActivity"; activity: string }
 
 export type ModelControlRequest =
   | {
@@ -547,28 +546,26 @@ export type DecisionControlRequest =
 export type FairValueGovernanceProposal =
   | {
       kind: "approve"
-      measurementId: string
-      decisionId: string
+      measurementToken: string
+      classificationToken: string
       expiresAt: string
     }
   | {
       kind: "override"
-      measurementId: string
-      decisionId: string
+      measurementToken: string
+      classificationToken: string
       requestedHierarchy: "level_2" | "level_3"
       justification: string
       expiresAt: string
     }
   | {
       kind: "revoke"
-      approvalId: string
+      approvalToken: string
       reason: string
     }
   | {
       kind: "market_access"
-      accountId: string
-      venueId: string
-      instrumentId: string
+      marketInputToken: string
       conclusion: "accessible" | "inaccessible"
       effectiveFrom: string
       effectiveUntil: string
@@ -577,7 +574,6 @@ export type FairValueGovernanceProposal =
 
 export type FairValueControlRequest =
   | { action: "measure"; measurement: Record<string, unknown> }
-  | { action: "classify"; measurementId: string }
   | {
       action: "previewGovernanceAction"
       proposal: FairValueGovernanceProposal
@@ -591,14 +587,12 @@ export type FairValueControlRequest =
 export type PaperControlRequest =
   | {
       action: "start"
-      provider: "coinbase" | "coinbase-direct" | "kraken"
-      providerSessionId?: string
       strategyMode: "manual" | "book_imbalance"
       initialCash: string
       feeBasisPoints: number
     }
   | { action: "stop" | "triggerKillSwitch"; reason: string }
-  | { action: "cancel"; orderId: string }
+  | { action: "cancel"; orderToken: string }
   | { action: "reconcile" }
 
 export type ManualPaperTargetLevel =
@@ -617,8 +611,7 @@ export type ManualPaperRequest =
   | { action: "targets" }
   | {
       action: "submit"
-      targetId: string
-      targetRevision: number
+      targetToken: string
       side: "buy" | "sell"
       orderType: "market" | "limit" | "stop" | "stop_limit"
       quantityLots: string

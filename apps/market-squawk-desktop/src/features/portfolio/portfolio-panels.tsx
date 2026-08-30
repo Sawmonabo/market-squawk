@@ -217,9 +217,9 @@ export function AllocationPanel({ holdings }: { holdings: PortfolioHolding[] }) 
       <div className="mt-4">
         <PortfolioChart
           data={holdings.map((holding) => ({
-            label: shortIdentity(holding.instrument_id, "Asset"),
-            exactAmount: holding.market_value.amount,
-            currency: holding.market_value.currency,
+            label: shortIdentity(holding.instrumentId, "Asset"),
+            exactAmount: holding.marketValue.amount,
+            currency: holding.marketValue.currency,
           }))}
         />
       </div>
@@ -354,7 +354,7 @@ export function DataQualityPanel({
   account: PortfolioAccount
   holdingsResult: PortfolioResult<PortfolioHolding[]>
 }) {
-  const quality = holdingsResult.evidence.dataQuality
+  const confidence = holdingsResult.evidence.confidence
   return (
     <section className="rounded-xl border border-border bg-card/35 p-5">
       <PanelHeading
@@ -366,19 +366,19 @@ export function DataQualityPanel({
         <Fact label="Reporting currency" value={account.currency.toUpperCase()} />
         <Fact
           label="Account updated"
-          value={formatTimestamp(account.currentRevision.effectiveAtUnixNanos)}
+          value={formatTimestamp(account.currentSnapshot.effectiveAtUnixNanos)}
         />
         <Fact
           label="Analysis updated"
-          value={formatTimestamp(account.currentRevision.availableAtUnixNanos)}
+          value={formatTimestamp(account.currentSnapshot.availableAtUnixNanos)}
         />
         <Fact
           label="Data quality"
-          value={evidenceLabel(quality?.class)}
+          value={evidenceLabel(confidence)}
         />
         <Fact
           label="Suitable for analysis"
-          value={quality?.executionEligible === true ? "Yes" : "No"}
+          value={account.currentSnapshot.dataState === "ready" ? "Yes" : "Needs review"}
         />
         <Fact
           label="Coverage"
@@ -468,8 +468,8 @@ export function ReconciliationPanel({
       </div>
       {details && details.discrepancies.length > 0 ? (
         <div className="mt-4 space-y-3">
-          {details.discrepancies.map((detail) => (
-            <div key={`${detail.sourceReference}-${detail.field}`} className="rounded-lg border border-border bg-background/35 p-3 text-xs">
+          {details.discrepancies.map((detail, index) => (
+            <div key={`${detail.field}-${index}`} className="rounded-lg border border-border bg-background/35 p-3 text-xs">
               <p className="font-medium text-foreground">{humanize(detail.field)}</p>
               <dl className="mt-2 grid gap-2 sm:grid-cols-3">
                 <Fact label="Supplied" value={formatMoney(detail.supplied)} />

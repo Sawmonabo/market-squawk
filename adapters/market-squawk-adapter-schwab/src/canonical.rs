@@ -17,6 +17,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::publication::SchwabDailyPriceHistoryCalendarRangeReceipt;
 use crate::{
     ExecutedRestResponse, FundamentalField, InstrumentResponse, MarketDataService, NativeField,
     NativeFieldEntry, NativeNumber, NativeScalar, OptionChain, OptionContract, OptionContractField,
@@ -224,9 +225,8 @@ pub(crate) struct SchwabDailyPriceHistoryCandidateRequest<'a> {
     pub(crate) interval: SourceIdentifier,
     pub(crate) adjustment: MarketBarAdjustment,
     pub(crate) currency: Currency,
-    /// Calendar-authority periods in the exact provider-response order.
-    pub(crate) time_semantics: Vec<BarTimeSemantics>,
-    pub(crate) completeness_evidence: EvidenceDigest,
+    /// Non-forgeable completed-session range authority for the exact response.
+    pub(crate) calendar_range: &'a dyn SchwabDailyPriceHistoryCalendarRangeReceipt,
     pub(crate) ingested_at: Timestamp,
 }
 
@@ -253,6 +253,8 @@ pub(crate) struct SchwabPendingPriceHistoryCandidate {
     pub(crate) interval: SourceIdentifier,
     pub(crate) adjustment: MarketBarAdjustment,
     pub(crate) currency: Currency,
+    pub(crate) completed_range_receipt_digest: EvidenceDigest,
+    pub(crate) range_completeness_evidence: EvidenceDigest,
     pub(crate) completeness_evidence: EvidenceDigest,
     pub(crate) ingested_at: Timestamp,
     pub(crate) bars: Box<[SchwabPendingPriceHistoryBar]>,
@@ -282,17 +284,47 @@ pub(crate) fn prepare_price_history_candidate(
         return Err(SchwabCanonicalError::PendingHistoryBinding);
     };
     let history = parsed.value();
-    if request.identity.provider_symbol().as_str() != history.symbol.as_str()
-        || history.empty
-        || history.candles().is_empty()
-        || request.time_semantics.len() != history.candles().len()
-    {
+    if request.identity.provider_symbol().as_str() != history.symbol.as_str() {
         return Err(SchwabCanonicalError::IdentityMismatch);
     }
+    if history.empty
+        || history.candles().is_empty()
+        || request.calendar_range.periods().len() != history.candles().len()
+    {
+        return Err(SchwabCanonicalError::CompletenessMismatch);
+    }
+    let completed_range_receipt_digest = request.calendar_range.receipt_digest();
+    let range_completeness_evidence = request.calendar_range.completeness_evidence();
+    let completeness_evidence = request.calendar_range.calendar_evidence();
     if request.instrument_revision_digest.bytes() == [0; 32]
         || request.admitted_plan_digest.bytes() == [0; 32]
         || request.identity.resolution_evidence().bytes() == [0; 32]
-        || request.completeness_evidence.bytes() == [0; 32]
+        || completed_range_receipt_digest.algorithm() != DigestAlgorithm::Sha256
+        || completed_range_receipt_digest.bytes() == [0; 32]
+        || range_completeness_evidence.algorithm() != DigestAlgorithm::Sha256
+        || range_completeness_evidence.bytes() == [0; 32]
+        || completeness_evidence.algorithm() != DigestAlgorithm::Sha256
+        || completeness_evidence.bytes() == [0; 32]
+        || request.calendar_range.instrument_id() != request.instrument_id
+        || request.calendar_range.instrument_revision_digest() != request.instrument_revision_digest
+        || request.calendar_range.admitted_plan_digest() != request.admitted_plan_digest
+        || request.calendar_range.venue_id() != &request.venue_id
+        || request.calendar_range.interval() != &request.interval
+        || request.calendar_range.adjustment() != request.adjustment
+        || request.calendar_range.provider_request_digest()
+            != EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                request.response.capture().receipt().request_sha256(),
+            )
+        || request.calendar_range.requested_start() != requested_start
+        || request.calendar_range.requested_end() != requested_end
+        || request.calendar_range.requested_end() > request.calendar_range.knowledge_cutoff()
+        || request.calendar_range.knowledge_cutoff() > request.calendar_range.evaluated_at()
+        || request.calendar_range.evaluated_at() > request.ingested_at
+        || request.ingested_at >= request.calendar_range.expires_at()
+        || !request
+            .calendar_range
+            .validate_current_at(request.ingested_at)
     {
         return Err(SchwabCanonicalError::PendingHistoryBinding);
     }
@@ -315,18 +347,32 @@ pub(crate) fn prepare_price_history_candidate(
         return Err(SchwabCanonicalError::PendingHistoryBinding);
     }
 
-    let mut bars = Vec::with_capacity(history.candles().len());
-    for (candle, time_semantics) in history.candles().iter().zip(request.time_semantics) {
+    let expected_periods = request.calendar_range.periods();
+    let mut bars = Vec::new();
+    bars.try_reserve_exact(history.candles().len())
+        .map_err(|_| SchwabCanonicalError::Allocation)?;
+    for (candle, time_semantics) in history.candles().iter().zip(expected_periods) {
         let provider_timestamp = millis_to_timestamp(candle.datetime_millis)?;
         if time_semantics.provider_timestamp() != provider_timestamp
             || provider_timestamp < requested_start
             || provider_timestamp >= requested_end
+            || time_semantics.period_start() < requested_start
+            || time_semantics.period_end_exclusive() > requested_end
             || time_semantics.period_start() >= time_semantics.period_end_exclusive()
             || response_received_at < time_semantics.period_end_exclusive()
+            || time_semantics.session().evidence() != completeness_evidence
             || bars
                 .last()
                 .is_some_and(|previous: &SchwabPendingPriceHistoryBar| {
                     previous.provider_timestamp >= provider_timestamp
+                        || previous.time_semantics.period_end_exclusive()
+                            > time_semantics.period_start()
+                        || previous.time_semantics.session().kind()
+                            != time_semantics.session().kind()
+                        || previous.time_semantics.session().ruleset()
+                            != time_semantics.session().ruleset()
+                        || previous.time_semantics.session().evidence()
+                            != time_semantics.session().evidence()
                 })
         {
             return Err(SchwabCanonicalError::CompletenessMismatch);
@@ -357,7 +403,7 @@ pub(crate) fn prepare_price_history_candidate(
         bars.push(SchwabPendingPriceHistoryBar {
             source_identifier,
             provider_timestamp,
-            time_semantics,
+            time_semantics: time_semantics.clone(),
             open,
             high,
             low,
@@ -420,7 +466,9 @@ pub(crate) fn prepare_price_history_candidate(
         interval: &request.interval,
         adjustment: request.adjustment,
         currency: request.currency,
-        completeness_evidence: request.completeness_evidence,
+        completed_range_receipt_digest,
+        range_completeness_evidence,
+        completeness_evidence,
         response_received_at,
         ingested_at: request.ingested_at,
         bars: &bars,
@@ -448,7 +496,9 @@ pub(crate) fn prepare_price_history_candidate(
         interval: request.interval,
         adjustment: request.adjustment,
         currency: request.currency,
-        completeness_evidence: request.completeness_evidence,
+        completed_range_receipt_digest,
+        range_completeness_evidence,
+        completeness_evidence,
         ingested_at: request.ingested_at,
         bars: bars.into_boxed_slice(),
         mapping_digest,
@@ -492,6 +542,8 @@ struct PendingHistoryDigestWire<'a> {
     interval: &'a SourceIdentifier,
     adjustment: MarketBarAdjustment,
     currency: Currency,
+    completed_range_receipt_digest: EvidenceDigest,
+    range_completeness_evidence: EvidenceDigest,
     completeness_evidence: EvidenceDigest,
     response_received_at: Timestamp,
     ingested_at: Timestamp,
@@ -1062,6 +1114,8 @@ pub enum SchwabCanonicalError {
     InvalidIdentity,
     #[error("Schwab canonical response/context cardinality differs")]
     CardinalityMismatch,
+    #[error("Schwab canonical bounded allocation failed")]
+    Allocation,
     #[error("Schwab daily-history calendar completeness does not match the exact response")]
     CompletenessMismatch,
     #[error("Schwab pending daily-history response, authority, semantics, or clocks differ")]

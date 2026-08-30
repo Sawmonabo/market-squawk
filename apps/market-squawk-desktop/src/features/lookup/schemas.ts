@@ -1,80 +1,82 @@
 import { z } from "zod"
 
-export const lookupCategories = [
-  "company",
-  "command",
-  "dataset",
-  "instrument",
-  "job",
-  "model",
-  "portfolio",
-  "provider",
-  "screen",
-  "target",
-] as const
+import {
+  PRODUCT_LOOKUP_QUERY_MAXIMUM_CHARACTERS,
+  productLookupActions,
+  productLookupCategories,
+  productLookupCategory,
+  type ProductLookupCategory,
+} from "@/lib/transport"
 
-export type LookupCategory = (typeof lookupCategories)[number]
+export const lookupCategories = productLookupCategories
+export type LookupCategory = ProductLookupCategory
 
-export const productLookupCategories = [
-  "company",
-  "dataset",
-  "instrument",
-  "model",
-  "portfolio",
-  "screen",
-  "target",
-] as const satisfies readonly LookupCategory[]
+const lookupControlCharacter = /[\u0000-\u001F\u007F-\u009F]/u
+const lookupNonScalarCharacter = /[\uD800-\uDFFF]/u
+const productScreenId = /^[a-z][a-z0-9._-]*$/u
 
-export type ProductLookupCategory = (typeof productLookupCategories)[number]
+export function normalizeLookupQuery(value: string): string | null {
+  const query = value.trim()
+  if (
+    query.length === 0 ||
+    lookupControlCharacter.test(query) ||
+    lookupNonScalarCharacter.test(query)
+  ) {
+    return null
+  }
+  return [...query].length <= PRODUCT_LOOKUP_QUERY_MAXIMUM_CHARACTERS
+    ? query
+    : null
+}
 
-export const instrumentLookupDetailSchema = z.object({
-  displayName: z.string(),
-  companyName: z.string().nullable(),
-  assetClass: z.string(),
-  tradingStatus: z.string(),
-  quoteCurrency: z.string(),
-  matchReasons: z.array(
-    z.object({
-      label: z.string(),
-      value: z.string(),
-      venueId: z.string().optional(),
-      current: z.boolean(),
-    }),
-  ).max(8),
-  matchReasonsTruncated: z.boolean(),
-})
+export function admittedLookupQuery(value: string) {
+  return normalizeLookupQuery(value) === value
+}
 
-const lookupDestinationSchema = z.discriminatedUnion("kind", [
+const lookupQuerySchema = z.string().refine(admittedLookupQuery)
+
+const lookupMatchText = {
+  title: z.string().min(1).max(2_048),
+  subtitle: z.string().min(1).max(2_048),
+}
+
+export const lookupMatchSchema = z.discriminatedUnion("category", [
   z.object({
-    kind: z.literal("market_instrument"),
-    instrumentId: z.string().uuid(),
-  }),
+    ...lookupMatchText,
+    category: z.literal(productLookupCategory.investment),
+    destination: z.object({
+      action: z.literal(productLookupActions.openInvestment),
+      instrumentId: z.string().uuid(),
+    }).strict(),
+  }).strict(),
   z.object({
-    kind: z.literal("research_company"),
-  }),
+    ...lookupMatchText,
+    category: z.literal(productLookupCategory.savedScreen),
+    destination: z.object({
+      action: z.literal(productLookupActions.openSavedScreen),
+      screenId: z.string().min(1).max(128).regex(productScreenId),
+    }).strict(),
+  }).strict(),
 ])
 
-export const lookupMatchSchema = z.object({
-  category: z.enum(lookupCategories),
-  id: z.string(),
-  label: z.string(),
-  detail: z.record(z.string(), z.unknown()),
-  destination: lookupDestinationSchema.optional(),
-})
+const lookupCategoryStateSchema = z.discriminatedUnion("state", [
+  z.object({
+    category: z.enum(lookupCategories),
+    state: z.literal("available"),
+  }).strict(),
+  z.object({
+    category: z.enum(lookupCategories),
+    state: z.literal("unavailable"),
+    message: z.string().min(1).max(256),
+  }).strict(),
+])
 
 export const lookupResultSchema = z.object({
-  query: z.string(),
+  query: lookupQuerySchema,
   matches: z.array(lookupMatchSchema).max(64),
-  categories: z.array(
-    z.object({
-      category: z.enum(lookupCategories),
-      state: z.enum(["available", "unavailable"]),
-      reason: z.string().optional(),
-    }),
-  ),
+  categories: z.array(lookupCategoryStateSchema).max(7),
   truncated: z.boolean(),
-})
+}).strict()
 
 export type LookupMatch = z.infer<typeof lookupMatchSchema>
 export type LookupResult = z.infer<typeof lookupResultSchema>
-export type InstrumentLookupDetail = z.infer<typeof instrumentLookupDetailSchema>

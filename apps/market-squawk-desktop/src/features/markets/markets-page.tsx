@@ -15,6 +15,7 @@ import { productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
+import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -63,12 +64,10 @@ function ReadyMarketsPage({
   const [searchParams, setSearchParams] = useSearchParams()
   const requestedInstrumentId = validInstrumentId(searchParams.get("instrumentId"))
   const requestedReferenceId = validReferenceId(searchParams.get("referenceId"))
-  const operationNames = new Set(
-    bootstrap.operations.map((operation) => operation.name),
-  )
-  const overviewAvailable = operationNames.has("Market.GetOverview")
-  const instrumentAvailable = operationNames.has("Market.GetInstrument")
-  const universeAvailable = operationNames.has("Market.SearchUniverse")
+  const capabilities = productCapabilitySet(bootstrap)
+  const overviewAvailable = capabilities.has("market_overview")
+  const instrumentAvailable = capabilities.has("market_instrument")
+  const universeAvailable = capabilities.has("market_universe")
   const pageVisible = usePageVisibility()
   const overview = useQuery({
     queryKey: productKeys.operation(

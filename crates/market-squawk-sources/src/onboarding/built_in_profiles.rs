@@ -276,6 +276,13 @@ const COINBASE_EVIDENCE: &[ProfileEvidence] = &[
 ];
 const COINBASE_DIRECT_EVIDENCE: &[ProfileEvidence] = &[
     ProfileEvidence::new(
+        SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE,
+        "https://github.com/Sawmonabo/market-squawk/blob/1b7231087780845e2a8358f8cb63a4525f6b38a3/docs/architecture/market-data-provider-architecture.md",
+        "2026-08-11",
+        Some(SELECTED_MARKET_DATA_ARCHITECTURE_DIGEST),
+        false,
+    ),
+    ProfileEvidence::new(
         "CB-DIRECT-AUTH",
         "https://docs.cdp.coinbase.com/exchange/rest-api/authentication",
         "2026-07-25",
@@ -1490,7 +1497,8 @@ fn has_provider_release_revision(profile_id: &str) -> bool {
 fn is_selected_architecture_profile(profile_id: &str) -> bool {
     matches!(
         profile_id,
-        ALPACA_BASIC_PROFILE
+        COINBASE_DIRECT_PROFILE
+            | ALPACA_BASIC_PROFILE
             | NASDAQ_REFERENCE_PROFILE
             | SCHWAB_MARKET_DATA_PROFILE
             | YAHOO_ENRICHMENT_PROFILE
@@ -1856,9 +1864,9 @@ fn coinbase_direct() -> Result<BuiltInSpec, ProviderProfileError> {
             "https://api.exchange.coinbase.com/users/self/verify",
             None,
         )?,
-        rights: RIGHTS_LIMITED,
-        duties: EXCHANGE_DUTIES,
-        persistence_evidence_source_id: None,
+        rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
+        duties: PRIVATE_CRYPTO_RESEARCH_DUTIES,
+        persistence_evidence_source_id: Some(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE),
         rotation: "create a replacement View-only Exchange key and import the complete envelope as a higher generation",
         revocation: "delete the exact Exchange key remotely, then delete the exact local generation",
         recovery: COMMON_RECOVERY,
@@ -1958,7 +1966,7 @@ fn schwab_market_data() -> Result<BuiltInSpec, ProviderProfileError> {
         zero_fee: ZeroFeeStatus::NotSeparatelyEstablished,
         account: Requirement::RequiredProviderControlled,
         contact: Requirement::NotRequired,
-        release: ProfileReleaseState::RefreshRequired,
+        release: ProfileReleaseState::Available,
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: Some("schwab.market-data.read"),
         permissions: &["market-data.read", "streamer-bootstrap.read"],
@@ -1999,14 +2007,14 @@ fn yahoo_enrichment() -> Result<BuiltInSpec, ProviderProfileError> {
         zero_fee: ZeroFeeStatus::NoCredentialFeeNotEstablished,
         account: Requirement::NotRequired,
         contact: Requirement::NotRequired,
-        release: ProfileReleaseState::RefreshRequired,
+        release: ProfileReleaseState::Available,
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: None,
         permissions: &[],
-        coverage: "Experimental no-key target for explicit-demand quote components, index and fund facts, price history, corporate actions, option expirations/chains, and search hints through a pinned and hashed yfinance-lineage request, cookie/crumb HTTP, parsing, admission, cache, and raw-evidence core; never a scheduled broad-market lane, authoritative tick source, sole decision input, or SIP/NBBO/OPRA substitute; application-owned doctor, governed activation, canonical publication, PIT typed read, frontend composition, and restart/release proof remain absent",
+        coverage: "Experimental no-key target for explicit-demand quote components, index and fund facts, price history, corporate actions, option expirations/chains, and search hints through one pinned and hashed yfinance-lineage request, cookie/crumb HTTP, adaptive admission, coalescing, schema pinning, raw sealing, canonical publication, and exact PIT restart authority; never a scheduled broad-market lane, authoritative tick source, sole decision input, or SIP/NBBO/OPRA substitute",
         quality: DataQuality::Aggregated,
         probe: VerificationProbe::local(
-            "Yahoo's pinned provider-native request, cookie/crumb HTTP, parsing, admission, and raw-evidence core is installed, but the application doctor, governed activation, canonical publication, PIT read, and product proof are not; activation remains refresh_required",
+            "Yahoo's selected no-key explicit-demand application composition is installed: governed onboarding activation, one durable adaptive HTTP lane, exact provider Retry-After handling, raw sealing, family-typed canonical publication, and exact PIT restart verification are code owned",
         ),
         rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
         duties: &[
@@ -2023,7 +2031,7 @@ fn yahoo_enrichment() -> Result<BuiltInSpec, ProviderProfileError> {
         evidence: YAHOO_ENRICHMENT_EVIDENCE,
         rate_policy: "yahoo-finance.experimental-enrichment.pending-rate-policy.v1",
         refresh_trigger: "YAHOO-FINANCE-EXPERIMENTAL",
-        handoff_instruction: "No account or key is required. The pinned, bounded provider-native core is present; the profile remains unavailable until its application doctor, governed explicit-demand activation, canonical publication, PIT read, frontend composition, and restart/release proof are implemented.",
+        handoff_instruction: "No account or key is required. Continue with the installed explicit-demand Yahoo enrichment activation; every request remains bounded, supplemental, adaptively admitted, and unavailable while exact currentness or provider cooldown authority blocks it.",
     })
 }
 
@@ -2036,7 +2044,7 @@ fn iex_hist() -> Result<BuiltInSpec, ProviderProfileError> {
         zero_fee: ZeroFeeStatus::NoCredentialFeeNotEstablished,
         account: Requirement::NotRequired,
         contact: Requirement::NotRequired,
-        release: ProfileReleaseState::RefreshRequired,
+        release: ProfileReleaseState::Available,
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: None,
         permissions: &[],
@@ -2305,20 +2313,20 @@ fn tiingo() -> Result<BuiltInSpec, ProviderProfileError> {
         zero_fee: ZeroFeeStatus::Confirmed,
         account: Requirement::RequiredProviderControlled,
         contact: Requirement::NotRequired,
-        release: ProfileReleaseState::RefreshRequired,
+        release: ProfileReleaseState::Available,
         rights_state: RightsAdmissionState::AdmittedScoped,
         authority: Some("tiingo.eod.read"),
         permissions: &["daily.read"],
-        coverage: "Optional credentialed target for supported mutual-fund daily NAV plus curated raw and adjusted equity/ETF EOD, dividends, and split factors; official Starter limits are 50 requests/hour, 1,000/day, 500 unique symbols/month, and 1 GB/month, with application budgets of 40/hour, 800/day, 400 symbols/month, and 800 MB/month; provider-native authentication, request planning, bounded HTTP/capture, decoding, NAV/EOD semantics, four-dimensional quota-state contracts, and canonical FundNav mapping are present, while an application redacted doctor, durable quota-store binding, activation, final canonical publication, PIT typed read, fund workflow composition, and restart/release proof remain absent",
+        coverage: "Optional credentialed target for supported mutual-fund daily NAV plus curated raw and adjusted equity/ETF EOD, dividends, and split factors; official Starter limits are 50 requests/hour, 1,000/day, 500 unique symbols/month, and 1 GB/month, with application budgets of 40/hour, 800/day, 400 symbols/month, and 800 MB/month; the installed application owns redacted secret-store activation, one shared provider-rate authority, persistent four-dimensional quota/history state, bounded provider-native HTTP/capture, strict decoding, distinct FundNav and EOD canonical publication, and exact PIT restart verification",
         quality: DataQuality::Aggregated,
         probe: VerificationProbe::local(
-            "Tiingo authentication, request, bounded HTTP/capture, decoder, NAV/EOD, quota-state, and FundNav-mapping core is installed, but the application redacted doctor, durable quota-store binding, activation, final canonical publisher, PIT read, and product proof are not; activation remains refresh_required",
+            "Tiingo's selected token-backed NAV/EOD application composition is installed: redacted secret-store activation, durable shared quota/history authority, bounded metadata/latest capture, distinct canonical families, exact-generation publication admission, and PIT restart verification are code owned",
         ),
         rights: RIGHTS_LOCAL_PERSONAL_RESEARCH,
         duties: &[
             "import the token as one protected value and redact it from URLs, headers, logs, traces, errors, receipts, and diagnostics",
             "require per-ticker metadata and non-null coverage dates before treating a symbol as supported",
-            "enforce persistent conjunctive budgets of 40 requests/hour, 800/day, 400 unique symbols/month, and 800 MB/month; the current profile budget encodes only request windows until the symbol and byte ledger exists",
+            "enforce persistent conjunctive budgets of 40 requests/hour, 800/day, 400 unique symbols/month, and 800 MB/month through the shared request authority and the durable symbol/byte ledger",
             "retain raw and adjusted EOD, dividend cash, split factor, and mutual-fund NAV as separate source-authored evidence with provisional/correction clocks",
             "never fabricate intraday mutual-fund prices or interpret four equal NAV fields as intraday OHLC trades",
         ],
@@ -2329,7 +2337,7 @@ fn tiingo() -> Result<BuiltInSpec, ProviderProfileError> {
         evidence: TIINGO_EVIDENCE,
         rate_policy: "tiingo.starter-eod-nav.pending-rate-policy.v1",
         refresh_trigger: "TIINGO-STARTER-EOD-NAV",
-        handoff_instruction: "Import the configured Tiingo API token. The provider-native HTTP/capture, decoder, quota-state, NAV/EOD, and FundNav-mapping core is present; the profile remains unavailable until an application redacted doctor, durable quota-store binding, activation, final canonical publication, PIT read, Funds composition, and restart/release proof are implemented.",
+        handoff_instruction: "Import the configured Tiingo API token as one protected generation. The installed application activates only bounded daily FundNav or EOD operations and reports unavailable while shared request capacity, provider Retry-After, monthly symbol/byte quota, schema, or exact-generation authority blocks dispatch.",
     })
 }
 

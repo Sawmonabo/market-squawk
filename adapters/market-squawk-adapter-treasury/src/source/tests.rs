@@ -570,10 +570,7 @@ async fn exercise_fiscal_source(
         native_batch["schema"]["data_types"]
             .as_array()
             .ok_or("missing Treasury Fiscal native data types")?
-            .contains(&serde_json::json!([
-                "avg_interest_rate_amt",
-                "PERCENTAGE"
-            ]))
+            .contains(&serde_json::json!(["avg_interest_rate_amt", "PERCENTAGE"]))
     );
     assert!(
         native_batch["schema"]["data_formats"]

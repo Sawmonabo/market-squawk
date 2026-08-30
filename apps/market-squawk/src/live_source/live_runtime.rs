@@ -10,17 +10,17 @@ use tokio_util::sync::CancellationToken;
 use crate::live_runtime::{LiveRuntimeComposition, LiveRuntimeCompositionError};
 
 #[derive(Debug)]
-pub(super) enum ProductionLiveRuntimeOwner {
+pub(in crate::live_source) enum ProductionLiveRuntimeOwner {
     Standard(LiveRuntimeComposition),
     ResearchExports(LiveRuntime),
 }
 
 impl ProductionLiveRuntimeOwner {
-    pub(super) const fn standard(runtime: LiveRuntimeComposition) -> Self {
+    pub(in crate::live_source) const fn standard(runtime: LiveRuntimeComposition) -> Self {
         Self::Standard(runtime)
     }
 
-    pub(super) async fn start_with_research_exports(
+    pub(in crate::live_source) async fn start_with_research_exports(
         config: LiveRuntimeConfig,
         routes: Vec<LiveRouteConfig>,
         qualified: Vec<RouteQualifiedMarketExport>,
@@ -36,21 +36,21 @@ impl ProductionLiveRuntimeOwner {
         Ok(Self::ResearchExports(runtime))
     }
 
-    pub(super) fn snapshots(&self) -> LiveSnapshotReader {
+    pub(in crate::live_source) fn snapshots(&self) -> LiveSnapshotReader {
         match self {
             Self::Standard(runtime) => runtime.snapshots(),
             Self::ResearchExports(runtime) => runtime.snapshots(),
         }
     }
 
-    pub(super) fn production_ingress(&self) -> LiveRuntimeIngress {
+    pub(in crate::live_source) fn production_ingress(&self) -> LiveRuntimeIngress {
         match self {
             Self::Standard(runtime) => runtime.production_ingress(),
             Self::ResearchExports(runtime) => runtime.ingress(),
         }
     }
 
-    pub(super) async fn prepare_action_hooks(
+    pub(in crate::live_source) async fn prepare_action_hooks(
         &mut self,
         hooks: Vec<RouteActionHook>,
         cancellation: CancellationToken,
@@ -64,7 +64,7 @@ impl ProductionLiveRuntimeOwner {
         }
     }
 
-    pub(super) async fn reap_action_hooks(
+    pub(in crate::live_source) async fn reap_action_hooks(
         &mut self,
         cancellation: CancellationToken,
     ) -> Result<market_squawk_live::LiveActionHookReapReceipt, LiveRuntimeCompositionError> {
@@ -77,7 +77,7 @@ impl ProductionLiveRuntimeOwner {
         }
     }
 
-    pub(super) async fn shutdown(self) -> Result<(), LiveRuntimeCompositionError> {
+    pub(in crate::live_source) async fn shutdown(self) -> Result<(), LiveRuntimeCompositionError> {
         match self {
             Self::Standard(runtime) => runtime.shutdown().await.map(|_outcome| ()),
             Self::ResearchExports(runtime) => {

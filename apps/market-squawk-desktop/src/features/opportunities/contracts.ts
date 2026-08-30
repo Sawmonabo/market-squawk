@@ -2,6 +2,10 @@ import { z } from "zod"
 
 import type { ApplicationResult } from "@/lib/schemas"
 import { losslessIntegerSchema } from "@/lib/lossless-integer"
+import {
+  productLookupActions,
+  productLookupCategory,
+} from "@/lib/transport"
 
 const MAXIMUM_U32 = 4_294_967_295
 const PARTS_PER_MILLION = 1_000_000
@@ -73,6 +77,40 @@ const operationIdentifierSchema = z
   .min(1)
   .max(256)
   .regex(/^[A-Za-z0-9_.:/-]+$/)
+const savedScreenIdSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[a-z][a-z0-9._-]*$/)
+
+export const savedScreenProductSchema = z
+  .object({
+    category: z.literal(productLookupCategory.savedScreen),
+    title: z.string().min(1).max(2_048),
+    subtitle: z.string().min(1).max(2_048),
+    destination: z
+      .object({
+        action: z.literal(productLookupActions.openSavedScreen),
+        screenId: savedScreenIdSchema,
+      })
+      .strict(),
+  })
+  .strict()
+
+const savedScreenProductEnvelopeSchema = z
+  .object({
+    data: savedScreenProductSchema,
+    metadata: z
+      .object({
+        completeness: z.literal("complete"),
+        returnedItems: z.literal(1),
+        availableItems: z.literal(1),
+        sourceCoverage: z.object({ status: z.literal("not_applicable") }).strict(),
+        dataQuality: z.object({ status: z.literal("not_applicable") }).strict(),
+      })
+      .strict(),
+  })
+  .strict()
 
 const notApplicableSchema = z
   .object({ status: z.literal("not_applicable") })
@@ -1185,6 +1223,29 @@ export type RecommendationTrackRecordRequestAvailability =
         | "profile_digest_algorithm_unsupported"
         | "profile_identifier_unsupported"
     }
+export type SavedScreenProduct = z.infer<typeof savedScreenProductSchema>
+
+export function admittedSavedScreenId(value: string | null): string | null {
+  if (value === null) return null
+  const parsed = savedScreenIdSchema.safeParse(value)
+  return parsed.success ? parsed.data : null
+}
+
+export function parseSavedScreenProduct(
+  result: ApplicationResult,
+  expectedScreenId: string,
+): SavedScreenProduct {
+  const parsed = savedScreenProductEnvelopeSchema.safeParse(result)
+  const expected = savedScreenIdSchema.safeParse(expectedScreenId)
+  if (
+    !parsed.success ||
+    !expected.success ||
+    parsed.data.data.destination.screenId !== expected.data
+  ) {
+    throw new Error("The installed service returned an unsupported saved screen.")
+  }
+  return parsed.data.data
+}
 
 export function recommendationTrackRecordRequestForAnalysis(
   analysis: InvestmentAnalysis,

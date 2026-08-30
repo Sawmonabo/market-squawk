@@ -683,6 +683,10 @@ impl Catalog {
                       SELECT 1 FROM provider_logical_publication_partitions AS partition
                       WHERE partition.raw_claim_digest=sealed_raw_objects.raw_claim_digest
                         AND partition.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
+                    OR EXISTS (
+                      SELECT 1 FROM official_options_reference_objects AS object
+                      WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
                  ) ORDER BY raw_claim_digest LIMIT ?2",
             )?;
             let mut rows = statement.query(params![after.bytes().as_slice(), limit])?;
@@ -721,6 +725,10 @@ impl Catalog {
                       SELECT 1 FROM provider_logical_publication_partitions AS partition
                       WHERE partition.raw_claim_digest=sealed_raw_objects.raw_claim_digest
                         AND partition.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
+                    OR EXISTS (
+                      SELECT 1 FROM official_options_reference_objects AS object
+                      WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
                  ORDER BY raw_claim_digest LIMIT ?1",
             )?;
             let mut rows = statement.query([limit])?;

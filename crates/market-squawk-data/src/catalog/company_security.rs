@@ -7,11 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use market_squawk_domain::{
-    CommonEquitySuitability, CompanyIdentityObservation, CompanyIdentitySurface,
-    CompanySecurityIdentityLink, CompanySecurityKind, CompanySecurityLinkTransition,
-    CompanySecurityRelationshipKind, CompanySecurityResolutionBasis, DigestAlgorithm,
-    EvidenceDigest, IdentifierEntitlement, InstrumentId, MarketDataInstrumentDefinition, SourceId,
-    SourceIdentifier, Timestamp,
+    AssignmentVerification, CommonEquitySuitability, CompanyIdentityObservation,
+    CompanyIdentitySurface, CompanySecurityIdentityLink, CompanySecurityKind,
+    CompanySecurityLinkTransition, CompanySecurityRelationshipKind, CompanySecurityResolutionBasis,
+    DigestAlgorithm, EvidenceDigest, ExternalIdentifier, IdentifierEntitlement, InstrumentId,
+    MarketDataInstrumentDefinition, SourceId, SourceIdentifier, Timestamp,
 };
 use rusqlite::{Connection, OptionalExtension as _, Row, Transaction, params};
 use sha2::{Digest as _, Sha256};
@@ -29,9 +29,13 @@ const MAX_INDUSTRY_COHORT_SCAN_ROWS: usize = 1_024;
 const MAX_INDUSTRY_COHORT_MEMBERS: usize = 256;
 const SQLITE_PROGRESS_OPERATIONS: i32 = 1_000;
 const COMPANY_SECURITY_SELECTION_RECEIPT_DOMAIN: &[u8] =
-    b"market-squawk/company-security-selection-receipt/v1\0";
+    b"market-squawk/company-security-selection-receipt/v3\0";
+const SEC_FUNDAMENTAL_IDENTITY_QUERY_DOMAIN: &[u8] =
+    b"market-squawk/sec-fundamental-identity-query/v1\0";
+const SEC_FUNDAMENTAL_IDENTITY_RECEIPT_DOMAIN: &[u8] =
+    b"market-squawk/sec-fundamental-identity-receipt/v1\0";
 const INSTRUMENT_COMPANY_SELECTION_RECEIPT_DOMAIN: &[u8] =
-    b"market-squawk/instrument-company-identity-selection-receipt/v1\0";
+    b"market-squawk/instrument-company-identity-selection-receipt/v3\0";
 const INDUSTRY_CLASSIFICATION_QUERY_DOMAIN: &[u8] =
     b"market-squawk/industry-classification-query/v1\0";
 const INDUSTRY_CLASSIFICATION_SELECTION_RECEIPT_DOMAIN: &[u8] =
@@ -89,6 +93,134 @@ impl CompanySecurityIdentityQuery {
     /// Returns whether only direct issuer common equity may qualify.
     pub const fn require_suitable_common_equity(&self) -> bool {
         self.require_suitable_common_equity
+    }
+}
+
+/// Exact point-in-time SEC company generation requiring one tradable common-equity identity.
+///
+/// The query deliberately contains no ticker, company name, exchange, or fuzzy lookup field.
+/// `effective_at` answers when the security relationship must apply, while `knowledge_at` is the
+/// latest information the caller permits the selector to know.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecFundamentalIdentityQuery {
+    company_source_id: SourceId,
+    cik: SourceIdentifier,
+    company_surface: CompanyIdentitySurface,
+    company_observation_digest: EvidenceDigest,
+    effective_at: Timestamp,
+    knowledge_at: Timestamp,
+}
+
+impl SecFundamentalIdentityQuery {
+    /// Constructs an exact SEC company-generation query.
+    pub fn try_new(
+        company_source_id: SourceId,
+        cik: SourceIdentifier,
+        company_surface: CompanyIdentitySurface,
+        company_observation_digest: EvidenceDigest,
+        effective_at: Timestamp,
+        knowledge_at: Timestamp,
+    ) -> Result<Self, CompanySecurityIdentityCatalogError> {
+        if !valid_sec_cik(cik.as_str())
+            || company_observation_digest.algorithm() != DigestAlgorithm::Sha256
+            || company_observation_digest.bytes() == [0; 32]
+        {
+            return Err(CompanySecurityIdentityCatalogError::InvalidInput);
+        }
+        Ok(Self {
+            company_source_id,
+            cik,
+            company_surface,
+            company_observation_digest,
+            effective_at,
+            knowledge_at,
+        })
+    }
+
+    /// Returns the exact SEC source namespace.
+    pub const fn company_source_id(&self) -> &SourceId {
+        &self.company_source_id
+    }
+    /// Returns the normalized ten-digit SEC CIK identity.
+    pub const fn cik(&self) -> &SourceIdentifier {
+        &self.cik
+    }
+    /// Returns the exact SEC company surface.
+    pub const fn company_surface(&self) -> CompanyIdentitySurface {
+        self.company_surface
+    }
+    /// Returns the exact immutable company-observation generation.
+    pub const fn company_observation_digest(&self) -> EvidenceDigest {
+        self.company_observation_digest
+    }
+    /// Returns the economic instant at which the identity must apply.
+    pub const fn effective_at(&self) -> Timestamp {
+        self.effective_at
+    }
+    /// Returns the latest local/source knowledge the selector may use.
+    pub const fn knowledge_at(&self) -> Timestamp {
+        self.knowledge_at
+    }
+}
+
+/// Application-facing SEC fundamental identity state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecFundamentalIdentityAvailability {
+    /// One exact company generation maps to one authoritative tradable security generation.
+    Available,
+    /// The company is known, but authoritative security identity is not yet usable.
+    IdentityPending,
+    /// Multiple identities or an ambiguous company parent prevent safe selection.
+    Conflict,
+    /// The exact company/security relationship is absent, ended, revoked, or unsuitable.
+    Unavailable,
+}
+
+/// Bounded SEC fundamental identity result with restart-verifiable generation evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecFundamentalIdentitySelection {
+    availability: SecFundamentalIdentityAvailability,
+    company_observation_digest: EvidenceDigest,
+    instrument_id: Option<InstrumentId>,
+    market_instrument_revision_digest: Option<EvidenceDigest>,
+    relationship: Option<CompanySecurityIdentityRecord>,
+    relationship_selection: CompanySecurityIdentitySelection,
+    query_digest: EvidenceDigest,
+    receipt_digest: EvidenceDigest,
+}
+
+impl SecFundamentalIdentitySelection {
+    /// Returns the closed application-facing identity state.
+    pub const fn availability(&self) -> SecFundamentalIdentityAvailability {
+        self.availability
+    }
+    /// Returns the exact requested company generation in every state.
+    pub const fn company_observation_digest(&self) -> EvidenceDigest {
+        self.company_observation_digest
+    }
+    /// Returns the stable tradable security only when identity is available.
+    pub const fn instrument_id(&self) -> Option<InstrumentId> {
+        self.instrument_id
+    }
+    /// Returns the exact immutable market-reference generation only when available.
+    pub const fn market_instrument_revision_digest(&self) -> Option<EvidenceDigest> {
+        self.market_instrument_revision_digest
+    }
+    /// Returns the exact authoritative relationship event only when available.
+    pub const fn relationship(&self) -> Option<&CompanySecurityIdentityRecord> {
+        self.relationship.as_ref()
+    }
+    /// Returns the complete bounded candidate/exclusion evidence considered.
+    pub const fn relationship_selection(&self) -> &CompanySecurityIdentitySelection {
+        &self.relationship_selection
+    }
+    /// Returns the digest of the exact CIK/company/effective/knowledge query.
+    pub const fn query_digest(&self) -> EvidenceDigest {
+        self.query_digest
+    }
+    /// Returns the restart-verifiable digest binding both immutable parent generations.
+    pub const fn receipt_digest(&self) -> EvidenceDigest {
+        self.receipt_digest
     }
 }
 
@@ -171,6 +303,7 @@ impl CompanySecurityIdentityExclusion {
 pub struct CompanySecuritySelectionReceiptEntry {
     link_digest: EvidenceDigest,
     event_sequence: u32,
+    previous_link_digest: Option<EvidenceDigest>,
     company_source_id: SourceId,
     provider_company_id: SourceIdentifier,
     company_surface: CompanyIdentitySurface,
@@ -212,6 +345,10 @@ impl CompanySecuritySelectionReceiptEntry {
     /// Returns the immutable one-based relationship revision.
     pub const fn event_sequence(&self) -> u32 {
         self.event_sequence
+    }
+    /// Returns the exact predecessor named by a successor or revocation event.
+    pub const fn previous_link_digest(&self) -> Option<EvidenceDigest> {
+        self.previous_link_digest
     }
     /// Returns the exact company source considered by the selection.
     pub const fn company_source_id(&self) -> &SourceId {
@@ -343,6 +480,7 @@ impl CompanySecuritySelectionReceiptEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompanySecurityIdentitySelectionReceipt {
     query_digest: EvidenceDigest,
+    effective_at: Timestamp,
     knowledge_at: Timestamp,
     disposition: CompanySecurityIdentityDisposition,
     ordered_candidates: Box<[CompanySecuritySelectionReceiptEntry]>,
@@ -359,6 +497,10 @@ impl CompanySecurityIdentitySelectionReceipt {
     /// Returns the exact query identity.
     pub const fn query_digest(&self) -> EvidenceDigest {
         self.query_digest
+    }
+    /// Returns the economic instant used for relationship and reference validity.
+    pub const fn effective_at(&self) -> Timestamp {
+        self.effective_at
     }
     /// Returns the explicit knowledge cutoff.
     pub const fn knowledge_at(&self) -> Timestamp {
@@ -834,6 +976,24 @@ impl CompanySecurityIdentityReadCapability {
             .as_of_company_security_links(query, knowledge_at, deadline, cancellation)
     }
 
+    /// Resolves one exact SEC company generation to authoritative tradable-security identity.
+    ///
+    /// Only a direct crosswalk backed by a verified, non-ticker external identifier in the exact
+    /// immutable market-definition generation can return [`SecFundamentalIdentityAvailability::Available`].
+    /// Operator resolutions and SEC ticker/name associations remain identity-pending.
+    pub fn sec_fundamental_identity_as_of(
+        &self,
+        query: &SecFundamentalIdentityQuery,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<SecFundamentalIdentitySelection, CompanySecurityIdentityCatalogError> {
+        check_operation(deadline, cancellation)?;
+        self.authority
+            .try_lock()
+            .map_err(|_| CompanySecurityIdentityCatalogError::AuthorityUnavailable)?
+            .sec_fundamental_identity_as_of(query, deadline, cancellation)
+    }
+
     /// Resolves an exact instrument to its source-qualified issuer company at a knowledge cutoff.
     ///
     /// The caller must explicitly require direct issuer common equity. This least-authority read
@@ -940,6 +1100,8 @@ pub enum CompanySecurityIdentityCatalogError {
     InvalidInput,
     #[error("company/security parent is unavailable or not current")]
     ParentUnavailable,
+    #[error("company/security direct authority is not backed by a verified reference identifier")]
+    UnverifiedIdentityAuthority,
     #[error("company/security current parent is ambiguous")]
     AmbiguousParent,
     #[error("company/security transition does not follow the exact current event")]
@@ -1024,12 +1186,13 @@ struct CompanyParent {
     completed_at: Timestamp,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct MarketParent {
     digest: EvidenceDigest,
     published_at: Timestamp,
     effective_start: Timestamp,
     effective_end: Option<Timestamp>,
+    definition: MarketDataInstrumentDefinition,
 }
 
 impl CatalogAuthority {
@@ -1146,6 +1309,15 @@ impl CatalogAuthority {
             {
                 return Err(CompanySecurityIdentityCatalogError::ParentUnavailable);
             }
+            if !link.transition().is_revocation()
+                && matches!(
+                    link.resolution_basis(),
+                    CompanySecurityResolutionBasis::DirectAuthoritativeCrosswalk { .. }
+                )
+                && !direct_crosswalk_is_reference_backed(&link, &market_parent.definition)
+            {
+                return Err(CompanySecurityIdentityCatalogError::UnverifiedIdentityAuthority);
+            }
             if !link.transition().is_revocation() {
                 let current_company = current_company_parent(
                     &transaction,
@@ -1154,11 +1326,15 @@ impl CatalogAuthority {
                     link.company_surface(),
                     now,
                 )?;
-                let current_market =
-                    current_market_parent(&transaction, link.instrument_id(), now)?;
+                let current_market = current_market_parent(
+                    &transaction,
+                    link.instrument_id(),
+                    now,
+                    link.effective_interval().starts_at(),
+                )?;
                 if current_company.map(|parent| parent.digest)
                     != Some(link.company_observation_digest())
-                    || current_market.map(|parent| parent.digest)
+                    || current_market.as_ref().map(|parent| parent.digest)
                         != Some(link.market_instrument_revision_digest())
                 {
                     return Err(CompanySecurityIdentityCatalogError::ParentUnavailable);
@@ -1294,6 +1470,7 @@ impl CatalogAuthority {
                 self.catalog().result_bytes,
                 query,
                 now,
+                now,
                 true,
                 deadline,
                 cancellation,
@@ -1319,10 +1496,126 @@ impl CatalogAuthority {
             self.catalog().result_bytes,
             query,
             knowledge_at,
+            knowledge_at,
             false,
             deadline,
             cancellation,
         );
+        clear_progress_handler(connection)?;
+        classify_operation(result, deadline, cancellation)
+    }
+
+    fn sec_fundamental_identity_as_of(
+        &self,
+        query: &SecFundamentalIdentityQuery,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<SecFundamentalIdentitySelection, CompanySecurityIdentityCatalogError> {
+        let connection = &self.catalog().connection;
+        install_progress_handler(connection, deadline, cancellation)?;
+        let result = (|| {
+            let relationship_query = CompanySecurityIdentityQuery::new(
+                query.company_source_id().clone(),
+                query.cik().clone(),
+                query.company_surface(),
+                None,
+                true,
+            );
+            let relationship_selection = select_links(
+                connection,
+                self.catalog().result_bytes,
+                &relationship_query,
+                query.effective_at(),
+                query.knowledge_at(),
+                false,
+                deadline,
+                cancellation,
+            )?;
+            let exact_company = exact_company_parent(
+                connection,
+                query.company_observation_digest(),
+                query.company_source_id(),
+                query.cik(),
+                query.company_surface(),
+            )?;
+            let (current_company, company_parent_ambiguous) = match current_company_parent(
+                connection,
+                query.company_source_id(),
+                query.cik(),
+                query.company_surface(),
+                query.knowledge_at(),
+            ) {
+                Ok(parent) => (parent, false),
+                Err(CompanySecurityIdentityCatalogError::AmbiguousParent) => (None, true),
+                Err(error) => return Err(error),
+            };
+
+            let mut authoritative = Vec::new();
+            authoritative
+                .try_reserve_exact(relationship_selection.candidates().len())
+                .map_err(|_| CompanySecurityIdentityCatalogError::ResultLimitExceeded)?;
+            for record in relationship_selection.candidates().iter().filter(|record| {
+                record.link().company_observation_digest() == query.company_observation_digest()
+            }) {
+                if matches!(
+                    record.link().resolution_basis(),
+                    CompanySecurityResolutionBasis::DirectAuthoritativeCrosswalk { .. }
+                ) {
+                    let parent = exact_market_parent(
+                        connection,
+                        record.link().market_instrument_revision_digest(),
+                        record.link().instrument_id(),
+                    )?
+                    .ok_or(CompanySecurityIdentityCatalogError::CorruptCatalog)?;
+                    if !direct_crosswalk_is_reference_backed(record.link(), &parent.definition) {
+                        return Err(CompanySecurityIdentityCatalogError::CorruptCatalog);
+                    }
+                    authoritative.push(record.clone());
+                }
+            }
+
+            let company_knowable = exact_company.is_some_and(|parent| {
+                parent
+                    .available_at
+                    .is_some_and(|time| time <= query.knowledge_at())
+                    && parent.ingested_at <= query.knowledge_at()
+                    && parent.completed_at <= query.knowledge_at()
+            });
+            let company_generation_current = current_company.map(|parent| parent.digest)
+                == Some(query.company_observation_digest());
+            let availability = if company_parent_ambiguous
+                || relationship_selection.disposition()
+                    == CompanySecurityIdentityDisposition::Conflict
+                || authoritative.len() > 1
+            {
+                SecFundamentalIdentityAvailability::Conflict
+            } else if exact_company.is_none() {
+                SecFundamentalIdentityAvailability::Unavailable
+            } else if !company_knowable || !company_generation_current {
+                SecFundamentalIdentityAvailability::IdentityPending
+            } else if authoritative.len() == 1 && relationship_selection.candidates().len() == 1 {
+                SecFundamentalIdentityAvailability::Available
+            } else if relationship_selection.exclusions().iter().any(|exclusion| {
+                matches!(
+                    exclusion.reason(),
+                    CompanySecurityIdentityExclusionReason::NoLongerEffective
+                        | CompanySecurityIdentityExclusionReason::NotSuitableCommonEquity
+                        | CompanySecurityIdentityExclusionReason::Revoked
+                )
+            }) {
+                SecFundamentalIdentityAvailability::Unavailable
+            } else {
+                SecFundamentalIdentityAvailability::IdentityPending
+            };
+            let relationship = (availability == SecFundamentalIdentityAvailability::Available)
+                .then(|| authoritative.remove(0));
+            finish_sec_fundamental_identity(
+                query,
+                relationship_selection,
+                availability,
+                relationship,
+            )
+        })();
         clear_progress_handler(connection)?;
         classify_operation(result, deadline, cancellation)
     }
@@ -1890,24 +2183,29 @@ fn select_instrument_company_links(
             Err(CompanySecurityIdentityCatalogError::AmbiguousParent) => (None, true),
             Err(error) => return Err(error),
         };
-        let current_market =
-            current_market_parent(connection, record.link().instrument_id(), knowledge_at)?;
+        let current_market = current_market_parent(
+            connection,
+            record.link().instrument_id(),
+            knowledge_at,
+            knowledge_at,
+        )?;
         let receipt_entry = receipt_entry(
             &record,
             linked_company,
             current_company,
-            linked_market,
-            current_market,
+            &linked_market,
+            current_market.as_ref(),
         );
         let reason = exclusion_reason(
             &record,
             required_suitability == CommonEquitySuitability::SuitableIssuerCommonEquity,
             knowledge_at,
+            knowledge_at,
             linked_company,
             current_company,
             company_parent_ambiguous,
-            linked_market,
-            current_market,
+            &linked_market,
+            current_market.as_ref(),
         );
         if let Some(reason) = reason {
             exclusion_receipts.push((receipt_entry, reason));
@@ -1925,6 +2223,7 @@ fn select_instrument_company_links(
             required_suitability,
         ),
         INSTRUMENT_COMPANY_SELECTION_RECEIPT_DOMAIN,
+        knowledge_at,
         knowledge_at,
         candidates,
         exclusions,
@@ -1991,6 +2290,7 @@ fn select_links(
     connection: &Connection,
     result_limits: super::CatalogResultLimits,
     query: &CompanySecurityIdentityQuery,
+    effective_at: Timestamp,
     knowledge_at: Timestamp,
     current_projection: bool,
     deadline: Instant,
@@ -2006,25 +2306,34 @@ fn select_links(
     let retrieval_limit = i64::try_from(MAX_COMPANY_SECURITY_SELECTION_ROWS + 1)
         .map_err(|_| CompanySecurityIdentityCatalogError::ResultLimitExceeded)?;
     let mut statement = connection.prepare(sql)?;
-    let rows = statement.query_map(
-        params![
+    let mut rows = if current_projection {
+        statement.query(params![
             query.company_source_id().as_str(),
             query.provider_company_id().as_str(),
             query.company_surface().database_name(),
             instrument,
             knowledge_at.unix_nanos(),
             retrieval_limit,
-        ],
-        decode_stored_link,
-    )?;
+        ])?
+    } else {
+        statement.query(params![
+            query.company_source_id().as_str(),
+            query.provider_company_id().as_str(),
+            query.company_surface().database_name(),
+            instrument,
+            knowledge_at.unix_nanos(),
+            effective_at.unix_nanos(),
+            retrieval_limit,
+        ])?
+    };
     let mut budget = ResultBudget::new(result_limits);
     let mut records = Vec::new();
     records
         .try_reserve_exact(MAX_COMPANY_SECURITY_SELECTION_ROWS + 1)
         .map_err(|_| CompanySecurityIdentityCatalogError::ResultLimitExceeded)?;
-    for row in rows {
+    while let Some(row) = rows.next()? {
         check_operation(deadline, cancellation)?;
-        let row = row?;
+        let row = decode_stored_link(row)?;
         charge_stored_link(&row, &mut budget)?;
         records.push(rebuild_link(row)?);
     }
@@ -2076,24 +2385,29 @@ fn select_links(
             record.link().instrument_id(),
         )?
         .ok_or(CompanySecurityIdentityCatalogError::CorruptCatalog)?;
-        let current_market =
-            current_market_parent(connection, record.link().instrument_id(), knowledge_at)?;
+        let current_market = current_market_parent(
+            connection,
+            record.link().instrument_id(),
+            knowledge_at,
+            effective_at,
+        )?;
         let receipt_entry = receipt_entry(
             &record,
             linked_company,
             current_company,
-            linked_market,
-            current_market,
+            &linked_market,
+            current_market.as_ref(),
         );
         let reason = exclusion_reason(
             &record,
             query.require_suitable_common_equity(),
+            effective_at,
             knowledge_at,
             linked_company,
             current_company,
             company_parent_ambiguous,
-            linked_market,
-            current_market,
+            &linked_market,
+            current_market.as_ref(),
         );
         if let Some(reason) = reason {
             exclusion_receipts.push((receipt_entry, reason));
@@ -2106,6 +2420,7 @@ fn select_links(
     finish_selection(
         query_digest(query),
         COMPANY_SECURITY_SELECTION_RECEIPT_DOMAIN,
+        effective_at,
         knowledge_at,
         candidates,
         exclusions,
@@ -2117,6 +2432,7 @@ fn select_links(
 fn finish_selection(
     query_digest: EvidenceDigest,
     receipt_domain: &'static [u8],
+    effective_at: Timestamp,
     knowledge_at: Timestamp,
     candidates: Vec<CompanySecurityIdentityRecord>,
     exclusions: Vec<CompanySecurityIdentityExclusion>,
@@ -2158,6 +2474,7 @@ fn finish_selection(
     let receipt_digest = selection_receipt_digest(
         receipt_domain,
         query_digest,
+        effective_at,
         knowledge_at,
         disposition,
         &candidate_receipts,
@@ -2165,6 +2482,7 @@ fn finish_selection(
     );
     let receipt = CompanySecurityIdentitySelectionReceipt {
         query_digest,
+        effective_at,
         knowledge_at,
         disposition,
         ordered_candidates: candidate_receipts.into_boxed_slice(),
@@ -2205,12 +2523,13 @@ fn compare_relationship_records(
 fn exclusion_reason(
     record: &CompanySecurityIdentityRecord,
     require_suitable_common_equity: bool,
+    effective_at: Timestamp,
     knowledge_at: Timestamp,
     linked_company: CompanyParent,
     current_company: Option<CompanyParent>,
     company_parent_ambiguous: bool,
-    linked_market: MarketParent,
-    current_market: Option<MarketParent>,
+    linked_market: &MarketParent,
+    current_market: Option<&MarketParent>,
 ) -> Option<CompanySecurityIdentityExclusionReason> {
     let link = record.link();
     if link.available_at() > knowledge_at
@@ -2226,13 +2545,13 @@ fn exclusion_reason(
     {
         return Some(CompanySecurityIdentityExclusionReason::NotYetAvailable);
     }
-    if link.effective_interval().starts_at() > knowledge_at {
+    if link.effective_interval().starts_at() > effective_at {
         return Some(CompanySecurityIdentityExclusionReason::NotYetEffective);
     }
     if link
         .effective_interval()
         .ends_at()
-        .is_some_and(|end| end <= knowledge_at)
+        .is_some_and(|end| end <= effective_at)
     {
         return Some(CompanySecurityIdentityExclusionReason::NoLongerEffective);
     }
@@ -2270,17 +2589,67 @@ fn market_interval_covers(
     }
 }
 
+fn direct_crosswalk_is_reference_backed(
+    link: &CompanySecurityIdentityLink,
+    definition: &MarketDataInstrumentDefinition,
+) -> bool {
+    let CompanySecurityResolutionBasis::DirectAuthoritativeCrosswalk {
+        authority_source_id,
+        authority_revision,
+        evidence,
+    } = link.resolution_basis()
+    else {
+        return false;
+    };
+    definition.identifiers().iter().any(|record| {
+        matches!(
+            record.identifier(),
+            ExternalIdentifier::Cusip(_)
+                | ExternalIdentifier::Isin(_)
+                | ExternalIdentifier::Sedol(_)
+                | ExternalIdentifier::Figi(_)
+        ) && record.assignment_verification() == AssignmentVerification::VerifiedAssigned
+            && record.source_id() == authority_source_id
+            && record.source_evidence() == evidence
+            && record
+                .source_evidence()
+                .version_pinned_locator()
+                .is_some_and(|locator| locator.version() == authority_revision)
+            && record.observed_at() <= link.available_at()
+            && record
+                .source_timestamp()
+                .is_none_or(|timestamp| timestamp <= link.available_at())
+            && record.rights_policy().entitlement() != IdentifierEntitlement::UnknownOrRestricted
+            && interval_covers(record.validity(), link.effective_interval())
+    })
+}
+
+fn interval_covers(
+    authority: market_squawk_domain::EffectiveInterval,
+    relationship: market_squawk_domain::EffectiveInterval,
+) -> bool {
+    if relationship.starts_at() < authority.starts_at() {
+        return false;
+    }
+    match (authority.ends_at(), relationship.ends_at()) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(authority_end), Some(relationship_end)) => relationship_end <= authority_end,
+    }
+}
+
 fn receipt_entry(
     record: &CompanySecurityIdentityRecord,
     linked_company: CompanyParent,
     current_company: Option<CompanyParent>,
-    linked_market: MarketParent,
-    current_market: Option<MarketParent>,
+    linked_market: &MarketParent,
+    current_market: Option<&MarketParent>,
 ) -> CompanySecuritySelectionReceiptEntry {
     let link = record.link();
     CompanySecuritySelectionReceiptEntry {
         link_digest: record.link_digest(),
         event_sequence: record.event_sequence(),
+        previous_link_digest: link.transition().previous_link_digest(),
         company_source_id: link.company_source_id().clone(),
         provider_company_id: link.provider_company_id().clone(),
         company_surface: link.company_surface(),
@@ -2686,6 +3055,7 @@ fn current_market_parent(
     connection: &Connection,
     instrument_id: InstrumentId,
     knowledge_at: Timestamp,
+    effective_at: Timestamp,
 ) -> Result<Option<MarketParent>, CompanySecurityIdentityCatalogError> {
     connection
         .query_row(
@@ -2693,10 +3063,14 @@ fn current_market_parent(
                     definition_json, instrument_id
              FROM market_data_instrument_revisions
              WHERE instrument_id=?1 AND published_at_ns<=?2
-               AND effective_start_ns<=?2
-               AND (effective_end_ns IS NULL OR effective_end_ns>?2)
+               AND effective_start_ns<=?3
+               AND (effective_end_ns IS NULL OR effective_end_ns>?3)
              ORDER BY revision_sequence DESC LIMIT 1",
-            params![instrument_id.to_string(), knowledge_at.unix_nanos()],
+            params![
+                instrument_id.to_string(),
+                knowledge_at.unix_nanos(),
+                effective_at.unix_nanos()
+            ],
             decode_market_parent,
         )
         .optional()
@@ -2732,6 +3106,7 @@ fn decode_market_parent(row: &Row<'_>) -> rusqlite::Result<MarketParent> {
         published_at: Timestamp::from_unix_nanos(row.get(1)?),
         effective_start,
         effective_end,
+        definition,
     })
 }
 
@@ -3117,6 +3492,67 @@ fn query_digest(query: &CompanySecurityIdentityQuery) -> EvidenceDigest {
     evidence_digest(hasher.finalize().into())
 }
 
+fn sec_fundamental_identity_query_digest(query: &SecFundamentalIdentityQuery) -> EvidenceDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(SEC_FUNDAMENTAL_IDENTITY_QUERY_DOMAIN);
+    hash_text(&mut hasher, query.company_source_id().as_str());
+    hash_text(&mut hasher, query.cik().as_str());
+    hasher.update([company_surface_tag(query.company_surface())]);
+    hash_digest(&mut hasher, query.company_observation_digest());
+    hasher.update(query.effective_at().unix_nanos().to_be_bytes());
+    hasher.update(query.knowledge_at().unix_nanos().to_be_bytes());
+    evidence_digest(hasher.finalize().into())
+}
+
+fn finish_sec_fundamental_identity(
+    query: &SecFundamentalIdentityQuery,
+    relationship_selection: CompanySecurityIdentitySelection,
+    availability: SecFundamentalIdentityAvailability,
+    relationship: Option<CompanySecurityIdentityRecord>,
+) -> Result<SecFundamentalIdentitySelection, CompanySecurityIdentityCatalogError> {
+    if (availability == SecFundamentalIdentityAvailability::Available) != relationship.is_some() {
+        return Err(CompanySecurityIdentityCatalogError::CorruptCatalog);
+    }
+    let instrument_id = relationship
+        .as_ref()
+        .map(|record| record.link().instrument_id());
+    let market_instrument_revision_digest = relationship
+        .as_ref()
+        .map(|record| record.link().market_instrument_revision_digest());
+    let query_digest = sec_fundamental_identity_query_digest(query);
+    let mut hasher = Sha256::new();
+    hasher.update(SEC_FUNDAMENTAL_IDENTITY_RECEIPT_DOMAIN);
+    hash_digest(&mut hasher, query_digest);
+    hasher.update([sec_fundamental_availability_tag(availability)]);
+    hash_digest(
+        &mut hasher,
+        relationship_selection.receipt().receipt_digest(),
+    );
+    match &relationship {
+        Some(record) => {
+            hasher.update([1]);
+            hash_digest(&mut hasher, record.link_digest());
+            hasher.update(record.link().instrument_id().as_uuid().as_bytes());
+            hash_digest(
+                &mut hasher,
+                record.link().market_instrument_revision_digest(),
+            );
+        }
+        None => hasher.update([0]),
+    }
+    let receipt_digest = evidence_digest(hasher.finalize().into());
+    Ok(SecFundamentalIdentitySelection {
+        availability,
+        company_observation_digest: query.company_observation_digest(),
+        instrument_id,
+        market_instrument_revision_digest,
+        relationship,
+        relationship_selection,
+        query_digest,
+        receipt_digest,
+    })
+}
+
 fn instrument_company_query_digest(
     instrument_id: InstrumentId,
     company_source_id: &SourceId,
@@ -3135,6 +3571,7 @@ fn instrument_company_query_digest(
 fn selection_receipt_digest(
     receipt_domain: &'static [u8],
     query_digest: EvidenceDigest,
+    effective_at: Timestamp,
     knowledge_at: Timestamp,
     disposition: CompanySecurityIdentityDisposition,
     candidates: &[CompanySecuritySelectionReceiptEntry],
@@ -3146,6 +3583,7 @@ fn selection_receipt_digest(
     let mut hasher = Sha256::new();
     hasher.update(receipt_domain);
     hash_digest(&mut hasher, query_digest);
+    hasher.update(effective_at.unix_nanos().to_be_bytes());
     hasher.update(knowledge_at.unix_nanos().to_be_bytes());
     hasher.update([disposition_tag(disposition)]);
     hasher.update((candidates.len() as u64).to_be_bytes());
@@ -3163,6 +3601,7 @@ fn selection_receipt_digest(
 fn hash_receipt_entry(hasher: &mut Sha256, entry: &CompanySecuritySelectionReceiptEntry) {
     hash_digest(hasher, entry.link_digest);
     hasher.update(entry.event_sequence.to_be_bytes());
+    hash_optional_digest(hasher, entry.previous_link_digest);
     hash_text(hasher, entry.company_source_id.as_str());
     hash_text(hasher, entry.provider_company_id.as_str());
     hasher.update([company_surface_tag(entry.company_surface)]);
@@ -3374,6 +3813,14 @@ const fn disposition_tag(value: CompanySecurityIdentityDisposition) -> u8 {
         CompanySecurityIdentityDisposition::Revoked => 5,
     }
 }
+const fn sec_fundamental_availability_tag(value: SecFundamentalIdentityAvailability) -> u8 {
+    match value {
+        SecFundamentalIdentityAvailability::Available => 1,
+        SecFundamentalIdentityAvailability::IdentityPending => 2,
+        SecFundamentalIdentityAvailability::Conflict => 3,
+        SecFundamentalIdentityAvailability::Unavailable => 4,
+    }
+}
 const fn exclusion_tag(value: CompanySecurityIdentityExclusionReason) -> u8 {
     match value {
         CompanySecurityIdentityExclusionReason::NotYetAvailable => 1,
@@ -3394,6 +3841,11 @@ const fn algorithm_code(value: DigestAlgorithm) -> i64 {
 }
 const fn evidence_digest(bytes: [u8; 32]) -> EvidenceDigest {
     EvidenceDigest::new(DigestAlgorithm::Sha256, bytes)
+}
+fn valid_sec_cik(value: &str) -> bool {
+    value.len() == 10
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.bytes().any(|byte| byte != b'0')
 }
 fn array_digest(bytes: &[u8]) -> Result<[u8; 32], CompanySecurityIdentityCatalogError> {
     let result: [u8; 32] = bytes
@@ -3550,6 +4002,7 @@ WITH ranked AS (
   WHERE events.company_source_id=?1 AND events.provider_company_id=?2
     AND events.company_surface=?3 AND (?4 IS NULL OR events.instrument_id=?4)
     AND events.published_at_ns<=?5
+    AND events.effective_start_ns<=?6
 )
 SELECT link_digest, company_source_id, provider_company_id, company_surface,
        company_observation_digest, instrument_id, market_revision_digest,
@@ -3561,4 +4014,4 @@ SELECT link_digest, company_source_id, provider_company_id, company_surface,
        published_at_ns
 FROM ranked WHERE as_of_rank=1
 ORDER BY instrument_id, hex(link_digest)
-LIMIT ?6";
+LIMIT ?7";

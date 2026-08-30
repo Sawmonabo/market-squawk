@@ -492,6 +492,47 @@ struct CaptureProviderEventIdentity {
     event_id: Uuid,
 }
 
+/// One-use capture-owned raw-envelope identity for an already admitted exact frame.
+///
+/// This capability carries no payload bytes and cannot admit, decode, or publish data. It exists
+/// only for application composition that must bind an adapter-owned logical handoff back to the
+/// physical connection/event identities minted by the capture generation.
+#[derive(Debug)]
+pub struct CaptureProviderEventIdentityClaim {
+    binding: FrameSessionBinding,
+    frame_id: FrameId,
+    received_at: Timestamp,
+    payload_digest: EvidenceDigest,
+    connection_id: Uuid,
+    event_id: Uuid,
+}
+
+impl CaptureProviderEventIdentityClaim {
+    pub const fn binding(&self) -> &FrameSessionBinding {
+        &self.binding
+    }
+
+    pub const fn frame_id(&self) -> FrameId {
+        self.frame_id
+    }
+
+    pub const fn received_at(&self) -> Timestamp {
+        self.received_at
+    }
+
+    pub const fn payload_digest(&self) -> EvidenceDigest {
+        self.payload_digest
+    }
+
+    pub const fn connection_id(&self) -> Uuid {
+        self.connection_id
+    }
+
+    pub const fn event_id(&self) -> Uuid {
+        self.event_id
+    }
+}
+
 /// Owned, non-serializable proof of exact raw-frame capture admission.
 #[derive(Debug)]
 pub struct CaptureAdmissionReceipt {
@@ -548,6 +589,30 @@ impl CaptureAdmissionReceipt {
         &self.lease
     }
 
+    /// Issues the capture-minted connection/event identity once for an exact admitted frame.
+    ///
+    /// The receipt remains available for mandatory authoritative-registry consumption. Successful
+    /// issuance prevents the same identity from also being issued as provider-event material.
+    pub fn try_issue_provider_event_identity_claim(
+        &mut self,
+        frame: &RawMarketFrame,
+    ) -> Result<CaptureProviderEventIdentityClaim, CaptureAdmissionError> {
+        self.validate_material_frame(frame)?;
+        self.validate_material_identity()?;
+        let identity = self
+            .material_identity
+            .take()
+            .ok_or(CaptureAdmissionError::MaterialAlreadyIssued)?;
+        Ok(CaptureProviderEventIdentityClaim {
+            binding: self.binding.clone(),
+            frame_id: self.frame_id,
+            received_at: self.receipt.received_at(),
+            payload_digest: self.payload_digest,
+            connection_id: identity.connection_id,
+            event_id: identity.event_id,
+        })
+    }
+
     /// Issues exact durable provider-event material once without consuming registry admission.
     ///
     /// Source identity, metadata revision, event identity, connection identity, receive time, and
@@ -570,13 +635,11 @@ impl CaptureAdmissionReceipt {
         stream_identity: SourceIdentifier,
     ) -> Result<ProviderEventMicrobatchMaterial, CaptureAdmissionError> {
         self.validate_material_frame(frame)?;
+        self.validate_material_identity()?;
         let identity = self
             .material_identity
             .as_ref()
             .ok_or(CaptureAdmissionError::MaterialAlreadyIssued)?;
-        if identity.connection_id.is_nil() || identity.event_id.is_nil() {
-            return Err(CaptureAdmissionError::MaterializationFailed);
-        }
         let record = RawCaptureRecord::try_from_exact_capture_frame(
             identity.event_id,
             identity.connection_id,
@@ -621,6 +684,18 @@ impl CaptureAdmissionReceipt {
         }
         self.material_identity = None;
         Ok(material)
+    }
+
+    fn validate_material_identity(&self) -> Result<(), CaptureAdmissionError> {
+        let identity = self
+            .material_identity
+            .as_ref()
+            .ok_or(CaptureAdmissionError::MaterialAlreadyIssued)?;
+        if identity.connection_id.is_nil() || identity.event_id.is_nil() {
+            Err(CaptureAdmissionError::MaterializationFailed)
+        } else {
+            Ok(())
+        }
     }
 
     fn validate_material_frame(&self, frame: &RawMarketFrame) -> Result<(), CaptureAdmissionError> {

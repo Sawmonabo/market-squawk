@@ -593,7 +593,10 @@ fn validate_committed_row(
         || binding.instrument_id() != evidence.instrument_id
         || binding.connection_generation() != evidence.connection_generation
         || committed.connection_generation() != evidence.connection_generation
-        || committed.frame_id().get() != evidence.generation_frame_ordinal
+        || committed
+            .frame_id()
+            .map(market_squawk_sources::FrameId::get)
+            != Some(evidence.generation_frame_ordinal)
         || binding.payload_digest() != evidence.raw_payload_digest
         || binding.source_identifier() != normalized.source_identifier()
         || binding.event_class() != normalized.event_class()

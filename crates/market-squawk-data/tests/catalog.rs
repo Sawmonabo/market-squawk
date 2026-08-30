@@ -19,23 +19,25 @@ use market_squawk_data::{
     MarketDataInstrumentPopulationExclusionReason, MarketDataInstrumentPopulationQuery,
     MarketDataInstrumentReadCapability, MarketDataInstrumentSynchronization,
     MarketDataInstrumentSynchronizationCapability, ObjectStoreConfig, OnboardingAppendOutcome,
-    OnboardingReservationRequest, RightsBasis, RightsDecisionInput, RightsError, SourceCursor,
-    SourceOperation,
+    OnboardingReservationRequest, RightsBasis, RightsDecisionInput, RightsError,
+    SecFundamentalIdentityAvailability, SecFundamentalIdentityQuery, SourceCursor, SourceOperation,
 };
 use market_squawk_domain::{
-    AssetClass, AuthorizationBasis, AvailabilityEvidence, ChecksumCapability,
-    CommonEquitySuitability, CompanyIdentityObservation, CompanyIdentityObservationInput,
-    CompanyIdentitySurface, CompanySecurityIdentityLink, CompanySecurityIdentityLinkInput,
-    CompanySecurityKind, CompanySecurityLinkTransition, CompanySecurityRelationshipKind,
-    CompanySecurityResolutionBasis, ContractRollMapping, CoverageDelay, Currency, DataQuality,
-    DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
-    IdentifierEntitlement, IdentifierRightsPolicyReference, InstrumentDefinition, InstrumentId,
-    LifecycleTransition, LifecycleTransitionKind, MarketDataDisplayName,
-    MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput, MetadataRevision,
-    ProviderIdentityEvidence, ProviderIdentityRecord, ProviderIdentityRecordInput,
-    ProviderInstrumentId, ProviderReportedSecurityAssociation, RevisionBoundPayloadEvidence,
-    SchemaVersion, SequenceCapability, SourceId, SourceIdentifier, SymbolIdentityRecord, Timestamp,
-    VenueId, VenueMapping, VenueSymbol,
+    AssetClass, AssignmentVerification, AuthorizationBasis, AvailabilityEvidence,
+    ChecksumCapability, CommonEquitySuitability, CompanyIdentityObservation,
+    CompanyIdentityObservationInput, CompanyIdentitySurface, CompanySecurityIdentityLink,
+    CompanySecurityIdentityLinkInput, CompanySecurityKind, CompanySecurityLinkTransition,
+    CompanySecurityRelationshipKind, CompanySecurityResolutionBasis, ContractRollMapping,
+    CoverageDelay, Currency, Cusip, DataQuality, DeliveryEvidence, DigestAlgorithm,
+    EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, ExternalIdentifier,
+    ExternalIdentifierRecord, ExternalIdentifierRecordInput, IdentifierEntitlement,
+    IdentifierRightsPolicyReference, InstrumentDefinition, InstrumentId, LifecycleTransition,
+    LifecycleTransitionKind, MarketDataDisplayName, MarketDataInstrumentDefinition,
+    MarketDataInstrumentDefinitionInput, MetadataRevision, ProviderIdentityEvidence,
+    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderInstrumentId,
+    ProviderReportedSecurityAssociation, RevisionBoundPayloadEvidence, SchemaVersion,
+    SequenceCapability, SourceId, SourceIdentifier, SymbolIdentityRecord, Timestamp, VenueId,
+    VenueMapping, VenueSymbol, VersionPinnedSourceLocator,
 };
 use market_squawk_platform::LocalPaths;
 use market_squawk_platform::{SecretGeneration, SecretRef};
@@ -1137,7 +1139,7 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
             company_source.source_id().clone(),
             company_payload,
             SourceOperation::Persist,
-            "sec:company:CIK0000320193:v1",
+            "sec:company:0000320193:v1",
         )?,
         &company_rights,
     )?;
@@ -1225,9 +1227,15 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
         relationship_kind: CompanySecurityRelationshipKind::Issuer,
         common_equity_suitability: CommonEquitySuitability::SuitableIssuerCommonEquity,
         resolution_basis: CompanySecurityResolutionBasis::DirectAuthoritativeCrosswalk {
-            authority_source_id: SourceId::try_from("sec-company-ticker-exchange-reference")?,
-            authority_revision: SourceIdentifier::try_from("sec-company-tickers-2026-08-10")?,
-            evidence: ExactPayloadEvidence::from_content_digest(digest(44)),
+            authority_source_id: SourceId::try_from("sec-authoritative-security-reference")?,
+            authority_revision: SourceIdentifier::try_from("sec-security-reference-31")?,
+            evidence: ExactPayloadEvidence::with_version_pinned_locator(
+                digest(35),
+                VersionPinnedSourceLocator::new(
+                    SourceIdentifier::try_from("sec-filing-security-record-31")?,
+                    SourceIdentifier::try_from("sec-security-reference-31")?,
+                ),
+            ),
         },
         relationship_evidence_rights: IdentifierRightsPolicyReference::new(
             SourceIdentifier::try_from("sec-reference-personal-use-v1")?,
@@ -1276,6 +1284,33 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
         selected.receipt().ordered_candidates()[0].linked_company_observation_digest(),
         company_digest
     );
+    assert_eq!(
+        selected.receipt().effective_at(),
+        relationship.record().published_at()
+    );
+    let sec_identity_query = SecFundamentalIdentityQuery::try_new(
+        company.source_id().clone(),
+        company.provider_company_id().clone(),
+        company.surface(),
+        company_digest,
+        Timestamp::from_unix_nanos(100),
+        relationship.record().published_at(),
+    )?;
+    let sec_identity = relationship_reader.sec_fundamental_identity_as_of(
+        &sec_identity_query,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(
+        sec_identity.availability(),
+        SecFundamentalIdentityAvailability::Available
+    );
+    assert_eq!(sec_identity.instrument_id(), Some(instrument_id));
+    assert_eq!(
+        sec_identity.market_instrument_revision_digest(),
+        Some(retained.revision_digest())
+    );
+    assert_eq!(sec_identity.company_observation_digest(), company_digest);
     let replay = publisher.synchronize(
         MarketDataInstrumentSynchronization::try_new(vec![initial], 1)?,
         deadline(),
@@ -1390,6 +1425,111 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
             .current_market_revision_digest(),
         Some(future_parent.revision_digest())
     );
+    let pending_identity_query = SecFundamentalIdentityQuery::try_new(
+        company.source_id().clone(),
+        company.provider_company_id().clone(),
+        company.surface(),
+        company_digest,
+        successor_effective_start,
+        future_parent.published_at(),
+    )?;
+    assert_eq!(
+        relationship_reader
+            .sec_fundamental_identity_as_of(&pending_identity_query, deadline(), &cancellation)?
+            .availability(),
+        SecFundamentalIdentityAvailability::IdentityPending
+    );
+    let future_revocation =
+        CompanySecurityIdentityLink::try_new(CompanySecurityIdentityLinkInput {
+            schema_version: SchemaVersion::CURRENT,
+            company_source_id: company.source_id().clone(),
+            provider_company_id: company.provider_company_id().clone(),
+            company_surface: company.surface(),
+            company_observation_digest: company_digest,
+            instrument_id,
+            market_instrument_revision_digest: future_parent.revision_digest(),
+            security_kind: CompanySecurityKind::CommonEquity,
+            relationship_kind: CompanySecurityRelationshipKind::Issuer,
+            common_equity_suitability: CommonEquitySuitability::SuitableIssuerCommonEquity,
+            resolution_basis: CompanySecurityResolutionBasis::DirectAuthoritativeCrosswalk {
+                authority_source_id: SourceId::try_from("sec-authoritative-security-reference")?,
+                authority_revision: SourceIdentifier::try_from("sec-security-reference-33")?,
+                evidence: ExactPayloadEvidence::with_version_pinned_locator(
+                    digest(37),
+                    VersionPinnedSourceLocator::new(
+                        SourceIdentifier::try_from("sec-filing-security-record-33")?,
+                        SourceIdentifier::try_from("sec-security-reference-33")?,
+                    ),
+                ),
+            },
+            relationship_evidence_rights: IdentifierRightsPolicyReference::new(
+                SourceIdentifier::try_from("sec-reference-personal-use-v1")?,
+                IdentifierEntitlement::LicensedInternalUse,
+                SourceIdentifier::try_from(
+                    "https://www.sec.gov/files/company_tickers_exchange.json",
+                )?,
+            ),
+            effective_interval: EffectiveInterval::new(
+                successor_effective_start,
+                Some(successor_effective_end),
+            )?,
+            available_at: future_parent.published_at(),
+            ingested_at: future_parent.published_at(),
+            transition: CompanySecurityLinkTransition::Revokes {
+                previous_link_digest: relationship.record().link_digest(),
+                reason: SourceIdentifier::try_from("future-delisting")?,
+            },
+        })?;
+    let revocation =
+        relationship_publisher.publish(future_revocation, deadline(), &cancellation)?;
+    let historical_after_future_revocation = relationship_reader.sec_fundamental_identity_as_of(
+        &SecFundamentalIdentityQuery::try_new(
+            company.source_id().clone(),
+            company.provider_company_id().clone(),
+            company.surface(),
+            company_digest,
+            Timestamp::from_unix_nanos(100),
+            revocation.record().published_at(),
+        )?,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(
+        historical_after_future_revocation.availability(),
+        SecFundamentalIdentityAvailability::Available
+    );
+    assert_eq!(
+        historical_after_future_revocation
+            .relationship()
+            .ok_or(CatalogError::InvalidRecord)?
+            .link_digest(),
+        relationship.record().link_digest()
+    );
+    let revoked = relationship_reader.sec_fundamental_identity_as_of(
+        &SecFundamentalIdentityQuery::try_new(
+            company.source_id().clone(),
+            company.provider_company_id().clone(),
+            company.surface(),
+            company_digest,
+            successor_effective_start,
+            revocation.record().published_at(),
+        )?,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(
+        revoked.availability(),
+        SecFundamentalIdentityAvailability::Unavailable
+    );
+    assert_eq!(
+        revoked
+            .relationship_selection()
+            .receipt()
+            .ordered_exclusions()[0]
+            .0
+            .previous_link_digest(),
+        Some(relationship.record().link_digest())
+    );
     assert_eq!(
         relationship_reader
             .exact(
@@ -1418,7 +1558,8 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
     drop(authority);
 
     let authority = Arc::new(Mutex::new(CatalogAuthority::open(config)?));
-    let reader = MarketDataInstrumentReadCapability::new(authority);
+    let reader = MarketDataInstrumentReadCapability::new(Arc::clone(&authority));
+    let relationship_reader = CompanySecurityIdentityReadCapability::new(authority);
     let reopened = reader
         .latest(instrument_id, deadline(), &cancellation)?
         .ok_or(CatalogError::InvalidRecord)?;
@@ -1442,6 +1583,14 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
     assert_eq!(
         reader.pin_population_as_of(ended_query, deadline(), &cancellation)?,
         ended
+    );
+    assert_eq!(
+        relationship_reader.sec_fundamental_identity_as_of(
+            &sec_identity_query,
+            deadline(),
+            &cancellation
+        )?,
+        sec_identity
     );
     Ok(())
 }
@@ -1506,7 +1655,32 @@ fn market_data_definition(
                 validity: effective,
                 supersedes: None,
             })],
-            identifiers: Vec::new(),
+            identifiers: vec![ExternalIdentifierRecord::new(
+                ExternalIdentifierRecordInput {
+                    identifier: ExternalIdentifier::Cusip(Cusip::try_from("037833100")?),
+                    assignment_verification: AssignmentVerification::VerifiedAssigned,
+                    source_id: SourceId::try_from("sec-authoritative-security-reference")?,
+                    source_evidence: ExactPayloadEvidence::with_version_pinned_locator(
+                        digest(evidence_byte.saturating_add(4)),
+                        VersionPinnedSourceLocator::new(
+                            SourceIdentifier::try_from(format!(
+                                "sec-filing-security-record-{evidence_byte}"
+                            ))?,
+                            SourceIdentifier::try_from(format!(
+                                "sec-security-reference-{evidence_byte}"
+                            ))?,
+                        ),
+                    ),
+                    source_timestamp: Some(Timestamp::from_unix_nanos(effective_start)),
+                    observed_at: Timestamp::from_unix_nanos(effective_start + 1),
+                    validity: effective,
+                    rights_policy: IdentifierRightsPolicyReference::new(
+                        SourceIdentifier::try_from("sec-reference-personal-use-v1")?,
+                        IdentifierEntitlement::LicensedInternalUse,
+                        SourceIdentifier::try_from("https://www.sec.gov/Archives/edgar/data")?,
+                    ),
+                },
+            )],
         },
     )?)
 }
@@ -1522,7 +1696,7 @@ fn company_identity_observation(
         CompanyIdentityObservationInput {
             schema_version: SchemaVersion::CURRENT,
             source_id,
-            provider_company_id: SourceIdentifier::try_from("CIK0000320193")?,
+            provider_company_id: SourceIdentifier::try_from("0000320193")?,
             surface: CompanyIdentitySurface::SecSubmissions,
             conformed_name: name.to_owned(),
             former_names: Vec::new(),

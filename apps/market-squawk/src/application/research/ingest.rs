@@ -12,8 +12,9 @@ use std::{
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
 use market_squawk_data::{
-    DatasetId, IngestError, IngestPrecommitAuthority, RightsBasis, RightsDecisionInput,
-    SourceOperation, extraction_provider_payload_digest,
+    CommittedDataset, DatasetId, DatasetManifestRef, IngestError, IngestPrecommitAuthority,
+    PersistedProviderCaptureBindingEvidence, RightsBasis, RightsDecisionInput, SourceOperation,
+    extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
     CompanyIdentityObservation, EvidenceDigest, SourceId, SourceIdentifier, Timestamp,
@@ -23,16 +24,18 @@ use market_squawk_services::{
     TypedToolResult,
 };
 use market_squawk_sources::{
-    AuthoritativeSourceRegistry, DiscoveryBatch, DiscoveryRequest, ExtractionBatch,
-    ExtractionRequest, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
-    MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
-    ProviderCaptureMaterial, ProviderNativeLineageBatch, RegisteredSource, RegistryError,
-    SourceClass, SourceError,
-    SourceMetadata, SourceObject, SourceObjectCaptureIdentity, built_in_provider_profiles,
+    AuthoritativeSourceRegistry, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority,
+    ExtractionBatch, ExtractionRequest, ExtractionRevisionPlan, ExtractionSource,
+    ExtractionSourceError, MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_RECORDS,
+    MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, ProviderCaptureError, ProviderCaptureMaterial,
+    ProviderNativeLineageBatch, ProviderNativeLineageImplementation, RegisteredSource,
+    RegistryError, SealedProviderCaptureBinding, SourceClass, SourceError, SourceMetadata,
+    SourceObject, SourceObjectCaptureIdentity, built_in_provider_profiles,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -42,7 +45,7 @@ use super::{
 };
 use crate::{ResearchIngestRequest, ResearchService, ResearchServiceError};
 
-use super::super::domain_support::DomainLifecycle;
+use super::super::domain_support::{DomainCall, DomainLifecycle};
 
 const STANDARD_EXTRACTION_DURATION: Duration = Duration::from_secs(60);
 const STANDARD_DISCOVERY_RECEIPT_RETENTION: Duration = Duration::from_secs(5 * 60);
@@ -51,12 +54,18 @@ const MAXIMUM_PREPUBLISHED_RESEARCH_SOURCES: usize = 64;
 mod alpaca_historical;
 mod bea;
 mod bls;
+mod bls_live;
+mod census;
 mod crypto_market;
+mod eia;
 mod fred;
 mod iex_hist;
+mod official_options_reference;
 mod provider_runtime;
 mod schwab_market;
 mod sec_fund;
+mod sec_fundamentals;
+mod sec_live;
 mod selection;
 mod tiingo;
 mod treasury;
@@ -68,10 +77,12 @@ pub(crate) use alpaca_historical::{
     AlpacaHistoricalSourceSlotError,
 };
 pub(crate) use bea::{
-    BEA_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION, BeaDoctorActivationState,
+    BEA_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION, BeaDoctorActivationState, BeaLivePublicationError,
     BeaMacroApplicationClosure, BeaMacroApplicationError, BeaMacroCapabilityState,
     BeaMacroPlanPublication, BeaProviderPeriodLatestKnownDto, BeaProviderPeriodLatestKnownRequest,
-    BeaSetupRequiredDto, BeaSetupRequiredKind, BeaUnavailableDto, BeaUnavailableReason,
+    BeaRegionalLiveComposition, BeaRegionalLiveOutcome, BeaRegionalLiveRequest,
+    BeaRegionalLiveRuntime, BeaRegisteredSource, BeaSetupRequiredDto, BeaSetupRequiredKind,
+    BeaUnavailableDto, BeaUnavailableReason,
 };
 pub(crate) use bls::{
     BLS_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION, BlsMacroApplicationClosure,
@@ -80,15 +91,31 @@ pub(crate) use bls::{
     BlsProviderPeriodLatestKnownRequest, BlsSealFirstExtractionLimits,
     BlsWholePlanApplicationHandoff,
 };
+pub(crate) use bls_live::{
+    BlsLivePublicationError, BlsRegisteredSource, BlsRegisteredV2LiveComposition,
+    BlsRegisteredV2LiveOutcome, BlsRegisteredV2LiveRequest, BlsRegisteredV2LiveRuntime,
+};
+pub(crate) use census::{
+    CENSUS_QUARTERLY_POINT_IN_TIME_OPERATION, CensusLiveComposition, CensusMacroApplicationClosure,
+    CensusMacroApplicationError, CensusPublicationReceipt, CensusQuarterlyPointInTimeRequest,
+    CensusQuarterlyRestartReceipt, CensusRegisteredSource, CensusRestartSelector,
+    CensusSealFirstExtractionLimits,
+};
 pub(crate) use crypto_market::{
-    CoinbaseMarketApplicationOutcome, CryptoCommittedRowIngress, CryptoMarketDurableRead,
-    CryptoMarketDurableReadWriter, CryptoMarketEventPublicationReceipt,
-    CryptoMarketEventRestartReceipt, CryptoMarketEventRestartSelector,
-    CryptoMarketPointInTimeReceipt, CryptoMarketPointInTimeSelector,
-    CryptoMarketPublicationClosure, CryptoMarketPublicationError,
-    CryptoMarketSealedReceiptEvidence, CryptoMarketSurface, CryptoPendingFrameIngress,
+    CoinbaseMarketApplicationOutcome, CryptoCommittedRowIngress, CryptoMarketPublicationClosure,
+    CryptoMarketPublicationError, CryptoMarketSurface, CryptoPendingFrameIngress,
     CryptoPublicationRendezvousLimits, KrakenMarketApplicationOutcome,
-    KrakenSealedRawCanonicalUnavailable,
+    KrakenSealedRawCanonicalUnavailable, MarketEventDurableRead, MarketEventDurableReadWriter,
+    MarketEventPointInTimeReceipt, MarketEventPointInTimeSelector, MarketEventPublicationReceipt,
+    MarketEventReadError, MarketEventRestartReceipt, MarketEventRestartSelector,
+    MarketEventSealedReceiptEvidence,
+};
+pub(crate) use eia::{
+    EIA_MACRO_CALENDAR_POINT_IN_TIME_OPERATION, EIA_MACRO_PROVIDER_PERIOD_POINT_IN_TIME_OPERATION,
+    EiaApplicationAcquisitionLimits, EiaLiveComposition, EiaMacroApplicationClosure,
+    EiaMacroApplicationError, EiaMacroEffectiveCutoff, EiaMacroPointInTimeRequest,
+    EiaMacroPublicationReceipt, EiaMacroRestartReceipt, EiaMacroRestartSelector,
+    EiaRegisteredSource,
 };
 pub(crate) use fred::{FredProductionPublicationError, FredPublishedGenerationHandoff};
 pub(crate) use iex_hist::{
@@ -100,18 +127,28 @@ pub(crate) use iex_hist::{
     IexHistPublicationBlocker, IexHistPublicationBlockers, IexHistResearchJobLeaf,
     IexHistSelectionStatus,
 };
+pub(crate) use official_options_reference::{
+    OfficialOptionsReferenceApplicationBinding, OfficialOptionsReferenceApplicationError,
+    OfficialOptionsReferenceCatalogCommitInput, OfficialOptionsReferenceClosureCommitment,
+    OfficialOptionsReferenceObjectCommitment, OfficialOptionsReferenceStrictObjectCommitment,
+};
+pub use provider_runtime::ResearchProviderRuntimeGeneration;
+pub(crate) use provider_runtime::{
+    CryptoMarketPublicationAuthority, ResearchProviderPublicationOperation,
+    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
+};
+use provider_runtime::{ResearchProviderAdmission, ResearchProviderPublicationLease};
+pub(crate) use schwab_market::{
+    SchwabMarketPublicationError, SchwabRestQuoteGenerationAuthority,
+    SchwabRestQuotePostSealFailure, SchwabRestQuoteSourceHealthOutcome,
+};
 pub(crate) use sec_fund::{
     SEC_NCEN_FUND_POINT_IN_TIME_OPERATION, SEC_NPORT_FUND_POINT_IN_TIME_OPERATION,
     SecFundApplicationBridge, SecFundApplicationError, SecFundPublicationReceipt,
     SecNcenFundPublicationReceipt, SecNcenFundRestartSelector, SecNportFundPublicationReceipt,
     SecNportFundRestartSelector,
 };
-pub use provider_runtime::ResearchProviderRuntimeGeneration;
-use provider_runtime::{ResearchProviderAdmission, ResearchProviderPublicationLease};
-pub(crate) use provider_runtime::{
-    CryptoMarketPublicationAuthority, ResearchProviderRuntimeMutationAuthority,
-    ResearchProviderRuntimeReplacement,
-};
+pub(crate) use sec_live::{SecLiveFundApplicationError, SecLiveFundRequest, SecLiveFundSource};
 use selection::{PreparedRetainedSelection, RetainedDiscoverySelections};
 pub use selection::{
     ResearchSourceDiscovery, ResearchSourceDiscoveryObject, ResearchSourceObjectListing,
@@ -119,7 +156,7 @@ pub use selection::{
 pub(crate) use tiingo::{
     TIINGO_EOD_MARKET_BAR_POINT_IN_TIME_OPERATION, TIINGO_FUND_NAV_POINT_IN_TIME_OPERATION,
     TiingoEodApplicationOutcome, TiingoEodRestartSelector, TiingoFundNavApplicationOutcome,
-    TiingoFundNavRestartSelector, TiingoLatestApplicationError, TiingoLatestApplicationState,
+    TiingoFundNavRestartSelector, TiingoLatestApplicationError,
 };
 pub(crate) use treasury::{
     TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION, TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION,
@@ -128,7 +165,6 @@ pub(crate) use treasury::{
     TreasuryFiscalDataLatestKnownRequest, TreasuryMacroPublicationReceipt,
     TreasuryMacroRestartSelector, TreasurySelectedObjectRequest,
 };
-
 
 /// Fixed operation ceilings applied independently of transport result limits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1001,6 +1037,270 @@ pub struct ProductionResearchIngestCoordinator {
     authority: Arc<Mutex<CoordinatorAuthority>>,
 }
 
+/// One lifecycle-tracked, exact-generation capability for a provider macro operation.
+///
+/// The capability is intentionally linear at the application boundary: registry extraction,
+/// subject-qualified rights, provider-generation cancellation, and the matching publication lease
+/// are acquired together and remain live for the same request lifetime.
+pub(super) struct ProviderMacroOperationAuthority {
+    _call: DomainCall,
+    research: Arc<ResearchService>,
+    generation: ResearchProviderRuntimeGeneration,
+    extraction: ExtractionAuthority,
+    rights: ResearchRightsAuthority,
+    publication: Arc<ResearchProviderPublicationLease>,
+    cancellation: CancellationToken,
+    watcher: JoinHandle<()>,
+    operation_deadline: Instant,
+}
+
+impl ProviderMacroOperationAuthority {
+    pub(super) const fn generation(&self) -> &ResearchProviderRuntimeGeneration {
+        &self.generation
+    }
+
+    pub(super) fn extraction(&self) -> ExtractionAuthority {
+        self.extraction.clone()
+    }
+
+    pub(super) const fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    pub(super) const fn operation_deadline(&self) -> Instant {
+        self.operation_deadline
+    }
+
+    pub(super) fn provider_deadline(&self) -> Result<Timestamp, ServiceError> {
+        wall_deadline(self.operation_deadline, &self.cancellation)
+    }
+
+    pub(super) fn ensure_live(&self) -> Result<(), ServiceError> {
+        ensure_operation_live(self.operation_deadline, &self.cancellation)?;
+        self.publication
+            .validate_precommit()
+            .map_err(|_error| ServiceError::Unavailable)
+    }
+
+    pub(super) fn rights_decision(
+        &self,
+        payload_digest: EvidenceDigest,
+        observed_at: Timestamp,
+    ) -> Result<RightsDecisionInput, ServiceError> {
+        self.ensure_live()?;
+        self.rights.decision(payload_digest, observed_at)
+    }
+
+    pub(super) fn publication_authority(&self) -> Arc<dyn IngestPrecommitAuthority> {
+        self.publication.clone()
+    }
+
+    /// Commits one exact provider capture/native/canonical binding through the shared research
+    /// publication path and immediately reconstructs its restart coordinate from the catalog.
+    pub(super) async fn publish_single_binding(
+        &self,
+        analytical_dataset: DatasetId,
+        binding: SealedProviderCaptureBinding,
+        revisions: ExtractionRevisionPlan,
+        expected_implementation: ProviderNativeLineageImplementation,
+        observed_at: Timestamp,
+    ) -> Result<ProviderMacroSinglePublication, ProviderMacroPublicationError> {
+        self.ensure_live()?;
+        binding.validate()?;
+        let capture = binding.capture_evidence();
+        let schema = binding.native_lineage().schema();
+        if capture.source_id() != self.generation.metadata().source_id()
+            || capture.metadata_revision() != self.generation.metadata().revision()
+            || schema.implementation() != expected_implementation
+            || binding.record_count() == 0
+            || binding.record_count() != revisions.len()
+            || !revisions.is_locally_observed()
+            || !revisions.native_lineage_required()
+        {
+            return Err(ProviderMacroPublicationError::InvalidBinding);
+        }
+        let binding_digest = binding.evidence_digest().evidence();
+        let payload_digest = extraction_provider_payload_digest(binding.batch());
+        let rights = self.rights_decision(payload_digest, observed_at)?;
+        let ingest = ResearchIngestRequest::with_provider_publication(
+            self.generation.metadata().clone(),
+            rights,
+            analytical_dataset,
+            binding,
+            revisions,
+        )?
+        .with_precommit_authority(self.publication_authority());
+        let committed = self
+            .research
+            .ingest(ingest, self.cancellation.clone())
+            .await?;
+        let restart = ProviderMacroRestartBinding::try_reopen(
+            self.research.as_ref(),
+            committed.manifest().clone(),
+            self.generation.metadata().source_id(),
+            expected_implementation,
+        )?;
+        if restart.binding_digest != binding_digest {
+            return Err(ProviderMacroPublicationError::RestartMismatch);
+        }
+        Ok(ProviderMacroSinglePublication { committed, restart })
+    }
+}
+
+impl Drop for ProviderMacroOperationAuthority {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.watcher.abort();
+    }
+}
+
+/// Catalog-reconstructible coordinate for a single-binding provider macro generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ProviderMacroRestartBinding {
+    manifest: DatasetManifestRef,
+    binding_digest: EvidenceDigest,
+    source_id: SourceId,
+    metadata_revision: SourceIdentifier,
+    provider_dataset: SourceIdentifier,
+    record_count: usize,
+    native_implementation: &'static str,
+    native_schema_version: u16,
+    native_schema_fingerprint: EvidenceDigest,
+}
+
+impl ProviderMacroRestartBinding {
+    pub(super) fn try_reopen(
+        research: &ResearchService,
+        manifest: DatasetManifestRef,
+        expected_source: &SourceId,
+        expected_implementation: ProviderNativeLineageImplementation,
+    ) -> Result<Self, ProviderMacroPublicationError> {
+        let binding_digests = research
+            .analytical()
+            .provider_capture_binding_digests(&manifest)?;
+        let [binding_digest] = binding_digests.as_slice() else {
+            return Err(ProviderMacroPublicationError::RestartMismatch);
+        };
+        let store = research.provider_capture_store();
+        let evidence = research.analytical().provider_capture_binding_evidence(
+            &manifest,
+            *binding_digest,
+            store.as_ref(),
+        )?;
+        let implementation = macro_native_implementation_name(expected_implementation)
+            .ok_or(ProviderMacroPublicationError::InvalidBinding)?;
+        if evidence.binding_digest() != *binding_digest
+            || evidence.capture().source_id() != expected_source
+            || evidence.record_count() == 0
+            || evidence.record_count() != evidence.rows().len()
+            || evidence.native_lineage().implementation() != implementation
+            || evidence.native_lineage().row_count() != evidence.record_count()
+        {
+            return Err(ProviderMacroPublicationError::RestartMismatch);
+        }
+        let _pinned = research.analytical().pinned(&manifest)?;
+        Ok(Self {
+            manifest,
+            binding_digest: *binding_digest,
+            source_id: evidence.capture().source_id().clone(),
+            metadata_revision: evidence
+                .capture()
+                .metadata_revision()
+                .as_source_identifier()
+                .clone(),
+            provider_dataset: evidence.capture().dataset().clone(),
+            record_count: evidence.record_count(),
+            native_implementation: implementation,
+            native_schema_version: evidence.native_lineage().version(),
+            native_schema_fingerprint: evidence.native_lineage().fingerprint(),
+        })
+    }
+
+    pub(super) const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
+    }
+
+    pub(super) const fn binding_digest(&self) -> EvidenceDigest {
+        self.binding_digest
+    }
+
+    pub(super) const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    pub(super) const fn provider_dataset(&self) -> &SourceIdentifier {
+        &self.provider_dataset
+    }
+
+    pub(super) fn evidence(
+        &self,
+        research: &ResearchService,
+    ) -> Result<PersistedProviderCaptureBindingEvidence, ProviderMacroPublicationError> {
+        let store = research.provider_capture_store();
+        let evidence = research.analytical().provider_capture_binding_evidence(
+            &self.manifest,
+            self.binding_digest,
+            store.as_ref(),
+        )?;
+        if evidence.capture().source_id() != &self.source_id
+            || evidence
+                .capture()
+                .metadata_revision()
+                .as_source_identifier()
+                != &self.metadata_revision
+            || evidence.capture().dataset() != &self.provider_dataset
+            || evidence.record_count() != self.record_count
+            || evidence.native_lineage().implementation() != self.native_implementation
+            || evidence.native_lineage().version() != self.native_schema_version
+            || evidence.native_lineage().fingerprint() != self.native_schema_fingerprint
+        {
+            return Err(ProviderMacroPublicationError::RestartMismatch);
+        }
+        Ok(evidence)
+    }
+}
+
+pub(super) struct ProviderMacroSinglePublication {
+    committed: CommittedDataset,
+    restart: ProviderMacroRestartBinding,
+}
+
+impl ProviderMacroSinglePublication {
+    pub(super) const fn committed(&self) -> &CommittedDataset {
+        &self.committed
+    }
+
+    pub(super) fn into_parts(self) -> (CommittedDataset, ProviderMacroRestartBinding) {
+        (self.committed, self.restart)
+    }
+}
+
+#[derive(Debug, Error)]
+pub(super) enum ProviderMacroPublicationError {
+    #[error("provider macro operation authority is unavailable")]
+    Service(#[from] ServiceError),
+    #[error("provider macro sealed binding is invalid")]
+    Capture(#[from] ProviderCaptureError),
+    #[error("provider macro research publication failed")]
+    Research(#[from] ResearchServiceError),
+    #[error("provider macro catalog reconstruction failed")]
+    Ingest(#[from] IngestError),
+    #[error("provider macro binding does not match the exact operation generation")]
+    InvalidBinding,
+    #[error("provider macro generation could not be reconstructed exactly")]
+    RestartMismatch,
+}
+
+const fn macro_native_implementation_name(
+    implementation: ProviderNativeLineageImplementation,
+) -> Option<&'static str> {
+    match implementation {
+        ProviderNativeLineageImplementation::CensusTabularV1 => Some("census_tabular_v1"),
+        ProviderNativeLineageImplementation::EiaSeriesV1 => Some("eia_series_v1"),
+        _ => None,
+    }
+}
+
 impl ProductionResearchIngestCoordinator {
     /// Binds restart-durable source authority to the sole analytical publication service.
     #[must_use]
@@ -1022,6 +1322,138 @@ impl ProductionResearchIngestCoordinator {
                 alpaca_historical: alpaca_historical::AlpacaHistoricalSourceSlot::absent(),
             })),
         }
+    }
+
+    /// Acquires every authority needed by one provider macro operation as one exact-generation
+    /// capability. No extraction authority, rights value, cancellation token, or publication
+    /// lease is returned independently.
+    pub(super) async fn acquire_provider_macro_operation(
+        &self,
+        generation: &ResearchProviderRuntimeGeneration,
+        provider_dataset: &SourceIdentifier,
+        context: &RequestContext,
+    ) -> Result<ProviderMacroOperationAuthority, ServiceError> {
+        let call = DomainLifecycle::enter(&self.lifecycle, context)?;
+        let operation_deadline = operation_deadline(context, self.limits.operation_duration)?;
+        let (extraction, rights, admission) = {
+            let authority = self
+                .authority
+                .lock()
+                .map_err(|_error| ServiceError::Unavailable)?;
+            let registry = authority
+                .registry
+                .as_ref()
+                .ok_or(ServiceError::Unavailable)?;
+            let registered = authority
+                .sources
+                .get(generation.profile())
+                .ok_or(ServiceError::NotFound)?;
+            if registered.generation.as_ref() != Some(generation)
+                || registered.metadata != *generation.metadata()
+                || registered.source.metadata() != generation.metadata()
+                || registered.registration.source_id() != generation.metadata().source_id()
+                || registered.registration.revision() != generation.metadata().revision()
+                || !registered
+                    .admission
+                    .admits_generation(generation)
+                    .map_err(|_error| ServiceError::Unavailable)?
+            {
+                return Err(ServiceError::Unavailable);
+            }
+            registered.rights.validate_at(system_timestamp()?)?;
+            let subject = registered
+                .source
+                .rights_subject(provider_dataset)
+                .map_err(|_error| ServiceError::InvalidRequest)?;
+            registered.rights.validate_subject(subject.as_ref())?;
+            let extraction = registry
+                .extraction_authority(&registered.registration, registered.source.as_ref())
+                .map_err(map_registry_error)?;
+            (
+                extraction,
+                registered.rights.clone(),
+                registered.admission.clone(),
+            )
+        };
+        let cancellation = CancellationToken::new();
+        let signal = cancellation.clone();
+        let caller = context.cancellation().clone();
+        let shutdown = self.lifecycle.shutdown_token().clone();
+        let revoked = admission.cancellation().clone();
+        let watched_caller = caller.clone();
+        let watched_shutdown = shutdown.clone();
+        let watched_revoked = revoked.clone();
+        let watcher = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                () = watched_caller.cancelled() => signal.cancel(),
+                () = watched_shutdown.cancelled() => signal.cancel(),
+                () = watched_revoked.cancelled() => signal.cancel(),
+                () = tokio::time::sleep_until(operation_deadline.into()) => signal.cancel(),
+            }
+        });
+        let lease = admission.acquire_publication_lease();
+        tokio::pin!(lease);
+        let publication = tokio::select! {
+            biased;
+            () = caller.cancelled() => {
+                cancellation.cancel();
+                watcher.abort();
+                return Err(ServiceError::Cancelled);
+            }
+            () = shutdown.cancelled() => {
+                cancellation.cancel();
+                watcher.abort();
+                return Err(ServiceError::Unavailable);
+            }
+            () = revoked.cancelled() => {
+                cancellation.cancel();
+                watcher.abort();
+                return Err(ServiceError::Unavailable);
+            }
+            () = tokio::time::sleep_until(operation_deadline.into()) => {
+                cancellation.cancel();
+                watcher.abort();
+                return Err(ServiceError::DeadlineExceeded);
+            }
+            () = cancellation.cancelled() => {
+                watcher.abort();
+                if caller.is_cancelled() {
+                    return Err(ServiceError::Cancelled);
+                }
+                if Instant::now() >= operation_deadline {
+                    return Err(ServiceError::DeadlineExceeded);
+                }
+                return Err(ServiceError::Unavailable);
+            }
+            result = lease.as_mut() => result.map(Arc::new),
+        };
+        let publication = match publication {
+            Ok(publication) => publication,
+            Err(_error) => {
+                cancellation.cancel();
+                watcher.abort();
+                return Err(ServiceError::Unavailable);
+            }
+        };
+        if publication.validate_precommit().is_err() {
+            cancellation.cancel();
+            watcher.abort();
+            return Err(ServiceError::Unavailable);
+        }
+        let operation = ProviderMacroOperationAuthority {
+            _call: call,
+            research: Arc::clone(&self.research),
+            generation: generation.clone(),
+            extraction,
+            rights,
+            publication,
+            cancellation,
+            watcher,
+            operation_deadline,
+        };
+        operation.ensure_live()?;
+        Ok(operation)
     }
 
     /// Consumes a bounded static adapter composition before publishing the coordinator.
@@ -2129,6 +2561,7 @@ fn map_ingest_error(error: IngestError) -> ServiceError {
         | IngestError::Arrow(_)
         | IngestError::Manifest(_)
         | IngestError::Catalog(_)
+        | IngestError::SecFundJob(_)
         | IngestError::ListingReference(_)
         | IngestError::Serialization(_)
         | IngestError::RevisionAuthority(_)

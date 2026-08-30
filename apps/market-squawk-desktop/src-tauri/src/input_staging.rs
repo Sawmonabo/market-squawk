@@ -208,7 +208,7 @@ pub(crate) async fn import_provider_credential_bundle(
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct PortfolioImportInterpretationInput {
-    record_id: String,
+    record_token: uuid::Uuid,
     interpretation: String,
     rationale: String,
     #[serde(default)]
@@ -272,8 +272,7 @@ pub(crate) async fn preview_portfolio_import(
 
 #[tauri::command]
 pub(crate) async fn commit_portfolio_import(
-    preview_id: String,
-    preview_digest: String,
+    review_token: uuid::Uuid,
     interpretations: Vec<PortfolioImportInterpretationInput>,
     confirmed: bool,
     state: State<'_, DesktopState>,
@@ -284,11 +283,7 @@ pub(crate) async fn commit_portfolio_import(
         "Confirm the exact preview and interpretations before committing this portfolio import.",
     )?;
     let mut approval_arguments = Map::new();
-    approval_arguments.insert("previewId".to_owned(), Value::String(preview_id.clone()));
-    approval_arguments.insert(
-        "previewDigest".to_owned(),
-        Value::String(preview_digest.clone()),
-    );
+    approval_arguments.insert("reviewToken".to_owned(), json!(review_token));
     approval_arguments.insert(
         "interpretations".to_owned(),
         serde_json::to_value(interpretations).map_err(|_error| DesktopCommandError::internal())?,
@@ -305,13 +300,13 @@ pub(crate) async fn commit_portfolio_import(
         .get("data")
         .and_then(Value::as_object)
         .ok_or_else(DesktopCommandError::internal)?;
-    let approval_id = approved
-        .get("approvalId")
+    let approval_token = approved
+        .get("approvalToken")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(DesktopCommandError::internal)?;
-    if approved.get("previewId").and_then(Value::as_str) != Some(preview_id.as_str())
-        || approved.get("previewDigest").and_then(Value::as_str) != Some(preview_digest.as_str())
+    if approved.get("reviewToken").and_then(Value::as_str)
+        != Some(review_token.to_string().as_str())
         || !matches!(
             approved.get("status").and_then(Value::as_str),
             Some("approved" | "promoting")
@@ -320,8 +315,8 @@ pub(crate) async fn commit_portfolio_import(
         return Err(DesktopCommandError::internal());
     }
     let commit_arguments = Map::from_iter([(
-        "approvalId".to_owned(),
-        Value::String(approval_id.to_owned()),
+        "approvalToken".to_owned(),
+        Value::String(approval_token.to_owned()),
     )]);
     invoke_private_application(
         COMMIT_PORTFOLIO_IMPORT,
@@ -335,7 +330,7 @@ pub(crate) async fn commit_portfolio_import(
 
 #[tauri::command]
 pub(crate) async fn discard_portfolio_import(
-    preview_id: String,
+    review_token: uuid::Uuid,
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
@@ -344,7 +339,7 @@ pub(crate) async fn discard_portfolio_import(
         confirmed,
         "Confirm that this uncommitted portfolio preview should be discarded.",
     )?;
-    let arguments = Map::from_iter([("previewId".to_owned(), Value::String(preview_id))]);
+    let arguments = Map::from_iter([("reviewToken".to_owned(), json!(review_token))]);
     invoke_private_application(
         DISCARD_PORTFOLIO_IMPORT,
         arguments,

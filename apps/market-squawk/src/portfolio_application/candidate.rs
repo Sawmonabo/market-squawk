@@ -1463,17 +1463,10 @@ impl ImportedPortfolioRiskAdvisory {
 
     fn structured_content(&self) -> Value {
         json!({
-            "outcome": "indeterminate_at_evaluation",
+            "state": "incomplete",
             "evaluatedAtUnixNanos": self.evaluated_at.unix_nanos().to_string(),
-            "checksEvaluated": self.evaluated.iter().map(|check| check.as_str()).collect::<Vec<_>>(),
-            "checksUnavailable": self.unavailable.iter().map(|check| check.as_str()).collect::<Vec<_>>(),
-            "evidenceDigest": {
-                "algorithm": self.digest.algorithm(),
-                "bytes": hex(&self.digest.bytes()),
-            },
-            "authority": "analysis_only",
-            "reservation": false,
-            "order": false,
+            "checksCompleted": self.evaluated.len(),
+            "checksUnavailable": self.unavailable.len(),
         })
     }
 }
@@ -1626,69 +1619,26 @@ impl PortfolioCandidateImpactPreview {
     /// Produces the bounded presentation payload without granting mutation or execution authority.
     pub(crate) fn structured_content(&self) -> Value {
         let observation = &self.market_evidence.observation;
-        let selection = &self.market_evidence.selection;
         let terms = self.market_evidence.execution_terms;
-        let fee_evidence = match &self.market_evidence.fees {
+        let fees = match &self.market_evidence.fees {
             PortfolioCandidateAvailability::Available(cost) => json!({
-                "status": "available",
+                "state": "available",
                 "amount": money_value(cost.amount()),
-                "evidenceDigest": {
-                    "algorithm": cost.evidence_digest().algorithm(),
-                    "bytes": hex(&cost.evidence_digest().bytes()),
-                },
             }),
-            PortfolioCandidateAvailability::Unavailable(reason) => json!({
-                "status": "unavailable",
-                "reason": reason.as_str(),
-            }),
+            PortfolioCandidateAvailability::Unavailable(_) => json!({"state": "not_available"}),
         };
-        let slippage_evidence = match &self.market_evidence.slippage {
+        let slippage = match &self.market_evidence.slippage {
             PortfolioCandidateAvailability::Available(cost) => json!({
-                "status": "available",
+                "state": "available",
                 "amount": money_value(cost.amount()),
-                "evidenceDigest": {
-                    "algorithm": cost.evidence_digest().algorithm(),
-                    "bytes": hex(&cost.evidence_digest().bytes()),
-                },
             }),
-            PortfolioCandidateAvailability::Unavailable(reason) => json!({
-                "status": "unavailable",
-                "reason": reason.as_str(),
-            }),
+            PortfolioCandidateAvailability::Unavailable(_) => json!({"state": "not_available"}),
         };
-        let setup_evidence = json!({
-            "setupRevision": self.setup.setup_revision.to_string(),
-            "setupDigest": hex(&self.setup.setup_digest),
-            "configurationDigest": hex(&self.setup.configuration_digest),
-            "profileDigest": hex(&self.setup.profile_digest),
-            "catalogDigest": hex(&self.setup.catalog_digest.bytes()),
-        });
-        let evidence_digest = json!({
-            "algorithm": self.evidence_digest.algorithm(),
-            "bytes": hex(&self.evidence_digest.bytes()),
-        });
-        let portfolio_evidence = json!({
-            "revisionId": hex(&self.revision.bytes()),
-            "effectiveAtUnixNanos": self.portfolio_effective_at.unix_nanos().to_string(),
-            "availableAtUnixNanos": self.portfolio_available_at.unix_nanos().to_string(),
-            "sourceId": self.portfolio_source_id.as_str(),
-            "sourceCoverage": self.portfolio_source_coverage
-                .iter()
-                .map(SourceId::as_str)
-                .collect::<Vec<_>>(),
-            "artifactSha256": hex(&self.portfolio_artifact_sha256),
-        });
         let instrument_terms = json!({
-            "definitionRevision": terms.definition_revision().get().to_string(),
             "priceTick": terms.price_tick().as_decimal().to_string(),
             "lotSize": terms.lot_size().as_decimal().to_string(),
             "quoteCurrency": terms.quote_currency().as_str(),
-            "settlementDenomination": denomination_value(terms.settlement_denomination()),
             "contractMultiplier": terms.contract_multiplier().to_string(),
-        });
-        let cost_evidence = json!({
-            "fees": fee_evidence,
-            "slippage": slippage_evidence,
         });
         let concentration = json!({
             "current": self.current_weight.to_string(),
@@ -1696,99 +1646,47 @@ impl PortfolioCandidateImpactPreview {
             "change": self.weight_change.to_string(),
         });
         let scenario = json!({
-            "scope": SCENARIO_SCOPE,
             "shock": self.scenario_shock.to_string(),
             "currentImpact": money_value(self.current_scenario_impact),
             "proposedImpact": money_value(self.proposed_scenario_impact),
             "marginalImpact": money_value(self.marginal_scenario_impact),
         });
-        let selection_evidence = json!({
-            "instrumentId": selection.instrument_id.to_string(),
-            "sourceId": selection.source_id.as_str(),
-            "policyRevision": selection.policy_revision,
-            "policyDigest": {
-                "algorithm": selection.policy_digest.algorithm(),
-                "bytes": hex(&selection.policy_digest.bytes()),
-            },
-            "receiptDigest": {
-                "algorithm": selection.receipt_digest.algorithm(),
-                "bytes": hex(&selection.receipt_digest.bytes()),
-            },
-            "sourceStateRevision": selection
-                .source_state_revision
-                .map(|revision| revision.to_string()),
-            "selectedAtUnixNanos": selection.selected_at.unix_nanos().to_string(),
-        });
-        let mark_evidence = json!({
-            "status": "fresh_selected_market_observation",
-            "instrumentId": observation.instrument_id.to_string(),
-            "unitMark": money_value(observation.unit_mark),
-            "markKind": observation.mark_kind.as_str(),
-            "quality": data_quality_str(observation.quality),
-            "sourceId": observation.source_id.as_str(),
-            "observationDigest": {
-                "algorithm": observation.observation_digest.algorithm(),
-                "bytes": hex(&observation.observation_digest.bytes()),
-            },
-            "observedAtUnixNanos": observation.observed_at.unix_nanos().to_string(),
-            "availableAtUnixNanos": observation.available_at.unix_nanos().to_string(),
-            "freshUntilUnixNanosExclusive": observation.fresh_until.unix_nanos().to_string(),
-            "evaluatedAtUnixNanos": self.evaluated_at.unix_nanos().to_string(),
-            "portfolioRevisionId": hex(&self.market_evidence.portfolio_revision.bytes()),
-            "selection": selection_evidence,
-        });
-        let availability = json!({
-            "portfolioWideSelectedMarks": {
-                "status": "unavailable",
-                "reason": PortfolioCandidateUnavailableReason::PortfolioWideSelectedMarks.as_str(),
-            },
-            "liquidity": {
-                "status": "unavailable",
-                "reason": PortfolioCandidateUnavailableReason::Liquidity.as_str(),
-            },
-            "settlementBackedSizing": {
-                "status": "unavailable",
-                "reason": PortfolioCandidateUnavailableReason::SettlementBackedSizing.as_str(),
-            },
-            "factorClassification": {
-                "status": "unavailable",
-                "reason": PortfolioCandidateUnavailableReason::FactorClassification.as_str(),
-            },
-        });
-        let authority = json!({
-            "analysisOnly": true,
-            "portfolioMutation": false,
-            "executionAuthority": false,
-            "riskAuthority": RISK_AUTHORITY,
-            "reservation": false,
-            "order": false,
-            "riskApprovalRequiredBeforeAnyOrder": true,
-        });
         json!({
             "accountId": self.account_id.to_string(),
-            "revisionId": hex(&self.revision.bytes()),
-            "setupEvidence": setup_evidence,
-            "policy": CANDIDATE_IMPACT_POLICY,
-            "evidenceSchemaVersion": CANDIDATE_IMPACT_EVIDENCE_SCHEMA_VERSION,
-            "evidenceDigest": evidence_digest,
-            "portfolioEvidence": portfolio_evidence,
             "instrumentId": self.instrument_id.to_string(),
-            "positionState": self.position_state.as_str(),
+            "positionState": match self.position_state {
+                PortfolioCandidatePositionState::ZeroPosition => "new",
+                PortfolioCandidatePositionState::ExistingHolding => "existing",
+            },
             "currentQuantity": self.current_quantity.to_string(),
             "proposedQuantity": self.proposed_quantity.to_string(),
             "currentMarketValue": money_value(self.current_market_value),
             "proposedMarketValue": money_value(self.proposed_market_value),
             "capitalChange": money_value(self.capital_change),
             "portfolioValue": money_value(self.portfolio_value),
-            "portfolioValueBasis": PORTFOLIO_VALUE_BASIS,
             "instrumentTerms": instrument_terms,
-            "costEvidence": cost_evidence,
+            "costs": {"fees": fees, "slippage": slippage},
             "concentration": concentration,
             "scenario": scenario,
-            "markEvidence": mark_evidence,
-            "availability": availability,
-            "riskAdvisory": self.advisory.structured_content(),
-            "authority": authority,
+            "price": {
+                "amount": money_value(observation.unit_mark),
+                "asOfUnixNanos": observation.observed_at.unix_nanos().to_string(),
+                "state": "current",
+                "method": match observation.mark_kind {
+                    PortfolioCandidateMarkKind::LastTrade => "Last trade",
+                    PortfolioCandidateMarkKind::Midpoint => "Bid-ask midpoint",
+                },
+                "confidence": "limited",
+            },
+            "missingInformation": [
+                "Portfolio-wide current prices",
+                "Liquidity",
+                "Settlement-backed sizing",
+                "Factor classification",
+            ],
+            "riskAssessment": self.advisory.structured_content(),
+            "updatedAtUnixNanos": self.evaluated_at.unix_nanos().to_string(),
+            "analysisOnly": true,
         })
     }
 
@@ -2002,18 +1900,8 @@ pub(super) async fn call_resolved_candidate_impact(
         .await?;
     ensure_read_live(&reader.runtime, context.deadline(), context.cancellation())?;
     let metadata = ToolResultMetadata::try_complete(
-        json!({
-            "portfolio": preview.portfolio_source_coverage()
-                .iter()
-                .map(SourceId::as_str)
-                .collect::<Vec<_>>(),
-            "market": preview.market_evidence().selection().source_id().as_str(),
-        }),
-        json!({
-            "portfolio": "direct_unverified",
-            "market": data_quality_str(preview.market_evidence().observation().quality()),
-            "executionEligible": false,
-        }),
+        json!({"scope": "portfolio_candidate"}),
+        json!({"state": "available", "confidence": "limited"}),
     )
     .map_err(|_| PortfolioApplicationServiceError::Publication)?;
     TypedToolResult::try_new(preview.structured_content(), 1, metadata, context.limits())
@@ -2658,39 +2546,22 @@ mod tests {
         );
         assert_eq!(content["concentration"]["proposed"], "0.25");
         assert_eq!(content["scenario"]["marginalImpact"]["amount"], "-50");
-        assert_eq!(content["authority"]["portfolioMutation"], false);
-        assert_eq!(content["authority"]["executionAuthority"], false);
-        assert_eq!(content["authority"]["reservation"], false);
+        assert_eq!(content["analysisOnly"], true);
+        assert_eq!(content["positionState"], "new");
         assert_eq!(
-            content["costEvidence"]["fees"],
-            serde_json::json!({
-                "status": "unavailable",
-                "reason": "exact_fees",
-            })
+            content["costs"]["fees"],
+            serde_json::json!({"state": "not_available"})
         );
         assert_eq!(
-            content["costEvidence"]["slippage"],
-            serde_json::json!({
-                "status": "unavailable",
-                "reason": "exact_slippage",
-            })
+            content["costs"]["slippage"],
+            serde_json::json!({"state": "not_available"})
         );
-        assert_eq!(
-            content["riskAdvisory"]["outcome"],
-            "indeterminate_at_evaluation"
-        );
+        assert_eq!(content["riskAssessment"]["state"], "incomplete");
         assert_eq!(content["instrumentTerms"]["lotSize"], "1");
-        assert_eq!(
-            content["instrumentTerms"]["settlementDenomination"],
-            serde_json::json!({
-                "kind": "asset",
-                "instrumentId": instrument_id.to_string(),
-            })
-        );
-        assert_eq!(
-            content["evidenceDigest"]["bytes"],
-            hex(&preview.evidence_digest().bytes())
-        );
+        let encoded = serde_json::to_string(&content).expect("serialize product result");
+        for forbidden in ["sourceId", "artifactSha256", "revisionId", "evidenceDigest"] {
+            assert!(!encoded.contains(forbidden));
+        }
         let repeated =
             calculate_preview(state.clone(), &valid_request).expect("deterministic preview");
         let mut tampered = preview.clone();

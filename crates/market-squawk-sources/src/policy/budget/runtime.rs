@@ -336,6 +336,23 @@ impl std::fmt::Debug for SharedProviderBudget {
 }
 
 impl SharedProviderBudget {
+    /// Projects the exact persisted provider/account admission state without reserving or charging
+    /// a request. Budgets without the shared provider-rate binding fail closed.
+    pub fn provider_rate_availability(
+        &self,
+    ) -> Result<ProviderRateAvailability, BudgetUnavailableReason> {
+        if self.allocation.terminal.load(Ordering::Acquire) {
+            return Ok(ProviderRateAvailability::Unavailable(
+                BudgetUnavailableReason::AvailabilityGenerationExhausted,
+            ));
+        }
+        self.allocation
+            .provider_rate
+            .as_ref()
+            .ok_or(BudgetUnavailableReason::PersistenceUnavailable)?
+            .inspect_availability()
+    }
+
     #[cfg(test)]
     #[allow(clippy::panic)]
     pub(crate) fn poison_state_during_admitted_unwind_for_test(&self) -> bool {

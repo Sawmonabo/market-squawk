@@ -10,7 +10,8 @@ import { useProduct } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
-import type { DesktopBootstrap } from "@/lib/schemas"
+import { hasProductCapability } from "@/lib/product-capabilities"
+import type { DesktopBootstrap, ProductCapability } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import { HoldingTable } from "./holding-table"
@@ -153,9 +154,9 @@ function PortfolioWorkspace({
         <>
           <FinancialPositionCoverage
             accounts={rows}
-            holdingsAvailable={hasOperation(bootstrap, "Portfolio.GetHoldings")}
-            performanceAvailable={hasOperation(bootstrap, "Portfolio.GetPerformance")}
-            transactionsAvailable={hasOperation(bootstrap, "Portfolio.GetTransactions")}
+            holdingsAvailable={hasProductCapability(bootstrap, "portfolio_holdings")}
+            performanceAvailable={hasProductCapability(bootstrap, "portfolio_performance")}
+            transactionsAvailable={hasProductCapability(bootstrap, "portfolio_transactions")}
           />
           <EmptyPortfolio />
         </>
@@ -163,9 +164,9 @@ function PortfolioWorkspace({
         <>
           <FinancialPositionCoverage
             accounts={rows}
-            holdingsAvailable={hasOperation(bootstrap, "Portfolio.GetHoldings")}
-            performanceAvailable={hasOperation(bootstrap, "Portfolio.GetPerformance")}
-            transactionsAvailable={hasOperation(bootstrap, "Portfolio.GetTransactions")}
+            holdingsAvailable={hasProductCapability(bootstrap, "portfolio_holdings")}
+            performanceAvailable={hasProductCapability(bootstrap, "portfolio_performance")}
+            transactionsAvailable={hasProductCapability(bootstrap, "portfolio_transactions")}
           />
           <AccountDirectory
             accounts={rows}
@@ -230,9 +231,9 @@ function DetailWorkspace({
 }) {
   const holdings = details.holdings.data?.value ?? null
   const performance = details.performance.data?.value ?? null
-  const missing = Object.entries(details.operationAvailable)
+  const missing = Object.entries(details.capabilityAvailable)
     .filter(([, available]) => !available)
-    .map(([operation]) => detailName(operation))
+    .map(([capability]) => detailName(capability as ProductCapability))
   const hasDetailError = [
     details.holdings.error,
     details.performance.error,
@@ -269,8 +270,8 @@ function DetailWorkspace({
         performance={performance}
       />
 
-      {(details.operationAvailable["Portfolio.GetHoldings"] && details.holdings.isPending) ||
-      (details.operationAvailable["Portfolio.GetPerformance"] && details.performance.isPending) ? (
+      {(details.capabilityAvailable.portfolio_holdings && details.holdings.isPending) ||
+      (details.capabilityAvailable.portfolio_performance && details.performance.isPending) ? (
         <div className="grid gap-4 xl:grid-cols-2">
           <Skeleton className="h-96 rounded-xl" />
           <Skeleton className="h-96 rounded-xl" />
@@ -294,7 +295,7 @@ function DetailWorkspace({
           </p>
         </div>
         <div className="mt-5">
-          {details.operationAvailable["Portfolio.GetHoldings"] && details.holdings.isPending ? (
+          {details.capabilityAvailable.portfolio_holdings && details.holdings.isPending ? (
             <Skeleton className="h-72 rounded-lg" />
           ) : holdings ? (
             <HoldingTable holdings={holdings} />
@@ -305,14 +306,14 @@ function DetailWorkspace({
       </section>
 
       <div className="grid gap-4 xl:grid-cols-2">
-        {details.operationAvailable["Portfolio.GetExposure"] && details.exposure.isPending ? (
+        {details.capabilityAvailable.portfolio_exposure && details.exposure.isPending ? (
           <Skeleton className="h-80 rounded-xl" />
         ) : details.exposure.data ? (
           <ExposurePanel exposure={details.exposure.data.value} />
         ) : (
           <InlineUnavailable text="Exposure analysis is unavailable for this account." />
         )}
-        {details.operationAvailable["Portfolio.GetRisk"] && details.risk.isPending ? (
+        {details.capabilityAvailable.portfolio_risk && details.risk.isPending ? (
           <Skeleton className="h-80 rounded-xl" />
         ) : details.risk.data ? (
           <RiskPanel risk={details.risk.data.value} />
@@ -368,15 +369,15 @@ function DetailWorkspace({
   )
 }
 
-function detailName(operation: string) {
-  switch (operation) {
-    case "Portfolio.GetHoldings":
+function detailName(capability: ProductCapability) {
+  switch (capability) {
+    case "portfolio_holdings":
       return "holding details"
-    case "Portfolio.GetPerformance":
+    case "portfolio_performance":
       return "performance history"
-    case "Portfolio.GetExposure":
+    case "portfolio_exposure":
       return "exposure analysis"
-    case "Portfolio.GetRisk":
+    case "portfolio_risk":
       return "risk analysis"
     default:
       return "a required portfolio view"
@@ -449,7 +450,7 @@ function AccountDirectory({
                 <AccountFact label="Account type" value="Not supplied" />
                 <AccountFact
                   label="Updated"
-                  value={formatTimestamp(account.currentRevision.effectiveAtUnixNanos)}
+                  value={formatTimestamp(account.currentSnapshot.effectiveAtUnixNanos)}
                 />
                 <AccountFact label="Assets" value={account.holdingCount.toLocaleString()} />
                 <AccountFact
@@ -489,10 +490,6 @@ function SelectAccountPrompt() {
       </p>
     </section>
   )
-}
-
-function hasOperation(bootstrap: DesktopBootstrap, operation: string) {
-  return bootstrap.operations.some((candidate) => candidate.name === operation)
 }
 
 function PortfolioFrame({ children }: { children: React.ReactNode }) {

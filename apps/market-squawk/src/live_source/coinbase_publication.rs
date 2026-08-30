@@ -2,28 +2,33 @@
 
 use std::num::NonZeroUsize;
 
-use market_squawk_adapter_coinbase::CoinbaseMarketSealRejoin;
+use market_squawk_adapter_coinbase::{
+    CoinbaseMarketHandoff, CoinbaseMarketPublicationContext, CoinbaseMarketSealRejoin,
+};
 use market_squawk_domain::Timestamp;
 use market_squawk_sources::ProviderCaptureSealRequest;
 use tokio::sync::mpsc;
 
-/// Exact provider continuation plus the common physical request split from one captured frame.
+/// Exact bounded Coinbase publication input transferred from one owning source generation.
 #[derive(Debug)]
-pub(in crate::live_source) struct CoinbaseCapturedPublicationInput {
-    rejoin: CoinbaseMarketSealRejoin,
-    seal_request: ProviderCaptureSealRequest,
-    observed_at: Timestamp,
+pub(in crate::live_source) enum CoinbaseCapturedPublicationInput {
+    Public {
+        rejoin: CoinbaseMarketSealRejoin,
+        seal_request: ProviderCaptureSealRequest,
+        observed_at: Timestamp,
+    },
+    Direct {
+        handoff: CoinbaseMarketHandoff,
+        context: CoinbaseMarketPublicationContext,
+        observed_at: Timestamp,
+    },
 }
 
 impl CoinbaseCapturedPublicationInput {
-    pub(in crate::live_source) fn into_parts(
-        self,
-    ) -> (
-        CoinbaseMarketSealRejoin,
-        ProviderCaptureSealRequest,
-        Timestamp,
-    ) {
-        (self.rejoin, self.seal_request, self.observed_at)
+    pub(in crate::live_source) const fn observed_at(&self) -> Timestamp {
+        match self {
+            Self::Public { observed_at, .. } | Self::Direct { observed_at, .. } => *observed_at,
+        }
     }
 }
 
@@ -51,9 +56,25 @@ impl CoinbaseCapturedPublicationIngress {
         seal_request: ProviderCaptureSealRequest,
         observed_at: Timestamp,
     ) -> Result<(), CoinbaseCapturedPublicationInput> {
-        let input = CoinbaseCapturedPublicationInput {
+        let input = CoinbaseCapturedPublicationInput::Public {
             rejoin,
             seal_request,
+            observed_at,
+        };
+        self.sender
+            .try_send(input)
+            .map_err(mpsc::error::TrySendError::into_inner)
+    }
+
+    pub(in crate::live_source) fn try_submit_direct(
+        &self,
+        handoff: CoinbaseMarketHandoff,
+        context: CoinbaseMarketPublicationContext,
+        observed_at: Timestamp,
+    ) -> Result<(), CoinbaseCapturedPublicationInput> {
+        let input = CoinbaseCapturedPublicationInput::Direct {
+            handoff,
+            context,
             observed_at,
         };
         self.sender

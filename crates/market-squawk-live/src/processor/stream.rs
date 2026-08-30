@@ -169,7 +169,7 @@ impl StreamState {
                 ProviderTimestampEvidence::Provided { value, .. } => Some(*value),
                 ProviderTimestampEvidence::AuthoritativelyAbsent(_) => None,
             };
-            self.received_at = Some(current.frame_evidence().received_at());
+            self.received_at = Some(current.evidence().received_at());
             self.evaluated_at = Some(evaluated_at);
         }
         self.quarantine();
@@ -443,7 +443,7 @@ pub(super) fn preview_stream<'a>(
         health_epoch: current.current_lease().health_epoch(),
         source_valid_until: current.current_lease().valid_until(),
         source_timestamp,
-        received_at: current.frame_evidence().received_at(),
+        received_at: current.evidence().received_at(),
         evaluated_at,
     })
 }
@@ -478,7 +478,7 @@ fn checksum_evidence(
     current: &CurrentProviderObservation,
     computed: Option<u32>,
 ) -> Result<ChecksumEvidence, LiveApplyError> {
-    let generation = current.frame_evidence().binding().connection_generation();
+    let generation = current.evidence().binding().connection_generation();
     match current.policy().protocol().checksum() {
         ChecksumValidationProfile::Unsupported { .. } => {
             if !matches!(

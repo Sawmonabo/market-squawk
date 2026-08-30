@@ -8,7 +8,6 @@ import {
   RefreshCw,
   ShieldCheck,
 } from "lucide-react"
-import { Link } from "react-router-dom"
 
 import { messageFrom, useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
@@ -23,14 +22,13 @@ import {
 } from "@/components/ui/dialog"
 import { Skeleton } from "@/components/ui/skeleton"
 import { humanize } from "@/lib/formatters"
-import type { DesktopBootstrap } from "@/lib/schemas"
+import type { DesktopBootstrap, ProviderBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
   parseResearchManifest,
   type ResearchDataset,
 } from "@/features/research/research-contracts"
-import { ResearchIngestion } from "@/features/research/research-ingestion"
 
 import {
   type DoctorRateEvidence,
@@ -42,9 +40,18 @@ import {
   parseSourceLifecycleReceipt,
   parseSourceStatusResult,
   sourceEvidence,
-  sourceNeedsSetup,
 } from "./source-evidence"
 import { ProviderCredentialImport } from "./provider-credential-import"
+import { ResearchIngestion } from "./research-ingestion"
+
+const unavailableConnectionCapabilities: ProviderBootstrap["capabilities"] = {
+  credentialImport: false,
+  health: false,
+  manifestEvidence: false,
+  researchIngestion: false,
+  status: false,
+  coverage: false,
+}
 
 export function SourcesPage() {
   const product = useProduct()
@@ -72,20 +79,36 @@ function ReadySourcesPage({
   transport: ProductTransport
 }) {
   const queryClient = useQueryClient()
+  const connections = useQuery({
+    queryKey: [
+      ...productKeys.domain(bootstrap.runtime, "source"),
+      "connections-bootstrap",
+    ],
+    queryFn: () => transport.onboard({ action: "bootstrap" }),
+  })
+  const profiles = connections.data?.profiles ?? []
+  const sessions = connections.data?.sessions ?? []
+  const capabilities =
+    connections.data?.capabilities ?? unavailableConnectionCapabilities
   const statusReads = useQueries({
-    queries: bootstrap.providerProfiles.map((profile) => ({
-      queryKey: productKeys.operation(
-        bootstrap.runtime,
-        "source",
-        "Source.GetStatus",
-        { sourceIds: [profile.id] },
-      ),
-      queryFn: async () =>
-        parseSourceStatusResult(
-          await transport.query({ query: "sourceStatus", sourceIds: [profile.id] }),
-          [profile.id],
-        ),
-    })),
+    queries: capabilities.status
+      ? profiles.map((profile) => ({
+          queryKey: productKeys.operation(
+            bootstrap.runtime,
+            "source",
+            "Source.GetStatus",
+            { sourceIds: [profile.id] },
+          ),
+          queryFn: async () =>
+            parseSourceStatusResult(
+              await transport.query({
+                query: "sourceStatus",
+                sourceIds: [profile.id],
+              }),
+              [profile.id],
+            ),
+        }))
+      : [],
   })
   const coverage = useQuery({
     queryKey: productKeys.operation(
@@ -95,6 +118,7 @@ function ReadySourcesPage({
       {},
     ),
     queryFn: () => transport.query({ query: "sourceCoverage" }),
+    enabled: capabilities.coverage,
   })
   const health = useQuery({
     queryKey: productKeys.operation(
@@ -104,25 +128,24 @@ function ReadySourcesPage({
       {},
     ),
     queryFn: () => transport.query({ query: "sourceHealth" }),
+    enabled: capabilities.health,
   })
   const statusRows = statusReads.flatMap((query) => query.data ?? [])
   const sourceRead = parseRead(() => sourceEvidence(
-    bootstrap.providerProfiles,
-    bootstrap.providerSessions,
+    profiles,
+    sessions,
     statusRows,
     coverage.data,
     health.data,
   ))
   const sourceRows = sourceRead.value ?? sourceEvidence(
-    bootstrap.providerProfiles,
-    bootstrap.providerSessions,
+    profiles,
+    sessions,
     statusRows,
     undefined,
     undefined,
   )
-  const manifestReadsAvailable = bootstrap.operations.some(
-    (operation) => operation.name === "Research.GetManifest",
-  )
+  const manifestReadsAvailable = capabilities.manifestEvidence
   const providerDatasets = manifestReadsAvailable
     ? [
         ...new Set(
@@ -156,22 +179,27 @@ function ReadySourcesPage({
     ),
   )
   const refreshing =
+    connections.isFetching ||
     statusReads.some((query) => query.isFetching) ||
     coverage.isFetching ||
     health.isFetching ||
     manifestReads.some((query) => query.isFetching)
   const failedStatusReads = statusReads.filter((query) => query.isError).length
   const failedSecondaryReads = Math.min(
-    2,
-    Number(coverage.isError) +
-      Number(health.isError) +
+    Number(capabilities.coverage) + Number(capabilities.health),
+    Number(capabilities.coverage && coverage.isError) +
+      Number(capabilities.health && health.isError) +
       Number(sourceRead.error !== null && !coverage.isError && !health.isError),
   )
   const failedReads =
     failedStatusReads +
     failedSecondaryReads +
     manifestReads.filter((query) => query.isError).length
-  const totalReads = statusReads.length + manifestReads.length + 2
+  const totalReads =
+    statusReads.length +
+    manifestReads.length +
+    Number(capabilities.coverage) +
+    Number(capabilities.health)
   const active = sources.filter(
     (source) => source.operationalState === "active",
   ).length
@@ -183,10 +211,11 @@ function ReadySourcesPage({
 
   const refresh = () => {
     void Promise.all([
+      connections.refetch(),
       ...statusReads.map((query) => query.refetch()),
       ...manifestReads.map((query) => query.refetch()),
-      coverage.refetch(),
-      health.refetch(),
+      ...(capabilities.coverage ? [coverage.refetch()] : []),
+      ...(capabilities.health ? [health.refetch()] : []),
     ])
   }
   const refreshAuthority = () =>
@@ -202,9 +231,19 @@ function ReadySourcesPage({
         queryKey: productKeys.domain(bootstrap.runtime, "market"),
       }),
     ]).then(() => undefined)
-  const credentialImportAvailable = bootstrap.operations.some(
-    (operation) => operation.name === "Source.ImportCredentialBundle",
-  )
+  const credentialImportAvailable = capabilities.credentialImport
+
+  if (connections.isPending) return <SourcesLoading />
+  if (connections.isError) {
+    return (
+      <PageFrame>
+        <EmptyState
+          title="Connections could not be opened"
+          detail={messageFrom(connections.error)}
+        />
+      </PageFrame>
+    )
+  }
 
   return (
     <PageFrame
@@ -225,6 +264,9 @@ function ReadySourcesPage({
       />
       <ResearchIngestion
         bootstrap={bootstrap}
+        connectedSourceIngestionAvailable={
+          capabilities.researchIngestion
+        }
         transport={transport}
         onStarted={() => {
           void Promise.all([
@@ -237,7 +279,7 @@ function ReadySourcesPage({
           ])
         }}
       />
-      {failedReads === totalReads ? (
+      {sources.length === 0 && totalReads > 0 && failedReads === totalReads ? (
         <EmptyState
           title="Source evidence could not be read"
           detail={messageFrom(
@@ -313,20 +355,13 @@ function SourceCard({
   const controls = lifecycleControls(source)
   const setupReady = source.nextAction === "active"
   const operationalActive = source.operationalState === "active"
-  const setupAgain = sourceNeedsSetup(source)
 
-  const run = async (control: LifecycleControl) => {
-    setConfirming(null)
-    setPending(control.action)
+  const runAndRefresh = async (action: string, request: () => Promise<void>) => {
+    setPending(action)
     setError(null)
     let requestError: unknown | null = null
     try {
-      const result = await transport.sourceControl(
-        control.action,
-        control.request,
-        true,
-      )
-      parseSourceLifecycleReceipt(result, control.action, control.request)
+      await request()
     } catch (error) {
       requestError = error
     }
@@ -339,6 +374,26 @@ function SourceCard({
     const error = requestError ?? refreshError
     setError(error === null ? null : messageFrom(error))
     setPending(null)
+  }
+
+  const run = async (control: LifecycleControl) => {
+    setConfirming(null)
+    await runAndRefresh(control.action, async () => {
+      const result = await transport.sourceControl(
+        control.action,
+        control.request,
+        true,
+      )
+      parseSourceLifecycleReceipt(result, control.action, control.request)
+    })
+  }
+
+  const openSetup = async (action: "protected_setup" | "official_page") => {
+    await runAndRefresh(action, () =>
+      action === "protected_setup"
+        ? transport.openProtectedProviderSetup(source.id)
+        : transport.openOfficialProviderPage(source.id),
+    )
   }
 
   return (
@@ -458,35 +513,43 @@ function SourceCard({
         <Fact label="Credential" value={source.credentialRequirement ?? "Not reported"} />
       </dl>
 
-      {controls.length > 0 || setupAgain ? (
-        <div className="mt-5 flex flex-wrap gap-2 border-t border-border/70 pt-4">
-          {controls.map((control) => (
-            <Button
-              key={control.action}
-              size="sm"
-              variant={control.destructive ? "outline" : "default"}
-              disabled={pending !== null}
-              onClick={() => {
-                if (control.destructive) setConfirming(control)
-                else void run(control)
-              }}
-            >
-              {pending === control.action ? "Working…" : control.label}
-            </Button>
-          ))}
-          {setupAgain ? (
-            <Button asChild size="sm">
-              <Link to="/">Set up again</Link>
-            </Button>
-          ) : null}
-          {source.lifecycle ? (
-            <p className="w-full text-[10px] text-muted-foreground">
-              Revision {source.lifecycle.stateRevision}; controls use this exact returned state and
-              its retained configuration only.
-            </p>
-          ) : null}
-        </div>
-      ) : null}
+      <div className="mt-5 flex flex-wrap gap-2 border-t border-border/70 pt-4">
+        {controls.map((control) => (
+          <Button
+            key={control.action}
+            size="sm"
+            variant={control.destructive ? "outline" : "default"}
+            disabled={pending !== null}
+            onClick={() => {
+              if (control.destructive) setConfirming(control)
+              else void run(control)
+            }}
+          >
+            {pending === control.action ? "Working…" : control.label}
+          </Button>
+        ))}
+        <Button
+          size="sm"
+          disabled={pending !== null}
+          onClick={() => void openSetup("protected_setup")}
+        >
+          {pending === "protected_setup" ? "Opening…" : "Manage setup"}
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={pending !== null}
+          onClick={() => void openSetup("official_page")}
+        >
+          {pending === "official_page" ? "Opening…" : "Open official page"}
+        </Button>
+        {source.lifecycle ? (
+          <p className="w-full text-[10px] text-muted-foreground">
+            Revision {source.lifecycle.stateRevision}; controls use this exact returned state and
+            its retained configuration only.
+          </p>
+        ) : null}
+      </div>
 
       {error ? (
         <p role="alert" className="mt-4 text-xs text-red-400">

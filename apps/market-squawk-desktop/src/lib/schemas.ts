@@ -8,19 +8,103 @@ export const readinessSchema = z.object({
   detail: z.string(),
 })
 
-export const operationSummarySchema = z.object({
-  name: z.string(),
-  description: z.string(),
-  domain: z.string(),
-  authorization: z.enum([
-    "read_only",
-    "local_confirmation",
-    "risk_mediated",
-  ]),
-  readOnly: z.boolean(),
-  destructive: z.boolean(),
-  inputSchema: z.record(z.string(), z.unknown()),
-})
+export const productCapabilitySchema = z.enum([
+  "backtest_advanced_start",
+  "backtest_activity",
+  "backtest_artifact_read",
+  "backtest_preparation",
+  "backtest_prepared_start",
+  "backtest_preview",
+  "backtest_result",
+  "bot_start",
+  "bot_status",
+  "bot_stop",
+  "decision_analysis",
+  "decision_analysis_list",
+  "decision_recommendation_history",
+  "decision_screen_list",
+  "decision_target_review",
+  "execution_cancel",
+  "execution_fills",
+  "execution_manual_draft",
+  "execution_manual_targets",
+  "execution_orders",
+  "execution_reconcile",
+  "fair_value_approvals",
+  "fair_value_audit",
+  "fair_value_classification",
+  "fair_value_classify",
+  "fair_value_evidence",
+  "fair_value_explain",
+  "fair_value_governance_commit",
+  "fair_value_governance_preview",
+  "fair_value_market_access",
+  "fair_value_measurement",
+  "fair_value_measurement_list",
+  "fair_value_workspace",
+  "feature_dataset_preparation",
+  "feature_dataset_prepared_start",
+  "feature_dataset_preview",
+  "forecast_detail",
+  "forecast_evaluate",
+  "forecast_list",
+  "forecast_metadata",
+  "forecast_outcomes",
+  "forecast_preparation",
+  "forecast_prepare",
+  "forecast_prepared_start",
+  "fundamental_facts",
+  "governance_authenticate",
+  "governance_principals",
+  "installation_status",
+  "investment_lookup",
+  "job_list",
+  "job_watch",
+  "macro_context",
+  "macro_revisions",
+  "market_instrument",
+  "market_overview",
+  "market_universe",
+  "model_activity",
+  "model_evidence",
+  "model_training_start",
+  "operations_backup_list",
+  "operations_log_export",
+  "operations_log_query",
+  "operations_rollback_preview",
+  "operations_rollback_start",
+  "operations_runtime_status",
+  "operations_settings",
+  "operations_update_check",
+  "operations_update_preview",
+  "operations_update_start",
+  "operations_update_status",
+  "operations_workspace_list",
+  "portfolio_account_list",
+  "portfolio_attribution",
+  "portfolio_candidate_impact",
+  "portfolio_exposure",
+  "portfolio_holdings",
+  "portfolio_import_approve",
+  "portfolio_import_commit",
+  "portfolio_import_discard",
+  "portfolio_import_preview",
+  "portfolio_performance",
+  "portfolio_rebalance",
+  "portfolio_recommendation_setup",
+  "portfolio_revision_list",
+  "portfolio_risk",
+  "portfolio_scenario",
+  "portfolio_scenario_batch",
+  "portfolio_transactions",
+  "research_dataset_list",
+  "research_export",
+  "research_file_commit",
+  "research_file_discard",
+  "research_file_preview",
+  "research_manifest",
+  "risk_kill_switch",
+])
 
 export const providerProfileSchema = z
   .object({
@@ -61,266 +145,6 @@ export const encryptedFileFallbackSchema = z.enum([
   "ready",
 ])
 
-export const setupGoalSchema = z.enum([
-  "everything_recommended",
-  "explore_public_markets",
-  "research_investments",
-  "manage_portfolio",
-  "build_and_evaluate_models",
-  "practice_paper_execution",
-  "use_claude_code",
-  "use_codex",
-])
-
-export const setupStarterPlanSchema = z.enum([
-  "everything_recommended",
-  "public_markets",
-  "research",
-  "portfolio",
-  "models",
-  "paper_practice",
-  "ai_clients",
-])
-
-const durableSetupPlanSelectionSchema = z.object({
-  goals: z.array(setupGoalSchema).min(1).max(8),
-  starterPlan: setupStarterPlanSchema,
-})
-
-const setupStepIdSchema = z.enum([
-  "goals_and_starter_plan",
-  "storage_retention_time_and_disk",
-  "public_and_zero_fee_providers",
-  "file_and_portfolio_import",
-  "model_runtime",
-  "paper_and_risk",
-  "claude_code",
-  "codex",
-  "backup",
-  "review",
-  "first_useful_result",
-])
-
-const setupExternalContactSchema = z.enum([
-  "coinbase_public_api",
-  "kraken_public_api",
-  "securities_and_exchange_commission",
-  "bureau_of_labor_statistics",
-  "united_states_treasury",
-  "federal_reserve_bank_of_st_louis",
-  "claude_code_official_cli",
-  "codex_official_cli",
-])
-
-const setupReversibleChangeSchema = z.enum([
-  "accept_workspace_plan",
-  "configure_workspace_retention_and_budget",
-  "activate_or_remove_provider_sessions",
-  "import_or_remove_derived_local_data",
-  "configure_or_reset_model_runtime",
-  "configure_stopped_paper_account_and_risk_defaults",
-  "register_or_disconnect_claude_code",
-  "register_or_disconnect_codex",
-  "create_or_remove_backup_policy",
-])
-
-const setupDiskImpactSchema = z.enum([
-  "no_additional_product_bytes",
-  "variable_within_workspace_soft_limit",
-  "variable_backup_destination",
-])
-
-const setupCapabilitySchema = z.enum([
-  "managed_workspace",
-  "retention_and_disk_budget",
-  "public_market_data",
-  "filing_research",
-  "macro_research",
-  "controlled_file_import",
-  "portfolio_import",
-  "managed_python_runtime",
-  "native_model_inference",
-  "onnx_model_inference",
-  "paper_only_execution",
-  "central_risk",
-  "claude_code_mcp",
-  "codex_mcp",
-  "verified_backup",
-  "capability_review",
-  "first_useful_result",
-])
-
-const setupPlanChoiceSchema = z.discriminatedUnion("kind", [
-  z.object({
-    kind: z.literal("goals"),
-    starter_plan: setupStarterPlanSchema,
-    goals: z.array(setupGoalSchema).min(1).max(8),
-  }),
-  z.object({
-    kind: z.literal("storage"),
-    retention_days: z.number().int().nonnegative(),
-    workspace_soft_limit_bytes: losslessIntegerSchema,
-    time_policy: z.literal(
-      "point_in_time_with_first_observed_locally_provenance",
-    ),
-  }),
-  z.object({
-    kind: z.literal("providers"),
-    outcomes: z.array(z.enum([
-      "coinbase_public_market_snapshot",
-      "kraken_public_market_snapshot",
-      "sec_filing_research",
-      "bls_macro_research",
-      "treasury_rates_research",
-      "fred_alfred_authorized_research",
-    ])).min(1).max(6),
-  }),
-  z.object({
-    kind: z.literal("imports"),
-    formats: z.array(z.enum(["csv", "json", "ndjson", "parquet", "portfolio_file"])).max(5),
-    preserve_source_identity: z.boolean(),
-    require_reconciliation_receipt: z.boolean(),
-  }),
-  z.object({
-    kind: z.literal("model_runtime"),
-    managed_python: z.boolean(),
-    native_inference: z.boolean(),
-    onnx_inference: z.boolean(),
-  }),
-  z.object({
-    kind: z.literal("paper_risk"),
-    starts_stopped: z.boolean(),
-    paper_only: z.boolean(),
-    central_risk_required: z.boolean(),
-  }),
-  z.object({
-    kind: z.literal("claude_code"),
-    separate_client_credential: z.boolean(),
-    require_real_safe_read: z.boolean(),
-  }),
-  z.object({
-    kind: z.literal("codex"),
-    separate_client_credential: z.boolean(),
-    require_real_safe_read: z.boolean(),
-  }),
-  z.object({
-    kind: z.literal("backup"),
-    retention_count: z.number().int().positive(),
-    verify_after_create: z.boolean(),
-  }),
-  z.object({
-    kind: z.literal("review"),
-    show_gaps_and_reversible_changes: z.boolean(),
-  }),
-  z.object({
-    kind: z.literal("first_useful_result"),
-    result: z.enum([
-      "verified_public_market_snapshot",
-      "point_in_time_research_result",
-      "reconciled_portfolio_summary",
-      "admitted_model_forecast",
-      "stopped_paper_and_risk_review",
-      "verified_mcp_safe_read",
-    ]),
-    target_minutes: z.number().int().positive(),
-  }),
-])
-
-const durableSetupPlanStepSchema = z.object({
-  id: setupStepIdSchema,
-  outcome: z.enum([
-    "durable_resumable_plan",
-    "governed_workspace_budget",
-    "quality_labeled_provider_evidence",
-    "receipt_bound_local_data",
-    "verified_local_model_runtime",
-    "stopped_paper_under_central_risk",
-    "verified_claude_code_mcp",
-    "verified_codex_mcp",
-    "verified_recovery_point",
-    "capability_gap_review",
-    "first_useful_result",
-  ]),
-  disposition: z.enum(["included", "available_to_finish_later"]),
-  requiredInput: z.enum([
-    "none",
-    "local_confirmation",
-    "local_disk",
-    "zero_fee_account_or_provider_key",
-    "owned_file",
-    "detected_local_client",
-  ]),
-  externalContacts: z.array(setupExternalContactSchema).max(8),
-  reversibleLocalChange: setupReversibleChangeSchema.nullable(),
-  expectedActiveMinutes: z.number().int().nonnegative(),
-  diskImpact: setupDiskImpactSchema,
-  safeSkip: z.enum([
-    "not_skippable",
-    "capability_remains_installed_and_available",
-  ]),
-  choice: setupPlanChoiceSchema,
-})
-
-export const durableSetupPlanSchema = z.object({
-  formatVersion: z.number().int().positive(),
-  revision: losslessIntegerSchema,
-  selection: durableSetupPlanSelectionSchema,
-  steps: z.array(durableSetupPlanStepSchema).length(11),
-})
-
-export const setupPlanStatusSchema = z.object({
-  formatVersion: z.number().int().positive(),
-  catalog: z.object({
-    formatVersion: z.number().int().positive(),
-    goals: z.array(setupGoalSchema).length(8),
-    starterPlans: z.array(setupStarterPlanSchema).length(7),
-    recommendedStarterPlan: setupStarterPlanSchema,
-  }),
-  currentRevision: losslessIntegerSchema,
-  acceptedPlan: z
-    .object({
-      revision: losslessIntegerSchema,
-      digest: z.string().regex(/^[0-9a-f]{64}$/),
-      acceptedAtUnixSeconds: losslessIntegerSchema,
-      plan: durableSetupPlanSchema,
-    })
-    .nullable(),
-})
-
-export const setupPlanPreviewSchema = z.object({
-  formatVersion: z.number().int().positive(),
-  previewId: z.string().uuid(),
-  ownerWorkspace: z.string().uuid(),
-  currentRevision: losslessIntegerSchema,
-  planDigest: z.string().regex(/^[0-9a-f]{64}$/),
-  plan: durableSetupPlanSchema,
-  includedCapabilities: z.array(setupCapabilitySchema).max(17),
-  externalContacts: z.array(setupExternalContactSchema).max(8),
-  reversibleLocalChanges: z.array(setupReversibleChangeSchema).max(9),
-  expectedTime: z.object({
-    expectedActiveMinutes: z.number().int().nonnegative(),
-    firstUseTargetMinutes: z.number().int().positive(),
-    includesExternalWait: z.boolean(),
-  }),
-  expectedDisk: z.object({
-    workspaceSoftLimitBytes: losslessIntegerSchema,
-    includedImpacts: z.array(setupDiskImpactSchema).max(3),
-  }),
-  safeSkipSteps: z.array(setupStepIdSchema).max(7),
-  issuedAtUnixSeconds: losslessIntegerSchema,
-  expiresAtUnixSeconds: losslessIntegerSchema,
-  previewSha256: z.string().regex(/^[0-9a-f]{64}$/),
-})
-
-export const setupPlanReceiptSchema = z.object({
-  revision: losslessIntegerSchema,
-  digest: z.string().regex(/^[0-9a-f]{64}$/),
-  acceptedAtUnixSeconds: losslessIntegerSchema,
-})
-
-export type SetupPlanStatus = z.infer<typeof setupPlanStatusSchema>
-export type SetupPlanPreview = z.infer<typeof setupPlanPreviewSchema>
-
 export const desktopBootstrapSchema = z.object({
   contractVersion: z.literal("market-squawk-desktop-v1"),
   applicationVersion: z.string(),
@@ -337,11 +161,8 @@ export const desktopBootstrapSchema = z.object({
   modelRuntime: readinessSchema,
   mcp: readinessSchema,
   telemetryEnabled: z.boolean(),
-  encryptedFileFallback: encryptedFileFallbackSchema,
-  providerProfiles: z.array(providerProfileSchema),
-  providerSessions: z.array(providerSessionSchema),
-  operations: z.array(operationSummarySchema),
-})
+  capabilities: z.array(productCapabilitySchema),
+}).strict()
 
 export const installationStatusSchema = z.object({
   installed: z.boolean(),
@@ -407,7 +228,15 @@ export const providerBootstrapSchema = z.object({
   profiles: z.array(providerProfileSchema),
   sessions: z.array(providerSessionSchema),
   encryptedFileFallback: encryptedFileFallbackSchema,
-})
+  capabilities: z.object({
+    credentialImport: z.boolean(),
+    health: z.boolean(),
+    manifestEvidence: z.boolean(),
+    researchIngestion: z.boolean(),
+    status: z.boolean(),
+    coverage: z.boolean(),
+  }).strict(),
+}).strict()
 
 export const inputTicketSchema = z.object({
   id: z.string().uuid(),
@@ -565,6 +394,7 @@ export const desktopStartupSchema = z.union([
 
 export type ApplicationResult = z.infer<typeof applicationResultSchema>
 export type DesktopBootstrap = z.infer<typeof desktopBootstrapSchema>
+export type ProductCapability = z.infer<typeof productCapabilitySchema>
 export type DesktopServiceBootstrap = z.infer<
   typeof desktopServiceBootstrapSchema
 >

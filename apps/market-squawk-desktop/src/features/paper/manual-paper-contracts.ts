@@ -2,8 +2,7 @@ import { z } from "zod"
 
 import type { ApplicationResult } from "@/lib/schemas"
 
-const targetIdSchema = z.string().regex(/^[a-z][a-z0-9._-]{0,127}$/)
-const targetRevisionSchema = z.number().int().positive()
+const targetTokenSchema = z.string().uuid()
 const timestampSchema = z.union([z.string().min(1), z.number().int()]).transform(String)
 const moneySchema = z
   .object({
@@ -34,19 +33,11 @@ const orderSideSchema = z.enum(["buy", "sell"])
 
 const governedTargetSchema = z
   .object({
-    targetId: targetIdSchema,
-    targetRevision: targetRevisionSchema,
+    targetToken: targetTokenSchema,
     instrumentId: z.string().uuid(),
-    status: z.literal("active"),
     thesis: z.string().min(1).max(4_096),
     expiresAt: timestampSchema,
     reviewDueAt: timestampSchema,
-    route: z
-      .object({
-        venueId: z.string().min(1).max(128),
-        instrumentId: z.string().uuid(),
-      })
-      .strict(),
     ladder: z
       .array(
         z
@@ -69,9 +60,8 @@ const targetCatalogSchema = z
 
 const acceptedManualPaperDraftSchema = z
   .object({
-    state: z.literal("accepted"),
-    targetId: targetIdSchema,
-    targetRevision: targetRevisionSchema,
+    accepted: z.literal(true),
+    targetToken: targetTokenSchema,
   })
   .strict()
 
@@ -91,8 +81,7 @@ export type ManualPaperTimeInForce = z.infer<typeof timeInForceSchema>
 
 export type ManualPaperSubmit = {
   action: "submit"
-  targetId: string
-  targetRevision: number
+  targetToken: string
   side: ManualPaperSide
   orderType: ManualPaperOrderType
   quantityLots: string
@@ -138,17 +127,16 @@ export function parseAcceptedManualPaperDraft(
   result: ApplicationResult,
   request: ManualPaperSubmit,
 ): void {
-  const receipt = acceptedManualPaperDraftSchema.safeParse(result.data)
+  const accepted = acceptedManualPaperDraftSchema.safeParse(result.data)
   const metadata = completeMetadataSchema.safeParse(result.metadata)
   if (
-    !receipt.success ||
+    !accepted.success ||
     !metadata.success ||
     metadata.data.returnedItems !== 1 ||
     metadata.data.availableItems !== 1 ||
-    receipt.data.targetId !== request.targetId ||
-    receipt.data.targetRevision !== request.targetRevision
+    accepted.data.targetToken !== request.targetToken
   ) {
-    throw new Error("The installed service returned an unsupported manual paper-order receipt.")
+    throw new Error("The installed service returned an unsupported manual paper-order result.")
   }
 }
 
@@ -197,7 +185,6 @@ function hasExactLadder(targets: GovernedPaperTarget[]): boolean {
     "upside",
   ])
   return targets.every((target) => {
-    if (target.route.instrumentId !== target.instrumentId) return false
     const levels = target.ladder.map((entry) => entry.level)
     return (
       levels.length === expected.size &&

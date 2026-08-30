@@ -8,6 +8,7 @@ use market_squawk_adapter_federal_reserve::{
     h15_treasury_constant_maturities_canonical_unit_identifier,
     h15_treasury_constant_maturities_dashboard_series,
 };
+use market_squawk_adapter_treasury::{TreasuryDailyRateMetric, TreasuryMaturity, TreasurySurface};
 use market_squawk_data::{
     AnalyticalMacroLatestKnownOutput, AnalyticalMacroLatestKnownRequest,
     AnalyticalMacroSeriesAllowlist, AnalyticalReadCapability, DatasetId, DatasetManifestRef,
@@ -15,7 +16,7 @@ use market_squawk_data::{
 };
 use market_squawk_domain::{
     CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest, MacroObservation, PayloadReference,
-    SourceId, SourceIdentifier, Timestamp,
+    ResearchTemporalCoordinate, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_services::{
     RequestContext, ServiceError, ServiceLimits, ToolResultMetadata, TypedToolRequest,
@@ -23,7 +24,10 @@ use market_squawk_services::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
+use tokio_util::sync::CancellationToken;
 
+use super::treasury::{TreasuryCurrentAnalyticalRead, TreasuryLatestKnownOperation};
 use super::{FredLatestKnownOperation, map_query_error, map_read_error, parse_timestamp};
 
 pub(crate) const MACRO_GET_CONTEXT: &str = "Macro.GetContext";
@@ -35,8 +39,10 @@ const RESULT_LIMITS_FIELD: &str = "resultLimits";
 const FRED_SOURCE_ID: &str = "fred-fred-alfred.api-v1-v2";
 const FRED_UNEMPLOYMENT_SERIES_ID: &str = "UNRATE";
 const FRED_UNEMPLOYMENT_UNIT_ID: &str = "fred-unit:v1:Percent";
+const TREASURY_PERCENT_UNIT_ID: &str = "percent";
 const H15_INDICATOR_COUNT: usize = 11;
 const MACRO_CONTEXT_INDICATOR_COUNT: usize = 12;
+const MAXIMUM_MACRO_CONTEXT_INPUTS: usize = 4_096;
 const MAXIMUM_TIMESTAMP_BYTES: usize = 64;
 const MACRO_CONTEXT_QUERY_BYTES: u64 = 256 * 1024;
 const MACRO_CONTEXT_QUERY_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
@@ -120,46 +126,98 @@ const UNEMPLOYMENT_INDICATOR: MacroContextIndicatorDefinition = MacroContextIndi
     source_slot: FRED_UNEMPLOYMENT_SERIES_ID,
 };
 
-/// One application-owned provider-neutral Macro product operation.
+/// Reusable provider-neutral point-in-time Macro selection below transport serialization.
 ///
-/// The analytical reader has no provider client, credential, network, mutation, or raw-SQL
-/// authority. FRED composition uses the typed canonical-read seam on the existing restart-safe
-/// operation, which continues to own its exact ready manifest.
-pub(crate) struct MacroContextOperation {
+/// Provider-qualified canonical evidence remains inside the opaque receipt and typed inputs.
+/// Ordinary product DTOs receive only economic meaning, explicit missingness, and selection
+/// confidence.
+#[derive(Clone)]
+pub(crate) struct MacroContextReadCapability {
     reader: AnalyticalReadCapability,
     fred: FredLatestKnownOperation,
+    treasury_fiscal: Option<TreasuryLatestKnownOperation>,
+    treasury_daily: Option<TreasuryLatestKnownOperation>,
 }
 
-impl MacroContextOperation {
-    /// Binds canonical analytical reads and the restart-safe FRED read owner.
+impl MacroContextReadCapability {
+    /// Binds the currently composed canonical Board/FRED read authorities.
     #[must_use]
     pub(crate) fn new(reader: AnalyticalReadCapability, fred: FredLatestKnownOperation) -> Self {
-        Self { reader, fred }
+        Self {
+            reader,
+            fred,
+            treasury_fiscal: None,
+            treasury_daily: None,
+        }
     }
 
-    /// Executes one bounded provider-neutral current or explicit point-in-time Macro read.
-    pub(crate) async fn call(
-        &self,
-        request: &TypedToolRequest,
-        context: &RequestContext,
-        limits: ServiceLimits,
-    ) -> Result<TypedToolResult, ServiceError> {
-        ensure_request_live(request, context)?;
-        if limits.maximum_result_items() < MACRO_CONTEXT_INDICATOR_COUNT {
-            return Err(ServiceError::ResourceExhausted);
+    /// Adds the restart-safe Treasury read authorities without changing the public projection.
+    #[must_use]
+    pub(crate) fn with_treasury(
+        reader: AnalyticalReadCapability,
+        fred: FredLatestKnownOperation,
+        treasury_fiscal: TreasuryLatestKnownOperation,
+        treasury_daily: TreasuryLatestKnownOperation,
+    ) -> Self {
+        Self {
+            reader,
+            fred,
+            treasury_fiscal: Some(treasury_fiscal),
+            treasury_daily: Some(treasury_daily),
         }
-        let cutoffs = MacroContextCutoffs::parse(request.arguments())?;
-        let (board, fred) = tokio::try_join!(
-            self.read_board(cutoffs, context),
-            self.read_fred(cutoffs, context),
+    }
+
+    /// Selects one bounded current or explicit point-in-time neutral Macro snapshot.
+    pub(crate) async fn read_latest_known(
+        &self,
+        knowledge_cutoff: Timestamp,
+        effective_date_cutoff: CalendarDate,
+        deadline: std::time::Instant,
+        cancellation: CancellationToken,
+    ) -> Result<MacroContextSnapshot, ServiceError> {
+        let evaluated_at = current_timestamp()?;
+        if knowledge_cutoff > evaluated_at
+            || effective_date_cutoff > timestamp_calendar_date(knowledge_cutoff)?
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        self.read_at(
+            MacroContextCutoffs {
+                knowledge_cutoff,
+                effective_date_cutoff,
+                evaluated_at,
+            },
+            deadline,
+            cancellation,
+        )
+        .await
+    }
+
+    async fn read_at(
+        &self,
+        cutoffs: MacroContextCutoffs,
+        deadline: std::time::Instant,
+        cancellation: CancellationToken,
+    ) -> Result<MacroContextSnapshot, ServiceError> {
+        if cancellation.is_cancelled() {
+            return Err(ServiceError::Cancelled);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ServiceError::DeadlineExceeded);
+        }
+        let (board, fred, (treasury_fiscal, treasury_daily)) = tokio::try_join!(
+            self.read_board(cutoffs, deadline, cancellation.child_token()),
+            self.read_fred(cutoffs, deadline, cancellation.child_token()),
+            self.read_treasury(cutoffs, deadline, cancellation.child_token()),
         )?;
-        product_result(cutoffs, board, fred, limits)
+        product_snapshot(cutoffs, board, fred, treasury_fiscal, treasury_daily)
     }
 
     async fn read_board(
         &self,
         cutoffs: MacroContextCutoffs,
-        context: &RequestContext,
+        deadline: std::time::Instant,
+        cancellation: CancellationToken,
     ) -> Result<Option<AnalyticalMacroLatestKnownOutput>, ServiceError> {
         let profile = BoardDatasetProfile::h15_treasury_constant_maturities_rolling_dashboard()
             .map_err(|_| ServiceError::Unavailable)?;
@@ -176,7 +234,7 @@ impl MacroContextOperation {
             .map_err(|_| ServiceError::Unavailable)?;
         let Some(generation) = self
             .reader
-            .latest(&dataset, context.deadline(), context.cancellation())
+            .latest(&dataset, deadline, &cancellation)
             .map_err(map_read_error)?
         else {
             return Ok(None);
@@ -208,15 +266,10 @@ impl MacroContextOperation {
             allowlist,
         )
         .map_err(map_read_error)?;
-        let query_limits = macro_context_query_limits(&request, context)?;
+        let query_limits = macro_context_query_limits(&request, deadline)?;
         let output = self
             .reader
-            .read_macro_latest_known_snapshot(
-                request,
-                query_limits,
-                context.deadline(),
-                context.cancellation().clone(),
-            )
+            .read_macro_latest_known_snapshot(request, query_limits, deadline, cancellation)
             .await
             .map_err(map_read_error)?;
         if output.output().manifest() != generation.manifest() {
@@ -228,16 +281,130 @@ impl MacroContextOperation {
     async fn read_fred(
         &self,
         cutoffs: MacroContextCutoffs,
-        context: &RequestContext,
+        deadline: std::time::Instant,
+        cancellation: CancellationToken,
     ) -> Result<Option<AnalyticalMacroLatestKnownOutput>, ServiceError> {
         self.fred
             .read_current_analytical_latest_known(
                 cutoffs.knowledge_cutoff,
                 cutoffs.effective_date_cutoff,
-                context.deadline(),
-                context.cancellation().clone(),
+                deadline,
+                cancellation,
             )
             .await
+    }
+
+    async fn read_treasury(
+        &self,
+        cutoffs: MacroContextCutoffs,
+        deadline: std::time::Instant,
+        cancellation: CancellationToken,
+    ) -> Result<
+        (
+            Box<[TreasuryCurrentAnalyticalRead]>,
+            Box<[TreasuryCurrentAnalyticalRead]>,
+        ),
+        ServiceError,
+    > {
+        let fiscal = async {
+            let Some(operation) = self.treasury_fiscal.as_ref() else {
+                return Ok(Vec::new().into_boxed_slice());
+            };
+            operation
+                .read_current_analytical_latest_known(
+                    cutoffs.knowledge_cutoff,
+                    cutoffs.effective_date_cutoff,
+                    deadline,
+                    cancellation.child_token(),
+                )
+                .await
+        };
+        let daily = async {
+            let Some(operation) = self.treasury_daily.as_ref() else {
+                return Ok(Vec::new().into_boxed_slice());
+            };
+            operation
+                .read_current_analytical_latest_known(
+                    cutoffs.knowledge_cutoff,
+                    cutoffs.effective_date_cutoff,
+                    deadline,
+                    cancellation.child_token(),
+                )
+                .await
+        };
+        tokio::try_join!(fiscal, daily)
+    }
+}
+
+impl fmt::Debug for MacroContextReadCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MacroContextReadCapability")
+            .field("analytical", &self.reader)
+            .field("treasury_composed", &self.treasury_daily.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One application-owned transport wrapper around [`MacroContextReadCapability`].
+pub(crate) struct MacroContextOperation {
+    read: MacroContextReadCapability,
+}
+
+impl MacroContextOperation {
+    /// Preserves the current Board/FRED composition until the shared integration owner wires the
+    /// already-created Treasury operations into [`Self::with_treasury`].
+    #[must_use]
+    pub(crate) fn new(reader: AnalyticalReadCapability, fred: FredLatestKnownOperation) -> Self {
+        Self {
+            read: MacroContextReadCapability::new(reader, fred),
+        }
+    }
+
+    /// Binds all currently durable Board/FRED/Treasury inputs below one neutral product read.
+    #[must_use]
+    pub(crate) fn with_treasury(
+        reader: AnalyticalReadCapability,
+        fred: FredLatestKnownOperation,
+        treasury_fiscal: TreasuryLatestKnownOperation,
+        treasury_daily: TreasuryLatestKnownOperation,
+    ) -> Self {
+        Self {
+            read: MacroContextReadCapability::with_treasury(
+                reader,
+                fred,
+                treasury_fiscal,
+                treasury_daily,
+            ),
+        }
+    }
+
+    /// Returns the reusable typed read capability without granting provider mutation authority.
+    #[must_use]
+    pub(crate) fn read_capability(&self) -> MacroContextReadCapability {
+        self.read.clone()
+    }
+
+    /// Executes one bounded provider-neutral current or explicit point-in-time Macro read.
+    pub(crate) async fn call(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+        limits: ServiceLimits,
+    ) -> Result<TypedToolResult, ServiceError> {
+        ensure_request_live(request, context)?;
+        if limits.maximum_result_items() < MACRO_CONTEXT_INDICATOR_COUNT {
+            return Err(ServiceError::ResourceExhausted);
+        }
+        let cutoffs = MacroContextCutoffs::parse(request.arguments())?;
+        self.read
+            .read_at(
+                cutoffs,
+                context.deadline(),
+                context.cancellation().child_token(),
+            )
+            .await?
+            .into_tool_result(limits)
     }
 }
 
@@ -246,7 +413,7 @@ impl fmt::Debug for MacroContextOperation {
         formatter
             .debug_struct("MacroContextOperation")
             .field("operation", &MACRO_GET_CONTEXT)
-            .field("fred_availability", &self.fred.availability())
+            .field("read", &self.read)
             .finish_non_exhaustive()
     }
 }
@@ -512,40 +679,266 @@ pub(crate) enum MacroContextAvailability {
     Unavailable,
 }
 
-fn product_result(
+/// Provider-neutral economic role for one retained canonical Macro input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MacroContextInputRole {
+    GovernmentYieldCurve,
+    ShortTermGovernmentFunding,
+    InflationAdjustedGovernmentRates,
+    GovernmentBorrowingCost,
+    LaborMarket,
+}
+
+/// One typed canonical input retained by the neutral selection snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MacroContextInputObservation {
+    role: MacroContextInputRole,
+    observation: MacroObservation,
+}
+
+impl MacroContextInputObservation {
+    /// Returns provider-neutral economic meaning for this canonical input.
+    pub(crate) const fn role(&self) -> MacroContextInputRole {
+        self.role
+    }
+
+    /// Returns exact canonical value, clocks, revisions, missingness, and internal provenance.
+    pub(crate) const fn observation(&self) -> &MacroObservation {
+        &self.observation
+    }
+}
+
+/// One requested product indicator with an observed, explicitly missing, or unavailable value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MacroContextSelectedObservation {
+    indicator_id: &'static str,
+    observation: Option<MacroObservation>,
+    authority: Option<MacroContextSelectionAuthority>,
+}
+
+impl MacroContextSelectedObservation {
+    fn unavailable(definition: MacroContextIndicatorDefinition) -> Self {
+        Self {
+            indicator_id: definition.indicator_id,
+            observation: None,
+            authority: None,
+        }
+    }
+
+    /// Returns the stable provider-neutral product indicator identity.
+    pub(crate) const fn indicator_id(&self) -> &'static str {
+        self.indicator_id
+    }
+
+    /// Returns `None` only when no canonical observation existed at the requested cutoff.
+    ///
+    /// A returned observation may still carry provider-authored explicit missingness.
+    pub(crate) const fn observation(&self) -> Option<&MacroObservation> {
+        self.observation.as_ref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum MacroContextSelectionAuthority {
+    Treasury,
+    Board,
+    Fred,
+}
+
+/// Reusable typed neutral Macro selection plus opaque exact evidence.
+pub(crate) struct MacroContextSnapshot {
+    dto: MacroContextDto,
+    inputs: Box<[MacroContextInputObservation]>,
+    selected: Box<[MacroContextSelectedObservation]>,
+    evidence: MacroContextEvidenceReceipt,
+}
+
+impl MacroContextSnapshot {
+    /// Returns every bounded canonical input considered by the neutral selector.
+    pub(crate) fn inputs(&self) -> &[MacroContextInputObservation] {
+        &self.inputs
+    }
+
+    /// Returns every requested product indicator, including explicit unavailable states.
+    pub(crate) fn selected(&self) -> &[MacroContextSelectedObservation] {
+        &self.selected
+    }
+
+    /// Returns the opaque evidence receipt and exact parent generation set.
+    pub(crate) const fn evidence(&self) -> &MacroContextEvidenceReceipt {
+        &self.evidence
+    }
+
+    fn into_tool_result(self, limits: ServiceLimits) -> Result<TypedToolResult, ServiceError> {
+        let availability = self.dto.availability;
+        let selected_indicators = self
+            .dto
+            .coverage
+            .observed
+            .checked_add(self.dto.coverage.missing)
+            .ok_or(ServiceError::ResourceExhausted)?;
+        let complete = self.dto.selection.complete;
+        let source_coverage = json!({
+            "requestedIndicators": MACRO_CONTEXT_INDICATOR_COUNT,
+            "selectedIndicators": selected_indicators,
+            "complete": complete,
+        });
+        let data_quality = json!({
+            "classification": match availability {
+                MacroContextAvailability::Available => "moderate",
+                MacroContextAvailability::Partial => "limited",
+                MacroContextAvailability::Unavailable => "unavailable",
+            },
+            "pointInTime": true,
+            "executionEligible": false,
+        });
+        let metadata = ToolResultMetadata::try_complete(source_coverage, data_quality)
+            .map_err(|_| ServiceError::InvalidResult)?;
+        let content = serde_json::to_value(self.dto).map_err(|_| ServiceError::InvalidResult)?;
+        TypedToolResult::try_new(content, MACRO_CONTEXT_INDICATOR_COUNT, metadata, limits)
+            .map_err(Into::into)
+    }
+}
+
+impl fmt::Debug for MacroContextSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MacroContextSnapshot")
+            .field("input_count", &self.inputs.len())
+            .field("selected_count", &self.selected.len())
+            .field("evidence", &self.evidence)
+            .finish_non_exhaustive()
+    }
+}
+
+fn product_snapshot(
     cutoffs: MacroContextCutoffs,
     board: Option<AnalyticalMacroLatestKnownOutput>,
     fred: Option<AnalyticalMacroLatestKnownOutput>,
-    limits: ServiceLimits,
-) -> Result<TypedToolResult, ServiceError> {
+    treasury_fiscal: Box<[TreasuryCurrentAnalyticalRead]>,
+    treasury_daily: Box<[TreasuryCurrentAnalyticalRead]>,
+) -> Result<MacroContextSnapshot, ServiceError> {
+    let definitions = H15_INDICATORS
+        .iter()
+        .copied()
+        .chain(std::iter::once(UNEMPLOYMENT_INDICATOR))
+        .collect::<Vec<_>>();
     let mut observations = Vec::new();
     observations
         .try_reserve_exact(MACRO_CONTEXT_INDICATOR_COUNT)
         .map_err(|_| ServiceError::ResourceExhausted)?;
     observations.extend(
-        H15_INDICATORS
+        definitions
             .iter()
             .copied()
-            .chain(std::iter::once(UNEMPLOYMENT_INDICATOR))
             .map(MacroContextIndicatorDefinition::unavailable),
     );
+    let mut selected = Vec::new();
+    selected
+        .try_reserve_exact(MACRO_CONTEXT_INDICATOR_COUNT)
+        .map_err(|_| ServiceError::ResourceExhausted)?;
+    selected.extend(
+        definitions
+            .iter()
+            .copied()
+            .map(MacroContextSelectedObservation::unavailable),
+    );
+
+    let input_count = board
+        .as_ref()
+        .map_or(0, |output| output.observations().len())
+        .checked_add(
+            fred.as_ref()
+                .map_or(0, |output| output.observations().len()),
+        )
+        .and_then(|count| {
+            treasury_fiscal.iter().try_fold(count, |count, read| {
+                count.checked_add(read.output().observations().len())
+            })
+        })
+        .and_then(|count| {
+            treasury_daily.iter().try_fold(count, |count, read| {
+                count.checked_add(read.output().observations().len())
+            })
+        })
+        .filter(|count| *count <= MAXIMUM_MACRO_CONTEXT_INPUTS)
+        .ok_or(ServiceError::ResourceExhausted)?;
+    let mut inputs = Vec::new();
+    inputs
+        .try_reserve_exact(input_count)
+        .map_err(|_| ServiceError::ResourceExhausted)?;
     let mut receipts = Vec::new();
     receipts
-        .try_reserve_exact(2)
+        .try_reserve_exact(
+            2_usize
+                .checked_add(treasury_fiscal.len())
+                .and_then(|count| count.checked_add(treasury_daily.len()))
+                .ok_or(ServiceError::ResourceExhausted)?,
+        )
         .map_err(|_| ServiceError::ResourceExhausted)?;
 
     if let Some(board) = board {
-        receipts.push(project_board(
-            board,
+        retain_inputs(
+            &board,
+            cutoffs,
+            |_| Ok(MacroContextInputRole::GovernmentYieldCurve),
+            &mut inputs,
+        )?;
+        project_board(
+            &board,
             cutoffs,
             &mut observations[..H15_INDICATOR_COUNT],
+            &mut selected[..H15_INDICATOR_COUNT],
+        )?;
+        receipts.push(MacroContextSourceReceipt::try_from_output(
+            MacroContextInternalSource::InterestRates,
+            &board,
         )?);
     }
     if let Some(fred) = fred {
-        receipts.push(project_fred(
-            fred,
+        retain_inputs(
+            &fred,
+            cutoffs,
+            |_| Ok(MacroContextInputRole::LaborMarket),
+            &mut inputs,
+        )?;
+        project_fred(
+            &fred,
             cutoffs,
             &mut observations[H15_INDICATOR_COUNT],
+            &mut selected[H15_INDICATOR_COUNT],
+        )?;
+        receipts.push(MacroContextSourceReceipt::try_from_output(
+            MacroContextInternalSource::LaborMarket,
+            &fred,
+        )?);
+    }
+    for read in treasury_fiscal {
+        if read.surface() != TreasurySurface::FiscalData {
+            return Err(ServiceError::InvalidResult);
+        }
+        let output = read.output();
+        retain_inputs(output, cutoffs, treasury_input_role, &mut inputs)?;
+        receipts.push(MacroContextSourceReceipt::try_from_output(
+            MacroContextInternalSource::FiscalConditions,
+            output,
+        )?);
+    }
+    for read in treasury_daily {
+        if read.surface() != TreasurySurface::DailyRatesXml {
+            return Err(ServiceError::InvalidResult);
+        }
+        let output = read.output();
+        retain_inputs(output, cutoffs, treasury_input_role, &mut inputs)?;
+        project_treasury_daily(
+            output,
+            cutoffs,
+            &mut observations[..H15_INDICATOR_COUNT],
+            &mut selected[..H15_INDICATOR_COUNT],
+        )?;
+        receipts.push(MacroContextSourceReceipt::try_from_output(
+            MacroContextInternalSource::InterestRates,
+            output,
         )?);
     }
 
@@ -599,10 +992,6 @@ fn product_result(
         },
     };
     let complete = coverage.unavailable == 0;
-    let selected_indicators = coverage
-        .observed
-        .checked_add(coverage.missing)
-        .ok_or(ServiceError::ResourceExhausted)?;
     let selection = MacroContextSelectionDto {
         knowledge_cutoff: timestamp_text(cutoffs.knowledge_cutoff)?,
         effective_date_cutoff: cutoffs.effective_date_cutoff.to_string(),
@@ -617,39 +1006,25 @@ fn product_result(
         coverage,
         observations,
     };
-    let content = serde_json::to_value(dto).map_err(|_| ServiceError::InvalidResult)?;
-    let source_coverage = json!({
-        "requestedIndicators": MACRO_CONTEXT_INDICATOR_COUNT,
-        "selectedIndicators": selected_indicators,
-        "complete": complete,
-    });
-    let data_quality = json!({
-        "classification": match availability {
-            MacroContextAvailability::Available => "moderate",
-            MacroContextAvailability::Partial => "limited",
-            MacroContextAvailability::Unavailable => "unavailable",
-        },
-        "pointInTime": true,
-        "executionEligible": false,
-    });
-    let metadata = ToolResultMetadata::try_complete(source_coverage, data_quality)
-        .map_err(|_| ServiceError::InvalidResult)?;
-    let _internal_receipt = MacroContextInternalReceipt {
-        _knowledge_cutoff: cutoffs.knowledge_cutoff,
-        _effective_date_cutoff: cutoffs.effective_date_cutoff,
-        _evaluated_at: cutoffs.evaluated_at,
-        _sources: receipts.into_boxed_slice(),
-    };
-    TypedToolResult::try_new(content, MACRO_CONTEXT_INDICATOR_COUNT, metadata, limits)
-        .map_err(Into::into)
+    let evidence = MacroContextEvidenceReceipt::try_new(cutoffs, receipts)?;
+    Ok(MacroContextSnapshot {
+        dto,
+        inputs: inputs.into_boxed_slice(),
+        selected: selected.into_boxed_slice(),
+        evidence,
+    })
 }
 
 fn project_board(
-    output: AnalyticalMacroLatestKnownOutput,
+    output: &AnalyticalMacroLatestKnownOutput,
     cutoffs: MacroContextCutoffs,
     target: &mut [MacroContextObservationDto],
-) -> Result<MacroContextSourceReceipt, ServiceError> {
-    if target.len() != H15_INDICATOR_COUNT || output.observations().len() != H15_INDICATOR_COUNT {
+    selected: &mut [MacroContextSelectedObservation],
+) -> Result<(), ServiceError> {
+    if target.len() != H15_INDICATOR_COUNT
+        || selected.len() != H15_INDICATOR_COUNT
+        || output.observations().len() > H15_INDICATOR_COUNT
+    {
         return Err(ServiceError::InvalidResult);
     }
     let expected_source =
@@ -660,7 +1035,7 @@ fn project_board(
         return Err(ServiceError::InvalidResult);
     }
 
-    let mut matched = [false; H15_INDICATOR_COUNT];
+    let mut matched = vec![false; output.observations().len()];
     for (target_index, (definition, descriptor)) in H15_INDICATORS
         .iter()
         .copied()
@@ -678,31 +1053,36 @@ fn project_board(
             .iter()
             .enumerate()
             .filter(|(_, observation)| observation.series() == &series);
-        let (source_index, observation) = candidates.next().ok_or(ServiceError::InvalidResult)?;
-        if candidates.next().is_some() || matched[source_index] {
-            return Err(ServiceError::InvalidResult);
+        if let Some((source_index, observation)) = candidates.next() {
+            if candidates.next().is_some() || matched[source_index] {
+                return Err(ServiceError::InvalidResult);
+            }
+            matched[source_index] = true;
+            select_observation(
+                &mut target[target_index],
+                &mut selected[target_index],
+                definition,
+                observation,
+                &expected_source,
+                &series,
+                &expected_unit,
+                MacroContextSelectionAuthority::Board,
+                cutoffs,
+            )?;
         }
-        matched[source_index] = true;
-        target[target_index] = project_observation(
-            definition,
-            observation,
-            &expected_source,
-            &series,
-            &expected_unit,
-            cutoffs,
-        )?;
     }
     if matched.iter().any(|value| !value) {
         return Err(ServiceError::InvalidResult);
     }
-    MacroContextSourceReceipt::try_from_output(MacroContextInternalSource::InterestRates, &output)
+    Ok(())
 }
 
 fn project_fred(
-    output: AnalyticalMacroLatestKnownOutput,
+    output: &AnalyticalMacroLatestKnownOutput,
     cutoffs: MacroContextCutoffs,
     target: &mut MacroContextObservationDto,
-) -> Result<MacroContextSourceReceipt, ServiceError> {
+    selected: &mut MacroContextSelectedObservation,
+) -> Result<(), ServiceError> {
     let expected_source =
         SourceId::try_from(FRED_SOURCE_ID).map_err(|_| ServiceError::Unavailable)?;
     let expected_series = SourceIdentifier::try_from(FRED_UNEMPLOYMENT_SERIES_ID)
@@ -715,18 +1095,198 @@ fn project_fred(
     match output.observations() {
         [] => {}
         [observation] => {
-            *target = project_observation(
+            select_observation(
+                target,
+                selected,
                 UNEMPLOYMENT_INDICATOR,
                 observation,
                 &expected_source,
                 &expected_series,
                 &expected_unit,
+                MacroContextSelectionAuthority::Fred,
                 cutoffs,
             )?;
         }
         [_, _, ..] => return Err(ServiceError::InvalidResult),
     }
-    MacroContextSourceReceipt::try_from_output(MacroContextInternalSource::LaborMarket, &output)
+    Ok(())
+}
+
+fn project_treasury_daily(
+    output: &AnalyticalMacroLatestKnownOutput,
+    cutoffs: MacroContextCutoffs,
+    target: &mut [MacroContextObservationDto],
+    selected: &mut [MacroContextSelectedObservation],
+) -> Result<(), ServiceError> {
+    if target.len() != H15_INDICATOR_COUNT || selected.len() != H15_INDICATOR_COUNT {
+        return Err(ServiceError::InvalidResult);
+    }
+    let expected_unit = SourceIdentifier::try_from(TREASURY_PERCENT_UNIT_ID)
+        .map_err(|_| ServiceError::Unavailable)?;
+    for (target_index, definition) in H15_INDICATORS.iter().copied().enumerate() {
+        let series = treasury_nominal_series(definition.source_slot)?;
+        let mut candidates = output
+            .observations()
+            .iter()
+            .filter(|observation| observation.series() == &series);
+        if let Some(observation) = candidates.next() {
+            if candidates.next().is_some() {
+                return Err(ServiceError::InvalidResult);
+            }
+            select_observation(
+                &mut target[target_index],
+                &mut selected[target_index],
+                definition,
+                observation,
+                output.source_id(),
+                &series,
+                &expected_unit,
+                MacroContextSelectionAuthority::Treasury,
+                cutoffs,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn retain_inputs(
+    output: &AnalyticalMacroLatestKnownOutput,
+    cutoffs: MacroContextCutoffs,
+    classify: impl Fn(&MacroObservation) -> Result<MacroContextInputRole, ServiceError>,
+    inputs: &mut Vec<MacroContextInputObservation>,
+) -> Result<(), ServiceError> {
+    let remaining = MAXIMUM_MACRO_CONTEXT_INPUTS
+        .checked_sub(inputs.len())
+        .ok_or(ServiceError::ResourceExhausted)?;
+    if output.observations().len() > remaining {
+        return Err(ServiceError::ResourceExhausted);
+    }
+    for observation in output.observations() {
+        validate_canonical_input(observation, output.source_id(), cutoffs)?;
+        inputs.push(MacroContextInputObservation {
+            role: classify(observation)?,
+            observation: observation.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn treasury_input_role(
+    observation: &MacroObservation,
+) -> Result<MacroContextInputRole, ServiceError> {
+    let series = observation.series().as_str();
+    if series.starts_with("treasury:average-interest-rate:v2:") {
+        Ok(MacroContextInputRole::GovernmentBorrowingCost)
+    } else if series.starts_with("treasury:daily-par-yield-curve:")
+        || series.starts_with("treasury:daily-long-term-rates:")
+    {
+        Ok(MacroContextInputRole::GovernmentYieldCurve)
+    } else if series.starts_with("treasury:daily-bill-rates:") {
+        Ok(MacroContextInputRole::ShortTermGovernmentFunding)
+    } else if series.starts_with("treasury:daily-real-par-yield-curve:")
+        || series.starts_with("treasury:daily-real-long-term-rates:")
+    {
+        Ok(MacroContextInputRole::InflationAdjustedGovernmentRates)
+    } else {
+        Err(ServiceError::InvalidResult)
+    }
+}
+
+fn treasury_nominal_series(slot: &str) -> Result<SourceIdentifier, ServiceError> {
+    let maturity = match slot {
+        "1m" => TreasuryMaturity::OneMonth,
+        "3m" => TreasuryMaturity::ThreeMonths,
+        "6m" => TreasuryMaturity::SixMonths,
+        "1y" => TreasuryMaturity::OneYear,
+        "2y" => TreasuryMaturity::TwoYears,
+        "3y" => TreasuryMaturity::ThreeYears,
+        "5y" => TreasuryMaturity::FiveYears,
+        "7y" => TreasuryMaturity::SevenYears,
+        "10y" => TreasuryMaturity::TenYears,
+        "20y" => TreasuryMaturity::TwentyYears,
+        "30y" => TreasuryMaturity::ThirtyYears,
+        _ => return Err(ServiceError::InvalidResult),
+    };
+    SourceIdentifier::try_from(
+        TreasuryDailyRateMetric::NominalParYield(maturity).canonical_series(),
+    )
+    .map_err(|_| ServiceError::Unavailable)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "selection keeps every canonical identity and cutoff invariant explicit"
+)]
+fn select_observation(
+    target: &mut MacroContextObservationDto,
+    selected: &mut MacroContextSelectedObservation,
+    definition: MacroContextIndicatorDefinition,
+    observation: &MacroObservation,
+    expected_source: &SourceId,
+    expected_series: &SourceIdentifier,
+    expected_unit: &SourceIdentifier,
+    authority: MacroContextSelectionAuthority,
+    cutoffs: MacroContextCutoffs,
+) -> Result<(), ServiceError> {
+    if target.indicator_id != definition.indicator_id
+        || selected.indicator_id != definition.indicator_id
+    {
+        return Err(ServiceError::InvalidResult);
+    }
+    let projected = project_observation(
+        definition,
+        observation,
+        expected_source,
+        expected_series,
+        expected_unit,
+        cutoffs,
+    )?;
+    let candidate_rank = selection_rank(observation, authority, cutoffs)?;
+    let replace = match (selected.observation.as_ref(), selected.authority) {
+        (None, None) => true,
+        (Some(current), Some(current_authority)) => {
+            candidate_rank > selection_rank(current, current_authority, cutoffs)?
+        }
+        (None, Some(_)) | (Some(_), None) => return Err(ServiceError::InvalidResult),
+    };
+    if replace {
+        *target = projected;
+        selected.observation = Some(observation.clone());
+        selected.authority = Some(authority);
+    }
+    Ok(())
+}
+
+fn selection_rank(
+    observation: &MacroObservation,
+    authority: MacroContextSelectionAuthority,
+    cutoffs: MacroContextCutoffs,
+) -> Result<
+    (
+        CalendarDate,
+        bool,
+        Timestamp,
+        MacroContextSelectionAuthority,
+    ),
+    ServiceError,
+> {
+    let observed = match (
+        observation.value().observed_value(),
+        observation.value().missing_value(),
+    ) {
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (Some(_), Some(_)) | (None, None) => return Err(ServiceError::InvalidResult),
+    };
+    let effective = effective_calendar_date(observation, cutoffs)?;
+    let available_at = observation
+        .context()
+        .provenance()
+        .availability()
+        .conservative_available_at()
+        .filter(|available_at| *available_at <= cutoffs.knowledge_cutoff)
+        .ok_or(ServiceError::InvalidResult)?;
+    Ok((effective, observed, available_at, authority))
 }
 
 fn project_observation(
@@ -737,35 +1297,21 @@ fn project_observation(
     expected_unit: &SourceIdentifier,
     cutoffs: MacroContextCutoffs,
 ) -> Result<MacroContextObservationDto, ServiceError> {
+    validate_canonical_input(observation, expected_source, cutoffs)?;
     let context = observation.context();
     let provenance = context.provenance();
     let time = context.time();
-    let effective_date = time
-        .effective()
-        .calendar_date_value()
-        .filter(|date| *date <= cutoffs.effective_date_cutoff)
-        .ok_or(ServiceError::InvalidResult)?;
-    let knowledge_date = timestamp_calendar_date(cutoffs.knowledge_cutoff)?;
+    let effective_date = effective_calendar_date(observation, cutoffs)?;
     let recorded = match time.published() {
-        Some(published) => {
-            let date = published
-                .calendar_date_value()
-                .filter(|date| *date <= knowledge_date)
-                .ok_or(ServiceError::InvalidResult)?;
-            MacroContextRecordedDateDto::Known {
-                date: date.to_string(),
-            }
-        }
+        Some(published) => MacroContextRecordedDateDto::Known {
+            date: coordinate_calendar_date_at_knowledge(published, cutoffs.knowledge_cutoff)?
+                .to_string(),
+        },
         None => MacroContextRecordedDateDto::NotSupplied,
     };
     let superseded_after = time
         .superseded()
-        .map(|superseded| {
-            superseded
-                .calendar_date_value()
-                .map(|date| date.to_string())
-                .ok_or(ServiceError::InvalidResult)
-        })
+        .map(coordinate_calendar_date)
         .transpose()?;
     let available_at = provenance
         .availability()
@@ -775,20 +1321,8 @@ fn project_observation(
     if observation.series() != expected_series
         || observation.unit() != expected_unit
         || provenance.source_id() != expected_source
-        || provenance.instrument_id().is_some()
-        || provenance.venue_id().is_some()
-        || provenance.quality() != DataQuality::OfficialDelayed
-        || provenance.received_at() > cutoffs.knowledge_cutoff
-        || provenance.ingested_at() > cutoffs.knowledge_cutoff
     {
         return Err(ServiceError::InvalidResult);
-    }
-    match provenance.payload_reference() {
-        PayloadReference::ContentHash(hash)
-            if hash.algorithm() == DigestAlgorithm::Sha256 && hash.digest() != [0; 32] => {}
-        PayloadReference::ContentHash(_) | PayloadReference::SourceReference(_) => {
-            return Err(ServiceError::InvalidResult);
-        }
     }
 
     let (value, availability, confidence) = match (
@@ -823,28 +1357,227 @@ fn project_observation(
         recorded,
         available_at: Some(timestamp_text(available_at)?),
         revision: Some(time.revision().get()),
-        superseded_after,
+        superseded_after: superseded_after.map(|date| date.to_string()),
         value,
         availability,
         confidence,
     })
 }
 
-struct MacroContextInternalReceipt {
-    _knowledge_cutoff: Timestamp,
-    _effective_date_cutoff: CalendarDate,
-    _evaluated_at: Timestamp,
-    _sources: Box<[MacroContextSourceReceipt]>,
+fn validate_canonical_input(
+    observation: &MacroObservation,
+    expected_source: &SourceId,
+    cutoffs: MacroContextCutoffs,
+) -> Result<(), ServiceError> {
+    let context = observation.context();
+    let provenance = context.provenance();
+    let time = context.time();
+    effective_calendar_date(observation, cutoffs)?;
+    if let Some(published) = time.published() {
+        coordinate_calendar_date_at_knowledge(published, cutoffs.knowledge_cutoff)?;
+    }
+    if let Some(superseded) = time.superseded() {
+        coordinate_calendar_date(superseded)?;
+    }
+    provenance
+        .availability()
+        .conservative_available_at()
+        .filter(|available_at| *available_at <= cutoffs.knowledge_cutoff)
+        .ok_or(ServiceError::InvalidResult)?;
+    if provenance.source_id() != expected_source
+        || provenance.instrument_id().is_some()
+        || provenance.venue_id().is_some()
+        || provenance.quality() != DataQuality::OfficialDelayed
+        || provenance.received_at() > cutoffs.knowledge_cutoff
+        || provenance.ingested_at() > cutoffs.knowledge_cutoff
+    {
+        return Err(ServiceError::InvalidResult);
+    }
+    match provenance.payload_reference() {
+        PayloadReference::ContentHash(hash)
+            if hash.algorithm() == DigestAlgorithm::Sha256 && hash.digest() != [0; 32] => {}
+        PayloadReference::ContentHash(_) | PayloadReference::SourceReference(_) => {
+            return Err(ServiceError::InvalidResult);
+        }
+    }
+    match (
+        observation.value().observed_value(),
+        observation.value().missing_value(),
+    ) {
+        (Some(_), None) | (None, Some(_)) => Ok(()),
+        (Some(_), Some(_)) | (None, None) => Err(ServiceError::InvalidResult),
+    }
+}
+
+fn effective_calendar_date(
+    observation: &MacroObservation,
+    cutoffs: MacroContextCutoffs,
+) -> Result<CalendarDate, ServiceError> {
+    let coordinate = observation.context().time().effective();
+    let date = if let Some(date) = coordinate.calendar_date_value() {
+        date
+    } else if let Some(timestamp) = coordinate.exact_timestamp() {
+        if timestamp > cutoffs.knowledge_cutoff {
+            return Err(ServiceError::InvalidResult);
+        }
+        timestamp_calendar_date(timestamp)?
+    } else {
+        return Err(ServiceError::InvalidResult);
+    };
+    if date > cutoffs.effective_date_cutoff {
+        Err(ServiceError::InvalidResult)
+    } else {
+        Ok(date)
+    }
+}
+
+fn coordinate_calendar_date_at_knowledge(
+    coordinate: &ResearchTemporalCoordinate,
+    knowledge_cutoff: Timestamp,
+) -> Result<CalendarDate, ServiceError> {
+    if let Some(date) = coordinate.calendar_date_value() {
+        if date <= timestamp_calendar_date(knowledge_cutoff)? {
+            Ok(date)
+        } else {
+            Err(ServiceError::InvalidResult)
+        }
+    } else if let Some(timestamp) = coordinate.exact_timestamp() {
+        if timestamp <= knowledge_cutoff {
+            timestamp_calendar_date(timestamp)
+        } else {
+            Err(ServiceError::InvalidResult)
+        }
+    } else {
+        Err(ServiceError::InvalidResult)
+    }
+}
+
+fn coordinate_calendar_date(
+    coordinate: &ResearchTemporalCoordinate,
+) -> Result<CalendarDate, ServiceError> {
+    if let Some(date) = coordinate.calendar_date_value() {
+        Ok(date)
+    } else if let Some(timestamp) = coordinate.exact_timestamp() {
+        timestamp_calendar_date(timestamp)
+    } else {
+        Err(ServiceError::InvalidResult)
+    }
+}
+
+/// Opaque exact evidence for one neutral Macro selection.
+///
+/// Provider-qualified inputs are intentionally retained below transport and product DTOs. The
+/// public internal API exposes only cutoffs, immutable parent generations, and a nonzero digest.
+pub(crate) struct MacroContextEvidenceReceipt {
+    knowledge_cutoff: Timestamp,
+    effective_date_cutoff: CalendarDate,
+    evaluated_at: Timestamp,
+    parent_manifests: Box<[DatasetManifestRef]>,
+    digest: EvidenceDigest,
+    sources: Box<[MacroContextSourceReceipt]>,
+}
+
+impl MacroContextEvidenceReceipt {
+    fn try_new(
+        cutoffs: MacroContextCutoffs,
+        mut sources: Vec<MacroContextSourceReceipt>,
+    ) -> Result<Self, ServiceError> {
+        sources.sort_by(compare_source_receipts);
+        if sources.windows(2).any(|pair| {
+            pair[0].source == pair[1].source
+                && pair[0].source_id == pair[1].source_id
+                && pair[0].manifest == pair[1].manifest
+        }) {
+            return Err(ServiceError::InvalidResult);
+        }
+
+        let mut parent_manifests = sources
+            .iter()
+            .map(|source| source.manifest.clone())
+            .collect::<Vec<_>>();
+        parent_manifests.sort_by(compare_manifest_refs);
+        for pair in parent_manifests.windows(2) {
+            if pair[0].dataset_id() == pair[1].dataset_id()
+                && pair[0].manifest_version() == pair[1].manifest_version()
+                && pair[0] != pair[1]
+            {
+                return Err(ServiceError::InvalidResult);
+            }
+        }
+        parent_manifests.dedup();
+
+        let mut hasher = Sha256::new();
+        hash_text(&mut hasher, "market-squawk/macro-context-evidence/v1");
+        hasher.update(cutoffs.knowledge_cutoff.unix_nanos().to_be_bytes());
+        hash_text(&mut hasher, &cutoffs.effective_date_cutoff.to_string());
+        hasher.update(cutoffs.evaluated_at.unix_nanos().to_be_bytes());
+        hash_usize(&mut hasher, sources.len());
+        for source in &sources {
+            hasher.update([source.source.digest_tag()]);
+            hash_text(&mut hasher, source.source_id.as_str());
+            hash_manifest(&mut hasher, &source.manifest);
+            hash_digest(&mut hasher, source.object_graph_digest);
+            hash_digest(&mut hasher, source.query_identity);
+            hash_digest(&mut hasher, source.result_digest);
+            hash_digest(&mut hasher, source.selection_digest);
+        }
+        let digest = EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into());
+        require_sha256(digest)?;
+        Ok(Self {
+            knowledge_cutoff: cutoffs.knowledge_cutoff,
+            effective_date_cutoff: cutoffs.effective_date_cutoff,
+            evaluated_at: cutoffs.evaluated_at,
+            parent_manifests: parent_manifests.into_boxed_slice(),
+            digest,
+            sources: sources.into_boxed_slice(),
+        })
+    }
+
+    /// Returns the exact point-in-time knowledge cutoff used for selection.
+    pub(crate) const fn knowledge_cutoff(&self) -> Timestamp {
+        self.knowledge_cutoff
+    }
+
+    /// Returns the exact effective-date cutoff used for selection.
+    pub(crate) const fn effective_date_cutoff(&self) -> CalendarDate {
+        self.effective_date_cutoff
+    }
+
+    /// Returns when the application evaluated this snapshot.
+    pub(crate) const fn evaluated_at(&self) -> Timestamp {
+        self.evaluated_at
+    }
+
+    /// Returns the canonical, duplicate-free immutable input generation set.
+    pub(crate) fn parent_manifests(&self) -> &[DatasetManifestRef] {
+        &self.parent_manifests
+    }
+
+    /// Returns a nonzero SHA-256 identity over exact input selections and cutoffs.
+    pub(crate) const fn digest(&self) -> EvidenceDigest {
+        self.digest
+    }
+}
+
+impl fmt::Debug for MacroContextEvidenceReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MacroContextEvidenceReceipt")
+            .field("parent_count", &self.parent_manifests.len())
+            .field("source_count", &self.sources.len())
+            .field("digest", &"[SHA-256]")
+            .finish_non_exhaustive()
+    }
 }
 
 struct MacroContextSourceReceipt {
-    _source: MacroContextInternalSource,
-    _source_id: SourceId,
-    _manifest: DatasetManifestRef,
-    _object_graph_digest: EvidenceDigest,
-    _query_identity: EvidenceDigest,
-    _result_digest: EvidenceDigest,
-    _selection_digest: EvidenceDigest,
+    source: MacroContextInternalSource,
+    source_id: SourceId,
+    manifest: DatasetManifestRef,
+    object_graph_digest: EvidenceDigest,
+    query_identity: EvidenceDigest,
+    result_digest: EvidenceDigest,
+    selection_digest: EvidenceDigest,
 }
 
 impl MacroContextSourceReceipt {
@@ -858,20 +1591,106 @@ impl MacroContextSourceReceipt {
         let result_digest = require_sha256(pinned.result_digest())?;
         let selection_digest = require_sha256(output.selection_digest())?;
         Ok(Self {
-            _source: source,
-            _source_id: output.source_id().clone(),
-            _manifest: pinned.manifest().clone(),
-            _object_graph_digest: object_graph_digest,
-            _query_identity: query_identity,
-            _result_digest: result_digest,
-            _selection_digest: selection_digest,
+            source,
+            source_id: output.source_id().clone(),
+            manifest: pinned.manifest().clone(),
+            object_graph_digest,
+            query_identity,
+            result_digest,
+            selection_digest,
         })
     }
 }
 
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum MacroContextInternalSource {
     InterestRates,
     LaborMarket,
+    FiscalConditions,
+}
+
+impl MacroContextInternalSource {
+    const fn digest_tag(self) -> u8 {
+        match self {
+            Self::InterestRates => 1,
+            Self::LaborMarket => 2,
+            Self::FiscalConditions => 3,
+        }
+    }
+}
+
+fn compare_source_receipts(
+    left: &MacroContextSourceReceipt,
+    right: &MacroContextSourceReceipt,
+) -> std::cmp::Ordering {
+    left.source
+        .cmp(&right.source)
+        .then_with(|| left.source_id.as_str().cmp(right.source_id.as_str()))
+        .then_with(|| compare_manifest_refs(&left.manifest, &right.manifest))
+        .then_with(|| {
+            left.object_graph_digest
+                .bytes()
+                .cmp(&right.object_graph_digest.bytes())
+        })
+        .then_with(|| {
+            left.query_identity
+                .bytes()
+                .cmp(&right.query_identity.bytes())
+        })
+        .then_with(|| left.result_digest.bytes().cmp(&right.result_digest.bytes()))
+        .then_with(|| {
+            left.selection_digest
+                .bytes()
+                .cmp(&right.selection_digest.bytes())
+        })
+}
+
+fn compare_manifest_refs(
+    left: &DatasetManifestRef,
+    right: &DatasetManifestRef,
+) -> std::cmp::Ordering {
+    left.dataset_id()
+        .as_str()
+        .cmp(right.dataset_id().as_str())
+        .then_with(|| left.manifest_version().cmp(&right.manifest_version()))
+        .then_with(|| left.schema().name().cmp(right.schema().name()))
+        .then_with(|| left.schema().version().cmp(&right.schema().version()))
+        .then_with(|| {
+            left.schema()
+                .fingerprint()
+                .cmp(&right.schema().fingerprint())
+        })
+        .then_with(|| {
+            left.content_hash()
+                .bytes()
+                .cmp(&right.content_hash().bytes())
+        })
+}
+
+fn hash_manifest(hasher: &mut Sha256, manifest: &DatasetManifestRef) {
+    hash_text(hasher, manifest.dataset_id().as_str());
+    hasher.update(manifest.manifest_version().to_be_bytes());
+    hash_text(hasher, manifest.schema().name());
+    hasher.update(manifest.schema().version().get().to_be_bytes());
+    hasher.update(manifest.schema().fingerprint());
+    hasher.update(manifest.content_hash().bytes());
+}
+
+fn hash_digest(hasher: &mut Sha256, digest: EvidenceDigest) {
+    hasher.update([match digest.algorithm() {
+        DigestAlgorithm::Sha256 => 1,
+        DigestAlgorithm::Blake3 => 2,
+    }]);
+    hasher.update(digest.bytes());
+}
+
+fn hash_text(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u128).to_be_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn hash_usize(hasher: &mut Sha256, value: usize) {
+    hasher.update((value as u128).to_be_bytes());
 }
 
 fn ensure_request_live(
@@ -892,14 +1711,13 @@ fn ensure_request_live(
 
 fn macro_context_query_limits(
     request: &AnalyticalMacroLatestKnownRequest,
-    context: &RequestContext,
+    deadline: std::time::Instant,
 ) -> Result<QueryLimits, ServiceError> {
     let now = std::time::Instant::now();
-    if now >= context.deadline() {
+    if now >= deadline {
         return Err(ServiceError::DeadlineExceeded);
     }
-    let deadline = context
-        .deadline()
+    let maximum_duration = deadline
         .saturating_duration_since(now)
         .min(Duration::from_secs(60));
     QueryLimits::try_new_with_inline_bytes(
@@ -910,7 +1728,7 @@ fn macro_context_query_limits(
         4,
         2_048,
         4_096,
-        deadline,
+        maximum_duration,
     )
     .map_err(map_query_error)
 }

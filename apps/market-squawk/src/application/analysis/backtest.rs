@@ -3,6 +3,7 @@
 use std::{fmt, num::NonZeroUsize, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
+use chrono::{DateTime, SecondsFormat};
 use market_squawk_backtesting::{
     BacktestCohortEvaluation, BacktestOutcome, ResearchExecutionAssumptions,
     ResearchExecutionAssumptionsInput, ResearchLiquidityPriority, TrialDatasetPartition,
@@ -13,10 +14,12 @@ use market_squawk_domain::{
     SourceIdentifier, Timestamp,
 };
 use market_squawk_services::ServiceError;
+use rust_decimal::{Decimal, prelude::FromPrimitive as _};
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::{
     PinnedBacktestInput, ProductionBacktestService, ProductionBacktestServiceError,
@@ -691,6 +694,135 @@ impl GovernedBacktestRecord {
             Sha256::digest(encoded).into(),
         ))
     }
+
+    /// Produces the ordinary investment-research projection for one opaque product token.
+    pub(crate) fn product_value(
+        &self,
+        token: Uuid,
+        completed_at: Timestamp,
+    ) -> Result<Value, ServiceError> {
+        let object = self
+            .content
+            .as_object()
+            .ok_or(ServiceError::InvalidResult)?;
+        let status = object
+            .get("status")
+            .and_then(Value::as_object)
+            .ok_or(ServiceError::InvalidResult)?;
+        if status.get("state").and_then(Value::as_str) != Some("completed") {
+            return Ok(unavailable_backtest_value(
+                token,
+                "This backtest did not produce a completed research result.",
+                vec!["No performance conclusion can be drawn from an incomplete backtest."],
+            ));
+        }
+        let execution_assumption_digest =
+            required_record_digest(object, "executionAssumptionDigest")?;
+        let cohort_universe_digest = optional_record_digest(object, "cohortUniverseDigest")?;
+        let terminal = parse_successful_terminal_evidence(
+            status,
+            execution_assumption_digest,
+            &cohort_universe_digest,
+        )?;
+        let Some(total_return) = terminal.metric("cost-adjusted-total-return") else {
+            return Ok(unavailable_backtest_value(
+                token,
+                "The retained result does not include cost-adjusted total return.",
+                vec!["A profit-oriented conclusion requires an exact cost-adjusted return."],
+            ));
+        };
+        let Some(maximum_drawdown) = terminal.metric("maximum-drawdown") else {
+            return Ok(unavailable_backtest_value(
+                token,
+                "The retained result does not include maximum drawdown.",
+                vec![
+                    "A result without drawdown evidence is not shown as usable investment research.",
+                ],
+            ));
+        };
+        let partition = terminal.dataset_partition();
+        let observations = terminal
+            .metric("return-observations")
+            .and_then(nonnegative_whole_number)
+            .unwrap_or(0);
+        let assumptions = *terminal.execution_assumptions();
+        let fixed_cost_basis_points = assumptions
+            .fee_basis_points()
+            .get()
+            .checked_add(assumptions.slippage_basis_points().get())
+            .and_then(|value| {
+                value.checked_add(assumptions.maximum_random_slippage_basis_points().get())
+            })
+            .ok_or(ServiceError::InvalidResult)?;
+        let (out_of_sample, uncertainty, interpretation, limitations) =
+            backtest_evidence_summary(&terminal, observations)?;
+        let selection_criterion = object
+            .get("selectionCriterion")
+            .and_then(Value::as_str)
+            .ok_or(ServiceError::InvalidResult)?;
+        Ok(json!({
+            "state": "completed",
+            "backtestToken": token,
+            "label": "Investment approach backtest",
+            "completedAt": timestamp_text(completed_at)?,
+            "expiresAt": Value::Null,
+            "investmentUniverse": "Selected point-in-time investment history",
+            "method": product_method_label(selection_criterion),
+            "period": {
+                "startsAt": timestamp_text(partition.starts_at())?,
+                "endsAt": timestamp_text(partition.ends_at())?,
+            },
+            "pointInTimeEvidence": {
+                "state": "limited",
+                "informationCutoff": timestamp_text(partition.ends_at())?,
+                "observedFrom": timestamp_text(partition.starts_at())?,
+                "observedThrough": timestamp_text(partition.ends_at())?,
+                "observationCount": observations,
+                "coveragePercent": Value::Null,
+                "interpretation": "The governed run proves its immutable event-time interval and execution assumptions. A separate row-level availability-coverage percentage is not retained, so point-in-time coverage remains limited.",
+            },
+            "outOfSampleEvidence": out_of_sample,
+            "performance": {
+                "totalReturnPercent": percent_decimal(total_return)?,
+                "annualizedReturnPercent": Value::Null,
+                "annualizedVolatilityPercent": Value::Null,
+                "maximumDrawdownPercent": percent_decimal(maximum_drawdown)?,
+                "sharpeRatio": optional_decimal(terminal.metric("sharpe"))?,
+                "winRatePercent": Value::Null,
+                "turnoverPercent": Value::Null,
+            },
+            "costs": {
+                "fees": format!("{} basis points of filled notional", assumptions.fee_basis_points().get()),
+                "spread": "Observed point-in-time half-spread",
+                "slippage": format!(
+                    "{} basis points plus up to {} seeded basis points",
+                    assumptions.slippage_basis_points().get(),
+                    assumptions.maximum_random_slippage_basis_points().get(),
+                ),
+                "latency": format!("{} nanoseconds after each signal", assumptions.latency_nanos()),
+                "participationLimit": format!(
+                    "{}% of evidenced executable depth",
+                    basis_points_percent(assumptions.maximum_participation_basis_points().get()),
+                ),
+                "partialFills": if assumptions.allow_partial_fills() { "Allowed" } else { "Not allowed" },
+                "totalCostPercent": basis_points_percent(fixed_cost_basis_points),
+            },
+            "execution": {
+                "fillCount": terminal.fill_count(),
+                "partialFillCount": terminal.partial_fill_count(),
+                "noActionCount": terminal.no_action_count(),
+            },
+            "comparison": Value::Null,
+            "uncertainty": uncertainty,
+            "interpretation": interpretation,
+            "limitations": limitations,
+            "invalidators": [
+                "Treat the result as invalid if the investment universe, cost assumptions, or decision horizon no longer match the intended use.",
+                "Do not use the result for an investment action after newer point-in-time evidence materially changes the tested conditions."
+            ],
+            "analysisOnly": true,
+        }))
+    }
 }
 
 impl fmt::Debug for GovernedBacktestRecord {
@@ -916,6 +1048,112 @@ impl GovernedBacktestSuccessfulTerminalEvidence {
     pub const fn cohort_diagnostics(&self) -> &GovernedBacktestCohortDiagnosticsEvidence {
         &self.cohort_diagnostics
     }
+
+    fn metric(&self, name: &str) -> Option<f64> {
+        self.metrics
+            .iter()
+            .find(|metric| metric.name().as_str() == name)
+            .map(TrialMetric::value)
+    }
+}
+
+fn unavailable_backtest_value(token: Uuid, reason: &str, limitations: Vec<&str>) -> Value {
+    json!({
+        "state": "unavailable",
+        "backtestToken": token,
+        "label": "Investment approach backtest",
+        "reason": reason,
+        "limitations": limitations,
+        "unavailableBehavior": "no_action",
+    })
+}
+
+fn backtest_evidence_summary(
+    terminal: &GovernedBacktestSuccessfulTerminalEvidence,
+    observations: u64,
+) -> Result<(Value, &'static str, &'static str, Vec<&'static str>), ServiceError> {
+    let common_limitations = vec![
+        "Annualized return, volatility, win rate, turnover, and a benchmark comparison are not retained by this terminal and are not inferred.",
+        "The displayed fixed cost percentage excludes the observed point-in-time spread, which varies by simulated fill.",
+        "Historical results do not guarantee future profit and cannot authorize a live trade.",
+    ];
+    match terminal.cohort_diagnostics() {
+        GovernedBacktestCohortDiagnosticsEvidence::Completed(evidence) => Ok((
+            json!({
+                "state": "evaluated",
+                "foldCount": evidence.fold_count(),
+                "observationCount": observations,
+                "method": "Governed cohort evaluation across independently retained folds",
+                "probabilityOfOverfittingPercent": percent_decimal(evidence.probability_of_backtest_overfitting())?,
+                "deflatedPerformanceProbabilityPercent": percent_decimal(evidence.deflated_performance_probability())?,
+                "expectedMaximumSharpe": finite_decimal(evidence.expected_maximum_sharpe())?,
+                "interpretation": "The retained cohort diagnostics test selection risk across folds. These statistics measure research stability, not the probability of making a profit.",
+            }),
+            "supported",
+            "The result retains cost-adjusted return, drawdown, execution outcomes, and governed cohort diagnostics. Treat it as historical research with explicit uncertainty, not a promise of profit.",
+            common_limitations,
+        )),
+        GovernedBacktestCohortDiagnosticsEvidence::NotEvaluated => {
+            let mut limitations = common_limitations;
+            limitations.push(
+                "No independent cohort evaluation is retained, so selection bias and overfitting risk remain unmeasured.",
+            );
+            Ok((
+                json!({
+                    "state": "not_evaluated",
+                    "foldCount": 0,
+                    "observationCount": observations,
+                    "method": "No independent cohort evaluation retained",
+                    "probabilityOfOverfittingPercent": Value::Null,
+                    "deflatedPerformanceProbabilityPercent": Value::Null,
+                    "expectedMaximumSharpe": Value::Null,
+                    "interpretation": "This run has no retained cross-fold cohort diagnostics, so it cannot establish robustness against selection bias or overfitting.",
+                }),
+                "limited",
+                "The result retains cost-adjusted return, drawdown, and execution outcomes, but lacks independent cohort evidence. Use it only as limited historical research.",
+                limitations,
+            ))
+        }
+    }
+}
+
+fn product_method_label(selection_criterion: &str) -> &'static str {
+    if selection_criterion == "cost-adjusted-total-return" {
+        "Cost-adjusted portfolio simulation"
+    } else {
+        "Governed investment approach simulation"
+    }
+}
+
+fn nonnegative_whole_number(value: f64) -> Option<u64> {
+    (value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= u64::MAX as f64)
+        .then(|| value as u64)
+}
+
+fn optional_decimal(value: Option<f64>) -> Result<Value, ServiceError> {
+    value
+        .map(finite_decimal)
+        .transpose()
+        .map(|value| value.map_or(Value::Null, Value::String))
+}
+
+fn percent_decimal(value: f64) -> Result<String, ServiceError> {
+    finite_decimal(value * 100.0)
+}
+
+fn finite_decimal(value: f64) -> Result<String, ServiceError> {
+    Decimal::from_f64_retain(value)
+        .map(|value| value.normalize().to_string())
+        .ok_or(ServiceError::InvalidResult)
+}
+
+fn basis_points_percent(value: i32) -> String {
+    Decimal::new(i64::from(value), 2).normalize().to_string()
+}
+
+fn timestamp_text(timestamp: Timestamp) -> Result<String, ServiceError> {
+    Ok(DateTime::from_timestamp_nanos(timestamp.unix_nanos())
+        .to_rfc3339_opts(SecondsFormat::Nanos, true))
 }
 
 /// Page-bound, revalidated research evidence for one recommendation candidate.

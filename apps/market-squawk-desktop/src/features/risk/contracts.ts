@@ -1,68 +1,20 @@
+import type { ApplicationResult } from "@/lib/schemas"
+import {
+  parsePortfolioResult,
+  portfolioAccountSchema,
+  riskSchema,
+  type PortfolioAccount,
+  type PortfolioResult,
+  type PortfolioRisk,
+} from "@/features/portfolio/portfolio-contracts"
 import { z } from "zod"
 
-import type { ApplicationResult } from "@/lib/schemas"
-
-const moneySchema = z.object({
-  amount: z.string(),
-  currency: z.string().min(1),
-})
-
-const revisionSchema = z
-  .object({
-    revisionId: z.string().min(1),
-    effectiveAtUnixNanos: z.string(),
-    availableAtUnixNanos: z.string().nullable(),
-    sourceId: z.string().min(1),
-    sourceCoverage: z.array(z.string()),
-    artifactSha256: z.string().min(1),
-    reconciliationDiscrepancies: z.number().int().nonnegative(),
-  })
-  .loose()
-
-const accountSchema = z
-  .object({
-    accountId: z.string().min(1),
-    currency: z.string().min(1),
-    currentRevision: revisionSchema,
-    holdingCount: z.number().int().nonnegative(),
-    transactionCount: z.number().int().nonnegative(),
-    reconciliationDiscrepancies: z.number().int().nonnegative(),
-  })
-  .loose()
-
-const scenarioSchema = z
-  .object({
-    id: z.string().min(1),
-    status: z.string().min(1).optional(),
-    impact: moneySchema.optional(),
-  })
-  .loose()
-
-const riskReportSchema = z
-  .object({
-    accountId: z.string().min(1),
-    revisionId: z.string().min(1),
-    policy: z.string().min(1),
-    confidence: z.number().min(0).max(1),
-    scenario: scenarioSchema,
-    effectiveAtUnixNanos: z.string().optional(),
-    availableAtUnixNanos: z.string().nullable().optional(),
-    valueAtRisk: z.number().nonnegative().optional(),
-    expectedShortfall: z.number().nonnegative().optional(),
-    annualizedVolatility: z.number().nonnegative().optional(),
-    observations: z.number().int().nonnegative().optional(),
-    historyStatus: z.string().min(1).optional(),
-    volatilityStatus: z.string().min(1).optional(),
-    trackingErrorStatus: z.string().min(1).optional(),
-  })
-  .loose()
-
-export type PortfolioAccountRiskSummary = z.infer<typeof accountSchema>
-export type PortfolioRiskReport = z.infer<typeof riskReportSchema>
+export type PortfolioAccountRiskSummary = PortfolioAccount
+export type PortfolioRiskReport = PortfolioRisk
 
 export interface RiskResult<T> {
   value: T
-  completeness: string
+  completeness: "complete" | "partial"
   returnedItems: number
   availableItems: number
 }
@@ -70,21 +22,20 @@ export interface RiskResult<T> {
 export function parseRiskAccounts(
   result: ApplicationResult,
 ): RiskResult<PortfolioAccountRiskSummary[]> {
-  const value = result.data === null ? [] : z.array(accountSchema).parse(result.data)
-  return boundary(result, value)
+  return boundary(parsePortfolioResult(result, z.array(portfolioAccountSchema), []))
 }
 
 export function parseRiskReport(
   result: ApplicationResult,
 ): RiskResult<PortfolioRiskReport> {
-  return boundary(result, riskReportSchema.parse(result.data))
+  return boundary(parsePortfolioResult(result, riskSchema))
 }
 
-function boundary<T>(result: ApplicationResult, value: T): RiskResult<T> {
+function boundary<T>(result: PortfolioResult<T>): RiskResult<T> {
   return {
-    value,
-    completeness: result.metadata.completeness,
-    returnedItems: result.metadata.returnedItems,
-    availableItems: result.metadata.availableItems,
+    value: result.value,
+    completeness: result.evidence.state,
+    returnedItems: result.evidence.returnedItems,
+    availableItems: result.evidence.availableItems,
   }
 }

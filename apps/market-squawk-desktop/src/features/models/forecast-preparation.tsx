@@ -21,28 +21,27 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { ApplicationResult, DesktopBootstrap } from "@/lib/schemas"
-import { humanize } from "@/lib/formatters"
 import { formatTimestamp } from "@/lib/time"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
   parseForecastPreparationOptions,
   parseForecastPreparationPreview,
-  parseForecastPreparedJobReceipt,
-  type ForecastPreparationDataset,
+  parseForecastStart,
+  type ForecastPreparationHistory,
   type ForecastPreparationModel,
   type ForecastPreparationOptions,
   type ForecastPreparationPolicy,
   type ForecastPreparationPreview,
-  type ForecastPreparationReceipt,
   type ForecastPreparationSelection,
 } from "./forecast-preparation-contracts"
 
-const PREPARATION_OPERATIONS = [
-  "Model.GetForecastPreparation",
-  "Model.PrepareForecast",
-  "Model.StartPreparedForecast",
+const PREPARATION_CAPABILITIES = [
+  "forecast_preparation",
+  "forecast_prepare",
+  "forecast_prepared_start",
 ] as const
 const CONTROL_CLASS =
   "h-10 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -50,26 +49,21 @@ const CONTROL_CLASS =
 export function ForecastPreparation({
   bootstrap,
   transport,
-  selectedModel,
   onStarted,
 }: {
   bootstrap: DesktopBootstrap
   transport: ProductTransport
-  selectedModel: {
-    modelId: string
-    bundleId: string
-    bundleVersion: number
-  } | null
   onStarted: () => Promise<unknown>
 }) {
-  const operations = new Set(bootstrap.operations.map((operation) => operation.name))
-  const operationsAvailable = PREPARATION_OPERATIONS.every((operation) =>
-    operations.has(operation),
+  const capabilities = productCapabilitySet(bootstrap)
+  const capabilitiesAvailable = PREPARATION_CAPABILITIES.every((capability) =>
+    capabilities.has(capability),
   )
   const guidedTransport = asForecastPreparationTransport(transport)
   const [draft, setDraft] = React.useState<PreparationDraft | null>(null)
-  const [preview, setPreview] = React.useState<ForecastPreparationPreview | null>(null)
-  const [queuedJobId, setQueuedJobId] = React.useState<string | null>(null)
+  const [preview, setPreview] =
+    React.useState<ForecastPreparationPreview | null>(null)
+  const [started, setStarted] = React.useState(false)
   const optionsQuery = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
@@ -77,7 +71,7 @@ export function ForecastPreparation({
       "Model.GetForecastPreparation",
       {},
     ),
-    enabled: operationsAvailable && guidedTransport !== null,
+    enabled: capabilitiesAvailable && guidedTransport !== null,
     staleTime: 30_000,
     queryFn: async () => {
       if (!guidedTransport) {
@@ -103,42 +97,38 @@ export function ForecastPreparation({
     onSuccess: setPreview,
   })
   const startMutation = useMutation({
-    mutationFn: async (receipt: ForecastPreparationReceipt) => {
+    mutationFn: async (confirmationToken: string) => {
       if (!guidedTransport) {
         throw new Error("Guided forecast preparation is unavailable.")
       }
-      return parseForecastPreparedJobReceipt(
+      return parseForecastStart(
         await guidedTransport.forecastPreparation(
-          { action: "start", receipt },
+          { action: "start", confirmationToken },
           true,
         ),
       )
     },
-    onSuccess: async (receipt) => {
-      setQueuedJobId(receipt.jobId)
+    onSuccess: async () => {
+      setStarted(true)
       setPreview(null)
       await onStarted()
     },
   })
 
   React.useEffect(() => {
-    const options = optionsQuery.data
-    if (!options) return
-    setDraft(defaultDraft(options, selectedModel))
+    if (!optionsQuery.data) return
+    setDraft(defaultDraft(optionsQuery.data))
     setPreview(null)
+    setStarted(false)
     previewMutation.reset()
     startMutation.reset()
-  }, [
-    optionsQuery.data,
-    selectedModel?.modelId,
-    selectedModel?.bundleId,
-    selectedModel?.bundleVersion,
-  ])
+  }, [optionsQuery.data])
 
-  const context = draft && optionsQuery.data
-    ? resolveDraft(optionsQuery.data, draft)
-    : null
-  const ready = context !== null && selectionIsValid(context, draft)
+  const context =
+    draft && optionsQuery.data
+      ? resolveDraft(optionsQuery.data, draft.selection)
+      : null
+  const ready = context !== null && selectionIsValid(context, draft?.selection)
 
   return (
     <section className="rounded-xl border border-primary/20 bg-card/45 p-5">
@@ -147,34 +137,36 @@ export function ForecastPreparation({
           <p className="font-mono text-[10px] uppercase tracking-wider text-primary">
             Point-in-time forecast builder
           </p>
-          <h2 className="mt-2 text-xl font-semibold">Prepare a statistical forecast</h2>
+          <h2 className="mt-2 text-xl font-semibold">
+            Prepare a statistical forecast
+          </h2>
           <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
-            Choose a reviewed model, investment, time horizon, and historical cutoff. Check the
-            limitations and uncertainty before starting.
+            Choose an investment, historical cutoff, and horizon. Review the
+            uncertainty and limitations before starting.
           </p>
         </div>
         <BrainCircuit className="size-5 text-primary" aria-hidden="true" />
       </div>
 
-      {!operationsAvailable || guidedTransport === null ? (
+      {!capabilitiesAvailable || guidedTransport === null ? (
         <Alert className="mt-4">
           <CircleAlert aria-hidden="true" />
-          <AlertTitle>Guided forecast preparation is unavailable</AlertTitle>
+          <AlertTitle>Forecast preparation is unavailable</AlertTitle>
           <AlertDescription>
             Forecast preparation is not available in this workspace.
           </AlertDescription>
         </Alert>
       ) : optionsQuery.isPending ? (
-        <Status text="Loading admitted models and compatible evidence…" />
+        <Status text="Loading forecast choices…" />
       ) : optionsQuery.isError ? (
         <Status text="Forecast choices are unavailable right now." tone="error" />
       ) : optionsQuery.data.models.length === 0 ? (
         <Alert className="mt-4">
           <Database aria-hidden="true" />
-          <AlertTitle>No forecast-ready evidence is available</AlertTitle>
+          <AlertTitle>No forecast-ready history is available</AlertTitle>
           <AlertDescription>
-            A reviewed model needs enough compatible historical information before it can produce
-            a forecast.
+            A reviewed method needs enough compatible historical information
+            before it can produce a forecast.
           </AlertDescription>
         </Alert>
       ) : draft && context ? (
@@ -187,13 +179,15 @@ export function ForecastPreparation({
             onChange={(next) => {
               setDraft(next)
               setPreview(null)
+              setStarted(false)
               previewMutation.reset()
               startMutation.reset()
             }}
           />
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-background/25 p-3">
             <p className="max-w-3xl text-[11px] leading-5 text-muted-foreground">
-              Review the model, investment, horizon, and historical cutoff before continuing.
+              Review the evidence cutoff, horizon, uncertainty, and limitations
+              before continuing.
             </p>
             <Button
               disabled={!ready || previewMutation.isPending}
@@ -206,11 +200,14 @@ export function ForecastPreparation({
             </Button>
           </div>
           {previewMutation.isError ? (
-            <Status text="This forecast could not be prepared. Review the choices and try again." tone="error" />
-          ) : null}
-          {queuedJobId ? (
             <Status
-              text={`Forecast queued as job ${queuedJobId}. Progress appears below.`}
+              text="This forecast could not be prepared. Review the choices and try again."
+              tone="error"
+            />
+          ) : null}
+          {started ? (
+            <Status
+              text="Forecast preparation started. Progress appears below."
               tone="success"
             />
           ) : null}
@@ -225,15 +222,18 @@ export function ForecastPreparation({
       >
         <DialogContent className="max-h-[88vh] overflow-y-auto sm:max-w-3xl">
           <DialogHeader>
-            <DialogTitle>Start this exact forecast?</DialogTitle>
+            <DialogTitle>Start this forecast?</DialogTitle>
             <DialogDescription>
-              Review the model purpose, evidence cutoff, limitations, and fallback before the
-              forecast begins.
+              Review the purpose, evidence cutoff, limitations, and uncertainty
+              before the forecast begins.
             </DialogDescription>
           </DialogHeader>
           {preview ? <ForecastPreviewEvidence prepared={preview} /> : null}
           {startMutation.isError ? (
-            <Status text="The forecast could not be started. Review it and try again." tone="error" />
+            <Status
+              text="The forecast could not be started. Review it and try again."
+              tone="error"
+            />
           ) : null}
           <DialogFooter>
             <Button
@@ -246,11 +246,15 @@ export function ForecastPreparation({
             <Button
               disabled={!preview || startMutation.isPending}
               onClick={() => {
-                if (preview) startMutation.mutate(preview.receipt)
+                if (preview) {
+                  startMutation.mutate(preview.receipt.confirmationToken)
+                }
               }}
             >
               <Play aria-hidden="true" />
-              {startMutation.isPending ? "Starting…" : "Confirm and start forecast"}
+              {startMutation.isPending
+                ? "Starting…"
+                : "Confirm and start forecast"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -261,12 +265,11 @@ export function ForecastPreparation({
 
 interface PreparationDraft {
   selection: ForecastPreparationSelection
-  policyKey: string
 }
 
 interface PreparationContext {
   model: ForecastPreparationModel
-  dataset: ForecastPreparationDataset
+  history: ForecastPreparationHistory
   policy: ForecastPreparationPolicy
 }
 
@@ -283,65 +286,72 @@ function PreparationFields({
   disabled: boolean
   onChange: (draft: PreparationDraft) => void
 }) {
-  const validityOptions = supportedValidityOptions(context.policy.maximumValidityNanos)
-  const instrument = selectedInstrument(context, draft)
+  const validityOptions = supportedValidityOptions(
+    context.policy.maximumValidityNanos,
+  )
+  const investment = selectedInvestment(context, draft.selection)
   return (
     <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-      <Field label="Admitted model" htmlFor="forecast-model">
+      <Field label="Forecast method" htmlFor="forecast-model">
         <select
           id="forecast-model"
           className={CONTROL_CLASS}
-          value={modelKey(context.model)}
+          value={context.model.modelToken}
           disabled={disabled}
           onChange={(event) => {
             const model = options.models.find(
-              (candidate) => modelKey(candidate) === event.target.value,
+              (candidate) => candidate.modelToken === event.target.value,
             )
             if (model) onChange(draftForModel(model))
           }}
         >
           {options.models.map((model) => (
-            <option key={modelKey(model)} value={modelKey(model)}>
-              {model.bundleId} · v{model.bundleVersion} · {humanize(model.format)}
+            <option key={model.modelToken} value={model.modelToken}>
+              {model.name}
             </option>
           ))}
         </select>
       </Field>
-      <Field label="Historical information" htmlFor="forecast-dataset">
+      <Field label="Historical information" htmlFor="forecast-history">
         <select
-          id="forecast-dataset"
+          id="forecast-history"
           className={CONTROL_CLASS}
-          value={datasetKey(context.dataset)}
+          value={context.history.historyToken}
           disabled={disabled}
           onChange={(event) => {
-            const dataset = context.model.datasets.find(
-              (candidate) => datasetKey(candidate) === event.target.value,
+            const history = context.model.histories.find(
+              (candidate) => candidate.historyToken === event.target.value,
             )
-            if (dataset) onChange(draftForDataset(context.model, dataset))
+            if (history) onChange(draftForHistory(context.model, history))
           }}
         >
-          {context.model.datasets.map((dataset) => (
-            <option key={datasetKey(dataset)} value={datasetKey(dataset)}>
-              {dataset.label}
+          {context.model.histories.map((history, index) => (
+            <option key={history.historyToken} value={history.historyToken}>
+              History {index + 1} · {history.instruments.length.toLocaleString()} investments
             </option>
           ))}
         </select>
       </Field>
-      <Field label="Instrument" htmlFor="forecast-instrument">
+      <Field label="Investment" htmlFor="forecast-investment">
         <select
-          id="forecast-instrument"
+          id="forecast-investment"
           className={CONTROL_CLASS}
-          value={draft.selection.instrumentId}
+          value={draft.selection.investmentToken}
           disabled={disabled}
           onChange={(event) =>
             onChange({
-              ...draft,
-              selection: { ...draft.selection, instrumentId: event.target.value },
+              selection: {
+                ...draft.selection,
+                investmentToken: event.target.value,
+              },
             })
           }
         >
-          {context.dataset.instruments.map((instrument) => (
-            <option key={instrument.instrumentId} value={instrument.instrumentId}>
+          {context.history.instruments.map((instrument) => (
+            <option
+              key={instrument.investmentToken}
+              value={instrument.investmentToken}
+            >
               {instrument.label} · {instrument.observedPoints.toLocaleString()} observations
             </option>
           ))}
@@ -351,17 +361,17 @@ function PreparationFields({
         <select
           id="forecast-policy"
           className={CONTROL_CLASS}
-          value={draft.policyKey}
+          value={context.policy.policyToken}
           disabled={disabled}
           onChange={(event) => {
-            const policy = context.dataset.policies.find(
-              (candidate) => policyKey(candidate) === event.target.value,
+            const policy = context.history.policies.find(
+              (candidate) => candidate.policyToken === event.target.value,
             )
             if (policy) onChange(draftForPolicy(draft, policy))
           }}
         >
-          {context.dataset.policies.map((policy) => (
-            <option key={policyKey(policy)} value={policyKey(policy)}>
+          {context.history.policies.map((policy) => (
+            <option key={policy.policyToken} value={policy.policyToken}>
               Every {formatDuration(policy.horizonStepNanos)} · up to{" "}
               {policy.maximumHorizonPoints} points
             </option>
@@ -380,7 +390,6 @@ function PreparationFields({
           disabled={disabled}
           onChange={(event) =>
             onChange({
-              ...draft,
               selection: {
                 ...draft.selection,
                 horizonPoints: Number(event.target.value),
@@ -397,13 +406,17 @@ function PreparationFields({
           disabled={disabled}
           onChange={(event) =>
             onChange({
-              ...draft,
-              selection: { ...draft.selection, validityNanos: event.target.value },
+              selection: {
+                ...draft.selection,
+                validityNanos: event.target.value,
+              },
             })
           }
         >
           {validityOptions.map((value) => (
-            <option key={value} value={value}>{formatDuration(value)}</option>
+            <option key={value} value={value}>
+              {formatDuration(value)}
+            </option>
           ))}
         </select>
       </Field>
@@ -412,31 +425,37 @@ function PreparationFields({
           Selected evidence window
         </p>
         <p className="mt-1 text-xs leading-5">
-          {formatTimestamp(instrument.observedFromUnixNanos)} through{" "}
-          {formatTimestamp(instrument.observedThroughUnixNanos)} · available by{" "}
-          {formatTimestamp(instrument.availableAtUnixNanos)} · decimal scale{" "}
-          {instrument.decimalScale}
+          {formatTimestamp(investment.observedFromUnixNanos)} through{" "}
+          {formatTimestamp(investment.observedThroughUnixNanos)} · available by{" "}
+          {formatTimestamp(investment.availableAtUnixNanos)}
         </p>
       </div>
     </div>
   )
 }
 
-function ForecastPreviewEvidence({ prepared }: { prepared: ForecastPreparationPreview }) {
+function ForecastPreviewEvidence({
+  prepared,
+}: {
+  prepared: ForecastPreparationPreview
+}) {
   const { preview, receipt } = prepared
   const facts = [
-    ["Model", `${preview.model.bundleId} v${preview.model.bundleVersion}`],
-    ["Instrument", `${preview.instrumentLabel} · ${short(preview.instrumentId)}`],
+    ["Forecast method", preview.model.name],
+    ["Investment", preview.instrumentLabel],
     ["Observed history", `${preview.observedPoints.toLocaleString()} points`],
     ["Observed cutoff", formatTimestamp(preview.observedThroughUnixNanos)],
     ["Evidence available", formatTimestamp(preview.availableAtUnixNanos)],
-    ["Forecast horizon", `${preview.horizonPoints} × ${formatDuration(preview.horizonStepNanos)}`],
+    [
+      "Forecast horizon",
+      `${preview.horizonPoints} × ${formatDuration(preview.horizonStepNanos)}`,
+    ],
     ["Result validity", formatDuration(preview.validityNanos)],
     [
       "Uncertainty",
-      preview.model.hasCalibratedIntervals
-        ? "Calibrated intervals available"
-        : "No calibrated bands; none will be shown",
+      preview.evidenceState === "calibrated"
+        ? "Calibrated ranges available"
+        : "Limited; do not treat the result as confident",
     ],
   ] as const
   return (
@@ -444,18 +463,23 @@ function ForecastPreviewEvidence({ prepared }: { prepared: ForecastPreparationPr
       <div className="rounded-xl border border-primary/20 bg-primary/[0.04] p-4">
         <p className="flex items-center gap-2 text-sm font-semibold">
           <ChartSpline className="size-4 text-primary" aria-hidden="true" />
-          Purpose and failure behavior
+          Purpose and unavailable behavior
         </p>
         <p className="mt-2 text-sm leading-6">{preview.model.intendedUse}</p>
         <p className="mt-2 text-xs leading-5 text-muted-foreground">
-          If inference cannot produce a valid result: {preview.model.fallbackReason}. Modeled output
-          cannot place a trade.
+          If valid evidence or a usable result is unavailable, Market Squawk
+          suggests no action. A forecast cannot place a trade.
         </p>
       </div>
       <dl className="grid gap-3 sm:grid-cols-2">
         {facts.map(([label, value]) => (
-          <div key={label} className="rounded-lg border border-border bg-background/35 p-3">
-            <dt className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</dt>
+          <div
+            key={label}
+            className="rounded-lg border border-border bg-background/35 p-3"
+          >
+            <dt className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              {label}
+            </dt>
             <dd className="mt-1 break-words text-xs">{value}</dd>
           </div>
         ))}
@@ -464,23 +488,23 @@ function ForecastPreviewEvidence({ prepared }: { prepared: ForecastPreparationPr
         <p className="text-xs font-medium text-amber-200">Known limitations</p>
         {preview.model.limitations.length > 0 ? (
           <ul className="mt-2 list-disc space-y-1 pl-4 text-xs leading-5 text-muted-foreground">
-            {preview.model.limitations.map((limitation) => <li key={limitation}>{limitation}</li>)}
+            {preview.model.limitations.map((limitation) => (
+              <li key={limitation}>{limitation}</li>
+            ))}
           </ul>
         ) : (
           <p className="mt-2 text-xs text-muted-foreground">
-            No additional limitation text was retained.
+            No additional limitations were supplied.
           </p>
         )}
       </div>
-      <div className="grid gap-2 text-[10px] text-muted-foreground sm:grid-cols-2">
-        <div className="rounded-lg border border-border p-2.5">
-          <p className="uppercase tracking-wider">Review expires</p>
-          <p className="mt-1 text-foreground">{formatTimestamp(receipt.expiresAtUnixNanos)}</p>
-        </div>
-      </div>
       <p className="flex gap-2 text-xs leading-5 text-muted-foreground">
-        <CalendarClock className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-        If this review expires, prepare it again before starting the forecast.
+        <CalendarClock
+          className="mt-0.5 size-3.5 shrink-0"
+          aria-hidden="true"
+        />
+        This review expires {formatTimestamp(receipt.expiresAtUnixNanos)}. If
+        it expires, prepare the forecast again before starting.
       </p>
     </div>
   )
@@ -488,42 +512,35 @@ function ForecastPreviewEvidence({ prepared }: { prepared: ForecastPreparationPr
 
 function defaultDraft(
   options: ForecastPreparationOptions,
-  preferred: { modelId: string; bundleId: string; bundleVersion: number } | null,
 ): PreparationDraft | null {
-  const model = options.models.find((candidate) =>
-    preferred !== null &&
-    candidate.modelId === preferred.modelId &&
-    candidate.bundleId === preferred.bundleId &&
-    candidate.bundleVersion === preferred.bundleVersion,
-  ) ?? options.models[0]
+  const model = options.models[0]
   return model ? draftForModel(model) : null
 }
 
 function draftForModel(model: ForecastPreparationModel): PreparationDraft {
-  const dataset = model.datasets[0]
-  if (!dataset) throw new Error("The admitted model has no compatible forecast dataset.")
-  return draftForDataset(model, dataset)
+  const history = model.histories[0]
+  if (!history) {
+    throw new Error("The forecast method has no compatible history.")
+  }
+  return draftForHistory(model, history)
 }
 
-function draftForDataset(
+function draftForHistory(
   model: ForecastPreparationModel,
-  dataset: ForecastPreparationDataset,
+  history: ForecastPreparationHistory,
 ): PreparationDraft {
-  const policy = dataset.policies[0]
-  const instrument = dataset.instruments[0]
-  if (!policy || !instrument) {
-    throw new Error("The forecast dataset has no compatible instrument or policy.")
+  const policy = history.policies[0]
+  const investment = history.instruments[0]
+  if (!policy || !investment) {
+    throw new Error("The history has no compatible investment or horizon.")
   }
   return {
-    policyKey: policyKey(policy),
     selection: {
-      modelId: model.modelId,
-      bundleId: model.bundleId,
-      bundleVersion: model.bundleVersion,
-      datasetManifest: dataset.manifest,
-      instrumentId: instrument.instrumentId,
+      modelToken: model.modelToken,
+      historyToken: history.historyToken,
+      investmentToken: investment.investmentToken,
+      policyToken: policy.policyToken,
       horizonPoints: Math.min(20, policy.maximumHorizonPoints),
-      horizonStepNanos: policy.horizonStepNanos,
       validityNanos: defaultValidity(policy.maximumValidityNanos),
     },
   }
@@ -534,11 +551,13 @@ function draftForPolicy(
   policy: ForecastPreparationPolicy,
 ): PreparationDraft {
   return {
-    policyKey: policyKey(policy),
     selection: {
       ...draft.selection,
-      horizonPoints: Math.min(draft.selection.horizonPoints, policy.maximumHorizonPoints),
-      horizonStepNanos: policy.horizonStepNanos,
+      policyToken: policy.policyToken,
+      horizonPoints: Math.min(
+        draft.selection.horizonPoints,
+        policy.maximumHorizonPoints,
+      ),
       validityNanos: defaultValidity(policy.maximumValidityNanos),
     },
   }
@@ -546,41 +565,52 @@ function draftForPolicy(
 
 function resolveDraft(
   options: ForecastPreparationOptions,
-  draft: PreparationDraft,
+  selection: ForecastPreparationSelection,
 ): PreparationContext | null {
-  const model = options.models.find((candidate) =>
-    candidate.modelId === draft.selection.modelId &&
-    candidate.bundleId === draft.selection.bundleId &&
-    candidate.bundleVersion === draft.selection.bundleVersion,
+  const model = options.models.find(
+    (candidate) => candidate.modelToken === selection.modelToken,
   )
-  const dataset = model?.datasets.find((candidate) =>
-    datasetKey(candidate) === datasetManifestKey(draft.selection.datasetManifest),
+  const history = model?.histories.find(
+    (candidate) => candidate.historyToken === selection.historyToken,
   )
-  const policy = dataset?.policies.find((candidate) => policyKey(candidate) === draft.policyKey)
-  return model && dataset && policy ? { model, dataset, policy } : null
+  const policy = history?.policies.find(
+    (candidate) => candidate.policyToken === selection.policyToken,
+  )
+  return model && history && policy ? { model, history, policy } : null
 }
 
 function selectionIsValid(
   context: PreparationContext,
-  draft: PreparationDraft | null,
+  selection: ForecastPreparationSelection | undefined,
 ): boolean {
-  if (!draft) return false
-  return context.dataset.instruments.some(
-    (instrument) => instrument.instrumentId === draft.selection.instrumentId,
-  ) && Number.isInteger(draft.selection.horizonPoints) &&
-    draft.selection.horizonPoints > 0 &&
-    draft.selection.horizonPoints <= context.policy.maximumHorizonPoints &&
-    draft.selection.horizonStepNanos === context.policy.horizonStepNanos &&
-    BigInt(draft.selection.validityNanos) > 0n &&
-    BigInt(draft.selection.validityNanos) <= BigInt(context.policy.maximumValidityNanos)
+  if (!selection) return false
+  return (
+    context.history.instruments.some(
+      (investment) =>
+        investment.investmentToken === selection.investmentToken,
+    ) &&
+    Number.isInteger(selection.horizonPoints) &&
+    selection.horizonPoints > 0 &&
+    selection.horizonPoints <= context.policy.maximumHorizonPoints &&
+    BigInt(selection.validityNanos) > 0n &&
+    BigInt(selection.validityNanos) <=
+      BigInt(context.policy.maximumValidityNanos)
+  )
 }
 
-function selectedInstrument(context: PreparationContext, draft: PreparationDraft) {
-  const instrument = context.dataset.instruments.find(
-    (instrument) => instrument.instrumentId === draft.selection.instrumentId,
-  ) ?? context.dataset.instruments[0]
-  if (!instrument) throw new Error("The forecast dataset has no compatible instrument.")
-  return instrument
+function selectedInvestment(
+  context: PreparationContext,
+  selection: ForecastPreparationSelection,
+) {
+  const investment =
+    context.history.instruments.find(
+      (candidate) =>
+        candidate.investmentToken === selection.investmentToken,
+    ) ?? context.history.instruments[0]
+  if (!investment) {
+    throw new Error("The history has no compatible investment.")
+  }
+  return investment
 }
 
 function supportedValidityOptions(maximum: string): string[] {
@@ -598,30 +628,7 @@ function supportedValidityOptions(maximum: string): string[] {
 function defaultValidity(maximum: string): string {
   const values = supportedValidityOptions(maximum)
   const oneDay = String(24n * 60n * 60n * 1_000_000_000n)
-  return values.includes(oneDay) ? oneDay : values.at(-1) ?? maximum
-}
-
-function modelKey(model: ForecastPreparationModel): string {
-  return `${model.modelId}:${model.bundleId}:${model.bundleVersion}`
-}
-
-function datasetKey(dataset: ForecastPreparationDataset): string {
-  return datasetManifestKey(dataset.manifest)
-}
-
-function datasetManifestKey(
-  manifest: ForecastPreparationSelection["datasetManifest"],
-): string {
-  return `${manifest.dataset}:${manifest.manifestVersion}:${manifest.contentHash}`
-}
-
-function policyKey(policy: ForecastPreparationPolicy): string {
-  return [
-    policy.horizonStepNanos,
-    policy.maximumHorizonPoints,
-    policy.maximumValidityNanos,
-    policy.minimumObservedPoints,
-  ].join(":")
+  return values.includes(oneDay) ? oneDay : (values.at(-1) ?? maximum)
 }
 
 function Field({
@@ -648,11 +655,12 @@ function Status({
   text: string
   tone?: "neutral" | "error" | "success"
 }) {
-  const color = tone === "error"
-    ? "text-red-300"
-    : tone === "success"
-      ? "text-emerald-300"
-      : "text-muted-foreground"
+  const color =
+    tone === "error"
+      ? "text-red-300"
+      : tone === "success"
+        ? "text-emerald-300"
+        : "text-muted-foreground"
   return (
     <p
       className={`mt-4 rounded-lg border border-border bg-background/25 p-3 text-xs leading-5 ${color}`}
@@ -665,7 +673,7 @@ function Status({
 type ForecastPreparationRequest =
   | { action: "options" }
   | { action: "preview"; selection: ForecastPreparationSelection }
-  | { action: "start"; receipt: ForecastPreparationReceipt }
+  | { action: "start"; confirmationToken: string }
 
 type ForecastPreparationTransport = ProductTransport & {
   forecastPreparation(
@@ -677,7 +685,9 @@ type ForecastPreparationTransport = ProductTransport & {
 function asForecastPreparationTransport(
   transport: ProductTransport,
 ): ForecastPreparationTransport | null {
-  const candidate = transport as ProductTransport & { forecastPreparation?: unknown }
+  const candidate = transport as ProductTransport & {
+    forecastPreparation?: unknown
+  }
   return typeof candidate.forecastPreparation === "function"
     ? (candidate as ForecastPreparationTransport)
     : null
@@ -686,16 +696,13 @@ function asForecastPreparationTransport(
 function formatDuration(value: string): string {
   const nanos = BigInt(value)
   if (nanos <= 0n) return "Unavailable"
-  const seconds = Number(nanos) / 1_000_000_000
-  if (!Number.isFinite(seconds)) return `${value} ns`
-  if (seconds < 60) return `${seconds.toLocaleString()} sec`
-  const minutes = seconds / 60
-  if (minutes < 60) return `${minutes.toLocaleString(undefined, { maximumFractionDigits: 2 })} min`
-  const hours = minutes / 60
-  if (hours < 48) return `${hours.toLocaleString(undefined, { maximumFractionDigits: 2 })} hr`
-  return `${(hours / 24).toLocaleString(undefined, { maximumFractionDigits: 2 })} days`
-}
-
-function short(value: string): string {
-  return value.length <= 20 ? value : `${value.slice(0, 11)}…${value.slice(-7)}`
+  const second = 1_000_000_000n
+  const minute = 60n * second
+  const hour = 60n * minute
+  const day = 24n * hour
+  if (nanos % day === 0n) return `${nanos / day} days`
+  if (nanos % hour === 0n) return `${nanos / hour} hours`
+  if (nanos % minute === 0n) return `${nanos / minute} minutes`
+  if (nanos % second === 0n) return `${nanos / second} seconds`
+  return "Custom interval"
 }

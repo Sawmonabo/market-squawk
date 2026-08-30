@@ -2,30 +2,39 @@
 
 use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
+use chrono::{DateTime, SecondsFormat};
 use market_squawk_data::{
     AnalyticalReadCapability, AnalyticalReadLimit, DatasetId, FeatureDatasetProductContract,
     ForecastDatasetReadLimits,
 };
 use market_squawk_domain::{SourceIdentifier, Timestamp};
+use market_squawk_jobs::{JobListPageLimit, JobState};
 use market_squawk_runtime::RuntimeIdentity;
 use market_squawk_services::{
     RequestContext, ServiceError, ToolResultMetadata, TypedToolRequest, TypedToolResult,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use uuid::Uuid;
 
 use crate::application::{
     analysis::{
         BacktestPreparationCatalog, BacktestPreparationDatasetInput, BacktestPreparationLimits,
-        BacktestPreparationReceipt, BacktestPreparationSelection,
+        BacktestPreparationReceipt, BacktestPreparationSelection, GovernedBacktestAuthority,
         GovernedBacktestInputRegistrationInput, GovernedBacktestPreparationAuthority,
     },
+    job::{JobView, product_activity_state, product_progress_percent},
     lifecycle::WorkspaceRuntimeIdentity,
+    opaque_product_token,
 };
+
+use super::jobs::InstalledJobOperations;
 
 pub(super) const GET_BACKTEST_PREPARATION: &str = "Analysis.GetBacktestPreparation";
 pub(super) const PREVIEW_BACKTEST: &str = "Analysis.PreviewBacktest";
 pub(super) const START_PREPARED_BACKTEST: &str = "Analysis.StartPreparedBacktest";
+pub(super) const LIST_PRODUCT_BACKTESTS: &str = "Analysis.ListProductBacktests";
+pub(super) const GET_PRODUCT_BACKTEST: &str = "Analysis.GetProductBacktest";
 
 const DATASET_PAGE: usize = 64;
 const MAXIMUM_DATASETS: usize = 4_096;
@@ -36,12 +45,14 @@ const MAXIMUM_BYTES_PER_DATASET: usize = 256 * 1024 * 1024;
 pub(super) struct InstalledBacktestPreparation {
     authority: Arc<GovernedBacktestPreparationAuthority>,
     analytical: AnalyticalReadCapability,
+    backtests: Arc<dyn GovernedBacktestAuthority>,
     runtime: RuntimeIdentity,
 }
 
 impl InstalledBacktestPreparation {
     pub(super) fn try_new(
         analytical: AnalyticalReadCapability,
+        backtests: Arc<dyn GovernedBacktestAuthority>,
         runtime: RuntimeIdentity,
     ) -> Result<Self, ServiceError> {
         Ok(Self {
@@ -53,23 +64,31 @@ impl InstalledBacktestPreparation {
                     .map_err(ServiceError::from)?,
                 ),
             analytical,
+            backtests,
             runtime,
         })
     }
 
     pub(super) fn owns(operation: &str) -> bool {
-        matches!(operation, GET_BACKTEST_PREPARATION | PREVIEW_BACKTEST)
+        matches!(
+            operation,
+            GET_BACKTEST_PREPARATION
+                | PREVIEW_BACKTEST
+                | LIST_PRODUCT_BACKTESTS
+                | GET_PRODUCT_BACKTEST
+        )
     }
 
     pub(super) async fn call(
         &self,
         request: &TypedToolRequest,
         context: &RequestContext,
+        jobs: &InstalledJobOperations,
     ) -> Result<TypedToolResult, ServiceError> {
         ensure_live(context)?;
-        let catalog = self.catalog(context).await?;
         let (content, item_count) = match request.name() {
             GET_BACKTEST_PREPARATION => {
+                let catalog = self.catalog(context).await?;
                 let options = self
                     .authority
                     .options(&catalog)
@@ -78,6 +97,7 @@ impl InstalledBacktestPreparation {
                 (encode(&options)?, count)
             }
             PREVIEW_BACKTEST => {
+                let catalog = self.catalog(context).await?;
                 let input: BacktestPreviewRequest =
                     decode(&super::business_arguments(request.arguments()))?;
                 let preview = self
@@ -94,6 +114,20 @@ impl InstalledBacktestPreparation {
                     .map_err(ServiceError::from)?;
                 (encode(&preview)?, 1)
             }
+            LIST_PRODUCT_BACKTESTS => {
+                let activities = self.product_activities(jobs, context).await?;
+                let count = activities.len();
+                (serde_json::json!({"activities": activities}), count)
+            }
+            GET_PRODUCT_BACKTEST => {
+                let input: BacktestProductRequest =
+                    decode(&super::business_arguments(request.arguments()))?;
+                (
+                    self.product_result(jobs, input.backtest_token, context)
+                        .await?,
+                    1,
+                )
+            }
             _ => return Err(ServiceError::NotFound),
         };
         ensure_live(context)?;
@@ -104,6 +138,46 @@ impl InstalledBacktestPreparation {
             context.limits(),
         )
         .map_err(ServiceError::from)
+    }
+
+    async fn product_activities(
+        &self,
+        jobs: &InstalledJobOperations,
+        context: &RequestContext,
+    ) -> Result<Vec<Value>, ServiceError> {
+        let page = jobs.list_page(product_job_page_limit(context)?).await?;
+        page.jobs()
+            .iter()
+            .filter(|view| is_backtest_job(view))
+            .map(product_backtest_activity)
+            .collect()
+    }
+
+    async fn product_result(
+        &self,
+        jobs: &InstalledJobOperations,
+        token: Uuid,
+        context: &RequestContext,
+    ) -> Result<Value, ServiceError> {
+        let page = jobs.list_page(product_job_page_limit(context)?).await?;
+        let view = page
+            .jobs()
+            .iter()
+            .find(|view| is_backtest_job(view) && product_backtest_token(view) == token)
+            .ok_or(ServiceError::NotFound)?;
+        if view.state() != JobState::Completed {
+            return Err(ServiceError::NotFound);
+        }
+        let run_id = view
+            .result()
+            .map(|result| result.identity().as_str())
+            .ok_or(ServiceError::InvalidResult)?;
+        let record = self
+            .backtests
+            .get(run_id, context.cancellation().clone(), context.deadline())
+            .await?
+            .ok_or(ServiceError::NotFound)?;
+        record.product_value(token, view.updated_at())
     }
 
     pub(super) async fn consume(
@@ -225,6 +299,7 @@ impl std::fmt::Debug for InstalledBacktestPreparation {
             .debug_struct("InstalledBacktestPreparation")
             .field("authority", &"[ONE-USE BACKTEST PREPARATION AUTHORITY]")
             .field("analytical", &self.analytical)
+            .field("backtests", &"[GOVERNED BACKTEST AUTHORITY]")
             .field("runtime", &self.runtime)
             .finish()
     }
@@ -240,6 +315,48 @@ struct BacktestPreviewRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BacktestStartRequest {
     receipt: BacktestPreparationReceipt,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BacktestProductRequest {
+    backtest_token: Uuid,
+}
+
+fn product_job_page_limit(context: &RequestContext) -> Result<JobListPageLimit, ServiceError> {
+    JobListPageLimit::try_new(context.limits().maximum_result_items().min(1_000))
+        .map_err(|_error| ServiceError::InvalidRequest)
+}
+
+fn is_backtest_job(view: &JobView) -> bool {
+    view.kind().as_str() == "analysis.backtest.v1"
+}
+
+fn product_backtest_token(view: &JobView) -> Uuid {
+    let job_id = view.job_id().as_uuid();
+    let generation = view.generation().get().to_be_bytes();
+    opaque_product_token(
+        b"market-squawk/product-backtest/v1\0",
+        &[job_id.as_bytes(), &generation],
+    )
+}
+
+fn product_backtest_activity(view: &JobView) -> Result<Value, ServiceError> {
+    let (state, status_message) = product_activity_state(view);
+    Ok(serde_json::json!({
+        "backtestToken": product_backtest_token(view),
+        "label": "Investment approach backtest",
+        "startedAt": timestamp_text(view.started_at()),
+        "updatedAt": timestamp_text(view.updated_at()),
+        "state": state,
+        "progressPercent": product_progress_percent(view),
+        "statusMessage": status_message,
+    }))
+}
+
+fn timestamp_text(timestamp: Timestamp) -> String {
+    DateTime::from_timestamp_nanos(timestamp.unix_nanos())
+        .to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
 fn display_name(dataset_id: &str) -> String {

@@ -56,7 +56,7 @@ export function PortfolioEvidenceSummary({
       <EvidenceFact
         icon={Landmark}
         label="Current value"
-        value={formatMoney(holding.market_value)}
+        value={formatMoney(holding.marketValue)}
         detail={`Quantity ${holding.quantity}`}
       />
       <EvidenceFact
@@ -68,8 +68,8 @@ export function PortfolioEvidenceSummary({
       <EvidenceFact
         icon={ShieldCheck}
         label="Data quality"
-        value={humanize(holding.markEvidence.quality)}
-        detail={`${humanize(holding.markEvidence.freshness.status)} · not a live trading quote`}
+        value={humanize(holding.price.confidence)}
+        detail={`${humanize(holding.price.state)} · not a live trading quote`}
       />
       <EvidenceFact
         icon={BadgeCheck}
@@ -86,17 +86,20 @@ export function PortfolioEvidenceSummary({
 }
 
 export function MeasurementSuccess({ result }: { result: PortfolioMeasurementResult }) {
-  const ready = result.classification.hierarchy !== "unclassified"
+  const hierarchy = result.measurement.classification?.hierarchy ?? "unclassified"
+  const ready = hierarchy !== "unclassified"
   return (
     <Alert className="mt-4 border-emerald-400/25 bg-emerald-400/5">
       <BadgeCheck className="text-emerald-300" aria-hidden="true" />
       <AlertTitle>Measurement saved</AlertTitle>
       <AlertDescription>
         <span className="block">
-          Classification: <strong>{humanize(result.classification.hierarchy)}</strong> ·{" "}
+          Classification: <strong>{humanize(hierarchy)}</strong> ·{" "}
           {ready ? "ready for governed review" : "more evidence or review is required"}.
         </span>
-        <span className="mt-1 block text-[10px]">Open the measurement below to review its inputs and classification.</span>
+        <span className="mt-1 block text-[10px]">
+          Open the measurement below to review its inputs and classification.
+        </span>
       </AlertDescription>
     </Alert>
   )

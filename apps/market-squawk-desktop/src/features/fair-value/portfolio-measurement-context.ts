@@ -34,7 +34,7 @@ export async function readFreshPortfolioMeasurementContext(
     before,
   )
   const matchingHoldings = holdingPage.holdings.filter(
-    (holding) => holding.instrument_id === expectedHolding.instrument_id,
+    (holding) => holding.instrumentId === expectedHolding.instrumentId,
   )
   const freshPrincipal = await readSelectedPrincipal(transport, expectedPrincipal)
   const after = await readSelectedAccount(transport, selected)

@@ -21,7 +21,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { friendlyResearchCollectionName } from "@/lib/formatters"
+import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { ApplicationResult, DesktopBootstrap } from "@/lib/schemas"
 import { formatTimestamp } from "@/lib/time"
 import type { ProductTransport } from "@/lib/transport"
@@ -35,12 +35,12 @@ import {
   type DatasetPreparationReceipt,
   type DatasetPreparationSelection,
 } from "./dataset-preparation-contracts"
-import { parseResearchJobReceipt } from "./research-contracts"
+import { parseResearchActionAccepted } from "./research-contracts"
 
-const PREPARATION_OPERATIONS = [
-  "Analysis.GetFeatureDatasetPreparationOptions",
-  "Analysis.PreviewFeatureDatasetBuild",
-  "Analysis.StartPreparedFeatureDatasetBuild",
+const PREPARATION_CAPABILITIES = [
+  "feature_dataset_preparation",
+  "feature_dataset_preview",
+  "feature_dataset_prepared_start",
 ] as const
 const CONTROL_CLASS =
   "mt-2 h-10 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
@@ -54,9 +54,9 @@ export function DatasetBuilder({
   transport: ProductTransport
   onStarted: () => Promise<unknown>
 }) {
-  const operations = new Set(bootstrap.operations.map((operation) => operation.name))
-  const operationsAvailable = PREPARATION_OPERATIONS.every((operation) =>
-    operations.has(operation),
+  const capabilities = productCapabilitySet(bootstrap)
+  const capabilitiesAvailable = PREPARATION_CAPABILITIES.every((capability) =>
+    capabilities.has(capability),
   )
   const guidedTransport = asDatasetPreparationTransport(transport)
   const [selection, setSelection] =
@@ -65,13 +65,11 @@ export function DatasetBuilder({
     React.useState<DatasetPreparationPreview | null>(null)
   const [started, setStarted] = React.useState(false)
   const optionsQuery = useQuery({
-    queryKey: productKeys.operation(
-      bootstrap.runtime,
-      "analysis",
-      "Analysis.GetFeatureDatasetPreparationOptions",
-      {},
-    ),
-    enabled: operationsAvailable && guidedTransport !== null,
+    queryKey: [
+      ...productKeys.domain(bootstrap.runtime, "research"),
+      "preparation-choices",
+    ],
+    enabled: capabilitiesAvailable && guidedTransport !== null,
     staleTime: 30_000,
     queryFn: async () => {
       if (!guidedTransport) {
@@ -90,7 +88,8 @@ export function DatasetBuilder({
       return parseDatasetPreparationPreview(
         await guidedTransport.datasetPreparation({
           action: "preview",
-          selection: draft,
+          choice: draft.choiceToken,
+          intendedUse: draft.intendedUse,
         }),
       )
     },
@@ -101,7 +100,7 @@ export function DatasetBuilder({
       if (!guidedTransport) {
         throw new Error("Guided dataset preparation is unavailable.")
       }
-      return parseResearchJobReceipt(
+      return parseResearchActionAccepted(
         await guidedTransport.datasetPreparation(
           { action: "start", receipt },
           true,
@@ -118,12 +117,11 @@ export function DatasetBuilder({
   React.useEffect(() => {
     const options = optionsQuery.data
     if (!options) return
-    const currentDataset = options.datasets.find(
-      (candidate) => candidate.id === selection?.dataset,
+    const currentDataset = options.choices.find(
+      (candidate) => candidate.choiceToken === selection?.choiceToken,
     )
     const currentUse = selection?.intendedUse
     if (
-      selection?.catalogGeneration === options.catalogGeneration &&
       currentUse !== undefined &&
       currentDataset?.availableUses.includes(currentUse)
     ) {
@@ -137,8 +135,8 @@ export function DatasetBuilder({
 
   const selectedDataset =
     optionsQuery.data && selection
-      ? optionsQuery.data.datasets.find(
-          (candidate) => candidate.id === selection.dataset,
+      ? optionsQuery.data.choices.find(
+          (candidate) => candidate.choiceToken === selection.choiceToken,
         ) ?? null
       : null
 
@@ -158,7 +156,7 @@ export function DatasetBuilder({
         <Layers3 className="size-5 text-primary" aria-hidden="true" />
       </div>
 
-      {!operationsAvailable || guidedTransport === null ? (
+      {!capabilitiesAvailable || guidedTransport === null ? (
         <Alert className="mt-4">
           <AlertCircle aria-hidden="true" />
           <AlertTitle>Research preparation is unavailable</AlertTitle>
@@ -171,7 +169,7 @@ export function DatasetBuilder({
         <Status text="Finding information that is ready to use…" />
       ) : optionsQuery.isError ? (
         <Status text="Available research choices could not be loaded. Try again." tone="error" />
-      ) : optionsQuery.data.datasets.length === 0 ? (
+      ) : optionsQuery.data.choices.length === 0 ? (
         <Alert className="mt-4">
           <Database aria-hidden="true" />
           <AlertTitle>No information is ready to prepare</AlertTitle>
@@ -236,7 +234,7 @@ export function DatasetBuilder({
           {preview && selectedDataset ? (
             <DatasetPreparationReview
               preview={preview}
-              collectionName={friendlyCollectionName(selectedDataset)}
+              collectionName={selectedDataset.title}
             />
           ) : null}
           {startMutation.isError ? (
@@ -253,7 +251,7 @@ export function DatasetBuilder({
             <Button
               disabled={!preview || startMutation.isPending}
               onClick={() => {
-                if (preview) startMutation.mutate(preview.receipt)
+                if (preview) startMutation.mutate(preview.receiptToken)
               }}
             >
               <Play aria-hidden="true" />
@@ -285,24 +283,24 @@ function DatasetPreparationFields({
         Available research collections
         <select
           className={CONTROL_CLASS}
-          value={selection.dataset}
+          value={selection.choiceToken}
           disabled={disabled}
           onChange={(event) => {
             const dataset =
-              options.datasets.find((candidate) => candidate.id === event.target.value) ??
-              options.datasets[0]
+              options.choices.find(
+                (candidate) => candidate.choiceToken === event.target.value,
+              ) ?? options.choices[0]
             const intendedUse = dataset?.availableUses[0]
             if (!dataset || !intendedUse) return
             onChange({
-              catalogGeneration: options.catalogGeneration,
-              dataset: dataset.id,
+              choiceToken: dataset.choiceToken,
               intendedUse,
             })
           }}
         >
-          {options.datasets.map((dataset) => (
-            <option key={dataset.id} value={dataset.id}>
-              {friendlyCollectionName(dataset)} · {dataset.examples.toLocaleString()} examples
+          {options.choices.map((dataset) => (
+            <option key={dataset.choiceToken} value={dataset.choiceToken}>
+              {dataset.title} · {dataset.examples.toLocaleString()} examples
             </option>
           ))}
         </select>
@@ -366,7 +364,7 @@ function DatasetPreparationReview({
         <ReviewFact
           icon={CalendarClock}
           label="Review available until"
-          value={formatTimestamp(preview.receipt.expiresAt)}
+          value={formatTimestamp(preview.expiresAt)}
         />
       </div>
 
@@ -465,7 +463,11 @@ function Status({
 
 type DatasetPreparationRequest =
   | { action: "options" }
-  | { action: "preview"; selection: DatasetPreparationSelection }
+  | {
+      action: "preview"
+      choice: string
+      intendedUse: DatasetPreparationSelection["intendedUse"]
+    }
   | { action: "start"; receipt: DatasetPreparationReceipt }
 
 type DatasetPreparationTransport = ProductTransport & {
@@ -487,16 +489,11 @@ function asDatasetPreparationTransport(
 function defaultSelection(
   options: DatasetPreparationOptions,
 ): DatasetPreparationSelection | null {
-  const dataset = options.datasets[0]
+  const dataset = options.choices[0]
   const intendedUse = dataset?.availableUses[0]
   if (!dataset || !intendedUse) return null
   return {
-    catalogGeneration: options.catalogGeneration,
-    dataset: dataset.id,
+    choiceToken: dataset.choiceToken,
     intendedUse,
   }
-}
-
-function friendlyCollectionName(dataset: DatasetPreparationOption) {
-  return friendlyResearchCollectionName(`${dataset.id} ${dataset.label}`)
 }

@@ -32,6 +32,7 @@ mod query;
 mod research_use;
 mod rights;
 mod schema;
+mod sec_research;
 mod universe;
 
 pub use analytical_backup::{
@@ -63,11 +64,12 @@ pub use authority_transition::{
     ArtifactInventoryDigest, AuthorityEventDigest, AuthorityEvidenceDigest, AuthorityGeneration,
     CatalogEndpointIdentity, StableArtifactRootIdentity,
 };
+pub use catalog::PersistedProviderLogicalGenerationBinding;
 pub use catalog::{
     ArtifactRecord, AuditEvent, BackupReceipt, Catalog, CatalogAuthority, CatalogConfig,
     CatalogDiagnosticSnapshot, CatalogError, CatalogHealth, CatalogLimit, CatalogResultLimits,
-    CompanyIdentityMatchKind, CompanyIdentityMatchReason, CompanyIdentitySearchMatch,
-    CompanyIdentitySearchPage, CompanySecurityIdentityCatalogError,
+    CompanyIdentityExactRecord, CompanyIdentityMatchKind, CompanyIdentityMatchReason,
+    CompanyIdentitySearchMatch, CompanyIdentitySearchPage, CompanySecurityIdentityCatalogError,
     CompanySecurityIdentityDisposition, CompanySecurityIdentityExclusion,
     CompanySecurityIdentityExclusionReason, CompanySecurityIdentityQuery,
     CompanySecurityIdentityReadCapability, CompanySecurityIdentityRecord,
@@ -93,6 +95,7 @@ pub use catalog::{
     MAX_LISTING_REFERENCE_MEMBERSHIP_PAGE_ROWS, MAX_LISTING_REFERENCE_RECORDS,
     MAX_LISTING_REFERENCE_SEARCH_ROWS, MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS,
     MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS, MAX_MARKET_DATA_INSTRUMENT_SYNC_ROWS,
+    MAX_SEC_FUND_POINT_IN_TIME_CANDIDATES, MAX_SEC_FUND_POINT_IN_TIME_RETAINED_BYTES,
     MarketDataInstrumentCatalogError, MarketDataInstrumentMatchKind,
     MarketDataInstrumentPopulationDisposition, MarketDataInstrumentPopulationExclusion,
     MarketDataInstrumentPopulationExclusionReason, MarketDataInstrumentPopulationQuery,
@@ -102,8 +105,43 @@ pub use catalog::{
     MarketDataInstrumentSynchronizationReceipt, OnboardingAppendOutcome, OnboardingReservation,
     OnboardingReservationRequest, PinnedInstrumentDefinitions, ProviderOnboardingDiagnostic,
     PublishedIngest, QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult,
-    ReferenceBundle, ResumedIngest, ResumedProviderOnboarding, SourceCursor,
-    StoredObservedRevision,
+    ReferenceBundle, ResumedIngest, ResumedProviderOnboarding, SecFundJobCatalogCapability,
+    SecFundJobCatalogError, SecFundJobCommit, SecFundJobCoordinate, SecFundJobDurablePublication,
+    SecFundJobFamily, SecFundJobPointInTimeSelection, SecFundJobRecovery,
+    SecFundPointInTimeReadOutcome, SecFundPointInTimeReadRequest,
+    SecFundamentalIdentityAvailability, SecFundamentalIdentityQuery,
+    SecFundamentalIdentitySelection, SourceCursor, StoredObservedRevision,
+};
+pub use catalog::{
+    MAX_OFFICIAL_OPTIONS_REFERENCE_ALIAS_ASSERTIONS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_ALIAS_RESOLUTIONS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_CANONICAL_CANDIDATES, MAX_OFFICIAL_OPTIONS_REFERENCE_CONFLICTS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_EXACT_ROWS, MAX_OFFICIAL_OPTIONS_REFERENCE_OBJECTS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_RECORDS, MAX_OFFICIAL_OPTIONS_REFERENCE_SEARCH_ROWS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_STRICT_ROWS, OfficialOptionsReferenceAliasAssertionSetBuilder,
+    OfficialOptionsReferenceAliasAssertionSetEvidence, OfficialOptionsReferenceAliasKey,
+    OfficialOptionsReferenceAliasResolutionInput, OfficialOptionsReferenceAliasResolutionState,
+    OfficialOptionsReferenceAmbiguity, OfficialOptionsReferenceCanonicalCandidate,
+    OfficialOptionsReferenceCanonicalMatchKind, OfficialOptionsReferenceCanonicalResolution,
+    OfficialOptionsReferenceCboeSeries, OfficialOptionsReferenceConflict,
+    OfficialOptionsReferenceConflictInput, OfficialOptionsReferenceConflictKind,
+    OfficialOptionsReferenceConflictSetDigestBuilder, OfficialOptionsReferenceConflictSetEvidence,
+    OfficialOptionsReferenceError, OfficialOptionsReferenceExactIdentity,
+    OfficialOptionsReferenceGenerationHeader, OfficialOptionsReferenceGenerationReceipt,
+    OfficialOptionsReferenceGenerationSelection, OfficialOptionsReferenceIdentityQuery,
+    OfficialOptionsReferenceIdentityResolution, OfficialOptionsReferenceObjectEvidence,
+    OfficialOptionsReferenceObjectInput, OfficialOptionsReferenceObjectInputFields,
+    OfficialOptionsReferenceOccExchangeListingEvidence, OfficialOptionsReferenceOccPositionLimit,
+    OfficialOptionsReferenceOccProduct, OfficialOptionsReferenceOccProductType,
+    OfficialOptionsReferenceProvider, OfficialOptionsReferencePublicationCapability,
+    OfficialOptionsReferencePublicationDisposition, OfficialOptionsReferencePublicationReceipt,
+    OfficialOptionsReferenceReadCapability, OfficialOptionsReferenceRecord,
+    OfficialOptionsReferenceRecordInput, OfficialOptionsReferenceRecordSetDigestBuilder,
+    OfficialOptionsReferenceRecordSetEvidence, OfficialOptionsReferenceRecordValue,
+    OfficialOptionsReferenceResolutionSetDigestBuilder,
+    OfficialOptionsReferenceResolutionSetEvidence, OfficialOptionsReferenceSearchPage,
+    OfficialOptionsReferenceSourceAuthority, OfficialOptionsReferenceSourceEvidence,
+    OfficialOptionsReferenceSurface,
 };
 pub use catalog::{
     PersistedProviderCaptureBindingEvidence, PersistedProviderCaptureBindingRow,
@@ -231,6 +269,14 @@ pub use rights::{
     ImportedUserInputBasis, ImportedUserInputEvidence, IngestIdentity, RegisteredRightsGrant,
     ReviewedTermsBasis, RightsBasis, RightsDecisionInput, RightsError, SourceOperation,
     UserOwnedLocalBasis,
+};
+pub use sec_research::{
+    MAX_SEC_RESEARCH_OBJECT_BYTES, SecResearchConflict, SecResearchDisposition,
+    SecResearchExcludedRow, SecResearchFamily, SecResearchIdentityOutcome,
+    SecResearchIdentityReadRequest, SecResearchIdentitySelection, SecResearchKnowledgeExclusions,
+    SecResearchOrigin, SecResearchPointInTimeIdentities, SecResearchReadCapability,
+    SecResearchReadError, SecResearchReadRequest, SecResearchRowIdentity, SecResearchSelectedRow,
+    SecResearchSelection, SecResearchSelectionReceipt,
 };
 pub use universe::{
     ContractRollEvidence, DerivativeBoundary, DerivativeCivilDate, DerivativeLifecycle,

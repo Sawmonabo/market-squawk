@@ -1,14 +1,13 @@
 //! Concrete fair-value adapter for server-held governed actions.
 
-use std::{fmt, str::FromStr, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::DateTime;
-use market_squawk_domain::{AccountId, FairValueHierarchy, InstrumentId, Timestamp, VenueId};
-use market_squawk_valuation::{
-    ActorId, DecisionId, FairValueError, MarketAccess, MeasurementId, ValuationApprovalId,
-};
+use market_squawk_domain::{FairValueHierarchy, Timestamp};
+use market_squawk_valuation::{ActorId, FairValueError, MarketAccess};
 use sha2::{Digest as _, Sha256};
+use uuid::Uuid;
 
 use crate::application::{
     FairValueDomainService,
@@ -53,15 +52,15 @@ impl FairValueGovernanceActionFactory for ProductionFairValueGovernanceActionFac
         proposal: FairValueApprovalProposal,
         prepared_at: Timestamp,
     ) -> Result<Arc<dyn CanonicalGovernanceAction>, GovernanceDomainAdapterError> {
-        let measurement_id = parse_measurement_id(proposal.measurement_id())?;
-        let decision_id = parse_decision_id(proposal.decision_id())?;
+        let measurement_token = parse_product_token(proposal.measurement_token())?;
+        let classification_token = parse_product_token(proposal.classification_token())?;
         let expires_at = parse_timestamp(proposal.requested_expires_at())?;
         if expires_at <= prepared_at {
             return Err(GovernanceDomainAdapterError::InvalidProposal);
         }
         let evidence = self
             .fair_value
-            .governed_decision_evidence(measurement_id, decision_id)
+            .governed_decision_evidence_for_tokens(measurement_token, classification_token)
             .await
             .map_err(map_fair_value_error)?;
         if evidence.hierarchy() == FairValueHierarchy::Unclassified {
@@ -79,8 +78,8 @@ impl FairValueGovernanceActionFactory for ProductionFairValueGovernanceActionFac
         proposal: FairValueOverrideProposal,
         prepared_at: Timestamp,
     ) -> Result<Arc<dyn CanonicalGovernanceAction>, GovernanceDomainAdapterError> {
-        let measurement_id = parse_measurement_id(proposal.measurement_id())?;
-        let decision_id = parse_decision_id(proposal.decision_id())?;
+        let measurement_token = parse_product_token(proposal.measurement_token())?;
+        let classification_token = parse_product_token(proposal.classification_token())?;
         let requested_hierarchy = match proposal.requested_hierarchy() {
             FairValueRequestedHierarchy::Level2 => FairValueHierarchy::Level2,
             FairValueRequestedHierarchy::Level3 => FairValueHierarchy::Level3,
@@ -91,7 +90,7 @@ impl FairValueGovernanceActionFactory for ProductionFairValueGovernanceActionFac
         }
         let evidence = self
             .fair_value
-            .governed_decision_evidence(measurement_id, decision_id)
+            .governed_decision_evidence_for_tokens(measurement_token, classification_token)
             .await
             .map_err(map_fair_value_error)?;
         validate_governed_override(&evidence, requested_hierarchy).map_err(map_fair_value_error)?;
@@ -109,10 +108,10 @@ impl FairValueGovernanceActionFactory for ProductionFairValueGovernanceActionFac
         proposal: FairValueRevocationProposal,
         prepared_at: Timestamp,
     ) -> Result<Arc<dyn CanonicalGovernanceAction>, GovernanceDomainAdapterError> {
-        let approval_id = parse_approval_id(proposal.approval_id())?;
+        let approval_token = parse_product_token(proposal.approval_token())?;
         let evidence = self
             .fair_value
-            .governed_approval_evidence(approval_id, prepared_at)
+            .governed_approval_evidence_for_token(approval_token, prepared_at)
             .await
             .map_err(map_fair_value_error)?;
         Ok(Arc::new(FairValueCanonicalAction::revocation(
@@ -127,12 +126,7 @@ impl FairValueGovernanceActionFactory for ProductionFairValueGovernanceActionFac
         proposal: FairValueMarketAccessProposal,
         _prepared_at: Timestamp,
     ) -> Result<Arc<dyn CanonicalGovernanceAction>, GovernanceDomainAdapterError> {
-        let account_id = AccountId::from_str(proposal.account_id())
-            .map_err(|_| GovernanceDomainAdapterError::InvalidProposal)?;
-        let venue_id = VenueId::try_from(proposal.venue_id())
-            .map_err(|_| GovernanceDomainAdapterError::InvalidProposal)?;
-        let instrument_id = InstrumentId::from_str(proposal.instrument_id())
-            .map_err(|_| GovernanceDomainAdapterError::InvalidProposal)?;
+        let market_input_token = parse_product_token(proposal.market_input_token())?;
         let conclusion = match proposal.conclusion() {
             FairValueMarketAccessConclusion::Accessible => MarketAccess::Accessible,
             FairValueMarketAccessConclusion::Inaccessible => MarketAccess::Inaccessible,
@@ -144,7 +138,7 @@ impl FairValueGovernanceActionFactory for ProductionFairValueGovernanceActionFac
         }
         let evidence = self
             .fair_value
-            .governed_market_access_evidence(account_id, venue_id, instrument_id, effective_from)
+            .governed_market_access_evidence_for_token(market_input_token, effective_from)
             .await
             .map_err(map_fair_value_error)?;
         Ok(Arc::new(FairValueCanonicalAction::market_access(
@@ -433,16 +427,8 @@ fn actor_id(
         .map_err(|_| GovernanceDomainAdapterError::Internal)
 }
 
-fn parse_measurement_id(value: &str) -> Result<MeasurementId, GovernanceDomainAdapterError> {
-    MeasurementId::from_str(value).map_err(|_| GovernanceDomainAdapterError::InvalidProposal)
-}
-
-fn parse_decision_id(value: &str) -> Result<DecisionId, GovernanceDomainAdapterError> {
-    DecisionId::from_str(value).map_err(|_| GovernanceDomainAdapterError::InvalidProposal)
-}
-
-fn parse_approval_id(value: &str) -> Result<ValuationApprovalId, GovernanceDomainAdapterError> {
-    ValuationApprovalId::from_str(value).map_err(|_| GovernanceDomainAdapterError::InvalidProposal)
+fn parse_product_token(value: &str) -> Result<Uuid, GovernanceDomainAdapterError> {
+    Uuid::parse_str(value).map_err(|_| GovernanceDomainAdapterError::InvalidProposal)
 }
 
 fn parse_timestamp(value: &str) -> Result<Timestamp, GovernanceDomainAdapterError> {

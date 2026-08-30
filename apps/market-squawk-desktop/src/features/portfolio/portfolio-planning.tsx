@@ -6,6 +6,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { formatMoney, humanize } from "@/lib/formatters"
+import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -40,7 +41,7 @@ export function PortfolioPlanning({
   bootstrap: DesktopBootstrap
   transport: ProductTransport
 }) {
-  const operations = new Set(bootstrap.operations.map((operation) => operation.name))
+  const capabilities = productCapabilitySet(bootstrap)
   return (
     <section className="rounded-xl border border-border bg-card/35 p-5">
       <header>
@@ -57,13 +58,13 @@ export function PortfolioPlanning({
           account={account}
           holdings={holdings}
           transport={transport}
-          available={operations.has("Portfolio.EvaluateCandidateImpact")}
+          available={capabilities.has("portfolio_candidate_impact")}
         />
         <RebalancePlanner
           account={account}
           holdings={holdings}
           transport={transport}
-          available={operations.has("Portfolio.ProposeRebalance")}
+          available={capabilities.has("portfolio_rebalance")}
         />
       </div>
     </section>
@@ -81,17 +82,17 @@ function CandidatePlanner({
   transport: ProductTransport
   available: boolean
 }) {
-  const [instrumentId, setInstrumentId] = React.useState(holdings[0]?.instrument_id ?? "")
-  const selected = holdings.find((holding) => holding.instrument_id === instrumentId)
+  const [instrumentId, setInstrumentId] = React.useState(holdings[0]?.instrumentId ?? "")
+  const selected = holdings.find((holding) => holding.instrumentId === instrumentId)
   const [proposedQuantity, setProposedQuantity] = React.useState(selected?.quantity ?? "")
   const [shock, setShock] = React.useState("-10")
   const [validation, setValidation] = React.useState<string | null>(null)
 
   React.useEffect(() => {
     const holding = holdings[0]
-    setInstrumentId(holding?.instrument_id ?? "")
+    setInstrumentId(holding?.instrumentId ?? "")
     setProposedQuantity(holding?.quantity ?? "")
-  }, [account.currentRevision.revisionId, holdings])
+  }, [account.currentSnapshot.snapshotToken, holdings])
 
   const mutation = useMutation({
     mutationFn: async ({
@@ -116,7 +117,7 @@ function CandidatePlanner({
 
   const selectHolding = (nextId: string) => {
     setInstrumentId(nextId)
-    const holding = holdings.find((row) => row.instrument_id === nextId)
+    const holding = holdings.find((row) => row.instrumentId === nextId)
     if (holding) setProposedQuantity(holding.quantity)
     mutation.reset()
   }
@@ -173,8 +174,8 @@ function CandidatePlanner({
             </label>
             <datalist id="portfolio-candidate-instruments">
               {holdings.map((holding) => (
-                <option key={holding.instrument_id} value={holding.instrument_id}>
-                  {shortIdentity(holding.instrument_id, "Asset")}
+                <option key={holding.instrumentId} value={holding.instrumentId}>
+                  {shortIdentity(holding.instrumentId, "Asset")}
                 </option>
               ))}
             </datalist>
@@ -188,7 +189,7 @@ function CandidatePlanner({
               />
               <span className="text-[10px] text-muted-foreground">
                 {selected
-                  ? `Current ${selected.quantity} · lot ${selected.lot_size}`
+                  ? `Current ${selected.quantity} · lot ${selected.lotSize}`
                   : "Lot-size alignment is checked before the comparison."}
               </span>
             </label>
@@ -221,12 +222,6 @@ function CandidatePlanner({
 }
 
 function CandidateResult({ result }: { result: PortfolioCandidateImpact }) {
-  const unavailable = [
-    ["Portfolio-wide current marks", result.availability.portfolioWideSelectedMarks],
-    ["Liquidity information", result.availability.liquidity],
-    ["Settlement-backed sizing", result.availability.settlementBackedSizing],
-    ["Factor classification", result.availability.factorClassification],
-  ] as const
   return (
     <div className="mt-4 rounded-lg border border-border bg-card/30 p-4" aria-live="polite">
       <dl className="grid gap-3 sm:grid-cols-2">
@@ -237,34 +232,31 @@ function CandidateResult({ result }: { result: PortfolioCandidateImpact }) {
         <Fact label="Portfolio value" value={formatMoney(result.portfolioValue)} />
         <Fact
           label="Position type"
-          value={result.positionState === "zero_position" ? "New position" : "Existing holding"}
+          value={result.positionState === "new" ? "New position" : "Existing holding"}
         />
         <Fact label="Current quantity" value={result.currentQuantity} />
         <Fact label="Proposed quantity" value={result.proposedQuantity} />
         <Fact label="Concentration change" value={formatPercent(result.concentration.change)} />
         <Fact label="Marginal stress impact" value={formatMoney(result.scenario.marginalImpact)} />
-        <Fact label="Selected mark" value={formatMoney(result.markEvidence.unitMark)} />
-        <Fact label="Mark quality" value={humanize(result.markEvidence.quality)} />
+        <Fact label="Selected price" value={formatMoney(result.price.amount)} />
+        <Fact label="Price confidence" value={humanize(result.price.confidence)} />
         <Fact label="Lot size" value={result.instrumentTerms.lotSize} />
         <Fact label="Contract multiplier" value={result.instrumentTerms.contractMultiplier} />
       </dl>
       <div className="mt-4 grid gap-2 sm:grid-cols-2">
-        <EvidenceStatus label="Exact fees" evidence={result.costEvidence.fees} />
-        <EvidenceStatus label="Exact slippage" evidence={result.costEvidence.slippage} />
+        <EvidenceStatus label="Estimated fees" evidence={result.costs.fees} />
+        <EvidenceStatus label="Estimated slippage" evidence={result.costs.slippage} />
       </div>
       <Alert className="mt-4 border-amber-400/25 bg-amber-400/5">
         <AlertCircle aria-hidden="true" />
         <AlertTitle>Risk review remains incomplete</AlertTitle>
         <AlertDescription>
           <ul className="mt-1 list-disc space-y-1 pl-4">
-            {unavailable.map(([label]) => (
+            {result.missingInformation.map((label) => (
               <li key={label}>{label} is unavailable.</li>
             ))}
-            {result.riskAdvisory.checksUnavailable.includes("fees") ? (
-              <li>Exact fees are unavailable.</li>
-            ) : null}
-            {result.riskAdvisory.checksUnavailable.includes("slippage") ? (
-              <li>Exact slippage is unavailable.</li>
+            {result.riskAssessment.checksUnavailable > 0 ? (
+              <li>{result.riskAssessment.checksUnavailable} additional checks are unavailable.</li>
             ) : null}
           </ul>
         </AlertDescription>
@@ -279,13 +271,13 @@ function EvidenceStatus({
   evidence,
 }: {
   label: string
-  evidence: PortfolioCandidateImpact["costEvidence"]["fees"]
+  evidence: PortfolioCandidateImpact["costs"]["fees"]
 }) {
   return (
     <div className="rounded-md border border-border/70 p-3 text-xs">
       <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
       <p className="mt-1 font-mono">
-        {evidence.status === "available" ? formatMoney(evidence.amount) : "Unavailable"}
+        {evidence.state === "available" ? formatMoney(evidence.amount) : "Unavailable"}
       </p>
     </div>
   )
@@ -309,7 +301,7 @@ function RebalancePlanner({
 
   React.useEffect(() => {
     setTargets(equalWeights(holdings))
-  }, [account.currentRevision.revisionId, holdings])
+  }, [account.currentSnapshot.snapshotToken, holdings])
 
   const mutation = useMutation({
     mutationFn: async (proposal: Record<string, unknown>) =>
@@ -326,8 +318,8 @@ function RebalancePlanner({
   const run = () => {
     setValidation(null)
     const targetRows = holdings.map((holding) => ({
-      instrumentId: holding.instrument_id,
-      basisPoints: percentageToBasisPoints(targets[holding.instrument_id] ?? ""),
+      instrumentId: holding.instrumentId,
+      basisPoints: percentageToBasisPoints(targets[holding.instrumentId] ?? ""),
     }))
     if (targetRows.some((row) => row.basisPoints === null)) {
       setValidation("Every target must be a percentage with at most two decimal places.")
@@ -368,7 +360,7 @@ function RebalancePlanner({
   }
 
   const totalBasisPoints = holdings.reduce(
-    (total, holding) => total + (percentageToBasisPoints(targets[holding.instrument_id] ?? "") ?? 0),
+    (total, holding) => total + (percentageToBasisPoints(targets[holding.instrumentId] ?? "") ?? 0),
     0,
   )
 
@@ -391,11 +383,11 @@ function RebalancePlanner({
           <div className="mt-4 max-h-56 space-y-2 overflow-y-auto pr-1">
             {holdings.map((holding) => (
               <label
-                key={holding.instrument_id}
+                key={holding.instrumentId}
                 className="grid grid-cols-[1fr_7rem] items-center gap-3 text-xs"
               >
                 <span className="truncate">
-                  {shortIdentity(holding.instrument_id, "Asset")}
+                  {shortIdentity(holding.instrumentId, "Asset")}
                 </span>
                 <span className="relative">
                   <Input
@@ -404,11 +396,11 @@ function RebalancePlanner({
                     min="0"
                     max="100"
                     step="0.01"
-                    value={targets[holding.instrument_id] ?? ""}
+                    value={targets[holding.instrumentId] ?? ""}
                     onChange={(event) =>
                       setTargets((current) => ({
                         ...current,
-                        [holding.instrument_id]: event.target.value,
+                        [holding.instrumentId]: event.target.value,
                       }))
                     }
                     className="pr-7 text-right font-mono"
@@ -502,7 +494,7 @@ function equalWeights(holdings: PortfolioHolding[]) {
     holdings.map((holding) => {
       const basisPoints = base + (remainder > 0 ? 1 : 0)
       remainder = Math.max(0, remainder - 1)
-      return [holding.instrument_id, basisPointsToPercentage(basisPoints)]
+      return [holding.instrumentId, basisPointsToPercentage(basisPoints)]
     }),
   )
 }

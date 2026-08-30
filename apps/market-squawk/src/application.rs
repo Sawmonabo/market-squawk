@@ -43,6 +43,13 @@ pub mod source;
 pub mod workspace;
 
 pub use contracts::{APPLICATION_CONTRACT_VERSION, application_capabilities};
+pub(crate) use contracts::{
+    PRODUCT_LOOKUP_ACTION_OPEN_INVESTMENT, PRODUCT_LOOKUP_ACTION_OPEN_SAVED_SCREEN,
+    PRODUCT_LOOKUP_CATEGORIES, PRODUCT_LOOKUP_CATEGORY_INVESTMENT,
+    PRODUCT_LOOKUP_CATEGORY_SAVED_SCREEN, PRODUCT_LOOKUP_QUERY_MAXIMUM_CHARACTERS,
+    internal_forecast_generation_descriptor, product_lookup_query_is_canonical,
+};
+pub(crate) use domain_support::opaque_product_token;
 pub use fair_value::{
     AnalyticsFairValueInputPublisher, FairValueDomainService, FairValueInputAuthorityError,
     FairValueInputAuthorityLimitInput, FairValueInputAuthorityLimits,
@@ -68,14 +75,20 @@ pub(crate) use research::{
     AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
     AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
     AnalyticalForecastEvidenceReader, CoinbaseMarketApplicationOutcome, CryptoCommittedRowIngress,
-    CryptoMarketDurableRead, CryptoMarketDurableReadWriter, CryptoMarketPublicationAuthority,
-    CryptoMarketPublicationError, CryptoPendingFrameIngress, CryptoPublicationRendezvousLimits,
-    DatasetPreparationAuthority, DatasetPreparationError,
+    CryptoMarketPublicationAuthority, CryptoMarketPublicationError, CryptoPendingFrameIngress,
+    CryptoPublicationRendezvousLimits, DatasetPreparationAuthority, DatasetPreparationError,
     DatasetPreparationOptions, DatasetPreparationPreview, DatasetPreparationPreviewRequest,
     DatasetPreparationReceipt, DatasetPreparationSelection, FredLatestKnownOperation,
-    FredPublishedGenerationHandoff, KrakenMarketApplicationOutcome, TreasuryApplicationClosure,
+    FredPublishedGenerationHandoff, KrakenMarketApplicationOutcome, MarketEventDurableRead,
+    MarketEventDurableReadWriter, MarketEventReadError, MarketEventRestartSelector,
+    ResearchProviderPublicationOperation, ResearchProviderRuntimeMutationAuthority,
+    ResearchProviderRuntimeReplacement, SEC_FUNDAMENTALS_RESEARCH_STATUS_OPERATION,
+    SchwabMarketPublicationError, SchwabRestQuoteGenerationAuthority,
+    SchwabRestQuotePostSealFailure, SchwabRestQuoteSourceHealthOutcome, SecFundPublicationReceipt,
+    SecFundamentalsResearchError, SecFundamentalsResearchOperation, SecFundamentalsResearchRequest,
+    SecFundamentalsResearchStatus, SecLiveFundApplicationError, SecLiveFundRequest,
+    SecLiveFundSource, SecResearchFamilyBinding, TreasuryApplicationClosure,
     TreasuryLatestKnownOperation, TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
-    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
 };
 pub use research::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,

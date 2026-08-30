@@ -83,7 +83,7 @@ pub use recommendation_outcome::{
     RecommendationTrackRecordGroup, RecommendationTrackRecordPerformance,
 };
 pub use repository::{
-    AppendOutcome, DecisionJournalSnapshot, DecisionRecord, DecisionRepository,
+    AppendOutcome, CurrentScreenPage, DecisionJournalSnapshot, DecisionRecord, DecisionRepository,
     DecisionRepositoryError, DecisionRepositoryLimits, InvestmentAnalysisCurrentIndexEntry,
     InvestmentProposalIndexEntry, InvestmentProposalIndexOutcome, ScreenRunIndexEntry,
     StagedPublishedInvestmentAnalysisAppend, TargetIndexEntry,

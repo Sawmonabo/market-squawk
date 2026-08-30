@@ -41,6 +41,7 @@ pub(super) struct InstalledPortfolioImportOperations {
     inputs: Arc<InputStager>,
     runtime: RuntimeIdentity,
     approvals: Arc<Mutex<ApprovalAuthority>>,
+    product_tokens: Arc<Mutex<ProductImportTokens>>,
 }
 
 impl InstalledPortfolioImportOperations {
@@ -73,6 +74,7 @@ impl InstalledPortfolioImportOperations {
             inputs,
             runtime,
             approvals: Arc::new(Mutex::new(ApprovalAuthority { store, manifest })),
+            product_tokens: Arc::new(Mutex::new(ProductImportTokens::default())),
         })
     }
 
@@ -185,7 +187,7 @@ impl InstalledPortfolioImportOperations {
                     .map_err(|_error| ServiceError::Unavailable)?,
             )
             .map_err(|_error| ServiceError::InvalidRequest)?;
-        let preview = self
+        let mut preview = self
             .portfolio
             .prepare_staged_import(
                 input.account_id,
@@ -194,6 +196,10 @@ impl InstalledPortfolioImportOperations {
                 context,
             )
             .map_err(|error| error.as_service_error())?;
+        self.product_tokens
+            .lock()
+            .map_err(|_error| ServiceError::Unavailable)?
+            .productize_preview(&mut preview)?;
         Ok(preview.result)
     }
 
@@ -203,22 +209,25 @@ impl InstalledPortfolioImportOperations {
         context: &RequestContext,
     ) -> Result<Value, ServiceError> {
         let input: ApproveRequest = decode(request.arguments())?;
-        if input.preview_id != input.preview_digest {
-            return Err(ServiceError::InvalidRequest);
-        }
+        let binding = self
+            .product_tokens
+            .lock()
+            .map_err(|_error| ServiceError::Unavailable)?
+            .preview(input.review_token)?
+            .clone();
         let preview = self
             .portfolio
-            .prepared_import_preview(&input.preview_id, context)
+            .prepared_import_preview(&binding.preview_id, context)
             .map_err(|error| error.as_service_error())?;
-        if preview.preview_id != input.preview_id
-            || hex(&preview.preview_digest) != input.preview_digest
+        if preview.preview_id != binding.preview_id
+            || preview.preview_digest != binding.preview_digest
         {
             return Err(ServiceError::InvalidRequest);
         }
         let ResolvedImportInterpretations {
             interpretations,
             specific_lot_ids,
-        } = resolve_interpretations(&preview, input.interpretations)?;
+        } = resolve_interpretations(&preview, &binding, input.interpretations)?;
         if requires_corporate_action_plan(&preview)? {
             // Corporate-action resolution is owned by the server's point-in-time plan authority;
             // this adapter never accepts a client-authored plan or raw plan bytes.
@@ -236,14 +245,23 @@ impl InstalledPortfolioImportOperations {
             .manifest
             .entries
             .iter()
-            .find(|entry| entry.preview_id == input.preview_id)
+            .find(|entry| entry.preview_id == binding.preview_id)
         {
             if existing.workspace_id == workspace_id
                 && existing.actor_id == actor_id
                 && existing.interpretations == interpretations
                 && existing.specific_lot_ids == specific_lot_ids
             {
-                return Ok(approval_value(existing));
+                let approval_token = self
+                    .product_tokens
+                    .lock()
+                    .map_err(|_error| ServiceError::Unavailable)?
+                    .approval_token(&existing.approval_id, binding.review_token)?;
+                return Ok(approval_value(
+                    approval_token,
+                    binding.review_token,
+                    existing,
+                ));
             }
             return Err(ServiceError::InvalidRequest);
         }
@@ -253,7 +271,7 @@ impl InstalledPortfolioImportOperations {
         let approval_id = Uuid::new_v4().to_string();
         let authorization_handle_digest = authorization_digest(
             &approval_id,
-            &input.preview_id,
+            &binding.preview_id,
             &workspace_id,
             &actor_id,
             approved_at.unix_nanos(),
@@ -262,7 +280,7 @@ impl InstalledPortfolioImportOperations {
         )?;
         let entry = ApprovalEntry {
             approval_id,
-            preview_id: input.preview_id,
+            preview_id: binding.preview_id,
             preview_digest: preview.preview_digest,
             workspace_id,
             actor_id: actor_id.clone(),
@@ -277,7 +295,12 @@ impl InstalledPortfolioImportOperations {
             phase: ApprovalPhase::Approved,
         };
         approvals.append(entry.clone())?;
-        Ok(approval_value(&entry))
+        let approval_token = self
+            .product_tokens
+            .lock()
+            .map_err(|_error| ServiceError::Unavailable)?
+            .approval_token(&entry.approval_id, binding.review_token)?;
+        Ok(approval_value(approval_token, binding.review_token, &entry))
     }
 
     fn commit(
@@ -286,6 +309,12 @@ impl InstalledPortfolioImportOperations {
         context: &RequestContext,
     ) -> Result<Value, ServiceError> {
         let input: ApprovalRequest = decode(request.arguments())?;
+        let product_approval = self
+            .product_tokens
+            .lock()
+            .map_err(|_error| ServiceError::Unavailable)?
+            .approval(input.approval_token)?
+            .clone();
         let origin = context.origin().ok_or(ServiceError::Unauthorized)?;
         let approval = {
             let mut approvals = self
@@ -296,7 +325,7 @@ impl InstalledPortfolioImportOperations {
                 .manifest
                 .entries
                 .iter()
-                .find(|entry| entry.approval_id == input.approval_id)
+                .find(|entry| entry.approval_id == product_approval.approval_id)
                 .cloned()
                 .ok_or(ServiceError::NotFound)?;
             if entry.workspace_id != origin.workspace_id().to_string()
@@ -327,13 +356,14 @@ impl InstalledPortfolioImportOperations {
             Err(error) => return Err(error.as_service_error()),
         }
         self.remove_approval(&approval.approval_id)?;
-        Ok(json!({
-            "approvalId": approval.approval_id,
-            "previewId": approval.preview_id,
-            "previewDigest": hex(&approval.preview_digest),
-            "receipt": approval.receipt,
-            "status": "committed",
-        }))
+        self.product_tokens
+            .lock()
+            .map_err(|_error| ServiceError::Unavailable)?
+            .remove_completed(
+                product_approval.approval_token,
+                product_approval.review_token,
+            );
+        Ok(json!({"accepted": true}))
     }
 
     fn discard(
@@ -342,6 +372,12 @@ impl InstalledPortfolioImportOperations {
         context: &RequestContext,
     ) -> Result<Value, ServiceError> {
         let input: PreviewIdentityRequest = decode(request.arguments())?;
+        let binding = self
+            .product_tokens
+            .lock()
+            .map_err(|_error| ServiceError::Unavailable)?
+            .preview(input.review_token)?
+            .clone();
         let approvals = self
             .approvals
             .lock()
@@ -350,15 +386,19 @@ impl InstalledPortfolioImportOperations {
             .manifest
             .entries
             .iter()
-            .any(|entry| entry.preview_id == input.preview_id)
+            .any(|entry| entry.preview_id == binding.preview_id)
         {
             return Err(ServiceError::InvalidRequest);
         }
         drop(approvals);
         self.portfolio
-            .discard_prepared_import(&input.preview_id, context)
+            .discard_prepared_import(&binding.preview_id, context)
             .map_err(|error| error.as_service_error())?;
-        Ok(json!({"previewId": input.preview_id, "status": "discarded"}))
+        self.product_tokens
+            .lock()
+            .map_err(|_error| ServiceError::Unavailable)?
+            .remove_preview(binding.review_token);
+        Ok(json!({"reviewToken": binding.review_token, "status": "discarded"}))
     }
 
     fn authorize(&self, context: &RequestContext) -> Result<(), ServiceError> {
@@ -385,6 +425,7 @@ impl fmt::Debug for InstalledPortfolioImportOperations {
             .field("inputs", &"[ONE-SHOT INPUT STAGER]")
             .field("runtime", &self.runtime)
             .field("approvals", &"[DURABLE APPROVAL AUTHORITY]")
+            .field("product_tokens", &"[SESSION PRODUCT TOKENS]")
             .finish()
     }
 }
@@ -392,6 +433,193 @@ impl fmt::Debug for InstalledPortfolioImportOperations {
 struct ApprovalAuthority {
     store: LocalAuthorityStateStore,
     manifest: ApprovalManifest,
+}
+
+#[derive(Default)]
+struct ProductImportTokens {
+    previews: Vec<ProductPreviewBinding>,
+    approvals: Vec<ProductApprovalBinding>,
+}
+
+#[derive(Clone)]
+struct ProductPreviewBinding {
+    review_token: Uuid,
+    preview_id: String,
+    preview_digest: [u8; 32],
+    records: Vec<ProductRecordBinding>,
+}
+
+#[derive(Clone)]
+struct ProductRecordBinding {
+    record_token: Uuid,
+    record_id: String,
+}
+
+#[derive(Clone)]
+struct ProductApprovalBinding {
+    approval_token: Uuid,
+    approval_id: String,
+    review_token: Uuid,
+}
+
+impl ProductImportTokens {
+    fn productize_preview(
+        &mut self,
+        preview: &mut PortfolioImportPreview,
+    ) -> Result<(), ServiceError> {
+        if let Some(binding) = self
+            .previews
+            .iter()
+            .find(|binding| binding.preview_id == preview.preview_id)
+            .cloned()
+        {
+            return apply_product_preview_tokens(preview, &binding);
+        }
+        if self.previews.len() >= MAX_APPROVALS {
+            return Err(ServiceError::ResourceExhausted);
+        }
+        let result_transactions = preview
+            .result
+            .get("transactions")
+            .and_then(Value::as_array)
+            .ok_or(ServiceError::Internal)?;
+        let review_transactions = preview
+            .review
+            .get("transactions")
+            .and_then(Value::as_array)
+            .ok_or(ServiceError::Internal)?;
+        if result_transactions.len() != review_transactions.len()
+            || review_transactions.len() > MAX_INTERPRETATIONS
+        {
+            return Err(ServiceError::Internal);
+        }
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(review_transactions.len())
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        for transaction in review_transactions {
+            let record_id = transaction
+                .get("recordId")
+                .and_then(Value::as_str)
+                .ok_or(ServiceError::Internal)?;
+            records.push(ProductRecordBinding {
+                record_token: Uuid::new_v4(),
+                record_id: record_id.to_owned(),
+            });
+        }
+        let binding = ProductPreviewBinding {
+            review_token: Uuid::new_v4(),
+            preview_id: preview.preview_id.clone(),
+            preview_digest: preview.preview_digest,
+            records,
+        };
+        apply_product_preview_tokens(preview, &binding)?;
+        self.previews
+            .try_reserve(1)
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        self.previews.push(binding);
+        Ok(())
+    }
+
+    fn preview(&self, token: Uuid) -> Result<&ProductPreviewBinding, ServiceError> {
+        self.previews
+            .iter()
+            .find(|binding| binding.review_token == token)
+            .ok_or(ServiceError::NotFound)
+    }
+
+    fn approval_token(
+        &mut self,
+        approval_id: &str,
+        review_token: Uuid,
+    ) -> Result<Uuid, ServiceError> {
+        if let Some(binding) = self
+            .approvals
+            .iter()
+            .find(|binding| binding.approval_id == approval_id)
+        {
+            return Ok(binding.approval_token);
+        }
+        if self.approvals.len() >= MAX_APPROVALS {
+            return Err(ServiceError::ResourceExhausted);
+        }
+        let approval_token = Uuid::new_v4();
+        self.approvals
+            .try_reserve(1)
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        self.approvals.push(ProductApprovalBinding {
+            approval_token,
+            approval_id: approval_id.to_owned(),
+            review_token,
+        });
+        Ok(approval_token)
+    }
+
+    fn approval(&self, token: Uuid) -> Result<&ProductApprovalBinding, ServiceError> {
+        self.approvals
+            .iter()
+            .find(|binding| binding.approval_token == token)
+            .ok_or(ServiceError::NotFound)
+    }
+
+    fn remove_completed(&mut self, approval_token: Uuid, review_token: Uuid) {
+        self.approvals
+            .retain(|binding| binding.approval_token != approval_token);
+        self.remove_preview(review_token);
+    }
+
+    fn remove_preview(&mut self, review_token: Uuid) {
+        self.previews
+            .retain(|binding| binding.review_token != review_token);
+    }
+}
+
+fn apply_product_preview_tokens(
+    preview: &mut PortfolioImportPreview,
+    binding: &ProductPreviewBinding,
+) -> Result<(), ServiceError> {
+    preview
+        .result
+        .as_object_mut()
+        .ok_or(ServiceError::Internal)?
+        .insert("reviewToken".to_owned(), json!(binding.review_token));
+    let result_transactions = preview
+        .result
+        .get_mut("transactions")
+        .and_then(Value::as_array_mut)
+        .ok_or(ServiceError::Internal)?;
+    let review_transactions = preview
+        .review
+        .get_mut("transactions")
+        .and_then(Value::as_array_mut)
+        .ok_or(ServiceError::Internal)?;
+    if result_transactions.len() != binding.records.len()
+        || review_transactions.len() != binding.records.len()
+    {
+        return Err(ServiceError::Internal);
+    }
+    for ((result, review), record) in result_transactions
+        .iter_mut()
+        .zip(review_transactions.iter_mut())
+        .zip(&binding.records)
+    {
+        let review_record_id = review
+            .get("recordId")
+            .and_then(Value::as_str)
+            .ok_or(ServiceError::Internal)?;
+        if review_record_id != record.record_id {
+            return Err(ServiceError::Internal);
+        }
+        result
+            .as_object_mut()
+            .ok_or(ServiceError::Internal)?
+            .insert("recordToken".to_owned(), json!(record.record_token));
+        review
+            .as_object_mut()
+            .ok_or(ServiceError::Internal)?
+            .insert("recordToken".to_owned(), json!(record.record_token));
+    }
+    Ok(())
 }
 
 impl ApprovalAuthority {
@@ -572,15 +800,14 @@ struct PreviewRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ApproveRequest {
-    preview_id: String,
-    preview_digest: String,
+    review_token: Uuid,
     interpretations: Vec<InterpretationSelection>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct InterpretationSelection {
-    record_id: String,
+    record_token: Uuid,
     interpretation: String,
     rationale: String,
     #[serde(default)]
@@ -595,13 +822,13 @@ struct ResolvedImportInterpretations {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ApprovalRequest {
-    approval_id: String,
+    approval_token: Uuid,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct PreviewIdentityRequest {
-    preview_id: String,
+    review_token: Uuid,
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(arguments: &Map<String, Value>) -> Result<T, ServiceError> {
@@ -611,12 +838,12 @@ fn decode<T: for<'de> Deserialize<'de>>(arguments: &Map<String, Value>) -> Resul
 
 fn resolve_interpretations(
     preview: &PortfolioImportPreview,
+    binding: &ProductPreviewBinding,
     selected: Vec<InterpretationSelection>,
 ) -> Result<ResolvedImportInterpretations, ServiceError> {
     let transactions = preview
-        .result
-        .get("preview")
-        .and_then(|value| value.get("transactions"))
+        .review
+        .get("transactions")
         .and_then(Value::as_array)
         .ok_or(ServiceError::Internal)?;
     let resolvable = transactions
@@ -633,7 +860,7 @@ fn resolve_interpretations(
     }
     let mut selections = selected
         .into_iter()
-        .map(|selection| (selection.record_id.clone(), selection))
+        .map(|selection| (selection.record_token, selection))
         .collect::<BTreeMap<_, _>>();
     if selections.len() != resolvable.len() {
         return Err(ServiceError::InvalidRequest);
@@ -648,12 +875,16 @@ fn resolve_interpretations(
             .get("recordId")
             .and_then(Value::as_str)
             .ok_or(ServiceError::Internal)?;
+        let record_token = binding
+            .records
+            .iter()
+            .find(|binding| binding.record_id == record_id)
+            .map(|binding| binding.record_token)
+            .ok_or(ServiceError::Internal)?;
         let selection = selections
-            .remove(record_id)
+            .remove(&record_token)
             .ok_or(ServiceError::InvalidRequest)?;
-        if selection.record_id.is_empty()
-            || selection.record_id.len() > 512
-            || selection.interpretation.is_empty()
+        if selection.interpretation.is_empty()
             || selection.interpretation.len() > 512
             || selection.rationale.trim().is_empty()
             || selection.rationale.len() > MAX_RATIONALE_BYTES
@@ -719,9 +950,8 @@ fn resolve_interpretations(
 
 fn requires_corporate_action_plan(preview: &PortfolioImportPreview) -> Result<bool, ServiceError> {
     preview
-        .result
-        .get("preview")
-        .and_then(|value| value.get("resolutionRequirements"))
+        .review
+        .get("resolutionRequirements")
         .and_then(|value| value.get("requiresServerHeldCorporateActionPlan"))
         .and_then(Value::as_bool)
         .ok_or(ServiceError::Internal)
@@ -753,11 +983,10 @@ fn authorization_digest(
     Ok(hasher.finalize().into())
 }
 
-fn approval_value(entry: &ApprovalEntry) -> Value {
+fn approval_value(approval_token: Uuid, review_token: Uuid, entry: &ApprovalEntry) -> Value {
     json!({
-        "approvalId": entry.approval_id,
-        "previewId": entry.preview_id,
-        "previewDigest": hex(&entry.preview_digest),
+        "approvalToken": approval_token,
+        "reviewToken": review_token,
         "status": match entry.phase {
             ApprovalPhase::Approved => "approved",
             ApprovalPhase::Promoting => "promoting",

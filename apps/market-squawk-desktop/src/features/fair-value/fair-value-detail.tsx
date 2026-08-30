@@ -7,7 +7,6 @@ import {
   FileCheck2,
   Landmark,
   Layers3,
-  ScrollText,
   ShieldCheck,
 } from "lucide-react"
 
@@ -16,7 +15,6 @@ import { formatMoney, humanize } from "@/lib/formatters"
 
 import type {
   FairValueApproval,
-  FairValueAuditEvent,
   FairValueHierarchy,
   FairValueInput,
   FairValueMarketAccess,
@@ -25,23 +23,16 @@ import type {
 
 export function FairValueDetail({
   measurement,
-  auditBoundary,
 }: {
   measurement: FairValueMeasurement
-  auditBoundary: FairValueAuditBoundary
 }) {
   const classification = measurement.classification
-  const inputs = measurement.evidence?.inputs
+  const inputs = measurement.inputs
   const reasons = measurement.explanation?.reasons
-  const approvals = measurement.approvalStatus?.approvals
-  const auditEvents = measurement.auditEvents
-  const marketAccess = mergeMarketAccess(measurement, inputs)
-  const qualities = unique(inputs?.map((input) => input.dataQuality))
-  const depths = unique(
-    inputs
-      ?.map((input) => input.marketDepth)
-      .filter((value): value is NonNullable<typeof value> => value !== undefined),
-  )
+  const approvals = measurement.approvals
+  const marketAccess = mergeMarketAccess(inputs)
+  const qualities = unique(inputs.map((input) => input.dataQuality))
+  const observability = unique(inputs.map((input) => input.observability))
 
   return (
     <article className="min-w-0 overflow-hidden rounded-xl border border-border bg-card/35">
@@ -69,7 +60,7 @@ export function FairValueDetail({
       <div className="space-y-4 p-4 lg:p-5">
         <SemanticSeparation
           hierarchy={classification?.hierarchy ?? null}
-          depths={depths}
+          observability={observability}
           qualities={qualities}
         />
 
@@ -78,41 +69,29 @@ export function FairValueDetail({
           <ClassificationPanel measurement={measurement} />
         </div>
 
-        <LevelOneReview reasons={reasons} classificationLoaded={classification !== undefined} />
+        <LevelOneReview reasons={reasons} classificationLoaded={classification !== null} />
         <EvidencePanel inputs={inputs} expectedCount={measurement.inputCount} />
 
         <div className="grid gap-4 lg:grid-cols-2">
-          <MarketAccessPanel assessments={marketAccess} loaded={inputs !== undefined} />
+          <MarketAccessPanel assessments={marketAccess} loaded />
           <GovernancePanel
             measurement={measurement}
             approvals={approvals}
-            evaluatedAt={measurement.approvalStatus?.at}
           />
         </div>
-
-        <AuditPanel events={auditEvents} boundary={auditBoundary} />
       </div>
     </article>
   )
 }
 
-interface FairValueAuditBoundary {
-  loadedEventCount: number
-  totalEventCount: number | undefined
-  hasMore: boolean
-  loadingMore: boolean
-  capped: boolean
-  onLoadMore: () => void
-}
-
 function SemanticSeparation({
   hierarchy,
-  depths,
+  observability,
   qualities,
 }: {
   hierarchy: FairValueHierarchy | null
-  depths: string[] | undefined
-  qualities: string[] | undefined
+  observability: string[] | undefined
+  qualities: FairValueInput["dataQuality"][] | undefined
 }) {
   return (
     <section
@@ -128,16 +107,16 @@ function SemanticSeparation({
       />
       <SemanticCard
         icon={Layers3}
-        eyebrow="Market-depth level"
-        value={depths?.length ? depths.map(humanize).join(", ") : "Not reported"}
-        detail="Order-book granularity. It is not inferred from hierarchy or method."
+        eyebrow="Input observability"
+        value={observability?.length ? observability.map(humanize).join(", ") : "Not reported"}
+        detail="Whether the valuation uses quoted, observable, or unobservable inputs."
         tone="neutral"
       />
       <SemanticCard
         icon={ShieldCheck}
-        eyebrow="Data-quality class"
-        value={qualities?.length ? qualities.map(humanize).join(", ") : "Not loaded"}
-        detail="How usable the supporting information is. It does not assign hierarchy."
+        eyebrow="Evidence reliability"
+        value={qualities?.length ? qualities.map(dataQualityLabel).join(", ") : "Not loaded"}
+        detail="How dependable the supporting information is. It does not assign hierarchy."
         tone={qualities?.includes("direct_verified") ? "good" : "warning"}
       />
     </section>
@@ -212,15 +191,15 @@ function ClassificationPanel({ measurement }: { measurement: FairValueMeasuremen
           <p className="text-[9px] uppercase tracking-wider text-muted-foreground">Hierarchy</p>
           <p className="mt-1 text-lg font-semibold">{humanize(classification.hierarchy)}</p>
         </div>
-        <span className="rounded-full border border-primary/35 bg-primary/10 px-2.5 py-1 font-mono text-[9px] text-primary">
-          Ruleset v{classification.rulesetVersion}
+        <span className="rounded-full border border-primary/35 bg-primary/10 px-2.5 py-1 text-[9px] text-primary">
+          Saved classification
         </span>
       </div>
       <dl className="mt-4 grid gap-x-4 gap-y-3 sm:grid-cols-2">
         <Fact label="Basis" value={humanize(classification.basis.kind)} />
         <Fact
           label="Explanation"
-          value={`${classification.truthTableItemCount} checks · ${classification.reasonCount} reasons`}
+          value={`${classification.checkCount} checks · ${classification.reasonCount} reasons`}
         />
       </dl>
       {classification.basis.kind === "override" ? (
@@ -241,7 +220,7 @@ function LevelOneReview({
   reasons,
   classificationLoaded,
 }: {
-  reasons: { inputId: string | null; code: string }[] | undefined
+  reasons: { inputToken: string | null; reason: string }[] | undefined
   classificationLoaded: boolean
 }) {
   if (!classificationLoaded || reasons === undefined) {
@@ -268,14 +247,14 @@ function LevelOneReview({
         <ul className="grid gap-2 md:grid-cols-2">
           {reasons.map((reason, index) => (
             <li
-              key={`${reason.inputId ?? "measurement"}:${reason.code}:${index}`}
+              key={`${reason.inputToken ?? "measurement"}:${reason.reason}:${index}`}
               className="flex gap-2 rounded-lg border border-amber-400/15 bg-amber-400/5 p-3"
             >
               <Ban className="mt-0.5 size-3.5 shrink-0 text-amber-200" aria-hidden="true" />
               <span>
-                <span className="block text-xs font-medium">{humanize(reason.code)}</span>
+                <span className="block text-xs font-medium">{humanize(reason.reason)}</span>
                 <span className="mt-1 block font-mono text-[9px] text-muted-foreground">
-                  {reason.inputId ? "Valuation input" : "Measurement-wide"}
+                  {reason.inputToken ? "Valuation input" : "Measurement-wide"}
                 </span>
               </span>
             </li>
@@ -302,7 +281,7 @@ function EvidencePanel({
       ) : (
         <div className="space-y-3">
           {inputs.map((input) => (
-            <EvidenceInput key={input.inputId} input={input} />
+            <EvidenceInput key={input.inputToken} input={input} />
           ))}
         </div>
       )}
@@ -318,7 +297,7 @@ function EvidenceInput({ input }: { input: FairValueInput }) {
         <span className="flex flex-wrap items-start justify-between gap-3">
           <span>
             <span className="block text-xs font-semibold">
-              {humanize(input.evidence.origin.kind)} input
+              {input.evidence.label}
             </span>
             <span className="mt-1 block text-[9px] text-muted-foreground">
               {humanize(input.significance)}
@@ -331,7 +310,7 @@ function EvidenceInput({ input }: { input: FairValueInput }) {
                 : "border-amber-400/25 bg-amber-400/10 text-amber-200"
             }`}
           >
-            Data quality · {humanize(input.dataQuality)}
+            Reliability · {dataQualityLabel(input.dataQuality)}
           </span>
         </span>
       </summary>
@@ -341,10 +320,6 @@ function EvidenceInput({ input }: { input: FairValueInput }) {
         <Fact label="Adjustment" value={humanize(input.adjustment)} />
         <Fact label="Market activity" value={humanize(input.marketActivity)} />
         <Fact label="Market access" value={humanize(input.marketAccess)} />
-        <Fact
-          label="Market depth"
-          value={input.marketDepth ? humanize(input.marketDepth) : "Not reported"}
-        />
         <Fact label="Input amount" value={formatMoney(input.amount)} />
         <Fact label="Verification status" value={humanize(input.evidence.verification)} />
         <Fact
@@ -353,17 +328,17 @@ function EvidenceInput({ input }: { input: FairValueInput }) {
         />
         <Fact
           label="Observation time"
-          value={input.evidence.sourceTimestamp ? dateTime(input.evidence.sourceTimestamp) : "Not reported"}
+          value={input.evidence.observedAt ? dateTime(input.evidence.observedAt) : "Not reported"}
         />
         <Fact
           label="Qualification valid until"
           value={
-            input.evidence.qualificationValidUntil
-              ? dateTime(input.evidence.qualificationValidUntil)
+            input.evidence.validUntil
+              ? dateTime(input.evidence.validUntil)
               : "Not reported"
           }
         />
-        <Fact label="Recorded at" value={dateTime(input.evidence.ingestedAt)} />
+        <Fact label="Recorded at" value={dateTime(input.evidence.recordedAt)} />
       </dl>
     </details>
   )
@@ -385,9 +360,9 @@ function MarketAccessPanel({
       ) : (
         <div className="space-y-3">
           {assessments.map((assessment) => (
-            <div key={assessment.assessmentId} className="rounded-lg border border-border p-3">
+            <div key={`${assessment.effectiveFrom}:${assessment.approvedAt}`} className="rounded-lg border border-border p-3">
               <div className="flex items-center justify-between gap-3">
-                <p className="text-xs font-semibold">{assessment.venueId}</p>
+                <p className="text-xs font-semibold">Market access assessment</p>
                 <span className="rounded-full border border-border px-2 py-0.5 text-[9px]">
                   {humanize(assessment.conclusion)}
                 </span>
@@ -409,11 +384,9 @@ function MarketAccessPanel({
 function GovernancePanel({
   measurement,
   approvals,
-  evaluatedAt,
 }: {
   measurement: FairValueMeasurement
   approvals: FairValueApproval[] | undefined
-  evaluatedAt: string | undefined
 }) {
   const override = measurement.classification?.basis.kind === "override"
   return (
@@ -426,11 +399,6 @@ function GovernancePanel({
           </p>
         </div>
       ) : null}
-      {evaluatedAt ? (
-        <p className="mb-3 text-[10px] text-muted-foreground">
-          Status evaluated at {dateTime(evaluatedAt)}.
-        </p>
-      ) : null}
       {approvals === undefined ? (
         <MissingDetail text="Approval status, override details, and revocation evidence were not included in this view." />
       ) : approvals.length === 0 ? (
@@ -438,7 +406,7 @@ function GovernancePanel({
       ) : (
         <div className="space-y-3">
           {approvals.map((approval) => (
-            <ApprovalCard key={approval.approvalId} approval={approval} />
+            <ApprovalCard key={approval.approvalToken} approval={approval} />
           ))}
         </div>
       )}
@@ -468,62 +436,6 @@ function ApprovalCard({ approval }: { approval: FairValueApproval }) {
         </div>
       ) : null}
     </div>
-  )
-}
-
-function AuditPanel({
-  events,
-  boundary,
-}: {
-  events: FairValueAuditEvent[] | undefined
-  boundary: FairValueAuditBoundary
-}) {
-  return (
-    <Panel title="Audit trail" icon={ScrollText}>
-      {events === undefined ? (
-        <MissingDetail text="Review history is not available in this view." />
-      ) : events.length === 0 ? (
-        <MissingDetail text="No matching fair-value review events were found." />
-      ) : (
-        <ol className="space-y-2">
-          {events.map((event) => (
-            <li key={event.auditEventId} className="flex gap-3 rounded-lg border border-border p-3">
-              <span className="font-mono text-[9px] text-muted-foreground">
-                #{event.sequence}
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block text-xs font-semibold">
-                  {humanize(event.subject.kind)}
-                </span>
-                <span className="mt-1 block text-[10px] text-muted-foreground">
-                  {event.actor} · {dateTime(event.businessAt)}
-                </span>
-              </span>
-            </li>
-          ))}
-        </ol>
-      )}
-      <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3">
-        <p className="text-[10px] leading-4 text-muted-foreground">
-          Showing {events?.length.toLocaleString() ?? 0} related review events.
-        </p>
-        {boundary.hasMore ? (
-          <button
-            type="button"
-            className="rounded-md border border-border px-3 py-1.5 text-[10px] font-medium transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-            onClick={boundary.onLoadMore}
-            disabled={boundary.loadingMore}
-          >
-            {boundary.loadingMore ? "Loading…" : "Load more history"}
-          </button>
-        ) : null}
-      </div>
-      {boundary.capped ? (
-        <p className="mt-2 text-[10px] leading-4 text-amber-200">
-          Additional older review history is available in Logs.
-        </p>
-      ) : null}
-    </Panel>
   )
 }
 
@@ -573,17 +485,13 @@ function HierarchyBadge({ hierarchy }: { hierarchy: FairValueHierarchy | null })
   )
 }
 
-function mergeMarketAccess(
-  measurement: FairValueMeasurement,
-  inputs: FairValueInput[] | undefined,
-) {
+function mergeMarketAccess(inputs: FairValueInput[]) {
   const byId = new Map<string, FairValueMarketAccess>()
-  for (const assessment of measurement.marketAccess ?? []) {
-    byId.set(assessment.assessmentId, assessment)
-  }
-  for (const input of inputs ?? []) {
+  for (const input of inputs) {
     const assessment = input.marketAccessAssessment
-    if (assessment) byId.set(assessment.assessmentId, assessment)
+    if (assessment) {
+      byId.set(`${assessment.effectiveFrom}:${assessment.approvedAt}`, assessment)
+    }
   }
   return [...byId.values()]
 }
@@ -599,4 +507,27 @@ function dateTime(value: string) {
     dateStyle: "medium",
     timeStyle: "medium",
   }).format(timestamp)
+}
+
+function dataQualityLabel(value: FairValueInput["dataQuality"]) {
+  switch (value) {
+    case "direct_verified":
+      return "Verified current data"
+    case "direct_unverified":
+      return "Current data with limited verification"
+    case "official_delayed":
+      return "Official delayed data"
+    case "aggregated":
+      return "Combined data"
+    case "indicative":
+      return "Indicative data"
+    case "modeled":
+      return "Model-derived estimate"
+    case "estimated":
+      return "Estimated value"
+    case "stale":
+      return "Out-of-date data"
+    case "quarantined":
+      return "Excluded pending review"
+  }
 }

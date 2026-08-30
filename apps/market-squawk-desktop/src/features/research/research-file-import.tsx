@@ -21,6 +21,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
+import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 
 import {
@@ -103,16 +104,14 @@ export function ResearchFileImport({
   bootstrap: DesktopBootstrap
   onStarted: () => void | Promise<unknown>
 }) {
-  const operations = new Set(
-    bootstrap.operations.map((operation) => operation.name),
-  )
-  const requiredOperations = [
-    "Research.PreviewStagedFile",
-    "Research.CommitStagedFile",
-    "Research.DiscardStagedFile",
-  ]
-  const missingOperations = requiredOperations.filter(
-    (operation) => !operations.has(operation),
+  const capabilities = productCapabilitySet(bootstrap)
+  const requiredCapabilities = [
+    "research_file_preview",
+    "research_file_commit",
+    "research_file_discard",
+  ] as const
+  const missingCapabilities = requiredCapabilities.filter(
+    (capability) => !capabilities.has(capability),
   )
   const [format, setFormat] = React.useState<ResearchFileFormat | "">("")
   const [preview, setPreview] = React.useState<ResearchFilePreview | null>(null)
@@ -323,7 +322,7 @@ export function ResearchFileImport({
       </div>
 
       <div className="p-5">
-        {missingOperations.length > 0 ? (
+        {missingCapabilities.length > 0 ? (
           <Alert>
             <AlertCircle aria-hidden="true" />
             <AlertTitle>File import is unavailable</AlertTitle>
@@ -344,7 +343,7 @@ export function ResearchFileImport({
 
         {!preview ? (
           <div className="mt-1">
-            <fieldset disabled={activity !== null || missingOperations.length > 0 || !isTauri()}>
+            <fieldset disabled={activity !== null || missingCapabilities.length > 0 || !isTauri()}>
               <legend className="text-xs font-semibold">What kind of file are you adding?</legend>
               <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
                 {formats.map((option) => (
@@ -380,7 +379,7 @@ export function ResearchFileImport({
                 disabled={
                   !format ||
                   activity !== null ||
-                  missingOperations.length > 0 ||
+                  missingCapabilities.length > 0 ||
                   !isTauri()
                 }
               >

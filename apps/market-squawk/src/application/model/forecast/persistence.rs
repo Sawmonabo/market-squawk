@@ -8,10 +8,12 @@ use std::{
 };
 
 use market_squawk_data::{
-    ComponentKind, ComponentScope, CorporateActionSensitivity, FeatureLabelComponentSpec,
-    Sha256Digest, UniverseId,
+    ComponentKind, ComponentScope, CorporateActionSensitivity, DatasetId, DatasetManifestRef,
+    DatasetSchemaRef, DatasetSchemaRegistry, FeatureLabelComponentSpec, Sha256Digest, UniverseId,
 };
-use market_squawk_domain::{Currency, DataQuality, InstrumentId, ModelId, Timestamp};
+use market_squawk_domain::{
+    Currency, DataQuality, InstrumentId, ModelId, SchemaVersion, SourceId, Timestamp,
+};
 use market_squawk_modeling::{
     BundleId, CalibrationBand, CalibrationEvidence, CalibrationMethod, CalibrationWindow,
     ForecastCentralStatistic, ForecastCoverage, ForecastEstimatorProfile, ForecastHorizon,
@@ -24,14 +26,17 @@ use market_squawk_services::{ArtifactRead, ArtifactReference};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use uuid::Uuid;
+
+use crate::application::domain_support::opaque_product_token;
 
 use super::{
-    FORECAST_PAYLOAD_SCHEMA_VERSION, FORECAST_SELECTION_POLICY_REVISION, ForecastApplicationError,
-    ForecastApplicationLimits, ForecastPriceEvidence, ForecastPriceUnavailableReason,
-    ForecastSelectionOrder, ForecastSelectionQualification, ForecastSelectionReceipt,
-    ForecastSelectionReceiptBody, INDEX_SCHEMA_VERSION, SelectedForecastPriceUnavailable,
-    SelectedPriceForecast, SelectedPriceForecastPoint, SelectedPriceInterval,
-    SelectedPriceIntervals,
+    FORECAST_PAYLOAD_SCHEMA_VERSION, FORECAST_SELECTION_POLICY_REVISION, ForecastAnalysisEvidence,
+    ForecastApplicationError, ForecastApplicationLimits, ForecastPriceEvidence,
+    ForecastPriceUnavailableReason, ForecastSelectionOrder, ForecastSelectionQualification,
+    ForecastSelectionReceipt, ForecastSelectionReceiptBody, ForecastServingEvidence,
+    INDEX_SCHEMA_VERSION, SelectedForecastPriceUnavailable, SelectedPriceForecast,
+    SelectedPriceForecastPoint, SelectedPriceInterval, SelectedPriceIntervals,
 };
 
 const MAXIMUM_CALIBRATION_ASSUMPTION_BYTES: usize = 512;
@@ -69,24 +74,84 @@ impl VintageRecord {
         })
     }
 
-    pub(super) fn summary(&self) -> Value {
-        json!({
-            "vintageId": self.vintage_id,
-            "requestHash": self.request_hash,
-            "instrumentId": self.payload.instrument_id,
-            "modelId": self.payload.model_id,
-            "bundleId": self.payload.bundle_id,
-            "bundleVersion": self.payload.bundle_version,
-            "observedThroughUnixNanos": self.payload.observed_through_unix_nanos,
-            "createdAtUnixNanos": self.payload.created_at_unix_nanos,
-            "expiresAtUnixNanos": self.payload.expires_at_unix_nanos,
-            "horizonPoints": self.payload.horizon_points,
-            "horizonStepNanos": self.payload.horizon_step_nanos,
-            "hasCalibratedIntervals": self.payload.calibration.is_some(),
-            "quality": self.payload.quality,
-            "unavailableReason": self.payload.unavailable_reason,
-            "controlledArtifact": self.controlled_artifact,
-        })
+    pub(super) fn product_token(&self) -> Result<Uuid, ForecastApplicationError> {
+        product_token(b"market-squawk/product-forecast/v1\0", &self.vintage_id)
+    }
+
+    pub(super) fn matches_product_token(
+        &self,
+        token: Uuid,
+    ) -> Result<bool, ForecastApplicationError> {
+        self.product_token().map(|candidate| candidate == token)
+    }
+
+    pub(super) fn product_summary(&self) -> Result<Value, ForecastApplicationError> {
+        Ok(json!({
+            "forecastToken": self.product_token()?,
+            "investmentToken": self.payload.instrument_id,
+            "observedThroughUnixNanos": self.payload.observed_through_unix_nanos.to_string(),
+            "createdAtUnixNanos": self.payload.created_at_unix_nanos.to_string(),
+            "expiresAtUnixNanos": self.payload.expires_at_unix_nanos.to_string(),
+            "horizon": {
+                "points": self.payload.horizon_points,
+                "stepNanos": self.payload.horizon_step_nanos.to_string(),
+            },
+            "evidenceState": if self.payload.calibration.is_some() {
+                "calibrated"
+            } else {
+                "limited"
+            },
+            "historicalObservationCount": self.payload.observed_history.len(),
+            "limitations": self.payload.limitations,
+        }))
+    }
+
+    pub(super) fn product_detail(
+        &self,
+        drift_monitoring: Value,
+    ) -> Result<Value, ForecastApplicationError> {
+        let estimates = self
+            .payload
+            .points
+            .iter()
+            .map(PointRecord::product_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        let observed_history = self
+            .payload
+            .observed_history
+            .iter()
+            .map(ObservedPointRecord::product_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        let calibration = self
+            .payload
+            .calibration
+            .as_ref()
+            .map(CalibrationRecord::product_value)
+            .transpose()?;
+        Ok(json!({
+            "forecastToken": self.product_token()?,
+            "investmentToken": self.payload.instrument_id,
+            "observedThroughUnixNanos": self.payload.observed_through_unix_nanos.to_string(),
+            "availableAtUnixNanos": self.payload.available_at_unix_nanos.to_string(),
+            "createdAtUnixNanos": self.payload.created_at_unix_nanos.to_string(),
+            "expiresAtUnixNanos": self.payload.expires_at_unix_nanos.to_string(),
+            "horizon": {
+                "points": self.payload.horizon_points,
+                "stepNanos": self.payload.horizon_step_nanos.to_string(),
+            },
+            "evidenceState": if self.payload.calibration.is_some() {
+                "calibrated"
+            } else {
+                "limited"
+            },
+            "observedHistory": observed_history,
+            "estimates": estimates,
+            "calibration": calibration,
+            "limitations": self.payload.limitations,
+            "unavailableBehavior": "no_action",
+            "outcomeMonitoring": drift_monitoring,
+            "analysisOnly": true,
+        }))
     }
 
     pub(super) fn decimal_scale(&self) -> Option<u8> {
@@ -134,6 +199,42 @@ impl VintageRecord {
             && self.payload.validate()
     }
 
+    fn exact_horizon_price_terminal_target(
+        &self,
+        requested_horizon_nanos: NonZeroU64,
+        as_of: Timestamp,
+    ) -> Result<Option<i64>, ForecastApplicationError> {
+        let payload = &self.payload;
+        let [point] = payload.points.as_slice() else {
+            return Ok(None);
+        };
+        let expected_target = payload
+            .observed_through_unix_nanos
+            .checked_add(
+                i64::try_from(requested_horizon_nanos.get())
+                    .map_err(|_| ForecastApplicationError::CorruptIndex)?,
+            )
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+        let exact_binding = matches!(
+            payload.output_binding.decoded_measurement(),
+            Some(ForecastMeasurement::Price { .. })
+        ) && payload.output_binding.decoded_central_statistic()
+            == Some(ForecastCentralStatistic::ModelEstimatedConditionalMean)
+            && payload.output_binding.target.decoded()
+                == Some(ForecastTargetMeaning::FixedHorizonTerminal {
+                    horizon_nanos: requested_horizon_nanos,
+                });
+        Ok((exact_binding
+            && payload.horizon_points == 1
+            && payload.horizon_step_nanos == requested_horizon_nanos.get()
+            && payload.calibration.is_some()
+            && point.intervals.is_some()
+            && point.target_at_unix_nanos == expected_target
+            && point.target_at_unix_nanos > as_of.unix_nanos()
+            && payload.expires_at_unix_nanos <= point.target_at_unix_nanos)
+            .then_some(point.target_at_unix_nanos))
+    }
+
     pub(super) fn verify_artifact_read(
         &self,
         artifact: &ArtifactRead,
@@ -168,6 +269,8 @@ impl VintageRecord {
         }
         let output_binding_identity = digest_from_hex(&stored_binding.identity_sha256)
             .map_err(|_error| ForecastApplicationError::CorruptIndex)?;
+        let analysis_evidence = self.payload.analysis_evidence.typed()?;
+        let serving_evidence = self.payload.serving_evidence.typed()?;
         let calibration = self.payload.revalidated_calibration(metadata)?;
         self.payload.verify_vintage_identity(
             vintage_id,
@@ -185,6 +288,8 @@ impl VintageRecord {
                         vintage_id,
                         instrument_id,
                         output_binding_identity,
+                        analysis_evidence,
+                        serving_evidence,
                         reason: ForecastPriceUnavailableReason::ReturnMeasurement,
                     },
                 ));
@@ -195,6 +300,8 @@ impl VintageRecord {
                         vintage_id,
                         instrument_id,
                         output_binding_identity,
+                        analysis_evidence,
+                        serving_evidence,
                         reason: ForecastPriceUnavailableReason::ProbabilityMeasurement,
                     },
                 ));
@@ -205,6 +312,8 @@ impl VintageRecord {
                         vintage_id,
                         instrument_id,
                         output_binding_identity,
+                        analysis_evidence,
+                        serving_evidence,
                         reason: ForecastPriceUnavailableReason::OtherRegressionMeasurement,
                     },
                 ));
@@ -218,6 +327,8 @@ impl VintageRecord {
                         vintage_id,
                         instrument_id,
                         output_binding_identity,
+                        analysis_evidence,
+                        serving_evidence,
                         reason: ForecastPriceUnavailableReason::TerminalHorizonUnavailable,
                     },
                 ));
@@ -231,6 +342,8 @@ impl VintageRecord {
                     vintage_id,
                     instrument_id,
                     output_binding_identity,
+                    analysis_evidence,
+                    serving_evidence,
                     reason: ForecastPriceUnavailableReason::CentralStatisticUnavailable,
                 },
             ));
@@ -254,6 +367,8 @@ impl VintageRecord {
                 created_at: Timestamp::from_unix_nanos(self.payload.created_at_unix_nanos),
                 expires_at: Timestamp::from_unix_nanos(self.payload.expires_at_unix_nanos),
                 output_binding_identity,
+                analysis_evidence,
+                serving_evidence,
                 model_metadata: metadata.clone(),
                 forecast_artifact: self.artifact_reference()?,
                 points,
@@ -682,6 +797,173 @@ const fn corporate_action_sensitivity_name(value: CorporateActionSensitivity) ->
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForecastAnalysisEvidenceRecord {
+    manifest: ForecastAnalysisManifestRecord,
+    production_identity_sha256: String,
+    production_receipt_sha256: String,
+    pairing_sha256: String,
+}
+
+impl ForecastAnalysisEvidenceRecord {
+    fn from_evidence(evidence: &ForecastAnalysisEvidence) -> Self {
+        let manifest = evidence.manifest();
+        Self {
+            manifest: ForecastAnalysisManifestRecord {
+                dataset: manifest.dataset_id().as_str().to_owned(),
+                manifest_version: manifest.manifest_version(),
+                schema: ForecastAnalysisSchemaRecord {
+                    name: manifest.schema().name().to_owned(),
+                    version: manifest.schema_version().get(),
+                    fingerprint: hex(manifest.schema().fingerprint()),
+                },
+                content_hash: hex(manifest.content_hash().bytes()),
+            },
+            production_identity_sha256: hex(evidence.production_identity_sha256().bytes()),
+            production_receipt_sha256: hex(evidence.production_receipt_sha256().bytes()),
+            pairing_sha256: hex(evidence.pairing_sha256().bytes()),
+        }
+    }
+
+    fn typed(&self) -> Result<ForecastAnalysisEvidence, ForecastApplicationError> {
+        let fingerprint = digest_from_hex(&self.manifest.schema.fingerprint)?;
+        let content_hash = digest_from_hex(&self.manifest.content_hash)?;
+        if fingerprint.bytes() == [0; 32] || content_hash.bytes() == [0; 32] {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        let schema = DatasetSchemaRef::try_new(
+            &self.manifest.schema.name,
+            SchemaVersion::new(self.manifest.schema.version)
+                .map_err(|_| ForecastApplicationError::CorruptIndex)?,
+            fingerprint.bytes(),
+        )
+        .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+        DatasetSchemaRegistry::local()
+            .resolve(&schema)
+            .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+        let manifest = DatasetManifestRef::try_new_with_schema(
+            DatasetId::try_from(self.manifest.dataset.as_str())
+                .map_err(|_| ForecastApplicationError::CorruptIndex)?,
+            self.manifest.manifest_version,
+            schema,
+            content_hash,
+        )
+        .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+        ForecastAnalysisEvidence::try_new(
+            manifest,
+            digest_from_hex(&self.production_identity_sha256)?,
+            digest_from_hex(&self.production_receipt_sha256)?,
+            digest_from_hex(&self.pairing_sha256)?,
+        )
+        .map_err(|_| ForecastApplicationError::CorruptIndex)
+    }
+
+    fn validate(&self) -> bool {
+        self.typed().is_ok()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForecastServingEvidenceRecord {
+    manifest: ForecastAnalysisManifestRecord,
+    source_id: String,
+    object_graph_sha256: String,
+    selection_sha256: String,
+    result_sha256: String,
+    knowledge_cutoff_unix_nanos: i64,
+    prior_observed_at_unix_nanos: i64,
+    observed_through_unix_nanos: i64,
+    feature_sha256: String,
+}
+
+impl ForecastServingEvidenceRecord {
+    fn from_evidence(evidence: &ForecastServingEvidence) -> Self {
+        let manifest = evidence.manifest();
+        Self {
+            manifest: ForecastAnalysisManifestRecord {
+                dataset: manifest.dataset_id().as_str().to_owned(),
+                manifest_version: manifest.manifest_version(),
+                schema: ForecastAnalysisSchemaRecord {
+                    name: manifest.schema().name().to_owned(),
+                    version: manifest.schema_version().get(),
+                    fingerprint: hex(manifest.schema().fingerprint()),
+                },
+                content_hash: hex(manifest.content_hash().bytes()),
+            },
+            source_id: evidence.source_id().as_str().to_owned(),
+            object_graph_sha256: hex(evidence.object_graph_sha256().bytes()),
+            selection_sha256: hex(evidence.selection_sha256().bytes()),
+            result_sha256: hex(evidence.result_sha256().bytes()),
+            knowledge_cutoff_unix_nanos: evidence.knowledge_cutoff().unix_nanos(),
+            prior_observed_at_unix_nanos: evidence.prior_observed_at().unix_nanos(),
+            observed_through_unix_nanos: evidence.observed_through().unix_nanos(),
+            feature_sha256: hex(evidence.feature_sha256().bytes()),
+        }
+    }
+
+    fn typed(&self) -> Result<ForecastServingEvidence, ForecastApplicationError> {
+        let fingerprint = digest_from_hex(&self.manifest.schema.fingerprint)?;
+        let content_hash = digest_from_hex(&self.manifest.content_hash)?;
+        if fingerprint.bytes() == [0; 32] || content_hash.bytes() == [0; 32] {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        let schema = DatasetSchemaRef::try_new(
+            &self.manifest.schema.name,
+            SchemaVersion::new(self.manifest.schema.version)
+                .map_err(|_| ForecastApplicationError::CorruptIndex)?,
+            fingerprint.bytes(),
+        )
+        .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+        DatasetSchemaRegistry::local()
+            .resolve(&schema)
+            .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+        let manifest = DatasetManifestRef::try_new_with_schema(
+            DatasetId::try_from(self.manifest.dataset.as_str())
+                .map_err(|_| ForecastApplicationError::CorruptIndex)?,
+            self.manifest.manifest_version,
+            schema,
+            content_hash,
+        )
+        .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+        ForecastServingEvidence::try_new(
+            manifest,
+            SourceId::try_from(self.source_id.as_str())
+                .map_err(|_| ForecastApplicationError::CorruptIndex)?,
+            digest_from_hex(&self.object_graph_sha256)?,
+            digest_from_hex(&self.selection_sha256)?,
+            digest_from_hex(&self.result_sha256)?,
+            Timestamp::from_unix_nanos(self.knowledge_cutoff_unix_nanos),
+            Timestamp::from_unix_nanos(self.prior_observed_at_unix_nanos),
+            Timestamp::from_unix_nanos(self.observed_through_unix_nanos),
+            digest_from_hex(&self.feature_sha256)?,
+        )
+        .map_err(|_| ForecastApplicationError::CorruptIndex)
+    }
+
+    fn validate(&self) -> bool {
+        self.typed().is_ok()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForecastAnalysisManifestRecord {
+    dataset: String,
+    manifest_version: u64,
+    schema: ForecastAnalysisSchemaRecord,
+    content_hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForecastAnalysisSchemaRecord {
+    name: String,
+    version: u16,
+    fingerprint: String,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct ForecastPayloadRecord {
@@ -694,6 +976,8 @@ pub(super) struct ForecastPayloadRecord {
     artifact_hash: String,
     training_run_hash: String,
     output_binding: ForecastOutputBindingRecord,
+    analysis_evidence: ForecastAnalysisEvidenceRecord,
+    serving_evidence: ForecastServingEvidenceRecord,
     dataset_export_hash: String,
     dataset_selection_hash: String,
     universe_id: String,
@@ -719,10 +1003,14 @@ pub(super) struct ForecastPayloadRecord {
 impl ForecastPayloadRecord {
     pub(super) fn from_path(
         path: &ForecastPath,
+        analysis_evidence: &ForecastAnalysisEvidence,
+        serving_evidence: &ForecastServingEvidence,
         created_at: market_squawk_domain::Timestamp,
         expires_at: market_squawk_domain::Timestamp,
     ) -> Result<Self, ForecastApplicationError> {
         if created_at < path.available_at()
+            || created_at < serving_evidence.knowledge_cutoff()
+            || path.observed_cutoff() != serving_evidence.observed_through()
             || path
                 .points()
                 .first()
@@ -752,6 +1040,8 @@ impl ForecastPayloadRecord {
             artifact_hash: hex(path.artifact_hash().bytes()),
             training_run_hash: hex(path.training_run_hash().bytes()),
             output_binding: ForecastOutputBindingRecord::from_binding(path.output_binding()),
+            analysis_evidence: ForecastAnalysisEvidenceRecord::from_evidence(analysis_evidence),
+            serving_evidence: ForecastServingEvidenceRecord::from_evidence(serving_evidence),
             dataset_export_hash: hex(path.dataset().export_digest().bytes()),
             dataset_selection_hash: hex(path.dataset().selection_digest().bytes()),
             universe_id: path.universe_id().as_str().to_owned(),
@@ -806,6 +1096,8 @@ impl ForecastPayloadRecord {
             .checked_sub(self.observed_through_unix_nanos);
         if self.payload_schema_version != FORECAST_PAYLOAD_SCHEMA_VERSION
             || !self.output_binding.validate()
+            || !self.analysis_evidence.validate()
+            || !self.serving_evidence.validate()
             || InstrumentId::from_str(&self.instrument_id).is_err()
             || ModelId::from_str(&self.model_id).is_err()
             || BundleId::try_new(&self.bundle_id).is_err()
@@ -829,6 +1121,8 @@ impl ForecastPayloadRecord {
             || self.training_start_unix_nanos >= self.training_end_unix_nanos
             || self.training_end_unix_nanos > self.observed_through_unix_nanos
             || self.available_at_unix_nanos < self.observed_through_unix_nanos
+            || self.serving_evidence.observed_through_unix_nanos != self.observed_through_unix_nanos
+            || self.available_at_unix_nanos > self.serving_evidence.knowledge_cutoff_unix_nanos
             || self.created_at_unix_nanos < self.available_at_unix_nanos
             || self.created_at_unix_nanos >= first.target_at_unix_nanos
             || self.expires_at_unix_nanos <= self.created_at_unix_nanos
@@ -1038,6 +1332,14 @@ impl ObservedPointRecord {
         )
         .map_err(|_error| ForecastApplicationError::CorruptIndex)
     }
+
+    fn product_value(&self) -> Result<Value, ForecastApplicationError> {
+        Ok(json!({
+            "observedAtUnixNanos": self.observed_at_unix_nanos.to_string(),
+            "availableAtUnixNanos": self.available_at_unix_nanos.to_string(),
+            "value": decimal_text(&self.mantissa, self.decimal_scale)?,
+        }))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1103,6 +1405,20 @@ impl PointRecord {
             central,
             intervals,
         })
+    }
+
+    fn product_value(&self) -> Result<Value, ForecastApplicationError> {
+        let central = decimal_text(&self.central_mantissa, self.decimal_scale)?;
+        let ranges = self
+            .intervals
+            .as_ref()
+            .map(|intervals| intervals.product_value(self.decimal_scale))
+            .transpose()?;
+        Ok(json!({
+            "targetAtUnixNanos": self.target_at_unix_nanos.to_string(),
+            "central": central,
+            "ranges": ranges,
+        }))
     }
 
     fn identity_point(
@@ -1217,6 +1533,20 @@ impl IntervalRecord {
         })
     }
 
+    fn product_value(&self, scale: u8) -> Result<Value, ForecastApplicationError> {
+        let range = |pair: &[String; 2]| -> Result<Value, ForecastApplicationError> {
+            Ok(json!({
+                "lower": decimal_text(&pair[0], scale)?,
+                "upper": decimal_text(&pair[1], scale)?,
+            }))
+        };
+        Ok(json!({
+            "likely": range(&self.interval_50)?,
+            "wider": range(&self.interval_80)?,
+            "stress": range(&self.interval_95)?,
+        }))
+    }
+
     fn identity_bounds(
         &self,
         scale: u8,
@@ -1298,6 +1628,30 @@ impl CalibrationRecord {
                 "realized marginal empirical coverage; not a per-observation guarantee".to_owned(),
             dependence_assumptions: value.dependence_assumptions().to_owned(),
         }
+    }
+
+    fn product_value(&self) -> Result<Value, ForecastApplicationError> {
+        let bands = [0_usize, 1, 2]
+            .map(|index| {
+                Ok(json!({
+                    "targetCoveragePercent": decimal_text(
+                        &self.target_coverage_basis_points[index].to_string(),
+                        2,
+                    )?,
+                    "realizedCovered": self.realized_covered[index],
+                    "realizedTotal": self.realized_total[index],
+                }))
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>, ForecastApplicationError>>()?;
+        Ok(json!({
+            "windowStartUnixNanos": self.window_start_unix_nanos.to_string(),
+            "windowEndUnixNanos": self.window_end_unix_nanos.to_string(),
+            "observationCount": self.observations,
+            "coverage": bands,
+            "interpretation": self.coverage_interpretation,
+            "assumptions": self.dependence_assumptions,
+        }))
     }
 
     fn validate(&self, observed_cutoff: i64) -> bool {
@@ -1431,6 +1785,17 @@ impl OutcomeRecord {
 
     pub(super) fn absolute_error_mantissa(&self) -> Option<i128> {
         self.absolute_error_mantissa.parse().ok()
+    }
+
+    pub(super) fn product_value(&self) -> Result<Value, ForecastApplicationError> {
+        Ok(json!({
+            "targetAtUnixNanos": self.target_at_unix_nanos.to_string(),
+            "observedAtUnixNanos": self.observed_at_unix_nanos.to_string(),
+            "availableAtUnixNanos": self.available_at_unix_nanos.to_string(),
+            "actual": decimal_text(&self.actual_mantissa, self.decimal_scale)?,
+            "signedError": decimal_text(&self.signed_error_mantissa, self.decimal_scale)?,
+            "absoluteError": decimal_text(&self.absolute_error_mantissa, self.decimal_scale)?,
+        }))
     }
 
     pub(super) fn from_outcome(
@@ -1701,6 +2066,96 @@ impl ForecastIndex {
             selected_available_at_unix_nanos: selected.payload.available_at_unix_nanos,
             selected_expires_at_unix_nanos: selected.payload.expires_at_unix_nanos,
             selected_terminal_target_at_unix_nanos: None,
+            selected_analysis_pairing_sha256: selected
+                .payload
+                .analysis_evidence
+                .pairing_sha256
+                .clone(),
+            selected_serving_feature_sha256: selected
+                .payload
+                .serving_evidence
+                .feature_sha256
+                .clone(),
+        })?;
+        Ok(ForecastIndexSelection {
+            vintage: selected.clone(),
+            receipt,
+        })
+    }
+
+    pub(super) fn latest_valid_exact_horizon_price_for_instrument(
+        &self,
+        instrument_id: InstrumentId,
+        requested_horizon_nanos: NonZeroU64,
+        as_of: Timestamp,
+        retained_vintage_hard_ceiling: NonZeroUsize,
+    ) -> Result<ForecastIndexSelection, ForecastApplicationError> {
+        if self.vintages.len() > retained_vintage_hard_ceiling.get() {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        let mut eligible_vintage_count = 0_usize;
+        let mut selected: Option<(&VintageRecord, i64)> = None;
+        for vintage in &self.vintages {
+            let candidate_instrument = InstrumentId::from_str(&vintage.payload.instrument_id)
+                .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+            if candidate_instrument != instrument_id
+                || vintage.payload.available_at_unix_nanos > as_of.unix_nanos()
+                || vintage.payload.created_at_unix_nanos > as_of.unix_nanos()
+                || vintage.payload.expires_at_unix_nanos <= as_of.unix_nanos()
+            {
+                continue;
+            }
+            if !vintage.validate() {
+                return Err(ForecastApplicationError::CorruptIndex);
+            }
+            let Some(terminal_target) =
+                vintage.exact_horizon_price_terminal_target(requested_horizon_nanos, as_of)?
+            else {
+                continue;
+            };
+            eligible_vintage_count = eligible_vintage_count
+                .checked_add(1)
+                .ok_or(ForecastApplicationError::CorruptIndex)?;
+            if selected
+                .is_none_or(|(current, _)| compare_selection_priority(vintage, current).is_gt())
+            {
+                selected = Some((vintage, terminal_target));
+            }
+        }
+        let (selected, terminal_target) = selected.ok_or(ForecastApplicationError::NotFound)?;
+        let competing_eligible_vintage_count = eligible_vintage_count
+            .checked_sub(1)
+            .ok_or(ForecastApplicationError::CorruptIndex)?;
+        let receipt = ForecastSelectionReceipt::try_new(ForecastSelectionReceiptBody {
+            policy_revision: FORECAST_SELECTION_POLICY_REVISION,
+            selection_order:
+                ForecastSelectionOrder::NewestCreatedAtObservedThroughAvailableAtThenLowestVintageId,
+            qualification: ForecastSelectionQualification::ExactCalibratedConditionalMeanPrice {
+                horizon_nanos: requested_horizon_nanos,
+            },
+            instrument_id,
+            as_of_unix_nanos: as_of.unix_nanos(),
+            considered_vintage_count: self.vintages.len(),
+            retained_vintage_hard_ceiling: retained_vintage_hard_ceiling.get(),
+            eligible_vintage_count,
+            competing_eligible_vintage_count,
+            selection_complete: true,
+            selected_vintage_id: selected.vintage_id.clone(),
+            selected_created_at_unix_nanos: selected.payload.created_at_unix_nanos,
+            selected_observed_through_unix_nanos: selected.payload.observed_through_unix_nanos,
+            selected_available_at_unix_nanos: selected.payload.available_at_unix_nanos,
+            selected_expires_at_unix_nanos: selected.payload.expires_at_unix_nanos,
+            selected_terminal_target_at_unix_nanos: Some(terminal_target),
+            selected_analysis_pairing_sha256: selected
+                .payload
+                .analysis_evidence
+                .pairing_sha256
+                .clone(),
+            selected_serving_feature_sha256: selected
+                .payload
+                .serving_evidence
+                .feature_sha256
+                .clone(),
         })?;
         Ok(ForecastIndexSelection {
             vintage: selected.clone(),
@@ -1791,6 +2246,49 @@ const fn observed_quality_name(quality: DataQuality) -> &'static str {
     }
 }
 
+fn product_token(domain: &[u8], identity: &str) -> Result<Uuid, ForecastApplicationError> {
+    let identity = digest_from_hex(identity)?;
+    Ok(opaque_product_token(domain, &[&identity.bytes()]))
+}
+
+pub(super) fn decimal_text(value: &str, scale: u8) -> Result<String, ForecastApplicationError> {
+    let parsed = value
+        .parse::<i128>()
+        .map_err(|_| ForecastApplicationError::CorruptIndex)?;
+    let negative = parsed.is_negative();
+    let digits = parsed
+        .checked_abs()
+        .ok_or(ForecastApplicationError::CorruptIndex)?
+        .to_string();
+    if scale == 0 {
+        return Ok(value.to_owned());
+    }
+    let scale = usize::from(scale);
+    let padded_length = scale
+        .checked_add(1)
+        .ok_or(ForecastApplicationError::CorruptIndex)?;
+    let mut magnitude = String::new();
+    magnitude
+        .try_reserve_exact(padded_length.max(digits.len()))
+        .map_err(|_| ForecastApplicationError::Capacity)?;
+    for _ in digits.len()..padded_length {
+        magnitude.push('0');
+    }
+    magnitude.push_str(&digits);
+    let integral_digits = magnitude.len() - scale;
+    let mut rendered = String::new();
+    rendered
+        .try_reserve_exact(magnitude.len() + usize::from(negative) + 1)
+        .map_err(|_| ForecastApplicationError::Capacity)?;
+    if negative {
+        rendered.push('-');
+    }
+    rendered.push_str(&magnitude[..integral_digits]);
+    rendered.push('.');
+    rendered.push_str(&magnitude[integral_digits..]);
+    Ok(rendered)
+}
+
 fn decoded_observed_quality(value: &str) -> Option<DataQuality> {
     match value {
         "direct_verified" => Some(DataQuality::DirectVerified),
@@ -1812,14 +2310,17 @@ mod tests {
         str::FromStr,
     };
 
+    use market_squawk_data::DatasetSchemaRegistry;
     use market_squawk_domain::{Currency, InstrumentId, Timestamp};
     use market_squawk_modeling::{ForecastMeasurement, ModelOutputSemantics};
     use sha2::{Digest as _, Sha256};
 
     use super::{
-        ControlledArtifactRecord, ForecastEstimatorRecord, ForecastIndex,
-        ForecastMeasurementRecord, ForecastOutputBindingRecord, ForecastOutputLabelRecord,
-        ForecastPayloadRecord, ForecastTargetRecord, OUTPUT_BINDING_SCHEMA_VERSION, PointRecord,
+        CalibrationRecord, ControlledArtifactRecord, ForecastAnalysisEvidenceRecord,
+        ForecastAnalysisManifestRecord, ForecastAnalysisSchemaRecord, ForecastEstimatorRecord,
+        ForecastIndex, ForecastMeasurementRecord, ForecastOutputBindingRecord,
+        ForecastOutputLabelRecord, ForecastPayloadRecord, ForecastServingEvidenceRecord,
+        ForecastTargetRecord, IntervalRecord, OUTPUT_BINDING_SCHEMA_VERSION, PointRecord,
         VintageRecord, hex,
     };
     use crate::application::model::forecast::{
@@ -1867,6 +2368,14 @@ mod tests {
             )?;
             assert_eq!(first.receipt.eligible_vintage_count(), 3);
             assert_eq!(first.receipt.selected_vintage_id(), hex([2; 32]));
+            assert_eq!(
+                first.receipt.selected_analysis_pairing_sha256()?,
+                super::digest_from_hex(&first.vintage.payload.analysis_evidence.pairing_sha256)?
+            );
+            assert_eq!(
+                first.receipt.selected_serving_feature_sha256()?,
+                super::digest_from_hex(&first.vintage.payload.serving_evidence.feature_sha256)?
+            );
             assert_eq!(first.receipt.body.considered_vintage_count, 6);
             assert_eq!(first.receipt.body.retained_vintage_hard_ceiling, 16);
             assert_eq!(first.receipt.body.competing_eligible_vintage_count, 2);
@@ -1886,8 +2395,8 @@ mod tests {
                     .is_exact_horizon_price_qualified(exact_horizon)
             );
 
-            // No current publication path can construct this receipt. It models the future
-            // sealed-provenance shape solely to pin the temporal boundary used by projection.
+            // Pin the temporal boundary independently of index selection so receipt validation
+            // still rejects target-expiry and selection-time drift.
             let mut future_qualified_body = first.receipt.body.clone();
             future_qualified_body.qualification =
                 ForecastSelectionQualification::ExactCalibratedConditionalMeanPrice {
@@ -1988,7 +2497,138 @@ mod tests {
             ),
             Err(ForecastApplicationError::NotFound)
         ));
+
+        let exact_horizon = NonZeroU64::new(100).ok_or("nonzero exact horizon")?;
+        let mut exact_index = ForecastIndex {
+            schema_version: INDEX_SCHEMA_VERSION,
+            vintages: vec![
+                calibrated_vintage(selected_instrument, 8, 35, 10, 100, 100, false),
+                calibrated_vintage(selected_instrument, 9, 40, 10, 100, 200, false),
+                calibrated_vintage(selected_instrument, 10, 45, 10, 100, 100, true),
+                vintage(selected_instrument, 11, 49, 10, 100),
+            ],
+            outcomes: Vec::new(),
+        };
+        let exact = exact_index.latest_valid_exact_horizon_price_for_instrument(
+            selected_instrument,
+            exact_horizon,
+            Timestamp::from_unix_nanos(50),
+            ceiling,
+        )?;
+        assert_eq!(exact.receipt.selected_vintage_id(), hex([8; 32]));
+        assert_eq!(exact.receipt.eligible_vintage_count(), 1);
+        assert_eq!(exact.receipt.body.considered_vintage_count, 4);
+        assert_eq!(
+            exact.receipt.qualification(),
+            ForecastSelectionQualification::ExactCalibratedConditionalMeanPrice {
+                horizon_nanos: exact_horizon
+            }
+        );
+        assert_eq!(
+            exact.receipt.selected_terminal_target_at_unix_nanos(),
+            Some(110)
+        );
+        assert!(
+            exact
+                .receipt
+                .binds_live_terminal_target(Timestamp::from_unix_nanos(110))
+        );
+        let exact_digest = exact.receipt.receipt_digest();
+        exact_index.vintages.reverse();
+        let reordered_exact = exact_index.latest_valid_exact_horizon_price_for_instrument(
+            selected_instrument,
+            exact_horizon,
+            Timestamp::from_unix_nanos(50),
+            ceiling,
+        )?;
+        assert_eq!(reordered_exact.receipt.receipt_digest(), exact_digest);
+        let return_only = ForecastIndex {
+            schema_version: INDEX_SCHEMA_VERSION,
+            vintages: vec![calibrated_vintage(
+                selected_instrument,
+                12,
+                35,
+                10,
+                100,
+                100,
+                true,
+            )],
+            outcomes: Vec::new(),
+        };
+        assert!(matches!(
+            return_only.latest_valid_exact_horizon_price_for_instrument(
+                selected_instrument,
+                exact_horizon,
+                Timestamp::from_unix_nanos(50),
+                ceiling,
+            ),
+            Err(ForecastApplicationError::NotFound)
+        ));
         Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the focused selector fixture keeps exact time and output coordinates explicit"
+    )]
+    fn calibrated_vintage(
+        instrument_id: InstrumentId,
+        identity: u8,
+        created_at_unix_nanos: i64,
+        available_at_unix_nanos: i64,
+        expires_at_unix_nanos: i64,
+        horizon_nanos: u64,
+        return_measurement: bool,
+    ) -> VintageRecord {
+        let mut vintage = vintage(
+            instrument_id,
+            identity,
+            created_at_unix_nanos,
+            available_at_unix_nanos,
+            expires_at_unix_nanos,
+        );
+        vintage.payload.horizon_step_nanos = horizon_nanos;
+        vintage.payload.points[0].target_at_unix_nanos =
+            available_at_unix_nanos + i64::try_from(horizon_nanos).expect("fixture horizon fits");
+        vintage.payload.points[0].intervals = Some(IntervalRecord {
+            interval_50: ["9900".to_owned(), "10100".to_owned()],
+            interval_80: ["9800".to_owned(), "10200".to_owned()],
+            interval_95: ["9700".to_owned(), "10300".to_owned()],
+        });
+        vintage.payload.calibration = Some(CalibrationRecord {
+            identity_sha256: hex([21; 32]),
+            method: "residual_quantile".to_owned(),
+            window_start_unix_nanos: 0,
+            window_end_unix_nanos: 1,
+            observations: 3,
+            policy_hash: hex([22; 32]),
+            policy_size_bytes: 1,
+            residuals_hash: hex([23; 32]),
+            residuals_size_bytes: 24,
+            target_coverage_basis_points: [5_000, 8_000, 9_500],
+            lower_offsets: [-1.0, -2.0, -3.0],
+            upper_offsets: [1.0, 2.0, 3.0],
+            realized_covered: [1, 2, 3],
+            realized_total: [3, 3, 3],
+            coverage_interpretation:
+                "realized marginal empirical coverage; not a per-observation guarantee".to_owned(),
+            dependence_assumptions: "fixture marginal calibration".to_owned(),
+        });
+        vintage.payload.output_binding.target =
+            ForecastTargetRecord::FixedHorizonTerminal { horizon_nanos };
+        if return_measurement {
+            vintage.payload.output_binding.measurement = ForecastMeasurementRecord::Return;
+            vintage.payload.output_binding.central_statistic = "unavailable".to_owned();
+        }
+        reseal_payload(&mut vintage);
+        vintage
+    }
+
+    fn reseal_payload(vintage: &mut VintageRecord) {
+        let encoded = serde_json::to_vec(&vintage.payload).expect("fixture payload serializes");
+        let payload_sha256: [u8; 32] = Sha256::digest(&encoded).into();
+        vintage.controlled_artifact.sha256 = hex(payload_sha256);
+        vintage.controlled_artifact.byte_count = encoded.len();
     }
 
     fn vintage(
@@ -2029,6 +2669,12 @@ mod tests {
                     version: 1,
                 },
             },
+            analysis_evidence: analysis_evidence(identity),
+            serving_evidence: serving_evidence(
+                identity,
+                observed_through_unix_nanos,
+                available_at_unix_nanos,
+            ),
             dataset_export_hash: hex([13; 32]),
             dataset_selection_hash: hex([14; 32]),
             universe_id: "selection-fixture".to_owned(),
@@ -2067,6 +2713,57 @@ mod tests {
                 media_type: "application/json".to_owned(),
             },
             payload,
+        }
+    }
+
+    fn analysis_evidence(identity: u8) -> ForecastAnalysisEvidenceRecord {
+        let schema = DatasetSchemaRegistry::local()
+            .canonical_feature_labels()
+            .expect("fixture schema is registered");
+        ForecastAnalysisEvidenceRecord {
+            manifest: ForecastAnalysisManifestRecord {
+                dataset: "selection-analysis-v1".to_owned(),
+                manifest_version: u64::from(identity),
+                schema: ForecastAnalysisSchemaRecord {
+                    name: schema.name().to_owned(),
+                    version: schema.version().get(),
+                    fingerprint: hex(schema.fingerprint()),
+                },
+                content_hash: hex([identity.saturating_add(64); 32]),
+            },
+            production_identity_sha256: hex([identity.saturating_add(65); 32]),
+            production_receipt_sha256: hex([identity.saturating_add(66); 32]),
+            pairing_sha256: hex([identity.saturating_add(67); 32]),
+        }
+    }
+
+    fn serving_evidence(
+        identity: u8,
+        observed_through_unix_nanos: i64,
+        knowledge_cutoff_unix_nanos: i64,
+    ) -> ForecastServingEvidenceRecord {
+        let schema = DatasetSchemaRegistry::local()
+            .canonical_research_observations()
+            .expect("fixture schema is registered");
+        ForecastServingEvidenceRecord {
+            manifest: ForecastAnalysisManifestRecord {
+                dataset: "selection-serving-v1".to_owned(),
+                manifest_version: u64::from(identity),
+                schema: ForecastAnalysisSchemaRecord {
+                    name: schema.name().to_owned(),
+                    version: schema.version().get(),
+                    fingerprint: hex(schema.fingerprint()),
+                },
+                content_hash: hex([identity.saturating_add(68); 32]),
+            },
+            source_id: "alpaca-basic-iex-market-data".to_owned(),
+            object_graph_sha256: hex([identity.saturating_add(69); 32]),
+            selection_sha256: hex([identity.saturating_add(70); 32]),
+            result_sha256: hex([identity.saturating_add(71); 32]),
+            knowledge_cutoff_unix_nanos,
+            prior_observed_at_unix_nanos: observed_through_unix_nanos - 1,
+            observed_through_unix_nanos,
+            feature_sha256: hex([identity.saturating_add(72); 32]),
         }
     }
 }

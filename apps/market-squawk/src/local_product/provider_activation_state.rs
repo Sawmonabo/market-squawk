@@ -44,7 +44,7 @@ const MAXIMUM_PROVIDER_METADATA_BACKUP_BYTES: usize = 160 * 1024 * 1024;
 const MAXIMUM_BACKUP_EVIDENCE_OBJECT_BYTES: u64 = 1024 * 1024;
 const RESTORED_REQUIREMENT_SCHEMA_VERSION: u16 = 1;
 
-pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 8] = [
+pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 10] = [
     "sec.edgar-public",
     "bls.v1-unregistered",
     "bls.v2-registered",
@@ -53,8 +53,10 @@ pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 8] = [
     "fred-alfred.api-v1-v2",
     "local.files",
     "federal-reserve-board.data-download-program",
+    "yahoo-finance.experimental-enrichment",
+    "tiingo.starter-eod-nav",
 ];
-pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 9] = [
+pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 11] = [
     "sec.edgar-public",
     "bls.v1-unregistered",
     "bls.v2-registered",
@@ -64,6 +66,8 @@ pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 9] = [
     "local.files",
     "local.portfolio-imports",
     "federal-reserve-board.data-download-program",
+    "yahoo-finance.experimental-enrichment",
+    "tiingo.starter-eod-nav",
 ];
 
 const COINBASE_DIRECT_LIVE_SURFACE: &str = "coinbase.exchange-direct-market-data";
@@ -76,7 +80,7 @@ const SESSION_BACKED_LIVE_SURFACES: [&str; 4] = [
 ];
 
 // New lifecycle surfaces are appended so schema-v1 backups remain an exact prefix.
-const SERIALIZED_LIFECYCLE_SURFACES: [&str; 15] = [
+const SERIALIZED_LIFECYCLE_SURFACES: [&str; 17] = [
     "coinbase.public-market-data",
     COINBASE_DIRECT_LIVE_SURFACE,
     "kraken.spot-public-market-data",
@@ -92,6 +96,8 @@ const SERIALIZED_LIFECYCLE_SURFACES: [&str; 15] = [
     ProviderMarketAccount::KrakenLevel3.surface_id(),
     "federal-reserve-board.data-download-program",
     ProviderMarketAccount::SchwabMarketData.surface_id(),
+    "yahoo-finance.experimental-enrichment",
+    "tiingo.starter-eod-nav",
 ];
 
 /// Least-authority owner seam for the protected provider-metadata component.
@@ -1826,6 +1832,8 @@ fn surface_key(surface_id: &str) -> Result<&'static str, DurableProviderActivati
         "fred-alfred.api-v1-v2" => Ok("fred-alfred"),
         "local.files" => Ok("local-files"),
         "federal-reserve-board.data-download-program" => Ok("federal-reserve-board-h15"),
+        "yahoo-finance.experimental-enrichment" => Ok("yahoo-enrichment"),
+        "tiingo.starter-eod-nav" => Ok("tiingo-starter-eod-nav"),
         _ => Err(DurableProviderActivationStateError::UnknownSurface),
     }
 }

@@ -43,11 +43,11 @@ use crate::{
 const PUBLIC_CHANNEL: &str = "level2+market_trades+heartbeats";
 const DIRECT_CHANNEL: &str = "full";
 
-/// Application-minted physical identities for one Coinbase raw handoff.
+/// Application-supplied capture-owned physical identities for one Coinbase raw handoff.
 ///
 /// The first event identity belongs to the public frame or Direct REST snapshot. Remaining Direct
 /// identities map one-for-one to replay frames. The adapter validates identity shape but never
-/// creates a UUID or connection authority.
+/// creates or substitutes a UUID or connection authority.
 #[derive(Debug)]
 pub struct CoinbaseMarketPhysicalCaptureIdentity {
     connection_id: [u8; 16],
@@ -55,7 +55,7 @@ pub struct CoinbaseMarketPhysicalCaptureIdentity {
 }
 
 impl CoinbaseMarketPhysicalCaptureIdentity {
-    /// Creates explicit application-owned physical identities.
+    /// Admits explicit capture-owned physical identities at the adapter boundary.
     pub fn try_new(
         connection_id: [u8; 16],
         event_ids: Vec<[u8; 16]>,
@@ -73,12 +73,12 @@ impl CoinbaseMarketPhysicalCaptureIdentity {
         })
     }
 
-    /// Returns the application-owned connection identity bytes.
+    /// Returns the capture-owned connection identity bytes.
     pub const fn connection_id(&self) -> [u8; 16] {
         self.connection_id
     }
 
-    /// Returns application-owned event identities in exact raw-frame order.
+    /// Returns capture-owned event identities in exact raw-object order.
     pub fn event_ids(&self) -> &[[u8; 16]] {
         &self.event_ids
     }
@@ -1558,7 +1558,7 @@ fn validate_committed_public_row(
                 .evidence()
                 .binding()
                 .connection_generation()
-        || committed.frame_id() != frame_id
+        || committed.frame_id() != Some(frame_id)
         || committed.wire_ordinal() != wire_ordinal
         || committed.row_count() != row_count
         || provenance.available_at() < available_at

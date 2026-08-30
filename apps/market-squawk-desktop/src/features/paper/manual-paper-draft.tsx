@@ -2,7 +2,6 @@ import * as React from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { CircleAlert, FileCheck2, Send, ShieldCheck } from "lucide-react"
 
-import { messageFrom } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -71,21 +70,19 @@ export function ManualPaperDraftPanel({
     enabled: enabled && manualPaper !== null,
     staleTime: 15_000,
     queryFn: async () => {
-      if (!manualPaper) throw new Error("Controlled manual paper operation is unavailable.")
+      if (!manualPaper) throw new Error("Paper drafting is unavailable.")
       return parseGovernedPaperTargets(await manualPaper.manualPaper({ action: "targets" }))
     },
   })
   const submit = useMutation({
     mutationFn: async (request: ManualPaperSubmit) => {
-      if (!manualPaper) throw new Error("Controlled manual paper operation is unavailable.")
+      if (!manualPaper) throw new Error("Paper drafting is unavailable.")
       const result = await manualPaper.manualPaper(request, true)
       parseAcceptedManualPaperDraft(result, request)
     },
-    onSuccess: async (_value, request) => {
+    onSuccess: async () => {
       setPending(null)
-      setAccepted(
-        `Paper draft for ${request.targetId} revision ${request.targetRevision} is waiting for the next qualified market event.`,
-      )
+      setAccepted("Your paper draft is waiting for the next eligible market update.")
       setDraft((current) => ({ ...current, quantityLots: "" }))
       await onAccepted()
     },
@@ -113,16 +110,15 @@ export function ManualPaperDraftPanel({
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
-            Controlled manual paper operation
+            Manual paper draft
           </p>
           <h2 id="manual-paper-heading" className="mt-1 text-lg font-semibold">
-            Express a governed target as a paper draft
+            Turn an investment target into a paper draft
           </h2>
           <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
             Choose an active target, your side, order constraint, and whole-lot quantity. The next
-            qualified committed event from the running live-market source supplies execution terms.
-            The target is not automatic order authority: central pre-trade risk still evaluates
-            every resulting intent before virtual paper dispatch.
+            eligible market update supplies the virtual execution terms. Choosing a target does not
+            place an order: every draft must still pass the paper-trading safety checks.
           </p>
         </div>
         <ShieldCheck className="size-5 text-primary" aria-hidden="true" />
@@ -131,16 +127,16 @@ export function ManualPaperDraftPanel({
       {!enabled || manualPaper === null ? (
         <Unavailable />
       ) : targets.isPending ? (
-        <Status text="Loading currently governed targets and their approved price ladders…" />
+        <Status text="Loading active investment targets and their price levels…" />
       ) : targets.isError ? (
-        <Status text={messageFrom(targets.error)} tone="error" />
+        <Status text="Investment targets could not be loaded. Try again." tone="error" />
       ) : targets.data?.length === 0 ? (
-        <Unavailable detail="Create and activate a governed investment target before preparing a paper draft." />
+        <Unavailable detail="Create and activate an investment target before preparing a paper draft." />
       ) : selected ? (
         <div className="mt-5 space-y-4">
           <TargetEvidence target={selected} />
           <div className="grid gap-4 lg:grid-cols-2">
-            <Field label="Governed target" htmlFor="manual-paper-target">
+            <Field label="Investment target" htmlFor="manual-paper-target">
               <select
                 id="manual-paper-target"
                 className={CONTROL_CLASS}
@@ -163,13 +159,11 @@ export function ManualPaperDraftPanel({
               >
                 {targets.data.map((target) => (
                   <option key={targetKey(target)} value={targetKey(target)}>
-                    {target.instrumentId} · revision {target.targetRevision}
+                    {target.instrumentId}
                   </option>
                 ))}
               </select>
-              <FieldMessage>
-                Only current active target revisions returned by the installed service appear here.
-              </FieldMessage>
+              <FieldMessage>Only active investment targets appear here.</FieldMessage>
             </Field>
             <Field label="Direction" htmlFor="manual-paper-side">
               <select
@@ -210,9 +204,9 @@ export function ManualPaperDraftPanel({
                 }}
               >
                 <option value="market">Market</option>
-                <option value="limit">Limit at governed level</option>
-                <option value="stop">Stop at governed level</option>
-                <option value="stop_limit">Stop-limit at governed levels</option>
+                <option value="limit">Limit at target level</option>
+                <option value="stop">Stop at target level</option>
+                <option value="stop_limit">Stop-limit at target levels</option>
               </select>
               <FieldMessage>
                 This does not supply current market price or market-data quality from the dashboard.
@@ -279,12 +273,11 @@ export function ManualPaperDraftPanel({
             </Field>
           </div>
 
-          {invalidTarget ? <Status text="The selected target is no longer an active governed target. Refresh before submitting." tone="error" /> : null}
+          {invalidTarget ? <Status text="The selected investment target is no longer active. Refresh before submitting." tone="error" /> : null}
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-background/25 p-3">
             <p className="max-w-3xl text-[11px] leading-5 text-muted-foreground">
-              The service owns the route, account, order identity, target content digest, reason,
-              timing, maximum slippage, and risk/dispatch authority. A confirmed draft does not
-              approve or guarantee an order.
+              Market Squawk applies the account, timing, slippage, and risk controls when eligible
+              market data arrives. Reviewing a draft does not place or guarantee an order.
             </p>
             <Button
               disabled={!ready}
@@ -311,15 +304,17 @@ export function ManualPaperDraftPanel({
       >
         <DialogContent className="max-h-[88vh] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
-            <DialogTitle>Submit this controlled paper draft?</DialogTitle>
+            <DialogTitle>Submit this paper draft?</DialogTitle>
             <DialogDescription>
-              Review the exact target-backed request. Submission occupies one bounded manual draft
-              slot and waits for the next qualified committed event from the running live-market
-              source; it still must pass central pre-trade risk before virtual paper dispatch.
+              Review the selected investment, price conditions, and quantity. The draft waits for
+              an eligible market update and must pass the paper-trading safety checks before a
+              virtual order can proceed.
             </DialogDescription>
           </DialogHeader>
           {pending && selected ? <ConfirmationEvidence request={pending} target={selected} /> : null}
-          {submit.isError ? <Status text={messageFrom(submit.error)} tone="error" /> : null}
+          {submit.isError ? (
+            <Status text="The paper draft could not be submitted. Review it and try again." tone="error" />
+          ) : null}
           <DialogFooter>
             <Button variant="outline" disabled={submit.isPending} onClick={() => setPending(null)}>
               Keep editing
@@ -346,13 +341,12 @@ function TargetEvidence({ target }: { target: GovernedPaperTarget }) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-            Active governed target · revision {target.targetRevision}
+            Active investment target
           </p>
-          <p className="mt-1 font-mono text-sm">{target.targetId} · {target.instrumentId}</p>
+          <p className="mt-1 font-mono text-sm">{target.instrumentId}</p>
           <p className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">{target.thesis}</p>
         </div>
         <p className="text-right text-[10px] text-muted-foreground">
-          {target.route.venueId}<br />
           Review due {formatTimestamp(target.reviewDueAt)}
         </p>
       </div>
@@ -383,8 +377,7 @@ function ConfirmationEvidence({
     : null
   return (
     <dl className="grid gap-3 rounded-xl border border-border bg-card/35 p-4 text-xs sm:grid-cols-2">
-      <Fact label="Governed target" value={`${request.targetId} · revision ${request.targetRevision}`} />
-      <Fact label="Instrument / route" value={`${target.instrumentId} · ${target.route.venueId}`} />
+      <Fact label="Investment" value={target.instrumentId} />
       <Fact label="Direction" value={humanize(request.side)} />
       <Fact label="Order constraint" value={humanize(request.orderType)} />
       <Fact label="Whole-lot quantity" value={`${request.quantityLots} lots`} />
@@ -392,9 +385,8 @@ function ConfirmationEvidence({
       {limit ? <Fact label="Limit target level" value={`${limit.label} · ${formatMoney(limit.value)}`} /> : null}
       {stop ? <Fact label="Stop target level" value={`${stop.label} · ${formatMoney(stop.value)}`} /> : null}
       <div className="sm:col-span-2 rounded-lg border border-amber-400/20 bg-amber-400/5 p-3 text-[11px] leading-5 text-amber-100">
-        No live market price, market-data quality, event time, account, order identity, target digest,
-        risk approval, or dispatch authority is supplied by this screen. The service resolves and
-        records those facts only when a qualified event arrives.
+        This draft does not use a live price or place an order now. If eligible market data arrives,
+        Market Squawk applies account and risk checks before a virtual order can proceed.
       </div>
     </dl>
   )
@@ -422,14 +414,14 @@ function LevelField({
         aria-invalid={value.length === 0}
         onChange={(event) => onChange(event.target.value as TargetLevel | "")}
       >
-        <option value="">Select a governed target level</option>
+        <option value="">Select a target level</option>
         {ladder.map((level) => (
           <option key={level.level} value={level.level}>
             {level.label} · {formatMoney(level.value)}
           </option>
         ))}
       </select>
-      <FieldMessage>Only a named level from this exact target revision can be submitted.</FieldMessage>
+      <FieldMessage>Only a price level from the selected target can be used.</FieldMessage>
     </Field>
   )
 }
@@ -465,7 +457,7 @@ function Fact({ label, value }: { label: string; value: string }) {
 }
 
 function Unavailable({
-  detail = "This service generation does not expose the closed manual-paper target and submission operations together.",
+  detail = "Paper drafting is not available in the current setup. Review Connections or Updates & Repair, then try again.",
 }: {
   detail?: string
 }) {
@@ -506,8 +498,7 @@ function normalizeDraft(draft: Draft, selected: GovernedPaperTarget | null): Man
   }
   return {
     action: "submit",
-    targetId: selected.targetId,
-    targetRevision: selected.targetRevision,
+    targetToken: selected.targetToken,
     side: draft.side,
     orderType: draft.orderType,
     quantityLots: draft.quantityLots,
@@ -541,5 +532,5 @@ function defaultTimeInForce(orderType: ManualPaperOrderType): ManualPaperTimeInF
 }
 
 function targetKey(target: GovernedPaperTarget): string {
-  return `${target.targetId}:${target.targetRevision}`
+  return target.targetToken
 }

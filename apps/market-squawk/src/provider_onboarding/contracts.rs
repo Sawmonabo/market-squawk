@@ -375,6 +375,10 @@ pub enum ProviderPortalActivationRequest {
     },
     /// Federal Reserve Board H.15 current-definition Treasury constant-maturity rates.
     FederalReserveBoardH15,
+    /// No-key, explicit-demand Yahoo enrichment using the application-owned adaptive lane.
+    YahooEnrichment,
+    /// Secret-store-backed Tiingo Starter NAV/EOD access using the durable application quota.
+    TiingoStarterEodNav,
 }
 
 /// Exact written St. Louis Fed permission for Market Squawk's durable FRED API operations.

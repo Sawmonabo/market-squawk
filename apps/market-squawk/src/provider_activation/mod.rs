@@ -12,12 +12,15 @@ pub(crate) mod nasdaq_reference;
 mod reference_identity;
 mod schwab;
 mod specs;
+pub mod tiingo;
 mod treasury;
+pub mod yahoo;
 
 use std::{
     fmt,
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
-    sync::Arc,
+    path::PathBuf,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
@@ -40,10 +43,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::application::{
-    CryptoMarketDurableRead, CryptoMarketDurableReadWriter, CryptoMarketPublicationAuthority,
-    ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,
+    CryptoMarketPublicationAuthority, ManagedResearchExtractionSource, MarketEventDurableRead,
+    MarketEventDurableReadWriter, ProductionResearchIngestCoordinator,
     ResearchProviderRuntimeGeneration, ResearchProviderRuntimeMutationAuthority,
-    ResearchProviderRuntimeReplacement, ResearchRightsAuthority,
+    ResearchProviderRuntimeReplacement, ResearchRightsAuthority, SecFundPublicationReceipt,
+    SecLiveFundApplicationError, SecLiveFundRequest, SecLiveFundSource,
 };
 use crate::provider_onboarding::ProviderOnboardingMutationAuthority;
 use crate::{
@@ -91,13 +95,22 @@ pub use specs::{
     CoinbaseDirectActivationSpecError, CoinbaseDirectAdapterActivation,
     CoinbaseDirectProductActivation, ControlledLocalFileAdapterActivation, FredAdapterActivation,
     LocalFileAdapterActivation, PortfolioAdapterActivation, ProviderAdapterActivationError,
-    ProviderAdapterActivationRequest, SecAdapterActivation, TreasuryAdapterActivation,
+    ProviderAdapterActivationRequest, SecAdapterActivation, TiingoAdapterActivation,
+    TreasuryAdapterActivation, YahooAdapterActivation,
+};
+pub(crate) use tiingo::{
+    TIINGO_EOD_OPERATION, TIINGO_FUND_NAV_OPERATION, TiingoCanonicalFamily, TiingoLatestOperation,
+    TiingoLatestOperationOutcome, TiingoProductAvailability, TiingoProductError,
+    TiingoProductStatus, TiingoUnavailableReason,
 };
 pub(crate) use treasury::{
     TreasuryDurableRecovery, TreasuryPublicationActivationError, publish_treasury_latest_known,
     reopen_treasury_latest_known,
 };
-
+pub(crate) use yahoo::{
+    YAHOO_ENRICHMENT_OPERATION, YahooEnrichmentOperationOutcome, YahooEnrichmentStatus,
+    YahooExplicitOperation, YahooProductAvailability, YahooProductError, YahooPublicationSummary,
+};
 
 const COINBASE_SURFACE: &str = "coinbase.public-market-data";
 const KRAKEN_SURFACE: &str = "kraken.spot-public-market-data";
@@ -113,7 +126,7 @@ const PORTFOLIO_SURFACE: &str = "local.portfolio-imports";
 const MAXIMUM_EPHEMERAL_DISCOVERY_PAGES: u16 = 64;
 const KRAKEN_BOOK_SOURCE_ID: &str = "kraken-public-book-v2";
 const KRAKEN_TRADE_SOURCE_ID: &str = "kraken-public-trades-v2";
-const CRYPTO_MARKET_ANALYTICAL_DATASET: &str = "market_squawk.market_events";
+const MARKET_EVENT_ANALYTICAL_DATASET: &str = "market_squawk.market_events";
 // Public authority is revoked by the exact runtime cancellation and generation admission. The
 // monotonic deadline is only a fail-closed process-lifetime ceiling required by the shared
 // publication-operation API; per-frame rights and metadata validity are checked at observation.
@@ -122,8 +135,8 @@ const CRYPTO_PUBLICATION_PROCESS_LIFETIME: Duration = Duration::from_secs(3_153_
 /// Exact research authority retained for one public Coinbase runtime incarnation.
 pub(crate) struct CoinbaseMarketPublicationPackage {
     market: Arc<CryptoMarketPublicationAuthority>,
-    durable_writer: CryptoMarketDurableReadWriter,
-    durable_read: CryptoMarketDurableRead,
+    durable_writer: MarketEventDurableReadWriter,
+    durable_read: MarketEventDurableRead,
 }
 
 /// Closed exact-authority topology for the selected public crypto runtime.
@@ -141,7 +154,7 @@ impl CryptoMarketPublicationPackage {
         }
     }
 
-    pub(crate) fn append_durable_reads(&self, destination: &mut Vec<CryptoMarketDurableRead>) {
+    pub(crate) fn append_durable_reads(&self, destination: &mut Vec<MarketEventDurableRead>) {
         match self {
             Self::Coinbase(package) => destination.push(package.durable_read().clone()),
             Self::Kraken(package) => destination.extend(package.durable_reads().iter().cloned()),
@@ -150,7 +163,7 @@ impl CryptoMarketPublicationPackage {
 }
 
 impl CoinbaseMarketPublicationPackage {
-    pub(crate) fn durable_read(&self) -> &CryptoMarketDurableRead {
+    pub(crate) fn durable_read(&self) -> &MarketEventDurableRead {
         &self.durable_read
     }
 
@@ -158,7 +171,7 @@ impl CoinbaseMarketPublicationPackage {
         self,
     ) -> (
         Arc<CryptoMarketPublicationAuthority>,
-        CryptoMarketDurableReadWriter,
+        MarketEventDurableReadWriter,
     ) {
         (self.market, self.durable_writer)
     }
@@ -177,13 +190,13 @@ impl fmt::Debug for CoinbaseMarketPublicationPackage {
 pub(crate) struct KrakenMarketPublicationPackage {
     book: Arc<CryptoMarketPublicationAuthority>,
     trades: Arc<CryptoMarketPublicationAuthority>,
-    book_durable_writer: CryptoMarketDurableReadWriter,
-    trade_durable_writer: CryptoMarketDurableReadWriter,
-    durable_reads: [CryptoMarketDurableRead; 2],
+    book_durable_writer: MarketEventDurableReadWriter,
+    trade_durable_writer: MarketEventDurableReadWriter,
+    durable_reads: [MarketEventDurableRead; 2],
 }
 
 impl KrakenMarketPublicationPackage {
-    pub(crate) fn durable_reads(&self) -> &[CryptoMarketDurableRead; 2] {
+    pub(crate) fn durable_reads(&self) -> &[MarketEventDurableRead; 2] {
         &self.durable_reads
     }
 
@@ -192,8 +205,8 @@ impl KrakenMarketPublicationPackage {
     ) -> (
         Arc<CryptoMarketPublicationAuthority>,
         Arc<CryptoMarketPublicationAuthority>,
-        CryptoMarketDurableReadWriter,
-        CryptoMarketDurableReadWriter,
+        MarketEventDurableReadWriter,
+        MarketEventDurableReadWriter,
     ) {
         (
             self.book,
@@ -241,6 +254,45 @@ impl FredEphemeralInspectionPage {
     }
 }
 
+/// Application-retained exact SEC source and its sole live fund publication authority.
+struct SecFundProductActivation {
+    lease: ProviderActivationLease,
+    source: Arc<SecEdgarSource>,
+    generation: ResearchProviderRuntimeGeneration,
+    operation: Arc<SecLiveFundSource>,
+}
+
+impl SecFundProductActivation {
+    fn matches(&self, lease: &ProviderActivationLease, metadata: &SourceMetadata) -> bool {
+        self.lease.same_authority_as(lease)
+            && self.generation.metadata() == metadata
+            && self.source.metadata() == metadata
+    }
+}
+
+impl fmt::Debug for SecFundProductActivation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SecFundProductActivation")
+            .field("surface_id", self.lease.surface_id())
+            .field("source_id", self.source.metadata().source_id())
+            .field("generation", &self.generation)
+            .field("operation", &"[APPLICATION-OWNED]")
+            .finish()
+    }
+}
+
+/// Closed SEC fund operation failure, including honest optional-provider availability.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SecFundProductError {
+    #[error("SEC fund setup is required")]
+    SetupRequired,
+    #[error("the activated SEC fund runtime is unavailable")]
+    Unavailable,
+    #[error(transparent)]
+    Application(#[from] SecLiveFundApplicationError),
+}
+
 /// Application-owned activation authority shared by CLI, MCP, and local onboarding transports.
 pub struct ProviderAdapterActivation {
     onboarding: Arc<ProviderOnboardingService>,
@@ -248,6 +300,10 @@ pub struct ProviderAdapterActivation {
     research_mutation: ResearchProviderRuntimeMutationAuthority,
     app_config: AppConfig,
     provider_rate: ProviderRateAuthority,
+    provider_control_root: PathBuf,
+    sec_fund: RwLock<Option<Arc<SecFundProductActivation>>>,
+    yahoo: RwLock<Option<Arc<yahoo::YahooProductActivation>>>,
+    tiingo: RwLock<Option<Arc<tiingo::TiingoProductActivation>>>,
     #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
     board_source_factory: Option<BoardScriptedTransportFactory>,
 }
@@ -302,6 +358,58 @@ impl ProviderAdapterActivation {
         Ok(lease)
     }
 
+    async fn acquire_coinbase_direct_market_publication_packages(
+        &self,
+        lease: &ProviderActivationLease,
+        metadata_set: &[SourceMetadata],
+        publication_cancellation: CancellationToken,
+    ) -> Result<Vec<CoinbaseMarketPublicationPackage>, ProviderAdapterActivationError> {
+        if publication_cancellation.is_cancelled()
+            || lease.surface_id().as_str() != direct::COINBASE_DIRECT_SURFACE
+            || metadata_set.is_empty()
+            || metadata_set.len() > COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS
+            || metadata_set.iter().enumerate().any(|(index, metadata)| {
+                metadata_set[index.saturating_add(1)..]
+                    .iter()
+                    .any(|candidate| candidate.source_id() == metadata.source_id())
+            })
+        {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        for metadata in metadata_set {
+            let (generation, rights) = public_live_runtime_generation(lease, metadata)?;
+            self.research_mutation
+                .register_provider_publication_generation(generation, rights)?;
+        }
+        let deadline = Instant::now()
+            .checked_add(CRYPTO_PUBLICATION_PROCESS_LIFETIME)
+            .ok_or(ProviderAdapterActivationError::SourceBinding)?;
+        let dataset = market_squawk_data::DatasetId::try_from(MARKET_EVENT_ANALYTICAL_DATASET)
+            .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+        let mut packages = Vec::new();
+        packages
+            .try_reserve_exact(metadata_set.len())
+            .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+        for metadata in metadata_set {
+            let market = acquire_crypto_market_authority(
+                self.research.as_ref(),
+                lease,
+                metadata,
+                publication_cancellation.clone(),
+                deadline,
+                dataset.clone(),
+            )
+            .await?;
+            let (durable_writer, durable_read) = market.durable_read_capability();
+            packages.push(CoinbaseMarketPublicationPackage {
+                market,
+                durable_writer,
+                durable_read,
+            });
+        }
+        Ok(packages)
+    }
+
     /// Acquires the exact publication generation for one public Coinbase runtime.
     pub(crate) async fn acquire_coinbase_market_publication_package(
         &self,
@@ -317,7 +425,7 @@ impl ProviderAdapterActivation {
         let deadline = Instant::now()
             .checked_add(CRYPTO_PUBLICATION_PROCESS_LIFETIME)
             .ok_or(ProviderAdapterActivationError::SourceBinding)?;
-        let dataset = market_squawk_data::DatasetId::try_from(CRYPTO_MARKET_ANALYTICAL_DATASET)
+        let dataset = market_squawk_data::DatasetId::try_from(MARKET_EVENT_ANALYTICAL_DATASET)
             .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
         let market = self
             .acquire_public_crypto_market_authority(
@@ -357,7 +465,7 @@ impl ProviderAdapterActivation {
         let deadline = Instant::now()
             .checked_add(CRYPTO_PUBLICATION_PROCESS_LIFETIME)
             .ok_or(ProviderAdapterActivationError::SourceBinding)?;
-        let dataset = market_squawk_data::DatasetId::try_from(CRYPTO_MARKET_ANALYTICAL_DATASET)
+        let dataset = market_squawk_data::DatasetId::try_from(MARKET_EVENT_ANALYTICAL_DATASET)
             .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
         let book = self
             .acquire_public_crypto_market_authority(
@@ -398,26 +506,15 @@ impl ProviderAdapterActivation {
         deadline: Instant,
         dataset: market_squawk_data::DatasetId,
     ) -> Result<Arc<CryptoMarketPublicationAuthority>, ProviderAdapterActivationError> {
-        let profile = SourceIdentifier::try_from(metadata.source_id().as_str())
-            .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
-        let (expected, _rights) = public_live_runtime_generation(lease, metadata)?;
-        let generation = self
-            .research
-            .provider_runtime_generation(&profile)?
-            .ok_or(ProviderAdapterActivationError::SourceBinding)?;
-        if generation != expected {
-            return Err(ProviderAdapterActivationError::SourceBinding);
-        }
-        Ok(Arc::new(
-            self.research
-                .acquire_crypto_market_publication_authority(
-                    &generation,
-                    publication_cancellation,
-                    deadline,
-                    dataset,
-                )
-                .await?,
-        ))
+        acquire_crypto_market_authority(
+            self.research.as_ref(),
+            lease,
+            metadata,
+            publication_cancellation,
+            deadline,
+            dataset,
+        )
+        .await
     }
 
     pub(crate) async fn acquire_account_market_runtime_mutation_authority(
@@ -436,6 +533,7 @@ impl ProviderAdapterActivation {
         research_mutation: ResearchProviderRuntimeMutationAuthority,
         app_config: AppConfig,
         provider_rate: ProviderRateAuthority,
+        provider_control_root: PathBuf,
     ) -> Self {
         Self {
             onboarding,
@@ -443,6 +541,10 @@ impl ProviderAdapterActivation {
             research_mutation,
             app_config,
             provider_rate,
+            provider_control_root,
+            sec_fund: RwLock::new(None),
+            yahoo: RwLock::new(None),
+            tiingo: RwLock::new(None),
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
             board_source_factory: None,
         }
@@ -455,6 +557,7 @@ impl ProviderAdapterActivation {
         research_mutation: ResearchProviderRuntimeMutationAuthority,
         app_config: AppConfig,
         provider_rate: ProviderRateAuthority,
+        provider_control_root: PathBuf,
         board_source_factory: BoardScriptedTransportFactory,
     ) -> Self {
         Self {
@@ -463,6 +566,10 @@ impl ProviderAdapterActivation {
             research_mutation,
             app_config,
             provider_rate,
+            provider_control_root,
+            sec_fund: RwLock::new(None),
+            yahoo: RwLock::new(None),
+            tiingo: RwLock::new(None),
             board_source_factory: Some(board_source_factory),
         }
     }
@@ -650,6 +757,45 @@ impl ProviderAdapterActivation {
             .map_err(Into::into)
     }
 
+    /// Executes one bounded SEC N-PORT or N-CEN publication through the retained exact source.
+    pub(crate) async fn execute_sec_fund_operation(
+        &self,
+        request: SecLiveFundRequest,
+        cancellation: CancellationToken,
+    ) -> Result<SecFundPublicationReceipt, SecFundProductError> {
+        let activation = self
+            .sec_fund
+            .read()
+            .map_err(|_| SecFundProductError::Unavailable)?
+            .as_ref()
+            .cloned()
+            .ok_or(SecFundProductError::SetupRequired)?;
+        self.onboarding
+            .try_acquire_runtime_mutation_authority()
+            .and_then(|authority| authority.require_active(&activation.lease))
+            .map_err(|_| SecFundProductError::Unavailable)?;
+        let current = self
+            .research
+            .provider_runtime_generation(activation.generation.profile())
+            .map_err(|_| SecFundProductError::Unavailable)?
+            .ok_or(SecFundProductError::Unavailable)?;
+        if current != activation.generation {
+            return Err(SecFundProductError::Unavailable);
+        }
+        match activation
+            .operation
+            .acquire_and_publish(request, cancellation)
+            .await
+        {
+            Err(
+                SecLiveFundApplicationError::RuntimeUnavailable
+                | SecLiveFundApplicationError::Runtime(_),
+            ) => Err(SecFundProductError::Unavailable),
+            Err(error) => Err(error.into()),
+            Ok(receipt) => Ok(receipt),
+        }
+    }
+
     /// Returns the exact fixed discovery dataset carried by one callable research adapter.
     pub(crate) fn registered_discovery_dataset(
         &self,
@@ -666,10 +812,50 @@ impl ProviderAdapterActivation {
         expected: &ResearchProviderRuntimeGeneration,
     ) -> Result<(), ProviderAdapterActivationError> {
         let _onboarding_authority = self.onboarding.acquire_runtime_mutation_authority().await;
-        self.research_mutation
-            .revoke_provider_generation(expected.profile(), expected)
-            .await
-            .map_err(Into::into)
+        if expected.profile().as_str() == SEC_SURFACE {
+            self.research_mutation
+                .revoke_sec_provider_generation_and_release(expected)
+                .await?;
+            let mut retained = self
+                .sec_fund
+                .write()
+                .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+            if retained
+                .as_ref()
+                .is_some_and(|current| current.generation == *expected)
+            {
+                retained.take();
+            }
+        } else {
+            self.research_mutation
+                .revoke_provider_generation(expected.profile(), expected)
+                .await?;
+            if expected.profile().as_str() == yahoo::YAHOO_SURFACE {
+                let mut retained = self
+                    .yahoo
+                    .write()
+                    .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+                if retained
+                    .as_ref()
+                    .is_some_and(|current| current.generation() == expected)
+                {
+                    retained.take();
+                }
+            }
+            if expected.profile().as_str() == tiingo::TIINGO_SURFACE {
+                let mut retained = self
+                    .tiingo
+                    .write()
+                    .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+                if retained
+                    .as_ref()
+                    .is_some_and(|current| current.generation() == expected)
+                {
+                    retained.take();
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Returns whether one exact runtime still has the current onboarding activation lease.
@@ -816,6 +1002,7 @@ impl ProviderAdapterActivation {
             expected: prepared.expected.clone(),
             candidate: prepared.candidate.clone(),
             transaction: prepared.transaction.take(),
+            specialized: prepared.specialized.take(),
         })
     }
 
@@ -868,11 +1055,65 @@ impl ProviderAdapterActivation {
             .as_mut()
             .ok_or(ProviderAdapterActivationError::SourceBinding)?;
         let profile = lease.surface_id().clone();
+        let specialized_authority = match committed.specialized {
+            Some(SpecializedReplacementKind::Yahoo) => {
+                let rights =
+                    provider_research_rights(&lease, committed.candidate.metadata().source_id())?;
+                Some(SpecializedReplacementAuthority::Yahoo(
+                    yahoo::YahooProductActivation::try_new(
+                        lease.clone(),
+                        committed.candidate.metadata().clone(),
+                        rights,
+                        committed.candidate.clone(),
+                        &self.provider_control_root,
+                    )?,
+                ))
+            }
+            Some(SpecializedReplacementKind::Tiingo) => {
+                let secret = self
+                    .onboarding
+                    .read_secret_for_activation_request(&lease, CancellationToken::new())
+                    .await?;
+                let token = market_squawk_adapter_tiingo::TiingoApiToken::try_new(
+                    secret.expose_secret().to_owned(),
+                )
+                .map_err(tiingo::TiingoProductError::from)?;
+                let rights =
+                    provider_research_rights(&lease, committed.candidate.metadata().source_id())?;
+                Some(SpecializedReplacementAuthority::Tiingo(
+                    tiingo::TiingoProductActivation::try_new(
+                        lease.clone(),
+                        committed.candidate.metadata().clone(),
+                        rights,
+                        committed.candidate.clone(),
+                        token,
+                        &self.provider_rate,
+                    )?,
+                ))
+            }
+            None => None,
+        };
         let generation = self.research_mutation.finalize(transaction)?;
         if generation != committed.candidate {
             return Err(ProviderAdapterActivationError::SourceBinding);
         }
+        match specialized_authority {
+            Some(SpecializedReplacementAuthority::Yahoo(authority)) => {
+                *self
+                    .yahoo
+                    .write()
+                    .map_err(|_| ProviderAdapterActivationError::SourceBinding)? = Some(authority);
+            }
+            Some(SpecializedReplacementAuthority::Tiingo(authority)) => {
+                *self
+                    .tiingo
+                    .write()
+                    .map_err(|_| ProviderAdapterActivationError::SourceBinding)? = Some(authority);
+            }
+            None => {}
+        }
         committed.transaction = None;
+        committed.specialized = None;
         Ok(ActivatedResearchProvider {
             lease,
             profile,
@@ -907,6 +1148,14 @@ impl ProviderAdapterActivation {
                 &spec.metadata,
                 provider_research_rights(lease, spec.metadata.source_id())?,
             ),
+            ProviderAdapterActivationRequest::Yahoo(spec) => (
+                &spec.metadata,
+                provider_research_rights(lease, spec.metadata.source_id())?,
+            ),
+            ProviderAdapterActivationRequest::Tiingo(spec) => (
+                &spec.metadata,
+                provider_research_rights(lease, spec.metadata.source_id())?,
+            ),
             ProviderAdapterActivationRequest::ControlledLocalFiles(spec) => (
                 &spec.metadata,
                 controlled_local_file_rights(lease, spec.metadata.source_id(), &spec.evidence)?,
@@ -934,7 +1183,7 @@ impl ProviderAdapterActivation {
         }
         let candidate = self.runtime_generation_for_request(&lease, &request)?;
         self.bind_authorization_subject(candidate.metadata())?;
-        let prepared = match request {
+        let (prepared, specialized) = match request {
             ProviderAdapterActivationRequest::Bls(spec) => {
                 require_surface(&lease, BLS_REGISTERED_SURFACE)?;
                 let BlsAdapterActivation {
@@ -960,14 +1209,17 @@ impl ProviderAdapterActivation {
                 let rights = provider_research_rights(&lease, metadata.source_id())?;
                 let config = BlsSourceConfig::try_new(authorization, series, start_year, end_year)?;
                 let source = BlsSource::try_new(metadata, config)?;
-                self.prepare_runtime_replacement(
-                    &lease,
-                    expected,
-                    candidate.clone(),
-                    source,
-                    rights,
+                (
+                    self.prepare_runtime_replacement(
+                        &lease,
+                        expected,
+                        candidate.clone(),
+                        source,
+                        rights,
+                    )
+                    .await?,
+                    None,
                 )
-                .await?
             }
             ProviderAdapterActivationRequest::Treasury(spec) => {
                 let matches = matches!(
@@ -982,14 +1234,17 @@ impl ProviderAdapterActivation {
                 }
                 let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
                 let source = TreasurySource::try_new(spec.metadata, spec.config)?;
-                self.prepare_runtime_replacement(
-                    &lease,
-                    expected,
-                    candidate.clone(),
-                    source,
-                    rights,
+                (
+                    self.prepare_runtime_replacement(
+                        &lease,
+                        expected,
+                        candidate.clone(),
+                        source,
+                        rights,
+                    )
+                    .await?,
+                    None,
                 )
-                .await?
             }
             ProviderAdapterActivationRequest::Fred(spec) => {
                 require_surface(&lease, FRED_SURFACE)?;
@@ -1000,14 +1255,17 @@ impl ProviderAdapterActivation {
                 let key = FredApiKey::try_new(secret.expose_secret().to_owned())?;
                 let rights = fred_research_rights(&lease, spec.metadata.source_id(), &spec.policy)?;
                 let source = FredSource::try_new(spec.metadata, key, spec.policy)?;
-                self.prepare_runtime_replacement(
-                    &lease,
-                    expected,
-                    candidate.clone(),
-                    source,
-                    rights,
+                (
+                    self.prepare_runtime_replacement(
+                        &lease,
+                        expected,
+                        candidate.clone(),
+                        source,
+                        rights,
+                    )
+                    .await?,
+                    None,
                 )
-                .await?
             }
             ProviderAdapterActivationRequest::ControlledLocalFiles(spec) => {
                 require_surface(&lease, LOCAL_FILES_SURFACE)?;
@@ -1023,14 +1281,61 @@ impl ProviderAdapterActivation {
                     spec.manifest,
                     spec.limits,
                 )?;
-                self.prepare_runtime_replacement(
-                    &lease,
-                    expected,
-                    candidate.clone(),
-                    source,
-                    rights,
+                (
+                    self.prepare_runtime_replacement(
+                        &lease,
+                        expected,
+                        candidate.clone(),
+                        source,
+                        rights,
+                    )
+                    .await?,
+                    None,
                 )
-                .await?
+            }
+            ProviderAdapterActivationRequest::Yahoo(spec) => {
+                require_surface(&lease, yahoo::YAHOO_SURFACE)?;
+                if lease.generation().is_some()
+                    || lease.secret_reference().is_some()
+                    || spec.metadata.authorization().mode() != AuthorizationMode::PublicInterface
+                {
+                    return Err(ProviderAdapterActivationError::SourceBinding);
+                }
+                let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
+                let transaction = self
+                    .research_mutation
+                    .prepare_provider_publication_replacement(
+                        expected,
+                        candidate.clone(),
+                        rights,
+                    )?;
+                (transaction, Some(SpecializedReplacementKind::Yahoo))
+            }
+            ProviderAdapterActivationRequest::Tiingo(spec) => {
+                require_surface(&lease, tiingo::TIINGO_SURFACE)?;
+                if lease.generation().is_none()
+                    || lease.secret_reference().is_none()
+                    || spec.metadata.authorization().mode() != AuthorizationMode::UserAuthorized
+                {
+                    return Err(ProviderAdapterActivationError::SourceBinding);
+                }
+                let secret = self
+                    .onboarding
+                    .read_secret_for_activation_request(&lease, cancellation.clone())
+                    .await?;
+                let _validated_token = market_squawk_adapter_tiingo::TiingoApiToken::try_new(
+                    secret.expose_secret().to_owned(),
+                )
+                .map_err(tiingo::TiingoProductError::from)?;
+                let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
+                let transaction = self
+                    .research_mutation
+                    .prepare_provider_publication_replacement(
+                        expected,
+                        candidate.clone(),
+                        rights,
+                    )?;
+                (transaction, Some(SpecializedReplacementKind::Tiingo))
             }
             ProviderAdapterActivationRequest::Live(_)
             | ProviderAdapterActivationRequest::CoinbaseDirect(_)
@@ -1050,6 +1355,7 @@ impl ProviderAdapterActivation {
             expected,
             candidate,
             transaction: Some(prepared),
+            specialized,
         })
     }
 
@@ -1087,14 +1393,42 @@ impl ProviderAdapterActivation {
                 self.activate_live(lease, routes).map(Into::into)
             }
             ProviderAdapterActivationRequest::CoinbaseDirect(spec) => {
-                direct::activate_coinbase_direct(
+                let metadata = crate::live_source::coinbase_direct_publication_metadata(
+                    &lease,
+                    spec.products(),
+                )
+                .map_err(|_error| ProviderAdapterActivationError::SourceBinding)?;
+                let publication_cancellation = CancellationToken::new();
+                let publication_packages = match self
+                    .acquire_coinbase_direct_market_publication_packages(
+                        &lease,
+                        &metadata,
+                        publication_cancellation.clone(),
+                    )
+                    .await
+                {
+                    Ok(packages) => packages,
+                    Err(error) => {
+                        publication_cancellation.cancel();
+                        return Err(error);
+                    }
+                };
+                let activation = direct::activate_coinbase_direct(
                     Arc::clone(&self.onboarding),
                     self.app_config.clone(),
                     self.provider_rate.clone(),
                     lease,
                     spec,
-                )
-                .map(Into::into)
+                    publication_packages,
+                    publication_cancellation.clone(),
+                );
+                match activation {
+                    Ok(activation) => Ok(activation.into()),
+                    Err(error) => {
+                        publication_cancellation.cancel();
+                        Err(error)
+                    }
+                }
             }
             ProviderAdapterActivationRequest::Sec(spec) => {
                 self.activate_sec(lease, spec).map(Into::into)
@@ -1113,6 +1447,13 @@ impl ProviderAdapterActivation {
             ProviderAdapterActivationRequest::Board(spec) => {
                 self.activate_board(lease, spec).map(Into::into)
             }
+            ProviderAdapterActivationRequest::Yahoo(spec) => {
+                self.activate_yahoo(lease, spec).map(Into::into)
+            }
+            ProviderAdapterActivationRequest::Tiingo(spec) => self
+                .activate_tiingo(lease, spec, cancellation)
+                .await
+                .map(Into::into),
             ProviderAdapterActivationRequest::LocalFiles(spec) => {
                 self.activate_local_files(lease, spec).map(Into::into)
             }
@@ -1153,6 +1494,13 @@ impl ProviderAdapterActivation {
             }
             ProviderAdapterActivationRequest::Board(spec) => {
                 self.activate_board(lease, spec).map(Into::into)
+            }
+            ProviderAdapterActivationRequest::Yahoo(spec) => {
+                self.activate_yahoo(lease, spec).map(Into::into)
+            }
+            ProviderAdapterActivationRequest::Tiingo(_spec) => {
+                require_surface(&lease, tiingo::TIINGO_SURFACE)?;
+                Err(ProviderAdapterActivationError::ExplicitResumeRequired)
             }
             ProviderAdapterActivationRequest::LocalFiles(spec) => {
                 self.activate_local_files(lease, spec).map(Into::into)
@@ -1201,7 +1549,27 @@ impl ProviderAdapterActivation {
             .ok_or(ProviderAdapterActivationError::SurfaceMismatch)?;
         let contact = SecContact::try_new(organization, administrative_email)?;
         let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
-        let source = SecEdgarSource::try_new(
+        let mut retained = self
+            .sec_fund
+            .write()
+            .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+        if let Some(current) = retained.as_ref() {
+            if current.matches(&lease, &spec.metadata)
+                && self
+                    .research
+                    .provider_runtime_generation(current.generation.profile())?
+                    .as_ref()
+                    == Some(&current.generation)
+            {
+                return Ok(ActivatedResearchProvider {
+                    lease,
+                    profile: current.generation.profile().clone(),
+                    generation: current.generation.clone(),
+                });
+            }
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        let source = Arc::new(SecEdgarSource::try_new(
             spec.metadata,
             contact,
             market_squawk_sources::install_ring_tls_provider()?,
@@ -1209,8 +1577,38 @@ impl ProviderAdapterActivation {
             spec.representations,
             spec.identities,
             spec.parser_limits,
-        )?;
-        self.register(lease, source, rights)
+        )?);
+        let profile = lease.surface_id().clone();
+        let generation = runtime_generation(&lease, source.metadata().clone(), rights.clone())?;
+        self.bind_authorization_subject(generation.metadata())?;
+        self.onboarding
+            .try_acquire_runtime_mutation_authority()?
+            .require_active(&lease)?;
+        let identity_authority_source_id = source.metadata().source_id().clone();
+        let operation = Arc::new(
+            self.research_mutation
+                .register_sec_live_fund_source(
+                    generation.clone(),
+                    Arc::clone(&source),
+                    rights,
+                    identity_authority_source_id,
+                )
+                .map_err(|error| {
+                    tracing::error!(%error, "SEC live fund application composition failed");
+                    ProviderAdapterActivationError::SourceBinding
+                })?,
+        );
+        *retained = Some(Arc::new(SecFundProductActivation {
+            lease: lease.clone(),
+            source,
+            generation: generation.clone(),
+            operation,
+        }));
+        Ok(ActivatedResearchProvider {
+            lease,
+            profile,
+            generation,
+        })
     }
 
     async fn activate_bls(
@@ -1330,6 +1728,134 @@ impl ProviderAdapterActivation {
         #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
         let source = BoardSource::try_new(spec.metadata, spec.profile)?;
         self.register(lease, source, rights)
+    }
+
+    fn activate_yahoo(
+        &self,
+        lease: ProviderActivationLease,
+        spec: YahooAdapterActivation,
+    ) -> Result<ActivatedYahooEnrichment, ProviderAdapterActivationError> {
+        require_surface(&lease, yahoo::YAHOO_SURFACE)?;
+        if lease.generation().is_some()
+            || lease.secret_reference().is_some()
+            || spec.metadata.authorization().mode() != AuthorizationMode::PublicInterface
+        {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
+        let generation = runtime_generation(&lease, spec.metadata.clone(), rights.clone())?;
+        self.bind_authorization_subject(&spec.metadata)?;
+        self.onboarding
+            .try_acquire_runtime_mutation_authority()?
+            .require_active(&lease)?;
+        let already_active = self
+            .yahoo
+            .read()
+            .map_err(|_| ProviderAdapterActivationError::SourceBinding)?
+            .as_ref()
+            .is_some_and(|current| current.matches(&lease, &spec.metadata));
+        if already_active
+            && matches!(
+                self.research.provider_runtime_generation(generation.profile()),
+                Ok(Some(current)) if current == generation
+            )
+        {
+            return Ok(ActivatedYahooEnrichment {
+                lease,
+                profile: SourceIdentifier::try_from(yahoo::YAHOO_SURFACE)
+                    .map_err(|_| ProviderAdapterActivationError::SourceBinding)?,
+                generation,
+            });
+        }
+        let authority = yahoo::YahooProductActivation::try_new(
+            lease.clone(),
+            spec.metadata,
+            rights.clone(),
+            generation.clone(),
+            &self.provider_control_root,
+        )?;
+        self.research_mutation
+            .register_provider_publication_generation(generation.clone(), rights)?;
+        *self
+            .yahoo
+            .write()
+            .map_err(|_| ProviderAdapterActivationError::SourceBinding)? =
+            Some(Arc::clone(&authority));
+        Ok(ActivatedYahooEnrichment {
+            lease,
+            profile: SourceIdentifier::try_from(yahoo::YAHOO_SURFACE)
+                .map_err(|_| ProviderAdapterActivationError::SourceBinding)?,
+            generation,
+        })
+    }
+
+    async fn activate_tiingo(
+        &self,
+        lease: ProviderActivationLease,
+        spec: TiingoAdapterActivation,
+        cancellation: CancellationToken,
+    ) -> Result<ActivatedTiingoProvider, ProviderAdapterActivationError> {
+        require_surface(&lease, tiingo::TIINGO_SURFACE)?;
+        if lease.generation().is_none()
+            || lease.secret_reference().is_none()
+            || spec.metadata.authorization().mode() != AuthorizationMode::UserAuthorized
+        {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
+        let generation = runtime_generation(&lease, spec.metadata.clone(), rights.clone())?;
+        self.bind_authorization_subject(&spec.metadata)?;
+        let already_active = self
+            .tiingo
+            .read()
+            .map_err(|_| ProviderAdapterActivationError::SourceBinding)?
+            .as_ref()
+            .is_some_and(|current| current.matches(&lease, &spec.metadata));
+        if already_active
+            && matches!(
+                self.research.provider_runtime_generation(generation.profile()),
+                Ok(Some(current)) if current == generation
+            )
+        {
+            return Ok(ActivatedTiingoProvider {
+                lease,
+                profile: SourceIdentifier::try_from(tiingo::TIINGO_SURFACE)
+                    .map_err(|_| ProviderAdapterActivationError::SourceBinding)?,
+                generation,
+            });
+        }
+        let secret = self
+            .onboarding
+            .read_secret_for_activation_request(&lease, cancellation)
+            .await?;
+        let token = market_squawk_adapter_tiingo::TiingoApiToken::try_new(
+            secret.expose_secret().to_owned(),
+        )
+        .map_err(tiingo::TiingoProductError::from)?;
+        self.onboarding
+            .try_acquire_runtime_mutation_authority()?
+            .require_active(&lease)?;
+        let authority = tiingo::TiingoProductActivation::try_new(
+            lease.clone(),
+            spec.metadata,
+            rights.clone(),
+            generation.clone(),
+            token,
+            &self.provider_rate,
+        )?;
+        self.research_mutation
+            .register_provider_publication_generation(generation.clone(), rights)?;
+        *self
+            .tiingo
+            .write()
+            .map_err(|_| ProviderAdapterActivationError::SourceBinding)? =
+            Some(Arc::clone(&authority));
+        Ok(ActivatedTiingoProvider {
+            lease,
+            profile: SourceIdentifier::try_from(tiingo::TIINGO_SURFACE)
+                .map_err(|_| ProviderAdapterActivationError::SourceBinding)?,
+            generation,
+        })
     }
 
     fn activate_local_files(
@@ -1507,12 +2033,57 @@ impl ActivatedResearchProvider {
     }
 }
 
+/// No-key Yahoo composition receipt without a provider session or state-path capability.
+#[derive(Clone, Debug)]
+pub struct ActivatedYahooEnrichment {
+    lease: ProviderActivationLease,
+    profile: SourceIdentifier,
+    generation: ResearchProviderRuntimeGeneration,
+}
+
+impl ActivatedYahooEnrichment {
+    pub const fn lease(&self) -> &ProviderActivationLease {
+        &self.lease
+    }
+
+    pub const fn profile(&self) -> &SourceIdentifier {
+        &self.profile
+    }
+
+    pub const fn generation(&self) -> &ResearchProviderRuntimeGeneration {
+        &self.generation
+    }
+}
+
+/// Secret-store-backed Tiingo receipt without token, HTTP client, or quota-store access.
+#[derive(Clone, Debug)]
+pub struct ActivatedTiingoProvider {
+    lease: ProviderActivationLease,
+    profile: SourceIdentifier,
+    generation: ResearchProviderRuntimeGeneration,
+}
+
+impl ActivatedTiingoProvider {
+    pub const fn lease(&self) -> &ProviderActivationLease {
+        &self.lease
+    }
+
+    pub const fn profile(&self) -> &SourceIdentifier {
+        &self.profile
+    }
+
+    pub const fn generation(&self) -> &ResearchProviderRuntimeGeneration {
+        &self.generation
+    }
+}
+
 /// Fully constructed credential replacement awaiting one serialized runtime publication.
 pub(crate) struct PreparedProviderAdapterReplacement {
     lease: ProviderActivationLease,
     expected: ResearchProviderRuntimeGeneration,
     candidate: ResearchProviderRuntimeGeneration,
     transaction: Option<ResearchProviderRuntimeReplacement>,
+    specialized: Option<SpecializedReplacementKind>,
 }
 
 impl PreparedProviderAdapterReplacement {
@@ -1543,6 +2114,18 @@ pub(crate) struct CommittedProviderAdapterReplacement {
     expected: ResearchProviderRuntimeGeneration,
     candidate: ResearchProviderRuntimeGeneration,
     transaction: Option<ResearchProviderRuntimeReplacement>,
+    specialized: Option<SpecializedReplacementKind>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SpecializedReplacementKind {
+    Yahoo,
+    Tiingo,
+}
+
+enum SpecializedReplacementAuthority {
+    Yahoo(Arc<yahoo::YahooProductActivation>),
+    Tiingo(Arc<tiingo::TiingoProductActivation>),
 }
 
 impl CommittedProviderAdapterReplacement {
@@ -1579,6 +2162,10 @@ pub enum ProviderActivationOutcome {
     CoinbaseDirect(Box<CoinbaseDirectAccountActivation>),
     /// Registered research extraction adapter.
     Research(Box<ActivatedResearchProvider>),
+    /// Explicit-demand Yahoo application authority.
+    Yahoo(Box<ActivatedYahooEnrichment>),
+    /// Bounded Tiingo daily NAV/EOD application authority.
+    Tiingo(Box<ActivatedTiingoProvider>),
 }
 
 impl From<LiveProviderActivation> for ProviderActivationOutcome {
@@ -1596,6 +2183,18 @@ impl From<CoinbaseDirectAccountActivation> for ProviderActivationOutcome {
 impl From<ActivatedResearchProvider> for ProviderActivationOutcome {
     fn from(value: ActivatedResearchProvider) -> Self {
         Self::Research(Box::new(value))
+    }
+}
+
+impl From<ActivatedYahooEnrichment> for ProviderActivationOutcome {
+    fn from(value: ActivatedYahooEnrichment) -> Self {
+        Self::Yahoo(Box::new(value))
+    }
+}
+
+impl From<ActivatedTiingoProvider> for ProviderActivationOutcome {
+    fn from(value: ActivatedTiingoProvider) -> Self {
+        Self::Tiingo(Box::new(value))
     }
 }
 
@@ -1638,6 +2237,35 @@ fn runtime_lease_is_current(
         Err(ProviderOnboardingError::ActivationUnavailable) => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+async fn acquire_crypto_market_authority(
+    research: &ProductionResearchIngestCoordinator,
+    lease: &ProviderActivationLease,
+    metadata: &SourceMetadata,
+    publication_cancellation: CancellationToken,
+    deadline: Instant,
+    dataset: market_squawk_data::DatasetId,
+) -> Result<Arc<CryptoMarketPublicationAuthority>, ProviderAdapterActivationError> {
+    let profile = SourceIdentifier::try_from(metadata.source_id().as_str())
+        .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+    let (expected, _rights) = public_live_runtime_generation(lease, metadata)?;
+    let generation = research
+        .provider_runtime_generation(&profile)?
+        .ok_or(ProviderAdapterActivationError::SourceBinding)?;
+    if generation != expected {
+        return Err(ProviderAdapterActivationError::SourceBinding);
+    }
+    Ok(Arc::new(
+        research
+            .acquire_crypto_market_publication_authority(
+                &generation,
+                publication_cancellation,
+                deadline,
+                dataset,
+            )
+            .await?,
+    ))
 }
 
 fn public_live_runtime_generation(

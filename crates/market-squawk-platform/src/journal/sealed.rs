@@ -26,7 +26,10 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::{CURRENT_MAGIC, JournalError, JournalReader, write_current_frame};
+use super::{
+    CURRENT_MAGIC, JournalError, JournalReader, write_current_frame,
+    write_current_frame_with_checkpoint,
+};
 use crate::RawCaptureRecord;
 
 #[path = "sealed_object.rs"]
@@ -584,6 +587,31 @@ impl SealedResearchJournalStore {
         self.open_verified_claim_inner(claim)
     }
 
+    /// Reopens a persisted claim under caller-owned cooperative cancellation and deadline checks.
+    ///
+    /// Verification reuses the bounded streaming verifier used by recovery. The operation mutex is
+    /// acquired without waiting so a contended owner cannot outlive the caller's absolute deadline.
+    pub fn open_verified_claim_with_control(
+        &self,
+        claim: &SealedResearchJournalSegmentClaim,
+        control: &dyn ResearchObjectControl,
+    ) -> Result<SealedResearchJournalSegment, SealedResearchJournalStoreError> {
+        control.checkpoint(ResearchObjectControlPoint::BeforeVerification)?;
+        let _operation = match self.operation.try_lock() {
+            Ok(operation) => operation,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(ResearchObjectControlError::Unavailable.into());
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(SealedResearchJournalStoreError::OperationLockPoisoned);
+            }
+        };
+        self.validate_owner()?;
+        let verified = self.open_verified_claim_inner_with_control(claim, Some(control))?;
+        control.checkpoint(ResearchObjectControlPoint::BeforeCommit)?;
+        Ok(verified)
+    }
+
     fn validate_owner(&self) -> Result<(), SealedResearchJournalStoreError> {
         let named = self
             .root
@@ -944,7 +972,7 @@ fn validate_frame_receipts(
         .map_err(|_| SealedResearchJournalStoreError::ReceiptMismatch)?;
     let mut verified_payload_bytes = 0_u64;
     for (ordinal, (record, frame)) in records.iter().zip(claim.frames.iter()).enumerate() {
-        let serialized = serialized_record_bytes(record)?;
+        let serialized = serialized_record_bytes(record, control)?;
         let framed_bytes = serialized
             .checked_add(8)
             .ok_or(SealedResearchJournalStoreError::ReceiptMismatch)?;
@@ -1122,7 +1150,17 @@ fn read_msj_records_bounded(
         failure: &failure,
         observed_bytes: 0,
     })
-    .read_all_bounded(maximum_records, maximum_bytes);
+    .read_all_bounded_with_checkpoint(maximum_records, maximum_bytes, |offset_bytes| {
+        if let Err(error) =
+            control.checkpoint(ResearchObjectControlPoint::BeforeVerificationChunk { offset_bytes })
+        {
+            failure.set(Some(error));
+            return Err(std::io::Error::other(
+                "sealed research recovery control stopped payload replay",
+            ));
+        }
+        Ok(())
+    });
     if let Some(error) = failure.get() {
         return Err(error.into());
     }
@@ -1131,9 +1169,29 @@ fn read_msj_records_bounded(
 
 fn serialized_record_bytes(
     record: &RawCaptureRecord,
+    control: Option<&dyn ResearchObjectControl>,
 ) -> Result<u64, SealedResearchJournalStoreError> {
     let mut sink = std::io::sink();
-    let written = write_current_frame(&mut sink, record)?;
+    let written = if let Some(control) = control {
+        let failure = Cell::new(None);
+        let result = write_current_frame_with_checkpoint(&mut sink, record, |offset_bytes| {
+            if let Err(error) = control
+                .checkpoint(ResearchObjectControlPoint::BeforeVerificationChunk { offset_bytes })
+            {
+                failure.set(Some(error));
+                return Err(std::io::Error::other(
+                    "sealed research recovery control stopped record verification",
+                ));
+            }
+            Ok(())
+        });
+        if let Some(error) = failure.get() {
+            return Err(error.into());
+        }
+        result?
+    } else {
+        write_current_frame(&mut sink, record)?
+    };
     u64::try_from(written.serialized_payload_bytes)
         .map_err(|_| SealedResearchJournalStoreError::ReceiptMismatch)
 }

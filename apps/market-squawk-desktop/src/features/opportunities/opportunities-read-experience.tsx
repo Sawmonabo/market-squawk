@@ -7,6 +7,7 @@ import {
   RefreshCw,
   Search,
 } from "lucide-react"
+import { useSearchParams } from "react-router-dom"
 
 import { useProduct } from "@/app/product-context"
 import { productKeys, type ProductScope } from "@/app/query-client"
@@ -14,12 +15,15 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useAnalyticalControllerStatus } from "@/features/advanced/use-analytical-profile"
+import { hasProductCapability } from "@/lib/product-capabilities"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
+  admittedSavedScreenId,
   parseInvestmentAnalysis,
   parseInvestmentAnalysisPage,
   parseRecommendationTrackRecord,
+  parseSavedScreenProduct,
   recommendationTrackRecordRequestForAnalysis,
   type InvestmentAnalysisLocator,
 } from "./contracts"
@@ -44,15 +48,36 @@ export function OpportunitiesReadExperience({
   readAvailable: boolean
 }) {
   const [selectedAnalysisId, setSelectedAnalysisId] = useState<string | null>(null)
+  const [searchParams] = useSearchParams()
   const product = useProduct()
+  const requestedScreenValue = searchParams.get("screenId")
+  const requestedScreenId = admittedSavedScreenId(requestedScreenValue)
+  const screenReadAvailable =
+    product.status === "ready" &&
+    hasProductCapability(product.bootstrap, "decision_screen_list")
+  const selectedScreen = useQuery({
+    queryKey: productKeys.operation(scope, "decision", "Decision.GetScreen", {
+      screenId: requestedScreenId,
+    }),
+    queryFn: async () => {
+      const screenId = requestedScreenId
+      if (screenId === null) {
+        throw new Error("Select a saved screen before opening it.")
+      }
+      return parseSavedScreenProduct(
+        await transport.query({ query: "decisionScreen", screenId }),
+        screenId,
+      )
+    },
+    enabled:
+      requestedScreenValue !== null &&
+      requestedScreenId !== null &&
+      screenReadAvailable,
+  })
   const controller = useAnalyticalControllerStatus(transport, scope)
   const trackRecordOperationAvailable =
     product.status === "ready" &&
-    product.bootstrap.operations.some(
-      (operation) =>
-        operation.readOnly &&
-        operation.name === "Decision.GetRecommendationTrackRecord",
-    )
+    hasProductCapability(product.bootstrap, "decision_recommendation_history")
   const analyses = useInfiniteQuery({
     queryKey: productKeys.operation(
       scope,
@@ -226,6 +251,17 @@ export function OpportunitiesReadExperience({
         </div>
       </header>
 
+      {requestedScreenValue !== null ? (
+        <SelectedSavedScreen
+          invalidIdentity={requestedScreenId === null}
+          available={screenReadAvailable}
+          pending={selectedScreen.isPending}
+          error={selectedScreen.isError}
+          screen={selectedScreen.data ?? null}
+          onRetry={() => void selectedScreen.refetch()}
+        />
+      ) : null}
+
       {!readAvailable ? (
         <Alert className="mt-6">
           <CircleAlert aria-hidden="true" />
@@ -364,6 +400,65 @@ export function OpportunitiesReadExperience({
         </div>
       ) : null}
     </>
+  )
+}
+
+function SelectedSavedScreen({
+  invalidIdentity,
+  available,
+  pending,
+  error,
+  screen,
+  onRetry,
+}: {
+  invalidIdentity: boolean
+  available: boolean
+  pending: boolean
+  error: boolean
+  screen: ReturnType<typeof parseSavedScreenProduct> | null
+  onRetry: () => void
+}) {
+  if (invalidIdentity || !available) {
+    return (
+      <Alert className="mt-6">
+        <CircleAlert aria-hidden="true" />
+        <AlertTitle>Saved screen is unavailable</AlertTitle>
+        <AlertDescription>
+          This saved screen cannot be opened right now. Choose another saved screen or try again.
+        </AlertDescription>
+      </Alert>
+    )
+  }
+  if (pending) {
+    return <Skeleton className="mt-6 h-28 w-full rounded-xl" aria-label="Opening saved screen" />
+  }
+  if (error || screen === null) {
+    return (
+      <Alert variant="destructive" className="mt-6">
+        <CircleAlert aria-hidden="true" />
+        <AlertTitle>Saved screen could not be opened</AlertTitle>
+        <AlertDescription>
+          Try again. If the problem continues, check Logs.
+          <Button type="button" variant="outline" size="sm" className="mt-2" onClick={onRetry}>
+            Try again
+          </Button>
+        </AlertDescription>
+      </Alert>
+    )
+  }
+  return (
+    <section
+      className="mt-6 rounded-xl border border-primary/35 bg-primary/5 p-5"
+      aria-labelledby="selected-saved-screen-title"
+    >
+      <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
+        Open saved screen
+      </p>
+      <h2 id="selected-saved-screen-title" className="mt-2 text-lg font-semibold">
+        {screen.title}
+      </h2>
+      <p className="mt-1 text-sm text-muted-foreground">{screen.subtitle}</p>
+    </section>
   )
 }
 

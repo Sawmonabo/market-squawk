@@ -15,9 +15,8 @@ use rust_decimal::Decimal;
 use serde_json::{Map, Value, json};
 
 use super::PortfolioApplicationServiceError;
-use super::import::hex;
 use super::model::{PortfolioReadImage, PublishedRevision};
-use super::read::{ReadScope, report_result};
+use super::read::{ReadScope, report_result, snapshot_token};
 
 pub(super) fn call(
     image: &PortfolioReadImage,
@@ -44,7 +43,7 @@ fn attribution(
     request: &TypedToolRequest,
     context: &RequestContext,
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
-    let baseline_id = required_string(request.arguments(), "baselineRevisionId")?;
+    let baseline_id = required_string(request.arguments(), "baselineSnapshotToken")?;
     let history = image
         .accounts
         .get(&scope.account_id)
@@ -56,7 +55,7 @@ fn attribution(
         .ok_or(PortfolioApplicationServiceError::CorruptPublication)?;
     let baseline = history.revisions[..selected_index]
         .iter()
-        .find(|revision| hex(&revision.token().bytes()) == baseline_id)
+        .find(|revision| snapshot_token(revision) == baseline_id)
         .ok_or(PortfolioApplicationServiceError::NotFound)?;
     if baseline.available_at.is_none()
         || selected.available_at.is_none()
@@ -115,10 +114,10 @@ fn attribution(
             })
         })
         .collect::<Vec<_>>();
-    let mut output = base_report(selected, "source_mark_change_attribution_v1");
+    let mut output = base_report(selected, "portfolio_change");
     output.insert(
-        "baselineRevisionId".to_owned(),
-        Value::String(hex(&baseline.token().bytes())),
+        "baselineSnapshotToken".to_owned(),
+        Value::String(snapshot_token(baseline)),
     );
     output.insert(
         "baselineEffectiveAtUnixNanos".to_owned(),
@@ -133,9 +132,10 @@ fn attribution(
     output.insert("contributions".to_owned(), Value::Array(contributions));
     output.insert("total".to_owned(), money_value(result.total().money()));
     output.insert(
-        "methodDisclosure".to_owned(),
+        "explanation".to_owned(),
         Value::String(
-            "source_mark_change_without_cash_flow_or_corporate_action_adjustment".to_owned(),
+            "Change in reported market value before cash-flow and corporate-action adjustments."
+                .to_owned(),
         ),
     );
     report_result(Value::Object(output), selected, scope, context)
@@ -160,17 +160,12 @@ pub(super) fn allocations(
         .collect()
 }
 
-pub(super) fn base_report(revision: &PublishedRevision, policy: &str) -> Map<String, Value> {
+pub(super) fn base_report(revision: &PublishedRevision, _report_kind: &str) -> Map<String, Value> {
     let mut output = Map::new();
     output.insert(
         "accountId".to_owned(),
         Value::String(revision.account.account_id().to_string()),
     );
-    output.insert(
-        "revisionId".to_owned(),
-        Value::String(hex(&revision.token().bytes())),
-    );
-    output.insert("policy".to_owned(), Value::String(policy.to_owned()));
     output.insert(
         "effectiveAtUnixNanos".to_owned(),
         Value::String(revision.effective_at.unix_nanos().to_string()),
@@ -182,18 +177,8 @@ pub(super) fn base_report(revision: &PublishedRevision, policy: &str) -> Map<Str
         }),
     );
     output.insert(
-        "markEvidence".to_owned(),
-        json!({
-            "sourceId": revision.source_id.as_str(),
-            "sourceCoverage": revision
-                .source_coverage
-                .iter()
-                .map(|source| source.as_str())
-                .collect::<Vec<_>>(),
-            "artifactSha256": hex(&revision.artifact_sha256),
-            "quality": "direct_unverified",
-            "executionEligible": false,
-        }),
+        "dataConfidence".to_owned(),
+        Value::String("limited".to_owned()),
     );
     output
 }

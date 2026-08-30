@@ -14,24 +14,28 @@ import { useNavigate } from "react-router-dom"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import type { ProductScope } from "@/app/query-client"
-import type { ProductTransport } from "@/lib/transport"
+import {
+  productLookupActions,
+  productLookupCategory,
+  type ProductTransport,
+} from "@/lib/transport"
 import { cn } from "@/lib/utils"
 
 import {
-  instrumentLookupDetailSchema,
-  productLookupCategories,
-  type ProductLookupCategory,
+  lookupCategories,
+  normalizeLookupQuery,
+  type LookupCategory,
 } from "./schemas"
 import { useLookup, type ProductLookupMatch } from "./use-lookup"
 
-const categoryLabels: Record<ProductLookupCategory, string> = {
-  company: "Companies",
-  dataset: "Research data",
-  instrument: "Instruments",
-  model: "Models",
-  portfolio: "Portfolio",
-  screen: "Saved screens",
-  target: "Investment targets",
+const categoryLabels: Record<LookupCategory, string> = {
+  [productLookupCategory.company]: "Companies",
+  [productLookupCategory.investment]: "Investments",
+  [productLookupCategory.investmentTarget]: "Investment targets",
+  [productLookupCategory.model]: "Models",
+  [productLookupCategory.portfolio]: "Portfolio",
+  [productLookupCategory.research]: "Research",
+  [productLookupCategory.savedScreen]: "Saved screens",
 }
 
 export function LookupSurface({
@@ -45,10 +49,10 @@ export function LookupSurface({
 }) {
   const navigate = useNavigate()
   const [text, setText] = React.useState("")
-  const [categories, setCategories] = React.useState<ProductLookupCategory[]>([])
+  const [categories, setCategories] = React.useState<LookupCategory[]>([])
   const state = useLookup(transport, scope, text, categories)
 
-  const toggle = (category: ProductLookupCategory) => {
+  const toggle = (category: LookupCategory) => {
     setCategories((current) =>
       current.includes(category)
         ? current.filter((value) => value !== category)
@@ -66,7 +70,6 @@ export function LookupSurface({
         <Input
           autoFocus={autoFocus}
           value={text}
-          maxLength={256}
           onChange={(event) => setText(event.target.value)}
           placeholder="Search a ticker, company, investment, or research item…"
           aria-label="Search your Market Squawk workspace"
@@ -75,7 +78,7 @@ export function LookupSurface({
       </div>
 
       <div className="flex flex-wrap gap-2" aria-label="Limit search categories">
-        {productLookupCategories.map((category) => {
+        {lookupCategories.map((category) => {
           const selected = categories.includes(category)
           return (
             <button
@@ -98,7 +101,7 @@ export function LookupSurface({
 
       <LookupResults
         state={state}
-        query={text.trim()}
+        query={normalizeLookupQuery(text) ?? ""}
         onOpen={(match) => navigate(lookupRoute(match))}
       />
     </div>
@@ -177,18 +180,18 @@ function LookupResults({
             <span className="text-[10px] text-muted-foreground">{matches.length}</span>
           </div>
           <div className="grid gap-2">
-            {matches.map((match) => (
+            {matches.map((match, index) => (
               <button
-                key={`${match.category}:${match.id}`}
+                key={`${match.category}:${match.title}:${match.subtitle}:${index}`}
                 type="button"
                 onClick={() => onOpen(match)}
                 className="group flex w-full items-start gap-3 rounded-lg border border-border bg-card/40 p-3 text-left transition-colors hover:border-primary/40 hover:bg-card/70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
               >
                 <LookupIcon category={match.category} />
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm font-medium">{friendlyLabel(match)}</span>
+                  <span className="block truncate text-sm font-medium">{match.title}</span>
                   <span className="mt-1 block truncate font-mono text-[10px] text-muted-foreground">
-                    {detailFor(match)}
+                    {match.subtitle}
                   </span>
                 </span>
                 <ArrowRight
@@ -213,7 +216,7 @@ function LookupResults({
 function UnavailableCategories({
   categories,
 }: {
-  categories: Array<{ category: ProductLookupCategory; reason?: string }>
+  categories: Array<{ category: LookupCategory; message: string }>
 }) {
   if (categories.length === 0) return null
   return (
@@ -233,15 +236,16 @@ function UnavailableCategories({
   )
 }
 
-function LookupIcon({ category }: { category: ProductLookupCategory }) {
+function LookupIcon({ category }: { category: LookupCategory }) {
   const Icon =
-    category === "company"
+    category === productLookupCategory.company
       ? Building2
-      : category === "dataset"
+      : category === productLookupCategory.research
         ? Database
-        : category === "instrument"
+        : category === productLookupCategory.investment
           ? ChartNoAxesCombined
-          : category === "portfolio" || category === "target"
+          : category === productLookupCategory.portfolio ||
+              category === productLookupCategory.investmentTarget
             ? BriefcaseBusiness
             : Settings2
   return (
@@ -251,69 +255,19 @@ function LookupIcon({ category }: { category: ProductLookupCategory }) {
   )
 }
 
-function friendlyLabel(match: ProductLookupMatch) {
-  if (match.category === "instrument") {
-    const parsed = instrumentLookupDetailSchema.safeParse(match.detail)
-    if (parsed.success) return parsed.data.companyName ?? parsed.data.displayName
-  }
-  return match.label
-}
-
-function detailFor(match: ProductLookupMatch) {
-  const detail = match.detail
-  if (match.category === "company") {
-    return isText(detail.sicDescription) ? detail.sicDescription : "Company"
-  }
-  if (match.category === "instrument") {
-    const parsed = instrumentLookupDetailSchema.safeParse(detail)
-    if (parsed.success) {
-      const reason = parsed.data.matchReasons[0]
-      const matched = reason
-        ? `${reason.label}: ${reason.value}${reason.venueId ? ` · ${reason.venueId}` : ""}`
-        : parsed.data.displayName
-      return `${matched} · ${friendlyAssetClass(parsed.data.assetClass)} · ${parsed.data.quoteCurrency}`
-    }
-  }
-  if (match.category === "dataset") {
-    const rows = typeof detail.rowCount === "number" ? `${detail.rowCount.toLocaleString()} rows` : null
-    return rows ?? "Research collection"
-  }
-  if (match.category === "screen") {
-    return typeof detail.revision === "number" ? `Revision ${detail.revision}` : match.id
-  }
-  return categoryLabels[match.category]
-}
-
 export function lookupRoute(match: ProductLookupMatch) {
-  if (match.destination?.kind === "market_instrument") {
+  if (match.destination.action === productLookupActions.openInvestment) {
     return `/markets?instrumentId=${encodeURIComponent(match.destination.instrumentId)}`
   }
-  if (match.destination?.kind === "research_company") {
-    return "/advanced/research-data"
-  }
-  if (match.category === "dataset") return "/advanced/research-data"
-  if (match.category === "screen") return "/opportunities"
-  if (match.category === "model") return "/advanced/models-forecasts"
-  if (match.category === "portfolio") return "/portfolio"
-  if (match.category === "target") return "/advanced/valuation-targets"
-  return "/home"
+  return `/opportunities?screenId=${encodeURIComponent(match.destination.screenId)}`
 }
 
 function groupMatches(matches: ProductLookupMatch[]) {
-  const grouped = new Map<ProductLookupCategory, ProductLookupMatch[]>()
+  const grouped = new Map<LookupCategory, ProductLookupMatch[]>()
   for (const match of matches) {
     const group = grouped.get(match.category)
     if (group) group.push(match)
     else grouped.set(match.category, [match])
   }
   return grouped
-}
-
-function isText(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0
-}
-
-function friendlyAssetClass(value: string) {
-  const label = value.replaceAll("_", " ")
-  return label.charAt(0).toUpperCase() + label.slice(1)
 }

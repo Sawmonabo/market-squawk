@@ -60,9 +60,10 @@ pub use option_publication::{
     SchwabSealedRawRestOptionPublication, SchwabSealedRestOptionPublication,
 };
 pub use publication::{
-    SchwabDailyPriceHistoryPublicationRequest, SchwabPendingDailyPriceHistoryPublication,
-    SchwabPriceHistoryMarketDataEvidence, SchwabPriceHistoryPublicationError,
-    SchwabRestDelayEvidence, SchwabSealedDailyPriceHistoryPublication,
+    SchwabDailyPriceHistoryCalendarRangeReceipt, SchwabDailyPriceHistoryPublicationRequest,
+    SchwabPendingDailyPriceHistoryPublication, SchwabPriceHistoryMarketDataEvidence,
+    SchwabPriceHistoryPublicationError, SchwabRestDelayEvidence,
+    SchwabSealedDailyPriceHistoryPublication,
 };
 pub use rest::{
     ChainContractType, ChainRequest, ChainStrategy, ExpirationChainRequest, ExpirationMonth,

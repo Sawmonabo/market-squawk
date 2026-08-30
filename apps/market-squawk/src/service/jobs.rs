@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::{
-    application::job::{JobAdmission, JobApplication, JobApplicationError, JobView},
+    application::job::{JobAdmission, JobApplication, JobApplicationError, JobView, JobViewPage},
     jobs::InstalledJobAuthority,
 };
 
@@ -185,6 +185,16 @@ impl InstalledJobOperations {
     ) -> Result<JobView, ServiceError> {
         self.application
             .get(parse_id(job_id)?, parse_generation(generation)?)
+            .await
+            .map_err(map_application)
+    }
+
+    pub(super) async fn list_page(
+        &self,
+        limit: JobListPageLimit,
+    ) -> Result<JobViewPage, ServiceError> {
+        self.application
+            .list(None, limit)
             .await
             .map_err(map_application)
     }

@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Skeleton } from "@/components/ui/skeleton"
+import { hasProductCapability } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -32,9 +33,7 @@ export interface MacroContextProps {
 }
 
 export function MacroContext({ bootstrap, transport }: MacroContextProps) {
-  const operationAvailable = bootstrap.operations.some(
-    (candidate) => candidate.name === operation && candidate.readOnly,
-  )
+  const operationAvailable = hasProductCapability(bootstrap, "macro_context")
   const [knowledgeCutoff, setKnowledgeCutoff] = React.useState("")
   const [effectiveDateCutoff, setEffectiveDateCutoff] = React.useState("")
   const [cutoffs, setCutoffs] = React.useState<Cutoffs | null>(null)

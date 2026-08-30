@@ -10,6 +10,7 @@ use market_squawk_jobs::{
     JobRepository, JobRepositoryError, JobResultReference, JobSnapshot, JobState,
 };
 use market_squawk_services::{RequestId, ToolAuthorization, ToolDescriptor, TypedToolRequest};
+use rust_decimal::Decimal;
 use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
@@ -167,6 +168,8 @@ pub struct JobView {
     failure: Option<JobFailure>,
     updated_at: Timestamp,
     recovery: Option<SourceIdentifier>,
+    #[serde(skip)]
+    started_at: Timestamp,
 }
 
 impl JobView {
@@ -191,6 +194,7 @@ impl JobView {
             failure: snapshot.terminal_failure().cloned(),
             updated_at: snapshot.updated_at_timestamp(),
             recovery,
+            started_at: snapshot.spec().admitted_at(),
         })
     }
 
@@ -222,6 +226,30 @@ impl JobView {
     #[must_use]
     pub const fn state(&self) -> JobState {
         self.state
+    }
+
+    /// Durable admission time retained for product activity projections.
+    #[must_use]
+    pub const fn started_at(&self) -> Timestamp {
+        self.started_at
+    }
+
+    /// Last durable lifecycle update time.
+    #[must_use]
+    pub const fn updated_at(&self) -> Timestamp {
+        self.updated_at
+    }
+
+    /// Last completed objective units when the runner reported measurable progress.
+    #[must_use]
+    pub const fn completed_units(&self) -> Option<u64> {
+        self.completed_units
+    }
+
+    /// Last total objective units when the runner reported measurable progress.
+    #[must_use]
+    pub const fn total_units(&self) -> Option<u64> {
+        self.total_units
     }
 
     /// Whether cooperative cancellation was requested for this generation.
@@ -389,6 +417,37 @@ impl<R: JobRepository + 'static> fmt::Debug for JobApplication<R> {
             .field("repository", &"[DURABLE JOB REPOSITORY]")
             .field("authority", &"[JOB RUNNER AUTHORITY]")
             .finish()
+    }
+}
+
+pub(crate) fn product_activity_state(view: &JobView) -> (&'static str, &'static str) {
+    match view.state() {
+        JobState::Queued => ("queued", "Waiting to start"),
+        JobState::Preparing | JobState::Recovering => ("running", "Preparing research inputs"),
+        JobState::Running => ("running", "Research is running"),
+        JobState::AwaitingConfirmation => ("running", "Waiting for confirmation"),
+        JobState::Cancelling => ("running", "Stopping research"),
+        JobState::Completed => ("completed", "Research completed"),
+        JobState::Failed | JobState::Cancelled | JobState::Interrupted => {
+            ("failed", "Research did not complete")
+        }
+    }
+}
+
+pub(crate) fn product_progress_percent(view: &JobView) -> Option<String> {
+    match (view.completed_units(), view.total_units()) {
+        (Some(completed), Some(total)) if total > 0 && completed <= total => {
+            let completed = Decimal::from(completed);
+            let total = Decimal::from(total);
+            Some(
+                (completed * Decimal::from(100_u32) / total)
+                    .normalize()
+                    .to_string(),
+            )
+        }
+        _ if view.state() == JobState::Completed => Some("100".to_owned()),
+        _ if view.state() == JobState::Queued => Some("0".to_owned()),
+        _ => None,
     }
 }
 

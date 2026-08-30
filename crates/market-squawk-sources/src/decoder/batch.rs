@@ -167,24 +167,7 @@ impl DecodedProviderBatch {
         evidence: DecoderEvidence,
         observations: Vec<ProviderNormalizedObservation>,
     ) -> Result<Self, DecodeError> {
-        if observations.is_empty() {
-            return Err(DecodeError::EmptyBatch);
-        }
-        let observations = BoundedVec::try_new(observations)
-            .map_err(|error| DecodeError::TooManyEvents { max: error.max })?;
-        let mut book_item_count = 0_usize;
-        for observation in observations.as_slice() {
-            book_item_count = book_item_count
-                .checked_add(observation.payload.book_item_count())
-                .ok_or(DecodeError::TooManyNumericFields {
-                    max: MAX_DECODED_BOOK_ITEMS,
-                })?;
-            if book_item_count > MAX_DECODED_BOOK_ITEMS {
-                return Err(DecodeError::TooManyNumericFields {
-                    max: MAX_DECODED_BOOK_ITEMS,
-                });
-            }
-        }
+        let observations = bounded_provider_observations(observations)?;
         Ok(Self {
             evidence,
             observations,
@@ -234,6 +217,30 @@ impl DecodedProviderBatch {
             .and_then(|bytes| bytes.checked_add(deep))
             .ok_or(DecodeError::RetainedSizeOverflow)
     }
+}
+
+pub(crate) fn bounded_provider_observations(
+    observations: Vec<ProviderNormalizedObservation>,
+) -> Result<BoundedVec<ProviderNormalizedObservation, MAX_DECODED_EVENTS>, DecodeError> {
+    if observations.is_empty() {
+        return Err(DecodeError::EmptyBatch);
+    }
+    let observations = BoundedVec::try_new(observations)
+        .map_err(|error| DecodeError::TooManyEvents { max: error.max })?;
+    let mut book_item_count = 0_usize;
+    for observation in observations.as_slice() {
+        book_item_count = book_item_count
+            .checked_add(observation.payload.book_item_count())
+            .ok_or(DecodeError::TooManyNumericFields {
+                max: MAX_DECODED_BOOK_ITEMS,
+            })?;
+        if book_item_count > MAX_DECODED_BOOK_ITEMS {
+            return Err(DecodeError::TooManyNumericFields {
+                max: MAX_DECODED_BOOK_ITEMS,
+            });
+        }
+    }
+    Ok(observations)
 }
 
 /// Synchronous object-safe provider decoder.

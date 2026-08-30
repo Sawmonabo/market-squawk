@@ -327,10 +327,11 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         Some((1, 60_000_000_000))
     );
 
-    for (profile_id, activation, setup, credential, coverage_marker, windows) in [
+    for (profile_id, activation, release, setup, credential, coverage_marker, windows) in [
         (
             "schwab.trader-api-market-data",
             ProfileActivationMode::ManualSecretImport,
+            ProfileReleaseState::RefreshRequired,
             SetupMode::ManualApiKeyImport,
             CredentialKind::ApiKeyPair,
             "provider-native read-only REST",
@@ -339,6 +340,7 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         (
             "yahoo-finance.experimental-enrichment",
             ProfileActivationMode::NoCredential,
+            ProfileReleaseState::Available,
             SetupMode::NoCredential,
             CredentialKind::None,
             "cookie/crumb HTTP",
@@ -347,6 +349,7 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         (
             "iex.hist-feed-files",
             ProfileActivationMode::NoCredential,
+            ProfileReleaseState::RefreshRequired,
             SetupMode::NoCredential,
             CredentialKind::None,
             "bounded cold-job",
@@ -355,6 +358,7 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         (
             "occ.options-reference",
             ProfileActivationMode::NoCredential,
+            ProfileReleaseState::RefreshRequired,
             SetupMode::NoCredential,
             CredentialKind::None,
             "selected/daily DLP",
@@ -363,6 +367,7 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         (
             "cboe.options-reference",
             ProfileActivationMode::NoCredential,
+            ProfileReleaseState::RefreshRequired,
             SetupMode::NoCredential,
             CredentialKind::None,
             "four-file request plans",
@@ -371,6 +376,7 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         (
             "bea.api-data",
             ProfileActivationMode::ManualSecretImport,
+            ProfileReleaseState::RefreshRequired,
             SetupMode::ManualApiKeyImport,
             CredentialKind::ApiKey,
             "100 requests, 100 MB, and 30 errors per minute",
@@ -379,6 +385,7 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         (
             "census.data-api",
             ProfileActivationMode::ManualSecretImport,
+            ProfileReleaseState::RefreshRequired,
             SetupMode::ManualApiKeyImport,
             CredentialKind::ApiKey,
             "400 requests per day",
@@ -387,6 +394,7 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         (
             "eia.api-v2",
             ProfileActivationMode::ManualSecretImport,
+            ProfileReleaseState::RefreshRequired,
             SetupMode::ManualApiKeyImport,
             CredentialKind::ApiKey,
             "5,000-row maximum",
@@ -395,6 +403,7 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         (
             "tiingo.starter-eod-nav",
             ProfileActivationMode::ManualSecretImport,
+            ProfileReleaseState::Available,
             SetupMode::ManualApiKeyImport,
             CredentialKind::ApiKey,
             "500 unique symbols/month",
@@ -405,10 +414,7 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
             .get(profile_id)
             .ok_or("missing selected pending provider profile")?;
         assert_eq!(profile.activation_mode(), activation);
-        assert_eq!(
-            profile.release_state(),
-            ProfileReleaseState::RefreshRequired
-        );
+        assert_eq!(profile.release_state(), release);
         assert_eq!(profile.capability().revision().get(), 3);
         assert_eq!(profile.capability().setup_mode(), setup);
         assert_eq!(profile.capability().credential_kind(), credential);

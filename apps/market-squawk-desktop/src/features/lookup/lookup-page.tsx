@@ -5,6 +5,7 @@ import { useProduct } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
+import { hasProductCapability } from "@/lib/product-capabilities"
 
 import { LookupSurface } from "./lookup-surface"
 
@@ -36,8 +37,9 @@ export function LookupPage() {
     )
   }
 
-  const lookupAvailable = product.bootstrap.operations.some(
-    (operation) => operation.name === "Analysis.Lookup",
+  const lookupAvailable = hasProductCapability(
+    product.bootstrap,
+    "investment_lookup",
   )
 
   return (
@@ -62,7 +64,7 @@ export function LookupPage() {
           <CircleAlert aria-hidden="true" />
           <AlertTitle>Search is unavailable</AlertTitle>
           <AlertDescription>
-            Search is not available in this build. You can continue using the main navigation.
+            Search is unavailable right now. You can continue using the main navigation.
           </AlertDescription>
         </Alert>
       )}

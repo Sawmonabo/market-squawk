@@ -12,7 +12,7 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::{Component, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,7 +27,7 @@ use market_squawk_adapter_schwab::{
 };
 use market_squawk_domain::Timestamp;
 use thiserror::Error;
-use tokio::sync::{Mutex, MutexGuard, Notify};
+use tokio::sync::{Mutex, MutexGuard, Notify, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
@@ -961,7 +961,7 @@ impl Drop for SchwabOAuthRuntime {
 }
 
 #[derive(Debug)]
-struct CurrentSchwabOAuthPublicationEpoch {
+struct CurrentSchwabOAuthGeneration {
     receipt: SchwabOAuthAuthorityReceipt,
     currentness: CancellationToken,
 }
@@ -974,8 +974,8 @@ struct CurrentSchwabOAuthPublicationEpoch {
 struct SchwabOAuthMarketEpochAuthority {
     session_id: Uuid,
     lifecycle: CancellationToken,
-    current: StdMutex<Option<CurrentSchwabOAuthPublicationEpoch>>,
-    token_acquisitions_in_flight: AtomicUsize,
+    current: StdMutex<Option<CurrentSchwabOAuthGeneration>>,
+    attempt_barrier: Arc<Mutex<()>>,
 }
 
 impl SchwabOAuthMarketEpochAuthority {
@@ -984,7 +984,7 @@ impl SchwabOAuthMarketEpochAuthority {
             session_id,
             lifecycle: shutdown.child_token(),
             current: StdMutex::new(None),
-            token_acquisitions_in_flight: AtomicUsize::new(0),
+            attempt_barrier: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1053,10 +1053,6 @@ impl SchwabOAuthMarketEpochAuthority {
             self.invalidate();
             return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
         }
-        if self.token_acquisitions_in_flight.load(Ordering::Acquire) != 0 {
-            self.invalidate();
-            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
-        }
         let mut current = self.current.lock().map_err(|_poisoned| {
             self.lifecycle.cancel();
             SchwabOAuthRuntimeError::MarketEpochUnavailable
@@ -1070,46 +1066,50 @@ impl SchwabOAuthMarketEpochAuthority {
             stale.currentness.cancel();
         }
         let currentness = self.lifecycle.child_token();
-        *current = Some(CurrentSchwabOAuthPublicationEpoch {
+        *current = Some(CurrentSchwabOAuthGeneration {
             receipt,
             currentness: currentness.clone(),
         });
         drop(current);
-        if self.is_cancelled() || self.token_acquisitions_in_flight.load(Ordering::Acquire) != 0 {
+        if self.is_cancelled() {
             self.invalidate();
             return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
         }
         Ok(currentness)
     }
 
-    fn begin_token_acquisition(
+    async fn acquire_attempt_barrier(
         self: &Arc<Self>,
-    ) -> Result<SchwabOAuthTokenAcquisition, SchwabOAuthRuntimeError> {
+    ) -> Result<OwnedMutexGuard<()>, SchwabOAuthRuntimeError> {
         if self.is_cancelled() {
             return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
         }
-        self.token_acquisitions_in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_current| SchwabOAuthRuntimeError::MarketEpochUnavailable)?;
-        let transition = SchwabOAuthTokenAcquisition {
-            authority: Arc::clone(self),
-            finished: false,
-        };
-        self.invalidate();
+        let barrier = Arc::clone(&self.attempt_barrier).lock_owned().await;
         if self.is_cancelled() {
             return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
         }
-        Ok(transition)
+        Ok(barrier)
     }
 
-    fn finish_token_acquisition(&self) -> Result<(), SchwabOAuthRuntimeError> {
-        self.token_acquisitions_in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_sub(1)
-            })
-            .map_err(|_current| SchwabOAuthRuntimeError::MarketEpochUnavailable)?;
+    fn validate_current_receipt(
+        &self,
+        receipt: SchwabOAuthAuthorityReceipt,
+    ) -> Result<(), SchwabOAuthRuntimeError> {
+        validate_receipt_time(receipt)?;
+        if self.is_cancelled() {
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+        }
+        let current = self.current.lock().map_err(|_poisoned| {
+            self.lifecycle.cancel();
+            SchwabOAuthRuntimeError::MarketEpochUnavailable
+        })?;
+        if current
+            .as_ref()
+            .is_none_or(|current| current.receipt != receipt || current.currentness.is_cancelled())
+        {
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+        }
+        drop(current);
         if self.is_cancelled() {
             return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
         }
@@ -1124,27 +1124,6 @@ impl fmt::Debug for SchwabOAuthMarketEpochAuthority {
             .field("session_id", &self.session_id)
             .field("revoked", &self.is_cancelled())
             .finish_non_exhaustive()
-    }
-}
-
-struct SchwabOAuthTokenAcquisition {
-    authority: Arc<SchwabOAuthMarketEpochAuthority>,
-    finished: bool,
-}
-
-impl SchwabOAuthTokenAcquisition {
-    fn finish(mut self) -> Result<(), SchwabOAuthRuntimeError> {
-        let result = self.authority.finish_token_acquisition();
-        self.finished = true;
-        result
-    }
-}
-
-impl Drop for SchwabOAuthTokenAcquisition {
-    fn drop(&mut self) {
-        if !self.finished && self.authority.finish_token_acquisition().is_err() {
-            self.authority.cancel();
-        }
     }
 }
 
@@ -1225,6 +1204,28 @@ pub(crate) struct SchwabOAuthMarketAuthority {
 }
 
 impl SchwabOAuthMarketAuthority {
+    #[cfg(test)]
+    pub(crate) fn from_test_authority(
+        session_id: Uuid,
+        issued_receipt: SchwabOAuthAuthorityReceipt,
+        authority: Arc<ProtectedSchwabOAuthAuthority>,
+    ) -> Self {
+        Self {
+            session_id,
+            issued_receipt,
+            authority,
+            currentness: Arc::new(SchwabOAuthMarketEpochAuthority::new(
+                session_id,
+                CancellationToken::new(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revoke_test_authority(&self) {
+        self.currentness.cancel();
+    }
+
     pub(crate) const fn session_id(&self) -> Uuid {
         self.session_id
     }
@@ -1240,6 +1241,52 @@ impl SchwabOAuthMarketAuthority {
         self.reconciled_receipt()
             .await
             .map(|(receipt, _currentness)| receipt)
+    }
+
+    /// Acquires one transient token and the exact non-cloneable publication epoch for that
+    /// attempt.
+    ///
+    /// The returned epoch retains the serialized token/publication barrier until the caller has
+    /// sealed the response and crossed durable precommit. A refresh therefore cannot rotate the
+    /// protected generation underneath an admitted response. If this acquisition did rotate the
+    /// token, the returned receipt exposes that exact generation so the account activation can
+    /// require a fresh doctor disposition before the request is dispatched.
+    pub(crate) async fn acquire_publication_attempt(
+        &self,
+    ) -> Result<(TransientAccessToken, SchwabOAuthPublicationEpoch), SchwabOAuthRuntimeError> {
+        let barrier = self.currentness.acquire_attempt_barrier().await?;
+        let token = match self.authority.acquire().await {
+            Ok(token) => token,
+            Err(error) => {
+                self.currentness.invalidate();
+                return Err(map_token_authority_error(error));
+            }
+        };
+        let (receipt, generation_currentness) = self.reconciled_receipt().await?;
+        if token.generation() != receipt.generation() {
+            self.currentness.invalidate();
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+        }
+        let epoch = SchwabOAuthPublicationEpoch {
+            session_id: self.currentness.session_id,
+            receipt,
+            currentness: generation_currentness.child_token(),
+            _attempt_barrier: barrier,
+        };
+        epoch.validate_current(receipt)?;
+        Ok((token, epoch))
+    }
+
+    /// Synchronously validates an exact reconciled receipt for durable precommit.
+    ///
+    /// Callers must also retain the attempt epoch that was minted with the response. The shared
+    /// generation check closes revocation and rotation races; the epoch's owned barrier prevents
+    /// a later acquisition from rotating that generation before precommit.
+    pub(crate) fn validate_current_receipt(
+        &self,
+        receipt: SchwabOAuthAuthorityReceipt,
+    ) -> Result<(), SchwabOAuthRuntimeError> {
+        self.currentness.validate_current_receipt(receipt)
     }
 
     async fn reconciled_receipt(
@@ -1273,20 +1320,6 @@ impl SchwabOAuthMarketAuthority {
             }
         }
     }
-
-    /// Mints a secret-free synchronous publication capability after exact async reconciliation.
-    pub(crate) async fn publication_epoch(
-        &self,
-    ) -> Result<SchwabOAuthPublicationEpoch, SchwabOAuthRuntimeError> {
-        let (receipt, currentness) = self.reconciled_receipt().await?;
-        let epoch = SchwabOAuthPublicationEpoch {
-            session_id: self.currentness.session_id,
-            receipt,
-            currentness,
-        };
-        epoch.validate_current(receipt)?;
-        Ok(epoch)
-    }
 }
 
 impl SchwabAccessTokenSource for SchwabOAuthMarketAuthority {
@@ -1297,21 +1330,39 @@ impl SchwabAccessTokenSource for SchwabOAuthMarketAuthority {
         let currentness = Arc::clone(&self.currentness);
         let authority = Arc::clone(&self.authority);
         Box::pin(async move {
-            let transition = currentness
-                .begin_token_acquisition()
+            let _barrier = currentness
+                .acquire_attempt_barrier()
+                .await
                 .map_err(map_market_epoch_token_error)?;
             let token = match authority.acquire().await {
                 Ok(token) => token,
                 Err(error) => {
-                    drop(transition);
                     currentness.invalidate();
                     return Err(error);
                 }
             };
-            transition.finish().map_err(|error| {
+            let status = authority.status().await.map_err(|error| {
+                currentness.invalidate();
+                match error {
+                    SchwabOAuthAuthorityError::ReauthorizationRequired
+                    | SchwabOAuthAuthorityError::MissingRefreshToken => {
+                        TokenAuthorityError::ReauthorizationRequired
+                    }
+                    _ => TokenAuthorityError::Unavailable,
+                }
+            })?;
+            let SchwabOAuthAuthorityStatus::Active(receipt) = status else {
+                currentness.invalidate();
+                return Err(TokenAuthorityError::ReauthorizationRequired);
+            };
+            let reconciled = currentness.reconcile_current(receipt).map_err(|error| {
                 currentness.invalidate();
                 map_market_epoch_token_error(error)
             })?;
+            if reconciled.is_cancelled() || token.generation() != receipt.generation() {
+                currentness.invalidate();
+                return Err(TokenAuthorityError::ReauthorizationRequired);
+            }
             Ok(token)
         })
     }
@@ -1329,15 +1380,17 @@ impl fmt::Debug for SchwabOAuthMarketAuthority {
     }
 }
 
-/// Secret-free synchronous currentness capability for one reconciled OAuth publication epoch.
+/// Secret-free synchronous currentness capability for one exact OAuth publication attempt.
 ///
 /// This value owns no token or protected store handle. It can only compare the exact receipt and
-/// process-local market epoch minted by [`SchwabOAuthMarketAuthority::publication_epoch`].
-#[derive(Clone)]
+/// process-local market epoch minted beside a transient token by
+/// [`SchwabOAuthMarketAuthority::acquire_publication_attempt`]. Its owned barrier makes the value
+/// deliberately non-cloneable and prevents another token acquisition or refresh until it drops.
 pub(crate) struct SchwabOAuthPublicationEpoch {
     session_id: Uuid,
     receipt: SchwabOAuthAuthorityReceipt,
     currentness: CancellationToken,
+    _attempt_barrier: OwnedMutexGuard<()>,
 }
 
 impl SchwabOAuthPublicationEpoch {
@@ -1495,6 +1548,15 @@ fn map_market_epoch_token_error(error: SchwabOAuthRuntimeError) -> TokenAuthorit
         | SchwabOAuthRuntimeError::ReauthorizationRequired
         | SchwabOAuthRuntimeError::ShuttingDown => TokenAuthorityError::ReauthorizationRequired,
         _ => TokenAuthorityError::Unavailable,
+    }
+}
+
+fn map_token_authority_error(error: TokenAuthorityError) -> SchwabOAuthRuntimeError {
+    match error {
+        TokenAuthorityError::ReauthorizationRequired => {
+            SchwabOAuthRuntimeError::ReauthorizationRequired
+        }
+        TokenAuthorityError::Unavailable => SchwabOAuthRuntimeError::MarketEpochUnavailable,
     }
 }
 

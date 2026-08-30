@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
-    CompanyIdentitySurface, DigestAlgorithm, EvidenceDigest, ResearchContext, ResearchObservation,
-    ResearchTemporalCoordinate, SourceId, Timestamp,
+    CommonEquitySuitability, CompanyIdentitySurface, DigestAlgorithm, EvidenceDigest, InstrumentId,
+    ResearchContext, ResearchObservation, ResearchTemporalCoordinate, SourceId, Timestamp,
 };
 use market_squawk_platform::{
     ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
@@ -21,7 +21,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::arrow_convert::{ProviderCaptureRowCoordinate, ResearchLineageDigestAccumulator};
-use crate::catalog::CompanyIdentityExactRecord;
+use crate::catalog::{
+    CompanyIdentityExactRecord, CompanySecurityIdentityDisposition,
+    CompanySecurityIdentityReadCapability, CompanySecurityIdentitySelection,
+};
 use crate::{
     AnalyticalManifestCatalog, ArrowConversionError, CatalogAuthority, CatalogError,
     DatasetManifestRef, ManifestCatalogError, ParquetObjectStore, ParquetStoreError,
@@ -93,6 +96,104 @@ pub struct SecResearchReadRequest {
     point_in_time_limits: PointInTimeLimits,
     maximum_object_bytes: usize,
     request_digest: EvidenceDigest,
+}
+
+/// Caller-safe SEC research request rooted only in canonical identity, family, and PIT policy.
+///
+/// Immutable manifests, provider bindings, and company-observation digests are intentionally
+/// absent. The data authority derives those coordinates from already admitted catalog evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecResearchIdentityReadRequest {
+    instrument_id: InstrumentId,
+    family: SecResearchFamily,
+    knowledge_at: Timestamp,
+    effective_cutoff: ResearchTemporalCoordinate,
+    revision_mode: PointInTimeRevisionMode,
+    point_in_time_limits: PointInTimeLimits,
+    maximum_object_bytes: usize,
+}
+
+impl SecResearchIdentityReadRequest {
+    /// Constructs one bounded canonical-identity request without forgeable storage coordinates.
+    pub fn try_new(
+        instrument_id: InstrumentId,
+        family: SecResearchFamily,
+        knowledge_at: Timestamp,
+        effective_cutoff: ResearchTemporalCoordinate,
+        revision_mode: PointInTimeRevisionMode,
+        point_in_time_limits: PointInTimeLimits,
+        maximum_object_bytes: usize,
+    ) -> Result<Self, SecResearchReadError> {
+        if maximum_object_bytes == 0 || maximum_object_bytes > MAX_SEC_RESEARCH_OBJECT_BYTES {
+            return Err(SecResearchReadError::InvalidRequest);
+        }
+        Ok(Self {
+            instrument_id,
+            family,
+            knowledge_at,
+            effective_cutoff,
+            revision_mode,
+            point_in_time_limits,
+            maximum_object_bytes,
+        })
+    }
+
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+    pub const fn family(&self) -> SecResearchFamily {
+        self.family
+    }
+    pub const fn knowledge_at(&self) -> Timestamp {
+        self.knowledge_at
+    }
+    pub const fn effective_cutoff(&self) -> &ResearchTemporalCoordinate {
+        &self.effective_cutoff
+    }
+    pub const fn revision_mode(&self) -> PointInTimeRevisionMode {
+        self.revision_mode
+    }
+    pub const fn point_in_time_limits(&self) -> PointInTimeLimits {
+        self.point_in_time_limits
+    }
+    pub const fn maximum_object_bytes(&self) -> usize {
+        self.maximum_object_bytes
+    }
+}
+
+/// Truthful canonical-identity resolution before an exact SEC generation is opened.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SecResearchIdentityOutcome {
+    /// No admitted issuer/security relationship is usable at the cutoff.
+    Missing,
+    /// More than one issuer relationship or an ambiguous company parent remains possible.
+    Ambiguous,
+    /// The retained relationship names a superseded company or market-definition parent.
+    Stale,
+    /// The latest applicable relationship explicitly revoked the mapping.
+    Revoked,
+    /// One exact retained generation was resolved and fully selected.
+    Exact(SecResearchSelection),
+}
+
+/// Complete canonical-identity selection with the relationship evidence considered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecResearchIdentitySelection {
+    request: SecResearchIdentityReadRequest,
+    identity: CompanySecurityIdentitySelection,
+    outcome: SecResearchIdentityOutcome,
+}
+
+impl SecResearchIdentitySelection {
+    pub const fn request(&self) -> &SecResearchIdentityReadRequest {
+        &self.request
+    }
+    pub const fn identity(&self) -> &CompanySecurityIdentitySelection {
+        &self.identity
+    }
+    pub const fn outcome(&self) -> &SecResearchIdentityOutcome {
+        &self.outcome
+    }
 }
 
 impl SecResearchReadRequest {
@@ -530,6 +631,145 @@ impl SecResearchReadCapability {
             manifests,
             objects,
         }
+    }
+
+    /// Resolves canonical security identity to one exact SEC generation, then performs the read.
+    ///
+    /// Missing, ambiguous, stale, and revoked issuer mappings remain explicit outcomes. Only an
+    /// exact direct common-equity relationship can supply the privately derived company, provider
+    /// binding, and immutable manifest coordinates consumed by [`Self::select`].
+    pub async fn select_by_identity(
+        &self,
+        request: SecResearchIdentityReadRequest,
+        raw_store: &SealedResearchJournalStore,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<SecResearchIdentitySelection, SecResearchReadError> {
+        check_operation(deadline, &cancellation)?;
+        let source_id =
+            SourceId::try_from(SEC_SOURCE_ID).map_err(|_| SecResearchReadError::InvalidRequest)?;
+        let identity = CompanySecurityIdentityReadCapability::new(Arc::clone(&self.authority))
+            .instrument_company_as_of(
+                request.instrument_id(),
+                &source_id,
+                request.family().company_surface(),
+                request.knowledge_at(),
+                CommonEquitySuitability::SuitableIssuerCommonEquity,
+                deadline,
+                &cancellation,
+            )?;
+        let closed = match identity.disposition() {
+            CompanySecurityIdentityDisposition::Unavailable => {
+                Some(SecResearchIdentityOutcome::Missing)
+            }
+            CompanySecurityIdentityDisposition::Conflict => {
+                Some(SecResearchIdentityOutcome::Ambiguous)
+            }
+            CompanySecurityIdentityDisposition::Stale => Some(SecResearchIdentityOutcome::Stale),
+            CompanySecurityIdentityDisposition::Revoked => {
+                Some(SecResearchIdentityOutcome::Revoked)
+            }
+            CompanySecurityIdentityDisposition::Complete => None,
+        };
+        if let Some(outcome) = closed {
+            return Ok(SecResearchIdentitySelection {
+                request,
+                identity,
+                outcome,
+            });
+        }
+
+        let [relationship] = identity.candidates() else {
+            return Err(SecResearchReadError::OriginMismatch);
+        };
+        let link = relationship.link();
+        if link.instrument_id() != request.instrument_id()
+            || link.company_source_id() != &source_id
+            || link.company_surface() != request.family().company_surface()
+            || link.common_equity_suitability()
+                != CommonEquitySuitability::SuitableIssuerCommonEquity
+        {
+            return Err(SecResearchReadError::OriginMismatch);
+        }
+        let company = self
+            .authority
+            .try_lock()
+            .map_err(|_| SecResearchReadError::AuthorityUnavailable)?
+            .catalog()
+            .exact_company_identity_by_digest(
+                link.company_observation_digest(),
+                deadline,
+                &cancellation,
+            )?
+            .ok_or(SecResearchReadError::OriginMismatch)?;
+        if company.observation().source_id() != &source_id
+            || company.observation().surface() != request.family().company_surface()
+            || company.observation().provider_company_id() != link.provider_company_id()
+            || company.observation_digest() != link.company_observation_digest()
+        {
+            return Err(SecResearchReadError::OriginMismatch);
+        }
+        let provider_binding_digest = company
+            .provider_binding_digest()
+            .ok_or(SecResearchReadError::ProviderBindingMismatch)?;
+        let pinned = self
+            .manifests
+            .for_run(company.run_id())?
+            .ok_or(SecResearchReadError::OriginMismatch)?;
+        if pinned.plan().content_hash().evidence() != company.manifest_content_digest()
+            || pinned
+                .objects()
+                .iter()
+                .filter(|object| object.artifact_id() == company.artifact_id())
+                .count()
+                != 1
+        {
+            return Err(SecResearchReadError::OriginMismatch);
+        }
+        let exact_request = SecResearchReadRequest::try_new(
+            pinned.manifest().clone(),
+            request.family(),
+            provider_binding_digest,
+            company.observation_digest(),
+            request.knowledge_at(),
+            request.effective_cutoff().clone(),
+            request.revision_mode(),
+            request.point_in_time_limits(),
+            request.maximum_object_bytes(),
+        )?;
+        let selected = self
+            .select(exact_request, raw_store, deadline, cancellation)
+            .await?;
+        if selected.company_identity() != &company {
+            return Err(SecResearchReadError::OriginMismatch);
+        }
+        Ok(SecResearchIdentitySelection {
+            request,
+            identity,
+            outcome: SecResearchIdentityOutcome::Exact(selected),
+        })
+    }
+
+    /// Re-resolves canonical identity and requires the same closed outcome and exact evidence.
+    pub async fn verify_identity_restart(
+        &self,
+        expected: &SecResearchIdentitySelection,
+        raw_store: &SealedResearchJournalStore,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<SecResearchIdentitySelection, SecResearchReadError> {
+        let replay = self
+            .select_by_identity(
+                expected.request().clone(),
+                raw_store,
+                deadline,
+                cancellation,
+            )
+            .await?;
+        if replay != *expected {
+            return Err(SecResearchReadError::RestartMismatch);
+        }
+        Ok(replay)
     }
 
     /// Reconstructs and selects one exact SEC generation from durable authorities only.
@@ -1049,6 +1289,8 @@ pub enum SecResearchReadError {
     Manifest(#[from] ManifestCatalogError),
     #[error(transparent)]
     Catalog(#[from] CatalogError),
+    #[error(transparent)]
+    CompanySecurity(#[from] crate::CompanySecurityIdentityCatalogError),
     #[error(transparent)]
     Parquet(#[from] ParquetStoreError),
     #[error(transparent)]

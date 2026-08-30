@@ -1,96 +1,217 @@
 import { z } from "zod"
 
 import type { ApplicationResult } from "@/lib/schemas"
-import {
-  compareLosslessIntegers,
-  losslessIntegerSchema,
-} from "@/lib/lossless-integer"
 
-export const BACKTEST_JOB_KIND = "analysis.backtest.v1"
-export const BACKTEST_RESULT_AUTHORITY =
-  "analysis.governed-backtest-terminal.v1"
-
-const digestSchema = z.string().regex(/^[0-9a-f]{64}$/)
-const identifierSchema = z
-  .string()
-  .min(1)
-  .max(256)
-  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/)
 const timestampSchema = z.string().datetime({ offset: true })
+const exactDecimalSchema = z.string().regex(/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/)
 
-const namedPreparationOptionSchema = z
+const namedChoiceSchema = z
   .object({
-    id: identifierSchema,
+    token: z.string().uuid(),
     label: z.string().min(1).max(200),
     description: z.string().min(1).max(1_000),
   })
   .strict()
 
-const periodOptionSchema = z
+const periodChoiceSchema = z
   .object({
-    id: identifierSchema,
+    periodToken: z.string().uuid(),
     label: z.string().min(1).max(240),
     startsAt: timestampSchema,
     endsAt: timestampSchema,
   })
   .strict()
+  .superRefine((period, context) => {
+    if (Date.parse(period.startsAt) >= Date.parse(period.endsAt)) {
+      context.addIssue({ code: "custom", message: "The backtest period is not ordered." })
+    }
+  })
 
-const datasetPreparationOptionSchema = z
+const historyChoiceSchema = z
   .object({
-    id: identifierSchema,
+    historyToken: z.string().uuid(),
     label: z.string().min(1).max(200),
-    immutableGeneration: losslessIntegerSchema.refine(
-      (value) => BigInt(value) > 0n,
-      "Expected a positive immutable generation.",
-    ),
-    instrumentCount: z.number().int().positive(),
-    periods: z.array(periodOptionSchema).min(1).max(2),
+    investmentCount: z.number().int().positive(),
+    periods: z.array(periodChoiceSchema).min(1).max(8),
   })
   .strict()
 
 const backtestPreparationOptionsSchema = z
   .object({
-    datasets: z.array(datasetPreparationOptionSchema).max(4_096),
-    strategies: z.array(namedPreparationOptionSchema).min(1).max(16),
-    costPolicies: z.array(namedPreparationOptionSchema).min(1).max(16),
-    seeds: z.array(namedPreparationOptionSchema).min(1).max(16),
-    portfolios: z.array(namedPreparationOptionSchema).min(1).max(16),
-    comparisons: z.array(namedPreparationOptionSchema).min(1).max(16),
-    defaultLimitPolicy: z.string().min(1).max(1_000),
+    histories: z.array(historyChoiceSchema).max(4_096),
+    methods: z.array(namedChoiceSchema).min(1).max(16),
+    costPlans: z.array(namedChoiceSchema).min(1).max(16),
+    portfolios: z.array(namedChoiceSchema).min(1).max(16),
+    comparisons: z.array(namedChoiceSchema).min(1).max(16),
+    guidance: z.string().min(1).max(1_000),
   })
   .strict()
 
-const backtestPreparationReceiptSchema = z
+const costAssumptionsSchema = z
   .object({
-    receiptId: z.string().uuid(),
-    preparationDigest: digestSchema,
+    fees: z.string().min(1).max(200),
+    spread: z.string().min(1).max(200),
+    slippage: z.string().min(1).max(200),
+    latency: z.string().min(1).max(200),
+    participationLimit: z.string().min(1).max(200),
+    partialFills: z.string().min(1).max(200),
   })
   .strict()
+
+const evidenceStateSchema = z.enum(["verified", "limited", "unavailable"])
 
 const backtestPreparationPreviewSchema = z
   .object({
-    receipt: backtestPreparationReceiptSchema,
+    confirmationToken: z.string().uuid(),
     expiresAt: timestampSchema,
-    dataset: z.string().min(1).max(400),
+    investmentUniverse: z.string().min(1).max(400),
     period: z.string().min(1).max(300),
-    strategy: z.string().min(1).max(200),
-    costPolicy: z.string().min(1).max(200),
-    deterministicSeed: z.string().min(1).max(200),
+    method: z.string().min(1).max(200),
+    costs: costAssumptionsSchema,
     portfolio: z.string().min(1).max(200),
     comparison: z.string().min(1).max(300),
+    pointInTimeEvidence: evidenceStateSchema,
+    outOfSamplePlan: z.string().min(1).max(1_000),
     evidence: z.array(z.string().min(1).max(1_000)).min(1).max(16),
     assumptions: z.array(z.string().min(1).max(1_000)).min(1).max(16),
+    limitations: z.array(z.string().min(1).max(1_000)).max(32),
+    analysisOnly: z.literal(true),
   })
   .strict()
 
-const backtestJobReceiptSchema = z
+const backtestStartResultSchema = z
+  .object({ state: z.literal("queued") })
+  .strict()
+
+const backtestActivitySchema = z
   .object({
-    jobId: z.string().uuid(),
-    generation: z.number().int().positive(),
-    sequence: z.number().int().nonnegative(),
-    state: z.literal("queued"),
+    backtestToken: z.string().uuid(),
+    label: z.string().min(1).max(240),
+    startedAt: timestampSchema,
+    updatedAt: timestampSchema,
+    state: z.enum(["queued", "running", "completed", "failed"]),
+    progressPercent: exactDecimalSchema.nullable(),
+    statusMessage: z.string().min(1).max(500),
   })
   .strict()
+
+const backtestActivitiesSchema = z
+  .object({
+    activities: z.array(backtestActivitySchema).max(1_000),
+  })
+  .strict()
+
+const pointInTimeEvidenceSchema = z
+  .object({
+    state: evidenceStateSchema,
+    informationCutoff: timestampSchema,
+    observedFrom: timestampSchema,
+    observedThrough: timestampSchema,
+    observationCount: z.number().int().nonnegative(),
+    coveragePercent: exactDecimalSchema.nullable(),
+    interpretation: z.string().min(1).max(2_000),
+  })
+  .strict()
+
+const outOfSampleEvidenceSchema = z
+  .object({
+    state: z.enum(["evaluated", "limited", "not_evaluated"]),
+    foldCount: z.number().int().nonnegative(),
+    observationCount: z.number().int().nonnegative(),
+    method: z.string().min(1).max(500),
+    probabilityOfOverfittingPercent: exactDecimalSchema.nullable(),
+    deflatedPerformanceProbabilityPercent: exactDecimalSchema.nullable(),
+    expectedMaximumSharpe: exactDecimalSchema.nullable(),
+    interpretation: z.string().min(1).max(2_000),
+  })
+  .strict()
+
+const performanceSchema = z
+  .object({
+    totalReturnPercent: exactDecimalSchema,
+    annualizedReturnPercent: exactDecimalSchema.nullable(),
+    annualizedVolatilityPercent: exactDecimalSchema.nullable(),
+    maximumDrawdownPercent: exactDecimalSchema,
+    sharpeRatio: exactDecimalSchema.nullable(),
+    winRatePercent: exactDecimalSchema.nullable(),
+    turnoverPercent: exactDecimalSchema.nullable(),
+  })
+  .strict()
+
+const costEvidenceSchema = costAssumptionsSchema.extend({
+  totalCostPercent: exactDecimalSchema,
+})
+
+const executionEvidenceSchema = z
+  .object({
+    fillCount: z.number().int().nonnegative(),
+    partialFillCount: z.number().int().nonnegative(),
+    noActionCount: z.number().int().nonnegative(),
+  })
+  .strict()
+  .superRefine((execution, context) => {
+    if (execution.partialFillCount > execution.fillCount) {
+      context.addIssue({
+        code: "custom",
+        message: "Partial fills cannot exceed total fills.",
+      })
+    }
+  })
+
+const comparisonEvidenceSchema = z
+  .object({
+    label: z.string().min(1).max(240),
+    totalReturnPercent: exactDecimalSchema,
+    excessReturnPercent: exactDecimalSchema,
+  })
+  .strict()
+
+const completedBacktestSchema = z
+  .object({
+    state: z.literal("completed"),
+    backtestToken: z.string().uuid(),
+    label: z.string().min(1).max(240),
+    completedAt: timestampSchema,
+    expiresAt: timestampSchema.nullable(),
+    investmentUniverse: z.string().min(1).max(400),
+    method: z.string().min(1).max(240),
+    period: z
+      .object({ startsAt: timestampSchema, endsAt: timestampSchema })
+      .strict(),
+    pointInTimeEvidence: pointInTimeEvidenceSchema,
+    outOfSampleEvidence: outOfSampleEvidenceSchema,
+    performance: performanceSchema,
+    costs: costEvidenceSchema,
+    execution: executionEvidenceSchema,
+    comparison: comparisonEvidenceSchema.nullable(),
+    uncertainty: z.enum(["supported", "limited", "unavailable"]),
+    interpretation: z.string().min(1).max(4_000),
+    limitations: z.array(z.string().min(1).max(2_000)).max(64),
+    invalidators: z.array(z.string().min(1).max(2_000)).max(64),
+    analysisOnly: z.literal(true),
+  })
+  .strict()
+  .superRefine((result, context) => {
+    if (Date.parse(result.period.startsAt) >= Date.parse(result.period.endsAt)) {
+      context.addIssue({ code: "custom", message: "The result period is not ordered." })
+    }
+  })
+
+const unavailableBacktestSchema = z
+  .object({
+    state: z.literal("unavailable"),
+    backtestToken: z.string().uuid(),
+    label: z.string().min(1).max(240),
+    reason: z.string().min(1).max(2_000),
+    limitations: z.array(z.string().min(1).max(2_000)).max(64),
+    unavailableBehavior: z.literal("no_action"),
+  })
+  .strict()
+
+const backtestResultSchema = z.union([
+  completedBacktestSchema,
+  unavailableBacktestSchema,
+])
 
 export type BacktestPreparationOptions = z.infer<
   typeof backtestPreparationOptionsSchema
@@ -98,29 +219,24 @@ export type BacktestPreparationOptions = z.infer<
 export type BacktestPreparationPreview = z.infer<
   typeof backtestPreparationPreviewSchema
 >
-export type BacktestPreparationReceipt = z.infer<
-  typeof backtestPreparationReceiptSchema
->
-export type BacktestJobReceipt = z.infer<typeof backtestJobReceiptSchema>
-export type BacktestPreparationSelection = {
-  dataset: string
-  period: string
-  strategy: string
-  costPolicy: string
-  seed: string
-  portfolio: string
-  comparison: string
+export type BacktestActivity = z.infer<typeof backtestActivitySchema>
+export type BacktestResult = z.infer<typeof backtestResultSchema>
+export type CompletedBacktest = z.infer<typeof completedBacktestSchema>
+
+export interface BacktestPreparationSelection {
+  historyToken: string
+  periodToken: string
+  methodToken: string
+  costToken: string
+  portfolioToken: string
+  comparisonToken: string
 }
 
 export function parseBacktestPreparationOptions(
   result: ApplicationResult,
 ): BacktestPreparationOptions {
   const parsed = backtestPreparationOptionsSchema.safeParse(result.data)
-  if (!parsed.success) {
-    throw new Error(
-      "The installed service returned unsupported guided-backtest options.",
-    )
-  }
+  if (!parsed.success) throw new Error("Backtest choices are unavailable right now.")
   return parsed.data
 }
 
@@ -128,180 +244,28 @@ export function parseBacktestPreparationPreview(
   result: ApplicationResult,
 ): BacktestPreparationPreview {
   const parsed = backtestPreparationPreviewSchema.safeParse(result.data)
-  if (!parsed.success) {
-    throw new Error(
-      "The installed service returned an unsupported guided-backtest preview.",
-    )
-  }
+  if (!parsed.success) throw new Error("This backtest cannot be reviewed right now.")
   return parsed.data
 }
 
-export function parseBacktestJobReceipt(
-  result: ApplicationResult,
-): BacktestJobReceipt {
-  const parsed = backtestJobReceiptSchema.safeParse(result.data)
-  if (!parsed.success) {
-    throw new Error(
-      "The installed service returned an unsupported backtest-job receipt.",
-    )
-  }
-  return parsed.data
+export function parseBacktestStart(result: ApplicationResult): { state: "queued" } {
+  const parsed = backtestStartResultSchema.safeParse(result.data)
+  if (!parsed.success) throw new Error("This backtest cannot be started right now.")
+  return { state: "queued" }
 }
-const metricSchema = z
-  .object({
-    name: z.string().min(1),
-    value: z.number().refine(Number.isFinite),
-  })
-  .strict()
 
-const executionAssumptionsSchema = z
-  .object({
-    policyVersion: z.literal(3),
-    feeBasisPoints: z.number().int().min(0).max(10_000),
-    spreadModel: z.literal("observed-point-in-time-half-spread"),
-    slippageBasisPoints: z.number().int().min(0).max(10_000),
-    maximumRandomSlippageBasisPoints: z.number().int().min(0).max(10_000),
-    latencyNanos: losslessIntegerSchema,
-    maximumParticipationBasisPoints: z.number().int().min(1).max(10_000),
-    liquidityPriority: z.literal("signal-time-then-order-id"),
-    partialFillsAllowed: z.boolean(),
-    feeDecimalScale: z.number().int().min(0).max(28),
-  })
-  .strict()
-  .superRefine((value, context) => {
-    if (compareLosslessIntegers(value.latencyNanos, "0") <= 0) {
-      context.addIssue({
-        code: "custom",
-        message: "Backtest latency must be positive.",
-      })
-    }
-  })
+export function parseBacktestActivities(result: ApplicationResult): BacktestActivity[] {
+  const parsed = backtestActivitiesSchema.safeParse(result.data)
+  if (!parsed.success) throw new Error("Backtest activity is unavailable right now.")
+  return parsed.data.activities
+}
 
-const controlledReportArtifactSchema = z
-  .object({
-    artifactId: z.string().regex(/^backtest-report-[0-9a-f]{64}$/),
-    sha256: digestSchema,
-    byteCount: z.number().int().positive(),
-    mediaType: z.literal("application/json"),
-  })
-  .strict()
-  .superRefine((artifact, context) => {
-    if (artifact.artifactId !== `backtest-report-${artifact.sha256}`) {
-      context.addIssue({
-        code: "custom",
-        message: "The report identity does not bind its digest.",
-      })
-    }
-  })
-
-const cohortDiagnosticsSchema = z.union([
-  z.object({ state: z.literal("not-evaluated") }).strict(),
-  z
-    .object({
-      state: z.literal("completed"),
-      evaluationId: digestSchema,
-      probabilityOfBacktestOverfitting: z.number().min(0).max(1).refine(Number.isFinite),
-      foldCount: z.number().int().min(2).max(1024),
-      deflatedPerformanceProbability: z.number().min(0).max(1).refine(Number.isFinite),
-      expectedMaximumSharpe: z.number().refine(Number.isFinite),
-    })
-    .strict(),
-])
-
-const completedStatusSchema = z
-  .object({
-    state: z.literal("completed"),
-    resultDigest: digestSchema,
-    artifact: controlledReportArtifactSchema,
-    metrics: z.array(metricSchema).max(256),
-    datasetPartition: z
-      .object({
-        startsAtUnixNanos: losslessIntegerSchema,
-        endsAtUnixNanos: losslessIntegerSchema,
-      })
-      .strict(),
-    fillCount: z.number().int().nonnegative(),
-    partialFillCount: z.number().int().nonnegative(),
-    noActionCount: z.number().int().nonnegative(),
-    accountingReconciliation: z.literal("independent"),
-    executionAssumptions: executionAssumptionsSchema,
-    cohortDiagnostics: cohortDiagnosticsSchema,
-  })
-  .strict()
-  .superRefine((status, context) => {
-    if (
-      compareLosslessIntegers(
-        status.datasetPartition.startsAtUnixNanos,
-        status.datasetPartition.endsAtUnixNanos,
-      ) >= 0
-    ) {
-      context.addIssue({
-        code: "custom",
-        message: "The dataset partition is not ordered.",
-      })
-    }
-    if (status.partialFillCount > status.fillCount) {
-      context.addIssue({
-        code: "custom",
-        message: "The partial-fill count exceeds the complete fill count.",
-      })
-    }
-  })
-
-const backtestRecordSchema = z
-  .object({
-    recordVersion: z.literal(2),
-    runId: digestSchema,
-    datasetIdentity: digestSchema,
-    objectGraphDigest: digestSchema,
-    executionAssumptionDigest: digestSchema,
-    cohortAuthorityDigest: digestSchema,
-    cohortUniverseDigest: digestSchema.nullable(),
-    seed: z.number().int().nonnegative(),
-    selectionCriterion: z.string().min(1),
-    status: z.union([
-      completedStatusSchema,
-      z.object({ state: z.literal("failed") }).strict(),
-    ]),
-  })
-  .strict()
-  .superRefine((record, context) => {
-    if (
-      record.status.state === "completed" &&
-      record.status.cohortDiagnostics.state === "completed" &&
-      record.cohortUniverseDigest === null
-    ) {
-      context.addIssue({
-        code: "custom",
-        message: "Completed cohort diagnostics require the exact cohort universe binding.",
-      })
-    }
-  })
-
-export type BacktestRecord = z.infer<typeof backtestRecordSchema>
-export type BacktestMetric = z.infer<typeof metricSchema>
-
-export function parseBacktestRecord(result: ApplicationResult): BacktestRecord {
-  const parsed = backtestRecordSchema.safeParse(result.data)
-  if (!parsed.success) {
-    throw new Error(
-      "The installed service returned an unsupported governed backtest record.",
-    )
-  }
+export function parseBacktestResult(result: ApplicationResult): BacktestResult {
+  const parsed = backtestResultSchema.safeParse(result.data)
+  if (!parsed.success) throw new Error("This backtest result is unavailable right now.")
   return parsed.data
 }
 
-export function metricValue(
-  metrics: readonly BacktestMetric[],
-  ...acceptedNames: string[]
-): number | null {
-  const accepted = new Set(acceptedNames.map(normalizeMetricName))
-  return (
-    metrics.find((metric) => accepted.has(normalizeMetricName(metric.name)))
-      ?.value ?? null
-  )
-}
-
-function normalizeMetricName(value: string): string {
-  return value.toLocaleLowerCase().replace(/[_\s]+/g, "-")
+export function newestBacktests(first: BacktestActivity, second: BacktestActivity): number {
+  return Date.parse(second.updatedAt) - Date.parse(first.updatedAt)
 }

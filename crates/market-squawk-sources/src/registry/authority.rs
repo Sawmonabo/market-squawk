@@ -989,6 +989,51 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
         self.validate_captured_batch_owned(batch, receipt)
     }
 
+    /// Upgrades one exact bounded HTTP response and its adapter-normalized observations through
+    /// the same current health, coverage, and protocol authority as captured transport frames.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale or transplanted response authority, non-success responses, a normalization
+    /// rule outside the current metadata revision, or invalid observation profile/scope evidence.
+    pub fn validate_http_response_batch_owned(
+        &self,
+        batch: NormalizedHttpResponseBatch,
+    ) -> Result<CurrentDecodedProviderBatches, RegistryError> {
+        self.validated.session.validate_current_lease()?;
+        let receipt = batch.receipt();
+        let currentness = receipt.currentness_lease();
+        let expected_currentness = FrameSessionLease::new(
+            self.validated.session.binding.clone(),
+            Arc::clone(&self.validated.session.lease),
+        );
+        currentness
+            .validate_current()
+            .map_err(|_error| RegistryError::SessionNotCurrent)?;
+        if !(200..=299).contains(&receipt.status())
+            || !self
+                .validated
+                .session
+                .binding
+                .shares_allocation_with(receipt.binding())
+            || !currentness.shares_authority_with(&expected_currentness)
+        {
+            return Err(RegistryError::CaptureReceiptMismatch);
+        }
+        self.validated
+            .session
+            .lease
+            .validate_receipt(receipt.trusted_receipt())?;
+        let (receipt, normalization_rule, observations) = batch.into_parts();
+        self.validate_normalized_observations_owned(
+            CurrentObservationEvidence::HttpResponse(CurrentHttpResponseEvidence::new(
+                receipt,
+                normalization_rule,
+            )),
+            observations,
+        )
+    }
+
     /// Issues an owned opaque source lease for pre-feed generation registration.
     ///
     /// The returned value retains the exact process-local session allocation, current health
@@ -1188,17 +1233,29 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             .session
             .lease
             .validate_receipt(receipt.trusted_receipt())?;
+        let (decoder_evidence, provider_observations) = batch.into_parts();
+        self.validate_normalized_observations_owned(
+            CurrentObservationEvidence::TransportFrame(CurrentFrameEvidence::new(decoder_evidence)),
+            provider_observations,
+        )
+    }
+
+    fn validate_normalized_observations_owned(
+        &self,
+        evidence: CurrentObservationEvidence,
+        provider_observations: Vec<crate::ProviderNormalizedObservation>,
+    ) -> Result<CurrentDecodedProviderBatches, RegistryError> {
         let crate::SourceProtocolProfile::Live(protocol) =
             self.validated.metadata.protocol_profile()
         else {
             return Err(RegistryError::DecoderProfileMismatch);
         };
-        if batch.evidence().decoder_rule() != protocol.decoder_rule() {
+        if evidence.normalization_rule() != protocol.decoder_rule() {
             return Err(RegistryError::DecoderProfileMismatch);
         }
-        let mut observation_authorities = Vec::with_capacity(batch.observations().len());
+        let mut observation_authorities = Vec::with_capacity(provider_observations.len());
         let quality_ceiling = self.validated.metadata.quality_ceiling();
-        for observation in batch.observations() {
+        for observation in &provider_observations {
             validate_observation_profile(protocol, quality_ceiling, observation)?;
             let scope = self.validate_live_scope(
                 observation.venue(),
@@ -1211,13 +1268,11 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             }
             observation_authorities.push(scope);
         }
-        let (decoder_evidence, provider_observations) = batch.into_parts();
-        let frame_evidence = CurrentFrameEvidence::new(decoder_evidence);
         let observations = provider_observations
             .into_iter()
             .zip(observation_authorities)
             .map(|(observation, scope)| {
-                scope.into_current_observation(observation, frame_evidence.clone())
+                scope.into_current_observation(observation, evidence.clone())
             })
             .collect::<Result<Vec<_>, RegistryError>>()?;
         let mut positions: HashMap<CurrentBatchKey, usize> =
@@ -1252,10 +1307,10 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
                                 .and_then(|bytes| bytes.checked_add(provider))
                                 .ok_or(RegistryError::RetainedSizeOverflow)
                         })?;
-                let frame_shared_allocation = observations
+                let evidence_shared_allocation = observations
                     .first()
                     .ok_or(RegistryError::DecoderProfileMismatch)?
-                    .frame_evidence
+                    .evidence
                     .shared_allocation_charge()?;
                 let authority_shared_allocation = observations
                     .first()
@@ -1267,7 +1322,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
                     observations.len(),
                     observation_unique_allocations,
                     authority_shared_allocation,
-                    frame_shared_allocation,
+                    evidence_shared_allocation,
                 )?;
                 let observations = observations.into_boxed_slice();
                 let authority = observations

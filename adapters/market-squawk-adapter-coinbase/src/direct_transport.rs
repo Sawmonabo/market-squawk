@@ -8,6 +8,7 @@
 mod http;
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -25,11 +26,11 @@ use market_squawk_sources::{
     BudgetReservationDecision, ChecksumValidationProfile, ControlFrameKind, DecodedControlFrame,
     DecodedProviderBatch, DecoderEvidence, DirectOrderBook, DirectOrderBookError,
     DirectPublishedBook, DirectPublishedLevel, HttpCaptureMethod, LiveSourceGeneration,
-    NetworkAccessPolicy, ProviderBookChange, ProviderBookLevel, ProviderBookSide,
-    ProviderChecksumEvidence, ProviderDecimalLexeme, ProviderNormalizedObservation,
-    ProviderObservationPayload, ProviderOrderEvent, ProviderOrderRecord, ProviderPrice,
-    ProviderQuantity, ProviderSequenceEvidence, ProviderSnapshotEvidence,
-    ProviderTimestampEvidence, RawMarketSink, SegmentedHttpCaptureError,
+    NetworkAccessPolicy, NormalizedHttpResponseBatch, ProviderBookChange, ProviderBookLevel,
+    ProviderBookSide, ProviderChecksumEvidence, ProviderDecimalLexeme,
+    ProviderNormalizedObservation, ProviderObservationPayload, ProviderOrderEvent,
+    ProviderOrderRecord, ProviderPrice, ProviderQuantity, ProviderSequenceEvidence,
+    ProviderSnapshotEvidence, ProviderTimestampEvidence, RawMarketSink, SegmentedHttpCaptureError,
     SegmentedHttpResponseCapture, SegmentedHttpResponseReceipt, SequenceValidationProfile,
     SharedProviderBudget, SinkError, SourceError, SourceMetadata, SourceMetadataProvider,
     SourceProtocolProfile, TlsProviderCapability, TransportFrameKind, apply_http_retry_after,
@@ -436,6 +437,89 @@ impl<'a> CoinbaseDirectOrderLevelUpdate<'a> {
         }
         Ok(())
     }
+
+    /// Normalizes the exact REST snapshot into the common current-market response spine.
+    ///
+    /// The level-3 order identities remain available through [`Self::payload`]; the canonical
+    /// market observation is the exact price-level aggregation of that same response and retains
+    /// the complete segmented response receipt as its source coordinate.
+    pub fn try_snapshot_http_batch(
+        self,
+    ) -> Result<NormalizedHttpResponseBatch, CoinbaseDirectPublicationError> {
+        self.validate_current()
+            .map_err(|_error| CoinbaseDirectPublicationError::EvidenceMismatch)?;
+        let CoinbaseDirectOrderLevelPayload::Snapshot {
+            snapshot_sequence,
+            snapshot_timestamp,
+            orders,
+            replay: _,
+        } = self.payload
+        else {
+            return Err(CoinbaseDirectPublicationError::SnapshotClaimRequired);
+        };
+        let SourceProtocolProfile::Live(protocol) = self.config.metadata().protocol_profile()
+        else {
+            return Err(CoinbaseDirectPublicationError::ProfileMismatch);
+        };
+        let sequence_rule = match protocol.sequence() {
+            SequenceValidationProfile::Provided { rule, .. } => rule.clone(),
+            SequenceValidationProfile::Unsupported { .. } => {
+                return Err(CoinbaseDirectPublicationError::ProfileMismatch);
+            }
+        };
+        let checksum_rule = match protocol.checksum() {
+            ChecksumValidationProfile::Unsupported { rule } => rule.clone(),
+            ChecksumValidationProfile::Provided { .. } => {
+                return Err(CoinbaseDirectPublicationError::ProfileMismatch);
+            }
+        };
+        let coverage = self
+            .config
+            .metadata()
+            .coverage()
+            .live()
+            .and_then(|coverage| {
+                coverage.rule_for(LiveEventClass::BookSnapshot, Some(MarketDepth::PriceLevel))
+            })
+            .ok_or(CoinbaseDirectPublicationError::ProfileMismatch)?;
+        if coverage.snapshot_applicability() != &SnapshotApplicability::Required {
+            return Err(CoinbaseDirectPublicationError::ProfileMismatch);
+        }
+        let terms = self.config.execution_terms();
+        let payload = ProviderObservationPayload::book_snapshot(
+            MarketDepth::PriceLevel,
+            snapshot_price_levels(orders, ProviderBookSide::Bid, terms)?,
+            snapshot_price_levels(orders, ProviderBookSide::Ask, terms)?,
+        )
+        .map_err(|_error| CoinbaseDirectPublicationError::InvalidObservation)?;
+        let observation = ProviderNormalizedObservation::try_new(
+            direct_book_identifier(snapshot_sequence, self.snapshot_receipt)?,
+            self.config.venue().clone(),
+            self.config.instrument(),
+            ProviderTimestampEvidence::Provided {
+                value: snapshot_timestamp,
+                rule: protocol.timestamp_rule().clone(),
+            },
+            ProviderSequenceEvidence::Provided {
+                value: snapshot_sequence,
+                rule: sequence_rule,
+            },
+            ProviderSnapshotEvidence::InitializingSnapshot {
+                provider_reference: None,
+            },
+            ProviderChecksumEvidence::Unsupported {
+                rule: checksum_rule,
+            },
+            payload,
+        )
+        .map_err(|_error| CoinbaseDirectPublicationError::InvalidObservation)?;
+        NormalizedHttpResponseBatch::try_new(
+            self.snapshot_receipt.clone(),
+            protocol.decoder_rule().clone(),
+            vec![observation],
+        )
+        .map_err(|_error| CoinbaseDirectPublicationError::InvalidObservation)
+    }
 }
 
 fn validate_order_level_event(
@@ -689,6 +773,43 @@ fn provider_levels(
         normalized.push(provider_level(*level, terms)?);
     }
     Ok(normalized)
+}
+
+fn snapshot_price_levels(
+    orders: &[ProviderOrderRecord],
+    side: ProviderBookSide,
+    terms: InstrumentExecutionTerms,
+) -> Result<Vec<ProviderBookLevel>, CoinbaseDirectPublicationError> {
+    let mut aggregated = BTreeMap::<PriceTicks, QuantityLots>::new();
+    for order in orders.iter().filter(|order| order.side() == side) {
+        if order.execution_terms() != terms {
+            return Err(CoinbaseDirectPublicationError::EvidenceMismatch);
+        }
+        match aggregated.get_mut(&order.price()) {
+            Some(quantity) => {
+                *quantity = quantity
+                    .checked_add(order.quantity())
+                    .map_err(|_error| CoinbaseDirectPublicationError::InvalidNumeric)?;
+            }
+            None => {
+                aggregated.insert(order.price(), order.quantity());
+            }
+        }
+    }
+    let mut levels = Vec::new();
+    levels
+        .try_reserve_exact(aggregated.len())
+        .map_err(|_error| CoinbaseDirectPublicationError::Allocation)?;
+    if side == ProviderBookSide::Bid {
+        for (price, quantity) in aggregated.into_iter().rev() {
+            levels.push(provider_level_parts(price, quantity, terms)?);
+        }
+    } else {
+        for (price, quantity) in aggregated {
+            levels.push(provider_level_parts(price, quantity, terms)?);
+        }
+    }
+    Ok(levels)
 }
 
 fn provider_changes(
@@ -1988,6 +2109,37 @@ impl CoinbaseDirectSession {
         let snapshot_coordinates = self
             .snapshot_coordinates
             .ok_or(DirectOrderBookError::SnapshotReceiptRequired)?;
+        if let Some(order_level) = self.order_level_state.as_ref() {
+            let snapshot_receipt = self
+                .snapshot_capture
+                .as_ref()
+                .ok_or(DirectOrderBookError::SnapshotReceiptRequired)?
+                .receipt();
+            let terminal = order_level
+                .replay_events
+                .last()
+                .ok_or(CoinbaseDirectSessionError::OrderLevelState)?;
+            if order_level.snapshot != Some(snapshot_coordinates)
+                || order_level.snapshot_orders.is_empty()
+                || terminal.sequence() != sequence
+            {
+                return Err(CoinbaseDirectSessionError::OrderLevelState);
+            }
+            output
+                .try_publish_order_level(CoinbaseDirectOrderLevelUpdate {
+                    config: &self.config,
+                    subscription_evidence,
+                    snapshot_receipt,
+                    decoder_evidence: terminal.evidence(),
+                    payload: CoinbaseDirectOrderLevelPayload::Snapshot {
+                        snapshot_sequence: snapshot_coordinates.sequence,
+                        snapshot_timestamp: snapshot_coordinates.timestamp,
+                        orders: &order_level.snapshot_orders,
+                        replay: &order_level.replay_events,
+                    },
+                })
+                .map_err(SourceError::Sink)?;
+        }
         let book = self
             .book
             .published_book()

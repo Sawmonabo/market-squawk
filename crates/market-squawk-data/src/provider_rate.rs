@@ -12,14 +12,15 @@ use cap_std::fs::{Dir, OpenOptions};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
 use market_squawk_sources::{
     AuthorizationMode, BudgetUnavailableReason, BudgetWindowSemantics,
-    PreparedProviderRateRegistrationBatch, ProviderBudgetPolicy, ProviderRateCollisionKind,
-    ProviderRateDeclaration, ProviderRateDispatchClaim, ProviderRateDispatchDecision,
-    ProviderRateExtensionKey, ProviderRateExtensionRevision, ProviderRateExtensionState,
-    ProviderRateGroupId, ProviderRatePermitId, ProviderRateRegistration,
-    ProviderRateReservationDecision, ProviderRateReservationId, ProviderRateResponseClass,
-    ProviderRateResponseSettlement, ProviderRateResponseSettlementReceipt,
-    ProviderRateRetryAfterDisposition, ProviderRateRunId, ProviderRateSettlementAvailability,
-    ProviderRateStore, ProviderRateStoreError, ProviderRateWeightedDimension, RetryAfter,
+    PreparedProviderRateRegistrationBatch, ProviderBudgetPolicy, ProviderRateAvailability,
+    ProviderRateCollisionKind, ProviderRateDeclaration, ProviderRateDispatchClaim,
+    ProviderRateDispatchDecision, ProviderRateExtensionKey, ProviderRateExtensionRevision,
+    ProviderRateExtensionState, ProviderRateGroupId, ProviderRatePermitId,
+    ProviderRateRegistration, ProviderRateReservationDecision, ProviderRateReservationId,
+    ProviderRateResponseClass, ProviderRateResponseSettlement,
+    ProviderRateResponseSettlementReceipt, ProviderRateRetryAfterDisposition, ProviderRateRunId,
+    ProviderRateSettlementAvailability, ProviderRateStore, ProviderRateStoreError,
+    ProviderRateWeightedDimension, RetryAfter,
 };
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior, params,
@@ -618,6 +619,42 @@ impl ProviderRateStore for SqliteProviderRateStore {
         persist_group(&transaction, &mut group, now)?;
         transaction.commit().map_err(map_sql)?;
         Ok(ProviderRateReservationDecision::Ready(reservation_id))
+    }
+
+    fn inspect_availability(
+        &self,
+        run_id: ProviderRateRunId,
+        registration: ProviderRateRegistration,
+        now: Timestamp,
+    ) -> Result<ProviderRateAvailability, ProviderRateStoreError> {
+        let connection = self.connection()?;
+        validate_run_readonly(&connection, run_id, now)?;
+        let mut group = load_group(&connection, registration)?;
+        group.state.advance(group.policy.as_ref(), now)?;
+        if group.state.disabled {
+            return Ok(ProviderRateAvailability::Unavailable(
+                BudgetUnavailableReason::Disabled,
+            ));
+        }
+        if let Some(deadline) = group.state.blocked_until(group.policy.as_ref(), now)? {
+            return Ok(ProviderRateAvailability::WaitUntil(deadline));
+        }
+        let in_flight: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM provider_rate_requests WHERE group_id = ?1",
+                [registration.group_id().bytes()],
+                |row| row.get(0),
+            )
+            .map_err(map_sql)?;
+        if in_flight < 0 || in_flight > i64::from(group.policy.max_concurrent()) {
+            return Err(ProviderRateStoreError::Corrupt);
+        }
+        if in_flight == i64::from(group.policy.max_concurrent()) {
+            return Ok(ProviderRateAvailability::Unavailable(
+                BudgetUnavailableReason::ConcurrencyExhausted,
+            ));
+        }
+        Ok(ProviderRateAvailability::Available)
     }
 
     fn commit_dispatch(
@@ -3597,6 +3634,27 @@ fn validate_run(
     Ok(())
 }
 
+fn validate_run_readonly(
+    connection: &Connection,
+    run_id: ProviderRateRunId,
+    now: Timestamp,
+) -> Result<(), ProviderRateStoreError> {
+    validate_global_clock(connection, now)?;
+    let status: Option<String> = connection
+        .query_row(
+            "SELECT status FROM provider_rate_runs WHERE run_id = ?1",
+            [run_id.bytes()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_sql)?;
+    if status.as_deref() == Some("active") {
+        Ok(())
+    } else {
+        Err(ProviderRateStoreError::Unavailable)
+    }
+}
+
 fn enforce_capacity(transaction: &Connection) -> Result<(), ProviderRateStoreError> {
     let (groups, declarations): (i64, i64) = transaction
         .query_row(
@@ -3819,7 +3877,7 @@ fn insert_group(
 }
 
 fn load_group(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     registration: ProviderRateRegistration,
 ) -> Result<LoadedGroup, ProviderRateStoreError> {
     let group = load_group_by_id(transaction, registration.group_id().bytes())?;

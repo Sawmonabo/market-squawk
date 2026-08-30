@@ -166,7 +166,7 @@ function CentralExecutionRisk({
   orders: PaperOrder[]
   error: unknown
 }) {
-  const rejected = orders.filter((order) => order.state === "rejected").length
+  const rejected = orders.filter((order) => order.status === "rejected").length
   const activeBounds = orders.filter((order) => order.maximumExecutionPriceTicks !== undefined).length
   return (
     <section className="mb-4 rounded-xl border border-border bg-card/35 p-4">
@@ -270,11 +270,11 @@ function RiskDecisionEvidence({ decisions }: { decisions: PaperRiskDecisions | u
         <div className="mt-3 space-y-2">
           {decisions.records.map((decision) => (
             <article
-              key={decision.sequence}
+              key={`${decision.orderToken}:${String(decision.observedAt)}`}
               className="rounded-md border border-border/70 p-3 text-xs"
             >
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <p>{humanize(decision.kind)}</p>
+                <p>{humanize(decision.outcome)}</p>
                 <span
                   className={
                     decision.reasons.length > 0
@@ -292,7 +292,7 @@ function RiskDecisionEvidence({ decisions }: { decisions: PaperRiskDecisions | u
               </p>
               {decision.reasons.length > 0 ? (
                 <p className="mt-2 text-rose-200">
-                  Reasons: {decision.reasons.map(reasonText).join(" · ")}
+                  {decision.reasons.join(" ")}
                 </p>
               ) : null}
             </article>
@@ -627,15 +627,6 @@ function timeValue(value: string | number) {
   if (typeof value === "string") return timeFromNanos(value)
   const date = new Date(Math.trunc(value / 1_000_000))
   return Number.isNaN(date.getTime()) ? value.toLocaleString() : date.toLocaleString()
-}
-
-function reasonText(reason: unknown) {
-  if (typeof reason === "string") return humanize(reason)
-  if (reason && typeof reason === "object") {
-    const [kind = "unknown", detail] = Object.entries(reason)[0] ?? []
-    return detail === undefined ? humanize(kind) : `${humanize(kind)}: ${humanize(String(detail))}`
-  }
-  return "Unknown reason"
 }
 
 function timeFromNanos(value: string | null | undefined) {

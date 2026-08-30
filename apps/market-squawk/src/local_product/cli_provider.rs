@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -33,10 +33,12 @@ use market_squawk_adapter_schwab::OAuthLoopbackError;
 use market_squawk_adapter_sec::{
     RawEvidenceStore, SecParserLimits, SecRepresentationLimits, SecRepresentationRegistry,
 };
+use market_squawk_adapter_tiingo::tiingo_provider_rate_declaration;
 use market_squawk_adapter_treasury::{TreasuryFiscalQuery, TreasurySourceConfig};
+use market_squawk_adapter_yahoo::YAHOO_SOURCE_ID;
 use market_squawk_data::ImportedUserInputEvidence;
 use market_squawk_domain::{
-    AuthorizationBasis, CalendarDate, ChecksumCapability, CoverageDelay, DataQuality,
+    AssetClass, AuthorizationBasis, CalendarDate, ChecksumCapability, CoverageDelay, DataQuality,
     DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
     InstrumentId, MetadataRevision, ProviderIdentityEvidence, ProviderIdentityLocator,
     ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderIdentityRegistry,
@@ -48,11 +50,11 @@ use market_squawk_platform::{
 };
 use market_squawk_sources::{
     ApiEndpointRule, AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope,
-    BudgetWindowSemantics, CoverageDomain, EndpointPolicy, FRED_ALFRED_API_SURFACE_ID,
-    FreshnessPolicy, HistoricalCapability, HttpRequestBounds, NetworkAccessPolicy, PathScope,
-    ProviderBudgetPolicy, ProviderBudgetWindow, ProviderRateDeclaration, QueryParameterRule,
-    QuerySensitivity, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
-    SourceMetadataInput, SourceProtocolProfile,
+    BudgetWindowSemantics, CoverageDomain, CoverageTopology, EndpointPolicy,
+    FRED_ALFRED_API_SURFACE_ID, FreshnessPolicy, HistoricalCapability, HttpRequestBounds,
+    InstrumentCoverage, NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
+    ProviderRateDeclaration, QueryParameterRule, QuerySensitivity, SourceCapabilities, SourceClass,
+    SourceCoverage, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -68,6 +70,7 @@ use crate::application::ResearchProviderRuntimeGeneration;
 use crate::provider_activation::{
     BoardAdapterActivation, CommittedProviderAdapterReplacement,
     ControlledLocalFileAdapterActivation, PreparedProviderAdapterReplacement,
+    TiingoAdapterActivation, YahooAdapterActivation,
 };
 use crate::provider_onboarding::{
     AcquiredFredTermsDocument, FredPortalEvidenceInput, FredPortalGrantInput,
@@ -75,8 +78,10 @@ use crate::provider_onboarding::{
     FredPortalServicePermissionInput, FredPortalServiceReviewInput, SecCikInput,
 };
 use crate::provider_onboarding::{
-    SchwabOAuthBrowserError, SchwabOAuthLifecycleAction, SchwabOAuthLifecycleView,
-    SchwabOAuthRuntime, SchwabOAuthRuntimeError,
+    SchwabMarketDoctorRunPreparation, SchwabMarketDoctorRuntimeCoordinator,
+    SchwabMarketDoctorRuntimeTerminal, SchwabOAuthBrowserError, SchwabOAuthLifecycleAction,
+    SchwabOAuthLifecycleView, SchwabOAuthMarketAuthority, SchwabOAuthRuntime,
+    SchwabOAuthRuntimeError,
 };
 use crate::{
     BlsAdapterActivation, FredAdapterActivation, ProviderActivationLease,
@@ -98,6 +103,7 @@ const EMBEDDED_PREDECESSOR_REQUEST_SCHEMA_VERSION: u16 = 3;
 const PREVIOUS_REQUEST_SCHEMA_VERSION: u16 = 5;
 const REQUEST_SCHEMA_VERSION: u16 = 6;
 const REQUEST_MAXIMUM_BYTES: u64 = 1024 * 1024;
+const SCHWAB_MARKET_DOCTOR_DURATION: Duration = Duration::from_secs(5 * 60);
 const BLS_SERIES_METADATA_MAXIMUM_BYTES: u64 = 4 * 1024;
 const FRED_RIGHTS_ARTIFACT_MAXIMUM_BYTES: u64 = 256 * 1024;
 const FRED_AUTHORIZATION_MAXIMUM_BYTES: u64 = 256 * 1024;
@@ -119,6 +125,9 @@ const TREASURY_XML_SURFACE: &str = "treasury.daily-rates-xml";
 const TREASURY_FISCAL_SURFACE: &str = "treasury.fiscal-data";
 const FRED_SURFACE: &str = FRED_ALFRED_API_SURFACE_ID;
 const FEDERAL_RESERVE_BOARD_SURFACE: &str = "federal-reserve-board.data-download-program";
+const YAHOO_SURFACE: &str = "yahoo-finance.experimental-enrichment";
+const TIINGO_SURFACE: &str = "tiingo.starter-eod-nav";
+const TIINGO_SOURCE_ID: &str = "tiingo-starter";
 const LOCAL_FILES_SURFACE: &str = "local.files";
 const FRED_RIGHTS_MANIFEST_BYTES: &[u8] =
     include_bytes!("../../../../docs/verification/fred-rights-decision.json");
@@ -157,8 +166,10 @@ pub(crate) struct ProviderResearchActivationService {
     activation: Arc<ProviderAdapterActivation>,
     state: DurableProviderActivationState,
     tasks: Arc<ProviderActivationTaskAuthority>,
+    schwab_doctor_tasks: Arc<SchwabMarketDoctorTaskAuthority>,
     schwab_oauth: Arc<OnceCell<Arc<SchwabOAuthRuntime>>>,
     schwab_oauth_factory: Option<SchwabOAuthRuntimeFactory>,
+    schwab_doctor: Option<Arc<SchwabMarketDoctorRuntimeCoordinator>>,
 }
 
 pub(crate) type SchwabOAuthRuntimeFactory = Arc<
@@ -184,6 +195,7 @@ impl ProviderResearchActivationService {
         activation: Arc<ProviderAdapterActivation>,
         state: DurableProviderActivationState,
         schwab_oauth_factory: Option<SchwabOAuthRuntimeFactory>,
+        schwab_doctor: Option<Arc<SchwabMarketDoctorRuntimeCoordinator>>,
     ) -> Self {
         Self {
             paths,
@@ -191,8 +203,10 @@ impl ProviderResearchActivationService {
             activation,
             state,
             tasks: Arc::new(ProviderActivationTaskAuthority::new()),
+            schwab_doctor_tasks: Arc::new(SchwabMarketDoctorTaskAuthority::new()),
             schwab_oauth: Arc::new(OnceCell::new()),
             schwab_oauth_factory,
+            schwab_doctor,
         }
     }
 
@@ -598,6 +612,130 @@ impl ProviderActivationTaskAuthority {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SchwabMarketDoctorTaskKey {
+    session_id: Uuid,
+    access_token_generation: u64,
+}
+
+struct RetainedSchwabMarketDoctorTask {
+    key: SchwabMarketDoctorTaskKey,
+    cancellation: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+/// One application-owned supervisor for immediate and delayed Schwab doctor work.
+///
+/// The retained key coalesces repeated Connections requests for the same exact OAuth generation.
+/// A replacement generation cancels and joins its predecessor before it can start, while unlink
+/// and shutdown retain the same drain authority.
+struct SchwabMarketDoctorTaskAuthority {
+    accepting: AtomicBool,
+    shutdown: CancellationToken,
+    task: AsyncMutex<Option<RetainedSchwabMarketDoctorTask>>,
+}
+
+impl SchwabMarketDoctorTaskAuthority {
+    fn new() -> Self {
+        Self {
+            accepting: AtomicBool::new(true),
+            shutdown: CancellationToken::new(),
+            task: AsyncMutex::new(None),
+        }
+    }
+
+    async fn schedule<F, Fut>(
+        &self,
+        key: SchwabMarketDoctorTaskKey,
+        work: F,
+    ) -> Result<(), CliProviderActivationError>
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        if !self.accepting.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
+            return Err(CliProviderActivationError::StateUnavailable);
+        }
+        let mut slot = self.task.lock().await;
+        if slot
+            .as_ref()
+            .is_some_and(|retained| retained.key == key && !retained.task.is_finished())
+        {
+            return Ok(());
+        }
+        if let Some(predecessor) = slot.take() {
+            if !predecessor.task.is_finished() {
+                predecessor.cancellation.cancel();
+            }
+            predecessor
+                .task
+                .await
+                .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
+        }
+        if !self.accepting.load(Ordering::Acquire) || self.shutdown.is_cancelled() {
+            return Err(CliProviderActivationError::StateUnavailable);
+        }
+        let cancellation = self.shutdown.child_token();
+        let task_cancellation = cancellation.clone();
+        *slot = Some(RetainedSchwabMarketDoctorTask {
+            key,
+            cancellation,
+            task: tokio::spawn(work(task_cancellation)),
+        });
+        Ok(())
+    }
+
+    async fn cancel_session(
+        &self,
+        session_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<(), CliProviderActivationError> {
+        let mut slot = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+            slot = self.task.lock() => slot,
+        };
+        let Some(retained) = slot.as_mut() else {
+            return Ok(());
+        };
+        if retained.key.session_id != session_id {
+            return Ok(());
+        }
+        retained.cancellation.cancel();
+        let joined = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(CliProviderActivationError::Cancelled),
+            joined = &mut retained.task => joined,
+        };
+        drop(slot.take());
+        joined.map_err(|_error| CliProviderActivationError::StateUnavailable)
+    }
+
+    fn begin_shutdown(&self) {
+        self.accepting.store(false, Ordering::Release);
+        self.shutdown.cancel();
+    }
+
+    async fn finish_shutdown(&self, deadline: Instant) -> Result<(), CliProviderActivationError> {
+        self.begin_shutdown();
+        let deadline = TokioInstant::from_std(deadline);
+        let mut slot = tokio::time::timeout_at(deadline, self.task.lock())
+            .await
+            .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
+        let Some(mut retained) = slot.take() else {
+            return Ok(());
+        };
+        match tokio::time::timeout_at(deadline, &mut retained.task).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_error)) => Err(CliProviderActivationError::StateUnavailable),
+            Err(_elapsed) => {
+                *slot = Some(retained);
+                Err(CliProviderActivationError::StateUnavailable)
+            }
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "durable recipe, runtime candidate, and cancellation authority remain explicit"
@@ -803,7 +941,7 @@ async fn publish_research_activation(
             return Err(CliProviderActivationError::Activation(error));
         }
     };
-    let ProviderActivationOutcome::Research(activated) = outcome else {
+    let Some(activated_generation) = provider_activation_generation(&outcome) else {
         quarantine_failed_candidate(
             state,
             onboarding,
@@ -814,7 +952,7 @@ async fn publish_research_activation(
         )?;
         return Err(CliProviderActivationError::ProviderConfiguration);
     };
-    if activated.generation() != &candidate {
+    if activated_generation != &candidate {
         activation_authority
             .revoke_research_runtime(&candidate)
             .await
@@ -1063,6 +1201,17 @@ fn runtime_generation_digest(
         .generation_digest()
         .map_err(ProviderAdapterActivationError::from)
         .map_err(CliProviderActivationError::Activation)
+}
+
+fn provider_activation_generation(
+    outcome: &ProviderActivationOutcome,
+) -> Option<&ResearchProviderRuntimeGeneration> {
+    match outcome {
+        ProviderActivationOutcome::Research(activated) => Some(activated.generation()),
+        ProviderActivationOutcome::Yahoo(activated) => Some(activated.generation()),
+        ProviderActivationOutcome::Tiingo(activated) => Some(activated.generation()),
+        ProviderActivationOutcome::Live(_) | ProviderActivationOutcome::CoinbaseDirect(_) => None,
+    }
 }
 
 enum ReplacementRuntimeTransaction {
@@ -1428,6 +1577,12 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
         action: SchwabOAuthLifecycleAction,
         cancellation: CancellationToken,
     ) -> Result<SchwabOAuthLifecycleView, ProviderPortalActivationError> {
+        if action == SchwabOAuthLifecycleAction::Unlink {
+            self.schwab_doctor_tasks
+                .cancel_session(session_id, cancellation.child_token())
+                .await
+                .map_err(map_portal_activation_error)?;
+        }
         let factory = self
             .schwab_oauth_factory
             .as_ref()
@@ -1437,14 +1592,73 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
             .get_or_try_init(|| async { factory() })
             .await
             .map_err(|_error| ProviderPortalActivationError::Unavailable)?;
-        runtime
+        let view = runtime
             .apply(session_id, action, cancellation)
             .await
-            .map_err(map_schwab_oauth_error)
+            .map_err(map_schwab_oauth_error)?;
+        if !matches!(
+            action,
+            SchwabOAuthLifecycleAction::Begin | SchwabOAuthLifecycleAction::Continue
+        ) {
+            return Ok(view);
+        }
+        let authority = match runtime
+            .market_authority(session_id, CancellationToken::new())
+            .await
+        {
+            Ok(authority) => authority,
+            Err(
+                SchwabOAuthRuntimeError::ReauthorizationRequired
+                | SchwabOAuthRuntimeError::AuthorizationExchangeInFlight,
+            ) => return Ok(view),
+            Err(error) => return Err(map_schwab_oauth_error(error)),
+        };
+        let current = authority
+            .current_receipt()
+            .await
+            .map_err(|_error| ProviderPortalActivationError::Unavailable)?;
+        let preparation = self
+            .onboarding
+            .prepare_schwab_market_doctor_run(
+                session_id,
+                current.generation().get(),
+                CancellationToken::new(),
+            )
+            .await
+            .map_err(map_schwab_doctor_onboarding_error)?;
+        if matches!(&preparation, SchwabMarketDoctorRunPreparation::Current) {
+            return Ok(view);
+        }
+        let doctor = self
+            .schwab_doctor
+            .as_ref()
+            .cloned()
+            .ok_or(ProviderPortalActivationError::Unavailable)?;
+        let onboarding = Arc::clone(&self.onboarding);
+        let key = SchwabMarketDoctorTaskKey {
+            session_id,
+            access_token_generation: current.generation().get(),
+        };
+        self.schwab_doctor_tasks
+            .schedule(key, move |completion| async move {
+                run_schwab_market_doctor_task(
+                    onboarding,
+                    doctor,
+                    authority,
+                    key,
+                    preparation,
+                    completion,
+                )
+                .await;
+            })
+            .await
+            .map_err(map_portal_activation_error)?;
+        Ok(view)
     }
 
     fn begin_shutdown(&self) {
         self.tasks.begin_shutdown();
+        self.schwab_doctor_tasks.begin_shutdown();
         if let Some(runtime) = self.schwab_oauth.get() {
             runtime.begin_shutdown();
         }
@@ -1455,6 +1669,7 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
         deadline: Instant,
     ) -> Result<(), ProviderPortalActivationError> {
         let tasks = self.tasks.finish_shutdown(deadline);
+        let schwab_doctor_tasks = self.schwab_doctor_tasks.finish_shutdown(deadline);
         let oauth = async {
             match self.schwab_oauth.get() {
                 Some(runtime) => runtime
@@ -1464,8 +1679,95 @@ impl ProviderPortalActivationAuthority for ProviderResearchActivationService {
                 None => Ok(()),
             }
         };
-        let (tasks, oauth) = tokio::join!(tasks, oauth);
-        tasks.map_err(map_portal_activation_error).and(oauth)
+        let (tasks, schwab_doctor_tasks, oauth) = tokio::join!(tasks, schwab_doctor_tasks, oauth);
+        tasks.map_err(map_portal_activation_error)?;
+        schwab_doctor_tasks.map_err(map_portal_activation_error)?;
+        oauth
+    }
+}
+
+async fn run_schwab_market_doctor_task(
+    onboarding: Arc<ProviderOnboardingService>,
+    doctor: Arc<SchwabMarketDoctorRuntimeCoordinator>,
+    authority: SchwabOAuthMarketAuthority,
+    key: SchwabMarketDoctorTaskKey,
+    mut preparation: SchwabMarketDoctorRunPreparation,
+    cancellation: CancellationToken,
+) {
+    let deferred_wait = match &preparation {
+        SchwabMarketDoctorRunPreparation::Deferred { wait } => Some(*wait),
+        SchwabMarketDoctorRunPreparation::Current | SchwabMarketDoctorRunPreparation::Ready(_) => {
+            None
+        }
+    };
+    if let Some(wait) = deferred_wait {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return,
+            () = tokio::time::sleep(wait) => {}
+        }
+    }
+    let current = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return,
+        current = authority.current_receipt() => match current {
+            Ok(current) => current,
+            Err(error) => {
+                tracing::warn!(%error, "Schwab market-data verification authority is unavailable");
+                return;
+            }
+        }
+    };
+    if current.generation().get() != key.access_token_generation {
+        tracing::warn!(
+            "Schwab market-data verification was superseded by a newer authorization generation"
+        );
+        return;
+    }
+    if deferred_wait.is_some() {
+        preparation = match onboarding
+            .prepare_schwab_market_doctor_run(
+                key.session_id,
+                key.access_token_generation,
+                cancellation.child_token(),
+            )
+            .await
+        {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                tracing::warn!(%error, "Schwab market-data verification renewal was not admitted");
+                return;
+            }
+        };
+    }
+    let lease = match preparation {
+        SchwabMarketDoctorRunPreparation::Ready(lease) => lease,
+        SchwabMarketDoctorRunPreparation::Current => return,
+        SchwabMarketDoctorRunPreparation::Deferred { .. } => {
+            tracing::warn!(
+                "Schwab market-data verification renewal did not reach its retained boundary"
+            );
+            return;
+        }
+    };
+    match doctor
+        .run(
+            lease,
+            authority,
+            cancellation,
+            Instant::now() + SCHWAB_MARKET_DOCTOR_DURATION,
+        )
+        .await
+    {
+        Ok(SchwabMarketDoctorRuntimeTerminal::Observed(_)) => {
+            tracing::info!("Schwab market-data verification completed");
+        }
+        Ok(SchwabMarketDoctorRuntimeTerminal::SetupRequired(_)) => {
+            tracing::warn!("Schwab market-data verification requires owner setup");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Schwab market-data verification failed");
+        }
     }
 }
 
@@ -1683,10 +1985,10 @@ pub(super) async fn resume_exact_research_provider(
         .activate_exact_research_profile(&expected, prepared.request, cancellation)
         .await
         .map_err(CliProviderActivationError::Activation)?;
-    let ProviderActivationOutcome::Research(activated) = outcome else {
+    let Some(activated_generation) = provider_activation_generation(&outcome) else {
         return Err(CliProviderActivationError::ProviderConfiguration);
     };
-    if activated.generation() != &expected {
+    if activated_generation != &expected {
         return Err(CliProviderActivationError::ProviderConfiguration);
     }
     Ok(expected)
@@ -2065,10 +2367,10 @@ fn restore_prepared_research_provider(
             }
             Err(error) => return Err(CliProviderActivationError::Activation(error)),
         };
-    let ProviderActivationOutcome::Research(activated) = outcome else {
+    let Some(activated_generation) = provider_activation_generation(&outcome) else {
         return Err(CliProviderActivationError::ProviderConfiguration);
     };
-    if activated.generation() != &prepared.generation {
+    if activated_generation != &prepared.generation {
         return Err(CliProviderActivationError::ProviderConfiguration);
     }
     Ok(ResearchProviderRecovery::Restored)
@@ -2384,6 +2686,20 @@ fn build_research_activation(
             )?;
             ProviderAdapterActivationRequest::Board(BoardAdapterActivation::new(metadata, profile))
         }
+        ProviderRequest::YahooEnrichment => {
+            let metadata = yahoo_metadata(lease, activation_evidence, metadata_effective)?;
+            ProviderAdapterActivationRequest::Yahoo(
+                YahooAdapterActivation::try_new(metadata)
+                    .map_err(CliProviderActivationError::Activation)?,
+            )
+        }
+        ProviderRequest::TiingoStarterEodNav => {
+            let metadata = tiingo_metadata(lease, activation_evidence, metadata_effective)?;
+            ProviderAdapterActivationRequest::Tiingo(
+                TiingoAdapterActivation::try_new(metadata)
+                    .map_err(CliProviderActivationError::Activation)?,
+            )
+        }
         ProviderRequest::ControlledLocalFiles { configuration } => {
             let manifest_digest = sha256_evidence(&configuration.manifest_sha256)?;
             let admitted_input_set = sha256_evidence(&configuration.admitted_input_set_sha256)?;
@@ -2505,6 +2821,8 @@ enum ProviderRequest {
         configuration: Box<FredProviderRequest>,
     },
     FederalReserveBoardH15,
+    YahooEnrichment,
+    TiingoStarterEodNav,
     ControlledLocalFiles {
         configuration: ControlledLocalFileRequest,
     },
@@ -2539,6 +2857,8 @@ impl ProviderRequest {
             Self::TreasuryDailyRates { .. } => ProviderSurface::Exact(TREASURY_XML_SURFACE),
             Self::FredAlfred { .. } => ProviderSurface::Exact(FRED_SURFACE),
             Self::FederalReserveBoardH15 => ProviderSurface::Exact(FEDERAL_RESERVE_BOARD_SURFACE),
+            Self::YahooEnrichment => ProviderSurface::Exact(YAHOO_SURFACE),
+            Self::TiingoStarterEodNav => ProviderSurface::Exact(TIINGO_SURFACE),
             Self::ControlledLocalFiles { .. } => ProviderSurface::Exact(LOCAL_FILES_SURFACE),
         }
     }
@@ -2625,6 +2945,24 @@ fn portal_provider_request(
             require_surface(lease, ProviderSurface::Exact(FEDERAL_RESERVE_BOARD_SURFACE))?;
             Ok((
                 ProviderRequest::FederalReserveBoardH15,
+                LoadedActivationEvidence {
+                    objects: BTreeMap::new(),
+                },
+            ))
+        }
+        ProviderPortalActivationRequest::YahooEnrichment => {
+            require_surface(lease, ProviderSurface::Exact(YAHOO_SURFACE))?;
+            Ok((
+                ProviderRequest::YahooEnrichment,
+                LoadedActivationEvidence {
+                    objects: BTreeMap::new(),
+                },
+            ))
+        }
+        ProviderPortalActivationRequest::TiingoStarterEodNav => {
+            require_surface(lease, ProviderSurface::Exact(TIINGO_SURFACE))?;
+            Ok((
+                ProviderRequest::TiingoStarterEodNav,
                 LoadedActivationEvidence {
                     objects: BTreeMap::new(),
                 },
@@ -3572,6 +3910,8 @@ fn evidence_references(
         ProviderRequest::TreasuryFiscal { .. }
         | ProviderRequest::TreasuryDailyRates { .. }
         | ProviderRequest::FederalReserveBoardH15
+        | ProviderRequest::YahooEnrichment
+        | ProviderRequest::TiingoStarterEodNav
         | ProviderRequest::ControlledLocalFiles { .. } => {}
         ProviderRequest::Bls {
             series_metadata, ..
@@ -3716,7 +4056,12 @@ fn decode_request(bytes: &[u8]) -> Result<ActivationRequest, CliProviderActivati
             let mut request: ActivationRequest = serde_json::from_slice(bytes)
                 .map_err(|_| CliProviderActivationError::InvalidRequest)?;
             if request.schema_version != PREVIOUS_REQUEST_SCHEMA_VERSION
-                || matches!(&request.provider, ProviderRequest::FredAlfred { .. })
+                || matches!(
+                    &request.provider,
+                    ProviderRequest::FredAlfred { .. }
+                        | ProviderRequest::YahooEnrichment
+                        | ProviderRequest::TiingoStarterEodNav
+                )
             {
                 return Err(CliProviderActivationError::InvalidRequest);
             }
@@ -3731,6 +4076,8 @@ fn decode_request(bytes: &[u8]) -> Result<ActivationRequest, CliProviderActivati
                     &request.provider,
                     ProviderRequest::FredAlfred { .. }
                         | ProviderRequest::FederalReserveBoardH15
+                        | ProviderRequest::YahooEnrichment
+                        | ProviderRequest::TiingoStarterEodNav
                         | ProviderRequest::ControlledLocalFiles { .. }
                 )
             {
@@ -4025,12 +4372,218 @@ fn metadata_with_source_id(
     .map_err(|_| CliProviderActivationError::InvalidMetadata)
 }
 
+fn yahoo_metadata(
+    lease: &ProviderActivationLease,
+    evidence: EvidenceDigest,
+    effective: EffectiveInterval,
+) -> Result<SourceMetadata, CliProviderActivationError> {
+    provider_market_metadata(
+        lease,
+        evidence,
+        SourceId::try_from(YAHOO_SOURCE_ID)
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+        "yahoo-finance-experimental",
+        AuthorizationMode::PublicInterface,
+        effective,
+        yahoo_network_policy()?,
+        None,
+        HistoricalCapability::Historical,
+        vec![AssetClass::Equity, AssetClass::Fund, AssetClass::Index],
+    )
+}
+
+fn tiingo_metadata(
+    lease: &ProviderActivationLease,
+    evidence: EvidenceDigest,
+    effective: EffectiveInterval,
+) -> Result<SourceMetadata, CliProviderActivationError> {
+    let declaration = tiingo_provider_rate_declaration()
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    provider_market_metadata(
+        lease,
+        evidence,
+        SourceId::try_from(TIINGO_SOURCE_ID)
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+        TIINGO_SOURCE_ID,
+        AuthorizationMode::UserAuthorized,
+        effective,
+        tiingo_network_policy()?,
+        Some(declaration.policy().clone()),
+        HistoricalCapability::Historical,
+        vec![AssetClass::Equity, AssetClass::Fund],
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "provider market coverage, authorization, network, and budget stay explicit"
+)]
+fn provider_market_metadata(
+    lease: &ProviderActivationLease,
+    evidence: EvidenceDigest,
+    source_id: SourceId,
+    provider: &str,
+    authorization_mode: AuthorizationMode,
+    effective: EffectiveInterval,
+    network: EndpointPolicy,
+    budget: Option<ProviderBudgetPolicy>,
+    historical: HistoricalCapability,
+    asset_classes: Vec<AssetClass>,
+) -> Result<SourceMetadata, CliProviderActivationError> {
+    let digest = lower_hex(&evidence.bytes());
+    let short = digest
+        .get(..24)
+        .ok_or(CliProviderActivationError::InvalidMetadata)?;
+    let revision = MetadataRevision::new(
+        SourceIdentifier::try_from(format!("activation-{short}"))
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+    );
+    let provider = SourceIdentifier::try_from(provider)
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    let basis = match authorization_mode {
+        AuthorizationMode::PublicInterface => {
+            SourceIdentifier::try_from("official-public-interface")
+                .map_err(|_| CliProviderActivationError::InvalidMetadata)?
+        }
+        AuthorizationMode::UserAuthorized => authorization_subject(lease)?,
+        AuthorizationMode::Licensed | AuthorizationMode::UserOwnedLocal => {
+            return Err(CliProviderActivationError::InvalidMetadata);
+        }
+    };
+    let exact = ExactPayloadEvidence::from_content_digest(evidence);
+    SourceMetadata::try_new(SourceMetadataInput::new(
+        SchemaVersion::CURRENT,
+        source_id,
+        RevisionBoundPayloadEvidence::new(revision, exact.clone()),
+        SourceClass::LicensedDataset,
+        provider,
+        AuthorizationGrant::new(
+            authorization_mode,
+            AuthorizationBasis::new(basis),
+            exact.clone(),
+            effective,
+        ),
+        SourceCoverage::try_instrument(
+            exact,
+            effective,
+            asset_classes,
+            CoverageTopology::not_applicable(),
+            InstrumentCoverage::partial(),
+            None,
+            CoverageDelay::Delayed(1),
+            DeliveryEvidence::Indirect,
+        )
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+        DataQuality::Aggregated,
+        NetworkAccessPolicy::Allowlisted(network),
+        FreshnessPolicy::try_new(
+            MINUTE_NANOS,
+            MINUTE_NANOS,
+            DAY_NANOS,
+            DAY_NANOS,
+            SECOND_NANOS,
+        )
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+        budget,
+        SourceCapabilities::new(
+            false,
+            true,
+            SequenceCapability::Unsupported,
+            ChecksumCapability::Unsupported,
+            historical,
+            false,
+        ),
+        SourceProtocolProfile::NotLive,
+    ))
+    .map_err(|_| CliProviderActivationError::InvalidMetadata)
+}
+
+fn yahoo_network_policy() -> Result<EndpointPolicy, CliProviderActivationError> {
+    let query_keys = [
+        "corsDomain",
+        "count",
+        "date",
+        "enableCb",
+        "enableCulturalAssets",
+        "enableFuzzyQuery",
+        "enableNavLinks",
+        "enableResearchReports",
+        "events",
+        "fetchPricingData",
+        "formatted",
+        "includeAdjustedClose",
+        "interval",
+        "lang",
+        "listsCount",
+        "modules",
+        "newsCount",
+        "period1",
+        "period2",
+        "q",
+        "query",
+        "quotesCount",
+        "range",
+        "recommendedCount",
+        "region",
+        "start",
+        "symbol",
+        "symbols",
+        "type",
+    ];
+    let query_rules = || {
+        query_keys
+            .iter()
+            .copied()
+            .map(|key| {
+                QueryParameterRule::try_new(
+                    SourceIdentifier::try_from(key)
+                        .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+                    4_096,
+                    false,
+                    QuerySensitivity::Public,
+                )
+                .map_err(|_| CliProviderActivationError::InvalidMetadata)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let rules = [
+        "https://fc.yahoo.com",
+        "https://query1.finance.yahoo.com",
+        "https://query2.finance.yahoo.com",
+        "https://guce.yahoo.com",
+        "https://consent.yahoo.com",
+        "https://finance.yahoo.com",
+    ]
+    .into_iter()
+    .map(|endpoint| {
+        ApiEndpointRule::try_new(endpoint, PathScope::Descendants, query_rules()?, 32, 16_384)
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    EndpointPolicy::try_from_api_rules(rules, request_bounds(4 * 1024 * 1024)?)
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)
+}
+
+fn tiingo_network_policy() -> Result<EndpointPolicy, CliProviderActivationError> {
+    let rule = ApiEndpointRule::try_new(
+        "https://api.tiingo.com/tiingo/daily",
+        PathScope::Descendants,
+        query_rules(&[("startDate", 10), ("endDate", 10)])?,
+        2,
+        64,
+    )
+    .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    EndpointPolicy::try_from_api_rules(vec![rule], request_bounds(2 * 1024 * 1024)?)
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)
+}
+
 fn authorization_subject(
     lease: &ProviderActivationLease,
 ) -> Result<SourceIdentifier, CliProviderActivationError> {
     let provider = match lease.surface_id().as_str() {
         BLS_REGISTERED_SURFACE => "us-bls",
         FRED_SURFACE => "fred",
+        TIINGO_SURFACE => TIINGO_SOURCE_ID,
         _ => return Err(CliProviderActivationError::InvalidMetadata),
     };
     let provider = SourceIdentifier::try_from(provider)
@@ -4657,6 +5210,15 @@ fn map_schwab_oauth_error(error: SchwabOAuthRuntimeError) -> ProviderPortalActiv
     }
 }
 
+fn map_schwab_doctor_onboarding_error(
+    error: ProviderOnboardingError,
+) -> ProviderPortalActivationError {
+    match error {
+        ProviderOnboardingError::OperationCancelled => ProviderPortalActivationError::Cancelled,
+        _ => ProviderPortalActivationError::Unavailable,
+    }
+}
+
 /// Closed provider-activation failure without path, secret, or response-body disclosure.
 #[derive(Debug, Error)]
 pub enum CliProviderActivationError {
@@ -4696,6 +5258,57 @@ mod tests {
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[tokio::test]
+    async fn schwab_doctor_scheduler_coalesces_replacement_and_unlink_drain() -> TestResult {
+        let tasks = SchwabMarketDoctorTaskAuthority::new();
+        let session_id = Uuid::new_v4();
+        let first_key = SchwabMarketDoctorTaskKey {
+            session_id,
+            access_token_generation: 1,
+        };
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_starts = Arc::clone(&starts);
+        let (first_started_tx, first_started_rx) = oneshot::channel();
+        tasks
+            .schedule(first_key, move |cancellation| async move {
+                first_starts.fetch_add(1, Ordering::SeqCst);
+                let _sent = first_started_tx.send(());
+                cancellation.cancelled().await;
+            })
+            .await?;
+        tokio::time::timeout(Duration::from_secs(1), first_started_rx).await??;
+
+        let duplicate_starts = Arc::clone(&starts);
+        tasks
+            .schedule(first_key, move |_cancellation| async move {
+                duplicate_starts.fetch_add(1, Ordering::SeqCst);
+            })
+            .await?;
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+        let replacement_key = SchwabMarketDoctorTaskKey {
+            session_id,
+            access_token_generation: 2,
+        };
+        let replacement_starts = Arc::clone(&starts);
+        let (replacement_started_tx, replacement_started_rx) = oneshot::channel();
+        tasks
+            .schedule(replacement_key, move |cancellation| async move {
+                replacement_starts.fetch_add(1, Ordering::SeqCst);
+                let _sent = replacement_started_tx.send(());
+                cancellation.cancelled().await;
+            })
+            .await?;
+        tokio::time::timeout(Duration::from_secs(1), replacement_started_rx).await??;
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+
+        tasks
+            .cancel_session(session_id, CancellationToken::new())
+            .await?;
+        assert!(tasks.task.lock().await.is_none());
+        Ok(())
+    }
 
     #[test]
     fn fred_legacy_request_versions_are_rejected() -> TestResult {
@@ -5111,6 +5724,7 @@ mod tests {
             recovered.provider_activation(),
             recovered.provider_activation_state().clone(),
             None,
+            None,
         );
         let _cancelled = cancellation
             .cancel_from_portal(recovery_lease.session_id(), CancellationToken::new())
@@ -5283,6 +5897,7 @@ mod tests {
             product.provider_activation(),
             product.provider_activation_state().clone(),
             None,
+            None,
         );
 
         activation
@@ -5363,6 +5978,7 @@ mod tests {
             product.provider_activation(),
             product.provider_activation_state().clone(),
             None,
+            None,
         );
 
         let activated = activation
@@ -5440,6 +6056,7 @@ mod tests {
             recovered.provider_onboarding(),
             recovered.provider_activation(),
             recovered.provider_activation_state().clone(),
+            None,
             None,
         );
         assert_eq!(

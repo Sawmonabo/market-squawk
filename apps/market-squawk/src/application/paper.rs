@@ -6,7 +6,6 @@ mod source_runtime;
 use std::{
     fmt,
     num::NonZeroU64,
-    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -26,8 +25,9 @@ use market_squawk_domain::{
     RevisionNumber, SourceIdentifier, TimeInForce, Timestamp,
 };
 use market_squawk_execution::{
-    CancelReceipt, CancelStatus, ExecutionAdapterError, ExecutionDispatchError, ExecutionState,
-    ManualPaperDraft, ManualPaperDraftInput, OrderTargetReference, RiskLimitsSnapshot,
+    AccountRiskViolation, CancelReceipt, CancelStatus, ExecutionAdapterError, ExecutionAuditKind,
+    ExecutionAuditReason, ExecutionDispatchError, ExecutionState, ManualPaperDraft,
+    ManualPaperDraftInput, OrderTargetReference, RiskLimitsSnapshot, RiskRejectionCode,
 };
 use market_squawk_live::{ActiveLiveActionHookGroup, LiveActionHookGeneration};
 use market_squawk_services::{
@@ -43,7 +43,7 @@ use uuid::Uuid;
 use super::decision::DecisionApplication;
 use super::market_runtime::{
     COINBASE_DIRECT_SURFACE_ID, COINBASE_PUBLIC_SURFACE_ID, KRAKEN_PUBLIC_SURFACE_ID,
-    MarketRuntimeRegistry,
+    MarketRuntimeRegistry, PaperMarketSurfaceSelection,
 };
 use super::recommendation::RecommendationSetupAuthority;
 use super::source::SourceRuntimeView;
@@ -75,6 +75,7 @@ const EXECUTION_SUBMIT_MANUAL_PAPER_DRAFT: &str = "Execution.SubmitManualPaperDr
 const MANUAL_PAPER_DRAFT_LIFETIME: Duration = Duration::from_secs(60);
 /// Upper bound inherited from the local decision catalog's installed-product capacity.
 const MAXIMUM_MANUAL_PAPER_TARGET_INDEX_ENTRIES: usize = 4_096;
+const MAXIMUM_PRODUCT_ORDER_TOKENS: usize = 4_096;
 
 /// Shared paper lifecycle exposed as distinct Bot and Execution domain services.
 pub struct PaperApplicationServices {
@@ -369,11 +370,11 @@ impl ApplicationDomainService for ExecutionDomainService {
                     .await?
             }
             EXECUTION_CANCEL => {
-                let order = required_string(&request, "orderId")?;
-                let order =
-                    OrderId::from_str(order).map_err(|_error| ServiceError::InvalidRequest)?;
-                let receipt = self.controller.cancel(order, &context).await?;
-                (cancel_receipt_value(receipt), 1, 1)
+                let order_token = required_string(&request, "orderToken")?
+                    .parse::<Uuid>()
+                    .map_err(|_error| ServiceError::InvalidRequest)?;
+                let receipt = self.controller.cancel(order_token, &context).await?;
+                (cancel_receipt_value(receipt, order_token), 1, 1)
             }
             EXECUTION_RECONCILE => {
                 let state = self.controller.reconcile(&context).await?;
@@ -408,6 +409,9 @@ struct PaperController {
     // Serializes every mutation that can replace the sole live/paper runtime owner.
     owner_gate: Mutex<()>,
     state: Mutex<PaperState>,
+    // Session-scoped opaque handles keep execution and decision authority out of ordinary product
+    // reads while still allowing an explicit follow-up cancellation or manual paper draft.
+    product_tokens: Mutex<ProductAuthorityTokens>,
     // Bot and Execution are separate facades over this shared controller. Retain one terminal
     // shutdown result so the second facade cannot repeat destruction of the same runtime owner.
     shutdown: Mutex<Option<Result<(), ServiceError>>>,
@@ -429,6 +433,7 @@ impl PaperController {
             state: Mutex::new(PaperState::Stopped {
                 last_complete: None,
             }),
+            product_tokens: Mutex::new(ProductAuthorityTokens::default()),
             shutdown: Mutex::new(None),
         }
     }
@@ -448,12 +453,12 @@ impl PaperController {
             PaperState::CleanupRequired { .. } => Ok(json!({
                 "state": "failed",
                 "requiresStop": true,
-                "reason": "paper action-hook cleanup requires retry",
+                "recoveryAction": "stop_before_restart",
             })),
             PaperState::Starting { .. } => Ok(json!({"state": "starting"})),
             PaperState::Stopping => Ok(json!({"state": "stopping"})),
             PaperState::Running {
-                provider,
+                provider: _,
                 strategy_mode,
                 runtime,
                 surface_id,
@@ -468,7 +473,6 @@ impl PaperController {
                 if cancellation.is_cancelled() || !runtime.source_is_healthy() || !source_healthy {
                     return Ok(json!({
                         "state": "failed",
-                        "provider": provider.name(),
                         "requiresStop": true,
                     }));
                 }
@@ -480,10 +484,15 @@ impl PaperController {
                 let audit = runtime
                     .execution_audit_snapshot(None, maximum_items)
                     .map_err(|_error| ServiceError::Unavailable)?;
+                let mut product_tokens = bounded_lock(
+                    &self.product_tokens,
+                    context.deadline(),
+                    context.cancellation(),
+                )
+                .await?;
                 Ok(json!({
                     "state": "running",
                     "strategyMode": strategy_mode.as_str(),
-                    "sequence": snapshot.sequence(),
                     "complete": snapshot.complete(),
                     "reconciliationRequired": snapshot.reconciliation_required(),
                     "financialReconciliationCurrent": financial_reconciliation_current,
@@ -492,12 +501,11 @@ impl PaperController {
                     "positions": snapshot.positions().len(),
                     "accounts": bounded_evidence(snapshot.accounts(), maximum_items, account_value)?,
                     "cash": bounded_evidence(snapshot.cash(), maximum_items, cash_value)?,
-                    "positionEvidence": bounded_evidence(snapshot.positions(), maximum_items, position_value)?,
-                    "configurationDigestSha256": hex(snapshot.configuration_digest()),
+                    "positionRecords": bounded_evidence(snapshot.positions(), maximum_items, position_value)?,
                     "simulation": simulation_value(snapshot.simulation()),
                     "reconciliation": reconciliation_value(&snapshot, financial_reconciliation_current),
                     "riskLimits": risk_limits_value(runtime.risk_limits(), maximum_items)?,
-                    "riskDecisions": audit_snapshot_value(&audit)?,
+                    "riskDecisions": audit_snapshot_value(&audit, &mut product_tokens)?,
                 }))
             }
         }
@@ -523,7 +531,11 @@ impl PaperController {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(ServiceError::Unavailable);
         }
-        let provider = PaperProvider::from_request(request)?;
+        let market_selection = self
+            .market_runtime
+            .select_paper_market_surface(deadline, request_cancellation)
+            .await?;
+        let provider = PaperProvider::from_selection(&market_selection)?;
         let surface_id = provider.surface_id()?;
         let onboarding_session_id = provider.onboarding_session_id();
         let strategy_mode = paper_strategy_mode(request)?;
@@ -547,8 +559,16 @@ impl PaperController {
             *state = PaperState::Starting { run_id };
             last_complete
         };
+        match bounded_lock(&self.product_tokens, deadline, request_cancellation).await {
+            Ok(mut tokens) => tokens.clear(),
+            Err(error) => {
+                run_cancellation.cancel();
+                self.set_stopped(last_complete).await;
+                return Err(error);
+            }
+        }
         let composition = match provider {
-            PaperProvider::Public(provider) => {
+            PaperProvider::Public { provider, .. } => {
                 local_paper_bot_on_existing_public_market_with_strategy_mode(
                     self.config.clone(),
                     provider,
@@ -721,7 +741,6 @@ impl PaperController {
             drop(state);
             return Ok(json!({
                 "state": "running",
-                "provider": provider.name(),
                 "strategyMode": strategy_mode.as_str(),
             }));
         }
@@ -784,11 +803,15 @@ impl PaperController {
         values
             .try_reserve_exact(returned)
             .map_err(|_error| ServiceError::ResourceExhausted)?;
-        values.extend(
-            snapshot.orders()[..returned]
-                .iter()
-                .map(|order| order_value(order, snapshot.fills())),
-        );
+        let mut tokens = bounded_lock(
+            &self.product_tokens,
+            context.deadline(),
+            context.cancellation(),
+        )
+        .await?;
+        for order in &snapshot.orders()[..returned] {
+            values.push(order_value(order, snapshot.fills(), &mut tokens)?);
+        }
         Ok((Value::Array(values), returned, available))
     }
 
@@ -809,7 +832,15 @@ impl PaperController {
         values
             .try_reserve_exact(returned)
             .map_err(|_error| ServiceError::ResourceExhausted)?;
-        values.extend(snapshot.fills()[..returned].iter().copied().map(fill_value));
+        let mut tokens = bounded_lock(
+            &self.product_tokens,
+            context.deadline(),
+            context.cancellation(),
+        )
+        .await?;
+        for fill in snapshot.fills()[..returned].iter().copied() {
+            values.push(fill_value(fill, &mut tokens)?);
+        }
         Ok((Value::Array(values), returned, available))
     }
 
@@ -848,6 +879,12 @@ impl PaperController {
         targets
             .try_reserve_exact(entries.len())
             .map_err(|_error| ServiceError::ResourceExhausted)?;
+        let mut product_tokens = bounded_lock(
+            &self.product_tokens,
+            context.deadline(),
+            context.cancellation(),
+        )
+        .await?;
         for entry in entries {
             if entry.status() != TargetStatus::Active {
                 continue;
@@ -859,10 +896,11 @@ impl PaperController {
             if !target_currently_usable(&target, now) {
                 continue;
             }
-            let Ok(route) = sole_compatible_manual_route(runtime, &target) else {
+            if sole_compatible_manual_route(runtime, &target).is_err() {
                 continue;
-            };
-            targets.push(manual_paper_target_value(&target, route)?);
+            }
+            let target_token = product_tokens.target_token(entry.id(), entry.revision())?;
+            targets.push(manual_paper_target_value(&target, target_token)?);
         }
         if targets.len() > maximum_items {
             return Err(ServiceError::ResourceExhausted);
@@ -877,15 +915,9 @@ impl PaperController {
         context: &RequestContext,
     ) -> Result<(Value, usize, usize), ServiceError> {
         ensure_live(context)?;
-        let target_id = InvestmentTargetSetId::try_new(required_string(request, "targetId")?)
+        let target_token = required_string(request, "targetToken")?
+            .parse::<Uuid>()
             .map_err(|_error| ServiceError::InvalidRequest)?;
-        let target_revision = request
-            .arguments()
-            .get("targetRevision")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .and_then(|value| RevisionNumber::new(value).ok())
-            .ok_or(ServiceError::InvalidRequest)?;
         let side = manual_order_side(required_string(request, "side")?)?;
         let order_type = manual_order_type(required_string(request, "orderType")?)?;
         let time_in_force = manual_time_in_force(required_string(request, "timeInForce")?)?;
@@ -916,6 +948,16 @@ impl PaperController {
             return Err(ServiceError::Unavailable);
         }
         let now = current_timestamp()?;
+        let (target_id, target_revision) = {
+            let product_tokens = bounded_lock(
+                &self.product_tokens,
+                context.deadline(),
+                context.cancellation(),
+            )
+            .await?;
+            let (target_id, target_revision) = product_tokens.resolve_target(target_token)?;
+            (target_id.clone(), target_revision)
+        };
         let target = self.current_active_target(&target_id, target_revision, now)?;
         let manual_route = sole_compatible_manual_route(runtime, &target)?;
         let route = manual_route.route();
@@ -972,9 +1014,8 @@ impl PaperController {
             .map_err(map_manual_paper_ingress_error)?;
         Ok((
             json!({
-                "state": "accepted",
-                "targetId": target_core.id().as_str(),
-                "targetRevision": target_core.revision().get(),
+                "accepted": true,
+                "targetToken": target_token,
             }),
             1,
             1,
@@ -1049,7 +1090,7 @@ impl PaperController {
 
     async fn cancel(
         &self,
-        order_id: OrderId,
+        order_token: Uuid,
         context: &RequestContext,
     ) -> Result<CancelReceipt, ServiceError> {
         ensure_live(context)?;
@@ -1073,6 +1114,13 @@ impl PaperController {
         {
             return Err(ServiceError::Unavailable);
         }
+        let order_id = bounded_lock(
+            &self.product_tokens,
+            context.deadline(),
+            context.cancellation(),
+        )
+        .await?
+        .resolve_order(order_token)?;
         runtime
             .cancel_tracked_order(order_id, context.deadline(), context.cancellation())
             .await
@@ -1403,7 +1451,7 @@ fn target_currently_usable(target: &TargetState, now: Timestamp) -> bool {
 
 fn manual_paper_target_value(
     target: &TargetState,
-    route: &crate::paper_bot::ManualPaperRoute,
+    target_token: Uuid,
 ) -> Result<Value, ServiceError> {
     let target_core = target.target().target();
     let mut ladder = Vec::new();
@@ -1429,17 +1477,11 @@ fn manual_paper_target_value(
         }));
     }
     Ok(json!({
-        "targetId": target_core.id().as_str(),
-        "targetRevision": target_core.revision().get(),
+        "targetToken": target_token,
         "instrumentId": target_core.instrument_id(),
-        "status": "active",
         "thesis": target.target().thesis().as_str(),
         "expiresAt": target_core.expires_at(),
         "reviewDueAt": target.target().review_due_at(),
-        "route": {
-            "venueId": route.route().venue(),
-            "instrumentId": route.route().instrument(),
-        },
         "ladder": ladder,
     }))
 }
@@ -1549,6 +1591,95 @@ enum PaperState {
     Stopping,
 }
 
+#[derive(Default)]
+struct ProductAuthorityTokens {
+    orders: Vec<ProductOrderToken>,
+    targets: Vec<ProductTargetToken>,
+}
+
+struct ProductOrderToken {
+    token: Uuid,
+    order_id: OrderId,
+}
+
+struct ProductTargetToken {
+    token: Uuid,
+    target_id: InvestmentTargetSetId,
+    revision: RevisionNumber,
+}
+
+impl ProductAuthorityTokens {
+    fn clear(&mut self) {
+        self.orders.clear();
+        self.targets.clear();
+    }
+
+    fn order_token(&mut self, order_id: OrderId) -> Result<Uuid, ServiceError> {
+        if let Some(existing) = self
+            .orders
+            .iter()
+            .find(|binding| binding.order_id == order_id)
+        {
+            return Ok(existing.token);
+        }
+        if self.orders.len() >= MAXIMUM_PRODUCT_ORDER_TOKENS {
+            return Err(ServiceError::ResourceExhausted);
+        }
+        self.orders
+            .try_reserve(1)
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        let token = Uuid::new_v4();
+        self.orders.push(ProductOrderToken { token, order_id });
+        Ok(token)
+    }
+
+    fn resolve_order(&self, token: Uuid) -> Result<OrderId, ServiceError> {
+        self.orders
+            .iter()
+            .find(|binding| binding.token == token)
+            .map(|binding| binding.order_id)
+            .ok_or(ServiceError::NotFound)
+    }
+
+    fn target_token(
+        &mut self,
+        target_id: &InvestmentTargetSetId,
+        revision: RevisionNumber,
+    ) -> Result<Uuid, ServiceError> {
+        if let Some(existing) = self
+            .targets
+            .iter()
+            .find(|binding| binding.target_id == *target_id && binding.revision == revision)
+        {
+            return Ok(existing.token);
+        }
+        if self.targets.len() >= MAXIMUM_MANUAL_PAPER_TARGET_INDEX_ENTRIES {
+            return Err(ServiceError::ResourceExhausted);
+        }
+        self.targets
+            .try_reserve(1)
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        let token = Uuid::new_v4();
+        self.targets.push(ProductTargetToken {
+            token,
+            target_id: target_id.clone(),
+            revision,
+        });
+        Ok(token)
+    }
+
+    fn resolve_target(
+        &self,
+        token: Uuid,
+    ) -> Result<(&InvestmentTargetSetId, RevisionNumber), ServiceError> {
+        self.targets
+            .iter()
+            .find(|binding| binding.token == token)
+            .map(|binding| (&binding.target_id, binding.revision))
+            .ok_or(ServiceError::NotFound)
+    }
+}
+
 async fn bounded_runtime_shutdown(runtime: ProductionPaperBotRuntime) -> bool {
     runtime.shutdown().await.is_complete()
 }
@@ -1567,44 +1698,46 @@ fn paper_strategy_mode(request: &TypedToolRequest) -> Result<PaperStrategyMode, 
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum PaperProvider {
-    Public(ProductionSourceProvider),
-    CoinbaseDirect { provider_session_id: Uuid },
+    Public {
+        provider: ProductionSourceProvider,
+        onboarding_session_id: Uuid,
+    },
+    CoinbaseDirect {
+        provider_session_id: Uuid,
+    },
 }
 
 impl PaperProvider {
-    fn from_request(request: &TypedToolRequest) -> Result<Self, ServiceError> {
-        let session = request
-            .arguments()
-            .get("providerSessionId")
-            .and_then(Value::as_str);
-        match required_string(request, "provider")? {
-            "coinbase" if session.is_none() => Ok(Self::Public(ProductionSourceProvider::Coinbase)),
-            "kraken" if session.is_none() => Ok(Self::Public(ProductionSourceProvider::Kraken)),
-            "coinbase-direct" => {
-                let provider_session_id = session
-                    .ok_or(ServiceError::InvalidRequest)?
-                    .parse()
-                    .map_err(|_error| ServiceError::InvalidRequest)?;
-                Ok(Self::CoinbaseDirect {
-                    provider_session_id,
-                })
-            }
-            _ => Err(ServiceError::InvalidRequest),
-        }
-    }
-
-    pub(super) const fn name(self) -> &'static str {
-        match self {
-            Self::Public(ProductionSourceProvider::Coinbase) => "coinbase",
-            Self::Public(ProductionSourceProvider::Kraken) => "kraken",
-            Self::CoinbaseDirect { .. } => "coinbase-direct",
+    fn from_selection(selection: &PaperMarketSurfaceSelection) -> Result<Self, ServiceError> {
+        let session_id = selection
+            .onboarding_session_id()
+            .ok_or(ServiceError::Unavailable)?;
+        match selection.surface_id().as_str() {
+            COINBASE_PUBLIC_SURFACE_ID => Ok(Self::Public {
+                provider: ProductionSourceProvider::Coinbase,
+                onboarding_session_id: session_id,
+            }),
+            KRAKEN_PUBLIC_SURFACE_ID => Ok(Self::Public {
+                provider: ProductionSourceProvider::Kraken,
+                onboarding_session_id: session_id,
+            }),
+            COINBASE_DIRECT_SURFACE_ID => Ok(Self::CoinbaseDirect {
+                provider_session_id: session_id,
+            }),
+            _ => Err(ServiceError::Unavailable),
         }
     }
 
     fn surface_id(self) -> Result<SourceIdentifier, ServiceError> {
         let value = match self {
-            Self::Public(ProductionSourceProvider::Coinbase) => COINBASE_PUBLIC_SURFACE_ID,
-            Self::Public(ProductionSourceProvider::Kraken) => KRAKEN_PUBLIC_SURFACE_ID,
+            Self::Public {
+                provider: ProductionSourceProvider::Coinbase,
+                ..
+            } => COINBASE_PUBLIC_SURFACE_ID,
+            Self::Public {
+                provider: ProductionSourceProvider::Kraken,
+                ..
+            } => KRAKEN_PUBLIC_SURFACE_ID,
             Self::CoinbaseDirect { .. } => COINBASE_DIRECT_SURFACE_ID,
         };
         SourceIdentifier::try_from(value).map_err(|_error| ServiceError::Internal)
@@ -1612,7 +1745,10 @@ impl PaperProvider {
 
     const fn onboarding_session_id(self) -> Option<Uuid> {
         match self {
-            Self::Public(_) => None,
+            Self::Public {
+                onboarding_session_id,
+                ..
+            } => Some(onboarding_session_id),
             Self::CoinbaseDirect {
                 provider_session_id,
             } => Some(provider_session_id),
@@ -1726,11 +1862,27 @@ const fn map_adapter_error(error: ExecutionAdapterError) -> ServiceError {
     }
 }
 
-fn order_value(order: &PaperOrderSnapshot, fills: &[PaperFillSnapshot]) -> Value {
-    json!({
-        "orderId": order.order_id(),
-        "accountId": order.account_id(),
-        "state": order.state(),
+fn order_value(
+    order: &PaperOrderSnapshot,
+    fills: &[PaperFillSnapshot],
+    tokens: &mut ProductAuthorityTokens,
+) -> Result<Value, ServiceError> {
+    let order_token = tokens.order_token(order.order_id())?;
+    let target_token = order
+        .target_reference()
+        .map(|target| {
+            let target_id = InvestmentTargetSetId::try_new(target.target_id())
+                .map_err(|_error| ServiceError::Unavailable)?;
+            let revision = u32::try_from(target.revision().get())
+                .ok()
+                .and_then(|revision| RevisionNumber::new(revision).ok())
+                .ok_or(ServiceError::Unavailable)?;
+            tokens.target_token(&target_id, revision)
+        })
+        .transpose()?;
+    Ok(json!({
+        "orderToken": order_token,
+        "status": order.state(),
         "requestedLots": order.requested(),
         "filledLots": order.cumulative_filled(),
         "averageFillPriceTicks": order.average_fill_price(),
@@ -1743,14 +1895,9 @@ fn order_value(order: &PaperOrderSnapshot, fills: &[PaperFillSnapshot]) -> Value
         "acceptedAt": order.accepted_at(),
         "eligibleAt": order.eligible_at(),
         "expiresAt": order.expires_at(),
-        "revision": order.revision(),
-        "targetReference": order.target_reference().map(|target| json!({
-            "targetId": target.target_id(),
-            "revision": target.revision().get(),
-            "contentSha256": hex(target.content_sha256()),
-        })),
+        "targetToken": target_token,
         "observed": observed_order_evidence(order, fills),
-    })
+    }))
 }
 
 fn observed_order_evidence(order: &PaperOrderSnapshot, fills: &[PaperFillSnapshot]) -> Value {
@@ -1787,7 +1934,6 @@ fn observed_order_evidence(order: &PaperOrderSnapshot, fills: &[PaperFillSnapsho
 
 fn simulation_value(simulation: market_squawk_adapter_paper::PaperSimulationSnapshot) -> Value {
     json!({
-        "configurationVersion": simulation.configuration_version(),
         "minimumLatencyNanos": simulation.minimum_latency_nanos(),
         "maximumLatencyNanos": simulation.maximum_latency_nanos(),
         "cancelLatencyNanos": simulation.cancel_latency_nanos(),
@@ -1806,9 +1952,7 @@ fn reconciliation_value(
     financial_reconciliation_current: bool,
 ) -> Value {
     json!({
-        "snapshotSequence": snapshot.sequence(),
         "snapshotComplete": snapshot.complete(),
-        "configurationDigestSha256": hex(snapshot.configuration_digest()),
         "reconciliationRequired": snapshot.reconciliation_required(),
         "financialReconciliationCurrent": financial_reconciliation_current,
         "activeOrderCount": snapshot.active_orders().len(),
@@ -1840,7 +1984,6 @@ fn bounded_evidence<T: Copy>(
 fn account_value(account: PaperAccountRiskSnapshot) -> Value {
     json!({
         "accountId": account.account_id(),
-        "revision": account.revision().get(),
         "eligible": account.eligible(),
         "currency": account.currency(),
         "settledCapital": account.settled_capital(),
@@ -1851,7 +1994,6 @@ fn account_value(account: PaperAccountRiskSnapshot) -> Value {
         "realizedPnl": account.realized_pnl(),
         "realizedLoss": account.realized_loss(),
         "drawdown": account.drawdown(),
-        "markDigestSha256": hex(account.mark_digest()),
     })
 }
 
@@ -1890,7 +2032,6 @@ fn risk_limits_value(
         "maximumSlippageBasisPoints": limits.maximum_slippage().get(),
         "maximumOrdersPerWindow": limits.maximum_orders_per_window().get(),
         "orderRateWindowNanos": limits.order_rate_window_nanos(),
-        "reservationTtlNanos": limits.reservation_ttl_nanos(),
         "allowShort": limits.allow_short(),
         "killSwitch": limits.kill_switch(),
     }))
@@ -1898,64 +2039,187 @@ fn risk_limits_value(
 
 fn audit_snapshot_value(
     snapshot: &ProductionExecutionAuditSnapshot,
+    tokens: &mut ProductAuthorityTokens,
 ) -> Result<Value, ServiceError> {
     let mut records = Vec::new();
     records
         .try_reserve_exact(snapshot.records().len())
         .map_err(|_error| ServiceError::ResourceExhausted)?;
-    records.extend(snapshot.records().iter().copied().map(audit_record_value));
+    for record in snapshot.records().iter().copied() {
+        records.push(audit_record_value(record, tokens)?);
+    }
     Ok(json!({
         "records": records,
         "returnedItems": snapshot.returned_items(),
         "availableItems": snapshot.available_items(),
-        "totalPublished": snapshot.total_published(),
-        "oldestSequence": snapshot.oldest_sequence(),
-        "latestSequence": snapshot.latest_sequence(),
-        "cursorExpired": snapshot.cursor_expired(),
-        "nextCursor": snapshot.next_cursor(),
     }))
 }
 
-fn audit_record_value(record: ProductionExecutionAuditRecord) -> Value {
+fn audit_record_value(
+    record: ProductionExecutionAuditRecord,
+    tokens: &mut ProductAuthorityTokens,
+) -> Result<Value, ServiceError> {
     let event = record.event();
-    json!({
-        "sequence": record.sequence(),
-        "kind": event.kind(),
-        "approvalId": event.approval_id(),
-        "orderId": event.order_id(),
-        "accountId": event.account_id(),
+    let order_token = tokens.order_token(event.order_id())?;
+    let mut reasons = Vec::new();
+    let reason_count = event.reasons().count();
+    reasons
+        .try_reserve_exact(reason_count)
+        .map_err(|_error| ServiceError::ResourceExhausted)?;
+    for raw_reason in event.reasons() {
+        let reason = product_risk_reason(raw_reason);
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
+    Ok(json!({
+        "outcome": product_risk_outcome(event.kind()),
+        "orderToken": order_token,
         "instrumentId": event.instrument_id(),
-        "strategyId": event.strategy_id(),
-        "modelId": event.model_id(),
-        "intentDigestSha256": hex(event.intent_digest().as_bytes()),
-        "assessmentDigestSha256": event.assessment_digest().map(hex),
-        "evidenceBindingDigestSha256": event.evidence_binding_digest().map(hex),
-        "executionIdentityDigestSha256": event.execution_identity_digest().map(hex),
-        "portfolioContentDigestSha256": event.portfolio_content_digest().map(hex),
-        "maximumExecutionPriceTicks": event.execution_price_bound().map(|bound| bound.maximum_price()),
-        "riskPolicyDigestSha256": hex(event.risk_policy().digest()),
-        "riskPolicyRulesetVersion": event.risk_policy().ruleset_version().get(),
+        "maximumPriceTicks": event.execution_price_bound().map(|bound| bound.maximum_price()),
         "marketObservedAt": event.market_observed_at(),
         "validUntil": event.valid_until(),
         "observedAt": event.observed_at(),
-        "reasons": event.reasons().collect::<Vec<_>>(),
-    })
+        "reasons": reasons,
+    }))
 }
 
-fn hex(bytes: [u8; 32]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(64);
-    for byte in bytes {
-        output.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+const fn product_risk_outcome(kind: ExecutionAuditKind) -> &'static str {
+    match kind {
+        ExecutionAuditKind::RiskRejected
+        | ExecutionAuditKind::DispatchRejected
+        | ExecutionAuditKind::DispatchKnownFailure => "declined",
+        ExecutionAuditKind::RiskApproved => "approved",
+        ExecutionAuditKind::DispatchAccepted => "accepted",
+        ExecutionAuditKind::DispatchUncertain => "needs_review",
+        ExecutionAuditKind::CancelAccepted => "cancel_requested",
+        ExecutionAuditKind::CancelTerminal => "cancelled",
+        ExecutionAuditKind::ReconciliationObserved => "reconciled",
     }
-    output
 }
 
-fn fill_value(fill: PaperFillSnapshot) -> Value {
-    json!({
-        "sequence": fill.sequence(),
-        "orderId": fill.order_id(),
+const fn product_risk_reason(reason: ExecutionAuditReason) -> &'static str {
+    match reason {
+        ExecutionAuditReason::Risk(reason) => product_rejection_reason(reason),
+        ExecutionAuditReason::AdapterRejected | ExecutionAuditReason::AdapterKnownFailure => {
+            "The virtual order was declined."
+        }
+        ExecutionAuditReason::AdapterUncertain => {
+            "The order result needs review before continuing."
+        }
+        ExecutionAuditReason::ReconciliationRequired => {
+            "The account needs reconciliation before another order."
+        }
+        ExecutionAuditReason::DuplicateApproval
+        | ExecutionAuditReason::ApprovalInvalid
+        | ExecutionAuditReason::PortfolioRevisionInvalid
+        | ExecutionAuditReason::ReceiptMismatch
+        | ExecutionAuditReason::ObservationTimestampInvalid
+        | ExecutionAuditReason::UnexpectedReconciliationOrder
+        | ExecutionAuditReason::AccountReplacementRejected => {
+            "The order or account changed before the check completed."
+        }
+        ExecutionAuditReason::QueueCountSaturated
+        | ExecutionAuditReason::QueueBytesSaturated
+        | ExecutionAuditReason::TaskOwnershipSaturated
+        | ExecutionAuditReason::RegistryCapacity
+        | ExecutionAuditReason::RegistryUnavailable
+        | ExecutionAuditReason::ClockFailure
+        | ExecutionAuditReason::PendingReconciliationCapacity
+        | ExecutionAuditReason::OperationDeadlineExceeded
+        | ExecutionAuditReason::AuditReasonOverflow => {
+            "Paper trading is temporarily unavailable. Try again."
+        }
+    }
+}
+
+const fn product_rejection_reason(reason: RiskRejectionCode) -> &'static str {
+    match reason {
+        RiskRejectionCode::MarketDepthUnavailable
+        | RiskRejectionCode::SourceQuality
+        | RiskRejectionCode::SourceIneligible
+        | RiskRejectionCode::SourceStale
+        | RiskRejectionCode::MarketTimestampInFuture
+        | RiskRejectionCode::MarketPredatesSignal
+        | RiskRejectionCode::InstrumentDefinitionMismatch => {
+            "Market data is unavailable or too old."
+        }
+        RiskRejectionCode::InstrumentNotTrading => "The investment cannot be traded right now.",
+        RiskRejectionCode::PolicyExpired
+        | RiskRejectionCode::IntentExpired
+        | RiskRejectionCode::StopNotTriggered => {
+            "The order is no longer valid at current conditions."
+        }
+        RiskRejectionCode::InvalidReferencePrice
+        | RiskRejectionCode::OrderPriceLimit
+        | RiskRejectionCode::IntentSlippageLimit
+        | RiskRejectionCode::PolicySlippageLimit
+        | RiskRejectionCode::PriceDeviationLimit => {
+            "The order is outside the active price and slippage limits."
+        }
+        RiskRejectionCode::Account(reason) => product_account_risk_reason(reason),
+        RiskRejectionCode::Portfolio(_) => "The account needs reconciliation before another order.",
+        RiskRejectionCode::ClockFailure
+        | RiskRejectionCode::ClockRollback
+        | RiskRejectionCode::Authority
+        | RiskRejectionCode::ApprovalIdentity
+        | RiskRejectionCode::AuditUnavailable => {
+            "Paper trading is temporarily unavailable. Try again."
+        }
+    }
+}
+
+const fn product_account_risk_reason(reason: AccountRiskViolation) -> &'static str {
+    match reason {
+        AccountRiskViolation::KillSwitch => "Paper trading is paused by the emergency stop.",
+        AccountRiskViolation::InsufficientPosition | AccountRiskViolation::InsufficientCash => {
+            "Available cash or holdings are insufficient."
+        }
+        AccountRiskViolation::InstrumentIneligible
+        | AccountRiskViolation::CurrencyMismatch
+        | AccountRiskViolation::UnsupportedSettlement => {
+            "The investment is not eligible for paper trading."
+        }
+        AccountRiskViolation::ReconciliationRequired
+        | AccountRiskViolation::PortfolioStateMismatch => {
+            "The account needs reconciliation before another order."
+        }
+        AccountRiskViolation::IntentExpired
+        | AccountRiskViolation::IntentLifetimeExceeded
+        | AccountRiskViolation::DuplicateClientOrder
+        | AccountRiskViolation::DuplicateOrder => {
+            "The order is no longer valid at current conditions."
+        }
+        AccountRiskViolation::OrderRateLimit
+        | AccountRiskViolation::OrderNotionalLimit
+        | AccountRiskViolation::PositionLimit
+        | AccountRiskViolation::ExposureLimit
+        | AccountRiskViolation::LeverageLimit
+        | AccountRiskViolation::CapitalLimit
+        | AccountRiskViolation::LossLimit
+        | AccountRiskViolation::DrawdownLimit => "The order is outside the active safety limits.",
+        AccountRiskViolation::AccountNotFound | AccountRiskViolation::AccountIneligible => {
+            "The virtual account is not eligible for paper trading."
+        }
+        AccountRiskViolation::IdempotencyCapacity
+        | AccountRiskViolation::IdempotencyRevisionExhausted
+        | AccountRiskViolation::ReservationCapacity
+        | AccountRiskViolation::ArithmeticOverflow
+        | AccountRiskViolation::AccountCoordinatorBusy
+        | AccountRiskViolation::AccountCoordinatorPoisoned
+        | AccountRiskViolation::ClockFailure => {
+            "Paper trading is temporarily unavailable. Try again."
+        }
+    }
+}
+
+fn fill_value(
+    fill: PaperFillSnapshot,
+    tokens: &mut ProductAuthorityTokens,
+) -> Result<Value, ServiceError> {
+    let order_token = tokens.order_token(fill.order_id())?;
+    Ok(json!({
+        "orderToken": order_token,
         "eventAt": fill.event_at(),
         "quantityLots": fill.quantity(),
         "averagePriceTicks": fill.average_price(),
@@ -1963,12 +2227,12 @@ fn fill_value(fill: PaperFillSnapshot) -> Value {
         "notional": fill.notional(),
         "fee": fill.fee(),
         "liquidity": fill.liquidity(),
-    })
+    }))
 }
 
-fn cancel_receipt_value(receipt: CancelReceipt) -> Value {
+fn cancel_receipt_value(receipt: CancelReceipt, order_token: Uuid) -> Value {
     json!({
-        "orderId": receipt.order_id(),
+        "orderToken": order_token,
         "status": cancel_status(receipt.status()),
         "observedAt": receipt.observed_at(),
         "cumulativeFilledLots": receipt.cumulative_filled(),
@@ -1981,9 +2245,9 @@ fn cancel_receipt_value(receipt: CancelReceipt) -> Value {
 fn execution_state_value(state: &ExecutionState) -> Value {
     json!({
         "observedAt": state.observed_at(),
-        "orderCount": state.orders().len(),
-        "accountCount": state.accounts().len(),
-        "sourceBound": state.source_binding().is_some(),
+        "ordersChecked": state.orders().len(),
+        "accountsChecked": state.accounts().len(),
+        "marketDataReady": state.source_binding().is_some(),
         "reconciliationRequired": state.reconciliation_required(),
     })
 }

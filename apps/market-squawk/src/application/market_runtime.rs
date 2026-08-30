@@ -7,6 +7,7 @@ mod generation;
 mod group;
 mod kraken;
 mod schwab;
+mod schwab_sink;
 
 pub(crate) use alpaca_historical::{
     AlpacaHistoricalCompositeCalendarAuthority, AlpacaHistoricalLookupError,
@@ -26,6 +27,8 @@ pub(crate) use schwab::{
     SchwabRestQuotePublicationReceipt, SchwabRestQuoteRuntimeBounds, SchwabRestQuoteRuntimeError,
     SchwabRestQuoteSinkError, SchwabRestQuoteSourceEvidence,
 };
+#[cfg(test)]
+pub(crate) use schwab_sink::SchwabRestQuoteSealFirstSink;
 
 use std::{
     fmt,
@@ -39,9 +42,9 @@ use std::{
 use market_squawk_adapter_alpaca::AlpacaHistoricalEquityPreflightPlan;
 use market_squawk_adapter_schwab::SchwabOAuthAuthorityReceipt;
 use market_squawk_domain::{
-    ConnectionGeneration, CoverageStatus, DataQuality, EvidenceDigest, InstrumentId,
-    MarketDataInstrumentDefinition, SourceId, SourceIdentifier, StreamIntegrityState, Timestamp,
-    VenueId,
+    ConnectionGeneration, CoverageDelay, CoverageStatus, DataQuality, EvidenceDigest, InstrumentId,
+    MarketDataInstrumentDefinition, MarketDepth, SourceId, SourceIdentifier, StreamIntegrityState,
+    Timestamp, VenueId,
 };
 use market_squawk_live::{
     LiveActionHookGeneration, LiveActionHookReapReceipt, LiveRouteConfig, LiveRuntimeSnapshotLease,
@@ -64,7 +67,7 @@ use self::{
 use super::live_fair_value::{LiveFairValueExportDrains, LiveFairValueObservationBuffer};
 use super::{
     AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
-    AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority, CryptoMarketDurableRead,
+    AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority, MarketEventDurableRead,
 };
 use crate::{
     AppConfig, CoinbaseDirectLiveRuntime, ProductionLiveSourceRuntime, ProductionSourceProvider,
@@ -111,21 +114,31 @@ pub(crate) struct MarketSourceSnapshotLease {
     lease: LiveRuntimeSnapshotLease,
 }
 
+/// Application-owned choice of one healthy live market runtime for virtual paper execution.
+///
+/// Provider identity remains internal to the runtime boundary. Product callers request the best
+/// eligible market evidence and never select or receive this coordinate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PaperMarketSurfaceSelection {
+    surface_id: SourceIdentifier,
+    onboarding_session_id: Option<uuid::Uuid>,
+}
+
 /// One source-bound immutable market reader joined to one validated runtime route.
 ///
 /// This is an internal application capability. Provider and route coordinates remain below the
 /// ordinary product boundary and are used only to prevent cross-source or cross-venue reads.
 #[derive(Clone, Debug)]
-pub(crate) struct CryptoMarketDurableRouteRead {
-    read: CryptoMarketDurableRead,
+pub(crate) struct MarketEventDurableRouteRead {
+    read: MarketEventDurableRead,
     surface_id: SourceIdentifier,
     metadata: Arc<[SourceMetadata]>,
     source_index: usize,
     route: ShardKey,
 }
 
-impl CryptoMarketDurableRouteRead {
-    pub(crate) const fn read(&self) -> &CryptoMarketDurableRead {
+impl MarketEventDurableRouteRead {
+    pub(crate) const fn read(&self) -> &MarketEventDurableRead {
         &self.read
     }
 
@@ -139,6 +152,16 @@ impl CryptoMarketDurableRouteRead {
 
     pub(crate) const fn route(&self) -> &ShardKey {
         &self.route
+    }
+}
+
+impl PaperMarketSurfaceSelection {
+    pub(crate) const fn surface_id(&self) -> &SourceIdentifier {
+        &self.surface_id
+    }
+
+    pub(crate) const fn onboarding_session_id(&self) -> Option<uuid::Uuid> {
+        self.onboarding_session_id
     }
 }
 
@@ -268,7 +291,7 @@ pub(crate) struct MarketRuntimeRegistry {
     shutdown: Mutex<Option<Result<(), ServiceError>>>,
     mutation: Mutex<()>,
     entries: Mutex<Vec<MarketRuntimeEntry>>,
-    durable_market_routes: Mutex<Vec<CryptoMarketDurableRouteRead>>,
+    durable_market_routes: Mutex<Vec<MarketEventDurableRouteRead>>,
     account_health_cancellation: CancellationToken,
     account_health_drain: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -879,6 +902,28 @@ impl MarketRuntimeRegistry {
                             return Err(error);
                         }
                     };
+                let durable_reads = runtime.durable_reads();
+                let durable_routes = match durable_route_bindings(
+                    provider,
+                    Arc::clone(&metadata),
+                    &topology,
+                    durable_reads.iter().cloned().collect(),
+                ) {
+                    Ok(routes) => routes,
+                    Err(error) => {
+                        runtime_cancellation.cancel();
+                        let _cleanup = runtime.shutdown().await;
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = self
+                    .replace_durable_market_routes(provider, durable_routes, deadline, cancellation)
+                    .await
+                {
+                    runtime_cancellation.cancel();
+                    let _cleanup = runtime.shutdown().await;
+                    return Err(error);
+                }
                 MarketRuntimeEntry {
                     surface_id: provider.clone(),
                     onboarding_session_id: Some(session_id),
@@ -1553,11 +1598,11 @@ impl MarketRuntimeRegistry {
     ///
     /// The returned coordinates remain internal to neutral product selection. The immutable
     /// topology, rather than a hot snapshot, is the route authority after process restart.
-    pub(crate) async fn crypto_market_durable_route_reads(
+    pub(crate) async fn market_event_durable_route_reads(
         &self,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<CryptoMarketDurableRouteRead>, ServiceError> {
+    ) -> Result<Vec<MarketEventDurableRouteRead>, ServiceError> {
         ensure_active(&self.accepting, deadline, cancellation)?;
         let bindings = {
             let retained =
@@ -1576,7 +1621,7 @@ impl MarketRuntimeRegistry {
     async fn replace_durable_market_routes(
         &self,
         surface_id: &SourceIdentifier,
-        routes: Vec<CryptoMarketDurableRouteRead>,
+        routes: Vec<MarketEventDurableRouteRead>,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), ServiceError> {
@@ -1602,6 +1647,47 @@ impl MarketRuntimeRegistry {
         retained.retain(|route| route.surface_id() != surface_id);
         retained.extend(routes);
         Ok(())
+    }
+
+    /// Selects the strongest healthy scalar market runtime for virtual paper execution.
+    ///
+    /// Ranking uses declared observation quality, real-time delivery, represented market depth,
+    /// and metadata coverage. Provider identity is used only as a deterministic final tie-breaker
+    /// and never crosses the application product boundary.
+    pub(crate) async fn select_paper_market_surface(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<PaperMarketSurfaceSelection, ServiceError> {
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
+        let mut selected: Option<(&MarketRuntimeEntry, (u8, u8, u8, usize))> = None;
+        for entry in entries.iter().filter(|entry| {
+            entry.is_published_healthy()
+                && entry.runtime.has_scalar_snapshots()
+                && !entry.action_hooks_installed
+                && matches!(
+                    entry.surface_id.as_str(),
+                    COINBASE_PUBLIC_SURFACE_ID
+                        | COINBASE_DIRECT_SURFACE_ID
+                        | KRAKEN_PUBLIC_SURFACE_ID
+                )
+        }) {
+            let rank = paper_market_surface_rank(entry.metadata.as_ref())?;
+            let replace = selected.as_ref().is_none_or(|(current, current_rank)| {
+                rank > *current_rank
+                    || (rank == *current_rank
+                        && entry.surface_id.as_str() < current.surface_id.as_str())
+            });
+            if replace {
+                selected = Some((entry, rank));
+            }
+        }
+        let (entry, _rank) = selected.ok_or(ServiceError::Unavailable)?;
+        Ok(PaperMarketSurfaceSelection {
+            surface_id: entry.surface_id.clone(),
+            onboarding_session_id: entry.onboarding_session_id,
+        })
     }
 
     /// Reads every account-backed display source for one instrument in exact actor-key order.
@@ -2454,8 +2540,8 @@ fn durable_route_bindings(
     surface_id: &SourceIdentifier,
     metadata: Arc<[SourceMetadata]>,
     topology: &MarketRuntimeTopology,
-    reads: Vec<CryptoMarketDurableRead>,
-) -> Result<Vec<CryptoMarketDurableRouteRead>, ServiceError> {
+    reads: Vec<MarketEventDurableRead>,
+) -> Result<Vec<MarketEventDurableRouteRead>, ServiceError> {
     if reads.is_empty() {
         return Ok(Vec::new());
     }
@@ -2490,7 +2576,7 @@ fn durable_route_bindings(
             .iter()
             .filter(|route| route.source_indexes().contains(&source_index))
         {
-            bindings.push(CryptoMarketDurableRouteRead {
+            bindings.push(MarketEventDurableRouteRead {
                 read: read.clone(),
                 surface_id: surface_id.clone(),
                 metadata: Arc::clone(&metadata),
@@ -2777,6 +2863,57 @@ fn ensure_active(
         Ok(())
     } else {
         Err(ServiceError::Unavailable)
+    }
+}
+
+fn paper_market_surface_rank(
+    metadata: &[SourceMetadata],
+) -> Result<(u8, u8, u8, usize), ServiceError> {
+    let mut quality = 0_u8;
+    let mut real_time = 0_u8;
+    let mut depth = 0_u8;
+    let mut live_declarations = 0_usize;
+    for source in metadata {
+        if !source.capabilities().live() {
+            continue;
+        }
+        let live = source.coverage().live().ok_or(ServiceError::Unavailable)?;
+        live_declarations = live_declarations
+            .checked_add(1)
+            .ok_or(ServiceError::ResourceExhausted)?;
+        quality = quality.max(data_quality_rank(source.quality_ceiling()));
+        if matches!(source.coverage().delay(), CoverageDelay::RealTime) {
+            real_time = 1;
+        }
+        for rule in live.rules() {
+            depth = depth.max(rule.depth().map_or(0, market_depth_rank));
+        }
+    }
+    if live_declarations == 0 {
+        return Err(ServiceError::Unavailable);
+    }
+    Ok((quality, real_time, depth, live_declarations))
+}
+
+const fn data_quality_rank(quality: DataQuality) -> u8 {
+    match quality {
+        DataQuality::DirectVerified => 8,
+        DataQuality::DirectUnverified => 7,
+        DataQuality::OfficialDelayed => 6,
+        DataQuality::Aggregated => 5,
+        DataQuality::Indicative => 4,
+        DataQuality::Modeled => 3,
+        DataQuality::Estimated => 2,
+        DataQuality::Stale => 1,
+        DataQuality::Quarantined => 0,
+    }
+}
+
+const fn market_depth_rank(depth: MarketDepth) -> u8 {
+    match depth {
+        MarketDepth::OrderLevel => 3,
+        MarketDepth::PriceLevel => 2,
+        MarketDepth::TopOfBook => 1,
     }
 }
 

@@ -2,7 +2,8 @@ import { useInfiniteQuery, useQuery } from "@tanstack/react-query"
 import { z } from "zod"
 
 import { productKeys, type ProductScope } from "@/app/query-client"
-import type { DesktopBootstrap } from "@/lib/schemas"
+import { hasProductCapability } from "@/lib/product-capabilities"
+import type { DesktopBootstrap, ProductCapability } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
@@ -18,23 +19,23 @@ import {
 } from "./portfolio-contracts"
 
 const REQUIRED_DETAILS = [
-  "Portfolio.GetHoldings",
-  "Portfolio.GetPerformance",
-  "Portfolio.GetExposure",
-  "Portfolio.GetRisk",
-] as const
+  "portfolio_holdings",
+  "portfolio_performance",
+  "portfolio_exposure",
+  "portfolio_risk",
+] as const satisfies readonly ProductCapability[]
 
-const HISTORY_OPERATIONS = [
-  "Portfolio.GetTransactions",
-  "Portfolio.ListRevisions",
-  "Portfolio.GetAttribution",
-] as const
+const HISTORY_CAPABILITIES = [
+  "portfolio_transactions",
+  "portfolio_revision_list",
+  "portfolio_attribution",
+] as const satisfies readonly ProductCapability[]
 
 export function usePortfolioAccounts(
   transport: ProductTransport,
   bootstrap: DesktopBootstrap,
 ) {
-  const available = hasOperation(bootstrap, "Portfolio.ListAccounts")
+  const available = hasProductCapability(bootstrap, "portfolio_account_list")
   const query = useInfiniteQuery({
     queryKey: [
       ...productKeys.domain(bootstrap.runtime, "portfolio"),
@@ -52,7 +53,7 @@ export function usePortfolioAccounts(
         [],
       ),
     getNextPageParam: (page) => {
-      if (page.evidence.completeness === "complete") return undefined
+      if (page.evidence.state === "complete") return undefined
       return page.value.at(-1)?.accountId
     },
   })
@@ -65,10 +66,10 @@ export function usePortfolioDetails(
   bootstrap: DesktopBootstrap,
   accountId: string | null,
 ) {
-  const operationAvailable = Object.fromEntries(
-    REQUIRED_DETAILS.map((operation) => [
-      operation,
-      hasOperation(bootstrap, operation),
+  const capabilityAvailable = Object.fromEntries(
+    REQUIRED_DETAILS.map((capability) => [
+      capability,
+      hasProductCapability(bootstrap, capability),
     ]),
   ) as Record<(typeof REQUIRED_DETAILS)[number], boolean>
   const enabled = accountId !== null
@@ -77,7 +78,7 @@ export function usePortfolioDetails(
     queryKey: productKeys.operation(scope, "portfolio", "holdings", {
       accountId,
     }),
-    enabled: enabled && operationAvailable["Portfolio.GetHoldings"],
+    enabled: enabled && capabilityAvailable.portfolio_holdings,
     queryFn: async () =>
       parsePortfolioResult(
         await transport.query({
@@ -92,7 +93,7 @@ export function usePortfolioDetails(
     queryKey: productKeys.operation(scope, "portfolio", "performance", {
       accountId,
     }),
-    enabled: enabled && operationAvailable["Portfolio.GetPerformance"],
+    enabled: enabled && capabilityAvailable.portfolio_performance,
     queryFn: async () =>
       parsePortfolioResult(
         await transport.query({
@@ -106,7 +107,7 @@ export function usePortfolioDetails(
     queryKey: productKeys.operation(scope, "portfolio", "exposure", {
       accountId,
     }),
-    enabled: enabled && operationAvailable["Portfolio.GetExposure"],
+    enabled: enabled && capabilityAvailable.portfolio_exposure,
     queryFn: async () =>
       parsePortfolioResult(
         await transport.query({
@@ -120,7 +121,7 @@ export function usePortfolioDetails(
     queryKey: productKeys.operation(scope, "portfolio", "risk", {
       accountId,
     }),
-    enabled: enabled && operationAvailable["Portfolio.GetRisk"],
+    enabled: enabled && capabilityAvailable.portfolio_risk,
     queryFn: async () =>
       parsePortfolioResult(
         await transport.query({
@@ -132,19 +133,19 @@ export function usePortfolioDetails(
   })
 
   return {
-    operationAvailable,
+    capabilityAvailable,
     holdings,
     performance,
     exposure,
     risk,
     refresh: () =>
       Promise.all([
-        ...(enabled && operationAvailable["Portfolio.GetHoldings"] ? [holdings.refetch()] : []),
-        ...(enabled && operationAvailable["Portfolio.GetPerformance"]
+        ...(enabled && capabilityAvailable.portfolio_holdings ? [holdings.refetch()] : []),
+        ...(enabled && capabilityAvailable.portfolio_performance
           ? [performance.refetch()]
           : []),
-        ...(enabled && operationAvailable["Portfolio.GetExposure"] ? [exposure.refetch()] : []),
-        ...(enabled && operationAvailable["Portfolio.GetRisk"] ? [risk.refetch()] : []),
+        ...(enabled && capabilityAvailable.portfolio_exposure ? [exposure.refetch()] : []),
+        ...(enabled && capabilityAvailable.portfolio_risk ? [risk.refetch()] : []),
       ]),
     isFetching:
       holdings.isFetching ||
@@ -159,21 +160,21 @@ export function usePortfolioHistory(
   scope: ProductScope,
   bootstrap: DesktopBootstrap,
   accountId: string | null,
-  baselineRevisionId: string | null,
+  baselineSnapshotToken: string | null,
 ) {
-  const operationAvailable = Object.fromEntries(
-    HISTORY_OPERATIONS.map((operation) => [
-      operation,
-      hasOperation(bootstrap, operation),
+  const capabilityAvailable = Object.fromEntries(
+    HISTORY_CAPABILITIES.map((capability) => [
+      capability,
+      hasProductCapability(bootstrap, capability),
     ]),
-  ) as Record<(typeof HISTORY_OPERATIONS)[number], boolean>
+  ) as Record<(typeof HISTORY_CAPABILITIES)[number], boolean>
   const enabled = accountId !== null
 
   const transactions = useQuery({
     queryKey: productKeys.operation(scope, "portfolio", "transactions", {
       accountId,
     }),
-    enabled: enabled && operationAvailable["Portfolio.GetTransactions"],
+    enabled: enabled && capabilityAvailable.portfolio_transactions,
     queryFn: async () =>
       parsePortfolioResult(
         await transport.query({
@@ -190,41 +191,41 @@ export function usePortfolioHistory(
       accountId,
     }),
     initialPageParam: undefined as string | undefined,
-    enabled: enabled && operationAvailable["Portfolio.ListRevisions"],
+    enabled: enabled && capabilityAvailable.portfolio_revision_list,
     queryFn: async ({ pageParam }) =>
       parsePortfolioResult(
         await transport.query({
           query: "portfolioRevisions",
           accountId: requiredAccount(accountId),
-          ...(pageParam ? { afterRevisionId: pageParam } : {}),
+          ...(pageParam ? { afterSnapshotToken: pageParam } : {}),
         }),
         z.array(portfolioRevisionSchema),
         [],
       ),
     getNextPageParam: (page) => {
-      if (page.evidence.completeness === "complete") return undefined
-      return page.value.at(-1)?.revisionId
+      if (page.evidence.state === "complete") return undefined
+      return page.value.at(-1)?.snapshotToken
     },
   })
 
   const attribution = useQuery({
     queryKey: productKeys.operation(scope, "portfolio", "attribution", {
       accountId,
-      baselineRevisionId,
+      baselineSnapshotToken,
     }),
     enabled:
       enabled &&
-      baselineRevisionId !== null &&
-      operationAvailable["Portfolio.GetAttribution"],
+      baselineSnapshotToken !== null &&
+      capabilityAvailable.portfolio_attribution,
     queryFn: async () => {
-      if (baselineRevisionId === null) {
-        throw new Error("Choose an earlier portfolio revision first.")
+      if (baselineSnapshotToken === null) {
+        throw new Error("Choose an earlier portfolio snapshot first.")
       }
       return parsePortfolioResult(
         await transport.query({
           query: "portfolioAttribution",
           accountId: requiredAccount(accountId),
-          baselineRevisionId,
+          baselineSnapshotToken,
         }),
         portfolioAttributionSchema,
       )
@@ -232,15 +233,11 @@ export function usePortfolioHistory(
   })
 
   return {
-    operationAvailable,
+    capabilityAvailable,
     transactions,
     revisions,
     attribution,
   }
-}
-
-function hasOperation(bootstrap: DesktopBootstrap, name: string) {
-  return bootstrap.operations.some((operation) => operation.name === name)
 }
 
 function requiredAccount(accountId: string | null): string {

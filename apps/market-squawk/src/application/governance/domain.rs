@@ -176,35 +176,35 @@ pub enum FairValueRequestedHierarchy {
 /// Bounded fair-value approval proposal with no actor, approval time, role, or digest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FairValueApprovalProposal {
-    measurement_id: Box<str>,
-    decision_id: Box<str>,
+    measurement_token: Box<str>,
+    classification_token: Box<str>,
     requested_expires_at: Box<str>,
 }
 
 impl FairValueApprovalProposal {
     /// Validates presentation identifiers and a domain-validated policy expiry selector.
     pub fn try_new(
-        measurement_id: impl Into<String>,
-        decision_id: impl Into<String>,
+        measurement_token: impl Into<String>,
+        classification_token: impl Into<String>,
         requested_expires_at: impl Into<String>,
     ) -> Result<Self, GovernanceDomainAdapterError> {
         Ok(Self {
-            measurement_id: bounded_identifier(measurement_id.into())?,
-            decision_id: bounded_identifier(decision_id.into())?,
+            measurement_token: bounded_identifier(measurement_token.into())?,
+            classification_token: bounded_identifier(classification_token.into())?,
             requested_expires_at: bounded_identifier(requested_expires_at.into())?,
         })
     }
 
     /// Retained measurement selector.
     #[must_use]
-    pub fn measurement_id(&self) -> &str {
-        &self.measurement_id
+    pub fn measurement_token(&self) -> &str {
+        &self.measurement_token
     }
 
     /// Retained classification decision selector.
     #[must_use]
-    pub fn decision_id(&self) -> &str {
-        &self.decision_id
+    pub fn classification_token(&self) -> &str {
+        &self.classification_token
     }
 
     /// Requested policy expiry; the fair-value domain parses and admits it before preview.
@@ -217,8 +217,8 @@ impl FairValueApprovalProposal {
 /// Bounded fair-value override proposal with no actor, approval time, role, or digest.
 #[derive(Clone, Eq, PartialEq)]
 pub struct FairValueOverrideProposal {
-    measurement_id: Box<str>,
-    decision_id: Box<str>,
+    measurement_token: Box<str>,
+    classification_token: Box<str>,
     requested_hierarchy: FairValueRequestedHierarchy,
     justification: Box<str>,
     requested_expires_at: Box<str>,
@@ -228,15 +228,15 @@ impl FairValueOverrideProposal {
     /// Validates one proposal before fair-value canonicalization.
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
-        measurement_id: impl Into<String>,
-        decision_id: impl Into<String>,
+        measurement_token: impl Into<String>,
+        classification_token: impl Into<String>,
         requested_hierarchy: FairValueRequestedHierarchy,
         justification: impl Into<String>,
         requested_expires_at: impl Into<String>,
     ) -> Result<Self, GovernanceDomainAdapterError> {
         Ok(Self {
-            measurement_id: bounded_identifier(measurement_id.into())?,
-            decision_id: bounded_identifier(decision_id.into())?,
+            measurement_token: bounded_identifier(measurement_token.into())?,
+            classification_token: bounded_identifier(classification_token.into())?,
             requested_hierarchy,
             justification: bounded_note(justification.into())?,
             requested_expires_at: bounded_identifier(requested_expires_at.into())?,
@@ -245,14 +245,14 @@ impl FairValueOverrideProposal {
 
     /// Retained measurement selector.
     #[must_use]
-    pub fn measurement_id(&self) -> &str {
-        &self.measurement_id
+    pub fn measurement_token(&self) -> &str {
+        &self.measurement_token
     }
 
     /// Retained classification decision selector.
     #[must_use]
-    pub fn decision_id(&self) -> &str {
-        &self.decision_id
+    pub fn classification_token(&self) -> &str {
+        &self.classification_token
     }
 
     /// Requested hierarchy, subject to current fair-value eligibility rules.
@@ -278,8 +278,8 @@ impl fmt::Debug for FairValueOverrideProposal {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("FairValueOverrideProposal")
-            .field("measurement_id", &self.measurement_id)
-            .field("decision_id", &self.decision_id)
+            .field("measurement_token", &self.measurement_token)
+            .field("classification_token", &self.classification_token)
             .field("requested_hierarchy", &self.requested_hierarchy)
             .field("justification", &"[REDACTED GOVERNANCE CONTENT]")
             .field("requested_expires_at", &self.requested_expires_at)
@@ -290,26 +290,26 @@ impl fmt::Debug for FairValueOverrideProposal {
 /// Bounded fair-value approval-revocation proposal with no actor, revocation time, or digest.
 #[derive(Clone, Eq, PartialEq)]
 pub struct FairValueRevocationProposal {
-    approval_id: Box<str>,
+    approval_token: Box<str>,
     reason: Box<str>,
 }
 
 impl FairValueRevocationProposal {
     /// Validates one revocation proposal before fair-value canonicalization.
     pub fn try_new(
-        approval_id: impl Into<String>,
+        approval_token: impl Into<String>,
         reason: impl Into<String>,
     ) -> Result<Self, GovernanceDomainAdapterError> {
         Ok(Self {
-            approval_id: bounded_identifier(approval_id.into())?,
+            approval_token: bounded_identifier(approval_token.into())?,
             reason: bounded_note(reason.into())?,
         })
     }
 
     /// Retained approval selector.
     #[must_use]
-    pub fn approval_id(&self) -> &str {
-        &self.approval_id
+    pub fn approval_token(&self) -> &str {
+        &self.approval_token
     }
 
     /// Bounded revocation reason retained only by the canonical domain action.
@@ -323,7 +323,7 @@ impl fmt::Debug for FairValueRevocationProposal {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("FairValueRevocationProposal")
-            .field("approval_id", &self.approval_id)
+            .field("approval_token", &self.approval_token)
             .field("reason", &"[REDACTED GOVERNANCE CONTENT]")
             .finish()
     }
@@ -341,9 +341,7 @@ pub enum FairValueMarketAccessConclusion {
 /// Bounded market-access proposal with no preparer, approver, approval time, role, or digest.
 #[derive(Clone, Eq, PartialEq)]
 pub struct FairValueMarketAccessProposal {
-    account_id: Box<str>,
-    venue_id: Box<str>,
-    instrument_id: Box<str>,
+    market_input_token: Box<str>,
     conclusion: FairValueMarketAccessConclusion,
     effective_from: Box<str>,
     effective_until: Box<str>,
@@ -354,18 +352,14 @@ impl FairValueMarketAccessProposal {
     /// Validates one market-access proposal before fair-value canonicalization.
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
-        account_id: impl Into<String>,
-        venue_id: impl Into<String>,
-        instrument_id: impl Into<String>,
+        market_input_token: impl Into<String>,
         conclusion: FairValueMarketAccessConclusion,
         effective_from: impl Into<String>,
         effective_until: impl Into<String>,
         rationale: impl Into<String>,
     ) -> Result<Self, GovernanceDomainAdapterError> {
         Ok(Self {
-            account_id: bounded_identifier(account_id.into())?,
-            venue_id: bounded_identifier(venue_id.into())?,
-            instrument_id: bounded_identifier(instrument_id.into())?,
+            market_input_token: bounded_identifier(market_input_token.into())?,
             conclusion,
             effective_from: bounded_identifier(effective_from.into())?,
             effective_until: bounded_identifier(effective_until.into())?,
@@ -375,20 +369,8 @@ impl FairValueMarketAccessProposal {
 
     /// Retained account selector.
     #[must_use]
-    pub fn account_id(&self) -> &str {
-        &self.account_id
-    }
-
-    /// Retained venue selector.
-    #[must_use]
-    pub fn venue_id(&self) -> &str {
-        &self.venue_id
-    }
-
-    /// Retained instrument selector.
-    #[must_use]
-    pub fn instrument_id(&self) -> &str {
-        &self.instrument_id
+    pub fn market_input_token(&self) -> &str {
+        &self.market_input_token
     }
 
     /// Proposed conclusion, subject to retained evidence validation in the domain.
@@ -420,9 +402,7 @@ impl fmt::Debug for FairValueMarketAccessProposal {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("FairValueMarketAccessProposal")
-            .field("account_id", &self.account_id)
-            .field("venue_id", &self.venue_id)
-            .field("instrument_id", &self.instrument_id)
+            .field("market_input_token", &self.market_input_token)
             .field("conclusion", &self.conclusion)
             .field("effective_from", &self.effective_from)
             .field("effective_until", &self.effective_until)

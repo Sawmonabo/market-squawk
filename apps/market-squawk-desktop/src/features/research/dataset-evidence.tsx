@@ -11,48 +11,54 @@ import { productKeys } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
-import { friendlyResearchCollectionName } from "@/lib/formatters"
+import { hasProductCapability } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
-  parseResearchJobReceipt,
-  parseResearchManifest,
+  parseResearchActionAccepted,
+  parseResearchCollection,
   parseResearchObservations,
-  type ResearchDataset,
+  type ResearchCollection,
+  type ResearchObservation,
   type ResearchObservationResult,
 } from "./research-contracts"
 
 export function DatasetEvidence({
-  dataset,
+  collection,
   bootstrap,
   transport,
 }: {
-  dataset: ResearchDataset
+  collection: ResearchCollection
   bootstrap: DesktopBootstrap
   transport: ProductTransport
 }) {
   const queryClient = useQueryClient()
-  const datasetId = dataset.manifest.datasetId
+  const collectionToken = collection.collectionToken
   const detailKey = [
     ...productKeys.domain(bootstrap.runtime, "research"),
-    "dataset",
-    datasetId,
+    "collection",
+    collectionToken,
   ] as const
-  const manifest = useQuery({
-    queryKey: [...detailKey, "manifest"],
+  const detail = useQuery({
+    queryKey: [...detailKey, "detail"],
     queryFn: async () =>
-      parseResearchManifest(
-        await transport.query({ query: "researchManifest", dataset: datasetId }),
-        datasetId,
+      parseResearchCollection(
+        await transport.query({
+          query: "researchCollection",
+          collection: collectionToken,
+        }),
+        collectionToken,
       ),
   })
   const history = useQuery({
     queryKey: [...detailKey, "history"],
     queryFn: async () =>
       parseResearchObservations(
-        await transport.query({ query: "researchHistory", dataset: datasetId }),
-        datasetId,
+        await transport.query({
+          query: "researchCollectionHistory",
+          collection: collectionToken,
+        }),
       ),
   })
   const alternative = useQuery({
@@ -60,20 +66,17 @@ export function DatasetEvidence({
     queryFn: async () =>
       parseResearchObservations(
         await transport.query({
-          query: "researchAlternativeData",
-          dataset: datasetId,
+          query: "researchCollectionAlternativeData",
+          collection: collectionToken,
         }),
-        datasetId,
       ),
   })
-  const canExport = bootstrap.operations.some(
-    (operation) => operation.name === "Research.StartExport",
-  )
+  const canExport = hasProductCapability(bootstrap, "research_export")
   const exportJob = useMutation({
     mutationFn: async () =>
-      parseResearchJobReceipt(
+      parseResearchActionAccepted(
         await transport.researchControl(
-          { action: "startExport", dataset: datasetId },
+          { action: "startCollectionExport", collection: collectionToken },
           true,
         ),
       ),
@@ -82,7 +85,7 @@ export function DatasetEvidence({
         queryKey: productKeys.domain(bootstrap.runtime, "job"),
       }),
   })
-  const exact = manifest.data ?? dataset
+  const exact = detail.data ?? collection
 
   return (
     <article className="rounded-xl border border-border bg-card/45">
@@ -93,7 +96,7 @@ export function DatasetEvidence({
               Selected collection
             </p>
             <h2 className="mt-2 break-words text-xl font-semibold">
-              {friendlyResearchCollectionName(exact.manifest.schema.name)}
+              {exact.title}
             </h2>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -129,10 +132,10 @@ export function DatasetEvidence({
         ) : null}
       </div>
 
-      {manifest.isError ? (
+      {detail.isError ? (
         <InlineError
           title="This collection could not be checked"
-          retry={() => void manifest.refetch()}
+          retry={() => void detail.refetch()}
         />
       ) : null}
       <div className="grid gap-px bg-border sm:grid-cols-2">
@@ -193,7 +196,7 @@ function HistoryEvidence({
     return (
       <div className="rounded-md border border-border bg-background/40 p-3">
         <p className="text-xs font-medium">
-          {formatCount(query.data.artifact.rowCount)} observations are available
+          {formatCount(query.data.rowCount)} observations are available
         </p>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
           This is more information than the page can show at once. Export the history to review
@@ -221,7 +224,7 @@ function HistoryEvidence({
   )
 }
 
-function ObservationEvidence({ row }: { row: Record<string, unknown> }) {
+function ObservationEvidence({ row }: { row: ResearchObservation }) {
   const revision = numberValue(row.revision)
   const quality = textValue(row.quality)
   return (
@@ -233,10 +236,10 @@ function ObservationEvidence({ row }: { row: Record<string, unknown> }) {
         <EvidenceBadge>Revision {revision ?? "unavailable"}</EvidenceBadge>
       </div>
       <dl className="mt-3 grid gap-2 text-[10px] sm:grid-cols-2">
-        <TimeFact label="Effective" value={row.effective_at ?? row.effective_date} />
-        <TimeFact label="First public" value={row.published_at ?? row.published_date} />
-        <TimeFact label="Available" value={row.available_at} />
-        <TimeFact label="Superseded" value={row.superseded_at ?? row.superseded_date} />
+        <TimeFact label="Effective" value={row.effectiveAt} />
+        <TimeFact label="First public" value={row.publishedAt} />
+        <TimeFact label="Available" value={row.availableAt} />
+        <TimeFact label="Superseded" value={row.supersededAt} />
         <div>
           <dt className="text-muted-foreground">Quality</dt>
           <dd className="mt-0.5 text-foreground">{qualityLabel(quality)}</dd>
@@ -269,7 +272,7 @@ function AlternativeEvidence({
   const value = !result || result.kind === "empty"
     ? "No additional information in this collection"
     : result.kind === "artifact"
-      ? `${formatCount(result.artifact.rowCount)} additional observations available`
+      ? `${formatCount(result.rowCount)} additional observations available`
       : `${formatCount(result.returnedItems)} additional observations available`
   return (
     <div className="rounded-md border border-border bg-background/40 p-3">

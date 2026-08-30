@@ -18,8 +18,8 @@ use market_squawk::BoardInstalledFixtureBundle;
 use market_squawk::{
     application::application_capabilities,
     service::{
-        InstalledService, InstalledServiceConnector, InstalledServiceError,
-        InstalledServiceRunOutcome,
+        BootstrapRequirement, InstalledService, InstalledServiceBootstrapState,
+        InstalledServiceConnector, InstalledServiceError, InstalledServiceRunOutcome,
     },
 };
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
@@ -33,7 +33,8 @@ use market_squawk_adapter_federal_reserve::{
 use market_squawk_domain::Timestamp;
 use market_squawk_mcp::{McpLimitSpec, McpLimits, McpStdioRelay};
 use market_squawk_platform::{
-    AppConfig, ConfigOverrides, ConfigSources, EncryptedFileSecretStore, SecretStore, SecretValue,
+    AppConfig, ConfigOverrides, ConfigSources, EncryptedFileSecretStore, LocalPaths, SecretStore,
+    SecretValue,
 };
 use market_squawk_runtime::{
     ApplicationClient, EventPageLimit, InputAdmission, LoopbackApplicationClient, NamedClient,
@@ -430,15 +431,41 @@ async fn run_installed_service_authority_scenario() -> TestResult {
         installed_service_authority_root(&process_root),
     )
     .context("construct installed process-restart connector")?;
+    let process_paths = LocalPaths::prepare(installed_service_authority_root(&process_root))
+        .context("prepare installed process-restart authority root")?;
+    let process_secrets: Arc<dyn SecretStore> = Arc::new(
+        EncryptedFileSecretStore::try_open(
+            process_paths
+                .control_root()
+                .context("open installed process-restart control root")?
+                .root()
+                .join("secrets/installed-runtime"),
+            SecretValue::new(INSTALLED_SERVICE_TEST_UNLOCK.to_owned())
+                .context("construct installed process-restart test unlock")?,
+        )
+        .context("open installed process-restart fallback store")?,
+    );
+    let seeded = InstalledService::start_with_secret_store(
+        process_config.clone(),
+        Arc::clone(&process_secrets),
+    )
+    .await
+    .context("seed installed process-restart protected runtime authority")?;
+    let seeded_shutdown = CancellationToken::new();
+    seeded_shutdown.cancel();
+    assert_eq!(
+        seeded
+            .run(seeded_shutdown)
+            .await
+            .context("stop installed process-restart authority seeder")?,
+        InstalledServiceRunOutcome::Stopped
+    );
+    drop(process_secrets);
     let mut service = start_installed_service_subprocess(&process_root)
         .context("start installed-service subprocess")?;
-    wait_until_ready(&process_connector)
+    let stale_cli = wait_until_ready(&process_connector)
         .await
         .context("wait for initial installed-service subprocess")?;
-    assert!(matches!(
-        process_connector.bootstrap_status().await,
-        Err(InstalledServiceError::ServiceUnavailable)
-    ));
 
     run_installed_subprocess(&process_root, "clients")
         .await
@@ -453,13 +480,16 @@ async fn run_installed_service_authority_scenario() -> TestResult {
 
     let mut restarted_service = start_installed_service_subprocess(&process_root)
         .context("restart crashed installed-service subprocess")?;
-    wait_until_ready(&process_connector)
+    let _current_cli = wait_until_ready(&process_connector)
         .await
         .context("wait for restarted installed-service subprocess")?;
-    assert!(matches!(
-        process_connector.bootstrap_status().await,
-        Err(InstalledServiceError::ServiceUnavailable)
-    ));
+    assert!(
+        stale_cli
+            .probe_ready(CancellationToken::new())
+            .await
+            .is_err(),
+        "a client admitted before the service restart retained valid authority"
+    );
     run_installed_subprocess(&process_root, "cli")
         .await
         .context("exercise CLI subprocess after service restart")?;
@@ -2384,12 +2414,38 @@ fn installed_service_authority_root(root: &Path) -> PathBuf {
     root.join(".market-squawk-installed-service")
 }
 
-async fn wait_until_ready(connector: &InstalledServiceConnector) -> TestResult {
+async fn wait_until_ready(
+    connector: &InstalledServiceConnector,
+) -> TestResult<LoopbackApplicationClient> {
+    let mut unlock_submitted = false;
     let client = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             match connector.connect(NamedClient::Cli, None) {
                 Ok(client) => break Ok::<_, InstalledServiceError>(client),
                 Err(InstalledServiceError::ServiceUnavailable) => {
+                    match connector.bootstrap_status().await {
+                        Ok(status) if !unlock_submitted => {
+                            assert_eq!(status.state(), InstalledServiceBootstrapState::Required);
+                            assert_eq!(
+                                status.requirement(),
+                                Some(BootstrapRequirement::EncryptedFallbackLocked)
+                            );
+                            let accepted = connector
+                                .bootstrap_unlock(
+                                    SecretValue::new(INSTALLED_SERVICE_TEST_UNLOCK.to_owned())
+                                        .map_err(|_error| InstalledServiceError::SecretStore)?,
+                                )
+                                .await?;
+                            assert_eq!(accepted.state(), InstalledServiceBootstrapState::Retrying);
+                            unlock_submitted = true;
+                        }
+                        Ok(_)
+                        | Err(
+                            InstalledServiceError::ServiceUnavailable
+                            | InstalledServiceError::BootstrapUnavailable,
+                        ) => {}
+                        Err(error) => break Err(error),
+                    }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 Err(error) => break Err(error),
@@ -2403,7 +2459,11 @@ async fn wait_until_ready(connector: &InstalledServiceConnector) -> TestResult {
         .probe_ready(CancellationToken::new())
         .await
         .context("probe newly ready installed-service client")?;
-    Ok(())
+    assert!(
+        unlock_submitted,
+        "service became ready without fallback unlock"
+    );
+    Ok(client)
 }
 
 async fn run_installed_subprocess(root: &Path, role: &str) -> TestResult {

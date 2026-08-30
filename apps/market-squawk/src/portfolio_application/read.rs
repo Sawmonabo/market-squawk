@@ -3,11 +3,13 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
-use market_squawk_domain::{AccountId, InstrumentId, Timestamp};
+use market_squawk_adapter_portfolio::{BasisResolution, LotMethod, TransactionKind};
+use market_squawk_domain::{AccountId, InstrumentId, Money, Timestamp};
 use market_squawk_services::{
     RequestContext, ServiceLimits, ToolResultMetadata, TypedToolRequest, TypedToolResult,
 };
 use serde_json::{Map, Value, json};
+use uuid::Uuid;
 
 use super::analytics;
 use super::import::hex;
@@ -21,7 +23,6 @@ pub(super) struct ReadScope {
     pub(super) end: Option<Timestamp>,
     pub(super) maximum_items: usize,
     pub(super) maximum_bytes: usize,
-    pub(super) sources: BTreeSet<String>,
 }
 
 impl ReadScope {
@@ -78,23 +79,6 @@ impl ReadScope {
             .and_then(|value| usize::try_from(value).ok())
             .ok_or(PortfolioApplicationServiceError::InvalidRequest)?
             .min(application_limits.max_retained_bytes);
-        let sources = request
-            .arguments()
-            .get("sourceCoverage")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .map(|value| {
-                        value
-                            .as_str()
-                            .map(ToOwned::to_owned)
-                            .ok_or(PortfolioApplicationServiceError::InvalidRequest)
-                    })
-                    .collect()
-            })
-            .transpose()?
-            .unwrap_or_default();
         Ok(Self {
             account_id,
             instruments,
@@ -102,7 +86,6 @@ impl ReadScope {
             end,
             maximum_items,
             maximum_bytes,
-            sources,
         })
     }
 
@@ -152,7 +135,6 @@ fn list_accounts(
     application_limits: PortfolioApplicationLimits,
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
     let (maximum_items, maximum_bytes) = read_result_limits(request, application_limits)?;
-    let requested_sources = source_filters(request)?;
     let after_account = request
         .arguments()
         .get("afterAccountId")
@@ -165,15 +147,6 @@ fn list_accounts(
         .iter()
         .filter(|(account_id, _)| after_account.is_none_or(|after| **account_id > after))
         .filter_map(|(_, history)| history.revisions.last())
-        .filter(|revision| {
-            requested_sources.is_empty()
-                || requested_sources.iter().all(|source| {
-                    revision
-                        .source_coverage
-                        .iter()
-                        .any(|covered| covered.as_str() == source)
-                })
-        })
         .map(account_summary)
         .collect::<Vec<_>>();
     portfolio_page(
@@ -181,10 +154,7 @@ fn list_accounts(
         maximum_items,
         maximum_bytes,
         context,
-        json!({
-            "authority": "immutable_portfolio_publication",
-            "sourceFilters": requested_sources,
-        }),
+        json!({"scope": "portfolio_accounts"}),
     )
 }
 
@@ -195,20 +165,20 @@ fn list_revisions(
     application_limits: PortfolioApplicationLimits,
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
     let scope = ReadScope::from_request(request, application_limits)?;
-    let after_revision = request
+    let after_snapshot = request
         .arguments()
-        .get("afterRevisionId")
+        .get("afterSnapshotToken")
         .and_then(Value::as_str);
     let history = image
         .accounts
         .get(&scope.account_id)
         .ok_or(PortfolioApplicationServiceError::NotFound)?;
-    let mut cursor_seen = after_revision.is_none();
+    let mut cursor_seen = after_snapshot.is_none();
     let mut rows = Vec::new();
     for revision in &history.revisions {
-        let revision_id = hex(&revision.token().bytes());
+        let token = snapshot_token(revision);
         if !cursor_seen {
-            if after_revision == Some(revision_id.as_str()) {
+            if after_snapshot == Some(token.as_str()) {
                 cursor_seen = true;
             }
             continue;
@@ -219,13 +189,6 @@ fn list_revisions(
                     .available_at
                     .is_none_or(|available| available > end)
             })
-            || (!scope.sources.is_empty()
-                && !scope.sources.iter().all(|source| {
-                    revision
-                        .source_coverage
-                        .iter()
-                        .any(|covered| covered.as_str() == source)
-                }))
         {
             continue;
         }
@@ -239,11 +202,7 @@ fn list_revisions(
         scope.maximum_items,
         scope.maximum_bytes,
         context,
-        json!({
-            "authority": "append_only_portfolio_revision_history",
-            "accountId": scope.account_id.to_string(),
-            "sourceFilters": scope.sources,
-        }),
+        json!({"scope": "portfolio_history"}),
     )
 }
 
@@ -251,7 +210,8 @@ fn account_summary(revision: &PublishedRevision) -> Value {
     json!({
         "accountId": revision.account.account_id().to_string(),
         "currency": revision.account.currency().as_str(),
-        "currentRevision": revision_summary(revision),
+        "cashBalance": money_value(revision.account.cash_balance()),
+        "currentSnapshot": revision_summary(revision),
         "holdingCount": revision.holdings.len(),
         "transactionCount": revision.transactions.len(),
         "reconciliationDiscrepancies": revision.discrepancies.len(),
@@ -260,45 +220,16 @@ fn account_summary(revision: &PublishedRevision) -> Value {
 
 fn revision_summary(revision: &PublishedRevision) -> Value {
     json!({
-        "revisionId": hex(&revision.token().bytes()),
+        "snapshotToken": snapshot_token(revision),
         "effectiveAtUnixNanos": revision.effective_at.unix_nanos().to_string(),
         "availableAtUnixNanos": revision
             .available_at
             .map(|value| value.unix_nanos().to_string()),
-        "sourceId": revision.source_id.as_str(),
-        "sourceCoverage": revision
-            .source_coverage
-            .iter()
-            .map(|source| source.as_str())
-            .collect::<Vec<_>>(),
-        "artifactSha256": hex(&revision.artifact_sha256),
         "holdingCount": revision.holdings.len(),
         "transactionCount": revision.transactions.len(),
-        "reconciliationDiscrepancies": revision.discrepancies.len(),
+        "dataIssueCount": revision.discrepancies.len(),
+        "dataState": if revision.discrepancies.is_empty() { "ready" } else { "needs_review" },
     })
-}
-
-fn source_filters(
-    request: &TypedToolRequest,
-) -> Result<BTreeSet<String>, PortfolioApplicationServiceError> {
-    request
-        .arguments()
-        .get("sourceCoverage")
-        .map(|values| {
-            values
-                .as_array()
-                .ok_or(PortfolioApplicationServiceError::InvalidRequest)?
-                .iter()
-                .map(|value| {
-                    value
-                        .as_str()
-                        .map(ToOwned::to_owned)
-                        .ok_or(PortfolioApplicationServiceError::InvalidRequest)
-                })
-                .collect()
-        })
-        .transpose()
-        .map(Option::unwrap_or_default)
 }
 
 fn read_result_limits(
@@ -338,11 +269,7 @@ fn portfolio_page(
     let upper = available
         .min(maximum_items)
         .min(context.limits().maximum_result_items());
-    let quality = json!({
-        "class": "direct_unverified",
-        "executionEligible": false,
-        "rawEvidenceRetained": true,
-    });
+    let quality = json!({"state": "available", "confidence": "limited"});
     let limits = narrowed_limits(context, maximum_items, maximum_bytes)?;
     let mut count = upper;
     loop {
@@ -387,13 +314,7 @@ pub(super) fn select_revision<'image>(
                     && revision
                         .available_at
                         .is_some_and(|available| available <= end)
-            }) && (scope.sources.is_empty()
-                || scope.sources.iter().all(|requested| {
-                    revision
-                        .source_coverage
-                        .iter()
-                        .any(|source| source.as_str() == requested)
-                }))
+            })
         })
         .ok_or(PortfolioApplicationServiceError::NotFound)?;
     if history
@@ -421,20 +342,18 @@ fn holdings(
         .iter()
         .filter(|holding| scope.admits_instrument(holding.instrument_id()))
         .map(|holding| {
-            let mut value = serde_json::to_value(holding)
-                .map_err(|_| PortfolioApplicationServiceError::Publication)?;
-            enrich_row(&mut value, revision)?;
-            let object = value
-                .as_object_mut()
-                .ok_or(PortfolioApplicationServiceError::Publication)?;
-            object.insert(
-                "markEvidence".to_owned(),
-                source_mark_details(
-                    holding.source_reference().as_str(),
-                    holding.as_of().unix_nanos().to_string(),
-                ),
-            );
-            Ok(value)
+            Ok(json!({
+                "accountId": holding.account_id().to_string(),
+                "snapshotToken": snapshot_token(revision),
+                "instrumentId": holding.instrument_id().to_string(),
+                "currency": holding.currency().as_str(),
+                "quantity": holding.quantity().to_string(),
+                "lotSize": holding.lot_size().as_decimal().to_string(),
+                "marketValue": money_value(holding.market_value()),
+                "asOfUnixNanos": holding.as_of().unix_nanos().to_string(),
+                "costBasis": basis_value(holding.basis()),
+                "price": source_mark_details(holding.as_of().unix_nanos().to_string()),
+            }))
         })
         .collect::<Result<Vec<_>, PortfolioApplicationServiceError>>()?;
     bounded_rows(rows, revision, scope, context)
@@ -455,45 +374,20 @@ fn transactions(
                 && scope.admits_time(transaction.occurred_at())
         })
         .map(|transaction| {
-            let mut value = serde_json::to_value(transaction)
-                .map_err(|_| PortfolioApplicationServiceError::Publication)?;
-            enrich_row(&mut value, revision)?;
-            Ok(value)
+            Ok(json!({
+                "transactionToken": transaction_token(transaction),
+                "accountId": transaction.account_id().to_string(),
+                "snapshotToken": snapshot_token(revision),
+                "instrumentId": transaction.instrument_id().map(|value| value.to_string()),
+                "category": transaction_kind(transaction.kind()),
+                "amount": money_value(transaction.amount()),
+                "quantity": transaction.quantity().map(|value| value.to_string()),
+                "occurredAtUnixNanos": transaction.occurred_at().unix_nanos().to_string(),
+                "lotMethod": transaction.lot_method().map(lot_method),
+            }))
         })
         .collect::<Result<Vec<_>, PortfolioApplicationServiceError>>()?;
     bounded_rows(rows, revision, scope, context)
-}
-
-fn enrich_row(
-    value: &mut Value,
-    revision: &PublishedRevision,
-) -> Result<(), PortfolioApplicationServiceError> {
-    let object = value
-        .as_object_mut()
-        .ok_or(PortfolioApplicationServiceError::Publication)?;
-    object.insert(
-        "revisionId".to_owned(),
-        Value::String(hex(&revision.token().bytes())),
-    );
-    object.insert(
-        "effectiveAtUnixNanos".to_owned(),
-        Value::String(revision.effective_at.unix_nanos().to_string()),
-    );
-    object.insert(
-        "availableAtUnixNanos".to_owned(),
-        revision.available_at.map_or(Value::Null, |timestamp| {
-            Value::String(timestamp.unix_nanos().to_string())
-        }),
-    );
-    object.insert(
-        "sourceId".to_owned(),
-        Value::String(revision.source_id.as_str().to_owned()),
-    );
-    object.insert(
-        "artifactSha256".to_owned(),
-        Value::String(hex(&revision.artifact_sha256)),
-    );
-    Ok(())
 }
 
 pub(super) fn bounded_rows(
@@ -546,11 +440,18 @@ pub(super) fn bounded_rows(
 }
 
 pub(super) fn report_result(
-    value: Value,
+    mut value: Value,
     revision: &PublishedRevision,
     scope: &ReadScope,
     context: &RequestContext,
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
+    project_report(&mut value);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "snapshotToken".to_owned(),
+            Value::String(snapshot_token(revision)),
+        );
+    }
     data_result(value, 1, 1, revision, scope, context)
 }
 
@@ -577,12 +478,11 @@ fn data_result(
     scope: &ReadScope,
     context: &RequestContext,
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
-    let coverage = source_coverage(revision);
+    let coverage = json!({"scope": "portfolio"});
     let quality = json!({
-        "class": "direct_unverified",
-        "executionEligible": false,
-        "reconciliationDiscrepancies": revision.discrepancies.len(),
-        "rawEvidenceRetained": true
+        "state": if revision.discrepancies.is_empty() { "available" } else { "needs_review" },
+        "confidence": "limited",
+        "dataIssueCount": revision.discrepancies.len(),
     });
     let metadata = if returned < available {
         ToolResultMetadata::try_truncated(available, coverage, quality)
@@ -593,23 +493,6 @@ fn data_result(
     let limits = narrowed_limits(context, scope.maximum_items, scope.maximum_bytes)?;
     TypedToolResult::try_new(value, returned, metadata, limits)
         .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)
-}
-
-fn source_coverage(revision: &PublishedRevision) -> Value {
-    json!({
-        "accountId": revision.account.account_id().to_string(),
-        "revisionId": hex(&revision.token().bytes()),
-        "sources": revision
-            .source_coverage
-            .iter()
-            .map(|source| source.as_str())
-            .collect::<Vec<_>>(),
-        "effectiveAtUnixNanos": revision.effective_at.unix_nanos().to_string(),
-        "availableAtUnixNanos": revision
-            .available_at
-            .map(|timestamp| timestamp.unix_nanos().to_string()),
-        "artifactSha256": hex(&revision.artifact_sha256)
-    })
 }
 
 fn narrowed_limits(
@@ -667,24 +550,139 @@ fn parse_timestamp(value: &str) -> Result<Timestamp, PortfolioApplicationService
 /// promote it to a live, delayed, stale, modeled, or venue-qualified market mark, and it has no
 /// alternate mark authority to select as a fallback. Keeping those facts adjacent to every value
 /// prevents presentation code from inferring a stronger mark state from the source record alone.
-pub(super) fn source_mark_details(source_reference: &str, observed_at_unix_nanos: String) -> Value {
+pub(super) fn source_mark_details(observed_at_unix_nanos: String) -> Value {
     json!({
-        "sourceReference": source_reference,
-        "observedAtUnixNanos": observed_at_unix_nanos,
-        "venue": Value::Null,
-        "venueStatus": "not_supplied_by_portfolio_source",
-        "state": "source_reported",
-        "quality": "direct_unverified",
-        "executionEligible": false,
-        "freshness": {
-            "status": "not_evaluated_no_market_policy",
-            "reason": "portfolio_import_does_not_authorize_market_freshness"
-        },
-        "fallback": {
-            "status": "not_applicable_no_alternate_mark_authority",
-            "reason": "no_live_delayed_stale_or_modeled_mark_was_selected"
-        }
+        "asOfUnixNanos": observed_at_unix_nanos,
+        "state": "reported",
+        "confidence": "limited",
+        "explanation": "This value came from the imported portfolio and has not been refreshed against the current market.",
     })
+}
+
+pub(super) fn snapshot_token(revision: &PublishedRevision) -> String {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!(
+            "market-squawk/portfolio-snapshot/v1/{}",
+            hex(&revision.token().bytes())
+        )
+        .as_bytes(),
+    )
+    .to_string()
+}
+
+fn transaction_token(
+    transaction: &market_squawk_adapter_portfolio::PortfolioTransaction,
+) -> String {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!(
+            "market-squawk/portfolio-transaction/v1/{}/{}",
+            transaction.account_id(),
+            transaction.broker_transaction_id().as_str()
+        )
+        .as_bytes(),
+    )
+    .to_string()
+}
+
+fn basis_value(basis: &BasisResolution) -> Value {
+    match basis {
+        BasisResolution::Resolved { observation } => json!({
+            "state": "available",
+            "amount": money_value(observation.amount()),
+            "method": lot_method(observation.lot_method()),
+        }),
+        BasisResolution::Missing => json!({"state": "not_available"}),
+        BasisResolution::Ambiguous {
+            candidates,
+            lot_method: method,
+        } => json!({
+            "state": "needs_review",
+            "choices": candidates.iter().copied().map(money_value).collect::<Vec<_>>(),
+            "method": lot_method(*method),
+        }),
+    }
+}
+
+const fn lot_method(method: LotMethod) -> &'static str {
+    match method {
+        LotMethod::Fifo => "First in, first out",
+        LotMethod::Lifo => "Last in, first out",
+        LotMethod::SpecificIdentification => "Specific lots",
+        LotMethod::AverageCost => "Average cost",
+    }
+}
+
+const fn transaction_kind(kind: TransactionKind) -> &'static str {
+    match kind {
+        TransactionKind::Trade => "trade",
+        TransactionKind::CashTransfer => "cash_transfer",
+        TransactionKind::Income => "income",
+        TransactionKind::Fee => "fee",
+        TransactionKind::CorporateAction => "corporate_action",
+    }
+}
+
+fn money_value(value: Money) -> Value {
+    json!({
+        "amount": value.amount().to_string(),
+        "currency": value.currency().as_str(),
+    })
+}
+
+fn project_report(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(project_report),
+        Value::Object(object) => {
+            for forbidden in [
+                "revisionId",
+                "policy",
+                "sourceId",
+                "sourceCoverage",
+                "sourceReference",
+                "source_reference",
+                "artifactSha256",
+                "analyticsEvidenceDigest",
+                "markEvidence",
+                "authority",
+                "reason",
+            ] {
+                object.remove(forbidden);
+            }
+            for child in object.values_mut() {
+                project_report(child);
+            }
+            if object.contains_key("accountId") && object.contains_key("effectiveAtUnixNanos") {
+                object.insert(
+                    "dataConfidence".to_owned(),
+                    Value::String("limited".to_owned()),
+                );
+            }
+        }
+        Value::String(state) => {
+            let product = match state.as_str() {
+                "source_reported_snapshot" => Some("available"),
+                "calculated_from_source_reported_mark_and_resolved_basis" => Some("available"),
+                "not_calculable_incomplete_source_basis"
+                | "requires_committed_trade_lifecycle_interpretation"
+                | "benchmark_not_supplied" => Some("not_available"),
+                "source_classified_pending_explicit_subtype" => Some("partial"),
+                "source_classified" => Some("available"),
+                "no_retained_discrepancies" => Some("clear"),
+                "discrepancies_require_review" => Some("needs_review"),
+                "not_supplied_by_portfolio_source" => Some("not_available"),
+                "task12_exact_exposure_v1" | "task12_historical_risk_v1" | "modified_dietz_v1" => {
+                    None
+                }
+                _ => None,
+            };
+            if let Some(product) = product {
+                *state = product.to_owned();
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -692,19 +690,17 @@ mod tests {
     use super::source_mark_details;
 
     #[test]
-    fn source_reported_mark_never_claims_an_unevidenced_freshness_or_fallback() {
-        let mark = source_mark_details("raw-holding-42", "1700000000000000000".to_owned());
+    fn ordinary_mark_is_plain_and_contains_no_source_authority() {
+        let mark = source_mark_details("1700000000000000000".to_owned());
+        let encoded = serde_json::to_string(&mark).expect("serialize product mark");
 
-        assert_eq!(mark["sourceReference"], "raw-holding-42");
-        assert_eq!(mark["observedAtUnixNanos"], "1700000000000000000");
-        assert_eq!(mark["state"], "source_reported");
-        assert_eq!(
-            mark["freshness"]["status"],
-            "not_evaluated_no_market_policy"
-        );
-        assert_eq!(
-            mark["fallback"]["status"],
-            "not_applicable_no_alternate_mark_authority"
-        );
+        assert_eq!(mark["asOfUnixNanos"], "1700000000000000000");
+        assert_eq!(mark["state"], "reported");
+        assert_eq!(mark["confidence"], "limited");
+        for forbidden in [
+            "source", "provider", "artifact", "revision", "policy", "venue",
+        ] {
+            assert!(!encoded.to_ascii_lowercase().contains(forbidden));
+        }
     }
 }

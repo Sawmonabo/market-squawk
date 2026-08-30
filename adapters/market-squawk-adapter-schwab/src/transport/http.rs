@@ -257,6 +257,16 @@ impl CapturedRestResponse {
         &self.receipt
     }
 
+    /// Borrows the exact bounded response body while its sole owning capture remains intact.
+    ///
+    /// This narrow view lets an application bind the same completed response to its registered
+    /// current-session raw-frame authority before consuming this value into the archival sealer.
+    /// It transfers no response ownership and grants no reconstruction, serialization, or
+    /// response-construction authority.
+    pub fn exact_body(&self) -> &[u8] {
+        &self.body
+    }
+
     /// Same-unit request completion retained even when the body is rejected or cannot be parsed.
     pub const fn accounting(&self) -> RestItemAccounting {
         self.accounting

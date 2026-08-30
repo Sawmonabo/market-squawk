@@ -3,21 +3,13 @@ import { z } from "zod"
 import type { ApplicationResult } from "@/lib/schemas"
 import { losslessIntegerSchema } from "@/lib/lossless-integer"
 
-const digestSchema = z.string().regex(/^[0-9a-f]{64}$/)
 const timestampSchema = losslessIntegerSchema
 const preparationUseSchema = z.enum(["local_analysis", "train"])
 
 const datasetPreparationOptionSchema = z
   .object({
-    id: z.string().min(1).max(256),
-    label: z.string().min(1).max(512),
-    sourceDataset: z.string().min(1).max(256),
-    immutableGeneration: losslessIntegerSchema.refine(
-      (value) => BigInt(value) >= 0n,
-      "Expected a non-negative immutable generation.",
-    ),
-    instrumentId: z.string().uuid(),
-    observedPoints: z.number().int().positive().max(4_096),
+    choiceToken: z.string().uuid(),
+    title: z.string().min(1).max(128),
     examples: z.number().int().min(3).max(2_048),
     observedFrom: timestampSchema,
     observedThrough: timestampSchema,
@@ -27,25 +19,13 @@ const datasetPreparationOptionSchema = z
 
 const datasetPreparationOptionsSchema = z
   .object({
-    catalogGeneration: digestSchema,
-    datasets: z.array(datasetPreparationOptionSchema).max(256),
-  })
-  .strict()
-
-const datasetPreparationReceiptSchema = z
-  .object({
-    receiptId: z.string().uuid(),
-    preparationSha256: digestSchema,
-    expiresAt: timestampSchema,
+    choices: z.array(datasetPreparationOptionSchema).max(256),
   })
   .strict()
 
 const datasetPreparationPreviewSchema = z
   .object({
-    receipt: datasetPreparationReceiptSchema,
-    dataset: z.string().min(1).max(512),
-    source: z.string().min(1).max(512),
-    instrumentId: z.string().uuid(),
+    receiptToken: z.string().uuid(),
     intendedUse: preparationUseSchema,
     examples: z.number().int().min(3).max(2_048),
     trainExamples: z.number().int().positive().max(2_048),
@@ -53,8 +33,7 @@ const datasetPreparationPreviewSchema = z
     testExamples: z.number().int().positive().max(2_048),
     observedFrom: timestampSchema,
     observedThrough: timestampSchema,
-    buildSpecSha256: digestSchema,
-    evidence: z.array(z.string().min(1).max(4_096)).min(1).max(16),
+    expiresAt: timestampSchema,
   })
   .strict()
   .superRefine((preview, context) => {
@@ -81,16 +60,13 @@ export type DatasetPreparationUse = z.infer<typeof preparationUseSchema>
 export type DatasetPreparationOptions = z.infer<
   typeof datasetPreparationOptionsSchema
 >
-export type DatasetPreparationOption = DatasetPreparationOptions["datasets"][number]
-export type DatasetPreparationReceipt = z.infer<
-  typeof datasetPreparationReceiptSchema
->
+export type DatasetPreparationOption = DatasetPreparationOptions["choices"][number]
+export type DatasetPreparationReceipt = string
 export type DatasetPreparationPreview = z.infer<
   typeof datasetPreparationPreviewSchema
 >
 export type DatasetPreparationSelection = {
-  catalogGeneration: string
-  dataset: string
+  choiceToken: string
   intendedUse: DatasetPreparationUse
 }
 

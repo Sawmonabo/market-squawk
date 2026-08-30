@@ -32,7 +32,7 @@ use crate::analytical_controller::DesktopAnalyticalController;
 use crate::contracts::{
     ApplicationInvocation, DesktopBootstrap, DesktopCommandError, DesktopServiceBootstrapCommand,
     DesktopServiceBootstrapRequirement, DesktopServiceBootstrapStatus, DesktopServiceReconnect,
-    DesktopStartup, InstallationControlCommand, OperationSummary, ProviderOnboardingCommand,
+    DesktopStartup, InstallationControlCommand, ProductCapability, ProviderOnboardingCommand,
     Readiness, ReadinessState,
 };
 use crate::events::DesktopEventSubscriptions;
@@ -47,6 +47,9 @@ const MAXIMUM_DESKTOP_RESULT_BYTES: u64 = 1024 * 1024;
 const MAXIMUM_DESKTOP_RESULT_ITEMS: u64 = 1_000;
 const MAXIMUM_SAFE_JAVASCRIPT_INTEGER: i64 = 9_007_199_254_740_991;
 const MAXIMUM_OPERATION_BYTES: usize = 128;
+const MAXIMUM_RESEARCH_COLLECTION_TOKENS: usize = 4_096;
+const MAXIMUM_RESEARCH_PRODUCT_TOKENS: usize = 4_096;
+const MAXIMUM_RESEARCH_PREPARATION_RECEIPTS: usize = 256;
 const APPLICATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const GOVERNANCE_AUTHORIZATION_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const MAXIMUM_GOVERNANCE_AUTHORIZATIONS: usize = 256;
@@ -173,26 +176,10 @@ pub(crate) enum InvocationAuthority {
 #[derive(Clone, Debug)]
 struct ServiceOperation {
     name: String,
-    description: String,
     domain: String,
     authorization: String,
     read_only: bool,
-    destructive: bool,
     input_schema: Value,
-}
-
-impl ServiceOperation {
-    fn into_summary(self) -> OperationSummary {
-        OperationSummary::new(
-            self.name,
-            self.description,
-            self.domain,
-            self.authorization,
-            self.read_only,
-            self.destructive,
-            self.input_schema,
-        )
-    }
 }
 
 #[derive(Debug)]
@@ -297,16 +284,16 @@ impl TryFrom<Value> for ServiceBootstrapSnapshot {
             {
                 return Err(DesktopCommandError::internal());
             }
+            required_string(operation, "/description")?;
+            operation
+                .pointer("/effects/destructive")
+                .and_then(Value::as_bool)
+                .ok_or_else(DesktopCommandError::internal)?;
             parsed_operations.push(ServiceOperation {
                 name,
-                description: required_string(operation, "/description")?.to_owned(),
                 domain: required_string(operation, "/contract/domain")?.to_owned(),
                 authorization,
                 read_only,
-                destructive: operation
-                    .pointer("/effects/destructive")
-                    .and_then(Value::as_bool)
-                    .ok_or_else(DesktopCommandError::internal)?,
                 input_schema: operation
                     .get("inputSchema")
                     .filter(|schema| schema.is_object())
@@ -359,9 +346,139 @@ pub(crate) struct DesktopGeneration {
     data_root: PathBuf,
     cancellation: CancellationToken,
     governance_authorizations: Mutex<HashMap<Uuid, NativeGovernanceAuthorization>>,
+    research_collections: Mutex<ResearchCollectionTokens>,
+    research_preparation_choices: Mutex<StableProductTokens>,
+    research_preparation_receipts: Mutex<OneUseProductTokens>,
+    research_activities: Mutex<StableProductTokens>,
     mcp_clients: Arc<DesktopMcpClientState>,
     analytical_controller: Arc<DesktopAnalyticalController>,
     analytical_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Default)]
+struct ResearchCollectionTokens {
+    by_dataset: HashMap<String, Uuid>,
+    by_token: HashMap<Uuid, String>,
+}
+
+#[derive(Default)]
+struct StableProductTokens {
+    by_key: HashMap<String, Uuid>,
+    by_token: HashMap<Uuid, Value>,
+}
+
+impl StableProductTokens {
+    fn register(
+        &mut self,
+        key: String,
+        authority: Value,
+        capacity_message: &'static str,
+    ) -> Result<Uuid, DesktopCommandError> {
+        if let Some(token) = self.by_key.get(&key).copied() {
+            self.by_token.insert(token, authority);
+            return Ok(token);
+        }
+        if self.by_key.len() >= MAXIMUM_RESEARCH_PRODUCT_TOKENS {
+            return Err(DesktopCommandError::new(
+                "resource_exhausted",
+                capacity_message,
+            ));
+        }
+        self.by_key
+            .try_reserve(1)
+            .map_err(|_error| DesktopCommandError::internal())?;
+        self.by_token
+            .try_reserve(1)
+            .map_err(|_error| DesktopCommandError::internal())?;
+        let token = next_opaque_token(&self.by_token);
+        self.by_key.insert(key, token);
+        self.by_token.insert(token, authority);
+        Ok(token)
+    }
+
+    fn resolve(
+        &self,
+        token: Uuid,
+        missing_message: &'static str,
+    ) -> Result<Value, DesktopCommandError> {
+        self.by_token
+            .get(&token)
+            .cloned()
+            .ok_or_else(|| DesktopCommandError::new("not_found", missing_message))
+    }
+}
+
+#[derive(Default)]
+struct OneUseProductTokens {
+    by_token: HashMap<Uuid, Value>,
+}
+
+impl OneUseProductTokens {
+    fn register(&mut self, authority: Value) -> Result<Uuid, DesktopCommandError> {
+        if self.by_token.len() >= MAXIMUM_RESEARCH_PREPARATION_RECEIPTS {
+            return Err(DesktopCommandError::new(
+                "resource_exhausted",
+                "Too many research preparations are waiting for review. Finish or reopen Research before preparing another.",
+            ));
+        }
+        self.by_token
+            .try_reserve(1)
+            .map_err(|_error| DesktopCommandError::internal())?;
+        let token = next_opaque_token(&self.by_token);
+        self.by_token.insert(token, authority);
+        Ok(token)
+    }
+
+    fn consume(&mut self, token: Uuid) -> Result<Value, DesktopCommandError> {
+        self.by_token.remove(&token).ok_or_else(|| {
+            DesktopCommandError::new(
+                "not_found",
+                "That research preparation is no longer available. Review the preparation again.",
+            )
+        })
+    }
+}
+
+fn next_opaque_token<T>(entries: &HashMap<Uuid, T>) -> Uuid {
+    loop {
+        let candidate = Uuid::new_v4();
+        if !entries.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+}
+
+impl ResearchCollectionTokens {
+    fn register(&mut self, dataset: &str) -> Result<Uuid, DesktopCommandError> {
+        if let Some(token) = self.by_dataset.get(dataset) {
+            return Ok(*token);
+        }
+        if self.by_dataset.len() >= MAXIMUM_RESEARCH_COLLECTION_TOKENS {
+            return Err(DesktopCommandError::new(
+                "resource_exhausted",
+                "Too many research collections are open. Reopen the workspace and narrow the collection list.",
+            ));
+        }
+        self.by_dataset
+            .try_reserve(1)
+            .map_err(|_error| DesktopCommandError::internal())?;
+        self.by_token
+            .try_reserve(1)
+            .map_err(|_error| DesktopCommandError::internal())?;
+        let token = next_opaque_token(&self.by_token);
+        self.by_dataset.insert(dataset.to_owned(), token);
+        self.by_token.insert(token, dataset.to_owned());
+        Ok(token)
+    }
+
+    fn resolve(&self, token: Uuid) -> Result<String, DesktopCommandError> {
+        self.by_token.get(&token).cloned().ok_or_else(|| {
+            DesktopCommandError::new(
+                "not_found",
+                "That research collection is no longer open. Refresh Research and try again.",
+            )
+        })
+    }
 }
 
 struct PreparedDesktopReplacement {
@@ -605,6 +722,10 @@ impl DesktopGeneration {
             data_root,
             cancellation: CancellationToken::new(),
             governance_authorizations: Mutex::new(HashMap::new()),
+            research_collections: Mutex::new(ResearchCollectionTokens::default()),
+            research_preparation_choices: Mutex::new(StableProductTokens::default()),
+            research_preparation_receipts: Mutex::new(OneUseProductTokens::default()),
+            research_activities: Mutex::new(StableProductTokens::default()),
             mcp_clients: Arc::new(mcp_clients),
             analytical_controller: Arc::new(analytical_controller),
             analytical_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -636,6 +757,10 @@ impl DesktopGeneration {
             data_root,
             cancellation: CancellationToken::new(),
             governance_authorizations: Mutex::new(HashMap::new()),
+            research_collections: Mutex::new(ResearchCollectionTokens::default()),
+            research_preparation_choices: Mutex::new(StableProductTokens::default()),
+            research_preparation_receipts: Mutex::new(OneUseProductTokens::default()),
+            research_activities: Mutex::new(StableProductTokens::default()),
             mcp_clients: Arc::clone(&current.mcp_clients),
             analytical_controller: Arc::clone(&current.analytical_controller),
             analytical_gate: Arc::clone(&current.analytical_gate),
@@ -652,6 +777,102 @@ impl DesktopGeneration {
 
     pub(crate) fn cancellation(&self) -> CancellationToken {
         self.cancellation.child_token()
+    }
+
+    pub(crate) fn register_research_collection(
+        &self,
+        dataset: &str,
+    ) -> Result<Uuid, DesktopCommandError> {
+        self.research_collections
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?
+            .register(dataset)
+    }
+
+    pub(crate) fn resolve_research_collection(
+        &self,
+        collection: Uuid,
+    ) -> Result<String, DesktopCommandError> {
+        self.research_collections
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?
+            .resolve(collection)
+    }
+
+    pub(crate) fn register_research_preparation_choice(
+        &self,
+        key: String,
+        authority: Value,
+    ) -> Result<Uuid, DesktopCommandError> {
+        self.research_preparation_choices
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?
+            .register(
+                key,
+                authority,
+                "Too many research choices are open. Reopen Research and narrow the available choices.",
+            )
+    }
+
+    pub(crate) fn resolve_research_preparation_choice(
+        &self,
+        choice: Uuid,
+    ) -> Result<Value, DesktopCommandError> {
+        self.research_preparation_choices
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?
+            .resolve(
+                choice,
+                "That research choice is no longer available. Refresh Research and try again.",
+            )
+    }
+
+    pub(crate) fn register_research_preparation_receipt(
+        &self,
+        authority: Value,
+    ) -> Result<Uuid, DesktopCommandError> {
+        self.research_preparation_receipts
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?
+            .register(authority)
+    }
+
+    pub(crate) fn consume_research_preparation_receipt(
+        &self,
+        receipt: Uuid,
+    ) -> Result<Value, DesktopCommandError> {
+        self.research_preparation_receipts
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?
+            .consume(receipt)
+    }
+
+    pub(crate) fn register_research_activity(
+        &self,
+        key: String,
+        authority: Value,
+    ) -> Result<Uuid, DesktopCommandError> {
+        self.research_activities
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?
+            .register(
+                key,
+                authority,
+                "Too much background activity is open. Reopen Research to refresh the activity list.",
+            )
+    }
+
+    pub(crate) fn resolve_research_activity(
+        &self,
+        activity: Uuid,
+    ) -> Result<Value, DesktopCommandError> {
+        self.research_activities
+            .lock()
+            .map_err(|_error| DesktopCommandError::internal())?
+            .resolve(
+                activity,
+                "That background activity is no longer available. Refresh Research and try again.",
+            )
     }
 
     pub(crate) fn service_operation_index(&self) -> BTreeMap<String, String> {
@@ -683,28 +904,24 @@ impl DesktopGeneration {
         self: &Arc<Self>,
         state: &DesktopState,
     ) -> Result<DesktopBootstrap, DesktopCommandError> {
-        let sessions = self.provider_sessions(state).await?;
-        Ok(self.present_bootstrap(&state.context.installation_status, sessions))
+        Ok(self.present_bootstrap(&state.context.installation_status))
     }
 
     async fn prepare_bootstrap(
         self: &Arc<Self>,
         installation_status: &InstallStatus,
     ) -> Result<DesktopBootstrap, DesktopCommandError> {
-        let sessions = self.provider_sessions_without_current().await?;
-        Ok(self.present_bootstrap(installation_status, sessions))
+        Ok(self.present_bootstrap(installation_status))
     }
 
-    fn present_bootstrap(
-        &self,
-        installation_status: &InstallStatus,
-        sessions: Vec<Value>,
-    ) -> DesktopBootstrap {
-        let capabilities = &self.service_bootstrap.operations;
-        let operations = capabilities
+    fn present_bootstrap(&self, installation_status: &InstallStatus) -> DesktopBootstrap {
+        let capabilities = self
+            .service_bootstrap
+            .operations
             .iter()
-            .cloned()
-            .map(ServiceOperation::into_summary)
+            .filter_map(|operation| ProductCapability::for_operation(&operation.name))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
         let model_runtime = if self.service_bootstrap.model_runtime_configured {
             Readiness::new(
@@ -770,10 +987,7 @@ impl DesktopGeneration {
             installation,
             model_runtime,
             mcp,
-            self.service_bootstrap.encrypted_file_fallback.clone(),
-            self.service_bootstrap.provider_profiles.clone(),
-            Value::Array(sessions),
-            operations,
+            capabilities,
         )
     }
 
@@ -789,20 +1003,6 @@ impl DesktopGeneration {
             state,
             self,
             InvocationAuthority::ReadOnly,
-        )
-        .await?;
-        Self::parse_provider_sessions(result)
-    }
-
-    async fn provider_sessions_without_current(
-        self: &Arc<Self>,
-    ) -> Result<Vec<Value>, DesktopCommandError> {
-        let result = invoke_generation_operation(
-            self,
-            SOURCE_STATUS_OPERATION,
-            Map::new(),
-            InvocationAuthority::ReadOnly,
-            true,
         )
         .await?;
         Self::parse_provider_sessions(result)
@@ -1413,7 +1613,7 @@ async fn invoke_service_operation(
     state: &DesktopState,
     generation: &Arc<DesktopGeneration>,
     operation: &str,
-    mut arguments: Map<String, Value>,
+    arguments: Map<String, Value>,
     authority: InvocationAuthority,
     apply_desktop_result_limits: bool,
 ) -> Result<Value, DesktopCommandError> {
@@ -1772,11 +1972,29 @@ async fn provider_bootstrap(
     generation: &Arc<DesktopGeneration>,
 ) -> Result<Value, DesktopCommandError> {
     let sessions = generation.provider_sessions(state).await?;
+    let supports = |operation: &str| {
+        generation
+            .service_bootstrap
+            .operations
+            .iter()
+            .any(|candidate| candidate.name == operation)
+    };
     state.admit_current(generation)?;
     Ok(json!({
         "profiles": generation.service_bootstrap.provider_profiles,
         "sessions": sessions,
         "encryptedFileFallback": generation.service_bootstrap.encrypted_file_fallback,
+        "capabilities": {
+            "credentialImport": supports("Source.ImportCredentialBundle"),
+            "health": supports("Source.GetHealth"),
+            "manifestEvidence": supports("Research.GetManifest"),
+            "researchIngestion": supports("Source.GetStatus")
+                && supports("Source.ListObjects")
+                && supports("Source.Discover")
+                && supports("Research.StartIngestSource"),
+            "status": supports("Source.GetStatus"),
+            "coverage": supports("Source.GetCoverage"),
+        },
     }))
 }
 

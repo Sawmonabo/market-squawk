@@ -37,8 +37,8 @@ export function GlobalLookup({
         <DialogHeader>
           <DialogTitle>Search Market Squawk</DialogTitle>
           <DialogDescription>
-            Find an investment by ticker, company, FIGI, or supported identifier, or search your
-            local research and workspace records.
+            Find an investment by ticker or company name, or search your saved research and
+            investment workspace.
           </DialogDescription>
         </DialogHeader>
         <LookupSurface transport={transport} scope={scope} autoFocus />

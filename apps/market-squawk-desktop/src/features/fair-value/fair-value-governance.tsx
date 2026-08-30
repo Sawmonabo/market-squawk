@@ -59,9 +59,9 @@ export function FairValueGovernanceWorkflow({
     "level_2",
   )
   const [justification, setJustification] = React.useState("")
-  const [approvalId, setApprovalId] = React.useState("")
+  const [approvalToken, setApprovalToken] = React.useState("")
   const [reason, setReason] = React.useState("")
-  const [marketInputId, setMarketInputId] = React.useState("")
+  const [marketInputToken, setMarketInputToken] = React.useState("")
   const [conclusion, setConclusion] = React.useState<"accessible" | "inaccessible">(
     "accessible",
   )
@@ -73,15 +73,15 @@ export function FairValueGovernanceWorkflow({
 
   const marketInputs = React.useMemo(
     () =>
-      (inputs ?? []).filter(
-        (input) => input.evidence.origin.kind === "live" && input.evidence.origin.venueId,
-      ),
+      (inputs ?? []).filter((input) => input.marketInputToken !== null),
     [inputs],
   )
   const activeApprovals = (approvals ?? []).filter(
     (approval) => approval.status !== "revoked",
   )
-  const selectedMarketInput = marketInputs.find((input) => input.inputId === marketInputId)
+  const selectedMarketInput = marketInputs.find(
+    (input) => input.marketInputToken === marketInputToken,
+  )
   const selectedPrincipal = principals?.find(
     (principal) => principal.principalId === selectedPrincipalId,
   )
@@ -112,7 +112,7 @@ export function FairValueGovernanceWorkflow({
       expiry,
       requestedHierarchy,
       justification,
-      approvalId,
+      approvalToken,
       reason,
       selectedMarketInput,
       conclusion,
@@ -199,21 +199,21 @@ export function FairValueGovernanceWorkflow({
           {kind === "revoke" ? (
             <RevocationFields
               approvals={activeApprovals}
-              approvalId={approvalId}
+              approvalToken={approvalToken}
               reason={reason}
-              onApprovalId={setApprovalId}
+              onApprovalToken={setApprovalToken}
               onReason={setReason}
             />
           ) : null}
           {kind === "market_access" ? (
             <MarketAccessFields
               inputs={marketInputs}
-              selectedInputId={marketInputId}
+              selectedInputToken={marketInputToken}
               conclusion={conclusion}
               effectiveFrom={effectiveFrom}
               effectiveUntil={effectiveUntil}
               rationale={rationale}
-              onInputId={setMarketInputId}
+              onInputToken={setMarketInputToken}
               onConclusion={setConclusion}
               onEffectiveFrom={setEffectiveFrom}
               onEffectiveUntil={setEffectiveUntil}
@@ -231,7 +231,7 @@ export function FairValueGovernanceWorkflow({
                 classification,
                 expiry,
                 justification,
-                approvalId,
+                approvalToken,
                 reason,
                 selectedMarketInput,
                 effectiveFrom,
@@ -401,15 +401,15 @@ function ClassificationProposalFields({
 
 function RevocationFields({
   approvals,
-  approvalId,
+  approvalToken,
   reason,
-  onApprovalId,
+  onApprovalToken,
   onReason,
 }: {
   approvals: FairValueApproval[]
-  approvalId: string
+  approvalToken: string
   reason: string
-  onApprovalId: (value: string) => void
+  onApprovalToken: (value: string) => void
   onReason: (value: string) => void
 }) {
   return (
@@ -417,14 +417,14 @@ function RevocationFields({
       <Field label="Approval to revoke" htmlFor="fair-value-governance-approval">
         <select
           id="fair-value-governance-approval"
-          value={approvalId}
-          onChange={(event) => onApprovalId(event.target.value)}
+          value={approvalToken}
+          onChange={(event) => onApprovalToken(event.target.value)}
           required
           className="h-9 w-full rounded-md border border-input bg-background px-3 font-mono text-[10px] outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <option value="">Select an approval</option>
           {approvals.map((approval) => (
-            <option key={approval.approvalId} value={approval.approvalId}>
+            <option key={approval.approvalToken} value={approval.approvalToken}>
               {approval.approvedBy} · {humanize(approval.status)} · {formatDate(approval.approvedAt)}
             </option>
           ))}
@@ -446,24 +446,24 @@ function RevocationFields({
 
 function MarketAccessFields({
   inputs,
-  selectedInputId,
+  selectedInputToken,
   conclusion,
   effectiveFrom,
   effectiveUntil,
   rationale,
-  onInputId,
+  onInputToken,
   onConclusion,
   onEffectiveFrom,
   onEffectiveUntil,
   onRationale,
 }: {
   inputs: FairValueInput[]
-  selectedInputId: string
+  selectedInputToken: string
   conclusion: "accessible" | "inaccessible"
   effectiveFrom: string
   effectiveUntil: string
   rationale: string
-  onInputId: (value: string) => void
+  onInputToken: (value: string) => void
   onConclusion: (value: "accessible" | "inaccessible") => void
   onEffectiveFrom: (value: string) => void
   onEffectiveUntil: (value: string) => void
@@ -474,15 +474,15 @@ function MarketAccessFields({
       <Field label="Market input" htmlFor="fair-value-governance-market-input">
         <select
           id="fair-value-governance-market-input"
-          value={selectedInputId}
-          onChange={(event) => onInputId(event.target.value)}
+          value={selectedInputToken}
+          onChange={(event) => onInputToken(event.target.value)}
           required
           className="h-9 w-full rounded-md border border-input bg-background px-3 font-mono text-[10px] outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <option value="">Select a current market input</option>
           {inputs.map((input) => (
-            <option key={input.inputId} value={input.inputId}>
-              {input.evidence.origin.venueId} · {humanize(input.significance)}
+            <option key={input.marketInputToken} value={input.marketInputToken ?? ""}>
+              {input.evidence.label} · {humanize(input.significance)}
             </option>
           ))}
         </select>
@@ -646,7 +646,7 @@ function canPreview({
   classification,
   expiry,
   justification,
-  approvalId,
+  approvalToken,
   reason,
   selectedMarketInput,
   effectiveFrom,
@@ -657,7 +657,7 @@ function canPreview({
   classification: FairValueClassification | undefined
   expiry: string
   justification: string
-  approvalId: string
+  approvalToken: string
   reason: string
   selectedMarketInput: FairValueInput | undefined
   effectiveFrom: string
@@ -668,7 +668,7 @@ function canPreview({
   if (kind === "override") {
     return classification !== undefined && validDateTime(expiry) && validText(justification)
   }
-  if (kind === "revoke") return approvalId.length > 0 && validText(reason)
+  if (kind === "revoke") return approvalToken.length > 0 && validText(reason)
   return (
     selectedMarketInput !== undefined &&
     validDateTime(effectiveFrom) &&
@@ -685,7 +685,7 @@ function proposalFor({
   expiry,
   requestedHierarchy,
   justification,
-  approvalId,
+  approvalToken,
   reason,
   selectedMarketInput,
   conclusion,
@@ -699,7 +699,7 @@ function proposalFor({
   expiry: string
   requestedHierarchy: "level_2" | "level_3"
   justification: string
-  approvalId: string
+  approvalToken: string
   reason: string
   selectedMarketInput: FairValueInput | undefined
   conclusion: "accessible" | "inaccessible"
@@ -708,25 +708,30 @@ function proposalFor({
   rationale: string
 }): FairValueGovernanceProposal | null {
   if (kind === "approve" && classification && validDateTime(expiry)) {
-    return { kind, measurementId: measurement.measurementId, decisionId: classification.decisionId, expiresAt: toIso(expiry)! }
+    return {
+      kind,
+      measurementToken: measurement.measurementToken,
+      classificationToken: classification.classificationToken,
+      expiresAt: toIso(expiry)!,
+    }
   }
   if (kind === "override" && classification && validDateTime(expiry) && validText(justification)) {
     return {
       kind,
-      measurementId: measurement.measurementId,
-      decisionId: classification.decisionId,
+      measurementToken: measurement.measurementToken,
+      classificationToken: classification.classificationToken,
       requestedHierarchy,
       justification: justification.trim(),
       expiresAt: toIso(expiry)!,
     }
   }
-  if (kind === "revoke" && approvalId && validText(reason)) {
-    return { kind, approvalId, reason: reason.trim() }
+  if (kind === "revoke" && approvalToken && validText(reason)) {
+    return { kind, approvalToken, reason: reason.trim() }
   }
-  const venueId = selectedMarketInput?.evidence.origin.venueId
+  const selectedMarketInputToken = selectedMarketInput?.marketInputToken
   if (
     kind === "market_access" &&
-    venueId &&
+    selectedMarketInputToken &&
     validDateTime(effectiveFrom) &&
     validDateTime(effectiveUntil) &&
     toIso(effectiveUntil)! > toIso(effectiveFrom)! &&
@@ -734,9 +739,7 @@ function proposalFor({
   ) {
     return {
       kind,
-      accountId: measurement.accountId,
-      venueId,
-      instrumentId: measurement.instrumentId,
+      marketInputToken: selectedMarketInputToken,
       conclusion,
       effectiveFrom: toIso(effectiveFrom)!,
       effectiveUntil: toIso(effectiveUntil)!,

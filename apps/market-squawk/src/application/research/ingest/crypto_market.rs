@@ -1,4 +1,4 @@
-//! Application-owned sealing and immutable publication for selected crypto market venues.
+//! Application-owned sealing and immutable market-event publication for selected venues.
 //!
 //! Coinbase Advanced Trade, Coinbase Exchange Direct, and Kraken Spot enter the common
 //! provider-event spine only after the owning live layer supplies already-qualified canonical
@@ -22,8 +22,8 @@ use market_squawk_adapter_kraken::{
     KrakenSealedPublication,
 };
 use market_squawk_data::{
-    DatasetId, DatasetManifestRef, IngestError, IngestIdentity, IngestPrecommitAuthority,
-    PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
+    DatasetId, DatasetManifestRef, DatasetSchemaRegistry, IngestError, IngestIdentity,
+    IngestPrecommitAuthority, PersistedProviderPublicationEvidence, ProviderMarketEventArrowBatch,
     ProviderMarketEventEffectiveTimeBasis, ProviderMarketEventPointInTimeRequest,
     ProviderMarketEventPointInTimeSelection, ProviderMarketEventPublicationKind,
     ProviderMarketEventSelectionError, RightsError, SourceOperation,
@@ -80,14 +80,6 @@ impl CryptoMarketSurface {
                 ProviderNativeLineageImplementation::CoinbaseExchangeDirectV1
             }
             Self::KrakenSpot => ProviderNativeLineageImplementation::KrakenSpotV1,
-        }
-    }
-
-    const fn persisted_native_implementation(self) -> &'static str {
-        match self {
-            Self::CoinbaseAdvancedTrade => COINBASE_ADVANCED_NATIVE_IMPLEMENTATION,
-            Self::CoinbaseExchangeDirect => COINBASE_DIRECT_NATIVE_IMPLEMENTATION,
-            Self::KrakenSpot => "kraken_spot_v1",
         }
     }
 
@@ -221,21 +213,16 @@ impl CryptoMarketPublicationClosure {
                     )
                     .await?;
                 Ok(CoinbaseMarketApplicationOutcome::Published(
-                    CryptoMarketEventPublicationReceipt {
-                        manifest: committed.manifest().clone(),
-                        restart: CryptoMarketEventRestartSelector {
-                            manifest: committed.manifest().clone(),
-                            publication_digest,
-                            publication_kind: prepared.publication_kind,
-                            surface,
-                            source_id: self.source.source_id().clone(),
-                            expected_event_count: prepared.event_count,
-                        },
-                        surface,
-                        provider_dataset: prepared.provider_dataset,
-                        sealed_receipts: prepared.sealed_receipts,
-                        event_count: prepared.event_count,
-                    },
+                    MarketEventPublicationReceipt::try_new(
+                        committed.manifest().clone(),
+                        publication_digest,
+                        prepared.publication_kind,
+                        surface.native_implementation(),
+                        self.source.source_id().clone(),
+                        prepared.provider_dataset,
+                        prepared.sealed_receipts,
+                        prepared.event_count,
+                    )?,
                 ))
             }
         }
@@ -316,21 +303,16 @@ impl CryptoMarketPublicationClosure {
             )
             .await?;
         Ok(CoinbaseMarketApplicationOutcome::Published(
-            CryptoMarketEventPublicationReceipt {
-                manifest: committed.manifest().clone(),
-                restart: CryptoMarketEventRestartSelector {
-                    manifest: committed.manifest().clone(),
-                    publication_digest,
-                    publication_kind: prepared.publication_kind,
-                    surface: CryptoMarketSurface::CoinbaseAdvancedTrade,
-                    source_id: self.source.source_id().clone(),
-                    expected_event_count: prepared.event_count,
-                },
-                surface: CryptoMarketSurface::CoinbaseAdvancedTrade,
-                provider_dataset: prepared.provider_dataset,
-                sealed_receipts: prepared.sealed_receipts,
-                event_count: prepared.event_count,
-            },
+            MarketEventPublicationReceipt::try_new(
+                committed.manifest().clone(),
+                publication_digest,
+                prepared.publication_kind,
+                CryptoMarketSurface::CoinbaseAdvancedTrade.native_implementation(),
+                self.source.source_id().clone(),
+                prepared.provider_dataset,
+                prepared.sealed_receipts,
+                prepared.event_count,
+            )?,
         ))
     }
 
@@ -434,35 +416,30 @@ impl CryptoMarketPublicationClosure {
             )
             .await?;
         Ok(KrakenMarketApplicationOutcome::Published(
-            CryptoMarketEventPublicationReceipt {
-                manifest: committed.manifest().clone(),
-                restart: CryptoMarketEventRestartSelector {
-                    manifest: committed.manifest().clone(),
-                    publication_digest,
-                    publication_kind: prepared.publication_kind,
-                    surface: CryptoMarketSurface::KrakenSpot,
-                    source_id: self.source.source_id().clone(),
-                    expected_event_count: prepared.event_count,
-                },
-                surface: CryptoMarketSurface::KrakenSpot,
-                provider_dataset: prepared.provider_dataset,
-                sealed_receipts: prepared.sealed_receipts,
-                event_count: prepared.event_count,
-            },
+            MarketEventPublicationReceipt::try_new(
+                committed.manifest().clone(),
+                publication_digest,
+                prepared.publication_kind,
+                CryptoMarketSurface::KrakenSpot.native_implementation(),
+                self.source.source_id().clone(),
+                prepared.provider_dataset,
+                prepared.sealed_receipts,
+                prepared.event_count,
+            )?,
         ))
     }
 
-    /// Binds provider-event point-in-time reads to this exact registered crypto source and one
+    /// Binds provider-event point-in-time reads to this exact registered source and one
     /// canonical analytical dataset. Source ranking remains outside this publication closure.
     pub(super) fn point_in_time_selector(
         &self,
         analytical_dataset: DatasetId,
-    ) -> CryptoMarketPointInTimeSelector {
-        CryptoMarketPointInTimeSelector {
-            research: Arc::clone(&self.research),
+    ) -> MarketEventPointInTimeSelector {
+        MarketEventPointInTimeSelector::new(
+            Arc::clone(&self.research),
             analytical_dataset,
-            source_surface: self.source.source_id().clone(),
-        }
+            self.source.source_id().clone(),
+        )
     }
 
     async fn seal_coinbase_material(
@@ -600,7 +577,7 @@ impl CryptoMarketPublicationClosure {
         &self,
         binding: &SealedProviderPublicationBinding,
         surface: CryptoMarketSurface,
-    ) -> Result<PreparedCryptoPublication, CryptoMarketPublicationError> {
+    ) -> Result<PreparedMarketEventPublication, CryptoMarketPublicationError> {
         let expected_implementation = surface.native_implementation();
         let expected_kind = surface.publication_kind();
         let publication_digest = provider_market_event_publication_digest(binding)?;
@@ -623,9 +600,7 @@ impl CryptoMarketPublicationClosure {
                 }
                 (
                     event.capture_evidence().dataset().clone(),
-                    CryptoMarketSealedReceiptEvidence::EventMicrobatch(
-                        event.sealed_receipt_digest(),
-                    ),
+                    MarketEventSealedReceiptEvidence::Single(event.sealed_receipt_digest()),
                     event.record_count(),
                 )
             }
@@ -653,7 +628,7 @@ impl CryptoMarketPublicationClosure {
                 }
                 (
                     composite.response().capture_evidence().dataset().clone(),
-                    CryptoMarketSealedReceiptEvidence::CompositeResponseEvent {
+                    MarketEventSealedReceiptEvidence::CompositeResponseEvent {
                         response: composite.response().sealed_receipt_digest(),
                         event: composite.event().sealed_receipt_digest(),
                     },
@@ -683,7 +658,7 @@ impl CryptoMarketPublicationClosure {
         {
             return Err(CryptoMarketPublicationError::AuthorityInvalid);
         }
-        Ok(PreparedCryptoPublication {
+        Ok(PreparedMarketEventPublication {
             publication_digest,
             publication_kind: expected_kind,
             provider_dataset,
@@ -776,28 +751,40 @@ impl CryptoMarketPublicationClosure {
     }
 }
 
-/// Source-bound current/PIT capability over immutable Coinbase or Kraken market publications.
+/// Source-bound current/PIT capability over immutable canonical market-event publications.
 ///
 /// The selector deliberately fixes one source surface. A later unified resolver may compare the
 /// independently returned source receipts, but this layer never ranks or blends venues.
 #[derive(Clone)]
-pub(crate) struct CryptoMarketPointInTimeSelector {
+pub(crate) struct MarketEventPointInTimeSelector {
     research: Arc<ResearchService>,
     analytical_dataset: DatasetId,
     source_surface: SourceId,
 }
 
-impl fmt::Debug for CryptoMarketPointInTimeSelector {
+impl fmt::Debug for MarketEventPointInTimeSelector {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("CryptoMarketPointInTimeSelector")
+            .debug_struct("MarketEventPointInTimeSelector")
             .field("analytical_dataset", &self.analytical_dataset)
             .field("source_surface", &self.source_surface)
             .finish_non_exhaustive()
     }
 }
 
-impl CryptoMarketPointInTimeSelector {
+impl MarketEventPointInTimeSelector {
+    pub(crate) fn new(
+        research: Arc<ResearchService>,
+        analytical_dataset: DatasetId,
+        source_surface: SourceId,
+    ) -> Self {
+        Self {
+            research,
+            analytical_dataset,
+            source_surface,
+        }
+    }
+
     pub(crate) const fn analytical_dataset(&self) -> &DatasetId {
         &self.analytical_dataset
     }
@@ -822,7 +809,7 @@ impl CryptoMarketPointInTimeSelector {
         effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
         maximum_candidates: usize,
         cancellation: CancellationToken,
-    ) -> Result<Option<CryptoMarketPointInTimeReceipt>, CryptoMarketPublicationError> {
+    ) -> Result<Option<MarketEventPointInTimeReceipt>, MarketEventReadError> {
         let request = ProviderMarketEventPointInTimeRequest::try_latest(
             self.analytical_dataset.clone(),
             instrument_id,
@@ -841,7 +828,7 @@ impl CryptoMarketPointInTimeSelector {
             .read_provider_market_event_point_in_time(&request, store.as_ref(), cancellation)
             .await?;
         selection
-            .map(|selection| CryptoMarketPointInTimeReceipt::try_new(self, selection))
+            .map(|selection| MarketEventPointInTimeReceipt::try_new(self, selection))
             .transpose()
     }
 
@@ -849,9 +836,9 @@ impl CryptoMarketPointInTimeSelector {
     /// exclusion, tie, evidence, or selection-digest drift after process restart.
     pub(crate) async fn verify_restart(
         &self,
-        original: &CryptoMarketPointInTimeReceipt,
+        original: &MarketEventPointInTimeReceipt,
         cancellation: CancellationToken,
-    ) -> Result<CryptoMarketPointInTimeReceipt, CryptoMarketPublicationError> {
+    ) -> Result<MarketEventPointInTimeReceipt, MarketEventReadError> {
         original.validate_selector(self)?;
         let store = self.research.provider_capture_store();
         let replay = self
@@ -863,27 +850,27 @@ impl CryptoMarketPointInTimeSelector {
                 cancellation,
             )
             .await?;
-        CryptoMarketPointInTimeReceipt::try_new(self, replay)
+        MarketEventPointInTimeReceipt::try_new(self, replay)
     }
 }
 
-/// Bounded internal handoff from one live crypto source into provider-neutral market selection.
+/// Bounded internal handoff from one live source into provider-neutral market selection.
 ///
 /// The current-process receipt is an optimization and diagnostic coordinate only. An empty value
 /// after restart does not override the durable catalog, which remains authoritative through the
 /// source-bound point-in-time selector.
 #[derive(Clone, Debug)]
-pub(crate) struct CryptoMarketDurableRead {
-    point_in_time: CryptoMarketPointInTimeSelector,
-    latest: Arc<Mutex<Option<Arc<CryptoMarketEventPublicationReceipt>>>>,
+pub(crate) struct MarketEventDurableRead {
+    point_in_time: MarketEventPointInTimeSelector,
+    latest: Arc<Mutex<Option<Arc<MarketEventPublicationReceipt>>>>,
 }
 
-impl CryptoMarketDurableRead {
+impl MarketEventDurableRead {
     pub(super) fn channel(
-        point_in_time: CryptoMarketPointInTimeSelector,
-    ) -> (CryptoMarketDurableReadWriter, Self) {
+        point_in_time: MarketEventPointInTimeSelector,
+    ) -> (MarketEventDurableReadWriter, Self) {
         let latest = Arc::new(Mutex::new(None));
-        let writer = CryptoMarketDurableReadWriter {
+        let writer = MarketEventDurableReadWriter {
             analytical_dataset: point_in_time.analytical_dataset.clone(),
             source_surface: point_in_time.source_surface.clone(),
             latest: Arc::clone(&latest),
@@ -897,37 +884,36 @@ impl CryptoMarketDurableRead {
         )
     }
 
-    pub(crate) const fn point_in_time_selector(&self) -> &CryptoMarketPointInTimeSelector {
+    pub(crate) const fn point_in_time_selector(&self) -> &MarketEventPointInTimeSelector {
         &self.point_in_time
     }
 
-    pub(crate) async fn latest_publication(
-        &self,
-    ) -> Option<Arc<CryptoMarketEventPublicationReceipt>> {
+    pub(crate) async fn latest_publication(&self) -> Option<Arc<MarketEventPublicationReceipt>> {
         self.latest.lock().await.clone()
     }
 }
 
 /// Sole writer for the compact latest-publication coordinate retained by one runtime lane.
 #[derive(Clone, Debug)]
-pub(crate) struct CryptoMarketDurableReadWriter {
+pub(crate) struct MarketEventDurableReadWriter {
     analytical_dataset: DatasetId,
     source_surface: SourceId,
-    latest: Arc<Mutex<Option<Arc<CryptoMarketEventPublicationReceipt>>>>,
+    latest: Arc<Mutex<Option<Arc<MarketEventPublicationReceipt>>>>,
 }
 
-impl CryptoMarketDurableReadWriter {
+impl MarketEventDurableReadWriter {
     /// Retains only a monotonic latest immutable generation. Out-of-order completion cannot move
     /// the runtime backward; a conflicting identity at one generation is terminal.
     pub(crate) async fn retain(
         &self,
-        receipt: CryptoMarketEventPublicationReceipt,
-    ) -> Result<bool, CryptoMarketPublicationError> {
+        receipt: MarketEventPublicationReceipt,
+    ) -> Result<bool, MarketEventReadError> {
         if receipt.manifest.dataset_id() != &self.analytical_dataset
+            || !is_canonical_market_event_manifest(&receipt.manifest)
             || receipt.restart.manifest() != &receipt.manifest
             || &receipt.restart.source_id != &self.source_surface
         {
-            return Err(CryptoMarketPublicationError::AuthorityInvalid);
+            return Err(MarketEventReadError::DurableGenerationInvalid);
         }
 
         let candidate_version = receipt.manifest.manifest_version();
@@ -944,7 +930,7 @@ impl CryptoMarketDurableReadWriter {
                 }
                 std::cmp::Ordering::Less => Ok(false),
                 std::cmp::Ordering::Equal if current.as_ref() == &receipt => Ok(false),
-                std::cmp::Ordering::Equal => Err(CryptoMarketPublicationError::DurableReadConflict),
+                std::cmp::Ordering::Equal => Err(MarketEventReadError::DurableReadConflict),
             },
         }
     }
@@ -952,17 +938,17 @@ impl CryptoMarketDurableReadWriter {
 
 /// Exact source-separated PIT selection with enough semantic state for verified restart replay.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CryptoMarketPointInTimeReceipt {
+pub(crate) struct MarketEventPointInTimeReceipt {
     analytical_dataset: DatasetId,
     source_surface: SourceId,
     selection: ProviderMarketEventPointInTimeSelection,
 }
 
-impl CryptoMarketPointInTimeReceipt {
+impl MarketEventPointInTimeReceipt {
     fn try_new(
-        selector: &CryptoMarketPointInTimeSelector,
+        selector: &MarketEventPointInTimeSelector,
         selection: ProviderMarketEventPointInTimeSelection,
-    ) -> Result<Self, CryptoMarketPublicationError> {
+    ) -> Result<Self, MarketEventReadError> {
         if selection.request().dataset() != &selector.analytical_dataset
             || selection.manifest().dataset_id() != &selector.analytical_dataset
             || selection.request().exact_source_surface() != Some(&selector.source_surface)
@@ -971,7 +957,7 @@ impl CryptoMarketPointInTimeReceipt {
                 .iter()
                 .any(|source| source.source_surface() != &selector.source_surface)
         {
-            return Err(CryptoMarketPublicationError::PointInTimeInvalid);
+            return Err(MarketEventReadError::PointInTimeInvalid);
         }
         Ok(Self {
             analytical_dataset: selector.analytical_dataset.clone(),
@@ -994,12 +980,12 @@ impl CryptoMarketPointInTimeReceipt {
 
     fn validate_selector(
         &self,
-        selector: &CryptoMarketPointInTimeSelector,
-    ) -> Result<(), CryptoMarketPublicationError> {
+        selector: &MarketEventPointInTimeSelector,
+    ) -> Result<(), MarketEventReadError> {
         if self.analytical_dataset != selector.analytical_dataset
             || self.source_surface != selector.source_surface
         {
-            return Err(CryptoMarketPublicationError::PointInTimeInvalid);
+            return Err(MarketEventReadError::PointInTimeInvalid);
         }
         Ok(())
     }
@@ -1008,7 +994,7 @@ impl CryptoMarketPointInTimeReceipt {
 /// Coinbase application result after exact physical sealing.
 #[derive(Debug)]
 pub(crate) enum CoinbaseMarketApplicationOutcome {
-    Published(CryptoMarketEventPublicationReceipt),
+    Published(MarketEventPublicationReceipt),
     SealedRaw(CoinbaseSealedRawMarketPublication),
 }
 
@@ -1016,7 +1002,7 @@ pub(crate) enum CoinbaseMarketApplicationOutcome {
 #[derive(Debug)]
 pub(crate) enum KrakenMarketApplicationOutcome {
     /// Exact sealed material and committed live rows were published through the common spine.
-    Published(CryptoMarketEventPublicationReceipt),
+    Published(MarketEventPublicationReceipt),
     /// Market observations retain exact snapshot/delta and native semantics while canonical
     /// qualification remains unavailable.
     CanonicalUnavailable(KrakenSealedRawCanonicalUnavailable),
@@ -1046,20 +1032,20 @@ impl KrakenSealedRawCanonicalUnavailable {
     }
 }
 
-/// Exact immutable raw receipt identities for one crypto publication kind.
+/// Exact immutable raw receipt identities for one canonical market-event publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CryptoMarketSealedReceiptEvidence {
-    EventMicrobatch(EvidenceDigest),
+pub(crate) enum MarketEventSealedReceiptEvidence {
+    Single(EvidenceDigest),
     CompositeResponseEvent {
         response: EvidenceDigest,
         event: EvidenceDigest,
     },
 }
 
-impl CryptoMarketSealedReceiptEvidence {
+impl MarketEventSealedReceiptEvidence {
     fn has_zero_digest(self) -> bool {
         match self {
-            Self::EventMicrobatch(digest) => digest.bytes() == [0; 32],
+            Self::Single(digest) => digest.bytes() == [0; 32],
             Self::CompositeResponseEvent { response, event } => {
                 response.bytes() == [0; 32] || event.bytes() == [0; 32]
             }
@@ -1067,47 +1053,93 @@ impl CryptoMarketSealedReceiptEvidence {
     }
 }
 
-struct PreparedCryptoPublication {
+struct PreparedMarketEventPublication {
     publication_digest: EvidenceDigest,
     publication_kind: ProviderMarketEventPublicationKind,
     provider_dataset: SourceIdentifier,
-    sealed_receipts: CryptoMarketSealedReceiptEvidence,
+    sealed_receipts: MarketEventSealedReceiptEvidence,
     event_count: usize,
 }
 
-/// Successful venue-qualified crypto publication and its exact restart coordinate.
+/// Successful source-qualified market-event publication and its exact restart coordinate.
 ///
 /// This receipt intentionally retains only compact immutable identities. The catalog owns the
 /// cumulative pinned generation graph; a continuously running source must not retain that graph
 /// once publication commits.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CryptoMarketEventPublicationReceipt {
+pub(crate) struct MarketEventPublicationReceipt {
     manifest: DatasetManifestRef,
-    restart: CryptoMarketEventRestartSelector,
-    surface: CryptoMarketSurface,
+    restart: MarketEventRestartSelector,
     provider_dataset: SourceIdentifier,
-    sealed_receipts: CryptoMarketSealedReceiptEvidence,
+    sealed_receipts: MarketEventSealedReceiptEvidence,
     event_count: usize,
 }
 
-impl CryptoMarketEventPublicationReceipt {
+impl MarketEventPublicationReceipt {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "immutable generation, publication, lineage, source, and capture identities stay explicit"
+    )]
+    pub(crate) fn try_new(
+        manifest: DatasetManifestRef,
+        publication_digest: EvidenceDigest,
+        publication_kind: ProviderMarketEventPublicationKind,
+        native_implementation: ProviderNativeLineageImplementation,
+        source_id: SourceId,
+        provider_dataset: SourceIdentifier,
+        sealed_receipts: MarketEventSealedReceiptEvidence,
+        event_count: usize,
+    ) -> Result<Self, MarketEventReadError> {
+        let receipt_shape_matches = matches!(
+            (publication_kind, sealed_receipts),
+            (
+                ProviderMarketEventPublicationKind::CompositeResponseEvent,
+                MarketEventSealedReceiptEvidence::CompositeResponseEvent { .. }
+            ) | (
+                ProviderMarketEventPublicationKind::EventMicrobatch
+                    | ProviderMarketEventPublicationKind::ResponseMarketEvent,
+                MarketEventSealedReceiptEvidence::Single(_)
+            )
+        );
+        if publication_digest.algorithm() != DigestAlgorithm::Sha256
+            || publication_digest.bytes() == [0; 32]
+            || !is_canonical_market_event_manifest(&manifest)
+            || persisted_market_event_implementation(native_implementation).is_none()
+            || sealed_receipts.has_zero_digest()
+            || event_count == 0
+            || !receipt_shape_matches
+        {
+            return Err(MarketEventReadError::DurableGenerationInvalid);
+        }
+        Ok(Self {
+            restart: MarketEventRestartSelector {
+                manifest: manifest.clone(),
+                publication_digest,
+                publication_kind,
+                native_implementation,
+                source_id,
+                expected_event_count: event_count,
+            },
+            manifest,
+            provider_dataset,
+            sealed_receipts,
+            event_count,
+        })
+    }
+
     pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
         &self.manifest
     }
 
-    pub(crate) const fn restart_selector(&self) -> &CryptoMarketEventRestartSelector {
+    pub(crate) const fn restart_selector(&self) -> &MarketEventRestartSelector {
         &self.restart
-    }
-
-    pub(crate) const fn surface(&self) -> CryptoMarketSurface {
-        self.surface
     }
 
     pub(crate) const fn provider_dataset(&self) -> &SourceIdentifier {
         &self.provider_dataset
     }
 
-    pub(crate) const fn sealed_receipts(&self) -> CryptoMarketSealedReceiptEvidence {
+    pub(crate) const fn sealed_receipts(&self) -> MarketEventSealedReceiptEvidence {
         self.sealed_receipts
     }
 
@@ -1116,18 +1148,24 @@ impl CryptoMarketEventPublicationReceipt {
     }
 }
 
-/// Exact manifest/digest/kind selector for one venue-qualified crypto publication.
+fn is_canonical_market_event_manifest(manifest: &DatasetManifestRef) -> bool {
+    DatasetSchemaRegistry::local()
+        .canonical_market_events()
+        .is_ok_and(|registered| manifest.schema() == &registered)
+}
+
+/// Exact manifest/digest/kind/lineage selector for one source-qualified market publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CryptoMarketEventRestartSelector {
+pub(crate) struct MarketEventRestartSelector {
     manifest: DatasetManifestRef,
     publication_digest: EvidenceDigest,
     publication_kind: ProviderMarketEventPublicationKind,
-    surface: CryptoMarketSurface,
+    native_implementation: ProviderNativeLineageImplementation,
     source_id: SourceId,
     expected_event_count: usize,
 }
 
-impl CryptoMarketEventRestartSelector {
+impl MarketEventRestartSelector {
     pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
         &self.manifest
     }
@@ -1140,8 +1178,8 @@ impl CryptoMarketEventRestartSelector {
         self.publication_kind
     }
 
-    pub(crate) const fn surface(&self) -> CryptoMarketSurface {
-        self.surface
+    pub(crate) const fn source_id(&self) -> &SourceId {
+        &self.source_id
     }
 
     /// Reopens the exact raw/native evidence and Parquet events after process restart. It never
@@ -1150,7 +1188,7 @@ impl CryptoMarketEventRestartSelector {
         &self,
         research: &ResearchService,
         cancellation: CancellationToken,
-    ) -> Result<CryptoMarketEventRestartReceipt, CryptoMarketPublicationError> {
+    ) -> Result<MarketEventRestartReceipt, MarketEventReadError> {
         let selector = research
             .analytical()
             .provider_market_event_publications(&self.manifest)?
@@ -1159,7 +1197,7 @@ impl CryptoMarketEventRestartSelector {
                 selector.publication_digest() == self.publication_digest
                     && selector.publication_kind() == self.publication_kind
             })
-            .ok_or(CryptoMarketPublicationError::RestartInvalid)?;
+            .ok_or(MarketEventReadError::RestartInvalid)?;
         let store = research.provider_capture_store();
         let evidence = research
             .analytical()
@@ -1178,20 +1216,20 @@ impl CryptoMarketEventRestartSelector {
             || events.publication_kind() != self.publication_kind.as_str()
             || events.events().len() != self.expected_event_count
         {
-            return Err(CryptoMarketPublicationError::RestartInvalid);
+            return Err(MarketEventReadError::RestartInvalid);
         }
-        Ok(CryptoMarketEventRestartReceipt { evidence, events })
+        Ok(MarketEventRestartReceipt { evidence, events })
     }
 }
 
 /// Restart-verified raw/native catalog evidence and typed canonical events.
 #[derive(Debug)]
-pub(crate) struct CryptoMarketEventRestartReceipt {
+pub(crate) struct MarketEventRestartReceipt {
     evidence: PersistedProviderPublicationEvidence,
     events: ProviderMarketEventArrowBatch,
 }
 
-impl CryptoMarketEventRestartReceipt {
+impl MarketEventRestartReceipt {
     pub(crate) const fn evidence(&self) -> &PersistedProviderPublicationEvidence {
         &self.evidence
     }
@@ -1202,22 +1240,20 @@ impl CryptoMarketEventRestartReceipt {
 }
 
 fn validate_restart_evidence(
-    expected: &CryptoMarketEventRestartSelector,
+    expected: &MarketEventRestartSelector,
     evidence: &PersistedProviderPublicationEvidence,
-) -> Result<(), CryptoMarketPublicationError> {
+) -> Result<(), MarketEventReadError> {
     if evidence.publication_digest() != expected.publication_digest
         || evidence.publication_kind() != expected.publication_kind.as_str()
     {
-        return Err(CryptoMarketPublicationError::RestartInvalid);
+        return Err(MarketEventReadError::RestartInvalid);
     }
-    let expected_implementation = expected.surface.persisted_native_implementation();
-    let (source_id, event_count, native_matches) = match (expected.surface, evidence) {
+    let expected_implementation =
+        persisted_market_event_implementation(expected.native_implementation)
+            .ok_or(MarketEventReadError::RestartInvalid)?;
+    let (source_id, event_count, native_matches) = match (expected.publication_kind, evidence) {
         (
-            CryptoMarketSurface::CoinbaseAdvancedTrade,
-            PersistedProviderPublicationEvidence::EventMicrobatch(event),
-        )
-        | (
-            CryptoMarketSurface::KrakenSpot,
+            ProviderMarketEventPublicationKind::EventMicrobatch,
             PersistedProviderPublicationEvidence::EventMicrobatch(event),
         ) => (
             event.capture().source_id(),
@@ -1225,7 +1261,15 @@ fn validate_restart_evidence(
             event.native_lineage().implementation() == expected_implementation,
         ),
         (
-            CryptoMarketSurface::CoinbaseExchangeDirect,
+            ProviderMarketEventPublicationKind::ResponseMarketEvent,
+            PersistedProviderPublicationEvidence::ResponseMarketEvent(response),
+        ) => (
+            response.capture().source_id(),
+            response.canonical_event_count(),
+            response.native_lineage().implementation() == expected_implementation,
+        ),
+        (
+            ProviderMarketEventPublicationKind::CompositeResponseEvent,
             PersistedProviderPublicationEvidence::CompositeResponseEvent {
                 response, event, ..
             },
@@ -1234,26 +1278,65 @@ fn validate_restart_evidence(
             response
                 .canonical_event_count()
                 .checked_add(event.canonical_event_count())
-                .ok_or(CryptoMarketPublicationError::RestartInvalid)?,
+                .ok_or(MarketEventReadError::RestartInvalid)?,
             response.native_lineage().implementation() == expected_implementation
                 && event.native_lineage().implementation() == expected_implementation
                 && response.capture().source_id() == event.capture().source_id()
                 && response.capture().metadata_revision() == event.capture().metadata_revision()
                 && response.capture().dataset() == event.capture().dataset(),
         ),
-        _ => return Err(CryptoMarketPublicationError::RestartInvalid),
+        _ => return Err(MarketEventReadError::RestartInvalid),
     };
     if source_id != &expected.source_id
         || event_count != expected.expected_event_count
         || !native_matches
     {
-        return Err(CryptoMarketPublicationError::RestartInvalid);
+        return Err(MarketEventReadError::RestartInvalid);
     }
     Ok(())
 }
 
+const fn persisted_market_event_implementation(
+    implementation: ProviderNativeLineageImplementation,
+) -> Option<&'static str> {
+    match implementation {
+        ProviderNativeLineageImplementation::CoinbaseAdvancedTradeV1 => {
+            Some(COINBASE_ADVANCED_NATIVE_IMPLEMENTATION)
+        }
+        ProviderNativeLineageImplementation::CoinbaseExchangeDirectV1 => {
+            Some(COINBASE_DIRECT_NATIVE_IMPLEMENTATION)
+        }
+        ProviderNativeLineageImplementation::KrakenSpotV1 => Some("kraken_spot_v1"),
+        ProviderNativeLineageImplementation::SchwabRestMarketDataV1 => {
+            Some("schwab_rest_market_data_v1")
+        }
+        ProviderNativeLineageImplementation::SchwabStreamerMarketDataV1 => {
+            Some("schwab_streamer_market_data_v1")
+        }
+        ProviderNativeLineageImplementation::YahooEnrichmentV1 => Some("yahoo_enrichment_v1"),
+        _ => None,
+    }
+}
+
 fn timestamp_to_utc(timestamp: Timestamp) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp_nanos(timestamp.unix_nanos())
+}
+
+/// Closed provider-neutral durable market-event read failure.
+#[derive(Debug, Error)]
+pub(crate) enum MarketEventReadError {
+    #[error("the durable market-event generation escaped its exact dataset or source surface")]
+    DurableGenerationInvalid,
+    #[error("the exact market-event generation failed restart verification")]
+    RestartInvalid,
+    #[error("the market-event point-in-time selection escaped its exact dataset or source surface")]
+    PointInTimeInvalid,
+    #[error("one market-event generation has conflicting durable publication identities")]
+    DurableReadConflict,
+    #[error(transparent)]
+    Ingest(#[from] IngestError),
+    #[error(transparent)]
+    PointInTime(#[from] ProviderMarketEventSelectionError),
 }
 
 /// Closed application crypto sealing/publication failure.
@@ -1263,14 +1346,8 @@ pub(crate) enum CryptoMarketPublicationError {
     AuthorityInvalid,
     #[error("sealed crypto evidence does not match the selected source or venue surface")]
     FamilyMismatch,
-    #[error("the exact crypto immutable generation failed restart verification")]
-    RestartInvalid,
-    #[error("the crypto point-in-time selection escaped its exact dataset or source surface")]
-    PointInTimeInvalid,
     #[error("the bounded crypto publication rendezvous rejected or expired exact material")]
     RendezvousUnavailable,
-    #[error("one crypto generation has conflicting durable publication identities")]
-    DurableReadConflict,
     #[error(transparent)]
     Coinbase(#[from] CoinbaseMarketPublicationError),
     #[error(transparent)]
@@ -1280,8 +1357,6 @@ pub(crate) enum CryptoMarketPublicationError {
     #[error(transparent)]
     Ingest(#[from] IngestError),
     #[error(transparent)]
-    PointInTime(#[from] ProviderMarketEventSelectionError),
-    #[error(transparent)]
     Capture(#[from] ProviderCaptureError),
     #[error(transparent)]
     RawCapture(#[from] RawCaptureRecordError),
@@ -1289,6 +1364,8 @@ pub(crate) enum CryptoMarketPublicationError {
     Rights(#[from] RightsError),
     #[error(transparent)]
     Service(#[from] ServiceError),
+    #[error(transparent)]
+    MarketEventRead(#[from] MarketEventReadError),
 }
 
 #[cfg(test)]
@@ -1302,7 +1379,7 @@ mod tests {
         let dataset = DatasetId::try_from("market_squawk.market_events").expect("valid dataset");
         let source = SourceId::try_from("crypto-test-source").expect("valid source");
         let latest = Arc::new(Mutex::new(None));
-        let writer = CryptoMarketDurableReadWriter {
+        let writer = MarketEventDurableReadWriter {
             analytical_dataset: dataset.clone(),
             source_surface: source.clone(),
             latest: Arc::clone(&latest),
@@ -1332,7 +1409,7 @@ mod tests {
         );
         assert!(matches!(
             writer.retain(receipt(dataset, source, 2, 3)).await,
-            Err(CryptoMarketPublicationError::DurableReadConflict)
+            Err(MarketEventReadError::DurableReadConflict)
         ));
     }
 
@@ -1341,32 +1418,27 @@ mod tests {
         source_id: SourceId,
         manifest_version: u64,
         marker: u8,
-    ) -> CryptoMarketEventPublicationReceipt {
+    ) -> MarketEventPublicationReceipt {
         let manifest = DatasetManifestRef::try_new_with_schema(
             dataset,
             manifest_version,
             DatasetSchemaRegistry::local()
-                .canonical_research_observations()
+                .canonical_market_events()
                 .expect("canonical schema"),
             Sha256Digest::new([marker; 32]),
         )
         .expect("valid manifest");
         let publication_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, [marker; 32]);
-        CryptoMarketEventPublicationReceipt {
-            manifest: manifest.clone(),
-            restart: CryptoMarketEventRestartSelector {
-                manifest,
-                publication_digest,
-                publication_kind: ProviderMarketEventPublicationKind::EventMicrobatch,
-                surface: CryptoMarketSurface::KrakenSpot,
-                source_id,
-                expected_event_count: 1,
-            },
-            surface: CryptoMarketSurface::KrakenSpot,
-            provider_dataset: SourceIdentifier::try_from("crypto-test-events")
-                .expect("valid provider dataset"),
-            sealed_receipts: CryptoMarketSealedReceiptEvidence::EventMicrobatch(publication_digest),
-            event_count: 1,
-        }
+        MarketEventPublicationReceipt::try_new(
+            manifest,
+            publication_digest,
+            ProviderMarketEventPublicationKind::EventMicrobatch,
+            ProviderNativeLineageImplementation::KrakenSpotV1,
+            source_id,
+            SourceIdentifier::try_from("crypto-test-events").expect("valid provider dataset"),
+            MarketEventSealedReceiptEvidence::Single(publication_digest),
+            1,
+        )
+        .expect("valid durable generation")
     }
 }

@@ -1,16 +1,18 @@
 //! Authority-derived forecast preparation and one-use job-admission receipts.
 
 use std::{
+    cmp::Ordering,
     collections::BTreeMap,
     fmt,
+    mem::size_of,
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
-use market_squawk_data::{DatasetManifestRef, Sha256Digest};
-use market_squawk_domain::{DataQuality, InstrumentId, ModelId, Timestamp};
+use market_squawk_data::{DatasetManifestRef, ForecastDatasetEvidenceFence, Sha256Digest};
+use market_squawk_domain::{DataQuality, InstrumentId, ModelId, SourceId, Timestamp};
 use market_squawk_modeling::{
     BundleId, ForecastHorizon, ForecastObservedPoint, ForecastRequest, ModelFeatureValue,
     ModelFormat, ModelInput, ModelMetadata, ModelOutputSemantics, TrainingDatasetIdentity,
@@ -34,6 +36,8 @@ const MAXIMUM_RETAINED_REQUEST_BYTES: usize = 256 * 1024 * 1024;
 const MAXIMUM_SINGLE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const MAXIMUM_FORECAST_VALIDITY_NANOS: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
 const RECEIPT_ID_ATTEMPTS: usize = 16;
+const MAXIMUM_EVIDENCE_PAIRS: usize = 4_096;
+const MAXIMUM_EVIDENCE_CATALOG_BYTES: usize = 256 * 1024 * 1024;
 
 /// Resource ceilings for one process-owned forecast preparation authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,6 +115,32 @@ pub(crate) struct ForecastInstrumentAvailability {
 }
 
 impl ForecastInstrumentAvailability {
+    /// Constructs a bounded, ordered point-in-time instrument summary.
+    pub(crate) fn try_new(
+        instrument_id: InstrumentId,
+        observed_from: Timestamp,
+        observed_through: Timestamp,
+        available_at: Timestamp,
+        observed_points: NonZeroUsize,
+        decimal_scale: u8,
+    ) -> Result<Self, ForecastEvidenceReadError> {
+        if observed_from > observed_through
+            || available_at < observed_through
+            || observed_points.get() > market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS
+            || decimal_scale > market_squawk_modeling::MAX_FORECAST_DECIMAL_SCALE
+        {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        Ok(Self {
+            instrument_id,
+            observed_from,
+            observed_through,
+            available_at,
+            observed_points,
+            decimal_scale,
+        })
+    }
+
     pub(crate) const fn instrument_id(&self) -> InstrumentId {
         self.instrument_id
     }
@@ -146,6 +176,28 @@ pub(crate) struct ForecastEvidencePolicy {
 }
 
 impl ForecastEvidencePolicy {
+    /// Constructs a policy no broader than the installed forecast contract.
+    pub(crate) fn try_new(
+        maximum_horizon_points: NonZeroU16,
+        horizon_step_nanos: NonZeroU64,
+        maximum_validity_nanos: NonZeroU64,
+        minimum_observed_points: NonZeroUsize,
+    ) -> Result<Self, ForecastEvidenceReadError> {
+        ForecastHorizon::try_new(maximum_horizon_points, horizon_step_nanos)
+            .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?;
+        if maximum_validity_nanos.get() > MAXIMUM_FORECAST_VALIDITY_NANOS
+            || minimum_observed_points.get() > market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS
+        {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        Ok(Self {
+            maximum_horizon_points,
+            horizon_step_nanos,
+            maximum_validity_nanos,
+            minimum_observed_points,
+        })
+    }
+
     fn admits(self, selection: &ForecastPreparationSelection) -> bool {
         selection.horizon.points().get() <= self.maximum_horizon_points.get()
             && selection.horizon.step_nanos() == self.horizon_step_nanos
@@ -169,18 +221,189 @@ impl ForecastEvidencePolicy {
     }
 }
 
+/// Sealed proof that one separately admitted AnalysisV1 selection is the inference counterpart
+/// of the model's immutable TrainingV1 selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ForecastDatasetPairingReceipt {
+    training: TrainingDatasetIdentity,
+    analysis: TrainingDatasetIdentity,
+    training_fence: ForecastDatasetEvidenceFence,
+    analysis_fence: ForecastDatasetEvidenceFence,
+    training_production_identity: Sha256Digest,
+    training_production_receipt_sha256: Sha256Digest,
+    analysis_production_identity: Sha256Digest,
+    analysis_production_receipt_sha256: Sha256Digest,
+    fixed_horizon_nanos: NonZeroU64,
+    shared_compatibility_sha256: Sha256Digest,
+    pairing_sha256: Sha256Digest,
+}
+
+impl ForecastDatasetPairingReceipt {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each independent training, analysis, production, and compatibility fence remains explicit"
+    )]
+    pub(crate) fn try_new(
+        training: TrainingDatasetIdentity,
+        analysis: TrainingDatasetIdentity,
+        training_fence: ForecastDatasetEvidenceFence,
+        analysis_fence: ForecastDatasetEvidenceFence,
+        training_production_identity: Sha256Digest,
+        training_production_receipt_sha256: Sha256Digest,
+        analysis_production_identity: Sha256Digest,
+        analysis_production_receipt_sha256: Sha256Digest,
+        fixed_horizon_nanos: NonZeroU64,
+        shared_compatibility_sha256: Sha256Digest,
+    ) -> Result<Self, ForecastEvidenceReadError> {
+        if training.manifest() != training_fence.manifest()
+            || training.catalog_identity() != training_fence.catalog_identity()
+            || training.export_digest() != training_fence.export_sha256()
+            || training.selection_digest() != training_fence.selection_sha256()
+            || training.selection_as_of() != training_fence.as_of()
+            || training.selected_component_rows() != training_fence.selected_rows()
+            || analysis.manifest() != analysis_fence.manifest()
+            || analysis.catalog_identity() != analysis_fence.catalog_identity()
+            || analysis.export_digest() != analysis_fence.export_sha256()
+            || analysis.selection_digest() != analysis_fence.selection_sha256()
+            || analysis.selection_as_of() != analysis_fence.as_of()
+            || analysis.selected_component_rows() != analysis_fence.selected_rows()
+            || analysis.manifest() == training.manifest()
+            || analysis.build_spec_digest() == training.build_spec_digest()
+            || analysis.universe_digest() != training.universe_digest()
+            || analysis.policy_digest() != training.policy_digest()
+            || analysis.selection_as_of() != training.selection_as_of()
+            || analysis.selected_component_rows() != training.selected_component_rows()
+            || analysis_production_identity == training_production_identity
+            || analysis_production_receipt_sha256 == training_production_receipt_sha256
+            || [
+                training_production_identity,
+                training_production_receipt_sha256,
+                analysis_production_identity,
+                analysis_production_receipt_sha256,
+                shared_compatibility_sha256,
+            ]
+            .iter()
+            .any(|digest| digest.bytes() == [0; 32])
+        {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        let pairing_sha256 = pairing_digest(
+            &training,
+            &analysis,
+            &training_fence,
+            &analysis_fence,
+            training_production_identity,
+            training_production_receipt_sha256,
+            analysis_production_identity,
+            analysis_production_receipt_sha256,
+            fixed_horizon_nanos,
+            shared_compatibility_sha256,
+        )?;
+        Ok(Self {
+            training,
+            analysis,
+            training_fence,
+            analysis_fence,
+            training_production_identity,
+            training_production_receipt_sha256,
+            analysis_production_identity,
+            analysis_production_receipt_sha256,
+            fixed_horizon_nanos,
+            shared_compatibility_sha256,
+            pairing_sha256,
+        })
+    }
+
+    pub(crate) const fn training(&self) -> &TrainingDatasetIdentity {
+        &self.training
+    }
+
+    pub(crate) const fn analysis(&self) -> &TrainingDatasetIdentity {
+        &self.analysis
+    }
+
+    pub(crate) const fn analysis_fence(&self) -> &ForecastDatasetEvidenceFence {
+        &self.analysis_fence
+    }
+
+    pub(crate) const fn training_fence(&self) -> &ForecastDatasetEvidenceFence {
+        &self.training_fence
+    }
+
+    pub(crate) const fn training_production_identity(&self) -> Sha256Digest {
+        self.training_production_identity
+    }
+
+    pub(crate) const fn training_production_receipt_sha256(&self) -> Sha256Digest {
+        self.training_production_receipt_sha256
+    }
+
+    pub(crate) const fn analysis_production_identity(&self) -> Sha256Digest {
+        self.analysis_production_identity
+    }
+
+    pub(crate) const fn analysis_production_receipt_sha256(&self) -> Sha256Digest {
+        self.analysis_production_receipt_sha256
+    }
+
+    pub(crate) const fn fixed_horizon_nanos(&self) -> NonZeroU64 {
+        self.fixed_horizon_nanos
+    }
+
+    pub(crate) const fn pairing_sha256(&self) -> Sha256Digest {
+        self.pairing_sha256
+    }
+}
+
 /// One exact admitted feature dataset and its data-owner-derived availability.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ForecastEvidenceDataset {
     model_id: ModelId,
     bundle_id: BundleId,
     bundle_version: NonZeroU64,
-    dataset: TrainingDatasetIdentity,
-    instruments: Box<[ForecastInstrumentAvailability]>,
-    policies: Box<[ForecastEvidencePolicy]>,
+    pairing: ForecastDatasetPairingReceipt,
+    instruments: Vec<ForecastInstrumentAvailability>,
+    policies: Vec<ForecastEvidencePolicy>,
 }
 
 impl ForecastEvidenceDataset {
+    /// Constructs one canonical nonempty compatibility record.
+    pub(crate) fn try_new(
+        model_id: ModelId,
+        bundle_id: BundleId,
+        bundle_version: NonZeroU64,
+        pairing: ForecastDatasetPairingReceipt,
+        mut instruments: Vec<ForecastInstrumentAvailability>,
+        mut policies: Vec<ForecastEvidencePolicy>,
+    ) -> Result<Self, ForecastEvidenceReadError> {
+        instruments.sort_unstable_by_key(ForecastInstrumentAvailability::instrument_id);
+        policies.sort_unstable_by_key(|policy| {
+            (
+                policy.horizon_step_nanos.get(),
+                policy.maximum_horizon_points.get(),
+                policy.maximum_validity_nanos.get(),
+                policy.minimum_observed_points.get(),
+            )
+        });
+        if instruments.is_empty()
+            || policies.is_empty()
+            || instruments
+                .windows(2)
+                .any(|pair| pair[0].instrument_id == pair[1].instrument_id)
+            || policies.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        Ok(Self {
+            model_id,
+            bundle_id,
+            bundle_version,
+            pairing,
+            instruments,
+            policies,
+        })
+    }
+
     pub(crate) const fn model_id(&self) -> ModelId {
         self.model_id
     }
@@ -193,8 +416,16 @@ impl ForecastEvidenceDataset {
         self.bundle_version
     }
 
+    pub(crate) const fn pairing(&self) -> &ForecastDatasetPairingReceipt {
+        &self.pairing
+    }
+
     pub(crate) const fn dataset(&self) -> &TrainingDatasetIdentity {
-        &self.dataset
+        self.pairing.training()
+    }
+
+    pub(crate) const fn analysis_manifest(&self) -> &DatasetManifestRef {
+        self.pairing.analysis_fence().manifest()
     }
 
     pub(crate) fn instruments(&self) -> &[ForecastInstrumentAvailability] {
@@ -204,35 +435,138 @@ impl ForecastEvidenceDataset {
     pub(crate) fn policies(&self) -> &[ForecastEvidencePolicy] {
         &self.policies
     }
+
+    pub(crate) fn retained_dynamic_bytes(&self) -> Result<usize, ForecastEvidenceReadError> {
+        evidence_dataset_dynamic_bytes(self)
+    }
 }
 
 /// Data-owner result for one coherent compatible-dataset catalog read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ForecastEvidenceCatalogSnapshot {
     authority_generation_sha256: Sha256Digest,
-    datasets: Box<[ForecastEvidenceDataset]>,
+    datasets: Vec<ForecastEvidenceDataset>,
 }
 
 impl ForecastEvidenceCatalogSnapshot {
     /// Constructs a catalog snapshot bound to a nonzero data-owner generation.
     pub(crate) fn try_new(
         authority_generation_sha256: Sha256Digest,
-        datasets: Vec<ForecastEvidenceDataset>,
+        mut datasets: Vec<ForecastEvidenceDataset>,
     ) -> Result<Self, ForecastEvidenceReadError> {
-        // A nonempty serving catalog needs a sealed AnalysisV1 identity and an explicit pairing
-        // receipt to the model's separate TrainingV1 provenance. Neither exists yet.
-        if authority_generation_sha256.bytes() == [0; 32] || !datasets.is_empty() {
+        if authority_generation_sha256.bytes() == [0; 32] || datasets.len() > MAXIMUM_EVIDENCE_PAIRS
+        {
             return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        datasets.sort_unstable_by(compare_evidence_datasets);
+        if datasets
+            .windows(2)
+            .any(|pair| same_evidence_coordinate(&pair[0], &pair[1]))
+        {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        let retained_bytes = datasets
+            .capacity()
+            .checked_mul(size_of::<ForecastEvidenceDataset>())
+            .ok_or(ForecastEvidenceReadError::Capacity)?;
+        let retained_bytes = datasets.iter().try_fold(retained_bytes, |total, dataset| {
+            total
+                .checked_add(dataset.retained_dynamic_bytes()?)
+                .ok_or(ForecastEvidenceReadError::Capacity)
+        })?;
+        if retained_bytes > MAXIMUM_EVIDENCE_CATALOG_BYTES {
+            return Err(ForecastEvidenceReadError::Capacity);
         }
         Ok(Self {
             authority_generation_sha256,
-            datasets: datasets.into_boxed_slice(),
+            datasets,
         })
     }
 
     pub(crate) fn datasets(&self) -> &[ForecastEvidenceDataset] {
         &self.datasets
     }
+}
+
+fn compare_evidence_datasets(
+    left: &ForecastEvidenceDataset,
+    right: &ForecastEvidenceDataset,
+) -> Ordering {
+    left.model_id
+        .cmp(&right.model_id)
+        .then_with(|| left.bundle_id.as_str().cmp(right.bundle_id.as_str()))
+        .then_with(|| left.bundle_version.cmp(&right.bundle_version))
+        .then_with(|| compare_manifest(left.dataset().manifest(), right.dataset().manifest()))
+        .then_with(|| compare_manifest(left.analysis_manifest(), right.analysis_manifest()))
+}
+
+fn same_evidence_coordinate(
+    left: &ForecastEvidenceDataset,
+    right: &ForecastEvidenceDataset,
+) -> bool {
+    left.model_id == right.model_id
+        && left.bundle_id == right.bundle_id
+        && left.bundle_version == right.bundle_version
+        && left.dataset().manifest() == right.dataset().manifest()
+        && left.analysis_manifest() == right.analysis_manifest()
+}
+
+fn compare_manifest(left: &DatasetManifestRef, right: &DatasetManifestRef) -> Ordering {
+    left.dataset_id()
+        .as_str()
+        .cmp(right.dataset_id().as_str())
+        .then_with(|| left.manifest_version().cmp(&right.manifest_version()))
+        .then_with(|| left.schema().name().cmp(right.schema().name()))
+        .then_with(|| left.schema_version().cmp(&right.schema_version()))
+        .then_with(|| {
+            left.schema()
+                .fingerprint()
+                .cmp(&right.schema().fingerprint())
+        })
+        .then_with(|| {
+            left.content_hash()
+                .bytes()
+                .cmp(&right.content_hash().bytes())
+        })
+}
+
+fn evidence_dataset_dynamic_bytes(
+    dataset: &ForecastEvidenceDataset,
+) -> Result<usize, ForecastEvidenceReadError> {
+    let manifests = [
+        dataset.dataset().manifest(),
+        dataset.pairing().analysis().manifest(),
+        dataset.pairing().training_fence().manifest(),
+        dataset.pairing().analysis_fence().manifest(),
+    ];
+    let manifest_bytes = manifests.iter().try_fold(0_usize, |total, manifest| {
+        total
+            .checked_add(manifest.dataset_id().as_str().len())
+            .and_then(|bytes| bytes.checked_add(manifest.schema().name().len()))
+            .ok_or(ForecastEvidenceReadError::Capacity)
+    })?;
+    dataset
+        .bundle_id
+        .as_str()
+        .len()
+        .checked_add(manifest_bytes)
+        .and_then(|bytes| {
+            bytes.checked_add(
+                dataset
+                    .instruments
+                    .capacity()
+                    .checked_mul(size_of::<ForecastInstrumentAvailability>())?,
+            )
+        })
+        .and_then(|bytes| {
+            bytes.checked_add(
+                dataset
+                    .policies
+                    .capacity()
+                    .checked_mul(size_of::<ForecastEvidencePolicy>())?,
+            )
+        })
+        .ok_or(ForecastEvidenceReadError::Capacity)
 }
 
 /// Complete admitted-model query supplied to the analytical evidence owner.
@@ -259,6 +593,7 @@ pub struct ForecastPreparationSelection {
     bundle_id: BundleId,
     bundle_version: NonZeroU64,
     dataset_manifest: DatasetManifestRef,
+    analysis_manifest: DatasetManifestRef,
     instrument_id: InstrumentId,
     horizon: ForecastHorizon,
     validity_nanos: u64,
@@ -275,6 +610,7 @@ impl ForecastPreparationSelection {
         bundle_id: BundleId,
         bundle_version: NonZeroU64,
         dataset_manifest: DatasetManifestRef,
+        analysis_manifest: DatasetManifestRef,
         instrument_id: InstrumentId,
         horizon: ForecastHorizon,
         validity_nanos: u64,
@@ -287,10 +623,27 @@ impl ForecastPreparationSelection {
             bundle_id,
             bundle_version,
             dataset_manifest,
+            analysis_manifest,
             instrument_id,
             horizon,
             validity_nanos,
         })
+    }
+
+    pub(crate) const fn dataset_manifest(&self) -> &DatasetManifestRef {
+        &self.dataset_manifest
+    }
+
+    pub(crate) const fn analysis_manifest(&self) -> &DatasetManifestRef {
+        &self.analysis_manifest
+    }
+
+    pub(crate) const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    pub(crate) const fn horizon(&self) -> ForecastHorizon {
+        self.horizon
     }
 }
 
@@ -299,12 +652,122 @@ impl ForecastPreparationSelection {
 pub(crate) struct ForecastEvidenceMaterializationRequest {
     model: ForecastModelRequirement,
     selection: ForecastPreparationSelection,
+    pairing: ForecastDatasetPairingReceipt,
     authority_generation_sha256: Sha256Digest,
+}
+
+/// Exact label-free current-PIT generation/query fence used to construct the serving feature at
+/// time `T`. Historical TrainingV1/AnalysisV1 evidence never supplies these coordinates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ForecastServingInputFence {
+    manifest: DatasetManifestRef,
+    source_id: SourceId,
+    object_graph_sha256: Sha256Digest,
+    selection_sha256: Sha256Digest,
+    result_sha256: Sha256Digest,
+    knowledge_cutoff: Timestamp,
+    prior_observed_at: Timestamp,
+    observed_through: Timestamp,
+    feature_sha256: Sha256Digest,
+}
+
+impl ForecastServingInputFence {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "manifest, query, cutoff, temporal, and derived-feature evidence stay explicit"
+    )]
+    pub(crate) fn try_new(
+        manifest: DatasetManifestRef,
+        source_id: SourceId,
+        object_graph_sha256: Sha256Digest,
+        selection_sha256: Sha256Digest,
+        result_sha256: Sha256Digest,
+        knowledge_cutoff: Timestamp,
+        prior_observed_at: Timestamp,
+        observed_through: Timestamp,
+        feature_sha256: Sha256Digest,
+    ) -> Result<Self, ForecastEvidenceReadError> {
+        if prior_observed_at >= observed_through
+            || observed_through > knowledge_cutoff
+            || [
+                object_graph_sha256,
+                selection_sha256,
+                result_sha256,
+                feature_sha256,
+            ]
+            .iter()
+            .any(|digest| digest.bytes() == [0; 32])
+        {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        Ok(Self {
+            manifest,
+            source_id,
+            object_graph_sha256,
+            selection_sha256,
+            result_sha256,
+            knowledge_cutoff,
+            prior_observed_at,
+            observed_through,
+            feature_sha256,
+        })
+    }
+
+    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
+    }
+
+    pub(crate) const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    pub(crate) const fn object_graph_sha256(&self) -> Sha256Digest {
+        self.object_graph_sha256
+    }
+
+    pub(crate) const fn selection_sha256(&self) -> Sha256Digest {
+        self.selection_sha256
+    }
+
+    pub(crate) const fn result_sha256(&self) -> Sha256Digest {
+        self.result_sha256
+    }
+
+    pub(crate) const fn knowledge_cutoff(&self) -> Timestamp {
+        self.knowledge_cutoff
+    }
+
+    pub(crate) const fn prior_observed_at(&self) -> Timestamp {
+        self.prior_observed_at
+    }
+
+    pub(crate) const fn observed_through(&self) -> Timestamp {
+        self.observed_through
+    }
+
+    pub(crate) const fn feature_sha256(&self) -> Sha256Digest {
+        self.feature_sha256
+    }
+}
+
+impl ForecastEvidenceMaterializationRequest {
+    pub(crate) const fn model(&self) -> &ForecastModelRequirement {
+        &self.model
+    }
+
+    pub(crate) const fn selection(&self) -> &ForecastPreparationSelection {
+        &self.selection
+    }
+
+    pub(crate) const fn pairing(&self) -> &ForecastDatasetPairingReceipt {
+        &self.pairing
+    }
 }
 
 /// Typed history and feature matrix produced only by the injected analytical authority.
 pub(crate) struct PreparedForecastEvidence {
     request: ForecastEvidenceMaterializationRequest,
+    serving_input: ForecastServingInputFence,
     observed_cutoff: Timestamp,
     available_at: Timestamp,
     decimal_scale: u8,
@@ -313,11 +776,74 @@ pub(crate) struct PreparedForecastEvidence {
     evidence_sha256: Sha256Digest,
 }
 
+impl PreparedForecastEvidence {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the materialized PIT cutoff, history, matrix, and sealed pairing remain explicit"
+    )]
+    pub(crate) fn try_new(
+        request: ForecastEvidenceMaterializationRequest,
+        serving_input: ForecastServingInputFence,
+        observed_cutoff: Timestamp,
+        available_at: Timestamp,
+        decimal_scale: u8,
+        observed_history: Vec<ForecastObservedPoint>,
+        inputs: Vec<Box<[f64]>>,
+    ) -> Result<Self, ForecastEvidenceReadError> {
+        let horizon_nanos = i64::try_from(request.selection.horizon.step_nanos().get())
+            .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?;
+        let target_at = observed_cutoff
+            .checked_add_nanos(horizon_nanos)
+            .map_err(|_| ForecastEvidenceReadError::InvalidEvidence)?;
+        if observed_history.is_empty()
+            || inputs.is_empty()
+            || observed_history.len() > market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS
+            || decimal_scale > market_squawk_modeling::MAX_FORECAST_DECIMAL_SCALE
+            || observed_history.last().map(|point| point.observed_at()) != Some(observed_cutoff)
+            || serving_input.observed_through() != observed_cutoff
+            || available_at > serving_input.knowledge_cutoff()
+            || target_at <= serving_input.knowledge_cutoff()
+            || observed_history
+                .iter()
+                .any(|point| point.available_at() > available_at)
+            || inputs
+                .iter()
+                .any(|row| row.is_empty() || row.iter().any(|value| !value.is_finite()))
+        {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        let evidence_sha256 = evidence_digest(
+            &request,
+            &serving_input,
+            observed_cutoff,
+            available_at,
+            decimal_scale,
+            &observed_history,
+            &inputs,
+        )?;
+        Ok(Self {
+            request,
+            serving_input,
+            observed_cutoff,
+            available_at,
+            decimal_scale,
+            observed_history: observed_history.into_boxed_slice(),
+            inputs: inputs.into_boxed_slice(),
+            evidence_sha256,
+        })
+    }
+
+    pub(crate) const fn evidence_sha256(&self) -> Sha256Digest {
+        self.evidence_sha256
+    }
+}
+
 impl fmt::Debug for PreparedForecastEvidence {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PreparedForecastEvidence")
             .field("request", &self.request)
+            .field("serving_input", &self.serving_input)
             .field("observed_cutoff", &self.observed_cutoff)
             .field("available_at", &self.available_at)
             .field("decimal_scale", &self.decimal_scale)
@@ -329,8 +855,26 @@ impl fmt::Debug for PreparedForecastEvidence {
 }
 
 /// Exact data-owner fence revalidated immediately before durable job admission.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ForecastEvidenceRevalidation;
+#[derive(Clone, Debug)]
+pub(crate) struct ForecastEvidenceRevalidation {
+    request: ForecastEvidenceMaterializationRequest,
+    serving_input: ForecastServingInputFence,
+    evidence_sha256: Sha256Digest,
+}
+
+impl ForecastEvidenceRevalidation {
+    pub(crate) const fn request(&self) -> &ForecastEvidenceMaterializationRequest {
+        &self.request
+    }
+
+    pub(crate) const fn evidence_sha256(&self) -> Sha256Digest {
+        self.evidence_sha256
+    }
+
+    pub(crate) const fn serving_input(&self) -> &ForecastServingInputFence {
+        &self.serving_input
+    }
+}
 
 /// Narrow analytical authority required by model-owned forecast preparation.
 #[async_trait]
@@ -747,6 +1291,27 @@ impl ReceiptRegistry {
             .ok_or(ForecastPreparationError::ReceiptUnavailable)
     }
 
+    fn consume_token(
+        &mut self,
+        receipt_id: Uuid,
+        owner: RequestOrigin,
+        workspace: WorkspaceRuntimeIdentity,
+        now: Instant,
+    ) -> Result<StoredForecastPreparation, ForecastPreparationError> {
+        self.prune(now);
+        let (_, stored) = self
+            .entries
+            .get(&receipt_id)
+            .ok_or(ForecastPreparationError::ReceiptUnavailable)?;
+        if stored.owner != owner || stored.workspace != workspace {
+            return Err(ForecastPreparationError::ReceiptMismatch);
+        }
+        self.entries
+            .remove(&receipt_id)
+            .map(|(_, stored)| stored)
+            .ok_or(ForecastPreparationError::ReceiptUnavailable)
+    }
+
     fn prune(&mut self, now: Instant) {
         self.entries
             .retain(|_, (_, stored)| stored.expires_at > now);
@@ -863,6 +1428,7 @@ impl ForecastPreparationAuthority {
         let materialization = ForecastEvidenceMaterializationRequest {
             model: model.clone(),
             selection: selection.clone(),
+            pairing: option.pairing.clone(),
             authority_generation_sha256: catalog.authority_generation_sha256,
         };
         let evidence = self
@@ -887,7 +1453,11 @@ impl ForecastPreparationAuthority {
         let expires_instant = Instant::now()
             .checked_add(self.limits.receipt_lifetime)
             .ok_or(ForecastPreparationError::TimeUnavailable)?;
-        let revalidation = ForecastEvidenceRevalidation;
+        let revalidation = ForecastEvidenceRevalidation {
+            request: materialization,
+            serving_input: evidence.serving_input.clone(),
+            evidence_sha256: evidence.evidence_sha256,
+        };
         let mut receipts = self
             .receipts
             .lock()
@@ -967,6 +1537,36 @@ impl ForecastPreparationAuthority {
             .await?;
         Ok(stored.request)
     }
+
+    /// Consumes one process-local opaque confirmation token without returning receipt evidence to
+    /// a presentation client. Owner, workspace, expiry, model generation, and analytical evidence
+    /// are still checked against the retained authority entry before the terminal request exists.
+    pub(crate) async fn consume_token(
+        &self,
+        origin: RequestOrigin,
+        workspace: WorkspaceRuntimeIdentity,
+        receipt_id: Uuid,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<TypedToolRequest, ForecastPreparationError> {
+        validate_origin(origin, workspace)?;
+        check_control(deadline, &cancellation)?;
+        let stored = self
+            .receipts
+            .lock()
+            .map_err(|_| ForecastPreparationError::Unavailable)?
+            .consume_token(receipt_id, origin, workspace, Instant::now())?;
+        self.runtime
+            .validate_forecast_runtime_generation(stored.runtime_generation_sha256)?;
+        let revalidation = stored
+            .revalidation
+            .as_ref()
+            .ok_or(ForecastPreparationError::InvalidEvidence)?;
+        self.evidence
+            .revalidate(revalidation, deadline, cancellation)
+            .await?;
+        Ok(stored.request)
+    }
 }
 
 impl fmt::Debug for ForecastPreparationAuthority {
@@ -1018,6 +1618,12 @@ fn validate_catalog(
         if model.runtime_generation_sha256 != request.runtime_generation_sha256 {
             return Err(ForecastPreparationError::InvalidEvidence);
         }
+        if dataset.pairing.training() != model.metadata.dataset()
+            || dataset.pairing.analysis_fence().as_of()
+                != model.metadata.dataset().selection_as_of()
+        {
+            return Err(ForecastPreparationError::InvalidEvidence);
+        }
     }
     Ok(())
 }
@@ -1033,7 +1639,8 @@ fn compatible_option<'catalog>(
             dataset.model_id == selection.model_id
                 && dataset.bundle_id == selection.bundle_id
                 && dataset.bundle_version == selection.bundle_version
-                && dataset.dataset.manifest() == &selection.dataset_manifest
+                && dataset.dataset().manifest() == &selection.dataset_manifest
+                && dataset.analysis_manifest() == &selection.analysis_manifest
         })
         .ok_or(ForecastPreparationError::IncompatibleSelection)
 }
@@ -1044,10 +1651,12 @@ fn validate_prepared_evidence(
 ) -> Result<(), ForecastPreparationError> {
     if evidence.request.model.runtime_generation_sha256 != expected.model.runtime_generation_sha256
         || evidence.request.selection != expected.selection
+        || evidence.request.pairing != expected.pairing
         || evidence.request.authority_generation_sha256 != expected.authority_generation_sha256
         || evidence.evidence_sha256
             != evidence_digest(
                 &evidence.request,
+                &evidence.serving_input,
                 evidence.observed_cutoff,
                 evidence.available_at,
                 evidence.decimal_scale,
@@ -1144,6 +1753,9 @@ fn typed_arguments(
         .iter()
         .map(|row| row.iter().map(|value| json!(value)).collect::<Vec<_>>())
         .collect::<Vec<_>>();
+    let pairing = evidence.request.pairing();
+    let analysis_manifest = pairing.analysis_fence().manifest();
+    let serving = &evidence.serving_input;
     Ok(Map::from_iter([
         ("confirm".to_owned(), Value::Bool(true)),
         ("modelId".to_owned(), json!(selection.model_id.to_string())),
@@ -1168,6 +1780,47 @@ fn typed_arguments(
                 "validityNanos": selection.validity_nanos,
                 "observedHistory": observed,
                 "inputs": inputs,
+                "analysisEvidence": {
+                    "manifest": {
+                        "dataset": analysis_manifest.dataset_id().as_str(),
+                        "manifestVersion": analysis_manifest.manifest_version(),
+                        "schema": {
+                            "name": analysis_manifest.schema().name(),
+                            "version": analysis_manifest.schema_version().get(),
+                            "fingerprint": hex(Sha256Digest::new(
+                                analysis_manifest.schema().fingerprint()
+                            )),
+                        },
+                        "contentHash": hex(analysis_manifest.content_hash()),
+                    },
+                    "productionIdentitySha256": hex(pairing.analysis_production_identity()),
+                    "productionReceiptSha256": hex(
+                        pairing.analysis_production_receipt_sha256()
+                    ),
+                    "pairingSha256": hex(pairing.pairing_sha256()),
+                },
+                "servingEvidence": {
+                    "manifest": {
+                        "dataset": serving.manifest().dataset_id().as_str(),
+                        "manifestVersion": serving.manifest().manifest_version(),
+                        "schema": {
+                            "name": serving.manifest().schema().name(),
+                            "version": serving.manifest().schema_version().get(),
+                            "fingerprint": hex(Sha256Digest::new(
+                                serving.manifest().schema().fingerprint()
+                            )),
+                        },
+                        "contentHash": hex(serving.manifest().content_hash()),
+                    },
+                    "sourceId": serving.source_id().as_str(),
+                    "objectGraphSha256": hex(serving.object_graph_sha256()),
+                    "selectionSha256": hex(serving.selection_sha256()),
+                    "resultSha256": hex(serving.result_sha256()),
+                    "knowledgeCutoffUnixNanos": serving.knowledge_cutoff().unix_nanos(),
+                    "priorObservedAtUnixNanos": serving.prior_observed_at().unix_nanos(),
+                    "observedThroughUnixNanos": serving.observed_through().unix_nanos(),
+                    "featureSha256": hex(serving.feature_sha256()),
+                },
             }),
         ),
     ]))
@@ -1175,6 +1828,7 @@ fn typed_arguments(
 
 fn evidence_digest(
     request: &ForecastEvidenceMaterializationRequest,
+    serving_input: &ForecastServingInputFence,
     observed_cutoff: Timestamp,
     available_at: Timestamp,
     decimal_scale: u8,
@@ -1190,6 +1844,9 @@ fn evidence_digest(
     hash_bytes(&mut digest, selection.bundle_id.as_str().as_bytes())?;
     digest.update(selection.bundle_version.get().to_be_bytes());
     hash_manifest(&mut digest, &selection.dataset_manifest)?;
+    hash_manifest(&mut digest, &selection.analysis_manifest)?;
+    digest.update(request.pairing.pairing_sha256().bytes());
+    hash_serving_input(&mut digest, serving_input)?;
     digest.update(selection.instrument_id.as_uuid().as_bytes());
     digest.update(selection.horizon.points().get().to_be_bytes());
     digest.update(selection.horizon.step_nanos().get().to_be_bytes());
@@ -1213,6 +1870,78 @@ fn evidence_digest(
         }
     }
     Ok(Sha256Digest::new(digest.finalize().into()))
+}
+
+fn hash_serving_input(
+    digest: &mut Sha256,
+    serving_input: &ForecastServingInputFence,
+) -> Result<(), ForecastEvidenceReadError> {
+    hash_manifest(digest, serving_input.manifest())?;
+    hash_bytes(digest, serving_input.source_id().as_str().as_bytes())?;
+    digest.update(serving_input.object_graph_sha256().bytes());
+    digest.update(serving_input.selection_sha256().bytes());
+    digest.update(serving_input.result_sha256().bytes());
+    digest.update(serving_input.knowledge_cutoff().unix_nanos().to_be_bytes());
+    digest.update(serving_input.prior_observed_at().unix_nanos().to_be_bytes());
+    digest.update(serving_input.observed_through().unix_nanos().to_be_bytes());
+    digest.update(serving_input.feature_sha256().bytes());
+    Ok(())
+}
+
+fn pairing_digest(
+    training: &TrainingDatasetIdentity,
+    analysis: &TrainingDatasetIdentity,
+    training_fence: &ForecastDatasetEvidenceFence,
+    analysis_fence: &ForecastDatasetEvidenceFence,
+    training_production_identity: Sha256Digest,
+    training_production_receipt_sha256: Sha256Digest,
+    analysis_production_identity: Sha256Digest,
+    analysis_production_receipt_sha256: Sha256Digest,
+    fixed_horizon_nanos: NonZeroU64,
+    shared_compatibility_sha256: Sha256Digest,
+) -> Result<Sha256Digest, ForecastEvidenceReadError> {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/forecast-training-analysis-pairing/v2\0");
+    hash_dataset_identity(&mut digest, training)?;
+    hash_dataset_identity(&mut digest, analysis)?;
+    hash_evidence_fence(&mut digest, training_fence)?;
+    hash_evidence_fence(&mut digest, analysis_fence)?;
+    digest.update(training_production_identity.bytes());
+    digest.update(training_production_receipt_sha256.bytes());
+    digest.update(analysis_production_identity.bytes());
+    digest.update(analysis_production_receipt_sha256.bytes());
+    digest.update(fixed_horizon_nanos.get().to_be_bytes());
+    digest.update(shared_compatibility_sha256.bytes());
+    Ok(Sha256Digest::new(digest.finalize().into()))
+}
+
+fn hash_dataset_identity(
+    digest: &mut Sha256,
+    identity: &TrainingDatasetIdentity,
+) -> Result<(), ForecastEvidenceReadError> {
+    hash_manifest(digest, identity.manifest())?;
+    digest.update(identity.build_spec_digest().digest().bytes());
+    digest.update(identity.universe_digest().bytes());
+    digest.update(identity.policy_digest().bytes());
+    digest.update(identity.catalog_identity().bytes());
+    digest.update(identity.export_digest().bytes());
+    digest.update(identity.selection_digest().bytes());
+    digest.update(identity.selection_as_of().unix_nanos().to_be_bytes());
+    digest.update(identity.selected_component_rows().get().to_be_bytes());
+    Ok(())
+}
+
+fn hash_evidence_fence(
+    digest: &mut Sha256,
+    fence: &ForecastDatasetEvidenceFence,
+) -> Result<(), ForecastEvidenceReadError> {
+    hash_manifest(digest, fence.manifest())?;
+    digest.update(fence.catalog_identity().bytes());
+    digest.update(fence.export_sha256().bytes());
+    digest.update(fence.selection_sha256().bytes());
+    digest.update(fence.selected_rows().get().to_be_bytes());
+    digest.update(fence.as_of().unix_nanos().to_be_bytes());
+    Ok(())
 }
 
 fn request_digest(

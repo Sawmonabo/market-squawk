@@ -10,23 +10,24 @@ import {
   WalletCards,
 } from "lucide-react"
 
-import { messageFrom, useProduct } from "@/app/product-context"
+import { useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { formatMoney, humanize } from "@/lib/formatters"
-import type { DesktopBootstrap } from "@/lib/schemas"
+import { productCapabilitySet } from "@/lib/product-capabilities"
+import type { DesktopBootstrap, ProductCapability } from "@/lib/schemas"
 import type { PaperControlRequest, ProductTransport } from "@/lib/transport"
 
 import {
   type PaperAccount,
   type PaperAuditDecision,
-  type PaperControlReceipt,
+  type PaperControlResult,
   type PaperFill,
   type PaperOrder,
   type PaperPosition,
   type PaperStatus,
-  parsePaperControlReceipt,
+  parsePaperControlResult,
   parsePaperFills,
   parsePaperOrders,
   parsePaperStatus,
@@ -39,16 +40,16 @@ import {
 } from "./paper-controls"
 import { ManualPaperDraftPanel } from "./manual-paper-draft"
 
-const CORE_PAPER_OPERATIONS = [
-  "Bot.GetStatus",
-  "Bot.Start",
-  "Bot.Stop",
-  "Execution.GetOrders",
-  "Execution.GetFills",
-  "Execution.Cancel",
-  "Execution.Reconcile",
-  "Risk.TriggerKillSwitch",
-] as const
+const CORE_PAPER_CAPABILITIES = [
+  "bot_status",
+  "bot_start",
+  "bot_stop",
+  "execution_orders",
+  "execution_fills",
+  "execution_cancel",
+  "execution_reconcile",
+  "risk_kill_switch",
+] as const satisfies readonly ProductCapability[]
 
 export function PaperExecutionPage() {
   const product = useProduct()
@@ -57,7 +58,10 @@ export function PaperExecutionPage() {
   if (product.status === "error") {
     return (
       <PageFrame>
-        <EmptyState title="Paper execution is unavailable" detail={product.error} />
+        <EmptyState
+          title="Paper execution is unavailable"
+          detail="Try again. If the problem continues, review Logs & Diagnostics."
+        />
       </PageFrame>
     )
   }
@@ -80,24 +84,24 @@ function ReadyPaperExecution({
   const queryClient = useQueryClient()
   const [pendingAction, setPendingAction] = React.useState<PaperControlRequest | null>(null)
   const [controlMessage, setControlMessage] = React.useState<string | null>(null)
-  const [controlReceipt, setControlReceipt] = React.useState<PaperControlReceipt | null>(null)
-  const operationNames = new Set(bootstrap.operations.map((operation) => operation.name))
-  const missingCoreOperations = CORE_PAPER_OPERATIONS.filter(
-    (operation) => !operationNames.has(operation),
+  const [controlResult, setControlResult] = React.useState<PaperControlResult | null>(null)
+  const capabilities = productCapabilitySet(bootstrap)
+  const missingCoreCapabilities = CORE_PAPER_CAPABILITIES.filter(
+    (capability) => !capabilities.has(capability),
   )
   const controlAvailability: PaperControlAvailability = {
-    start: operationNames.has("Bot.Start"),
-    stop: operationNames.has("Bot.Stop"),
-    cancel: operationNames.has("Execution.Cancel"),
-    reconcile: operationNames.has("Execution.Reconcile"),
-    killSwitch: operationNames.has("Risk.TriggerKillSwitch"),
+    start: capabilities.has("bot_start"),
+    stop: capabilities.has("bot_stop"),
+    cancel: capabilities.has("execution_cancel"),
+    reconcile: capabilities.has("execution_reconcile"),
+    killSwitch: capabilities.has("risk_kill_switch"),
   }
-  const statusAvailable = operationNames.has("Bot.GetStatus")
-  const ordersAvailable = operationNames.has("Execution.GetOrders")
-  const fillsAvailable = operationNames.has("Execution.GetFills")
+  const statusAvailable = capabilities.has("bot_status")
+  const ordersAvailable = capabilities.has("execution_orders")
+  const fillsAvailable = capabilities.has("execution_fills")
   const manualPaperAvailable =
-    operationNames.has("Execution.GetManualPaperTargets") &&
-    operationNames.has("Execution.SubmitManualPaperDraft")
+    capabilities.has("execution_manual_targets") &&
+    capabilities.has("execution_manual_draft")
   const status = useQuery({
     queryKey: productKeys.operation(bootstrap.runtime, "bot", "Bot.GetStatus", {}),
     enabled: statusAvailable,
@@ -131,11 +135,11 @@ function ReadyPaperExecution({
     advertisedReadCount > 0 && failures.length === advertisedReadCount
   const control = useMutation({
     mutationFn: async (request: PaperControlRequest) =>
-      parsePaperControlReceipt(await transport.paperControl(request, true), request),
-    onSuccess: async (receipt, request) => {
+      parsePaperControlResult(await transport.paperControl(request, true), request),
+    onSuccess: async (result, request) => {
       setPendingAction(null)
       setControlMessage(paperActionCompleted(request))
-      setControlReceipt(receipt)
+      setControlResult(result)
       await Promise.all([
         queryClient.invalidateQueries({
           queryKey: productKeys.domain(bootstrap.runtime, "bot"),
@@ -177,20 +181,20 @@ function ReadyPaperExecution({
         </Button>
       }
     >
-      {missingCoreOperations.length > 0 ? (
-        <PaperSetupNotice missingOperations={missingCoreOperations} />
+      {missingCoreCapabilities.length > 0 ? (
+        <PaperSetupNotice />
       ) : null}
       {status.isLoading && orders.isLoading && fills.isLoading ? (
         <PaperGridLoading />
       ) : allAdvertisedReadsFailed ? (
         <EmptyState
-          title="No paper evidence is available"
-          detail={messageFrom(failures[0])}
+          title="Paper activity could not be loaded"
+          detail="Try refreshing. If the problem continues, review Logs & Diagnostics."
         />
       ) : (
         <>
           {failures.length > 0 ? (
-            <Notice text="One paper view could not be read. The page shows only evidence returned by the remaining views." />
+            <Notice text="Some paper information is temporarily unavailable. The rest of the page remains usable." />
           ) : null}
           <PaperSummary
             status={status.data?.value}
@@ -223,13 +227,12 @@ function ReadyPaperExecution({
           />
           <PaperControlPanel
             status={status.data?.value}
-            sessions={bootstrap.providerSessions}
             availability={controlAvailability}
             busy={control.isPending}
             onRequest={requestControl}
           />
           {controlMessage ? <SuccessNotice text={controlMessage} /> : null}
-          {controlReceipt ? <ControlReceiptEvidence receipt={controlReceipt} /> : null}
+          {controlResult ? <CompletedAction result={controlResult} /> : null}
           <div className="mt-4 grid gap-4 2xl:grid-cols-[1.4fr_1fr]">
             <OrdersPanel
               orders={orders.data?.value ?? []}
@@ -237,7 +240,7 @@ function ReadyPaperExecution({
               available={ordersAvailable}
               cancelAvailable={controlAvailability.cancel}
               busy={control.isPending}
-              onCancel={(orderId) => requestControl({ action: "cancel", orderId })}
+              onCancel={(orderToken) => requestControl({ action: "cancel", orderToken })}
             />
             <FillsPanel
               fills={fills.data?.value ?? []}
@@ -246,14 +249,17 @@ function ReadyPaperExecution({
             />
           </div>
           <EvidenceBoundary
-            status={status.data}
             orders={orders.data}
             fills={fills.data}
           />
           <PaperConfirmationDialog
             request={pendingAction}
             busy={control.isPending}
-            error={control.isError ? messageFrom(control.error) : null}
+            error={
+              control.isError
+                ? "This action could not be completed. Try again or review Logs & Diagnostics."
+                : null
+            }
             onClose={() => {
               control.reset()
               setPendingAction(null)
@@ -268,16 +274,13 @@ function ReadyPaperExecution({
   )
 }
 
-function PaperSetupNotice({ missingOperations }: { missingOperations: readonly string[] }) {
+function PaperSetupNotice() {
   return (
     <div className="mb-4 rounded-xl border border-amber-400/25 bg-amber-400/5 p-4">
       <p className="text-sm font-semibold text-amber-100">Paper setup is incomplete</p>
       <p className="mt-1 text-xs leading-5 text-muted-foreground">
-        The installed service does not advertise the complete paper lifecycle. This page invokes
-        only operations that are present and does not treat Markets availability as tradability.
-      </p>
-      <p className="mt-2 font-mono text-[10px] text-amber-100">
-        Missing: {missingOperations.join(", ")}
+        Some paper features are unavailable. Review Connections or Updates &amp; Repair. Market data
+        availability alone does not make an investment eligible for paper trading.
       </p>
     </div>
   )
@@ -287,12 +290,12 @@ function LifecycleEvidence({ status }: { status: PaperStatus | undefined }) {
   let content: React.ReactNode
   if (!status) {
     content = (
-      <InlineEmpty detail="Bot.GetStatus is unavailable, so shutdown, checkpoint, and restart state cannot be inferred." />
+      <InlineEmpty detail="Paper lifecycle status is unavailable, so shutdown and recovery state cannot be confirmed." />
     )
   } else if (status.state === "stopped") {
     const shutdown =
       status.lastShutdownComplete === null
-        ? "No prior shutdown receipt returned"
+        ? "No previous shutdown recorded"
         : status.lastShutdownComplete
           ? "Complete"
           : "Incomplete"
@@ -301,13 +304,11 @@ function LifecycleEvidence({ status }: { status: PaperStatus | undefined }) {
         <dl className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           <Fact label="Lifecycle" value="Stopped" />
           <Fact label="Last shutdown" value={shutdown} />
-          <Fact label="Durable checkpoint" value="Not returned by Bot.GetStatus" />
-          <Fact label="Restart recovery" value="Not returned by Bot.GetStatus" />
         </dl>
         {status.lastShutdownComplete === false ? (
           <Notice
             bad
-            text="The last paper shutdown was incomplete. Do not treat this as checkpoint or restart-recovery evidence."
+            text="The last shutdown was incomplete. Review Logs & Diagnostics before starting a new paper session."
           />
         ) : null}
       </>
@@ -315,41 +316,36 @@ function LifecycleEvidence({ status }: { status: PaperStatus | undefined }) {
   } else if (status.state === "running") {
     content = (
       <dl className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <Fact label="Snapshot sequence" value={status.sequence.toLocaleString()} />
+        <Fact label="Lifecycle" value="Running" />
         <Fact label="Snapshot state" value={status.complete ? "Complete" : "Incomplete"} />
         <Fact
-          label="Configuration"
-          value={
-            status.configurationDigestSha256
-              ? shortId(status.configurationDigestSha256)
-              : "Not returned"
-          }
+          label="Reconciliation"
+          value={status.financialReconciliationCurrent ? "Current" : "Needs attention"}
         />
-        <Fact label="Durable checkpoint / restart" value="Not returned by Bot.GetStatus" />
       </dl>
     )
   } else if (status.state === "failed") {
     content = (
       <dl className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <Fact label="Lifecycle" value="Failed" />
-        <Fact label="Provider" value={status.provider ?? "Not returned"} />
-        <Fact label="Failure evidence" value={status.reason ?? "Provider runtime unhealthy"} />
-        <Fact label="Recovery action" value="Explicit stop required" />
+        <Fact label="Market data" value="Unavailable" />
+        <Fact label="Status" value="The paper session needs attention" />
+        <Fact label="Next step" value="Stop the session before restarting" />
       </dl>
     )
   } else {
     content = (
       <dl className="grid gap-3 sm:grid-cols-2">
         <Fact label="Lifecycle transition" value={humanize(status.state)} />
-        <Fact label="Checkpoint / restart evidence" value="Unavailable during transition" />
+        <Fact label="Next step" value="Wait for the current action to finish" />
       </dl>
     )
   }
   return (
     <div className="mt-4">
       <Panel
-        title="Lifecycle, shutdown, and recovery evidence"
-        subtitle="Only receipts and snapshot facts returned by the paper authority are shown."
+        title="Lifecycle and recovery"
+        subtitle="Current session state, shutdown status, and any required recovery action."
       >
         {content}
       </Panel>
@@ -357,55 +353,57 @@ function LifecycleEvidence({ status }: { status: PaperStatus | undefined }) {
   )
 }
 
-function ControlReceiptEvidence({ receipt }: { receipt: PaperControlReceipt }) {
+function CompletedAction({ result }: { result: PaperControlResult }) {
   let facts: React.ReactNode
-  if (receipt.action === "start") {
+  if (result.action === "start") {
     facts = (
       <>
-        <Fact label="Action" value="Started virtual paper operation" />
-        <Fact label="Live market source" value={receipt.value.provider} />
-        <Fact label="Strategy mode" value={humanize(receipt.value.strategyMode)} />
-        <Fact label="Brokerage authority" value="None" />
+        <Fact label="Action" value="Started virtual paper session" />
+        <Fact label="Live market data" value="Best eligible data selected" />
+        <Fact label="Paper mode" value={humanize(result.value.strategyMode)} />
+        <Fact label="Real brokerage orders" value="Disabled" />
       </>
     )
-  } else if (receipt.action === "stop" || receipt.action === "triggerKillSwitch") {
+  } else if (result.action === "stop" || result.action === "triggerKillSwitch") {
     facts = (
       <>
-        <Fact label="Action" value={humanize(receipt.action)} />
+        <Fact label="Action" value={humanize(result.action)} />
         <Fact
           label="Shutdown"
-          value={receipt.value.shutdownComplete ? "Complete" : "Incomplete"}
+          value={result.value.shutdownComplete ? "Complete" : "Incomplete"}
         />
-        <Fact label="Reason" value={receipt.value.reason} />
-        <Fact label="Checkpoint / restart receipt" value="Not supplied by this result" />
+        <Fact label="Reason" value={result.value.reason} />
       </>
     )
-  } else if (receipt.action === "cancel") {
+  } else if (result.action === "cancel") {
     facts = (
       <>
         <Fact label="Action" value="Paper cancellation" />
-        <Fact label="Order" value={shortId(receipt.value.orderId)} />
-        <Fact label="Status" value={humanize(receipt.value.status)} />
-        <Fact label="Observed" value={timeValue(receipt.value.observedAt)} />
+        <Fact label="Order" value={shortId(result.value.orderToken)} />
+        <Fact label="Status" value={humanize(result.value.status)} />
+        <Fact label="Observed" value={timeValue(result.value.observedAt)} />
         <Fact
           label="Cumulative virtual fill"
-          value={`${receipt.value.cumulativeFilledLots.toLocaleString()} lots`}
+          value={`${result.value.cumulativeFilledLots.toLocaleString()} lots`}
         />
-        <Fact label="Cumulative virtual fees" value={formatMoney(receipt.value.cumulativeFees)} />
+        <Fact label="Cumulative virtual fees" value={formatMoney(result.value.cumulativeFees)} />
       </>
     )
-  } else if (receipt.action === "reconcile") {
+  } else if (result.action === "reconcile") {
     facts = (
       <>
         <Fact label="Action" value="Paper reconciliation" />
-        <Fact label="Observed" value={timeValue(receipt.value.observedAt)} />
-        <Fact label="Source binding" value={receipt.value.sourceBound ? "Bound" : "Not bound"} />
+        <Fact label="Observed" value={timeValue(result.value.observedAt)} />
+        <Fact
+          label="Market data check"
+          value={result.value.marketDataReady ? "Passed" : "Needs attention"}
+        />
         <Fact
           label="Reconciliation state"
-          value={receipt.value.reconciliationRequired ? "Still required" : "Current"}
+          value={result.value.reconciliationRequired ? "Still required" : "Current"}
         />
-        <Fact label="Order scope" value={receipt.value.orderCount.toLocaleString()} />
-        <Fact label="Account scope" value={receipt.value.accountCount.toLocaleString()} />
+        <Fact label="Orders checked" value={result.value.ordersChecked.toLocaleString()} />
+        <Fact label="Accounts checked" value={result.value.accountsChecked.toLocaleString()} />
       </>
     )
   } else {
@@ -414,8 +412,8 @@ function ControlReceiptEvidence({ receipt }: { receipt: PaperControlReceipt }) {
   return (
     <div className="mt-4">
       <Panel
-        title="Most recent confirmed control receipt"
-        subtitle="This is the exact result returned to this page, not a reconstructed durable history."
+        title="Latest completed action"
+        subtitle="Review the latest change before continuing."
       >
         <dl className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">{facts}</dl>
       </Panel>
@@ -471,23 +469,17 @@ function PaperSummary({
         <div className="mt-4 rounded-xl border border-border bg-card/35 p-4">
           <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs text-muted-foreground">
             <span>
-              Runtime sequence <strong className="font-mono text-foreground">{status.sequence}</strong>
-            </span>
-            <span>
               Positions <strong className="font-mono text-foreground">{status.positions}</strong>
             </span>
             <span>
-              Snapshot <strong className="text-foreground">{status.complete ? "Complete" : "Incomplete"}</strong>
+              Account update <strong className="text-foreground">{status.complete ? "Complete" : "Incomplete"}</strong>
             </span>
           </div>
         </div>
       ) : null}
       {status?.state === "failed" ? (
         <Notice
-          text={
-            status.reason ??
-            `${status.provider ?? "Selected"} paper runtime failed and requires an explicit stop before restart.`
-          }
+          text="The paper session failed and must be stopped before it can restart."
           bad
         />
       ) : null}
@@ -499,22 +491,22 @@ function FinancialEvidence({ status }: { status: PaperStatus | undefined }) {
   if (status?.state !== "running") return null
   const accounts = status.accounts?.rows ?? []
   const cash = status.cash?.rows ?? []
-  const positions = status.positionEvidence?.rows ?? []
+  const positions = status.positionRecords?.rows ?? []
   return (
     <div className="mt-4 grid gap-4 xl:grid-cols-2">
       <Panel
         title="Virtual balances and P&L"
-        subtitle="Paper-ledger cash, equity, exposure, fees, and marked accounting values; none are brokerage balances."
+        subtitle="Virtual cash, equity, exposure, fees, and profit or loss; none are brokerage balances."
       >
         {accounts.length === 0 ? (
-          <InlineEmpty detail="The active snapshot returned no account evidence." />
+          <InlineEmpty detail="No virtual account balance is available yet." />
         ) : (
           <div className="space-y-4">
             {accounts.map((account) => <AccountEvidence key={account.accountId} account={account} />)}
           </div>
         )}
-        <EvidenceCount label="Account rows" evidence={status.accounts} />
-        <EvidenceCount label="Cash rows" evidence={status.cash} />
+        <EvidenceCount label="Accounts shown" evidence={status.accounts} />
+        <EvidenceCount label="Cash balances shown" evidence={status.cash} />
         {cash.length > 0 ? (
           <dl className="mt-4 grid gap-3 border-t border-border/70 pt-3 sm:grid-cols-2">
             {cash.map((row) => <Fact key={`${row.accountId}:${row.balance.currency}`} label={`Cash · ${shortId(row.accountId)}`} value={formatMoney(row.balance)} />)}
@@ -526,16 +518,18 @@ function FinancialEvidence({ status }: { status: PaperStatus | undefined }) {
         subtitle="Settled paper lots and cost basis from the same snapshot; no brokerage position is represented."
       >
         {positions.length === 0 ? (
-          <InlineEmpty detail="No settled paper positions were returned." />
+          <InlineEmpty detail="No settled paper positions yet." />
         ) : (
           <div className="space-y-3">
             {positions.map((position) => <PositionEvidence key={`${position.accountId}:${position.instrumentId}`} position={position} />)}
           </div>
         )}
-        <EvidenceCount label="Position rows" evidence={status.positionEvidence} />
+        <EvidenceCount label="Positions shown" evidence={status.positionRecords} />
         <div className="mt-4 rounded-lg border border-border/70 bg-background/35 p-3 text-xs text-muted-foreground">
-          <p>Snapshot configuration {status.configurationDigestSha256 ? shortId(status.configurationDigestSha256) : "not returned"} · sequence {status.sequence}.</p>
-          <p className="mt-1">Financial fence: {status.financialReconciliationCurrent ? "current" : "not current"}; reconciliation {status.reconciliationRequired ? "required" : "not required"}.</p>
+          <p>
+            Account check: {status.financialReconciliationCurrent ? "current" : "needs attention"};
+            reconciliation {status.reconciliationRequired ? "required" : "not required"}.
+          </p>
         </div>
       </Panel>
     </div>
@@ -545,7 +539,9 @@ function FinancialEvidence({ status }: { status: PaperStatus | undefined }) {
 function AccountEvidence({ account }: { account: PaperAccount }) {
   return (
     <article className="rounded-lg border border-border bg-background/35 p-3">
-      <p className="font-mono text-[10px] text-muted-foreground">{shortId(account.accountId)} · revision {account.revision}</p>
+      <p className="font-mono text-[10px] text-muted-foreground">
+        Virtual account {shortId(account.accountId)}
+      </p>
       <dl className="mt-3 grid gap-3 sm:grid-cols-2">
         <Fact label="Marked equity" value={formatMoney(account.markedEquity)} />
         <Fact label="Peak marked equity" value={formatMoney(account.peakMarkedEquity)} />
@@ -556,7 +552,6 @@ function AccountEvidence({ account }: { account: PaperAccount }) {
         <Fact label="Gross exposure" value={formatMoney(account.grossExposure)} />
         <Fact label="Drawdown" value={formatMoney(account.drawdown)} />
         <Fact label="Risk eligibility" value={account.eligible ? "Eligible" : "Ineligible"} />
-        <Fact label="Mark evidence" value={shortId(account.markDigestSha256)} />
       </dl>
     </article>
   )
@@ -570,9 +565,9 @@ function PaperRiskEvidence({ status }: { status: PaperStatus | undefined }) {
     <div className="mt-4 grid gap-4 xl:grid-cols-2">
       <Panel
         title="Central risk limits and supported instruments"
-        subtitle="Immutable runtime limits enforced before any virtual paper dispatch."
+        subtitle="These limits are checked before any virtual order can proceed."
       >
-        {!limits ? <InlineEmpty detail="The active runtime did not return a risk-limit image." /> : (
+        {!limits ? <InlineEmpty detail="Risk limits are unavailable for this paper session." /> : (
           <>
             <dl className="grid gap-3 sm:grid-cols-2">
               <Fact label="Order notional" value={formatMoney(limits.maximumOrderNotional)} />
@@ -588,7 +583,6 @@ function PaperRiskEvidence({ status }: { status: PaperStatus | undefined }) {
               <Fact label="Shorting" value={limits.allowShort ? "Allowed" : "Disabled"} />
               <Fact label="Kill switch" value={limits.killSwitch ? "Engaged" : "Clear"} />
               <Fact label="Order rate" value={`${limits.maximumOrdersPerWindow} / ${durationNanos(limits.orderRateWindowNanos)}`} />
-              <Fact label="Reservation lifetime" value={durationNanos(limits.reservationTtlNanos)} />
             </dl>
             <EligibleInstrumentEvidence limits={limits} />
           </>
@@ -596,22 +590,23 @@ function PaperRiskEvidence({ status }: { status: PaperStatus | undefined }) {
       </Panel>
       <Panel
         title="Risk decisions and market timing"
-        subtitle="Bounded decisions, observation times, validity windows, and rejection evidence committed by central risk."
+        subtitle="Recent approvals and rejections, including when market data was observed and when each decision expires."
       >
-        {!decisions ? <InlineEmpty detail="No retained durable decision image was returned." /> : (
+        {!decisions ? <InlineEmpty detail="No recent risk decisions are available." /> : (
           <>
             <dl className="grid gap-3 sm:grid-cols-2">
-              <Fact label="Retained decisions" value={`${decisions.returnedItems} of ${decisions.availableItems}`} />
-              <Fact label="Published decisions" value={decisions.totalPublished.toLocaleString()} />
-              <Fact label="Latest sequence" value={decisions.latestSequence?.toLocaleString() ?? "Not reported"} />
+              <Fact label="Recent decisions shown" value={`${decisions.returnedItems} of ${decisions.availableItems}`} />
               <Fact label="Reconciliation" value={status.reconciliationRequired ? "Required" : "Current"} />
             </dl>
             {decisions.records.length === 0 ? (
-              <InlineEmpty detail="No retained decision record supplied a market observation or risk outcome." />
+              <InlineEmpty detail="No recent approval or rejection is available." />
             ) : (
               <div className="mt-4 max-h-80 space-y-2 overflow-y-auto pr-1">
                 {decisions.records.map((decision) => (
-                  <RiskDecisionEvidence key={decision.sequence} decision={decision} />
+                  <RiskDecisionEvidence
+                    key={`${decision.orderToken}:${String(decision.observedAt)}`}
+                    decision={decision}
+                  />
                 ))}
               </div>
             )}
@@ -626,10 +621,10 @@ function EligibleInstrumentEvidence({ limits }: { limits: NonNullable<Extract<Pa
   const eligible = limits.eligibleInstruments
   return (
     <div className="mt-4 rounded-lg border border-border/70 bg-background/35 p-3">
-      <h3 className="text-xs font-semibold">Supported instruments for this runtime</h3>
+      <h3 className="text-xs font-semibold">Assets eligible for paper trading</h3>
       <p className="mt-1 text-[10px] leading-4 text-muted-foreground">
-        The service returns exact instrument IDs, not display symbols. Only this bounded risk image
-        may be eligible; availability elsewhere in Markets does not make an asset paper-tradable.
+        Only assets listed here can be used in this paper session. Availability in Markets alone
+        does not make an investment eligible for paper trading.
       </p>
       {eligible.rows.length === 0 ? (
         <p className="mt-3 text-xs text-amber-100">No eligible instrument was returned.</p>
@@ -643,7 +638,7 @@ function EligibleInstrumentEvidence({ limits }: { limits: NonNullable<Extract<Pa
         </div>
       )}
       <p className="mt-3 text-[10px] text-muted-foreground">
-        {eligible.returnedItems} of {eligible.availableItems} eligible instrument IDs returned.
+        Showing {eligible.returnedItems} of {eligible.availableItems} eligible assets.
       </p>
     </div>
   )
@@ -653,9 +648,7 @@ function RiskDecisionEvidence({ decision }: { decision: PaperAuditDecision }) {
   return (
     <article className="rounded-lg border border-border/70 bg-background/35 p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <p className="font-mono text-[10px]">
-          #{decision.sequence} · {humanize(decision.kind)}
-        </p>
+        <p className="text-xs font-medium">{humanize(decision.outcome)}</p>
         <EvidenceBadge
           label={decision.reasons.length > 0 ? `${decision.reasons.length} reason(s)` : "No rejection reason"}
           tone={decision.reasons.length > 0 ? "bad" : "neutral"}
@@ -663,16 +656,10 @@ function RiskDecisionEvidence({ decision }: { decision: PaperAuditDecision }) {
       </div>
       <dl className="mt-3 grid gap-3 sm:grid-cols-2">
         <Fact label="Instrument" value={decision.instrumentId} />
-        <Fact label="Account" value={shortId(decision.accountId)} />
         <Fact label="Market observed" value={timeValue(decision.marketObservedAt)} />
         <Fact label="Decision valid until" value={timeValue(decision.validUntil)} />
-        <Fact label="Audit observed" value={timeValue(decision.observedAt)} />
-        <Fact label="Risk policy" value={`${shortId(decision.riskPolicyDigestSha256)} · v${decision.riskPolicyRulesetVersion}`} />
+        <Fact label="Decision recorded" value={timeValue(decision.observedAt)} />
       </dl>
-      <p className="mt-3 text-[10px] leading-4 text-muted-foreground">
-        Market source identity is not included in this decision record; this page does not infer it
-        from the instrument or provider catalog.
-      </p>
     </article>
   )
 }
@@ -682,12 +669,11 @@ function SimulationAndReconciliationEvidence({ status }: { status: PaperStatus |
   return (
     <div className="mt-4 grid gap-4 xl:grid-cols-3">
       <Panel
-        title="Live market binding"
-        subtitle="The running status is returned only while its selected market runtime is healthy at the status read."
+        title="Market data readiness"
+        subtitle="The paper session pauses if current market data becomes unavailable."
       >
         <dl className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
-          <Fact label="Provider health" value="Active at status read" />
-          <Fact label="Provider / source identity" value="Not returned by Bot.GetStatus" />
+          <Fact label="Market data health" value="Active" />
           <Fact
             label="Actual observation freshness"
             value={
@@ -697,7 +683,7 @@ function SimulationAndReconciliationEvidence({ status }: { status: PaperStatus |
             }
           />
           <Fact
-            label="Maximum admitted mark age"
+            label="Maximum market-data age"
             value={
               status.simulation
                 ? durationNanos(status.simulation.maximumMarkAgeNanos)
@@ -706,14 +692,12 @@ function SimulationAndReconciliationEvidence({ status }: { status: PaperStatus |
           />
         </dl>
         <p className="mt-3 text-[10px] leading-4 text-muted-foreground">
-          Source identity and an actual age are shown only when supplied. A configured maximum age
-          is a limit, not proof that a particular observation is fresh.
+          A maximum allowed age is a safety limit, not proof that every observation is fresh.
         </p>
       </Panel>
-      <Panel title="Configured paper simulation" subtitle="Fixed virtual execution terms from the active runtime; these are not estimates inferred by the dashboard.">
-        {!status.simulation ? <InlineEmpty detail="Configured simulation evidence was not returned." /> : (
+      <Panel title="Paper fill assumptions" subtitle="These fixed assumptions shape virtual fills; they are not predictions about real execution.">
+        {!status.simulation ? <InlineEmpty detail="Paper fill assumptions are unavailable." /> : (
           <dl className="grid gap-3 sm:grid-cols-2">
-            <Fact label="Configuration version" value={status.simulation.configurationVersion.toLocaleString()} />
             <Fact label="Entry latency" value={`${durationNanos(status.simulation.minimumLatencyNanos)} to ${durationNanos(status.simulation.maximumLatencyNanos)}`} />
             <Fact label="Cancel latency" value={durationNanos(status.simulation.cancelLatencyNanos)} />
             <Fact label="Maximum mark age" value={durationNanos(status.simulation.maximumMarkAgeNanos)} />
@@ -724,18 +708,17 @@ function SimulationAndReconciliationEvidence({ status }: { status: PaperStatus |
           </dl>
         )}
       </Panel>
-      <Panel title="Reconciliation report" subtitle="A point-in-time report from the same virtual paper snapshot; no external or brokerage balance is fabricated.">
-        {!status.reconciliation ? <InlineEmpty detail="The runtime did not return a reconciliation report." /> : (
+      <Panel title="Account reconciliation" subtitle="Checks that virtual balances, positions, orders, and fills agree; it never represents a brokerage balance.">
+        {!status.reconciliation ? <InlineEmpty detail="No reconciliation details are available." /> : (
           <>
             <dl className="grid gap-3 sm:grid-cols-2">
-              <Fact label="Snapshot" value={`${status.reconciliation.snapshotComplete ? "Complete" : "Incomplete"} · #${status.reconciliation.snapshotSequence}`} />
-              <Fact label="Financial fence" value={status.reconciliation.financialReconciliationCurrent ? "Current" : "Not current"} />
-              <Fact label="Order scope" value={`${status.reconciliation.activeOrderCount} active · ${status.reconciliation.archivedOrderCount} archived`} />
-              <Fact label="Financial scope" value={`${status.reconciliation.accountCount} accounts · ${status.reconciliation.cashBalanceCount} cash balances · ${status.reconciliation.positionCount} positions`} />
-              <Fact label="Fill evidence" value={status.reconciliation.fillCount.toLocaleString()} />
+              <Fact label="Account update" value={status.reconciliation.snapshotComplete ? "Complete" : "Incomplete"} />
+              <Fact label="Account check" value={status.reconciliation.financialReconciliationCurrent ? "Current" : "Needs attention"} />
+              <Fact label="Virtual orders" value={`${status.reconciliation.activeOrderCount} active · ${status.reconciliation.archivedOrderCount} archived`} />
+              <Fact label="Balances and positions" value={`${status.reconciliation.accountCount} accounts · ${status.reconciliation.cashBalanceCount} cash balances · ${status.reconciliation.positionCount} positions`} />
+              <Fact label="Fills reviewed" value={status.reconciliation.fillCount.toLocaleString()} />
               <Fact label="Action required" value={status.reconciliation.reconciliationRequired ? "Yes" : "No"} />
             </dl>
-            <p className="mt-3 font-mono text-[10px] text-muted-foreground">Configuration {shortId(status.reconciliation.configurationDigestSha256)}</p>
           </>
         )}
       </Panel>
@@ -753,7 +736,7 @@ function PositionEvidence({ position }: { position: PaperPosition }) {
 }
 
 function EvidenceCount({ label, evidence }: { label: string; evidence: { returnedItems: number; availableItems: number } | undefined }) {
-  return <p className="mt-3 text-[10px] text-muted-foreground">{label}: {evidence ? `${evidence.returnedItems} of ${evidence.availableItems} returned` : "not returned"}.</p>
+  return <p className="mt-3 text-[10px] text-muted-foreground">{label}: {evidence ? `${evidence.returnedItems} of ${evidence.availableItems}` : "unavailable"}.</p>
 }
 
 function OrdersPanel({
@@ -772,13 +755,13 @@ function OrdersPanel({
   onCancel: (orderId: string) => void
 }) {
   return (
-    <Panel title="Virtual orders" subtitle="Requested and filled lots returned by the paper adapter; these are not brokerage orders.">
+    <Panel title="Virtual orders" subtitle="Tracked virtual orders and fill progress; these are never brokerage orders.">
       {!available ? (
-        <InlineEmpty detail="Setup required: Execution.GetOrders is not advertised by the installed service." />
+        <InlineEmpty detail="Virtual order history is not available in the current setup." />
       ) : error ? (
-        <InlineEmpty detail={messageFrom(error)} />
+        <InlineEmpty detail="Virtual order history could not be loaded. Try refreshing." />
       ) : orders.length === 0 ? (
-        <InlineEmpty detail="No paper orders were returned for the active workspace." />
+        <InlineEmpty detail="No virtual orders yet." />
       ) : (
         <div className="overflow-x-auto">
           <table className="w-full min-w-[860px] text-left text-xs">
@@ -787,8 +770,8 @@ function OrdersPanel({
                 <th className="pb-3 pr-4 font-medium">Order</th>
                 <th className="pb-3 pr-4 font-medium">State</th>
                 <th className="pb-3 pr-4 font-medium">Fill progress</th>
-                <th className="pb-3 pr-4 font-medium">Target provenance</th>
-                <th className="pb-3 pr-4 font-medium">Price evidence</th>
+                <th className="pb-3 pr-4 font-medium">Investment target</th>
+                <th className="pb-3 pr-4 font-medium">Price and risk limits</th>
                 <th className="pb-3 pr-4 font-medium">Fees</th>
                 <th className="pb-3 font-medium">Timing</th>
               </tr>
@@ -796,7 +779,7 @@ function OrdersPanel({
             <tbody className="divide-y divide-border/70">
               {orders.map((order) => (
                 <OrderRow
-                  key={order.orderId}
+                  key={order.orderToken}
                   order={order}
                   cancelAvailable={cancelAvailable}
                   busy={busy}
@@ -828,17 +811,12 @@ function OrderRow({
   return (
     <tr>
       <td className="py-3 pr-4 font-mono text-[11px]">
-        {shortId(order.orderId)}
-        {order.accountId ? (
-          <span className="mt-1 block text-[10px] text-muted-foreground">
-            account {shortId(order.accountId)}
-          </span>
-        ) : null}
+        {shortId(order.orderToken)}
       </td>
       <td className="py-3 pr-4">
         <EvidenceBadge
-          label={humanize(order.state)}
-          tone={order.state === "rejected" ? "bad" : "neutral"}
+          label={humanize(order.status)}
+          tone={order.status === "rejected" ? "bad" : "neutral"}
         />
         {partial ? (
           <span className="ml-2 inline-flex rounded-md border border-amber-400/20 bg-amber-400/10 px-2 py-1 text-[10px] font-medium text-amber-200">
@@ -854,17 +832,10 @@ function OrderRow({
         ) : null}
       </td>
       <td className="py-3 pr-4 text-muted-foreground">
-        {order.targetReference ? (
-          <>
-            <span className="block font-mono text-[11px] text-foreground">
-              {shortId(order.targetReference.targetId)} · revision {order.targetReference.revision}
-            </span>
-            <span className="block font-mono text-[10px]">
-              {shortId(order.targetReference.contentSha256)}
-            </span>
-          </>
+        {order.targetToken ? (
+          <span className="block text-[11px] text-foreground">Linked investment target</span>
         ) : (
-          "No governed target recorded"
+          "No investment target linked"
         )}
       </td>
       <td className="py-3 pr-4 text-muted-foreground">
@@ -884,7 +855,7 @@ function OrderRow({
           <span className="block">Reference {order.referencePriceTicks.toLocaleString()} ticks</span>
         ) : null}
         {order.maximumSlippageBasisPoints !== undefined ? (
-          <span className="block">Risk slippage bound {order.maximumSlippageBasisPoints.toLocaleString()} bp</span>
+          <span className="block">Maximum slippage {order.maximumSlippageBasisPoints.toLocaleString()} bp</span>
         ) : null}
         {order.observed?.averageFillSlippageTicks !== null && order.observed?.averageFillSlippageTicks !== undefined ? (
           <span className="block">Observed average slippage {order.observed.averageFillSlippageTicks.toLocaleString()} ticks ({order.observed.averageFillSlippageBasisPoints?.toLocaleString() ?? "not calculable"} bp)</span>
@@ -906,20 +877,20 @@ function OrderRow({
         {order.expiresAt !== undefined ? (
           <span className="block">Expires {timeValue(order.expiresAt)}</span>
         ) : null}
-        {isCancelable(order.state) && cancelAvailable ? (
+        {isCancelable(order.status) && cancelAvailable ? (
           <Button
             type="button"
             variant="ghost"
             size="xs"
             className="mt-2 text-rose-200 hover:text-rose-100"
             disabled={busy}
-            onClick={() => onCancel(order.orderId)}
+            onClick={() => onCancel(order.orderToken)}
           >
             Cancel order
           </Button>
-        ) : isCancelable(order.state) ? (
+        ) : isCancelable(order.status) ? (
           <span className="mt-2 block text-[10px] text-muted-foreground">
-            Cancel unavailable: Execution.Cancel is not advertised.
+            Cancellation is unavailable in the current setup.
           </span>
         ) : null}
       </td>
@@ -937,24 +908,24 @@ function FillsPanel({
   available: boolean
 }) {
   return (
-    <Panel title="Virtual fills" subtitle="Paper fill events, prices, liquidity, fees, and exact returned costs; no brokerage fill is represented.">
+    <Panel title="Virtual fills" subtitle="Virtual fill prices, liquidity, fees, and costs; no brokerage fill is represented.">
       {!available ? (
-        <InlineEmpty detail="Setup required: Execution.GetFills is not advertised by the installed service." />
+        <InlineEmpty detail="Virtual fill history is not available in the current setup." />
       ) : error ? (
-        <InlineEmpty detail={messageFrom(error)} />
+        <InlineEmpty detail="Virtual fill history could not be loaded. Try refreshing." />
       ) : fills.length === 0 ? (
-        <InlineEmpty detail="No paper fills were returned for the active workspace." />
+        <InlineEmpty detail="No virtual fills yet." />
       ) : (
         <div className="space-y-3">
           {fills.map((fill) => (
             <article
-              key={`${fill.orderId}:${fill.sequence}`}
+              key={`${fill.orderToken}:${String(fill.eventAt)}:${fill.quantityLots}`}
               className="rounded-lg border border-border bg-background/45 p-4"
             >
               <div className="flex items-start justify-between gap-4">
                 <div>
                   <p className="font-mono text-[10px] text-muted-foreground">
-                    #{fill.sequence} · {shortId(fill.orderId)}
+                    Order {shortId(fill.orderToken)}
                   </p>
                   <p className="mt-2 font-mono text-base font-semibold">
                     {fill.quantityLots.toLocaleString()} lots
@@ -994,19 +965,17 @@ function FillsPanel({
 }
 
 function EvidenceBoundary({
-  status,
   orders,
   fills,
 }: {
-  status: { completeness: string } | undefined
   orders: { completeness: string; returnedItems: number; availableItems: number } | undefined
   fills: { completeness: string; returnedItems: number; availableItems: number } | undefined
 }) {
   return (
     <p className="mt-4 text-[10px] leading-relaxed text-muted-foreground">
-      Bot status: {status?.completeness ?? "unavailable"}. Orders: {countBoundary(orders)}. Fills:{" "}
-      {countBoundary(fills)}. Timing is calculated only from the returned accepted and eligible timestamps.
-      Price bounds are the central-risk-approved bounds returned with the order, not a claim about future fills.
+      Order history: {countBoundary(orders)}. Fill history: {countBoundary(fills)}. Timing uses only
+      recorded accepted and eligible times. Price limits are safety limits for the virtual order,
+      not a prediction of future fills.
     </p>
   )
 }
@@ -1063,7 +1032,7 @@ function PageFrame({ children, action }: { children: React.ReactNode; action?: R
           <h1 className="mt-2 text-3xl font-semibold tracking-tight">Paper Execution</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
             Live-market-backed virtual cash, positions, orders, fills, fees, slippage, P&amp;L,
-            central risk, and lifecycle evidence returned by the active workspace.
+            safety limits, and session controls.
           </p>
         </div>
         {action}
@@ -1078,12 +1047,12 @@ function PageFrame({ children, action }: { children: React.ReactNode; action?: R
             Virtual paper execution — no real money or brokerage orders
           </h2>
           <p className="mt-1 max-w-4xl text-xs leading-5 text-muted-foreground">
-            While a paper runtime is active, prices and market events come from its selected live
-            provider or provider session. Balances, positions, orders, fills, P&amp;L, and risk
+            While a paper session is active, prices and market events come from the best eligible
+            live market data. Balances, positions, orders, fills, P&amp;L, and risk
             outcomes are virtual. No brokerage account is connected or instructed by this page,
             and an investment recommendation never becomes an order automatically. A user-confirmed
             manual draft or explicit paper-only strategy still requires current supported-instrument
-            admission and central risk before virtual dispatch.
+            eligibility and safety checks before it can proceed.
           </p>
         </div>
       </section>
@@ -1181,7 +1150,7 @@ function countBoundary(
   value: { completeness: string; returnedItems: number; availableItems: number } | undefined,
 ) {
   return value
-    ? `${value.completeness}, ${value.returnedItems} of ${value.availableItems} returned`
+    ? `${value.returnedItems} of ${value.availableItems} shown`
     : "unavailable"
 }
 
@@ -1199,7 +1168,7 @@ function timeValue(value: string | number) {
 function latencyValue(accepted: string | number, eligible: string | number) {
   if (typeof accepted !== "number" || typeof eligible !== "number") return "latency not numeric"
   const nanos = eligible - accepted
-  if (nanos < 0) return "invalid timing evidence"
+  if (nanos < 0) return "timing unavailable"
   return nanos >= 1_000_000 ? `${(nanos / 1_000_000).toLocaleString()} ms simulated latency` : `${nanos.toLocaleString()} ns simulated latency`
 }
 

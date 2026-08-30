@@ -12,7 +12,8 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { formatMoney, humanize } from "@/lib/formatters"
-import type { DesktopBootstrap } from "@/lib/schemas"
+import { productCapabilitySet } from "@/lib/product-capabilities"
+import type { DesktopBootstrap, ProductCapability } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
@@ -24,7 +25,6 @@ import {
   parsePortfolioMeasurementResult,
   type PortfolioMeasurementAmountBasis,
   type PortfolioMeasurementMethod,
-  verifyPortfolioMeasurementEvidence,
 } from "./portfolio-measurement-contracts"
 import { readFreshPortfolioMeasurementContext } from "./portfolio-measurement-context"
 import {
@@ -38,15 +38,13 @@ import {
   WorkflowNotice,
 } from "./portfolio-measurement-view"
 
-const REQUIRED_OPERATIONS = [
-  "FairValue.Measure",
-  "FairValue.GetEvidence",
-  "Portfolio.ListAccounts",
-  "Portfolio.GetHoldings",
-  "Governance.ListPrincipals",
-] as const
-
-class RetainedMeasurementVerificationError extends Error {}
+const REQUIRED_CAPABILITIES = [
+  "fair_value_measurement",
+  "fair_value_workspace",
+  "portfolio_account_list",
+  "portfolio_holdings",
+  "governance_principals",
+] as const satisfies readonly ProductCapability[]
 
 export function PortfolioMeasurementWorkflow({
   bootstrap,
@@ -55,16 +53,16 @@ export function PortfolioMeasurementWorkflow({
 }: {
   bootstrap: DesktopBootstrap
   transport: ProductTransport
-  onCreated: (measurementId: string) => void | Promise<void>
+  onCreated: (measurementToken: string) => void | Promise<void>
 }) {
-  const advertised = React.useMemo(
-    () => new Set(bootstrap.operations.map((operation) => operation.name)),
-    [bootstrap.operations],
+  const capabilities = React.useMemo(
+    () => productCapabilitySet(bootstrap),
+    [bootstrap],
   )
-  const missingOperations = REQUIRED_OPERATIONS.filter(
-    (operation) => !advertised.has(operation),
+  const missingCapabilities = REQUIRED_CAPABILITIES.filter(
+    (capability) => !capabilities.has(capability),
   )
-  const available = missingOperations.length === 0
+  const available = missingCapabilities.length === 0
   const [selectedAccountId, setSelectedAccountId] = React.useState("")
   const [selectedInstrumentId, setSelectedInstrumentId] = React.useState("")
   const [amount, setAmount] = React.useState("")
@@ -128,7 +126,7 @@ export function PortfolioMeasurementWorkflow({
       "Portfolio.GetHoldings",
       {
         accountId: selectedAccount?.account.accountId ?? null,
-        revisionId: selectedAccount?.account.currentRevision.revisionId ?? null,
+        snapshotToken: selectedAccount?.account.currentSnapshot.snapshotToken ?? null,
         purpose: "fair-value-measurement",
       },
     ),
@@ -145,23 +143,23 @@ export function PortfolioMeasurementWorkflow({
     },
   })
   const selectedHolding = holdings.data?.holdings.find(
-    (holding) => holding.instrument_id === selectedInstrumentId,
+    (holding) => holding.instrumentId === selectedInstrumentId,
   )
 
   React.useEffect(() => {
     if (!selectedHolding && holdings.data?.holdings[0]) {
-      setSelectedInstrumentId(holdings.data.holdings[0].instrument_id)
+      setSelectedInstrumentId(holdings.data.holdings[0].instrumentId)
     }
   }, [holdings.data, selectedHolding])
 
   const holdingSeed = selectedHolding
-    ? `${selectedHolding.revisionId}:${selectedHolding.instrument_id}:${selectedHolding.market_value.amount}:${selectedHolding.market_value.currency}`
+    ? `${selectedHolding.snapshotToken}:${selectedHolding.instrumentId}:${selectedHolding.marketValue.amount}:${selectedHolding.marketValue.currency}`
     : ""
   React.useEffect(() => {
     if (!selectedHolding) return
-    setAmount(selectedHolding.market_value.amount)
-    setCurrency(selectedHolding.market_value.currency)
-    setScale(String(decimalPlaces(selectedHolding.market_value.amount)))
+    setAmount(selectedHolding.marketValue.amount)
+    setCurrency(selectedHolding.marketValue.currency)
+    setScale(String(decimalPlaces(selectedHolding.marketValue.amount)))
   }, [holdingSeed])
 
   const principals = useInfiniteQuery({
@@ -235,7 +233,7 @@ export function PortfolioMeasurementWorkflow({
       const at = new Date().toISOString()
       const expected = {
         accountId: context.account.accountId,
-        instrumentId: context.holding.instrument_id,
+        instrumentId: context.holding.instrumentId,
         amount,
         currency,
         scale: scaleNumber,
@@ -243,6 +241,9 @@ export function PortfolioMeasurementWorkflow({
         method,
         preparedBy: context.principal.principalId,
         at,
+        portfolioAmount: context.holding.marketValue.amount,
+        portfolioCurrency: context.holding.marketValue.currency,
+        significance,
       }
       const result = parsePortfolioMeasurementResult(
         await transport.fairValueControl(
@@ -266,36 +267,13 @@ export function PortfolioMeasurementWorkflow({
         ),
         expected,
       )
-      try {
-        verifyPortfolioMeasurementEvidence(
-          await transport.query({
-            query: "fairValueEvidence",
-            measurementId: result.measurement.measurementId,
-          }),
-          {
-            measurementId: result.measurement.measurementId,
-            evidenceHash: result.measurement.evidenceHash,
-            accountId: context.account.accountId,
-            instrumentId: context.holding.instrument_id,
-            revisionId: context.account.currentRevision.revisionId,
-            quantity: context.holding.quantity,
-            portfolioAmount: context.holding.market_value.amount,
-            portfolioCurrency: context.holding.market_value.currency,
-            significance,
-          },
-        )
-      } catch {
-        throw new RetainedMeasurementVerificationError(
-          "The measurement was saved, but its supporting inputs could not be confirmed for display. Refresh before relying on it; diagnostic details are available in Logs.",
-        )
-      }
       return result
     },
     onSuccess: async (result) => {
       setAnnouncement(
-        `Measurement saved and classified ${humanize(result.classification.hierarchy)}.`,
+        `Measurement saved and classified ${humanize(result.measurement.classification?.hierarchy ?? "unclassified")}.`,
       )
-      await onCreated(result.measurement.measurementId)
+      await onCreated(result.measurement.measurementToken)
     },
     onError: (error) => setAnnouncement(measurementErrorMessage(error)),
   })
@@ -452,8 +430,8 @@ export function PortfolioMeasurementWorkflow({
                   {holdings.isPending ? "Loading current holdings…" : "Select a holding"}
                 </option>
                 {(holdings.data?.holdings ?? []).map((holding) => (
-                  <option key={holding.instrument_id} value={holding.instrument_id}>
-                    {shortIdentity(holding.instrument_id)} · {formatMoney(holding.market_value)}
+                  <option key={holding.instrumentId} value={holding.instrumentId}>
+                    {shortIdentity(holding.instrumentId)} · {formatMoney(holding.marketValue)}
                   </option>
                 ))}
               </select>
@@ -659,11 +637,7 @@ export function PortfolioMeasurementWorkflow({
 
       {measure.isError ? (
         <WorkflowError
-          title={
-            measure.error instanceof RetainedMeasurementVerificationError
-              ? "Measurement outcome needs verification"
-              : undefined
-          }
+          title="Measurement was not saved"
           message={measurementErrorMessage(measure.error)}
         />
       ) : null}
@@ -680,7 +654,7 @@ function decimalPlaces(value: string) {
 }
 
 function measurementErrorMessage(error: unknown) {
-  return error instanceof RetainedMeasurementVerificationError
+  return error instanceof Error && error.message
     ? error.message
     : "The measurement could not be created. Review the fields and try again, or open Logs for diagnostic details."
 }

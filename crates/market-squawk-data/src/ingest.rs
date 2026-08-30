@@ -1157,6 +1157,18 @@ fn verify_persisted_sec_fund_raw_objects(
 pub trait IngestPrecommitAuthority: fmt::Debug + Send + Sync {
     /// Revalidates the exact caller authority immediately before catalog and manifest commit.
     fn validate_precommit(&self) -> Result<(), IngestError>;
+
+    /// Claims an optional one-shot SEC fund job binding at the final provider-logical boundary.
+    ///
+    /// Ordinary ingest authorities retain the default absence. The SEC job implementation must
+    /// consume its terminal common-job permit here, not during earlier conversion or object
+    /// publication checks, and must bind the returned intent to `binding_digest` exactly.
+    fn claim_sec_fund_job_commit(
+        &self,
+        _binding_digest: EvidenceDigest,
+    ) -> Result<Option<crate::SecFundJobCommit>, IngestError> {
+        Ok(None)
+    }
 }
 
 /// Rights-bound research ingestion service.
@@ -1888,6 +1900,39 @@ impl AnalyticalDataService {
         crate::AnalyticalReadCapability::new(Arc::clone(&self.manifests), Arc::clone(&self.objects))
     }
 
+    /// Returns exact-origin SEC research reads over this service's durable authorities.
+    pub fn sec_research_reader(&self) -> crate::SecResearchReadCapability {
+        crate::SecResearchReadCapability::new(
+            Arc::clone(&self.authority),
+            Arc::clone(&self.manifests),
+            Arc::clone(&self.objects),
+        )
+    }
+
+    /// Returns the OCC/Cboe publisher bound to this sole catalog and exact source grants.
+    pub fn official_options_reference_publication(
+        &self,
+        dataset: SourceIdentifier,
+        sources: Vec<crate::OfficialOptionsReferenceSourceAuthority>,
+    ) -> Result<
+        crate::OfficialOptionsReferencePublicationCapability,
+        crate::OfficialOptionsReferenceError,
+    > {
+        crate::OfficialOptionsReferencePublicationCapability::try_new(
+            Arc::clone(&self.authority),
+            dataset,
+            sources,
+        )
+    }
+
+    /// Returns bounded immutable OCC/Cboe reads for one provider-specific dataset.
+    pub fn official_options_reference_reader(
+        &self,
+        dataset: SourceIdentifier,
+    ) -> crate::OfficialOptionsReferenceReadCapability {
+        crate::OfficialOptionsReferenceReadCapability::new(Arc::clone(&self.authority), dataset)
+    }
+
     /// Executes one exact pinned query, reserving durable artifact authority only after the first
     /// bounded execution proves that the result crossed the inline threshold.
     ///
@@ -1957,6 +2002,14 @@ impl AnalyticalDataService {
     /// Returns fair-value persistence authority over this service's sole catalog writer.
     pub fn fair_value_catalog(&self) -> crate::FairValueCatalogCapability {
         crate::FairValueCatalogCapability::new(Arc::clone(&self.authority))
+    }
+
+    /// Returns exact-coordinate SEC fund job recovery over this sole catalog/manifest pair.
+    pub fn sec_fund_job_catalog(&self) -> crate::SecFundJobCatalogCapability {
+        crate::SecFundJobCatalogCapability::new(
+            Arc::clone(&self.authority),
+            Arc::clone(&self.manifests),
+        )
     }
 
     /// Returns bounded point-in-time definition reads over this service's sole catalog session.
@@ -2645,6 +2698,117 @@ impl AnalyticalDataService {
         let selected = selected.ok_or(IngestError::ProviderLogicalFundRequired)?;
         FundPointInTimeSelection::try_new(request, manifest.clone(), &selected)
             .map_err(IngestError::Arrow)
+    }
+
+    /// Resolves canonical fund identity and family to an exact retained generation, then reads it.
+    ///
+    /// The caller supplies no dataset, manifest, provider binding, or catalog digest. Equally-new
+    /// generations, incomplete projections, and canonical filing revision failures remain typed
+    /// in the returned outcome.
+    pub async fn select_sec_fund_point_in_time(
+        &self,
+        request: &crate::SecFundPointInTimeReadRequest,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<crate::SecFundPointInTimeReadOutcome, IngestError> {
+        let selected =
+            self.sec_fund_job_catalog()
+                .select_point_in_time(request, deadline, &cancellation)?;
+        let publications = match selected {
+            crate::SecFundJobPointInTimeSelection::Missing => {
+                return Ok(crate::SecFundPointInTimeReadOutcome::Missing);
+            }
+            crate::SecFundJobPointInTimeSelection::Ambiguous {
+                candidates,
+                truncated,
+            } => {
+                return Ok(crate::SecFundPointInTimeReadOutcome::Ambiguous {
+                    candidates,
+                    truncated,
+                });
+            }
+            crate::SecFundJobPointInTimeSelection::Conflict {
+                coordinates,
+                truncated,
+            } => {
+                return Ok(crate::SecFundPointInTimeReadOutcome::Conflict {
+                    coordinates,
+                    truncated,
+                });
+            }
+            crate::SecFundJobPointInTimeSelection::Exact(publications) => publications,
+        };
+        if publications.is_empty()
+            || publications.len() > crate::MAX_SEC_FUND_POINT_IN_TIME_CANDIDATES
+        {
+            return Err(IngestError::ProviderLogicalFundRequired);
+        }
+        for publication in &publications {
+            if publication.fund_instrument_id() != request.fund_instrument_id()
+                || publication.family().source_family() != request.family()
+                || publication.committed_at() > request.knowledge_cutoff()
+            {
+                return Err(IngestError::ProviderLogicalFundRequired);
+            }
+        }
+        if publications.len() > 1 {
+            return Ok(crate::SecFundPointInTimeReadOutcome::RevisionSet { publications });
+        }
+        let mut publications = publications.into_vec();
+        let publication = publications
+            .pop()
+            .ok_or(IngestError::ProviderLogicalFundRequired)?;
+        let exact_request = request.exact_request(publication.pinned().manifest().clone())?;
+        let read_cancellation = cancellation.child_token();
+        let read = self.read_sec_fund_point_in_time(
+            &exact_request,
+            publication.binding_digest(),
+            store,
+            read_cancellation.clone(),
+        );
+        tokio::pin!(read);
+        let deadline_wait = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(deadline_wait);
+        let selection = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                read_cancellation.cancel();
+                let _drained = read.as_mut().await;
+                return Err(IngestError::Cancelled);
+            }
+            _ = deadline_wait.as_mut() => {
+                read_cancellation.cancel();
+                let _drained = read.as_mut().await;
+                return Err(IngestError::DeadlineExceeded);
+            }
+            result = read.as_mut() => result?,
+        };
+        if selection.manifest() != publication.pinned().manifest() {
+            return Err(IngestError::ProviderLogicalFundRequired);
+        }
+        Ok(crate::SecFundPointInTimeReadOutcome::Exact {
+            publication,
+            selection,
+        })
+    }
+
+    /// Re-runs canonical fund selection and requires identical coordinates and typed PIT evidence.
+    pub async fn verify_sec_fund_identity_restart(
+        &self,
+        request: &crate::SecFundPointInTimeReadRequest,
+        expected: &crate::SecFundPointInTimeReadOutcome,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<crate::SecFundPointInTimeReadOutcome, IngestError> {
+        let replay = self
+            .select_sec_fund_point_in_time(request, store, deadline, cancellation)
+            .await?;
+        if !expected.restart_matches(&replay) {
+            return Err(IngestError::ReplayConflict);
+        }
+        Ok(replay)
     }
 
     /// Repeats one exact-manifest fund PIT read and rejects any receipt or outcome drift.
@@ -4039,6 +4203,25 @@ impl AnalyticalDataService {
             if kind != GenerationKind::Ingest {
                 return Err(IngestError::ProviderCaptureRequired);
             }
+            let sec_fund_job = match (&source_evidence, precommit_authority) {
+                (PublicationSourceEvidence::ProviderLogical(binding), Some(authority)) => {
+                    authority.claim_sec_fund_job_commit(binding.binding_digest())?
+                }
+                _ => None,
+            };
+            if let Some(sec_fund_job) = sec_fund_job.as_ref() {
+                let PublicationSourceEvidence::ProviderLogical(binding) = &source_evidence else {
+                    return Err(IngestError::ProviderLogicalFundRequired);
+                };
+                if binding.terminal().source_id().as_str() != SEC_FUND_SOURCE_ID
+                    || sec_fund_job.binding_digest() != binding.binding_digest()
+                {
+                    return Err(IngestError::ProviderLogicalFundRequired);
+                }
+                authority
+                    .catalog()
+                    .stage_sec_fund_job_commit(sec_fund_job, reservation.run_id())?;
+            }
             let manifest = self
                 .manifests
                 .commit_provider_ingest_publication(
@@ -4218,6 +4401,9 @@ pub enum IngestError {
     /// SEC fund canonical rows do not match their exact logical raw/native publication evidence.
     #[error("SEC fund publication requires exact provider-logical evidence")]
     ProviderLogicalFundRequired,
+    /// SEC fund canonical-identity generation selection failed.
+    #[error("SEC fund generation selection failed")]
+    SecFundJob(#[from] crate::SecFundJobCatalogError),
     /// Provider page/frame and sealed-segment receipts could not be bound exactly.
     #[error("provider capture receipt is invalid")]
     ProviderCapture(#[from] ProviderCaptureError),

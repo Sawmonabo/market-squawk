@@ -31,7 +31,7 @@ const SCHWAB_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
 const YAHOO_FINANCE_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "yahoo-finance.experimental-enrichment",
     capability_revision: 3,
-    release_state: ProfileReleaseState::RefreshRequired,
+    release_state: ProfileReleaseState::Available,
 };
 const NASDAQ_TRADER_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "nasdaq-trader-symbol-directory-reference",
@@ -86,7 +86,7 @@ const SEC_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
 const TIINGO_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "tiingo.starter-eod-nav",
     capability_revision: 3,
-    release_state: ProfileReleaseState::RefreshRequired,
+    release_state: ProfileReleaseState::Available,
 };
 const TREASURY_FISCAL_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "treasury.fiscal-data",

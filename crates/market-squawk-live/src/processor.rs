@@ -13,8 +13,8 @@ use market_squawk_domain::{
     QualificationAssessment, Timestamp, TradingStatus,
 };
 use market_squawk_sources::{
-    CurrentDecodedProviderBatch, CurrentObservationIter, CurrentProviderObservation,
-    CurrentStreamKey, FrameId,
+    CurrentDecodedProviderBatch, CurrentObservationEvidence, CurrentObservationIter,
+    CurrentProviderObservation, CurrentStreamKey,
 };
 #[path = "processor/error.rs"]
 mod error;
@@ -107,7 +107,7 @@ impl CurrentBatchCursor {
 pub(crate) struct AppliedLiveObservation {
     pub(crate) stream: CurrentStreamKey,
     pub(crate) generation: ConnectionGeneration,
-    pub(crate) frame_id: FrameId,
+    pub(crate) source_evidence: CurrentObservationEvidence,
     pub(crate) event: MarketEvent,
     pub(crate) assessment: QualificationAssessment,
     pub(crate) binding_digest: [u8; 32],
@@ -267,7 +267,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
         let Some(current) = cursor.observations.next() else {
             return Ok(None);
         };
-        let frame_id = current.frame_evidence().frame_id();
+        let source_evidence = current.evidence().clone();
         let now = self.clock.now()?;
         self.validate_observation(&current, cursor, now.wall())?;
         let key = current.stream_key().clone();
@@ -363,7 +363,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
         Ok(Some(AppliedLiveObservation {
             stream: key,
             generation: cursor.admission.source().binding().connection_generation(),
-            frame_id,
+            source_evidence,
             event: qualified.event,
             assessment: qualified.assessment,
             binding_digest: qualified.binding_digest,
@@ -445,7 +445,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
         cursor.admission.validate_at(at)?;
         self.liveness.validate()?;
         if !current
-            .frame_evidence()
+            .evidence()
             .binding()
             .shares_allocation_with(cursor.admission.source().binding())
         {
@@ -466,7 +466,7 @@ impl<C: TrustedClock> InstrumentLiveProcessor<C> {
     ) -> Result<(), LiveApplyError> {
         let key = current.stream_key();
         let source_id = key.source_id();
-        let generation = current.frame_evidence().binding().connection_generation();
+        let generation = current.evidence().binding().connection_generation();
         let source_transition = match self.source_generations.get(source_id).copied() {
             Some(existing) if existing > generation => {
                 return Err(LiveApplyError::GenerationNotAdvanced);
@@ -650,7 +650,7 @@ fn validate_current_identity(
     let observation = current.observation();
     let stream = current.stream_key();
     let policy = current.policy();
-    let frame = current.frame_evidence();
+    let source_evidence = current.evidence();
     if current.key().venue() != batch_venue
         || current.key().instrument() != batch_instrument
         || observation.venue() != batch_venue
@@ -658,9 +658,9 @@ fn validate_current_identity(
         || observation.instrument() != definition_instrument
         || stream.venue() != batch_venue
         || stream.instrument() != batch_instrument
-        || stream.source_id() != frame.binding().source_id()
-        || policy.coverage().source_id() != frame.binding().source_id()
-        || policy.coverage().metadata_revision() != frame.binding().metadata_revision()
+        || stream.source_id() != source_evidence.binding().source_id()
+        || policy.coverage().source_id() != source_evidence.binding().source_id()
+        || policy.coverage().metadata_revision() != source_evidence.binding().metadata_revision()
         || stream.provider_product() != policy.provider_product()
         || stream.provider_channel() != policy.provider_channel()
         || policy.coverage().event_class() != observation.event_class()

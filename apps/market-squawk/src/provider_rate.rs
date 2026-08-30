@@ -2,6 +2,8 @@
 
 mod tiingo;
 
+pub(crate) use tiingo::DurableTiingoProviderAuthority;
+
 use std::path::Path;
 use std::sync::Arc;
 

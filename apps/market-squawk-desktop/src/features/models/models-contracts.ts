@@ -1,515 +1,258 @@
 import { z } from "zod"
 
-import type { ApplicationResult } from "@/lib/schemas"
 import { losslessIntegerSchema } from "@/lib/lossless-integer"
+import type { ApplicationResult } from "@/lib/schemas"
 
-const digestSchema = z.string().regex(/^[0-9a-f]{64}$/)
-const U64_MAX = 18_446_744_073_709_551_615n
-const canonicalUnsignedU64Schema = z.string().refine(
-  (value) =>
-    value.length <= 20 &&
-    /^(?:0|[1-9]\d*)$/.test(value) &&
-    BigInt(value) <= U64_MAX,
-  { message: "Expected a canonical unsigned 64-bit decimal" },
-)
-const canonicalPositiveU64Schema = canonicalUnsignedU64Schema.refine(
-  (value) => value !== "0",
-  { message: "Expected a positive canonical 64-bit decimal" },
-)
+const exactDecimalSchema = z.string().regex(/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/)
 
-const manifestSchema = z.object({
-  dataset: z.string().min(1),
-  manifestVersion: z.number().int().nonnegative(),
-  schema: z.object({
-    name: z.string().min(1),
-    version: z.number().int().positive(),
-    fingerprint: digestSchema,
-  }),
-  contentHash: digestSchema,
-})
-
-export const modelBundleSchema = z.object({
-  modelId: z.string().uuid(),
-  bundleId: z.string().min(1),
-  bundleVersion: z.number().int().positive(),
-  metadataHash: digestSchema,
-  artifactHash: digestSchema,
-  format: z.enum(["native_linear", "native_logistic", "onnx"]),
-  formatVersion: z.number().int().positive(),
-  trainingDataset: manifestSchema,
-  fallbackBehavior: z.object({
-    decision: z.literal("no_action"),
-    reason: z.string().min(1),
-  }),
-})
-
-const featureSchema = z.object({
-  name: z.string().min(1),
-  version: z.number().int().positive(),
-  inputSchemaDigest: digestSchema,
-  semanticDigest: digestSchema,
-  normalizer: z.discriminatedUnion("kind", [
-    z.object({ kind: z.literal("identity") }),
-    z.object({
-      kind: z.literal("standard"),
-      mean: z.number().finite(),
-      scale: z.number().finite(),
-    }),
-  ]),
-})
-
-export const modelMetadataSchema = modelBundleSchema.extend({
-  trainingRunHash: digestSchema,
-  features: z.array(featureSchema).min(1).max(4_096),
-  trainingDataset: z.object({
-    manifest: manifestSchema,
-    buildSpecDigest: digestSchema,
-    universeDigest: digestSchema,
-    policyDigest: digestSchema,
-    catalogIdentity: digestSchema,
-    exportDigest: digestSchema,
-    selectionDigest: digestSchema,
-    selectionAsOfUnixNanos: losslessIntegerSchema,
-    selectedComponentRows: z.number().int().positive(),
-  }),
-  universeId: z.string().min(1),
-  trainingPeriod: z.object({
-    startUnixNanos: losslessIntegerSchema,
-    endUnixNanos: losslessIntegerSchema,
-  }),
-  label: z.object({
-    name: z.string().min(1),
-    version: z.number().int().positive(),
-    kind: z.string().min(1),
-  }),
-  trainingCodeRevision: z.string().min(1),
-  trainingEnvironmentHash: digestSchema,
-  validationMetrics: z
-    .array(
-      z.object({
-        name: z.enum([
-          "mean_squared_error",
-          "accuracy",
-          "log_loss",
-          "area_under_roc",
-        ]),
-        value: z.number().finite(),
-      }),
-    )
-    .max(256),
-  decisionThresholds: z.object({
-    negativeMaximum: z.number().finite(),
-    positiveMinimum: z.number().finite(),
-    minimumConfidence: z.number().finite(),
-  }),
-  intendedUse: z.string().min(1),
-  limitations: z.array(z.string().min(1)).max(256),
-  admissionEvidence: z.object({
-    status: z.literal("admitted"),
-    authority: z.literal("rust_verified_durable_registry"),
-    metadataHash: digestSchema,
-    artifactHash: digestSchema,
-    trainingRunHash: digestSchema,
-    rejectionPolicy: z.string().min(1),
-    failureBehavior: z.literal("no_action"),
-  }),
-  runtimeHealth: z.object({
-    status: z.literal("ready"),
-    probe: z.literal("registry_backend_identity_match"),
-    backendGenerations: z.number().int().nonnegative(),
-    registryGenerations: z.number().int().nonnegative(),
-    failureBehavior: z.string().min(1),
-  }),
-  trainingEvidence: z.object({
-    schemaVersion: z.number().int().positive(),
-    trialHash: digestSchema,
-    seed: z.number().int().nonnegative(),
-    missingPolicy: z.enum(["reject", "drop_row"]),
-    splits: z.object({
-      train: z.number().int().nonnegative(),
-      validation: z.number().int().nonnegative(),
-      test: z.number().int().nonnegative(),
-      splitHash: digestSchema,
-    }),
-    forecastSchedule: z
+const modelEvidenceSchema = z
+  .object({
+    modelToken: z.string().uuid(),
+    label: z.string().min(1).max(240),
+    objective: z.enum(["numeric_outcome", "likelihood"]),
+    intendedUse: z.string().min(1).max(4_096),
+    evidenceState: z.enum(["sufficient", "limited", "unavailable"]),
+    training: z
       .object({
-        strategy: z.enum(["direct", "recursive", "multi_output", "chained"]),
-        horizons: z.array(z.number().int().positive()).min(1).max(512),
-        observedCutoffUnixNanos: losslessIntegerSchema,
-        rollingSplits: z.number().int().min(2).max(32),
-        selectionHash: digestSchema,
+        observedFromUnixNanos: losslessIntegerSchema,
+        observedThroughUnixNanos: losslessIntegerSchema,
+        availableAtUnixNanos: losslessIntegerSchema,
+        trainingObservations: z.number().int().nonnegative(),
+        validationObservations: z.number().int().nonnegative(),
+        outOfSampleObservations: z.number().int().nonnegative(),
+        rollingOutOfSampleFolds: z.number().int().nonnegative(),
+        evaluatedHorizons: z.number().int().nonnegative(),
       })
-      .nullable(),
-    cohortEvidence: z
+      .strict(),
+    validation: z
       .array(
-        z.object({
-          dimension: z.enum(["horizon", "regime", "instrument", "confidence"]),
-          status: z.enum([
-            "recorded",
-            "not_applicable",
-            "not_recorded",
-            "universe_bound_only",
-            "calibration_bound_only",
-          ]),
-          reason: z.string().min(1),
-        }),
+        z
+          .object({
+            label: z.string().min(1).max(200),
+            value: exactDecimalSchema,
+            interpretation: z.string().min(1).max(1_000),
+          })
+          .strict(),
       )
-      .length(4),
-  }),
-})
+      .max(64),
+    coverage: z
+      .array(
+        z
+          .object({
+            label: z.string().min(1).max(200),
+            state: z.enum(["evaluated", "limited", "unavailable"]),
+            interpretation: z.string().min(1).max(1_000),
+          })
+          .strict(),
+      )
+      .max(64),
+    limitations: z.array(z.string().min(1).max(4_096)).max(256),
+    unavailableBehavior: z.literal("no_action"),
+    analysisOnly: z.literal(true),
+  })
+  .strict()
 
-const modelBundlePageSchema = z.object({
-  bundles: z.array(modelBundleSchema).max(4_096),
-})
+const modelEvidencePageSchema = z
+  .object({ models: z.array(modelEvidenceSchema).max(4_096) })
+  .strict()
 
-const controlledArtifactSchema = z.object({
-  artifactId: z.string().min(1),
-  sha256: digestSchema,
-  byteCount: z.number().int().positive(),
-  mediaType: z.literal("application/json"),
-})
+const modelActivitySchema = z
+  .object({
+    activityToken: z.string().uuid(),
+    label: z.string().min(1).max(240),
+    state: z.enum(["queued", "running", "completed", "failed"]),
+    statusMessage: z.string().min(1).max(1_000),
+    progressPercent: exactDecimalSchema.nullable(),
+    updatedAtUnixNanos: losslessIntegerSchema,
+  })
+  .strict()
 
-export const forecastSummarySchema = z.object({
-  vintageId: digestSchema,
-  requestHash: digestSchema,
-  instrumentId: z.string().uuid(),
-  modelId: z.string().uuid(),
-  bundleId: z.string().min(1),
-  bundleVersion: z.number().int().positive(),
-  observedThroughUnixNanos: losslessIntegerSchema,
-  createdAtUnixNanos: losslessIntegerSchema,
-  expiresAtUnixNanos: losslessIntegerSchema,
-  horizonPoints: z.number().int().positive().max(512),
-  horizonStepNanos: losslessIntegerSchema,
-  hasCalibratedIntervals: z.boolean(),
-  quality: z.literal("modeled"),
-  unavailableReason: z.string().min(1),
-  controlledArtifact: controlledArtifactSchema,
-})
+const modelActivityPageSchema = z
+  .object({ activities: z.array(modelActivitySchema).max(1_024) })
+  .strict()
 
-const forecastPageSchema = z.object({
-  forecasts: z.array(forecastSummarySchema).max(4_096),
-  available: z.number().int().nonnegative(),
-  truncated: z.boolean(),
-})
+const forecastEvidenceStateSchema = z.enum(["calibrated", "limited"])
 
-const forecastIntervalsSchema = z.object({
-  interval50: z.tuple([z.string().regex(/^-?\d+$/), z.string().regex(/^-?\d+$/)]),
-  interval80: z.tuple([z.string().regex(/^-?\d+$/), z.string().regex(/^-?\d+$/)]),
-  interval95: z.tuple([z.string().regex(/^-?\d+$/), z.string().regex(/^-?\d+$/)]),
-})
+export const forecastSummarySchema = z
+  .object({
+    forecastToken: z.string().uuid(),
+    investmentToken: z.string().uuid(),
+    observedThroughUnixNanos: losslessIntegerSchema,
+    createdAtUnixNanos: losslessIntegerSchema,
+    expiresAtUnixNanos: losslessIntegerSchema,
+    horizon: z
+      .object({
+        points: z.number().int().positive().max(512),
+        stepNanos: losslessIntegerSchema,
+      })
+      .strict(),
+    evidenceState: forecastEvidenceStateSchema,
+    historicalObservationCount: z.number().int().nonnegative().max(4_096),
+    limitations: z.array(z.string().min(1).max(4_096)).max(256),
+  })
+  .strict()
 
-const forecastPointSchema = z.object({
-  targetAtUnixNanos: losslessIntegerSchema,
-  centralMantissa: z.string().regex(/^-?\d+$/),
-  decimalScale: z.number().int().min(0).max(18),
-  intervals: forecastIntervalsSchema.nullable(),
-})
+const forecastPageSchema = z
+  .object({
+    forecasts: z.array(forecastSummarySchema).max(4_096),
+    available: z.number().int().nonnegative(),
+    truncated: z.boolean(),
+  })
+  .strict()
 
-const observedHistoryPointSchema = z.object({
-  observedAtUnixNanos: losslessIntegerSchema,
-  availableAtUnixNanos: losslessIntegerSchema,
-  mantissa: z.string().regex(/^-?\d+$/),
-  decimalScale: z.number().int().min(0).max(18),
-  sourcePitHash: digestSchema,
-  quality: z.enum([
-    "direct_verified",
-    "direct_unverified",
-    "official_delayed",
-    "aggregated",
-    "indicative",
-    "estimated",
-    "stale",
-    "quarantined",
-  ]),
-})
+const forecastRangeSchema = z
+  .object({ lower: exactDecimalSchema, upper: exactDecimalSchema })
+  .strict()
 
-const driftMonitoringSchema = z.object({
-  status: z.enum(["awaiting_observed_outcomes", "outcome_error_observed"]),
-  basis: z.literal("immutable_forecast_outcomes"),
-  observedOutcomeCount: z.number().int().nonnegative(),
-  includedOutcomeCount: z.number().int().nonnegative(),
-  truncated: z.boolean(),
-  absoluteErrorMantissaTotal: z.string().regex(/^\d+$/),
-  meanAbsoluteErrorMantissa: z.string().regex(/^\d+$/).nullable(),
-  decimalScale: z.number().int().min(0).max(18),
-  thresholdState: z.literal("not_configured"),
-  interpretation: z.string().min(1),
-})
+const forecastPointSchema = z
+  .object({
+    targetAtUnixNanos: losslessIntegerSchema,
+    central: exactDecimalSchema,
+    ranges: z
+      .object({
+        likely: forecastRangeSchema,
+        wider: forecastRangeSchema,
+        stress: forecastRangeSchema,
+      })
+      .strict()
+      .nullable(),
+  })
+  .strict()
 
-const calibrationSchema = z.object({
-  method: z.enum(["mapie_enbpi", "mapie_aci", "residual_quantile"]),
-  windowStartUnixNanos: losslessIntegerSchema,
-  windowEndUnixNanos: losslessIntegerSchema,
-  observations: z.number().int().positive(),
-  policyHash: digestSchema,
-  residualsHash: digestSchema,
-  targetCoverageBasisPoints: z.tuple([
-    z.number().int().min(0).max(10_000),
-    z.number().int().min(0).max(10_000),
-    z.number().int().min(0).max(10_000),
-  ]),
-  lowerOffsets: z.tuple([z.number().finite(), z.number().finite(), z.number().finite()]),
-  upperOffsets: z.tuple([z.number().finite(), z.number().finite(), z.number().finite()]),
-  realizedCovered: z.tuple([
-    z.number().int().nonnegative(),
-    z.number().int().nonnegative(),
-    z.number().int().nonnegative(),
-  ]),
-  realizedTotal: z.tuple([
-    z.number().int().positive(),
-    z.number().int().positive(),
-    z.number().int().positive(),
-  ]),
-  coverageInterpretation: z.string().min(1),
-  dependenceAssumptions: z.string().min(1),
-})
+const observedHistoryPointSchema = z
+  .object({
+    observedAtUnixNanos: losslessIntegerSchema,
+    availableAtUnixNanos: losslessIntegerSchema,
+    value: exactDecimalSchema,
+  })
+  .strict()
 
-export const forecastVintageSchema = z.object({
-  vintageId: digestSchema,
-  requestHash: digestSchema,
-  controlledArtifact: controlledArtifactSchema,
-  instrumentId: z.string().uuid(),
-  modelId: z.string().uuid(),
-  bundleId: z.string().min(1),
-  bundleVersion: z.number().int().positive(),
-  metadataHash: digestSchema,
-  artifactHash: digestSchema,
-  trainingRunHash: digestSchema,
-  datasetExportHash: digestSchema,
-  datasetSelectionHash: digestSchema,
-  universeId: z.string().min(1),
-  trainingStartUnixNanos: losslessIntegerSchema,
-  trainingEndUnixNanos: losslessIntegerSchema,
-  featureSemanticHashes: z.array(digestSchema).min(1).max(4_096),
-  observedThroughUnixNanos: losslessIntegerSchema,
-  availableAtUnixNanos: losslessIntegerSchema,
-  createdAtUnixNanos: losslessIntegerSchema,
-  expiresAtUnixNanos: losslessIntegerSchema,
-  modelAgeNanosAtPublication: losslessIntegerSchema,
-  dataAgeNanosAtPublication: losslessIntegerSchema,
-  horizonPoints: z.number().int().positive().max(512),
-  horizonStepNanos: losslessIntegerSchema,
-  quality: z.literal("modeled"),
-  observedHistory: z.array(observedHistoryPointSchema).max(4_096),
-  points: z.array(forecastPointSchema).min(1).max(512),
-  calibration: calibrationSchema.nullable(),
-  limitations: z.array(z.string().min(1)).max(256),
-  unavailableReason: z.string().min(1),
-  driftMonitoring: driftMonitoringSchema,
-})
+const driftMonitoringSchema = z
+  .object({
+    state: z.enum(["awaiting_outcomes", "outcomes_available"]),
+    observedCount: z.number().int().nonnegative(),
+    includedCount: z.number().int().nonnegative(),
+    truncated: z.boolean(),
+    meanAbsoluteError: exactDecimalSchema.nullable(),
+    interpretation: z.string().min(1).max(2_000),
+  })
+  .strict()
 
-const forecastOutcomeSchema = z.object({
-  outcomeId: digestSchema,
-  vintageId: digestSchema,
-  targetAtUnixNanos: losslessIntegerSchema,
-  observedAtUnixNanos: losslessIntegerSchema,
-  availableAtUnixNanos: losslessIntegerSchema,
-  actualMantissa: z.string().regex(/^-?\d+$/),
-  decimalScale: z.number().int().min(0).max(18),
-  signedErrorMantissa: z.string().regex(/^-?\d+$/),
-  absoluteErrorMantissa: z.string().regex(/^\d+$/),
-  sourcePitHash: digestSchema,
-  quality: z.enum([
-    "direct_verified",
-    "direct_unverified",
-    "official_delayed",
-    "aggregated",
-    "indicative",
-    "estimated",
-    "stale",
-    "quarantined",
-  ]),
-})
+const calibrationSchema = z
+  .object({
+    windowStartUnixNanos: losslessIntegerSchema,
+    windowEndUnixNanos: losslessIntegerSchema,
+    observationCount: z.number().int().positive(),
+    coverage: z
+      .array(
+        z
+          .object({
+            targetCoveragePercent: exactDecimalSchema,
+            realizedCovered: z.number().int().nonnegative(),
+            realizedTotal: z.number().int().positive(),
+          })
+          .strict(),
+      )
+      .length(3),
+    interpretation: z.string().min(1).max(2_000),
+    assumptions: z.string().min(1).max(2_000),
+  })
+  .strict()
 
-const forecastOutcomesSchema = z.object({
-  vintageId: digestSchema,
-  outcomes: z.array(forecastOutcomeSchema).max(4_096),
-  available: z.number().int().nonnegative(),
-  truncated: z.boolean(),
-})
+export const forecastVintageSchema = z
+  .object({
+    forecastToken: z.string().uuid(),
+    investmentToken: z.string().uuid(),
+    observedThroughUnixNanos: losslessIntegerSchema,
+    availableAtUnixNanos: losslessIntegerSchema,
+    createdAtUnixNanos: losslessIntegerSchema,
+    expiresAtUnixNanos: losslessIntegerSchema,
+    horizon: z
+      .object({
+        points: z.number().int().positive().max(512),
+        stepNanos: losslessIntegerSchema,
+      })
+      .strict(),
+    evidenceState: forecastEvidenceStateSchema,
+    observedHistory: z.array(observedHistoryPointSchema).max(4_096),
+    estimates: z.array(forecastPointSchema).min(1).max(512),
+    calibration: calibrationSchema.nullable(),
+    limitations: z.array(z.string().min(1).max(4_096)).max(256),
+    unavailableBehavior: z.literal("no_action"),
+    outcomeMonitoring: driftMonitoringSchema,
+    analysisOnly: z.literal(true),
+  })
+  .strict()
 
-const jobSchema = z.object({
-  jobId: z.string().uuid(),
-  generation: canonicalPositiveU64Schema,
-  sequence: canonicalUnsignedU64Schema,
-  kind: z.string().min(1),
-  state: z.enum([
-    "queued",
-    "preparing",
-    "running",
-    "awaiting_confirmation",
-    "cancelling",
-    "completed",
-    "failed",
-    "cancelled",
-    "interrupted",
-    "recovering",
-  ]),
-  phase: z.string().min(1).nullable(),
-  completedUnits: z.number().int().nonnegative().nullable(),
-  totalUnits: z.number().int().nonnegative().nullable(),
-  cancellationRequested: z.boolean(),
-  updatedAt: losslessIntegerSchema,
-  recovery: z.string().min(1).nullable(),
-  failure: z
-    .object({
-      class: z.string().min(1),
-      diagnostic: z.string().min(1),
-      retryable: z.boolean(),
-    })
-    .nullable(),
-})
+const forecastOutcomeSchema = z
+  .object({
+    targetAtUnixNanos: losslessIntegerSchema,
+    observedAtUnixNanos: losslessIntegerSchema,
+    availableAtUnixNanos: losslessIntegerSchema,
+    actual: exactDecimalSchema,
+    signedError: exactDecimalSchema,
+    absoluteError: exactDecimalSchema,
+  })
+  .strict()
 
-const jobPageSchema = z.object({
-  jobs: z.array(jobSchema).max(1_024),
-  next: z.unknown().nullable(),
-})
+const forecastOutcomesSchema = z
+  .object({
+    forecastToken: z.string().uuid(),
+    outcomes: z.array(forecastOutcomeSchema).max(4_096),
+    available: z.number().int().nonnegative(),
+    truncated: z.boolean(),
+  })
+  .strict()
 
-const evaluationResultSchema = z.object({
-  modelId: z.string().uuid(),
-  bundleId: z.string().min(1),
-  bundleVersion: z.number().int().positive(),
-  trainingDataset: manifestSchema,
-  featureSemanticDigests: z.array(digestSchema).min(1).max(4_096),
-  score: z.number().finite(),
-  confidence: z.number().finite(),
-  decision: z.enum(["negative", "no_action", "positive"]),
-  executionAuthority: z.literal("none"),
-  inferenceFailureBehavior: z.literal("no_action"),
-  evaluationEvidence: z.object({
-    sequence: z.number().int().nonnegative(),
-    digest: digestSchema,
-    retention: z.literal("bounded_process_local"),
-  }),
-  validationMetrics: z.array(z.object({ name: z.string().min(1), value: z.number().finite() })).max(256),
-})
-
-const jobReceiptSchema = z.object({
-  jobId: z.string().uuid(),
-  generation: z.number().int().positive(),
-  sequence: z.number().int().nonnegative(),
-  state: z.literal("queued"),
-})
-
-export type ModelBundle = z.infer<typeof modelBundleSchema>
-export type ModelMetadata = z.infer<typeof modelMetadataSchema>
+export type ModelEvidence = z.infer<typeof modelEvidenceSchema>
+export type ModelActivity = z.infer<typeof modelActivitySchema>
 export type ForecastSummary = z.infer<typeof forecastSummarySchema>
 export type ForecastVintage = z.infer<typeof forecastVintageSchema>
 export type ForecastOutcome = z.infer<typeof forecastOutcomeSchema>
-export type ModelJob = z.infer<typeof jobSchema>
-export type EvaluationResult = z.infer<typeof evaluationResultSchema>
-export type ModelJobReceipt = z.infer<typeof jobReceiptSchema>
 
-export interface ModelBundlePage {
-  bundles: ModelBundle[]
-  completeness: string
-  available: number
+export function parseModelEvidence(result: ApplicationResult): ModelEvidence[] {
+  const parsed = modelEvidencePageSchema.safeParse(result.data)
+  if (!parsed.success) throw new Error("Model evidence is unavailable right now.")
+  return parsed.data.models
+}
+
+export function parseModelActivities(result: ApplicationResult): ModelActivity[] {
+  const parsed = modelActivityPageSchema.safeParse(result.data)
+  if (!parsed.success) throw new Error("Research activity is unavailable right now.")
+  return parsed.data.activities
 }
 
 export interface ForecastPage {
   forecasts: ForecastSummary[]
-  completeness: string
   available: number
   truncated: boolean
 }
 
-export function parseModelBundles(result: ApplicationResult): ModelBundlePage {
-  const parsed = modelBundlePageSchema.safeParse(result.data)
-  if (!parsed.success) {
-    throw new Error(
-      "The installed service returned an unsupported model-bundle response.",
-    )
-  }
-  return {
-    bundles: parsed.data.bundles,
-    completeness: result.metadata.completeness,
-    available: result.metadata.availableItems,
-  }
-}
-
 export function parseForecasts(result: ApplicationResult): ForecastPage {
   const parsed = forecastPageSchema.safeParse(result.data)
-  if (!parsed.success) {
-    throw new Error(
-      "The installed service returned an unsupported forecast-vintage response.",
-    )
-  }
-  return { ...parsed.data, completeness: result.metadata.completeness }
-}
-
-export function parseModelMetadata(result: ApplicationResult): ModelMetadata {
-  const parsed = modelMetadataSchema.safeParse(result.data)
-  if (!parsed.success) {
-    throw new Error(
-      "The installed service returned unsupported admitted-model metadata.",
-    )
-  }
+  if (!parsed.success) throw new Error("Forecasts are unavailable right now.")
   return parsed.data
 }
 
 export function parseForecastVintage(result: ApplicationResult): ForecastVintage {
   const parsed = forecastVintageSchema.safeParse(result.data)
-  if (!parsed.success) {
-    throw new Error(
-      "The installed service returned an unsupported forecast vintage.",
-    )
-  }
+  if (!parsed.success) throw new Error("Forecast details are unavailable right now.")
   return parsed.data
 }
 
 export interface ForecastOutcomes {
-  vintageId: string
+  forecastToken: string
   outcomes: ForecastOutcome[]
   available: number
   truncated: boolean
-  completeness: string
 }
 
 export function parseForecastOutcomes(result: ApplicationResult): ForecastOutcomes {
   const parsed = forecastOutcomesSchema.safeParse(result.data)
-  if (!parsed.success) {
-    throw new Error(
-      "The installed service returned unsupported forecast outcomes.",
-    )
-  }
-  return { ...parsed.data, completeness: result.metadata.completeness }
-}
-
-export function parseModelJobs(result: ApplicationResult): ModelJob[] {
-  const parsed = jobPageSchema.safeParse(result.data)
-  if (!parsed.success) {
-    throw new Error(
-      "The installed service returned an unsupported model-job response.",
-    )
-  }
-  return parsed.data.jobs.filter(
-    (job) => job.kind.startsWith("model.") || job.kind.startsWith("training."),
-  )
-}
-
-export function parseEvaluationResult(result: ApplicationResult): EvaluationResult {
-  const parsed = evaluationResultSchema.safeParse(result.data)
-  if (!parsed.success) {
-    throw new Error(
-      "The installed service returned an unsupported model-evaluation result.",
-    )
-  }
+  if (!parsed.success) throw new Error("Forecast outcomes are unavailable right now.")
   return parsed.data
 }
 
-export function parseModelJobReceipt(result: ApplicationResult): ModelJobReceipt {
-  const parsed = jobReceiptSchema.safeParse(result.data)
-  if (!parsed.success) {
-    throw new Error(
-      "The installed service returned an unsupported model-job receipt.",
-    )
-  }
-  return parsed.data
-}
-
-export function isActiveModelJob(job: ModelJob): boolean {
-  return !["completed", "failed", "cancelled", "interrupted"].includes(
-    job.state,
-  )
+export function isActiveModelActivity(activity: ModelActivity): boolean {
+  return activity.state === "queued" || activity.state === "running"
 }

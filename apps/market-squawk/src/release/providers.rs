@@ -509,7 +509,6 @@ async fn collect_provider_evidence(
             let evidence = exercise_live_surface(
                 product.application().as_ref(),
                 surface_id,
-                session.session_id().to_string(),
                 arguments.require_direct_verified_action && *surface_id == COINBASE_DIRECT,
                 shutdown_timeout,
             )
@@ -2157,24 +2156,18 @@ fn lower_hex(bytes: [u8; 32]) -> String {
 async fn exercise_live_surface(
     application: &Application,
     surface_id: &'static str,
-    session_id: String,
     require_action: bool,
     shutdown_timeout: Duration,
 ) -> Result<LiveRuntimeEvidence> {
-    let (provider, expected_quality) = match surface_id {
-        COINBASE_PUBLIC => ("coinbase", "direct_unverified"),
-        COINBASE_DIRECT => ("coinbase-direct", "direct_verified"),
-        KRAKEN_PUBLIC => ("kraken", "direct_unverified"),
+    let expected_quality = match surface_id {
+        COINBASE_PUBLIC | KRAKEN_PUBLIC => "direct_unverified",
+        COINBASE_DIRECT => "direct_verified",
         _ => bail!("selected provider surface is not a live runtime"),
     };
-    let mut start_arguments = json_object(json!({
-        "provider": provider,
+    let start_arguments = json_object(json!({
         "initialCash": "100000",
         "feeBasisPoints": 100,
     }))?;
-    if surface_id == COINBASE_DIRECT {
-        start_arguments.insert("providerSessionId".to_owned(), Value::String(session_id));
-    }
     let run = async {
         let start = invoke(
             application,

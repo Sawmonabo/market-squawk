@@ -37,7 +37,7 @@ export function PortfolioHistory({
   )
   const revisions = history.revisions.data?.pages.flatMap((page) => page.value) ?? []
   const baselines = revisions.filter(
-    (revision) => revision.revisionId !== account.currentRevision.revisionId,
+    (revision) => revision.snapshotToken !== account.currentSnapshot.snapshotToken,
   )
 
   React.useEffect(() => {
@@ -46,7 +46,7 @@ export function PortfolioHistory({
 
   React.useEffect(() => {
     if (baselineId === null && baselines.length > 0) {
-      setBaselineId(baselines.at(-1)?.revisionId ?? null)
+      setBaselineId(baselines.at(-1)?.snapshotToken ?? null)
     }
   }, [baselineId, baselines])
 
@@ -86,7 +86,7 @@ export function PortfolioHistory({
           selectedId={baselineId}
           select={setBaselineId}
           loading={history.revisions.isPending}
-          available={history.operationAvailable["Portfolio.ListRevisions"]}
+          available={history.capabilityAvailable.portfolio_revision_list}
           loadMore={
             history.revisions.hasNextPage
               ? () => void history.revisions.fetchNextPage()
@@ -95,12 +95,12 @@ export function PortfolioHistory({
           loadingMore={history.revisions.isFetchingNextPage}
           attribution={history.attribution.data?.value ?? null}
           attributionLoading={history.attribution.isPending && baselineId !== null}
-          attributionAvailable={history.operationAvailable["Portfolio.GetAttribution"]}
+          attributionAvailable={history.capabilityAvailable.portfolio_attribution}
         />
         <TransactionHistory
           rows={history.transactions.data?.value ?? []}
           loading={history.transactions.isPending}
-          available={history.operationAvailable["Portfolio.GetTransactions"]}
+          available={history.capabilityAvailable.portfolio_transactions}
         />
       </div>
     </section>
@@ -119,9 +119,9 @@ function RevisionComparison({
   attributionLoading,
   attributionAvailable,
 }: {
-  baselines: PortfolioAccount["currentRevision"][]
+  baselines: PortfolioAccount["currentSnapshot"][]
   selectedId: string | null
-  select: (revisionId: string) => void
+  select: (snapshotToken: string) => void
   loading: boolean
   available: boolean
   loadMore: (() => void) | null
@@ -152,7 +152,7 @@ function RevisionComparison({
               className="h-9 rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               {baselines.map((revision) => (
-                <option key={revision.revisionId} value={revision.revisionId}>
+                <option key={revision.snapshotToken} value={revision.snapshotToken}>
                   {formatTimestamp(revision.effectiveAtUnixNanos)} · {revision.holdingCount} holdings
                 </option>
               ))}
@@ -220,21 +220,21 @@ function TransactionHistory({
   const columns = React.useMemo<ColumnDef<PortfolioTransaction, unknown>[]>(
     () => [
       {
-        accessorKey: "occurred_at",
+        accessorKey: "occurredAtUnixNanos",
         header: "Occurred",
-        cell: ({ row }) => formatTimestamp(row.original.occurred_at),
+        cell: ({ row }) => formatTimestamp(row.original.occurredAtUnixNanos),
       },
       {
-        accessorKey: "kind",
+        accessorKey: "category",
         header: "Type",
-        cell: ({ row }) => humanize(row.original.kind),
+        cell: ({ row }) => humanize(row.original.category),
       },
       {
         id: "asset",
         header: "Asset",
         cell: ({ row }) =>
-          row.original.instrument_id
-            ? shortIdentity(row.original.instrument_id, "Asset")
+          row.original.instrumentId
+            ? shortIdentity(row.original.instrumentId, "Asset")
             : "Account cash",
       },
       {
@@ -263,7 +263,7 @@ function TransactionHistory({
             columns={columns}
             data={rows}
             emptyMessage="No transactions are available in this account snapshot."
-            getRowId={(row) => row.broker_transaction_id}
+            getRowId={(row) => row.transactionToken}
             pageSize={8}
             ariaLabel="Portfolio transactions"
           />

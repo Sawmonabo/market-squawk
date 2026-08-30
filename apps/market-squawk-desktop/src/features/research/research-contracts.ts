@@ -72,10 +72,16 @@ export const researchDatasetSchema = z.discriminatedUnion("generationKind", [
   }),
 ])
 
-const researchDatasetPageSchema = z.strictObject({
-  items: z.array(researchDatasetSchema),
+export const researchCollectionSchema = z.strictObject({
+  collectionToken: z.string().uuid(),
+  title: z.string().min(1),
+  rowCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+})
+
+const researchCollectionPageSchema = z.strictObject({
+  items: z.array(researchCollectionSchema),
   hasMore: z.boolean(),
-  nextAfterDataset: z.string().nullable(),
+  nextCollection: z.string().uuid().nullable(),
 })
 
 export const researchJobSchema = z
@@ -112,23 +118,80 @@ const researchJobPageSchema = z.strictObject({
   next: z.unknown().nullable(),
 })
 
-const observationArtifactSchema = z.strictObject({
-  artifactId: z.string().min(1),
-  sha256: digestSchema,
-  byteCount: z.number().int().nonnegative(),
-  mediaType: z.string().min(1),
-  rowCount: z.number().int().nonnegative(),
+const researchActivitySchema = z
+  .strictObject({
+    activityToken: z.string().uuid(),
+    label: z.string().min(1).max(128),
+    state: z.enum([
+      "queued",
+      "preparing",
+      "running",
+      "awaiting_confirmation",
+      "cancelling",
+      "completed",
+      "failed",
+      "cancelled",
+      "interrupted",
+      "recovering",
+    ]),
+    completedUnits: z.number().int().nonnegative().nullable(),
+    totalUnits: z.number().int().nonnegative().nullable(),
+    cancellationRequested: z.boolean(),
+    updatedAt: losslessIntegerSchema,
+    canCancel: z.boolean(),
+    canRetry: z.boolean(),
+  })
+  .superRefine((activity, context) => {
+    if (
+      (activity.completedUnits === null) !== (activity.totalUnits === null) ||
+      (activity.completedUnits !== null &&
+        activity.totalUnits !== null &&
+        activity.completedUnits > activity.totalUnits)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "The research activity progress is inconsistent.",
+      })
+    }
+    if (activity.canCancel && activity.canRetry) {
+      context.addIssue({
+        code: "custom",
+        message: "The research activity actions are inconsistent.",
+      })
+    }
+  })
+
+const researchActivityPageSchema = z.strictObject({
+  activities: z.array(researchActivitySchema).max(25),
+})
+
+const researchActionAcceptedSchema = z.strictObject({
+  accepted: z.literal(true),
+})
+
+const researchObservationScalarSchema = z.union([
+  z.string(),
+  z.number().finite(),
+  z.null(),
+])
+
+export const researchObservationSchema = z.strictObject({
+  revision: researchObservationScalarSchema.optional(),
+  quality: researchObservationScalarSchema.optional(),
+  effectiveAt: researchObservationScalarSchema.optional(),
+  publishedAt: researchObservationScalarSchema.optional(),
+  availableAt: researchObservationScalarSchema.optional(),
+  supersededAt: researchObservationScalarSchema.optional(),
 })
 
 const inlineObservationResultSchema = z.strictObject({
-  manifest: researchManifestSchema,
-  arrowIpcBytes: z.number().int().nonnegative(),
-  rows: z.array(z.record(z.string(), z.unknown())),
+  kind: z.literal("inline"),
+  rows: z.array(researchObservationSchema),
 })
 
 const artifactObservationResultSchema = z.strictObject({
-  manifest: researchManifestSchema,
-  artifact: observationArtifactSchema,
+  kind: z.literal("artifact"),
+  rowCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 })
 
 const researchJobReceiptSchema = z.strictObject({
@@ -175,149 +238,14 @@ const researchFileDiscardSchema = z.strictObject({
   status: z.literal("discarded"),
 })
 
-const researchSourceInputSchema = z.strictObject({
-  provider: z.string().min(1),
-  dataset: z.string().min(1),
-  label: z.string().min(1),
-})
-
-const evidenceDigestWireSchema = z
-  .object({
-    algorithm: z.enum(["sha256", "blake3"]),
-    bytes: z.array(z.number().int().min(0).max(255)).length(32),
-  })
-  .strict()
-
-const discoveryRequestSchema = z
-  .object({
-    dataset: z.string().min(1),
-    effective_at: losslessIntegerSchema.nullable(),
-    max_results: z.number().int().positive(),
-    deadline: losslessIntegerSchema,
-    request_id: evidenceDigestWireSchema,
-  })
-  .strict()
-
-const effectiveIntervalSchema = z
-  .object({
-    starts_at: losslessIntegerSchema,
-    ends_at: losslessIntegerSchema.nullable(),
-  })
-  .strict()
-
-const availabilityEvidenceSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("observed"), available_at: losslessIntegerSchema, evidence: z.string().min(1) }).strict(),
-  z.object({ kind: z.literal("local_first_observed"), observed_at: losslessIntegerSchema }).strict(),
-  z.object({ kind: z.literal("inferred"), inferred_at: losslessIntegerSchema, method: z.string().min(1) }).strict(),
-  z.object({ kind: z.literal("unknown") }).strict(),
-])
-
-const exactPayloadEvidenceSchema = z
-  .object({
-    content_digest: evidenceDigestWireSchema,
-    version_pinned_locator: z
-      .object({ reference: z.string().min(1), version: z.string().min(1) })
-      .strict()
-      .optional(),
-  })
-  .strict()
-
-const sourceObjectSchema = z
-  .object({
-    source_id: z.string().min(1),
-    metadata_revision: z.string().min(1),
-    dataset: z.string().min(1),
-    discovery_request_id: evidenceDigestWireSchema,
-    object_id: z.string().min(1),
-    media_type: z.string().min(1),
-    evidence: exactPayloadEvidenceSchema,
-    effective: effectiveIntervalSchema,
-    expected_bytes: losslessIntegerSchema.nullable(),
-    published_at: losslessIntegerSchema.nullable(),
-    availability: availabilityEvidenceSchema.optional(),
-  })
-  .strict()
-
-const providerProfileForResearchSchema = z
-  .object({
-    id: z.string().min(1),
-    display_name: z.string().min(1),
-    capability_revision: z.unknown(),
-    capability_digest: z.unknown(),
-    selected_setup_mode: z.unknown(),
-    setup_modes: z.unknown(),
-    human_boundary: z.unknown(),
-    credential_kind: z.unknown(),
-    minimum_authority: z.unknown(),
-    maximum_authority: z.unknown(),
-    verifier_revision: z.unknown(),
-    rate_policy: z.unknown(),
-    rights_state: z.unknown(),
-    lifecycle_support: z.unknown(),
-    capability_evidence: z.unknown(),
-    refresh_trigger: z.unknown(),
-    zero_fee: z.unknown(),
-    account_requirement: z.unknown(),
-    credential_requirement: z.unknown(),
-    administrative_contact_requirement: z.unknown(),
-    release_state: z.unknown(),
-    official_handoff_url: z.unknown(),
-    handoff_instruction: z.unknown(),
-    permissions: z.unknown(),
-    coverage: z.unknown(),
-    quality_ceiling: z.unknown(),
-    rights: z.unknown(),
-    rights_duties: z.unknown(),
-    rights_decision_digest: z.unknown(),
-    persistence_evidence: z.unknown(),
-    rotation: z.unknown(),
-    revocation: z.unknown(),
-    recovery: z.unknown(),
-    evidence: z.unknown(),
-  })
-  .strict()
-
-const researchSourceStatusSchema = z
-  .object({
-    profile: providerProfileForResearchSchema,
-    currentSession: z.record(z.string(), z.unknown()).nullable(),
-    providerDatasetIdentifier: z.string().min(1).nullable(),
-    runtime: z.record(z.string(), z.unknown()),
-  })
-  .strict()
-
-const sourceObjectListingSchema = z
-  .object({
-    profile: z.string().min(1),
-    metadata: z.record(z.string(), z.unknown()),
-    request: discoveryRequestSchema,
-    objects: z.array(sourceObjectSchema),
-  })
-  .strict()
-
-const discoveredSourceObjectSchema = sourceObjectSchema.extend({
-  discovery_receipt: z.string().uuid(),
-  discovery_receipt_expires_at: losslessIntegerSchema,
-})
-
-const sourceDiscoverySchema = z
-  .object({
-    profile: z.string().min(1),
-    metadata: z.record(z.string(), z.unknown()),
-    rights: z.record(z.string(), z.unknown()),
-    request: discoveryRequestSchema,
-    objects: z.array(discoveredSourceObjectSchema),
-    receipts_survive_restart: z.literal(false),
-  })
-  .strict()
-
 export type ResearchDataset = z.infer<typeof researchDatasetSchema>
+export type ResearchCollection = z.infer<typeof researchCollectionSchema>
+export type ResearchObservation = z.infer<typeof researchObservationSchema>
 export type ResearchJob = z.infer<typeof researchJobSchema>
+export type ResearchActivity = z.infer<typeof researchActivitySchema>
 export type ResearchManifest = z.infer<typeof researchManifestSchema>
 export type ResearchJobReceipt = z.infer<typeof researchJobReceiptSchema>
 export type ResearchFilePreview = z.infer<typeof researchFilePreviewSchema>
-export type ResearchSourceInput = z.infer<typeof researchSourceInputSchema>
-export type ResearchSourceObject = z.infer<typeof sourceObjectSchema>
 
 export type ResearchObservationResult =
   | {
@@ -327,50 +255,64 @@ export type ResearchObservationResult =
     }
   | {
       kind: "inline"
-      manifest: ResearchManifest
-      rows: Record<string, unknown>[]
-      arrowIpcBytes: number
+      rows: ResearchObservation[]
       returnedItems: number
       completeness: string
     }
   | {
       kind: "artifact"
-      manifest: ResearchManifest
-      artifact: z.infer<typeof observationArtifactSchema>
+      rowCount: number
       returnedItems: number
       completeness: string
     }
 
-export interface ResearchDatasetPage {
-  items: ResearchDataset[]
+export interface ResearchCollectionPage {
+  items: ResearchCollection[]
   hasMore: boolean
-  nextAfterDataset: string | null
+  nextCollection: string | null
   completeness: string
 }
 
-export function parseResearchDatasetPage(
+export function parseResearchCollectionPage(
   result: ApplicationResult,
-): ResearchDatasetPage {
+): ResearchCollectionPage {
   if (result.data === null) {
-    validateReturnedItems(result, 0, "research dataset")
+    validateReturnedItems(result, 0, "research collection")
     return {
       items: [],
       hasMore: false,
-      nextAfterDataset: null,
+      nextCollection: null,
       completeness: result.metadata.completeness,
     }
   }
-  const page = researchDatasetPageSchema.safeParse(result.data)
+  const page = researchCollectionPageSchema.safeParse(result.data)
   if (!page.success) {
     throw new Error(
-      "The installed service returned an unsupported research dataset response.",
+      "The installed service returned an unsupported research collection response.",
     )
   }
-  if (page.data.hasMore && page.data.nextAfterDataset === null) {
-    throw new Error("The research dataset continuation is incomplete.")
+  if (page.data.hasMore && page.data.nextCollection === null) {
+    throw new Error("The research collection continuation is incomplete.")
   }
-  validateReturnedItems(result, page.data.items.length, "research dataset")
+  validateReturnedItems(result, page.data.items.length, "research collection")
   return { ...page.data, completeness: result.metadata.completeness }
+}
+
+export function parseResearchCollection(
+  result: ApplicationResult,
+  expectedCollection: string,
+): ResearchCollection {
+  const collection = researchCollectionSchema.safeParse(result.data)
+  if (
+    !collection.success ||
+    collection.data.collectionToken !== expectedCollection
+  ) {
+    throw new Error(
+      "The installed service returned an unsupported research collection response.",
+    )
+  }
+  validateReturnedItems(result, 1, "research collection")
+  return collection.data
 }
 
 export function parseResearchJobs(result: ApplicationResult): ResearchJob[] {
@@ -386,6 +328,19 @@ export function parseResearchJobs(result: ApplicationResult): ResearchJob[] {
       job.kind.startsWith("research.") ||
       job.kind === "analysis.phase-one-feature-derived-generation-job.v1",
   )
+}
+
+export function parseResearchActivities(
+  result: ApplicationResult,
+): ResearchActivity[] {
+  const page = researchActivityPageSchema.safeParse(result.data)
+  if (!page.success) {
+    throw new Error(
+      "The installed service returned unsupported research activity.",
+    )
+  }
+  validateReturnedItems(result, page.data.activities.length, "research activity")
+  return page.data.activities
 }
 
 export function parseResearchManifest(
@@ -407,7 +362,6 @@ export function parseResearchManifest(
 
 export function parseResearchObservations(
   result: ApplicationResult,
-  expectedDataset: string,
 ): ResearchObservationResult {
   const common = {
     returnedItems: result.metadata.returnedItems,
@@ -419,23 +373,15 @@ export function parseResearchObservations(
   }
 
   const inline = inlineObservationResultSchema.safeParse(result.data)
-  if (
-    inline.success &&
-    inline.data.manifest.datasetId === expectedDataset &&
-    inline.data.rows.length === result.metadata.returnedItems
-  ) {
+  if (inline.success && inline.data.rows.length === result.metadata.returnedItems) {
     validateReturnedItems(result, inline.data.rows.length, "research history")
-    return { kind: "inline", ...inline.data, ...common }
+    return { ...inline.data, ...common }
   }
 
   const artifact = artifactObservationResultSchema.safeParse(result.data)
-  if (
-    artifact.success &&
-    artifact.data.manifest.datasetId === expectedDataset &&
-    artifact.data.artifact.rowCount === result.metadata.returnedItems
-  ) {
-    validateReturnedItems(result, artifact.data.artifact.rowCount, "research history")
-    return { kind: "artifact", ...artifact.data, ...common }
+  if (artifact.success && artifact.data.rowCount === result.metadata.returnedItems) {
+    validateReturnedItems(result, artifact.data.rowCount, "research history")
+    return { ...artifact.data, ...common }
   }
 
   throw new Error(
@@ -454,6 +400,16 @@ export function parseResearchJobReceipt(
   }
   validateReturnedItems(result, 1, "research-job receipt")
   return receipt.data
+}
+
+export function parseResearchActionAccepted(result: ApplicationResult): void {
+  const accepted = researchActionAcceptedSchema.safeParse(result.data)
+  if (!accepted.success) {
+    throw new Error(
+      "The installed service did not accept the requested research action.",
+    )
+  }
+  validateReturnedItems(result, 1, "research action")
 }
 
 export function parseResearchFilePreview(value: unknown): ResearchFilePreview {
@@ -513,100 +469,7 @@ export function parseResearchFileDiscard(
   validateReturnedItems(parsed.data, 1, "research-file discard receipt")
 }
 
-export function parseResearchSourceInputs(
-  result: ApplicationResult,
-): ResearchSourceInput[] {
-  if (result.data === null) {
-    validateReturnedItems(result, 0, "research source")
-    return []
-  }
-  const statuses = z.array(researchSourceStatusSchema).safeParse(result.data)
-  if (!statuses.success) {
-    throw new Error(
-      "The installed service returned an unsupported research-source response.",
-    )
-  }
-  validateReturnedItems(result, statuses.data.length, "research source")
-  const inputs = statuses.data.flatMap((row) =>
-    row.providerDatasetIdentifier === null
-      ? []
-      : [
-          researchSourceInputSchema.parse({
-            provider: row.profile.id,
-            dataset: row.providerDatasetIdentifier,
-            label: row.profile.display_name,
-          }),
-        ],
-  )
-  const unique = new Map<string, ResearchSourceInput>()
-  for (const input of inputs) {
-    const key = `${input.provider}\u0000${input.dataset}`
-    if (unique.has(key)) {
-      throw new Error("The installed service returned a duplicate research-source identity.")
-    }
-    unique.set(key, input)
-  }
-  return [...unique.values()].sort((left, right) =>
-    left.label.localeCompare(right.label),
-  )
-}
-
-export function parseResearchSourceObjects(
-  result: ApplicationResult,
-  expected: ResearchSourceInput,
-): ResearchSourceObject[] {
-  const listing = sourceObjectListingSchema.safeParse(result.data)
-  if (
-    !listing.success ||
-    listing.data.profile !== expected.provider ||
-    listing.data.request.dataset !== expected.dataset ||
-    listing.data.objects.some((object) => object.dataset !== expected.dataset)
-  ) {
-    throw new Error(
-      "The installed service returned an unsupported source-object listing.",
-    )
-  }
-  validateReturnedItems(result, listing.data.objects.length, "source-object listing")
-  validateSourceObjectIdentities(listing.data)
-  return listing.data.objects
-}
-
-export function receiptForDiscoveredObject(
-  result: ApplicationResult,
-  expected: ResearchSourceInput,
-  objectId: string,
-): string {
-  const discovery = sourceDiscoverySchema.safeParse(result.data)
-  if (
-    !discovery.success ||
-    discovery.data.profile !== expected.provider ||
-    discovery.data.request.dataset !== expected.dataset
-  ) {
-    throw new Error(
-      "The installed service returned unsupported discovery evidence.",
-    )
-  }
-  validateReturnedItems(result, discovery.data.objects.length, "source discovery")
-  validateSourceObjectIdentities(discovery.data)
-  if (
-    new Set(discovery.data.objects.map((object) => object.discovery_receipt)).size !==
-    discovery.data.objects.length
-  ) {
-    throw new Error("The source discovery returned a duplicate selection receipt.")
-  }
-  const selected = discovery.data.objects.find(
-    (object) =>
-      object.object_id === objectId && object.dataset === expected.dataset,
-  )
-  if (!selected) {
-    throw new Error(
-      "The selected source object was not present in the confirmed discovery.",
-    )
-  }
-  return selected.discovery_receipt
-}
-
-function validateReturnedItems(
+export function validateReturnedItems(
   result: ApplicationResult,
   actual: number,
   label: string,
@@ -625,34 +488,5 @@ function validateReturnedItems(
     (completeness === "truncated" && returnedItems >= availableItems)
   ) {
     throw new Error(`The ${label} result counts are inconsistent.`)
-  }
-}
-
-function validateSourceObjectIdentities(envelope: {
-  metadata: Record<string, unknown>
-  request: z.infer<typeof discoveryRequestSchema>
-  objects: ResearchSourceObject[]
-}) {
-  const metadataIdentity = z
-    .object({
-      source_id: z.string().min(1),
-      revision_evidence: z.object({ metadata_revision: z.string().min(1) }),
-    })
-    .safeParse(envelope.metadata)
-  const requestIdentity = JSON.stringify(envelope.request.request_id)
-  if (
-    !metadataIdentity.success ||
-    envelope.objects.length > envelope.request.max_results ||
-    envelope.objects.some(
-      (object) =>
-        object.source_id !== metadataIdentity.data.source_id ||
-        object.metadata_revision !==
-          metadataIdentity.data.revision_evidence.metadata_revision ||
-        JSON.stringify(object.discovery_request_id) !== requestIdentity,
-    ) ||
-    new Set(envelope.objects.map((object) => object.object_id)).size !==
-      envelope.objects.length
-  ) {
-    throw new Error("The source-object identities are inconsistent.")
   }
 }

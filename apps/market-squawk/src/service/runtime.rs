@@ -3,14 +3,16 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use getrandom::fill as fill_random;
 use market_squawk_domain::Timestamp;
 use market_squawk_platform::{
-    InstalledServiceInstanceGuard, LocalAuthorityStateStore, LocalPaths, SecretBackend,
-    SecretInteractionPolicy, SecretMutationPlan, SecretRef, SecretStore, SecretValue,
+    InstalledServiceInstanceGuard, LocalAuthorityStateStore, LocalPaths, LocalSecretStoreError,
+    SecretBackend, SecretCancellation, SecretGeneration, SecretInteractionPolicy, SecretKey,
+    SecretMutationPlan, SecretOperationControl, SecretReconciliationObservation, SecretRef,
+    SecretStore, SecretValue,
 };
 use market_squawk_runtime::{
     ApplicationProtocolRange, ApplicationProtocolVersion, ApplicationRequestScope,
@@ -31,48 +33,63 @@ use super::{
 };
 use crate::application::lifecycle::WorkspaceRuntimeIdentity;
 
-const STATE_FORMAT_VERSION: u16 = 2;
-const LEGACY_STATE_FORMAT_VERSION: u16 = 1;
+const STATE_FORMAT_VERSION: u16 = 1;
 const SERVICE_DIRECTORY: &str = "installed-service";
 const IDENTITY_DIRECTORY: &str = "identity";
 const RENDEZVOUS_DIRECTORY: &str = "rendezvous";
+const SIGNING_SECRET_SCOPE: &str = "runtime-service";
+const SIGNING_SECRET_NAME: &str = "rendezvous-signing";
+const SECRET_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const SIGNING_SECRET_BYTES: usize = 32;
-const MAXIMUM_LEGACY_SECRET_REFERENCES: usize = 5;
+const MAXIMUM_RUNTIME_STATE_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct DurableRuntimeInitialization {
+    format_version: u16,
+    installation_id: InstallationId,
+    rendezvous_signing_plan: SecretMutationPlan,
+}
+
+impl DurableRuntimeInitialization {
+    fn validate(self) -> Result<Self, InstalledServiceError> {
+        if self.format_version != STATE_FORMAT_VERSION
+            || self.rendezvous_signing_plan.target().generation().get() != 1
+        {
+            return Err(InstalledServiceError::InvalidRuntimeState);
+        }
+        Ok(self)
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct DurableRuntimeState {
     format_version: u16,
     installation_id: InstallationId,
-    /// Retired V1 references are non-authoritative, cleanup-pending debt. They remain durable
-    /// until an explicit foreground owner deletes and verifies the exact secrets.
-    #[serde(default)]
-    legacy_secret_cleanup: Vec<SecretRef>,
+    rendezvous_signing_secret: SecretRef,
 }
 
 impl DurableRuntimeState {
-    fn new(installation_id: InstallationId) -> Self {
-        Self {
-            format_version: STATE_FORMAT_VERSION,
-            installation_id,
-            legacy_secret_cleanup: Vec::new(),
-        }
-    }
-
     fn validate(self) -> Result<Self, InstalledServiceError> {
         if self.format_version != STATE_FORMAT_VERSION
-            || self.legacy_secret_cleanup.len() > MAXIMUM_LEGACY_SECRET_REFERENCES
+            || self.rendezvous_signing_secret.generation().get() != 1
         {
-            return Err(InstalledServiceError::InvalidRuntimeState);
-        }
-        let mut references = self.legacy_secret_cleanup.clone();
-        references.sort();
-        references.dedup();
-        if references.len() != self.legacy_secret_cleanup.len() {
             return Err(InstalledServiceError::InvalidRuntimeState);
         }
         Ok(self)
     }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "phase")]
+enum DurableRuntimeDocument {
+    Initializing {
+        initialization: DurableRuntimeInitialization,
+    },
+    Active {
+        state: DurableRuntimeState,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -114,52 +131,6 @@ impl InstalledRuntimeState {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct LegacyCredentialRegistration {
-    client_id: ClientId,
-    client: NamedClient,
-    reference: SecretRef,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct LegacyCredentialPlan {
-    client_id: ClientId,
-    client: NamedClient,
-    mutation: SecretMutationPlan,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct LegacyRuntimeInitialization {
-    format_version: u16,
-    runtime: RuntimeIdentity,
-    credentials: Vec<LegacyCredentialPlan>,
-    rendezvous_signing_plan: SecretMutationPlan,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct LegacyRuntimeState {
-    format_version: u16,
-    runtime: RuntimeIdentity,
-    endpoint: SocketAddr,
-    credentials: Vec<LegacyCredentialRegistration>,
-    rendezvous_signing_secret: SecretRef,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "phase")]
-enum LegacyRuntimeDocument {
-    Initializing {
-        initialization: LegacyRuntimeInitialization,
-    },
-    Active {
-        state: LegacyRuntimeState,
-    },
-}
-
 /// Prepared single-instance runtime. The rendezvous remains unpublished until composition ends.
 pub(super) struct PreparedRuntime {
     state: InstalledRuntimeState,
@@ -192,12 +163,17 @@ impl PreparedRuntime {
         secret_store: Arc<dyn SecretStore>,
         selected: WorkspaceRuntimeIdentity,
         installation_id: InstallationId,
-        _interaction: SecretInteractionPolicy,
+        interaction: SecretInteractionPolicy,
     ) -> Result<Self, InstalledServiceError> {
         let service_root = paths.control_root()?.root().join(SERVICE_DIRECTORY);
         let identity_store =
             LocalAuthorityStateStore::try_open(service_root.join(IDENTITY_DIRECTORY))?;
-        let durable = load_or_migrate_runtime_state(&identity_store, installation_id)?;
+        let (durable, signing_key) = prepare_runtime_authority(
+            &identity_store,
+            secret_store.as_ref(),
+            installation_id,
+            interaction,
+        )?;
         let runtime = selected
             .to_runtime(durable.installation_id)
             .map_err(|_error| InstalledServiceError::InvalidRuntimeState)?;
@@ -223,7 +199,6 @@ impl PreparedRuntime {
             credentials: registrations.into_vec(),
         }
         .validate()?;
-        let signing_key = random_secret()?;
         let mcp_roots = [
             state
                 .registration(NamedClient::ClaudeCode)
@@ -387,10 +362,16 @@ pub(super) fn installation_id(
     let Some(encoded) = identity_store.load()? else {
         return Ok(None);
     };
-    Ok(Some(decode_runtime_state(&encoded)?.installation_id))
+    let installation_id = match decode_runtime_document(&encoded)? {
+        DurableRuntimeDocument::Initializing { initialization } => {
+            initialization.validate()?.installation_id
+        }
+        DurableRuntimeDocument::Active { state } => state.validate()?.installation_id,
+    };
+    Ok(Some(installation_id))
 }
 
-/// Returns only retired, non-authoritative V1 references retained for explicit foreground cleanup.
+/// Returns only the exact protected signing generation retained by runtime authority.
 pub(super) fn credential_references(
     paths: &LocalPaths,
 ) -> Result<Vec<SecretRef>, InstalledServiceError> {
@@ -399,7 +380,15 @@ pub(super) fn credential_references(
     let Some(encoded) = identity_store.load()? else {
         return Ok(Vec::new());
     };
-    Ok(decode_runtime_state(&encoded)?.legacy_secret_cleanup)
+    let reference = match decode_runtime_document(&encoded)? {
+        DurableRuntimeDocument::Initializing { initialization } => initialization
+            .validate()?
+            .rendezvous_signing_plan
+            .target()
+            .clone(),
+        DurableRuntimeDocument::Active { state } => state.validate()?.rendezvous_signing_secret,
+    };
+    Ok(vec![reference])
 }
 
 pub(super) fn encrypted_fallback_eligible(
@@ -416,132 +405,182 @@ async fn bind_loopback() -> Result<TcpListener, InstalledServiceError> {
         .map_err(|_error| InstalledServiceError::EndpointUnavailable)
 }
 
-fn load_or_migrate_runtime_state(
+fn prepare_runtime_authority(
     store: &LocalAuthorityStateStore,
+    secret_store: &dyn SecretStore,
     installation_id: InstallationId,
-) -> Result<DurableRuntimeState, InstalledServiceError> {
-    let state = store
+    interaction: SecretInteractionPolicy,
+) -> Result<(DurableRuntimeState, SecretValue), InstalledServiceError> {
+    match store
         .load()?
-        .map(|encoded| decode_runtime_state(&encoded))
+        .map(|encoded| decode_runtime_document(&encoded))
         .transpose()?
-        .unwrap_or_else(|| DurableRuntimeState::new(installation_id));
-    store_runtime_state(store, &state)?;
-    Ok(state)
-}
-
-fn decode_runtime_state(encoded: &[u8]) -> Result<DurableRuntimeState, InstalledServiceError> {
-    if let Ok(state) = serde_json::from_slice::<DurableRuntimeState>(encoded) {
-        return state.validate();
-    }
-    if let Ok(document) = serde_json::from_slice::<LegacyRuntimeDocument>(encoded) {
-        return migrate_legacy_document(document);
-    }
-    serde_json::from_slice::<LegacyRuntimeState>(encoded)
-        .map(migrate_legacy_state)
-        .map_err(|_error| InstalledServiceError::InvalidRuntimeState)?
-}
-
-fn migrate_legacy_document(
-    document: LegacyRuntimeDocument,
-) -> Result<DurableRuntimeState, InstalledServiceError> {
-    match document {
-        LegacyRuntimeDocument::Initializing { initialization } => {
-            migrate_legacy_initialization(initialization)
-        }
-        LegacyRuntimeDocument::Active { state } => migrate_legacy_state(state),
-    }
-}
-
-fn migrate_legacy_initialization(
-    initialization: LegacyRuntimeInitialization,
-) -> Result<DurableRuntimeState, InstalledServiceError> {
-    let clients = initialization
-        .credentials
-        .iter()
-        .map(|plan| (plan.client_id, plan.client))
-        .collect::<Vec<_>>();
-    validate_legacy_clients(initialization.format_version, &clients)?;
-    let mut references = initialization
-        .credentials
-        .into_iter()
-        .map(|plan| plan.mutation.target().clone())
-        .collect::<Vec<_>>();
-    references.push(initialization.rendezvous_signing_plan.target().clone());
-    migrated_state(initialization.runtime.installation_id(), references)
-}
-
-fn migrate_legacy_state(
-    state: LegacyRuntimeState,
-) -> Result<DurableRuntimeState, InstalledServiceError> {
-    if state.endpoint.ip() != Ipv4Addr::LOCALHOST || state.endpoint.port() == 0 {
-        return Err(InstalledServiceError::InvalidRuntimeState);
-    }
-    let clients = state
-        .credentials
-        .iter()
-        .map(|registration| (registration.client_id, registration.client))
-        .collect::<Vec<_>>();
-    validate_legacy_clients(state.format_version, &clients)?;
-    let mut references = state
-        .credentials
-        .into_iter()
-        .map(|registration| registration.reference)
-        .collect::<Vec<_>>();
-    references.push(state.rendezvous_signing_secret);
-    migrated_state(state.runtime.installation_id(), references)
-}
-
-fn validate_legacy_clients(
-    format_version: u16,
-    clients: &[(ClientId, NamedClient)],
-) -> Result<(), InstalledServiceError> {
-    let expected = [
-        NamedClient::Desktop,
-        NamedClient::Cli,
-        NamedClient::ClaudeCode,
-        NamedClient::Codex,
-    ];
-    if format_version != LEGACY_STATE_FORMAT_VERSION
-        || clients.len() != expected.len()
-        || expected.into_iter().any(|expected| {
-            clients
-                .iter()
-                .filter(|(_id, client)| *client == expected)
-                .count()
-                != 1
-        })
     {
-        return Err(InstalledServiceError::InvalidRuntimeState);
+        Some(DurableRuntimeDocument::Active { state }) => {
+            let state = state.validate()?;
+            if state.installation_id != installation_id {
+                return Err(InstalledServiceError::InvalidRuntimeState);
+            }
+            let signing_key = secret_store
+                .read(
+                    &state.rendezvous_signing_secret,
+                    &secret_control("installed-runtime-signing-load", interaction)?,
+                )
+                .map_err(map_secret_store_error)?;
+            Ok((state, signing_key))
+        }
+        Some(DurableRuntimeDocument::Initializing { initialization }) => {
+            let initialization = initialization.validate()?;
+            if initialization.installation_id != installation_id {
+                return Err(InstalledServiceError::InvalidRuntimeState);
+            }
+            resume_runtime_initialization(store, secret_store, initialization, interaction)
+        }
+        None => initialize_runtime_authority(store, secret_store, installation_id, interaction),
     }
-    let mut ids = clients.iter().map(|(id, _client)| *id).collect::<Vec<_>>();
-    ids.sort_unstable();
-    ids.dedup();
-    if ids.len() != clients.len() {
-        return Err(InstalledServiceError::InvalidRuntimeState);
-    }
-    Ok(())
 }
 
-fn migrated_state(
+fn initialize_runtime_authority(
+    store: &LocalAuthorityStateStore,
+    secret_store: &dyn SecretStore,
     installation_id: InstallationId,
-    mut references: Vec<SecretRef>,
-) -> Result<DurableRuntimeState, InstalledServiceError> {
-    references.sort();
-    references.dedup();
-    DurableRuntimeState {
+    interaction: SecretInteractionPolicy,
+) -> Result<(DurableRuntimeState, SecretValue), InstalledServiceError> {
+    let signing_key = signing_secret_key()?;
+    let generation =
+        SecretGeneration::new(1).map_err(|_error| InstalledServiceError::SecretStore)?;
+    let signing_plan = secret_store
+        .plan_create(
+            &signing_key,
+            generation,
+            &secret_control("installed-runtime-signing-plan", interaction)?,
+        )
+        .map_err(map_secret_store_error)?;
+    let initialization = DurableRuntimeInitialization {
         format_version: STATE_FORMAT_VERSION,
         installation_id,
-        legacy_secret_cleanup: references,
+        rendezvous_signing_plan: signing_plan,
     }
-    .validate()
+    .validate()?;
+    store_runtime_document(
+        store,
+        &DurableRuntimeDocument::Initializing {
+            initialization: initialization.clone(),
+        },
+    )?;
+    resume_runtime_initialization(store, secret_store, initialization, interaction)
 }
 
-fn store_runtime_state(
+fn resume_runtime_initialization(
     store: &LocalAuthorityStateStore,
-    state: &DurableRuntimeState,
+    secret_store: &dyn SecretStore,
+    initialization: DurableRuntimeInitialization,
+    interaction: SecretInteractionPolicy,
+) -> Result<(DurableRuntimeState, SecretValue), InstalledServiceError> {
+    let signing_key = signing_secret_key()?;
+    let plan = &initialization.rendezvous_signing_plan;
+    match secret_store
+        .inspect_planned(
+            &signing_key,
+            plan,
+            &secret_control("installed-runtime-signing-inspect", interaction)?,
+        )
+        .map_err(map_secret_store_error)?
+    {
+        SecretReconciliationObservation::Absent => {
+            if let Err(failure) = secret_store.execute_planned(
+                &signing_key,
+                plan,
+                random_secret()?,
+                &secret_control("installed-runtime-signing-create", interaction)?,
+            ) {
+                let error = failure.into_error();
+                let reconciled = secret_store
+                    .inspect_planned(
+                        &signing_key,
+                        plan,
+                        &secret_control("installed-runtime-signing-reconcile", interaction)?,
+                    )
+                    .map_err(map_secret_store_error)?;
+                if !matches!(
+                    reconciled,
+                    SecretReconciliationObservation::PresentUnverified
+                        | SecretReconciliationObservation::Matches
+                ) {
+                    return Err(map_secret_store_error(error));
+                }
+            }
+        }
+        SecretReconciliationObservation::PresentUnverified
+        | SecretReconciliationObservation::Matches => {}
+        SecretReconciliationObservation::Mismatch => {
+            return Err(InstalledServiceError::SecretStore);
+        }
+    }
+    let signing_secret = secret_store
+        .read(
+            plan.target(),
+            &secret_control("installed-runtime-signing-load", interaction)?,
+        )
+        .map_err(map_secret_store_error)?;
+    let state = DurableRuntimeState {
+        format_version: STATE_FORMAT_VERSION,
+        installation_id: initialization.installation_id,
+        rendezvous_signing_secret: plan.target().clone(),
+    }
+    .validate()?;
+    store_runtime_document(
+        store,
+        &DurableRuntimeDocument::Active {
+            state: state.clone(),
+        },
+    )?;
+    Ok((state, signing_secret))
+}
+
+fn signing_secret_key() -> Result<SecretKey, InstalledServiceError> {
+    SecretKey::try_new(SIGNING_SECRET_SCOPE, SIGNING_SECRET_NAME)
+        .map_err(|_error| InstalledServiceError::SecretStore)
+}
+
+fn secret_control(
+    owner: &'static str,
+    interaction: SecretInteractionPolicy,
+) -> Result<SecretOperationControl, InstalledServiceError> {
+    let deadline = Instant::now()
+        .checked_add(SECRET_OPERATION_TIMEOUT)
+        .ok_or(InstalledServiceError::SecretStore)?;
+    SecretOperationControl::try_new(owner, deadline, 1, interaction, SecretCancellation::new())
+        .map_err(|_error| InstalledServiceError::SecretStore)
+}
+
+fn map_secret_store_error(error: LocalSecretStoreError) -> InstalledServiceError {
+    match error {
+        LocalSecretStoreError::InteractionRequired => {
+            InstalledServiceError::SecretInteractionRequired
+        }
+        _ => InstalledServiceError::SecretStore,
+    }
+}
+
+fn decode_runtime_document(
+    encoded: &[u8],
+) -> Result<DurableRuntimeDocument, InstalledServiceError> {
+    if encoded.is_empty() || encoded.len() > MAXIMUM_RUNTIME_STATE_BYTES {
+        return Err(InstalledServiceError::InvalidRuntimeState);
+    }
+    serde_json::from_slice(encoded).map_err(|_error| InstalledServiceError::InvalidRuntimeState)
+}
+
+fn store_runtime_document(
+    store: &LocalAuthorityStateStore,
+    document: &DurableRuntimeDocument,
 ) -> Result<(), InstalledServiceError> {
-    let encoded =
-        serde_json::to_vec(state).map_err(|_error| InstalledServiceError::InvalidRuntimeState)?;
+    let encoded = serde_json::to_vec(document)
+        .map_err(|_error| InstalledServiceError::InvalidRuntimeState)?;
+    if encoded.len() > MAXIMUM_RUNTIME_STATE_BYTES {
+        return Err(InstalledServiceError::InvalidRuntimeState);
+    }
     store.store(&encoded)?;
     Ok(())
 }

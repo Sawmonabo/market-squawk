@@ -32,12 +32,12 @@ use serde_json::Value;
 
 use super::ensure_live;
 use crate::application::market_runtime::{
-    CryptoMarketDurableRouteRead, MarketDisplaySnapshotBatch, MarketDisplaySnapshotLease,
+    MarketDisplaySnapshotBatch, MarketDisplaySnapshotLease, MarketEventDurableRouteRead,
     MarketKrakenPriceProjectionLease, MarketOrderLevelSnapshot, MarketRuntimeRegistry,
     MarketRuntimeSnapshotBatch,
 };
 use crate::application::market_selection::{MarketOperation, MarketOperationSet};
-use crate::application::research::CryptoMarketPointInTimeReceipt;
+use crate::application::research::MarketEventPointInTimeReceipt;
 use crate::application::{ApplicationDomainService, effective_service_limits};
 pub(super) use candidate::ProductionPortfolioCandidateResolutionFactory;
 use results::{
@@ -144,7 +144,7 @@ struct DurableMarketRouteEvidence {
     source_id: SourceId,
     instrument_id: InstrumentId,
     venue_id: VenueId,
-    selections: Vec<CryptoMarketPointInTimeReceipt>,
+    selections: Vec<MarketEventPointInTimeReceipt>,
 }
 
 impl DurableMarketRouteEvidence {
@@ -154,7 +154,7 @@ impl DurableMarketRouteEvidence {
         source_id: SourceId,
         instrument_id: InstrumentId,
         venue_id: VenueId,
-        mut selections: Vec<CryptoMarketPointInTimeReceipt>,
+        mut selections: Vec<MarketEventPointInTimeReceipt>,
     ) -> Result<Option<Self>, ServiceError> {
         let mut seen_event_kinds = Vec::new();
         seen_event_kinds
@@ -953,7 +953,7 @@ async fn load_durable_market_evidence(
     context: &RequestContext,
 ) -> Result<DurableMarketEvidenceSet, ServiceError> {
     let mut bindings = registry
-        .crypto_market_durable_route_reads(context.deadline(), context.cancellation())
+        .market_event_durable_route_reads(context.deadline(), context.cancellation())
         .await?;
     bindings.retain(|binding| filters.matches_durable_identity(binding));
     let mut bound_sources = Vec::new();
@@ -985,7 +985,7 @@ async fn load_durable_market_evidence(
 }
 
 async fn load_durable_route_evidence(
-    binding: &CryptoMarketDurableRouteRead,
+    binding: &MarketEventDurableRouteRead,
     reference_at: Timestamp,
     context: &RequestContext,
 ) -> Result<Option<DurableMarketRouteEvidence>, ServiceError> {
@@ -1588,7 +1588,7 @@ impl<'request> MarketFilters<'request> {
                     .is_ok())
     }
 
-    fn matches_durable_identity(&self, binding: &CryptoMarketDurableRouteRead) -> bool {
+    fn matches_durable_identity(&self, binding: &MarketEventDurableRouteRead) -> bool {
         matches_instrument_filter(self, binding.route().instrument())
             && (self.sources.is_empty()
                 || self

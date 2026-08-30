@@ -13,8 +13,9 @@ pub(crate) use completed_session::{
     CompletedMarketSessionCandidateSnapshot, CompletedMarketSessionCurrentnessIdentity,
     CompletedMarketSessionCurrentnessReceipt, CompletedMarketSessionCurrentnessResolution,
     CompletedMarketSessionError, CompletedMarketSessionEvidenceAccessError,
-    CompletedMarketSessionEvidenceAuthority, CompletedMarketSessionReceipt,
-    CompletedMarketSessionRequest, CompletedMarketSessionResolution,
+    CompletedMarketSessionEvidenceAuthority, CompletedMarketSessionRangeReceipt,
+    CompletedMarketSessionRangeRequest, CompletedMarketSessionRangeResolution,
+    CompletedMarketSessionReceipt, CompletedMarketSessionRequest, CompletedMarketSessionResolution,
     CompletedMarketSessionUnavailable,
 };
 

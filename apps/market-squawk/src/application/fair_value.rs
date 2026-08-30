@@ -13,20 +13,21 @@ use market_squawk_services::{
     TypedToolResult,
 };
 use market_squawk_valuation::{
-    ActorId, ApprovalStatus, ApprovedMarketAccess, AuditEventId, AuditEventKind,
-    ClassificationRuleset, DecisionBasis, DecisionId, EvidenceOrigin, FairValueAuditCursor,
-    FairValueAuditEvent, FairValueError, FairValueEvidenceHash, FairValueLimits,
-    FairValueSelectionError, FairValueSelectionReceipt, FairValueSelectionRequest,
-    FairValueService, InputSignificance, MarketAccess, MarketAccessAssessmentId,
-    MarketPriceSelection, MeasurementId, OverrideProposal, RulesetHash, ValuationAmount,
-    ValuationAmountBasis, ValuationApprovalId, ValuationInput, ValuationMeasurement,
-    ValuationMeasurementSpec, ValuationMethod,
+    ActorId, ApprovalRevocation, ApprovalStatus, ApprovedMarketAccess, AuditEventId,
+    AuditEventKind, ClassificationDecision, ClassificationRuleset, DecisionBasis, DecisionId,
+    EvidenceOrigin, FairValueAuditCursor, FairValueAuditEvent, FairValueError,
+    FairValueEvidenceHash, FairValueLimits, FairValueSelectionError, FairValueSelectionReceipt,
+    FairValueSelectionRequest, FairValueService, InputId, InputSignificance, MarketAccess,
+    MarketAccessAssessmentId, MarketPriceSelection, MeasurementId, OverrideProposal, RulesetHash,
+    ValuationAmount, ValuationAmountBasis, ValuationApprovalId, ValuationInput,
+    ValuationMeasurement, ValuationMeasurementSpec, ValuationMethod,
 };
 use rust_decimal::Decimal;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use super::{
     ApplicationDomainService,
@@ -44,11 +45,15 @@ pub use resolver::{
     ResearchFairValueInputPublisher,
 };
 use serialization::{
-    approval_value, classification_value, evidence_value, explanation_reason_value,
-    market_access_assessment_value, measurement_value, predicate_result_value, timestamp_value,
+    access_name, activity_name, adjustment_name, amount_value, approval_status_name,
+    approval_value, classification_value, evidence_value, explanation_reason_value, hierarchy_name,
+    market_access_assessment_value, measurement_value, method_name, observability_name,
+    predicate_name, predicate_result_value, product_basis_value, quality_name, reason_name,
+    relation_name, significance_name, timestamp_value,
 };
 
 const LIST_MEASUREMENTS: &str = "FairValue.ListMeasurements";
+const GET_WORKSPACE: &str = "FairValue.GetWorkspace";
 const GET_CLASSIFICATION: &str = "FairValue.GetClassification";
 const EXPLAIN: &str = "FairValue.Explain";
 const GET_EVIDENCE: &str = "FairValue.GetEvidence";
@@ -65,6 +70,7 @@ const BACKUP_ATTESTATION_MAGIC: [u8; 8] = *b"MSQFVA01";
 const BACKUP_ATTESTATION_FORMAT_VERSION: u16 = 1;
 const BACKUP_ATTESTATION_BYTES: usize = 115;
 const RECOMMENDATION_MAXIMUM_ELIGIBLE_SELECTIONS: usize = 256;
+const MAXIMUM_WORKFLOW_TOKENS: usize = 16_384;
 
 /// Producer family named by one opaque, application-resolved receipt selector.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -387,6 +393,7 @@ pub trait FairValueInputResolver: Send + Sync + 'static {
 /// Application-owned fair-value surface over one durable catalog writer and receipt resolver.
 pub struct FairValueDomainService {
     state: Arc<Mutex<FairValueService>>,
+    workflow_tokens: Arc<Mutex<FairValueWorkflowTokens>>,
     resolver: Arc<dyn FairValueInputResolver>,
     selection_authority: Arc<dyn FairValueProducerSelectionAuthority>,
     ruleset: ClassificationRuleset,
@@ -394,6 +401,72 @@ pub struct FairValueDomainService {
     maximum_query_results: usize,
     recommendation_maximum_eligible: NonZeroUsize,
     lifecycle: Arc<DomainLifecycle>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClassificationCoordinate {
+    measurement_id: MeasurementId,
+    decision_id: DecisionId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MarketInputCoordinate {
+    input_id: InputId,
+    account_id: AccountId,
+    venue_id: VenueId,
+    instrument_id: InstrumentId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProductTokenBinding<T> {
+    token: Uuid,
+    value: T,
+}
+
+struct ProductTokenStore<T> {
+    bindings: Vec<ProductTokenBinding<T>>,
+}
+
+impl<T> Default for ProductTokenStore<T> {
+    fn default() -> Self {
+        Self {
+            bindings: Vec::new(),
+        }
+    }
+}
+
+impl<T: Clone + Eq> ProductTokenStore<T> {
+    fn token_for(&mut self, value: T) -> Result<Uuid, ServiceError> {
+        if let Some(existing) = self.bindings.iter().find(|binding| binding.value == value) {
+            return Ok(existing.token);
+        }
+        if self.bindings.len() >= MAXIMUM_WORKFLOW_TOKENS {
+            return Err(ServiceError::ResourceExhausted);
+        }
+        self.bindings
+            .try_reserve(1)
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        let token = Uuid::new_v4();
+        self.bindings.push(ProductTokenBinding { token, value });
+        Ok(token)
+    }
+
+    fn resolve(&self, token: Uuid) -> Result<T, ServiceError> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.token == token)
+            .map(|binding| binding.value.clone())
+            .ok_or(ServiceError::NotFound)
+    }
+}
+
+#[derive(Default)]
+struct FairValueWorkflowTokens {
+    measurements: ProductTokenStore<MeasurementId>,
+    classifications: ProductTokenStore<ClassificationCoordinate>,
+    inputs: ProductTokenStore<InputId>,
+    approvals: ProductTokenStore<ValuationApprovalId>,
+    market_inputs: ProductTokenStore<MarketInputCoordinate>,
 }
 
 /// Cloneable read-only fair-value authority for personalized investment analysis.
@@ -406,6 +479,116 @@ pub(crate) struct FairValueRecommendationReadCapability {
     state: Arc<Mutex<FairValueService>>,
     maximum_eligible: NonZeroUsize,
     lifecycle: Arc<DomainLifecycle>,
+}
+
+/// Typed read-only fair-value evidence for in-process dossier assembly.
+///
+/// This capability deliberately returns retained domain records rather than serialized product
+/// JSON. Dossier assembly can therefore bind exact evidence identities without reconstructing
+/// native authority from a transport representation.
+#[derive(Clone)]
+pub(crate) struct FairValueDossierReadCapability {
+    state: Arc<Mutex<FairValueService>>,
+    workflow_tokens: Arc<Mutex<FairValueWorkflowTokens>>,
+    ruleset_hash: RulesetHash,
+    maximum_scan: usize,
+    lifecycle: Arc<DomainLifecycle>,
+}
+
+/// One dossier-eligible measurement and its exact current rules classification.
+#[derive(Clone, Debug)]
+pub(crate) struct FairValueDossierRecord {
+    selector_token: Uuid,
+    measurement: Arc<ValuationMeasurement>,
+    decision: Arc<ClassificationDecision>,
+}
+
+impl FairValueDossierRecord {
+    pub(crate) const fn selector_token(&self) -> Uuid {
+        self.selector_token
+    }
+
+    pub(crate) fn measurement(&self) -> &ValuationMeasurement {
+        &self.measurement
+    }
+
+    pub(crate) fn decision(&self) -> &ClassificationDecision {
+        &self.decision
+    }
+}
+
+impl FairValueDossierReadCapability {
+    pub(crate) async fn records(
+        &self,
+        instrument_id: InstrumentId,
+        selected_at: Timestamp,
+        maximum: usize,
+        context: &RequestContext,
+    ) -> Result<Vec<FairValueDossierRecord>, ServiceError> {
+        let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
+        if maximum == 0 {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let scan_limit = self.maximum_scan.min(maximum.max(1));
+        let state = lock_fair_value_state(&self.state, &self.lifecycle, context).await?;
+        let measurements = state
+            .measurements(scan_limit)
+            .map_err(map_fair_value_error)?;
+        let mut selected = Vec::new();
+        selected
+            .try_reserve(measurements.len().min(maximum))
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        for measurement in measurements {
+            if measurement.instrument_id() != instrument_id
+                || measurement.measurement_at() > selected_at
+                || measurement.prepared_at() > selected_at
+            {
+                continue;
+            }
+            let Some(decision) = state
+                .rules_decision_for_measurement(measurement.id(), self.ruleset_hash)
+                .map_err(map_fair_value_error)?
+            else {
+                continue;
+            };
+            selected.push((measurement, decision));
+        }
+        drop(state);
+        selected.sort_unstable_by(
+            |(left_measurement, left_decision), (right_measurement, right_decision)| {
+                right_measurement
+                    .measurement_at()
+                    .cmp(&left_measurement.measurement_at())
+                    .then_with(|| {
+                        right_measurement
+                            .prepared_at()
+                            .cmp(&left_measurement.prepared_at())
+                    })
+                    .then_with(|| left_decision.id().cmp(&right_decision.id()))
+            },
+        );
+        selected.truncate(maximum);
+
+        let mut tokens = self.workflow_tokens.lock().await;
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(selected.len())
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        for (measurement, decision) in selected {
+            let selector_token = tokens.classifications.token_for(ClassificationCoordinate {
+                measurement_id: measurement.id(),
+                decision_id: decision.id(),
+            })?;
+            records.push(FairValueDossierRecord {
+                selector_token,
+                measurement,
+                decision,
+            });
+        }
+        drop(tokens);
+        ensure_request_live(context, &self.lifecycle)?;
+        Ok(records)
+    }
 }
 
 impl FairValueRecommendationReadCapability {
@@ -738,6 +921,7 @@ impl FairValueDomainService {
         })?;
         Ok(Self {
             state: Arc::new(Mutex::new(service)),
+            workflow_tokens: Arc::new(Mutex::new(FairValueWorkflowTokens::default())),
             resolver,
             selection_authority,
             ruleset: ClassificationRuleset::current(maximum_quote_age_nanos)?,
@@ -753,6 +937,17 @@ impl FairValueDomainService {
         FairValueRecommendationReadCapability {
             state: Arc::clone(&self.state),
             maximum_eligible: self.recommendation_maximum_eligible,
+            lifecycle: Arc::clone(&self.lifecycle),
+        }
+    }
+
+    /// Issues a typed read-only capability for exact in-process dossier preparation.
+    pub(crate) fn dossier_read_capability(&self) -> FairValueDossierReadCapability {
+        FairValueDossierReadCapability {
+            state: Arc::clone(&self.state),
+            workflow_tokens: Arc::clone(&self.workflow_tokens),
+            ruleset_hash: self.ruleset.hash(),
+            maximum_scan: self.maximum_query_results,
             lifecycle: Arc::clone(&self.lifecycle),
         }
     }
@@ -778,36 +973,67 @@ impl FairValueDomainService {
         })
     }
 
-    /// Resolves the immutable evidence chain used by one governed approval or override preview.
-    pub(crate) async fn governed_decision_evidence(
+    /// Resolves product workflow tokens to the immutable evidence used by governance.
+    pub(crate) async fn governed_decision_evidence_for_tokens(
         &self,
-        measurement_id: MeasurementId,
-        decision_id: DecisionId,
+        measurement_token: Uuid,
+        classification_token: Uuid,
     ) -> Result<GovernedFairValueDecisionEvidence, FairValueError> {
+        let tokens = self.workflow_tokens.lock().await;
+        let measurement_id = tokens
+            .measurements
+            .resolve(measurement_token)
+            .map_err(|_error| FairValueError::InvalidMeasurement)?;
+        let coordinate = tokens
+            .classifications
+            .resolve(classification_token)
+            .map_err(|_error| FairValueError::InvalidMeasurement)?;
+        drop(tokens);
+        if coordinate.measurement_id != measurement_id {
+            return Err(FairValueError::InvalidMeasurement);
+        }
         let state = self.state.lock().await;
-        resolve_governed_decision(&state, measurement_id, decision_id)
+        resolve_governed_decision(&state, measurement_id, coordinate.decision_id)
     }
 
-    /// Resolves an active approval and its complete immutable measurement/decision chain.
-    pub(crate) async fn governed_approval_evidence(
+    /// Resolves one product approval token to active immutable approval evidence.
+    pub(crate) async fn governed_approval_evidence_for_token(
         &self,
-        approval_id: ValuationApprovalId,
+        approval_token: Uuid,
         at: Timestamp,
     ) -> Result<GovernedFairValueApprovalEvidence, FairValueError> {
+        let approval_id = self
+            .workflow_tokens
+            .lock()
+            .await
+            .approvals
+            .resolve(approval_token)
+            .map_err(|_error| FairValueError::ApprovalNotFound)?;
         let state = self.state.lock().await;
         resolve_governed_approval(&state, approval_id, at)
     }
 
-    /// Resolves the exact typed market and the assessment current at the proposed effective start.
-    pub(crate) async fn governed_market_access_evidence(
+    /// Resolves one market-input token to exact typed market evidence.
+    pub(crate) async fn governed_market_access_evidence_for_token(
         &self,
-        account_id: AccountId,
-        venue_id: VenueId,
-        instrument_id: InstrumentId,
+        market_input_token: Uuid,
         effective_from: Timestamp,
     ) -> Result<GovernedFairValueMarketAccessEvidence, FairValueError> {
+        let coordinate = self
+            .workflow_tokens
+            .lock()
+            .await
+            .market_inputs
+            .resolve(market_input_token)
+            .map_err(|_error| FairValueError::InvalidMarketAccessAssessment)?;
         let state = self.state.lock().await;
-        resolve_governed_market_access(&state, account_id, venue_id, instrument_id, effective_from)
+        resolve_governed_market_access(
+            &state,
+            coordinate.account_id,
+            coordinate.venue_id,
+            coordinate.instrument_id,
+            effective_from,
+        )
     }
 
     /// Revalidates the preview evidence and durably approves through the existing authority.
@@ -913,6 +1139,115 @@ impl FairValueDomainService {
                 committed_at,
             )
             .map(|assessment| assessment.id())
+    }
+
+    async fn workspace(
+        &self,
+        request: &TypedToolRequest,
+        context: &RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        let limits = admitted_result_limits(request, context)?;
+        let at = admitted_timestamp(request.arguments(), "at")?;
+        let requested_measurement = request
+            .arguments()
+            .get("measurementToken")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or(ServiceError::InvalidRequest)
+                    .and_then(|value| {
+                        Uuid::parse_str(value).map_err(|_error| ServiceError::InvalidRequest)
+                    })
+            })
+            .transpose()?;
+        let requested_measurement_id = match requested_measurement {
+            Some(token) => Some(
+                self.workflow_tokens
+                    .lock()
+                    .await
+                    .measurements
+                    .resolve(token)?,
+            ),
+            None => None,
+        };
+        let limit = limits
+            .maximum_result_items()
+            .min(self.maximum_query_results);
+        let state = self.lock_state(context).await?;
+        let available = state.measurement_count();
+        let mut measurements = state.measurements(limit).map_err(map_fair_value_error)?;
+        measurements.sort_unstable_by(|left, right| {
+            right
+                .measurement_at()
+                .cmp(&left.measurement_at())
+                .then_with(|| right.prepared_at().cmp(&left.prepared_at()))
+                .then_with(|| left.id().cmp(&right.id()))
+        });
+        let mut summaries = Vec::new();
+        summaries
+            .try_reserve_exact(measurements.len())
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        for measurement in &measurements {
+            let decision = state
+                .rules_decision_for_measurement(measurement.id(), self.ruleset.hash())
+                .map_err(map_fair_value_error)?;
+            summaries.push((Arc::clone(measurement), decision));
+        }
+        let selected_measurement = match requested_measurement_id {
+            Some(id) => state.measurement(id).ok_or(ServiceError::NotFound)?,
+            None => match measurements.first() {
+                Some(measurement) => Arc::clone(measurement),
+                None => {
+                    drop(state);
+                    return bounded_result(
+                        json!({"measurements": [], "selectedMeasurement": null}),
+                        0,
+                        available,
+                        limits,
+                    );
+                }
+            },
+        };
+        let selected_decision = state
+            .rules_decision_for_measurement(selected_measurement.id(), self.ruleset.hash())
+            .map_err(map_fair_value_error)?;
+        let approvals = state
+            .approvals_for_measurement(selected_measurement.id(), limit)
+            .map_err(map_fair_value_error)?
+            .into_iter()
+            .map(|approval| {
+                let status = state
+                    .approval_status(approval.id(), at)
+                    .map_err(map_fair_value_error)?;
+                let revocation = state.revocation(approval.id());
+                Ok((approval, status, revocation))
+            })
+            .collect::<Result<Vec<_>, ServiceError>>()?;
+        drop(state);
+
+        let mut tokens = self.workflow_tokens.lock().await;
+        let summary_values = summaries
+            .iter()
+            .map(|(measurement, decision)| {
+                product_measurement_summary(&mut tokens, measurement, decision.as_deref())
+            })
+            .collect::<Result<Vec<_>, ServiceError>>()?;
+        let selected_value = product_measurement_detail(
+            &mut tokens,
+            &selected_measurement,
+            selected_decision.as_deref(),
+            &approvals,
+        )?;
+        drop(tokens);
+        bounded_result(
+            json!({
+                "measurements": summary_values,
+                "selectedMeasurement": selected_value,
+            }),
+            summary_values.len(),
+            available,
+            limits,
+        )
     }
 
     async fn list_measurements(
@@ -1225,12 +1560,15 @@ impl FairValueDomainService {
             .measurement(decision.measurement_id())
             .ok_or(ServiceError::Internal)?;
         drop(state);
+        let mut tokens = self.workflow_tokens.lock().await;
+        let product_measurement =
+            product_measurement_detail(&mut tokens, &retained, Some(&decision), &[])?;
+        drop(tokens);
         one_result(
             json!({
-                "measurement": measurement_value(&retained),
-                "classification": classification_value(&decision),
-                "measurementReplay": measurement_replay,
-                "classificationReplay": classification_replay
+                "measurement": product_measurement,
+                "created": !measurement_replay,
+                "classified": !classification_replay,
             }),
             request,
             context,
@@ -1564,6 +1902,215 @@ impl FairValueDomainService {
     }
 }
 
+fn product_measurement_summary(
+    tokens: &mut FairValueWorkflowTokens,
+    measurement: &ValuationMeasurement,
+    decision: Option<&ClassificationDecision>,
+) -> Result<Value, ServiceError> {
+    let measurement_token = tokens.measurements.token_for(measurement.id())?;
+    let classification = decision
+        .map(|decision| product_classification_value(tokens, measurement.id(), decision))
+        .transpose()?;
+    Ok(json!({
+        "measurementToken": measurement_token,
+        "accountId": measurement.account_id(),
+        "instrumentId": measurement.instrument_id(),
+        "amount": amount_value(measurement.amount()),
+        "measurementAt": timestamp_value(measurement.measurement_at()),
+        "preparedAt": timestamp_value(measurement.prepared_at()),
+        "preparedBy": measurement.prepared_by().as_str(),
+        "method": method_name(measurement.method()),
+        "inputCount": measurement.inputs().len(),
+        "classification": classification,
+    }))
+}
+
+fn product_measurement_detail(
+    tokens: &mut FairValueWorkflowTokens,
+    measurement: &ValuationMeasurement,
+    decision: Option<&ClassificationDecision>,
+    approvals: &[(
+        Arc<market_squawk_valuation::ValuationApproval>,
+        ApprovalStatus,
+        Option<Arc<ApprovalRevocation>>,
+    )],
+) -> Result<Value, ServiceError> {
+    let mut value = product_measurement_summary(tokens, measurement, decision)?;
+    let object = value.as_object_mut().ok_or(ServiceError::Internal)?;
+    let inputs = measurement
+        .inputs()
+        .iter()
+        .map(|input| product_input_value(tokens, measurement, input))
+        .collect::<Result<Vec<_>, ServiceError>>()?;
+    let explanation = decision
+        .map(|decision| product_explanation_value(tokens, decision))
+        .transpose()?;
+    let approvals = approvals
+        .iter()
+        .map(|(approval, status, revocation)| {
+            product_approval_value(tokens, approval, *status, revocation.as_deref())
+        })
+        .collect::<Result<Vec<_>, ServiceError>>()?;
+    object.insert("inputs".to_owned(), Value::Array(inputs));
+    object.insert("explanation".to_owned(), explanation.unwrap_or(Value::Null));
+    object.insert("approvals".to_owned(), Value::Array(approvals));
+    Ok(value)
+}
+
+fn product_classification_value(
+    tokens: &mut FairValueWorkflowTokens,
+    measurement_id: MeasurementId,
+    decision: &ClassificationDecision,
+) -> Result<Value, ServiceError> {
+    if decision.measurement_id() != measurement_id {
+        return Err(ServiceError::InvalidResult);
+    }
+    let classification_token = tokens.classifications.token_for(ClassificationCoordinate {
+        measurement_id,
+        decision_id: decision.id(),
+    })?;
+    Ok(json!({
+        "classificationToken": classification_token,
+        "hierarchy": hierarchy_name(decision.hierarchy()),
+        "basis": product_basis_value(decision.basis()),
+        "checkCount": decision.truth_table().len(),
+        "reasonCount": decision.reasons().len(),
+    }))
+}
+
+fn product_explanation_value(
+    tokens: &mut FairValueWorkflowTokens,
+    decision: &ClassificationDecision,
+) -> Result<Value, ServiceError> {
+    let checks = decision
+        .truth_table()
+        .iter()
+        .map(|result| {
+            Ok(json!({
+                "inputToken": tokens.inputs.token_for(result.input_id())?,
+                "check": predicate_name(result.predicate()),
+                "passed": result.passed(),
+            }))
+        })
+        .collect::<Result<Vec<_>, ServiceError>>()?;
+    let reasons = decision
+        .reasons()
+        .iter()
+        .map(|reason| {
+            let input_token = reason
+                .input_id()
+                .map(|input_id| tokens.inputs.token_for(input_id))
+                .transpose()?;
+            Ok(json!({
+                "inputToken": input_token,
+                "reason": reason_name(reason.code()),
+            }))
+        })
+        .collect::<Result<Vec<_>, ServiceError>>()?;
+    Ok(json!({"checks": checks, "reasons": reasons}))
+}
+
+fn product_input_value(
+    tokens: &mut FairValueWorkflowTokens,
+    measurement: &ValuationMeasurement,
+    input: &ValuationInput,
+) -> Result<Value, ServiceError> {
+    let input_token = tokens.inputs.token_for(input.id())?;
+    let market_input_token = match input.evidence().origin() {
+        EvidenceOrigin::Market { venue_id, .. } => {
+            Some(tokens.market_inputs.token_for(MarketInputCoordinate {
+                input_id: input.id(),
+                account_id: measurement.account_id(),
+                venue_id: venue_id.clone(),
+                instrument_id: input.reference_instrument_id(),
+            })?)
+        }
+        EvidenceOrigin::Research { .. }
+        | EvidenceOrigin::Analytics { .. }
+        | EvidenceOrigin::Portfolio { .. } => None,
+    };
+    let evidence = input.evidence();
+    let (evidence_kind, evidence_label) = match evidence.origin() {
+        EvidenceOrigin::Market { .. } => ("market_observation", "Current market observation"),
+        EvidenceOrigin::Research { .. } => ("published_research", "Published research"),
+        EvidenceOrigin::Analytics { .. } => ("analysis", "Analytical estimate"),
+        EvidenceOrigin::Portfolio { .. } => ("portfolio", "Portfolio position"),
+    };
+    let market_access = input.market_access_assessment().map(|assessment| {
+        json!({
+            "conclusion": access_name(assessment.conclusion()),
+            "effectiveFrom": timestamp_value(assessment.effective_from()),
+            "effectiveUntil": timestamp_value(assessment.effective_until()),
+            "rationale": assessment.rationale(),
+            "preparedBy": assessment.prepared_by().as_str(),
+            "preparedAt": timestamp_value(assessment.prepared_at()),
+            "approvedBy": assessment.approved_by().as_str(),
+            "approvedAt": timestamp_value(assessment.approved_at()),
+        })
+    });
+    let use_assessment = input.use_assessment().map(|assessment| {
+        json!({
+            "relationship": relation_name(assessment.relationship()),
+            "observability": observability_name(assessment.observability()),
+            "adjustment": adjustment_name(assessment.adjustment()),
+            "rationale": assessment.rationale(),
+            "assessedBy": assessment.assessed_by().as_str(),
+            "assessedAt": timestamp_value(assessment.assessed_at()),
+        })
+    });
+    Ok(json!({
+        "inputToken": input_token,
+        "marketInputToken": market_input_token,
+        "referenceInstrumentId": input.reference_instrument_id(),
+        "relationship": relation_name(input.relationship()),
+        "amount": amount_value(input.amount()),
+        "significance": significance_name(input.significance()),
+        "observability": observability_name(input.observability()),
+        "adjustment": adjustment_name(input.adjustment()),
+        "marketActivity": activity_name(input.market_activity()),
+        "marketAccess": access_name(input.market_access()),
+        "marketAccessAssessment": market_access,
+        "dataQuality": quality_name(input.data_quality()),
+        "useAssessment": use_assessment,
+        "evidence": {
+            "kind": evidence_kind,
+            "label": evidence_label,
+            "observedAt": evidence.source_timestamp().map(timestamp_value),
+            "effectiveAt": evidence.effective_at().map(timestamp_value),
+            "publishedAt": evidence.published_at().map(timestamp_value),
+            "availableAt": evidence.available_at().map(timestamp_value),
+            "receivedAt": evidence.received_at().map(timestamp_value),
+            "validUntil": evidence.qualification_valid_until().map(timestamp_value),
+            "recordedAt": timestamp_value(evidence.ingested_at()),
+            "verification": match evidence.verification() {
+                market_squawk_valuation::EvidenceVerification::Verified => "verified",
+                market_squawk_valuation::EvidenceVerification::Unverified => "unverified",
+            },
+        },
+    }))
+}
+
+fn product_approval_value(
+    tokens: &mut FairValueWorkflowTokens,
+    approval: &market_squawk_valuation::ValuationApproval,
+    status: ApprovalStatus,
+    revocation: Option<&ApprovalRevocation>,
+) -> Result<Value, ServiceError> {
+    let approval_token = tokens.approvals.token_for(approval.id())?;
+    Ok(json!({
+        "approvalToken": approval_token,
+        "approvedBy": approval.approved_by().as_str(),
+        "approvedAt": timestamp_value(approval.approved_at()),
+        "expiresAt": timestamp_value(approval.expires_at()),
+        "status": approval_status_name(status),
+        "revocation": revocation.map(|revocation| json!({
+            "revokedBy": revocation.revoked_by().as_str(),
+            "revokedAt": timestamp_value(revocation.revoked_at()),
+            "reason": revocation.reason(),
+        })),
+    }))
+}
+
 async fn lock_fair_value_state<'state>(
     state: &'state Mutex<FairValueService>,
     lifecycle: &DomainLifecycle,
@@ -1618,6 +2165,7 @@ impl ApplicationDomainService for FairValueDomainService {
         }
         let _call = DomainLifecycle::enter(&self.lifecycle, &context)?;
         let result = match request.name() {
+            GET_WORKSPACE => self.workspace(&request, &context).await,
             LIST_MEASUREMENTS => self.list_measurements(&request, &context).await,
             GET_CLASSIFICATION => self.classification(&request, &context).await,
             EXPLAIN => self.explain(&request, &context).await,

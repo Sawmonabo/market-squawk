@@ -27,8 +27,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { productCapabilitySet } from "@/lib/product-capabilities"
 import { formatTimestamp } from "@/lib/time"
-import type { InstallationStatus } from "@/lib/schemas"
+import type { InstallationStatus, ProductCapability } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 import { cn } from "@/lib/utils"
 
@@ -50,13 +51,13 @@ type PendingConfirmation =
   | { kind: "repair"; installation: InstallationStatus }
   | { kind: "remove"; installation: InstallationStatus }
 
-const UPDATE_OPERATIONS = [
-  "Operations.GetUpdateStatus",
-  "Operations.CheckForUpdates",
-  "Operations.PreviewUpdate",
-  "Operations.StartUpdate",
-  "Operations.PreviewProgramRollback",
-  "Operations.StartProgramRollback",
+const LIFECYCLE_CAPABILITIES = [
+  "operations_update_status",
+  "operations_update_check",
+  "operations_update_preview",
+  "operations_update_start",
+  "operations_rollback_preview",
+  "operations_rollback_start",
 ] as const
 
 export function LifecyclePage() {
@@ -75,7 +76,7 @@ export function LifecyclePage() {
     <ReadyLifecycle
       transport={product.transport}
       scope={product.bootstrap.runtime}
-      operations={new Set(product.bootstrap.operations.map((operation) => operation.name))}
+      capabilities={productCapabilitySet(product.bootstrap)}
     />
   )
 }
@@ -83,18 +84,20 @@ export function LifecyclePage() {
 function ReadyLifecycle({
   transport,
   scope,
-  operations,
+  capabilities,
 }: {
   transport: ProductTransport
   scope: ProductScope
-  operations: ReadonlySet<string>
+  capabilities: ReadonlySet<ProductCapability>
 }) {
   const queryClient = useQueryClient()
   const [pending, setPending] = React.useState<PendingConfirmation | null>(null)
   const [receipt, setReceipt] = React.useState<LifecycleJobReceipt | null>(null)
   const [notice, setNotice] = React.useState<string | null>(null)
-  const supportsUpdateStatus = operations.has("Operations.GetUpdateStatus")
-  const supportsLifecycle = UPDATE_OPERATIONS.every((operation) => operations.has(operation))
+  const supportsUpdateStatus = capabilities.has("operations_update_status")
+  const supportsLifecycle = LIFECYCLE_CAPABILITIES.every((capability) =>
+    capabilities.has(capability),
+  )
   const updatePreviewKey = productKeys.operation(
     scope,
     "operations",

@@ -193,7 +193,6 @@ async fn execute(
         | Command::Mcp { .. }
         | Command::Doctor
         | Command::Mock(_)
-        | Command::PaperBot(_)
         | Command::Replay(_) => Err(CliProductError::WrongCommand),
     }
 }
@@ -667,7 +666,19 @@ async fn model(
     command: ModelCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
-        ModelCommand::List => ("Model.ListBundles", Map::new(), "model bundles listed"),
+        ModelCommand::List => ("Model.ListBundles", Map::new(), "model evidence listed"),
+        ModelCommand::Activity => {
+            if matches!(authority, CliAuthority::Local(_)) {
+                return Err(CliProductError::InstalledServiceRequired {
+                    operation: "Model.ListProductActivity",
+                });
+            }
+            (
+                "Model.ListProductActivity",
+                Map::new(),
+                "model activity listed",
+            )
+        }
         ModelCommand::Admit { request, confirm } => {
             let value = cli_model::admit_model_bundle(
                 authority.local_for("Model.Admit")?,
@@ -752,20 +763,39 @@ async fn backtest(
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
         BacktestCommand::Run { request, confirm } => {
+            if matches!(authority, CliAuthority::Local(_)) {
+                return Err(CliProductError::InstalledServiceRequired {
+                    operation: "Analysis.StartBacktest",
+                });
+            }
             let value = cli_backtest::register_backtest_input(&request, confirm).await?;
             let arguments = json_object(value)?;
-            match authority {
-                CliAuthority::Local(_) => ("Analysis.RunBacktest", arguments, "backtest completed"),
-                CliAuthority::Installed(_) => {
-                    ("Analysis.StartBacktest", arguments, "backtest job started")
-                }
-            }
+            ("Analysis.StartBacktest", arguments, "backtest job started")
         }
-        BacktestCommand::Show { run } => (
-            "Analysis.GetBacktests",
-            json_object(json!({"runId": run}))?,
-            "backtest result read",
-        ),
+        BacktestCommand::List => {
+            if matches!(authority, CliAuthority::Local(_)) {
+                return Err(CliProductError::InstalledServiceRequired {
+                    operation: "Analysis.ListProductBacktests",
+                });
+            }
+            (
+                "Analysis.ListProductBacktests",
+                Map::new(),
+                "backtest activity listed",
+            )
+        }
+        BacktestCommand::Show { backtest_token } => {
+            if matches!(authority, CliAuthority::Local(_)) {
+                return Err(CliProductError::InstalledServiceRequired {
+                    operation: "Analysis.GetProductBacktest",
+                });
+            }
+            (
+                "Analysis.GetProductBacktest",
+                json_object(json!({"backtestToken": backtest_token}))?,
+                "backtest result read",
+            )
+        }
     };
     invoke(authority, operation, &mut arguments, None, summary).await
 }
@@ -788,21 +818,10 @@ async fn bot(
         }
         BotCommand::Start { paper, confirm } => {
             let mut start_arguments = json_object(json!({
-                "provider": match paper.provider {
-                    crate::cli::ProductionSourceArgument::Coinbase => "coinbase",
-                    crate::cli::ProductionSourceArgument::CoinbaseDirect => "coinbase-direct",
-                    crate::cli::ProductionSourceArgument::Kraken => "kraken",
-                },
                 "initialCash": paper.initial_cash.to_string(),
                 "feeBasisPoints": paper.fee_basis_points,
                 "confirm": confirm,
             }))?;
-            if let Some(provider_session_id) = paper.provider_session_id {
-                start_arguments.insert(
-                    "providerSessionId".to_owned(),
-                    Value::String(provider_session_id.to_string()),
-                );
-            }
             let started = invoke(
                 authority,
                 "Bot.Start",
@@ -875,9 +894,9 @@ async fn fair_value(
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
         FairValueCommand::List => (
-            "FairValue.ListMeasurements",
-            Map::new(),
-            "fair-value measurements listed",
+            "FairValue.GetWorkspace",
+            json_object(json!({"at": chrono::Utc::now().to_rfc3339()}))?,
+            "fair-value workspace read",
         ),
         FairValueCommand::Measure { request, confirm } => {
             let mut arguments = read_json_object(&request)?;

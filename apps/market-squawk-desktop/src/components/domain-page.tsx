@@ -4,14 +4,16 @@ import { useLocation } from "react-router-dom"
 import { useProduct } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { navigationAdmission, navigationForPath } from "@/lib/navigation"
+import { productCapabilitySet } from "@/lib/product-capabilities"
+import type { ProductCapability } from "@/lib/schemas"
 
 export function DomainPage({
   title,
-  domain,
+  capabilities,
   description,
 }: {
   title: string
-  domain?: string | readonly string[]
+  capabilities?: readonly ProductCapability[]
   description: string
 }) {
   const product = useProduct()
@@ -36,36 +38,32 @@ export function DomainPage({
     )
   }
 
-  const operations = domain
-    ? product.bootstrap.operations.filter((operation) =>
-        typeof domain === "string"
-          ? operation.domain === domain
-          : domain.includes(operation.domain),
-      )
-    : []
-  const reads = operations.filter((operation) => operation.readOnly).length
-  const protectedChanges = operations.length - reads
+  const availableCapabilities = productCapabilitySet(product.bootstrap)
+  const availableFeatures = capabilities?.filter((capability) =>
+    availableCapabilities.has(capability),
+  ).length ?? 0
+  const unavailableFeatures = (capabilities?.length ?? 0) - availableFeatures
 
   return (
     <PageFrame title={title} description={description}>
       <div className="grid gap-4 lg:grid-cols-3">
         <CapabilityFact
           icon={DatabaseZap}
-          label="Available views"
-          value={reads}
-          detail="Information available in this workspace."
+          label="Available features"
+          value={availableFeatures}
+          detail="Features ready to use in this workspace."
         />
         <CapabilityFact
           icon={ShieldCheck}
-          label="Protected actions"
-          value={protectedChanges}
-          detail="Changes require review and confirmation."
+          label="Unavailable features"
+          value={unavailableFeatures}
+          detail="Features that still need setup or a product update."
         />
         <CapabilityFact
           icon={DatabaseZap}
-          label="Available tools"
-          value={operations.length}
-          detail="Features available in this area."
+          label="Area features"
+          value={capabilities?.length ?? 0}
+          detail="Features included in this area."
         />
       </div>
     </PageFrame>

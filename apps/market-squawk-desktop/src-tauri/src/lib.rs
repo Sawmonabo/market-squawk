@@ -46,9 +46,9 @@ use input_staging::{
 };
 use mcp_clients::{mcp_client_control, mcp_status};
 use service_client::{
-    analysis_control, dashboard_query, decision_control, fair_value_control, governance_control,
-    governance_query, job_control, model_control, operations_control, paper_control,
-    research_control, source_control,
+    analysis_control, backtest_products, dashboard_query, decision_control, fair_value_control,
+    governance_control, governance_query, job_control, model_control, model_products,
+    operations_control, paper_control, research_control, source_control,
 };
 
 #[cfg(target_os = "linux")]
@@ -267,6 +267,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
         .invoke_handler(tauri::generate_handler![
             analytical_controller,
             analysis_control,
+            backtest_products,
             commit_research_file_import,
             dashboard_query,
             decision_control,
@@ -284,6 +285,7 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
             mcp_client_control,
             mcp_status,
             model_control,
+            model_products,
             operations_control,
             open_official_provider_page,
             open_protected_provider_setup,

@@ -18,6 +18,7 @@ use market_squawk_adapter_fred::{
 use market_squawk_adapter_portfolio::PortfolioImportLimits;
 use market_squawk_adapter_sec::{RawEvidenceStore, SecParserLimits, SecRepresentationRegistry};
 use market_squawk_adapter_treasury::TreasurySourceConfig;
+use market_squawk_adapter_yahoo::YAHOO_SOURCE_ID;
 use market_squawk_data::ImportedUserInputEvidence;
 use market_squawk_domain::{ProviderIdentityRegistry, ProviderProduct, SourceIdentifier};
 use market_squawk_live::LiveRouteConfig;
@@ -28,6 +29,8 @@ use market_squawk_platform::{
 use market_squawk_sources::{FreshnessPolicy, SourceMetadata};
 
 use crate::application::ResearchIngestCompositionError;
+
+const TIINGO_SOURCE_ID: &str = "tiingo-starter";
 
 /// Coinbase Direct account subscription ceiling for the exact `full` product/channel pair.
 pub const COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS: usize = 10;
@@ -219,6 +222,40 @@ impl fmt::Debug for SecAdapterActivation {
             .field("metadata_revision", self.metadata.revision())
             .field("stores", &"[CAPABILITY-CONFINED]")
             .finish()
+    }
+}
+
+/// Exact no-key source metadata for the explicit-demand Yahoo enrichment lane.
+#[derive(Debug)]
+pub struct YahooAdapterActivation {
+    pub(super) metadata: SourceMetadata,
+}
+
+impl YahooAdapterActivation {
+    /// Retains only the reviewed Yahoo source contract; session, cache, circuit, and paths remain
+    /// application-owned.
+    pub fn try_new(metadata: SourceMetadata) -> Result<Self, ProviderAdapterActivationError> {
+        if metadata.source_id().as_str() != YAHOO_SOURCE_ID {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        Ok(Self { metadata })
+    }
+}
+
+/// Exact secret-backed source metadata for the bounded Tiingo Starter NAV/EOD lane.
+#[derive(Debug)]
+pub struct TiingoAdapterActivation {
+    pub(super) metadata: SourceMetadata,
+}
+
+impl TiingoAdapterActivation {
+    /// Retains only reviewed source metadata. The token is resolved from the active onboarding
+    /// lease and never enters an activation request or application result.
+    pub fn try_new(metadata: SourceMetadata) -> Result<Self, ProviderAdapterActivationError> {
+        if metadata.source_id().as_str() != TIINGO_SOURCE_ID {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        Ok(Self { metadata })
     }
 }
 
@@ -560,6 +597,10 @@ pub enum ProviderAdapterActivationRequest {
     Fred(FredAdapterActivation),
     /// Federal Reserve Board H.15 extraction from one exact no-key DDP package.
     Board(BoardAdapterActivation),
+    /// No-key, explicit-demand-only Yahoo experimental enrichment.
+    Yahoo(YahooAdapterActivation),
+    /// Secret-backed bounded Tiingo Starter NAV/EOD retrieval.
+    Tiingo(TiingoAdapterActivation),
     /// User-owned local file extraction.
     LocalFiles(LocalFileAdapterActivation),
     /// Workspace-controlled exact bytes admitted by the guided local-file workflow.
@@ -579,6 +620,8 @@ impl ProviderAdapterActivationRequest {
             | Self::CoinbaseDirect(_)
             | Self::Sec(_)
             | Self::Treasury(_)
+            | Self::Yahoo(_)
+            | Self::Tiingo(_)
             | Self::LocalFiles(_)
             | Self::ControlledLocalFiles(_)
             | Self::Portfolio(_) => None,
@@ -625,6 +668,12 @@ pub enum ProviderAdapterActivationError {
     /// Federal Reserve Board construction rejected exact metadata or the H.15 profile.
     #[error(transparent)]
     Board(#[from] market_squawk_adapter_federal_reserve::BoardSourceError),
+    /// Yahoo source/session/application composition rejected the exact operation authority.
+    #[error(transparent)]
+    Yahoo(#[from] super::yahoo::YahooProductError),
+    /// Tiingo source/quota/application composition rejected the exact operation authority.
+    #[error(transparent)]
+    Tiingo(#[from] super::tiingo::TiingoProductError),
     /// Local-file construction rejected root, manifest, metadata, or storage authority.
     #[error(transparent)]
     Files(#[from] market_squawk_adapter_files::FileAdapterError),

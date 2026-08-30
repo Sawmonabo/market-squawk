@@ -13,11 +13,11 @@ use std::{collections::BTreeMap, fmt, sync::Mutex, time::Instant};
 
 use market_squawk_decisions::{
     AnalyticalProfileBindingReference, AppendOutcome, CandidateAssessment, CandidateInput,
-    DecisionAuthority, DecisionDossier, DecisionRepository, DecisionRepositoryError,
-    DecisionRepositoryLimits, InvestmentAnalysisCurrentIndexEntry, InvestmentAnalysisId,
-    InvestmentOutcomeProjection, InvestmentProposalDecision, InvestmentProposalId,
-    InvestmentProposalIndexEntry, InvestmentSizingProjection, InvestmentTargetSetId,
-    PreparedPublishedInvestmentAnalysis, PublishedInvestmentAnalysis,
+    CurrentScreenPage, DecisionAuthority, DecisionDossier, DecisionRepository,
+    DecisionRepositoryError, DecisionRepositoryLimits, InvestmentAnalysisCurrentIndexEntry,
+    InvestmentAnalysisId, InvestmentOutcomeProjection, InvestmentProposalDecision,
+    InvestmentProposalId, InvestmentProposalIndexEntry, InvestmentSizingProjection,
+    InvestmentTargetSetId, PreparedPublishedInvestmentAnalysis, PublishedInvestmentAnalysis,
     RecommendationOutcomeStatusRecord, RecommendationTrackRecord, SavedScreen, ScreenExecution,
     ScreenId, ScreenRun, ScreenRunId, TargetIndexEntry, TargetInvalidation, TargetReview,
     TargetState, TargetStatus,
@@ -343,22 +343,27 @@ impl DecisionApplication {
         Ok(resolve_screen_job_plan(&state, input_identity, input_digest)?.clone())
     }
 
-    /// `Decision.ListScreens` typed implementation with caller-selected bounded output.
+    /// `Decision.ListScreens` typed implementation with one current revision per stable screen.
     pub fn list_screens(
         &self,
         maximum: usize,
     ) -> Result<Vec<SavedScreen>, DecisionApplicationError> {
-        if maximum == 0 {
-            return Err(DecisionRepositoryError::InvalidLimits.into());
-        }
-        let state = self.reader()?;
-        let count = state.authority.list_screens().count().min(maximum);
-        let mut result = Vec::new();
-        result
-            .try_reserve_exact(count)
-            .map_err(|_error| DecisionApplicationError::Allocation)?;
-        result.extend(state.authority.list_screens().take(maximum).cloned());
-        Ok(result)
+        Ok(self
+            .list_current_screens_after(None, maximum)?
+            .into_screens())
+    }
+
+    /// Reads a deterministic page of current saved-screen heads after one stable identity.
+    pub fn list_current_screens_after(
+        &self,
+        after: Option<&ScreenId>,
+        maximum: usize,
+    ) -> Result<CurrentScreenPage, DecisionApplicationError> {
+        self.reader()?
+            .authority
+            .repository()
+            .list_current_screens_after(after, maximum)
+            .map_err(Into::into)
     }
 
     /// `Decision.GetCandidates` typed implementation.
@@ -923,6 +928,19 @@ impl DecisionApplication {
         revision: RevisionNumber,
     ) -> Result<SavedScreen, DecisionApplicationError> {
         Ok(self.reader()?.authority.get_screen(id, revision)?.clone())
+    }
+
+    /// Returns the current immutable revision for one stable saved-screen identity.
+    pub fn get_current_screen(
+        &self,
+        id: &ScreenId,
+    ) -> Result<SavedScreen, DecisionApplicationError> {
+        self.reader()?
+            .authority
+            .repository()
+            .current_screen(id)
+            .cloned()
+            .ok_or_else(|| DecisionRepositoryError::NotFound.into())
     }
 
     fn writer(&self) -> Result<std::sync::MutexGuard<'_, DecisionState>, DecisionApplicationError> {

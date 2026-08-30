@@ -3,20 +3,24 @@
 use std::{
     fmt,
     sync::{Arc, RwLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Datelike, Utc};
 use market_squawk_adapter_treasury::{
     TreasuryDailyRateFamily, TreasuryDailyRateQuery, TreasurySurface,
 };
-use market_squawk_data::{AnalyticalMacroSeriesAllowlist, AnalyticalReadError, DatasetManifestRef};
+use market_squawk_data::{
+    AnalyticalMacroLatestKnownOutput, AnalyticalMacroSeriesAllowlist, AnalyticalReadError,
+    DatasetManifestRef, QueryLimits,
+};
 use market_squawk_domain::{CalendarDate, SourceIdentifier, Timestamp};
 use market_squawk_services::{
     RequestContext, ServiceError, ServiceLimits, ToolResultMetadata, TypedToolRequest,
     TypedToolResult,
 };
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 
 use super::fred::{
     FredGenerationSelector, generation_matches, generation_selector_value, parse_calendar_date,
@@ -24,14 +28,18 @@ use super::fred::{
 };
 use super::ingest::{
     TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION, TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION,
-    TreasuryApplicationClosure, TreasuryApplicationError, TreasuryDailyRatesLatestKnownRequest,
+    TreasuryApplicationClosure, TreasuryApplicationError, TreasuryDailyRatesLatestKnownReceipt,
+    TreasuryDailyRatesLatestKnownRequest, TreasuryFiscalDataLatestKnownReceipt,
     TreasuryFiscalDataLatestKnownRequest, TreasuryMacroPublicationReceipt,
     TreasuryMacroRestartSelector,
 };
-use super::{encode_hex, map_read_error, parse_timestamp, query_limits};
+use super::{encode_hex, map_query_error, map_read_error, parse_timestamp, query_limits};
 
 const SCHEMA: &str = "market-squawk-treasury-latest-known-operation/v1";
 const MAX_SERIES: usize = 32;
+const INTERNAL_QUERY_BYTES: u64 = 256 * 1024;
+const INTERNAL_QUERY_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+const INTERNAL_QUERY_MAXIMUM_DURATION: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub(crate) struct TreasuryLatestKnownOperation {
@@ -52,6 +60,35 @@ enum TreasuryState {
 struct TreasuryPublishedGeneration {
     selector: TreasuryMacroRestartSelector,
     fixed_series: AnalyticalMacroSeriesAllowlist,
+}
+
+/// One manifest-pinned Treasury Macro selection retained below transport serialization.
+///
+/// The variant is intentionally internal. Product composition consumes [`Self::output`] and
+/// preserves the underlying receipt as opaque evidence; provider state and operation names never
+/// enter an ordinary product DTO.
+#[derive(Debug)]
+pub(crate) enum TreasuryCurrentAnalyticalRead {
+    Fiscal(TreasuryFiscalDataLatestKnownReceipt),
+    DailyRates(TreasuryDailyRatesLatestKnownReceipt),
+}
+
+impl TreasuryCurrentAnalyticalRead {
+    /// Returns the selected canonical observations and exact query/selection evidence.
+    pub(crate) const fn output(&self) -> &AnalyticalMacroLatestKnownOutput {
+        match self {
+            Self::Fiscal(receipt) => receipt.output(),
+            Self::DailyRates(receipt) => receipt.output(),
+        }
+    }
+
+    /// Returns the internal source surface without exposing it through product serialization.
+    pub(crate) const fn surface(&self) -> TreasurySurface {
+        match self {
+            Self::Fiscal(_) => TreasurySurface::FiscalData,
+            Self::DailyRates(_) => TreasurySurface::DailyRatesXml,
+        }
+    }
 }
 
 impl TreasuryLatestKnownOperation {
@@ -165,6 +202,113 @@ impl TreasuryLatestKnownOperation {
                     .await
             }
         }
+    }
+
+    /// Returns every current manifest-pinned Treasury Macro selection for neutral composition.
+    ///
+    /// Setup-required and configured-unavailable states produce an empty bounded result. Ready
+    /// state reads remain pinned to the restart-verified manifests and retain their complete
+    /// raw/native evidence receipts. No provider DTO is serialized or reparsed.
+    pub(crate) async fn read_current_analytical_latest_known(
+        &self,
+        knowledge_cutoff: Timestamp,
+        effective_date_cutoff: CalendarDate,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<Box<[TreasuryCurrentAnalyticalRead]>, ServiceError> {
+        if cancellation.is_cancelled() {
+            return Err(ServiceError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(ServiceError::DeadlineExceeded);
+        }
+        let evaluated_at = evaluated_at()?;
+        if knowledge_cutoff > evaluated_at
+            || effective_date_cutoff > timestamp_calendar_date(knowledge_cutoff)?
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let state = self
+            .state
+            .read()
+            .map_err(|_| ServiceError::Unavailable)?
+            .clone();
+        let TreasuryState::Ready {
+            closure,
+            generations,
+        } = state.as_ref()
+        else {
+            return Ok(Vec::new().into_boxed_slice());
+        };
+
+        let mut selected = Vec::new();
+        selected
+            .try_reserve_exact(generations.len())
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        for generation in generations {
+            if cancellation.is_cancelled() {
+                return Err(ServiceError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(ServiceError::DeadlineExceeded);
+            }
+            let selector = generation.selector.clone();
+            let fixed_series = generation.fixed_series.clone();
+            let read = match self.surface {
+                TreasurySurface::FiscalData => {
+                    let request = TreasuryFiscalDataLatestKnownRequest::try_new(
+                        selector.clone(),
+                        fixed_series.clone(),
+                        knowledge_cutoff,
+                        effective_date_cutoff,
+                    )
+                    .map_err(map_error)?;
+                    let limits = internal_query_limits(request.required_query_rows(), deadline)?;
+                    closure
+                        .read_fiscal_data_latest_known(
+                            request,
+                            limits,
+                            deadline,
+                            cancellation.clone(),
+                        )
+                        .await
+                        .map(TreasuryCurrentAnalyticalRead::Fiscal)
+                        .map_err(map_error)?
+                }
+                TreasurySurface::DailyRatesXml => {
+                    let request = TreasuryDailyRatesLatestKnownRequest::try_new(
+                        selector.clone(),
+                        fixed_series.clone(),
+                        knowledge_cutoff,
+                        effective_date_cutoff,
+                    )
+                    .map_err(map_error)?;
+                    let limits = internal_query_limits(request.required_query_rows(), deadline)?;
+                    closure
+                        .read_daily_rates_latest_known(
+                            request,
+                            limits,
+                            deadline,
+                            cancellation.clone(),
+                        )
+                        .await
+                        .map(TreasuryCurrentAnalyticalRead::DailyRates)
+                        .map_err(map_error)?
+                }
+            };
+            let output = read.output();
+            if read.surface() != self.surface
+                || output.output().manifest() != selector.manifest()
+                || output.observations().iter().any(|observation| {
+                    !fixed_series.series().contains(observation.series())
+                        || observation.context().provenance().source_id() != output.source_id()
+                })
+            {
+                return Err(ServiceError::InvalidResult);
+            }
+            selected.push(read);
+        }
+        Ok(selected.into_boxed_slice())
     }
 
     fn status(
@@ -399,6 +543,29 @@ fn result(
     let metadata = ToolResultMetadata::try_complete(coverage, quality)
         .map_err(|_| ServiceError::InvalidResult)?;
     TypedToolResult::try_new(content, items, metadata, limits).map_err(Into::into)
+}
+
+fn internal_query_limits(
+    required_rows: u64,
+    deadline: Instant,
+) -> Result<QueryLimits, ServiceError> {
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(ServiceError::DeadlineExceeded);
+    }
+    QueryLimits::try_new_with_inline_bytes(
+        required_rows,
+        INTERNAL_QUERY_BYTES,
+        INTERNAL_QUERY_BYTES,
+        INTERNAL_QUERY_MEMORY_BYTES,
+        4,
+        2_048,
+        4_096,
+        deadline
+            .saturating_duration_since(now)
+            .min(INTERNAL_QUERY_MAXIMUM_DURATION),
+    )
+    .map_err(map_query_error)
 }
 
 fn quality(classification: &'static str, manifest_pinned: bool) -> Value {

@@ -6,7 +6,7 @@ pub struct CurrentBatchKey {
 }
 
 /// Exact receipt-validated raw-frame and decoder evidence shared across routed observations.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CurrentFrameEvidence(Arc<crate::DecoderEvidence>);
 
 impl CurrentFrameEvidence {
@@ -50,6 +50,188 @@ impl CurrentFrameEvidence {
             >())
             .and_then(|bytes| bytes.checked_add(dynamic))
             .ok_or(RegistryError::RetainedSizeOverflow)
+    }
+}
+
+/// Exact bounded HTTP-response receipt and adapter normalization rule shared across observations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentHttpResponseEvidence(Arc<CurrentHttpResponseEvidenceInner>);
+
+#[derive(Debug, Eq, PartialEq)]
+struct CurrentHttpResponseEvidenceInner {
+    receipt: crate::SegmentedHttpResponseReceipt,
+    normalization_rule: market_squawk_domain::IntegrityRule,
+}
+
+impl CurrentHttpResponseEvidence {
+    fn new(
+        receipt: crate::SegmentedHttpResponseReceipt,
+        normalization_rule: market_squawk_domain::IntegrityRule,
+    ) -> Self {
+        Self(Arc::new(CurrentHttpResponseEvidenceInner {
+            receipt,
+            normalization_rule,
+        }))
+    }
+
+    /// Returns the complete exact response receipt, including every retained segment coordinate.
+    pub fn receipt(&self) -> &crate::SegmentedHttpResponseReceipt {
+        &self.0.receipt
+    }
+
+    fn shared_allocation_charge(&self) -> Result<usize, RegistryError> {
+        let dynamic = self
+            .0
+            .receipt
+            .dynamic_retained_bytes()
+            .ok_or(RegistryError::RetainedSizeOverflow)?;
+        std::mem::size_of::<CurrentHttpResponseEvidenceInner>()
+            .checked_add(crate::conservative_arc_control_block_charge::<
+                CurrentHttpResponseEvidenceInner,
+            >())
+            .and_then(|bytes| bytes.checked_add(dynamic))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.0
+                        .normalization_rule
+                        .dynamic_retained_bytes()
+                        .unwrap_or(usize::MAX),
+                )
+            })
+            .ok_or(RegistryError::RetainedSizeOverflow)
+    }
+}
+
+/// Closed exact source coordinate for one provider-normalized current observation batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CurrentObservationEvidence {
+    /// One exact captured transport frame plus its decoder evidence.
+    TransportFrame(CurrentFrameEvidence),
+    /// One complete bounded HTTP response plus its adapter normalization rule.
+    HttpResponse(CurrentHttpResponseEvidence),
+}
+
+impl CurrentObservationEvidence {
+    /// Returns the exact process-local source/session/generation binding.
+    pub fn binding(&self) -> &FrameSessionBinding {
+        match self {
+            Self::TransportFrame(evidence) => evidence.binding(),
+            Self::HttpResponse(evidence) => evidence.receipt().binding(),
+        }
+    }
+
+    /// Returns the trusted local receive time of the complete source object.
+    pub fn received_at(&self) -> Timestamp {
+        match self {
+            Self::TransportFrame(evidence) => evidence.received_at(),
+            Self::HttpResponse(evidence) => evidence.receipt().received_at(),
+        }
+    }
+
+    /// Returns the SHA-256 digest of the exact transport payload or complete response body.
+    pub fn payload_digest(&self) -> market_squawk_domain::EvidenceDigest {
+        match self {
+            Self::TransportFrame(evidence) => evidence.payload_digest(),
+            Self::HttpResponse(evidence) => evidence.receipt().body_digest(),
+        }
+    }
+
+    /// Returns the exact metadata-bound adapter rule used to normalize the source object.
+    pub fn normalization_rule(&self) -> &market_squawk_domain::IntegrityRule {
+        match self {
+            Self::TransportFrame(evidence) => evidence.decoder_rule(),
+            Self::HttpResponse(evidence) => &evidence.0.normalization_rule,
+        }
+    }
+
+    /// Returns frame evidence only for transport-frame observations.
+    pub const fn transport_frame(&self) -> Option<&CurrentFrameEvidence> {
+        match self {
+            Self::TransportFrame(evidence) => Some(evidence),
+            Self::HttpResponse(_) => None,
+        }
+    }
+
+    /// Returns complete response evidence only for HTTP-response observations.
+    pub const fn http_response(&self) -> Option<&CurrentHttpResponseEvidence> {
+        match self {
+            Self::TransportFrame(_) => None,
+            Self::HttpResponse(evidence) => Some(evidence),
+        }
+    }
+
+    /// Returns a domain-separated digest of the exact source-object coordinate.
+    pub fn coordinate_digest(&self) -> market_squawk_domain::EvidenceDigest {
+        use sha2::Digest as _;
+
+        let mut digest = sha2::Sha256::new();
+        match self {
+            Self::TransportFrame(evidence) => {
+                digest.update(b"market-squawk/current-transport-frame-coordinate/v1");
+                digest.update(evidence.frame_id().get().to_be_bytes());
+            }
+            Self::HttpResponse(evidence) => {
+                return evidence.receipt().coordinate_digest();
+            }
+        }
+        market_squawk_domain::EvidenceDigest::new(
+            market_squawk_domain::DigestAlgorithm::Sha256,
+            digest.finalize().into(),
+        )
+    }
+
+    fn shared_allocation_charge(&self) -> Result<usize, RegistryError> {
+        match self {
+            Self::TransportFrame(evidence) => evidence.shared_allocation_charge(),
+            Self::HttpResponse(evidence) => evidence.shared_allocation_charge(),
+        }
+    }
+}
+
+/// Bounded adapter-normalized observations derived from one exact complete HTTP response.
+#[derive(Debug)]
+pub struct NormalizedHttpResponseBatch {
+    receipt: crate::SegmentedHttpResponseReceipt,
+    normalization_rule: market_squawk_domain::IntegrityRule,
+    observations: BoundedVec<crate::ProviderNormalizedObservation, { crate::MAX_DECODED_EVENTS }>,
+}
+
+impl NormalizedHttpResponseBatch {
+    /// Binds normalized observations to one exact complete response without inventing frame evidence.
+    pub fn try_new(
+        receipt: crate::SegmentedHttpResponseReceipt,
+        normalization_rule: market_squawk_domain::IntegrityRule,
+        observations: Vec<crate::ProviderNormalizedObservation>,
+    ) -> Result<Self, crate::DecodeError> {
+        Ok(Self {
+            receipt,
+            normalization_rule,
+            observations: crate::decoder::bounded_provider_observations(observations)?,
+        })
+    }
+
+    /// Returns the complete response receipt.
+    pub const fn receipt(&self) -> &crate::SegmentedHttpResponseReceipt {
+        &self.receipt
+    }
+
+    /// Returns provider observations in response order.
+    pub fn observations(&self) -> &[crate::ProviderNormalizedObservation] {
+        self.observations.as_slice()
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        crate::SegmentedHttpResponseReceipt,
+        market_squawk_domain::IntegrityRule,
+        Vec<crate::ProviderNormalizedObservation>,
+    ) {
+        (
+            self.receipt,
+            self.normalization_rule,
+            self.observations.into_vec(),
+        )
     }
 }
 
@@ -353,7 +535,7 @@ fn current_routed_batch_retained_bytes(
     observation_count: usize,
     observation_unique_allocations: usize,
     authority_shared_allocation: usize,
-    frame_shared_allocation: usize,
+    evidence_shared_allocation: usize,
 ) -> Result<usize, RegistryError> {
     observation_count
         .checked_mul(std::mem::size_of::<CurrentProviderObservation>())
@@ -361,7 +543,7 @@ fn current_routed_batch_retained_bytes(
         .and_then(|bytes| bytes.checked_add(batch_key_allocation))
         .and_then(|bytes| bytes.checked_add(observation_unique_allocations))
         .and_then(|bytes| bytes.checked_add(authority_shared_allocation))
-        .and_then(|bytes| bytes.checked_add(frame_shared_allocation))
+        .and_then(|bytes| bytes.checked_add(evidence_shared_allocation))
         .ok_or(RegistryError::RetainedSizeOverflow)
 }
 
@@ -440,12 +622,8 @@ impl CurrentLivePolicy {
         } = self;
         stream_key
             .dynamic_retained_bytes()
-            .and_then(|bytes| {
-                bytes.checked_add(static_authorization.dynamic_retained_bytes()?)
-            })
-            .and_then(|bytes| {
-                bytes.checked_add(runtime_authorization.dynamic_retained_bytes()?)
-            })
+            .and_then(|bytes| bytes.checked_add(static_authorization.dynamic_retained_bytes()?))
+            .and_then(|bytes| bytes.checked_add(runtime_authorization.dynamic_retained_bytes()?))
             .and_then(|bytes| bytes.checked_add(coverage.dynamic_retained_bytes()?))
             .and_then(|bytes| bytes.checked_add(runtime_coverage.dynamic_retained_bytes()?))
             .and_then(|bytes| bytes.checked_add(rule.dynamic_retained_bytes()?))
@@ -465,7 +643,7 @@ impl CurrentLivePolicy {
 #[derive(Debug)]
 pub struct CurrentProviderObservation {
     key: CurrentBatchKey,
-    frame_evidence: CurrentFrameEvidence,
+    evidence: CurrentObservationEvidence,
     observation: crate::ProviderNormalizedObservation,
     policy: CurrentLivePolicy,
     authority: CurrentSourceAuthorityLease,
@@ -477,9 +655,9 @@ impl CurrentProviderObservation {
         &self.key
     }
 
-    /// Returns exact receipt-validated raw-frame and decoder evidence.
-    pub const fn frame_evidence(&self) -> &CurrentFrameEvidence {
-        &self.frame_evidence
+    /// Returns exact receipt-validated frame or complete-response evidence.
+    pub const fn evidence(&self) -> &CurrentObservationEvidence {
+        &self.evidence
     }
 
     pub const fn observation(&self) -> &crate::ProviderNormalizedObservation {

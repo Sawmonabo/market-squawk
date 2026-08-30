@@ -121,6 +121,16 @@ impl AlpacaHistoricalRuntimeCapability {
         self.inner.group_generation
     }
 
+    /// Confirms that this capability belongs to a freshly minted physical runtime generation.
+    ///
+    /// The group-generation digest includes the runtime incarnation. Keeping this comparison on
+    /// the opaque capability prevents the history coordinator from reconstructing runtime identity
+    /// from looser account or configuration fields.
+    pub(crate) fn is_fresh_generation_from(&self, retired: &Self) -> bool {
+        !Arc::ptr_eq(&self.inner, &retired.inner)
+            && self.inner.group_generation != retired.inner.group_generation
+    }
+
     pub(crate) fn account_binding(&self) -> &ProviderAccountBinding {
         &self.inner.account_binding
     }

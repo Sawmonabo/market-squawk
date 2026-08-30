@@ -1,11 +1,5 @@
 import * as React from "react"
-import {
-  useInfiniteQuery,
-  useMutation,
-  useQueries,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   BadgeCheck,
   CircleAlert,
@@ -20,36 +14,22 @@ import { useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
 import { Skeleton } from "@/components/ui/skeleton"
 import { formatMoney, humanize } from "@/lib/formatters"
+import {
+  hasProductCapability,
+  productCapabilitySet,
+} from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
 import {
-  type FairValueApproval,
-  type FairValueAuditEvent,
-  type FairValueClassification,
   type FairValueGovernanceProposal,
-  type FairValueInput,
   type FairValueMeasurement,
+  type FairValueMeasurementSummary,
   type GovernanceAuthorization,
-  parseFairValueApprovals,
-  parseFairValueAuditPage,
-  parseFairValueClassification,
-  parseFairValueClassificationControl,
-  parseFairValueEvidence,
   parseFairValueGovernanceCommit,
   parseFairValueGovernancePreview,
-  parseFairValueExplanation,
-  parseFairValueMarketAccess,
   parseGovernanceAuthorization,
   parseGovernancePrincipals,
   parseFairValueWorkspace,
@@ -79,8 +59,9 @@ export function FairValuePage() {
     )
   }
 
-  const available = product.bootstrap.operations.some(
-    (operation) => operation.name === "FairValue.ListMeasurements",
+  const available = hasProductCapability(
+    product.bootstrap,
+    "fair_value_workspace",
   )
   if (!available) {
     return (
@@ -108,25 +89,27 @@ function FairValueWorkspace({
   bootstrap: DesktopBootstrap
   transport: ProductTransport
 }) {
-  const [selectedId, setSelectedId] = React.useState<string | null>(null)
+  const [selectedToken, setSelectedToken] = React.useState<string | null>(null)
+  const [evaluatedAt] = React.useState(() => new Date().toISOString())
   const measurements = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
       "FairValue",
-      "FairValue.ListMeasurements",
-      {},
+      "FairValue.GetWorkspace",
+      { measurementToken: selectedToken, at: evaluatedAt },
     ),
     queryFn: async () =>
       parseFairValueWorkspace(
-        await transport.query({ query: "fairValueMeasurements" }),
+        await transport.query({
+          query: "fairValueWorkspace",
+          at: evaluatedAt,
+          ...(selectedToken ? { measurementToken: selectedToken } : {}),
+        }),
       ),
   })
 
   const rows = measurements.data?.measurements ?? []
-  const selected =
-    rows.find((measurement) => measurement.measurementId === selectedId) ??
-    rows[0] ??
-    null
+  const selected = measurements.data?.selectedMeasurement ?? null
   const accountCount = new Set(rows.map((measurement) => measurement.accountId)).size
   const instrumentCount = new Set(
     rows.map((measurement) => measurement.instrumentId),
@@ -156,8 +139,8 @@ function FairValueWorkspace({
       <PortfolioMeasurementWorkflow
         bootstrap={bootstrap}
         transport={transport}
-        onCreated={async (measurementId) => {
-          setSelectedId(measurementId)
+        onCreated={async (measurementToken) => {
+          setSelectedToken(measurementToken)
           await measurements.refetch()
         }}
       />
@@ -223,12 +206,12 @@ function FairValueWorkspace({
           <div className="mt-4 grid min-h-[650px] gap-4 xl:grid-cols-[minmax(260px,0.68fr)_minmax(0,1.62fr)]">
             <MeasurementIndex
               measurements={rows}
-              selectedId={selected?.measurementId ?? null}
-              onSelect={setSelectedId}
+              selectedToken={selected?.measurementToken ?? null}
+              onSelect={setSelectedToken}
             />
             {selected ? (
               <SelectedFairValue
-                key={selected.measurementId}
+                key={selected.measurementToken}
                 bootstrap={bootstrap}
                 transport={transport}
                 measurement={selected}
@@ -246,9 +229,6 @@ function FairValueWorkspace({
   )
 }
 
-const AUDIT_PAGE_LIMIT = 50
-const MAXIMUM_AUDIT_PAGES = 20
-
 function SelectedFairValue({
   bootstrap,
   transport,
@@ -259,161 +239,19 @@ function SelectedFairValue({
   measurement: FairValueMeasurement
 }) {
   const queryClient = useQueryClient()
-  const [approvalCutoff] = React.useState(() => new Date().toISOString())
-  const [confirmClassification, setConfirmClassification] = React.useState(false)
   const [announcement, setAnnouncement] = React.useState("")
   const [governanceAuthorizations, setGovernanceAuthorizations] = React.useState<
     GovernanceAuthorization[]
   >([])
-  const operations = React.useMemo(
-    () => new Set(bootstrap.operations.map((operation) => operation.name)),
-    [bootstrap.operations],
+  const capabilities = React.useMemo(
+    () => productCapabilitySet(bootstrap),
+    [bootstrap],
   )
-  const requiredDetailOperations = [
-    "FairValue.GetClassification",
-    "FairValue.Explain",
-    "FairValue.GetEvidence",
-    "FairValue.GetApprovalStatus",
-    "FairValue.ListAuditEvents",
-    "FairValue.GetMarketAccess",
-  ]
-  const unavailableOperations = requiredDetailOperations.filter(
-    (operation) => !operations.has(operation),
-  )
-  const detailKey = (operation: string, input: Record<string, unknown>) =>
-    productKeys.operation(bootstrap.runtime, "FairValue", operation, input)
-
-  const classification = useQuery({
-    queryKey: detailKey("FairValue.GetClassification", {
-      measurementId: measurement.measurementId,
-    }),
-    queryFn: async () =>
-      parseFairValueClassification(
-        await transport.query({
-          query: "fairValueClassification",
-          measurementId: measurement.measurementId,
-        }),
-        measurement,
-      ),
-    enabled: operations.has("FairValue.GetClassification"),
-  })
-  const explanation = useQuery({
-    queryKey: detailKey("FairValue.Explain", {
-      measurementId: measurement.measurementId,
-    }),
-    queryFn: async () =>
-      parseFairValueExplanation(
-        await transport.query({
-          query: "fairValueExplanation",
-          measurementId: measurement.measurementId,
-        }),
-        measurement,
-      ),
-    enabled: operations.has("FairValue.Explain"),
-  })
-  const evidence = useQuery({
-    queryKey: detailKey("FairValue.GetEvidence", {
-      measurementId: measurement.measurementId,
-    }),
-    queryFn: async () =>
-      parseFairValueEvidence(
-        await transport.query({
-          query: "fairValueEvidence",
-          measurementId: measurement.measurementId,
-        }),
-        measurement,
-      ),
-    enabled: operations.has("FairValue.GetEvidence"),
-  })
-  const approvals = useQuery({
-    queryKey: detailKey("FairValue.GetApprovalStatus", {
-      measurementId: measurement.measurementId,
-      at: approvalCutoff,
-    }),
-    queryFn: async () =>
-      parseFairValueApprovals(
-        await transport.query({
-          query: "fairValueApprovalStatus",
-          measurementId: measurement.measurementId,
-          at: approvalCutoff,
-        }),
-        measurement.measurementId,
-      ),
-    enabled: operations.has("FairValue.GetApprovalStatus"),
-  })
-  const audit = useInfiniteQuery({
-    queryKey: detailKey("FairValue.ListAuditEvents", {
-      limit: AUDIT_PAGE_LIMIT,
-    }),
-    initialPageParam: undefined as
-      | { sequence: number; eventId: string }
-      | undefined,
-    queryFn: async ({ pageParam }) =>
-      parseFairValueAuditPage(
-        await transport.query({
-          query: "fairValueAudit",
-          limit: AUDIT_PAGE_LIMIT,
-          ...(pageParam ? { after: pageParam } : {}),
-        }),
-      ),
-    getNextPageParam: (page, pages) =>
-      pages.length < MAXIMUM_AUDIT_PAGES
-        ? (page.nextCursor ?? undefined)
-        : undefined,
-    enabled: operations.has("FairValue.ListAuditEvents"),
-  })
-
-  const assessmentIds = React.useMemo(
-    () =>
-      [...new Set(
-        (evidence.data?.inputs ?? []).flatMap((input) =>
-          input.marketAccessAssessment
-            ? [input.marketAccessAssessment.assessmentId]
-            : [],
-        ),
-      )],
-    [evidence.data],
-  )
-  const marketAccess = useQueries({
-    queries: assessmentIds.map((assessmentId) => ({
-      queryKey: detailKey("FairValue.GetMarketAccess", { assessmentId }),
-      queryFn: async () =>
-        parseFairValueMarketAccess(
-          await transport.query({
-            query: "fairValueMarketAccess",
-            assessmentId,
-          }),
-          assessmentId,
-        ),
-      enabled: operations.has("FairValue.GetMarketAccess"),
-    })),
-  })
-  const classify = useMutation({
-    mutationFn: async () =>
-      parseFairValueClassificationControl(
-        await transport.fairValueControl(
-          { action: "classify", measurementId: measurement.measurementId },
-          true,
-        ),
-        measurement,
-      ),
-    onSuccess: async (result) => {
-      setConfirmClassification(false)
-      setAnnouncement(
-        result.replay
-          ? "The current rules classification was already saved."
-          : "The measurement was evaluated with the current rules.",
-      )
-      await queryClient.invalidateQueries({
-        queryKey: productKeys.domain(bootstrap.runtime, "FairValue"),
-      })
-    },
-  })
   const governanceAvailable =
-    operations.has("Governance.ListPrincipals") &&
-    operations.has("Governance.AuthenticateAction") &&
-    operations.has("FairValue.PreviewGovernanceAction") &&
-    operations.has("FairValue.CommitGovernanceAction")
+    capabilities.has("governance_principals") &&
+    capabilities.has("governance_authenticate") &&
+    capabilities.has("fair_value_governance_preview") &&
+    capabilities.has("fair_value_governance_commit")
   const governancePrincipals = useQuery({
     queryKey: productKeys.operation(bootstrap.runtime, "Governance", "Governance.ListPrincipals", {}),
     queryFn: async () =>
@@ -497,156 +335,18 @@ function SelectedFairValue({
     },
   })
 
-  const resolvedClassification =
-    classification.data ?? explanation.data?.classification
-  const auditEvents = React.useMemo(
-    () =>
-      relatedAuditEvents(
-        measurement,
-        resolvedClassification,
-        evidence.data?.inputs,
-        approvals.data?.approvals,
-        audit.data?.pages,
-      ),
-    [measurement, resolvedClassification, evidence.data, approvals.data, audit.data],
-  )
-  const hydrated: FairValueMeasurement = {
-    ...measurement,
-    ...(resolvedClassification
-      ? { classification: resolvedClassification }
-      : {}),
-    ...(explanation.data
-      ? {
-          explanation: {
-            truthTable: explanation.data.truthTable,
-            reasons: explanation.data.reasons,
-          },
-        }
-      : {}),
-    ...(evidence.data ? { evidence: { inputs: evidence.data.inputs } } : {}),
-    ...(approvals.data
-      ? {
-          approvalStatus: {
-            at: approvals.data.at,
-            approvals: approvals.data.approvals,
-          },
-        }
-      : {}),
-    ...(marketAccess.some((query) => query.data)
-      ? {
-          marketAccess: marketAccess.flatMap((query) =>
-            query.data ? [query.data] : [],
-          ),
-        }
-      : {}),
-    ...(audit.data ? { auditEvents } : {}),
-  }
-  const queries = [classification, explanation, evidence, approvals, audit]
-  const loading =
-    (operations.has("FairValue.GetClassification") && classification.isPending) ||
-    (operations.has("FairValue.Explain") && explanation.isPending) ||
-    (operations.has("FairValue.GetEvidence") && evidence.isPending) ||
-    (operations.has("FairValue.GetApprovalStatus") && approvals.isPending) ||
-    (operations.has("FairValue.ListAuditEvents") && audit.isPending) ||
-    (operations.has("FairValue.GetMarketAccess") &&
-      marketAccess.some((query) => query.isPending))
-  const hasDetailErrors =
-    queries.some((query) => query.isError) ||
-    marketAccess.some((query) => query.isError)
-  const boundedDetails = [explanation.data, evidence.data, approvals.data].filter(
-    (result) =>
-      result !== undefined && result.availableItems > result.returnedItems,
-  )
-  const auditCapped =
-    (audit.data?.pages.length ?? 0) >= MAXIMUM_AUDIT_PAGES &&
-    audit.data?.pages.at(-1)?.nextCursor !== null
-
   return (
     <div className="min-w-0 space-y-3">
       <p className="sr-only" aria-live="polite">
         {announcement}
       </p>
-      {loading ? (
-        <Alert>
-          <RefreshCw className="animate-spin" aria-hidden="true" />
-          <AlertTitle>Loading valuation review</AlertTitle>
-          <AlertDescription>
-            Loading classification, supporting inputs, approvals, market access, and review history.
-          </AlertDescription>
-        </Alert>
-      ) : null}
-      {hasDetailErrors ? (
-        <Alert variant="destructive">
-          <CircleAlert aria-hidden="true" />
-          <AlertTitle>Some fair-value details could not be loaded</AlertTitle>
-          <AlertDescription>
-            Refresh this measurement. If the problem continues, open Logs for diagnostic details.
-          </AlertDescription>
-        </Alert>
-      ) : null}
-      {unavailableOperations.length > 0 ? (
-        <Alert>
-          <CircleAlert aria-hidden="true" />
-          <AlertTitle>Some review details are unavailable</AlertTitle>
-          <AlertDescription>
-            This installation cannot open every part of the valuation review. Update or restore
-            the Fair Value component before treating this record as complete.
-          </AlertDescription>
-        </Alert>
-      ) : null}
-      {boundedDetails.length > 0 ? (
-        <Alert>
-          <CircleAlert aria-hidden="true" />
-          <AlertTitle>Some review details are not shown</AlertTitle>
-          <AlertDescription>
-            Some supporting inputs, explanations, or approvals are outside the current view. Treat
-            this screen as partial until the remaining details are available.
-          </AlertDescription>
-        </Alert>
-      ) : null}
-      {operations.has("FairValue.Classify") ? (
-        <div className="flex justify-end">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => setConfirmClassification(true)}
-            disabled={classify.isPending}
-          >
-            <BadgeCheck aria-hidden="true" />
-            Evaluate with current rules
-          </Button>
-        </div>
-      ) : null}
-      {classify.isError ? (
-        <Alert variant="destructive">
-          <CircleAlert aria-hidden="true" />
-          <AlertTitle>Classification was not accepted</AlertTitle>
-          <AlertDescription>
-            Review the measurement and try again. If the problem continues, open Logs for details.
-          </AlertDescription>
-        </Alert>
-      ) : null}
-      <FairValueDetail
-        measurement={hydrated}
-        auditBoundary={{
-          loadedEventCount: audit.data?.pages.reduce(
-            (count, page) => count + page.events.length,
-            0,
-          ) ?? 0,
-          totalEventCount: audit.data?.pages[0]?.totalEventCount,
-          hasMore: audit.hasNextPage,
-          loadingMore: audit.isFetchingNextPage,
-          capped: auditCapped,
-          onLoadMore: () => void audit.fetchNextPage(),
-        }}
-      />
+      <FairValueDetail measurement={measurement} />
       {governanceAvailable ? (
         <FairValueGovernanceWorkflow
           measurement={measurement}
-          classification={resolvedClassification}
-          inputs={evidence.data?.inputs}
-          approvals={approvals.data?.approvals}
+          classification={measurement.classification ?? undefined}
+          inputs={measurement.inputs}
+          approvals={measurement.approvals}
           principals={governancePrincipals.data}
           state={{
             preview: governancePreview.data ?? null,
@@ -681,80 +381,18 @@ function SelectedFairValue({
           </AlertDescription>
         </Alert>
       )}
-      <Dialog open={confirmClassification} onOpenChange={setConfirmClassification}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Evaluate this measurement?</DialogTitle>
-            <DialogDescription>
-              Market Squawk will apply the current valuation policy to the saved measurement and
-              its supporting inputs. Earlier decisions remain available in review history.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setConfirmClassification(false)}>
-              Cancel
-            </Button>
-            <Button onClick={() => classify.mutate()} disabled={classify.isPending}>
-              {classify.isPending ? "Evaluating…" : "Evaluate measurement"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   )
 }
 
-function relatedAuditEvents(
-  measurement: FairValueMeasurement,
-  classification: FairValueClassification | undefined,
-  inputs: FairValueInput[] | undefined,
-  approvals: FairValueApproval[] | undefined,
-  pages: { events: FairValueAuditEvent[] }[] | undefined,
-) {
-  const decisionIds = new Set(
-    [classification?.decisionId, ...(approvals ?? []).map((item) => item.decisionId)]
-      .filter((value): value is string => value !== undefined),
-  )
-  const approvalIds = new Set((approvals ?? []).map((approval) => approval.approvalId))
-  const overrideIds = new Set(
-    (approvals ?? []).flatMap((approval) =>
-      approval.overrideId ? [approval.overrideId] : [],
-    ),
-  )
-  const assessmentIds = new Set(
-    inputs?.flatMap((input) =>
-      input.marketAccessAssessment
-        ? [input.marketAccessAssessment.assessmentId]
-        : [],
-    ) ?? [],
-  )
-  return (pages ?? [])
-    .flatMap((page) => page.events)
-    .filter((event) => {
-      const subject = event.subject
-      switch (subject.kind) {
-        case "classified":
-          return subject.measurementId === measurement.measurementId
-        case "override_proposed":
-          return decisionIds.has(subject.decisionId) || overrideIds.has(subject.overrideId)
-        case "approved":
-          return decisionIds.has(subject.decisionId) || approvalIds.has(subject.approvalId)
-        case "revoked":
-          return approvalIds.has(subject.approvalId)
-        case "market_access_approved":
-          return assessmentIds.has(subject.assessmentId)
-      }
-    })
-}
-
 function MeasurementIndex({
   measurements,
-  selectedId,
+  selectedToken,
   onSelect,
 }: {
-  measurements: FairValueMeasurement[]
-  selectedId: string | null
-  onSelect: (id: string) => void
+  measurements: FairValueMeasurementSummary[]
+  selectedToken: string | null
+  onSelect: (token: string) => void
 }) {
   return (
     <section className="overflow-hidden rounded-xl border border-border bg-card/35">
@@ -768,13 +406,13 @@ function MeasurementIndex({
       </div>
       <ul className="max-h-[720px] space-y-1 overflow-y-auto p-2">
         {measurements.map((measurement) => {
-          const active = measurement.measurementId === selectedId
+          const active = measurement.measurementToken === selectedToken
           return (
-            <li key={measurement.measurementId}>
+            <li key={measurement.measurementToken}>
               <button
                 type="button"
                 aria-pressed={active}
-                onClick={() => onSelect(measurement.measurementId)}
+                onClick={() => onSelect(measurement.measurementToken)}
                 className={`w-full rounded-lg border px-3 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
                   active
                     ? "border-primary/45 bg-primary/10"

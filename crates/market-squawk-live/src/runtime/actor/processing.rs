@@ -484,7 +484,7 @@ fn process_applied_observation(
                     applied.binding_digest,
                     applied.committed_state_revision,
                     applied.generation,
-                    applied.frame_id,
+                    applied.source_evidence,
                     wire_ordinal,
                     row_count,
                     applied.stable_trade_id,

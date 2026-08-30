@@ -1,5 +1,6 @@
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use serde_json::{Map, Number, Value};
 use sha2::{Digest as _, Sha256};
 
@@ -295,6 +296,54 @@ pub(crate) fn parse_json_payload(
         Sha256::digest(bytes).into(),
         ParseContext::new(bounds),
     ))
+}
+
+/// Rejects duplicate keys in a provider response whose top-level object is semantically keyed.
+///
+/// `serde_json::Value` necessarily collapses duplicate object keys, so keyed response families
+/// must perform this streaming pass over the exact bytes before treating the materialized map as
+/// unambiguous provider evidence.
+pub(crate) fn validate_unique_top_level_keys(bytes: &[u8]) -> Result<(), SchwabAdapterError> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    TopLevelUniqueKeys
+        .deserialize(&mut deserializer)
+        .and_then(|()| deserializer.end())
+        .map_err(|_| SchwabAdapterError::SchemaViolation)
+}
+
+struct TopLevelUniqueKeys;
+
+impl<'de> Visitor<'de> for TopLevelUniqueKeys {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object with unique top-level keys")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = BTreeSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(serde::de::Error::custom("duplicate top-level object key"));
+            }
+            map.next_value::<IgnoredAny>()?;
+        }
+        Ok(())
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for TopLevelUniqueKeys {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(self)
+    }
 }
 
 pub(crate) fn take_object(value: Value) -> Result<Map<String, Value>, SchwabAdapterError> {

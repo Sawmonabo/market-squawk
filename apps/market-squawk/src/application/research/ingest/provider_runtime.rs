@@ -7,7 +7,9 @@ use std::time::Instant;
 use futures_util::future::BoxFuture;
 use market_squawk_adapter_schwab::SchwabOAuthAuthorityReceipt;
 use market_squawk_data::{DatasetId, IngestError, IngestPrecommitAuthority, SourceOperation};
-use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
+};
 use market_squawk_platform::{SecretGeneration, SecretRef};
 use market_squawk_sources::{ProviderCapabilityRevision, SourceMetadata};
 use serde::Serialize;
@@ -18,11 +20,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    CryptoMarketDurableRead, CryptoMarketDurableReadWriter, CryptoMarketPublicationClosure,
-    ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,
+    CryptoMarketPublicationClosure, ManagedResearchExtractionSource, MarketEventDurableRead,
+    MarketEventDurableReadWriter, ProductionResearchIngestCoordinator,
     ResearchIngestCompositionError, ResearchRightsAuthority,
 };
-use crate::provider_onboarding::SchwabOAuthPublicationEpoch;
+use crate::provider_onboarding::SchwabOAuthMarketAuthority;
 
 /// Exact non-secret generation identity for one callable research-provider adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -328,6 +330,8 @@ fn digest_runtime_wire<T: Serialize>(
 #[derive(Clone, Debug)]
 pub(super) struct ResearchProviderAdmission {
     generation_digest: Option<EvidenceDigest>,
+    source_id: Option<SourceId>,
+    metadata_revision: Option<MetadataRevision>,
     state: Arc<ResearchProviderAdmissionState>,
     cancellation: CancellationToken,
 }
@@ -414,11 +418,11 @@ impl CryptoMarketPublicationAuthority {
     /// Mints the sole source- and dataset-bound durable-read handoff for this runtime generation.
     pub(crate) fn durable_read_capability(
         &self,
-    ) -> (CryptoMarketDurableReadWriter, CryptoMarketDurableRead) {
+    ) -> (MarketEventDurableReadWriter, MarketEventDurableRead) {
         let point_in_time = self
             .publication
             .point_in_time_selector(self.analytical_dataset.clone());
-        CryptoMarketDurableRead::channel(point_in_time)
+        MarketEventDurableRead::channel(point_in_time)
     }
 
     pub(crate) const fn cancellation(&self) -> &CancellationToken {
@@ -517,6 +521,8 @@ impl ResearchProviderAdmission {
         }
         Ok(Self {
             generation_digest: Some(parent_digest),
+            source_id: None,
+            metadata_revision: None,
             state: Arc::new(ResearchProviderAdmissionState {
                 phase: AtomicU8::new(ADMISSION_PENDING),
                 publication_barrier: Arc::new(RwLock::new(())),
@@ -529,10 +535,18 @@ impl ResearchProviderAdmission {
         generation: Option<&ResearchProviderRuntimeGeneration>,
         phase: u8,
     ) -> Result<Self, ResearchIngestCompositionError> {
+        let (generation_digest, source_id, metadata_revision) = match generation {
+            Some(generation) => (
+                Some(generation.generation_digest()?),
+                Some(generation.metadata().source_id().clone()),
+                Some(generation.metadata().revision().clone()),
+            ),
+            None => (None, None, None),
+        };
         Ok(Self {
-            generation_digest: generation
-                .map(ResearchProviderRuntimeGeneration::generation_digest)
-                .transpose()?,
+            generation_digest,
+            source_id,
+            metadata_revision,
             state: Arc::new(ResearchProviderAdmissionState {
                 phase: AtomicU8::new(phase),
                 publication_barrier: Arc::new(RwLock::new(())),
@@ -551,8 +565,28 @@ impl ResearchProviderAdmission {
         }
     }
 
+    /// Returns whether this live admission was minted for the exact source, metadata revision,
+    /// and complete non-secret runtime generation supplied by the caller.
+    pub(super) fn admits_generation(
+        &self,
+        generation: &ResearchProviderRuntimeGeneration,
+    ) -> Result<bool, ResearchIngestCompositionError> {
+        self.ensure_live()?;
+        let metadata = generation.metadata();
+        Ok(
+            self.generation_digest == Some(generation.generation_digest()?)
+                && self.source_id.as_ref() == Some(metadata.source_id())
+                && self.metadata_revision.as_ref() == Some(metadata.revision())
+                && metadata.source_id() == &generation.rights.source_id
+                && metadata.is_effective_at(generation.authority_effective_at()),
+        )
+    }
+
     pub(super) fn matches(&self, other: &Self) -> bool {
-        self.generation_digest == other.generation_digest && Arc::ptr_eq(&self.state, &other.state)
+        self.generation_digest == other.generation_digest
+            && self.source_id == other.source_id
+            && self.metadata_revision == other.metadata_revision
+            && Arc::ptr_eq(&self.state, &other.state)
     }
 
     pub(super) fn revoke(&self) {
@@ -627,7 +661,26 @@ impl ResearchProviderAdmission {
 struct SchwabCompositeMarketRuntimeAdmission {
     generation_digest: EvidenceDigest,
     admission: ResearchProviderAdmission,
-    oauth_epoch: SchwabOAuthPublicationEpoch,
+    oauth: SchwabOAuthMarketAuthority,
+    oauth_receipt: SchwabOAuthAuthorityReceipt,
+}
+
+#[cfg(test)]
+pub(super) fn test_schwab_composite_market_runtime_admission(
+    generation: &ResearchProviderRuntimeGeneration,
+    oauth: SchwabOAuthMarketAuthority,
+    oauth_receipt: SchwabOAuthAuthorityReceipt,
+) -> Result<
+    Arc<dyn super::schwab_market::SchwabMarketRuntimeAdmission>,
+    ResearchIngestCompositionError,
+> {
+    let generation_digest = generation.generation_digest()?;
+    Ok(Arc::new(SchwabCompositeMarketRuntimeAdmission {
+        generation_digest,
+        admission: ResearchProviderAdmission::new(Some(generation))?,
+        oauth,
+        oauth_receipt,
+    }))
 }
 
 impl SchwabCompositeMarketRuntimeAdmission {
@@ -636,8 +689,8 @@ impl SchwabCompositeMarketRuntimeAdmission {
         if self.admission.generation_digest != Some(self.generation_digest) {
             return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
         }
-        self.oauth_epoch
-            .validate_current(self.oauth_epoch.receipt())
+        self.oauth
+            .validate_current_receipt(self.oauth_receipt)
             .map_err(|_error| ResearchIngestCompositionError::StaleRuntimeGeneration)?;
         self.admission.ensure_live()
     }
@@ -659,8 +712,11 @@ impl super::schwab_market::SchwabMarketRuntimeAdmission for SchwabCompositeMarke
         receipt: SchwabOAuthAuthorityReceipt,
     ) -> Result<(), ResearchIngestCompositionError> {
         self.admission.ensure_live()?;
-        self.oauth_epoch
-            .validate_current(receipt)
+        if receipt != self.oauth_receipt {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        self.oauth
+            .validate_current_receipt(receipt)
             .map_err(|_error| ResearchIngestCompositionError::StaleRuntimeGeneration)?;
         self.ensure_exact_current()
     }
@@ -701,7 +757,8 @@ impl std::fmt::Debug for SchwabCompositeMarketRuntimeAdmission {
         formatter
             .debug_struct("SchwabCompositeMarketRuntimeAdmission")
             .field("generation_digest", &self.generation_digest)
-            .field("oauth_epoch", &self.oauth_epoch)
+            .field("oauth", &"[PROTECTED TOKEN AUTHORITY]")
+            .field("oauth_generation", &self.oauth_receipt.generation().get())
             .finish_non_exhaustive()
     }
 }
@@ -1042,6 +1099,247 @@ impl Drop for CommittedResearchProviderReplacement {
     }
 }
 
+/// Pending exact-generation replacement for a specialized publication-only provider.
+struct PreparedResearchProviderPublicationReplacement {
+    coordinator: Arc<ProductionResearchIngestCoordinator>,
+    profile: SourceIdentifier,
+    token: Uuid,
+    expected: ResearchProviderRuntimeGeneration,
+    candidate: ResearchProviderRuntimeGeneration,
+    candidate_rights: ResearchRightsAuthority,
+    candidate_admission: ResearchProviderAdmission,
+    completed: bool,
+}
+
+impl PreparedResearchProviderPublicationReplacement {
+    async fn revoke_predecessor(&mut self) -> Result<(), ResearchIngestCompositionError> {
+        self.candidate_admission.ensure_pending()?;
+        let predecessor = {
+            let authority = self
+                .coordinator
+                .authority
+                .lock()
+                .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+            if self.coordinator.lifecycle.shutdown_token().is_cancelled()
+                || authority.pending_replacements.get(&self.profile) != Some(&self.token)
+            {
+                return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+            }
+            let current = authority
+                .publication_sources
+                .get(&self.profile)
+                .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+            if current.generation != self.expected
+                || current.metadata != *self.expected.metadata()
+                || current.rights != self.expected.rights
+            {
+                return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+            }
+            current.admission.revoke();
+            current.admission.clone()
+        };
+        predecessor.revoke_and_drain().await;
+        Ok(())
+    }
+
+    fn rollback(
+        mut self,
+    ) -> Result<ResearchProviderRuntimeGeneration, ResearchIngestCompositionError> {
+        self.candidate_admission.ensure_pending()?;
+        let mut authority = self
+            .coordinator
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        if authority.pending_replacements.get(&self.profile) != Some(&self.token) {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        let current = authority
+            .publication_sources
+            .get_mut(&self.profile)
+            .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+        if current.generation != self.expected || current.metadata != *self.expected.metadata() {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        self.candidate_admission.revoke();
+        if current.admission.revocation_drained() {
+            current.admission = ResearchProviderAdmission::new(Some(&self.expected))?;
+        } else {
+            current.admission.ensure_live()?;
+        }
+        let removed = authority.pending_replacements.remove(&self.profile);
+        debug_assert_eq!(removed, Some(self.token));
+        self.completed = true;
+        Ok(self.expected.clone())
+    }
+
+    fn commit(
+        &mut self,
+    ) -> Result<CommittedResearchProviderPublicationReplacement, ResearchIngestCompositionError>
+    {
+        self.candidate_admission.ensure_pending()?;
+        let authority = self
+            .coordinator
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        if authority.pending_replacements.get(&self.profile) != Some(&self.token) {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        let current = authority
+            .publication_sources
+            .get(&self.profile)
+            .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+        if current.generation != self.expected
+            || current.metadata != *self.expected.metadata()
+            || !current.admission.revocation_drained()
+        {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        drop(authority);
+        self.completed = true;
+        Ok(CommittedResearchProviderPublicationReplacement {
+            coordinator: Arc::clone(&self.coordinator),
+            profile: self.profile.clone(),
+            token: self.token,
+            expected: self.expected.clone(),
+            candidate: self.candidate.clone(),
+            candidate_rights: self.candidate_rights.clone(),
+            candidate_admission: self.candidate_admission.clone(),
+            completed: false,
+        })
+    }
+}
+
+impl Drop for PreparedResearchProviderPublicationReplacement {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.candidate_admission.revoke();
+        if let Ok(mut authority) = self.coordinator.authority.lock()
+            && authority.pending_replacements.get(&self.profile) == Some(&self.token)
+        {
+            let _removed = authority.pending_replacements.remove(&self.profile);
+        }
+    }
+}
+
+/// Committed, still-non-callable specialized provider candidate.
+struct CommittedResearchProviderPublicationReplacement {
+    coordinator: Arc<ProductionResearchIngestCoordinator>,
+    profile: SourceIdentifier,
+    token: Uuid,
+    expected: ResearchProviderRuntimeGeneration,
+    candidate: ResearchProviderRuntimeGeneration,
+    candidate_rights: ResearchRightsAuthority,
+    candidate_admission: ResearchProviderAdmission,
+    completed: bool,
+}
+
+impl CommittedResearchProviderPublicationReplacement {
+    fn rollback(
+        mut self,
+    ) -> Result<ResearchProviderRuntimeGeneration, ResearchIngestCompositionError> {
+        self.candidate_admission.ensure_pending()?;
+        let predecessor_admission = ResearchProviderAdmission::new(Some(&self.expected))?;
+        let mut authority = self
+            .coordinator
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        if authority.pending_replacements.get(&self.profile) != Some(&self.token) {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        let current = authority
+            .publication_sources
+            .get_mut(&self.profile)
+            .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+        if current.generation != self.expected || !current.admission.revocation_drained() {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        self.candidate_admission.revoke();
+        current.admission = predecessor_admission;
+        let removed = authority.pending_replacements.remove(&self.profile);
+        debug_assert_eq!(removed, Some(self.token));
+        self.completed = true;
+        Ok(self.expected.clone())
+    }
+
+    fn finalize(
+        &mut self,
+    ) -> Result<ResearchProviderRuntimeGeneration, ResearchIngestCompositionError> {
+        self.candidate_admission.ensure_pending()?;
+        let registered_at = super::system_timestamp()
+            .map_err(|_error| ResearchIngestCompositionError::TrustedTimeUnavailable)?;
+        if !self.candidate.metadata().is_effective_at(registered_at) {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration);
+        }
+        let mut authority = self
+            .coordinator
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        if authority.pending_replacements.get(&self.profile) != Some(&self.token) {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        let super::CoordinatorAuthority {
+            registry,
+            sources: _,
+            publication_sources,
+            pending_replacements,
+            selections: _,
+            alpaca_historical: _,
+        } = &mut *authority;
+        let current = publication_sources
+            .get_mut(&self.profile)
+            .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+        if current.generation != self.expected
+            || !current.admission.revocation_drained()
+            || current.registration.source_id() != self.expected.metadata().source_id()
+            || current.registration.revision() != self.expected.metadata().revision()
+        {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        if current.metadata != *self.candidate.metadata() {
+            current.registration = Box::new(
+                registry
+                    .as_mut()
+                    .ok_or(ResearchIngestCompositionError::ShuttingDown)?
+                    .replace_metadata(
+                        current.registration.as_ref(),
+                        self.candidate.metadata().clone(),
+                        registered_at,
+                    )?,
+            );
+            current.registered_at = registered_at;
+        }
+        current.metadata = self.candidate.metadata().clone();
+        current.rights = self.candidate_rights.clone();
+        current.generation = self.candidate.clone();
+        current.admission = self.candidate_admission.clone();
+        let removed = pending_replacements.remove(&self.profile);
+        debug_assert_eq!(removed, Some(self.token));
+        self.candidate_admission.activate_pending();
+        self.completed = true;
+        Ok(self.candidate.clone())
+    }
+}
+
+impl Drop for CommittedResearchProviderPublicationReplacement {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.candidate_admission.revoke();
+        if let Ok(mut authority) = self.coordinator.authority.lock()
+            && authority.pending_replacements.get(&self.profile) == Some(&self.token)
+        {
+            let _removed = authority.pending_replacements.remove(&self.profile);
+        }
+    }
+}
+
 /// Non-cloneable mutation authority minted with one exact production coordinator.
 ///
 /// The coordinator itself exposes only read-only provider-generation inspection. Every provider
@@ -1049,6 +1347,11 @@ impl Drop for CommittedResearchProviderReplacement {
 /// activation boundary at composition.
 pub(crate) struct ResearchProviderRuntimeMutationAuthority {
     coordinator: Arc<ProductionResearchIngestCoordinator>,
+}
+
+/// Unforgeable proof that SEC live-fund composition came from the locked coordinator registry.
+pub(super) struct SecLiveFundCoordinatorSeal {
+    _private: (),
 }
 
 /// Opaque token-bound replacement whose transitions are available only through its minting
@@ -1063,6 +1366,8 @@ pub(crate) struct ResearchProviderRuntimeReplacement {
 enum ResearchProviderRuntimeReplacementState {
     Prepared(PreparedResearchProviderReplacement),
     Committed(CommittedResearchProviderReplacement),
+    PreparedPublication(PreparedResearchProviderPublicationReplacement),
+    CommittedPublication(CommittedResearchProviderPublicationReplacement),
 }
 
 impl ResearchProviderRuntimeMutationAuthority {
@@ -1081,24 +1386,124 @@ impl ResearchProviderRuntimeMutationAuthority {
         }
     }
 
-    /// Binds one exact callable Schwab provider generation to a reconciled OAuth epoch.
+    /// Atomically registers one exact SEC source and composes its sole live-fund authority.
+    ///
+    /// No callable coordinator entry is published until registry registration, extraction
+    /// authority, and application bridge composition all succeed. A post-registration failure
+    /// releases only that exact process registration while preserving its clean-resumable durable
+    /// metadata history.
+    pub(crate) fn register_sec_live_fund_source(
+        &self,
+        generation: ResearchProviderRuntimeGeneration,
+        source: Arc<market_squawk_adapter_sec::SecEdgarSource>,
+        rights: ResearchRightsAuthority,
+        identity_authority_source_id: market_squawk_domain::SourceId,
+    ) -> Result<super::sec_live::SecLiveFundSource, super::sec_live::SecLiveFundApplicationError>
+    {
+        let metadata =
+            market_squawk_sources::SourceMetadataProvider::metadata(source.as_ref()).clone();
+        if self.coordinator.lifecycle.shutdown_token().is_cancelled()
+            || generation.profile().as_str() != super::sec_live::SEC_PROFILE
+            || metadata.source_id().as_str() != super::sec_live::SEC_RUNTIME_SOURCE_ID
+            || metadata != *generation.metadata()
+            || rights != generation.rights
+            || rights.source_id() != metadata.source_id()
+            || identity_authority_source_id != *metadata.source_id()
+        {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration.into());
+        }
+        let registered_at = super::system_timestamp()
+            .map_err(|_error| ResearchIngestCompositionError::TrustedTimeUnavailable)?;
+        let admission = ResearchProviderAdmission::new(Some(&generation))?;
+        let generation_digest = generation.generation_digest()?;
+        let source_erased: Arc<dyn ManagedResearchExtractionSource> = source.clone();
+        let mut authority = self
+            .coordinator
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        if self.coordinator.lifecycle.shutdown_token().is_cancelled()
+            || authority.registry.is_none()
+        {
+            return Err(ResearchIngestCompositionError::ShuttingDown.into());
+        }
+        if authority.sources.contains_key(generation.profile()) {
+            return Err(ResearchIngestCompositionError::DuplicateProfile.into());
+        }
+        let (registration, operation) = {
+            let registry = authority
+                .registry
+                .as_mut()
+                .ok_or(ResearchIngestCompositionError::ShuttingDown)?;
+            let registration = registry
+                .register_or_resume_exact(metadata.clone(), registered_at)
+                .map_err(ResearchIngestCompositionError::from)?;
+            let composition = (|| {
+                let extraction = registry
+                    .extraction_authority(&registration, source.as_ref())
+                    .map_err(ResearchIngestCompositionError::from)?;
+                let operation = super::sec_live::SecLiveFundSource::from_coordinator(
+                    SecLiveFundCoordinatorSeal { _private: () },
+                    Arc::clone(&source),
+                    extraction,
+                    generation.clone(),
+                    admission.clone(),
+                    rights.clone(),
+                    Arc::clone(&self.coordinator.research),
+                    identity_authority_source_id,
+                )?;
+                admission.ensure_live()?;
+                if admission.generation_digest != Some(generation_digest)
+                    || source_erased.metadata() != &metadata
+                {
+                    return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration.into());
+                }
+                Ok(operation)
+            })();
+            match composition {
+                Ok(operation) => (registration, operation),
+                Err(error) => {
+                    registry
+                        .release_process_registration_exact(&registration)
+                        .map_err(ResearchIngestCompositionError::from)?;
+                    return Err(error);
+                }
+            }
+        };
+        authority.sources.insert(
+            generation.profile().clone(),
+            super::RegisteredExtractionSource {
+                source: source_erased,
+                metadata,
+                registration: Box::new(registration),
+                rights,
+                generation: Some(generation),
+                admission,
+            },
+        );
+        Ok(operation)
+    }
+
+    /// Binds one exact callable Schwab provider generation to the shared OAuth authority and the
+    /// doctor-proven receipt that admitted it.
     pub(super) fn schwab_market_runtime_admission(
         &self,
         generation: &ResearchProviderRuntimeGeneration,
-        oauth_epoch: SchwabOAuthPublicationEpoch,
+        oauth: SchwabOAuthMarketAuthority,
+        oauth_receipt: SchwabOAuthAuthorityReceipt,
     ) -> Result<
         Arc<dyn super::schwab_market::SchwabMarketRuntimeAdmission>,
         ResearchIngestCompositionError,
     > {
         if self.coordinator.lifecycle.shutdown_token().is_cancelled()
             || generation.profile().as_str() != market_squawk_sources::SCHWAB_MARKET_DATA_SURFACE_ID
-            || oauth_epoch.session_id() != generation.session_id()
+            || oauth.session_id() != generation.session_id()
         {
             return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
         }
         let generation_digest = generation.generation_digest()?;
-        oauth_epoch
-            .validate_current(oauth_epoch.receipt())
+        oauth
+            .validate_current_receipt(oauth_receipt)
             .map_err(|_error| ResearchIngestCompositionError::StaleRuntimeGeneration)?;
         let admission = {
             let authority = self
@@ -1126,15 +1531,16 @@ impl ResearchProviderRuntimeMutationAuthority {
                 return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
             }
             current.admission.ensure_live()?;
-            oauth_epoch
-                .validate_current(oauth_epoch.receipt())
+            oauth
+                .validate_current_receipt(oauth_receipt)
                 .map_err(|_error| ResearchIngestCompositionError::StaleRuntimeGeneration)?;
             current.admission.clone()
         };
         let admission = Arc::new(SchwabCompositeMarketRuntimeAdmission {
             generation_digest,
             admission,
-            oauth_epoch,
+            oauth,
+            oauth_receipt,
         });
         admission.ensure_exact_current()?;
         Ok(admission)
@@ -1451,6 +1857,67 @@ impl ProductionResearchIngestCoordinator {
 }
 
 impl ResearchProviderRuntimeMutationAuthority {
+    /// Prepares an exact replacement for a specialized provider that publishes but does not expose
+    /// generic extraction authority.
+    pub(crate) fn prepare_provider_publication_replacement(
+        &self,
+        expected: ResearchProviderRuntimeGeneration,
+        candidate: ResearchProviderRuntimeGeneration,
+        rights: ResearchRightsAuthority,
+    ) -> Result<ResearchProviderRuntimeReplacement, ResearchIngestCompositionError> {
+        if self.coordinator.lifecycle.shutdown_token().is_cancelled()
+            || !candidate.is_exact_successor_of(&expected)?
+            || rights != candidate.rights
+            || rights.source_id() != candidate.metadata().source_id()
+        {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeReplacement);
+        }
+        let profile = candidate.profile().clone();
+        let token = Uuid::new_v4();
+        let candidate_admission = ResearchProviderAdmission::new_pending(&candidate)?;
+        let mut authority = self
+            .coordinator
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        if authority.registry.is_none() || authority.sources.contains_key(&profile) {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeReplacement);
+        }
+        if authority.pending_replacements.contains_key(&profile) {
+            return Err(ResearchIngestCompositionError::ReplacementInProgress);
+        }
+        let current = authority
+            .publication_sources
+            .get(&profile)
+            .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+        if current.generation != expected
+            || current.metadata != *expected.metadata()
+            || current.rights != expected.rights
+            || current.admission.ensure_live().is_err()
+        {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        authority
+            .pending_replacements
+            .insert(profile.clone(), token);
+        let prepared = PreparedResearchProviderPublicationReplacement {
+            coordinator: Arc::clone(&self.coordinator),
+            profile,
+            token,
+            expected: expected.clone(),
+            candidate: candidate.clone(),
+            candidate_rights: rights,
+            candidate_admission,
+            completed: false,
+        };
+        Ok(ResearchProviderRuntimeReplacement {
+            coordinator: Arc::clone(&self.coordinator),
+            expected,
+            candidate,
+            state: Some(ResearchProviderRuntimeReplacementState::PreparedPublication(prepared)),
+        })
+    }
+
     /// Prepares an exact expected-old to exact-new adapter replacement without publishing it.
     pub(crate) fn prepare_provider_replacement<S>(
         &self,
@@ -1526,9 +1993,14 @@ impl ResearchProviderRuntimeMutationAuthority {
             Some(ResearchProviderRuntimeReplacementState::Prepared(prepared)) => {
                 prepared.revoke_predecessor().await
             }
-            Some(ResearchProviderRuntimeReplacementState::Committed(_)) | None => {
-                Err(ResearchIngestCompositionError::InvalidRuntimeReplacement)
+            Some(ResearchProviderRuntimeReplacementState::PreparedPublication(prepared)) => {
+                prepared.revoke_predecessor().await
             }
+            Some(
+                ResearchProviderRuntimeReplacementState::Committed(_)
+                | ResearchProviderRuntimeReplacementState::CommittedPublication(_),
+            )
+            | None => Err(ResearchIngestCompositionError::InvalidRuntimeReplacement),
         }
     }
 
@@ -1563,6 +2035,29 @@ impl ResearchProviderRuntimeMutationAuthority {
                 ));
                 Ok(())
             }
+            ResearchProviderRuntimeReplacementState::PreparedPublication(mut prepared) => {
+                match prepared.commit() {
+                    Ok(committed) => {
+                        transaction.state = Some(
+                            ResearchProviderRuntimeReplacementState::CommittedPublication(
+                                committed,
+                            ),
+                        );
+                        Ok(())
+                    }
+                    Err(error) => {
+                        transaction.state = Some(
+                            ResearchProviderRuntimeReplacementState::PreparedPublication(prepared),
+                        );
+                        Err(error)
+                    }
+                }
+            }
+            ResearchProviderRuntimeReplacementState::CommittedPublication(committed) => {
+                transaction.state =
+                    Some(ResearchProviderRuntimeReplacementState::CommittedPublication(committed));
+                Ok(())
+            }
         }
     }
 
@@ -1578,6 +2073,12 @@ impl ResearchProviderRuntimeMutationAuthority {
         {
             ResearchProviderRuntimeReplacementState::Prepared(prepared) => prepared.rollback(),
             ResearchProviderRuntimeReplacementState::Committed(committed) => committed.rollback(),
+            ResearchProviderRuntimeReplacementState::PreparedPublication(prepared) => {
+                prepared.rollback()
+            }
+            ResearchProviderRuntimeReplacementState::CommittedPublication(committed) => {
+                committed.rollback()
+            }
         }
     }
 
@@ -1590,10 +2091,87 @@ impl ResearchProviderRuntimeMutationAuthority {
             Some(ResearchProviderRuntimeReplacementState::Committed(committed)) => {
                 committed.finalize()
             }
-            Some(ResearchProviderRuntimeReplacementState::Prepared(_)) | None => {
-                Err(ResearchIngestCompositionError::InvalidRuntimeReplacement)
+            Some(ResearchProviderRuntimeReplacementState::CommittedPublication(committed)) => {
+                committed.finalize()
             }
+            Some(
+                ResearchProviderRuntimeReplacementState::Prepared(_)
+                | ResearchProviderRuntimeReplacementState::PreparedPublication(_),
+            )
+            | None => Err(ResearchIngestCompositionError::InvalidRuntimeReplacement),
         }
+    }
+
+    /// Drains and releases one exact SEC generation without durably revoking its source history.
+    pub(crate) async fn revoke_sec_provider_generation_and_release(
+        &self,
+        expected: &ResearchProviderRuntimeGeneration,
+    ) -> Result<(), ResearchIngestCompositionError> {
+        if expected.profile().as_str() != super::sec_live::SEC_PROFILE
+            || expected.metadata().source_id().as_str() != super::sec_live::SEC_RUNTIME_SOURCE_ID
+        {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration);
+        }
+        let admission = {
+            let mut authority = self
+                .coordinator
+                .authority
+                .lock()
+                .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+            let current = authority
+                .sources
+                .get(expected.profile())
+                .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+            if current.generation.as_ref() != Some(expected)
+                || current.metadata != *expected.metadata()
+                || current.registration.source_id() != expected.metadata().source_id()
+                || current.registration.revision() != expected.metadata().revision()
+            {
+                return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+            }
+            current.admission.revoke();
+            let admission = current.admission.clone();
+            authority.selections.revoke_profile(expected.profile());
+            admission
+        };
+        admission.revoke_and_drain().await;
+
+        let mut authority = self
+            .coordinator
+            .authority
+            .lock()
+            .map_err(|_error| ResearchIngestCompositionError::AuthorityUnavailable)?;
+        let super::CoordinatorAuthority {
+            registry,
+            sources,
+            publication_sources: _,
+            pending_replacements: _,
+            selections: _,
+            alpaca_historical: _,
+        } = &mut *authority;
+        let current = sources
+            .get(expected.profile())
+            .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+        if current.generation.as_ref() != Some(expected)
+            || !current.admission.matches(&admission)
+            || !current.admission.revocation_drained()
+            || current.metadata != *expected.metadata()
+            || current.registration.source_id() != expected.metadata().source_id()
+            || current.registration.revision() != expected.metadata().revision()
+        {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        registry
+            .as_mut()
+            .ok_or(ResearchIngestCompositionError::ShuttingDown)?
+            .release_process_registration_exact(current.registration.as_ref())?;
+        let removed = sources
+            .remove(expected.profile())
+            .ok_or(ResearchIngestCompositionError::RuntimeGenerationUnavailable)?;
+        if removed.generation.as_ref() != Some(expected) || !removed.admission.matches(&admission) {
+            return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
+        }
+        Ok(())
     }
 
     /// Revokes exactly one callable generation and every retained receipt minted from it.
@@ -1660,9 +2238,77 @@ impl std::fmt::Debug for ResearchProviderRuntimeReplacement {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::future::Future;
+    use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::str::FromStr;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use bytes::Bytes;
+    use market_squawk_adapter_schwab::{
+        AccessTokenAdmission, CallbackOutcome, OAuthCallback, ProtectedSchwabOAuthAuthority,
+        ProviderIdentifier, QuoteField, QuoteRequest, RequestAdmission, ResponseHeaderEvidence,
+        RestExecutionOutcome, RestTransportBounds, SchwabHttpWire, SchwabHttpWireRequest,
+        SchwabHttpWireResponse, SchwabOAuthAuthorityConfiguration, SchwabOAuthInteraction,
+        SchwabOAuthSecretPolicy, SchwabOAuthWire, SchwabOAuthWireError, SchwabOAuthWireRequest,
+        SchwabOAuthWireResponse, SchwabRestDelayEvidence, SchwabRestExecutor,
+        SchwabTransportTelemetry, TransientAccessToken,
+    };
+    use market_squawk_data::{
+        CatalogConfig, CatalogResultLimits, ObjectStoreConfig, RightsBasis, SourceOperation,
+    };
+    use market_squawk_domain::{
+        AssetClass, AssignmentVerification, AuthorizationBasis, ChecksumCapability, CoverageDelay,
+        Currency, DataQuality, DeliveryEvidence, Denomination, DigestAlgorithm, EffectiveInterval,
+        EvidenceDigest, ExactPayloadEvidence, ExternalIdentifier, ExternalIdentifierRecord,
+        ExternalIdentifierRecordInput, IdentifierEntitlement, IdentifierRightsPolicyReference,
+        InstrumentDefinition, InstrumentDefinitionInput, InstrumentDefinitionRevision,
+        InstrumentId, IntegrityRule, LotSize, MetadataRevision, ProviderChannel,
+        ProviderIdentityEvidence, ProviderIdentityRecord, ProviderIdentityRecordInput,
+        ProviderInstrumentId, ProviderProduct, RevisionBoundPayloadEvidence, RuleVersion,
+        SchemaVersion, SequenceCapability, SnapshotApplicability, SourceId, SourceIdentifier,
+        TickSize, Ticker, Timestamp, TradingStatus, VenueId,
+    };
+    use market_squawk_platform::{
+        EncryptedFileSecretStore, LocalPaths, SecretCancellation, SecretGeneration,
+        SecretInteractionPolicy, SecretKey, SecretOperationControl, SecretRef, SecretStore,
+        SecretValue,
+    };
+    use market_squawk_sources::{
+        AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope,
+        ChecksumValidationProfile, CoverageTopology, EndpointPolicy, FreshnessPolicy,
+        HistoricalCapability, InstrumentCoverage, LiveCoverageDeclaration, LiveCoverageRule,
+        LiveProtocolProfile, NetworkAccessPolicy, ProviderBudgetPolicy, ProviderCapabilityRevision,
+        ProviderNumericPolicy, RuntimeCapabilityDisposition, SCHWAB_MARKET_DATA_SURFACE_ID,
+        SchwabMarketDataDoctorObservation, SchwabMarketDataDoctorReceiptInput,
+        SchwabMarketDataDoctorReceiptV1, SchwabMarketDataFamily, SchwabMarketDataFamilyEvidence,
+        SchwabUserPreferenceDoctorEvidence, SemanticInterpretationProfile,
+        SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
+        SourceMetadataInput, SourceProtocolProfile,
+    };
+    use rust_decimal::Decimal;
+
+    use crate::ResearchService;
+    use crate::application::market_runtime::{
+        SchwabRestQuoteInstrumentBinding, SchwabRestQuoteProducer, SchwabRestQuoteSealFirstSink,
+        SchwabRestQuoteSourceEvidence,
+    };
+    use crate::live_source::{
+        SchwabRestQuoteCurrentBridge, SchwabRestQuoteCurrentPublication,
+        SchwabRestQuoteCurrentRequest,
+    };
+    use crate::provider_activation::{
+        MarketInstrumentBinding, MarketInstrumentReferenceBinding, MarketSubscriptionPriority,
+        SchwabMarketDataAccountActivation, SchwabMarketDataActivationError,
+    };
+    use crate::provider_onboarding::SchwabOAuthMarketAuthority;
 
     use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[tokio::test]
     async fn exact_generation_revocation_drains_the_publication_lease()
@@ -1683,5 +2329,671 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), drain).await??;
         assert!(admission.revocation_drained());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn schwab_quote_attempt_retains_exact_epoch_through_precommit_and_fails_closed()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let session_id = Uuid::new_v4();
+        let (oauth, wire, secret_reference) =
+            scripted_market_authority(directory.path().join("stable-oauth"), session_id, 1_800, 60)
+                .await?;
+        let (token, epoch) =
+            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&oauth, 1).await?;
+        let oauth_receipt = epoch.receipt();
+        let (durable, evidence, binding) = quote_publication_fixture(
+            directory.path(),
+            session_id,
+            secret_reference,
+            oauth.clone(),
+            oauth_receipt,
+        )?;
+        let generation = market_squawk_domain::ConnectionGeneration::new(1)?;
+        let sink = SchwabRestQuoteSealFirstSink::new(
+            Arc::clone(&durable),
+            Arc::new(PublishedCurrentBridge(generation)),
+        );
+        let accepted = SchwabRestQuoteProducer::publish_test_completed_response(
+            &sink,
+            executed_quote(token, oauth_receipt.access_issued_at_unix_seconds()).await?,
+            evidence.clone(),
+            vec![binding.clone()],
+            epoch,
+            generation,
+        )
+        .await?;
+        assert_eq!(accepted.published(), 1);
+        assert_eq!(wire.exchange_count(), 1);
+
+        let (token, revoked_epoch) =
+            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&oauth, 1).await?;
+        let completed =
+            executed_quote(token, oauth_receipt.access_issued_at_unix_seconds()).await?;
+        oauth.revoke_test_authority();
+        assert!(
+            revoked_epoch
+                .validate_current(revoked_epoch.receipt())
+                .is_err()
+        );
+        assert!(
+            SchwabRestQuoteProducer::publish_test_completed_response(
+                &sink,
+                completed,
+                evidence,
+                vec![binding],
+                revoked_epoch,
+                generation,
+            )
+            .await
+            .is_err()
+        );
+        assert!(matches!(
+            durable.latest_source_health()?,
+            Some(super::super::schwab_market::SchwabRestQuoteSourceHealthOutcome::PostSealPublicationUnavailable {
+                sealed_receipt_digest: Some(_),
+                ..
+            })
+        ));
+
+        let (rotating, rotating_wire, _secret_reference) =
+            scripted_market_authority(directory.path().join("rotating-oauth"), session_id, 30, 300)
+                .await?;
+        let mut quote_dispatches = 0_u8;
+        let attempt =
+            SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&rotating, 1).await;
+        if attempt.is_ok() {
+            quote_dispatches += 1;
+        }
+        assert!(matches!(
+            attempt,
+            Err(SchwabMarketDataActivationError::DoctorRenewalRequired)
+        ));
+        assert_eq!(rotating_wire.exchange_count(), 2);
+        assert_eq!(quote_dispatches, 0);
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct PublishedCurrentBridge(market_squawk_domain::ConnectionGeneration);
+
+    impl SchwabRestQuoteCurrentBridge for PublishedCurrentBridge {
+        fn publish_current(
+            &self,
+            _request: SchwabRestQuoteCurrentRequest<'_>,
+        ) -> SchwabRestQuoteCurrentPublication {
+            SchwabRestQuoteCurrentPublication::Published {
+                observations: 1,
+                source_generation: self.0,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedSchwabOAuthWire {
+        initial_lifetime_seconds: u64,
+        exchanges: AtomicUsize,
+    }
+
+    impl ScriptedSchwabOAuthWire {
+        fn exchange_count(&self) -> usize {
+            self.exchanges.load(Ordering::SeqCst)
+        }
+    }
+
+    impl SchwabOAuthWire for ScriptedSchwabOAuthWire {
+        fn exchange(
+            &self,
+            _request: SchwabOAuthWireRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<SchwabOAuthWireResponse, SchwabOAuthWireError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                let attempt = self.exchanges.fetch_add(1, Ordering::SeqCst);
+                let body = match attempt {
+                    0 => format!(
+                        r#"{{"access_token":"initial-access","refresh_token":"initial-refresh","token_type":"Bearer","expires_in":{},"scope":"market-data"}}"#,
+                        self.initial_lifetime_seconds
+                    )
+                    .into_bytes(),
+                    1 => br#"{"access_token":"rotated-access","refresh_token":"rotated-refresh","token_type":"Bearer","expires_in":1800,"scope":"market-data"}"#
+                        .to_vec(),
+                    _ => return Err(SchwabOAuthWireError::Protocol),
+                };
+                SchwabOAuthWireResponse::try_new(200, body, nonzero(4 * 1024))
+            })
+        }
+    }
+
+    async fn scripted_market_authority(
+        root: impl AsRef<Path>,
+        session_id: Uuid,
+        initial_lifetime_seconds: u64,
+        refresh_early_seconds: u64,
+    ) -> Result<
+        (
+            SchwabOAuthMarketAuthority,
+            Arc<ScriptedSchwabOAuthWire>,
+            SecretRef,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let root = root.as_ref();
+        let secrets = Arc::new(EncryptedFileSecretStore::try_open(
+            root.join("secrets"),
+            SecretValue::new("schwab publication attempt test unlock".to_owned())?,
+        )?);
+        let control = SecretOperationControl::try_new(
+            "schwab-publication-attempt-test",
+            Instant::now() + Duration::from_secs(30),
+            0,
+            SecretInteractionPolicy::Forbid,
+            SecretCancellation::new(),
+        )?;
+        let application_credential = secrets.create(
+            &SecretKey::try_new("market-squawk.schwab", "test-application")?,
+            SecretGeneration::new(1)?,
+            SecretValue::new(
+                r#"{"version":1,"app_key":"test-app-key","app_secret":"test-app-secret"}"#
+                    .to_owned(),
+            )?,
+            &control,
+        )?;
+        let wire = Arc::new(ScriptedSchwabOAuthWire {
+            initial_lifetime_seconds,
+            exchanges: AtomicUsize::new(0),
+        });
+        let authority = Arc::new(
+            ProtectedSchwabOAuthAuthority::try_open(
+                root.join("authority"),
+                SchwabOAuthAuthorityConfiguration::try_new(
+                    secrets,
+                    wire.clone(),
+                    application_credential.clone(),
+                    SchwabOAuthSecretPolicy::try_new(Duration::from_secs(30), 0)?,
+                    parse_bounds(),
+                    AccessTokenAdmission::new(nonzero(4 * 1024), Duration::from_secs(1)),
+                    refresh_early_seconds,
+                )?,
+            )
+            .await?,
+        );
+        let callback = match OAuthCallback::parse(
+            "https://127.0.0.1:8182/?code=one-time&state=publication-attempt",
+            "publication-attempt",
+            RequestAdmission::new(nonzero(4 * 1024), NonZeroUsize::MIN),
+        )? {
+            CallbackOutcome::Authorized(callback) => callback,
+            CallbackOutcome::Denied { .. } => return Err("test callback was denied".into()),
+        };
+        let issued_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let receipt = authority
+            .complete_authorization(&callback, issued_at, SchwabOAuthInteraction::Background)
+            .await?;
+        Ok((
+            SchwabOAuthMarketAuthority::from_test_authority(
+                session_id,
+                receipt,
+                Arc::clone(&authority),
+            ),
+            wire,
+            application_credential,
+        ))
+    }
+
+    #[derive(Debug)]
+    struct QuoteHttpWire(Mutex<Option<SchwabHttpWireResponse>>);
+
+    impl SchwabHttpWire for QuoteHttpWire {
+        fn get<'a>(
+            &'a self,
+            _request: SchwabHttpWireRequest<'a>,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            SchwabHttpWireResponse,
+                            market_squawk_adapter_schwab::SchwabTransportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.0
+                    .lock()
+                    .map_err(|_poisoned| {
+                        market_squawk_adapter_schwab::SchwabTransportError::Protocol
+                    })?
+                    .take()
+                    .ok_or(market_squawk_adapter_schwab::SchwabTransportError::Protocol)
+            })
+        }
+    }
+
+    async fn executed_quote(
+        token: TransientAccessToken,
+        source_seconds: u64,
+    ) -> Result<market_squawk_adapter_schwab::ExecutedRestResponse, Box<dyn std::error::Error>>
+    {
+        let request = QuoteRequest::try_new(
+            vec![ProviderIdentifier::try_new("AAPL".to_owned())?],
+            vec![QuoteField::Quote],
+            None,
+            RequestAdmission::new(nonzero(4 * 1024), NonZeroUsize::MIN),
+        )?;
+        let body = Bytes::from(format!(
+            r#"{{"AAPL":{{"assetMainType":"EQUITY","realtime":true,"quote":{{"bidPrice":100.12,"askPrice":100.13,"bidSize":2,"askSize":3,"quoteTime":{}}}}}}}"#,
+            source_seconds.saturating_mul(1_000)
+        ));
+        let bounds = RestTransportBounds::try_new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            nonzero(64 * 1024),
+            nonzero(8),
+            nonzero(2 * 1024),
+        )?;
+        let response = SchwabHttpWireResponse::try_new(
+            200,
+            request.request().url().to_owned(),
+            Some(u64::try_from(body.len())?),
+            vec![ResponseHeaderEvidence::try_new(
+                "content-type".to_owned(),
+                b"application/json".to_vec(),
+            )?],
+            body,
+            bounds,
+        )?;
+        let executor = SchwabRestExecutor::try_new(
+            Arc::new(QuoteHttpWire(Mutex::new(Some(response)))),
+            bounds,
+            parse_bounds(),
+            AccessTokenAdmission::new(nonzero(4 * 1024), Duration::from_secs(1)),
+            SchwabTransportTelemetry::default(),
+        )?;
+        match executor
+            .execute(request.request(), &token, CancellationToken::new())
+            .await?
+        {
+            RestExecutionOutcome::Accepted(response) => Ok(response),
+            _ => Err("mock quote response was not accepted".into()),
+        }
+    }
+
+    fn quote_publication_fixture(
+        root: &Path,
+        session_id: Uuid,
+        secret_reference: SecretRef,
+        oauth: SchwabOAuthMarketAuthority,
+        oauth_receipt: SchwabOAuthAuthorityReceipt,
+    ) -> Result<
+        (
+            Arc<super::super::schwab_market::SchwabRestQuoteGenerationAuthority>,
+            SchwabRestQuoteSourceEvidence,
+            SchwabRestQuoteInstrumentBinding,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let instrument_id = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
+        let source_id = SourceId::try_from("schwab-trader-api")?;
+        let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+        let product = ProviderProduct::new(SourceIdentifier::try_from("schwab-rest")?);
+        let channel = ProviderChannel::new(SourceIdentifier::try_from("quotes")?);
+        let metadata = quote_metadata(
+            source_id.clone(),
+            instrument_id,
+            effective,
+            product.clone(),
+            channel.clone(),
+        )?;
+        let binding = quote_binding(source_id.clone(), instrument_id, effective)?;
+        let capability_digest = digest(31);
+        let parent_rights = digest(32);
+        let rights = ResearchRightsAuthority::try_new_scoped(
+            source_id,
+            RightsBasis::reviewed_terms("https://developer.schwab.com/terms", digest(33))?,
+            parent_rights,
+            digest(34),
+            timestamp_seconds(oauth_receipt.refresh_expires_at_unix_seconds())?,
+            vec![SourceIdentifier::try_from("schwab-rest-quotes-aapl")?],
+            vec![SourceOperation::Persist],
+        )?;
+        let generation = ResearchProviderRuntimeGeneration::try_new(
+            SourceIdentifier::try_from(SCHWAB_MARKET_DATA_SURFACE_ID)?,
+            session_id,
+            ProviderCapabilityRevision::new(1)?,
+            capability_digest,
+            Some(secret_reference.generation()),
+            Some(secret_reference),
+            timestamp_seconds(oauth_receipt.access_issued_at_unix_seconds())?,
+            metadata.clone(),
+            rights.clone(),
+        )?;
+        let doctor = doctor_receipt(session_id, capability_digest, parent_rights, oauth_receipt)?;
+        let paths = LocalPaths::prepare(root.join("research"))?;
+        let research = Arc::new(ResearchService::open_or_initialize(
+            &paths,
+            CatalogConfig::try_new(
+                paths.catalog()?.clone(),
+                Duration::from_millis(750),
+                market_squawk_data::CatalogLimit::new(64)?,
+                CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+            )?,
+            8,
+            ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?,
+        )?);
+        let durable = super::super::schwab_market::SchwabRestQuoteGenerationAuthority::bind_test_rest_quote_sink(
+            research,
+            generation,
+            rights,
+            doctor,
+            oauth,
+            oauth_receipt,
+            Duration::from_secs(5),
+        )?;
+        let evidence = SchwabRestQuoteSourceEvidence::try_new(
+            metadata,
+            SourceIdentifier::try_from("schwab-rest-quotes")?,
+            VenueId::try_from("schwab")?,
+            SchwabRestDelayEvidence::RealTime,
+            DataQuality::DirectUnverified,
+            product,
+            channel,
+            digest(35),
+        )?;
+        Ok((durable, evidence, binding))
+    }
+
+    fn quote_metadata(
+        source_id: SourceId,
+        instrument_id: InstrumentId,
+        effective: EffectiveInterval,
+        product: ProviderProduct,
+        channel: ProviderChannel,
+    ) -> Result<SourceMetadata, Box<dyn std::error::Error>> {
+        let provider = SourceIdentifier::try_from("schwab-trader-api")?;
+        let authorization = AuthorizationGrant::new(
+            AuthorizationMode::UserAuthorized,
+            AuthorizationBasis::new(SourceIdentifier::try_from("schwab-test-account")?),
+            ExactPayloadEvidence::from_content_digest(digest(2)),
+            effective,
+        );
+        let live = LiveCoverageDeclaration::try_new(
+            product,
+            channel,
+            vec![LiveCoverageRule::try_new(
+                market_squawk_domain::LiveEventClass::Quote,
+                None,
+                SnapshotApplicability::NotApplicable {
+                    metadata_rule: rule("schwab-rest-quote-snapshot")?,
+                },
+            )?],
+        )?;
+        let budget = ProviderBudgetPolicy::try_new(
+            BudgetScope::for_authorization(provider.clone(), &authorization)?,
+            NonZeroU32::new(20).ok_or("invalid request budget")?,
+            NonZeroU64::new(15 * 60 * 1_000_000_000).ok_or("invalid budget window")?,
+            NonZeroU16::new(1).ok_or("invalid concurrency budget")?,
+            BackoffPolicy::try_new(
+                NonZeroU64::new(1_000_000).ok_or("invalid backoff")?,
+                NonZeroU64::new(60_000_000_000).ok_or("invalid backoff cap")?,
+                1_000,
+            )?,
+        )?;
+        Ok(SourceMetadata::try_new(SourceMetadataInput::new(
+            SchemaVersion::CURRENT,
+            source_id,
+            RevisionBoundPayloadEvidence::new(
+                MetadataRevision::new(SourceIdentifier::try_from("schwab-rest-quote-v1")?),
+                ExactPayloadEvidence::from_content_digest(digest(3)),
+            ),
+            SourceClass::Broker,
+            provider,
+            authorization,
+            SourceCoverage::try_instrument(
+                ExactPayloadEvidence::from_content_digest(digest(4)),
+                effective,
+                vec![AssetClass::Index],
+                CoverageTopology::single_venue(VenueId::try_from("schwab")?),
+                InstrumentCoverage::enumerated(vec![instrument_id])?,
+                Some(live),
+                CoverageDelay::RealTime,
+                DeliveryEvidence::AuthorizedBroker,
+            )?,
+            DataQuality::DirectUnverified,
+            NetworkAccessPolicy::Allowlisted(EndpointPolicy::try_new([
+                "https://api.schwabapi.com/marketdata/v1/quotes",
+            ])?),
+            FreshnessPolicy::try_new(
+                60_000_000_000,
+                60_000_000_000,
+                60_000_000_000,
+                60_000_000_000,
+                1_000_000_000,
+            )?,
+            Some(budget),
+            SourceCapabilities::new(
+                true,
+                true,
+                SequenceCapability::Unsupported,
+                ChecksumCapability::Unsupported,
+                HistoricalCapability::None,
+                true,
+            ),
+            SourceProtocolProfile::Live(Box::new(LiveProtocolProfile::new(
+                rule("schwab-rest-decoder")?,
+                SemanticInterpretationProfile::new(
+                    rule("schwab-rest-aggressor")?,
+                    rule("schwab-rest-auction")?,
+                    rule("schwab-rest-status")?,
+                    rule("schwab-rest-corporate-action")?,
+                ),
+                rule("schwab-rest-timestamp")?,
+                SequenceValidationProfile::Unsupported {
+                    rule: rule("schwab-rest-no-sequence")?,
+                },
+                ChecksumValidationProfile::Unsupported {
+                    rule: rule("schwab-rest-no-checksum")?,
+                },
+                true,
+                ProviderNumericPolicy::ExactDecimalLexeme,
+            ))),
+        ))?)
+    }
+
+    fn quote_binding(
+        source_id: SourceId,
+        instrument_id: InstrumentId,
+        effective: EffectiveInterval,
+    ) -> Result<SchwabRestQuoteInstrumentBinding, Box<dyn std::error::Error>> {
+        let provider_identity = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+            instrument_id,
+            source_id: source_id.clone(),
+            provider_instrument_id: ProviderInstrumentId::try_from("AAPL")?,
+            evidence: ProviderIdentityEvidence::from_content_digest(digest(10)),
+            source_timestamp: Some(Timestamp::from_unix_nanos(0)),
+            observed_at: Timestamp::from_unix_nanos(1),
+            metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+                "schwab-provider-identity-v1",
+            )?),
+            validity: effective,
+            supersedes: None,
+        });
+        let identifier = ExternalIdentifierRecord::new(ExternalIdentifierRecordInput {
+            identifier: ExternalIdentifier::Ticker(Ticker::try_from("AAPL")?),
+            assignment_verification: AssignmentVerification::VerifiedAssigned,
+            source_id: SourceId::try_from("reference-master")?,
+            source_evidence: ExactPayloadEvidence::from_content_digest(digest(11)),
+            source_timestamp: Some(Timestamp::from_unix_nanos(0)),
+            observed_at: Timestamp::from_unix_nanos(1),
+            validity: effective,
+            rights_policy: IdentifierRightsPolicyReference::new(
+                SourceIdentifier::try_from("reference-personal-use-v1")?,
+                IdentifierEntitlement::LicensedInternalUse,
+                SourceIdentifier::try_from("https://example.test/reference")?,
+            ),
+        });
+        let definition = InstrumentDefinition::try_new(InstrumentDefinitionInput {
+            instrument_id,
+            definition_revision: InstrumentDefinitionRevision::try_from(1_u64)?,
+            asset_class: AssetClass::Index,
+            primary_denomination: Denomination::Currency(Currency::try_from("USD")?),
+            quote_currency: Currency::try_from("USD")?,
+            tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
+            lot_size: LotSize::try_from_decimal(Decimal::ONE)?,
+            contract_multiplier: Decimal::ONE,
+            venue_mappings: Vec::new(),
+            provider_identities: vec![provider_identity.clone()],
+            identifiers: vec![identifier.clone()],
+            trading_status: TradingStatus::Active,
+        })?;
+        SchwabRestQuoteInstrumentBinding::try_new(
+            MarketInstrumentBinding::try_new(
+                MarketSubscriptionPriority::CurrentlyViewed,
+                definition,
+                provider_identity,
+                MarketInstrumentReferenceBinding::AssignedExternalIdentifier(identifier),
+            )?,
+            &source_id,
+        )
+        .map_err(Into::into)
+    }
+
+    fn doctor_receipt(
+        session_id: Uuid,
+        capability_digest: EvidenceDigest,
+        rights_decision_digest: EvidenceDigest,
+        oauth: SchwabOAuthAuthorityReceipt,
+    ) -> Result<SchwabMarketDataDoctorReceiptV1, Box<dyn std::error::Error>> {
+        let completed_at = timestamp_seconds(oauth.access_issued_at_unix_seconds())?;
+        let access_expires_at = timestamp_seconds(oauth.access_expires_at_unix_seconds())?;
+        let refresh_expires_at = timestamp_seconds(oauth.refresh_expires_at_unix_seconds())?;
+        let families = schwab_families()
+            .into_iter()
+            .map(|family| {
+                let available = family == SchwabMarketDataFamily::Quotes;
+                SchwabMarketDataFamilyEvidence {
+                    family,
+                    disposition: if available {
+                        RuntimeCapabilityDisposition::Available
+                    } else {
+                        RuntimeCapabilityDisposition::NotProbed
+                    },
+                    disposition_evidence_sha256: digest(20),
+                    observation_sha256: available.then(|| digest(21)),
+                    observed_at: available.then_some(completed_at),
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(SchwabMarketDataDoctorReceiptV1::try_new(
+            SchwabMarketDataDoctorReceiptInput {
+                surface_id: SourceIdentifier::try_from(SCHWAB_MARKET_DATA_SURFACE_ID)?,
+                session_identifier: SourceIdentifier::try_from(session_id.to_string())?,
+                application_credential_generation: SecretGeneration::new(1)?,
+                capability_revision: ProviderCapabilityRevision::new(1)?,
+                capability_digest,
+                public_configuration_digest: digest(22),
+                rights_decision_digest,
+                rate_policy_digest: digest(23),
+                data_quality: DataQuality::DirectUnverified,
+                observation: SchwabMarketDataDoctorObservation {
+                    provider_observation_origin:
+                        SchwabMarketDataDoctorObservation::provider_observed_origin()?,
+                    access_token_generation: oauth.generation().get(),
+                    access_issued_at: completed_at,
+                    access_expires_at,
+                    refresh_authorized_at: timestamp_seconds(
+                        oauth.refresh_authorized_at_unix_seconds(),
+                    )?,
+                    refresh_expires_at,
+                    user_preference: SchwabUserPreferenceDoctorEvidence {
+                        endpoint_contract_sha256: digest(24),
+                        request_sha256: digest(25),
+                        response_sha256: digest(26),
+                        status_code: 200,
+                        response_bytes: 1,
+                        received_at: completed_at,
+                        latency_nanos: 1,
+                        market_data_principal_sha256: digest(27),
+                        streamer_bootstrap_sha256: digest(28),
+                        market_data_offer_sha256: None,
+                    },
+                    families,
+                    completed_at,
+                },
+                exclusive_expires_at: Timestamp::from_unix_nanos(
+                    completed_at
+                        .unix_nanos()
+                        .checked_add(SchwabMarketDataDoctorReceiptV1::VALIDITY_NANOS)
+                        .ok_or("doctor expiry overflow")?
+                        .min(access_expires_at.unix_nanos())
+                        .min(refresh_expires_at.unix_nanos()),
+                ),
+                predecessor_digest: None,
+            },
+        )?)
+    }
+
+    fn schwab_families() -> [SchwabMarketDataFamily; 19] {
+        use SchwabMarketDataFamily::*;
+        [
+            Quotes,
+            PriceHistory,
+            OptionChains,
+            ExpirationChains,
+            Movers,
+            MarketHours,
+            Instruments,
+            LevelOneEquities,
+            LevelOneOptions,
+            LevelOneFutures,
+            LevelOneFuturesOptions,
+            LevelOneForex,
+            NyseBook,
+            NasdaqBook,
+            OptionsBook,
+            ChartEquity,
+            ChartFutures,
+            ScreenerEquity,
+            ScreenerOption,
+        ]
+    }
+
+    fn parse_bounds() -> market_squawk_adapter_schwab::ParseBounds {
+        market_squawk_adapter_schwab::ParseBounds::new(
+            nonzero(64 * 1024),
+            nonzero(64),
+            nonzero(2_048),
+            nonzero(16),
+            32,
+            8 * 1024,
+        )
+    }
+
+    fn timestamp_seconds(seconds: u64) -> Result<Timestamp, Box<dyn std::error::Error>> {
+        Ok(Timestamp::from_unix_nanos(i64::try_from(
+            seconds.checked_mul(1_000_000_000).ok_or("clock overflow")?,
+        )?))
+    }
+
+    fn rule(value: &str) -> Result<IntegrityRule, Box<dyn std::error::Error>> {
+        Ok(IntegrityRule::new(
+            SourceIdentifier::try_from(value)?,
+            RuleVersion::new(1)?,
+        ))
+    }
+
+    fn digest(byte: u8) -> EvidenceDigest {
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [byte; 32])
+    }
+
+    fn nonzero(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN)
     }
 }

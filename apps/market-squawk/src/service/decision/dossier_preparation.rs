@@ -1,8 +1,5 @@
 //! Closed service surface for application-owned candidate-dossier assembly.
 
-use std::{str::FromStr as _, sync::Arc};
-
-use chrono::DateTime;
 use market_squawk_decisions::{CandidateId, DecisionContentDigest};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, InstrumentId, Timestamp};
 use market_squawk_modeling::BundleId;
@@ -13,6 +10,7 @@ use market_squawk_services::{
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use std::sync::Arc;
 
 use crate::application::{
     Application,
@@ -22,6 +20,7 @@ use crate::application::{
         DossierPreparationError, DossierPreparationFence, DossierPreparationReceipt,
         PreparedDossierPreview,
     },
+    fair_value::{FairValueDossierReadCapability, FairValueDossierRecord},
 };
 
 use super::append_outcome_value;
@@ -30,8 +29,6 @@ pub(super) const GET_DOSSIER_PREPARATION: &str = "Decision.GetDossierPreparation
 pub(super) const PREPARE_DOSSIER: &str = "Decision.PrepareDossier";
 pub(super) const CREATE_DOSSIER: &str = "Decision.CreateDossier";
 const LIST_FORECASTS: &str = "Model.ListForecasts";
-const LIST_MEASUREMENTS: &str = "FairValue.ListMeasurements";
-const GET_CLASSIFICATION: &str = "FairValue.GetClassification";
 const FORECAST_SELECTOR_PREFIX: &str = "forecast:";
 const FAIR_VALUE_SELECTOR_PREFIX: &str = "fair-value:";
 const MAXIMUM_FORECAST_OPTIONS: usize = 64;
@@ -43,6 +40,7 @@ const MAXIMUM_EVIDENCE_RESULT_BYTES: usize = 8 * 1024 * 1024;
 pub(super) struct DossierPreparationOperations {
     decisions: Arc<DecisionApplication>,
     application: Arc<Application>,
+    fair_value: FairValueDossierReadCapability,
     runtime: RuntimeIdentity,
 }
 
@@ -50,11 +48,13 @@ impl DossierPreparationOperations {
     pub(super) const fn new(
         decisions: Arc<DecisionApplication>,
         application: Arc<Application>,
+        fair_value: FairValueDossierReadCapability,
         runtime: RuntimeIdentity,
     ) -> Self {
         Self {
             decisions,
             application,
+            fair_value,
             runtime,
         }
     }
@@ -175,61 +175,24 @@ impl DossierPreparationOperations {
             return Err(ServiceError::InvalidResult);
         }
 
-        let fair_value_context = evidence_context(context, MAXIMUM_EVIDENCE_SCAN_ITEMS)?;
-        let measurement_result = self
-            .application
-            .invoke(LIST_MEASUREMENTS, Map::new(), fair_value_context)
-            .await?;
-        let measurements: MeasurementList =
-            serde_json::from_value(measurement_result.structured_content().clone())
-                .map_err(|_error| ServiceError::InvalidResult)?;
-        let mut compatible_measurements = Vec::new();
-        compatible_measurements
-            .try_reserve_exact(
-                measurements
-                    .measurements
-                    .len()
-                    .min(MAXIMUM_FAIR_VALUE_OPTIONS),
+        let fair_value_records = self
+            .fair_value
+            .records(
+                inventory.instrument_id,
+                inventory.selected_at,
+                MAXIMUM_EVIDENCE_SCAN_ITEMS,
+                context,
             )
-            .map_err(|_error| ServiceError::ResourceExhausted)?;
-        for record in measurements.measurements {
-            if let Some(option) = FairValueMeasurementOption::try_from_record(record, inventory)? {
-                compatible_measurements.push(option);
-            }
-        }
-        compatible_measurements.sort_unstable_by(|left, right| {
-            right
-                .measurement_at
-                .cmp(&left.measurement_at)
-                .then_with(|| left.measurement_id.cmp(&right.measurement_id))
-        });
-        compatible_measurements.truncate(MAXIMUM_FAIR_VALUE_OPTIONS);
+            .await?;
         let mut fair_values = Vec::new();
         fair_values
-            .try_reserve_exact(compatible_measurements.len())
+            .try_reserve_exact(fair_value_records.len().min(MAXIMUM_FAIR_VALUE_OPTIONS))
             .map_err(|_error| ServiceError::ResourceExhausted)?;
-        for measurement in compatible_measurements {
-            ensure_live(context)?;
-            let mut arguments = Map::new();
-            arguments.insert(
-                "measurementId".to_owned(),
-                Value::String(measurement.measurement_id.clone()),
-            );
-            let classification_context = evidence_context(context, 1)?;
-            match self
-                .application
-                .invoke(GET_CLASSIFICATION, arguments, classification_context)
-                .await
-            {
-                Ok(result) => {
-                    let classified: ClassifiedMeasurement =
-                        serde_json::from_value(result.structured_content().clone())
-                            .map_err(|_error| ServiceError::InvalidResult)?;
-                    fair_values.push(measurement.finish(classified)?);
-                }
-                Err(ServiceError::NotFound) => {}
-                Err(error) => return Err(error),
-            }
+        for record in fair_value_records
+            .into_iter()
+            .take(MAXIMUM_FAIR_VALUE_OPTIONS)
+        {
+            fair_values.push(FairValueEvidenceOption::try_from_record(record)?);
         }
         if fair_values.iter().enumerate().any(|(index, option)| {
             fair_values[index + 1..]
@@ -251,6 +214,7 @@ impl std::fmt::Debug for DossierPreparationOperations {
             .debug_struct("DossierPreparationOperations")
             .field("decisions", &"[DURABLE DECISION AUTHORITY]")
             .field("application", &"[INSTALLED EVIDENCE AUTHORITIES]")
+            .field("fair_value", &"[TYPED FAIR-VALUE DOSSIER EVIDENCE]")
             .field("runtime", &self.runtime)
             .finish()
     }
@@ -513,158 +477,9 @@ fn forecast_option(
     }))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MeasurementList {
-    measurements: Vec<FairValueMeasurementRecord>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct FairValueMeasurementRecord {
-    measurement_id: String,
-    evidence_hash: String,
-    account_id: String,
-    instrument_id: InstrumentId,
-    amount: FairValueAmount,
-    measurement_at: String,
-    prepared_at: String,
-    prepared_by: String,
-    method: String,
-    input_count: usize,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-struct FairValueAmount {
-    amount: String,
-    currency: String,
-    scale: u32,
-    #[serde(rename = "amountBasis")]
-    amount_basis: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ClassifiedMeasurement {
-    measurement: FairValueMeasurementRecord,
-    classification: FairValueClassificationRecord,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct FairValueClassificationRecord {
-    decision_id: String,
-    measurement_id: String,
-    evidence_hash: String,
-    ruleset_version: u32,
-    ruleset_hash: String,
-    hierarchy: String,
-    basis: Value,
-    truth_table_item_count: usize,
-    reason_count: usize,
-}
-
-#[derive(Debug)]
-struct FairValueMeasurementOption {
-    measurement_id: String,
-    record: FairValueMeasurementRecord,
-    measurement_at: Timestamp,
-    prepared_at: Timestamp,
-}
-
-impl FairValueMeasurementOption {
-    fn try_from_record(
-        record: FairValueMeasurementRecord,
-        inventory: &DossierEvidenceInventory,
-    ) -> Result<Option<Self>, ServiceError> {
-        let measurement_at = timestamp(&record.measurement_at)?;
-        let prepared_at = timestamp(&record.prepared_at)?;
-        if record.prepared_by.is_empty()
-            || record.input_count == 0
-            || !matches!(
-                record.amount.amount_basis.as_str(),
-                "per_instrument_unit" | "reporting_entity_total" | "position_total"
-            )
-            || !matches!(
-                record.method.as_str(),
-                "quoted_market_price" | "market_approach" | "income_approach" | "cost_approach"
-            )
-        {
-            return Err(ServiceError::InvalidResult);
-        }
-        if record.instrument_id != inventory.instrument_id
-            || measurement_at > inventory.selected_at
-            || prepared_at > inventory.selected_at
-        {
-            return Ok(None);
-        }
-        validate_hex_digest(&record.measurement_id)?;
-        validate_hex_digest(&record.evidence_hash)?;
-        Ok(Some(Self {
-            measurement_id: record.measurement_id.clone(),
-            record,
-            measurement_at,
-            prepared_at,
-        }))
-    }
-
-    fn finish(
-        self,
-        classified: ClassifiedMeasurement,
-    ) -> Result<FairValueEvidenceOption, ServiceError> {
-        if classified.measurement != self.record
-            || classified.classification.measurement_id != self.measurement_id
-            || classified.classification.evidence_hash != self.record.evidence_hash
-            || classified.classification.ruleset_version == 0
-            || classified.classification.truth_table_item_count == 0
-            || classified.classification.hierarchy.is_empty()
-            || !matches!(
-                classified.classification.hierarchy.as_str(),
-                "level_1" | "level_2" | "level_3" | "unclassified"
-            )
-        {
-            return Err(ServiceError::InvalidResult);
-        }
-        validate_hex_digest(&classified.classification.ruleset_hash)?;
-        if !classified.classification.basis.is_object() {
-            return Err(ServiceError::InvalidResult);
-        }
-        let decision_id =
-            market_squawk_valuation::DecisionId::from_str(&classified.classification.decision_id)
-                .map_err(|_error| ServiceError::InvalidResult)?;
-        let selector = format!("{FAIR_VALUE_SELECTOR_PREFIX}{decision_id}").into_boxed_str();
-        let content_identity = DecisionContentDigest::try_new(EvidenceDigest::new(
-            DigestAlgorithm::Sha256,
-            decision_id.bytes(),
-        ))
-        .map_err(|_error| ServiceError::InvalidResult)?;
-        let evidence =
-            DossierFairValueEvidence::try_new(selector.clone(), content_identity, decision_id)
-                .map_err(map_preparation)?;
-        Ok(FairValueEvidenceOption {
-            selector,
-            measurement_id: self.measurement_id.into_boxed_str(),
-            account_id: self.record.account_id.into_boxed_str(),
-            amount: self.record.amount.amount.into_boxed_str(),
-            currency: self.record.amount.currency.into_boxed_str(),
-            scale: self.record.amount.scale,
-            amount_basis: self.record.amount.amount_basis.into_boxed_str(),
-            measurement_at: self.measurement_at,
-            prepared_at: self.prepared_at,
-            method: self.record.method.into_boxed_str(),
-            hierarchy: classified.classification.hierarchy.into_boxed_str(),
-            ruleset_version: classified.classification.ruleset_version,
-            reason_count: classified.classification.reason_count,
-            evidence,
-        })
-    }
-}
-
 #[derive(Clone, Debug)]
 struct FairValueEvidenceOption {
     selector: Box<str>,
-    measurement_id: Box<str>,
     account_id: Box<str>,
     amount: Box<str>,
     currency: Box<str>,
@@ -674,16 +489,44 @@ struct FairValueEvidenceOption {
     prepared_at: Timestamp,
     method: Box<str>,
     hierarchy: Box<str>,
-    ruleset_version: u32,
     reason_count: usize,
     evidence: DossierFairValueEvidence,
 }
 
 impl FairValueEvidenceOption {
+    fn try_from_record(record: FairValueDossierRecord) -> Result<Self, ServiceError> {
+        let measurement = record.measurement();
+        let decision = record.decision();
+        let selector =
+            format!("{FAIR_VALUE_SELECTOR_PREFIX}{}", record.selector_token()).into_boxed_str();
+        let content_identity = DecisionContentDigest::try_new(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            decision.id().bytes(),
+        ))
+        .map_err(|_error| ServiceError::InvalidResult)?;
+        let evidence =
+            DossierFairValueEvidence::try_new(selector.clone(), content_identity, decision.id())
+                .map_err(map_preparation)?;
+        let amount = measurement.amount();
+        Ok(Self {
+            selector,
+            account_id: measurement.account_id().to_string().into_boxed_str(),
+            amount: amount.money().amount().to_string().into_boxed_str(),
+            currency: amount.money().currency().as_str().into(),
+            scale: u32::from(amount.scale()),
+            amount_basis: amount_basis_name(amount.basis()).into(),
+            measurement_at: measurement.measurement_at(),
+            prepared_at: measurement.prepared_at(),
+            method: valuation_method_name(measurement.method()).into(),
+            hierarchy: hierarchy_name(decision.hierarchy()).into(),
+            reason_count: decision.reasons().len(),
+            evidence,
+        })
+    }
+
     fn value(&self) -> Value {
         json!({
             "selector": self.selector,
-            "measurementId": self.measurement_id,
             "accountId": self.account_id,
             "amount": {
                 "amount": self.amount,
@@ -695,9 +538,36 @@ impl FairValueEvidenceOption {
             "preparedAt": self.prepared_at,
             "method": self.method,
             "hierarchy": self.hierarchy,
-            "rulesetVersion": self.ruleset_version,
             "reasonCount": self.reason_count,
         })
+    }
+}
+
+const fn amount_basis_name(value: market_squawk_valuation::ValuationAmountBasis) -> &'static str {
+    match value {
+        market_squawk_valuation::ValuationAmountBasis::PerInstrumentUnit => "per_instrument_unit",
+        market_squawk_valuation::ValuationAmountBasis::ReportingEntityTotal => {
+            "reporting_entity_total"
+        }
+        market_squawk_valuation::ValuationAmountBasis::PositionTotal => "position_total",
+    }
+}
+
+const fn valuation_method_name(value: market_squawk_valuation::ValuationMethod) -> &'static str {
+    match value {
+        market_squawk_valuation::ValuationMethod::QuotedMarketPrice => "quoted_market_price",
+        market_squawk_valuation::ValuationMethod::MarketApproach => "market_approach",
+        market_squawk_valuation::ValuationMethod::IncomeApproach => "income_approach",
+        market_squawk_valuation::ValuationMethod::CostApproach => "cost_approach",
+    }
+}
+
+const fn hierarchy_name(value: market_squawk_domain::FairValueHierarchy) -> &'static str {
+    match value {
+        market_squawk_domain::FairValueHierarchy::Level1 => "level_1",
+        market_squawk_domain::FairValueHierarchy::Level2 => "level_2",
+        market_squawk_domain::FairValueHierarchy::Level3 => "level_3",
+        market_squawk_domain::FairValueHierarchy::Unclassified => "unclassified",
     }
 }
 
@@ -728,15 +598,6 @@ fn evidence_context(
         child = child.with_origin(origin);
     }
     Ok(child)
-}
-
-fn timestamp(value: &str) -> Result<Timestamp, ServiceError> {
-    let parsed =
-        DateTime::parse_from_rfc3339(value).map_err(|_error| ServiceError::InvalidResult)?;
-    let nanos = parsed
-        .timestamp_nanos_opt()
-        .ok_or(ServiceError::InvalidResult)?;
-    Ok(Timestamp::from_unix_nanos(nanos))
 }
 
 fn decision_digest_from_hex(value: &str) -> Result<DecisionContentDigest, ServiceError> {

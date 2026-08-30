@@ -46,6 +46,9 @@ mod forecast_evidence;
 mod fred;
 mod ingest;
 mod macro_context;
+mod sec_fund_job;
+mod sec_fund_product;
+mod sec_fundamentals;
 mod treasury;
 
 pub(crate) use dataset_preparation::{
@@ -68,12 +71,8 @@ pub(crate) use ingest::{
     BlsMacroCapabilityState, BlsMacroPlanPublication, BlsMacroUnavailableReason,
     BlsPreparedMacroPlan, BlsProviderPeriodLatestKnownDto, BlsProviderPeriodLatestKnownRequest,
     BlsSealFirstExtractionLimits, BlsWholePlanApplicationHandoff, CoinbaseMarketApplicationOutcome,
-    CryptoCommittedRowIngress, CryptoMarketDurableRead, CryptoMarketDurableReadWriter,
-    CryptoMarketEventPublicationReceipt, CryptoMarketEventRestartReceipt,
-    CryptoMarketEventRestartSelector, CryptoMarketPointInTimeReceipt,
-    CryptoMarketPointInTimeSelector, CryptoMarketPublicationAuthority,
-    CryptoMarketPublicationClosure, CryptoMarketPublicationError,
-    CryptoMarketSealedReceiptEvidence, CryptoMarketSurface, CryptoPendingFrameIngress,
+    CryptoCommittedRowIngress, CryptoMarketPublicationAuthority, CryptoMarketPublicationClosure,
+    CryptoMarketPublicationError, CryptoMarketSurface, CryptoPendingFrameIngress,
     CryptoPublicationRendezvousLimits, FredPublishedGenerationHandoff, IexHistApplicationError,
     IexHistApplicationLane, IexHistCaptureSealHandoff, IexHistCaptureSealRequirements,
     IexHistCatalogSealHandoff, IexHistClockStatus, IexHistExactJobPreview,
@@ -81,8 +80,14 @@ pub(crate) use ingest::{
     IexHistJobAuthority, IexHistJobStatus, IexHistPhysicalArtifact, IexHistPhysicalSealRequirement,
     IexHistPublicationAvailability, IexHistPublicationBlocker, IexHistPublicationBlockers,
     IexHistResearchJobLeaf, IexHistSelectionStatus, KrakenMarketApplicationOutcome,
-    KrakenSealedRawCanonicalUnavailable, ResearchProviderRuntimeMutationAuthority,
-    ResearchProviderRuntimeReplacement,
+    KrakenSealedRawCanonicalUnavailable, MarketEventDurableRead, MarketEventDurableReadWriter,
+    MarketEventPointInTimeReceipt, MarketEventPointInTimeSelector, MarketEventPublicationReceipt,
+    MarketEventReadError, MarketEventRestartReceipt, MarketEventRestartSelector,
+    MarketEventSealedReceiptEvidence, ResearchProviderPublicationOperation,
+    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
+    SchwabMarketPublicationError, SchwabRestQuoteGenerationAuthority,
+    SchwabRestQuotePostSealFailure, SchwabRestQuoteSourceHealthOutcome, SecFundPublicationReceipt,
+    SecLiveFundApplicationError, SecLiveFundRequest, SecLiveFundSource,
     TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION, TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION,
     TreasuryApplicationClosure, TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
 };
@@ -93,8 +98,25 @@ pub use ingest::{
     ResearchSourceDiscovery, ResearchSourceDiscoveryObject, ResearchSourceDiscoveryRights,
     ResearchSourceObjectListing,
 };
-pub(crate) use treasury::TreasuryLatestKnownOperation;
 pub(crate) use macro_context::{MACRO_GET_CONTEXT, MacroContextOperation};
+pub(crate) use sec_fund_job::{
+    SecFundJobCommitAuthority, SecFundJobExecutionError, SecFundJobRunner, SecFundJobRunnerError,
+};
+pub(crate) use sec_fund_product::{
+    SEC_FUND_START_PUBLICATION_OPERATION, SecAdmittedFundProductRequest,
+    SecFundProductBoundaryError, SecFundProductCoordinate, SecFundProductFamily,
+    SecFundProductProjection, SecFundProductRequest, SecFundProductRequestFactory,
+    SecFundPublicationProjection,
+};
+pub(crate) use sec_fundamentals::{
+    SEC_FUNDAMENTALS_RESEARCH_STATUS_OPERATION, SecAvailableResearchFamily,
+    SecCombinedIdentityStatus, SecConflictResearchFamily, SecFamilyResearchStatus,
+    SecFamilyUnavailableReason, SecFourClockStatus, SecFundamentalsResearchError,
+    SecFundamentalsResearchOperation, SecFundamentalsResearchRequest,
+    SecFundamentalsResearchStatus, SecRatioResearchStatus, SecRatioUnavailableReason,
+    SecResearchFamilyBinding, SecUnavailableResearchFamily,
+};
+pub(crate) use treasury::TreasuryLatestKnownOperation;
 
 const RESEARCH_LIST_DATASETS: &str = "Research.ListDatasets";
 const RESEARCH_GET_MANIFEST: &str = "Research.GetManifest";
@@ -277,7 +299,12 @@ impl ResearchApplicationServices {
         treasury_daily_latest_known: TreasuryLatestKnownOperation,
     ) -> Self {
         let reader = service.analytical_reader();
-        let macro_context = MacroContextOperation::new(reader.clone(), fred_latest_known.clone());
+        let macro_context = MacroContextOperation::with_treasury(
+            reader.clone(),
+            fred_latest_known.clone(),
+            treasury_fiscal_latest_known.clone(),
+            treasury_daily_latest_known.clone(),
+        );
         Self {
             controller: Arc::new(ResearchController {
                 authority: service,
@@ -312,6 +339,13 @@ impl ResearchApplicationServices {
         Arc::new(MacroDomainService {
             controller: Arc::clone(&self.controller),
         })
+    }
+
+    /// Returns the provider-neutral point-in-time Macro read for analytical consumers.
+    pub(crate) fn macro_context_read_capability(
+        &self,
+    ) -> macro_context::MacroContextReadCapability {
+        self.controller.macro_context.read_capability()
     }
 
     /// Reads bounded, manifest-pinned Fund NAV history through the application lifecycle.

@@ -48,6 +48,7 @@ use self::{
 const SAVE_SCREEN: &str = "Decision.SaveScreen";
 pub(super) const RUN_SCREEN: &str = screen_workflow::RUN_SCREEN;
 const LIST_SCREENS: &str = "Decision.ListScreens";
+const GET_SCREEN: &str = "Decision.GetScreen";
 const GET_CANDIDATES: &str = "Decision.GetCandidates";
 const LIST_SCREEN_RUNS: &str = "Decision.ListScreenRuns";
 const GET_DOSSIER: &str = "Decision.GetDossier";
@@ -72,6 +73,7 @@ impl InstalledDecisionOperations {
     pub(super) fn try_new(
         application: Arc<Application>,
         decisions: Arc<DecisionApplication>,
+        fair_value: crate::application::fair_value::FairValueDossierReadCapability,
         analytical_reader: market_squawk_data::AnalyticalReadCapability,
         portfolio: PortfolioFairValueReadCapability,
         runtime: market_squawk_runtime::RuntimeIdentity,
@@ -82,6 +84,7 @@ impl InstalledDecisionOperations {
             dossier_preparation: DossierPreparationOperations::new(
                 Arc::clone(&decisions),
                 application,
+                fair_value,
                 runtime,
             ),
             investment_analysis: InvestmentAnalysisOperations::new(Arc::clone(&decisions)),
@@ -108,6 +111,7 @@ impl InstalledDecisionOperations {
                 SAVE_SCREEN
                     | RUN_SCREEN
                     | LIST_SCREENS
+                    | GET_SCREEN
                     | GET_CANDIDATES
                     | LIST_SCREEN_RUNS
                     | GET_DOSSIER
@@ -150,6 +154,43 @@ impl InstalledDecisionOperations {
             return self.target_preparation.call(request, context);
         }
         let arguments = super::business_arguments(request.arguments());
+        if request.name() == GET_SCREEN {
+            let input: ScreenIdentityRequest = decode(&arguments)?;
+            let screen_id = ScreenId::try_new(input.screen_id).map_err(invalid)?;
+            let screen = self
+                .decisions
+                .get_current_screen(&screen_id)
+                .map_err(map_application)?;
+            ensure_live(context)?;
+            return TypedToolResult::try_new(
+                super::analysis::saved_screen_product_value(&screen),
+                1,
+                ToolResultMetadata::complete_not_applicable(),
+                context.limits(),
+            )
+            .map_err(Into::into);
+        }
+        if request.name() == LIST_SCREENS {
+            let input: ListRequest = decode(&arguments)?;
+            let page = self
+                .decisions
+                .list_current_screens_after(None, input.limit)
+                .map_err(map_application)?;
+            let count = page.screens().len();
+            let metadata = if page.has_more() {
+                ToolResultMetadata::try_truncated_not_applicable(page.available_count())?
+            } else {
+                ToolResultMetadata::complete_not_applicable()
+            };
+            ensure_live(context)?;
+            return TypedToolResult::try_new(
+                json!({"screens": page.screens().iter().map(screen_value).collect::<Vec<_>>() }),
+                count,
+                metadata,
+                context.limits(),
+            )
+            .map_err(Into::into);
+        }
         let (content, item_count) = match request.name() {
             SAVE_SCREEN => {
                 let input: SaveScreenRequest = decode(&arguments)?;
@@ -159,18 +200,6 @@ impl InstalledDecisionOperations {
                     .save_screen(input.expected_revision.map(revision).transpose()?, screen)
                     .map_err(map_application)?;
                 (append_outcome_value(outcome), 1)
-            }
-            LIST_SCREENS => {
-                let input: ListRequest = decode(&arguments)?;
-                let screens = self
-                    .decisions
-                    .list_screens(input.limit)
-                    .map_err(map_application)?;
-                let count = screens.len();
-                (
-                    json!({"screens": screens.iter().map(screen_value).collect::<Vec<_>>() }),
-                    count,
-                )
             }
             GET_CANDIDATES => {
                 let input: RunIdentityRequest = decode(&arguments)?;
@@ -345,6 +374,12 @@ struct SaveScreenRequest {
 #[serde(deny_unknown_fields)]
 struct ListRequest {
     limit: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ScreenIdentityRequest {
+    screen_id: String,
 }
 
 #[derive(Deserialize)]

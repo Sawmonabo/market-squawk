@@ -1,13 +1,13 @@
 //! Seal-first Schwab REST publication boundaries.
 
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, sync::Arc};
 
 use bytes::Bytes;
 use market_squawk_domain::{
     AvailabilityEvidence as ResearchAvailabilityEvidence, DataQuality, DigestAlgorithm,
     EvidenceDigest, ExactPayloadEvidence, Money, PayloadHash, PayloadReference, ResearchContext,
     ResearchObservation, ResearchProvenance, ResearchProvenanceInput, ResearchTime, RevisionNumber,
-    SourceIdentifier, VenueId,
+    SourceId, SourceIdentifier, VenueId,
 };
 use market_squawk_sources::{
     AvailabilityEvidence, CURRENT_RESEARCH_RECORD_SCHEMA, ExtractionBatch, ExtractionRecord,
@@ -20,6 +20,8 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
+
+const SCHWAB_DAILY_INTERVAL: &str = "1d";
 
 use crate::canonical::{
     SchwabDailyPriceHistoryCandidateRequest, SchwabPendingPriceHistoryCandidate,
@@ -111,6 +113,67 @@ impl SchwabPriceHistoryMarketDataEvidence {
     }
 }
 
+/// Read-only application-calendar capability for one exact completed daily-history range.
+///
+/// The adapter deliberately cannot mint this receipt. Its application owner must derive it from
+/// retained, current completed-session calendar authority. Publication consumes the exact ordered
+/// period set and revalidates the receipt immediately before canonical mapping.
+pub trait SchwabDailyPriceHistoryCalendarRangeReceipt: std::fmt::Debug + Send + Sync {
+    /// Exact Schwab source generation that owns publication.
+    fn publication_source_id(&self) -> &SourceId;
+
+    /// Canonical instrument expected in every returned candle.
+    fn instrument_id(&self) -> InstrumentId;
+
+    /// Exact canonical instrument-definition revision admitted by the plan.
+    fn instrument_revision_digest(&self) -> EvidenceDigest;
+
+    /// Exact immutable application plan that admitted the request.
+    fn admitted_plan_digest(&self) -> EvidenceDigest;
+
+    /// SHA-256 identity of the exact admitted Schwab REST request bytes.
+    fn provider_request_digest(&self) -> EvidenceDigest;
+
+    /// Exact venue whose completed sessions were selected.
+    fn venue_id(&self) -> &VenueId;
+
+    /// Exact code-owned daily interval retained by the calendar receipt.
+    fn interval(&self) -> &SourceIdentifier;
+
+    /// Exact code-owned raw adjustment semantics retained by the calendar receipt.
+    fn adjustment(&self) -> MarketBarAdjustment;
+
+    /// Exact half-open start admitted by the calendar selection.
+    fn requested_start(&self) -> Timestamp;
+
+    /// Exact half-open end admitted by the calendar selection.
+    fn requested_end(&self) -> Timestamp;
+
+    /// Point-in-time knowledge cutoff used by the selection.
+    fn knowledge_cutoff(&self) -> Timestamp;
+
+    /// Trusted instant at which the receipt was minted.
+    fn evaluated_at(&self) -> Timestamp;
+
+    /// Exclusive expiry bounded by calendar and currentness evidence.
+    fn expires_at(&self) -> Timestamp;
+
+    /// Exact provider/calendar evidence that proves the enumerated range is complete.
+    fn completeness_evidence(&self) -> EvidenceDigest;
+
+    /// Exact calendar ruleset evidence shared by every returned period.
+    fn calendar_evidence(&self) -> EvidenceDigest;
+
+    /// Nonzero digest binding the complete range selection and its retained capture.
+    fn receipt_digest(&self) -> EvidenceDigest;
+
+    /// Every expected daily period in strict provider-timestamp order.
+    fn periods(&self) -> &[BarTimeSemantics];
+
+    /// Revalidates the exact retained generation/revocation identity at publication time.
+    fn validate_current_at(&self, checked_at: Timestamp) -> bool;
+}
+
 /// Semantic and application-lineage inputs for one accepted daily price-history response.
 #[derive(Debug)]
 pub struct SchwabDailyPriceHistoryPublicationRequest<'a> {
@@ -123,11 +186,8 @@ pub struct SchwabDailyPriceHistoryPublicationRequest<'a> {
     admitted_plan_digest: EvidenceDigest,
     identity: SchwabResolvedProviderIdentity,
     market_data: SchwabPriceHistoryMarketDataEvidence,
-    interval: SourceIdentifier,
-    adjustment: MarketBarAdjustment,
     currency: Currency,
-    time_semantics: Vec<BarTimeSemantics>,
-    completeness_evidence: EvidenceDigest,
+    calendar_range: Arc<dyn SchwabDailyPriceHistoryCalendarRangeReceipt>,
     ingested_at: Timestamp,
 }
 
@@ -147,11 +207,8 @@ impl<'a> SchwabDailyPriceHistoryPublicationRequest<'a> {
         admitted_plan_digest: EvidenceDigest,
         identity: SchwabResolvedProviderIdentity,
         market_data: SchwabPriceHistoryMarketDataEvidence,
-        interval: SourceIdentifier,
-        adjustment: MarketBarAdjustment,
         currency: Currency,
-        time_semantics: Vec<BarTimeSemantics>,
-        completeness_evidence: EvidenceDigest,
+        calendar_range: Arc<dyn SchwabDailyPriceHistoryCalendarRangeReceipt>,
         ingested_at: Timestamp,
     ) -> Self {
         Self {
@@ -164,11 +221,8 @@ impl<'a> SchwabDailyPriceHistoryPublicationRequest<'a> {
             admitted_plan_digest,
             identity,
             market_data,
-            interval,
-            adjustment,
             currency,
-            time_semantics,
-            completeness_evidence,
+            calendar_range,
             ingested_at,
         }
     }
@@ -180,6 +234,7 @@ pub struct SchwabPendingDailyPriceHistoryPublication {
     candidate: SchwabPendingPriceHistoryCandidate,
     extraction_request: ExtractionRequest,
     market_data: SchwabPriceHistoryMarketDataEvidence,
+    calendar_range: Arc<dyn SchwabDailyPriceHistoryCalendarRangeReceipt>,
 }
 
 impl std::fmt::Debug for SchwabPendingDailyPriceHistoryPublication {
@@ -218,13 +273,28 @@ impl ExecutedRestResponse {
             admitted_plan_digest,
             identity,
             market_data,
-            interval,
-            adjustment,
             currency,
-            time_semantics,
-            completeness_evidence,
+            calendar_range,
             ingested_at,
         } = request;
+        // The admitted REST request is exactly `frequencyType=daily&frequency=1` and exposes no
+        // corporate-action adjustment selector. Preserve provider-returned values without
+        // allowing callers to relabel their interval or claim a provider-side adjustment.
+        let interval = SourceIdentifier::try_from(SCHWAB_DAILY_INTERVAL)
+            .map_err(|_| SchwabPriceHistoryPublicationError::InvalidEvidence)?;
+        let adjustment = MarketBarAdjustment::Raw;
+        if calendar_range.publication_source_id() != coordinates.source_id()
+            || calendar_range.venue_id() != market_data.venue_id()
+            || calendar_range.interval() != &interval
+            || calendar_range.adjustment() != adjustment
+            || calendar_range.provider_request_digest()
+                != EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    self.capture().receipt().request_sha256(),
+                )
+        {
+            return Err(SchwabPriceHistoryPublicationError::InvalidEvidence);
+        }
         validate_preseal_request(
             &extraction_request,
             &coordinates,
@@ -245,8 +315,7 @@ impl ExecutedRestResponse {
             interval,
             adjustment,
             currency,
-            time_semantics,
-            completeness_evidence,
+            calendar_range: calendar_range.as_ref(),
             ingested_at,
         })?;
         let pending = self.into_pending_capture(coordinates, event_id)?;
@@ -257,6 +326,7 @@ impl ExecutedRestResponse {
                 candidate,
                 extraction_request,
                 market_data,
+                calendar_range,
             },
             seal_request,
         ))
@@ -340,6 +410,7 @@ impl SchwabPendingDailyPriceHistoryPublication {
             market_data: self.market_data,
             revision_plan,
             sealed_capture_binding,
+            calendar_range: self.calendar_range,
         })
     }
 }
@@ -350,6 +421,7 @@ pub struct SchwabSealedDailyPriceHistoryPublication {
     market_data: SchwabPriceHistoryMarketDataEvidence,
     revision_plan: ExtractionRevisionPlan,
     sealed_capture_binding: SealedProviderCaptureBinding,
+    calendar_range: Arc<dyn SchwabDailyPriceHistoryCalendarRangeReceipt>,
 }
 
 impl SchwabSealedDailyPriceHistoryPublication {
@@ -369,8 +441,20 @@ impl SchwabSealedDailyPriceHistoryPublication {
     }
 
     /// Consumes the adapter handoff into the exact shared publication inputs.
-    pub fn into_parts(self) -> (ExtractionRevisionPlan, SealedProviderCaptureBinding) {
-        (self.revision_plan, self.sealed_capture_binding)
+    pub fn into_parts(
+        self,
+        publication_checked_at: Timestamp,
+    ) -> Result<
+        (ExtractionRevisionPlan, SealedProviderCaptureBinding),
+        SchwabPriceHistoryPublicationError,
+    > {
+        if !self
+            .calendar_range
+            .validate_current_at(publication_checked_at)
+        {
+            return Err(SchwabPriceHistoryPublicationError::InvalidEvidence);
+        }
+        Ok((self.revision_plan, self.sealed_capture_binding))
     }
 }
 
@@ -582,6 +666,8 @@ struct SchwabPriceHistoryNativeSidecarV1<'a> {
     admitted_plan_digest: EvidenceDigest,
     provider_instrument_id: &'a ProviderInstrumentId,
     resolution_evidence: EvidenceDigest,
+    completed_range_receipt_digest: EvidenceDigest,
+    range_completeness_evidence: EvidenceDigest,
     completeness_evidence: EvidenceDigest,
     mapping_digest: EvidenceDigest,
 }
@@ -687,6 +773,8 @@ fn native_lineage(
             admitted_plan_digest: candidate.admitted_plan_digest,
             provider_instrument_id: candidate.identity.provider_instrument_id(),
             resolution_evidence: candidate.identity.resolution_evidence(),
+            completed_range_receipt_digest: candidate.completed_range_receipt_digest,
+            range_completeness_evidence: candidate.range_completeness_evidence,
             completeness_evidence: candidate.completeness_evidence,
             mapping_digest: candidate.mapping_digest,
         })

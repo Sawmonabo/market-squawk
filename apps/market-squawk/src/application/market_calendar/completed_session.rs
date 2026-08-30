@@ -1,11 +1,11 @@
-//! Pure selection of one latest, evidence-backed completed market session.
+//! Pure selection of latest-session and complete-range market-calendar receipts.
 
 use std::{fmt, sync::Arc};
 
 use market_squawk_domain::{
     BarTimeSemantics, BarTimestampBasis, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
-    MarketBarSessionEvidence, MarketBarSessionKind, MetadataRevision, SourceId, SourceIdentifier,
-    Timestamp, VenueId,
+    InstrumentId, MarketBarAdjustment, MarketBarSessionEvidence, MarketBarSessionKind,
+    MetadataRevision, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{ProviderCaptureTerminalDisposition, SealedProviderCaptureSetReceipt};
 use sha2::{Digest as _, Sha256};
@@ -24,6 +24,108 @@ pub(crate) struct CompletedMarketSessionRequest {
     knowledge_cutoff: Timestamp,
     evaluated_at: Timestamp,
     digest: EvidenceDigest,
+}
+
+/// Exact half-open history range whose complete session set must be proven by retained evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompletedMarketSessionRangeRequest {
+    publication_source_id: SourceId,
+    instrument_id: InstrumentId,
+    instrument_revision_digest: EvidenceDigest,
+    admitted_plan_digest: EvidenceDigest,
+    provider_request_digest: EvidenceDigest,
+    venue_id: VenueId,
+    timeframe: SourceIdentifier,
+    adjustment: MarketBarAdjustment,
+    evidence_series: SourceIdentifier,
+    requested_start: Timestamp,
+    requested_end: Timestamp,
+    knowledge_cutoff: Timestamp,
+    evaluated_at: Timestamp,
+    digest: EvidenceDigest,
+}
+
+impl CompletedMarketSessionRangeRequest {
+    /// Constructs a completed range without consulting a wall clock or widening any cutoff.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "publication, instrument, calendar, range, and PIT coordinates remain exact"
+    )]
+    pub(crate) fn try_new(
+        publication_source_id: SourceId,
+        instrument_id: InstrumentId,
+        instrument_revision_digest: EvidenceDigest,
+        admitted_plan_digest: EvidenceDigest,
+        provider_request_digest: EvidenceDigest,
+        venue_id: VenueId,
+        timeframe: SourceIdentifier,
+        adjustment: MarketBarAdjustment,
+        evidence_series: SourceIdentifier,
+        requested_start: Timestamp,
+        requested_end: Timestamp,
+        knowledge_cutoff: Timestamp,
+        evaluated_at: Timestamp,
+    ) -> Result<Self, CompletedMarketSessionError> {
+        if requested_start >= requested_end
+            || requested_end > knowledge_cutoff
+            || knowledge_cutoff > evaluated_at
+            || [
+                instrument_revision_digest,
+                admitted_plan_digest,
+                provider_request_digest,
+            ]
+            .into_iter()
+            .any(|evidence| {
+                evidence.algorithm() != DigestAlgorithm::Sha256 || evidence.bytes() == [0; 32]
+            })
+        {
+            return Err(CompletedMarketSessionError::InvalidRequest);
+        }
+        let digest = range_request_digest(
+            &publication_source_id,
+            instrument_id,
+            instrument_revision_digest,
+            admitted_plan_digest,
+            provider_request_digest,
+            &venue_id,
+            &timeframe,
+            adjustment,
+            &evidence_series,
+            requested_start,
+            requested_end,
+            knowledge_cutoff,
+            evaluated_at,
+        );
+        Ok(Self {
+            publication_source_id,
+            instrument_id,
+            instrument_revision_digest,
+            admitted_plan_digest,
+            provider_request_digest,
+            venue_id,
+            timeframe,
+            adjustment,
+            evidence_series,
+            requested_start,
+            requested_end,
+            knowledge_cutoff,
+            evaluated_at,
+            digest,
+        })
+    }
+
+    fn selector_request(
+        &self,
+    ) -> Result<CompletedMarketSessionRequest, CompletedMarketSessionError> {
+        CompletedMarketSessionRequest::try_new(
+            self.venue_id.clone(),
+            self.timeframe.clone(),
+            self.evidence_series.clone(),
+            self.requested_end,
+            self.knowledge_cutoff,
+            self.evaluated_at,
+        )
+    }
 }
 
 impl CompletedMarketSessionRequest {
@@ -320,6 +422,7 @@ impl CompletedMarketSessionCandidate {
 pub(crate) struct CompletedMarketSessionCandidateSnapshot {
     request_digest: EvidenceDigest,
     currentness: CompletedMarketSessionCurrentnessIdentity,
+    complete_from: Timestamp,
     complete_through: Timestamp,
     completeness_evidence: EvidenceDigest,
     capture: SealedProviderCaptureSetReceipt,
@@ -331,13 +434,15 @@ impl CompletedMarketSessionCandidateSnapshot {
     pub(crate) fn try_new(
         request: &CompletedMarketSessionRequest,
         currentness: CompletedMarketSessionCurrentnessIdentity,
+        complete_from: Timestamp,
         complete_through: Timestamp,
         completeness_evidence: EvidenceDigest,
         capture: SealedProviderCaptureSetReceipt,
         candidates: Vec<CompletedMarketSessionCandidate>,
     ) -> Result<Self, CompletedMarketSessionError> {
         require_nonzero(completeness_evidence)?;
-        if complete_through != request.completion_cutoff
+        if complete_from > complete_through
+            || complete_through != request.completion_cutoff
             || currentness.venue_id != request.venue_id
             || currentness.timeframe != request.timeframe
             || currentness.evidence_series != request.evidence_series
@@ -349,6 +454,7 @@ impl CompletedMarketSessionCandidateSnapshot {
         Ok(Self {
             request_digest: request.digest,
             currentness,
+            complete_from,
             complete_through,
             completeness_evidence,
             capture,
@@ -362,6 +468,10 @@ impl CompletedMarketSessionCandidateSnapshot {
 
     pub(crate) const fn complete_through(&self) -> Timestamp {
         self.complete_through
+    }
+
+    pub(crate) const fn complete_from(&self) -> Timestamp {
+        self.complete_from
     }
 
     pub(crate) const fn completeness_evidence(&self) -> EvidenceDigest {
@@ -503,6 +613,110 @@ impl CompletedMarketSessionAuthority {
         Ok(CompletedMarketSessionResolution::Available(receipt))
     }
 
+    /// Resolves every exact completed session contained by one half-open historical range.
+    ///
+    /// The provider evidence owner must enumerate the complete range. This authority never
+    /// accepts a caller-authored timestamp list, fills a missing session, or drops a session whose
+    /// evidence was unavailable by the request's knowledge cutoff.
+    pub(crate) fn resolve_range(
+        &self,
+        request: CompletedMarketSessionRangeRequest,
+    ) -> Result<CompletedMarketSessionRangeResolution, CompletedMarketSessionError> {
+        let selector_request = request.selector_request()?;
+        let snapshot = match self.evidence.candidate_snapshot(&selector_request) {
+            Ok(snapshot) => snapshot,
+            Err(CompletedMarketSessionEvidenceAccessError::Unavailable) => {
+                return Ok(CompletedMarketSessionRangeResolution::Unavailable(
+                    CompletedMarketSessionUnavailable::CurrentnessUnproven,
+                ));
+            }
+            Err(CompletedMarketSessionEvidenceAccessError::Conflict) => {
+                return Ok(CompletedMarketSessionRangeResolution::Unavailable(
+                    CompletedMarketSessionUnavailable::Conflict,
+                ));
+            }
+        };
+        validate_snapshot(&selector_request, &snapshot)?;
+        if snapshot.complete_from > request.requested_start {
+            return Ok(CompletedMarketSessionRangeResolution::Unavailable(
+                CompletedMarketSessionUnavailable::IncompleteRange,
+            ));
+        }
+        let precheck = match self.currentness(&selector_request, snapshot.currentness())? {
+            CurrentnessCheck::Current(receipt) => receipt,
+            CurrentnessCheck::Unavailable(reason) => {
+                return Ok(CompletedMarketSessionRangeResolution::Unavailable(reason));
+            }
+        };
+        let selected = select_range(&request, snapshot.candidates())?;
+        let postcheck = match self.currentness(&selector_request, snapshot.currentness())? {
+            CurrentnessCheck::Current(receipt) => receipt,
+            CurrentnessCheck::Unavailable(reason) => {
+                return Ok(CompletedMarketSessionRangeResolution::Unavailable(reason));
+            }
+        };
+        if precheck != postcheck {
+            return Ok(CompletedMarketSessionRangeResolution::Unavailable(
+                CompletedMarketSessionUnavailable::Conflict,
+            ));
+        }
+        let selected = match selected {
+            RangeCandidateSelection::None => {
+                return Ok(CompletedMarketSessionRangeResolution::Unavailable(
+                    CompletedMarketSessionUnavailable::NoCompletedPeriod,
+                ));
+            }
+            RangeCandidateSelection::Incomplete => {
+                return Ok(CompletedMarketSessionRangeResolution::Unavailable(
+                    CompletedMarketSessionUnavailable::IncompleteRange,
+                ));
+            }
+            RangeCandidateSelection::Complete(selected) => selected,
+        };
+
+        let mut periods = Vec::new();
+        periods
+            .try_reserve_exact(selected.len())
+            .map_err(|_| CompletedMarketSessionError::ResourceBoundExceeded)?;
+        let mut expires_at = precheck.expires_at;
+        for ordinal in &selected {
+            let candidate = snapshot
+                .candidates
+                .get(*ordinal)
+                .ok_or(CompletedMarketSessionError::InvalidEvidence)?;
+            let Some(candidate_expires_at) =
+                qualify_selected_candidate(&selector_request, candidate, &precheck)?
+            else {
+                return Ok(CompletedMarketSessionRangeResolution::Unavailable(
+                    CompletedMarketSessionUnavailable::Stale,
+                ));
+            };
+            expires_at = expires_at.min(candidate_expires_at);
+            periods.push(candidate.period.clone());
+        }
+        if periods.is_empty() || expires_at <= request.evaluated_at {
+            return Err(CompletedMarketSessionError::InvalidEvidence);
+        }
+
+        let receipt = CompletedMarketSessionRangeReceipt::mint(
+            Arc::clone(&self.evidence),
+            request,
+            snapshot.currentness,
+            snapshot.complete_from,
+            snapshot.complete_through,
+            snapshot.completeness_evidence,
+            snapshot.capture,
+            u32::try_from(selected[0])
+                .map_err(|_| CompletedMarketSessionError::ResourceBoundExceeded)?,
+            u32::try_from(snapshot.candidates.len())
+                .map_err(|_| CompletedMarketSessionError::ResourceBoundExceeded)?,
+            periods,
+            precheck,
+            expires_at,
+        );
+        Ok(CompletedMarketSessionRangeResolution::Available(receipt))
+    }
+
     fn currentness(
         &self,
         request: &CompletedMarketSessionRequest,
@@ -547,10 +761,17 @@ enum CandidateSelection {
     Conflict,
 }
 
+enum RangeCandidateSelection {
+    None,
+    Incomplete,
+    Complete(Vec<usize>),
+}
+
 /// Fail-closed, expected absence from a completed-session query.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CompletedMarketSessionUnavailable {
     NoCompletedPeriod,
+    IncompleteRange,
     CurrentnessUnproven,
     Stale,
     Revoked,
@@ -562,6 +783,189 @@ pub(crate) enum CompletedMarketSessionUnavailable {
 pub(crate) enum CompletedMarketSessionResolution {
     Available(CompletedMarketSessionReceipt),
     Unavailable(CompletedMarketSessionUnavailable),
+}
+
+/// Available exact multi-session receipt or a typed fail-closed disposition.
+#[derive(Debug)]
+pub(crate) enum CompletedMarketSessionRangeResolution {
+    Available(CompletedMarketSessionRangeReceipt),
+    Unavailable(CompletedMarketSessionUnavailable),
+}
+
+/// Non-forgeable, live-revalidated proof of every completed session in one history range.
+///
+/// Only [`CompletedMarketSessionAuthority::resolve_range`] can mint this capability. The ordered
+/// periods are retained directly so a provider publication must prove exact set equality rather
+/// than trusting a caller-authored completeness digest.
+pub(crate) struct CompletedMarketSessionRangeReceipt {
+    evidence: Arc<dyn CompletedMarketSessionEvidenceAuthority>,
+    request: CompletedMarketSessionRangeRequest,
+    currentness: CompletedMarketSessionCurrentnessIdentity,
+    complete_from: Timestamp,
+    complete_through: Timestamp,
+    completeness_evidence: EvidenceDigest,
+    capture: SealedProviderCaptureSetReceipt,
+    periods: Box<[BarTimeSemantics]>,
+    currentness_receipt: CompletedMarketSessionCurrentnessReceipt,
+    expires_at: Timestamp,
+    digest: EvidenceDigest,
+}
+
+impl fmt::Debug for CompletedMarketSessionRangeReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompletedMarketSessionRangeReceipt")
+            .field("request", &self.request)
+            .field("currentness", &self.currentness)
+            .field("complete_from", &self.complete_from)
+            .field("complete_through", &self.complete_through)
+            .field(
+                "calendar_capture_receipt_digest",
+                &self.capture.receipt_digest(),
+            )
+            .field("period_count", &self.periods.len())
+            .field("expires_at", &self.expires_at)
+            .field("digest", &self.digest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CompletedMarketSessionRangeReceipt {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private mint binds every independently governed range coordinate"
+    )]
+    fn mint(
+        evidence: Arc<dyn CompletedMarketSessionEvidenceAuthority>,
+        request: CompletedMarketSessionRangeRequest,
+        currentness: CompletedMarketSessionCurrentnessIdentity,
+        complete_from: Timestamp,
+        complete_through: Timestamp,
+        completeness_evidence: EvidenceDigest,
+        capture: SealedProviderCaptureSetReceipt,
+        first_selected_ordinal: u32,
+        candidate_count: u32,
+        periods: Vec<BarTimeSemantics>,
+        currentness_receipt: CompletedMarketSessionCurrentnessReceipt,
+        expires_at: Timestamp,
+    ) -> Self {
+        let digest = completed_session_range_receipt_digest(
+            &request,
+            &currentness,
+            complete_from,
+            complete_through,
+            completeness_evidence,
+            &capture,
+            first_selected_ordinal,
+            candidate_count,
+            &periods,
+            &currentness_receipt,
+            expires_at,
+        );
+        Self {
+            evidence,
+            request,
+            currentness,
+            complete_from,
+            complete_through,
+            completeness_evidence,
+            capture,
+            periods: periods.into_boxed_slice(),
+            currentness_receipt,
+            expires_at,
+            digest,
+        }
+    }
+
+    pub(crate) fn validate_current_at(&self, checked_at: Timestamp) -> bool {
+        if checked_at < self.request.evaluated_at || checked_at >= self.expires_at {
+            return false;
+        }
+        matches!(
+            self.evidence
+                .validate_currentness(&self.currentness, checked_at),
+            CompletedMarketSessionCurrentnessResolution::Current(receipt)
+                if receipt.identity() == &self.currentness
+                    && receipt.checked_at() == checked_at
+                    && checked_at < receipt.expires_at()
+        )
+    }
+}
+
+impl market_squawk_adapter_schwab::SchwabDailyPriceHistoryCalendarRangeReceipt
+    for CompletedMarketSessionRangeReceipt
+{
+    fn publication_source_id(&self) -> &SourceId {
+        &self.request.publication_source_id
+    }
+
+    fn instrument_id(&self) -> InstrumentId {
+        self.request.instrument_id
+    }
+
+    fn instrument_revision_digest(&self) -> EvidenceDigest {
+        self.request.instrument_revision_digest
+    }
+
+    fn admitted_plan_digest(&self) -> EvidenceDigest {
+        self.request.admitted_plan_digest
+    }
+
+    fn provider_request_digest(&self) -> EvidenceDigest {
+        self.request.provider_request_digest
+    }
+
+    fn venue_id(&self) -> &VenueId {
+        &self.request.venue_id
+    }
+
+    fn interval(&self) -> &SourceIdentifier {
+        &self.request.timeframe
+    }
+
+    fn adjustment(&self) -> MarketBarAdjustment {
+        self.request.adjustment
+    }
+
+    fn requested_start(&self) -> Timestamp {
+        self.request.requested_start
+    }
+
+    fn requested_end(&self) -> Timestamp {
+        self.request.requested_end
+    }
+
+    fn knowledge_cutoff(&self) -> Timestamp {
+        self.request.knowledge_cutoff
+    }
+
+    fn evaluated_at(&self) -> Timestamp {
+        self.request.evaluated_at
+    }
+
+    fn expires_at(&self) -> Timestamp {
+        self.expires_at
+    }
+
+    fn completeness_evidence(&self) -> EvidenceDigest {
+        self.completeness_evidence
+    }
+
+    fn calendar_evidence(&self) -> EvidenceDigest {
+        self.currentness.calendar_evidence
+    }
+
+    fn receipt_digest(&self) -> EvidenceDigest {
+        self.digest
+    }
+
+    fn periods(&self) -> &[BarTimeSemantics] {
+        &self.periods
+    }
+
+    fn validate_current_at(&self, checked_at: Timestamp) -> bool {
+        CompletedMarketSessionRangeReceipt::validate_current_at(self, checked_at)
+    }
 }
 
 /// Non-forgeable exact result of one completed-session selection.
@@ -710,6 +1114,7 @@ fn validate_snapshot(
     snapshot: &CompletedMarketSessionCandidateSnapshot,
 ) -> Result<(), CompletedMarketSessionError> {
     if snapshot.request_digest != request.digest
+        || snapshot.complete_from > snapshot.complete_through
         || snapshot.complete_through != request.completion_cutoff
         || snapshot.currentness.venue_id != request.venue_id
         || snapshot.currentness.timeframe != request.timeframe
@@ -746,6 +1151,7 @@ fn validate_candidate_sequence(
             || candidate.period.session().ruleset() != &currentness.calendar_ruleset
             || candidate.period.session().evidence() != currentness.calendar_evidence
             || candidate.capture_receipt_digest != sealed_capture.receipt_digest()
+            || candidate.period.period_end_exclusive() > request.completion_cutoff
             || previous_end.is_some_and(|end| end > candidate.period.period_end_exclusive())
         {
             return Err(CompletedMarketSessionError::InvalidEvidence);
@@ -791,6 +1197,52 @@ fn select_latest(
         CandidateSelection::Unique(index)
     } else {
         CandidateSelection::None
+    })
+}
+
+fn select_range(
+    request: &CompletedMarketSessionRangeRequest,
+    candidates: &[CompletedMarketSessionCandidate],
+) -> Result<RangeCandidateSelection, CompletedMarketSessionError> {
+    let mut selected = Vec::new();
+    selected
+        .try_reserve_exact(candidates.len())
+        .map_err(|_| CompletedMarketSessionError::ResourceBoundExceeded)?;
+    let mut previous_period: Option<&BarTimeSemantics> = None;
+    let mut common_timestamp_basis = None;
+    let mut common_session: Option<&MarketBarSessionEvidence> = None;
+    for (index, candidate) in candidates.iter().enumerate() {
+        let period = &candidate.period;
+        let overlaps = period.period_end_exclusive() > request.requested_start
+            && period.period_start() < request.requested_end;
+        if !overlaps {
+            continue;
+        }
+        if period.period_start() < request.requested_start
+            || period.period_end_exclusive() > request.requested_end
+            || period.provider_timestamp() < request.requested_start
+            || period.provider_timestamp() >= request.requested_end
+            || candidate.knowledge_available_at > request.knowledge_cutoff
+        {
+            return Ok(RangeCandidateSelection::Incomplete);
+        }
+        if previous_period.is_some_and(|previous| {
+            previous.provider_timestamp() >= period.provider_timestamp()
+                || previous.period_end_exclusive() > period.period_start()
+        }) || common_timestamp_basis.is_some_and(|basis| basis != period.timestamp_basis())
+            || common_session.is_some_and(|session| session != period.session())
+        {
+            return Err(CompletedMarketSessionError::InvalidEvidence);
+        }
+        common_timestamp_basis = Some(period.timestamp_basis());
+        common_session = Some(period.session());
+        previous_period = Some(period);
+        selected.push(index);
+    }
+    Ok(if selected.is_empty() {
+        RangeCandidateSelection::None
+    } else {
+        RangeCandidateSelection::Complete(selected)
     })
 }
 
@@ -869,6 +1321,39 @@ fn request_digest(
     sha256_evidence(digest)
 }
 
+fn range_request_digest(
+    publication_source_id: &SourceId,
+    instrument_id: InstrumentId,
+    instrument_revision_digest: EvidenceDigest,
+    admitted_plan_digest: EvidenceDigest,
+    provider_request_digest: EvidenceDigest,
+    venue_id: &VenueId,
+    timeframe: &SourceIdentifier,
+    adjustment: MarketBarAdjustment,
+    evidence_series: &SourceIdentifier,
+    requested_start: Timestamp,
+    requested_end: Timestamp,
+    knowledge_cutoff: Timestamp,
+    evaluated_at: Timestamp,
+) -> EvidenceDigest {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/completed-market-session-range-request/v1\0");
+    hash_text(&mut digest, publication_source_id.as_str());
+    digest.update(instrument_id.as_uuid().as_bytes());
+    hash_evidence(&mut digest, instrument_revision_digest);
+    hash_evidence(&mut digest, admitted_plan_digest);
+    hash_evidence(&mut digest, provider_request_digest);
+    hash_text(&mut digest, venue_id.as_str());
+    hash_text(&mut digest, timeframe.as_str());
+    digest.update([market_bar_adjustment_tag(adjustment)]);
+    hash_text(&mut digest, evidence_series.as_str());
+    hash_timestamp(&mut digest, requested_start);
+    hash_timestamp(&mut digest, requested_end);
+    hash_timestamp(&mut digest, knowledge_cutoff);
+    hash_timestamp(&mut digest, evaluated_at);
+    sha256_evidence(digest)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the digest binds every independently governed selection coordinate"
@@ -888,63 +1373,118 @@ fn completed_session_receipt_digest(
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/completed-market-session-receipt/v1\0");
     hash_evidence(&mut digest, request.digest);
-    hash_text(&mut digest, currentness.source_id.as_str());
-    hash_text(
-        &mut digest,
-        currentness
-            .metadata_revision
-            .as_source_identifier()
-            .as_str(),
-    );
-    hash_text(&mut digest, currentness.venue_id.as_str());
-    hash_text(&mut digest, currentness.timeframe.as_str());
-    hash_text(&mut digest, currentness.evidence_series.as_str());
-    hash_text(&mut digest, currentness.calendar_id.as_str());
-    hash_text(&mut digest, currentness.calendar_ruleset.as_str());
-    hash_evidence(&mut digest, currentness.calendar_evidence);
-    hash_evidence(&mut digest, currentness.source_generation);
-    hash_evidence(&mut digest, currentness.revocation_identity);
+    hash_currentness_identity(&mut digest, currentness);
     hash_timestamp(&mut digest, complete_through);
     hash_evidence(&mut digest, completeness_evidence);
     digest.update(selected_ordinal.to_be_bytes());
     digest.update(candidate_count.to_be_bytes());
-    let period = &candidate.period;
-    hash_timestamp(&mut digest, period.period_start());
-    hash_timestamp(&mut digest, period.period_end_exclusive());
-    digest.update([timestamp_basis_tag(period.timestamp_basis())]);
-    digest.update([session_kind_tag(period.session().kind())]);
-    hash_text(&mut digest, period.session().ruleset().as_str());
-    hash_evidence(&mut digest, period.session().evidence());
+    hash_period(&mut digest, &candidate.period);
     hash_timestamp(&mut digest, candidate.calendar_effective.starts_at());
     hash_optional_timestamp(&mut digest, candidate.calendar_effective.ends_at());
     hash_timestamp(&mut digest, candidate.calendar_available_at);
     hash_timestamp(&mut digest, candidate.knowledge_available_at);
     hash_timestamp(&mut digest, candidate.expires_at);
-    let capture = sealed_capture.capture();
-    hash_text(&mut digest, capture.source_id().as_str());
+    hash_sealed_capture(&mut digest, sealed_capture);
+    hash_evidence(&mut digest, candidate.capture_receipt_digest);
+    hash_currentness_receipt(&mut digest, currentness_receipt);
+    hash_timestamp(&mut digest, expires_at);
+    sha256_evidence(digest)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the digest binds every independently governed range-selection coordinate"
+)]
+fn completed_session_range_receipt_digest(
+    request: &CompletedMarketSessionRangeRequest,
+    currentness: &CompletedMarketSessionCurrentnessIdentity,
+    complete_from: Timestamp,
+    complete_through: Timestamp,
+    completeness_evidence: EvidenceDigest,
+    sealed_capture: &SealedProviderCaptureSetReceipt,
+    first_selected_ordinal: u32,
+    candidate_count: u32,
+    periods: &[BarTimeSemantics],
+    currentness_receipt: &CompletedMarketSessionCurrentnessReceipt,
+    expires_at: Timestamp,
+) -> EvidenceDigest {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/completed-market-session-range-receipt/v1\0");
+    hash_evidence(&mut digest, request.digest);
+    hash_currentness_identity(&mut digest, currentness);
+    hash_timestamp(&mut digest, complete_from);
+    hash_timestamp(&mut digest, complete_through);
+    hash_evidence(&mut digest, completeness_evidence);
+    digest.update(first_selected_ordinal.to_be_bytes());
+    digest.update(candidate_count.to_be_bytes());
+    digest.update((periods.len() as u64).to_be_bytes());
+    for period in periods {
+        hash_period(&mut digest, period);
+    }
+    hash_sealed_capture(&mut digest, sealed_capture);
+    hash_currentness_receipt(&mut digest, currentness_receipt);
+    hash_timestamp(&mut digest, expires_at);
+    sha256_evidence(digest)
+}
+
+fn hash_currentness_identity(
+    digest: &mut Sha256,
+    currentness: &CompletedMarketSessionCurrentnessIdentity,
+) {
+    hash_text(digest, currentness.source_id.as_str());
     hash_text(
-        &mut digest,
+        digest,
+        currentness
+            .metadata_revision
+            .as_source_identifier()
+            .as_str(),
+    );
+    hash_text(digest, currentness.venue_id.as_str());
+    hash_text(digest, currentness.timeframe.as_str());
+    hash_text(digest, currentness.evidence_series.as_str());
+    hash_text(digest, currentness.calendar_id.as_str());
+    hash_text(digest, currentness.calendar_ruleset.as_str());
+    hash_evidence(digest, currentness.calendar_evidence);
+    hash_evidence(digest, currentness.source_generation);
+    hash_evidence(digest, currentness.revocation_identity);
+}
+
+fn hash_period(digest: &mut Sha256, period: &BarTimeSemantics) {
+    hash_timestamp(digest, period.provider_timestamp());
+    hash_timestamp(digest, period.period_start());
+    hash_timestamp(digest, period.period_end_exclusive());
+    digest.update([timestamp_basis_tag(period.timestamp_basis())]);
+    digest.update([session_kind_tag(period.session().kind())]);
+    hash_text(digest, period.session().ruleset().as_str());
+    hash_evidence(digest, period.session().evidence());
+}
+
+fn hash_sealed_capture(digest: &mut Sha256, sealed_capture: &SealedProviderCaptureSetReceipt) {
+    let capture = sealed_capture.capture();
+    hash_text(digest, capture.source_id().as_str());
+    hash_text(
+        digest,
         capture.metadata_revision().as_source_identifier().as_str(),
     );
-    hash_text(&mut digest, capture.dataset().as_str());
-    hash_evidence(&mut digest, capture.request_set_identity());
+    hash_text(digest, capture.dataset().as_str());
+    hash_evidence(digest, capture.request_set_identity());
     digest.update([capture_terminal_tag(capture.terminal())]);
     digest.update(capture.total_body_bytes().to_be_bytes());
     digest.update((capture.pages().len() as u64).to_be_bytes());
-    hash_evidence(&mut digest, capture.content_digest());
-    hash_evidence(&mut digest, capture.observation_digest());
-    hash_evidence(&mut digest, sealed_capture.segment().content_digest());
-    hash_evidence(
-        &mut digest,
-        sealed_capture.segment().physical_receipt_digest(),
-    );
-    hash_evidence(&mut digest, sealed_capture.receipt_digest());
-    hash_evidence(&mut digest, candidate.capture_receipt_digest);
-    hash_timestamp(&mut digest, currentness_receipt.checked_at);
-    hash_timestamp(&mut digest, currentness_receipt.expires_at);
-    hash_evidence(&mut digest, currentness_receipt.evidence);
-    hash_timestamp(&mut digest, expires_at);
-    sha256_evidence(digest)
+    hash_evidence(digest, capture.content_digest());
+    hash_evidence(digest, capture.observation_digest());
+    hash_evidence(digest, sealed_capture.segment().content_digest());
+    hash_evidence(digest, sealed_capture.segment().physical_receipt_digest());
+    hash_evidence(digest, sealed_capture.receipt_digest());
+}
+
+fn hash_currentness_receipt(
+    digest: &mut Sha256,
+    currentness_receipt: &CompletedMarketSessionCurrentnessReceipt,
+) {
+    hash_timestamp(digest, currentness_receipt.checked_at);
+    hash_timestamp(digest, currentness_receipt.expires_at);
+    hash_evidence(digest, currentness_receipt.evidence);
 }
 
 fn hash_text(digest: &mut Sha256, value: &str) {
@@ -991,6 +1531,16 @@ const fn session_kind_tag(kind: MarketBarSessionKind) -> u8 {
         MarketBarSessionKind::Extended => 2,
         MarketBarSessionKind::Continuous => 3,
         MarketBarSessionKind::ProviderDefined => 4,
+    }
+}
+
+const fn market_bar_adjustment_tag(adjustment: MarketBarAdjustment) -> u8 {
+    match adjustment {
+        MarketBarAdjustment::Raw => 1,
+        MarketBarAdjustment::Split => 2,
+        MarketBarAdjustment::Dividend => 3,
+        MarketBarAdjustment::SpinOff => 4,
+        MarketBarAdjustment::All => 5,
     }
 }
 

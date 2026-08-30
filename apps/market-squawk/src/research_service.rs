@@ -6,13 +6,14 @@ use std::time::Instant;
 use market_squawk_data::{
     AnalyticalDataService, AnalyticalManifestCatalog, AnalyticalReadCapability, CatalogAuthority,
     CatalogConfig, CatalogLimit, CommittedDataset, CompanyIdentityReadCapability,
-    CompanySecurityLinkPublicationCapability, DatasetBuildError, DatasetBuildPrecommitAuthority,
-    DatasetBuildRequest, DatasetBuilder, DatasetId, FairValueCatalogCapability,
-    FeatureLabelDataset, IngestError, IngestIdentity, IngestPrecommitAuthority,
-    InstrumentDefinitionReadCapability, ManifestCatalogError, MarketDataInstrumentReadCapability,
-    MarketDataInstrumentSynchronizationCapability, ObjectStoreConfig, OnboardingCatalogCapability,
-    ProviderPublicationInput, ResearchIngestService, RightsDecisionInput, RightsError,
-    SourceOperation, extraction_provider_payload_digest,
+    CompanySecurityIdentityReadCapability, CompanySecurityLinkPublicationCapability,
+    DatasetBuildError, DatasetBuildPrecommitAuthority, DatasetBuildRequest, DatasetBuilder,
+    DatasetId, FairValueCatalogCapability, FeatureLabelDataset, IngestError, IngestIdentity,
+    IngestPrecommitAuthority, InstrumentDefinitionReadCapability, ManifestCatalogError,
+    MarketDataInstrumentReadCapability, MarketDataInstrumentSynchronizationCapability,
+    ObjectStoreConfig, OnboardingCatalogCapability, ProviderPublicationInput,
+    ResearchIngestService, RightsDecisionInput, RightsError, SourceOperation,
+    extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
     CompanyIdentityObservation, DigestAlgorithm, ExactPayloadEvidence, InstrumentDefinition,
@@ -661,6 +662,15 @@ impl ResearchService {
     /// Returns bounded company-identity reads over the canonical research catalog.
     pub fn company_identities(&self) -> CompanyIdentityReadCapability {
         self.analytical.company_identities()
+    }
+
+    /// Returns bounded authoritative company/security relationship reads.
+    ///
+    /// This capability owns no publication, identity inference, review, or execution authority.
+    pub fn company_security_identities(&self) -> CompanySecurityIdentityReadCapability {
+        self.analytical
+            .company_identities()
+            .security_relationships()
     }
 
     /// Returns the pure, narrow publisher for a fully evidenced company/security link.

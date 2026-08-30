@@ -43,21 +43,21 @@ use crate::{
     RequestAdmission, ResponseHeaderEvidence, RestExecutionOutcome, RestTransportBounds,
     SchwabAccessTokenSource, SchwabAdapterError, SchwabApplicationCredentialReplacement,
     SchwabCanonicalError, SchwabCanonicalField, SchwabCaptureCoordinates,
-    SchwabDailyPriceHistoryPublicationRequest, SchwabHttpWire, SchwabHttpWireRequest,
-    SchwabHttpWireResponse, SchwabOAuthAuthorityConfiguration, SchwabOAuthAuthorityError,
-    SchwabOAuthAuthorityStatus, SchwabOAuthInteraction, SchwabOAuthSecretPolicy, SchwabOAuthWire,
-    SchwabOAuthWireError, SchwabOAuthWireRequest, SchwabOAuthWireResponse,
-    SchwabObservedCapabilityFamily, SchwabOptionCandidateOutcome,
-    SchwabPriceHistoryCapabilityObservation, SchwabPriceHistoryMarketDataEvidence,
-    SchwabResolvedProviderIdentity, SchwabRestDelayEvidence, SchwabRestExecutor, SchwabRestFamily,
-    SchwabRestFamilyDoctorInput, SchwabRestOptionContractRequest,
-    SchwabRestOptionMarketDataEvidence, SchwabRestOptionPublicationOutcome,
-    SchwabRestOptionPublicationRequest, SchwabRestOptionUnderlyingRequest,
-    SchwabRestQuoteMarketDataEvidence, SchwabRestQuotePublicationOutcome,
-    SchwabRestQuotePublicationRequest, SchwabRestQuoteRecordRequest, SchwabStreamerConnection,
-    SchwabStreamerConnectionControl, SchwabStreamerConnectionControlSource,
-    SchwabStreamerConnector, SchwabStreamerDelayEvidence, SchwabStreamerExecutor,
-    SchwabStreamerFamilyDoctorInput, SchwabStreamerFieldDictionary,
+    SchwabDailyPriceHistoryCalendarRangeReceipt, SchwabDailyPriceHistoryPublicationRequest,
+    SchwabHttpWire, SchwabHttpWireRequest, SchwabHttpWireResponse,
+    SchwabOAuthAuthorityConfiguration, SchwabOAuthAuthorityError, SchwabOAuthAuthorityStatus,
+    SchwabOAuthInteraction, SchwabOAuthSecretPolicy, SchwabOAuthWire, SchwabOAuthWireError,
+    SchwabOAuthWireRequest, SchwabOAuthWireResponse, SchwabObservedCapabilityFamily,
+    SchwabOptionCandidateOutcome, SchwabPriceHistoryCapabilityObservation,
+    SchwabPriceHistoryMarketDataEvidence, SchwabResolvedProviderIdentity, SchwabRestDelayEvidence,
+    SchwabRestExecutor, SchwabRestFamily, SchwabRestFamilyDoctorInput,
+    SchwabRestOptionContractRequest, SchwabRestOptionMarketDataEvidence,
+    SchwabRestOptionPublicationOutcome, SchwabRestOptionPublicationRequest,
+    SchwabRestOptionUnderlyingRequest, SchwabRestQuoteMarketDataEvidence,
+    SchwabRestQuotePublicationOutcome, SchwabRestQuotePublicationRequest,
+    SchwabRestQuoteRecordRequest, SchwabStreamerConnection, SchwabStreamerConnectionControl,
+    SchwabStreamerConnectionControlSource, SchwabStreamerConnector, SchwabStreamerDelayEvidence,
+    SchwabStreamerExecutor, SchwabStreamerFamilyDoctorInput, SchwabStreamerFieldDictionary,
     SchwabStreamerQuoteMarketDataEvidence, SchwabStreamerQuotePublicationOutcome,
     SchwabStreamerQuotePublicationRequest, SchwabStreamerQuoteRecordRequest,
     SchwabStreamerSemanticField, SchwabTransportError, SchwabTransportTelemetry, StreamerAdmission,
@@ -70,6 +70,99 @@ use crate::{
 };
 
 use crate::canonical::{SchwabDailyPriceHistoryCandidateRequest, prepare_price_history_candidate};
+
+#[derive(Debug)]
+struct TestDailyHistoryCalendarRangeReceipt {
+    publication_source_id: SourceId,
+    instrument_id: InstrumentId,
+    instrument_revision_digest: EvidenceDigest,
+    admitted_plan_digest: EvidenceDigest,
+    provider_request_digest: EvidenceDigest,
+    venue_id: VenueId,
+    interval: SourceIdentifier,
+    requested_start: Timestamp,
+    requested_end: Timestamp,
+    evaluated_at: Timestamp,
+    expires_at: Timestamp,
+    completeness_evidence: EvidenceDigest,
+    calendar_evidence: EvidenceDigest,
+    receipt_digest: EvidenceDigest,
+    periods: Box<[BarTimeSemantics]>,
+}
+
+impl SchwabDailyPriceHistoryCalendarRangeReceipt for TestDailyHistoryCalendarRangeReceipt {
+    fn publication_source_id(&self) -> &SourceId {
+        &self.publication_source_id
+    }
+
+    fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    fn instrument_revision_digest(&self) -> EvidenceDigest {
+        self.instrument_revision_digest
+    }
+
+    fn admitted_plan_digest(&self) -> EvidenceDigest {
+        self.admitted_plan_digest
+    }
+
+    fn provider_request_digest(&self) -> EvidenceDigest {
+        self.provider_request_digest
+    }
+
+    fn venue_id(&self) -> &VenueId {
+        &self.venue_id
+    }
+
+    fn interval(&self) -> &SourceIdentifier {
+        &self.interval
+    }
+
+    fn adjustment(&self) -> MarketBarAdjustment {
+        MarketBarAdjustment::Raw
+    }
+
+    fn requested_start(&self) -> Timestamp {
+        self.requested_start
+    }
+
+    fn requested_end(&self) -> Timestamp {
+        self.requested_end
+    }
+
+    fn knowledge_cutoff(&self) -> Timestamp {
+        self.evaluated_at
+    }
+
+    fn evaluated_at(&self) -> Timestamp {
+        self.evaluated_at
+    }
+
+    fn expires_at(&self) -> Timestamp {
+        self.expires_at
+    }
+
+    fn completeness_evidence(&self) -> EvidenceDigest {
+        self.completeness_evidence
+    }
+
+    fn calendar_evidence(&self) -> EvidenceDigest {
+        self.calendar_evidence
+    }
+
+    fn receipt_digest(&self) -> EvidenceDigest {
+        self.receipt_digest
+    }
+
+    fn periods(&self) -> &[BarTimeSemantics] {
+        &self.periods
+    }
+
+    fn validate_current_at(&self, checked_at: Timestamp) -> bool {
+        checked_at >= self.evaluated_at && checked_at < self.expires_at
+    }
+}
 
 struct TemporaryDirectory(PathBuf);
 
@@ -680,6 +773,28 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
             .unwrap_or_else(|error| panic!("receive clock: {error}"))
             * 1_000_000,
     );
+    let calendar_range = Arc::new(TestDailyHistoryCalendarRangeReceipt {
+        publication_source_id: registered_coordinates.source_id().clone(),
+        instrument_id,
+        instrument_revision_digest,
+        admitted_plan_digest,
+        provider_request_digest: EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            history.capture().receipt().request_sha256(),
+        ),
+        venue_id: venue_id.clone(),
+        interval: interval.clone(),
+        requested_start: provider_timestamp,
+        requested_end: period_end,
+        evaluated_at: received_at,
+        expires_at: received_at
+            .checked_add_nanos(60_000_000_000)
+            .unwrap_or_else(|error| panic!("calendar receipt expiry: {error}")),
+        completeness_evidence,
+        calendar_evidence: EvidenceDigest::new(DigestAlgorithm::Sha256, [21; 32]),
+        receipt_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [27; 32]),
+        periods: vec![time_semantics.clone()].into_boxed_slice(),
+    });
     let request_for = |user_preference| SchwabDailyPriceHistoryCandidateRequest {
         capability,
         oauth_authority: oauth_receipt,
@@ -694,8 +809,7 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
         interval: interval.clone(),
         adjustment: MarketBarAdjustment::Raw,
         currency,
-        time_semantics: vec![time_semantics.clone()],
-        completeness_evidence,
+        calendar_range: calendar_range.as_ref(),
         ingested_at: received_at,
     };
 
@@ -777,11 +891,8 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
         admitted_plan_digest,
         identity,
         market_data,
-        interval,
-        MarketBarAdjustment::Raw,
         currency,
-        vec![time_semantics],
-        completeness_evidence,
+        calendar_range,
         received_at,
     );
     let event_id = Uuid::new_v4();

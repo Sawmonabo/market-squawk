@@ -12,6 +12,7 @@ import { useProduct } from "@/app/product-context"
 import { productKeys } from "@/app/query-client"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
+import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -19,13 +20,11 @@ import { BundleEvidence } from "./bundle-evidence"
 import { ForecastPreparation } from "./forecast-preparation"
 import { ForecastReview } from "./forecast-review"
 import { ModelJobActivity } from "./model-jobs"
-import { ModelWorkflows } from "./model-workflows"
 import {
-  isActiveModelJob,
+  isActiveModelActivity,
   parseForecasts,
-  parseModelMetadata,
-  parseModelBundles,
-  parseModelJobs,
+  parseModelActivities,
+  parseModelEvidence,
 } from "./models-contracts"
 
 export function ModelsPage() {
@@ -58,28 +57,28 @@ function ModelsWorkspace({
   bootstrap: DesktopBootstrap
   transport: ProductTransport
 }) {
-  const [selectedBundleId, setSelectedBundleId] = React.useState<string | null>(
-    null,
-  )
-  const [selectedVintageId, setSelectedVintageId] = React.useState<
+  const [selectedModelToken, setSelectedModelToken] = React.useState<
     string | null
   >(null)
-  const supports = (operation: string) =>
-    bootstrap.operations.some((candidate) => candidate.name === operation)
-  const bundleAvailable = supports("Model.ListBundles")
-  const forecastsAvailable = supports("Model.ListForecasts")
-  const jobsAvailable = supports("Job.List")
-  const metadataAvailable = supports("Model.GetMetadata")
+  const [selectedForecastToken, setSelectedForecastToken] = React.useState<
+    string | null
+  >(null)
+  const capabilities = productCapabilitySet(bootstrap)
+  const forecastsAvailable = capabilities.has("forecast_list")
+  const modelsAvailable = capabilities.has("model_evidence")
+  const modelActivityAvailable = capabilities.has("model_activity")
 
-  const bundles = useQuery({
+  const models = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
       "Model",
-      "Model.ListBundles",
+      "Model.ListProductEvidence",
       {},
     ),
-    queryFn: async () => parseModelBundles(await transport.query({ query: "modelBundles" })),
-    enabled: bundleAvailable,
+    queryFn: async () => {
+      return parseModelEvidence(await transport.modelProducts({ action: "list" }))
+    },
+    enabled: modelsAvailable,
   })
   const forecasts = useQuery({
     queryKey: productKeys.operation(
@@ -88,73 +87,52 @@ function ModelsWorkspace({
       "Model.ListForecasts",
       {},
     ),
-    queryFn: async () => parseForecasts(await transport.query({ query: "forecasts" })),
+    queryFn: async () =>
+      parseForecasts(await transport.query({ query: "forecasts" })),
     enabled: forecastsAvailable,
   })
-  const jobs = useQuery({
-    queryKey: [
-      ...productKeys.domain(bootstrap.runtime, "job"),
-      "model-activity",
-    ],
-    queryFn: async () =>
-      parseModelJobs(await transport.query({ query: "jobs", limit: 25 })),
-    enabled: jobsAvailable,
-    refetchInterval: 5_000,
-  })
-
-  const bundleRows = bundles.data?.bundles ?? []
-  const selectedBundle =
-    bundleRows.find(
-      (bundle) =>
-        `${bundle.bundleId}@${bundle.bundleVersion}` === selectedBundleId,
-    ) ??
-    bundleRows[0] ??
-    null
-  const forecastRows = forecasts.data?.forecasts ?? []
-  const relevantForecasts = selectedBundle
-    ? forecastRows.filter(
-        (forecast) =>
-          forecast.modelId === selectedBundle.modelId &&
-          forecast.bundleId === selectedBundle.bundleId &&
-          forecast.bundleVersion === selectedBundle.bundleVersion,
-      )
-    : forecastRows
-  const selectedForecast =
-    relevantForecasts.find(
-      (forecast) => forecast.vintageId === selectedVintageId,
-    ) ??
-    relevantForecasts[0] ??
-    null
-  const modelJobs = jobs.data ?? []
-  const metadata = useQuery({
+  const activities = useQuery({
     queryKey: productKeys.operation(
       bootstrap.runtime,
       "Model",
-      "Model.GetMetadata",
-      { modelId: selectedBundle?.modelId ?? null },
+      "Model.ListProductActivity",
+      {},
     ),
     queryFn: async () => {
-      if (!selectedBundle) throw new Error("No admitted model is selected.")
-      return parseModelMetadata(
-        await transport.query({
-          query: "modelMetadata",
-          modelId: selectedBundle.modelId,
-        }),
+      return parseModelActivities(
+        await transport.modelProducts({ action: "activity" }),
       )
     },
-    enabled: metadataAvailable && selectedBundle !== null,
+    enabled: modelActivityAvailable,
+    refetchInterval: 5_000,
   })
-  const activeJobs = modelJobs.filter(isActiveModelJob).length
+
+  const modelRows = models.data ?? []
+  const selectedModel =
+    modelRows.find((model) => model.modelToken === selectedModelToken) ??
+    modelRows[0] ??
+    null
+  const forecastRows = forecasts.data?.forecasts ?? []
+  const selectedForecast =
+    forecastRows.find(
+      (forecast) => forecast.forecastToken === selectedForecastToken,
+    ) ??
+    forecastRows[0] ??
+    null
+  const activityRows = activities.data ?? []
+  const activeCount = activityRows.filter(isActiveModelActivity).length
   const calibratedForecasts = forecastRows.filter(
-    (forecast) => forecast.hasCalibratedIntervals,
+    (forecast) => forecast.evidenceState === "calibrated",
   ).length
   const refreshing =
-    bundles.isFetching || forecasts.isFetching || jobs.isFetching
+    models.isFetching || forecasts.isFetching || activities.isFetching
 
   const refresh = () => {
-    if (bundleAvailable) void bundles.refetch()
+    if (modelsAvailable) {
+      void models.refetch()
+      void activities.refetch()
+    }
     if (forecastsAvailable) void forecasts.refetch()
-    if (jobsAvailable) void jobs.refetch()
   }
 
   return (
@@ -168,14 +146,17 @@ function ModelsWorkspace({
             Models & forecasts
           </h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Review model quality, forecasts, uncertainty, and background work. Modeled values
-            are estimates, not guaranteed outcomes or automatic investment actions.
+            Review model purpose, out-of-sample evidence, forecasts,
+            uncertainty, and limitations. Modeled values are estimates, not
+            guaranteed outcomes.
           </p>
         </div>
         <Button
           variant="outline"
           onClick={refresh}
-          disabled={refreshing || (!bundleAvailable && !forecastsAvailable && !jobsAvailable)}
+          disabled={
+            refreshing || (!modelsAvailable && !forecastsAvailable)
+          }
         >
           <RefreshCw
             className={refreshing ? "animate-spin" : ""}
@@ -191,12 +172,17 @@ function ModelsWorkspace({
       >
         <SummaryFact
           icon={Boxes}
-          label="Admitted bundles"
-          value={queryCount(bundleAvailable, bundles.isPending, bundles.isError, bundleRows.length)}
+          label="Research models"
+          value={queryCount(
+            modelsAvailable,
+            models.isPending,
+            models.isError,
+            modelRows.length,
+          )}
         />
         <SummaryFact
           icon={ChartNoAxesCombined}
-          label="Forecast vintages"
+          label="Forecasts"
           value={queryCount(
             forecastsAvailable,
             forecasts.isPending,
@@ -206,7 +192,7 @@ function ModelsWorkspace({
         />
         <SummaryFact
           icon={ShieldAlert}
-          label="Calibrated vintages"
+          label="Calibrated forecasts"
           value={queryCount(
             forecastsAvailable,
             forecasts.isPending,
@@ -216,8 +202,13 @@ function ModelsWorkspace({
         />
         <SummaryFact
           icon={Activity}
-          label="Active model jobs"
-          value={queryCount(jobsAvailable, jobs.isPending, jobs.isError, activeJobs)}
+          label="Work in progress"
+          value={queryCount(
+            modelsAvailable,
+            activities.isPending,
+            activities.isError,
+            activeCount,
+          )}
         />
       </section>
 
@@ -226,33 +217,30 @@ function ModelsWorkspace({
           <div className="border-b border-border p-4">
             <h2 className="text-sm font-semibold">Available models</h2>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              Select a model to review its purpose, validation, limitations, and forecasts.
+              Select a model to review its purpose, validation, limitations,
+              and out-of-sample evidence.
             </p>
           </div>
-          {!bundleAvailable ? (
-            <InlineUnavailable text="Models are unavailable in this workspace." />
-          ) : bundles.isPending ? (
+          {!modelsAvailable ? (
+            <InlineUnavailable text="Model evidence is unavailable in this installation." />
+          ) : models.isPending ? (
             <ListLoading />
-          ) : bundles.isError ? (
-            <InlineUnavailable text="Models are unavailable right now." />
-          ) : bundleRows.length === 0 ? (
+          ) : models.isError ? (
+            <InlineUnavailable text="Model evidence is unavailable right now." />
+          ) : modelRows.length === 0 ? (
             <InlineUnavailable text="No model is ready for investment research yet." />
           ) : (
             <ul className="max-h-[570px] space-y-1 overflow-y-auto p-2">
-              {bundleRows.map((bundle) => {
-                const identity = `${bundle.bundleId}@${bundle.bundleVersion}`
-                const active = selectedBundle
-                  ? bundle.bundleId === selectedBundle.bundleId &&
-                    bundle.bundleVersion === selectedBundle.bundleVersion
-                  : false
+              {modelRows.map((model) => {
+                const active = model.modelToken === selectedModel?.modelToken
                 return (
-                  <li key={`${bundle.modelId}:${identity}`}>
+                  <li key={model.modelToken}>
                     <button
                       type="button"
                       aria-pressed={active}
                       onClick={() => {
-                        setSelectedBundleId(identity)
-                        setSelectedVintageId(null)
+                        setSelectedModelToken(model.modelToken)
+                        setSelectedForecastToken(null)
                       }}
                       className={`w-full rounded-lg border px-3 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
                         active
@@ -261,13 +249,14 @@ function ModelsWorkspace({
                       }`}
                     >
                       <span className="block truncate text-sm font-medium">
-                        {bundle.bundleId}
+                        {model.label}
                       </span>
-                      <span className="mt-1 flex items-center justify-between gap-3 text-[11px] text-muted-foreground">
-                        <span className="truncate">{bundle.format.replaceAll("_", " ")}</span>
-                        <span className="shrink-0 font-mono">
-                          v{bundle.bundleVersion}
-                        </span>
+                      <span className="mt-1 block text-[11px] text-muted-foreground">
+                        {model.evidenceState === "sufficient"
+                          ? "Evidence available"
+                          : model.evidenceState === "limited"
+                            ? "Limited evidence"
+                            : "Unavailable"}
                       </span>
                     </button>
                   </li>
@@ -279,32 +268,19 @@ function ModelsWorkspace({
 
         <div className="space-y-4">
           <BundleEvidence
-            bundle={selectedBundle}
-            metadata={metadata.data ?? null}
-            metadataAvailable={metadataAvailable}
-            loading={metadata.isPending && selectedBundle !== null}
-            error={metadata.isError ? "Model details are unavailable right now." : null}
-          />
-          <ModelWorkflows
-            bootstrap={bootstrap}
-            transport={transport}
-            metadata={metadata.data ?? null}
+            model={selectedModel}
+            available={modelsAvailable}
+            loading={models.isPending}
+            error={models.isError ? "Try refreshing the page." : null}
           />
           <ForecastPreparation
             bootstrap={bootstrap}
             transport={transport}
-            selectedModel={
-              selectedBundle
-                ? {
-                    modelId: selectedBundle.modelId,
-                    bundleId: selectedBundle.bundleId,
-                    bundleVersion: selectedBundle.bundleVersion,
-                  }
-                : null
-            }
             onStarted={async () => {
               await Promise.all([
-                jobsAvailable ? jobs.refetch() : Promise.resolve(),
+                modelsAvailable
+                  ? activities.refetch()
+                  : Promise.resolve(),
                 forecastsAvailable ? forecasts.refetch() : Promise.resolve(),
               ])
             }}
@@ -312,19 +288,24 @@ function ModelsWorkspace({
           <ForecastReview
             bootstrap={bootstrap}
             transport={transport}
-            forecasts={relevantForecasts}
+            forecasts={forecastRows}
             selected={selectedForecast}
             available={forecastsAvailable}
             loading={forecasts.isPending}
-            error={forecasts.isError ? "Forecasts are unavailable right now." : null}
-            completeness={forecasts.data?.completeness ?? null}
-            select={setSelectedVintageId}
+            error={
+              forecasts.isError ? "Forecasts are unavailable right now." : null
+            }
+            select={setSelectedForecastToken}
           />
           <ModelJobActivity
-            jobs={modelJobs}
-            available={jobsAvailable}
-            loading={jobs.isPending}
-            error={jobs.isError ? "Model activity is unavailable right now." : null}
+            activities={activityRows}
+            available={modelsAvailable}
+            loading={activities.isPending}
+            error={
+              activities.isError
+                ? "Research activity is unavailable right now."
+                : null
+            }
           />
         </div>
       </div>
@@ -386,7 +367,11 @@ function UnavailableEvidence({
 }
 
 function ModelsFrame({ children }: { children: React.ReactNode }) {
-  return <main className="mx-auto w-full max-w-[1320px] p-5 lg:p-7">{children}</main>
+  return (
+    <main className="mx-auto w-full max-w-[1320px] p-5 lg:p-7">
+      {children}
+    </main>
+  )
 }
 
 function ModelsLoading() {

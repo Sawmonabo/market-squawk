@@ -61,7 +61,8 @@ pub use order_level::{
 };
 pub use qualification::{
     CommittedQualifiedMarketObservation, CommittedResearchMarketObservation,
-    CommittedResearchMarketObservationParts, QualifiedMarketPrice,
+    CommittedResearchMarketObservationParts, CommittedResearchSourceCoordinate,
+    QualifiedMarketPrice,
 };
 pub use qualified_export::{
     QualifiedMarketExportError, QualifiedMarketObservationLease,

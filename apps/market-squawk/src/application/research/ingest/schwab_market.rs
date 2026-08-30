@@ -6,24 +6,24 @@
 
 use std::{
     fmt,
-    sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::future::BoxFuture;
 use market_squawk_adapter_schwab::{
     AccessTokenGeneration, ConnectionGeneration, ExecutedRestResponse, ParseBounds, ReadOnlyRoute,
-    SchwabCaptureCoordinates, SchwabDailyPriceHistoryPublicationRequest,
+    SchwabAdapterError, SchwabCaptureCoordinates, SchwabDailyPriceHistoryPublicationRequest,
     SchwabOAuthAuthorityReceipt, SchwabPriceHistoryMarketDataEvidence,
     SchwabPriceHistoryPublicationError, SchwabRestOptionDisposition,
     SchwabRestOptionMarketDataEvidence, SchwabRestOptionPublicationError,
     SchwabRestOptionPublicationOutcome, SchwabRestOptionPublicationRequest,
-    SchwabRestQuoteDisposition, SchwabRestQuotePublicationError, SchwabRestQuotePublicationOutcome,
-    SchwabRestQuotePublicationRequest, SchwabSealedRawRestOptionPublication,
-    SchwabSealedRawRestQuotePublication, SchwabSealedRawStreamerPublication,
-    SchwabSealedRestResponse, SchwabSealedStreamerCapture, SchwabStreamerPublicationError,
-    SchwabStreamerQuotePublicationOutcome, SchwabStreamerQuotePublicationRequest,
-    SchwabStreamerRecordDisposition, SchwabTransportError, StreamerMicrobatch,
+    SchwabRestQuoteDisposition, SchwabRestQuotePublicationError,
+    SchwabSealedRawRestOptionPublication, SchwabSealedRawStreamerPublication,
+    SchwabSealedRestQuotePublication, SchwabSealedRestResponse, SchwabSealedStreamerCapture,
+    SchwabStreamerPublicationError, SchwabStreamerQuotePublicationOutcome,
+    SchwabStreamerQuotePublicationRequest, SchwabStreamerRecordDisposition, SchwabTransportError,
+    StreamerMicrobatch,
 };
 use market_squawk_data::{
     CommittedDataset, DatasetId, IngestError, IngestIdentity, IngestPrecommitAuthority,
@@ -37,10 +37,11 @@ use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    OptionMarketBatchKind, ProviderCaptureError, ProviderNativeLineageImplementation,
-    RuntimeCapabilityDisposition, SchwabMarketDataDoctorReceiptV1, SchwabMarketDataFamily,
+    OptionMarketBatchKind, ProviderCaptureError, ProviderCaptureSealRequest,
+    ProviderNativeLineageImplementation, RuntimeCapabilityDisposition,
+    SchwabMarketDataDoctorReceiptV1, SchwabMarketDataFamily, SealedProviderCaptureMaterial,
     SealedProviderEventMicrobatchBinding, SealedProviderPublicationBinding,
-    SealedProviderResponseMarketEventBinding,
+    SealedProviderResponseMarketEventBinding, SourceMetadata,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -50,6 +51,7 @@ use super::{
     ResearchIngestCompositionError, ResearchProviderPublicationLease,
     ResearchProviderRuntimeGeneration, ResearchRightsAuthority,
 };
+use crate::provider_onboarding::SchwabOAuthPublicationEpoch;
 use crate::{ResearchIngestRequest, ResearchService, ResearchServiceError};
 
 const NANOS_PER_MILLISECOND: u64 = 1_000_000;
@@ -96,6 +98,168 @@ pub(crate) struct SchwabMarketPublicationClosure {
     admission: Arc<dyn SchwabMarketRuntimeAdmission>,
 }
 
+/// Opaque exact-generation authority consumed by the Schwab REST quote sink.
+///
+/// Source metadata, provider/analytical datasets, capture coordinates, and the durable
+/// publication closure are derived once from the admitted research generation. The transport
+/// runtime cannot replace any of them with caller-authored identity strings or UUIDs.
+pub(crate) struct SchwabRestQuoteGenerationAuthority {
+    closure: Arc<SchwabMarketPublicationClosure>,
+    coordinates: SchwabCaptureCoordinates,
+    session_identifier: SourceIdentifier,
+    analytical_dataset: DatasetId,
+    operation_timeout: Duration,
+    latest_source_health: Mutex<Option<SchwabRestQuoteSourceHealthOutcome>>,
+}
+
+impl fmt::Debug for SchwabRestQuoteGenerationAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabRestQuoteGenerationAuthority")
+            .field("source_id", self.closure.generation.metadata().source_id())
+            .field("provider_dataset", self.coordinates.dataset())
+            .field("analytical_dataset", &self.analytical_dataset)
+            .field("session_identifier", &self.session_identifier)
+            .field("operation_timeout", &self.operation_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Generation-local source-health evidence retained after the raw body crosses the sole sealer.
+///
+/// This is a bounded single-outcome health surface, not a provider-data store. Raw bytes and exact
+/// physical evidence remain solely in the research capture store. A later live-runtime owner may
+/// consume this outcome when updating registered source health.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SchwabRestQuoteSourceHealthOutcome {
+    ProviderRejected {
+        status: u16,
+        payload_digest: EvidenceDigest,
+        sealed_receipt_digest: EvidenceDigest,
+    },
+    InvalidPayload {
+        status: u16,
+        error: SchwabAdapterError,
+        payload_digest: EvidenceDigest,
+        sealed_receipt_digest: EvidenceDigest,
+    },
+    AllRowsAbstained {
+        payload_digest: EvidenceDigest,
+        sealed_receipt_digest: EvidenceDigest,
+        dispositions: Box<[SchwabRestQuoteDisposition]>,
+    },
+    PostSealPublicationUnavailable {
+        payload_digest: EvidenceDigest,
+        sealed_receipt_digest: Option<EvidenceDigest>,
+        reason: SchwabRestQuotePostSealFailure,
+    },
+    DurablePublishedCurrentUnavailable {
+        publication_digest: EvidenceDigest,
+        sealed_receipt_digest: EvidenceDigest,
+        event_count: usize,
+        dispositions: Box<[SchwabRestQuoteDisposition]>,
+    },
+}
+
+/// Closed source-health classification for a canonical response retained raw but not published.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SchwabRestQuotePostSealFailure {
+    Deadline,
+    ShutdownOrRevocation,
+    AuthorityOrBinding,
+    StorageUnavailable,
+}
+
+impl SchwabRestQuoteGenerationAuthority {
+    pub(crate) fn metadata(&self) -> &SourceMetadata {
+        self.closure.generation.metadata()
+    }
+
+    pub(crate) fn coordinates(&self) -> SchwabCaptureCoordinates {
+        self.coordinates.clone()
+    }
+
+    pub(crate) const fn provider_dataset(&self) -> &SourceIdentifier {
+        self.coordinates.dataset()
+    }
+
+    pub(crate) const fn session_identifier(&self) -> &SourceIdentifier {
+        &self.session_identifier
+    }
+
+    pub(crate) const fn operation_timeout(&self) -> Duration {
+        self.operation_timeout
+    }
+
+    pub(crate) async fn seal_capture(
+        &self,
+        request: ProviderCaptureSealRequest,
+        deadline: Instant,
+    ) -> Result<SealedProviderCaptureMaterial, SchwabMarketPublicationError> {
+        // A completed provider response must remain sealable during runtime shutdown. The finite
+        // deadline bounds the worker; a late physical object is recovered by the existing startup
+        // quarantine/recovery path.
+        let sealing_cancellation = CancellationToken::new();
+        self.closure
+            .research
+            .seal_provider_capture(request, &sealing_cancellation, deadline)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn publish_sealed_rest_quotes(
+        &self,
+        publication: Box<SchwabSealedRestQuotePublication>,
+        oauth_epoch: SchwabOAuthPublicationEpoch,
+        observed_at: Timestamp,
+        idempotency_key: String,
+        deadline: Instant,
+    ) -> Result<SchwabRestQuotePublicationReceipt, SchwabMarketPublicationError> {
+        self.closure
+            .publish_already_sealed_rest_quotes(
+                publication,
+                oauth_epoch,
+                observed_at,
+                self.analytical_dataset.clone(),
+                idempotency_key,
+                deadline,
+            )
+            .await
+    }
+
+    pub(crate) fn record_source_health(
+        &self,
+        outcome: SchwabRestQuoteSourceHealthOutcome,
+    ) -> Result<(), SchwabMarketPublicationError> {
+        let mut latest = self
+            .latest_source_health
+            .lock()
+            .map_err(|_error| SchwabMarketPublicationError::SourceHealthUnavailable)?;
+        *latest = Some(outcome);
+        Ok(())
+    }
+
+    pub(crate) fn latest_source_health(
+        &self,
+    ) -> Result<Option<SchwabRestQuoteSourceHealthOutcome>, SchwabMarketPublicationError> {
+        self.latest_source_health
+            .lock()
+            .map(|latest| latest.clone())
+            .map_err(|_error| SchwabMarketPublicationError::SourceHealthUnavailable)
+    }
+
+    pub(crate) fn begin_revocation(&self) {
+        self.closure.begin_revocation();
+    }
+
+    pub(crate) async fn finish_revocation_drain(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), SchwabMarketPublicationError> {
+        self.closure.finish_revocation_drain(cancellation).await
+    }
+}
+
 impl fmt::Debug for SchwabMarketPublicationClosure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -105,6 +269,29 @@ impl fmt::Debug for SchwabMarketPublicationClosure {
             .field("runtime_session_id", &self.generation.session_id())
             .field("doctor_receipt_sha256", &self.doctor.receipt_sha256())
             .finish_non_exhaustive()
+    }
+}
+
+impl SchwabRestQuoteGenerationAuthority {
+    #[cfg(test)]
+    pub(crate) fn bind_test_rest_quote_sink(
+        research: Arc<ResearchService>,
+        generation: ResearchProviderRuntimeGeneration,
+        rights: ResearchRightsAuthority,
+        doctor: SchwabMarketDataDoctorReceiptV1,
+        oauth: crate::provider_onboarding::SchwabOAuthMarketAuthority,
+        oauth_receipt: SchwabOAuthAuthorityReceipt,
+        operation_timeout: Duration,
+    ) -> Result<Arc<SchwabRestQuoteGenerationAuthority>, SchwabMarketPublicationError> {
+        let admission = super::provider_runtime::test_schwab_composite_market_runtime_admission(
+            &generation,
+            oauth,
+            oauth_receipt,
+        )?;
+        Arc::new(SchwabMarketPublicationClosure::try_new(
+            research, generation, rights, doctor, admission,
+        )?)
+        .bind_rest_quote_sink(operation_timeout)
     }
 }
 
@@ -149,71 +336,133 @@ impl SchwabMarketPublicationClosure {
         })
     }
 
-    /// Seals, maps, reserves, and atomically publishes one REST quote response.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "transport, capture, mapping, publication, and authority coordinates remain exact"
-    )]
-    pub(crate) async fn seal_and_publish_rest_quotes(
+    /// Derives the sole quote sink authority from one exactly scoped research generation.
+    ///
+    /// Quote production is intentionally unavailable for source-wide or multi-subject rights.
+    /// The activation owner must bind this runtime generation to exactly one provider dataset;
+    /// that subject also deterministically names the immutable analytical dataset.
+    pub(crate) fn bind_rest_quote_sink(
+        self: &Arc<Self>,
+        operation_timeout: Duration,
+    ) -> Result<Arc<SchwabRestQuoteGenerationAuthority>, SchwabMarketPublicationError> {
+        let subjects = self
+            .generation
+            .rights_exact_subjects()
+            .ok_or(SchwabMarketPublicationError::AuthorityInvalid)?;
+        if subjects.len() != 1 || operation_timeout.is_zero() {
+            return Err(SchwabMarketPublicationError::AuthorityInvalid);
+        }
+        let provider_dataset = subjects
+            .iter()
+            .next()
+            .cloned()
+            .ok_or(SchwabMarketPublicationError::AuthorityInvalid)?;
+        self.rights
+            .validate_subject(Some(&provider_dataset))
+            .map_err(|_error| SchwabMarketPublicationError::AuthorityInvalid)?;
+        let analytical_dataset = DatasetId::try_from(provider_dataset.as_str())
+            .map_err(|_error| SchwabMarketPublicationError::AuthorityInvalid)?;
+        let session_id = self.generation.session_id();
+        let session_identifier = SourceIdentifier::try_from(session_id.to_string().as_str())
+            .map_err(|_error| SchwabMarketPublicationError::AuthorityInvalid)?;
+        let coordinates = SchwabCaptureCoordinates::try_new(
+            self.generation.metadata().source_id().clone(),
+            self.generation.metadata().revision().clone(),
+            provider_dataset,
+            session_id,
+        )?;
+        Ok(Arc::new(SchwabRestQuoteGenerationAuthority {
+            closure: Arc::clone(self),
+            coordinates,
+            session_identifier,
+            analytical_dataset,
+            operation_timeout,
+            latest_source_health: Mutex::new(None),
+        }))
+    }
+
+    /// Publishes one quote response that has already crossed the sole physical raw sealer.
+    ///
+    /// This is the generation-bound continuation used by the REST runtime sink. It deliberately
+    /// acquires the revocable publication lease after physical sealing, so expiry or shutdown can
+    /// prevent analytical publication without losing the recoverable sealed provider response.
+    pub(crate) async fn publish_already_sealed_rest_quotes(
         &self,
-        response: ExecutedRestResponse,
-        coordinates: SchwabCaptureCoordinates,
-        event_id: Uuid,
-        request: SchwabRestQuotePublicationRequest,
-        oauth: SchwabOAuthAuthorityReceipt,
+        publication: Box<SchwabSealedRestQuotePublication>,
+        oauth_epoch: SchwabOAuthPublicationEpoch,
         observed_at: Timestamp,
         analytical_dataset: DatasetId,
-        idempotency_key: impl Into<String>,
-        cancellation: CancellationToken,
+        idempotency_key: String,
         deadline: Instant,
-    ) -> Result<SchwabRestQuoteApplicationOutcome, SchwabMarketPublicationError> {
-        self.validate_rest_input(
-            &response,
-            &coordinates,
-            &[ReadOnlyRoute::Quotes, ReadOnlyRoute::SingleQuote],
-            SchwabMarketDataFamily::Quotes,
-            oauth,
-            observed_at,
-        )?;
-        let lease = self
-            .acquire_publication_lease(oauth, observed_at, &cancellation)
-            .await?;
-        let sealed = self
-            .seal_rest_response(response, coordinates, event_id, &cancellation, deadline)
-            .await?;
-        match sealed.into_quote_publication(request)? {
-            SchwabRestQuotePublicationOutcome::SealedRaw(raw) => {
-                Ok(SchwabRestQuoteApplicationOutcome::SealedRaw(raw))
-            }
-            SchwabRestQuotePublicationOutcome::Published(publication) => {
-                publication.binding().validate()?;
-                self.validate_response_binding(publication.binding())?;
-                if publication.binding().native_lineage().implementation()
-                    != ProviderNativeLineageImplementation::SchwabRestMarketDataV1
-                {
-                    return Err(SchwabMarketPublicationError::AuthorityInvalid);
-                }
-                let dispositions = publication.dispositions().to_vec().into_boxed_slice();
-                let binding = publication.into_binding();
-                let generation = self
-                    .publish_market_events(
-                        binding.into(),
-                        ProviderMarketEventPublicationKind::ResponseMarketEvent,
-                        analytical_dataset,
-                        idempotency_key,
-                        observed_at,
-                        lease,
-                        cancellation,
-                    )
-                    .await?;
-                Ok(SchwabRestQuoteApplicationOutcome::Published(
-                    SchwabRestQuotePublicationReceipt {
-                        generation,
-                        dispositions,
-                    },
-                ))
-            }
+    ) -> Result<SchwabRestQuotePublicationReceipt, SchwabMarketPublicationError> {
+        let oauth = oauth_epoch.receipt();
+        oauth_epoch
+            .validate_current(oauth)
+            .map_err(|_error| SchwabMarketPublicationError::AuthorityRevoked)?;
+        if idempotency_key.is_empty() {
+            return Err(SchwabMarketPublicationError::AuthorityInvalid);
         }
+        if Instant::now() >= deadline {
+            return Err(SchwabMarketPublicationError::Deadline);
+        }
+        publication.binding().validate()?;
+        self.validate_response_binding(publication.binding())?;
+        self.rights
+            .validate_subject(Some(publication.binding().capture_evidence().dataset()))
+            .map_err(|_error| SchwabMarketPublicationError::AuthorityInvalid)?;
+        if publication.binding().native_lineage().implementation()
+            != ProviderNativeLineageImplementation::SchwabRestMarketDataV1
+        {
+            return Err(SchwabMarketPublicationError::AuthorityInvalid);
+        }
+        self.validate_doctor_family(SchwabMarketDataFamily::Quotes, observed_at)?;
+        self.validate_doctor_oauth(oauth, observed_at)?;
+
+        let publication_cancellation = CancellationToken::new();
+        let lease = tokio::select! {
+            biased;
+            () = self.admission.cancellation().cancelled() => {
+                return Err(SchwabMarketPublicationError::AuthorityRevoked);
+            }
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                return Err(SchwabMarketPublicationError::Deadline);
+            }
+            lease = self.acquire_attempt_publication_lease(
+                oauth_epoch,
+                observed_at,
+                &publication_cancellation,
+            ) => lease?,
+        };
+
+        let dispositions = publication.dispositions().to_vec().into_boxed_slice();
+        let binding = publication.into_binding();
+        let publish_cancellation = publication_cancellation.clone();
+        let publication = self.publish_market_events(
+            binding.into(),
+            ProviderMarketEventPublicationKind::ResponseMarketEvent,
+            analytical_dataset,
+            idempotency_key,
+            observed_at,
+            lease,
+            publish_cancellation,
+        );
+        tokio::pin!(publication);
+        let generation = tokio::select! {
+            biased;
+            result = &mut publication => result?,
+            () = self.admission.cancellation().cancelled() => {
+                publication_cancellation.cancel();
+                return Err(SchwabMarketPublicationError::AuthorityRevoked);
+            }
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                publication_cancellation.cancel();
+                return Err(SchwabMarketPublicationError::Deadline);
+            }
+        };
+        Ok(SchwabRestQuotePublicationReceipt {
+            generation,
+            dispositions,
+        })
     }
 
     /// Seals, rejoins, and publishes one exact daily-history response through the common provider
@@ -256,7 +505,8 @@ impl SchwabMarketPublicationClosure {
             .await?;
         let publication = pending.try_rejoin(sealed)?;
         let market_data = publication.market_data().clone();
-        let (revisions, binding) = publication.into_parts();
+        let publication_checked_at = trusted_now()?;
+        let (revisions, binding) = publication.into_parts(publication_checked_at)?;
         binding.validate()?;
         self.validate_capture_binding(
             binding.capture_evidence().source_id(),
@@ -565,6 +815,51 @@ impl SchwabMarketPublicationClosure {
         observed_at: Timestamp,
         cancellation: &CancellationToken,
     ) -> Result<Arc<SchwabMarketPublicationLease>, SchwabMarketPublicationError> {
+        let generation = self
+            .acquire_publication_generation(oauth, observed_at, cancellation)
+            .await?;
+        Ok(Arc::new(SchwabMarketPublicationLease {
+            generation: Arc::new(generation),
+            generation_digest: self.generation.generation_digest()?,
+            oauth,
+            oauth_epoch: None,
+            admission: Arc::clone(&self.admission),
+            exclusive_expires_at: exact_exclusive_expiry(&self.generation, &self.doctor, oauth)?,
+        }))
+    }
+
+    async fn acquire_attempt_publication_lease(
+        &self,
+        oauth_epoch: SchwabOAuthPublicationEpoch,
+        observed_at: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<SchwabMarketPublicationLease>, SchwabMarketPublicationError> {
+        let oauth = oauth_epoch.receipt();
+        oauth_epoch
+            .validate_current(oauth)
+            .map_err(|_error| SchwabMarketPublicationError::AuthorityRevoked)?;
+        let generation = self
+            .acquire_publication_generation(oauth, observed_at, cancellation)
+            .await?;
+        oauth_epoch
+            .validate_current(oauth)
+            .map_err(|_error| SchwabMarketPublicationError::AuthorityRevoked)?;
+        Ok(Arc::new(SchwabMarketPublicationLease {
+            generation: Arc::new(generation),
+            generation_digest: self.generation.generation_digest()?,
+            oauth,
+            oauth_epoch: Some(oauth_epoch),
+            admission: Arc::clone(&self.admission),
+            exclusive_expires_at: exact_exclusive_expiry(&self.generation, &self.doctor, oauth)?,
+        }))
+    }
+
+    async fn acquire_publication_generation(
+        &self,
+        oauth: SchwabOAuthAuthorityReceipt,
+        observed_at: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<ResearchProviderPublicationLease, SchwabMarketPublicationError> {
         self.validate_doctor_oauth(oauth, observed_at)?;
         self.admission.ensure_live()?;
         self.admission.validate_oauth_current(oauth)?;
@@ -578,13 +873,7 @@ impl SchwabMarketPublicationClosure {
         };
         self.admission.ensure_live()?;
         self.admission.validate_oauth_current(oauth)?;
-        Ok(Arc::new(SchwabMarketPublicationLease {
-            generation: Arc::new(generation),
-            generation_digest: self.generation.generation_digest()?,
-            oauth,
-            admission: Arc::clone(&self.admission),
-            exclusive_expires_at: exact_exclusive_expiry(&self.generation, &self.doctor, oauth)?,
-        }))
+        Ok(generation)
     }
 
     async fn publish_market_events(
@@ -597,6 +886,11 @@ impl SchwabMarketPublicationClosure {
         lease: Arc<SchwabMarketPublicationLease>,
         cancellation: CancellationToken,
     ) -> Result<SchwabMarketEventPublicationReceipt, SchwabMarketPublicationError> {
+        if kind == ProviderMarketEventPublicationKind::ResponseMarketEvent
+            && lease.oauth_epoch.is_none()
+        {
+            return Err(SchwabMarketPublicationError::AuthorityInvalid);
+        }
         lease.validate_precommit_exact()?;
         let runtime_generation_digest = self.generation.generation_digest()?;
         if lease.generation_digest() != runtime_generation_digest {
@@ -800,6 +1094,7 @@ pub(crate) struct SchwabMarketPublicationLease {
     generation: Arc<ResearchProviderPublicationLease>,
     generation_digest: EvidenceDigest,
     oauth: SchwabOAuthAuthorityReceipt,
+    oauth_epoch: Option<SchwabOAuthPublicationEpoch>,
     admission: Arc<dyn SchwabMarketRuntimeAdmission>,
     exclusive_expires_at: Timestamp,
 }
@@ -835,6 +1130,11 @@ impl SchwabMarketPublicationLease {
         self.admission
             .validate_oauth_current(self.oauth)
             .map_err(|_error| SchwabMarketPublicationError::AuthorityRevoked)?;
+        if let Some(oauth_epoch) = self.oauth_epoch.as_ref() {
+            oauth_epoch
+                .validate_current(self.oauth)
+                .map_err(|_error| SchwabMarketPublicationError::AuthorityRevoked)?;
+        }
         if trusted_now()? >= self.exclusive_expires_at {
             return Err(SchwabMarketPublicationError::AuthorityExpired);
         }
@@ -970,12 +1270,6 @@ impl SchwabMarketEventPublicationReceipt {
     pub(crate) const fn oauth_generation(&self) -> AccessTokenGeneration {
         self.oauth_generation
     }
-}
-
-#[derive(Debug)]
-pub(crate) enum SchwabRestQuoteApplicationOutcome {
-    Published(SchwabRestQuotePublicationReceipt),
-    SealedRaw(Box<SchwabSealedRawRestQuotePublication>),
 }
 
 #[derive(Debug)]
@@ -1386,6 +1680,10 @@ pub(crate) enum SchwabMarketPublicationError {
     FamilyMismatch,
     #[error("Schwab market-data publication was cancelled")]
     Cancelled,
+    #[error("Schwab market-data post-seal publication deadline elapsed")]
+    Deadline,
+    #[error("Schwab quote source-health outcome could not be retained")]
+    SourceHealthUnavailable,
     #[error("Schwab provider-event generation failed exact immutable restart verification")]
     RestartInvalid,
     #[error(transparent)]

@@ -212,6 +212,7 @@ pub enum SchwabRestOptionDispositionReason {
     InvalidRequiredTerms,
     CanonicalMappingRejected,
     DuplicateCanonicalIdentity,
+    InvalidComponentClock,
 }
 
 /// Exact provider record omitted from the canonical option batch.
@@ -314,12 +315,15 @@ impl SchwabSealedRestResponse {
         let provider_records = parts.accounting.provider_records;
         let (rows, native_rows, dispositions, reported_records, filter) = match &parts.payload {
             SchwabRestPayload::OptionChain(parsed) if self.route() == ReadOnlyRoute::Chains => {
-                let mapped = map_snapshots(parts, parsed.value().contracts(), &request)?;
+                let reported_records = native_u64(parsed.value().number_of_contracts())
+                    .ok_or(SchwabRestOptionPublicationError::InvalidEvidence)?;
+                let mapped =
+                    map_snapshots(parts, parsed.value().contracts(), &request, received_at)?;
                 (
                     OptionRows::Snapshots(mapped.rows),
                     mapped.native_rows,
                     mapped.dispositions,
-                    native_u64(parsed.value().number_of_contracts()),
+                    Some(reported_records),
                     option_chain_filter(parts.receipt.request_url(), request.market_data.currency)?,
                 )
             }
@@ -462,6 +466,7 @@ fn map_snapshots(
     parts: &SchwabSealedRestResponseParts,
     contracts: &[OptionContract],
     request: &SchwabRestOptionPublicationRequest,
+    received_at: Timestamp,
 ) -> Result<MappedRows<OptionSnapshotObservation>, SchwabRestOptionPublicationError> {
     let mut inputs = BTreeMap::new();
     for input in &request.contracts {
@@ -523,18 +528,19 @@ fn map_snapshots(
             ));
             continue;
         }
-        let snapshot = match option_snapshot(contract, input, request, underlying.clone()) {
-            Ok(value) => value,
-            Err(reason) => {
-                dispositions.push(contract_disposition(
-                    ordinal,
-                    contract,
-                    Some(provider_symbol.as_str()),
-                    reason,
-                ));
-                continue;
-            }
-        };
+        let snapshot =
+            match option_snapshot(contract, input, request, underlying.clone(), received_at) {
+                Ok(value) => value,
+                Err(reason) => {
+                    dispositions.push(contract_disposition(
+                        ordinal,
+                        contract,
+                        Some(provider_symbol.as_str()),
+                        reason,
+                    ));
+                    continue;
+                }
+            };
         native_rows.push(encode_snapshot_native_row(
             ordinal, contract, input, request,
         )?);
@@ -606,6 +612,7 @@ fn option_snapshot(
     input: &SchwabRestOptionContractRequest,
     request: &SchwabRestOptionPublicationRequest,
     underlying: OptionUnderlyingObservation,
+    received_at: Timestamp,
 ) -> Result<OptionSnapshotObservation, SchwabRestOptionDispositionReason> {
     let expiration = contract_expiration(contract)?;
     let strike = contract_strike(contract)?;
@@ -627,8 +634,8 @@ fn option_snapshot(
         settlement: settlement_component(contract),
     })
     .map_err(|_| SchwabRestOptionDispositionReason::InvalidRequiredTerms)?;
-    let quote_at = option_timestamp(contract, OptionContractField::QuoteTimeInLong);
-    let trade_at = option_timestamp(contract, OptionContractField::TradeTimeInLong);
+    let quote_at = option_timestamp(contract, OptionContractField::QuoteTimeInLong, received_at)?;
+    let trade_at = option_timestamp(contract, OptionContractField::TradeTimeInLong, received_at)?;
     OptionSnapshotObservation::try_new(OptionSnapshotObservationInput {
         terms,
         bid_price: money_component(
@@ -927,16 +934,29 @@ fn settlement_component(contract: &OptionContract) -> OptionComponent<OptionSett
     }
 }
 
-fn option_timestamp(contract: &OptionContract, name: OptionContractField) -> Option<Timestamp> {
-    let NativeScalar::Number(value) = option_scalar(contract, name)? else {
-        return None;
+fn option_timestamp(
+    contract: &OptionContract,
+    name: OptionContractField,
+    received_at: Timestamp,
+) -> Result<Option<Timestamp>, SchwabRestOptionDispositionReason> {
+    let value = match option_scalar(contract, name) {
+        None | Some(NativeScalar::Null) => return Ok(None),
+        Some(NativeScalar::Number(value)) => value,
+        Some(NativeScalar::Bool(_) | NativeScalar::Text(_)) => {
+            return Err(SchwabRestOptionDispositionReason::InvalidComponentClock);
+        }
     };
-    value.as_str().parse::<u64>().ok().and_then(|value| {
-        i64::try_from(value)
-            .ok()
-            .and_then(|value| value.checked_mul(1_000_000))
-            .map(Timestamp::from_unix_nanos)
-    })
+    let timestamp = value
+        .as_str()
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value != 0)
+        .and_then(|value| i64::try_from(value).ok())
+        .and_then(|value| value.checked_mul(1_000_000))
+        .map(Timestamp::from_unix_nanos)
+        .filter(|timestamp| *timestamp <= received_at)
+        .ok_or(SchwabRestOptionDispositionReason::InvalidComponentClock)?;
+    Ok(Some(timestamp))
 }
 
 fn parse_decimal(value: &NativeNumber) -> Option<Decimal> {
@@ -1026,6 +1046,7 @@ fn option_chain_filter(
     let mut kind = None;
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
+            "symbol" => {}
             "fromDate" if from.is_none() => from = Some(calendar_date(&value)?),
             "toDate" if to.is_none() => to = Some(calendar_date(&value)?),
             "strike" if strike.is_none() => {
@@ -1047,7 +1068,7 @@ fn option_chain_filter(
             "fromDate" | "toDate" | "strike" | "contractType" => {
                 return Err(SchwabRestOptionPublicationError::InvalidEvidence);
             }
-            _ => {}
+            _ => return Err(SchwabRestOptionPublicationError::InvalidEvidence),
         }
     }
     let expiration_range = match (from, to) {

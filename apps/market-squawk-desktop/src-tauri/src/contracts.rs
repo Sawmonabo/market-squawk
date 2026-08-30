@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use market_squawk::{ProviderPortalActivationRequest, application::setup::SetupPlanSelection};
+use market_squawk::ProviderPortalActivationRequest;
 use market_squawk_runtime::RuntimeIdentity;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
@@ -42,37 +42,191 @@ impl Readiness {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct OperationSummary {
-    name: String,
-    description: String,
-    domain: String,
-    authorization: String,
-    read_only: bool,
-    destructive: bool,
-    input_schema: Value,
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProductCapability {
+    BacktestAdvancedStart,
+    BacktestActivity,
+    BacktestArtifactRead,
+    BacktestPreparation,
+    BacktestPreparedStart,
+    BacktestPreview,
+    BacktestResult,
+    BotStart,
+    BotStatus,
+    BotStop,
+    DecisionAnalysis,
+    DecisionAnalysisList,
+    DecisionRecommendationHistory,
+    DecisionScreenList,
+    DecisionTargetReview,
+    ExecutionCancel,
+    ExecutionFills,
+    ExecutionManualDraft,
+    ExecutionManualTargets,
+    ExecutionOrders,
+    ExecutionReconcile,
+    FairValueGovernanceCommit,
+    FairValueGovernancePreview,
+    FairValueMeasurement,
+    FairValueWorkspace,
+    FeatureDatasetPreparation,
+    FeatureDatasetPreparedStart,
+    FeatureDatasetPreview,
+    ForecastDetail,
+    ForecastEvaluate,
+    ForecastList,
+    ForecastMetadata,
+    ForecastOutcomes,
+    ForecastPreparation,
+    ForecastPrepare,
+    ForecastPreparedStart,
+    FundamentalFacts,
+    GovernanceAuthenticate,
+    GovernancePrincipals,
+    InstallationStatus,
+    InvestmentLookup,
+    JobList,
+    JobWatch,
+    MacroContext,
+    MacroRevisions,
+    MarketInstrument,
+    MarketOverview,
+    MarketUniverse,
+    ModelActivity,
+    ModelEvidence,
+    ModelTrainingStart,
+    OperationsBackupList,
+    OperationsLogExport,
+    OperationsLogQuery,
+    OperationsRollbackPreview,
+    OperationsRollbackStart,
+    OperationsRuntimeStatus,
+    OperationsSettings,
+    OperationsUpdateCheck,
+    OperationsUpdatePreview,
+    OperationsUpdateStart,
+    OperationsUpdateStatus,
+    OperationsWorkspaceList,
+    PortfolioAccountList,
+    PortfolioAttribution,
+    PortfolioCandidateImpact,
+    PortfolioExposure,
+    PortfolioHoldings,
+    PortfolioImportApprove,
+    PortfolioImportCommit,
+    PortfolioImportDiscard,
+    PortfolioImportPreview,
+    PortfolioPerformance,
+    PortfolioRebalance,
+    PortfolioRecommendationSetup,
+    PortfolioRevisionList,
+    PortfolioRisk,
+    PortfolioScenario,
+    PortfolioScenarioBatch,
+    PortfolioTransactions,
+    ResearchDatasetList,
+    ResearchExport,
+    ResearchFileCommit,
+    ResearchFileDiscard,
+    ResearchFilePreview,
+    ResearchManifest,
+    RiskKillSwitch,
 }
 
-impl OperationSummary {
-    pub(crate) fn new(
-        name: String,
-        description: String,
-        domain: String,
-        authorization: String,
-        read_only: bool,
-        destructive: bool,
-        input_schema: Value,
-    ) -> Self {
-        Self {
-            name,
-            description,
-            domain,
-            authorization,
-            read_only,
-            destructive,
-            input_schema,
-        }
+impl ProductCapability {
+    pub(crate) fn for_operation(operation: &str) -> Option<Self> {
+        Some(match operation {
+            "Analysis.GetBacktestPreparation" => Self::BacktestPreparation,
+            "Analysis.GetProductBacktest" => Self::BacktestResult,
+            "Analysis.GetFeatureDatasetPreparationOptions" => Self::FeatureDatasetPreparation,
+            "Analysis.Lookup" => Self::InvestmentLookup,
+            "Analysis.PreviewBacktest" => Self::BacktestPreview,
+            "Analysis.PreviewFeatureDatasetBuild" => Self::FeatureDatasetPreview,
+            "Analysis.ReadArtifact" => Self::BacktestArtifactRead,
+            "Analysis.StartBacktest" => Self::BacktestAdvancedStart,
+            "Analysis.StartPreparedBacktest" => Self::BacktestPreparedStart,
+            "Analysis.StartPreparedFeatureDatasetBuild" => Self::FeatureDatasetPreparedStart,
+            "Analysis.ListProductBacktests" => Self::BacktestActivity,
+            "Bot.GetStatus" => Self::BotStatus,
+            "Bot.Start" => Self::BotStart,
+            "Bot.Stop" => Self::BotStop,
+            "Decision.GetInvestmentAnalysis" => Self::DecisionAnalysis,
+            "Decision.GetScreen" => Self::DecisionScreenList,
+            "Decision.GetRecommendationTrackRecord" => Self::DecisionRecommendationHistory,
+            "Decision.ListInvestmentAnalyses" => Self::DecisionAnalysisList,
+            "Decision.ListScreens" => Self::DecisionScreenList,
+            "Decision.ReviewTargetSet" => Self::DecisionTargetReview,
+            "Execution.Cancel" => Self::ExecutionCancel,
+            "Execution.GetFills" => Self::ExecutionFills,
+            "Execution.GetManualPaperTargets" => Self::ExecutionManualTargets,
+            "Execution.GetOrders" => Self::ExecutionOrders,
+            "Execution.Reconcile" => Self::ExecutionReconcile,
+            "Execution.SubmitManualPaperDraft" => Self::ExecutionManualDraft,
+            "FairValue.CommitGovernanceAction" => Self::FairValueGovernanceCommit,
+            "FairValue.Measure" => Self::FairValueMeasurement,
+            "FairValue.GetWorkspace" => Self::FairValueWorkspace,
+            "FairValue.PreviewGovernanceAction" => Self::FairValueGovernancePreview,
+            "Fundamental.GetFacts" => Self::FundamentalFacts,
+            "Governance.AuthenticateAction" => Self::GovernanceAuthenticate,
+            "Governance.ListPrincipals" => Self::GovernancePrincipals,
+            "Installation.Status" => Self::InstallationStatus,
+            "Job.List" => Self::JobList,
+            "Job.Watch" => Self::JobWatch,
+            "Macro.GetContext" => Self::MacroContext,
+            "Macro.GetRevisions" => Self::MacroRevisions,
+            "Market.GetInstrument" => Self::MarketInstrument,
+            "Market.GetOverview" => Self::MarketOverview,
+            "Market.SearchUniverse" => Self::MarketUniverse,
+            "Model.Evaluate" => Self::ForecastEvaluate,
+            "Model.GetForecast" => Self::ForecastDetail,
+            "Model.GetForecastOutcomes" => Self::ForecastOutcomes,
+            "Model.GetForecastPreparation" => Self::ForecastPreparation,
+            "Model.GetMetadata" => Self::ForecastMetadata,
+            "Model.ListBundles" => Self::ModelEvidence,
+            "Model.ListForecasts" => Self::ForecastList,
+            "Model.ListProductActivity" => Self::ModelActivity,
+            "Model.PrepareForecast" => Self::ForecastPrepare,
+            "Model.StartPreparedForecast" => Self::ForecastPreparedStart,
+            "Model.StartTraining" => Self::ModelTrainingStart,
+            "Operations.CheckForUpdates" => Self::OperationsUpdateCheck,
+            "Operations.ExportLogs" => Self::OperationsLogExport,
+            "Operations.GetRuntimeStatus" => Self::OperationsRuntimeStatus,
+            "Operations.GetSettings" => Self::OperationsSettings,
+            "Operations.GetUpdateStatus" => Self::OperationsUpdateStatus,
+            "Operations.ListBackups" => Self::OperationsBackupList,
+            "Operations.ListWorkspaces" => Self::OperationsWorkspaceList,
+            "Operations.PreviewProgramRollback" => Self::OperationsRollbackPreview,
+            "Operations.PreviewUpdate" => Self::OperationsUpdatePreview,
+            "Operations.QueryLogs" => Self::OperationsLogQuery,
+            "Operations.StartProgramRollback" => Self::OperationsRollbackStart,
+            "Operations.StartUpdate" => Self::OperationsUpdateStart,
+            "Portfolio.ApproveStagedImport" => Self::PortfolioImportApprove,
+            "Portfolio.CommitRecommendationSetup" => Self::PortfolioRecommendationSetup,
+            "Portfolio.CommitStagedImport" => Self::PortfolioImportCommit,
+            "Portfolio.DiscardStagedImport" => Self::PortfolioImportDiscard,
+            "Portfolio.EvaluateCandidateImpact" => Self::PortfolioCandidateImpact,
+            "Portfolio.EvaluateScenario" => Self::PortfolioScenario,
+            "Portfolio.EvaluateScenarioBatch" => Self::PortfolioScenarioBatch,
+            "Portfolio.GetAttribution" => Self::PortfolioAttribution,
+            "Portfolio.GetExposure" => Self::PortfolioExposure,
+            "Portfolio.GetHoldings" => Self::PortfolioHoldings,
+            "Portfolio.GetPerformance" => Self::PortfolioPerformance,
+            "Portfolio.GetRisk" => Self::PortfolioRisk,
+            "Portfolio.GetTransactions" => Self::PortfolioTransactions,
+            "Portfolio.ListAccounts" => Self::PortfolioAccountList,
+            "Portfolio.ListRevisions" => Self::PortfolioRevisionList,
+            "Portfolio.PreviewStagedImport" => Self::PortfolioImportPreview,
+            "Portfolio.ProposeRebalance" => Self::PortfolioRebalance,
+            "Research.CommitStagedFile" => Self::ResearchFileCommit,
+            "Research.DiscardStagedFile" => Self::ResearchFileDiscard,
+            "Research.GetManifest" => Self::ResearchManifest,
+            "Research.ListDatasets" => Self::ResearchDatasetList,
+            "Research.PreviewStagedFile" => Self::ResearchFilePreview,
+            "Research.StartExport" => Self::ResearchExport,
+            "Risk.TriggerKillSwitch" => Self::RiskKillSwitch,
+            _ => return None,
+        })
     }
 }
 
@@ -90,10 +244,7 @@ pub(crate) struct DesktopBootstrap {
     model_runtime: Readiness,
     mcp: Readiness,
     telemetry_enabled: bool,
-    encrypted_file_fallback: Value,
-    provider_profiles: Value,
-    provider_sessions: Value,
-    operations: Vec<OperationSummary>,
+    capabilities: Vec<ProductCapability>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -139,7 +290,7 @@ pub(crate) enum DesktopServiceBootstrapCommand {
     RetryAfterForegroundKeyring,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct DesktopServiceReconnect {
     expected_runtime: RuntimeIdentity,
@@ -165,10 +316,7 @@ impl DesktopBootstrap {
         installation: Readiness,
         model_runtime: Readiness,
         mcp: Readiness,
-        encrypted_file_fallback: Value,
-        provider_profiles: Value,
-        provider_sessions: Value,
-        operations: Vec<OperationSummary>,
+        capabilities: Vec<ProductCapability>,
     ) -> Self {
         Self {
             contract_version: DESKTOP_CONTRACT_VERSION,
@@ -182,10 +330,7 @@ impl DesktopBootstrap {
             model_runtime,
             mcp,
             telemetry_enabled: false,
-            encrypted_file_fallback,
-            provider_profiles,
-            provider_sessions,
-            operations,
+            capabilities,
         }
     }
 }
@@ -231,6 +376,19 @@ pub(crate) enum DashboardQueryCommand {
     SourceHealth {
         source_ids: Option<Vec<String>>,
     },
+    ResearchCollections {
+        after_collection: Option<Uuid>,
+    },
+    ResearchCollection {
+        collection: Uuid,
+    },
+    ResearchCollectionHistory {
+        collection: Uuid,
+    },
+    ResearchCollectionAlternativeData {
+        collection: Uuid,
+    },
+    ResearchActivities,
     ResearchDatasets {
         after_dataset: Option<String>,
     },
@@ -267,11 +425,11 @@ pub(crate) enum DashboardQueryCommand {
     },
     PortfolioRevisions {
         account_id: String,
-        after_revision_id: Option<String>,
+        after_snapshot_token: Option<String>,
     },
     PortfolioAttribution {
         account_id: String,
-        baseline_revision_id: String,
+        baseline_snapshot_token: String,
     },
     PortfolioScenario {
         account_id: String,
@@ -290,7 +448,6 @@ pub(crate) enum DashboardQueryCommand {
         proposed_quantity: String,
         scenario_shock: String,
     },
-    ModelBundles,
     Forecasts,
     LatestValidForecast {
         instrument_id: Uuid,
@@ -304,13 +461,16 @@ pub(crate) enum DashboardQueryCommand {
         input: Map<String, Value>,
     },
     Forecast {
-        vintage_id: String,
+        forecast_token: Uuid,
     },
     ForecastOutcomes {
-        vintage_id: String,
+        forecast_token: Uuid,
     },
     DecisionScreens {
         limit: u16,
+    },
+    DecisionScreen {
+        screen_id: String,
     },
     AnalysisFeatureDatasets {
         dataset: Option<String>,
@@ -366,9 +526,6 @@ pub(crate) enum DashboardQueryCommand {
         target_id: String,
         revision: u32,
     },
-    Backtest {
-        run_id: String,
-    },
     AnalysisArtifact {
         artifact_id: String,
         sha256: String,
@@ -380,26 +537,9 @@ pub(crate) enum DashboardQueryCommand {
     PaperStatus,
     PaperOrders,
     PaperFills,
-    FairValueMeasurements,
-    FairValueClassification {
-        measurement_id: String,
-    },
-    FairValueExplanation {
-        measurement_id: String,
-    },
-    FairValueEvidence {
-        measurement_id: String,
-    },
-    FairValueApprovalStatus {
-        measurement_id: String,
+    FairValueWorkspace {
+        measurement_token: Option<Uuid>,
         at: String,
-    },
-    FairValueAudit {
-        after: Option<Map<String, Value>>,
-        limit: u16,
-    },
-    FairValueMarketAccess {
-        assessment_id: String,
     },
     Jobs {
         after_job_id: Option<String>,
@@ -449,11 +589,6 @@ pub(crate) enum DashboardQueryCommand {
     OperationSettingsRollbackPreview {
         expected_revision: String,
         target_revision: String,
-    },
-    SetupPlanStatus,
-    SetupPlanPreview {
-        expected_revision: String,
-        selection: SetupPlanSelection,
     },
 }
 
@@ -558,10 +693,6 @@ pub(crate) enum OperationsControlCommand {
         preview_id: Uuid,
         preview_digest: String,
     },
-    ApplySetupPlan {
-        preview_id: Uuid,
-        preview_sha256: String,
-    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -582,9 +713,22 @@ pub(crate) enum ResearchControlCommand {
         dataset: String,
         discovery_receipt: Uuid,
     },
-    StartExport {
-        dataset: String,
+    StartCollectionExport {
+        collection: Uuid,
     },
+    CancelActivity {
+        activity: Uuid,
+    },
+    RetryActivity {
+        activity: Uuid,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DatasetPreparationUse {
+    LocalAnalysis,
+    Train,
 }
 
 #[derive(Debug, Deserialize)]
@@ -596,11 +740,32 @@ pub(crate) enum ResearchControlCommand {
 )]
 pub(crate) enum AnalysisControlCommand {
     FeatureDatasetOptions,
-    PreviewFeatureDataset { selection: Map<String, Value> },
-    StartPreparedFeatureDataset { receipt: Map<String, Value> },
+    PreviewFeatureDataset {
+        choice: Uuid,
+        intended_use: DatasetPreparationUse,
+    },
+    StartPreparedFeatureDataset {
+        receipt: Uuid,
+    },
     BacktestOptions,
-    PreviewBacktest { selection: Map<String, Value> },
-    StartPreparedBacktest { receipt: Map<String, Value> },
+    PreviewBacktest {
+        selection: Map<String, Value>,
+    },
+    StartPreparedBacktest {
+        receipt: Map<String, Value>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
+pub(crate) enum BacktestProductCommand {
+    List,
+    Get { backtest_token: Uuid },
 }
 
 #[derive(Debug, Deserialize)]
@@ -628,6 +793,18 @@ pub(crate) enum ModelControlCommand {
     },
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "action"
+)]
+pub(crate) enum ModelProductCommand {
+    List,
+    Activity,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(
     deny_unknown_fields,
@@ -638,9 +815,6 @@ pub(crate) enum ModelControlCommand {
 pub(crate) enum FairValueControlCommand {
     Measure {
         measurement: Map<String, Value>,
-    },
-    Classify {
-        measurement_id: String,
     },
     PreviewGovernanceAction {
         proposal: FairValueGovernanceProposal,
@@ -660,25 +834,23 @@ pub(crate) enum FairValueControlCommand {
 )]
 pub(crate) enum FairValueGovernanceProposal {
     Approve {
-        measurement_id: String,
-        decision_id: String,
+        measurement_token: Uuid,
+        classification_token: Uuid,
         expires_at: String,
     },
     Override {
-        measurement_id: String,
-        decision_id: String,
+        measurement_token: Uuid,
+        classification_token: Uuid,
         requested_hierarchy: FairValueHierarchyInput,
         justification: String,
         expires_at: String,
     },
     Revoke {
-        approval_id: String,
+        approval_token: Uuid,
         reason: String,
     },
     MarketAccess {
-        account_id: String,
-        venue_id: String,
-        instrument_id: String,
+        market_input_token: Uuid,
         conclusion: MarketAccessConclusionInput,
         effective_from: String,
         effective_until: String,
@@ -857,8 +1029,7 @@ impl fmt::Debug for GovernanceControlCommand {
 pub(crate) enum PaperControlCommand {
     Targets,
     Submit {
-        target_id: String,
-        target_revision: u64,
+        target_token: Uuid,
         side: String,
         order_type: String,
         quantity_lots: String,
@@ -867,8 +1038,6 @@ pub(crate) enum PaperControlCommand {
         time_in_force: String,
     },
     Start {
-        provider: String,
-        provider_session_id: Option<String>,
         strategy_mode: String,
         initial_cash: String,
         fee_basis_points: u16,
@@ -877,7 +1046,7 @@ pub(crate) enum PaperControlCommand {
         reason: String,
     },
     Cancel {
-        order_id: String,
+        order_token: Uuid,
     },
     Reconcile,
     TriggerKillSwitch {

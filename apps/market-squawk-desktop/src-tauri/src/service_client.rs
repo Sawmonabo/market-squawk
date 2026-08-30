@@ -6,16 +6,27 @@ use tauri::State;
 use crate::{
     bridge::{DesktopState, InvocationAuthority, invoke_application, invoke_private_application},
     contracts::{
-        AnalysisControlCommand, ApplicationInvocation, DashboardQueryCommand,
-        DecisionControlCommand, DesktopCommandError, FairValueControlCommand,
-        GovernanceControlCommand, GovernanceQueryCommand, JobControlCommand, ModelControlCommand,
-        OperationLogDomain, OperationLogSeverity, OperationSettingValue, OperationsControlCommand,
-        PaperControlCommand, ResearchControlCommand, SourceLifecycleAction, SourceLifecycleInput,
+        AnalysisControlCommand, ApplicationInvocation, BacktestProductCommand,
+        DashboardQueryCommand, DecisionControlCommand, DesktopCommandError,
+        FairValueControlCommand, GovernanceControlCommand, GovernanceQueryCommand,
+        JobControlCommand, ModelControlCommand, ModelProductCommand, OperationLogDomain,
+        OperationLogSeverity, OperationSettingValue, OperationsControlCommand, PaperControlCommand,
+        ResearchControlCommand, SourceLifecycleAction, SourceLifecycleInput,
     },
 };
 
 // Canonical string conversion happens after the shared bridge's size check, so retain its cap.
 const MAXIMUM_CANONICAL_JOB_RESULT_BYTES: usize = 1024 * 1024;
+const MAXIMUM_SAFE_WEB_NUMBER: u64 = 9_007_199_254_740_991;
+
+#[derive(Clone, Copy)]
+enum DashboardProjection {
+    None,
+    ResearchCollections,
+    ResearchCollection,
+    ResearchObservations,
+    ResearchActivities,
+}
 
 #[tauri::command]
 pub(crate) async fn dashboard_query(
@@ -23,6 +34,7 @@ pub(crate) async fn dashboard_query(
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
     let generation = state.generation()?;
+    let mut projection = DashboardProjection::None;
     let (operation, arguments) = match request {
         DashboardQueryCommand::Overview => ("Analysis.GetDecisionOverview", Map::new()),
         DashboardQueryCommand::MacroContext {
@@ -62,6 +74,36 @@ pub(crate) async fn dashboard_query(
         }
         DashboardQueryCommand::SourceHealth { source_ids } => {
             ("Source.GetHealth", source_arguments(source_ids))
+        }
+        DashboardQueryCommand::ResearchCollections { after_collection } => {
+            projection = DashboardProjection::ResearchCollections;
+            let mut arguments = Map::new();
+            let after_dataset = after_collection
+                .map(|collection| generation.resolve_research_collection(collection))
+                .transpose()?;
+            insert_optional(&mut arguments, "afterDataset", after_dataset);
+            ("Research.ListDatasets", arguments)
+        }
+        DashboardQueryCommand::ResearchCollection { collection } => {
+            projection = DashboardProjection::ResearchCollection;
+            let dataset = generation.resolve_research_collection(collection)?;
+            ("Research.GetManifest", dataset_arguments(dataset))
+        }
+        DashboardQueryCommand::ResearchCollectionHistory { collection } => {
+            projection = DashboardProjection::ResearchObservations;
+            let dataset = generation.resolve_research_collection(collection)?;
+            ("Research.GetHistory", dataset_arguments(dataset))
+        }
+        DashboardQueryCommand::ResearchCollectionAlternativeData { collection } => {
+            projection = DashboardProjection::ResearchObservations;
+            let dataset = generation.resolve_research_collection(collection)?;
+            ("Research.GetAlternativeData", dataset_arguments(dataset))
+        }
+        DashboardQueryCommand::ResearchActivities => {
+            projection = DashboardProjection::ResearchActivities;
+            let mut arguments = Map::new();
+            arguments.insert("limit".to_owned(), json!(25_u16));
+            ("Job.List", arguments)
         }
         DashboardQueryCommand::ResearchDatasets { after_dataset } => {
             let mut arguments = Map::new();
@@ -103,18 +145,21 @@ pub(crate) async fn dashboard_query(
         }
         DashboardQueryCommand::PortfolioRevisions {
             account_id,
-            after_revision_id,
+            after_snapshot_token,
         } => {
             let mut arguments = account_arguments(account_id);
-            insert_optional(&mut arguments, "afterRevisionId", after_revision_id);
+            insert_optional(&mut arguments, "afterSnapshotToken", after_snapshot_token);
             ("Portfolio.ListRevisions", arguments)
         }
         DashboardQueryCommand::PortfolioAttribution {
             account_id,
-            baseline_revision_id,
+            baseline_snapshot_token,
         } => {
             let mut arguments = account_arguments(account_id);
-            arguments.insert("baselineRevisionId".to_owned(), json!(baseline_revision_id));
+            arguments.insert(
+                "baselineSnapshotToken".to_owned(),
+                json!(baseline_snapshot_token),
+            );
             ("Portfolio.GetAttribution", arguments)
         }
         DashboardQueryCommand::PortfolioScenario {
@@ -152,7 +197,6 @@ pub(crate) async fn dashboard_query(
             arguments.insert("scenarioShock".to_owned(), json!(scenario_shock));
             ("Portfolio.EvaluateCandidateImpact", arguments)
         }
-        DashboardQueryCommand::ModelBundles => ("Model.ListBundles", Map::new()),
         DashboardQueryCommand::Forecasts => ("Model.ListForecasts", Map::new()),
         DashboardQueryCommand::LatestValidForecast {
             instrument_id,
@@ -171,16 +215,22 @@ pub(crate) async fn dashboard_query(
             arguments.insert("input".to_owned(), Value::Object(input));
             ("Model.Predict", arguments)
         }
-        DashboardQueryCommand::Forecast { vintage_id } => {
-            ("Model.GetForecast", vintage_arguments(vintage_id))
+        DashboardQueryCommand::Forecast { forecast_token } => {
+            ("Model.GetForecast", forecast_arguments(forecast_token))
         }
-        DashboardQueryCommand::ForecastOutcomes { vintage_id } => {
-            ("Model.GetForecastOutcomes", vintage_arguments(vintage_id))
-        }
+        DashboardQueryCommand::ForecastOutcomes { forecast_token } => (
+            "Model.GetForecastOutcomes",
+            forecast_arguments(forecast_token),
+        ),
         DashboardQueryCommand::DecisionScreens { limit } => {
             let mut arguments = Map::new();
             arguments.insert("limit".to_owned(), json!(limit));
             ("Decision.ListScreens", arguments)
+        }
+        DashboardQueryCommand::DecisionScreen { screen_id } => {
+            let mut arguments = Map::new();
+            arguments.insert("screenId".to_owned(), json!(screen_id));
+            ("Decision.GetScreen", arguments)
         }
         DashboardQueryCommand::AnalysisFeatureDatasets {
             dataset,
@@ -300,11 +350,6 @@ pub(crate) async fn dashboard_query(
             "Decision.GetTargetSetStatus",
             target_arguments(target_id, revision),
         ),
-        DashboardQueryCommand::Backtest { run_id } => {
-            let mut arguments = Map::new();
-            arguments.insert("runId".to_owned(), json!(run_id));
-            ("Analysis.GetBacktests", arguments)
-        }
         DashboardQueryCommand::AnalysisArtifact {
             artifact_id,
             sha256,
@@ -325,33 +370,14 @@ pub(crate) async fn dashboard_query(
         DashboardQueryCommand::PaperStatus => ("Bot.GetStatus", Map::new()),
         DashboardQueryCommand::PaperOrders => ("Execution.GetOrders", Map::new()),
         DashboardQueryCommand::PaperFills => ("Execution.GetFills", Map::new()),
-        DashboardQueryCommand::FairValueMeasurements => ("FairValue.ListMeasurements", Map::new()),
-        DashboardQueryCommand::FairValueClassification { measurement_id } => (
-            "FairValue.GetClassification",
-            measurement_arguments(measurement_id),
-        ),
-        DashboardQueryCommand::FairValueExplanation { measurement_id } => {
-            ("FairValue.Explain", measurement_arguments(measurement_id))
-        }
-        DashboardQueryCommand::FairValueEvidence { measurement_id } => (
-            "FairValue.GetEvidence",
-            measurement_arguments(measurement_id),
-        ),
-        DashboardQueryCommand::FairValueApprovalStatus { measurement_id, at } => {
-            let mut arguments = measurement_arguments(measurement_id);
+        DashboardQueryCommand::FairValueWorkspace {
+            measurement_token,
+            at,
+        } => {
+            let mut arguments = Map::new();
+            insert_optional(&mut arguments, "measurementToken", measurement_token);
             arguments.insert("at".to_owned(), json!(at));
-            ("FairValue.GetApprovalStatus", arguments)
-        }
-        DashboardQueryCommand::FairValueAudit { after, limit } => {
-            let mut arguments = Map::new();
-            insert_optional(&mut arguments, "after", after);
-            arguments.insert("limit".to_owned(), json!(limit));
-            ("FairValue.ListAuditEvents", arguments)
-        }
-        DashboardQueryCommand::FairValueMarketAccess { assessment_id } => {
-            let mut arguments = Map::new();
-            arguments.insert("assessmentId".to_owned(), json!(assessment_id));
-            ("FairValue.GetMarketAccess", arguments)
+            ("FairValue.GetWorkspace", arguments)
         }
         DashboardQueryCommand::Jobs {
             after_job_id,
@@ -467,22 +493,6 @@ pub(crate) async fn dashboard_query(
             );
             ("Operations.PreviewSettingsRollback", arguments)
         }
-        DashboardQueryCommand::SetupPlanStatus => ("Setup.GetStatus", Map::new()),
-        DashboardQueryCommand::SetupPlanPreview {
-            expected_revision,
-            selection,
-        } => {
-            let mut arguments = Map::new();
-            arguments.insert(
-                "expectedRevision".to_owned(),
-                json!(parse_unsigned_decimal(
-                    expected_revision,
-                    "The setup-plan revision must be an unsigned decimal.",
-                )?),
-            );
-            arguments.insert("selection".to_owned(), json!(selection));
-            ("Setup.PreviewPlan", arguments)
-        }
     };
     let mut result = invoke_application(
         ApplicationInvocation {
@@ -497,7 +507,571 @@ pub(crate) async fn dashboard_query(
     if operation == "Job.List" {
         canonicalize_job_result(operation, &mut result)?;
     }
+    match projection {
+        DashboardProjection::None => {}
+        DashboardProjection::ResearchCollections => {
+            project_research_collections(&mut result, &generation)?;
+        }
+        DashboardProjection::ResearchCollection => {
+            project_research_collection(&mut result, &generation)?;
+        }
+        DashboardProjection::ResearchObservations => {
+            project_research_observations(&mut result)?;
+        }
+        DashboardProjection::ResearchActivities => {
+            project_research_activities(&mut result, &generation)?;
+        }
+    }
     Ok(result)
+}
+
+fn project_research_collections(
+    result: &mut Value,
+    generation: &crate::bridge::DesktopGeneration,
+) -> Result<(), DesktopCommandError> {
+    let data = application_result_data(result)?.clone();
+    if data.is_null() {
+        return project_product_metadata(result);
+    }
+    let page = data.as_object().ok_or_else(DesktopCommandError::internal)?;
+    let items = page
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(DesktopCommandError::internal)?;
+    let mut collections = Vec::new();
+    collections
+        .try_reserve_exact(items.len())
+        .map_err(|_error| DesktopCommandError::internal())?;
+    for item in items {
+        collections.push(project_research_collection_value(item, generation)?);
+    }
+    let has_more = page
+        .get("hasMore")
+        .and_then(Value::as_bool)
+        .ok_or_else(DesktopCommandError::internal)?;
+    let next_collection = if has_more {
+        let dataset = page
+            .get("nextAfterDataset")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(DesktopCommandError::internal)?;
+        Value::String(
+            generation
+                .register_research_collection(dataset)?
+                .to_string(),
+        )
+    } else {
+        Value::Null
+    };
+    *application_result_data_mut(result)? = json!({
+        "items": collections,
+        "hasMore": has_more,
+        "nextCollection": next_collection,
+    });
+    project_product_metadata(result)
+}
+
+fn project_research_collection(
+    result: &mut Value,
+    generation: &crate::bridge::DesktopGeneration,
+) -> Result<(), DesktopCommandError> {
+    let data = application_result_data(result)?.clone();
+    if data.is_null() {
+        return Err(DesktopCommandError::internal());
+    }
+    *application_result_data_mut(result)? = project_research_collection_value(&data, generation)?;
+    project_product_metadata(result)
+}
+
+fn project_research_collection_value(
+    generation_value: &Value,
+    generation: &crate::bridge::DesktopGeneration,
+) -> Result<Value, DesktopCommandError> {
+    let dataset = generation_value
+        .pointer("/manifest/datasetId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(DesktopCommandError::internal)?;
+    let schema = generation_value
+        .pointer("/manifest/schema/name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(DesktopCommandError::internal)?;
+    let row_count = safe_web_count(
+        generation_value
+            .get("rowCount")
+            .and_then(Value::as_u64)
+            .ok_or_else(DesktopCommandError::internal)?,
+    )?;
+    let collection = generation.register_research_collection(dataset)?;
+    Ok(json!({
+        "collectionToken": collection,
+        "title": research_collection_title(schema),
+        "rowCount": row_count,
+    }))
+}
+
+fn project_research_observations(result: &mut Value) -> Result<(), DesktopCommandError> {
+    let data = application_result_data(result)?.clone();
+    if data.is_null() {
+        return project_product_metadata(result);
+    }
+    let observations = data.as_object().ok_or_else(DesktopCommandError::internal)?;
+    let projected = if let Some(rows) = observations.get("rows").and_then(Value::as_array) {
+        let mut projected_rows = Vec::new();
+        projected_rows
+            .try_reserve_exact(rows.len())
+            .map_err(|_error| DesktopCommandError::internal())?;
+        for row in rows {
+            projected_rows.push(project_research_observation_row(row)?);
+        }
+        json!({
+            "kind": "inline",
+            "rows": projected_rows,
+        })
+    } else {
+        let row_count = observations
+            .get("artifact")
+            .and_then(Value::as_object)
+            .and_then(|artifact| artifact.get("rowCount"))
+            .and_then(Value::as_u64)
+            .ok_or_else(DesktopCommandError::internal)?;
+        json!({
+            "kind": "artifact",
+            "rowCount": safe_web_count(row_count)?,
+        })
+    };
+    *application_result_data_mut(result)? = projected;
+    project_product_metadata(result)
+}
+
+fn project_feature_dataset_options(
+    result: &mut Value,
+    generation: &crate::bridge::DesktopGeneration,
+) -> Result<(), DesktopCommandError> {
+    let data = application_result_data(result)?
+        .as_object()
+        .ok_or_else(DesktopCommandError::internal)?;
+    let catalog_generation = data
+        .get("catalogGeneration")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(DesktopCommandError::internal)?;
+    let datasets = data
+        .get("datasets")
+        .and_then(Value::as_array)
+        .ok_or_else(DesktopCommandError::internal)?;
+    let mut choices = Vec::new();
+    choices
+        .try_reserve_exact(datasets.len())
+        .map_err(|_error| DesktopCommandError::internal())?;
+    for dataset in datasets {
+        let dataset = dataset
+            .as_object()
+            .ok_or_else(DesktopCommandError::internal)?;
+        let id = dataset
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(DesktopCommandError::internal)?;
+        let label = dataset
+            .get("label")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(DesktopCommandError::internal)?;
+        let examples = safe_web_count(
+            dataset
+                .get("examples")
+                .and_then(Value::as_u64)
+                .ok_or_else(DesktopCommandError::internal)?,
+        )?;
+        let observed_from = required_scalar(dataset, "observedFrom")?;
+        let observed_through = required_scalar(dataset, "observedThrough")?;
+        let available_uses = dataset
+            .get("availableUses")
+            .and_then(Value::as_array)
+            .filter(|uses| {
+                !uses.is_empty()
+                    && uses.iter().all(|use_case| {
+                        matches!(use_case.as_str(), Some("local_analysis" | "train"))
+                    })
+            })
+            .cloned()
+            .ok_or_else(DesktopCommandError::internal)?;
+        let choice = generation.register_research_preparation_choice(
+            format!("{catalog_generation}:{id}"),
+            json!({
+                "catalogGeneration": catalog_generation,
+                "dataset": id,
+            }),
+        )?;
+        choices.push(json!({
+            "choiceToken": choice,
+            "title": research_collection_title(label),
+            "examples": examples,
+            "observedFrom": observed_from,
+            "observedThrough": observed_through,
+            "availableUses": available_uses,
+        }));
+    }
+    *application_result_data_mut(result)? = json!({ "choices": choices });
+    project_product_metadata(result)
+}
+
+fn project_feature_dataset_preview(
+    result: &mut Value,
+    generation: &crate::bridge::DesktopGeneration,
+) -> Result<(), DesktopCommandError> {
+    let data = application_result_data(result)?
+        .as_object()
+        .ok_or_else(DesktopCommandError::internal)?;
+    let receipt = data
+        .get("receipt")
+        .cloned()
+        .filter(Value::is_object)
+        .ok_or_else(DesktopCommandError::internal)?;
+    let expires_at = receipt
+        .get("expiresAt")
+        .filter(|value| value.is_string() || value.is_number())
+        .cloned()
+        .ok_or_else(DesktopCommandError::internal)?;
+    let receipt_token = generation.register_research_preparation_receipt(receipt)?;
+    let projected = json!({
+        "receiptToken": receipt_token,
+        "intendedUse": required_string_value(data, "intendedUse")?,
+        "examples": required_safe_web_count(data, "examples")?,
+        "trainExamples": required_safe_web_count(data, "trainExamples")?,
+        "validationExamples": required_safe_web_count(data, "validationExamples")?,
+        "testExamples": required_safe_web_count(data, "testExamples")?,
+        "observedFrom": required_scalar(data, "observedFrom")?,
+        "observedThrough": required_scalar(data, "observedThrough")?,
+        "expiresAt": expires_at,
+    });
+    *application_result_data_mut(result)? = projected;
+    project_product_metadata(result)
+}
+
+fn project_research_action_accepted(result: &mut Value) -> Result<(), DesktopCommandError> {
+    *application_result_data_mut(result)? = json!({ "accepted": true });
+    set_product_item_counts(result, 1)?;
+    project_product_metadata(result)
+}
+
+fn required_string_value(
+    object: &Map<String, Value>,
+    field: &'static str,
+) -> Result<String, DesktopCommandError> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(DesktopCommandError::internal)
+}
+
+fn required_scalar(
+    object: &Map<String, Value>,
+    field: &'static str,
+) -> Result<Value, DesktopCommandError> {
+    object
+        .get(field)
+        .filter(|value| value.is_string() || value.is_number())
+        .cloned()
+        .ok_or_else(DesktopCommandError::internal)
+}
+
+fn required_safe_web_count(
+    object: &Map<String, Value>,
+    field: &'static str,
+) -> Result<u64, DesktopCommandError> {
+    object
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(DesktopCommandError::internal)
+        .and_then(safe_web_count)
+}
+
+fn project_research_activities(
+    result: &mut Value,
+    generation: &crate::bridge::DesktopGeneration,
+) -> Result<(), DesktopCommandError> {
+    let jobs = application_result_data(result)?
+        .get("jobs")
+        .and_then(Value::as_array)
+        .ok_or_else(DesktopCommandError::internal)?;
+    let mut activities = Vec::new();
+    activities
+        .try_reserve_exact(jobs.len())
+        .map_err(|_error| DesktopCommandError::internal())?;
+    for job in jobs {
+        let Some(activity) = project_research_activity(job, generation)? else {
+            continue;
+        };
+        activities.push(activity);
+    }
+    let count = safe_web_count(
+        u64::try_from(activities.len()).map_err(|_error| DesktopCommandError::internal())?,
+    )?;
+    *application_result_data_mut(result)? = json!({ "activities": activities });
+    set_product_item_counts(result, count)?;
+    project_product_metadata(result)
+}
+
+fn project_research_activity(
+    value: &Value,
+    generation: &crate::bridge::DesktopGeneration,
+) -> Result<Option<Value>, DesktopCommandError> {
+    let job = value
+        .as_object()
+        .ok_or_else(DesktopCommandError::internal)?;
+    let kind = job
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(DesktopCommandError::internal)?;
+    if !kind.starts_with("research.")
+        && kind != "analysis.phase-one-feature-derived-generation-job.v1"
+    {
+        return Ok(None);
+    }
+    let job_id = job
+        .get("jobId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(DesktopCommandError::internal)?;
+    let generation_value = job
+        .get("generation")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(DesktopCommandError::internal)?;
+    let sequence = job
+        .get("sequence")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(DesktopCommandError::internal)?;
+    let activity = generation.register_research_activity(
+        format!("{job_id}:{generation_value}"),
+        json!({
+            "jobId": job_id,
+            "generation": generation_value,
+            "expectedSequence": sequence,
+        }),
+    )?;
+    Ok(Some(project_research_activity_payload(job, activity)?))
+}
+
+fn project_research_activity_payload(
+    job: &Map<String, Value>,
+    activity: uuid::Uuid,
+) -> Result<Value, DesktopCommandError> {
+    let kind = job
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(DesktopCommandError::internal)?;
+    let state = job
+        .get("state")
+        .and_then(Value::as_str)
+        .ok_or_else(DesktopCommandError::internal)?;
+    let completed_units = optional_safe_web_count(job.get("completedUnits"))?;
+    let total_units = optional_safe_web_count(job.get("totalUnits"))?;
+    let cancellation_requested = job
+        .get("cancellationRequested")
+        .and_then(Value::as_bool)
+        .ok_or_else(DesktopCommandError::internal)?;
+    let retryable = state == "failed"
+        && job
+            .get("failure")
+            .and_then(Value::as_object)
+            .and_then(|failure| failure.get("retryable"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    Ok(json!({
+        "activityToken": activity,
+        "label": research_activity_label(kind),
+        "state": state,
+        "completedUnits": completed_units,
+        "totalUnits": total_units,
+        "cancellationRequested": cancellation_requested,
+        "updatedAt": job
+            .get("updatedAt")
+            .filter(|value| value.is_string() || value.is_number())
+            .cloned()
+            .ok_or_else(DesktopCommandError::internal)?,
+        "canCancel": matches!(
+            state,
+            "queued" | "preparing" | "running" | "awaiting_confirmation" | "recovering"
+        ) && !cancellation_requested,
+        "canRetry": retryable,
+    }))
+}
+
+fn research_activity_label(kind: &str) -> &'static str {
+    match kind {
+        "research.ingest-source.v1" => "Load research information",
+        "research.phase-one-derived-generation-job.v1" => "Prepare derived research data",
+        "analysis.phase-one-feature-derived-generation-job.v1" => "Prepare model features",
+        "research.dataset-export.v1" => "Export research history",
+        "research.sec-fund-publication.v1" => "Prepare company and fund reports",
+        _ => "Research activity",
+    }
+}
+
+fn optional_safe_web_count(value: Option<&Value>) -> Result<Option<u64>, DesktopCommandError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(DesktopCommandError::internal)
+            .and_then(safe_web_count)
+            .map(Some),
+    }
+}
+
+fn project_research_observation_row(row: &Value) -> Result<Value, DesktopCommandError> {
+    let row = row.as_object().ok_or_else(DesktopCommandError::internal)?;
+    let mut projected = Map::new();
+    copy_first_scalar(row, &mut projected, "revision", &["revision"]);
+    copy_first_scalar(row, &mut projected, "quality", &["quality"]);
+    copy_first_scalar(
+        row,
+        &mut projected,
+        "effectiveAt",
+        &[
+            "effective_at",
+            "effectiveAt",
+            "effective_date",
+            "effectiveDate",
+        ],
+    );
+    copy_first_scalar(
+        row,
+        &mut projected,
+        "publishedAt",
+        &[
+            "published_at",
+            "publishedAt",
+            "published_date",
+            "publishedDate",
+        ],
+    );
+    copy_first_scalar(
+        row,
+        &mut projected,
+        "availableAt",
+        &["available_at", "availableAt"],
+    );
+    copy_first_scalar(
+        row,
+        &mut projected,
+        "supersededAt",
+        &[
+            "superseded_at",
+            "supersededAt",
+            "superseded_date",
+            "supersededDate",
+        ],
+    );
+    Ok(Value::Object(projected))
+}
+
+fn copy_first_scalar(
+    source: &Map<String, Value>,
+    destination: &mut Map<String, Value>,
+    output: &str,
+    candidates: &[&str],
+) {
+    if let Some(value) = candidates
+        .iter()
+        .filter_map(|candidate| source.get(*candidate))
+        .find(|value| value.is_null() || value.is_string() || value.is_number())
+    {
+        destination.insert(output.to_owned(), value.clone());
+    }
+}
+
+fn research_collection_title(schema: &str) -> &'static str {
+    let name = schema.to_ascii_lowercase();
+    if name.contains("fund_nav") || name.contains("fund-nav") || name.contains("fund nav") {
+        "Mutual fund NAV history"
+    } else if name.contains("option") {
+        "Options history"
+    } else if name.contains("macro") || name.contains("economic") || name.contains("rate") {
+        "Economic indicators"
+    } else if name.contains("filing") || name.contains("fundamental") {
+        "Company and fund reports"
+    } else if name.contains("feature") {
+        "Model inputs"
+    } else if name.contains("label") || name.contains("outcome") {
+        "Model outcomes"
+    } else if name.contains("bar") || name.contains("price") || name.contains("eod") {
+        "Market price history"
+    } else {
+        "Research collection"
+    }
+}
+
+fn project_product_metadata(result: &mut Value) -> Result<(), DesktopCommandError> {
+    let metadata = result
+        .get_mut("metadata")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(DesktopCommandError::internal)?;
+    let completeness = metadata
+        .get("completeness")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(DesktopCommandError::internal)?
+        .to_owned();
+    let returned_items = safe_web_count(
+        metadata
+            .get("returnedItems")
+            .and_then(Value::as_u64)
+            .ok_or_else(DesktopCommandError::internal)?,
+    )?;
+    let available_items = safe_web_count(
+        metadata
+            .get("availableItems")
+            .and_then(Value::as_u64)
+            .ok_or_else(DesktopCommandError::internal)?,
+    )?;
+    *metadata = Map::from_iter([
+        ("completeness".to_owned(), json!(completeness)),
+        ("returnedItems".to_owned(), json!(returned_items)),
+        ("availableItems".to_owned(), json!(available_items)),
+        ("sourceCoverage".to_owned(), Value::Null),
+        ("dataQuality".to_owned(), json!({ "state": "available" })),
+    ]);
+    Ok(())
+}
+
+fn set_product_item_counts(result: &mut Value, count: u64) -> Result<(), DesktopCommandError> {
+    let metadata = result
+        .get_mut("metadata")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(DesktopCommandError::internal)?;
+    metadata.insert("returnedItems".to_owned(), json!(count));
+    metadata.insert("availableItems".to_owned(), json!(count));
+    Ok(())
+}
+
+fn application_result_data(result: &Value) -> Result<&Value, DesktopCommandError> {
+    result
+        .as_object()
+        .and_then(|result| result.get("data"))
+        .ok_or_else(DesktopCommandError::internal)
+}
+
+fn application_result_data_mut(result: &mut Value) -> Result<&mut Value, DesktopCommandError> {
+    result
+        .as_object_mut()
+        .and_then(|result| result.get_mut("data"))
+        .ok_or_else(DesktopCommandError::internal)
+}
+
+fn safe_web_count(value: u64) -> Result<u64, DesktopCommandError> {
+    if value <= MAXIMUM_SAFE_WEB_NUMBER {
+        Ok(value)
+    } else {
+        Err(DesktopCommandError::internal())
+    }
 }
 
 #[tauri::command]
@@ -590,15 +1164,6 @@ pub(crate) async fn operations_control(
             "Operations.RollbackSettings",
             preview_arguments(preview_id, preview_digest),
         ),
-        OperationsControlCommand::ApplySetupPlan {
-            preview_id,
-            preview_sha256,
-        } => {
-            let mut arguments = Map::new();
-            arguments.insert("previewId".to_owned(), json!(preview_id));
-            arguments.insert("previewSha256".to_owned(), json!(preview_sha256));
-            ("Setup.ApplyPlan", arguments)
-        }
     };
     invoke_application(
         ApplicationInvocation {
@@ -627,17 +1192,6 @@ pub(crate) async fn fair_value_control(
             invoke_narrow(
                 "FairValue.Measure",
                 arguments,
-                true,
-                confirmed,
-                &state,
-                &generation,
-            )
-            .await
-        }
-        FairValueControlCommand::Classify { measurement_id } => {
-            invoke_narrow(
-                "FairValue.Classify",
-                measurement_arguments(measurement_id),
                 true,
                 confirmed,
                 &state,
@@ -947,8 +1501,7 @@ pub(crate) async fn paper_control(
             InvocationAuthority::ReadOnly,
         ),
         PaperControlCommand::Submit {
-            target_id,
-            target_revision,
+            target_token,
             side,
             order_type,
             quantity_lots,
@@ -958,8 +1511,7 @@ pub(crate) async fn paper_control(
         } => {
             require_confirmation(confirmed)?;
             let mut arguments = Map::new();
-            arguments.insert("targetId".to_owned(), json!(target_id));
-            arguments.insert("targetRevision".to_owned(), json!(target_revision));
+            arguments.insert("targetToken".to_owned(), json!(target_token));
             arguments.insert("side".to_owned(), json!(side));
             arguments.insert("orderType".to_owned(), json!(order_type));
             arguments.insert("quantityLots".to_owned(), json!(quantity_lots));
@@ -973,16 +1525,12 @@ pub(crate) async fn paper_control(
             )
         }
         PaperControlCommand::Start {
-            provider,
-            provider_session_id,
             strategy_mode,
             initial_cash,
             fee_basis_points,
         } => {
             require_confirmation(confirmed)?;
             let mut arguments = Map::new();
-            arguments.insert("provider".to_owned(), json!(provider));
-            insert_optional(&mut arguments, "providerSessionId", provider_session_id);
             arguments.insert("strategyMode".to_owned(), json!(strategy_mode));
             arguments.insert("initialCash".to_owned(), json!(initial_cash));
             arguments.insert("feeBasisPoints".to_owned(), json!(fee_basis_points));
@@ -1000,10 +1548,10 @@ pub(crate) async fn paper_control(
                 InvocationAuthority::ExactConfirmed("Bot.Stop"),
             )
         }
-        PaperControlCommand::Cancel { order_id } => {
+        PaperControlCommand::Cancel { order_token } => {
             require_confirmation(confirmed)?;
             let mut arguments = Map::new();
-            arguments.insert("orderId".to_owned(), json!(order_id));
+            arguments.insert("orderToken".to_owned(), json!(order_token));
             (
                 "Execution.Cancel",
                 arguments,
@@ -1046,20 +1594,62 @@ pub(crate) async fn analysis_control(
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
     let generation = state.generation()?;
-    let (operation, arguments, mutation) = match request {
-        AnalysisControlCommand::FeatureDatasetOptions => (
-            "Analysis.GetFeatureDatasetPreparationOptions",
-            Map::new(),
-            false,
-        ),
-        AnalysisControlCommand::PreviewFeatureDataset { selection } => {
-            ("Analysis.PreviewFeatureDatasetBuild", selection, false)
+    match request {
+        AnalysisControlCommand::FeatureDatasetOptions => {
+            let mut result = invoke_narrow(
+                "Analysis.GetFeatureDatasetPreparationOptions",
+                Map::new(),
+                false,
+                confirmed,
+                &state,
+                &generation,
+            )
+            .await?;
+            project_feature_dataset_options(&mut result, &generation)?;
+            return Ok(result);
+        }
+        AnalysisControlCommand::PreviewFeatureDataset {
+            choice,
+            intended_use,
+        } => {
+            let authority = generation.resolve_research_preparation_choice(choice)?;
+            let mut arguments = authority
+                .as_object()
+                .cloned()
+                .ok_or_else(DesktopCommandError::internal)?;
+            arguments.insert("intendedUse".to_owned(), json!(intended_use));
+            let mut result = invoke_narrow(
+                "Analysis.PreviewFeatureDatasetBuild",
+                arguments,
+                false,
+                confirmed,
+                &state,
+                &generation,
+            )
+            .await?;
+            project_feature_dataset_preview(&mut result, &generation)?;
+            return Ok(result);
         }
         AnalysisControlCommand::StartPreparedFeatureDataset { receipt } => {
+            require_confirmation(confirmed)?;
+            let authority = generation.consume_research_preparation_receipt(receipt)?;
             let mut arguments = Map::new();
-            arguments.insert("receipt".to_owned(), Value::Object(receipt));
-            ("Analysis.StartPreparedFeatureDatasetBuild", arguments, true)
+            arguments.insert("receipt".to_owned(), authority);
+            let mut result = invoke_narrow(
+                "Analysis.StartPreparedFeatureDatasetBuild",
+                arguments,
+                true,
+                confirmed,
+                &state,
+                &generation,
+            )
+            .await?;
+            project_research_action_accepted(&mut result)?;
+            return Ok(result);
         }
+        _ => {}
+    }
+    let (operation, arguments, mutation) = match request {
         AnalysisControlCommand::BacktestOptions => {
             ("Analysis.GetBacktestPreparation", Map::new(), false)
         }
@@ -1073,6 +1663,9 @@ pub(crate) async fn analysis_control(
             arguments.insert("receipt".to_owned(), Value::Object(receipt));
             ("Analysis.StartPreparedBacktest", arguments, true)
         }
+        AnalysisControlCommand::FeatureDatasetOptions
+        | AnalysisControlCommand::PreviewFeatureDataset { .. }
+        | AnalysisControlCommand::StartPreparedFeatureDataset { .. } => unreachable!(),
     };
     invoke_narrow(
         operation,
@@ -1083,6 +1676,23 @@ pub(crate) async fn analysis_control(
         &generation,
     )
     .await
+}
+
+#[tauri::command]
+pub(crate) async fn backtest_products(
+    request: BacktestProductCommand,
+    state: State<'_, DesktopState>,
+) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
+    let (operation, arguments) = match request {
+        BacktestProductCommand::List => ("Analysis.ListProductBacktests", Map::new()),
+        BacktestProductCommand::Get { backtest_token } => {
+            let mut arguments = Map::new();
+            arguments.insert("backtestToken".to_owned(), json!(backtest_token));
+            ("Analysis.GetProductBacktest", arguments)
+        }
+    };
+    invoke_narrow(operation, arguments, false, false, &state, &generation).await
 }
 
 #[tauri::command]
@@ -1133,12 +1743,26 @@ pub(crate) async fn model_control(
 }
 
 #[tauri::command]
+pub(crate) async fn model_products(
+    request: ModelProductCommand,
+    state: State<'_, DesktopState>,
+) -> Result<Value, DesktopCommandError> {
+    let generation = state.generation()?;
+    let operation = match request {
+        ModelProductCommand::List => "Model.ListBundles",
+        ModelProductCommand::Activity => "Model.ListProductActivity",
+    };
+    invoke_narrow(operation, Map::new(), false, false, &state, &generation).await
+}
+
+#[tauri::command]
 pub(crate) async fn research_control(
     request: ResearchControlCommand,
     confirmed: bool,
     state: State<'_, DesktopState>,
 ) -> Result<Value, DesktopCommandError> {
     let generation = state.generation()?;
+    let mut product_projection = false;
     let (operation, arguments) = match request {
         ResearchControlCommand::DiscoverSourceObjects { provider, dataset } => (
             "Source.Discover",
@@ -1157,11 +1781,30 @@ pub(crate) async fn research_control(
             arguments.insert("discoveryReceipt".to_owned(), json!(discovery_receipt));
             ("Research.StartIngestSource", arguments)
         }
-        ResearchControlCommand::StartExport { dataset } => {
+        ResearchControlCommand::StartCollectionExport { collection } => {
+            product_projection = true;
+            let dataset = generation.resolve_research_collection(collection)?;
             ("Research.StartExport", dataset_arguments(dataset))
         }
+        ResearchControlCommand::CancelActivity { activity } => {
+            require_confirmation(confirmed)?;
+            product_projection = true;
+            let authority = generation.resolve_research_activity(activity)?;
+            ("Job.Cancel", research_activity_arguments(authority)?)
+        }
+        ResearchControlCommand::RetryActivity { activity } => {
+            require_confirmation(confirmed)?;
+            product_projection = true;
+            let authority = generation.resolve_research_activity(activity)?;
+            ("Job.Retry", research_activity_arguments(authority)?)
+        }
     };
-    invoke_narrow(operation, arguments, true, confirmed, &state, &generation).await
+    let mut result =
+        invoke_narrow(operation, arguments, true, confirmed, &state, &generation).await?;
+    if product_projection {
+        project_research_action_accepted(&mut result)?;
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1400,15 +2043,9 @@ fn model_arguments(model_id: String) -> Map<String, Value> {
     arguments
 }
 
-fn vintage_arguments(vintage_id: String) -> Map<String, Value> {
+fn forecast_arguments(forecast_token: uuid::Uuid) -> Map<String, Value> {
     let mut arguments = Map::new();
-    arguments.insert("vintageId".to_owned(), json!(vintage_id));
-    arguments
-}
-
-fn measurement_arguments(measurement_id: String) -> Map<String, Value> {
-    let mut arguments = Map::new();
-    arguments.insert("measurementId".to_owned(), json!(measurement_id));
+    arguments.insert("forecastToken".to_owned(), json!(forecast_token));
     arguments
 }
 
@@ -1604,6 +2241,22 @@ fn job_mutation_arguments(
     Ok(arguments)
 }
 
+fn research_activity_arguments(
+    authority: Value,
+) -> Result<Map<String, Value>, DesktopCommandError> {
+    let authority = authority
+        .as_object()
+        .ok_or_else(DesktopCommandError::internal)?;
+    let job_id = authority
+        .get("jobId")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<uuid::Uuid>().ok())
+        .ok_or_else(DesktopCommandError::internal)?;
+    let generation = required_string_value(authority, "generation")?;
+    let expected_sequence = required_string_value(authority, "expectedSequence")?;
+    job_mutation_arguments(job_id, generation, expected_sequence)
+}
+
 fn canonicalize_job_result(
     operation: &'static str,
     result: &mut Value,
@@ -1707,5 +2360,40 @@ fn insert_optional<T: serde::Serialize>(
 ) {
     if let Some(value) = value {
         arguments.insert(key.to_owned(), json!(value));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::project_research_activity_payload;
+
+    #[test]
+    fn research_activity_projection_keeps_internal_authority_native() {
+        let sentinel = "raw-provider-manifest-job-authority";
+        let raw = json!({
+            "jobId": "2e59a77e-5115-4860-92f2-61a18dd4136c",
+            "generation": "91",
+            "sequence": "7",
+            "kind": "research.ingest-source.v1",
+            "state": "running",
+            "completedUnits": 3,
+            "totalUnits": 10,
+            "cancellationRequested": false,
+            "updatedAt": "1800000000000000001",
+            "result": {"manifest": sentinel},
+            "failure": {"provider": sentinel},
+            "sourceCoverage": [sentinel],
+        });
+        let token = Uuid::from_u128(7);
+        let projected =
+            project_research_activity_payload(raw.as_object().expect("raw activity object"), token)
+                .expect("product activity projection");
+
+        assert_eq!(projected.get("activityToken"), Some(&json!(token)));
+        assert!(!projected.to_string().contains(sentinel));
+        assert_eq!(projected.as_object().map(serde_json::Map::len), Some(9));
     }
 }

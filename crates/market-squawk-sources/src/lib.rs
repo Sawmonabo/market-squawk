@@ -41,7 +41,7 @@ pub(crate) const fn conservative_arc_control_block_charge<T>() -> usize {
 pub use capture::{
     CaptureAdmissionError, CaptureAdmissionIssuer, CaptureAdmissionReceipt,
     CaptureDegradationCapability, CaptureGenerationCapabilities, CaptureGenerationHealth,
-    CaptureGenerationLease, CaptureInitializationControl,
+    CaptureGenerationLease, CaptureInitializationControl, CaptureProviderEventIdentityClaim,
 };
 pub use checksum::{
     ChecksumValidationError, ExactChecksumLevel, KRAKEN_V2_CANONICALIZATION_ID, KRAKEN_V2_SCOPE_ID,
@@ -196,27 +196,28 @@ pub use policy::{
     BudgetScope, BudgetUnavailableReason, BudgetWindowSemantics, EndpointDenialReason,
     EndpointPolicy, HttpClientProfile, HttpRequestBounds, MonotonicInstant, NetworkPolicyError,
     PathScope, PreparedProviderRateRegistrationBatch, ProviderBudgetPolicy, ProviderBudgetWindow,
-    ProviderRateAuthority, ProviderRateCollisionIdentity, ProviderRateCollisionKind,
-    ProviderRateDeclaration, ProviderRateDispatchDecision, ProviderRateExtensionKey,
-    ProviderRateExtensionRevision, ProviderRateExtensionState, ProviderRateGroupId,
-    ProviderRatePermitId, ProviderRateRegistration, ProviderRateReservationDecision,
-    ProviderRateReservationId, ProviderRateRunId, ProviderRateStore, ProviderRateStoreError,
-    QueryParameterRule, QuerySensitivity, RedirectAuthorization, RetryAfter, SharedProviderBudget,
-    apply_http_retry_after,
+    ProviderRateAuthority, ProviderRateAvailability, ProviderRateCollisionIdentity,
+    ProviderRateCollisionKind, ProviderRateDeclaration, ProviderRateDispatchDecision,
+    ProviderRateExtensionKey, ProviderRateExtensionRevision, ProviderRateExtensionState,
+    ProviderRateGroupId, ProviderRatePermitId, ProviderRateRegistration,
+    ProviderRateReservationDecision, ProviderRateReservationId, ProviderRateRunId,
+    ProviderRateStore, ProviderRateStoreError, QueryParameterRule, QuerySensitivity,
+    RedirectAuthorization, RetryAfter, SharedProviderBudget, apply_http_retry_after,
 };
 pub use registry::{
     ActiveLiveSourceGeneration, AuthoritativeSourceRegistry, CapturedDecodedProviderBatch,
     CurrentBatchIter, CurrentBatchKey, CurrentCoveragePolicy, CurrentDecodedProviderBatch,
     CurrentDecodedProviderBatches, CurrentFrameEvidence, CurrentHealthRecording,
-    CurrentHealthReporter, CurrentHealthUnqualification, CurrentHealthUpdate, CurrentLivePolicy,
+    CurrentHealthReporter, CurrentHealthUnqualification, CurrentHealthUpdate,
+    CurrentHttpResponseEvidence, CurrentLivePolicy, CurrentObservationEvidence,
     CurrentObservationIter, CurrentProviderObservation, CurrentSourceAuthorityLease,
     CurrentSourceSession, CurrentStreamKey, ExtractionAuthority, FrameSessionLease,
-    InstrumentUniverseAttestation, LiveSourceGeneration, ProviderBackoffAuthority,
-    ProviderBackoffDecision, ProviderBackoffError, RESEARCH_SOURCE_AUTHORITY_DIRECTORY,
-    RawFrameFactory, RegisteredSource, RegistryAuthorityState, RegistryError,
-    SessionControlDisposition, SessionIgnoredDisposition, SessionQuarantineDisposition,
-    SessionRecoveryDisposition, ValidatedCurrentSourceAuthority, ValidatedLiveScope,
-    ValidatedSessionDecodeOutcome, ValidatedSourceSession,
+    InstrumentUniverseAttestation, LiveSourceGeneration, NormalizedHttpResponseBatch,
+    ProviderBackoffAuthority, ProviderBackoffDecision, ProviderBackoffError,
+    RESEARCH_SOURCE_AUTHORITY_DIRECTORY, RawFrameFactory, RegisteredSource, RegistryAuthorityState,
+    RegistryError, SessionControlDisposition, SessionIgnoredDisposition,
+    SessionQuarantineDisposition, SessionRecoveryDisposition, ValidatedCurrentSourceAuthority,
+    ValidatedLiveScope, ValidatedSessionDecodeOutcome, ValidatedSourceSession,
 };
 pub use tls::{TlsProviderCapability, TlsProviderError, install_ring_tls_provider};
 

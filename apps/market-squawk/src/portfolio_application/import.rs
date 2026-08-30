@@ -28,6 +28,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use uuid::Uuid;
 
 use super::backup::{
     BACKUP_SCHEMA_VERSION, ImmutableBackupObject, PortfolioBackupEnvelope,
@@ -58,7 +59,10 @@ const MAX_PENDING_IMPORTS: usize = 4_096;
 pub(crate) struct PortfolioImportPreview {
     pub(crate) preview_id: String,
     pub(crate) preview_digest: [u8; 32],
+    /// Product-safe projection returned to ordinary presentation clients.
     pub(crate) result: Value,
+    /// Exact evidence retained for native governance and never returned to the WebView.
+    pub(crate) review: Value,
 }
 
 /// One ambiguity-only interpretation submitted at the governed commit boundary.
@@ -572,7 +576,7 @@ impl ImportAuthority {
             .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
         let imported = self.preview_batch(&batch)?;
         validate_account_binding(account_id, &imported)?;
-        let preview_body = preview_projection(
+        let mut review = review_projection(
             account_id,
             &imported,
             self.accounts
@@ -583,12 +587,22 @@ impl ImportAuthority {
             serde_json::to_vec(&json!({
                 "accountId": account_id.to_string(),
                 "artifactSha256": hex(&artifact_sha256),
-                "preview": preview_body,
+                "preview": review,
             }))
             .map_err(|_| PortfolioApplicationServiceError::Publication)?,
         )
         .into();
         let preview_id = hex(&preview_digest);
+        let review_token = import_review_token(preview_digest);
+        attach_review_tokens(&mut review, &review_token)?;
+        let result = product_preview_projection(
+            account_id,
+            &imported,
+            self.accounts
+                .get(&account_id)
+                .and_then(|history| history.revisions.last()),
+            &review_token,
+        )?;
         let artifact_reference = format!(
             "{IMMUTABLE_PREVIEW_NAMESPACE}/{}.json",
             hex(&artifact_sha256)
@@ -631,11 +645,8 @@ impl ImportAuthority {
         Ok(PortfolioImportPreview {
             preview_id,
             preview_digest,
-            result: json!({
-                "previewId": hex(&preview_digest),
-                "digest": hex(&preview_digest),
-                "preview": preview_body,
-            }),
+            result,
+            review,
         })
     }
 
@@ -663,7 +674,7 @@ impl ImportAuthority {
             .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?;
         let imported = self.preview_batch(&batch)?;
         validate_account_binding(pending.account_id, &imported)?;
-        let result = preview_projection(
+        let mut review = review_projection(
             pending.account_id,
             &imported,
             self.accounts
@@ -674,7 +685,7 @@ impl ImportAuthority {
             serde_json::to_vec(&json!({
                 "accountId": pending.account_id.to_string(),
                 "artifactSha256": hex(&pending.artifact_sha256),
-                "preview": result,
+                "preview": review,
             }))
             .map_err(|_| PortfolioApplicationServiceError::Publication)?,
         )
@@ -682,14 +693,20 @@ impl ImportAuthority {
         if digest != pending.preview_digest || hex(&digest) != pending.preview_id {
             return Err(PortfolioApplicationServiceError::CorruptPublication);
         }
+        let review_token = import_review_token(digest);
+        attach_review_tokens(&mut review, &review_token)?;
         Ok(PortfolioImportPreview {
             preview_id: pending.preview_id,
             preview_digest: digest,
-            result: json!({
-                "previewId": hex(&digest),
-                "digest": hex(&digest),
-                "preview": result,
-            }),
+            result: product_preview_projection(
+                pending.account_id,
+                &imported,
+                self.accounts
+                    .get(&pending.account_id)
+                    .and_then(|history| history.revisions.last()),
+                &review_token,
+            )?,
+            review,
         })
     }
 
@@ -782,7 +799,7 @@ impl ImportAuthority {
             .map_err(|_| PortfolioApplicationServiceError::CorruptPublication)?;
         let preview = self.preview_batch(&batch)?;
         validate_account_binding(pending.account_id, &preview)?;
-        let recomputed = preview_projection(
+        let recomputed = review_projection(
             pending.account_id,
             &preview,
             self.accounts
@@ -2180,7 +2197,7 @@ fn build_governed_core_revision(
 /// The projection is intentionally evidence-first: all user-selectable values are keys into
 /// retained normalized evidence, never caller-reported amounts or source references. Exact raw
 /// payloads remain private, but their immutable reference/digest are visible for audit.
-fn preview_projection(
+fn review_projection(
     account_id: AccountId,
     imported: &PortfolioImport,
     prior: Option<&PublishedRevision>,
@@ -2204,9 +2221,7 @@ fn preview_projection(
                 "value": hex(&evidence.raw_payload_digest().bytes()),
             },
             "sourceRevision": evidence.source_revision().as_str(),
-            "supersedesSourceRevision": evidence
-                .supersedes_source_revision()
-                .map(|value| value.as_str()),
+            "supersedesSourceRevision": evidence.supersedes_source_revision(),
             "classification": classification_name(evidence.classification()),
             "amount": {
                 "value": evidence.amount().amount().to_string(),
@@ -2274,6 +2289,141 @@ fn preview_projection(
             "specificIdentificationUsesOnlyServerEnumeratedLots": true,
         },
     }))
+}
+
+/// Builds the only import payload permitted to cross the ordinary product boundary.
+///
+/// Raw record references, broker transaction identifiers, revision coordinates, lot identities,
+/// and payload digests remain in `review_projection`. The product receives one opaque review token
+/// and bounded financial facts needed to make an informed interpretation.
+fn product_preview_projection(
+    account_id: AccountId,
+    imported: &PortfolioImport,
+    prior: Option<&PublishedRevision>,
+    review_token: &str,
+) -> Result<Value, PortfolioApplicationServiceError> {
+    let namespace =
+        Uuid::parse_str(review_token).map_err(|_| PortfolioApplicationServiceError::Publication)?;
+    let mut transactions = Vec::new();
+    transactions
+        .try_reserve_exact(imported.transaction_evidence().len())
+        .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)?;
+    for evidence in imported.transaction_evidence() {
+        let eligible_lots = eligible_lot_ids(prior, evidence);
+        let allowed = allowed_interpretations(evidence, &eligible_lots);
+        let options = allowed
+            .into_iter()
+            .map(|value| {
+                let requires_lot_selection = matches!(
+                    value,
+                    "sell_specific_identification" | "buy_to_cover_specific_identification"
+                );
+                json!({
+                    "value": value,
+                    "label": interpretation_label(value),
+                    "requiresLotSelection": requires_lot_selection,
+                })
+            })
+            .collect::<Vec<_>>();
+        transactions.push(json!({
+            "recordToken": review_record_token(
+                namespace,
+                evidence.logical_record_id().as_str(),
+            ),
+            "category": classification_name(evidence.classification()),
+            "amount": {
+                "amount": evidence.amount().amount().to_string(),
+                "currency": evidence.amount().currency().as_str(),
+            },
+            "quantity": evidence.quantity().map(|value| value.to_string()),
+            "occurredAtUnixNanos": evidence.occurred_at().unix_nanos().to_string(),
+            "interpretationOptions": options,
+            "eligibleLotCount": eligible_lots.len(),
+        }));
+    }
+    Ok(json!({
+        "reviewToken": review_token,
+        "accountId": account_id.to_string(),
+        "state": match imported.disposition() {
+            market_squawk_adapter_portfolio::ImportDisposition::Applied => "ready",
+            market_squawk_adapter_portfolio::ImportDisposition::Replay => "already_saved",
+        },
+        "recordCount": imported.raw_records().len(),
+        "transactionCount": imported.transaction_evidence().len(),
+        "dataIssueCount": imported.discrepancies().len(),
+        "transactions": transactions,
+        "requiresCorporateActionReview": imported.transaction_evidence().iter().any(|record| {
+            record.classification() == NormalizedPortfolioTransactionClass::CorporateAction
+        }),
+    }))
+}
+
+fn import_review_token(preview_digest: [u8; 32]) -> String {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!(
+            "market-squawk/portfolio-import-review/v1/{}",
+            hex(&preview_digest)
+        )
+        .as_bytes(),
+    )
+    .to_string()
+}
+
+fn review_record_token(namespace: Uuid, record_id: &str) -> String {
+    Uuid::new_v5(&namespace, record_id.as_bytes()).to_string()
+}
+
+fn attach_review_tokens(
+    review: &mut Value,
+    review_token: &str,
+) -> Result<(), PortfolioApplicationServiceError> {
+    let namespace =
+        Uuid::parse_str(review_token).map_err(|_| PortfolioApplicationServiceError::Publication)?;
+    let transactions = review
+        .get_mut("transactions")
+        .and_then(Value::as_array_mut)
+        .ok_or(PortfolioApplicationServiceError::Publication)?;
+    for transaction in transactions {
+        let object = transaction
+            .as_object_mut()
+            .ok_or(PortfolioApplicationServiceError::Publication)?;
+        let record_id = object
+            .get("recordId")
+            .and_then(Value::as_str)
+            .ok_or(PortfolioApplicationServiceError::Publication)?;
+        object.insert(
+            "recordToken".to_owned(),
+            Value::String(review_record_token(namespace, record_id)),
+        );
+    }
+    Ok(())
+}
+
+fn interpretation_label(value: &str) -> &'static str {
+    match value {
+        "buy" => "Buy",
+        "buy_to_cover" => "Buy to cover",
+        "sell" => "Sell",
+        "sell_short" => "Sell short",
+        "buy_lifo" => "Buy — last in, first out",
+        "buy_to_cover_lifo" => "Buy to cover — last in, first out",
+        "sell_lifo" => "Sell — last in, first out",
+        "sell_short_lifo" => "Sell short — last in, first out",
+        "buy_average_cost" => "Buy — average cost",
+        "buy_to_cover_average_cost" => "Buy to cover — average cost",
+        "sell_average_cost" => "Sell — average cost",
+        "sell_short_average_cost" => "Sell short — average cost",
+        "buy_specific_identification" => "Buy — specific lots",
+        "buy_to_cover_specific_identification" => "Buy to cover — specific lots",
+        "sell_specific_identification" => "Sell — specific lots",
+        "sell_short_specific_identification" => "Sell short — specific lots",
+        "dividend_income" => "Dividend income",
+        "interest_income" => "Interest income",
+        "staking_income" => "Staking income",
+        "other_income" => "Other income",
+        _ => "Review required",
+    }
 }
 
 fn eligible_lot_ids(
@@ -2536,14 +2686,13 @@ fn import_result(
     read::mutation_result(
         json!({
             "accountId": revision.account.account_id().to_string(),
-            "revisionId": hex(&revision.token().bytes()),
-            "disposition": disposition,
-            "sourceId": revision.source_id.as_str(),
-            "effectiveAtUnixNanos": revision.effective_at.unix_nanos().to_string(),
-            "availableAtUnixNanos": revision.available_at.map(|value| value.unix_nanos().to_string()),
-            "artifactSha256": hex(&revision.artifact_sha256),
-            "rawEvidenceRetained": true,
-            "reconciliationDiscrepancies": revision.discrepancies.len()
+            "state": match disposition {
+                "applied" => "saved",
+                "replay" => "unchanged",
+                _ => "saved",
+            },
+            "updatedAtUnixNanos": revision.effective_at.unix_nanos().to_string(),
+            "dataIssueCount": revision.discrepancies.len(),
         }),
         context,
         requested_maximum_bytes,

@@ -16,7 +16,7 @@ use super::{AnalyticalFeatureDataset, AnalyticalReadCapability, AnalyticalReadEr
 use crate::manifest::CatalogFeatureDatasetSelection;
 use crate::python_dataset::{finish_selection_hash, new_selection_hasher, update_selection_hash};
 use crate::{
-    CatalogEndpointIdentity, DatasetManifestRef, FeatureDatasetProductContract,
+    CatalogEndpointIdentity, DatasetManifestRef, DatasetSplit, FeatureDatasetProductContract,
     PythonDatasetCatalogError, PythonDatasetRow, PythonDatasetValue, Sha256Digest,
 };
 
@@ -66,6 +66,7 @@ pub struct ForecastFeatureRow {
     observed_effective_at: Option<Timestamp>,
     label_effective_at: Option<Timestamp>,
     target_coordinate_kind: u8,
+    split: DatasetSplit,
     component_kind: u8,
     component_name: Box<str>,
     component_version: u32,
@@ -98,6 +99,11 @@ impl ForecastFeatureRow {
     /// unsupported effective precision.
     pub const fn target_coordinate_kind(&self) -> u8 {
         self.target_coordinate_kind
+    }
+
+    /// Returns the exact chronological split retained by the admitted dataset row.
+    pub const fn split(&self) -> DatasetSplit {
+        self.split
     }
 
     pub const fn component_kind(&self) -> u8 {
@@ -317,7 +323,13 @@ fn decode_row(
     let observed_effective_at = optional_timestamp(batch, "observed_effective_at", index)?;
     let label_effective_at = optional_timestamp(batch, "label_effective_at", index)?;
     let target_coordinate_kind = uint8(batch, "target_coordinate_kind")?.value(index);
-    let split = uint8(batch, "split")?.value(index);
+    let split_tag = uint8(batch, "split")?.value(index);
+    let split = match split_tag {
+        1 => DatasetSplit::Train,
+        2 => DatasetSplit::Validation,
+        3 => DatasetSplit::Test,
+        _ => return Err(PythonDatasetCatalogError::CorruptAdmission.into()),
+    };
     let component_kind = uint8(batch, "component_kind")?.value(index);
     let component_name = padded_text(fixed("component_name")?, index)?;
     let component_version = batch
@@ -369,7 +381,7 @@ fn decode_row(
         observed_effective_at,
         label_effective_at,
         target_coordinate_kind,
-        split,
+        split_tag,
         component_kind,
         component_name,
         component_version,
@@ -386,6 +398,7 @@ fn decode_row(
             observed_effective_at,
             label_effective_at,
             target_coordinate_kind,
+            split,
             component_kind,
             component_name: component_name.into(),
             component_version,

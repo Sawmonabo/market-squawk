@@ -19,13 +19,14 @@ import {
   type LucideIcon,
 } from "lucide-react"
 
-import type { DesktopBootstrap } from "@/lib/schemas"
+import { productCapabilitySet } from "@/lib/product-capabilities"
+import type { DesktopBootstrap, ProductCapability } from "@/lib/schemas"
 
 export interface NavigationItem {
   label: string
   path: string
   icon: LucideIcon
-  domain?: string
+  capabilities?: readonly ProductCapability[]
 }
 
 export interface NavigationSection {
@@ -41,18 +42,23 @@ const homeNavigation: NavigationItem = {
 
 export const everydayNavigation: NavigationItem[] = [
   homeNavigation,
-  { label: "Markets", path: "/markets", icon: BarChart3, domain: "market" },
+  {
+    label: "Markets",
+    path: "/markets",
+    icon: BarChart3,
+    capabilities: ["market_overview", "market_universe"],
+  },
   {
     label: "Opportunities",
     path: "/opportunities",
     icon: Crosshair,
-    domain: "decision",
+    capabilities: ["decision_screen_list", "decision_analysis_list"],
   },
   {
     label: "Portfolio",
     path: "/portfolio",
     icon: BriefcaseBusiness,
-    domain: "portfolio",
+    capabilities: ["portfolio_account_list", "portfolio_holdings"],
   },
 ]
 
@@ -61,7 +67,7 @@ export const paperExecutionNavigation: NavigationItem[] = [
     label: "Paper Execution",
     path: "/paper-execution",
     icon: FileTerminal,
-    domain: "execution",
+    capabilities: ["execution_orders", "bot_status"],
   },
 ]
 
@@ -71,31 +77,31 @@ export const advancedNavigation: NavigationItem[] = [
     label: "Research & Data",
     path: "/advanced/research-data",
     icon: FlaskConical,
-    domain: "research",
+    capabilities: ["research_dataset_list", "macro_context"],
   },
   {
     label: "Models & Forecasts",
     path: "/advanced/models-forecasts",
     icon: Bot,
-    domain: "model",
+    capabilities: ["model_evidence", "forecast_list"],
   },
   {
     label: "Backtests",
     path: "/advanced/backtests",
     icon: FileClock,
-    domain: "analysis",
+    capabilities: ["backtest_preparation", "backtest_activity"],
   },
   {
     label: "Valuation & Targets",
     path: "/advanced/valuation-targets",
     icon: Landmark,
-    domain: "fair_value",
+    capabilities: ["fair_value_measurement", "fair_value_workspace"],
   },
   {
     label: "Risk & Recommendation Policy",
     path: "/advanced/risk-recommendation-policy",
     icon: ShieldCheck,
-    domain: "bot",
+    capabilities: ["portfolio_risk", "risk_kill_switch", "bot_status"],
   },
 ]
 
@@ -104,7 +110,6 @@ export const connectionsSystemNavigation: NavigationItem[] = [
     label: "Connections & Sources",
     path: "/connections/sources",
     icon: Database,
-    domain: "source",
   },
   { label: "AI Connections", path: "/system/ai-connections", icon: Network },
   {
@@ -157,13 +162,14 @@ export function navigationAdmission(
   item: NavigationItem,
   bootstrap: DesktopBootstrap,
 ): NavigationAdmission {
-  const operationReady =
-    !item.domain ||
-    bootstrap.operations.some((operation) => operation.domain === item.domain)
-  if (!operationReady) {
+  const capabilities = productCapabilitySet(bootstrap)
+  const capabilityReady =
+    !item.capabilities ||
+    item.capabilities.some((capability) => capabilities.has(capability))
+  if (!capabilityReady) {
     return {
       admitted: false,
-      reason: `The installed application does not expose the ${item.label} service.`,
+      reason: `${item.label} is not available in this workspace.`,
     }
   }
   return { admitted: true, reason: null }

@@ -309,8 +309,109 @@ pub(super) struct AlpacaHistoricalSlotCompletion {
     >,
 }
 
+/// Coordinator-owned terminal evidence for one exact historical-parent drain.
+#[derive(Clone, Debug)]
+enum AlpacaHistoricalDrainEvidence {
+    Installed {
+        parent: AlpacaHistoricalParentGeneration,
+        admission: ResearchProviderAdmission,
+    },
+    NoInstallation,
+}
+
+/// Non-cloneable proof that one exact Alpaca history parent can be retired.
+///
+/// The coordinator mints this only after its retained drain worker has revoked and drained every
+/// publication lease for the exact parent. A missing installation is also bound to the exact
+/// parent requested by the caller, so sequence B cannot reuse the receipt for another runtime
+/// generation.
+pub(crate) struct AlpacaHistoricalSuccessorDrainReceipt {
+    retired_parent: AlpacaHistoricalParentGeneration,
+    proof: AlpacaHistoricalDrainProof,
+    _private: (),
+}
+
+enum AlpacaHistoricalDrainProof {
+    Installed(ResearchProviderAdmission),
+    NoInstallation,
+}
+
+impl AlpacaHistoricalSuccessorDrainReceipt {
+    fn try_from_evidence(
+        retired_parent: AlpacaHistoricalParentGeneration,
+        evidence: AlpacaHistoricalDrainEvidence,
+    ) -> Result<Self, AlpacaHistoricalSourceSlotError> {
+        let proof = match evidence {
+            AlpacaHistoricalDrainEvidence::Installed { parent, admission } => {
+                if parent != retired_parent {
+                    return Err(AlpacaHistoricalSourceSlotError::StaleParent);
+                }
+                if !admission.revocation_drained() {
+                    return Err(AlpacaHistoricalSourceSlotError::DrainIncomplete);
+                }
+                AlpacaHistoricalDrainProof::Installed(admission)
+            }
+            AlpacaHistoricalDrainEvidence::NoInstallation => {
+                AlpacaHistoricalDrainProof::NoInstallation
+            }
+        };
+        Ok(Self {
+            retired_parent,
+            proof,
+            _private: (),
+        })
+    }
+
+    /// Revalidates the proof against the exact capability being retired.
+    pub(crate) fn validate_retired_runtime(
+        &self,
+        runtime: &AlpacaHistoricalRuntimeCapability,
+    ) -> Result<(), AlpacaHistoricalSourceSlotError> {
+        let current = AlpacaHistoricalParentGeneration::try_from_runtime(runtime)?;
+        if current != self.retired_parent {
+            return Err(AlpacaHistoricalSourceSlotError::StaleParent);
+        }
+        if let AlpacaHistoricalDrainProof::Installed(admission) = &self.proof
+            && !admission.revocation_drained()
+        {
+            return Err(AlpacaHistoricalSourceSlotError::DrainIncomplete);
+        }
+        Ok(())
+    }
+
+    /// Rejects same-parent reminting before sequence B publishes a successor runtime.
+    pub(crate) fn validate_fresh_successor(
+        &self,
+        retired: &AlpacaHistoricalRuntimeCapability,
+        successor: &AlpacaHistoricalRuntimeCapability,
+    ) -> Result<(), AlpacaHistoricalSourceSlotError> {
+        self.validate_retired_runtime(retired)?;
+        if !successor.is_fresh_generation_from(retired) {
+            return Err(AlpacaHistoricalSourceSlotError::StaleParent);
+        }
+        let successor_parent = AlpacaHistoricalParentGeneration::try_from_runtime(successor)?;
+        if successor_parent == self.retired_parent
+            || successor_parent.group_generation() == self.retired_parent.group_generation()
+        {
+            return Err(AlpacaHistoricalSourceSlotError::StaleParent);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for AlpacaHistoricalSuccessorDrainReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AlpacaHistoricalSuccessorDrainReceipt")
+            .field("retired_parent", &self.retired_parent)
+            .finish_non_exhaustive()
+    }
+}
+
 pub(super) struct AlpacaHistoricalDrainCompletion {
-    sender: watch::Sender<Option<Result<(), AlpacaHistoricalSourceSlotError>>>,
+    sender: watch::Sender<
+        Option<Result<AlpacaHistoricalDrainEvidence, AlpacaHistoricalSourceSlotError>>,
+    >,
 }
 
 impl AlpacaHistoricalDrainCompletion {
@@ -319,7 +420,10 @@ impl AlpacaHistoricalDrainCompletion {
         Arc::new(Self { sender })
     }
 
-    fn complete(&self, result: Result<(), AlpacaHistoricalSourceSlotError>) {
+    fn complete(
+        &self,
+        result: Result<AlpacaHistoricalDrainEvidence, AlpacaHistoricalSourceSlotError>,
+    ) {
         self.sender.send_replace(Some(result));
     }
 
@@ -327,10 +431,10 @@ impl AlpacaHistoricalDrainCompletion {
         &self,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<(), AlpacaHistoricalSourceSlotError> {
+    ) -> Result<AlpacaHistoricalDrainEvidence, AlpacaHistoricalSourceSlotError> {
         let mut receiver = self.sender.subscribe();
         loop {
-            if let Some(result) = *receiver.borrow() {
+            if let Some(result) = receiver.borrow().clone() {
                 return result;
             }
             tokio::select! {
@@ -694,7 +798,16 @@ impl AlpacaHistoricalSourceMutationAuthority {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(), AlpacaHistoricalSourceSlotError> {
-        self.drain_exact(parent, deadline, cancellation).await
+        self.drain_exact(parent, deadline, cancellation)
+            .await
+            .map(|_receipt| ())
+    }
+
+    pub(crate) fn parent_for_runtime(
+        &self,
+        runtime: &AlpacaHistoricalRuntimeCapability,
+    ) -> Result<AlpacaHistoricalParentGeneration, AlpacaHistoricalSourceSlotError> {
+        AlpacaHistoricalParentGeneration::try_from_runtime(runtime)
     }
 
     pub(crate) async fn drain_exact(
@@ -702,8 +815,9 @@ impl AlpacaHistoricalSourceMutationAuthority {
         parent: AlpacaHistoricalParentGeneration,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<(), AlpacaHistoricalSourceSlotError> {
-        drain_slot(&self.coordinator, Some(parent), deadline, cancellation).await
+    ) -> Result<AlpacaHistoricalSuccessorDrainReceipt, AlpacaHistoricalSourceSlotError> {
+        let evidence = drain_slot(&self.coordinator, Some(parent), deadline, cancellation).await?;
+        AlpacaHistoricalSuccessorDrainReceipt::try_from_evidence(parent, evidence)
     }
 }
 
@@ -711,7 +825,9 @@ pub(super) async fn drain_before_registry_close(
     coordinator: &ProductionResearchIngestCoordinator,
     deadline: Instant,
 ) -> Result<(), AlpacaHistoricalSourceSlotError> {
-    drain_slot(coordinator, None, deadline, &CancellationToken::new()).await
+    drain_slot(coordinator, None, deadline, &CancellationToken::new())
+        .await
+        .map(|_evidence| ())
 }
 
 fn ensure_plan_receipt_wait_current(
@@ -732,10 +848,10 @@ async fn drain_slot(
     expected_parent: Option<AlpacaHistoricalParentGeneration>,
     deadline: Instant,
     cancellation: &CancellationToken,
-) -> Result<(), AlpacaHistoricalSourceSlotError> {
+) -> Result<AlpacaHistoricalDrainEvidence, AlpacaHistoricalSourceSlotError> {
     loop {
         enum Action {
-            Done,
+            Done(AlpacaHistoricalDrainEvidence),
             WaitInstall(Arc<AlpacaHistoricalSlotCompletion>),
             WaitDrain(Arc<AlpacaHistoricalDrainCompletion>),
             StartDrain(
@@ -749,7 +865,9 @@ async fn drain_slot(
                 .lock()
                 .map_err(|_error| AlpacaHistoricalSourceSlotError::CoordinatorUnavailable)?;
             match &authority.alpaca_historical {
-                AlpacaHistoricalSourceSlot::Absent => Action::Done,
+                AlpacaHistoricalSourceSlot::Absent => {
+                    Action::Done(AlpacaHistoricalDrainEvidence::NoInstallation)
+                }
                 AlpacaHistoricalSourceSlot::Installing {
                     parent, completion, ..
                 } => {
@@ -797,12 +915,18 @@ async fn drain_slot(
                     if expected_parent.is_some_and(|expected| expected != stable.parent) {
                         return Err(AlpacaHistoricalSourceSlotError::StaleParent);
                     }
-                    Action::Done
+                    if !stable.admission.revocation_drained() {
+                        return Err(AlpacaHistoricalSourceSlotError::DrainIncomplete);
+                    }
+                    Action::Done(AlpacaHistoricalDrainEvidence::Installed {
+                        parent: stable.parent,
+                        admission: stable.admission.clone(),
+                    })
                 }
             }
         };
         match action {
-            Action::Done => return Ok(()),
+            Action::Done(evidence) => return Ok(evidence),
             Action::WaitInstall(completion) => {
                 match completion.wait(deadline, cancellation).await {
                     Err(
@@ -840,7 +964,12 @@ fn spawn_drain_worker(
                     () = tokio::time::sleep_until(tokio::time::Instant::from_std(worker_deadline)) => {
                         Err(AlpacaHistoricalSourceSlotError::DrainIncomplete)
                     }
-                    () = stable.admission.revoke_and_drain() => Ok(()),
+                    () = stable.admission.revoke_and_drain() => {
+                        Ok(AlpacaHistoricalDrainEvidence::Installed {
+                            parent: stable.parent,
+                            admission: stable.admission.clone(),
+                        })
+                    },
                 }
             }
             None => Err(AlpacaHistoricalSourceSlotError::DrainIncomplete),
@@ -864,8 +993,12 @@ fn spawn_drain_worker(
                 AlpacaHistoricalSourceSlot::ReconciliationRequired(stable);
             Err(error)
         } else {
+            let evidence = AlpacaHistoricalDrainEvidence::Installed {
+                parent: stable.parent,
+                admission: stable.admission.clone(),
+            };
             authority.alpaca_historical = AlpacaHistoricalSourceSlot::Stopped(stable);
-            Ok(())
+            Ok(evidence)
         };
         drop(authority);
         completion.complete(result);

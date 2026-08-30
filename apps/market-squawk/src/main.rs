@@ -16,14 +16,12 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use market_squawk::{
     AppConfig, AppPaths, DiagnosticEngine, DiagnosticEngineSnapshot, LocalProduct,
-    ProductionSourceProvider,
     cli::{
-        Cli, Command, ConfigCommand, McpCommand, OutputFormat, ProductionSourceArgument,
-        ReleaseCommand, ReleaseEvidenceCommand, ServiceCommand, SourceCommand,
+        Cli, Command, ConfigCommand, McpCommand, OutputFormat, ReleaseCommand,
+        ReleaseEvidenceCommand, ServiceCommand, SourceCommand,
     },
     doctor,
     local_product::{execute_installed_cli_command, verified_installed_service_program},
-    paper_bot::local_paper_bot,
     release::execute_release_command,
     replay::replay_coinbase_journal,
     service::InstalledServiceConnector,
@@ -209,56 +207,8 @@ async fn run() -> Result<()> {
             let snapshot = finish_run_source(disposition).await?;
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
-        Command::PaperBot(arguments) => {
-            let provider = match arguments.provider {
-                ProductionSourceArgument::Coinbase => ProductionSourceProvider::Coinbase,
-                ProductionSourceArgument::Kraken => ProductionSourceProvider::Kraken,
-                ProductionSourceArgument::CoinbaseDirect => {
-                    return Err(anyhow!(
-                        "Coinbase Direct requires `market-squawk bot start` so the exact \
-                         provider-onboarding session and application authority are retained"
-                    ));
-                }
-            };
-            let seconds = arguments.seconds;
-            let initial_cash = arguments.initial_cash;
-            let fee_basis_points = arguments.fee_basis_points;
-            let config = load_config(config_file.as_deref(), cli_overrides)?;
-            let composition = local_paper_bot(config, provider, initial_cash, fee_basis_points)?;
-            let cancellation = CancellationToken::new();
-            let runtime = composition.start(cancellation.clone()).await?;
-            let primary = match seconds {
-                Some(seconds) => {
-                    tokio::time::sleep(Duration::from_secs(seconds)).await;
-                    None
-                }
-                None => tokio::signal::ctrl_c()
-                    .await
-                    .err()
-                    .map(|error| anyhow!(error).context("failed to listen for Ctrl-C")),
-            };
-            let shutdown = cancel_and_shutdown_paper_bot(
-                &cancellation,
-                primary,
-                runtime.shutdown(),
-                |shutdown| shutdown.is_complete(),
-            )
-            .await?;
-            let paper = shutdown
-                .paper()
-                .as_ref()
-                .map_err(|error| anyhow!(error.to_string()))?;
-            println!(
-                "paper bot stopped cleanly: sequence={}, orders={}, fills={}",
-                paper.sequence(),
-                paper.orders().len(),
-                paper.fills().len()
-            );
-        }
         Command::Mcp { command } => {
-            let Some(McpCommand::Serve { client }) = command else {
-                anyhow::bail!("mcp serve requires --client claude-code or --client codex");
-            };
+            let McpCommand::Serve { client } = command;
             let termination = TerminationSignals::install()?;
             let config = load_config(config_file.as_deref(), cli_overrides)?;
             let client = NamedClient::from(client);

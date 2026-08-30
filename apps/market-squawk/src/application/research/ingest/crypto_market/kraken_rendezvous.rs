@@ -8,7 +8,10 @@ use std::{
 };
 
 use market_squawk_adapter_coinbase::{
-    CoinbaseMarketNonPublicationReason, CoinbaseMarketSealRejoin,
+    CoinbaseMarketHandoff, CoinbaseMarketNonPublicationReason, CoinbaseMarketOmission,
+    CoinbaseMarketOmissionReason, CoinbaseMarketPublicationContext,
+    CoinbaseMarketQualificationOutcome, CoinbaseMarketRawLineage, CoinbaseMarketSealRejoin,
+    CoinbaseQualifiedDirectReplayRow, CoinbaseQualifiedMarketPublication,
 };
 use market_squawk_adapter_kraken::{
     KrakenPublicationUnavailable, KrakenSealedMarketPublicationMaterial,
@@ -51,20 +54,26 @@ impl CryptoPublicationRendezvousLimits {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct FrameKey {
+struct SourceObjectKey {
     source_id: SourceId,
     generation: ConnectionGeneration,
-    generation_frame_ordinal: u64,
+    coordinate: SourceObjectCoordinate,
     raw_payload_digest: EvidenceDigest,
 }
 
-impl FrameKey {
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum SourceObjectCoordinate {
+    TransportFrame(u64),
+    HttpResponse(EvidenceDigest),
+}
+
+impl SourceObjectKey {
     fn from_material(material: &KrakenSealedMarketPublicationMaterial) -> Self {
         let evidence = material.evidence();
         Self {
             source_id: evidence.source_id().clone(),
             generation: evidence.connection_generation(),
-            generation_frame_ordinal: evidence.generation_frame_ordinal(),
+            coordinate: SourceObjectCoordinate::TransportFrame(evidence.generation_frame_ordinal()),
             raw_payload_digest: evidence.raw_payload_digest(),
         }
     }
@@ -75,20 +84,68 @@ impl FrameKey {
         Ok(Self {
             source_id: material.source_id().clone(),
             generation: material.connection_generation(),
-            generation_frame_ordinal: material.frame_id()?.get(),
+            coordinate: SourceObjectCoordinate::TransportFrame(material.frame_id()?.get()),
             raw_payload_digest: material.raw_payload_digest(),
         })
     }
 
-    fn from_lease(lease: &CommittedResearchMarketObservationLease) -> Self {
+    fn direct(
+        handoff: &CoinbaseMarketHandoff,
+    ) -> Result<(Self, Self, usize), CryptoMarketPublicationError> {
+        let CoinbaseMarketRawLineage::DirectInitial(lineage) = handoff.raw_lineage() else {
+            return Err(CryptoMarketPublicationError::RendezvousUnavailable);
+        };
+        let decoder = handoff.typed_batch().evidence();
+        let snapshot = lineage.snapshot().receipt();
+        let terminal = lineage
+            .replay()
+            .last()
+            .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?;
+        if terminal.decoder_evidence().frame_id() != decoder.frame_id()
+            || terminal.decoder_evidence().payload_digest() != decoder.payload_digest()
+            || !terminal
+                .decoder_evidence()
+                .binding()
+                .shares_allocation_with(decoder.binding())
+            || !snapshot.binding().shares_allocation_with(decoder.binding())
+        {
+            return Err(CryptoMarketPublicationError::RendezvousUnavailable);
+        }
+        Ok((
+            Self {
+                source_id: snapshot.source_id().clone(),
+                generation: snapshot.connection_generation(),
+                coordinate: SourceObjectCoordinate::HttpResponse(snapshot.coordinate_digest()),
+                raw_payload_digest: snapshot.body_digest(),
+            },
+            Self {
+                source_id: decoder.binding().source_id().clone(),
+                generation: decoder.binding().connection_generation(),
+                coordinate: SourceObjectCoordinate::TransportFrame(decoder.frame_id().get()),
+                raw_payload_digest: decoder.payload_digest(),
+            },
+            lineage.replay().len(),
+        ))
+    }
+
+    fn from_lease(
+        lease: &CommittedResearchMarketObservationLease,
+    ) -> Result<Self, CryptoMarketPublicationError> {
         let observation = lease.observation();
         let binding = observation.qualification().binding();
-        Self {
+        Ok(Self {
             source_id: binding.source_id().clone(),
             generation: observation.connection_generation(),
-            generation_frame_ordinal: observation.frame_id().get(),
+            coordinate: match observation.source_coordinate().evidence() {
+                market_squawk_sources::CurrentObservationEvidence::TransportFrame(evidence) => {
+                    SourceObjectCoordinate::TransportFrame(evidence.frame_id().get())
+                }
+                market_squawk_sources::CurrentObservationEvidence::HttpResponse(evidence) => {
+                    SourceObjectCoordinate::HttpResponse(evidence.receipt().coordinate_digest())
+                }
+            },
             raw_payload_digest: binding.payload_digest(),
-        }
+        })
     }
 }
 
@@ -99,9 +156,9 @@ struct PendingRows {
 
 #[derive(Default)]
 struct State {
-    rows: HashMap<FrameKey, PendingRows>,
-    sealed: HashMap<FrameKey, usize>,
-    deadlines: HashMap<FrameKey, Instant>,
+    rows: HashMap<SourceObjectKey, PendingRows>,
+    sealed: HashMap<SourceObjectKey, usize>,
+    deadlines: HashMap<SourceObjectKey, Instant>,
     retained_bytes: usize,
 }
 
@@ -224,7 +281,7 @@ impl CryptoPendingFrameIngress {
         observed_at: market_squawk_domain::Timestamp,
         precommit_authority: Arc<dyn market_squawk_data::IngestPrecommitAuthority>,
     ) -> Result<KrakenMarketApplicationOutcome, CryptoMarketPublicationError> {
-        let key = FrameKey::from_material(&material);
+        let key = SourceObjectKey::from_material(&material);
         let Some(retained_bytes) = material.conservative_retained_bytes() else {
             return Ok(unavailable(
                 material,
@@ -266,7 +323,7 @@ impl CryptoPendingFrameIngress {
         observed_at: market_squawk_domain::Timestamp,
         precommit_authority: Arc<dyn market_squawk_data::IngestPrecommitAuthority>,
     ) -> Result<CoinbaseMarketApplicationOutcome, CryptoMarketPublicationError> {
-        let key = FrameKey::from_coinbase(&material)?;
+        let key = SourceObjectKey::from_coinbase(&material)?;
         let expected = material.expected_row_count();
         let Some(retained_bytes) = material.conservative_retained_bytes() else {
             return Ok(CoinbaseMarketApplicationOutcome::SealedRaw(
@@ -297,9 +354,89 @@ impl CryptoPendingFrameIngress {
             .await
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the exact Direct raw graph, committed source objects, authority, and deadline remain explicit"
+    )]
+    pub(crate) async fn publish_coinbase_direct_when_committed(
+        &self,
+        publication: &CryptoMarketPublicationClosure,
+        handoff: CoinbaseMarketHandoff,
+        context: CoinbaseMarketPublicationContext,
+        analytical_dataset: market_squawk_data::DatasetId,
+        idempotency_key: String,
+        observed_at: market_squawk_domain::Timestamp,
+        precommit_authority: Arc<dyn market_squawk_data::IngestPrecommitAuthority>,
+    ) -> Result<CoinbaseMarketApplicationOutcome, CryptoMarketPublicationError> {
+        let (snapshot_key, terminal_key, replay_count) = SourceObjectKey::direct(&handoff)?;
+        let retained_bytes = direct_retained_bytes(&handoff)
+            .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?;
+        let snapshot = self.wait_for_rows(snapshot_key, 1, retained_bytes).await;
+        let terminal = self.wait_for_rows(terminal_key, 1, retained_bytes).await;
+        let qualification = match (snapshot, terminal) {
+            (Some(mut snapshot), Some(mut terminal)) => {
+                let initial_snapshot = snapshot
+                    .pop()
+                    .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?
+                    .into_observation()
+                    .into_parts()
+                    .event;
+                let replay = terminal
+                    .pop()
+                    .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?
+                    .into_observation()
+                    .into_parts()
+                    .event;
+                let terminal_ordinal = replay_count
+                    .checked_sub(1)
+                    .and_then(|ordinal| u16::try_from(ordinal).ok())
+                    .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?;
+                let mut replay_omissions = Vec::new();
+                replay_omissions
+                    .try_reserve_exact(usize::from(terminal_ordinal))
+                    .map_err(|_| CryptoMarketPublicationError::RendezvousUnavailable)?;
+                for ordinal in 0..terminal_ordinal {
+                    replay_omissions.push(CoinbaseMarketOmission::new(
+                        ordinal,
+                        CoinbaseMarketOmissionReason::UnsupportedCanonicalFamily,
+                    ));
+                }
+                CoinbaseMarketQualificationOutcome::Qualified(
+                    CoinbaseQualifiedMarketPublication::ExchangeDirect {
+                        initial_snapshot,
+                        replay_rows: vec![CoinbaseQualifiedDirectReplayRow::new(
+                            terminal_ordinal,
+                            replay,
+                        )],
+                        replay_omissions,
+                    },
+                )
+            }
+            _ => CoinbaseMarketQualificationOutcome::Unavailable(
+                CoinbaseMarketNonPublicationReason::ApplicationBackpressure,
+            ),
+        };
+        let deadline = Instant::now()
+            .checked_add(self.core.limits.frame_timeout)
+            .ok_or(CryptoMarketPublicationError::RendezvousUnavailable)?;
+        publication
+            .seal_and_publish_coinbase(
+                handoff,
+                context,
+                qualification,
+                analytical_dataset,
+                idempotency_key,
+                observed_at,
+                precommit_authority,
+                self.core.cancellation.clone(),
+                deadline,
+            )
+            .await
+    }
+
     async fn wait_for_rows(
         &self,
-        key: FrameKey,
+        key: SourceObjectKey,
         expected: usize,
         retained_bytes: usize,
     ) -> Option<Vec<CommittedResearchMarketObservationLease>> {
@@ -326,7 +463,7 @@ impl CryptoPendingFrameIngress {
         }
     }
 
-    async fn frame_deadline(&self, key: &FrameKey) -> Option<Instant> {
+    async fn frame_deadline(&self, key: &SourceObjectKey) -> Option<Instant> {
         if self.core.cancellation.is_cancelled() {
             return None;
         }
@@ -346,7 +483,7 @@ impl CryptoPendingFrameIngress {
 
     async fn take_complete_rows(
         &self,
-        key: &FrameKey,
+        key: &SourceObjectKey,
         expected: usize,
     ) -> Option<Vec<CommittedResearchMarketObservationLease>> {
         let mut state = self.core.state.lock().await;
@@ -364,7 +501,7 @@ impl CryptoPendingFrameIngress {
         pending.rows.into_iter().collect()
     }
 
-    async fn admit_material(&self, key: &FrameKey, retained_bytes: usize) -> bool {
+    async fn admit_material(&self, key: &SourceObjectKey, retained_bytes: usize) -> bool {
         let mut state = self.core.state.lock().await;
         if !state.deadlines.contains_key(key) || state.sealed.contains_key(key) {
             return false;
@@ -380,7 +517,7 @@ impl CryptoPendingFrameIngress {
         true
     }
 
-    async fn discard(&self, key: &FrameKey) {
+    async fn discard(&self, key: &SourceObjectKey) {
         let mut state = self.core.state.lock().await;
         if let Some(pending) = state.rows.remove(key) {
             state.retained_bytes = state.retained_bytes.saturating_sub(pending.retained_bytes);
@@ -411,7 +548,7 @@ impl CryptoCommittedRowIngress {
         {
             return Err(CryptoMarketPublicationError::RendezvousUnavailable);
         }
-        let key = FrameKey::from_lease(&lease);
+        let key = SourceObjectKey::from_lease(&lease)?;
         let retained_bytes = lease.retained_bytes();
         let row_slot_bytes = std::mem::size_of::<Option<CommittedResearchMarketObservationLease>>()
             .checked_mul(row_count)
@@ -479,6 +616,26 @@ impl CryptoCommittedRowIngress {
         self.core.changed.notify_waiters();
         Ok(())
     }
+}
+
+fn direct_retained_bytes(handoff: &CoinbaseMarketHandoff) -> Option<usize> {
+    let CoinbaseMarketRawLineage::DirectInitial(lineage) = handoff.raw_lineage() else {
+        return None;
+    };
+    let snapshot = lineage.snapshot().receipt();
+    std::mem::size_of::<CoinbaseMarketHandoff>()
+        .checked_add(handoff.typed_batch().retained_bytes().ok()?)?
+        .checked_add(usize::try_from(snapshot.body_length()).ok()?)?
+        .checked_add(snapshot.final_url().len())?
+        .checked_add(snapshot.segments().len().checked_mul(std::mem::size_of::<
+            market_squawk_sources::HttpResponseSegmentReceipt,
+        >())?)?
+        .checked_add(lineage.replay().len().checked_mul(std::mem::size_of::<
+            market_squawk_adapter_coinbase::CoinbaseDirectReplayFrame,
+        >())?)?
+        .checked_add(lineage.replay().iter().try_fold(0_usize, |total, frame| {
+            total.checked_add(frame.raw_payload().as_bytes().len())
+        })?)
 }
 
 fn unavailable(

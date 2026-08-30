@@ -41,8 +41,8 @@ use super::super::order_level::{
 };
 use super::super::route_actor::{RouteActorWorker, RouteBufferLimits, spawn_route_activation};
 use super::super::sink::{
-    ProductionPredecodedMarketSinkInput, ProductionRawMarketSink, ProductionSinkConstructionError,
-    ProductionSinkFailure,
+    CoinbaseCapturedPublicationIngress, ProductionPredecodedMarketSinkInput,
+    ProductionRawMarketSink, ProductionSinkConstructionError, ProductionSinkFailure,
 };
 use super::super::subscription_state::{
     GenerationIdentity, SubscriptionConstructionError, SubscriptionLimits, SubscriptionStateMachine,
@@ -111,6 +111,7 @@ pub(super) async fn run_product(
     admission: CoinbaseDirectRuntimeAdmission,
     capture_process: CaptureProcessInfrastructure,
     live_ingress: LiveRuntimeIngress,
+    publication: CoinbaseCapturedPublicationIngress,
     order_level: Option<OrderLevelDirectory>,
     route_buffer_limits: RouteBufferLimits,
     signer: Arc<CoinbaseDirectHmacSigner>,
@@ -145,6 +146,7 @@ pub(super) async fn run_product(
         admission,
         capture_process,
         live_ingress,
+        &publication,
         order_level.as_ref(),
         route_buffer_limits,
         signer.as_ref(),
@@ -181,6 +183,7 @@ async fn run_product_loop(
     admission: CoinbaseDirectRuntimeAdmission,
     capture_process: CaptureProcessInfrastructure,
     live_ingress: LiveRuntimeIngress,
+    publication: &CoinbaseCapturedPublicationIngress,
     order_level: Option<&OrderLevelDirectory>,
     route_buffer_limits: RouteBufferLimits,
     signer: &CoinbaseDirectHmacSigner,
@@ -204,6 +207,7 @@ async fn run_product_loop(
             admission,
             capture_process,
             live_ingress.clone(),
+            publication.clone(),
             order_level,
             route_buffer_limits,
             signer,
@@ -338,6 +342,7 @@ async fn run_generation(
     admission: CoinbaseDirectRuntimeAdmission,
     capture_process: CaptureProcessInfrastructure,
     live_ingress: LiveRuntimeIngress,
+    publication: CoinbaseCapturedPublicationIngress,
     order_level: Option<&OrderLevelDirectory>,
     route_buffer_limits: RouteBufferLimits,
     signer: &CoinbaseDirectHmacSigner,
@@ -488,6 +493,23 @@ async fn run_generation(
             bootstrap_permit,
             order_level_ingress,
             order_level_publish_timeout,
+            publication,
+            spec.config
+                .metadata()
+                .coverage()
+                .live()
+                .ok_or(CoinbaseDirectProductRuntimeError::ActivationBinding)?
+                .provider_product()
+                .as_source_identifier()
+                .clone(),
+            spec.config
+                .metadata()
+                .coverage()
+                .live()
+                .ok_or(CoinbaseDirectProductRuntimeError::ActivationBinding)?
+                .provider_channel()
+                .as_source_identifier()
+                .clone(),
         );
         let session_result = match order_level_monitor.as_mut() {
             Some(monitor) => tokio::select! {

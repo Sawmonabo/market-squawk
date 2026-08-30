@@ -72,7 +72,10 @@ fn assessment_provenance_retains_binding_payload_and_assessment_reference() -> T
         unsupported_evidence(1, TradingStatus::Active)?,
     )?;
     let provenance = provenance(&qualified.event)?;
-    let frame = fixture.observations[0].frame_evidence();
+    let frame = fixture.observations[0]
+        .evidence()
+        .transport_frame()
+        .expect("fixture transport frame");
 
     assert_eq!(provenance.binding(), qualified.assessment.binding());
     assert_eq!(

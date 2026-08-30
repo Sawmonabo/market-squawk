@@ -6,6 +6,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { formatMoney } from "@/lib/formatters"
+import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { DesktopBootstrap } from "@/lib/schemas"
 import type { ProductTransport } from "@/lib/transport"
 
@@ -39,9 +40,9 @@ export function PortfolioScenarios({
   bootstrap: DesktopBootstrap
   transport: ProductTransport
 }) {
-  const operations = new Set(bootstrap.operations.map((operation) => operation.name))
-  const canRunOne = operations.has("Portfolio.EvaluateScenario")
-  const canRunBatch = operations.has("Portfolio.EvaluateScenarioBatch")
+  const capabilities = productCapabilitySet(bootstrap)
+  const canRunOne = capabilities.has("portfolio_scenario")
+  const canRunBatch = capabilities.has("portfolio_scenario_batch")
   const [scope, setScope] = React.useState("all")
   const [shock, setShock] = React.useState("-10")
   const [composition, setComposition] = React.useState<"additive" | "compounded">("additive")
@@ -54,7 +55,7 @@ export function PortfolioScenarios({
   const mutation = useMutation({
     mutationFn: async ({ batch, basisPoints }: { batch: boolean; basisPoints: number }) => {
       const instrumentIds =
-        scope === "all" ? holdings.map((holding) => holding.instrument_id) : [scope]
+        scope === "all" ? holdings.map((holding) => holding.instrumentId) : [scope]
       const scenarios = (batch ? [1, 2, 3] : [1]).map((multiple) => {
         const scaled = basisPoints * multiple
         return {
@@ -144,8 +145,8 @@ export function PortfolioScenarios({
               >
                 <option value="all">Every holding</option>
                 {holdings.map((holding) => (
-                  <option key={holding.instrument_id} value={holding.instrument_id}>
-                    {shortIdentity(holding.instrument_id, "Asset")}
+                  <option key={holding.instrumentId} value={holding.instrumentId}>
+                    {shortIdentity(holding.instrumentId, "Asset")}
                   </option>
                 ))}
               </select>

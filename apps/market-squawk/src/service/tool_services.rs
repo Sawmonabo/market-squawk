@@ -5,8 +5,8 @@ use std::{sync::Arc, time::Instant};
 use async_trait::async_trait;
 use market_squawk_domain::{SourceIdentifier, Timestamp};
 use market_squawk_jobs::{
-    JobAuthority, JobAuthorityError, JobGeneration, JobId, JobOrigin, JobRepository,
-    JobRepositoryError, JobSnapshot, JobState, SqliteJobRepository,
+    JobAuthority, JobAuthorityError, JobGeneration, JobId, JobListPageLimit, JobOrigin,
+    JobRepository, JobRepositoryError, JobSnapshot, JobState, SqliteJobRepository,
 };
 use market_squawk_runtime::{ClientId, InputStager, InputTicketId, RuntimeIdentity};
 use market_squawk_services::{
@@ -21,8 +21,11 @@ use crate::{
     LocalProduct,
     application::{
         Application, DatasetPreparationPreviewRequest, DatasetPreparationReceipt,
-        DatasetPreparationSelection, lifecycle::WorkspaceRuntimeIdentity,
-        operations::OperationsApplicationServices, recommendation::RecommendationSetupAuthority,
+        DatasetPreparationSelection,
+        lifecycle::WorkspaceRuntimeIdentity,
+        model::{LIST_PRODUCT_ACTIVITY, product_model_activity},
+        operations::OperationsApplicationServices,
+        recommendation::RecommendationSetupAuthority,
     },
     jobs::{InstalledJobAuthority, InstalledJobRunners},
     local_product::cli_dataset::admit_inline_phase_one_derived_generation_request,
@@ -54,7 +57,6 @@ const START_PREPARED_FEATURE_DATASET: &str = "Analysis.StartPreparedFeatureDatas
 const START_SCENARIO: &str = "Analysis.StartScenarioBatch";
 const START_BACKTEST: &str = "Analysis.StartBacktest";
 const START_TRAINING: &str = "Model.StartTraining";
-const START_FORECAST: &str = "Model.StartForecast";
 const TRAINING_CONFIG_MEDIA_TYPE: &str = "market-squawk.training-config.v1";
 const TRAINING_AUTHORITY_MEDIA_TYPE: &str = "market-squawk.model-authority.v1";
 const RESEARCH_INGEST_JOB_KIND: &str = "research.ingest-source.v1";
@@ -177,6 +179,7 @@ impl InstalledToolServices {
             dataset_preparation: InstalledResearchDatasetPreparation::new(product.research()),
             backtest_preparation: InstalledBacktestPreparation::try_new(
                 product.research().analytical_reader(),
+                product.backtests(),
                 runtime,
             )?,
             forecast_preparation,
@@ -184,6 +187,7 @@ impl InstalledToolServices {
             decisions: InstalledDecisionOperations::try_new(
                 Arc::clone(&application),
                 product.decisions(),
+                product.fair_value_service().dossier_read_capability(),
                 product.research().analytical_reader(),
                 product.portfolio().fair_value_reader(),
                 runtime,
@@ -427,15 +431,6 @@ impl InstalledToolServices {
                     .map_err(map_training_admission)?;
                 (admission, JobAdmissionOwner::Training)
             }
-            START_FORECAST => {
-                let terminal = self.terminal_request(request, "Model.GenerateForecast")?;
-                let admission = self
-                    .runners
-                    .forecast()
-                    .admit(terminal, limits, captured_at)
-                    .map_err(map_forecast_admission)?;
-                (admission, JobAdmissionOwner::Forecast)
-            }
             START_PREPARED_FORECAST => {
                 let terminal = self.forecast_preparation.consume(request, context).await?;
                 let admission = self
@@ -462,6 +457,22 @@ impl InstalledToolServices {
         let retained = admission.clone();
         let metadata = job_receipt_metadata(request)?;
         match self.jobs.start(admission, context, metadata).await {
+            Ok(result)
+                if matches!(
+                    revoke,
+                    JobAdmissionOwner::Backtest | JobAdmissionOwner::Forecast
+                ) =>
+            {
+                let queued = TypedToolResult::try_new(
+                    serde_json::json!({"state": "queued"}),
+                    1,
+                    ToolResultMetadata::complete_not_applicable(),
+                    context.limits(),
+                )
+                .map_err(ServiceError::from)?;
+                drop(result);
+                Ok(Some(queued))
+            }
             Ok(result) => Ok(Some(result)),
             Err(error) => {
                 self.revoke(revoke, &retained);
@@ -855,6 +866,40 @@ impl ToolServices for InstalledToolServices {
                 .map_err(ServiceError::from)?;
             return Ok(result);
         }
+        if request.name() == LIST_PRODUCT_ACTIVITY {
+            let descriptor = self
+                .application
+                .capabilities()
+                .find(request.name())
+                .cloned()
+                .ok_or(ServiceError::NotFound)?;
+            if descriptor.version() != request.version()
+                || descriptor.contract() != request.contract()
+            {
+                return Err(ServiceError::InvalidRequest);
+            }
+            ensure_live(&context)?;
+            let maximum = context.limits().maximum_result_items().min(1_024);
+            let limit = JobListPageLimit::try_new(maximum)
+                .map_err(|_error| ServiceError::InvalidRequest)?;
+            let page = self.jobs.list_page(limit).await?;
+            let activities = page
+                .jobs()
+                .iter()
+                .filter_map(product_model_activity)
+                .collect::<Vec<_>>();
+            let result = TypedToolResult::try_new(
+                serde_json::json!({"activities": activities}),
+                activities.len(),
+                ToolResultMetadata::complete_not_applicable(),
+                context.limits(),
+            )
+            .map_err(ServiceError::from)?;
+            result
+                .validate_for(&descriptor)
+                .map_err(ServiceError::from)?;
+            return Ok(result);
+        }
         if matches!(
             request.name(),
             GET_FEATURE_DATASET_PREPARATION | PREVIEW_FEATURE_DATASET
@@ -955,7 +1000,10 @@ impl ToolServices for InstalledToolServices {
             {
                 return Err(ServiceError::InvalidRequest);
             }
-            let result = self.backtest_preparation.call(&request, &context).await?;
+            let result = self
+                .backtest_preparation
+                .call(&request, &context, &self.jobs)
+                .await?;
             result
                 .validate_for(&descriptor)
                 .map_err(ServiceError::from)?;

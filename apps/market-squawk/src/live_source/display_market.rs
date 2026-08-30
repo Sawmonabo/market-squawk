@@ -264,6 +264,8 @@ pub(crate) enum DisplayMarketIntegrityFailure {
     ProvenanceMismatch,
     #[error("observation payload is not a supported quote, trade, or status event")]
     UnsupportedPayload,
+    #[error("source object is not applicable to the live display projection")]
+    NonDisplaySourceObject,
     #[error("display-only authority rejected executable, stale, or quarantined source quality")]
     InvalidQuality,
     #[error("provider frame identity did not strictly advance")]
@@ -1530,7 +1532,13 @@ fn project_batch(
     let mut update = ProjectedUpdate::default();
     for current in batch.into_observations() {
         validate_observation_identity(&current, &batch_authority, key, validated_at)?;
-        let frame_id = current.frame_evidence().frame_id();
+        let frame_id = current
+            .evidence()
+            .transport_frame()
+            .ok_or(DisplayMarketTerminalFailure::Integrity(
+                DisplayMarketIntegrityFailure::NonDisplaySourceObject,
+            ))?
+            .frame_id();
         match update.frame_id {
             None => update.frame_id = Some(frame_id),
             Some(expected) if expected == frame_id => {}
@@ -1565,7 +1573,7 @@ fn validate_observation_identity(
         .current_lease()
         .validate_at(validated_at)
         .map_err(DisplayMarketTerminalFailure::Registry)?;
-    let binding = current.frame_evidence().binding();
+    let binding = current.evidence().binding();
     let authority_binding = current.current_lease().binding();
     let policy = current.policy();
     let coverage = policy.coverage();
@@ -1700,7 +1708,13 @@ fn project_observation(
             rule.version(),
         ),
     };
-    let frame = current.frame_evidence();
+    let frame =
+        current
+            .evidence()
+            .transport_frame()
+            .ok_or(DisplayMarketTerminalFailure::Integrity(
+                DisplayMarketIntegrityFailure::NonDisplaySourceObject,
+            ))?;
     let policy = current.policy();
     let coverage = policy.coverage();
     let received_at = frame.received_at();

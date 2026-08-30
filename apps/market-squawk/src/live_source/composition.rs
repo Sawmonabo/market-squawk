@@ -60,9 +60,11 @@ use super::sink::{
 };
 use super::supervisor::{ProductionSourceSupervisor, ProductionSupervisorError};
 use crate::provider_activation::CryptoMarketPublicationPackage;
-use coinbase_publication_supervisor::CoinbasePublicationSupervisor;
+pub(in crate::live_source) use coinbase_publication_supervisor::{
+    CoinbasePublicationSupervisor, CoinbasePublicationSupervisorError,
+};
 use kraken_publication_supervisor::KrakenPublicationSupervisor;
-use live_runtime::ProductionLiveRuntimeOwner;
+pub(in crate::live_source) use live_runtime::ProductionLiveRuntimeOwner;
 
 const SOURCE_ID: &str = "coinbase-exchange-public";
 const PROVISIONAL_METADATA_REVISION: &str = "coinbase-advanced-trade-v1-provisional";
@@ -80,8 +82,8 @@ const BACKOFF_JITTER_BASIS_POINTS: u16 = 2_000;
 const MAX_CLOCK_SKEW_NANOS: u64 = 1_000_000_000;
 const PRE_ACKNOWLEDGEMENT_DATA_MESSAGE_CAPACITY: usize = 64;
 const PRE_ACKNOWLEDGEMENT_DATA_BYTE_CAPACITY: usize = 32 * 1024 * 1024;
-const CRYPTO_PUBLICATION_CHANNEL_CAPACITY: usize = 4;
-const CRYPTO_PUBLICATION_RETAINED_FRAMES: usize = 8;
+pub(in crate::live_source) const CRYPTO_PUBLICATION_CHANNEL_CAPACITY: usize = 4;
+pub(in crate::live_source) const CRYPTO_PUBLICATION_RETAINED_FRAMES: usize = 8;
 
 struct CryptoPublicationStartup {
     package: CryptoMarketPublicationPackage,
@@ -221,7 +223,7 @@ fn validate_crypto_publication_topology(
     }
 }
 
-fn committed_research_exports(
+pub(in crate::live_source) fn committed_research_exports(
     routes: &[LiveRouteConfig],
     capacity: NonZeroUsize,
     maximum_retained_bytes: NonZeroUsize,
@@ -1167,15 +1169,22 @@ impl ProductionLiveSourceRuntime {
 #[derive(Debug)]
 pub(super) struct SupervisorDropCancellation {
     token: CancellationToken,
+    armed: bool,
 }
 
 impl SupervisorDropCancellation {
     pub(super) const fn new(token: CancellationToken) -> Self {
-        Self { token }
+        Self { token, armed: true }
     }
 
     pub(super) fn cancel(&self) {
-        self.token.cancel();
+        if self.armed {
+            self.token.cancel();
+        }
+    }
+
+    pub(super) fn disarm(mut self) {
+        self.armed = false;
     }
 }
 

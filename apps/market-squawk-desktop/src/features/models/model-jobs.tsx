@@ -1,16 +1,16 @@
 import { Activity, AlertTriangle, CheckCircle2, Clock3 } from "lucide-react"
 
-import { humanize } from "@/lib/formatters"
+import { formatTimestamp } from "@/lib/time"
 
-import type { ModelJob } from "./models-contracts"
+import type { ModelActivity } from "./models-contracts"
 
 export function ModelJobActivity({
-  jobs,
+  activities,
   available,
   loading,
   error,
 }: {
-  jobs: ModelJob[]
+  activities: ModelActivity[]
   available: boolean
   loading: boolean
   error: string | null
@@ -20,75 +20,69 @@ export function ModelJobActivity({
       <div className="flex items-center gap-3">
         <Activity className="size-4 text-primary" aria-hidden="true" />
         <div>
-          <h2 className="text-sm font-semibold">Durable model activity</h2>
+          <h2 className="text-sm font-semibold">Research activity</h2>
           <p className="mt-1 text-xs text-muted-foreground">
-            Recent training, evaluation, and forecast activity.
+            Recent model and forecast preparation.
           </p>
         </div>
       </div>
       {!available ? (
-        <Message text="Model activity is unavailable in this workspace." />
+        <Message text="Research activity is unavailable in this workspace." />
       ) : loading ? (
-        <Message text="Loading model jobs…" />
+        <Message text="Loading research activity…" />
       ) : error ? (
-        <Message text="Model activity is unavailable right now. Try refreshing the page." />
-      ) : jobs.length === 0 ? (
-        <Message text="No durable model or training job has been retained." />
+        <Message text="Research activity is unavailable right now. Try refreshing the page." />
+      ) : activities.length === 0 ? (
+        <Message text="No recent model or forecast activity." />
       ) : (
         <ul className="mt-4 grid gap-2">
-          {jobs.map((job) => {
-            const progress =
-              job.completedUnits !== null && job.totalUnits !== null && job.totalUnits > 0
-                ? Math.min(100, (job.completedUnits / job.totalUnits) * 100)
-                : null
-            const Icon = job.failure
-              ? AlertTriangle
-              : job.state === "completed"
-                ? CheckCircle2
-                : Clock3
+          {activities.map((activity) => {
+            const Icon =
+              activity.state === "failed"
+                ? AlertTriangle
+                : activity.state === "completed"
+                  ? CheckCircle2
+                  : Clock3
             return (
-              <li key={`${job.jobId}:${job.generation}`} className="rounded-lg border border-border bg-background/25 p-3">
+              <li
+                key={activity.activityToken}
+                className="rounded-lg border border-border bg-background/25 p-3"
+              >
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="flex min-w-0 items-start gap-2.5">
-                    <Icon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+                    <Icon
+                      className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
+                      aria-hidden="true"
+                    />
                     <div className="min-w-0">
-                      <p className="truncate text-xs font-medium">{humanize(job.kind)}</p>
-                      <p className="mt-1 font-mono text-[10px] text-muted-foreground">
-                        Job {job.jobId}
+                      <p className="truncate text-xs font-medium">
+                        {activity.label}
+                      </p>
+                      <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                        {activity.statusMessage}
                       </p>
                     </div>
                   </div>
                   <span className="rounded-full border border-border px-2 py-0.5 text-[10px] uppercase tracking-wider text-muted-foreground">
-                    {humanize(job.state)}
+                    {activity.state === "running"
+                      ? "In progress"
+                      : activity.state.charAt(0).toUpperCase() +
+                        activity.state.slice(1)}
                   </span>
                 </div>
-                {job.phase ? <p className="mt-2 text-xs text-muted-foreground">Phase: {humanize(job.phase)}</p> : null}
-                {progress !== null ? (
-                  <div className="mt-2" aria-label={`${progress.toFixed(0)} percent complete`}>
-                    <div className="h-1.5 overflow-hidden rounded-full bg-muted">
-                      <div className="h-full bg-primary" style={{ width: `${progress}%` }} />
-                    </div>
-                    <p className="mt-1 text-[10px] text-muted-foreground">
-                      {job.completedUnits?.toLocaleString()} / {job.totalUnits?.toLocaleString()} units
-                    </p>
-                  </div>
-                ) : null}
-                {job.failure ? (
-                  <p className="mt-2 text-xs leading-5 text-red-300">
-                    {humanize(job.failure.class)}: {job.failure.diagnostic}
-                    {job.failure.retryable ? " · retryable" : " · not retryable"}
+                {activity.progressPercent ? (
+                  <p className="mt-2 text-[11px] text-muted-foreground">
+                    {activity.progressPercent}% complete
                   </p>
                 ) : null}
-                {job.recovery ? <p className="mt-2 text-xs text-amber-200">Recovery: {job.recovery}</p> : null}
+                <p className="mt-1 text-[10px] text-muted-foreground">
+                  Updated {formatTimestamp(activity.updatedAtUnixNanos)}
+                </p>
               </li>
             )
           })}
         </ul>
       )}
-      <p className="mt-3 text-[11px] leading-5 text-muted-foreground">
-        Cancellation, retry, and exact confirmation remain centralized in Operations, where the
-        the latest job state is checked before the change is applied.
-      </p>
     </section>
   )
 }

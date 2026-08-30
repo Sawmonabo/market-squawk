@@ -8,6 +8,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { OpportunitiesReadExperience } from "@/features/opportunities"
+import { productCapabilitySet } from "@/lib/product-capabilities"
 import type { ProductTransport } from "@/lib/transport"
 
 import { CandidateDossierWorkspace } from "./candidate-dossier"
@@ -41,21 +42,17 @@ export function DecisionsPage() {
     )
   }
 
-  const readOperationNames = new Set(
-    product.bootstrap.operations
-      .filter((operation) => operation.readOnly)
-      .map((operation) => operation.name),
-  )
+  const capabilities = productCapabilitySet(product.bootstrap)
 
   return (
     <ReadyDecisions
       transport={product.transport}
       scope={product.bootstrap.runtime}
       investmentReadsAvailable={
-        readOperationNames.has("Decision.ListInvestmentAnalyses") &&
-        readOperationNames.has("Decision.GetInvestmentAnalysis")
+        capabilities.has("decision_analysis_list") &&
+        capabilities.has("decision_analysis")
       }
-      manualAnalysisAvailable={readOperationNames.has("Decision.ListScreens")}
+      manualAnalysisAvailable={capabilities.has("decision_screen_list")}
     />
   )
 }

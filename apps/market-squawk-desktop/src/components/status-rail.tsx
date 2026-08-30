@@ -1,12 +1,12 @@
 import * as React from "react"
 
 import type { ProductScope } from "@/app/query-client"
-import {
-  type EventConnectionState,
-  useProduct,
-} from "@/app/product-context"
+import { useProduct } from "@/app/product-context"
 import { GlobalLookup } from "@/features/lookup/global-lookup"
-import { useOperationalQueries } from "@/features/overview/use-overview"
+import {
+  isActiveResearchActivity,
+  useHomeStatusQueries,
+} from "@/features/overview/use-overview"
 import type { ProductTransport } from "@/lib/transport"
 
 export function StatusRail() {
@@ -14,7 +14,7 @@ export function StatusRail() {
 
   return (
     <section
-      aria-label="Operational status"
+      aria-label="Workspace summary"
       className="flex min-h-7 shrink-0 items-center gap-4 border-b border-border/70 bg-card/20 px-5 font-mono text-[9px] uppercase tracking-wide text-muted-foreground"
     >
       <StatusFact
@@ -23,17 +23,13 @@ export function StatusRail() {
           product.status === "loading"
             ? "Starting"
             : product.status === "ready"
-              ? product.bootstrap.storage.label
+              ? "Ready"
               : "Unavailable"
         }
-        ready={product.status === "ready" && product.bootstrap.storage.state === "ready"}
+        ready={product.status === "ready"}
       />
       {product.status === "ready" ? (
         <>
-          <EventConnectionFact
-            state={product.eventConnection}
-            onRetry={product.retryEventConnection}
-          />
           <ReadyStatusRail
             transport={product.transport}
             scope={product.bootstrap.runtime}
@@ -53,47 +49,6 @@ export function StatusRail() {
   )
 }
 
-function EventConnectionFact({
-  state,
-  onRetry,
-}: {
-  state: EventConnectionState
-  onRetry: () => void
-}) {
-  if (state.status === "unavailable") {
-    return (
-      <button
-        type="button"
-        className="font-medium text-[var(--danger)] hover:underline"
-        onClick={onRetry}
-      >
-        Updates unavailable · retry
-      </button>
-    )
-  }
-  const value = (() => {
-    switch (state.status) {
-      case "inactive":
-        return "Inactive"
-      case "connecting":
-        return "Connecting"
-      case "connected":
-        return "Connected"
-      case "reconnecting":
-        return `Retry ${state.attempt}/${state.maximumAttempts}`
-      case "resynchronizing":
-        return "Resynchronizing"
-    }
-  })()
-  return (
-    <StatusFact
-      label="Updates"
-      value={value}
-      ready={state.status === "connected"}
-    />
-  )
-}
-
 function ReadyStatusRail({
   transport,
   scope,
@@ -101,12 +56,10 @@ function ReadyStatusRail({
   transport: ProductTransport
   scope: ProductScope
 }) {
-  const status = useOperationalQueries(transport, scope)
-  const activeJobs =
-    status.jobs.status === "ready"
-      ? status.jobs.data.jobs.filter(
-          (job) => !["completed", "failed", "cancelled", "interrupted"].includes(job.state),
-        ).length
+  const status = useHomeStatusQueries(transport, scope)
+  const activeAnalyses =
+    status.activities.status === "ready"
+      ? status.activities.data.filter(isActiveResearchActivity).length
       : null
   return (
     <>
@@ -116,9 +69,13 @@ function ReadyStatusRail({
         ready={status.markets.status === "ready" && (status.markets.data?.length ?? 0) > 0}
       />
       <StatusFact
-        label="Jobs"
-        value={activeJobs === null ? statusLabel(status.jobs.status) : `${activeJobs} active`}
-        ready={status.jobs.status === "ready"}
+        label="Analysis"
+        value={
+          activeAnalyses === null
+            ? statusLabel(status.activities.status)
+            : `${activeAnalyses} active`
+        }
+        ready={status.activities.status === "ready"}
       />
     </>
   )
