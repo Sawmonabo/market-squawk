@@ -70,6 +70,8 @@ pub(crate) use research::{
     AnalyticalForecastEvidenceReader, DatasetPreparationAuthority, DatasetPreparationError,
     DatasetPreparationOptions, DatasetPreparationPreview, DatasetPreparationPreviewRequest,
     DatasetPreparationReceipt, DatasetPreparationSelection, FredLatestKnownOperation,
+    FredPublishedGenerationHandoff, TreasuryApplicationClosure, TreasuryLatestKnownOperation,
+    TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
     ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
 };
 pub use research::{

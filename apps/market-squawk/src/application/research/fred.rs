@@ -20,7 +20,9 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use super::ingest::{FredProductionPublicationError, FredPublishedGenerationHandoff};
 use super::{encode_hex, map_query_error, map_read_error, parse_timestamp};
+use crate::ResearchService;
 use crate::provider_activation::{
     FRED_ALFRED_READ_OPERATION, FredPointInTimeReadCapability, FredPointInTimeReadError,
 };
@@ -110,6 +112,31 @@ impl FredLatestKnownOperation {
         Ok(Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
         })
+    }
+
+    /// Installs only a publication handoff whose exact raw/native bindings still reopen after
+    /// restart. The operation never discovers or selects a latest generation at read time.
+    pub(crate) fn install_published(
+        &self,
+        research: &ResearchService,
+        handoff: FredPublishedGenerationHandoff,
+    ) -> Result<(), FredLatestKnownCompositionError> {
+        handoff
+            .restart_selector()
+            .verify(research)
+            .map_err(FredLatestKnownCompositionError::RestartVerification)?;
+        let (capability, generation) = handoff.into_operation_parts();
+        let replacement = Self::try_from_desired_activation(capability, Some(generation))?;
+        let replacement = replacement
+            .state
+            .read()
+            .map_err(|_| FredLatestKnownCompositionError::StateUnavailable)?
+            .clone();
+        *self
+            .state
+            .write()
+            .map_err(|_| FredLatestKnownCompositionError::StateUnavailable)? = replacement;
+        Ok(())
     }
 
     /// Returns the application-owned availability state without provider or filesystem access.
@@ -241,7 +268,7 @@ struct FredLatestKnownReadArguments {
     effective_date_cutoff: CalendarDate,
 }
 
-struct FredGenerationSelector {
+pub(super) struct FredGenerationSelector {
     manifest_version: u64,
     schema_name: String,
     schema_version: u16,
@@ -309,7 +336,9 @@ fn parse_invocation(
     }
 }
 
-fn parse_generation_selector(value: &Value) -> Result<FredGenerationSelector, ServiceError> {
+pub(super) fn parse_generation_selector(
+    value: &Value,
+) -> Result<FredGenerationSelector, ServiceError> {
     let fields = value.as_object().ok_or(ServiceError::InvalidRequest)?;
     if fields.len() != 3
         || !fields.contains_key("manifestVersion")
@@ -515,7 +544,7 @@ fn provider_binding(capability: &FredPointInTimeReadCapability) -> Value {
     })
 }
 
-fn generation_selector_value(manifest: &DatasetManifestRef) -> Value {
+pub(super) fn generation_selector_value(manifest: &DatasetManifestRef) -> Value {
     json!({
         "manifestVersion": manifest.manifest_version().to_string(),
         "schema": {
@@ -527,7 +556,10 @@ fn generation_selector_value(manifest: &DatasetManifestRef) -> Value {
     })
 }
 
-fn generation_matches(selector: &FredGenerationSelector, manifest: &DatasetManifestRef) -> bool {
+pub(super) fn generation_matches(
+    selector: &FredGenerationSelector,
+    manifest: &DatasetManifestRef,
+) -> bool {
     selector.manifest_version == manifest.manifest_version()
         && selector.schema_name == manifest.schema().name()
         && selector.schema_version == manifest.schema().version().get()
@@ -557,7 +589,7 @@ fn evaluated_at() -> Result<Timestamp, ServiceError> {
         .ok_or(ServiceError::Unavailable)
 }
 
-fn parse_calendar_date(value: &str) -> Result<CalendarDate, ServiceError> {
+pub(super) fn parse_calendar_date(value: &str) -> Result<CalendarDate, ServiceError> {
     let bytes = value.as_bytes();
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
         return Err(ServiceError::InvalidRequest);
@@ -630,9 +662,15 @@ fn map_fred_read_error(error: FredPointInTimeReadError) -> ServiceError {
 }
 
 /// Invalid application composition for the fixed FRED/ALFRED operation.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[derive(Debug, Error)]
 pub(crate) enum FredLatestKnownCompositionError {
     /// Desired provider state and the retained immutable analytical manifest disagree.
     #[error("FRED/ALFRED desired activation and analytical manifest do not match")]
     InvalidManifestBinding,
+    /// Durable FRED raw/native coordinates did not reopen exactly.
+    #[error("FRED/ALFRED restart verification failed: {0}")]
+    RestartVerification(#[source] FredProductionPublicationError),
+    /// The replaceable application state could not be read or updated.
+    #[error("FRED/ALFRED operation state is unavailable")]
+    StateUnavailable,
 }

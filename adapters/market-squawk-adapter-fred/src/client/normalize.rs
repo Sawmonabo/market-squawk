@@ -9,14 +9,218 @@ use market_squawk_domain::{
     SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
-    AvailabilityEvidence as ExtractionAvailabilityEvidence, SourceMetadata,
+    AvailabilityEvidence as ExtractionAvailabilityEvidence, ExtractionBatch,
+    ProviderNativeLineageBatch, ProviderNativeLineageBatchBuilder,
+    ProviderNativeLineageImplementation, SourceMetadata,
 };
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::{FredDataset, FredNamespace, FredSeriesMetadataDocument, FredSourceError};
+use super::{
+    FredDataset, FredNamespace, FredSeriesMetadata, FredSeriesMetadataDocument, FredSourceError,
+};
 
 pub(super) struct CanonicalPageContext {
     pub(super) payload_digest: [u8; 32],
+}
+
+#[derive(Debug)]
+pub(super) struct FredNativeLineagePlan {
+    provider_dataset: SourceIdentifier,
+    dataset: FredDataset,
+    page: crate::FredObservationPage,
+    series: FredSeriesMetadata,
+}
+
+impl FredNativeLineagePlan {
+    pub(super) fn try_new(
+        provider_dataset: SourceIdentifier,
+        dataset: FredDataset,
+        page: crate::FredObservationPage,
+        series: FredSeriesMetadata,
+    ) -> Result<Self, FredSourceError> {
+        if FredDataset::parse(&provider_dataset).ok().as_ref() != Some(&dataset)
+            || series.series_id().as_str() != dataset.series_id()
+            || series.realtime_start() != dataset.realtime_start()
+            || series.realtime_end() != dataset.realtime_end()
+            || page.realtime_start() != dataset.realtime_start()
+            || page.realtime_end() != dataset.realtime_end()
+            || page.observations().is_empty()
+        {
+            return Err(FredSourceError::Protocol);
+        }
+        Ok(Self {
+            provider_dataset,
+            dataset,
+            page,
+            series,
+        })
+    }
+
+    pub(super) fn try_encode(
+        self,
+        batch: &ExtractionBatch,
+    ) -> Result<(ProviderNativeLineageBatch, Vec<u16>), FredSourceError> {
+        if batch.request().object().dataset() != &self.provider_dataset
+            || batch.records().len() != self.page.observations().len()
+        {
+            return Err(FredSourceError::Protocol);
+        }
+        let mut builder = ProviderNativeLineageBatchBuilder::try_new(
+            ProviderNativeLineageImplementation::FredAlfredSeriesObservationsV1,
+            batch,
+        )
+        .map_err(|_| FredSourceError::Protocol)?;
+        builder
+            .try_set_batch_sidecar(&FredNativeLineageBatchV1 {
+                version: 1,
+                family: "fred_alfred_series_observations",
+                namespace: match self.dataset.namespace {
+                    FredNamespace::Fred => "fred",
+                    FredNamespace::Alfred => "alfred",
+                },
+                provider_dataset: &self.provider_dataset,
+                response_mode: FredNativeResponseModeV1 {
+                    output_type: 1,
+                    file_type: "json",
+                    order_by: "observation_date",
+                    sort_order: "asc",
+                },
+                series: FredNativeSeriesV1 {
+                    id: self.series.series_id(),
+                    realtime_start: self.series.realtime_start(),
+                    realtime_end: self.series.realtime_end(),
+                    title: self.series.title(),
+                    observation_start: self.series.observation_start(),
+                    observation_end: self.series.observation_end(),
+                    frequency: self.series.frequency(),
+                    frequency_short: self.series.frequency_short(),
+                    units: self.series.units(),
+                    units_short: self.series.units_short(),
+                    seasonal_adjustment: self.series.seasonal_adjustment(),
+                    seasonal_adjustment_short: self.series.seasonal_adjustment_short(),
+                    last_updated: self.series.last_updated(),
+                    popularity: self.series.popularity(),
+                    notes: self.series.notes(),
+                },
+                page: FredNativePageV1 {
+                    realtime_start: self.page.realtime_start(),
+                    realtime_end: self.page.realtime_end(),
+                    observation_start: self.page.observation_start(),
+                    observation_end: self.page.observation_end(),
+                    units: self.page.units(),
+                    count: self.page.count(),
+                    offset: self.page.offset(),
+                    limit: self.page.limit(),
+                    next_offset: self.page.next_offset(),
+                    terminal: self.page.next_offset().is_none(),
+                    returned: self.page.observations().len(),
+                },
+            })
+            .map_err(|_| FredSourceError::Protocol)?;
+        let mut row_capture_page_ordinals = Vec::new();
+        row_capture_page_ordinals
+            .try_reserve_exact(self.page.observations().len())
+            .map_err(|_| FredSourceError::Protocol)?;
+        for (record, observation) in batch.records().iter().zip(self.page.observations()) {
+            let expected_revision = source_revision_identifier(
+                &self.dataset,
+                observation.observation_date(),
+                observation.realtime_start(),
+            )?;
+            if record.revision() != &expected_revision
+                || record.effective_time().calendar_date_value()
+                    != Some(observation.observation_date())
+                || record
+                    .published_time()
+                    .and_then(ResearchTemporalCoordinate::calendar_date_value)
+                    != Some(observation.realtime_start())
+            {
+                return Err(FredSourceError::Protocol);
+            }
+            builder
+                .try_push(&FredNativeLineageRowV1 {
+                    realtime_start: observation.realtime_start(),
+                    realtime_end: observation.realtime_end(),
+                    observation_date: observation.observation_date(),
+                    raw_value: observation.raw_value(),
+                    value: observation.value(),
+                    missing_marker: observation.value().is_none().then_some("."),
+                })
+                .map_err(|_| FredSourceError::Protocol)?;
+            row_capture_page_ordinals.push(1);
+        }
+        let lineage = builder.finish().map_err(|_| FredSourceError::Protocol)?;
+        Ok((lineage, row_capture_page_ordinals))
+    }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct FredNativeLineageBatchV1<'a> {
+    version: u16,
+    family: &'static str,
+    namespace: &'static str,
+    provider_dataset: &'a SourceIdentifier,
+    response_mode: FredNativeResponseModeV1,
+    series: FredNativeSeriesV1<'a>,
+    page: FredNativePageV1<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct FredNativeResponseModeV1 {
+    output_type: u8,
+    file_type: &'static str,
+    order_by: &'static str,
+    sort_order: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct FredNativeSeriesV1<'a> {
+    id: &'a SourceIdentifier,
+    realtime_start: CalendarDate,
+    realtime_end: CalendarDate,
+    title: &'a str,
+    observation_start: CalendarDate,
+    observation_end: CalendarDate,
+    frequency: &'a str,
+    frequency_short: &'a str,
+    units: &'a str,
+    units_short: &'a str,
+    seasonal_adjustment: &'a str,
+    seasonal_adjustment_short: &'a str,
+    last_updated: &'a str,
+    popularity: u32,
+    notes: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct FredNativePageV1<'a> {
+    realtime_start: CalendarDate,
+    realtime_end: CalendarDate,
+    observation_start: CalendarDate,
+    observation_end: CalendarDate,
+    units: &'a str,
+    count: usize,
+    offset: usize,
+    limit: usize,
+    next_offset: Option<usize>,
+    terminal: bool,
+    returned: usize,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct FredNativeLineageRowV1<'a> {
+    realtime_start: CalendarDate,
+    realtime_end: CalendarDate,
+    observation_date: CalendarDate,
+    raw_value: &'a str,
+    value: Option<rust_decimal::Decimal>,
+    missing_marker: Option<&'static str>,
 }
 
 pub(super) fn canonical_observation_payloads(

@@ -18,9 +18,9 @@ use market_squawk_sources::{
     ApiEndpointRule, AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     BackoffPolicy, BudgetScope, BudgetWindowSemantics, CoverageDomain, DiscoveryRequest,
     EndpointPolicy, ExtractionRequest, ExtractionSource, FreshnessPolicy, HistoricalCapability,
-    NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow, QueryParameterRule,
-    QuerySensitivity, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
-    SourceMetadataInput, SourceProtocolProfile,
+    NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
+    ProviderNativeLineageImplementation, QueryParameterRule, QuerySensitivity, SourceCapabilities,
+    SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -236,6 +236,7 @@ async fn authority_bound_sources_emit_canonical_fiscal_and_daily_rate_records() 
             .checked_add(all_family_doctor.receipt().explicit_missing_points()),
         Some(all_family_doctor.receipt().canonical_points())
     );
+
     Ok(())
 }
 
@@ -328,7 +329,12 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
         u64::try_from(canonical.batch().records().len())?
     );
     let (_, capture, admission) = first.into_parts();
-    let sealed = capture.seal(&store)?;
+    let (expectation, seal_request) = capture.into_whole_seal_parts();
+    let sealed = expectation
+        .try_rejoin(seal_request.seal(&store)?)?
+        .try_into_whole()?
+        .persisted_receipt()
+        .clone();
     backfill.accept_sealed_page(admission, sealed)?;
     assert_eq!(backfill.checkpoint().next_page(), 1);
     assert!(backfill.acquisition_completion().is_err());
@@ -366,7 +372,12 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
     assert!(terminal.terminal());
     assert!(terminal.canonical().is_none());
     let (_, capture, admission) = terminal.into_parts();
-    let sealed = capture.seal(&store)?;
+    let (expectation, seal_request) = capture.into_whole_seal_parts();
+    let sealed = expectation
+        .try_rejoin(seal_request.seal(&store)?)?
+        .try_into_whole()?
+        .persisted_receipt()
+        .clone();
     restored.accept_sealed_page(admission, sealed)?;
     let completion = restored.acquisition_completion()?;
     assert_eq!(completion.response_count(), 2);
@@ -522,16 +533,75 @@ async fn exercise_fiscal_source(
         retry_capture.receipt().observation_digest(),
         output.capture_material().receipt().observation_digest()
     );
-    let mismatched_output = super::TreasuryExtractionOutput {
-        batch: output.batch().clone(),
-        capture: retry_capture,
-        accounting: output.accounting().clone(),
-    };
+    let mismatched_batch = output
+        .batch()
+        .clone()
+        .try_bind_provider_capture(retry_capture.receipt())?;
     assert!(matches!(
-        mismatched_output.try_into_common_publication(),
+        output
+            .accounting()
+            .validate_common_publication(&mismatched_batch, &retry_capture),
         Err(crate::TreasuryVerticalError::InvalidExtractionHandoff)
     ));
-    let (extraction, capture_material) = output.try_into_common_publication()?;
+    let (extraction, capture_material, native_lineage, row_capture_page_ordinals) =
+        output.try_into_common_publication()?;
+    assert_eq!(row_capture_page_ordinals, [0, 1]);
+    assert_eq!(
+        native_lineage.schema().implementation(),
+        ProviderNativeLineageImplementation::UsTreasuryMacroV1
+    );
+    native_lineage.validate(&extraction)?;
+    let native_batch: serde_json::Value = serde_json::from_slice(
+        native_lineage
+            .batch_sidecar()
+            .ok_or("missing Treasury Fiscal native sidecar")?
+            .semantic_payload(),
+    )?;
+    assert_eq!(native_batch["surface"], "fiscal_data");
+    assert_eq!(native_batch["profile"], "average_interest_rates_v2");
+    assert_eq!(native_batch["page_size"], 1);
+    assert!(
+        native_batch["schema"]["labels"]
+            .as_array()
+            .ok_or("missing Treasury Fiscal native labels")?
+            .contains(&serde_json::json!(["record_date", "Record Date"]))
+    );
+    assert!(
+        native_batch["schema"]["data_types"]
+            .as_array()
+            .ok_or("missing Treasury Fiscal native data types")?
+            .contains(&serde_json::json!([
+                "avg_interest_rate_amt",
+                "PERCENTAGE"
+            ]))
+    );
+    assert!(
+        native_batch["schema"]["data_formats"]
+            .as_array()
+            .ok_or("missing Treasury Fiscal native data formats")?
+            .contains(&serde_json::json!(["avg_interest_rate_amt", "10.2%"]))
+    );
+    assert_eq!(native_batch["pages"][0]["page_number"], 1);
+    assert_eq!(native_batch["pages"][0]["returned"], 1);
+    assert_eq!(native_batch["pages"][1]["page_number"], 2);
+    assert_eq!(native_batch["pages"][1]["returned"], 1);
+    let first_native: serde_json::Value =
+        serde_json::from_slice(native_lineage.rows()[0].semantic_payload())?;
+    let second_native: serde_json::Value =
+        serde_json::from_slice(native_lineage.rows()[1].semantic_payload())?;
+    assert!(
+        first_native["fields"]
+            .as_array()
+            .ok_or("missing first Treasury Fiscal native fields")?
+            .contains(&serde_json::json!(["record_date", "2026-06-30"]))
+    );
+    assert!(
+        second_native["fields"]
+            .as_array()
+            .ok_or("missing second Treasury Fiscal native fields")?
+            .contains(&serde_json::json!(["record_date", "2026-07-01"]))
+    );
+    assert_ne!(first_native["row_identity"], second_native["row_identity"]);
     assert_eq!(
         market_squawk_sources::SourceObjectCaptureIdentity::try_from_capture(
             capture_material.receipt()
@@ -541,6 +611,7 @@ async fn exercise_fiscal_source(
     assert_eq!(capture_material.records()[0].payload(), payloads[0]);
     let revisions = source.revision_plan(&extraction)?;
     assert!(revisions.is_locally_observed());
+    assert!(revisions.native_lineage_required());
 
     let urls = transport
         .requested_urls

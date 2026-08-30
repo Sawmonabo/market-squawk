@@ -10,7 +10,10 @@ use market_squawk_decisions::{
 };
 use market_squawk_sources::FRED_ALFRED_API_SURFACE_ID;
 
-use super::super::research::MACRO_GET_CONTEXT;
+use super::super::research::{
+    MACRO_GET_CONTEXT, TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION,
+    TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION,
+};
 use crate::provider_activation::FRED_ALFRED_READ_OPERATION;
 
 pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
@@ -178,6 +181,8 @@ pub(super) fn output_data_schema(operation: &str) -> Option<Value> {
         MACRO_GET_CONTEXT => macro_context(),
         "Macro.GetDashboard" => macro_dashboard(),
         FRED_ALFRED_READ_OPERATION => fred_alfred_latest_known(),
+        TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION
+        | TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION => treasury_latest_known(operation),
         "Macro.ListSeries"
         | "Macro.GetObservations"
         | "Macro.GetVintages"
@@ -5113,6 +5118,85 @@ fn fred_alfred_latest_known() -> Value {
             ],
         ),
     ])
+}
+
+fn treasury_latest_known(operation: &str) -> Value {
+    let base = |mut fields: Vec<(&str, Value)>, required: &[&str]| {
+        let mut common = vec![
+            (
+                "schemaIdentity",
+                constant("market-squawk-treasury-latest-known-operation/v1"),
+            ),
+            ("operation", constant(operation)),
+        ];
+        common.append(&mut fields);
+        closed(common, required)
+    };
+    one_of(vec![
+        base(
+            vec![
+                ("state", constant("setup_required")),
+                ("reason", constant("desired_activation_absent")),
+                ("generations", null()),
+            ],
+            &[
+                "schemaIdentity",
+                "operation",
+                "state",
+                "reason",
+                "generations",
+            ],
+        ),
+        base(
+            vec![
+                ("state", constant("unavailable")),
+                ("reason", constant("exact_manifest_absent")),
+                ("generations", null()),
+            ],
+            &[
+                "schemaIdentity",
+                "operation",
+                "state",
+                "reason",
+                "generations",
+            ],
+        ),
+        base(
+            vec![
+                ("state", constant("ready")),
+                ("reason", constant("manifest_bound")),
+                (
+                    "generations",
+                    bounded_nonempty_array(fred_alfred_generation(), 32),
+                ),
+            ],
+            &[
+                "schemaIdentity",
+                "operation",
+                "state",
+                "reason",
+                "generations",
+            ],
+        ),
+        base(
+            vec![
+                ("state", constant("ready")),
+                ("result", treasury_latest_known_result()),
+            ],
+            &["schemaIdentity", "operation", "state", "result"],
+        ),
+    ])
+}
+
+fn treasury_latest_known_result() -> Value {
+    closed(
+        vec![
+            ("generation", fred_alfred_generation()),
+            ("selectionDigest", lowercase_sha256()),
+            ("observations", bounded_nonempty_array(record(), 32)),
+        ],
+        &["generation", "selectionDigest", "observations"],
+    )
 }
 
 fn fred_alfred_provider_binding() -> Value {

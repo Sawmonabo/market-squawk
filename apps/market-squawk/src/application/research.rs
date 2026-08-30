@@ -46,6 +46,7 @@ mod forecast_evidence;
 mod fred;
 mod ingest;
 mod macro_context;
+mod treasury;
 
 pub(crate) use dataset_preparation::{
     DatasetPreparationAuthority, DatasetPreparationError, DatasetPreparationOptions,
@@ -70,6 +71,7 @@ pub(crate) use ingest::{
     CryptoMarketEventPublicationReceipt, CryptoMarketEventRestartReceipt,
     CryptoMarketEventRestartSelector, CryptoMarketPointInTimeReceipt,
     CryptoMarketPointInTimeSelector, CryptoMarketPublicationClosure, CryptoMarketPublicationError,
+    FredPublishedGenerationHandoff,
     CryptoMarketSealedReceiptEvidence, CryptoMarketSurface, IexHistApplicationError,
     IexHistApplicationLane, IexHistCaptureSealHandoff, IexHistCaptureSealRequirements,
     IexHistCatalogSealHandoff, IexHistClockStatus, IexHistExactJobPreview,
@@ -79,6 +81,8 @@ pub(crate) use ingest::{
     IexHistResearchJobLeaf, IexHistSelectionStatus, KrakenMarketApplicationOutcome,
     KrakenSealedRawCanonicalUnavailable, ResearchProviderRuntimeMutationAuthority,
     ResearchProviderRuntimeReplacement,
+    TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION, TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION,
+    TreasuryApplicationClosure, TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
 };
 pub use ingest::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,
@@ -87,6 +91,7 @@ pub use ingest::{
     ResearchSourceDiscovery, ResearchSourceDiscoveryObject, ResearchSourceDiscoveryRights,
     ResearchSourceObjectListing,
 };
+pub(crate) use treasury::TreasuryLatestKnownOperation;
 pub(crate) use macro_context::{MACRO_GET_CONTEXT, MacroContextOperation};
 
 const RESEARCH_LIST_DATASETS: &str = "Research.ListDatasets";
@@ -222,6 +227,8 @@ impl ResearchApplicationServices {
             ingest,
             None,
             FredLatestKnownOperation::setup_required(),
+            TreasuryLatestKnownOperation::fiscal_setup_required(),
+            TreasuryLatestKnownOperation::daily_setup_required(),
         )
     }
 
@@ -237,6 +244,8 @@ impl ResearchApplicationServices {
             ingest,
             Some(artifacts),
             FredLatestKnownOperation::setup_required(),
+            TreasuryLatestKnownOperation::fiscal_setup_required(),
+            TreasuryLatestKnownOperation::daily_setup_required(),
         )
     }
 
@@ -247,7 +256,14 @@ impl ResearchApplicationServices {
         artifacts: Arc<dyn ArtifactRepository>,
         fred_latest_known: FredLatestKnownOperation,
     ) -> Self {
-        Self::compose(service, ingest, Some(artifacts), fred_latest_known)
+        Self::compose(
+            service,
+            ingest,
+            Some(artifacts),
+            fred_latest_known,
+            TreasuryLatestKnownOperation::fiscal_setup_required(),
+            TreasuryLatestKnownOperation::daily_setup_required(),
+        )
     }
 
     fn compose(
@@ -255,6 +271,8 @@ impl ResearchApplicationServices {
         ingest: Arc<dyn ResearchIngestCoordinator>,
         artifacts: Option<Arc<dyn ArtifactRepository>>,
         fred_latest_known: FredLatestKnownOperation,
+        treasury_fiscal_latest_known: TreasuryLatestKnownOperation,
+        treasury_daily_latest_known: TreasuryLatestKnownOperation,
     ) -> Self {
         let reader = service.analytical_reader();
         let macro_context = MacroContextOperation::new(reader.clone(), fred_latest_known.clone());
@@ -266,6 +284,8 @@ impl ResearchApplicationServices {
                 artifacts,
                 fred_latest_known,
                 macro_context,
+                treasury_fiscal_latest_known,
+                treasury_daily_latest_known,
                 lifecycle: DomainLifecycle::new(),
             }),
         }
@@ -313,6 +333,52 @@ impl ResearchApplicationServices {
             )
             .await
             .map_err(map_read_error)
+    }
+
+    /// Installs the exact restart-verified FRED publication into the replaceable Macro route.
+    pub(crate) fn install_fred_published(
+        &self,
+        handoff: FredPublishedGenerationHandoff,
+    ) -> Result<(), FredLatestKnownCompositionError> {
+        self.controller
+            .fred_latest_known
+            .install_published(self.controller.authority.as_ref(), handoff)
+    }
+
+    /// Marks configured Fiscal Data unavailable until an exact publication is installed.
+    pub(crate) fn configure_treasury_fiscal_unavailable(&self) -> Result<(), ServiceError> {
+        self.controller
+            .treasury_fiscal_latest_known
+            .configured_unavailable()
+    }
+
+    /// Marks configured daily rates unavailable until an exact publication is installed.
+    pub(crate) fn configure_treasury_daily_unavailable(&self) -> Result<(), ServiceError> {
+        self.controller
+            .treasury_daily_latest_known
+            .configured_unavailable()
+    }
+
+    /// Installs restart-verified Fiscal Data publication receipts.
+    pub(crate) fn install_treasury_fiscal_published(
+        &self,
+        closure: Arc<TreasuryApplicationClosure>,
+        receipts: Vec<TreasuryMacroPublicationReceipt>,
+    ) -> Result<(), ServiceError> {
+        self.controller
+            .treasury_fiscal_latest_known
+            .install_published(closure, receipts)
+    }
+
+    /// Installs restart-verified daily-rate publication receipts.
+    pub(crate) fn install_treasury_daily_published(
+        &self,
+        closure: Arc<TreasuryApplicationClosure>,
+        receipts: Vec<TreasuryMacroPublicationReceipt>,
+    ) -> Result<(), ServiceError> {
+        self.controller
+            .treasury_daily_latest_known
+            .install_published(closure, receipts)
     }
 }
 
@@ -467,6 +533,20 @@ impl ApplicationDomainService for MacroDomainService {
                     .call(&request, &context, limits)
                     .await
             }
+            TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION => {
+                let limits = effective_service_limits(&request, &context)?;
+                self.controller
+                    .treasury_fiscal_latest_known
+                    .call(&request, &context, limits)
+                    .await
+            }
+            TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION => {
+                let limits = effective_service_limits(&request, &context)?;
+                self.controller
+                    .treasury_daily_latest_known
+                    .call(&request, &context, limits)
+                    .await
+            }
             MACRO_GET_DASHBOARD => {
                 let limits = effective_service_limits(&request, &context)?;
                 self.controller
@@ -507,6 +587,8 @@ struct ResearchController {
     artifacts: Option<Arc<dyn ArtifactRepository>>,
     fred_latest_known: FredLatestKnownOperation,
     macro_context: MacroContextOperation,
+    treasury_fiscal_latest_known: TreasuryLatestKnownOperation,
+    treasury_daily_latest_known: TreasuryLatestKnownOperation,
     lifecycle: Arc<DomainLifecycle>,
 }
 

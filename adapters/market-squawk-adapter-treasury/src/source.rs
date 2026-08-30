@@ -16,8 +16,8 @@ use market_squawk_sources::{
     ExtractionBatch, ExtractionBatchAccumulator, ExtractionRecord, ExtractionRequest,
     ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HistoricalCapability,
     ProviderCaptureMaterial, ProviderCaptureMaterialSealError, ProviderCapturePageReceipt,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SourceClass, SourceError,
-    SourceMetadata, SourceMetadataProvider, SourceProtocolProfile,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, ProviderNativeLineageBatch,
+    SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceProtocolProfile,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -33,6 +33,7 @@ use crate::{
 
 mod backfill;
 pub(crate) mod lineage;
+mod native_lineage;
 pub(crate) mod normalize;
 
 pub use backfill::{
@@ -49,6 +50,7 @@ use lineage::{
     FiscalChainFraming, ObjectKind, ParsedObjectId, fiscal_chain_source_object, invalid_protocol,
     lower_hex, source_object, verify_refetched_fiscal_chain, verify_refetched_object,
 };
+use native_lineage::TreasuryNativeLineagePlan;
 use normalize::{
     CanonicalRecordAdmission, CanonicalTreasuryRecord, canonical_daily_rate_records,
     canonical_fiscal_records,
@@ -430,6 +432,7 @@ pub struct TreasuryExtractionOutput {
     batch: ExtractionBatch,
     capture: ProviderCaptureMaterial,
     accounting: TreasuryExtractionAccounting,
+    native_lineage_plan: TreasuryNativeLineagePlan,
 }
 
 /// Network-authorized Treasury doctor result paired with every exact raw probe response.
@@ -514,21 +517,43 @@ impl TreasuryExtractionOutput {
     /// The returned batch is bound to the exact retained capture receipt only after the
     /// provider-local aggregate rows, points, raw bytes, request set, payload, terminal-page count,
     /// and clocks match both values.
+    /// The returned provider-native batch is minted against that rebound canonical identity. Its
+    /// aligned page-ordinal vector maps Fiscal rows to their exact chain page and daily-rate rows
+    /// to the standalone response at page zero.
     /// The application remains responsible for sealing and reopening the original capture through
     /// its shared research journal before committing an analytical generation.
     pub fn try_into_common_publication(
         self,
-    ) -> Result<(ExtractionBatch, ProviderCaptureMaterial), crate::TreasuryVerticalError> {
+    ) -> Result<
+        (
+            ExtractionBatch,
+            ProviderCaptureMaterial,
+            ProviderNativeLineageBatch,
+            Vec<u16>,
+        ),
+        crate::TreasuryVerticalError,
+    > {
         let Self {
             batch,
             capture,
             accounting,
+            native_lineage_plan,
         } = self;
         let batch = batch
             .try_bind_provider_capture(capture.receipt())
             .map_err(|_| crate::TreasuryVerticalError::InvalidExtractionHandoff)?;
         accounting.validate_common_publication(&batch, &capture)?;
-        Ok((batch, capture))
+        let (native_lineage, row_capture_page_ordinals) = native_lineage_plan
+            .try_encode(&batch)
+            .map_err(|_| crate::TreasuryVerticalError::InvalidExtractionHandoff)?;
+        if row_capture_page_ordinals.len() != batch.records().len()
+            || row_capture_page_ordinals
+                .iter()
+                .any(|ordinal| usize::from(*ordinal) >= capture.receipt().pages().len())
+        {
+            return Err(crate::TreasuryVerticalError::InvalidExtractionHandoff);
+        }
+        Ok((batch, capture, native_lineage, row_capture_page_ordinals))
     }
 }
 
@@ -557,6 +582,8 @@ impl TreasurySource {
     ///
     /// Neither Treasury surface exposes an immutable provider revision identifier. Revisions are
     /// therefore bound to exact locally observed canonical content instead of a fabricated order.
+    /// Publication additionally requires the aligned Treasury-native lineage emitted by the
+    /// extraction handoff.
     ///
     /// # Errors
     ///
@@ -572,7 +599,8 @@ impl TreasurySource {
         {
             return Err(TreasurySourceError::InvalidMetadata);
         }
-        ExtractionRevisionPlan::locally_observed(batch.records().len()).map_err(Into::into)
+        ExtractionRevisionPlan::locally_observed_with_native_lineage(batch.records().len())
+            .map_err(Into::into)
     }
 
     /// Binds immutable metadata to one official Treasury profile.
@@ -1233,7 +1261,7 @@ impl TreasurySource {
         let schema =
             SourceIdentifier::try_from(market_squawk_sources::CURRENT_RESEARCH_RECORD_SCHEMA)
                 .map_err(|_| invalid_protocol())?;
-        let (batch, capture, accounting) = match (&self.config, parsed.kind) {
+        let (batch, capture, accounting, native_lineage_plan) = match (&self.config, parsed.kind) {
             (TreasurySourceConfig::AverageInterestRates(query), ObjectKind::FiscalChain) => {
                 let first_request = query.page(1).map_err(|_| invalid_protocol())?;
                 parsed.verify_request(first_request.request_digest())?;
@@ -1253,6 +1281,8 @@ impl TreasurySource {
                 let mut framing = FiscalChainFraming::try_new()?;
                 let mut batch = ExtractionBatchAccumulator::try_new(&request)?;
                 let mut canonical_admission = CanonicalRecordAdmission::new();
+                let mut native_lineage_plan =
+                    TreasuryNativeLineagePlan::fiscal(request.object().dataset().clone(), query);
                 let mut source_rows = 0_usize;
                 let mut raw_body_bytes = 0_u64;
                 let mut received_at = None;
@@ -1304,7 +1334,10 @@ impl TreasurySource {
                     let response_next_page_token =
                         retrieved.page().next_page_token().map(str::to_owned);
                     let received = retrieved.received_at();
-                    let (_, body, _decoded, _standalone_capture) = retrieved.into_parts();
+                    let (_, body, decoded, _standalone_capture) = retrieved.into_parts();
+                    native_lineage_plan
+                        .try_push_fiscal_page(decoded)
+                        .map_err(map_adapter_error)?;
                     captured.push(FiscalCapturedPage {
                         request_digest,
                         request_page_token,
@@ -1353,7 +1386,7 @@ impl TreasurySource {
                         terminal_for_query: true,
                     })
                     .map_err(|_| invalid_protocol())?;
-                (batch.finish()?, capture, accounting)
+                (batch.finish()?, capture, accounting, native_lineage_plan)
             }
             (TreasurySourceConfig::DailyRates(config), ObjectKind::DailyRate) => {
                 let query = config
@@ -1420,7 +1453,13 @@ impl TreasurySource {
                         terminal_for_query,
                     })
                     .map_err(|_| invalid_protocol())?;
-                (batch.finish()?, retrieved.capture, accounting)
+                let (_, _, decoded, capture) = retrieved.into_parts();
+                let native_lineage_plan = TreasuryNativeLineagePlan::try_daily(
+                    request.object().dataset().clone(),
+                    decoded,
+                )
+                .map_err(map_adapter_error)?;
+                (batch.finish()?, capture, accounting, native_lineage_plan)
             }
             _ => {
                 return Err(ExtractionSourceError::Source(
@@ -1432,6 +1471,7 @@ impl TreasurySource {
             batch,
             capture,
             accounting,
+            native_lineage_plan,
         })
     }
 

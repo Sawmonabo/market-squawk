@@ -41,6 +41,8 @@ pub enum ProviderNativeLineageImplementation {
     CoinbaseExchangeDirectV1,
     /// EIA series observation semantics encoder v1.
     EiaSeriesV1,
+    /// FRED/ALFRED series-observation semantics encoder v1.
+    FredAlfredSeriesObservationsV1,
     /// Kraken Spot public market-data semantics encoder v1.
     KrakenSpotV1,
     /// SEC EDGAR submissions, Company Facts, and filing-XBRL semantics encoder v1.
@@ -53,6 +55,8 @@ pub enum ProviderNativeLineageImplementation {
     TiingoFundNavV1,
     /// Tiingo end-of-day market-bar response semantics encoder v1.
     TiingoEodMarketBarV1,
+    /// U.S. Treasury Fiscal Data and daily-rate macro semantics encoder v1.
+    UsTreasuryMacroV1,
     /// Yahoo explicit-demand enrichment response semantics encoder v1.
     YahooEnrichmentV1,
 }
@@ -73,6 +77,9 @@ impl ProviderNativeLineageImplementation {
                 b"market-squawk/coinbase-exchange-direct/provider-native-lineage/v1"
             }
             Self::EiaSeriesV1 => b"market-squawk/eia/provider-native-lineage/v1",
+            Self::FredAlfredSeriesObservationsV1 => {
+                b"market-squawk/fred-alfred-series-observations/provider-native-lineage/v1"
+            }
             Self::KrakenSpotV1 => b"market-squawk/kraken-spot/provider-native-lineage/v1",
             Self::SecEdgarV1 => b"market-squawk/sec-edgar/provider-native-lineage/v1",
             Self::SchwabRestMarketDataV1 => {
@@ -84,6 +91,9 @@ impl ProviderNativeLineageImplementation {
             Self::TiingoFundNavV1 => b"market-squawk/tiingo-fund-nav/provider-native-lineage/v1",
             Self::TiingoEodMarketBarV1 => {
                 b"market-squawk/tiingo-eod-market-bar/provider-native-lineage/v1"
+            }
+            Self::UsTreasuryMacroV1 => {
+                b"market-squawk/us-treasury-macro/provider-native-lineage/v1"
             }
             Self::YahooEnrichmentV1 => b"market-squawk/yahoo-enrichment/provider-native-lineage/v1",
         }
@@ -98,12 +108,14 @@ impl ProviderNativeLineageImplementation {
             Self::CoinbaseAdvancedTradeV1 => 17,
             Self::CoinbaseExchangeDirectV1 => 18,
             Self::EiaSeriesV1 => 4,
+            Self::FredAlfredSeriesObservationsV1 => 20,
             Self::KrakenSpotV1 => 19,
             Self::SecEdgarV1 => 8,
             Self::SchwabRestMarketDataV1 => 14,
             Self::SchwabStreamerMarketDataV1 => 15,
             Self::TiingoFundNavV1 => 6,
             Self::TiingoEodMarketBarV1 => 7,
+            Self::UsTreasuryMacroV1 => 21,
             Self::YahooEnrichmentV1 => 16,
         }
     }

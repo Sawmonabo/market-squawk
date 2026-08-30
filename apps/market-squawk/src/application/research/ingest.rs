@@ -16,8 +16,7 @@ use market_squawk_data::{
     SourceOperation, extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
-    CompanyIdentityObservation, DigestAlgorithm, EvidenceDigest, SourceId, SourceIdentifier,
-    Timestamp,
+    CompanyIdentityObservation, EvidenceDigest, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_services::{
     RequestContext, ServiceError, ServiceLimits, ToolResultMetadata, TypedToolRequest,
@@ -27,12 +26,12 @@ use market_squawk_sources::{
     AuthoritativeSourceRegistry, DiscoveryBatch, DiscoveryRequest, ExtractionBatch,
     ExtractionRequest, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
     MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
-    ProviderCaptureMaterial, RegisteredSource, RegistryError, SourceClass, SourceError,
+    ProviderCaptureMaterial, ProviderNativeLineageBatch, RegisteredSource, RegistryError,
+    SourceClass, SourceError,
     SourceMetadata, SourceObject, SourceObjectCaptureIdentity, built_in_provider_profiles,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -53,12 +52,14 @@ mod alpaca_historical;
 mod bea;
 mod bls;
 mod crypto_market;
+mod fred;
 mod iex_hist;
 mod provider_runtime;
 mod schwab_market;
 mod sec_fund;
 mod selection;
 mod tiingo;
+mod treasury;
 mod yahoo_enrichment;
 
 pub(crate) use alpaca_historical::{
@@ -87,6 +88,7 @@ pub(crate) use crypto_market::{
     CryptoMarketSealedReceiptEvidence, CryptoMarketSurface, KrakenMarketApplicationOutcome,
     KrakenSealedRawCanonicalUnavailable,
 };
+pub(crate) use fred::{FredProductionPublicationError, FredPublishedGenerationHandoff};
 pub(crate) use iex_hist::{
     IexHistApplicationError, IexHistApplicationLane, IexHistCaptureSealHandoff,
     IexHistCaptureSealRequirements, IexHistCatalogSealHandoff, IexHistClockStatus,
@@ -116,6 +118,14 @@ pub(crate) use tiingo::{
     TiingoEodApplicationOutcome, TiingoEodRestartSelector, TiingoFundNavApplicationOutcome,
     TiingoFundNavRestartSelector, TiingoLatestApplicationError, TiingoLatestApplicationState,
 };
+pub(crate) use treasury::{
+    TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION, TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION,
+    TreasuryApplicationClosure, TreasuryApplicationError, TreasuryDailyRatesLatestKnownReceipt,
+    TreasuryDailyRatesLatestKnownRequest, TreasuryFiscalDataLatestKnownReceipt,
+    TreasuryFiscalDataLatestKnownRequest, TreasuryMacroPublicationReceipt,
+    TreasuryMacroRestartSelector, TreasurySelectedObjectRequest,
+};
+
 
 /// Fixed operation ceilings applied independently of transport result limits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -463,6 +473,18 @@ pub struct ManagedExtraction {
     capture_material: Option<ProviderCaptureMaterial>,
 }
 
+#[derive(Debug)]
+struct ManagedProviderNativePublication {
+    native_lineage: ProviderNativeLineageBatch,
+    row_capture_page_ordinals: Vec<u16>,
+}
+
+#[derive(Debug)]
+pub struct ManagedExtractionWithNative {
+    extraction: ManagedExtraction,
+    provider_native: Option<ManagedProviderNativePublication>,
+}
+
 impl ManagedExtraction {
     fn analytical_only(batch: ExtractionBatch) -> Self {
         Self {
@@ -543,6 +565,28 @@ pub trait ManagedResearchExtractionSource: ExtractionSource + Send + Sync + 'sta
         Box::pin(async move { extracted.await.map(ManagedExtraction::analytical_only) })
     }
 
+    /// Extracts canonical and exact adapter-native publication material as one owned handoff.
+    ///
+    /// Most sources use the canonical-only default. Provider adapters whose durable publication
+    /// requires native lineage override this method so neither lineage nor the exact row-to-page
+    /// map can be discarded between adapter extraction and application raw sealing.
+    fn extract_managed_with_native(
+        &self,
+        authority: market_squawk_sources::ExtractionAuthority,
+        request: ExtractionRequest,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<ManagedExtractionWithNative, ExtractionSourceError>> {
+        let extracted = self.extract_managed(authority, request, cancellation);
+        Box::pin(async move {
+            extracted
+                .await
+                .map(|extraction| ManagedExtractionWithNative {
+                    extraction,
+                    provider_native: None,
+                })
+        })
+    }
+
     /// Returns the exact provider dataset used to begin discovery, when one fixed dataset is
     /// carried by the admitted adapter configuration.
     fn discovery_dataset_identifier(&self) -> Option<&SourceIdentifier> {
@@ -595,6 +639,34 @@ fn bind_single_provider_capture(
     })
 }
 
+fn bind_managed_provider_native_capture(
+    batch: ExtractionBatch,
+    capture_material: ProviderCaptureMaterial,
+    native_lineage: ProviderNativeLineageBatch,
+    row_capture_page_ordinals: Vec<u16>,
+) -> Result<ManagedExtractionWithNative, ExtractionSourceError> {
+    if !capture_material_matches_batch(&capture_material, &batch)
+        || native_lineage.validate(&batch).is_err()
+        || row_capture_page_ordinals.len() != batch.records().len()
+        || row_capture_page_ordinals
+            .iter()
+            .any(|ordinal| usize::from(*ordinal) >= capture_material.receipt().pages().len())
+    {
+        return Err(invalid_capture_protocol());
+    }
+    Ok(ManagedExtractionWithNative {
+        extraction: ManagedExtraction {
+            batch,
+            company_identity: None,
+            capture_material: Some(capture_material),
+        },
+        provider_native: Some(ManagedProviderNativePublication {
+            native_lineage,
+            row_capture_page_ordinals,
+        }),
+    })
+}
+
 fn capture_material_matches_batch(
     capture_material: &ProviderCaptureMaterial,
     batch: &ExtractionBatch,
@@ -606,64 +678,6 @@ fn capture_material_matches_batch(
         && receipt.dataset() == object.dataset()
         && SourceObjectCaptureIdentity::try_from_capture(receipt)
             .is_ok_and(|identity| identity == object.capture_identity())
-}
-
-fn bind_provider_capture_graph(
-    batch: ExtractionBatch,
-    graph_purpose: &'static [u8],
-    components: Vec<ProviderCaptureMaterial>,
-) -> Result<ManagedExtraction, ExtractionSourceError> {
-    let graph_identity = provider_capture_graph_identity(&batch, graph_purpose, &components)?;
-    let dataset = batch.request().object().dataset().clone();
-    let capture_material =
-        ProviderCaptureMaterial::try_combine_request_graph(dataset, graph_identity, components)
-            .map_err(|_error| invalid_capture_protocol())?;
-    bind_single_provider_capture(batch, capture_material)
-}
-
-fn provider_capture_graph_identity(
-    batch: &ExtractionBatch,
-    graph_purpose: &'static [u8],
-    components: &[ProviderCaptureMaterial],
-) -> Result<EvidenceDigest, ExtractionSourceError> {
-    let object = batch.request().object();
-    let mut digest = Sha256::new();
-    digest.update(b"market-squawk/provider-request-graph-composition/v1\0");
-    update_capture_graph_field(&mut digest, graph_purpose)?;
-    update_capture_graph_field(&mut digest, object.source_id().as_str().as_bytes())?;
-    update_capture_graph_field(
-        &mut digest,
-        object
-            .metadata_revision()
-            .as_source_identifier()
-            .as_str()
-            .as_bytes(),
-    )?;
-    update_capture_graph_field(&mut digest, object.dataset().as_str().as_bytes())?;
-    let component_count =
-        u64::try_from(components.len()).map_err(|_error| invalid_capture_protocol())?;
-    digest.update(component_count.to_be_bytes());
-    for component in components {
-        update_capture_graph_field(
-            &mut digest,
-            component.receipt().dataset().as_str().as_bytes(),
-        )?;
-        digest.update(component.receipt().request_set_identity().bytes());
-    }
-    Ok(EvidenceDigest::new(
-        DigestAlgorithm::Sha256,
-        digest.finalize().into(),
-    ))
-}
-
-fn update_capture_graph_field(
-    digest: &mut Sha256,
-    value: &[u8],
-) -> Result<(), ExtractionSourceError> {
-    let length = u64::try_from(value.len()).map_err(|_error| invalid_capture_protocol())?;
-    digest.update(length.to_be_bytes());
-    digest.update(value);
-    Ok(())
 }
 
 /// Rights-bound static research adapter sealed before its coordinator is published.
@@ -760,19 +774,21 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_sec::SecEdgarSour
 }
 
 impl ManagedResearchExtractionSource for market_squawk_adapter_fred::FredSource {
-    fn extract_managed(
+    fn extract_managed_with_native(
         &self,
         authority: market_squawk_sources::ExtractionAuthority,
         request: ExtractionRequest,
         cancellation: CancellationToken,
-    ) -> BoxFuture<'_, Result<ManagedExtraction, ExtractionSourceError>> {
+    ) -> BoxFuture<'_, Result<ManagedExtractionWithNative, ExtractionSourceError>> {
         let extracted = self.extract_with_capture(authority, request, cancellation);
         Box::pin(async move {
-            let (batch, captures) = extracted.await?.into_parts();
-            bind_provider_capture_graph(
+            let (batch, capture, native_lineage, row_capture_page_ordinals) =
+                extracted.await?.try_into_common_publication()?;
+            bind_managed_provider_native_capture(
                 batch,
-                b"fred-series-metadata-and-observation-page/v1",
-                captures.into_vec(),
+                capture,
+                native_lineage,
+                row_capture_page_ordinals,
             )
         })
     }
@@ -834,19 +850,24 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_bls::BlsSource {
 }
 
 impl ManagedResearchExtractionSource for market_squawk_adapter_treasury::TreasurySource {
-    fn extract_managed(
+    fn extract_managed_with_native(
         &self,
         authority: market_squawk_sources::ExtractionAuthority,
         request: ExtractionRequest,
         cancellation: CancellationToken,
-    ) -> BoxFuture<'_, Result<ManagedExtraction, ExtractionSourceError>> {
+    ) -> BoxFuture<'_, Result<ManagedExtractionWithNative, ExtractionSourceError>> {
         let extracted = self.extract_with_capture(authority, request, cancellation);
         Box::pin(async move {
             let output = extracted.await?;
-            let (batch, capture_material) = output
+            let (batch, capture_material, native_lineage, row_capture_page_ordinals) = output
                 .try_into_common_publication()
                 .map_err(|_error| invalid_capture_protocol())?;
-            bind_single_provider_capture(batch, capture_material)
+            bind_managed_provider_native_capture(
+                batch,
+                capture_material,
+                native_lineage,
+                row_capture_page_ordinals,
+            )
         })
     }
 
@@ -1552,7 +1573,7 @@ impl ProductionResearchIngestCoordinator {
             ExtractionRequest::try_new(object, self.limits.records, self.limits.bytes, deadline)
                 .map_err(|_error| ServiceError::InvalidRequest)?;
         let managed = await_extraction(
-            prepared.source.extract_managed(
+            prepared.source.extract_managed_with_native(
                 prepared.authority,
                 extraction_request,
                 operation.clone(),
@@ -1563,10 +1584,14 @@ impl ProductionResearchIngestCoordinator {
             operation_deadline,
         )
         .await?;
-        let ManagedExtraction {
-            batch,
-            company_identity,
-            capture_material: extraction_capture,
+        let ManagedExtractionWithNative {
+            extraction:
+                ManagedExtraction {
+                    batch,
+                    company_identity,
+                    capture_material: extraction_capture,
+                },
+            provider_native,
         } = managed;
         let (batch, capture_material) = match (discovery_capture, extraction_capture) {
             (Some(_), Some(_)) => return Err(ServiceError::InvalidResult),
@@ -1615,6 +1640,7 @@ impl ProductionResearchIngestCoordinator {
             payload_digest,
             rights,
             admission: prepared.admission,
+            provider_native,
         })
     }
 
@@ -1739,6 +1765,7 @@ struct AuthorizedExtraction {
     payload_digest: EvidenceDigest,
     rights: RightsDecisionInput,
     admission: ResearchProviderAdmission,
+    provider_native: Option<ManagedProviderNativePublication>,
 }
 
 struct ChainedIngestPrecommitAuthority {
@@ -1799,6 +1826,7 @@ impl ProductionResearchIngestCoordinator {
             payload_digest,
             rights,
             admission,
+            provider_native: _provider_native,
         } = extracted;
         let provider: Arc<dyn IngestPrecommitAuthority> = Arc::new(
             admission

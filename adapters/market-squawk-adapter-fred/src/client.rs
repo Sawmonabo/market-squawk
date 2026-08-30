@@ -17,8 +17,9 @@ use market_squawk_sources::{
     ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError, HistoricalCapability,
     MAX_PROVIDER_CAPTURE_PAGE_BYTES, NetworkAccessPolicy, ObservedProviderOrder,
     ObservedRevisionError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
-    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, SourceClass, SourceError,
-    SourceMetadata, SourceMetadataProvider, SourceObject, payload_matches_exact_evidence,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, ProviderNativeLineageBatch,
+    SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceObject,
+    payload_matches_exact_evidence,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -42,7 +43,7 @@ use http::{
 };
 pub use lineage::FredPageObjectIdentity;
 use lineage::{evidence_for_payload, map_adapter_error, page_object_id, parse_object_id};
-use normalize::{CanonicalPageContext, canonical_observation_payloads};
+use normalize::{CanonicalPageContext, FredNativeLineagePlan, canonical_observation_payloads};
 
 const OBSERVATIONS_ENDPOINT: &str = "https://api.stlouisfed.org/fred/series/observations";
 const DISCOVERY_PAGE_RECORDS: usize = 10_000;
@@ -253,6 +254,7 @@ impl FredExtractedPage {
 pub struct FredExtractionOutput {
     batch: ExtractionBatch,
     captures: Box<[ProviderCaptureMaterial]>,
+    native_lineage_plan: FredNativeLineagePlan,
 }
 
 impl FredExtractionOutput {
@@ -266,10 +268,105 @@ impl FredExtractionOutput {
         &self.captures
     }
 
-    /// Consumes the application handoff. Both captures must be sealed before publishing `batch`.
-    pub fn into_parts(self) -> (ExtractionBatch, Box<[ProviderCaptureMaterial]>) {
-        (self.batch, self.captures)
+    /// Closes the application handoff around one complete metadata-and-observation request graph.
+    ///
+    /// The canonical batch is rebound to that exact graph before provider-native lineage is
+    /// encoded. Canonical rows map to raw page `1`; raw page `0` is the series-metadata response.
+    pub fn try_into_common_publication(
+        self,
+    ) -> Result<
+        (
+            ExtractionBatch,
+            ProviderCaptureMaterial,
+            ProviderNativeLineageBatch,
+            Vec<u16>,
+        ),
+        ExtractionSourceError,
+    > {
+        let Self {
+            batch,
+            captures,
+            native_lineage_plan,
+        } = self;
+        if captures.len() != 2 {
+            return Err(invalid_protocol_state());
+        }
+        let graph_identity = fred_request_graph_identity(&batch, &captures)?;
+        let capture = ProviderCaptureMaterial::try_combine_request_graph(
+            batch.request().object().dataset().clone(),
+            graph_identity,
+            captures.into_vec(),
+        )
+        .map_err(|_| invalid_protocol_state())?;
+        if capture.receipt().pages().len() != 2
+            || capture.receipt().request_graph_components().len() != 2
+            || capture.receipt().request_graph_components()[0].first_page_ordinal() != 0
+            || capture.receipt().request_graph_components()[1].first_page_ordinal() != 1
+        {
+            return Err(invalid_protocol_state());
+        }
+        let batch = batch
+            .try_bind_provider_capture(capture.receipt())
+            .map_err(ExtractionSourceError::from)?;
+        let (native_lineage, row_capture_page_ordinals) = native_lineage_plan
+            .try_encode(&batch)
+            .map_err(map_adapter_error)?;
+        if row_capture_page_ordinals.len() != batch.records().len()
+            || row_capture_page_ordinals
+                .iter()
+                .any(|ordinal| *ordinal != 1)
+        {
+            return Err(invalid_protocol_state());
+        }
+        Ok((batch, capture, native_lineage, row_capture_page_ordinals))
     }
+}
+
+fn fred_request_graph_identity(
+    batch: &ExtractionBatch,
+    captures: &[ProviderCaptureMaterial],
+) -> Result<EvidenceDigest, ExtractionSourceError> {
+    let object = batch.request().object();
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/provider-request-graph-composition/v1\0");
+    update_fred_graph_field(&mut digest, b"fred-series-metadata-and-observation-page/v1")?;
+    update_fred_graph_field(&mut digest, object.source_id().as_str().as_bytes())?;
+    update_fred_graph_field(
+        &mut digest,
+        object
+            .metadata_revision()
+            .as_source_identifier()
+            .as_str()
+            .as_bytes(),
+    )?;
+    update_fred_graph_field(&mut digest, object.dataset().as_str().as_bytes())?;
+    digest.update(
+        u64::try_from(captures.len())
+            .map_err(|_| invalid_protocol_state())?
+            .to_be_bytes(),
+    );
+    for capture in captures {
+        update_fred_graph_field(&mut digest, capture.receipt().dataset().as_str().as_bytes())?;
+        digest.update(capture.receipt().request_set_identity().bytes());
+    }
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
+}
+
+fn update_fred_graph_field(digest: &mut Sha256, value: &[u8]) -> Result<(), ExtractionSourceError> {
+    digest.update(
+        u64::try_from(value.len())
+            .map_err(|_| invalid_protocol_state())?
+            .to_be_bytes(),
+    );
+    digest.update(value);
+    Ok(())
+}
+
+fn invalid_protocol_state() -> ExtractionSourceError {
+    ExtractionSourceError::Source(SourceError::InvalidProtocolState)
 }
 
 /// Registry-bound FRED and ALFRED extraction source.
@@ -411,6 +508,8 @@ impl FredSource {
     /// FRED's `realtime_start` civil date is retained as the provider order coordinate. The
     /// canonical ALFRED revision identifier is retained as both version evidence and the stable
     /// tie-breaker, so durable assignment never depends on an invented time zone or arrival order.
+    /// Publication additionally requires the aligned FRED/ALFRED-native lineage emitted by the
+    /// extraction handoff.
     ///
     /// # Errors
     ///
@@ -447,7 +546,8 @@ impl FredSource {
                     .map_err(FredSourceError::RevisionAuthority)?,
             );
         }
-        ExtractionRevisionPlan::try_new(evidence).map_err(FredSourceError::RevisionAuthority)
+        ExtractionRevisionPlan::try_new_with_native_lineage(evidence)
+            .map_err(FredSourceError::RevisionAuthority)
     }
 
     fn try_new_with_transport(
@@ -824,9 +924,21 @@ impl FredSource {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let batch = ExtractionBatch::try_new(&request, records)?;
-        let captures =
-            vec![series_metadata.into_capture_material(), fetched.capture].into_boxed_slice();
-        Ok(FredExtractionOutput { batch, captures })
+        let (series_semantics, metadata_capture) =
+            series_metadata.into_native_semantics_and_capture();
+        let native_lineage_plan = FredNativeLineagePlan::try_new(
+            request.object().dataset().clone(),
+            dataset,
+            fetched.page,
+            series_semantics,
+        )
+        .map_err(map_adapter_error)?;
+        let captures = vec![metadata_capture, fetched.capture].into_boxed_slice();
+        Ok(FredExtractionOutput {
+            batch,
+            captures,
+            native_lineage_plan,
+        })
     }
 
     async fn fetch_page(

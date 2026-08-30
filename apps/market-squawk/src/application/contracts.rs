@@ -16,7 +16,10 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use self::output::output_data_schema;
-use super::research::MACRO_GET_CONTEXT;
+use super::research::{
+    MACRO_GET_CONTEXT, TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION,
+    TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION,
+};
 use crate::provider_activation::FRED_ALFRED_READ_OPERATION;
 
 /// Exact contract version shared by CLI and MCP for the first local release.
@@ -135,6 +138,12 @@ const FRED_ALFRED_LATEST_KNOWN_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::optional("generation", ArgumentKind::FredGeneration),
     ArgumentSpec::optional("knowledgeCutoff", ArgumentKind::BoundedTimestamp),
     ArgumentSpec::optional("effectiveDateCutoff", ArgumentKind::CalendarDate),
+];
+const TREASURY_LATEST_KNOWN_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("generation", ArgumentKind::FredGeneration),
+    ArgumentSpec::optional("knowledgeCutoff", ArgumentKind::BoundedTimestamp),
+    ArgumentSpec::optional("effectiveDateCutoff", ArgumentKind::CalendarDate),
+    ArgumentSpec::optional("seriesIds", ArgumentKind::TreasurySeriesIds),
 ];
 const PROVIDER_CREDENTIAL_BUNDLE_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("inputTicketId", ArgumentKind::Uuid)];
@@ -1152,6 +1161,22 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         ServiceDomain::Macro,
         LOCAL_SCOPE,
         FRED_ALFRED_LATEST_KNOWN_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION,
+        "Return Treasury Fiscal Data availability or one exact manifest-pinned latest-known snapshot.",
+        ServiceDomain::Macro,
+        LOCAL_SCOPE,
+        TREASURY_LATEST_KNOWN_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION,
+        "Return Treasury daily-rates availability or one exact manifest-pinned latest-known snapshot.",
+        ServiceDomain::Macro,
+        LOCAL_SCOPE,
+        TREASURY_LATEST_KNOWN_ARGUMENTS,
         SourceEvidencePolicy::Required,
     ),
     read_observations(
@@ -2467,6 +2492,7 @@ enum ArgumentKind {
     CalendarDate,
     BoundedTimestamp,
     FredGeneration,
+    TreasurySeriesIds,
     FairValueMeasurement,
     ForecastRequest,
     PortfolioImportInterpretations,
@@ -2508,20 +2534,40 @@ fn schema_for(spec: OperationSpec) -> Value {
     if !required.is_empty() {
         schema.insert("required".to_owned(), Value::Array(required));
     }
-    if spec.name == FRED_ALFRED_READ_OPERATION {
+    if latest_known_grouped_operation(spec.name) {
+        let absent_fields = if spec.name == FRED_ALFRED_READ_OPERATION {
+            json!([
+                {"required": ["generation"]},
+                {"required": ["knowledgeCutoff"]},
+                {"required": ["effectiveDateCutoff"]},
+            ])
+        } else {
+            json!([
+                {"required": ["generation"]},
+                {"required": ["knowledgeCutoff"]},
+                {"required": ["effectiveDateCutoff"]},
+                {"required": ["seriesIds"]},
+            ])
+        };
+        let required_read = if spec.name == FRED_ALFRED_READ_OPERATION {
+            json!(["generation", "knowledgeCutoff", "effectiveDateCutoff"])
+        } else {
+            json!([
+                "generation",
+                "knowledgeCutoff",
+                "effectiveDateCutoff",
+                "seriesIds"
+            ])
+        };
         schema.insert(
             "oneOf".to_owned(),
             json!([
                 {
                     "not": {
-                        "anyOf": [
-                            {"required": ["generation"]},
-                            {"required": ["knowledgeCutoff"]},
-                            {"required": ["effectiveDateCutoff"]},
-                        ]
+                        "anyOf": absent_fields
                     }
                 },
-                {"required": ["generation", "knowledgeCutoff", "effectiveDateCutoff"]},
+                {"required": required_read},
             ]),
         );
     }
@@ -2682,6 +2728,10 @@ fn argument_schema(kind: ArgumentKind) -> Value {
             "maxLength": 64,
         }),
         ArgumentKind::FredGeneration => fred_generation_argument_schema(),
+        ArgumentKind::TreasurySeriesIds => json!({
+            "type":"array","minItems":1,"maxItems":32,"uniqueItems":true,
+            "items":{"type":"string","minLength":1,"maxLength":256}
+        }),
         ArgumentKind::FairValueMeasurement => fair_value_measurement_schema(),
         ArgumentKind::ForecastRequest => forecast_request_schema(),
         ArgumentKind::PortfolioImportInterpretations => portfolio_import_interpretations_schema(),
@@ -2707,8 +2757,8 @@ fn admit(spec: OperationSpec, arguments: &Map<String, Value>) -> Result<(), Tool
     allowed
         .try_reserve(5_usize.saturating_add(spec.arguments.len()))
         .map_err(|_| ToolInputError::Invalid)?;
-    if spec.name == FRED_ALFRED_READ_OPERATION {
-        admit_fred_latest_known_argument_group(arguments)?;
+    if latest_known_grouped_operation(spec.name) {
+        admit_latest_known_argument_group(arguments, spec.name != FRED_ALFRED_READ_OPERATION)?;
     }
     if spec.name == MACRO_GET_CONTEXT {
         admit_macro_context_cutoffs(arguments)?;
@@ -2953,6 +3003,7 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
         ArgumentKind::CalendarDate => admit_calendar_date(value),
         ArgumentKind::BoundedTimestamp => admit_bounded_timestamp(value),
         ArgumentKind::FredGeneration => admit_fred_generation(value),
+        ArgumentKind::TreasurySeriesIds => admit_treasury_series_ids(value),
         ArgumentKind::FairValueMeasurement => admit_fair_value_measurement(value),
         ArgumentKind::ForecastRequest => admit_forecast_request(value),
         ArgumentKind::PortfolioImportInterpretations => {
@@ -3038,14 +3089,25 @@ fn calendar_date_argument_schema() -> Value {
     })
 }
 
-fn admit_fred_latest_known_argument_group(
+fn latest_known_grouped_operation(name: &str) -> bool {
+    matches!(
+        name,
+        FRED_ALFRED_READ_OPERATION
+            | TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION
+            | TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION
+    )
+}
+
+fn admit_latest_known_argument_group(
     arguments: &Map<String, Value>,
+    requires_series: bool,
 ) -> Result<(), ToolInputError> {
     let supplied = ["generation", "knowledgeCutoff", "effectiveDateCutoff"]
         .into_iter()
         .filter(|name| arguments.contains_key(*name))
         .count();
-    if supplied == 0 || supplied == 3 {
+    let series = arguments.contains_key("seriesIds");
+    if (supplied == 0 && !series) || (supplied == 3 && series == requires_series) {
         Ok(())
     } else {
         Err(ToolInputError::Invalid)
@@ -3062,6 +3124,24 @@ fn admit_macro_context_cutoffs(arguments: &Map<String, Value>) -> Result<(), Too
     } else {
         Err(ToolInputError::Invalid)
     }
+}
+
+fn admit_treasury_series_ids(value: &Value) -> Result<(), ToolInputError> {
+    let values = value.as_array().ok_or(ToolInputError::Invalid)?;
+    if values.is_empty() || values.len() > 32 {
+        return Err(ToolInputError::Invalid);
+    }
+    let mut seen = HashSet::new();
+    for value in values {
+        let identifier = value
+            .as_str()
+            .filter(|value| !value.is_empty() && value.len() <= 256)
+            .ok_or(ToolInputError::Invalid)?;
+        if !seen.insert(identifier) {
+            return Err(ToolInputError::Invalid);
+        }
+    }
+    Ok(())
 }
 
 fn admit_fred_generation(value: &Value) -> Result<(), ToolInputError> {

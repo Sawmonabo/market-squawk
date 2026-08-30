@@ -1609,6 +1609,9 @@ pub(super) const fn native_implementation_name(
             "coinbase_exchange_direct_v1"
         }
         ProviderNativeLineageImplementation::EiaSeriesV1 => "eia_series_v1",
+        ProviderNativeLineageImplementation::FredAlfredSeriesObservationsV1 => {
+            "fred_alfred_series_observations_v1"
+        }
         ProviderNativeLineageImplementation::KrakenSpotV1 => "kraken_spot_v1",
         ProviderNativeLineageImplementation::SecEdgarV1 => "sec_edgar_v1",
         ProviderNativeLineageImplementation::AlpacaHistoricalBarV1 => "alpaca_historical_bar_v1",
@@ -1618,6 +1621,7 @@ pub(super) const fn native_implementation_name(
         }
         ProviderNativeLineageImplementation::TiingoFundNavV1 => "tiingo_fund_nav_v1",
         ProviderNativeLineageImplementation::TiingoEodMarketBarV1 => "tiingo_eod_market_bar_v1",
+        ProviderNativeLineageImplementation::UsTreasuryMacroV1 => "us_treasury_macro_v1",
         ProviderNativeLineageImplementation::YahooEnrichmentV1 => "yahoo_enrichment_v1",
     }
 }
@@ -1636,6 +1640,9 @@ pub(super) fn parse_native_implementation(
             Ok(ProviderNativeLineageImplementation::CoinbaseExchangeDirectV1)
         }
         "eia_series_v1" => Ok(ProviderNativeLineageImplementation::EiaSeriesV1),
+        "fred_alfred_series_observations_v1" => {
+            Ok(ProviderNativeLineageImplementation::FredAlfredSeriesObservationsV1)
+        }
         "kraken_spot_v1" => Ok(ProviderNativeLineageImplementation::KrakenSpotV1),
         "sec_edgar_v1" => Ok(ProviderNativeLineageImplementation::SecEdgarV1),
         "alpaca_historical_bar_v1" => {
@@ -1649,8 +1656,28 @@ pub(super) fn parse_native_implementation(
         }
         "tiingo_fund_nav_v1" => Ok(ProviderNativeLineageImplementation::TiingoFundNavV1),
         "tiingo_eod_market_bar_v1" => Ok(ProviderNativeLineageImplementation::TiingoEodMarketBarV1),
+        "us_treasury_macro_v1" => Ok(ProviderNativeLineageImplementation::UsTreasuryMacroV1),
         "yahoo_enrichment_v1" => Ok(ProviderNativeLineageImplementation::YahooEnrichmentV1),
         _ => Err(CatalogError::CorruptCatalog),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{native_implementation_name, parse_native_implementation};
+    use market_squawk_sources::ProviderNativeLineageImplementation;
+
+    #[test]
+    fn fred_and_treasury_native_implementations_round_trip_through_catalog_names() {
+        for implementation in [
+            ProviderNativeLineageImplementation::FredAlfredSeriesObservationsV1,
+            ProviderNativeLineageImplementation::UsTreasuryMacroV1,
+        ] {
+            assert!(matches!(
+                parse_native_implementation(native_implementation_name(implementation)),
+                Ok(parsed) if parsed == implementation
+            ));
+        }
     }
 }
 

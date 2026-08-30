@@ -4,6 +4,7 @@ mod account;
 mod alpaca;
 pub(crate) mod credentials;
 mod direct;
+mod fred;
 mod fred_read;
 mod kraken_l3;
 mod market_config;
@@ -11,6 +12,7 @@ pub(crate) mod nasdaq_reference;
 mod reference_identity;
 mod schwab;
 mod specs;
+mod treasury;
 
 use std::{
     fmt,
@@ -57,6 +59,9 @@ pub(crate) use account::ProviderAccountRuntimeCurrentness;
 pub use account::{ProviderAccountActivationError, ProviderAccountBinding, ProviderMarketAccount};
 pub use alpaca::{AlpacaBasicAccountActivation, AlpacaBasicActivationError};
 pub use direct::{CoinbaseDirectAccountActivation, CoinbaseDirectRuntimeAdmission};
+pub(crate) use fred::{
+    FredPublicationActivationError, publish_fred_latest_known, reopen_fred_latest_known,
+};
 pub(crate) use fred_read::{
     FRED_ALFRED_READ_OPERATION, FredDesktopPointInTimeReadDto, FredPointInTimeReadCapability,
     FredPointInTimeReadError,
@@ -86,6 +91,11 @@ pub use specs::{
     LocalFileAdapterActivation, PortfolioAdapterActivation, ProviderAdapterActivationError,
     ProviderAdapterActivationRequest, SecAdapterActivation, TreasuryAdapterActivation,
 };
+pub(crate) use treasury::{
+    TreasuryDurableRecovery, TreasuryPublicationActivationError, publish_treasury_latest_known,
+    reopen_treasury_latest_known,
+};
+
 
 const COINBASE_SURFACE: &str = "coinbase.public-market-data";
 const KRAKEN_SURFACE: &str = "kraken.spot-public-market-data";

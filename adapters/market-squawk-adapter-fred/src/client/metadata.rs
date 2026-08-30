@@ -233,6 +233,12 @@ impl FredSeriesMetadataDocument {
     pub fn into_capture_material(self) -> ProviderCaptureMaterial {
         self.capture
     }
+
+    pub(super) fn into_native_semantics_and_capture(
+        self,
+    ) -> (FredSeriesMetadata, ProviderCaptureMaterial) {
+        (self.series, self.capture)
+    }
 }
 
 impl FredSource {

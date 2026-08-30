@@ -109,6 +109,9 @@ impl FredObservation {
 pub struct FredObservationPage {
     realtime_start: CalendarDate,
     realtime_end: CalendarDate,
+    observation_start: CalendarDate,
+    observation_end: CalendarDate,
+    units: String,
     count: usize,
     offset: usize,
     limit: usize,
@@ -151,9 +154,9 @@ impl FredObservationPage {
 
         let realtime_start = parse_date(&wire.realtime_start)?;
         let realtime_end = parse_date(&wire.realtime_end)?;
-        let _observation_start = parse_date(&wire.observation_start)?;
-        let _observation_end = parse_date(&wire.observation_end)?;
-        if realtime_start > realtime_end {
+        let observation_start = parse_date(&wire.observation_start)?;
+        let observation_end = parse_date(&wire.observation_end)?;
+        if realtime_start > realtime_end || observation_start > observation_end {
             return Err(FredProtocolError::InvalidField("realtime interval"));
         }
 
@@ -210,6 +213,9 @@ impl FredObservationPage {
         Ok(Self {
             realtime_start,
             realtime_end,
+            observation_start,
+            observation_end,
+            units: wire.units,
             count: wire.count,
             offset: wire.offset,
             limit: wire.limit,
@@ -251,6 +257,21 @@ impl FredObservationPage {
     /// Returns the page-level closed realtime interval end.
     pub const fn realtime_end(&self) -> CalendarDate {
         self.realtime_end
+    }
+
+    /// Returns the provider-declared first observation civil date for this response.
+    pub const fn observation_start(&self) -> CalendarDate {
+        self.observation_start
+    }
+
+    /// Returns the provider-declared final observation civil date for this response.
+    pub const fn observation_end(&self) -> CalendarDate {
+        self.observation_end
+    }
+
+    /// Returns the exact provider unit mode declared by the observation response.
+    pub fn units(&self) -> &str {
+        &self.units
     }
 }
 

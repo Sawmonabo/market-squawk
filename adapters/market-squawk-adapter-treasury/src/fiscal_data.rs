@@ -76,18 +76,31 @@ impl FiscalDataParseLimits {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FiscalDataSchema {
+    labels: FiscalFields,
     data_types: FiscalFields,
     data_formats: FiscalFields,
     digest: [u8; 32],
 }
 
 impl FiscalDataSchema {
+    pub(crate) fn labels(&self) -> &[(String, String)] {
+        &self.labels
+    }
+
     pub(crate) fn data_type(&self, field: &str) -> Option<&str> {
         field_value(&self.data_types, field)
     }
 
     pub(crate) fn data_format(&self, field: &str) -> Option<&str> {
         field_value(&self.data_formats, field)
+    }
+
+    pub(crate) fn data_types(&self) -> &[(String, String)] {
+        &self.data_types
+    }
+
+    pub(crate) fn data_formats(&self) -> &[(String, String)] {
+        &self.data_formats
     }
 }
 
@@ -124,6 +137,10 @@ impl FiscalDataRecord {
 
     pub(crate) fn schema(&self) -> &FiscalDataSchema {
         &self.schema
+    }
+
+    pub(crate) fn values(&self) -> &[(String, String)] {
+        &self.values
     }
 }
 
@@ -254,6 +271,7 @@ impl FiscalDataPage {
             &wire.meta.data_formats,
         );
         let schema = Arc::new(FiscalDataSchema {
+            labels: wire.meta.labels,
             data_types: wire.meta.data_types,
             data_formats: wire.meta.data_formats,
             digest,
@@ -349,6 +367,10 @@ impl FiscalDataPage {
     /// Returns the exact validated provider next-page token, if this page is nonterminal.
     pub fn next_page_token(&self) -> Option<&str> {
         self.next_page_token.as_deref()
+    }
+
+    pub(crate) fn schema(&self) -> &FiscalDataSchema {
+        &self.schema
     }
 }
 

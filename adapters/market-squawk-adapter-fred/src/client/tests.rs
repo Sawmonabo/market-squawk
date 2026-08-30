@@ -15,10 +15,10 @@ use market_squawk_sources::{
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy, BudgetScope,
     CURRENT_RESEARCH_RECORD_SCHEMA, CoverageDomain, EndpointPolicy, ExtractionAuthority,
     ExtractionRequest, ExtractionSource, FreshnessPolicy, HistoricalCapability,
-    NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, QueryParameterRule, QuerySensitivity,
-    SourceCapabilities, SourceClass, SourceCoverage, SourceError, SourceMetadata,
-    SourceMetadataInput, SourceMetadataProvider, SourceObject, SourceProtocolProfile,
-    payload_matches_exact_evidence,
+    NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderNativeLineageImplementation,
+    QueryParameterRule, QuerySensitivity, SourceCapabilities, SourceClass, SourceCoverage,
+    SourceError, SourceMetadata, SourceMetadataInput, SourceMetadataProvider, SourceObject,
+    SourceProtocolProfile, payload_matches_exact_evidence,
 };
 use sha2::Digest;
 use tokio_util::sync::CancellationToken;
@@ -349,13 +349,47 @@ async fn durable_extraction_emits_canonical_schema_v3_macro_observations() -> Te
         output.captures()[1].records()[0].payload(),
         observation_body.as_ref()
     );
-    let (batch, captures) = output.into_parts();
-    assert_eq!(captures.len(), 2);
+    let (batch, capture, native_lineage, row_capture_page_ordinals) =
+        output.try_into_common_publication()?;
+    assert_eq!(capture.receipt().pages().len(), 2);
+    assert_eq!(row_capture_page_ordinals, [1, 1]);
+    assert_eq!(
+        native_lineage.schema().implementation(),
+        ProviderNativeLineageImplementation::FredAlfredSeriesObservationsV1
+    );
+    native_lineage.validate(&batch)?;
+    let native_batch: serde_json::Value = serde_json::from_slice(
+        native_lineage
+            .batch_sidecar()
+            .ok_or("missing FRED native batch sidecar")?
+            .semantic_payload(),
+    )?;
+    assert_eq!(native_batch["family"], "fred_alfred_series_observations");
+    assert_eq!(native_batch["namespace"], "alfred");
+    assert_eq!(native_batch["series"]["id"], "CPIAUCSL");
+    assert_eq!(native_batch["series"]["observation_start"]["year"], 1947);
+    assert_eq!(native_batch["series"]["observation_end"]["year"], 2023);
+    assert_eq!(native_batch["series"]["units"], "Index 1982-1984=100");
+    assert_eq!(native_batch["page"]["units"], "lin");
+    assert_eq!(native_batch["page"]["offset"], 0);
+    assert_eq!(native_batch["page"]["returned"], 2);
+    assert_eq!(native_batch["page"]["terminal"], true);
+    let first_native: serde_json::Value =
+        serde_json::from_slice(native_lineage.rows()[0].semantic_payload())?;
+    let second_native: serde_json::Value =
+        serde_json::from_slice(native_lineage.rows()[1].semantic_payload())?;
+    assert_eq!(first_native["raw_value"], "101.25");
+    assert!(!first_native["value"].is_null());
+    assert!(first_native["missing_marker"].is_null());
+    assert_eq!(second_native["raw_value"], ".");
+    assert!(second_native["value"].is_null());
+    assert_eq!(second_native["missing_marker"], ".");
     let revisions = source.source.revision_plan(&batch)?;
 
     assert_eq!(batch.records().len(), 2);
     assert_eq!(revisions.len(), batch.records().len());
     assert!(!revisions.is_locally_observed());
+    assert!(revisions.native_lineage_required());
     for record in batch.records() {
         assert_eq!(record.schema().as_str(), CURRENT_RESEARCH_RECORD_SCHEMA);
         assert!(payload_matches_exact_evidence(
