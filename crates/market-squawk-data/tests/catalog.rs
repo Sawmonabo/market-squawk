@@ -1031,6 +1031,7 @@ fn listing_reference_catalog_replays_and_reopens_one_complete_generation() -> Te
     );
     drop(reader);
     drop(publisher);
+    drop(mismatched_publisher);
     drop(authority);
 
     let reopened = CatalogAuthority::open(config)?;
