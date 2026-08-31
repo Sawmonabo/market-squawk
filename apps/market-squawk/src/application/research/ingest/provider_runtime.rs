@@ -2488,6 +2488,19 @@ mod tests {
         assert_eq!(accepted.published(), 1);
         assert_eq!(wire.exchange_count(), 1);
 
+        let wrong_family =
+            SchwabMarketDataAccountActivation::acquire_test_family_publication_attempt(
+                &oauth,
+                evidence.doctor_receipt(),
+                SchwabMarketDataFamily::PriceHistory,
+            )
+            .await;
+        assert!(matches!(
+            wrong_family,
+            Err(SchwabMarketDataActivationError::AuthorityMismatch)
+        ));
+        assert_eq!(wire.exchange_count(), 1);
+
         let (token, revoked_epoch) =
             SchwabMarketDataAccountActivation::acquire_test_publication_attempt(&oauth, 1).await?;
         let completed =

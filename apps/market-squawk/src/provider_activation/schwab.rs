@@ -2,14 +2,19 @@
 
 use std::{
     collections::BTreeSet,
+    future::Future,
     num::NonZeroUsize,
+    pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use market_squawk_adapter_schwab::{
-    AccessTokenAdmission, ParseBounds, ProviderIdentifier, RequestAdmission, RestTransportBounds,
-    SchwabTransportTelemetry, TransientAccessToken,
+    AccessTokenAdmission, MarketDataService, ParseBounds, ProviderIdentifier,
+    RawRestResponseReceipt, ReadOnlyRequest, ReadOnlyRoute, RequestAdmission, RestExecutionOutcome,
+    RestItemAccounting, RestTransportBounds, SchwabAccessTokenSource,
+    SchwabMarketDataQualification, SchwabRestFamily, SchwabSealedStreamerCapture,
+    SchwabTransportTelemetry, TokenAuthorityError, TransientAccessToken,
 };
 use market_squawk_data::{
     DatasetId, ListingReferenceGenerationReceipt, ListingReferenceReadCapability,
@@ -21,7 +26,7 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     ProviderRateAuthority, SCHWAB_MARKET_DATA_SURFACE_ID, SchwabMarketDataDoctorReceiptV1,
-    SourceMetadata,
+    SchwabMarketDataFamily, SourceMetadata,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -74,7 +79,320 @@ pub struct SchwabMarketDataAccountActivation {
     authority: Arc<ProviderAccountRuntimeAuthority>,
     oauth: SchwabOAuthMarketAuthority,
     doctor: SchwabMarketDataDoctorReceiptV1,
-    doctor_generation: Mutex<SchwabDoctorGenerationDisposition>,
+    doctor_generation: Arc<Mutex<SchwabDoctorGenerationDisposition>>,
+    streamer_authority_issued: Mutex<bool>,
+}
+
+/// Provider-neutral product meaning of one internally qualified read-only market-data leaf.
+///
+/// This type is deliberately not serialized. It lets application composition route an internal
+/// provider handoff without exposing provider names, endpoints, token state, or adapter terms to
+/// ordinary product DTOs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadOnlyMarketDataLeaf {
+    CurrentQuotes,
+    HistoricalPrices,
+    OptionSurface,
+    OptionExpirations,
+    TradingHours,
+    MarketMovers,
+    InstrumentReference,
+    EquityLive,
+    OptionLive,
+    FuturesLive,
+    FuturesOptionLive,
+    ForexLive,
+    VenueBook,
+    IntradayChart,
+    MarketScreener,
+}
+
+/// One-use REST attempt minted by the sole account activation.
+///
+/// The bearer and OAuth epoch remain private and non-cloneable. A caller may borrow the bearer for
+/// exactly the already-bound allowlisted request, then must consume this attempt together with the
+/// completed adapter outcome. The response cannot be relabeled as another family or another
+/// request after transport.
+pub(crate) struct SchwabReadOnlyRestAttempt {
+    leaf: ReadOnlyMarketDataLeaf,
+    family: SchwabMarketDataFamily,
+    route: ReadOnlyRoute,
+    request_url: Box<str>,
+    requested_items: u64,
+    doctor: SchwabMarketDataDoctorReceiptV1,
+    currentness: ProviderAccountRuntimeCurrentness,
+    token: TransientAccessToken,
+    oauth_epoch: SchwabOAuthPublicationEpoch,
+}
+
+impl SchwabReadOnlyRestAttempt {
+    pub(crate) const fn leaf(&self) -> ReadOnlyMarketDataLeaf {
+        self.leaf
+    }
+
+    /// Borrows the zeroizing bearer owner only for immediate adapter execution.
+    pub(crate) const fn token(&self) -> &TransientAccessToken {
+        &self.token
+    }
+
+    /// Consumes the exact attempt and completed provider-native response into the only application
+    /// handoff admitted for this request.
+    pub(crate) fn complete(
+        self,
+        outcome: RestExecutionOutcome,
+    ) -> Result<SchwabReadOnlyRestHandoff, SchwabMarketDataActivationError> {
+        if !self.currentness.is_active_now() {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
+        let receipt = rest_outcome_receipt(&outcome)?;
+        let accounting = rest_outcome_accounting(&outcome)?;
+        let expected_payload = rest_payload_family(self.route)
+            .ok_or(SchwabMarketDataActivationError::AuthorityMismatch)?;
+        if receipt.route() != self.route
+            || receipt.request_url() != self.request_url.as_ref()
+            || accounting.requested != self.requested_items
+            || receipt.token_generation() != self.token.generation()
+            || receipt.credential_authority() != self.token.credential_authority()
+            || receipt.token_generation() != self.oauth_epoch.receipt().generation()
+            || receipt.credential_authority() != self.oauth_epoch.receipt().credential_authority()
+            || matches!(
+                &outcome,
+                RestExecutionOutcome::Accepted(response)
+                    if response.payload().family() != expected_payload
+            )
+        {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
+        self.oauth_epoch
+            .validate_current(self.oauth_epoch.receipt())?;
+        let observed_at = timestamp_from_millis(receipt.received_at_unix_millis())?;
+        let qualification = SchwabMarketDataQualification::try_from_doctor_receipt(
+            &self.doctor,
+            self.family,
+            observed_at,
+            self.oauth_epoch.receipt(),
+        )
+        .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
+        if !self.currentness.is_active_now() {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
+        self.oauth_epoch
+            .validate_current(self.oauth_epoch.receipt())?;
+        Ok(SchwabReadOnlyRestHandoff {
+            leaf: self.leaf,
+            qualification,
+            outcome,
+            oauth_epoch: self.oauth_epoch,
+        })
+    }
+}
+
+impl std::fmt::Debug for SchwabReadOnlyRestAttempt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SchwabReadOnlyRestAttempt")
+            .field("leaf", &self.leaf)
+            .field("family", &self.family)
+            .field("route", &self.route)
+            .field("request_url", &self.request_url)
+            .field("requested_items", &self.requested_items)
+            .field("token", &"[PROTECTED TOKEN]")
+            .finish()
+    }
+}
+
+/// Non-cloneable provider-native response handoff with a neutral application routing key.
+pub(crate) struct SchwabReadOnlyRestHandoff {
+    leaf: ReadOnlyMarketDataLeaf,
+    qualification: SchwabMarketDataQualification,
+    outcome: RestExecutionOutcome,
+    oauth_epoch: SchwabOAuthPublicationEpoch,
+}
+
+impl SchwabReadOnlyRestHandoff {
+    pub(crate) const fn leaf(&self) -> ReadOnlyMarketDataLeaf {
+        self.leaf
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        SchwabMarketDataQualification,
+        RestExecutionOutcome,
+        SchwabOAuthPublicationEpoch,
+    ) {
+        (self.qualification, self.outcome, self.oauth_epoch)
+    }
+}
+
+impl std::fmt::Debug for SchwabReadOnlyRestHandoff {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SchwabReadOnlyRestHandoff")
+            .field("leaf", &self.leaf)
+            .field("qualification", &self.qualification)
+            .field("outcome", &self.outcome)
+            .field("oauth_epoch", &"[CURRENTNESS BARRIER]")
+            .finish()
+    }
+}
+
+/// Sole doctor-bound token authority for one multiplexed Streamer owner.
+///
+/// The activation issues this value at most once. It implements no account activity service and
+/// every token acquisition rechecks the complete selected service set against the exact current
+/// doctor generation. A refresh that advances the token generation latches renewal-required and
+/// returns no callable token.
+pub(crate) struct SchwabReadOnlyStreamerAuthority {
+    services: Box<
+        [(
+            MarketDataService,
+            ReadOnlyMarketDataLeaf,
+            SchwabMarketDataFamily,
+        )],
+    >,
+    currentness: ProviderAccountRuntimeCurrentness,
+    oauth: SchwabOAuthMarketAuthority,
+    doctor: SchwabMarketDataDoctorReceiptV1,
+    doctor_generation: Arc<Mutex<SchwabDoctorGenerationDisposition>>,
+}
+
+impl SchwabReadOnlyStreamerAuthority {
+    pub(crate) fn services(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (MarketDataService, ReadOnlyMarketDataLeaf)> + '_ {
+        self.services
+            .iter()
+            .map(|(service, leaf, _family)| (*service, *leaf))
+    }
+
+    /// Revalidates the account lease, OAuth receipt, doctor generation, and every selected family.
+    /// A shared Streamer sink calls this before admitting or committing a sealed microbatch.
+    pub(crate) async fn require_current(&self) -> Result<(), SchwabMarketDataActivationError> {
+        if !self.currentness.is_active().await {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
+        let current = self.oauth.current_receipt().await?;
+        require_doctor_generation(&self.doctor_generation, current.generation().get())?;
+        let observed_at = system_timestamp()
+            .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
+        for (_service, _leaf, family) in self.services.iter() {
+            SchwabMarketDataQualification::try_from_doctor_receipt(
+                &self.doctor,
+                *family,
+                observed_at,
+                current,
+            )
+            .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
+        }
+        if !self.currentness.is_active().await {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Qualifies one exact frame from an already physically sealed provider-native microbatch.
+    ///
+    /// The frame time and token/principal/session coordinates come only from the sealed capture;
+    /// callers cannot provide or relabel them. Service/content-coordinate validation remains in
+    /// the adapter's canonical mapper, and the shared publisher must still retain the connection's
+    /// exact successful subscription acknowledgement.
+    pub(crate) async fn qualify_sealed_frame(
+        &self,
+        service: MarketDataService,
+        capture: &SchwabSealedStreamerCapture,
+        frame_index: usize,
+    ) -> Result<SchwabMarketDataQualification, SchwabMarketDataActivationError> {
+        if !self.currentness.is_active().await {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
+        let (_selected_service, _leaf, family) = self
+            .services
+            .iter()
+            .find(|(selected, _leaf, _family)| *selected == service)
+            .copied()
+            .ok_or(SchwabMarketDataActivationError::AuthorityMismatch)?;
+        let frame = capture
+            .frames()
+            .get(frame_index)
+            .ok_or(SchwabMarketDataActivationError::AuthorityMismatch)?;
+        let receipt = capture.streamer_receipt();
+        let current = self.oauth.current_receipt().await?;
+        require_doctor_generation(&self.doctor_generation, current.generation().get())?;
+        if receipt.token_generation() != current.generation()
+            || receipt.credential_authority() != current.credential_authority()
+            || receipt.session_identifier() != self.doctor.session_identifier()
+            || receipt.market_data_principal_sha256() != self.doctor.market_data_principal_sha256()
+            || frame.generation() != receipt.generation()
+        {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
+        let observed_at = timestamp_from_millis(frame.received_at_unix_millis())?;
+        let qualification = SchwabMarketDataQualification::try_from_doctor_receipt(
+            &self.doctor,
+            family,
+            observed_at,
+            current,
+        )
+        .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
+        if !self.currentness.is_active().await {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
+        Ok(qualification)
+    }
+
+    async fn acquire_bound_token(&self) -> Result<TransientAccessToken, TokenAuthorityError> {
+        if !self.currentness.is_active().await {
+            return Err(TokenAuthorityError::Unavailable);
+        }
+        let (token, epoch) = self
+            .oauth
+            .acquire_publication_attempt()
+            .await
+            .map_err(map_streamer_token_error)?;
+        require_doctor_generation(&self.doctor_generation, epoch.receipt().generation().get())
+            .map_err(map_streamer_activation_error)?;
+        let observed_at = system_timestamp().map_err(|_error| TokenAuthorityError::Unavailable)?;
+        for (_service, _leaf, family) in self.services.iter() {
+            SchwabMarketDataQualification::try_from_doctor_receipt(
+                &self.doctor,
+                *family,
+                observed_at,
+                epoch.receipt(),
+            )
+            .map_err(|_error| TokenAuthorityError::ReauthorizationRequired)?;
+        }
+        if token.generation() != epoch.receipt().generation()
+            || token.credential_authority() != epoch.receipt().credential_authority()
+            || !self.currentness.is_active().await
+        {
+            return Err(TokenAuthorityError::ReauthorizationRequired);
+        }
+        epoch
+            .validate_current(epoch.receipt())
+            .map_err(map_streamer_token_error)?;
+        Ok(token)
+    }
+}
+
+impl SchwabAccessTokenSource for SchwabReadOnlyStreamerAuthority {
+    fn acquire(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<TransientAccessToken, TokenAuthorityError>> + Send + '_>>
+    {
+        Box::pin(self.acquire_bound_token())
+    }
+}
+
+impl std::fmt::Debug for SchwabReadOnlyStreamerAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SchwabReadOnlyStreamerAuthority")
+            .field("services", &self.services)
+            .field("oauth", &"[PROTECTED TOKEN AUTHORITY]")
+            .field("doctor_receipt", &self.doctor.receipt_sha256())
+            .finish()
+    }
 }
 
 /// One-use upstream package for the exact registered Schwab current-quote generation.
@@ -218,6 +536,102 @@ impl SchwabMarketDataAccountActivation {
         self.require_doctor_generation(current.generation().get())
     }
 
+    /// Mints one exact non-cloneable REST attempt for the supplied typed read-only request.
+    ///
+    /// The route remains the adapter's closed market-data allowlist. `userPreference` is excluded
+    /// here because it is reserved for the one Streamer bootstrap owner, and no account, order, or
+    /// money-movement route can be represented by `ReadOnlyRequest`.
+    pub(crate) async fn acquire_read_only_rest_attempt(
+        &self,
+        request: &ReadOnlyRequest,
+    ) -> Result<SchwabReadOnlyRestAttempt, SchwabMarketDataActivationError> {
+        let (family, leaf, _payload) =
+            rest_leaf(request.route()).ok_or(SchwabMarketDataActivationError::AuthorityMismatch)?;
+        if ReadOnlyRoute::classify(request.method(), request.url())
+            .ok()
+            .is_none_or(|classified| classified != request.route())
+        {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
+        let requested_items = u64::try_from(request.requested_items())
+            .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
+        let (token, oauth_epoch) = self.acquire_publication_attempt().await?;
+        let observed_at = system_timestamp()
+            .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
+        SchwabMarketDataQualification::try_from_doctor_receipt(
+            &self.doctor,
+            family,
+            observed_at,
+            oauth_epoch.receipt(),
+        )
+        .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
+        Ok(SchwabReadOnlyRestAttempt {
+            leaf,
+            family,
+            route: request.route(),
+            request_url: request.url().to_owned().into_boxed_str(),
+            requested_items,
+            doctor: self.doctor.clone(),
+            currentness: self.currentness(),
+            token,
+            oauth_epoch,
+        })
+    }
+
+    /// Issues the sole doctor-bound token authority for one multiplexed Streamer owner.
+    ///
+    /// Every desired service must be one of the twelve market-data-only services and must have an
+    /// available/degraded observation in this exact doctor receipt. Issuance is one-shot for this
+    /// activation, so application composition cannot manufacture a second socket owner.
+    pub(crate) async fn issue_read_only_streamer_authority(
+        &self,
+        services: Vec<MarketDataService>,
+    ) -> Result<SchwabReadOnlyStreamerAuthority, SchwabMarketDataActivationError> {
+        if services.is_empty() {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
+        let mut distinct = BTreeSet::new();
+        let mut qualified = Vec::new();
+        qualified
+            .try_reserve_exact(services.len())
+            .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
+        self.require_current().await?;
+        let current = self.oauth.current_receipt().await?;
+        self.require_doctor_generation(current.generation().get())?;
+        let observed_at = system_timestamp()
+            .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
+        for service in services {
+            if !distinct.insert(service) {
+                return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+            }
+            let (family, leaf) = streamer_leaf(service);
+            SchwabMarketDataQualification::try_from_doctor_receipt(
+                &self.doctor,
+                family,
+                observed_at,
+                current,
+            )
+            .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
+            qualified.push((service, leaf, family));
+        }
+        let mut issued = self
+            .streamer_authority_issued
+            .lock()
+            .map_err(|_poisoned| SchwabMarketDataActivationError::AuthorityMismatch)?;
+        if *issued {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
+        *issued = true;
+        drop(issued);
+        Ok(SchwabReadOnlyStreamerAuthority {
+            services: qualified.into_boxed_slice(),
+            currentness: self.currentness(),
+            oauth: self.oauth.clone(),
+            doctor: self.doctor.clone(),
+            doctor_generation: Arc::clone(&self.doctor_generation),
+        })
+    }
+
     /// Acquires one exact token/publication attempt behind the serialized OAuth barrier.
     ///
     /// A protected refresh may legitimately advance the token generation. That observation is
@@ -294,6 +708,27 @@ impl SchwabMarketDataAccountActivation {
         require_doctor_generation(&disposition, epoch.receipt().generation().get())?;
         Ok((token, epoch))
     }
+
+    #[cfg(test)]
+    pub(crate) async fn acquire_test_family_publication_attempt(
+        oauth: &SchwabOAuthMarketAuthority,
+        doctor: &SchwabMarketDataDoctorReceiptV1,
+        family: SchwabMarketDataFamily,
+    ) -> Result<(TransientAccessToken, SchwabOAuthPublicationEpoch), SchwabMarketDataActivationError>
+    {
+        let (token, epoch) =
+            Self::acquire_test_publication_attempt(oauth, doctor.access_token_generation()).await?;
+        let observed_at = system_timestamp()
+            .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
+        SchwabMarketDataQualification::try_from_doctor_receipt(
+            doctor,
+            family,
+            observed_at,
+            epoch.receipt(),
+        )
+        .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
+        Ok((token, epoch))
+    }
 }
 
 fn require_doctor_generation(
@@ -319,6 +754,175 @@ fn require_doctor_generation(
         SchwabDoctorGenerationDisposition::RenewalRequired { .. } => {
             Err(SchwabMarketDataActivationError::DoctorRenewalRequired)
         }
+    }
+}
+
+fn rest_leaf(
+    route: ReadOnlyRoute,
+) -> Option<(
+    SchwabMarketDataFamily,
+    ReadOnlyMarketDataLeaf,
+    SchwabRestFamily,
+)> {
+    Some(match route {
+        ReadOnlyRoute::Quotes | ReadOnlyRoute::SingleQuote => (
+            SchwabMarketDataFamily::Quotes,
+            ReadOnlyMarketDataLeaf::CurrentQuotes,
+            SchwabRestFamily::Quotes,
+        ),
+        ReadOnlyRoute::PriceHistory => (
+            SchwabMarketDataFamily::PriceHistory,
+            ReadOnlyMarketDataLeaf::HistoricalPrices,
+            SchwabRestFamily::DailyPriceHistory,
+        ),
+        ReadOnlyRoute::Chains => (
+            SchwabMarketDataFamily::OptionChains,
+            ReadOnlyMarketDataLeaf::OptionSurface,
+            SchwabRestFamily::OptionChain,
+        ),
+        ReadOnlyRoute::ExpirationChain => (
+            SchwabMarketDataFamily::ExpirationChains,
+            ReadOnlyMarketDataLeaf::OptionExpirations,
+            SchwabRestFamily::ExpirationChain,
+        ),
+        ReadOnlyRoute::Markets | ReadOnlyRoute::SingleMarket => (
+            SchwabMarketDataFamily::MarketHours,
+            ReadOnlyMarketDataLeaf::TradingHours,
+            SchwabRestFamily::MarketHours,
+        ),
+        ReadOnlyRoute::Movers => (
+            SchwabMarketDataFamily::Movers,
+            ReadOnlyMarketDataLeaf::MarketMovers,
+            SchwabRestFamily::Movers,
+        ),
+        ReadOnlyRoute::Instruments | ReadOnlyRoute::InstrumentByCusip => (
+            SchwabMarketDataFamily::Instruments,
+            ReadOnlyMarketDataLeaf::InstrumentReference,
+            SchwabRestFamily::Instruments,
+        ),
+        ReadOnlyRoute::UserPreference => return None,
+    })
+}
+
+fn rest_payload_family(route: ReadOnlyRoute) -> Option<SchwabRestFamily> {
+    rest_leaf(route).map(|(_family, _leaf, payload)| payload)
+}
+
+const fn streamer_leaf(
+    service: MarketDataService,
+) -> (SchwabMarketDataFamily, ReadOnlyMarketDataLeaf) {
+    match service {
+        MarketDataService::LevelOneEquities => (
+            SchwabMarketDataFamily::LevelOneEquities,
+            ReadOnlyMarketDataLeaf::EquityLive,
+        ),
+        MarketDataService::LevelOneOptions => (
+            SchwabMarketDataFamily::LevelOneOptions,
+            ReadOnlyMarketDataLeaf::OptionLive,
+        ),
+        MarketDataService::LevelOneFutures => (
+            SchwabMarketDataFamily::LevelOneFutures,
+            ReadOnlyMarketDataLeaf::FuturesLive,
+        ),
+        MarketDataService::LevelOneFuturesOptions => (
+            SchwabMarketDataFamily::LevelOneFuturesOptions,
+            ReadOnlyMarketDataLeaf::FuturesOptionLive,
+        ),
+        MarketDataService::LevelOneForex => (
+            SchwabMarketDataFamily::LevelOneForex,
+            ReadOnlyMarketDataLeaf::ForexLive,
+        ),
+        MarketDataService::NyseBook => (
+            SchwabMarketDataFamily::NyseBook,
+            ReadOnlyMarketDataLeaf::VenueBook,
+        ),
+        MarketDataService::NasdaqBook => (
+            SchwabMarketDataFamily::NasdaqBook,
+            ReadOnlyMarketDataLeaf::VenueBook,
+        ),
+        MarketDataService::OptionsBook => (
+            SchwabMarketDataFamily::OptionsBook,
+            ReadOnlyMarketDataLeaf::VenueBook,
+        ),
+        MarketDataService::ChartEquity => (
+            SchwabMarketDataFamily::ChartEquity,
+            ReadOnlyMarketDataLeaf::IntradayChart,
+        ),
+        MarketDataService::ChartFutures => (
+            SchwabMarketDataFamily::ChartFutures,
+            ReadOnlyMarketDataLeaf::IntradayChart,
+        ),
+        MarketDataService::ScreenerEquity => (
+            SchwabMarketDataFamily::ScreenerEquity,
+            ReadOnlyMarketDataLeaf::MarketScreener,
+        ),
+        MarketDataService::ScreenerOption => (
+            SchwabMarketDataFamily::ScreenerOption,
+            ReadOnlyMarketDataLeaf::MarketScreener,
+        ),
+    }
+}
+
+fn rest_outcome_receipt(
+    outcome: &RestExecutionOutcome,
+) -> Result<&RawRestResponseReceipt, SchwabMarketDataActivationError> {
+    match outcome {
+        RestExecutionOutcome::Accepted(response) => Ok(response.capture().receipt()),
+        RestExecutionOutcome::ProviderRejected(capture)
+        | RestExecutionOutcome::InvalidPayload { capture, .. } => Ok(capture.receipt()),
+        RestExecutionOutcome::AcceptedUserPreference(_)
+        | RestExecutionOutcome::UserPreferenceRejected(_)
+        | RestExecutionOutcome::InvalidUserPreference { .. } => {
+            Err(SchwabMarketDataActivationError::AuthorityMismatch)
+        }
+    }
+}
+
+fn rest_outcome_accounting(
+    outcome: &RestExecutionOutcome,
+) -> Result<RestItemAccounting, SchwabMarketDataActivationError> {
+    match outcome {
+        RestExecutionOutcome::Accepted(response) => Ok(response.accounting()),
+        RestExecutionOutcome::ProviderRejected(capture)
+        | RestExecutionOutcome::InvalidPayload { capture, .. } => Ok(capture.accounting()),
+        RestExecutionOutcome::AcceptedUserPreference(_)
+        | RestExecutionOutcome::UserPreferenceRejected(_)
+        | RestExecutionOutcome::InvalidUserPreference { .. } => {
+            Err(SchwabMarketDataActivationError::AuthorityMismatch)
+        }
+    }
+}
+
+fn timestamp_from_millis(millis: u64) -> Result<Timestamp, SchwabMarketDataActivationError> {
+    millis
+        .checked_mul(1_000_000)
+        .and_then(|value| i64::try_from(value).ok())
+        .map(Timestamp::from_unix_nanos)
+        .ok_or(SchwabMarketDataActivationError::AuthorityMismatch)
+}
+
+fn map_streamer_token_error(
+    error: crate::provider_onboarding::SchwabOAuthRuntimeError,
+) -> TokenAuthorityError {
+    use crate::provider_onboarding::SchwabOAuthRuntimeError;
+    match error {
+        SchwabOAuthRuntimeError::ReauthorizationRequired
+        | SchwabOAuthRuntimeError::MarketAuthorityRevoked
+        | SchwabOAuthRuntimeError::ShuttingDown => TokenAuthorityError::ReauthorizationRequired,
+        _ => TokenAuthorityError::Unavailable,
+    }
+}
+
+fn map_streamer_activation_error(error: SchwabMarketDataActivationError) -> TokenAuthorityError {
+    match error {
+        SchwabMarketDataActivationError::DoctorRenewalRequired
+        | SchwabMarketDataActivationError::AuthorityMismatch => {
+            TokenAuthorityError::ReauthorizationRequired
+        }
+        SchwabMarketDataActivationError::Cancelled
+        | SchwabMarketDataActivationError::Account(_)
+        | SchwabMarketDataActivationError::Onboarding(_)
+        | SchwabMarketDataActivationError::OAuth(_) => TokenAuthorityError::Unavailable,
     }
 }
 
@@ -380,9 +984,10 @@ impl ProviderAdapterActivation {
             authority,
             oauth,
             doctor,
-            doctor_generation: Mutex::new(SchwabDoctorGenerationDisposition::Current(
+            doctor_generation: Arc::new(Mutex::new(SchwabDoctorGenerationDisposition::Current(
                 current.generation().get(),
-            )),
+            ))),
+            streamer_authority_issued: Mutex::new(false),
         };
         activation.require_current().await?;
         Ok(activation)
