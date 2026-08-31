@@ -38,6 +38,10 @@ const positiveDecimalSchema = canonicalDecimalSchema.refine(
   (value) => value !== "0" && !value.startsWith("-"),
   "Expected a positive exact amount.",
 )
+const nonnegativeDecimalSchema = canonicalDecimalSchema.refine(
+  (value) => !value.startsWith("-"),
+  "Expected a nonnegative exact amount.",
+)
 const percentageSchema = canonicalDecimalSchema.refine(
   (value) =>
     !value.startsWith("-") && comparePositiveDecimals(value, "100") <= 0,
@@ -68,6 +72,25 @@ const savedScreenIdSchema = z
 const moneySchema = z
   .object({ amount: positiveDecimalSchema, currency: currencySchema })
   .strict()
+
+const signedMoneySchema = z
+  .object({ amount: canonicalDecimalSchema, currency: currencySchema })
+  .strict()
+
+const signedMoneyRangeSchema = z
+  .object({ lower: signedMoneySchema, upper: signedMoneySchema })
+  .strict()
+  .superRefine((value, context) => {
+    if (
+      value.lower.currency !== value.upper.currency ||
+      compareCanonicalDecimals(value.lower.amount, value.upper.amount) > 0
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "The signed money range is inconsistent.",
+      })
+    }
+  })
 
 const priceRangeSchema = z
   .object({ lower: moneySchema, upper: moneySchema })
@@ -188,6 +211,8 @@ const priceSummarySchema = z
 
 const coverageKinds = [
   "current_market",
+  "non_harmonic_features",
+  "price_pattern",
   "forecast",
   "valuation",
   "historical_test",
@@ -338,9 +363,91 @@ const evidenceSummarySchema = z
   })
   .strict()
 
+const evidenceFamilySchema = z.discriminatedUnion("state", [
+  z
+    .object({ state: z.literal("available"), summary: productTextSchema })
+    .strict(),
+  z
+    .object({ state: z.literal("unavailable"), summary: productTextSchema })
+    .strict(),
+])
+
+const analyticalEvidenceSchema = z
+  .object({
+    currentMarket: evidenceFamilySchema,
+    nonHarmonicFeatures: evidenceFamilySchema,
+    pricePattern: evidenceFamilySchema,
+    forecast: evidenceFamilySchema,
+    financialModelAndValuation: evidenceFamilySchema,
+    historicalTest: evidenceFamilySchema,
+    liquidity: evidenceFamilySchema,
+    portfolioRisk: evidenceFamilySchema,
+    combination: z
+      .object({
+        state: z.enum(["multi_evidence", "insufficient"]),
+        summary: productTextSchema,
+      })
+      .strict(),
+  })
+  .strict()
+
+const liquiditySchema = z.discriminatedUnion("state", [
+  z
+    .object({
+      state: z.literal("available"),
+      quotedSpreadPercent: nonnegativeDecimalSchema,
+      policyRelativeCapacityPercent: percentageSchema,
+      summary: productTextSchema,
+    })
+    .strict(),
+  z
+    .object({ state: z.literal("unavailable"), summary: productTextSchema })
+    .strict(),
+])
+
+const portfolioImpactSchema = z.discriminatedUnion("state", [
+  z
+    .object({
+      state: z.literal("available"),
+      portfolioLabel: z.string().trim().min(1).max(128),
+      positionState: z.enum(["no_position", "current_position"]),
+      riskCapacityPercent: percentageSchema,
+      summary: productTextSchema,
+    })
+    .strict(),
+  z
+    .object({ state: z.literal("unavailable"), summary: productTextSchema })
+    .strict(),
+])
+
+const virtualPaperEligibilitySchema = z
+  .object({
+    state: z.literal("not_eligible"),
+    executionAuthority: z.literal("none"),
+    requiresExplicitPaperApproval: z.literal(true),
+    requiresFreshRiskCheck: z.literal(true),
+    summary: productTextSchema,
+  })
+  .strict()
+
+const grossPricePnlSchema = z.discriminatedUnion("state", [
+  z
+    .object({
+      state: z.literal("available"),
+      range: signedMoneyRangeSchema,
+      summary: productTextSchema,
+    })
+    .strict(),
+  z
+    .object({ state: z.literal("unavailable"), summary: productTextSchema })
+    .strict(),
+])
+
 const priceChangeRangeSchema = z
   .object({
     priceRange: priceRangeSchema,
+    absolutePriceChange: signedMoneyRangeSchema,
+    grossPricePnl: grossPricePnlSchema,
     priceChangePercent: z
       .object({
         lower: canonicalDecimalSchema,
@@ -356,13 +463,66 @@ const priceChangeRangeSchema = z
   })
   .strict()
 
+const expectedReturnSchema = z.discriminatedUnion("state", [
+  z
+    .object({
+      state: z.literal("available"),
+      grossPriceReturnPercent: canonicalDecimalSchema.nullable(),
+      exactRatio: z
+        .object({ numerator: signedMoneySchema, denominator: moneySchema })
+        .strict()
+        .superRefine((value, context) => {
+          if (value.numerator.currency !== value.denominator.currency) {
+            context.addIssue({
+              code: "custom",
+              message: "The exact expected-return ratio mixes currencies.",
+            })
+          }
+        }),
+      summary: productTextSchema,
+    })
+    .strict(),
+  z
+    .object({ state: z.literal("unavailable"), summary: productTextSchema })
+    .strict(),
+])
+
+const expectedGrossPricePnlSchema = z.discriminatedUnion("state", [
+  z
+    .object({
+      state: z.literal("available"),
+      amount: signedMoneySchema,
+      summary: productTextSchema,
+    })
+    .strict(),
+  z
+    .object({ state: z.literal("unavailable"), summary: productTextSchema })
+    .strict(),
+])
+
+const unavailableProjectionMetricSchema = z
+  .object({ state: z.literal("unavailable"), summary: productTextSchema })
+  .strict()
+
 const outcomeProjectionSchema = z
   .object({
     startingPrice: moneySchema,
     endsAt: canonicalRfc3339Schema,
+    positionScale: z
+      .object({
+        quantityLots: nonnegativeIntegerSchema,
+        summary: productTextSchema,
+      })
+      .strict()
+      .nullable(),
     downside: priceChangeRangeSchema,
     base: priceChangeRangeSchema,
     upside: priceChangeRangeSchema,
+    expectedReturn: expectedReturnSchema,
+    expectedGrossPricePnl: expectedGrossPricePnlSchema,
+    netPnl: unavailableProjectionMetricSchema,
+    benchmarkReturn: unavailableProjectionMetricSchema,
+    afterTaxPnl: unavailableProjectionMetricSchema,
     limitations: z.array(productTextSchema).min(1).max(8),
   })
   .strict()
@@ -563,12 +723,30 @@ function analysisMoney(analysis: {
     )
   }
   if (analysis.outcomeProjection) {
+    const projection = analysis.outcomeProjection
     values.push(
-      analysis.outcomeProjection.startingPrice,
-      ...rangeMoney(analysis.outcomeProjection.downside.priceRange),
-      ...rangeMoney(analysis.outcomeProjection.base.priceRange),
-      ...rangeMoney(analysis.outcomeProjection.upside.priceRange),
+      projection.startingPrice,
+      ...rangeMoney(projection.downside.priceRange),
+      ...rangeMoney(projection.base.priceRange),
+      ...rangeMoney(projection.upside.priceRange),
+      ...rangeMoney(projection.downside.absolutePriceChange),
+      ...rangeMoney(projection.base.absolutePriceChange),
+      ...rangeMoney(projection.upside.absolutePriceChange),
     )
+    for (const scenario of [projection.downside, projection.base, projection.upside]) {
+      if (scenario.grossPricePnl.state === "available") {
+        values.push(...rangeMoney(scenario.grossPricePnl.range))
+      }
+    }
+    if (projection.expectedReturn.state === "available") {
+      values.push(
+        projection.expectedReturn.exactRatio.numerator,
+        projection.expectedReturn.exactRatio.denominator,
+      )
+    }
+    if (projection.expectedGrossPricePnl.state === "available") {
+      values.push(projection.expectedGrossPricePnl.amount)
+    }
   }
   const realized = analysis.realizedOutcome?.result
   if (realized?.kind === "completed") {
@@ -596,8 +774,12 @@ export const investmentAnalysisSchema = z
     assumptions: z.array(productTextSchema).max(32),
     invalidators: z.array(productTextSchema).max(32),
     evidenceSummary: evidenceSummarySchema,
+    analyticalEvidence: analyticalEvidenceSchema,
+    liquidity: liquiditySchema,
+    portfolioImpact: portfolioImpactSchema,
     outcomeProjection: outcomeProjectionSchema.nullable(),
     sizing: sizingSchema.nullable(),
+    virtualPaperEligibility: virtualPaperEligibilitySchema,
     realizedOutcome: realizedOutcomeSchema.nullable(),
     trackRecordActionToken: actionTokenSchema.nullable(),
   })
@@ -654,6 +836,109 @@ export const investmentAnalysisSchema = z
         path: ["outcomeProjection", "endsAt"],
         message: "The outcome projection uses a different investment horizon.",
       })
+    }
+    if (
+      analysis.portfolioImpact.state === "available" &&
+      analysis.portfolioImpact.portfolioLabel !== analysis.portfolioLabel
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["portfolioImpact", "portfolioLabel"],
+        message: "The portfolio-impact advisory belongs to a different portfolio.",
+      })
+    }
+    const evidenceFamilies = [
+      ["current_market", analysis.analyticalEvidence.currentMarket],
+      ["non_harmonic_features", analysis.analyticalEvidence.nonHarmonicFeatures],
+      ["price_pattern", analysis.analyticalEvidence.pricePattern],
+      ["forecast", analysis.analyticalEvidence.forecast],
+      ["valuation", analysis.analyticalEvidence.financialModelAndValuation],
+      ["historical_test", analysis.analyticalEvidence.historicalTest],
+      ["liquidity", analysis.analyticalEvidence.liquidity],
+      ["portfolio_risk", analysis.analyticalEvidence.portfolioRisk],
+    ] as const
+    evidenceFamilies.forEach(([kind, family], index) => {
+      const coverage = analysis.evidenceSummary.coverage.items[index]
+      if (coverage?.kind !== kind || coverage.state !== family.state) {
+        context.addIssue({
+          code: "custom",
+          path: ["analyticalEvidence"],
+          message: "The analytical evidence families contradict evidence coverage.",
+        })
+      }
+    })
+    const expectedCombination =
+      analysis.recommendation.kind === "unavailable"
+        ? "insufficient"
+        : "multi_evidence"
+    if (analysis.analyticalEvidence.combination.state !== expectedCombination) {
+      context.addIssue({
+        code: "custom",
+        path: ["analyticalEvidence", "combination", "state"],
+        message: "The evidence-combination state contradicts the recommendation.",
+      })
+    }
+    const structuredAvailability = [
+      [analysis.priceSummary.current, analysis.analyticalEvidence.currentMarket.state],
+      [
+        analysis.priceSummary.fairValue,
+        analysis.analyticalEvidence.financialModelAndValuation.state,
+      ],
+      [analysis.priceSummary.scenarios, analysis.analyticalEvidence.forecast.state],
+      [analysis.evidenceSummary.historicalTest, analysis.analyticalEvidence.historicalTest.state],
+    ] as const
+    if (
+      structuredAvailability.some(
+        ([structured, state]) =>
+          (structured === null ? "unavailable" : "available") !== state,
+      ) ||
+      analysis.liquidity.state !== analysis.analyticalEvidence.liquidity.state ||
+      analysis.portfolioImpact.state !== analysis.analyticalEvidence.portfolioRisk.state
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["analyticalEvidence"],
+        message: "The evidence-family summary contradicts its structured evidence.",
+      })
+    }
+    if (
+      analysis.recommendation.kind === "action" &&
+      [
+        analysis.analyticalEvidence.currentMarket,
+        analysis.analyticalEvidence.forecast,
+        analysis.analyticalEvidence.financialModelAndValuation,
+        analysis.analyticalEvidence.historicalTest,
+        analysis.analyticalEvidence.liquidity,
+        analysis.analyticalEvidence.portfolioRisk,
+      ].some((family) => family.state !== "available")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["analyticalEvidence"],
+        message: "An investment action is missing an independent required evidence family.",
+      })
+    }
+    const projection = analysis.outcomeProjection
+    if (projection !== null) {
+      const grossPricePnlStates = [
+        projection.downside.grossPricePnl.state,
+        projection.base.grossPricePnl.state,
+        projection.upside.grossPricePnl.state,
+      ]
+      if (
+        (projection.positionScale === null &&
+          grossPricePnlStates.some((state) => state === "available")) ||
+        (projection.positionScale !== null &&
+          grossPricePnlStates.some((state) => state !== "available")) ||
+        (projection.expectedGrossPricePnl.state === "available" &&
+          projection.positionScale === null)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["outcomeProjection", "positionScale"],
+          message: "Gross profit-or-loss availability contradicts the exact position scale.",
+        })
+      }
     }
     const scenarios = analysis.priceSummary.scenarios
     const actionRanges = analysis.priceSummary.actionRanges

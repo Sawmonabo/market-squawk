@@ -33,7 +33,7 @@ import {
   InvestmentBrief,
   locatorOutcomeLabel,
 } from "./investment-brief"
-import { formatUnixNanos } from "./format"
+import { formatProductTimestamp } from "./format"
 
 const ANALYSIS_PAGE_LIMIT = 24
 
@@ -468,10 +468,10 @@ function AnalysisHistoryCard({
       <dl className="mt-4 grid gap-3 border-t border-border/70 pt-3 sm:grid-cols-3">
         <CardFact
           label="Information current through"
-          value={formatUnixNanos(analysis.horizon.informationCurrentThrough)}
+          value={formatProductTimestamp(analysis.horizon.informationCurrentThrough)}
         />
-        <CardFact label="Horizon" value={formatUnixNanos(analysis.horizon.endsAt)} />
-        <CardFact label="Expires" value={formatUnixNanos(analysis.horizon.expiresAt)} />
+        <CardFact label="Horizon" value={formatProductTimestamp(analysis.horizon.endsAt)} />
+        <CardFact label="Expires" value={formatProductTimestamp(analysis.horizon.expiresAt)} />
       </dl>
       <div className="mt-4 flex items-center justify-end gap-1 text-xs font-medium text-primary">
         Open brief

@@ -14,6 +14,16 @@ export function formatLosslessInteger(value: string): string {
   }
 }
 
+/** Formats the opportunity product's canonical UTC timestamp without changing its precision. */
+export function formatProductTimestamp(value: string): string {
+  const match = value.match(
+    /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2}\.\d{9})Z$/,
+  )
+  const date = match?.[1]
+  const time = match?.[2]
+  return date && time ? `${date} ${time} UTC` : value
+}
+
 /** Formats an exact Unix-nanosecond timestamp with BigInt-only calendar arithmetic. */
 export function formatUnixNanos(value: string): string {
   try {

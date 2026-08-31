@@ -10,12 +10,15 @@ import type {
   InvestmentAnalysisLocator,
   RecommendationTrackRecord,
 } from "./contracts"
-import { formatLosslessInteger } from "./format"
+import { formatLosslessInteger, formatProductTimestamp } from "./format"
 
 type Money = NonNullable<InvestmentAnalysis["priceSummary"]["current"]>
 type PriceRange = NonNullable<
   InvestmentAnalysis["priceSummary"]["scenarios"]
 >["base"]
+type Projection = NonNullable<InvestmentAnalysis["outcomeProjection"]>
+type ProjectedScenario = Projection["downside"]
+type EvidenceFamily = InvestmentAnalysis["analyticalEvidence"]["forecast"]
 
 export function InvestmentBrief({
   analysis,
@@ -103,9 +106,12 @@ export function InvestmentBrief({
 
       <PriceRanges analysis={analysis} />
       <ProductLists analysis={analysis} />
+      <AnalyticalEvidence analysis={analysis} />
       <EvidenceSummary analysis={analysis} />
       <OutcomeProjection analysis={analysis} />
+      <PortfolioImpact analysis={analysis} />
       <SizingSummary analysis={analysis} />
+      <VirtualPaperEligibility analysis={analysis} />
       <RealizedOutcome analysis={analysis} />
       <TrackRecord
         record={trackRecord}
@@ -121,15 +127,15 @@ function PriceRanges({ analysis }: { analysis: InvestmentAnalysis }) {
   const actionRanges = analysis.priceSummary.actionRanges
   if (!scenarios && !actionRanges) return null
   return (
-    <Disclosure title="Price ranges">
+    <Disclosure title="Price targets and action ranges">
       <p className="text-xs leading-5 text-muted-foreground">
         These are saved research ranges, not guaranteed prices.
       </p>
       {scenarios ? (
         <dl className="mt-4 grid gap-4 sm:grid-cols-3">
-          <Fact label="Downside scenario" value={priceRange(scenarios.downside)} />
-          <Fact label="Base scenario" value={priceRange(scenarios.base)} />
-          <Fact label="Upside scenario" value={priceRange(scenarios.upside)} />
+          <Fact label="Downside target range" value={priceRange(scenarios.downside)} />
+          <Fact label="Base target range" value={priceRange(scenarios.base)} />
+          <Fact label="Upside target range" value={priceRange(scenarios.upside)} />
         </dl>
       ) : null}
       {actionRanges ? (
@@ -137,7 +143,7 @@ function PriceRanges({ analysis }: { analysis: InvestmentAnalysis }) {
           <Fact label="Entry range" value={priceRange(actionRanges.entry)} />
           <Fact label="Add range" value={priceRange(actionRanges.add)} />
           <Fact label="Trim range" value={priceRange(actionRanges.trim)} />
-          <Fact label="Exit range" value={priceRange(actionRanges.exit)} />
+          <Fact label="Sell / invalidation range" value={priceRange(actionRanges.exit)} />
         </dl>
       ) : null}
     </Disclosure>
@@ -163,6 +169,43 @@ function ProductLists({ analysis }: { analysis: InvestmentAnalysis }) {
   )
 }
 
+function AnalyticalEvidence({ analysis }: { analysis: InvestmentAnalysis }) {
+  const evidence = analysis.analyticalEvidence
+  return (
+    <Disclosure title="What the analysis combined">
+      <p className="text-xs leading-5 text-muted-foreground">
+        No single forecast, valuation, feature, pattern, or data source can set this
+        recommendation or its evidence reliability.
+      </p>
+      <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        <Fact label="Current market" value={evidenceFamily(evidence.currentMarket)} />
+        <Fact
+          label="Other (non-harmonic) features"
+          value={evidenceFamily(evidence.nonHarmonicFeatures)}
+        />
+        <Fact
+          label="Harmonic price-pattern feature"
+          value={evidenceFamily(evidence.pricePattern)}
+        />
+        <Fact label="Forecast" value={evidenceFamily(evidence.forecast)} />
+        <Fact
+          label="Financial model and valuation"
+          value={evidenceFamily(evidence.financialModelAndValuation)}
+        />
+        <Fact label="Historical test" value={evidenceFamily(evidence.historicalTest)} />
+        <Fact label="Liquidity" value={evidenceFamily(evidence.liquidity)} />
+        <Fact label="Portfolio risk" value={evidenceFamily(evidence.portfolioRisk)} />
+        <Fact
+          label="Combined evidence"
+          value={`${
+            evidence.combination.state === "multi_evidence" ? "Combined" : "Insufficient"
+          }. ${evidence.combination.summary}`}
+        />
+      </dl>
+    </Disclosure>
+  )
+}
+
 function EvidenceSummary({ analysis }: { analysis: InvestmentAnalysis }) {
   const evidence = analysis.evidenceSummary
   const historical = evidence.historicalTest
@@ -173,10 +216,11 @@ function EvidenceSummary({ analysis }: { analysis: InvestmentAnalysis }) {
         <Fact label="Evidence coverage" value={evidence.coverage.summary} />
         <Fact label="Forecast calibration" value={evidence.calibration.summary} />
         <Fact label="Out-of-sample evidence" value={evidence.outOfSample.summary} />
-        <Fact label="Cost treatment" value={evidence.costs.summary} />
+        <Fact label="Historical cost treatment" value={evidence.costs.summary} />
+        <Fact label="Current liquidity" value={analysis.liquidity.summary} />
         <Fact label="Uncertainty" value={uncertainty.summary} />
         <Fact
-          label="Evidence reliability"
+          label="Combined evidence reliability (not profit odds)"
           value={
             uncertainty.state === "available"
               ? formatPercent(uncertainty.evidenceReliabilityPercent)
@@ -202,6 +246,7 @@ function EvidenceSummary({ analysis }: { analysis: InvestmentAnalysis }) {
       ) : null}
       {historical ? (
         <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          <Fact label="Historical-test meaning" value={historical.summary} />
           <Fact
             label="Historical net return"
             value={formatPercent(historical.netReturnPercent)}
@@ -238,6 +283,19 @@ function EvidenceSummary({ analysis }: { analysis: InvestmentAnalysis }) {
           />
         </dl>
       ) : null}
+      {analysis.liquidity.state === "available" ? (
+        <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          <Fact
+            label="Current quoted spread"
+            value={formatPercent(analysis.liquidity.quotedSpreadPercent)}
+          />
+          <Fact
+            label="Usable policy-relative capacity"
+            value={formatPercent(analysis.liquidity.policyRelativeCapacityPercent)}
+          />
+          <Fact label="Liquidity meaning" value={analysis.liquidity.summary} />
+        </dl>
+      ) : null}
     </Disclosure>
   )
 }
@@ -246,33 +304,103 @@ function OutcomeProjection({ analysis }: { analysis: InvestmentAnalysis }) {
   const projection = analysis.outcomeProjection
   if (!projection) return null
   return (
-    <Disclosure title="Projected gross price change">
-      <dl className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+    <Disclosure title="Projected outcomes">
+      <p className="text-xs leading-5 text-muted-foreground">
+        These are gross price projections. Expected values appear only when the saved forecast
+        separately admitted a conditional mean; scenario bands are never treated as expected
+        returns.
+      </p>
+      <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
         <Fact label="Starting price" value={money(projection.startingPrice)} />
         <Fact label="Projection horizon" value={formatProductTimestamp(projection.endsAt)} />
-        <Fact label="Downside range" value={priceRange(projection.downside.priceRange)} />
-        <Fact label="Base range" value={priceRange(projection.base.priceRange)} />
-        <Fact label="Upside range" value={priceRange(projection.upside.priceRange)} />
+        <Fact
+          label="Exact position scale"
+          value={
+            projection.positionScale
+              ? `${formatLosslessInteger(
+                  projection.positionScale.quantityLots,
+                )} lots. ${projection.positionScale.summary}`
+              : "Unavailable; exact-quantity gross profit or loss is not shown."
+          }
+        />
+        <Fact label="Expected gross price return" value={expectedReturn(projection)} />
+        <Fact
+          label="Expected gross price P/L"
+          value={
+            projection.expectedGrossPricePnl.state === "available"
+              ? `${money(projection.expectedGrossPricePnl.amount)}. ${
+                  projection.expectedGrossPricePnl.summary
+                }`
+              : projection.expectedGrossPricePnl.summary
+          }
+        />
+        <Fact label="Net P/L" value={projection.netPnl.summary} />
+        <Fact label="Benchmark-relative return" value={projection.benchmarkReturn.summary} />
+        <Fact label="After-tax P/L" value={projection.afterTaxPnl.summary} />
+      </dl>
+      <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <Fact label="Downside price range" value={priceRange(projection.downside.priceRange)} />
+        <Fact
+          label="Downside absolute price change"
+          value={signedMoneyRange(projection.downside.absolutePriceChange)}
+        />
         {projection.downside.priceChangePercent ? (
           <Fact
             label="Downside price change"
             value={percentRange(projection.downside.priceChangePercent)}
           />
         ) : null}
+        <Fact label="Downside gross price P/L" value={grossPricePnl(projection.downside)} />
+        <Fact label="Base price range" value={priceRange(projection.base.priceRange)} />
+        <Fact
+          label="Base absolute price change"
+          value={signedMoneyRange(projection.base.absolutePriceChange)}
+        />
         {projection.base.priceChangePercent ? (
           <Fact
             label="Base price change"
             value={percentRange(projection.base.priceChangePercent)}
           />
         ) : null}
+        <Fact label="Base gross price P/L" value={grossPricePnl(projection.base)} />
+        <Fact label="Upside price range" value={priceRange(projection.upside.priceRange)} />
+        <Fact
+          label="Upside absolute price change"
+          value={signedMoneyRange(projection.upside.absolutePriceChange)}
+        />
         {projection.upside.priceChangePercent ? (
           <Fact
             label="Upside price change"
             value={percentRange(projection.upside.priceChangePercent)}
           />
         ) : null}
+        <Fact label="Upside gross price P/L" value={grossPricePnl(projection.upside)} />
       </dl>
       <TextList title="Projection limitations" values={projection.limitations} empty="" />
+    </Disclosure>
+  )
+}
+
+function PortfolioImpact({ analysis }: { analysis: InvestmentAnalysis }) {
+  const impact = analysis.portfolioImpact
+  return (
+    <Disclosure title="Portfolio impact">
+      {impact.state === "available" ? (
+        <dl className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          <Fact label="Selected portfolio" value={impact.portfolioLabel} />
+          <Fact
+            label="Current position"
+            value={impact.positionState === "current_position" ? "Position held" : "No position"}
+          />
+          <Fact
+            label="Saved risk capacity"
+            value={formatPercent(impact.riskCapacityPercent)}
+          />
+          <Fact label="Impact meaning" value={impact.summary} />
+        </dl>
+      ) : (
+        <p className="text-xs leading-5 text-muted-foreground">{impact.summary}</p>
+      )}
     </Disclosure>
   )
 }
@@ -287,6 +415,21 @@ function SizingSummary({ analysis }: { analysis: InvestmentAnalysis }) {
         <Fact label="Current lots" value={formatLosslessInteger(sizing.currentLots)} />
         <Fact label="Mandatory range" value={lotRange(sizing.hardFeasibleLots)} />
         <Fact label="Preferred range" value={lotRange(sizing.preferredFeasibleLots)} />
+      </dl>
+    </Disclosure>
+  )
+}
+
+function VirtualPaperEligibility({ analysis }: { analysis: InvestmentAnalysis }) {
+  const eligibility = analysis.virtualPaperEligibility
+  return (
+    <Disclosure title="Virtual-paper eligibility">
+      <dl className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        <Fact label="Status" value="Not eligible from this brief" />
+        <Fact label="Order authority" value="None" />
+        <Fact label="Explicit paper approval" value="Required in a separate workflow" />
+        <Fact label="Fresh risk check" value="Required before any simulated order" />
+        <Fact label="Why" value={eligibility.summary} />
       </dl>
     </Disclosure>
   )
@@ -489,6 +632,32 @@ function priceRange(value: PriceRange): string {
   return `${money(value.lower)} – ${money(value.upper)}`
 }
 
+function signedMoneyRange(value: ProjectedScenario["absolutePriceChange"]): string {
+  return `${money(value.lower)} – ${money(value.upper)}`
+}
+
+function grossPricePnl(value: ProjectedScenario): string {
+  return value.grossPricePnl.state === "available"
+    ? `${signedMoneyRange(value.grossPricePnl.range)}. ${value.grossPricePnl.summary}`
+    : value.grossPricePnl.summary
+}
+
+function expectedReturn(value: Projection): string {
+  const expected = value.expectedReturn
+  if (expected.state === "unavailable") return expected.summary
+  const retainedValue =
+    expected.grossPriceReturnPercent === null
+      ? `Exact saved ratio: ${money(expected.exactRatio.numerator)} divided by ${money(
+          expected.exactRatio.denominator,
+        )}; no unrounded decimal display is available`
+      : formatPercent(expected.grossPriceReturnPercent)
+  return `${retainedValue}. ${expected.summary}`
+}
+
+function evidenceFamily(value: EvidenceFamily): string {
+  return `${value.state === "available" ? "Available" : "Unavailable"}. ${value.summary}`
+}
+
 function lotRange(value: NonNullable<InvestmentAnalysis["sizing"]>["hardFeasibleLots"]): string {
   return value.kind === "available"
     ? `${formatLosslessInteger(value.lower)}–${formatLosslessInteger(value.upper)} lots`
@@ -503,12 +672,6 @@ function investmentTitle(analysis: InvestmentAnalysis): string {
 
 function formatPercent(value: string): string {
   return `${value}%`
-}
-
-function formatProductTimestamp(value: string): string {
-  const date = value.slice(0, 10)
-  const time = value.slice(11, -1)
-  return `${date} ${time} UTC`
 }
 
 function negativePercent(value: string): string {

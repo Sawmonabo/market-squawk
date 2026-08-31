@@ -2,17 +2,19 @@
 
 use std::sync::Arc;
 
+use market_squawk_analytics::HARMONIC_PATTERN_FEATURE_NAME;
 use market_squawk_data::{MarketDataInstrumentCatalogError, MarketDataInstrumentReadCapability};
 use market_squawk_decisions::{
-    CostAdjustedPitBacktestEvidence, FeasibleLotRangeAvailability, InvestmentAnalysisEvidence,
-    InvestmentOutcomeProjection, InvestmentProposalDecision, InvestmentProposalIndexEntry,
-    InvestmentProposalIndexOutcome, InvestmentSizingProjection, NoActionReason,
-    ProposalInvalidator, ProposalUnavailableReason, RecommendationAction, RecommendationConfidence,
-    RecommendationConfidenceComponentKind, RecommendationConfidenceMeaning,
-    RecommendationOutcomeCohort, RecommendationOutcomeStatus,
+    CostAdjustedPitBacktestEvidence, ExactFinancialRatio, ExpectedGrossPricePnlAvailability,
+    ExpectedReturnAvailability, FeasibleLotRangeAvailability, GrossPricePnlAvailability,
+    InvestmentAnalysisEvidence, InvestmentOutcomeProjection, InvestmentProposalDecision,
+    InvestmentProposalIndexEntry, InvestmentProposalIndexOutcome, InvestmentSizingProjection,
+    NoActionReason, PortfolioPositionState, ProposalInvalidator, ProposalUnavailableReason,
+    RecommendationAction, RecommendationConfidence, RecommendationConfidenceComponentKind,
+    RecommendationConfidenceMeaning, RecommendationOutcomeCohort, RecommendationOutcomeStatus,
     RecommendationOutcomeUnavailableReason, RecommendationTrackRecord,
-    RecommendationTrackRecordGroup, RecommendationTrackRecordPerformance, SizingUnavailableReason,
-    TargetPriceRange,
+    RecommendationTrackRecordGroup, RecommendationTrackRecordPerformance, SignedMoneyRange,
+    SizingUnavailableReason, TargetPriceRange,
 };
 use market_squawk_domain::{AccountId, InstrumentId, Money};
 use market_squawk_services::{
@@ -313,8 +315,12 @@ fn investment_analysis_value(
         "assumptions": decision.policy().assumptions().iter().map(|value| value.as_str()).collect::<Vec<_>>(),
         "invalidators": invalidators_value(decision),
         "evidenceSummary": evidence_summary_value(decision),
+        "analyticalEvidence": analytical_evidence_value(decision),
+        "liquidity": liquidity_value(evidence),
+        "portfolioImpact": portfolio_impact_value(evidence, &portfolio_label),
         "outcomeProjection": read.outcome_projection.as_ref().map(outcome_projection_value),
         "sizing": read.sizing_projection.as_ref().map(sizing_projection_value),
+        "virtualPaperEligibility": virtual_paper_eligibility_value(),
         "realizedOutcome": realized_outcome,
         "trackRecordActionToken": read.current.as_ref().map(|_| action_token),
     }))
@@ -391,9 +397,27 @@ fn outcome_projection_value(value: &InvestmentOutcomeProjection) -> Value {
     json!({
         "startingPrice": money_value(value.mark()),
         "endsAt": super::product_timestamp(value.horizon_at()),
+        "positionScale": value.position_scale().map(|scale| json!({
+            "quantityLots": scale.quantity().get(),
+            "summary": "Gross dollar ranges use this exact saved quantity and instrument scale."
+        })),
         "downside": gross_range_value(value.downside()),
         "base": gross_range_value(value.base()),
         "upside": gross_range_value(value.upside()),
+        "expectedReturn": expected_return_value(value.expected_return()),
+        "expectedGrossPricePnl": expected_gross_price_pnl_value(value.expected_gross_price_pnl()),
+        "netPnl": {
+            "state": "unavailable",
+            "summary": "Net profit or loss is unavailable because exact forward trading costs were not supplied."
+        },
+        "benchmarkReturn": {
+            "state": "unavailable",
+            "summary": "Benchmark-relative return is unavailable because exact proposal-time benchmark evidence was not supplied."
+        },
+        "afterTaxPnl": {
+            "state": "unavailable",
+            "summary": "After-tax profit or loss is unavailable because account-, lot-, and jurisdiction-specific tax evidence was not supplied."
+        },
         "limitations": [
             "Projected price changes do not include future trading costs.",
             "Projected price changes are not compared with a benchmark.",
@@ -404,10 +428,20 @@ fn outcome_projection_value(value: &InvestmentOutcomeProjection) -> Value {
 
 fn gross_range_value(value: market_squawk_decisions::GrossMarkRelativeRange) -> Value {
     let ratio = value.gross_return_from_mark();
-    let mut result = Map::from_iter([(
-        "priceRange".to_owned(),
-        price_range_value(value.price_range()),
-    )]);
+    let mut result = Map::from_iter([
+        (
+            "priceRange".to_owned(),
+            price_range_value(value.price_range()),
+        ),
+        (
+            "absolutePriceChange".to_owned(),
+            signed_money_range_value(value.absolute_change()),
+        ),
+        (
+            "grossPricePnl".to_owned(),
+            gross_price_pnl_value(value.gross_price_pnl()),
+        ),
+    ]);
     if let (Some(lower), Some(upper)) = (
         exact_money_ratio_percentage(ratio.lower().numerator(), ratio.lower().denominator()),
         exact_money_ratio_percentage(ratio.upper().numerator(), ratio.upper().denominator()),
@@ -418,6 +452,87 @@ fn gross_range_value(value: market_squawk_decisions::GrossMarkRelativeRange) -> 
         );
     }
     Value::Object(result)
+}
+
+fn expected_return_value(value: ExpectedReturnAvailability) -> Value {
+    match value {
+        ExpectedReturnAvailability::Available(ratio) => {
+            let percentage = exact_financial_ratio_percentage(ratio);
+            json!({
+                "state": "available",
+                "grossPriceReturnPercent": percentage,
+                "exactRatio": exact_financial_ratio_value(ratio),
+                "summary": if percentage.is_some() {
+                    "Expected gross price return comes from an admitted conditional-mean terminal price; it is not a probability of profit."
+                } else {
+                    "An exact conditional-mean gross price-return ratio is retained, but it has no finite decimal percentage without rounding."
+                }
+            })
+        }
+        ExpectedReturnAvailability::UnavailableAdmittedExpectedTerminalValueNotSupplied => json!({
+            "state": "unavailable",
+            "summary": "Expected return is unavailable because no admitted conditional-mean terminal price was supplied. Scenario ranges are not an expected value."
+        }),
+    }
+}
+
+fn expected_gross_price_pnl_value(value: ExpectedGrossPricePnlAvailability) -> Value {
+    match value {
+        ExpectedGrossPricePnlAvailability::Available(amount) => json!({
+            "state": "available",
+            "amount": signed_money_value(amount),
+            "summary": "This is exact-quantity expected gross price profit or loss before costs and tax."
+        }),
+        ExpectedGrossPricePnlAvailability::UnavailableAdmittedExpectedTerminalValueNotSupplied => {
+            json!({
+                "state": "unavailable",
+                "summary": "Expected gross profit or loss is unavailable because no admitted conditional-mean terminal price was supplied."
+            })
+        }
+        ExpectedGrossPricePnlAvailability::UnavailableExactQuantityNotSupplied => json!({
+            "state": "unavailable",
+            "summary": "Expected gross profit or loss is unavailable because no exact quantity and instrument scale were supplied."
+        }),
+    }
+}
+
+fn gross_price_pnl_value(value: GrossPricePnlAvailability) -> Value {
+    match value {
+        GrossPricePnlAvailability::Available(range) => json!({
+            "state": "available",
+            "range": signed_money_range_value(range),
+            "summary": "This is exact-quantity gross price profit or loss before costs and tax."
+        }),
+        GrossPricePnlAvailability::UnavailableExactQuantityNotSupplied => json!({
+            "state": "unavailable",
+            "summary": "Gross profit or loss is unavailable because no exact quantity and instrument scale were supplied."
+        }),
+    }
+}
+
+fn exact_financial_ratio_value(value: ExactFinancialRatio) -> Value {
+    json!({
+        "numerator": signed_money_value(value.numerator()),
+        "denominator": money_value(value.denominator()),
+    })
+}
+
+fn exact_financial_ratio_percentage(value: ExactFinancialRatio) -> Option<String> {
+    exact_money_ratio_percentage(value.numerator(), value.denominator())
+}
+
+fn signed_money_range_value(value: SignedMoneyRange) -> Value {
+    json!({
+        "lower": signed_money_value(value.lower()),
+        "upper": signed_money_value(value.upper()),
+    })
+}
+
+fn signed_money_value(money: Money) -> Value {
+    json!({
+        "amount": money.amount().normalize().to_string(),
+        "currency": money.currency().as_str(),
+    })
 }
 
 fn sizing_projection_value(value: &InvestmentSizingProjection) -> Value {
@@ -670,9 +785,144 @@ fn evidence_summary_value(decision: &InvestmentProposalDecision) -> Value {
     })
 }
 
+fn analytical_evidence_value(decision: &InvestmentProposalDecision) -> Value {
+    let evidence = decision.evidence();
+    let (non_harmonic_features, price_pattern) = feature_family_availability(evidence);
+    let combined = !matches!(decision, InvestmentProposalDecision::Unavailable(_));
+    json!({
+        "currentMarket": evidence_family_value(
+            evidence.market().is_some(),
+            "An eligible current market observation anchored the saved analysis.",
+            "An eligible current market observation was not available."
+        ),
+        "nonHarmonicFeatures": evidence_family_value(
+            non_harmonic_features,
+            "Observed non-harmonic research inputs were retained with the selected candidate; no one input set the recommendation.",
+            "No observed non-harmonic screening contribution was retained with the selected candidate."
+        ),
+        "pricePattern": evidence_family_value(
+            price_pattern,
+            "An observed harmonic price-pattern research input was retained with the selected candidate; it did not set evidence reliability or create an action by itself.",
+            "No observed harmonic price-pattern screening contribution was retained with the selected candidate."
+        ),
+        "forecast": evidence_family_value(
+            evidence.price_forecast().is_some(),
+            "A horizon-aligned calibrated price forecast contributed to the decision.",
+            "A horizon-aligned calibrated price forecast was not available."
+        ),
+        "financialModelAndValuation": evidence_family_value(
+            evidence.valuation().is_some(),
+            "An independently governed per-investment valuation contributed to the decision.",
+            "An independently governed valuation was not available."
+        ),
+        "historicalTest": evidence_family_value(
+            evidence.backtest().is_some(),
+            "A cost-adjusted point-in-time historical test contributed to the decision.",
+            "A qualifying cost-adjusted point-in-time historical test was not available."
+        ),
+        "liquidity": evidence_family_value(
+            evidence.liquidity().is_some(),
+            "Current spread and policy-relative liquidity capacity contributed to the decision.",
+            "Qualifying liquidity evidence was not available."
+        ),
+        "portfolioRisk": evidence_family_value(
+            evidence.portfolio_risk().is_some(),
+            "The explicitly selected portfolio revision and non-reserving risk advisory contributed to the decision.",
+            "Qualifying selected-portfolio risk evidence was not available."
+        ),
+        "combination": {
+            "state": if combined { "multi_evidence" } else { "insufficient" },
+            "summary": if combined {
+                "The saved decision combined forecast, valuation, historical testing, market integrity, liquidity, and portfolio risk. Research features can support selection but cannot produce evidence reliability on their own."
+            } else {
+                "The independent evidence families could not support a recommendation. No model, feature, or market observation was promoted into confidence by itself."
+            }
+        }
+    })
+}
+
+fn feature_family_availability(evidence: &InvestmentAnalysisEvidence) -> (bool, bool) {
+    let mut non_harmonic = false;
+    let mut harmonic = false;
+    if let Some(candidate) = evidence.selected_candidate() {
+        for contribution in candidate.score_contributions() {
+            if contribution.observed().is_none() {
+                continue;
+            }
+            if contribution.binding().key().name() == HARMONIC_PATTERN_FEATURE_NAME {
+                harmonic = true;
+            } else {
+                non_harmonic = true;
+            }
+        }
+    }
+    (non_harmonic, harmonic)
+}
+
+fn evidence_family_value(
+    available: bool,
+    available_summary: &str,
+    unavailable_summary: &str,
+) -> Value {
+    json!({
+        "state": if available { "available" } else { "unavailable" },
+        "summary": if available { available_summary } else { unavailable_summary },
+    })
+}
+
+fn liquidity_value(evidence: &InvestmentAnalysisEvidence) -> Value {
+    match evidence.liquidity() {
+        Some(value) => json!({
+            "state": "available",
+            "quotedSpreadPercent": percentage_from_basis_points(value.quoted_spread().get()),
+            "policyRelativeCapacityPercent": percentage_from_ppm(value.capacity_ppm()),
+            "summary": "Spread and usable capacity describe current marketability. They are not a promise of a future fill."
+        }),
+        None => json!({
+            "state": "unavailable",
+            "summary": "Current liquidity and marketability evidence was not available."
+        }),
+    }
+}
+
+fn portfolio_impact_value(evidence: &InvestmentAnalysisEvidence, portfolio_label: &str) -> Value {
+    match evidence.portfolio_risk() {
+        Some(value) => {
+            let position_state = match value.position_state() {
+                PortfolioPositionState::NoPosition => "no_position",
+                PortfolioPositionState::Position { .. } => "current_position",
+            };
+            json!({
+                "state": "available",
+                "portfolioLabel": portfolio_label,
+                "positionState": position_state,
+                "riskCapacityPercent": percentage_from_ppm(value.risk_capacity_ppm()),
+                "summary": "This portfolio-impact estimate belongs to the exact saved portfolio snapshot. It does not change holdings or set aside risk."
+            })
+        }
+        None => json!({
+            "state": "unavailable",
+            "summary": "Portfolio impact is unavailable because no qualifying selected-portfolio risk advisory was retained."
+        }),
+    }
+}
+
+fn virtual_paper_eligibility_value() -> Value {
+    json!({
+        "state": "not_eligible",
+        "executionAuthority": "none",
+        "requiresExplicitPaperApproval": true,
+        "requiresFreshRiskCheck": true,
+        "summary": "This saved analysis cannot create a simulated or real order. A separate virtual-paper workflow must recheck the investment, current market, size, liquidity, and risk limits before any simulated order."
+    })
+}
+
 fn coverage_summary_value(evidence: &InvestmentAnalysisEvidence) -> Value {
+    let (non_harmonic_features, price_pattern) = feature_family_availability(evidence);
     let items = [
         ("current_market", evidence.market().is_some()),
+        ("non_harmonic_features", non_harmonic_features),
+        ("price_pattern", price_pattern),
         ("forecast", evidence.price_forecast().is_some()),
         ("valuation", evidence.valuation().is_some()),
         ("historical_test", evidence.backtest().is_some()),
