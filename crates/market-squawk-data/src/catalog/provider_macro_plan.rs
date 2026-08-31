@@ -16,7 +16,7 @@ use super::provider_capture::{
 };
 use super::storage::{append_audit, parse_digest, trusted_catalog_now};
 use super::{Catalog, CatalogError};
-use crate::{DatasetId, DatasetManifestRef};
+use crate::{DatasetId, DatasetManifestRef, PublishedObject, Sha256Digest};
 
 pub(crate) const MAX_PROVIDER_MACRO_PLAN_BINDINGS: usize = 4_096;
 pub(crate) const MAX_PROVIDER_MACRO_PLAN_RESPONSES: usize = 1_024;
@@ -33,6 +33,13 @@ const CATALOG_RECEIPT_DOMAIN: &[u8] = b"market-squawk/provider-macro-plan/catalo
 const CATALOG_OUTPUT_MAPPING_DOMAIN: &[u8] = b"market-squawk/provider-macro-plan/output-mapping/v1";
 const CHUNKED_VALUE_DOMAIN: &[u8] = b"market-squawk/provider-macro-plan/chunked-value/v1";
 const PUBLICATION_AUDIT_EVENT: &str = "provider-macro-plan.published";
+const PROVIDER_MACRO_PLAN_SESSION_DOMAIN: &[u8] = b"market-squawk/provider-macro-plan/session/v1";
+const PROVIDER_MACRO_PLAN_REPLAY_PAGE_DOMAIN: &[u8] =
+    b"market-squawk/provider-macro-plan/replay-page/v1";
+const PROVIDER_MACRO_PLAN_REPLAY_GROUP_DOMAIN: &[u8] =
+    b"market-squawk/staged-provider-macro-plan/group/v1";
+pub(crate) const PROVIDER_MACRO_PLAN_REPLAY_GROUP_PAGES: usize = 32;
+const PROVIDER_MACRO_PLAN_REPLAY_GROUP_METADATA_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderMacroPlanValueKind {
@@ -82,21 +89,32 @@ pub(crate) struct ProviderMacroPlanSessionKey {
     metadata_revision: MetadataRevision,
     provider_dataset: SourceIdentifier,
     source_generation_digest: EvidenceDigest,
+    plan_identity: EvidenceDigest,
+    initial_checkpoint_digest: EvidenceDigest,
 }
 
 impl ProviderMacroPlanSessionKey {
     pub(crate) fn try_new(
-        session_id: Uuid,
         analytical_dataset: DatasetId,
         source_id: SourceId,
         metadata_revision: MetadataRevision,
         provider_dataset: SourceIdentifier,
         source_generation_digest: EvidenceDigest,
+        plan_identity: EvidenceDigest,
+        initial_checkpoint_digest: EvidenceDigest,
     ) -> Result<Self, CatalogError> {
         require_digest(source_generation_digest)?;
-        if session_id.is_nil() {
-            return Err(CatalogError::InvalidRecord);
-        }
+        require_digest(plan_identity)?;
+        require_digest(initial_checkpoint_digest)?;
+        let session_id = provider_macro_plan_session_id(
+            &analytical_dataset,
+            &source_id,
+            &metadata_revision,
+            &provider_dataset,
+            source_generation_digest,
+            plan_identity,
+            initial_checkpoint_digest,
+        )?;
         Ok(Self {
             session_id,
             analytical_dataset,
@@ -104,6 +122,8 @@ impl ProviderMacroPlanSessionKey {
             metadata_revision,
             provider_dataset,
             source_generation_digest,
+            plan_identity,
+            initial_checkpoint_digest,
         })
     }
 
@@ -125,6 +145,12 @@ impl ProviderMacroPlanSessionKey {
     pub(crate) const fn source_generation_digest(&self) -> EvidenceDigest {
         self.source_generation_digest
     }
+    pub(crate) const fn plan_identity(&self) -> EvidenceDigest {
+        self.plan_identity
+    }
+    pub(crate) const fn initial_checkpoint_digest(&self) -> EvidenceDigest {
+        self.initial_checkpoint_digest
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,6 +161,22 @@ pub(crate) struct ProviderMacroPlanStageCoordinate {
 }
 
 impl ProviderMacroPlanStageCoordinate {
+    pub(crate) fn from_parts(
+        session_id: Uuid,
+        state_version: u16,
+        checkpoint_digest: EvidenceDigest,
+    ) -> Result<Self, CatalogError> {
+        require_digest(checkpoint_digest)?;
+        if session_id.is_nil() {
+            return Err(CatalogError::InvalidRecord);
+        }
+        Ok(Self {
+            session_id,
+            state_version,
+            checkpoint_digest,
+        })
+    }
+
     pub(crate) const fn session_id(self) -> Uuid {
         self.session_id
     }
@@ -184,6 +226,7 @@ pub(crate) struct ProviderMacroPlanStagedPageInput {
     candidate_digest: EvidenceDigest,
     semantics: ProviderMacroPlanSemanticsEvidence,
     binding: PreparedProviderCaptureBinding,
+    object: ProviderMacroPlanPageObjectEvidence,
 }
 
 impl ProviderMacroPlanStagedPageInput {
@@ -192,12 +235,14 @@ impl ProviderMacroPlanStagedPageInput {
         candidate_digest: EvidenceDigest,
         semantics: ProviderMacroPlanSemanticsEvidence,
         binding: PreparedProviderCaptureBinding,
+        object: ProviderMacroPlanPageObjectEvidence,
     ) -> Result<Self, CatalogError> {
         require_digest(candidate_digest)?;
         if usize::from(page_ordinal) >= MAX_PROVIDER_MACRO_PLAN_DATA_PAGES
             || binding.capture().terminal()
                 != ProviderCaptureTerminalDisposition::StandaloneResponse
             || binding.capture().pages().len() != 1
+            || object.row_count != u64::try_from(binding.record_count()).unwrap_or(u64::MAX)
         {
             return Err(CatalogError::ProviderCaptureMismatch);
         }
@@ -206,7 +251,61 @@ impl ProviderMacroPlanStagedPageInput {
             candidate_digest,
             semantics,
             binding,
+            object,
         })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderMacroPlanPageObjectEvidence {
+    relative_reference: Box<str>,
+    content_hash: Sha256Digest,
+    size_bytes: u64,
+    row_count: u64,
+    lineage_digest: EvidenceDigest,
+    created_at: Timestamp,
+}
+
+impl ProviderMacroPlanPageObjectEvidence {
+    pub(crate) fn try_new(
+        object: &PublishedObject,
+        lineage_digest: EvidenceDigest,
+    ) -> Result<Self, CatalogError> {
+        require_digest(lineage_digest)?;
+        if object.relative_reference().is_empty()
+            || object.relative_reference().len() > 1_024
+            || object.size_bytes() == 0
+            || object.size_bytes() > 1024 * 1024 * 1024
+            || object.row_count() == 0
+        {
+            return Err(CatalogError::InvalidRecord);
+        }
+        Ok(Self {
+            relative_reference: object.relative_reference().into(),
+            content_hash: object.content_hash(),
+            size_bytes: object.size_bytes(),
+            row_count: object.row_count(),
+            lineage_digest,
+            created_at: object.created_at(),
+        })
+    }
+
+    pub(crate) fn published_object(&self) -> Result<PublishedObject, CatalogError> {
+        PublishedObject::try_from_catalog_parts(
+            self.relative_reference.to_string(),
+            self.content_hash,
+            self.size_bytes,
+            self.row_count,
+            self.created_at,
+        )
+        .map_err(|_| CatalogError::CorruptCatalog)
+    }
+
+    pub(crate) const fn lineage_digest(&self) -> EvidenceDigest {
+        self.lineage_digest
+    }
+    pub(crate) const fn row_count(&self) -> u64 {
+        self.row_count
     }
 }
 
@@ -436,6 +535,7 @@ pub(crate) struct ProviderMacroPlanReplayPageEvidence {
     semantics_payload: Box<[u8]>,
     semantics_payload_digest: EvidenceDigest,
     binding: PersistedProviderCaptureBindingEvidence,
+    object: ProviderMacroPlanPageObjectEvidence,
 }
 
 impl ProviderMacroPlanReplayPageEvidence {
@@ -463,6 +563,70 @@ impl ProviderMacroPlanReplayPageEvidence {
     pub(crate) const fn binding(&self) -> &PersistedProviderCaptureBindingEvidence {
         &self.binding
     }
+    pub(crate) const fn object(&self) -> &ProviderMacroPlanPageObjectEvidence {
+        &self.object
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderMacroPlanReplayObjectEvidence {
+    page_ordinal: u16,
+    page_identity_digest: EvidenceDigest,
+    object: ProviderMacroPlanPageObjectEvidence,
+}
+
+impl ProviderMacroPlanReplayObjectEvidence {
+    pub(crate) const fn page_ordinal(&self) -> u16 {
+        self.page_ordinal
+    }
+    pub(crate) const fn page_identity_digest(&self) -> EvidenceDigest {
+        self.page_identity_digest
+    }
+    pub(crate) const fn object(&self) -> &ProviderMacroPlanPageObjectEvidence {
+        &self.object
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderMacroPlanReplayObjectGroup {
+    first_ordinal: u16,
+    pages: Box<[ProviderMacroPlanReplayObjectEvidence]>,
+    next_ordinal: Option<u16>,
+}
+
+impl ProviderMacroPlanReplayObjectGroup {
+    pub(crate) const fn first_ordinal(&self) -> u16 {
+        self.first_ordinal
+    }
+    pub(crate) fn pages(&self) -> &[ProviderMacroPlanReplayObjectEvidence] {
+        &self.pages
+    }
+    pub(crate) const fn next_ordinal(&self) -> Option<u16> {
+        self.next_ordinal
+    }
+
+    pub(crate) fn lineage_digest(
+        &self,
+        publication_digest: EvidenceDigest,
+        plan_identity: EvidenceDigest,
+        source_generation_digest: EvidenceDigest,
+        output_ordinal: usize,
+    ) -> Result<EvidenceDigest, CatalogError> {
+        provider_macro_plan_replay_group_lineage(
+            publication_digest,
+            plan_identity,
+            source_generation_digest,
+            output_ordinal,
+            self.pages.iter().map(|page| {
+                (
+                    page.page_ordinal,
+                    page.page_identity_digest,
+                    page.object.lineage_digest,
+                    page.object.row_count,
+                )
+            }),
+        )
+    }
 }
 
 impl Catalog {
@@ -473,9 +637,23 @@ impl Catalog {
     ) -> Result<ProviderMacroPlanStageCoordinate, CatalogError> {
         validate_checkpoint(&checkpoint)?;
         let checkpoint_digest = sha256_evidence(&checkpoint);
+        if checkpoint_digest != key.initial_checkpoint_digest {
+            return Err(CatalogError::InvalidRecord);
+        }
         let storage_chunk_bytes = self.provider_macro_plan_storage_chunk_bytes()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        match load_session(&transaction, key.session_id) {
+            Ok(existing) => {
+                if existing.key != key {
+                    return Err(CatalogError::ProviderCaptureConflict);
+                }
+                transaction.commit()?;
+                return Ok(existing.coordinate);
+            }
+            Err(CatalogError::ProviderCaptureConflict) => {}
+            Err(error) => return Err(error),
+        }
         let now = trusted_catalog_now(&transaction)?;
         let source_matches: bool = transaction.query_row(
             "SELECT EXISTS(
@@ -507,10 +685,12 @@ impl Catalog {
         transaction.execute(
             "INSERT INTO provider_macro_plan_sessions
              (session_id, analytical_dataset, source_id, metadata_revision, provider_dataset,
-              source_generation_digest, state, state_version, checkpoint_digest,
+              source_generation_digest, plan_identity, initial_checkpoint_digest,
+              state, state_version, checkpoint_digest,
               checkpoint_value_id, response_count, data_page_count, analytical_row_count,
               semantics_bytes, created_at_ns, updated_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'acquiring', 0, ?7, ?8, 0, 0, 0, 0, ?9, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'acquiring', 0, ?9, ?10,
+                     0, 0, 0, 0, ?11, ?11)",
             params![
                 key.session_id.to_string(),
                 key.analytical_dataset.as_str(),
@@ -518,6 +698,8 @@ impl Catalog {
                 key.metadata_revision.as_source_identifier().as_str(),
                 key.provider_dataset.as_str(),
                 digest_bytes(key.source_generation_digest),
+                digest_bytes(key.plan_identity),
+                digest_bytes(key.initial_checkpoint_digest),
                 digest_bytes(checkpoint_digest),
                 digest_bytes(checkpoint_value.value_id),
                 now.unix_nanos(),
@@ -575,8 +757,10 @@ impl Catalog {
              (session_id, page_ordinal, candidate_digest, binding_digest,
               capture_observation_digest, canonical_record_count, semantics_schema,
               semantics_schema_requirement_digest, semantics_digest, semantics_value_id,
-              semantics_payload_digest, staged_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              semantics_payload_digest, object_relative_reference, object_content_hash,
+              object_size_bytes, object_lineage_hash, object_created_at_ns, staged_at_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17)",
             params![
                 expected.session_id.to_string(),
                 i64::from(input.page_ordinal),
@@ -589,6 +773,11 @@ impl Catalog {
                 digest_bytes(input.semantics.semantic_digest),
                 digest_bytes(semantics_value.value_id),
                 digest_bytes(input.semantics.payload_digest),
+                input.object.relative_reference.as_ref(),
+                input.object.content_hash.bytes().as_slice(),
+                to_i64(input.object.size_bytes)?,
+                digest_bytes(input.object.lineage_digest),
+                input.object.created_at.unix_nanos(),
                 now.unix_nanos(),
             ],
         )?;
@@ -762,13 +951,29 @@ impl Catalog {
         session_id: Uuid,
         page_ordinal: u16,
     ) -> Result<Option<ProviderMacroPlanReplayPageEvidence>, CatalogError> {
-        type Row = (Vec<u8>, Vec<u8>, String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+        type Row = (
+            Vec<u8>,
+            Vec<u8>,
+            String,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            String,
+            Vec<u8>,
+            i64,
+            Vec<u8>,
+            i64,
+            i64,
+        );
         let row: Option<Row> = self
             .connection
             .query_row(
                 "SELECT candidate_digest, binding_digest, semantics_schema,
                     semantics_schema_requirement_digest, semantics_digest,
-                    semantics_value_id, semantics_payload_digest
+                    semantics_value_id, semantics_payload_digest,
+                    object_relative_reference, object_content_hash, object_size_bytes,
+                    object_lineage_hash, object_created_at_ns, canonical_record_count
              FROM provider_macro_plan_staged_pages
              WHERE session_id=?1 AND page_ordinal=?2",
                 params![session_id.to_string(), i64::from(page_ordinal)],
@@ -781,6 +986,12 @@ impl Catalog {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
                     ))
                 },
             )
@@ -808,9 +1019,129 @@ impl Catalog {
                 semantics_payload: payload.bytes,
                 semantics_payload_digest: payload_digest,
                 binding,
+                object: ProviderMacroPlanPageObjectEvidence {
+                    relative_reference: row.7.into_boxed_str(),
+                    content_hash: Sha256Digest::new(parse_sha256(&row.8)?.bytes()),
+                    size_bytes: u64::try_from(row.9).map_err(|_| CatalogError::CorruptCatalog)?,
+                    row_count: u64::try_from(row.12).map_err(|_| CatalogError::CorruptCatalog)?,
+                    lineage_digest: parse_sha256(&row.10)?,
+                    created_at: Timestamp::from_unix_nanos(row.11),
+                },
             })
         })
         .transpose()
+    }
+
+    pub(crate) fn provider_macro_plan_replay_object_group(
+        &self,
+        session_id: Uuid,
+        first_ordinal: u16,
+    ) -> Result<ProviderMacroPlanReplayObjectGroup, CatalogError> {
+        let session = load_completed_session(&self.connection, session_id)?;
+        if first_ordinal >= session.data_page_count {
+            return Err(CatalogError::InvalidRecord);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT page.page_ordinal, page.candidate_digest, page.binding_digest,
+                    capture.request_set_identity, capture.capture_content_digest,
+                    capture.capture_observation_digest, binding.sealed_capture_receipt_digest,
+                    binding.extraction_content_digest, native.batch_digest,
+                    page.canonical_record_count, page.semantics_schema,
+                    page.semantics_schema_requirement_digest, page.semantics_digest,
+                    page.semantics_payload_digest, page.object_relative_reference,
+                    page.object_content_hash, page.object_size_bytes, page.object_lineage_hash,
+                    page.object_created_at_ns
+             FROM provider_macro_plan_staged_pages AS page
+             JOIN provider_capture_bindings AS binding ON binding.binding_digest=page.binding_digest
+             JOIN provider_raw_observations AS capture
+               ON capture.capture_observation_digest=page.capture_observation_digest
+             JOIN provider_capture_binding_native_lineage AS native
+               ON native.binding_digest=page.binding_digest
+             WHERE page.session_id=?1 AND page.page_ordinal>=?2
+             ORDER BY page.page_ordinal LIMIT ?3",
+        )?;
+        let mut rows = statement.query(params![
+            session_id.to_string(),
+            i64::from(first_ordinal),
+            to_i64(PROVIDER_MACRO_PLAN_REPLAY_GROUP_PAGES + 1)?,
+        ])?;
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(PROVIDER_MACRO_PLAN_REPLAY_GROUP_PAGES)
+            .map_err(|_| CatalogError::Allocation)?;
+        let mut metadata_bytes = 0usize;
+        let mut has_more = false;
+        while let Some(row) = rows.next()? {
+            if pages.len() == PROVIDER_MACRO_PLAN_REPLAY_GROUP_PAGES {
+                has_more = true;
+                break;
+            }
+            let ordinal = parse_u16(row.get(0)?)?;
+            let expected = first_ordinal
+                .checked_add(to_u16(pages.len())?)
+                .ok_or(CatalogError::CorruptCatalog)?;
+            let relative_reference: String = row.get(14)?;
+            metadata_bytes = metadata_bytes
+                .checked_add(relative_reference.len())
+                .and_then(|value| value.checked_add(18 * 32 + 3 * 8))
+                .ok_or(CatalogError::CorruptCatalog)?;
+            if ordinal != expected
+                || metadata_bytes > PROVIDER_MACRO_PLAN_REPLAY_GROUP_METADATA_BYTES
+            {
+                return Err(CatalogError::CorruptCatalog);
+            }
+            let row_count =
+                u64::try_from(row.get::<_, i64>(9)?).map_err(|_| CatalogError::CorruptCatalog)?;
+            let object = ProviderMacroPlanPageObjectEvidence {
+                relative_reference: relative_reference.into_boxed_str(),
+                content_hash: Sha256Digest::new(parse_sha256(&row.get::<_, Vec<u8>>(15)?)?.bytes()),
+                size_bytes: u64::try_from(row.get::<_, i64>(16)?)
+                    .map_err(|_| CatalogError::CorruptCatalog)?,
+                row_count,
+                lineage_digest: parse_sha256(&row.get::<_, Vec<u8>>(17)?)?,
+                created_at: Timestamp::from_unix_nanos(row.get(18)?),
+            };
+            object.published_object()?;
+            let page_identity_digest = replay_page_identity_digest(
+                ordinal,
+                parse_sha256(&row.get::<_, Vec<u8>>(1)?)?,
+                parse_sha256(&row.get::<_, Vec<u8>>(2)?)?,
+                parse_sha256(&row.get::<_, Vec<u8>>(3)?)?,
+                parse_sha256(&row.get::<_, Vec<u8>>(4)?)?,
+                parse_sha256(&row.get::<_, Vec<u8>>(5)?)?,
+                parse_sha256(&row.get::<_, Vec<u8>>(6)?)?,
+                parse_sha256(&row.get::<_, Vec<u8>>(7)?)?,
+                parse_sha256(&row.get::<_, Vec<u8>>(8)?)?,
+                row_count,
+                &row.get::<_, String>(10)?,
+                parse_sha256(&row.get::<_, Vec<u8>>(11)?)?,
+                parse_sha256(&row.get::<_, Vec<u8>>(12)?)?,
+                parse_sha256(&row.get::<_, Vec<u8>>(13)?)?,
+                &object,
+            )?;
+            pages.push(ProviderMacroPlanReplayObjectEvidence {
+                page_ordinal: ordinal,
+                page_identity_digest,
+                object,
+            });
+        }
+        if pages.is_empty() {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let observed_end = first_ordinal
+            .checked_add(to_u16(pages.len())?)
+            .ok_or(CatalogError::CorruptCatalog)?;
+        let next_ordinal = if has_more { Some(observed_end) } else { None };
+        if observed_end > session.data_page_count
+            || (!has_more && observed_end != session.data_page_count)
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        Ok(ProviderMacroPlanReplayObjectGroup {
+            first_ordinal,
+            pages: pages.into_boxed_slice(),
+            next_ordinal,
+        })
     }
 
     fn provider_macro_plan_storage_chunk_bytes(&self) -> Result<usize, CatalogError> {
@@ -1105,6 +1436,8 @@ fn load_session(connection: &Connection, session_id: Uuid) -> Result<StoredSessi
         String,
         String,
         Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
         String,
         i64,
         Vec<u8>,
@@ -1117,7 +1450,8 @@ fn load_session(connection: &Connection, session_id: Uuid) -> Result<StoredSessi
     let row: Row = connection
         .query_row(
             "SELECT analytical_dataset, source_id, metadata_revision, provider_dataset,
-                    source_generation_digest, state, state_version, checkpoint_digest,
+                    source_generation_digest, plan_identity, initial_checkpoint_digest,
+                    state, state_version, checkpoint_digest,
                     checkpoint_value_id, response_count, data_page_count, analytical_row_count,
                     semantics_bytes
              FROM provider_macro_plan_sessions WHERE session_id=?1",
@@ -1137,14 +1471,16 @@ fn load_session(connection: &Connection, session_id: Uuid) -> Result<StoredSessi
                     row.get(10)?,
                     row.get(11)?,
                     row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
                 ))
             },
         )
         .optional()?
         .ok_or(CatalogError::ProviderCaptureConflict)?;
-    let checkpoint_digest = parse_sha256(&row.7)?;
-    let state_version = parse_u16(row.6)?;
-    let checkpoint_value_id = parse_sha256(&row.8)?;
+    let checkpoint_digest = parse_sha256(&row.9)?;
+    let state_version = parse_u16(row.8)?;
+    let checkpoint_value_id = parse_sha256(&row.10)?;
     let checkpoint = load_chunked_value(connection, checkpoint_value_id)?;
     if checkpoint.session_id != session_id
         || checkpoint.kind != ProviderMacroPlanValueKind::Checkpoint
@@ -1153,19 +1489,23 @@ fn load_session(connection: &Connection, session_id: Uuid) -> Result<StoredSessi
     {
         return Err(CatalogError::CorruptCatalog);
     }
+    let key = ProviderMacroPlanSessionKey::try_new(
+        DatasetId::try_from(row.0.as_str()).map_err(|_| CatalogError::CorruptCatalog)?,
+        SourceId::try_from(row.1.as_str()).map_err(|_| CatalogError::CorruptCatalog)?,
+        MetadataRevision::new(
+            SourceIdentifier::try_from(row.2.as_str()).map_err(|_| CatalogError::CorruptCatalog)?,
+        ),
+        SourceIdentifier::try_from(row.3.as_str()).map_err(|_| CatalogError::CorruptCatalog)?,
+        parse_sha256(&row.4)?,
+        parse_sha256(&row.5)?,
+        parse_sha256(&row.6)?,
+    )?;
+    if key.session_id() != session_id {
+        return Err(CatalogError::CorruptCatalog);
+    }
     Ok(StoredSession {
-        key: ProviderMacroPlanSessionKey::try_new(
-            session_id,
-            DatasetId::try_from(row.0.as_str()).map_err(|_| CatalogError::CorruptCatalog)?,
-            SourceId::try_from(row.1.as_str()).map_err(|_| CatalogError::CorruptCatalog)?,
-            MetadataRevision::new(
-                SourceIdentifier::try_from(row.2.as_str())
-                    .map_err(|_| CatalogError::CorruptCatalog)?,
-            ),
-            SourceIdentifier::try_from(row.3.as_str()).map_err(|_| CatalogError::CorruptCatalog)?,
-            parse_sha256(&row.4)?,
-        )?,
-        state: row.5,
+        key,
+        state: row.7,
         coordinate: ProviderMacroPlanStageCoordinate {
             session_id,
             state_version,
@@ -1173,10 +1513,10 @@ fn load_session(connection: &Connection, session_id: Uuid) -> Result<StoredSessi
         },
         checkpoint_value_id,
         checkpoint: checkpoint.bytes,
-        response_count: parse_u16(row.9)?,
-        data_page_count: parse_u16(row.10)?,
-        analytical_row_count: u64::try_from(row.11).map_err(|_| CatalogError::CorruptCatalog)?,
-        semantics_bytes: u64::try_from(row.12).map_err(|_| CatalogError::CorruptCatalog)?,
+        response_count: parse_u16(row.11)?,
+        data_page_count: parse_u16(row.12)?,
+        analytical_row_count: u64::try_from(row.13).map_err(|_| CatalogError::CorruptCatalog)?,
+        semantics_bytes: u64::try_from(row.14).map_err(|_| CatalogError::CorruptCatalog)?,
     })
 }
 
@@ -1207,6 +1547,7 @@ struct StoredPageIdentity {
     semantics_schema_requirement_digest: EvidenceDigest,
     semantics_digest: EvidenceDigest,
     semantics_payload_digest: EvidenceDigest,
+    object: ProviderMacroPlanPageObjectEvidence,
 }
 
 fn load_page_identities(
@@ -1220,7 +1561,9 @@ fn load_page_identities(
                 binding.extraction_content_digest, native.batch_digest,
                 page.canonical_record_count, page.semantics_schema,
                 page.semantics_schema_requirement_digest, page.semantics_digest,
-                page.semantics_value_id, page.semantics_payload_digest
+                page.semantics_value_id, page.semantics_payload_digest,
+                page.object_relative_reference, page.object_content_hash,
+                page.object_size_bytes, page.object_lineage_hash, page.object_created_at_ns
          FROM provider_macro_plan_staged_pages AS page
          JOIN provider_capture_bindings AS binding ON binding.binding_digest=page.binding_digest
          JOIN provider_raw_observations AS capture
@@ -1258,6 +1601,17 @@ fn load_page_identities(
         {
             return Err(CatalogError::CorruptCatalog);
         }
+        let object = ProviderMacroPlanPageObjectEvidence {
+            relative_reference: row.get::<_, String>(15)?.into_boxed_str(),
+            content_hash: Sha256Digest::new(parse_sha256(&row.get::<_, Vec<u8>>(16)?)?.bytes()),
+            size_bytes: u64::try_from(row.get::<_, i64>(17)?)
+                .map_err(|_| CatalogError::CorruptCatalog)?,
+            row_count: u64::try_from(row.get::<_, i64>(9)?)
+                .map_err(|_| CatalogError::CorruptCatalog)?,
+            lineage_digest: parse_sha256(&row.get::<_, Vec<u8>>(18)?)?,
+            created_at: Timestamp::from_unix_nanos(row.get(19)?),
+        };
+        object.published_object()?;
         pages.push(StoredPageIdentity {
             ordinal,
             candidate_digest: parse_sha256(&row.get::<_, Vec<u8>>(1)?)?,
@@ -1274,6 +1628,7 @@ fn load_page_identities(
             semantics_schema_requirement_digest: parse_sha256(&row.get::<_, Vec<u8>>(11)?)?,
             semantics_digest: parse_sha256(&row.get::<_, Vec<u8>>(12)?)?,
             semantics_payload_digest: payload_digest,
+            object,
         });
     }
     Ok(pages)
@@ -1413,6 +1768,8 @@ fn publication_digest(
     )?;
     hash_text(&mut hash, session.key.provider_dataset.as_str())?;
     hash.update(session.key.source_generation_digest.bytes());
+    hash.update(session.key.plan_identity.bytes());
+    hash.update(session.key.initial_checkpoint_digest.bytes());
     hash.update(request_set_identity.bytes());
     hash.update(adapter_completion_digest.bytes());
     hash.update(session.response_count.to_be_bytes());
@@ -1429,12 +1786,119 @@ fn publication_digest(
         hash.update(page.semantics_schema_requirement_digest.bytes());
         hash.update(page.semantics_digest.bytes());
         hash.update(page.semantics_payload_digest.bytes());
+        hash.update(page.object.content_hash.bytes());
+        hash.update(page.object.size_bytes.to_be_bytes());
+        hash.update(page.object.row_count.to_be_bytes());
+        hash.update(page.object.lineage_digest.bytes());
     }
     hash.update(terminal_observation_digest.bytes());
     hash.update(terminal_seal_digest.bytes());
     Ok(EvidenceDigest::new(
         DigestAlgorithm::Sha256,
         hash.finalize().into(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_page_identity_digest(
+    ordinal: u16,
+    candidate_digest: EvidenceDigest,
+    binding_digest: EvidenceDigest,
+    capture_request_set_identity: EvidenceDigest,
+    capture_content_digest: EvidenceDigest,
+    capture_observation_digest: EvidenceDigest,
+    sealed_capture_receipt_digest: EvidenceDigest,
+    extraction_content_digest: EvidenceDigest,
+    native_batch_digest: EvidenceDigest,
+    canonical_record_count: u64,
+    semantics_schema: &str,
+    semantics_schema_requirement_digest: EvidenceDigest,
+    semantics_digest: EvidenceDigest,
+    semantics_payload_digest: EvidenceDigest,
+    object: &ProviderMacroPlanPageObjectEvidence,
+) -> Result<EvidenceDigest, CatalogError> {
+    let mut hash = Sha256::new();
+    hash.update(PROVIDER_MACRO_PLAN_REPLAY_PAGE_DOMAIN);
+    hash.update(ordinal.to_be_bytes());
+    for digest in [
+        candidate_digest,
+        binding_digest,
+        capture_request_set_identity,
+        capture_content_digest,
+        capture_observation_digest,
+        sealed_capture_receipt_digest,
+        extraction_content_digest,
+        native_batch_digest,
+    ] {
+        hash.update(digest.bytes());
+    }
+    hash.update(canonical_record_count.to_be_bytes());
+    hash_text(&mut hash, semantics_schema)?;
+    hash.update(semantics_schema_requirement_digest.bytes());
+    hash.update(semantics_digest.bytes());
+    hash.update(semantics_payload_digest.bytes());
+    hash_text(&mut hash, &object.relative_reference)?;
+    hash.update(object.content_hash.bytes());
+    hash.update(object.size_bytes.to_be_bytes());
+    hash.update(object.row_count.to_be_bytes());
+    hash.update(object.lineage_digest.bytes());
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        hash.finalize().into(),
+    ))
+}
+
+fn stored_page_replay_identity_digest(
+    page: &StoredPageIdentity,
+) -> Result<EvidenceDigest, CatalogError> {
+    replay_page_identity_digest(
+        page.ordinal,
+        page.candidate_digest,
+        page.binding_digest,
+        page.capture_request_set_identity,
+        page.capture_content_digest,
+        page.capture_observation_digest,
+        page.sealed_capture_receipt_digest,
+        page.extraction_content_digest,
+        page.native_batch_digest,
+        page.canonical_record_count,
+        &page.semantics_schema,
+        page.semantics_schema_requirement_digest,
+        page.semantics_digest,
+        page.semantics_payload_digest,
+        &page.object,
+    )
+}
+
+fn provider_macro_plan_replay_group_lineage<I>(
+    publication_digest: EvidenceDigest,
+    plan_identity: EvidenceDigest,
+    source_generation_digest: EvidenceDigest,
+    output_ordinal: usize,
+    pages: I,
+) -> Result<EvidenceDigest, CatalogError>
+where
+    I: ExactSizeIterator<Item = (u16, EvidenceDigest, EvidenceDigest, u64)>,
+{
+    if pages.len() == 0 || pages.len() > PROVIDER_MACRO_PLAN_REPLAY_GROUP_PAGES {
+        return Err(CatalogError::InvalidRecord);
+    }
+    let mut digest = Sha256::new();
+    digest.update(PROVIDER_MACRO_PLAN_REPLAY_GROUP_DOMAIN);
+    digest.update(publication_digest.bytes());
+    digest.update(plan_identity.bytes());
+    digest.update(source_generation_digest.bytes());
+    digest.update(to_u16(output_ordinal)?.to_be_bytes());
+    digest.update(to_u16(pages.len())?.to_be_bytes());
+    for (page_ordinal, page_identity, lineage_digest, row_count) in pages {
+        digest.update(page_ordinal.to_be_bytes());
+        digest.update(page_identity.bytes());
+        digest.update(lineage_digest.bytes());
+        digest.update(row_count.to_be_bytes());
+    }
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
     ))
 }
 
@@ -1616,6 +2080,7 @@ pub(crate) fn publish_provider_macro_plan_record(
         transaction,
         generation_sequence,
         run_id,
+        &completed,
         &pages,
     )?;
     let receipt = catalog_receipt_digest(
@@ -1632,7 +2097,7 @@ pub(crate) fn publish_provider_macro_plan_record(
           manifest_version, manifest_schema_name, manifest_schema_version,
           manifest_schema_fingerprint, manifest_content_hash, anchor_manifest_id, run_id,
           source_id, metadata_revision, provider_dataset, source_generation_digest,
-          request_set_identity, adapter_completion_digest, terminal_seal_digest,
+          plan_identity, request_set_identity, adapter_completion_digest, terminal_seal_digest,
           catalog_receipt_digest, response_count, data_page_count, analytical_row_count,
           completed_checkpoint_version, completed_checkpoint_digest,
           predecessor_publication_digest, predecessor_manifest_dataset_id,
@@ -1640,7 +2105,7 @@ pub(crate) fn publish_provider_macro_plan_record(
           predecessor_checkpoint_digest, published_at_ns)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                  ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
-                 ?28, ?29, ?30)",
+                 ?28, ?29, ?30, ?31)",
         params![
             digest_bytes(completed.publication_digest),
             generation_sequence,
@@ -1661,6 +2126,7 @@ pub(crate) fn publish_provider_macro_plan_record(
                 .as_str(),
             completed.key.provider_dataset.as_str(),
             digest_bytes(completed.key.source_generation_digest),
+            digest_bytes(completed.key.plan_identity),
             digest_bytes(completed.request_set_identity),
             digest_bytes(completed.adapter_completion_digest),
             digest_bytes(completed.terminal_seal_digest),
@@ -1757,6 +2223,7 @@ pub(crate) fn reconstruct_provider_macro_plan_projection(
     type Row = (
         i64,
         Vec<u8>,
+        Vec<u8>,
         String,
         String,
         Vec<u8>,
@@ -1778,7 +2245,8 @@ pub(crate) fn reconstruct_provider_macro_plan_projection(
     let row: Row = connection
         .query_row(
             "SELECT publication.generation_sequence, publication.publication_digest,
-                    publication.session_id, publication.anchor_manifest_id,
+                    publication.plan_identity, publication.session_id,
+                    publication.anchor_manifest_id,
                     publication.request_set_identity, publication.adapter_completion_digest,
                     publication.terminal_seal_digest, publication.catalog_receipt_digest,
                     publication.response_count, publication.data_page_count,
@@ -1826,28 +2294,30 @@ pub(crate) fn reconstruct_provider_macro_plan_projection(
                     row.get(16)?,
                     row.get(17)?,
                     row.get(18)?,
+                    row.get(19)?,
                 ))
             },
         )
         .optional()?
         .ok_or(CatalogError::ProviderCaptureConflict)?;
-    let session_id = Uuid::parse_str(&row.2).map_err(|_| CatalogError::CorruptCatalog)?;
+    let session_id = Uuid::parse_str(&row.3).map_err(|_| CatalogError::CorruptCatalog)?;
     let completed = load_completed_session(connection, session_id)?;
     let publication_digest = parse_sha256(&row.1)?;
-    let catalog_receipt = parse_sha256(&row.7)?;
+    let catalog_receipt = parse_sha256(&row.8)?;
     if publication_digest != completed.publication_digest
-        || parse_sha256(&row.4)? != completed.request_set_identity
-        || parse_sha256(&row.5)? != completed.adapter_completion_digest
-        || parse_sha256(&row.6)? != completed.terminal_seal_digest
-        || parse_u16(row.8)? != completed.response_count
-        || parse_u16(row.9)? != completed.data_page_count
-        || u64::try_from(row.10).ok() != Some(completed.analytical_row_count)
-        || parse_u16(row.11)? != completed.coordinate.state_version
-        || parse_sha256(&row.12)? != completed.coordinate.checkpoint_digest
+        || parse_sha256(&row.2)? != completed.key.plan_identity
+        || parse_sha256(&row.5)? != completed.request_set_identity
+        || parse_sha256(&row.6)? != completed.adapter_completion_digest
+        || parse_sha256(&row.7)? != completed.terminal_seal_digest
+        || parse_u16(row.9)? != completed.response_count
+        || parse_u16(row.10)? != completed.data_page_count
+        || u64::try_from(row.11).ok() != Some(completed.analytical_row_count)
+        || parse_u16(row.12)? != completed.coordinate.state_version
+        || parse_sha256(&row.13)? != completed.coordinate.checkpoint_digest
     {
         return Err(CatalogError::CorruptCatalog);
     }
-    let predecessor = match (&row.13, &row.14, row.15, row.16, &row.17) {
+    let predecessor = match (&row.14, &row.15, row.16, row.17, &row.18) {
         (
             Some(publication),
             Some(dataset),
@@ -1865,13 +2335,13 @@ pub(crate) fn reconstruct_provider_macro_plan_projection(
         (None, None, None, None, None) => None,
         _ => return Err(CatalogError::CorruptCatalog),
     };
-    let anchor = Uuid::parse_str(&row.3).map_err(|_| CatalogError::CorruptCatalog)?;
-    let run_id = Uuid::parse_str(&row.18).map_err(|_| CatalogError::CorruptCatalog)?;
+    let anchor = Uuid::parse_str(&row.4).map_err(|_| CatalogError::CorruptCatalog)?;
+    let run_id = Uuid::parse_str(&row.19).map_err(|_| CatalogError::CorruptCatalog)?;
     let generation_sequence = u64::try_from(row.0).map_err(|_| CatalogError::CorruptCatalog)?;
     let pages = load_page_identities(connection, session_id)?;
     verify_generation_page_bindings(connection, row.0, run_id, &pages)?;
     let output_mapping_digest =
-        provider_macro_plan_output_mapping_digest(connection, row.0, run_id, &pages)?;
+        provider_macro_plan_output_mapping_digest(connection, row.0, run_id, &completed, &pages)?;
     if catalog_receipt_digest(
         manifest,
         anchor,
@@ -1979,9 +2449,13 @@ fn provider_macro_plan_output_mapping_digest(
     connection: &Connection,
     generation_sequence: i64,
     run_id: Uuid,
+    completed: &CompletedProviderMacroPlanSession,
     pages: &[StoredPageIdentity],
 ) -> Result<EvidenceDigest, CatalogError> {
-    if generation_sequence <= 0 || pages.is_empty() {
+    if generation_sequence <= 0
+        || pages.is_empty()
+        || usize::from(completed.data_page_count) != pages.len()
+    {
         return Err(CatalogError::CorruptCatalog);
     }
     let artifact_count: i64 = connection.query_row(
@@ -2008,6 +2482,10 @@ fn provider_macro_plan_output_mapping_digest(
         .ok_or(CatalogError::CorruptCatalog)?;
     let mut object_rows = Vec::new();
     object_rows
+        .try_reserve_exact(artifact_count)
+        .map_err(|_| CatalogError::Allocation)?;
+    let mut object_lineages = Vec::new();
+    object_lineages
         .try_reserve_exact(artifact_count)
         .map_err(|_| CatalogError::Allocation)?;
     let mut hash = Sha256::new();
@@ -2085,6 +2563,7 @@ fn provider_macro_plan_output_mapping_digest(
         hash.update(row_count.to_be_bytes());
         hash.update(object_size.to_be_bytes());
         object_rows.push(row_count);
+        object_lineages.push(lineage_digest);
         output_ordinal += 1;
     }
     if output_ordinal != artifact_count {
@@ -2095,6 +2574,11 @@ fn provider_macro_plan_output_mapping_digest(
         .try_reserve_exact(artifact_count)
         .map_err(|_| CatalogError::Allocation)?;
     mapped_rows.resize(artifact_count, 0_u64);
+    let mut output_page_ranges = Vec::new();
+    output_page_ranges
+        .try_reserve_exact(artifact_count)
+        .map_err(|_| CatalogError::Allocation)?;
+    output_page_ranges.resize(artifact_count, None::<(usize, usize)>);
     let mut input_statement = connection.prepare(
         "SELECT input.input_ordinal, input.output_artifact_ordinal,
                 input.object_input_ordinal, input.binding_digest,
@@ -2138,6 +2622,15 @@ fn provider_macro_plan_output_mapping_digest(
         {
             return Err(CatalogError::CorruptCatalog);
         }
+        match output_page_ranges[output_ordinal] {
+            None if object_input_ordinal == 0 => {
+                output_page_ranges[output_ordinal] = Some((input_ordinal, input_ordinal + 1));
+            }
+            Some((start, end)) if object_input_ordinal > 0 && end == input_ordinal => {
+                output_page_ranges[output_ordinal] = Some((start, input_ordinal + 1));
+            }
+            _ => return Err(CatalogError::CorruptCatalog),
+        }
         mapped_rows[output_ordinal] = mapped_rows[output_ordinal]
             .checked_add(row_count)
             .ok_or(CatalogError::InvalidRecord)?;
@@ -2164,6 +2657,36 @@ fn provider_macro_plan_output_mapping_digest(
     if input_ordinal != pages.len() || mapped_rows != object_rows {
         return Err(CatalogError::CorruptCatalog);
     }
+    let mut page_identity_digests = Vec::new();
+    page_identity_digests
+        .try_reserve_exact(pages.len())
+        .map_err(|_| CatalogError::Allocation)?;
+    for page in pages {
+        page_identity_digests.push(stored_page_replay_identity_digest(page)?);
+    }
+    for (output_ordinal, range) in output_page_ranges.into_iter().enumerate() {
+        let (start, end) = range.ok_or(CatalogError::CorruptCatalog)?;
+        if end <= start || end - start > PROVIDER_MACRO_PLAN_REPLAY_GROUP_PAGES {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let expected_lineage = provider_macro_plan_replay_group_lineage(
+            completed.publication_digest,
+            completed.key.plan_identity,
+            completed.key.source_generation_digest,
+            output_ordinal,
+            pages[start..end].iter().enumerate().map(|(offset, page)| {
+                (
+                    page.ordinal,
+                    page_identity_digests[start + offset],
+                    page.object.lineage_digest,
+                    page.object.row_count,
+                )
+            }),
+        )?;
+        if object_lineages.get(output_ordinal) != Some(&expected_lineage) {
+            return Err(CatalogError::CorruptCatalog);
+        }
+    }
     Ok(EvidenceDigest::new(
         DigestAlgorithm::Sha256,
         hash.finalize().into(),
@@ -2189,6 +2712,8 @@ fn catalog_receipt_digest(
     hash.update(anchor_manifest_id.as_bytes());
     hash.update(run_id.as_bytes());
     hash.update(completed.key.session_id.as_bytes());
+    hash.update(completed.key.plan_identity.bytes());
+    hash.update(completed.key.initial_checkpoint_digest.bytes());
     hash.update(completed.publication_digest.bytes());
     hash.update(completed.request_set_identity.bytes());
     hash.update(completed.adapter_completion_digest.bytes());
@@ -2244,6 +2769,31 @@ fn sha256_evidence(value: &[u8]) -> EvidenceDigest {
     EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(value).into())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn provider_macro_plan_session_id(
+    analytical_dataset: &DatasetId,
+    source_id: &SourceId,
+    metadata_revision: &MetadataRevision,
+    provider_dataset: &SourceIdentifier,
+    source_generation_digest: EvidenceDigest,
+    plan_identity: EvidenceDigest,
+    initial_checkpoint_digest: EvidenceDigest,
+) -> Result<Uuid, CatalogError> {
+    let mut identity = Sha256::new();
+    identity.update(PROVIDER_MACRO_PLAN_SESSION_DOMAIN);
+    hash_text(&mut identity, analytical_dataset.as_str())?;
+    hash_text(&mut identity, source_id.as_str())?;
+    hash_text(
+        &mut identity,
+        metadata_revision.as_source_identifier().as_str(),
+    )?;
+    hash_text(&mut identity, provider_dataset.as_str())?;
+    identity.update(source_generation_digest.bytes());
+    identity.update(plan_identity.bytes());
+    identity.update(initial_checkpoint_digest.bytes());
+    Ok(Uuid::new_v5(&Uuid::NAMESPACE_OID, &identity.finalize()))
+}
+
 fn digest_bytes(digest: EvidenceDigest) -> [u8; 32] {
     digest.bytes()
 }
@@ -2281,11 +2831,14 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ProviderMacroPlanSessionKey, ProviderMacroPlanStageCoordinate, ProviderMacroPlanValueKind,
-        StoredPageIdentity, digest_bytes, load_session, retain_chunked_value,
-        retire_superseded_checkpoint_value, verify_generation_page_bindings,
+        ProviderMacroPlanPageObjectEvidence, ProviderMacroPlanSessionKey,
+        ProviderMacroPlanStageCoordinate, ProviderMacroPlanValueKind, StoredPageIdentity,
+        digest_bytes, load_session, retain_chunked_value, retire_superseded_checkpoint_value,
+        sha256_evidence, verify_generation_page_bindings,
     };
-    use crate::{Catalog, CatalogConfig, CatalogLimit, CatalogResultLimits, DatasetId};
+    use crate::{
+        Catalog, CatalogConfig, CatalogLimit, CatalogResultLimits, DatasetId, Sha256Digest,
+    };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -2315,19 +2868,18 @@ mod tests {
             params!["macro-source", source_revision],
         )?;
         source.commit()?;
-        let session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000001")?;
         let checkpoint = vec![0x5a; 1024 * 1024 + 17].into_boxed_slice();
-        let coordinate = catalog.begin_provider_macro_plan_session(
-            ProviderMacroPlanSessionKey::try_new(
-                session_id,
-                DatasetId::try_from("macro-observations")?,
-                SourceId::try_from("macro-source")?,
-                MetadataRevision::new(SourceIdentifier::try_from("revision-1")?),
-                SourceIdentifier::try_from("provider-dataset")?,
-                EvidenceDigest::new(DigestAlgorithm::Sha256, [4_u8; 32]),
-            )?,
-            checkpoint.clone(),
+        let key = ProviderMacroPlanSessionKey::try_new(
+            DatasetId::try_from("macro-observations")?,
+            SourceId::try_from("macro-source")?,
+            MetadataRevision::new(SourceIdentifier::try_from("revision-1")?),
+            SourceIdentifier::try_from("provider-dataset")?,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [4_u8; 32]),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [5_u8; 32]),
+            sha256_evidence(&checkpoint),
         )?;
+        let session_id = key.session_id();
+        let coordinate = catalog.begin_provider_macro_plan_session(key, checkpoint.clone())?;
         let recovered = catalog.provider_macro_plan_session_recovery(session_id)?;
         assert_eq!(recovered.coordinate(), coordinate);
         assert_eq!(recovered.checkpoint(), checkpoint.as_ref());
@@ -2499,7 +3051,8 @@ mod tests {
                 digest_bytes(page_zero_binding),
             ],
         )?;
-        let page = |ordinal, binding_digest| StoredPageIdentity {
+        let page = |ordinal, binding_digest| {
+            StoredPageIdentity {
             ordinal,
             candidate_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0x10; 32]),
             binding_digest,
@@ -2517,6 +3070,15 @@ mod tests {
             ),
             semantics_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0x18; 32]),
             semantics_payload_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0x19; 32]),
+            object: ProviderMacroPlanPageObjectEvidence {
+                relative_reference: "objects/sha256/1a/1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a.parquet".into(),
+                content_hash: Sha256Digest::new([0x1a; 32]),
+                size_bytes: 1,
+                row_count: 1,
+                lineage_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0x1b; 32]),
+                created_at: Timestamp::from_unix_nanos(1),
+            },
+        }
         };
         let pages = [page(0, page_zero_binding), page(1, page_one_binding)];
         verify_generation_page_bindings(&ordering, 7, run_id, &pages)?;

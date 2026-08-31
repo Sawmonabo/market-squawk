@@ -191,17 +191,20 @@ pub use fund_holdings::{
     MAX_FUND_HOLDINGS_BATCH_RECORDS, MAX_FUND_HOLDINGS_RETAINED_BYTES,
 };
 pub use ingest::{
-    AnalyticalDataService, CommittedDataset, CompactionRequest,
+    AnalyticalDataService, CommittedDataset, CompactionRequest, CompletedProviderMacroPlanReceipt,
     GenerationOwnedProviderCaptureEvidence, GenerationOwnedProviderCaptureInputEvidence,
     GenerationOwnedProviderCaptureObjectEvidence, IngestError, IngestPrecommitAuthority,
     ListingReferenceAdmissionCapability, PendingProviderMacroPlanPublication,
-    PinnedArtifactQueryRequest, ProviderMacroPlanChunkInput, ProviderMacroPlanPublicationInput,
-    ProviderMacroPlanPublicationReceipt, ProviderMacroPlanRestartSelector,
-    ProviderMacroPlanSemantics, ProviderMarketEventPublicationKind,
-    ProviderMarketEventPublicationSelector, ProviderOptionMarketPublicationSelector,
-    ProviderPublicationInput, QueryArtifactPublication, ResearchIngestService,
-    extraction_batch_digest, extraction_provider_payload_digest,
-    provider_market_event_publication_digest, provider_option_market_publication_digest,
+    PinnedArtifactQueryRequest, ProviderMacroPlanChunkInput, ProviderMacroPlanManifestSelector,
+    ProviderMacroPlanPublicationInput, ProviderMacroPlanPublicationReceipt,
+    ProviderMacroPlanRestartSelector, ProviderMacroPlanSemantics, ProviderMacroPlanSessionInput,
+    ProviderMacroPlanSessionReceipt, ProviderMacroPlanStagedPage, ProviderMacroPlanTerminal,
+    ProviderMarketEventPublicationKind, ProviderMarketEventPublicationSelector,
+    ProviderOptionMarketPublicationSelector, ProviderPublicationInput, QueryArtifactPublication,
+    ResearchIngestService, StagedProviderMacroPlanPublicationReceipt,
+    StagedProviderMacroPlanRestartEvidence, extraction_batch_digest,
+    extraction_provider_payload_digest, provider_market_event_publication_digest,
+    provider_option_market_publication_digest,
 };
 pub use manifest::{
     AnalyticalManifestCatalog, CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,

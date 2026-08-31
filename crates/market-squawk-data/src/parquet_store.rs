@@ -5,6 +5,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
@@ -12,9 +13,10 @@ use cap_std::fs::{Dir, OpenOptions};
 use market_squawk_domain::Timestamp;
 use market_squawk_platform::{ArtifactRoot, PathError};
 use parquet::arrow::ArrowWriter;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::ParquetError;
+use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -43,6 +45,10 @@ const QUERY_WRITER_SCHEMA_EXPANSION: usize = 16;
 const QUERY_WRITER_COLUMN_METADATA: usize = 8 * 1024;
 const QUERY_WRITER_ROW_GROUP_METADATA: usize = 4 * 1024;
 const QUERY_WRITER_PAGE_BYTES: usize = 64 * 1024;
+const MAX_REPLAY_PUBLICATION_OBJECTS: usize = 32;
+// Each retained provider capture is already capped at 100,000 canonical rows. Keep the generic
+// replay primitive independently bounded even if a future caller bypasses that upstream check.
+const MAX_REPLAY_PUBLICATION_ROWS: u64 = 3_200_000;
 #[path = "parquet_store/authority.rs"]
 mod authority;
 #[path = "parquet_store/pinned.rs"]
@@ -172,6 +178,15 @@ pub(crate) struct QueryArtifactWriterAdmission {
     total_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplayPublicationAdmission {
+    max_decoded_batch_bytes: usize,
+    active_writer_bytes: usize,
+    metadata_bytes: usize,
+    row_groups: usize,
+    total_bytes: usize,
+}
+
 impl QueryArtifactWriterAdmission {
     pub(crate) const fn bytes(self) -> usize {
         self.total_bytes
@@ -179,6 +194,27 @@ impl QueryArtifactWriterAdmission {
 }
 
 impl PublishedObject {
+    pub(crate) fn try_from_catalog_parts(
+        relative_reference: String,
+        content_hash: Sha256Digest,
+        size_bytes: u64,
+        row_count: u64,
+        created_at: Timestamp,
+    ) -> Result<Self, ParquetStoreError> {
+        let digest = encode_hex(content_hash.bytes());
+        let expected_reference = format!("{OBJECTS}/{}/{}.parquet", &digest[..2], digest);
+        if relative_reference != expected_reference || size_bytes == 0 || row_count == 0 {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        Ok(Self {
+            relative_reference,
+            content_hash,
+            size_bytes,
+            row_count,
+            created_at,
+        })
+    }
+
     /// Returns the portable path below the controlled artifact root.
     pub fn relative_reference(&self) -> &str {
         &self.relative_reference
@@ -493,6 +529,54 @@ impl ParquetObjectStore {
         }
     }
 
+    /// Streams one checked ordered object group into one immutable replacement object.
+    ///
+    /// The group is deliberately smaller than a complete provider plan. Only one decoded record
+    /// batch and the Parquet writer's active row group are retained at a time.
+    pub(crate) async fn publish_replayed_objects_under_lease(
+        &self,
+        objects: Vec<PublishedObject>,
+        target_schema: SchemaRef,
+        expected_rows: u64,
+        cancellation: &CancellationToken,
+        lease: &PublicationLease,
+    ) -> Result<PublishedObject, ParquetStoreError> {
+        if !self.authority.publication.owns(lease) {
+            return Err(ParquetStoreError::InvalidPublicationLease);
+        }
+        validate_replay_group(&objects, expected_rows, self.config.max_staging_bytes)?;
+        let store = Self {
+            root: self.root.clone(),
+            directory: self.directory.try_clone()?,
+            config: self.config,
+            blocking_tasks: Arc::clone(&self.blocking_tasks),
+            authority: Arc::clone(&self.authority),
+        };
+        let permit = self.acquire_blocking_permit(cancellation).await?;
+        let operation_cancellation = cancellation.child_token();
+        let worker_cancellation = operation_cancellation.clone();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let staged = store.stage_replayed_objects_blocking(
+                &objects,
+                target_schema,
+                expected_rows,
+                &worker_cancellation,
+            )?;
+            store.finalize_staged(staged)
+        });
+        tokio::select! {
+            result = &mut worker => {
+                result.map_err(|_| ParquetStoreError::BlockingTaskFailed)?
+            }
+            _ = cancellation.cancelled() => {
+                operation_cancellation.cancel();
+                worker.await.map_err(|_| ParquetStoreError::BlockingTaskFailed)??;
+                Err(ParquetStoreError::Cancelled)
+            }
+        }
+    }
+
     /// Atomically moves an exact staged object into the immutable content-addressed namespace.
     pub(crate) fn finalize_staged_under_lease(
         &self,
@@ -739,6 +823,275 @@ impl ParquetObjectStore {
                 .map_err(|_| ParquetStoreError::SizeOverflow)?,
             created_at,
         })
+    }
+
+    fn stage_replayed_objects_blocking(
+        &self,
+        objects: &[PublishedObject],
+        target_schema: SchemaRef,
+        expected_rows: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<StagedObject, ParquetStoreError> {
+        if cancellation.is_cancelled() {
+            return Err(ParquetStoreError::Cancelled);
+        }
+        validate_replay_group(objects, expected_rows, self.config.max_staging_bytes)?;
+        let admission = self.replay_publication_admission(
+            objects,
+            &target_schema,
+            expected_rows,
+            cancellation,
+        )?;
+        let stage = format!("{STAGING}/{}.tmp", Uuid::new_v4());
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        configure_private_staging(&mut options);
+        let staged = self.directory.open_with(&stage, &options)?.into_std();
+        let mut cleanup = StagingCleanup {
+            directory: &self.directory,
+            reference: &stage,
+            active: true,
+        };
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(self.config.max_row_group_rows))
+            .set_write_page_header_statistics(false)
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::Chunk)
+            .set_data_page_size_limit(QUERY_WRITER_PAGE_BYTES)
+            .set_write_batch_size(1024)
+            .set_max_row_group_bytes(Some(admission.active_writer_bytes))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(staged, Arc::clone(&target_schema), Some(properties))?;
+        let mut written_rows = 0_u64;
+        for object in objects {
+            if cancellation.is_cancelled() {
+                let _ignored = self.directory.remove_file(&stage);
+                return Err(ParquetStoreError::Cancelled);
+            }
+            let (input, metadata) =
+                self.verified_replay_input(object, &target_schema, cancellation)?;
+            if metadata.schema().as_ref() != target_schema.as_ref() {
+                let _ignored = self.directory.remove_file(&stage);
+                return Err(ParquetStoreError::ObjectMetadataMismatch);
+            }
+            let mut object_rows = 0_u64;
+            for row_group in 0..metadata.metadata().num_row_groups() {
+                let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                    input.try_clone()?,
+                    metadata.clone(),
+                )
+                .with_row_groups(vec![row_group])
+                .with_batch_size(self.config.max_row_group_rows)
+                .build()?;
+                for batch in reader {
+                    if cancellation.is_cancelled() {
+                        let _ignored = self.directory.remove_file(&stage);
+                        return Err(ParquetStoreError::Cancelled);
+                    }
+                    let batch = batch?;
+                    let batch_bytes = replay_batch_retained_bytes(&batch)?;
+                    if batch_bytes > admission.max_decoded_batch_bytes {
+                        let _ignored = self.directory.remove_file(&stage);
+                        return Err(ParquetStoreError::StagingLimitExceeded);
+                    }
+                    let normalized =
+                        RecordBatch::try_new(Arc::clone(&target_schema), batch.columns().to_vec())?;
+                    writer.flush()?;
+                    validate_replay_peak(&writer, &target_schema, batch_bytes, admission)?;
+                    writer.write(&normalized)?;
+                    writer.flush()?;
+                    validate_replay_peak(&writer, &target_schema, batch_bytes, admission)?;
+                    let rows = u64::try_from(normalized.num_rows())
+                        .map_err(|_| ParquetStoreError::SizeOverflow)?;
+                    object_rows = object_rows
+                        .checked_add(rows)
+                        .ok_or(ParquetStoreError::SizeOverflow)?;
+                    written_rows = written_rows
+                        .checked_add(rows)
+                        .ok_or(ParquetStoreError::SizeOverflow)?;
+                }
+            }
+            if object_rows != object.row_count {
+                let _ignored = self.directory.remove_file(&stage);
+                return Err(ParquetStoreError::ObjectMetadataMismatch);
+            }
+        }
+        if written_rows != expected_rows || cancellation.is_cancelled() {
+            let _ignored = self.directory.remove_file(&stage);
+            return Err(if cancellation.is_cancelled() {
+                ParquetStoreError::Cancelled
+            } else {
+                ParquetStoreError::ObjectMetadataMismatch
+            });
+        }
+        if writer.flushed_row_groups().len() > admission.row_groups
+            || replay_writer_retained_bytes(&writer, &target_schema)?
+                > admission
+                    .active_writer_bytes
+                    .checked_add(admission.metadata_bytes)
+                    .ok_or(ParquetStoreError::SizeOverflow)?
+        {
+            let _ignored = self.directory.remove_file(&stage);
+            return Err(ParquetStoreError::StagingLimitExceeded);
+        }
+        let mut staged = match writer.into_inner() {
+            Ok(staged) => staged,
+            Err(error) => {
+                let _ignored = self.directory.remove_file(&stage);
+                return Err(error.into());
+            }
+        };
+        staged.sync_all()?;
+        let size_bytes = staged.metadata()?.len();
+        if size_bytes == 0 || size_bytes > self.config.max_staging_bytes {
+            drop(staged);
+            let _ignored = self.directory.remove_file(&stage);
+            return Err(ParquetStoreError::StagingLimitExceeded);
+        }
+        let content_hash = hash_file(&mut staged, Some(cancellation))?;
+        drop(staged);
+        if cancellation.is_cancelled() {
+            self.directory.remove_file(&stage)?;
+            return Err(ParquetStoreError::Cancelled);
+        }
+        let created_at = timestamp_from_system_time(
+            self.directory
+                .open(&stage)?
+                .into_std()
+                .metadata()?
+                .modified()?,
+        )?;
+        let cleanup_directory = self.directory.try_clone()?;
+        cleanup.disarm();
+        drop(cleanup);
+        Ok(StagedObject {
+            cleanup: OwnedStagingCleanup {
+                directory: cleanup_directory,
+                reference: Some(stage),
+            },
+            content_hash,
+            size_bytes,
+            row_count: written_rows,
+            created_at,
+        })
+    }
+
+    fn replay_publication_admission(
+        &self,
+        objects: &[PublishedObject],
+        target_schema: &SchemaRef,
+        expected_rows: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<ReplayPublicationAdmission, ParquetStoreError> {
+        let mut observed_rows = 0_u64;
+        let mut output_row_groups = 0_usize;
+        let mut maximum_input_row_groups = 0_usize;
+        let mut max_decoded_batch_bytes = 0_usize;
+        for object in objects {
+            let (_, metadata) = self.verified_replay_input(object, target_schema, cancellation)?;
+            let row_groups = metadata.metadata().row_groups();
+            if row_groups.is_empty() {
+                return Err(ParquetStoreError::ObjectMetadataMismatch);
+            }
+            maximum_input_row_groups = maximum_input_row_groups.max(row_groups.len());
+            let mut object_rows = 0_u64;
+            for row_group in row_groups {
+                let rows = u64::try_from(row_group.num_rows())
+                    .map_err(|_| ParquetStoreError::SizeOverflow)?;
+                if rows == 0 {
+                    return Err(ParquetStoreError::ObjectMetadataMismatch);
+                }
+                object_rows = object_rows
+                    .checked_add(rows)
+                    .ok_or(ParquetStoreError::SizeOverflow)?;
+                let rows = usize::try_from(rows).map_err(|_| ParquetStoreError::SizeOverflow)?;
+                output_row_groups = output_row_groups
+                    .checked_add(
+                        rows.checked_add(self.config.max_row_group_rows - 1)
+                            .ok_or(ParquetStoreError::SizeOverflow)?
+                            / self.config.max_row_group_rows,
+                    )
+                    .ok_or(ParquetStoreError::SizeOverflow)?;
+                max_decoded_batch_bytes = max_decoded_batch_bytes
+                    .max(replay_row_group_decoded_bytes(row_group, target_schema)?);
+            }
+            if object_rows != object.row_count {
+                return Err(ParquetStoreError::ObjectMetadataMismatch);
+            }
+            observed_rows = observed_rows
+                .checked_add(object_rows)
+                .ok_or(ParquetStoreError::SizeOverflow)?;
+        }
+        if observed_rows != expected_rows || max_decoded_batch_bytes == 0 || output_row_groups == 0
+        {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        let active_writer_bytes =
+            replay_active_writer_bytes(max_decoded_batch_bytes, target_schema.fields().len())?;
+        let output_metadata_bytes = replay_writer_metadata_bytes(output_row_groups, target_schema)?;
+        let decoder_metadata_bytes =
+            replay_writer_metadata_bytes(maximum_input_row_groups, target_schema)?;
+        let metadata_bytes = output_metadata_bytes
+            .checked_add(decoder_metadata_bytes)
+            .ok_or(ParquetStoreError::SizeOverflow)?;
+        let total_bytes = max_decoded_batch_bytes
+            .checked_add(active_writer_bytes)
+            .and_then(|value| value.checked_add(metadata_bytes))
+            .ok_or(ParquetStoreError::SizeOverflow)?;
+        if u64::try_from(total_bytes).map_err(|_| ParquetStoreError::SizeOverflow)?
+            > self.config.max_staging_bytes
+        {
+            return Err(ParquetStoreError::StagingLimitExceeded);
+        }
+        Ok(ReplayPublicationAdmission {
+            max_decoded_batch_bytes,
+            active_writer_bytes,
+            metadata_bytes,
+            row_groups: output_row_groups,
+            total_bytes,
+        })
+    }
+
+    fn verified_replay_input(
+        &self,
+        object: &PublishedObject,
+        target_schema: &SchemaRef,
+        cancellation: &CancellationToken,
+    ) -> Result<(File, ArrowReaderMetadata), ParquetStoreError> {
+        if cancellation.is_cancelled() {
+            return Err(ParquetStoreError::Cancelled);
+        }
+        let digest = encode_hex(object.content_hash.bytes());
+        let expected_reference = format!("{OBJECTS}/{}/{}.parquet", &digest[..2], digest);
+        if object.relative_reference != expected_reference
+            || object.size_bytes == 0
+            || object.size_bytes > self.config.max_staging_bytes
+        {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        self.root.resolve(&object.relative_reference)?;
+        let mut input_options = OpenOptions::new();
+        input_options.read(true).follow(FollowSymlinks::No);
+        let mut input = self
+            .directory
+            .open_with(&object.relative_reference, &input_options)?
+            .into_std();
+        let metadata = input.metadata()?;
+        if !metadata.is_file()
+            || metadata.len() != object.size_bytes
+            || timestamp_from_system_time(metadata.modified()?)? != object.created_at
+            || hash_file(&mut input, Some(cancellation))? != object.content_hash
+        {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        input.seek(SeekFrom::Start(0))?;
+        let reader_metadata = ArrowReaderMetadata::load(&input, Default::default())?;
+        if reader_metadata.schema().as_ref() != target_schema.as_ref() {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        Ok((input, reader_metadata))
     }
 
     fn finalize_staged(
@@ -1278,6 +1631,178 @@ impl ParquetObjectStore {
             "no-replace publication is unsupported",
         ))
     }
+}
+
+fn validate_replay_group(
+    objects: &[PublishedObject],
+    expected_rows: u64,
+    max_staging_bytes: u64,
+) -> Result<(), ParquetStoreError> {
+    if objects.is_empty()
+        || objects.len() > MAX_REPLAY_PUBLICATION_OBJECTS
+        || expected_rows == 0
+        || expected_rows > MAX_REPLAY_PUBLICATION_ROWS
+    {
+        return Err(ParquetStoreError::ObjectMetadataMismatch);
+    }
+    let mut rows = 0_u64;
+    let mut bytes = 0_u64;
+    for (ordinal, object) in objects.iter().enumerate() {
+        if object.size_bytes == 0
+            || object.size_bytes > max_staging_bytes
+            || object.row_count == 0
+            || objects[..ordinal].iter().any(|prior| {
+                prior.relative_reference == object.relative_reference
+                    || prior.content_hash == object.content_hash
+            })
+        {
+            return Err(ParquetStoreError::ObjectMetadataMismatch);
+        }
+        rows = rows
+            .checked_add(object.row_count)
+            .ok_or(ParquetStoreError::SizeOverflow)?;
+        bytes = bytes
+            .checked_add(object.size_bytes)
+            .ok_or(ParquetStoreError::SizeOverflow)?;
+    }
+    if rows != expected_rows {
+        return Err(ParquetStoreError::ObjectMetadataMismatch);
+    }
+    if bytes > max_staging_bytes {
+        return Err(ParquetStoreError::StagingLimitExceeded);
+    }
+    Ok(())
+}
+
+fn replay_row_group_decoded_bytes(
+    row_group: &RowGroupMetaData,
+    schema: &SchemaRef,
+) -> Result<usize, ParquetStoreError> {
+    if row_group.num_columns() != schema.fields().len() {
+        return Err(ParquetStoreError::ObjectMetadataMismatch);
+    }
+    let rows =
+        usize::try_from(row_group.num_rows()).map_err(|_| ParquetStoreError::SizeOverflow)?;
+    let encoded = row_group
+        .columns()
+        .iter()
+        .try_fold(0_usize, |total, column| {
+            total
+                .checked_add(
+                    usize::try_from(column.uncompressed_size())
+                        .map_err(|_| ParquetStoreError::SizeOverflow)?,
+                )
+                .ok_or(ParquetStoreError::SizeOverflow)
+        })?;
+    let cells = rows
+        .checked_mul(schema.fields().len())
+        .ok_or(ParquetStoreError::SizeOverflow)?;
+    // Staged objects are emitted by the local non-dictionary writer. Two encoded copies plus
+    // offsets, validity, and ArrayRef ownership is a conservative pre-decode Arrow bound.
+    encoded
+        .checked_mul(2)
+        .and_then(|value| {
+            cells
+                .checked_mul(16)
+                .and_then(|cells| value.checked_add(cells))
+        })
+        .and_then(|value| value.checked_add(std::mem::size_of::<RecordBatch>()))
+        .and_then(|value| {
+            schema
+                .fields()
+                .len()
+                .checked_mul(std::mem::size_of::<arrow::array::ArrayRef>())
+                .and_then(|arrays| value.checked_add(arrays))
+        })
+        .ok_or(ParquetStoreError::SizeOverflow)
+}
+
+fn replay_batch_retained_bytes(batch: &RecordBatch) -> Result<usize, ParquetStoreError> {
+    batch
+        .get_array_memory_size()
+        .checked_add(std::mem::size_of::<RecordBatch>())
+        .and_then(|value| {
+            batch
+                .num_columns()
+                .checked_mul(std::mem::size_of::<arrow::array::ArrayRef>())
+                .and_then(|arrays| value.checked_add(arrays))
+        })
+        .ok_or(ParquetStoreError::SizeOverflow)
+}
+
+fn replay_active_writer_bytes(
+    batch_bytes: usize,
+    columns: usize,
+) -> Result<usize, ParquetStoreError> {
+    batch_bytes
+        .checked_mul(QUERY_WRITER_INPUT_EXPANSION)
+        .and_then(|value| value.checked_add(QUERY_WRITER_FIXED_RECEIPT))
+        .and_then(|value| {
+            columns
+                .checked_mul(QUERY_WRITER_PAGE_BYTES)
+                .and_then(|pages| value.checked_add(pages))
+        })
+        .ok_or(ParquetStoreError::SizeOverflow)
+}
+
+fn replay_writer_metadata_bytes(
+    row_groups: usize,
+    schema: &SchemaRef,
+) -> Result<usize, ParquetStoreError> {
+    let column_metadata = row_groups
+        .checked_mul(schema.fields().len())
+        .and_then(|units| units.checked_mul(QUERY_WRITER_COLUMN_METADATA))
+        .ok_or(ParquetStoreError::SizeOverflow)?;
+    let row_group_metadata = row_groups
+        .checked_mul(QUERY_WRITER_ROW_GROUP_METADATA)
+        .ok_or(ParquetStoreError::SizeOverflow)?;
+    let schema_bytes = schema.fields().iter().try_fold(0_usize, |total, field| {
+        total
+            .checked_add(field.size())
+            .ok_or(ParquetStoreError::SizeOverflow)
+    })?;
+    column_metadata
+        .checked_add(row_group_metadata)
+        .and_then(|value| {
+            schema_bytes
+                .checked_mul(QUERY_WRITER_SCHEMA_EXPANSION)
+                .and_then(|schema| value.checked_add(schema))
+        })
+        .ok_or(ParquetStoreError::SizeOverflow)
+}
+
+fn validate_replay_peak(
+    writer: &ArrowWriter<File>,
+    schema: &SchemaRef,
+    batch_bytes: usize,
+    admission: ReplayPublicationAdmission,
+) -> Result<(), ParquetStoreError> {
+    let active = replay_active_writer_bytes(batch_bytes, schema.fields().len())?;
+    let retained = replay_writer_retained_bytes(writer, schema)?;
+    let peak = batch_bytes
+        .checked_add(active)
+        .and_then(|value| value.checked_add(retained))
+        .ok_or(ParquetStoreError::SizeOverflow)?;
+    if batch_bytes > admission.max_decoded_batch_bytes
+        || active > admission.active_writer_bytes
+        || writer.flushed_row_groups().len() > admission.row_groups
+        || peak > admission.total_bytes
+    {
+        return Err(ParquetStoreError::StagingLimitExceeded);
+    }
+    Ok(())
+}
+
+fn replay_writer_retained_bytes(
+    writer: &ArrowWriter<File>,
+    schema: &SchemaRef,
+) -> Result<usize, ParquetStoreError> {
+    let metadata = replay_writer_metadata_bytes(writer.flushed_row_groups().len(), schema)?;
+    let retained = writer
+        .memory_size()
+        .checked_add(metadata)
+        .ok_or(ParquetStoreError::SizeOverflow)?;
+    Ok(retained)
 }
 
 struct StagingCleanup<'a> {

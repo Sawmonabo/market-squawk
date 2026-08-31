@@ -2668,6 +2668,13 @@ CREATE TABLE provider_macro_plan_sessions (
         length(source_generation_digest) = 32
         AND source_generation_digest <> zeroblob(32)
     ),
+    plan_identity BLOB NOT NULL CHECK (
+        length(plan_identity) = 32 AND plan_identity <> zeroblob(32)
+    ),
+    initial_checkpoint_digest BLOB NOT NULL CHECK (
+        length(initial_checkpoint_digest) = 32
+        AND initial_checkpoint_digest <> zeroblob(32)
+    ),
     state TEXT NOT NULL CHECK (state IN ('acquiring', 'complete')),
     state_version INTEGER NOT NULL CHECK (state_version BETWEEN 0 AND 1024),
     checkpoint_digest BLOB NOT NULL CHECK (
@@ -2700,8 +2707,11 @@ CREATE UNIQUE INDEX provider_macro_plan_one_acquiring_session
 ON provider_macro_plan_sessions(
     analytical_dataset,
     source_id,
+    metadata_revision,
     provider_dataset,
-    source_generation_digest
+    source_generation_digest,
+    plan_identity,
+    initial_checkpoint_digest
 )
 WHERE state = 'acquiring';
 
@@ -2733,10 +2743,24 @@ CREATE TABLE provider_macro_plan_staged_pages (
         length(semantics_payload_digest) = 32
         AND semantics_payload_digest <> zeroblob(32)
     ),
+    object_relative_reference TEXT NOT NULL CHECK (
+        length(CAST(object_relative_reference AS BLOB)) BETWEEN 1 AND 1024
+    ),
+    object_content_hash BLOB NOT NULL CHECK (
+        length(object_content_hash) = 32 AND object_content_hash <> zeroblob(32)
+    ),
+    object_size_bytes INTEGER NOT NULL CHECK (
+        object_size_bytes BETWEEN 1 AND 1073741824
+    ),
+    object_lineage_hash BLOB NOT NULL CHECK (
+        length(object_lineage_hash) = 32 AND object_lineage_hash <> zeroblob(32)
+    ),
+    object_created_at_ns INTEGER NOT NULL,
     staged_at_ns INTEGER NOT NULL,
     PRIMARY KEY (session_id, page_ordinal),
     UNIQUE (session_id, candidate_digest),
     UNIQUE (session_id, binding_digest),
+    UNIQUE (session_id, object_content_hash),
     FOREIGN KEY (semantics_value_id, semantics_payload_digest)
         REFERENCES provider_macro_plan_values(value_id, value_digest)
 ) STRICT, WITHOUT ROWID;
@@ -2807,6 +2831,9 @@ CREATE TABLE provider_macro_plan_publications (
     source_generation_digest BLOB NOT NULL CHECK (
         length(source_generation_digest) = 32
         AND source_generation_digest <> zeroblob(32)
+    ),
+    plan_identity BLOB NOT NULL CHECK (
+        length(plan_identity) = 32 AND plan_identity <> zeroblob(32)
     ),
     request_set_identity BLOB NOT NULL CHECK (
         length(request_set_identity) = 32 AND request_set_identity <> zeroblob(32)
@@ -2917,6 +2944,8 @@ WHEN OLD.state <> 'acquiring'
     OR NEW.metadata_revision <> OLD.metadata_revision
     OR NEW.provider_dataset <> OLD.provider_dataset
     OR NEW.source_generation_digest <> OLD.source_generation_digest
+    OR NEW.plan_identity <> OLD.plan_identity
+    OR NEW.initial_checkpoint_digest <> OLD.initial_checkpoint_digest
     OR NEW.created_at_ns <> OLD.created_at_ns
     OR NEW.updated_at_ns < OLD.updated_at_ns
     OR NEW.checkpoint_digest = OLD.checkpoint_digest
@@ -2999,6 +3028,13 @@ WHEN NOT EXISTS (
       AND session.response_count = NEW.page_ordinal
       AND binding.capture_observation_digest = NEW.capture_observation_digest
       AND binding.canonical_record_count = NEW.canonical_record_count
+      AND NEW.object_size_bytes BETWEEN 1 AND 1073741824
+      AND length(CAST(NEW.object_relative_reference AS BLOB)) BETWEEN 1 AND 1024
+      AND length(NEW.object_content_hash) = 32
+      AND NEW.object_content_hash <> zeroblob(32)
+      AND length(NEW.object_lineage_hash) = 32
+      AND NEW.object_lineage_hash <> zeroblob(32)
+      AND NEW.object_created_at_ns <= NEW.staged_at_ns
       AND capture.source_id = session.source_id
       AND capture.metadata_revision = session.metadata_revision
       AND capture.provider_dataset = session.provider_dataset
@@ -3094,6 +3130,7 @@ WHEN NOT EXISTS (
       AND session.metadata_revision = NEW.metadata_revision
       AND session.provider_dataset = NEW.provider_dataset
       AND session.source_generation_digest = NEW.source_generation_digest
+      AND session.plan_identity = NEW.plan_identity
       AND session.response_count = NEW.response_count
       AND session.data_page_count = NEW.data_page_count
       AND session.analytical_row_count = NEW.analytical_row_count

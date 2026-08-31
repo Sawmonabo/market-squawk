@@ -3628,7 +3628,7 @@ fn append_reference_membership(
     let query_capacity = candidates
         .len()
         .checked_mul(24)
-        .and_then(|value| value.checked_add(768))
+        .and_then(|value| value.checked_add(1_280))
         .ok_or(ManifestCatalogError::CountOverflow)?;
     let mut query = String::new();
     query
@@ -3660,6 +3660,16 @@ fn append_reference_membership(
                   AND results.content_digest=candidates.content_hash
                   AND reservations.state='published'
                   AND reservations.expires_at_ns>?{now_parameter}
+            ) OR EXISTS(
+                SELECT 1
+                FROM provider_macro_plan_staged_pages AS staged
+                JOIN provider_macro_plan_sessions AS session USING (session_id)
+                WHERE staged.object_content_hash=candidates.content_hash
+                  AND session.state IN ('acquiring', 'complete')
+                  AND NOT EXISTS(
+                      SELECT 1 FROM provider_macro_plan_publications AS publication
+                      WHERE publication.session_id=staged.session_id
+                  )
             )
          FROM candidates ORDER BY candidate_ordinal"
     )
