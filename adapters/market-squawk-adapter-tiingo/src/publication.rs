@@ -44,7 +44,6 @@ use crate::{
     normalize_mutual_fund_row,
 };
 
-const TIINGO_MUTUAL_FUND_EXCHANGE_CODE: &str = "MF";
 const TIINGO_CANONICAL_MEDIA_TYPE: &str = "application-json";
 const TIINGO_LOCAL_REVISION_PREFIX: &str = "tiingo-local";
 
@@ -254,9 +253,7 @@ impl TiingoSealedLatestPublication {
             metadata,
             latest,
         } = self;
-        if metadata.metadata().exchange_code() != TIINGO_MUTUAL_FUND_EXCHANGE_CODE
-            || metadata.metadata().ticker() != context.ticker()
-        {
+        if metadata.metadata().ticker() != context.ticker() {
             return Err(TiingoLatestPublicationError::WrongInstrumentFamily);
         }
         if matches!(metadata.metadata().coverage(), TiingoCoverage::Unsupported) {
@@ -268,6 +265,11 @@ impl TiingoSealedLatestPublication {
                     0,
                 )?,
             ));
+        }
+        if metadata.metadata().exchange_code() != crate::nav::TIINGO_MUTUAL_FUND_EXCHANGE_CODE
+            || context.provider_exchange_code().as_str() != metadata.metadata().exchange_code()
+        {
+            return Err(TiingoLatestPublicationError::WrongInstrumentFamily);
         }
         let [row] = latest.rows() else {
             if latest.rows().is_empty() {
@@ -341,7 +343,7 @@ impl TiingoSealedLatestPublication {
             metadata,
             latest,
         } = self;
-        if metadata.metadata().exchange_code() == TIINGO_MUTUAL_FUND_EXCHANGE_CODE {
+        if metadata.metadata().exchange_code() == crate::nav::TIINGO_MUTUAL_FUND_EXCHANGE_CODE {
             return Err(TiingoLatestPublicationError::WrongInstrumentFamily);
         }
         let sealed_capture = token.persisted_receipt();

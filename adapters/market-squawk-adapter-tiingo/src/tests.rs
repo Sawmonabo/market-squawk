@@ -65,11 +65,15 @@ fn date(year: u16, month: u8, day: u8) -> Result<CalendarDate, Box<dyn Error>> {
     Ok(CalendarDate::new(year, month, day)?)
 }
 
-fn context(ticker: &TiingoTicker) -> Result<TiingoFundContext, Box<dyn Error>> {
+fn context(
+    ticker: &TiingoTicker,
+    provider_exchange_code: &str,
+) -> Result<TiingoFundContext, Box<dyn Error>> {
     Ok(TiingoFundContext::try_new(
         "06dd06da-ef2d-44dd-bf28-b006da06b24b".parse::<InstrumentId>()?,
         ProviderInstrumentId::try_from(ticker.as_str())?,
         ticker.clone(),
+        identifier(provider_exchange_code)?,
         RevisionBoundPayloadEvidence::new(
             MetadataRevision::new(identifier("instrument-revision-7")?),
             ExactPayloadEvidence::from_content_digest(digest(b"instrument-revision-7")),
@@ -297,7 +301,7 @@ fn mutual_fund_nav_maps_exactly_and_defers_revision_authority() -> Result<(), Bo
         identifier("tiingo-daily-native-v1")?,
         identifier("tiingo-entitlement-generation-11")?,
     );
-    let metadata_body = br#"{"ticker":"VTSAX","name":"Vanguard Total Stock Market Index Fund Admiral Shares","exchangeCode":"MF","description":"Mutual fund","startDate":"2000-11-13","endDate":"2026-08-10"}"#;
+    let metadata_body = br#"{"ticker":"VTSAX","name":"Vanguard Total Stock Market Index Fund Admiral Shares","exchangeCode":"NMFQS","description":"Mutual fund","startDate":"2000-11-13","endDate":"2026-08-10"}"#;
     let metadata = decoder.decode_metadata(
         TiingoRequestSpec::metadata(ticker.clone())?,
         200,
@@ -314,7 +318,8 @@ fn mutual_fund_nav_maps_exactly_and_defers_revision_authority() -> Result<(), Bo
         Timestamp::from_unix_nanos(201),
     )?;
 
-    let candidate = normalize_mutual_fund_row(context(&ticker)?, &metadata, &latest_response, 0)?;
+    let candidate =
+        normalize_mutual_fund_row(context(&ticker, "NMFQS")?, &metadata, &latest_response, 0)?;
     let TiingoNavValueState::Observed(nav) = candidate.value() else {
         return Err("expected an observed NAV".into());
     };
@@ -381,9 +386,9 @@ fn mutual_fund_nav_maps_exactly_and_defers_revision_authority() -> Result<(), Bo
         Timestamp::from_unix_nanos(204),
     )?;
     let historical_first =
-        normalize_mutual_fund_row(context(&ticker)?, &metadata, &history_response, 0)?;
+        normalize_mutual_fund_row(context(&ticker, "NMFQS")?, &metadata, &history_response, 0)?;
     let historical_second =
-        normalize_mutual_fund_row(context(&ticker)?, &metadata, &history_response, 1)?;
+        normalize_mutual_fund_row(context(&ticker, "NMFQS")?, &metadata, &history_response, 1)?;
     let historical_sealed =
         seal_response(history_body, history_response.evidence(), &contract, &store)?;
     let completed_history = completed_single_page_history(
@@ -540,7 +545,7 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
     assert_eq!(latest_response.disposition().missing_symbols(), 1);
     assert!(matches!(
         missing_nav_candidate(
-            context(&ticker)?,
+            context(&ticker, "N/A")?,
             date(2026, 8, 10)?,
             TiingoNavValueState::Unsupported,
             &metadata,
@@ -558,7 +563,7 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
         Timestamp::from_unix_nanos(33),
     )?;
     let unsupported = missing_nav_candidate(
-        context(&ticker)?,
+        context(&ticker, "N/A")?,
         date(2026, 8, 10)?,
         TiingoNavValueState::Unsupported,
         &metadata,
@@ -585,7 +590,7 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
 
     assert!(matches!(
         missing_nav_candidate(
-            context(&ticker)?,
+            context(&ticker, "N/A")?,
             date(2026, 8, 10)?,
             TiingoNavValueState::Unavailable,
             &metadata,
@@ -594,7 +599,7 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
         Err(TiingoAdapterError::UnprovenNavState)
     ));
     let supported_ticker = TiingoTicker::try_new("VTSAX")?;
-    let supported_metadata_body = br#"{"ticker":"VTSAX","name":"Vanguard Total Stock Market Index Fund Admiral Shares","exchangeCode":"MF","description":"Mutual fund","startDate":"2000-11-13","endDate":"2026-08-10"}"#;
+    let supported_metadata_body = br#"{"ticker":"VTSAX","name":"Vanguard Total Stock Market Index Fund Admiral Shares","exchangeCode":"NMFQS","description":"Mutual fund","startDate":"2000-11-13","endDate":"2026-08-10"}"#;
     let supported_metadata = decoder.decode_metadata(
         TiingoRequestSpec::metadata(supported_ticker.clone())?,
         200,
@@ -615,7 +620,7 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
         Timestamp::from_unix_nanos(35),
     )?;
     let source_missing = missing_nav_candidate(
-        context(&supported_ticker)?,
+        context(&supported_ticker, "NMFQS")?,
         date(2026, 8, 10)?,
         TiingoNavValueState::SourceMissing,
         &supported_metadata,
@@ -695,7 +700,7 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
     )?;
     assert!(matches!(
         normalize_mutual_fund_row(
-            context(&equity_ticker)?,
+            context(&equity_ticker, "NMFQS")?,
             &equity_metadata,
             &equity_response,
             0,

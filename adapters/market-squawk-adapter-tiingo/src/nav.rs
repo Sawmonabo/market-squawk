@@ -12,7 +12,11 @@ use crate::{
     TiingoTicker,
 };
 
-const TIINGO_MUTUAL_FUND_EXCHANGE_CODE: &str = "MF";
+/// Tiingo's live daily metadata identifies supported US mutual funds through the Nasdaq Mutual
+/// Fund Quotation Service code. Asset authority still comes from the exact externally resolved
+/// fund/share-class context; this provider-native guard prevents equity metadata from being
+/// normalized as NAV.
+pub(crate) const TIINGO_MUTUAL_FUND_EXCHANGE_CODE: &str = "NMFQS";
 
 /// Exact canonical-reference context required before a Tiingo ticker can become mutual-fund NAV.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,6 +24,7 @@ pub struct TiingoFundContext {
     instrument_id: InstrumentId,
     provider_instrument_id: ProviderInstrumentId,
     ticker: TiingoTicker,
+    provider_exchange_code: SourceIdentifier,
     instrument_definition: RevisionBoundPayloadEvidence,
     mutual_fund_classification: RevisionBoundPayloadEvidence,
     entitlement_generation: SourceIdentifier,
@@ -33,13 +38,15 @@ impl TiingoFundContext {
     ///
     /// # Errors
     ///
-    /// Rejects a provider identifier that differs from the exact Tiingo ticker. A caller must not
+    /// Rejects a provider identifier that differs from the exact Tiingo ticker. The selected
+    /// provider exchange code is later matched to the exact metadata response. A caller must not
     /// construct this context for an ETF, equity, or unresolved fund/share class.
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         instrument_id: InstrumentId,
         provider_instrument_id: ProviderInstrumentId,
         ticker: TiingoTicker,
+        provider_exchange_code: SourceIdentifier,
         instrument_definition: RevisionBoundPayloadEvidence,
         mutual_fund_classification: RevisionBoundPayloadEvidence,
         entitlement_generation: SourceIdentifier,
@@ -65,6 +72,7 @@ impl TiingoFundContext {
             instrument_id,
             provider_instrument_id,
             ticker,
+            provider_exchange_code,
             instrument_definition,
             mutual_fund_classification,
             entitlement_generation,
@@ -87,6 +95,11 @@ impl TiingoFundContext {
     /// Returns the exact Tiingo ticker.
     pub const fn ticker(&self) -> &TiingoTicker {
         &self.ticker
+    }
+
+    /// Returns the exact Tiingo metadata exchange code selected with the fund/share class.
+    pub const fn provider_exchange_code(&self) -> &SourceIdentifier {
+        &self.provider_exchange_code
     }
 
     /// Returns the exact external instrument-definition revision.
@@ -479,6 +492,7 @@ pub fn missing_nav_candidate(
     }
     if context.ticker() != metadata.metadata().ticker()
         || context.ticker() != evidence.request().ticker()
+        || context.provider_exchange_code().as_str() != metadata.metadata().exchange_code()
         || evidence.request().endpoint() == crate::TiingoEndpointFamily::Metadata
         || context.native_schema_revision() != metadata.evidence().native_contract_revision()
         || context.native_schema_revision() != evidence.native_contract_revision()
@@ -521,6 +535,7 @@ fn validate_context(
     if context.ticker() != metadata.metadata().ticker()
         || context.ticker() != response.request().ticker()
         || context.provider_instrument_id().as_str() != context.ticker().as_str()
+        || context.provider_exchange_code().as_str() != metadata.metadata().exchange_code()
         || metadata.evidence().decoded_at() > response.received_at()
         || context.native_schema_revision() != metadata.evidence().native_contract_revision()
         || context.native_schema_revision() != response.native_contract_revision()
@@ -691,6 +706,10 @@ fn nav_provenance_identity(
     append_field(
         &mut hasher,
         context.entitlement_generation().as_str().as_bytes(),
+    );
+    append_field(
+        &mut hasher,
+        context.provider_exchange_code().as_str().as_bytes(),
     );
     append_field(
         &mut hasher,

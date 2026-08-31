@@ -26,7 +26,6 @@ use crate::{
 };
 
 const TIINGO_SOURCE_ID: &str = "tiingo-starter";
-const TIINGO_MUTUAL_FUND_EXCHANGE_CODE: &str = "MF";
 const TIINGO_HISTORY_DATASET: &str = "tiingo-daily-history-window";
 const TIINGO_DAILY_INTERVAL: &str = "tiingo-calendar-day";
 const TIINGO_RAW_EOD_FEED: &str = "tiingo-starter-daily-eod-raw";
@@ -2051,7 +2050,7 @@ fn validate_authority(input: &TiingoEodMappingInput<'_>) -> Result<(), TiingoEod
         || metadata.ticker() != input.instrument.ticker()
         || metadata.exchange_code() != input.instrument.provider_exchange_code().as_str()
         || input.instrument.provider_instrument_id().as_str() != input.instrument.ticker().as_str()
-        || metadata.exchange_code() == TIINGO_MUTUAL_FUND_EXCHANGE_CODE
+        || metadata.exchange_code() == crate::nav::TIINGO_MUTUAL_FUND_EXCHANGE_CODE
         || matches!(metadata.coverage(), TiingoCoverage::Unsupported)
         || input.metadata.evidence().request().endpoint() != TiingoEndpointFamily::Metadata
         || input.metadata.evidence().request().ticker() != input.instrument.ticker()

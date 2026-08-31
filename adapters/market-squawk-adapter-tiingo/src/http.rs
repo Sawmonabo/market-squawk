@@ -2378,7 +2378,7 @@ mod tests {
         let rate_authority = ProviderRateAuthority::try_new(rate_store.clone())?;
 
         let success_bodies = vec![
-            Bytes::from_static(br#"{"ticker":"VTSAX","name":"Vanguard Total Stock Market Index Fund Admiral Shares","exchangeCode":"MF","description":"Mutual fund","startDate":"2000-11-13","endDate":"2026-01-02"}"#),
+            Bytes::from_static(br#"{"ticker":"VTSAX","name":"Vanguard Total Stock Market Index Fund Admiral Shares","exchangeCode":"NMFQS","description":"Mutual fund","startDate":"2000-11-13","endDate":"2026-01-02"}"#),
             Bytes::from_static(br#"[{"date":"2026-01-02T00:00:00.000Z","open":151.23,"high":151.23,"low":151.23,"close":151.23,"volume":0,"adjOpen":151.23,"adjHigh":151.23,"adjLow":151.23,"adjClose":151.23,"adjVolume":0,"divCash":0,"splitFactor":1}]"#),
             Bytes::from_static(br#"[{"date":"2025-01-01T00:00:00.000Z","open":140,"high":140,"low":140,"close":140,"volume":0,"adjOpen":140,"adjHigh":140,"adjLow":140,"adjClose":140,"adjVolume":0,"divCash":0,"splitFactor":1}]"#),
             Bytes::from_static(br#"[{"date":"2026-01-02T00:00:00.000Z","open":151.23,"high":151.23,"low":151.23,"close":151.23,"volume":0,"adjOpen":151.23,"adjHigh":151.23,"adjLow":151.23,"adjClose":151.23,"adjVolume":0,"divCash":0,"splitFactor":1}]"#),
