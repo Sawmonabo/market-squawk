@@ -516,6 +516,35 @@ pub enum SinkError {
 
 /// Closed payload-free metadata-schema failure retained only by internal diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceMetadataIntervalViolation {
+    /// The response-envelope start was not a valid civil date.
+    ResponseEnvelopeStart,
+    /// The response-envelope end was not a valid civil date.
+    ResponseEnvelopeEnd,
+    /// The response envelope was reversed.
+    ResponseEnvelopeOrder,
+    /// The response envelope did not equal the exact requested envelope.
+    ResponseEnvelopeBinding,
+    /// A metadata-record start was not a valid civil date.
+    RecordStart,
+    /// A metadata-record end was not a valid civil date.
+    RecordEnd,
+    /// A metadata-record interval was reversed.
+    RecordOrder,
+    /// The earliest metadata record did not cover the response-envelope start.
+    OuterStartCoverage,
+    /// The latest metadata record did not cover the response-envelope end.
+    OuterEndCoverage,
+    /// Two metadata records declared the same interval.
+    DuplicateInterval,
+    /// Adjacent ordered metadata records left an uncovered interval.
+    Gap,
+    /// Adjacent ordered metadata records overlapped.
+    Overlap,
+}
+
+/// Closed payload-free metadata-schema failure retained only by internal diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceMetadataSchemaViolation {
     /// The bounded response was not the selected document shape.
     DocumentShape,
@@ -528,7 +557,7 @@ pub enum SourceMetadataSchemaViolation {
     /// The returned record identity did not bind to the exact request.
     RecordIdentity,
     /// Page and record effective intervals were malformed or inconsistent.
-    PageRecordInterval,
+    PageRecordInterval(SourceMetadataIntervalViolation),
     /// The provider-declared observation interval was malformed.
     ObservationInterval,
 }

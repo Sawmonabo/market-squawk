@@ -7,7 +7,7 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     ApiEndpointRule, ExtractionAuthority, ExtractionSourceError, NetworkPolicyError, PathScope,
     ProviderCaptureMaterial, QueryParameterRule, QuerySensitivity, SourceError,
-    SourceMetadataSchemaViolation, SourceProtocolViolation,
+    SourceMetadataIntervalViolation, SourceMetadataSchemaViolation, SourceProtocolViolation,
 };
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -440,13 +440,18 @@ fn parse_series_metadata_for_series(
         return Err(SourceMetadataSchemaViolation::RecordCardinality);
     }
     let page_start = parse_date(&wire.realtime_start)
-        .map_err(|_| SourceMetadataSchemaViolation::PageRecordInterval)?;
+        .map_err(|_| metadata_interval(SourceMetadataIntervalViolation::ResponseEnvelopeStart))?;
     let page_end = parse_date(&wire.realtime_end)
-        .map_err(|_| SourceMetadataSchemaViolation::PageRecordInterval)?;
-    if page_start > page_end
-        || expected_page_interval.is_some_and(|expected| expected != (page_start, page_end))
-    {
-        return Err(SourceMetadataSchemaViolation::PageRecordInterval);
+        .map_err(|_| metadata_interval(SourceMetadataIntervalViolation::ResponseEnvelopeEnd))?;
+    if page_start > page_end {
+        return Err(metadata_interval(
+            SourceMetadataIntervalViolation::ResponseEnvelopeOrder,
+        ));
+    }
+    if expected_page_interval.is_some_and(|expected| expected != (page_start, page_end)) {
+        return Err(metadata_interval(
+            SourceMetadataIntervalViolation::ResponseEnvelopeBinding,
+        ));
     }
     let mut revisions = Vec::new();
     revisions
@@ -476,9 +481,9 @@ fn parse_series_metadata_for_series(
         let series_id = SourceIdentifier::try_from(row.id)
             .map_err(|_| SourceMetadataSchemaViolation::RecordIdentity)?;
         let realtime_start = parse_date(&row.realtime_start)
-            .map_err(|_| SourceMetadataSchemaViolation::PageRecordInterval)?;
+            .map_err(|_| metadata_interval(SourceMetadataIntervalViolation::RecordStart))?;
         let realtime_end = parse_date(&row.realtime_end)
-            .map_err(|_| SourceMetadataSchemaViolation::PageRecordInterval)?;
+            .map_err(|_| metadata_interval(SourceMetadataIntervalViolation::RecordEnd))?;
         let observation_start = parse_date(&row.observation_start)
             .map_err(|_| SourceMetadataSchemaViolation::ObservationInterval)?;
         let observation_end = parse_date(&row.observation_end)
@@ -487,7 +492,9 @@ fn parse_series_metadata_for_series(
             return Err(SourceMetadataSchemaViolation::RecordIdentity);
         }
         if realtime_start > realtime_end {
-            return Err(SourceMetadataSchemaViolation::PageRecordInterval);
+            return Err(metadata_interval(
+                SourceMetadataIntervalViolation::RecordOrder,
+            ));
         }
         if observation_start > observation_end {
             return Err(SourceMetadataSchemaViolation::ObservationInterval);
@@ -522,15 +529,43 @@ fn parse_series_metadata_for_series(
     // The response-level dates are the requested envelope. Provider-authored metadata validity
     // can begin before or end after that envelope, so require complete coverage without erasing
     // those exact source intervals.
-    if first.realtime_start > page_start
-        || last.realtime_end < page_end
-        || revisions.windows(2).any(|pair| {
-            !closed_intervals_are_contiguous(pair[0].realtime_end, pair[1].realtime_start)
-        })
-    {
-        return Err(SourceMetadataSchemaViolation::PageRecordInterval);
+    if first.realtime_start > page_start {
+        return Err(metadata_interval(
+            SourceMetadataIntervalViolation::OuterStartCoverage,
+        ));
+    }
+    if last.realtime_end < page_end {
+        return Err(metadata_interval(
+            SourceMetadataIntervalViolation::OuterEndCoverage,
+        ));
+    }
+    for pair in revisions.windows(2) {
+        if let Some(reason) = metadata_interval_discontinuity(&pair[0], &pair[1]) {
+            return Err(metadata_interval(reason));
+        }
     }
     Ok(revisions.into_boxed_slice())
+}
+
+const fn metadata_interval(
+    reason: SourceMetadataIntervalViolation,
+) -> SourceMetadataSchemaViolation {
+    SourceMetadataSchemaViolation::PageRecordInterval(reason)
+}
+
+fn metadata_interval_discontinuity(
+    previous: &FredSeriesMetadata,
+    next: &FredSeriesMetadata,
+) -> Option<SourceMetadataIntervalViolation> {
+    if previous.realtime_start == next.realtime_start && previous.realtime_end == next.realtime_end
+    {
+        return Some(SourceMetadataIntervalViolation::DuplicateInterval);
+    }
+    if next.realtime_start <= previous.realtime_end {
+        return Some(SourceMetadataIntervalViolation::Overlap);
+    }
+    (!closed_intervals_are_contiguous(previous.realtime_end, next.realtime_start))
+        .then_some(SourceMetadataIntervalViolation::Gap)
 }
 
 fn closed_intervals_are_contiguous(previous_end: CalendarDate, next_start: CalendarDate) -> bool {
