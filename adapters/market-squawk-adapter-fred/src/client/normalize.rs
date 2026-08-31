@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     FredDataset, FredNamespace, FredSeriesMetadata, FredSeriesMetadataDocument, FredSourceError,
+    MAX_FRED_SERIES_METADATA_REVISIONS,
 };
 
 pub(super) struct CanonicalPageContext {
@@ -29,7 +30,7 @@ pub(super) struct FredNativeLineagePlan {
     provider_dataset: SourceIdentifier,
     dataset: FredDataset,
     page: crate::FredObservationPage,
-    series: FredSeriesMetadata,
+    series_revisions: Box<[FredSeriesMetadata]>,
 }
 
 impl FredNativeLineagePlan {
@@ -37,12 +38,10 @@ impl FredNativeLineagePlan {
         provider_dataset: SourceIdentifier,
         dataset: FredDataset,
         page: crate::FredObservationPage,
-        series: FredSeriesMetadata,
+        series_revisions: Box<[FredSeriesMetadata]>,
     ) -> Result<Self, FredSourceError> {
         if FredDataset::parse(&provider_dataset).ok().as_ref() != Some(&dataset)
-            || series.series_id().as_str() != dataset.series_id()
-            || series.realtime_start() != dataset.realtime_start()
-            || series.realtime_end() != dataset.realtime_end()
+            || !metadata_revisions_cover_dataset(&series_revisions, &dataset)
             || page.realtime_start() != dataset.realtime_start()
             || page.realtime_end() != dataset.realtime_end()
             || page.observations().is_empty()
@@ -53,7 +52,7 @@ impl FredNativeLineagePlan {
             provider_dataset,
             dataset,
             page,
-            series,
+            series_revisions,
         })
     }
 
@@ -71,6 +70,29 @@ impl FredNativeLineagePlan {
             batch,
         )
         .map_err(|_| FredSourceError::Protocol)?;
+        let mut native_series_revisions = Vec::new();
+        native_series_revisions
+            .try_reserve_exact(self.series_revisions.len())
+            .map_err(|_| FredSourceError::Protocol)?;
+        for series in &self.series_revisions {
+            native_series_revisions.push(FredNativeSeriesV1 {
+                id: series.series_id(),
+                realtime_start: series.realtime_start(),
+                realtime_end: series.realtime_end(),
+                title: series.title(),
+                observation_start: series.observation_start(),
+                observation_end: series.observation_end(),
+                frequency: series.frequency(),
+                frequency_short: series.frequency_short(),
+                units: series.units(),
+                units_short: series.units_short(),
+                seasonal_adjustment: series.seasonal_adjustment(),
+                seasonal_adjustment_short: series.seasonal_adjustment_short(),
+                last_updated: series.last_updated(),
+                popularity: series.popularity(),
+                notes: series.notes(),
+            });
+        }
         builder
             .try_set_batch_sidecar(&FredNativeLineageBatchV1 {
                 version: 1,
@@ -86,23 +108,7 @@ impl FredNativeLineagePlan {
                     order_by: "observation_date",
                     sort_order: "asc",
                 },
-                series: FredNativeSeriesV1 {
-                    id: self.series.series_id(),
-                    realtime_start: self.series.realtime_start(),
-                    realtime_end: self.series.realtime_end(),
-                    title: self.series.title(),
-                    observation_start: self.series.observation_start(),
-                    observation_end: self.series.observation_end(),
-                    frequency: self.series.frequency(),
-                    frequency_short: self.series.frequency_short(),
-                    units: self.series.units(),
-                    units_short: self.series.units_short(),
-                    seasonal_adjustment: self.series.seasonal_adjustment(),
-                    seasonal_adjustment_short: self.series.seasonal_adjustment_short(),
-                    last_updated: self.series.last_updated(),
-                    popularity: self.series.popularity(),
-                    notes: self.series.notes(),
-                },
+                series_revisions: native_series_revisions,
                 page: FredNativePageV1 {
                     realtime_start: self.page.realtime_start(),
                     realtime_end: self.page.realtime_end(),
@@ -123,6 +129,8 @@ impl FredNativeLineagePlan {
             .try_reserve_exact(self.page.observations().len())
             .map_err(|_| FredSourceError::Protocol)?;
         for (record, observation) in batch.records().iter().zip(self.page.observations()) {
+            let (metadata_revision_ordinal, _series) =
+                applicable_metadata_revision(&self.series_revisions, observation.realtime_start())?;
             let expected_revision = source_revision_identifier(
                 &self.dataset,
                 observation.observation_date(),
@@ -146,6 +154,8 @@ impl FredNativeLineagePlan {
                     raw_value: observation.raw_value(),
                     value: observation.value(),
                     missing_marker: observation.value().is_none().then_some("."),
+                    metadata_revision_ordinal: u16::try_from(metadata_revision_ordinal)
+                        .map_err(|_| FredSourceError::Protocol)?,
                 })
                 .map_err(|_| FredSourceError::Protocol)?;
             row_capture_page_ordinals.push(1);
@@ -163,7 +173,7 @@ struct FredNativeLineageBatchV1<'a> {
     namespace: &'static str,
     provider_dataset: &'a SourceIdentifier,
     response_mode: FredNativeResponseModeV1,
-    series: FredNativeSeriesV1<'a>,
+    series_revisions: Vec<FredNativeSeriesV1<'a>>,
     page: FredNativePageV1<'a>,
 }
 
@@ -221,6 +231,7 @@ struct FredNativeLineageRowV1<'a> {
     raw_value: &'a str,
     value: Option<rust_decimal::Decimal>,
     missing_marker: Option<&'static str>,
+    metadata_revision_ordinal: u16,
 }
 
 pub(super) fn canonical_observation_payloads(
@@ -232,7 +243,6 @@ pub(super) fn canonical_observation_payloads(
     received_at: Timestamp,
     ingested_at: Timestamp,
 ) -> Result<Vec<CanonicalFredRecord>, FredSourceError> {
-    let unit = fred_unit_identifier(series_metadata.series().units())?;
     let series =
         SourceIdentifier::try_from(dataset.series_id()).map_err(|_| FredSourceError::Protocol)?;
     let page_reference = PayloadReference::ContentHash(PayloadHash::new(
@@ -242,6 +252,11 @@ pub(super) fn canonical_observation_payloads(
     page.observations()
         .iter()
         .map(|observation| {
+            let (_metadata_revision_ordinal, metadata) = applicable_metadata_revision(
+                series_metadata.series_revisions(),
+                observation.realtime_start(),
+            )?;
+            let unit = fred_unit_identifier(metadata.units())?;
             let revision_number = revision_number_for_vintage(observation.realtime_start())?;
             let source_revision = source_revision_identifier(
                 dataset,
@@ -308,6 +323,43 @@ pub(super) fn canonical_observation_payloads(
             })
         })
         .collect()
+}
+
+fn metadata_revisions_cover_dataset(
+    revisions: &[FredSeriesMetadata],
+    dataset: &FredDataset,
+) -> bool {
+    if revisions.is_empty() || revisions.len() > MAX_FRED_SERIES_METADATA_REVISIONS {
+        return false;
+    }
+    let mut previous_end = None;
+    for revision in revisions {
+        if revision.series_id().as_str() != dataset.series_id()
+            || revision.realtime_start() > revision.realtime_end()
+            || previous_end.is_some_and(|end: CalendarDate| {
+                end.days_since_unix_epoch().checked_add(1)
+                    != Some(revision.realtime_start().days_since_unix_epoch())
+            })
+        {
+            return false;
+        }
+        previous_end = Some(revision.realtime_end());
+    }
+    revisions.first().map(FredSeriesMetadata::realtime_start) == Some(dataset.realtime_start())
+        && revisions.last().map(FredSeriesMetadata::realtime_end) == Some(dataset.realtime_end())
+}
+
+fn applicable_metadata_revision(
+    revisions: &[FredSeriesMetadata],
+    published: CalendarDate,
+) -> Result<(usize, &FredSeriesMetadata), FredSourceError> {
+    let upper = revisions.partition_point(|revision| revision.realtime_start() <= published);
+    let ordinal = upper.checked_sub(1).ok_or(FredSourceError::Protocol)?;
+    let revision = revisions.get(ordinal).ok_or(FredSourceError::Protocol)?;
+    if published > revision.realtime_end() {
+        return Err(FredSourceError::Protocol);
+    }
+    Ok((ordinal, revision))
 }
 
 fn revision_number_for_vintage(
@@ -418,10 +470,13 @@ fn exclusive_superseded_at(
 mod tests {
     use market_squawk_domain::{CalendarDate, SourceIdentifier};
 
-    use crate::{FredObservationPage, FredParseLimits};
+    use crate::{FredObservationPage, FredParseLimits, FredSeriesMetadata};
 
     use super::{FredDataset, FredNamespace};
-    use super::{exclusive_superseded_at, revision_number_for_vintage, source_revision_identifier};
+    use super::{
+        applicable_metadata_revision, exclusive_superseded_at, revision_number_for_vintage,
+        source_revision_identifier,
+    };
 
     #[test]
     fn provider_vintage_identity_is_window_invariant_ordered_and_exact()
@@ -522,6 +577,63 @@ mod tests {
             .ok_or("missing January boundary")?;
         assert_eq!(january, CalendarDate::new(2024, 2, 1)?);
         assert!(exclusive_superseded_at(wide.observations()[1].realtime_end())?.is_none());
+
+        let series_id = SourceIdentifier::try_from("CPIAUCSL")?;
+        let metadata_response = |realtime_start: &str,
+                                 realtime_end: &str,
+                                 units: &str|
+         -> Result<Vec<u8>, serde_json::Error> {
+            serde_json::to_vec(&serde_json::json!({
+                "realtime_start": realtime_start,
+                "realtime_end": realtime_end,
+                "seriess": [{
+                    "id": "CPIAUCSL",
+                    "realtime_start": realtime_start,
+                    "realtime_end": realtime_end,
+                    "title": "Consumer price index",
+                    "observation_start": "1947-01-01",
+                    "observation_end": "2024-12-31",
+                    "frequency": "Monthly",
+                    "frequency_short": "M",
+                    "units": units,
+                    "units_short": units,
+                    "seasonal_adjustment": "Seasonally Adjusted",
+                    "seasonal_adjustment_short": "SA",
+                    "last_updated": "2024-02-01 07:30:00-06",
+                    "popularity": 90
+                }]
+            }))
+        };
+        let metadata_revisions = [
+            FredSeriesMetadata::parse_probe_response(
+                &metadata_response("2023-01-01", "2024-01-31", "Index")?,
+                &series_id,
+                limits,
+            )?,
+            FredSeriesMetadata::parse_probe_response(
+                &metadata_response("2024-02-01", "2024-12-31", "Percent")?,
+                &series_id,
+                limits,
+            )?,
+        ];
+        assert_eq!(
+            applicable_metadata_revision(
+                &metadata_revisions,
+                wide.observations()[0].realtime_start()
+            )?
+            .1
+            .units(),
+            "Index"
+        );
+        assert_eq!(
+            applicable_metadata_revision(
+                &metadata_revisions,
+                wide.observations()[1].realtime_start()
+            )?
+            .1
+            .units(),
+            "Percent"
+        );
 
         let divergent_same_version = serde_json::json!([
             {

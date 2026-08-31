@@ -12,14 +12,14 @@
 
 use std::{sync::Arc, time::Instant};
 
-use market_squawk_adapter_fred::FredSource;
+use market_squawk_adapter_fred::{FredSource, MAX_FRED_SERIES_METADATA_REVISIONS};
 use market_squawk_data::{
     AnalyticalGeneration, AnalyticalReadError, DatasetId, DatasetManifestRef,
     GenerationOwnedProviderCaptureEvidence, IngestError, IngestIdentity, IngestPrecommitAuthority,
-    ManifestObject, PersistedProviderCaptureBindingEvidence, ProviderMacroPlanChunkInput,
-    ProviderMacroPlanPublicationInput, ProviderMacroPlanPublicationReceipt,
-    ProviderMacroPlanSemantics, RightsDecisionInput, SourceOperation,
-    extraction_provider_payload_digest,
+    ManifestObject, PersistedProviderCaptureBindingEvidence, PersistedProviderCaptureBindingRow,
+    ProviderMacroPlanChunkInput, ProviderMacroPlanPublicationInput,
+    ProviderMacroPlanPublicationReceipt, ProviderMacroPlanSemantics, RightsDecisionInput,
+    SourceOperation, extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
     CalendarDate, DigestAlgorithm, EvidenceDigest, SourceId, SourceIdentifier,
@@ -32,6 +32,7 @@ use market_squawk_sources::{
     SourceMetadata,
 };
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -401,7 +402,7 @@ fn restored_fred_binding_coordinate(
             .ok_or(FredProductionPublicationError::RestartVerificationMismatch)?,
     )
     .map_err(|_error| FredProductionPublicationError::RestartVerificationMismatch)?;
-    sidecar.validate(provider_dataset, evidence.record_count())?;
+    sidecar.validate(provider_dataset, evidence.record_count(), evidence.rows())?;
     let object_id = SourceIdentifier::try_from(format!(
         "fred-page-v2:{}:{}:{}:{}:{}:{}:{}",
         sidecar.page.offset,
@@ -446,7 +447,7 @@ struct RestoredFredNativeBatchV1 {
     namespace: String,
     provider_dataset: SourceIdentifier,
     response_mode: RestoredFredResponseModeV1,
-    series: RestoredFredSeriesV1,
+    series_revisions: Vec<RestoredFredSeriesV1>,
     page: RestoredFredPageV1,
 }
 
@@ -455,6 +456,7 @@ impl RestoredFredNativeBatchV1 {
         &self,
         provider_dataset: &SourceIdentifier,
         record_count: usize,
+        rows: &[PersistedProviderCaptureBindingRow],
     ) -> Result<(), FredProductionPublicationError> {
         let expected_namespace = provider_dataset
             .as_str()
@@ -478,18 +480,12 @@ impl RestoredFredNativeBatchV1 {
             || self.response_mode.file_type != "json"
             || self.response_mode.order_by != "observation_date"
             || self.response_mode.sort_order != "asc"
-            || self.series.id != expected_series
-            || self.series.realtime_start != expected_realtime_start
-            || self.series.realtime_end != expected_realtime_end
-            || self.series.observation_start > self.series.observation_end
-            || self.series.title.is_empty()
-            || self.series.frequency.is_empty()
-            || self.series.frequency_short.is_empty()
-            || self.series.units.is_empty()
-            || self.series.units_short.is_empty()
-            || self.series.seasonal_adjustment.is_empty()
-            || self.series.seasonal_adjustment_short.is_empty()
-            || self.series.last_updated.is_empty()
+            || !restored_metadata_revisions_cover_interval(
+                &self.series_revisions,
+                &expected_series,
+                expected_realtime_start,
+                expected_realtime_end,
+            )
             || self.page.realtime_start != expected_realtime_start
             || self.page.realtime_end != expected_realtime_end
             || self.page.observation_start > self.page.observation_end
@@ -501,11 +497,65 @@ impl RestoredFredNativeBatchV1 {
             || consumed > self.page.count
             || self.page.terminal != (consumed == self.page.count)
             || self.page.next_offset != (!self.page.terminal).then_some(consumed)
+            || rows.len() != record_count
         {
             return Err(FredProductionPublicationError::RestartVerificationMismatch);
         }
+        for row in rows {
+            let restored: RestoredFredNativeRowV1 =
+                serde_json::from_slice(row.native_semantic_payload()).map_err(|_error| {
+                    FredProductionPublicationError::RestartVerificationMismatch
+                })?;
+            let metadata = self
+                .series_revisions
+                .get(usize::from(restored.metadata_revision_ordinal))
+                .ok_or(FredProductionPublicationError::RestartVerificationMismatch)?;
+            if restored.realtime_start > restored.realtime_end
+                || restored.raw_value.is_empty()
+                || restored.realtime_start < metadata.realtime_start
+                || restored.realtime_start > metadata.realtime_end
+                || restored.value.is_none() != (restored.missing_marker.as_deref() == Some("."))
+            {
+                return Err(FredProductionPublicationError::RestartVerificationMismatch);
+            }
+        }
         Ok(())
     }
+}
+
+fn restored_metadata_revisions_cover_interval(
+    revisions: &[RestoredFredSeriesV1],
+    expected_series: &SourceIdentifier,
+    expected_start: CalendarDate,
+    expected_end: CalendarDate,
+) -> bool {
+    if revisions.is_empty() || revisions.len() > MAX_FRED_SERIES_METADATA_REVISIONS {
+        return false;
+    }
+    let mut previous_end = None;
+    for revision in revisions {
+        if &revision.id != expected_series
+            || revision.realtime_start > revision.realtime_end
+            || revision.observation_start > revision.observation_end
+            || revision.title.is_empty()
+            || revision.frequency.is_empty()
+            || revision.frequency_short.is_empty()
+            || revision.units.is_empty()
+            || revision.units_short.is_empty()
+            || revision.seasonal_adjustment.is_empty()
+            || revision.seasonal_adjustment_short.is_empty()
+            || revision.last_updated.is_empty()
+            || previous_end.is_some_and(|end: CalendarDate| {
+                end.days_since_unix_epoch().checked_add(1)
+                    != Some(revision.realtime_start.days_since_unix_epoch())
+            })
+        {
+            return false;
+        }
+        previous_end = Some(revision.realtime_end);
+    }
+    revisions.first().map(|revision| revision.realtime_start) == Some(expected_start)
+        && revisions.last().map(|revision| revision.realtime_end) == Some(expected_end)
 }
 
 #[derive(Deserialize)]
@@ -537,6 +587,19 @@ struct RestoredFredSeriesV1 {
     _popularity: u32,
     #[serde(rename = "notes")]
     _notes: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoredFredNativeRowV1 {
+    realtime_start: CalendarDate,
+    realtime_end: CalendarDate,
+    #[serde(rename = "observation_date")]
+    _observation_date: CalendarDate,
+    raw_value: String,
+    value: Option<Value>,
+    missing_marker: Option<String>,
+    metadata_revision_ordinal: u16,
 }
 
 #[derive(Deserialize)]

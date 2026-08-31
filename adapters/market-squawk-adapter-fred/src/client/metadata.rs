@@ -24,6 +24,8 @@ use super::{
 
 const SERIES_ENDPOINT: &str = "https://api.stlouisfed.org/fred/series";
 const MAX_METADATA_STRING_BYTES: usize = 8 * 1024;
+/// Maximum ordered metadata revisions retained from one bounded series response.
+pub const MAX_FRED_SERIES_METADATA_REVISIONS: usize = 4_096;
 
 /// Builds the exact endpoint-policy rule required by [`FredSource::acquire_series_metadata`].
 ///
@@ -166,8 +168,12 @@ impl FredSeriesMetadata {
         expected_series: &SourceIdentifier,
         limits: FredParseLimits,
     ) -> Result<Self, FredSourceError> {
-        parse_series_metadata_for_series(bytes, expected_series.as_str(), limits)
-            .map_err(|_| FredSourceError::Protocol)
+        let revisions = parse_series_metadata_for_series(bytes, expected_series.as_str(), limits)
+            .map_err(|_| FredSourceError::Protocol)?;
+        if revisions.len() != 1 {
+            return Err(FredSourceError::Protocol);
+        }
+        revisions.into_vec().pop().ok_or(FredSourceError::Protocol)
     }
 }
 
@@ -177,7 +183,7 @@ pub struct FredSeriesMetadataDocument {
     source_id: SourceId,
     metadata_revision: MetadataRevision,
     dataset: SourceIdentifier,
-    series: FredSeriesMetadata,
+    series_revisions: Box<[FredSeriesMetadata]>,
     response_bytes: Bytes,
     response_length: u64,
     evidence: ExactPayloadEvidence,
@@ -201,12 +207,12 @@ impl FredSeriesMetadataDocument {
         &self.dataset
     }
 
-    /// Returns validated provider-authored series semantics.
-    pub const fn series(&self) -> &FredSeriesMetadata {
-        &self.series
+    /// Returns every validated provider-authored metadata revision in real-time order.
+    pub fn series_revisions(&self) -> &[FredSeriesMetadata] {
+        &self.series_revisions
     }
 
-    /// Returns the exact response bytes used to construct [`Self::series`].
+    /// Returns the exact response bytes used to construct [`Self::series_revisions`].
     pub const fn response_bytes(&self) -> &Bytes {
         &self.response_bytes
     }
@@ -238,8 +244,8 @@ impl FredSeriesMetadataDocument {
 
     pub(super) fn into_native_semantics_and_capture(
         self,
-    ) -> (FredSeriesMetadata, ProviderCaptureMaterial) {
-        (self.series, self.capture)
+    ) -> (Box<[FredSeriesMetadata]>, ProviderCaptureMaterial) {
+        (self.series_revisions, self.capture)
     }
 }
 
@@ -358,7 +364,7 @@ impl FredSource {
         }
 
         let limits = FredParseLimits::try_new(
-            1,
+            MAX_FRED_SERIES_METADATA_REVISIONS,
             self.response_limit,
             self.response_limit.min(MAX_METADATA_STRING_BYTES),
         )
@@ -367,7 +373,7 @@ impl FredSource {
                 SourceMetadataSchemaViolation::DocumentShape,
             ))
         })?;
-        let series = parse_series_metadata(&response.body, &dataset_identity, limits)
+        let series_revisions = parse_series_metadata(&response.body, &dataset_identity, limits)
             .map_err(protocol_violation)?;
         let response_length = u64::try_from(response.body.len())
             .map_err(|_| protocol_violation(SourceProtocolViolation::CaptureBinding))?;
@@ -381,7 +387,7 @@ impl FredSource {
             source_id: self.metadata.source_id().clone(),
             metadata_revision: self.metadata.revision().clone(),
             dataset: dataset.clone(),
-            series,
+            series_revisions,
             response_bytes: response.body,
             response_length,
             evidence,
@@ -395,91 +401,125 @@ fn parse_series_metadata(
     bytes: &[u8],
     dataset: &FredDataset,
     limits: FredParseLimits,
-) -> Result<FredSeriesMetadata, SourceProtocolViolation> {
-    let series = parse_series_metadata_for_series(bytes, dataset.series_id(), limits)
+) -> Result<Box<[FredSeriesMetadata]>, SourceProtocolViolation> {
+    let series_revisions = parse_series_metadata_for_series(bytes, dataset.series_id(), limits)
         .map_err(SourceProtocolViolation::MetadataSchema)?;
-    if series.realtime_start != dataset.realtime_start()
-        || series.realtime_end != dataset.realtime_end()
+    let Some(first) = series_revisions.first() else {
+        return Err(SourceProtocolViolation::MetadataSchema(
+            SourceMetadataSchemaViolation::RecordCardinality,
+        ));
+    };
+    let Some(last) = series_revisions.last() else {
+        return Err(SourceProtocolViolation::MetadataSchema(
+            SourceMetadataSchemaViolation::RecordCardinality,
+        ));
+    };
+    if first.realtime_start != dataset.realtime_start()
+        || last.realtime_end != dataset.realtime_end()
     {
         return Err(SourceProtocolViolation::MetadataInterval);
     }
-    Ok(series)
+    Ok(series_revisions)
 }
 
 fn parse_series_metadata_for_series(
     bytes: &[u8],
     expected_series: &str,
     limits: FredParseLimits,
-) -> Result<FredSeriesMetadata, SourceMetadataSchemaViolation> {
+) -> Result<Box<[FredSeriesMetadata]>, SourceMetadataSchemaViolation> {
     admit_body(bytes, limits).map_err(|_| SourceMetadataSchemaViolation::DocumentShape)?;
     let wire: SeriesResponseWire =
         serde_json::from_slice(bytes).map_err(|_| SourceMetadataSchemaViolation::DocumentShape)?;
-    if wire.seriess.len() != 1 {
+    if wire.seriess.is_empty() || wire.seriess.len() > limits.max_records {
         return Err(SourceMetadataSchemaViolation::RecordCardinality);
     }
     let page_start = parse_date(&wire.realtime_start)
         .map_err(|_| SourceMetadataSchemaViolation::PageRecordInterval)?;
     let page_end = parse_date(&wire.realtime_end)
         .map_err(|_| SourceMetadataSchemaViolation::PageRecordInterval)?;
-    let mut rows = wire.seriess.into_iter();
-    let row = rows
-        .next()
-        .ok_or(SourceMetadataSchemaViolation::RecordCardinality)?;
-    let values = [
-        row.id.as_str(),
-        row.title.as_str(),
-        row.frequency.as_str(),
-        row.frequency_short.as_str(),
-        row.units.as_str(),
-        row.units_short.as_str(),
-        row.seasonal_adjustment.as_str(),
-        row.seasonal_adjustment_short.as_str(),
-        row.last_updated.as_str(),
-        row.notes.as_deref().unwrap_or_default(),
-    ];
-    validate_strings(values, limits).map_err(|_| SourceMetadataSchemaViolation::RequiredText)?;
-    if values[..9].iter().any(|value| value.is_empty()) {
-        return Err(SourceMetadataSchemaViolation::RequiredText);
-    }
-    if !is_valid_last_updated(&row.last_updated) {
-        return Err(SourceMetadataSchemaViolation::UpdateTimestamp);
-    }
-    let series_id = SourceIdentifier::try_from(row.id)
-        .map_err(|_| SourceMetadataSchemaViolation::RecordIdentity)?;
-    let realtime_start = parse_date(&row.realtime_start)
-        .map_err(|_| SourceMetadataSchemaViolation::PageRecordInterval)?;
-    let realtime_end = parse_date(&row.realtime_end)
-        .map_err(|_| SourceMetadataSchemaViolation::PageRecordInterval)?;
-    let observation_start = parse_date(&row.observation_start)
-        .map_err(|_| SourceMetadataSchemaViolation::ObservationInterval)?;
-    let observation_end = parse_date(&row.observation_end)
-        .map_err(|_| SourceMetadataSchemaViolation::ObservationInterval)?;
-    if series_id.as_str() != expected_series {
-        return Err(SourceMetadataSchemaViolation::RecordIdentity);
-    }
-    if realtime_start != page_start || realtime_end != page_end {
+    if page_start > page_end {
         return Err(SourceMetadataSchemaViolation::PageRecordInterval);
     }
-    if observation_start > observation_end {
-        return Err(SourceMetadataSchemaViolation::ObservationInterval);
+    let mut revisions = Vec::new();
+    revisions
+        .try_reserve_exact(wire.seriess.len())
+        .map_err(|_| SourceMetadataSchemaViolation::RecordCardinality)?;
+    let mut previous_end = None;
+    for row in wire.seriess {
+        let values = [
+            row.id.as_str(),
+            row.title.as_str(),
+            row.frequency.as_str(),
+            row.frequency_short.as_str(),
+            row.units.as_str(),
+            row.units_short.as_str(),
+            row.seasonal_adjustment.as_str(),
+            row.seasonal_adjustment_short.as_str(),
+            row.last_updated.as_str(),
+            row.notes.as_deref().unwrap_or_default(),
+        ];
+        validate_strings(values, limits)
+            .map_err(|_| SourceMetadataSchemaViolation::RequiredText)?;
+        if values[..9].iter().any(|value| value.is_empty()) {
+            return Err(SourceMetadataSchemaViolation::RequiredText);
+        }
+        if !is_valid_last_updated(&row.last_updated) {
+            return Err(SourceMetadataSchemaViolation::UpdateTimestamp);
+        }
+        let series_id = SourceIdentifier::try_from(row.id)
+            .map_err(|_| SourceMetadataSchemaViolation::RecordIdentity)?;
+        let realtime_start = parse_date(&row.realtime_start)
+            .map_err(|_| SourceMetadataSchemaViolation::PageRecordInterval)?;
+        let realtime_end = parse_date(&row.realtime_end)
+            .map_err(|_| SourceMetadataSchemaViolation::PageRecordInterval)?;
+        let observation_start = parse_date(&row.observation_start)
+            .map_err(|_| SourceMetadataSchemaViolation::ObservationInterval)?;
+        let observation_end = parse_date(&row.observation_end)
+            .map_err(|_| SourceMetadataSchemaViolation::ObservationInterval)?;
+        if series_id.as_str() != expected_series {
+            return Err(SourceMetadataSchemaViolation::RecordIdentity);
+        }
+        if realtime_start > realtime_end
+            || previous_end.is_some_and(|end| !closed_intervals_are_contiguous(end, realtime_start))
+        {
+            return Err(SourceMetadataSchemaViolation::PageRecordInterval);
+        }
+        if observation_start > observation_end {
+            return Err(SourceMetadataSchemaViolation::ObservationInterval);
+        }
+        previous_end = Some(realtime_end);
+        revisions.push(FredSeriesMetadata {
+            series_id,
+            realtime_start,
+            realtime_end,
+            title: row.title,
+            observation_start,
+            observation_end,
+            frequency: row.frequency,
+            frequency_short: row.frequency_short,
+            units: row.units,
+            units_short: row.units_short,
+            seasonal_adjustment: row.seasonal_adjustment,
+            seasonal_adjustment_short: row.seasonal_adjustment_short,
+            last_updated: row.last_updated,
+            popularity: row.popularity,
+            notes: row.notes,
+        });
     }
-    Ok(FredSeriesMetadata {
-        series_id,
-        realtime_start,
-        realtime_end,
-        title: row.title,
-        observation_start,
-        observation_end,
-        frequency: row.frequency,
-        frequency_short: row.frequency_short,
-        units: row.units,
-        units_short: row.units_short,
-        seasonal_adjustment: row.seasonal_adjustment,
-        seasonal_adjustment_short: row.seasonal_adjustment_short,
-        last_updated: row.last_updated,
-        popularity: row.popularity,
-        notes: row.notes,
-    })
+    let first = revisions
+        .first()
+        .ok_or(SourceMetadataSchemaViolation::RecordCardinality)?;
+    let last = revisions
+        .last()
+        .ok_or(SourceMetadataSchemaViolation::RecordCardinality)?;
+    if first.realtime_start != page_start || last.realtime_end != page_end {
+        return Err(SourceMetadataSchemaViolation::PageRecordInterval);
+    }
+    Ok(revisions.into_boxed_slice())
+}
+
+fn closed_intervals_are_contiguous(previous_end: CalendarDate, next_start: CalendarDate) -> bool {
+    previous_end.days_since_unix_epoch().checked_add(1) == Some(next_start.days_since_unix_epoch())
 }
 
 fn is_valid_last_updated(value: &str) -> bool {

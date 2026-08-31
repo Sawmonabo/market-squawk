@@ -35,7 +35,10 @@ mod macro_pages;
 mod metadata;
 mod normalize;
 
-pub use metadata::{FredSeriesMetadata, FredSeriesMetadataDocument, fred_series_endpoint_rule};
+pub use metadata::{
+    FredSeriesMetadata, FredSeriesMetadataDocument, MAX_FRED_SERIES_METADATA_REVISIONS,
+    fred_series_endpoint_rule,
+};
 
 use http::{
     FredHttpAuthorization, FredHttpRequest, FredHttpResponse, FredTransport, ReqwestFredTransport,

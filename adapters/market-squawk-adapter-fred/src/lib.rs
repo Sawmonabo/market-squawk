@@ -9,9 +9,9 @@ pub use client::{
     FredApiKey, FredDiscoveryError, FredExtractedPage, FredExtractionOutput,
     FredPageObjectIdentity, FredReleaseExtraction, FredReleaseExtractionPage, FredSeriesMetadata,
     FredSeriesMetadataDocument, FredSource, FredSourceError, FredVintageExtraction,
-    FredVintageExtractionPage, MAX_FRED_EPHEMERAL_PAGE_RECORDS, fred_observations_endpoint_rule,
-    fred_release_observations_v2_endpoint_rule, fred_series_endpoint_rule,
-    fred_vintage_dates_endpoint_rule,
+    FredVintageExtractionPage, MAX_FRED_EPHEMERAL_PAGE_RECORDS, MAX_FRED_SERIES_METADATA_REVISIONS,
+    fred_observations_endpoint_rule, fred_release_observations_v2_endpoint_rule,
+    fred_series_endpoint_rule, fred_vintage_dates_endpoint_rule,
 };
 pub use release::{
     FredReleaseCursor, FredReleaseMetadata, FredReleaseObservation, FredReleaseObservationPage,

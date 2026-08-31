@@ -557,7 +557,7 @@ async fn non_identity_content_encoding_is_rejected() -> TestResult {
 }
 
 #[tokio::test]
-async fn series_metadata_is_exact_request_bound_and_rejects_non_unique_identity() -> TestResult {
+async fn series_metadata_is_exact_request_bound_and_retains_ordered_revisions() -> TestResult {
     let now = system_timestamp()?;
     let fred_source = source(
         now,
@@ -616,7 +616,8 @@ async fn series_metadata_is_exact_request_bound_and_rejects_non_unique_identity(
     );
     assert!(!locator.reference().as_str().contains("api_key"));
 
-    let series = document.series();
+    assert_eq!(document.series_revisions().len(), 1);
+    let series = &document.series_revisions()[0];
     assert_eq!(series.series_id().as_str(), "CPIAUCSL");
     assert_eq!(series.realtime_start().to_string(), "2024-01-01");
     assert_eq!(series.realtime_end().to_string(), "2024-01-31");
@@ -635,6 +636,60 @@ async fn series_metadata_is_exact_request_bound_and_rejects_non_unique_identity(
     assert_eq!(series.last_updated(), "2024-01-11 07:42:02-06");
     assert_eq!(series.popularity(), 95);
     assert_eq!(series.notes(), Some("Exact provider notes"));
+
+    let mut revisioned_value: serde_json::Value = serde_json::from_slice(EXACT_SERIES_RESPONSE)?;
+    revisioned_value["seriess"][0]["realtime_end"] = serde_json::json!("2024-01-15");
+    let mut later_revision = revisioned_value["seriess"][0].clone();
+    later_revision["realtime_start"] = serde_json::json!("2024-01-16");
+    later_revision["realtime_end"] = serde_json::json!("2024-01-31");
+    later_revision["title"] = serde_json::json!("Revised consumer price index title");
+    later_revision["units"] = serde_json::json!("Revised index units");
+    revisioned_value["seriess"]
+        .as_array_mut()
+        .ok_or("test series revisions")?
+        .push(later_revision);
+    let revisioned_source = source_with_options(
+        now,
+        FredHttpResponse {
+            status: 200,
+            retry_after: None,
+            content_encoding: None,
+            body: Bytes::from_static(include_bytes!("../../fixtures/observations.json")),
+            received_at: now,
+        },
+        FredHttpResponse {
+            status: 200,
+            retry_after: None,
+            content_encoding: None,
+            body: Bytes::from(serde_json::to_vec(&revisioned_value)?),
+            received_at: now,
+        },
+        "fred-series-metadata-revisions-test-user",
+    )?;
+    let revisioned = revisioned_source
+        .source
+        .acquire_series_metadata(
+            &revisioned_source.authority,
+            &dataset,
+            now.checked_add_nanos(10_000_000_000)?,
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(revisioned.series_revisions().len(), 2);
+    assert_eq!(
+        revisioned.series_revisions()[0].realtime_end().to_string(),
+        "2024-01-15"
+    );
+    assert_eq!(
+        revisioned.series_revisions()[1]
+            .realtime_start()
+            .to_string(),
+        "2024-01-16"
+    );
+    assert_eq!(
+        revisioned.series_revisions()[1].units(),
+        "Revised index units"
+    );
 
     let exact_value: serde_json::Value = serde_json::from_slice(EXACT_SERIES_RESPONSE)?;
     let mut absent_value = exact_value.clone();
