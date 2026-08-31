@@ -2851,7 +2851,12 @@ async fn decode_macro_latest_known_snapshot(
     let pit_request = PointInTimeRequest::try_new(
         policy,
         request.knowledge_cutoff,
-        None,
+        Some(ResearchTemporalCoordinate::calendar_date(
+            request
+                .knowledge_cutoff
+                .utc_calendar_date()
+                .map_err(|_| AnalyticalReadError::InvalidMacroSnapshotResult)?,
+        )),
         ResearchTemporalCoordinate::calendar_date(request.effective_date_cutoff),
         None,
         pit_limits,
@@ -2943,7 +2948,9 @@ fn macro_latest_known_selection_digest(
     hash.update(request.effective_date_cutoff.year().to_be_bytes());
     hash.update([request.effective_date_cutoff.month()]);
     hash.update([request.effective_date_cutoff.day()]);
-    hash.update(b"point-in-time-policy/v1:latest-known;calendar-latest-effective/v1");
+    hash.update(
+        b"point-in-time-policy/v1:latest-known;calendar-publication-cutoff-from-knowledge-date/v1;calendar-latest-effective/v1",
+    );
     hash.update(
         u64::try_from(request.series_allowlist.series().len())
             .unwrap_or(u64::MAX)

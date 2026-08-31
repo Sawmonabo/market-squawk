@@ -54,7 +54,11 @@ pub use macro_pages::{
 use normalize::{CanonicalPageContext, FredNativeLineagePlan, canonical_observation_payloads};
 
 const OBSERVATIONS_ENDPOINT: &str = "https://api.stlouisfed.org/fred/series/observations";
-const DISCOVERY_PAGE_RECORDS: usize = 10_000;
+// Keep durable provider pages below the shared 64 MiB Arrow validation ceiling with
+// headroom for decoded canonical values, exact lineage, and the rebuilt projection.
+// The provider permits larger pages, but using them would make a valid response
+// impossible to publish under the application's bounded-memory contract.
+const DISCOVERY_PAGE_RECORDS: usize = 1_024;
 /// Maximum provider rows retained in one key-only inspection page.
 pub const MAX_FRED_EPHEMERAL_PAGE_RECORDS: u16 = 1_024;
 

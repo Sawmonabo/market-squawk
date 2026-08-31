@@ -25,7 +25,10 @@ const FRED_POINT_IN_TIME_POLICY: &str = "latest_known_by_series_as_of_cutoff_v1"
 /// Fixed application operation that returns one manifest-pinned latest-known FRED observation.
 pub const FRED_ALFRED_READ_OPERATION: &str = "Macro.GetFredAlfredLatestKnown";
 const FRED_QUERY_BYTES: u64 = 8 * 1024 * 1024;
-const FRED_QUERY_MEMORY_BYTES: u64 = 32 * 1024 * 1024;
+// One query scans at most one 1,024-row durable page at a time. FRED's canonical rows retain the
+// exact provider payload and lineage, so the bounded scan needs more working memory than the tiny
+// one-row result it returns.
+const FRED_QUERY_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
 const FRED_QUERY_MAXIMUM_DURATION: Duration = Duration::from_secs(60);
 
 /// One exact configured FRED/ALFRED dataset bound to immutable analytical reads.

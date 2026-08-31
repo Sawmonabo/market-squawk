@@ -209,6 +209,13 @@ mod tests {
         let first_read = serde_json::to_value(first_read)?;
         assert_latest_unemployment_read(&first_read, provider_dataset)?;
 
+        // The restart proof models a new process. Release every cloned service handle before
+        // shutting down the first product so its exclusive catalog writer can retire completely.
+        drop(generation);
+        drop(capability);
+        drop(coordinator);
+        drop(onboarding);
+
         if !product
             .application()
             .shutdown(Instant::now() + Duration::from_secs(10))
@@ -251,6 +258,8 @@ mod tests {
         if reopened_read != first_read {
             return Err("typed FRED point-in-time result changed after reopen".into());
         }
+        drop(reopened_generation);
+        drop(reopened_capability);
         eprintln!(
             "live durable macro proof: dataset={provider_dataset} rows={provider_rows} pages={page_count} manifest_version={}",
             manifest.manifest_version()
