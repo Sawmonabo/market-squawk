@@ -32,24 +32,24 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         .get("fred-alfred.api-v1-v2")
         .ok_or("missing FRED/ALFRED profile")?;
     assert_eq!(fred.zero_fee(), ZeroFeeStatus::Confirmed);
-    assert_eq!(fred.release_state(), ProfileReleaseState::RightsLimited);
+    assert_eq!(fred.release_state(), ProfileReleaseState::Available);
     assert_eq!(
         fred.capability().rights_state(),
-        RightsAdmissionState::Pending
+        RightsAdmissionState::AdmittedScoped
     );
-    assert_eq!(fred.capability().revision().get(), 5);
+    assert_eq!(fred.capability().revision().get(), 1);
     assert_eq!(
         fred.capability_history()
             .map(|capability| capability.revision().get())
             .collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5]
+        [1]
     );
-    assert!(
-        fred.capability_history()
-            .filter(|capability| capability.revision().get() < 4)
-            .all(|capability| capability.rights_state() == RightsAdmissionState::Blocked)
+    assert_eq!(
+        fred.persistence_evidence()
+            .ok_or("FRED/ALFRED profile omitted personal-research evidence")?
+            .source_id(),
+        "MSQ-SELECTED-MARKET-DATA-ARCHITECTURE-2026-08-11"
     );
-    assert!(fred.persistence_evidence().is_none());
     let fred_probe_policy = fred
         .probe()
         .endpoint_policy()
@@ -68,35 +68,12 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
             )
             .is_err()
     );
-    for source in [
-        "MSQ-FRED-ALFRED-SELF-HOSTED-AUTHORITY-2026-07-26",
-        "MSQ-FRED-RIGHTS-MANIFEST-2026-07-26",
-    ] {
-        assert!(
-            fred.capability()
-                .evidence()
-                .iter()
-                .any(|binding| binding.source_id().as_str() == source)
-        );
-    }
-    let revision_four = fred
-        .capability_history()
-        .find(|capability| capability.revision().get() == 4)
-        .ok_or("missing immutable FRED/ALFRED revision 4")?;
-    let revision_four_source = concat!("MSQ-FRED-ALFRED-LOCAL-", "FIRST-AUTHORITY-2026-07-26");
     assert!(
-        revision_four
+        fred.capability()
             .evidence()
             .iter()
-            .any(|binding| { binding.source_id().as_str() == revision_four_source })
-    );
-    assert_eq!(
-        revision_four.content_digest().bytes(),
-        [
-            0x18, 0x95, 0xc5, 0xf1, 0x1f, 0x81, 0xc0, 0x98, 0x9b, 0x24, 0x89, 0x78, 0xbb, 0x66,
-            0x58, 0x74, 0x04, 0x4c, 0xd5, 0x0a, 0x1a, 0x9e, 0x1a, 0x9e, 0x06, 0xb6, 0x91, 0xe0,
-            0x5e, 0x05, 0xca, 0x18,
-        ]
+            .any(|binding| binding.source_id().as_str()
+                == "MSQ-SELECTED-MARKET-DATA-ARCHITECTURE-2026-08-11")
     );
     for (profile_id, evidence_source, evidence_digest) in [
         (
@@ -367,10 +344,10 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         (
             "bea.api-data",
             ProfileActivationMode::ManualSecretImport,
-            ProfileReleaseState::RefreshRequired,
+            ProfileReleaseState::Available,
             SetupMode::ManualApiKeyImport,
             CredentialKind::ApiKey,
-            "100 requests, 100 MB, and 30 errors per minute",
+            "exact GetData dataset coordinates",
             &[(60, 60_000_000_000)][..],
         ),
         (
@@ -1379,13 +1356,6 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
             binding.source_id().as_str() == "MSQ-PROVIDER-RELEASE-EVIDENCE-2026-07-25"
         }));
     }
-    assert_eq!(fred.capability().revision().get(), 5);
-    assert_eq!(
-        fred.capability_history()
-            .map(|capability| capability.revision().get())
-            .collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5]
-    );
     assert_eq!(
         treasury_fiscal.probe().endpoint(),
         Some(

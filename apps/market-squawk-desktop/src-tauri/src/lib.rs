@@ -311,7 +311,6 @@ fn try_run(args: DesktopArgs) -> Result<i32, DesktopStartupError> {
     let mut environment = ConfigSources::process_environment();
     environment.remove(&OsString::from("MARKET_SQUAWK_LOG"));
     environment.remove(&OsString::from("MARKET_SQUAWK_EXTERNAL_NETWORK"));
-    environment.remove(&OsString::from("MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED"));
     #[cfg(debug_assertions)]
     {
         environment.remove(&OsString::from("MARKET_SQUAWK_DEVELOPMENT_SERVICE_PROGRAM"));

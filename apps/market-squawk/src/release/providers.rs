@@ -46,7 +46,6 @@ use crate::{
 
 const REPORT_KIND: &str = "market_squawk.release.providers";
 const EXTERNAL_NETWORK_GATE: &str = "MARKET_SQUAWK_EXTERNAL_NETWORK";
-const PROVIDER_TERMS_GATE: &str = "MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED";
 const MAXIMUM_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAXIMUM_PROVIDER_SESSIONS: usize = 32;
 const REQUEST_MAXIMUM_BYTES: usize = 1024 * 1024;
@@ -107,16 +106,15 @@ struct ProviderEvidence {
     surfaces: Vec<SurfaceEvidence>,
     restart_recovery: RestartRecoveryEvidence,
     direct_verified_action: DirectActionEvidence,
-    fred_alfred_rights: FredAlfredRightsEvidence,
+    fred_alfred_source_authority: FredAlfredSourceAuthorityEvidence,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct EvidenceRequirements {
     external_network_authorized: bool,
-    provider_terms_accepted: bool,
     direct_verified_action_required: bool,
-    fred_alfred_rights_required: bool,
+    fred_alfred_source_authority_required: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -312,14 +310,14 @@ struct DirectActionEvidence {
 
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
-struct FredAlfredRightsEvidence {
+struct FredAlfredSourceAuthorityEvidence {
     required: bool,
     selected: bool,
-    persistence_admitted: bool,
-    model_training_rights_admitted: bool,
-    parent_authorization_digest: Option<EvidenceDigest>,
-    authorization_digest: Option<EvidenceDigest>,
-    authorization_expires_at_unix_nanos: Option<i64>,
+    persistence_enabled: bool,
+    model_training_enabled: bool,
+    activation_digest: Option<EvidenceDigest>,
+    series_scope_digest: Option<EvidenceDigest>,
+    series_scope_expires_at_unix_nanos: Option<i64>,
     exact_series: Vec<String>,
     admitted: bool,
 }
@@ -334,7 +332,6 @@ struct RecoveryExpectation {
 pub(super) async fn run(config: AppConfig, arguments: ReleaseProviderArguments) -> Result<Value> {
     require_exact_repository_arguments(&arguments)?;
     require_gate(EXTERNAL_NETWORK_GATE)?;
-    require_gate(PROVIDER_TERMS_GATE)?;
     let selected = admit_selected_surfaces(&arguments)?;
     let output_directory = admit_new_output_directory(&arguments.output)?;
     let repository = RepositoryIdentity::admit(&arguments.repository)?;
@@ -349,7 +346,7 @@ pub(super) async fn run(config: AppConfig, arguments: ReleaseProviderArguments) 
     let collection =
         collect_provider_evidence(&product, &selected, &arguments, shutdown_timeout).await;
     let shutdown = shutdown_product(&product).await;
-    let (mut surfaces, expectations, direct_action, fred_rights) = match (collection, shutdown) {
+    let (mut surfaces, expectations, direct_action, fred_authority) = match (collection, shutdown) {
         (Ok(collection), Ok(())) => collection,
         (Err(collection_error), Ok(())) => return Err(collection_error),
         (Ok(_), Err(shutdown_error)) => return Err(shutdown_error),
@@ -390,9 +387,8 @@ pub(super) async fn run(config: AppConfig, arguments: ReleaseProviderArguments) 
         collected_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         requirements: EvidenceRequirements {
             external_network_authorized: true,
-            provider_terms_accepted: true,
             direct_verified_action_required: arguments.require_direct_verified_action,
-            fred_alfred_rights_required: arguments.require_fred_alfred_rights,
+            fred_alfred_source_authority_required: arguments.require_fred_alfred_source_authority,
         },
         selected_surfaces: selected.iter().map(|value| (*value).to_owned()).collect(),
         surfaces,
@@ -401,7 +397,7 @@ pub(super) async fn run(config: AppConfig, arguments: ReleaseProviderArguments) 
             recovered_surfaces: selected.iter().map(|value| (*value).to_owned()).collect(),
         },
         direct_verified_action: direct_action,
-        fred_alfred_rights: fred_rights,
+        fred_alfred_source_authority: fred_authority,
     };
     let output = create_output_directory(&output_directory)?;
     let report_path = output.join("provider-evidence.json");
@@ -427,7 +423,7 @@ async fn collect_provider_evidence(
     Vec<SurfaceEvidence>,
     Vec<RecoveryExpectation>,
     DirectActionEvidence,
-    FredAlfredRightsEvidence,
+    FredAlfredSourceAuthorityEvidence,
 )> {
     let onboarding = product.provider_onboarding();
     let activation = product.provider_activation();
@@ -451,10 +447,10 @@ async fn collect_provider_evidence(
     let mut expectations = Vec::new();
     let mut direct_order_count = 0_usize;
     let mut fred_persistence = false;
-    let mut fred_model_training_rights = false;
-    let mut fred_parent_authorization = None;
-    let mut fred_authorization = None;
-    let mut fred_authorization_expires_at = None;
+    let mut fred_model_training = false;
+    let mut fred_activation_digest = None;
+    let mut fred_series_scope_digest = None;
+    let mut fred_series_scope_expires_at = None;
     let mut fred_exact_series = Vec::new();
 
     for surface_id in selected {
@@ -506,10 +502,10 @@ async fn collect_provider_evidence(
                 .as_ref()
                 .ok_or_else(|| anyhow!("FRED/ALFRED research runtime evidence is absent"))?;
             fred_persistence = runtime.rights_operations.contains(&"persist");
-            fred_model_training_rights = runtime.rights_operations.contains(&"train");
-            fred_parent_authorization = Some(runtime.parent_rights_authorization_digest);
-            fred_authorization = Some(runtime.rights_authorization_digest);
-            fred_authorization_expires_at = runtime.rights_authorization_expires_at_unix_nanos;
+            fred_model_training = runtime.rights_operations.contains(&"train");
+            fred_activation_digest = Some(runtime.parent_rights_authorization_digest);
+            fred_series_scope_digest = Some(runtime.rights_authorization_digest);
+            fred_series_scope_expires_at = runtime.rights_authorization_expires_at_unix_nanos;
             fred_exact_series.clone_from(&runtime.rights_subjects);
         }
         let live_runtime = if is_live_surface(surface_id) {
@@ -569,15 +565,15 @@ async fn collect_provider_evidence(
         .ok_or_else(|| anyhow!("provider collection time is outside nanosecond range"))?;
     let fred_admitted = fred_selected
         && fred_persistence
-        && fred_model_training_rights
-        && fred_parent_authorization.is_some_and(|digest| digest.bytes() != [0; 32])
-        && fred_authorization.is_some_and(|digest| {
-            digest.bytes() != [0; 32] && Some(digest) != fred_parent_authorization
+        && fred_model_training
+        && fred_activation_digest.is_some_and(|digest| digest.bytes() != [0; 32])
+        && fred_series_scope_digest.is_some_and(|digest| {
+            digest.bytes() != [0; 32] && Some(digest) != fred_activation_digest
         })
-        && fred_authorization_expires_at.is_some_and(|expiry| expiry > collected_at_unix_nanos)
+        && fred_series_scope_expires_at.is_some_and(|expiry| expiry > collected_at_unix_nanos)
         && fred_exact_series.len() == 1;
-    if arguments.require_fred_alfred_rights && !fred_admitted {
-        bail!("required FRED and ALFRED persistence and model-training rights are not admitted");
+    if arguments.require_fred_alfred_source_authority && !fred_admitted {
+        bail!("required FRED and ALFRED exact-series source authority is not active");
     }
     Ok((
         surfaces,
@@ -588,14 +584,14 @@ async fn collect_provider_evidence(
             completed: direct_completed,
             order_count: direct_order_count,
         },
-        FredAlfredRightsEvidence {
-            required: arguments.require_fred_alfred_rights,
+        FredAlfredSourceAuthorityEvidence {
+            required: arguments.require_fred_alfred_source_authority,
             selected: fred_selected,
-            persistence_admitted: fred_persistence,
-            model_training_rights_admitted: fred_model_training_rights,
-            parent_authorization_digest: fred_parent_authorization,
-            authorization_digest: fred_authorization,
-            authorization_expires_at_unix_nanos: fred_authorization_expires_at,
+            persistence_enabled: fred_persistence,
+            model_training_enabled: fred_model_training,
+            activation_digest: fred_activation_digest,
+            series_scope_digest: fred_series_scope_digest,
+            series_scope_expires_at_unix_nanos: fred_series_scope_expires_at,
             exact_series: fred_exact_series,
             admitted: fred_admitted,
         },
@@ -2818,8 +2814,8 @@ fn admit_selected_surfaces(arguments: &ReleaseProviderArguments) -> Result<Vec<&
     if arguments.require_direct_verified_action && !requested.contains(COINBASE_DIRECT) {
         bail!("DirectVerified action evidence requires the Coinbase Direct surface");
     }
-    if arguments.require_fred_alfred_rights && !requested.contains(FRED_ALFRED) {
-        bail!("FRED and ALFRED rights evidence requires the exact FRED/ALFRED surface");
+    if arguments.require_fred_alfred_source_authority && !requested.contains(FRED_ALFRED) {
+        bail!("FRED and ALFRED source-authority evidence requires the exact FRED/ALFRED surface");
     }
     if requested.contains(FRED_ALFRED) {
         admit_fred_release_dataset(arguments)?;

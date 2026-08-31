@@ -148,19 +148,19 @@ const PROVIDER_COPY = Object.freeze({
     purpose: 'Economic indicators and the historical revisions available at each point in time.',
     examples: ['Unemployment and inflation', 'Historical data vintages', 'Economic research inputs'],
     goals: [],
-    effort: 'Permission review',
-    access: 'Written permission + free API key',
+    effort: 'About 2 minutes',
+    access: 'Free API key',
     account:
-      'A free FRED account and API key provide access. Saving data or using it for model training also requires an exact written St. Louis Fed permission response and separate authority for each selected series.',
+      'A free FRED account and API key provide access. Market Squawk stores the key in its protected local secret store and binds each connection to one exact series and vintage range.',
     handoffUrl: 'https://fred.stlouisfed.org/docs/api/api_key.html',
     handoffInstruction:
-      'After importing and reviewing the written permission response below, create or sign in to a free FRED account and request a distinct Market Squawk API key.',
+      'Create or sign in to a free FRED account, request an API key, and return here without pasting the key into chat.',
     setupSteps: [
-      'If you only need unemployment data, use the recommended public BLS source instead.',
-      'Request written St. Louis Fed permission for Market Squawk’s exact FRED API use.',
-      'Import the exact response and record your local scope review below.',
       'Create or sign in to a free FRED account and request a distinct API key.',
-      'Return here and submit the API key once.'
+      'Choose current observations or historical vintages.',
+      'Enter the exact economic series and vintage range to retain.',
+      'Return here and submit the API key once.',
+      'Market Squawk verifies availability before activating the saved configuration.'
     ],
     credentialLabel: 'FRED API key',
     submitLabel: 'Save FRED API key and activate',
@@ -370,11 +370,11 @@ const ERROR_COPY = Object.freeze({
   ],
   operation_cancelled: [
     'The operation was cancelled',
-    'No incomplete authority was granted. You can safely continue from the saved provider state.'
+    'The connection was not changed. You can continue from the saved setup state.'
   ],
   invalid_adapter_request: [
     'The provider settings were not accepted',
-    'Review the date range, series details, and evidence fields, then try again.'
+    'Review the date range and series details, then try again.'
   ],
   adapter_activation_unavailable: [
     'This provider cannot be activated yet',
@@ -851,7 +851,7 @@ function renderConnectedPanel(profile, session) {
         element(
           'p',
           '',
-          `${providerCopy(profile).name} is active through the current provider authority.`
+          `${providerCopy(profile).name} is connected and available for local research.`
         )
       );
       return copy;
@@ -1415,7 +1415,7 @@ function buildConfiguration(profile, advanced) {
     return secConfiguration();
   }
   if (profile.id === 'fred-alfred.api-v1-v2') {
-    return fredConfiguration(advanced);
+    return fredConfiguration();
   }
   if (profile.id === 'bls.v1-unregistered' || profile.id === 'bls.v2-registered') {
     return blsConfiguration(advanced);
@@ -1585,299 +1585,64 @@ function blsConfiguration(advanced) {
   };
 }
 
-function fredConfiguration(advanced) {
+function fredConfiguration() {
   const root = element('fieldset');
   root.append(
-    element('legend', 'field-label', 'Written permission and exact series authority')
+    element('legend', 'field-label', 'Economic series and vintage range'),
+    element(
+      'p',
+      'field-hint',
+      'Choose one exact series. Historical vintages preserve what was known at different points in time; current observations retain the latest published values.'
+    )
   );
 
-  const guidance = element('section', 'notice notice-info');
-  const guidanceCopy = element('div');
-  guidanceCopy.append(
-    element('h3', '', 'Start with BLS unless you need FRED vintages'),
+  const grid = element('div', 'form-grid');
+  const history = selectField('Data history', 'fred-history', [
+    ['alfred', 'Historical vintages — recommended for point-in-time research'],
+    ['fred', 'Current series observations']
+  ]);
+  const series = textField('Economic series ID', 'fred-series', 'UNRATE', 120);
+  series.input.pattern = '[A-Za-z0-9_.-]{1,120}';
+  series.input.autocomplete = 'off';
+  const vintageStart = dateField(
+    'First vintage date',
+    'fred-vintage-start',
+    '1776-07-04'
+  );
+  const vintageEnd = dateField(
+    'Last vintage date',
+    'fred-vintage-end',
+    '9999-12-31'
+  );
+  grid.append(history.root, series.root, vintageStart.root, vintageEnd.root);
+  root.append(grid);
+
+  const note = element('section', 'notice notice-info');
+  const noteCopy = element('div');
+  noteCopy.append(
+    element('h3', '', 'Exact point-in-time scope'),
     element(
       'p',
       '',
-      'The public BLS source provides unemployment data with no account or key. FRED is the advanced path for provider-reported vintages and requires a written St. Louis Fed permission response before Market Squawk can save or train on the data.'
-    ),
-    element(
-      'p',
-      'provider-legal-notice',
-      'This product uses the FRED® API but is not endorsed or certified by the Federal Reserve Bank of St. Louis.'
-    ),
-    externalLink(
-      'Read the FRED API terms',
-      'https://fred.stlouisfed.org/docs/api/terms_of_use.html'
-    ),
-    externalLink('Open the official St. Louis Fed permission form', 'https://fred.stlouisfed.org/contactus/')
-  );
-  guidance.append(element('span', 'notice-mark', 'i'), guidanceCopy);
-  root.append(guidance);
-
-  const requestTemplate = [
-    'Application: Market Squawk',
-    'Service: FRED API',
-    'Series: UNRATE',
-    'Requested operations: local persistence, caching, archival, and model training',
-    'Please confirm in writing whether the Federal Reserve Bank of St. Louis authorizes these exact operations for this application and series.'
-  ].join('\n');
-  const request = textareaField(
-    'Permission request template',
-    'fred-permission-template',
-    'Copy this into the official permission form, then import the exact response you receive.'
-  );
-  request.input.value = requestTemplate;
-  request.input.readOnly = true;
-  const copyTemplate = actionButton('Copy permission request', 'button-quiet', async () => {
-    try {
-      await navigator.clipboard.writeText(requestTemplate);
-      showNotice(
-        'success',
-        'Permission request copied',
-        'Paste it into the official St. Louis Fed form.'
-      );
-    } catch (_error) {
-      request.input.focus();
-      request.input.select();
-    }
-  });
-  root.append(request.root, copyTemplate);
-
-  const permission = element('fieldset');
-  permission.append(
-    element('legend', 'field-label', '1. Import the exact St. Louis Fed response'),
-    element(
-      'p',
-      'field-hint',
-      'Choose the exact response downloaded from its official stlouisfed.org HTTPS URL. Market Squawk reacquires that URL and compares every byte before activation.'
+      'Market Squawk saves the selected series and vintage interval with every raw capture, immutable publication, and later research read.'
     )
   );
-  const permissionFile = fileField(
-    'Exact permission response',
-    'fred-service-permission-file',
-    '.txt,.html,.pdf,text/plain,text/html,application/pdf,application/octet-stream'
-  );
-  const evidenceUrl = urlField('Exact response URL', 'fred-permission-evidence-url', '');
-  const authorityUrl = urlField(
-    'Official authority URL',
-    'fred-permission-authority-url',
-    'https://fred.stlouisfed.org/contactus/'
-  );
-  const channelGrid = element('div', 'form-grid');
-  channelGrid.append(
-    permissionFile.root,
-    evidenceUrl.root,
-    authorityUrl.root
-  );
-  permission.append(channelGrid);
-  evidenceUrl.input.required = true;
-  authorityUrl.input.required = true;
-  root.append(permission);
-
-  const review = element('fieldset');
-  review.append(
-    element('legend', 'field-label', '2. Record your local scope review'),
-    element(
-      'p',
-      'field-hint',
-      'Confirm only what the imported response actually authorizes. Market Squawk binds this decision to the response hash and current terms.'
-    )
-  );
-  const reviewer = textField(
-    'Reviewer identifier',
-    'fred-permission-reviewer',
-    'local-rights-reviewer',
-    256
-  );
-  const effectiveDate = dateField(
-    'Permission effective date',
-    'fred-permission-effective',
-    utcDateOffset(0)
-  );
-  const permissionExpiry = dateField(
-    'Permission expiry date (if stated)',
-    'fred-permission-expiry',
-    ''
-  );
-  permissionExpiry.input.required = false;
-  const revalidateDate = dateField(
-    'Review again by',
-    'fred-permission-revalidate',
-    utcDateOffset(2)
-  );
-  const conditions = textareaField(
-    'Conditions in the response (one per line)',
-    'fred-permission-conditions',
-    'Leave blank only when the response states no additional conditions.'
-  );
-  conditions.input.maxLength = 32768;
-  const reviewGrid = element('div', 'form-grid');
-  reviewGrid.append(
-    reviewer.root,
-    effectiveDate.root,
-    permissionExpiry.root,
-    revalidateDate.root
-  );
-  review.append(reviewGrid, conditions.root);
-  const scopeConfirmation = checkboxField(
-    'fred-permission-scope-confirmed',
-    'I reviewed the exact response and it explicitly covers Market Squawk, the FRED API, this series, local persistence, caching, archival, and model training.'
-  );
-  review.append(scopeConfirmation.root);
-  root.append(review);
-
-  const seriesSection = element('fieldset');
-  seriesSection.append(
-    element('legend', 'field-label', '3. Confirm the exact series'),
-    element(
-      'p',
-      'field-hint',
-      'The guided starter uses FRED series UNRATE with the code-reviewed BLS public-domain decision.'
-    )
-  );
-  const series = textField('FRED series ID', 'fred-series', 'UNRATE', 120);
-  const owner = textField(
-    'Series owner',
-    'fred-owner',
-    'us-bureau-of-labor-statistics',
-    256
-  );
-  series.input.readOnly = true;
-  owner.input.readOnly = true;
-  const basis = selectField('Series authority', 'fred-rights-basis', [
-    ['reviewed_unrate', 'Reviewed UNRATE public-domain decision']
-  ]);
-  const grantEffective = dateField(
-    'Series authority effective date',
-    'fred-grant-effective',
-    utcDateOffset(0)
-  );
-  const grantExpiry = dateField(
-    'Review series authority again by',
-    'fred-grant-expiry',
-    utcDateOffset(2)
-  );
-  const seriesGrid = element('div', 'form-grid');
-  seriesGrid.append(
-    series.root,
-    owner.root,
-    basis.root,
-    grantEffective.root,
-    grantExpiry.root
-  );
-  seriesSection.append(seriesGrid);
-  root.append(seriesSection);
+  note.append(element('span', 'notice-mark', 'i'), noteCopy);
+  root.append(note);
 
   return {
     root,
-    read: async () => {
-      requireFields([
-        permissionFile,
-        evidenceUrl,
-        authorityUrl,
-        reviewer,
-        effectiveDate,
-        revalidateDate,
-        series,
-        owner,
-        basis,
-        grantEffective,
-        grantExpiry
-      ]);
-      if (!scopeConfirmation.input.reportValidity()) throw new Error('invalid_input');
-      if (
-        basis.input.value !== 'reviewed_unrate' ||
-        series.input.value !== 'UNRATE' ||
-        owner.input.value !== 'us-bureau-of-labor-statistics'
-      ) {
+    read: () => {
+      requireFields([history, series, vintageStart, vintageEnd]);
+      if (vintageStart.input.value > vintageEnd.input.value) {
         throwInvalidRange(
-          series.input,
-          'The reviewed starter decision is available only for UNRATE and its BLS owner.'
-        );
-      }
-
-      const reviewedAt = currentUnixNanos();
-      const permissionEffective = dateUnixNanos(effectiveDate.input.value);
-      const revalidateBy = dateUnixNanos(revalidateDate.input.value);
-      const permissionExpires = permissionExpiry.input.value
-        ? dateUnixNanos(permissionExpiry.input.value)
-        : null;
-      const grantStarts = dateUnixNanos(grantEffective.input.value);
-      const grantEnds = dateUnixNanos(grantExpiry.input.value);
-      if (permissionEffective > reviewedAt || reviewedAt >= revalidateBy) {
-        throwInvalidRange(
-          revalidateDate.input,
-          'The permission must already be effective and the review deadline must be in the future.'
-        );
-      }
-      if (
-        permissionExpires !== null &&
-        (permissionExpires <= permissionEffective || permissionExpires <= reviewedAt)
-      ) {
-        throwInvalidRange(
-          permissionExpiry.input,
-          'The permission expiry must be after its effective date and still be in the future.'
-        );
-      }
-      if (grantStarts >= grantEnds || grantEnds <= reviewedAt) {
-        throwInvalidRange(
-          grantExpiry.input,
-          'The series-authority review deadline must be after its effective date and still be in the future.'
-        );
-      }
-
-      const permissionBytes = await exactPortalEvidence(permissionFile.input.files[0]);
-      const permissionChannel = {
-        kind: 'official_https',
-        evidence_url: evidenceUrl.input.value,
-        authority_url: authorityUrl.input.value
-      };
-      const grantEvidence = {kind: 'reviewed_unrate'};
-      const reviewedConditions = conditions.input.value
-        .split('\n')
-        .map((condition) => condition.trim())
-        .filter(Boolean);
-      if (
-        reviewedConditions.length > 32 ||
-        new Set(reviewedConditions).size !== reviewedConditions.length ||
-        reviewedConditions.some((condition) => condition.length > 1024)
-      ) {
-        throwInvalidRange(
-          conditions.input,
-          'Use at most 32 distinct conditions, each no longer than 1,024 characters.'
+          vintageStart.input,
+          'The first vintage date must not follow the last vintage date.'
         );
       }
       return {
         kind: 'fred_alfred',
-        service_permission: {
-          evidence: {
-            channel: permissionChannel,
-            ...permissionBytes
-          },
-          review: {
-            reviewer: reviewer.input.value,
-            reviewed_at_unix_nanos: reviewedAt.toString(),
-            issuer: 'federal-reserve-bank-of-st-louis',
-            application: 'market-squawk',
-            service: 'fred-api',
-            series: [series.input.value],
-            operations: ['persist', 'cache', 'archive', 'train'],
-            conditions: reviewedConditions,
-            effective_at_unix_nanos: permissionEffective.toString(),
-            expires_at_unix_nanos:
-              permissionExpires === null ? null : permissionExpires.toString(),
-            revalidate_by_unix_nanos: revalidateBy.toString()
-          }
-        },
-        grants: [
-          {
-            series: series.input.value,
-            owner: owner.input.value,
-            evidence: grantEvidence,
-            effective_at_unix_nanos: grantStarts.toString(),
-            expires_at_unix_nanos: grantEnds.toString()
-          }
-        ]
+        provider_dataset: `${history.input.value}:series-observations:${series.input.value}:${vintageStart.input.value}:${vintageEnd.input.value}`
       };
     }
   };
@@ -2510,9 +2275,6 @@ function statusBadge(profile) {
       return badge('Authorization needed', 'status-attention');
     }
   }
-  if (profile.id === 'fred-alfred.api-v1-v2') {
-    return badge('Written permission needed', 'status-attention');
-  }
   const release = releasePresentation(profile.release_state);
   return badge(release.label, release.className);
 }
@@ -2658,7 +2420,6 @@ function secretAction(action) {
 }
 
 function primarySetupLabel(profile) {
-  if (profile.id === 'fred-alfred.api-v1-v2') return 'Review permission and connect';
   if (requiresProviderHandoff(profile)) return 'Start guided connection';
   return 'Connect this source';
 }
@@ -2683,30 +2444,8 @@ function emailField(label, id, maximum) {
   return inputField(label, id, 'email', '', maximum);
 }
 
-function urlField(label, id, value) {
-  const field = inputField(label, id, 'url', value, 2048);
-  field.input.pattern = 'https://.*';
-  return field;
-}
-
 function dateField(label, id, value) {
   return inputField(label, id, 'date', value);
-}
-
-function fileField(label, id, accept) {
-  const field = inputField(label, id, 'file', '');
-  field.input.accept = accept;
-  return field;
-}
-
-function checkboxField(id, label) {
-  const root = element('label', 'checkbox-field field-full');
-  const input = document.createElement('input');
-  input.id = id;
-  input.type = 'checkbox';
-  input.required = true;
-  root.append(input, element('span', '', label));
-  return {root, input};
 }
 
 function numberField(label, id, value, minimum, maximum) {
@@ -2747,20 +2486,6 @@ function selectField(label, id, options) {
   return {root, input};
 }
 
-function textareaField(label, id, hint) {
-  const root = element('div', 'field field-full');
-  const labelNode = element('label', '', label);
-  labelNode.htmlFor = id;
-  const input = document.createElement('textarea');
-  input.id = id;
-  input.maxLength = 262144;
-  input.setAttribute('aria-describedby', `${id}-hint`);
-  const hintNode = element('p', 'field-hint', hint);
-  hintNode.id = `${id}-hint`;
-  root.append(labelNode, input, hintNode);
-  return {root, input};
-}
-
 function requireFields(fields) {
   for (const field of fields) {
     if (!field.input.reportValidity()) throw new Error('invalid_input');
@@ -2784,56 +2509,6 @@ function isoDate(date) {
   const month = String(date.getUTCMonth() + 1).padStart(2, '0');
   const day = String(date.getUTCDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
-}
-
-function utcDateOffset(days) {
-  const date = new Date();
-  date.setUTCHours(0, 0, 0, 0);
-  date.setUTCDate(date.getUTCDate() + days);
-  return isoDate(date);
-}
-
-function currentUnixNanos() {
-  return BigInt(Date.now()) * 1000000n;
-}
-
-function dateUnixNanos(value) {
-  const milliseconds = Date.parse(`${value}T00:00:00.000Z`);
-  if (!Number.isSafeInteger(milliseconds)) throw new Error('invalid_input');
-  return BigInt(milliseconds) * 1000000n;
-}
-
-async function exactPortalEvidence(file) {
-  const maximumBytes = 256 * 1024;
-  if (!(file instanceof File) || file.size === 0 || file.size > maximumBytes) {
-    throw new PortalError('invalid_adapter_request', 400, {
-      message: 'Evidence files must contain 1 to 262,144 bytes.'
-    });
-  }
-  let bytes;
-  let digest;
-  try {
-    bytes = new Uint8Array(await file.arrayBuffer());
-    digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
-  } catch (_error) {
-    throw new PortalError('invalid_adapter_request', 400, {
-      message: 'The selected evidence file could not be read and hashed locally.'
-    });
-  }
-  return {
-    sha256: Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join(''),
-    byte_length: bytes.byteLength,
-    content_base64: bytesToBase64(bytes)
-  };
-}
-
-function bytesToBase64(bytes) {
-  const chunkSize = 32768;
-  let binary = '';
-  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
-  }
-  return btoa(binary);
 }
 
 function applyBootstrap(data) {

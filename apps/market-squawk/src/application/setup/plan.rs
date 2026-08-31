@@ -404,7 +404,7 @@ pub enum SetupProviderOutcome {
     BlsMacroResearch,
     /// Treasury rates research under its exact public dataset authority.
     TreasuryRatesResearch,
-    /// FRED/ALFRED research only after its exact key, permission, and series authority exists.
+    /// FRED/ALFRED research after its protected key and exact dataset, series, and vintage range are verified.
     FredAlfredAuthorizedResearch,
 }
 

@@ -1578,9 +1578,9 @@ pub struct ReleaseProviderArguments {
     /// Require one authorized source to drive a verified risk-approved paper action.
     #[arg(long)]
     pub require_direct_verified_action: bool,
-    /// Require admitted FRED and ALFRED persistence and training rights.
+    /// Require exact FRED and ALFRED source authority for durable personal research.
     #[arg(long)]
-    pub require_fred_alfred_rights: bool,
+    pub require_fred_alfred_source_authority: bool,
     /// Exact zero-padded ten-digit CIK exercised through SEC filings and Company Facts.
     #[arg(long, value_name = "CIK")]
     pub sec_cik: Option<String>,

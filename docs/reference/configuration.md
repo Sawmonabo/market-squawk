@@ -19,9 +19,9 @@ file, `MARKET_SQUAWK_*` environment, and the command's supported CLI override. T
 configuration-file discovery or in-process reload. An invalid value at any layer rejects the whole
 merged configuration without echoing secret material.
 
-`market-squawk-service` and `market-squawk-mcp-relay` remove `MARKET_SQUAWK_LOG`,
-`MARKET_SQUAWK_EXTERNAL_NETWORK`, and `MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED` before loading
-`AppConfig`; `MARKET_SQUAWK_LOG` is instead a tracing option. The installed service owns the active
+`market-squawk-service` and `market-squawk-mcp-relay` remove `MARKET_SQUAWK_LOG` and
+`MARKET_SQUAWK_EXTERNAL_NETWORK` before loading `AppConfig`; `MARKET_SQUAWK_LOG` is instead a
+tracing option. The installed service owns the active
 workspace after startup. Client commands discover it through the authenticated owner-only rendezvous;
 the rendezvous endpoint, credentials, service generation, and workspace identity are not user
 configuration fields.

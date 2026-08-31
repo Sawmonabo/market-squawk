@@ -49,9 +49,9 @@ use market_squawk_sources::{
     BudgetWindowSemantics, CoverageDomain, CoverageTopology, EndpointPolicy,
     FRED_ALFRED_API_SURFACE_ID, FreshnessPolicy, HistoricalCapability, HttpRequestBounds,
     InstrumentCoverage, NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
-    ProviderRateDeclaration, QueryParameterRule, QuerySensitivity, SEC_EDGAR_AUTHORITY,
-    SEC_EDGAR_PROFILE_ID, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
-    SourceMetadataInput, SourceProtocolProfile,
+    ProviderCapabilityRevision, ProviderRateDeclaration, QueryParameterRule, QuerySensitivity,
+    SEC_EDGAR_AUTHORITY, SEC_EDGAR_PROFILE_ID, SourceCapabilities, SourceClass, SourceCoverage,
+    SourceMetadata, SourceMetadataInput, SourceProtocolProfile, built_in_provider_profiles,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -100,7 +100,6 @@ const SCHWAB_MARKET_DOCTOR_DURATION: Duration = Duration::from_secs(5 * 60);
 const BLS_SERIES_METADATA_MAXIMUM_BYTES: u64 = 4 * 1024;
 const MAXIMUM_SEC_IDENTITIES: usize = 16;
 const MAXIMUM_BLS_SERIES: usize = 1_000;
-const FRED_CAPABILITY_REVISION: u64 = 4;
 const SECOND_NANOS: u64 = 1_000_000_000;
 const MINUTE_NANOS: u64 = 60 * SECOND_NANOS;
 const DAY_NANOS: u64 = 86_400 * SECOND_NANOS;
@@ -2697,9 +2696,7 @@ fn build_research_activation(
             ))
         }
         ProviderRequest::FredAlfred { configuration } => {
-            if lease.capability_revision().get() != FRED_CAPABILITY_REVISION {
-                return Err(CliProviderActivationError::InvalidRights);
-            }
+            require_current_fred_revision(lease)?;
             let FredProviderRequest { provider_dataset } = *configuration;
             let metadata = metadata(
                 lease,
@@ -3181,9 +3178,7 @@ fn fred_portal_request(
     provider_dataset: SourceIdentifier,
 ) -> Result<(ProviderRequest, LoadedActivationEvidence), CliProviderActivationError> {
     require_surface(lease, ProviderSurface::Exact(FRED_SURFACE))?;
-    if lease.capability_revision().get() != FRED_CAPABILITY_REVISION {
-        return Err(CliProviderActivationError::InvalidRights);
-    }
+    require_current_fred_revision(lease)?;
     FredSource::series_identifier(&provider_dataset)
         .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
     Ok((
@@ -3211,14 +3206,31 @@ fn validate_file_fred_request_scope(
     let ProviderRequest::FredAlfred { configuration } = &request.provider else {
         return Ok(());
     };
-    if request.schema_version != REQUEST_SCHEMA_VERSION
-        || lease.capability_revision().get() != FRED_CAPABILITY_REVISION
-    {
+    if request.schema_version != REQUEST_SCHEMA_VERSION {
         return Err(CliProviderActivationError::InvalidRights);
     }
+    require_current_fred_revision(lease)?;
     FredSource::series_identifier(&configuration.provider_dataset)
         .map(|_series| ())
         .map_err(|_| CliProviderActivationError::ProviderConfiguration)
+}
+
+fn current_fred_revision() -> Result<ProviderCapabilityRevision, CliProviderActivationError> {
+    let profiles =
+        built_in_provider_profiles().map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    profiles
+        .get(FRED_SURFACE)
+        .map(|profile| profile.capability().revision())
+        .ok_or(CliProviderActivationError::InvalidMetadata)
+}
+
+fn require_current_fred_revision(
+    lease: &ProviderActivationLease,
+) -> Result<(), CliProviderActivationError> {
+    if lease.capability_revision() != current_fred_revision()? {
+        return Err(CliProviderActivationError::InvalidRights);
+    }
+    Ok(())
 }
 
 fn treasury_daily_rates_config(
@@ -4665,7 +4677,8 @@ mod tests {
     }
 
     #[test]
-    fn fred_request_requires_current_schema_and_retains_exact_dataset() -> TestResult {
+    fn fred_request_requires_current_v1_authority_and_retains_exact_dataset() -> TestResult {
+        assert_eq!(current_fred_revision()?.get(), 1);
         let session_id = Uuid::new_v4();
         let mut request = json!({
             "schema_version": REQUEST_SCHEMA_VERSION,

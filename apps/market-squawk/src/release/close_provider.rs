@@ -63,15 +63,11 @@ pub(super) fn validate_provider_evidence(payload: &Value) -> Result<()> {
             .and_then(Value::as_bool)
             != Some(true)
         || payload
-            .pointer("/requirements/provider_terms_accepted")
-            .and_then(Value::as_bool)
-            != Some(true)
-        || payload
             .pointer("/requirements/direct_verified_action_required")
             .and_then(Value::as_bool)
             != Some(true)
         || payload
-            .pointer("/requirements/fred_alfred_rights_required")
+            .pointer("/requirements/fred_alfred_source_authority_required")
             .and_then(Value::as_bool)
             != Some(true)
     {
@@ -180,23 +176,23 @@ pub(super) fn validate_provider_evidence(payload: &Value) -> Result<()> {
             surface.pointer("/surface_id").and_then(Value::as_str) == Some("fred-alfred.api-v1-v2")
         })
         .ok_or_else(|| anyhow::anyhow!("FRED/ALFRED surface evidence is absent"))?;
-    validate_fred_rights_summary(payload, fred_surface)?;
+    validate_fred_source_authority_summary(payload, fred_surface)?;
     Ok(())
 }
 
-fn validate_fred_rights_summary(payload: &Value, surface: &Value) -> Result<()> {
+fn validate_fred_source_authority_summary(payload: &Value, surface: &Value) -> Result<()> {
     let summary = payload
-        .pointer("/fred_alfred_rights")
+        .pointer("/fred_alfred_source_authority")
         .and_then(Value::as_object)
-        .ok_or_else(|| anyhow::anyhow!("FRED/ALFRED rights summary is absent"))?;
+        .ok_or_else(|| anyhow::anyhow!("FRED/ALFRED source-authority summary is absent"))?;
     let expected_summary_fields = [
         "required",
         "selected",
-        "persistence_admitted",
-        "model_training_rights_admitted",
-        "parent_authorization_digest",
-        "authorization_digest",
-        "authorization_expires_at_unix_nanos",
+        "persistence_enabled",
+        "model_training_enabled",
+        "activation_digest",
+        "series_scope_digest",
+        "series_scope_expires_at_unix_nanos",
         "exact_series",
         "admitted",
     ];
@@ -205,7 +201,7 @@ fn validate_fred_rights_summary(payload: &Value, surface: &Value) -> Result<()> 
             .iter()
             .any(|field| !summary.contains_key(*field))
     {
-        bail!("FRED/ALFRED rights summary does not match provider schema v6");
+        bail!("FRED/ALFRED source-authority summary does not match provider schema v6");
     }
     let runtime_value = surface
         .pointer("/research_runtime")
@@ -214,7 +210,7 @@ fn validate_fred_rights_summary(payload: &Value, surface: &Value) -> Result<()> 
     let runtime = runtime_value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("FRED/ALFRED research runtime is invalid"))?;
-    validate_fred_runtime_authority(runtime_value)?;
+    validate_fred_source_authority(runtime_value)?;
     let expiry = runtime
         .get("rights_authorization_expires_at_unix_nanos")
         .and_then(Value::as_i64)
@@ -227,15 +223,14 @@ fn validate_fred_rights_summary(payload: &Value, surface: &Value) -> Result<()> 
         .ok_or_else(|| anyhow::anyhow!("provider collection time is invalid"))?;
     if summary.get("required").and_then(Value::as_bool) != Some(true)
         || summary.get("selected").and_then(Value::as_bool) != Some(true)
-        || summary.get("persistence_admitted").and_then(Value::as_bool) != Some(true)
+        || summary.get("persistence_enabled").and_then(Value::as_bool) != Some(true)
         || summary
-            .get("model_training_rights_admitted")
+            .get("model_training_enabled")
             .and_then(Value::as_bool)
             != Some(true)
         || summary.get("admitted").and_then(Value::as_bool) != Some(true)
-        || summary.get("parent_authorization_digest")
-            != runtime.get("parent_rights_authorization_digest")
-        || summary.get("authorization_digest") != runtime.get("rights_authorization_digest")
+        || summary.get("activation_digest") != runtime.get("parent_rights_authorization_digest")
+        || summary.get("series_scope_digest") != runtime.get("rights_authorization_digest")
         || runtime.get("parent_rights_authorization_digest")
             != surface.pointer("/activation/rights_decision_digest")
         || runtime.get("session_id") != surface.pointer("/session/session_id")
@@ -245,24 +240,26 @@ fn validate_fred_rights_summary(payload: &Value, surface: &Value) -> Result<()> 
         || runtime.get("authority_effective_at_unix_nanos")
             != surface.pointer("/activation/authority_effective_at_unix_nanos")
         || summary
-            .get("authorization_expires_at_unix_nanos")
+            .get("series_scope_expires_at_unix_nanos")
             .and_then(Value::as_i64)
             != Some(expiry)
         || summary.get("exact_series") != runtime.get("rights_subjects")
         || expiry <= collected_at
     {
-        bail!("FRED/ALFRED rights summary is not bound to current exact-series runtime authority");
+        bail!(
+            "FRED/ALFRED source-authority summary is not bound to current exact-series runtime authority"
+        );
     }
     Ok(())
 }
 
-fn validate_fred_runtime_authority(runtime: &Value) -> Result<()> {
+fn validate_fred_source_authority(runtime: &Value) -> Result<()> {
     let parent = runtime
         .get("parent_rights_authorization_digest")
-        .ok_or_else(|| anyhow::anyhow!("FRED/ALFRED parent rights digest is absent"))?;
+        .ok_or_else(|| anyhow::anyhow!("FRED/ALFRED activation digest is absent"))?;
     let subordinate = runtime
         .get("rights_authorization_digest")
-        .ok_or_else(|| anyhow::anyhow!("FRED/ALFRED subordinate rights digest is absent"))?;
+        .ok_or_else(|| anyhow::anyhow!("FRED/ALFRED exact-series scope digest is absent"))?;
     let effective = runtime
         .get("authority_effective_at_unix_nanos")
         .and_then(Value::as_i64)
@@ -286,7 +283,7 @@ fn validate_fred_runtime_authority(runtime: &Value) -> Result<()> {
             .get("rights_operations")
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow::anyhow!("FRED/ALFRED operation authority is absent"))?,
-        "FRED/ALFRED rights operations",
+        "FRED/ALFRED source operations",
     )?;
     let allowed = BTreeSet::from(["display", "persist", "cache", "redistribute", "train"]);
     if runtime.get("source_id").and_then(Value::as_str) != Some(FRED_SOURCE_ID)
@@ -382,7 +379,7 @@ fn validate_provider_surface_runtime(surface_id: &str, surface: &Value) -> Resul
                 bail!("durable research-provider runtime evidence is invalid");
             }
             if surface_id == "fred-alfred.api-v1-v2" {
-                validate_fred_runtime_authority(runtime)?;
+                validate_fred_source_authority(runtime)?;
             }
             if matches!(surface_id, "bls.v1-unregistered" | "bls.v2-registered")
                 && (surface
@@ -1084,7 +1081,7 @@ fn validate_treasury_publications(runtime: &Value) -> Result<()> {
 }
 
 fn validate_fred_publications(runtime: &Value) -> Result<()> {
-    validate_fred_runtime_authority(runtime)?;
+    validate_fred_source_authority(runtime)?;
     let authorized_series = fred_runtime_series(runtime)?;
     let publications = runtime
         .pointer("/publications")
@@ -1731,7 +1728,7 @@ fn validate_bls_publication(runtime: &Value, surface_id: &str) -> Result<()> {
 
 fn require_feature_product_producer_receipt(source_label: &str) -> Result<()> {
     bail!(
-        "{source_label} release closure requires an exact feature-product producer receipt; raw provider publication and model-training rights do not prove product production"
+        "{source_label} release closure requires an exact feature-product producer receipt; raw provider publication and model-training eligibility do not prove product production"
     )
 }
 
@@ -2020,7 +2017,7 @@ mod tests {
                         .to_string()
                         .contains("exact feature-product producer receipt")
             ),
-            "raw publication and training rights must not replace a producer receipt",
+            "raw publication and training eligibility must not replace a producer receipt",
         );
     }
 }
