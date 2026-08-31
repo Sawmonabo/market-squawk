@@ -14,11 +14,12 @@ use std::{sync::Arc, time::Instant};
 
 use market_squawk_adapter_fred::FredSource;
 use market_squawk_data::{
-    AnalyticalGeneration, AnalyticalReadError, DatasetId, DatasetManifestRef, IngestError,
-    IngestIdentity, IngestPrecommitAuthority, PersistedProviderCaptureBindingEvidence,
-    ProviderMacroPlanChunkInput, ProviderMacroPlanPublicationInput,
-    ProviderMacroPlanPublicationReceipt, ProviderMacroPlanSemantics, RightsDecisionInput,
-    SourceOperation, extraction_provider_payload_digest,
+    AnalyticalGeneration, AnalyticalReadError, DatasetId, DatasetManifestRef,
+    GenerationOwnedProviderCaptureEvidence, IngestError, IngestIdentity, IngestPrecommitAuthority,
+    ManifestObject, PersistedProviderCaptureBindingEvidence, ProviderMacroPlanChunkInput,
+    ProviderMacroPlanPublicationInput, ProviderMacroPlanPublicationReceipt,
+    ProviderMacroPlanSemantics, RightsDecisionInput, SourceOperation,
+    extraction_provider_payload_digest,
 };
 use market_squawk_domain::{
     CalendarDate, DigestAlgorithm, EvidenceDigest, SourceId, SourceIdentifier,
@@ -224,31 +225,60 @@ impl FredPublishedGenerationHandoff {
             )?;
         if owned.pinned().manifest() != &manifest
             || owned.source_id() != generation.source_id()
-            || owned.bindings().is_empty()
+            || owned.objects().is_empty()
         {
             return Err(FredProductionPublicationError::RestartVerificationMismatch);
         }
+        let binding_count = owned.objects().iter().try_fold(0_usize, |count, object| {
+            if object.inputs().is_empty() {
+                return None;
+            }
+            count.checked_add(object.inputs().len())
+        });
+        let Some(binding_count) = binding_count.filter(|count| *count > 0) else {
+            return Err(FredProductionPublicationError::RestartVerificationMismatch);
+        };
         let mut selected_bindings = Vec::new();
         selected_bindings
-            .try_reserve_exact(owned.bindings().len())
+            .try_reserve_exact(binding_count)
+            .map_err(|_error| FredProductionPublicationError::Capacity)?;
+        let mut published_objects = Vec::new();
+        published_objects
+            .try_reserve_exact(owned.objects().len())
             .map_err(|_error| FredProductionPublicationError::Capacity)?;
         let mut row_count = 0_u64;
-        for evidence in owned.bindings() {
-            let coordinate = restored_fred_binding_coordinate(
-                evidence,
-                generation.source_id(),
-                &provider_dataset,
-            )?;
+        for (publication_ordinal, object) in owned.objects().iter().enumerate() {
+            if object.publication_ordinal() != publication_ordinal
+                || owned
+                    .pinned()
+                    .objects()
+                    .get(object.generation_object_ordinal())
+                    != Some(object.object())
+            {
+                return Err(FredProductionPublicationError::RestartVerificationMismatch);
+            }
+            let mut object_rows = 0_u64;
+            for input in object.inputs() {
+                let coordinate = restored_fred_binding_coordinate(
+                    input.binding(),
+                    generation.source_id(),
+                    &provider_dataset,
+                )?;
+                object_rows = object_rows
+                    .checked_add(
+                        u64::try_from(coordinate.record_count)
+                            .map_err(|_error| FredProductionPublicationError::Capacity)?,
+                    )
+                    .ok_or(FredProductionPublicationError::Capacity)?;
+                selected_bindings.push(coordinate);
+            }
+            if object.object().object().row_count() != object_rows {
+                return Err(FredProductionPublicationError::RestartVerificationMismatch);
+            }
             row_count = row_count
-                .checked_add(
-                    u64::try_from(coordinate.record_count)
-                        .map_err(|_error| FredProductionPublicationError::Capacity)?,
-                )
+                .checked_add(object_rows)
                 .ok_or(FredProductionPublicationError::Capacity)?;
-            selected_bindings.push(coordinate);
-        }
-        if owned.anchor_object().object().row_count() != row_count {
-            return Err(FredProductionPublicationError::RestartVerificationMismatch);
+            published_objects.push(object.object().object().clone());
         }
         let expectation = FredPublishedGenerationExpectation {
             provider_dataset,
@@ -262,7 +292,7 @@ impl FredPublishedGenerationHandoff {
             manifest.clone(),
             &expectation,
             selected_bindings,
-            owned.anchor_object().object().clone(),
+            published_objects,
         )?;
         Ok(Self {
             capability,
@@ -689,7 +719,7 @@ struct FredPublishedBindingCoordinate {
 pub(crate) struct FredMacroRestartSelector {
     manifest: DatasetManifestRef,
     bindings: Box<[FredPublishedBindingCoordinate]>,
-    anchor_object: market_squawk_data::ManifestObject,
+    objects: Box<[ManifestObject]>,
     source_id: SourceId,
     metadata_revision: SourceIdentifier,
     provider_dataset: SourceIdentifier,
@@ -702,12 +732,13 @@ impl FredMacroRestartSelector {
         manifest: DatasetManifestRef,
         expectation: &FredPublishedGenerationExpectation,
         selected_bindings: Vec<FredPublishedBindingCoordinate>,
-        anchor_object: market_squawk_data::ManifestObject,
+        objects: Vec<ManifestObject>,
     ) -> Result<Self, FredProductionPublicationError> {
         if manifest.dataset_id() != &expectation.analytical_dataset
             || expectation.object_count == 0
             || expectation.row_count == 0
             || selected_bindings.len() != expectation.object_count
+            || objects.is_empty()
         {
             return Err(FredProductionPublicationError::RestartVerificationMismatch);
         }
@@ -721,55 +752,29 @@ impl FredMacroRestartSelector {
                 &manifest,
                 research.provider_capture_store().as_ref(),
             )?;
-        if owned.pinned().manifest() != &manifest
-            || owned.source_id() != &expectation.source_id
-            || owned.anchor_object().object() != &anchor_object
-            || owned.bindings().len() != selected_bindings.len()
-            || owned
-                .bindings()
-                .iter()
-                .zip(&selected_bindings)
-                .any(|(evidence, selected)| evidence.binding_digest() != selected.binding_digest)
-        {
+        if owned.pinned().manifest() != &manifest || owned.source_id() != &expectation.source_id {
             return Err(FredProductionPublicationError::RestartVerificationMismatch);
         }
-        let mut metadata_revision = None;
-        let mut row_count = 0_u64;
-        for (evidence, selected) in owned.bindings().iter().zip(&selected_bindings) {
-            if !valid_fred_persisted_binding(
-                evidence,
-                selected,
-                &expectation.source_id,
-                &expectation.provider_dataset,
-                metadata_revision.as_ref(),
-            ) {
-                return Err(FredProductionPublicationError::RestartVerificationMismatch);
-            }
-            let evidence_revision = evidence
-                .capture()
-                .metadata_revision()
-                .as_source_identifier()
-                .clone();
-            metadata_revision.get_or_insert(evidence_revision);
-            row_count = row_count
-                .checked_add(
-                    u64::try_from(evidence.record_count())
-                        .map_err(|_error| FredProductionPublicationError::Capacity)?,
-                )
-                .ok_or(FredProductionPublicationError::Capacity)?;
-        }
-        if row_count != expectation.row_count || anchor_object.row_count() != row_count {
+        let verified = validate_fred_owned_generation(
+            &owned,
+            &expectation.source_id,
+            &expectation.provider_dataset,
+            &objects,
+            &selected_bindings,
+            None,
+            |_evidence| Ok(()),
+        )?;
+        if verified.row_count != expectation.row_count {
             return Err(FredProductionPublicationError::RestartVerificationMismatch);
         }
         let selector = Self {
             manifest,
             bindings: selected_bindings.into_boxed_slice(),
-            anchor_object,
+            objects: objects.into_boxed_slice(),
             source_id: expectation.source_id.clone(),
-            metadata_revision: metadata_revision
-                .ok_or(FredProductionPublicationError::RestartVerificationMismatch)?,
+            metadata_revision: verified.metadata_revision,
             provider_dataset: expectation.provider_dataset.clone(),
-            row_count,
+            row_count: verified.row_count,
         };
         selector.verify(research)?;
         Ok(selector)
@@ -792,46 +797,124 @@ impl FredMacroRestartSelector {
                 &self.manifest,
                 research.provider_capture_store().as_ref(),
             )?;
-        if owned.pinned().manifest() != &self.manifest
-            || owned.source_id() != &self.source_id
-            || owned.anchor_object().object() != &self.anchor_object
-            || owned.bindings().len() != self.bindings.len()
-            || owned
-                .bindings()
-                .iter()
-                .zip(self.bindings.iter())
-                .any(|(evidence, selected)| evidence.binding_digest() != selected.binding_digest)
-        {
+        if owned.pinned().manifest() != &self.manifest || owned.source_id() != &self.source_id {
             return Err(FredProductionPublicationError::RestartVerificationMismatch);
         }
         let mut retained = Vec::new();
         retained
             .try_reserve_exact(self.bindings.len())
             .map_err(|_error| FredProductionPublicationError::Capacity)?;
-        let mut row_count = 0_u64;
-        for (evidence, selected) in owned.bindings().iter().zip(self.bindings.iter()) {
-            if !valid_fred_persisted_binding(
-                evidence,
-                selected,
-                &self.source_id,
-                &self.provider_dataset,
-                Some(&self.metadata_revision),
-            ) {
-                return Err(FredProductionPublicationError::RestartVerificationMismatch);
-            }
-            row_count = row_count
-                .checked_add(
-                    u64::try_from(evidence.record_count())
-                        .map_err(|_error| FredProductionPublicationError::Capacity)?,
-                )
-                .ok_or(FredProductionPublicationError::Capacity)?;
-            retained.push(evidence.clone());
-        }
-        if row_count != self.row_count || self.anchor_object.row_count() != row_count {
+        let verified = validate_fred_owned_generation(
+            &owned,
+            &self.source_id,
+            &self.provider_dataset,
+            &self.objects,
+            &self.bindings,
+            Some(&self.metadata_revision),
+            |evidence| {
+                retained.push(evidence.clone());
+                Ok(())
+            },
+        )?;
+        if verified.row_count != self.row_count
+            || verified.metadata_revision != self.metadata_revision
+        {
             return Err(FredProductionPublicationError::RestartVerificationMismatch);
         }
         Ok(retained.into_boxed_slice())
     }
+}
+
+struct VerifiedFredOwnedGeneration {
+    metadata_revision: SourceIdentifier,
+    row_count: u64,
+}
+
+fn validate_fred_owned_generation(
+    owned: &GenerationOwnedProviderCaptureEvidence,
+    expected_source_id: &SourceId,
+    expected_provider_dataset: &SourceIdentifier,
+    expected_objects: &[ManifestObject],
+    selected_bindings: &[FredPublishedBindingCoordinate],
+    expected_metadata_revision: Option<&SourceIdentifier>,
+    mut retain_binding: impl FnMut(
+        &PersistedProviderCaptureBindingEvidence,
+    ) -> Result<(), FredProductionPublicationError>,
+) -> Result<VerifiedFredOwnedGeneration, FredProductionPublicationError> {
+    if owned.source_id() != expected_source_id
+        || owned.objects().is_empty()
+        || owned.objects().len() != expected_objects.len()
+        || selected_bindings.is_empty()
+    {
+        return Err(FredProductionPublicationError::RestartVerificationMismatch);
+    }
+    let mut metadata_revision = expected_metadata_revision.cloned();
+    let mut input_ordinal = 0_usize;
+    let mut row_count = 0_u64;
+    for (publication_ordinal, (object, expected_object)) in
+        owned.objects().iter().zip(expected_objects).enumerate()
+    {
+        if object.publication_ordinal() != publication_ordinal
+            || object.object().object() != expected_object
+            || object.inputs().is_empty()
+            || owned
+                .pinned()
+                .objects()
+                .get(object.generation_object_ordinal())
+                != Some(object.object())
+        {
+            return Err(FredProductionPublicationError::RestartVerificationMismatch);
+        }
+        let mut object_rows = 0_u64;
+        for (object_input_ordinal, input) in object.inputs().iter().enumerate() {
+            let selected = selected_bindings
+                .get(input_ordinal)
+                .ok_or(FredProductionPublicationError::RestartVerificationMismatch)?;
+            let evidence = input.binding();
+            if input.input_ordinal() != input_ordinal
+                || input.object_input_ordinal() != object_input_ordinal
+                || evidence.binding_digest() != selected.binding_digest
+                || !valid_fred_persisted_binding(
+                    evidence,
+                    selected,
+                    expected_source_id,
+                    expected_provider_dataset,
+                    metadata_revision.as_ref(),
+                )
+            {
+                return Err(FredProductionPublicationError::RestartVerificationMismatch);
+            }
+            let evidence_revision = evidence
+                .capture()
+                .metadata_revision()
+                .as_source_identifier()
+                .clone();
+            metadata_revision.get_or_insert(evidence_revision);
+            let evidence_rows = u64::try_from(evidence.record_count())
+                .map_err(|_error| FredProductionPublicationError::Capacity)?;
+            object_rows = object_rows
+                .checked_add(evidence_rows)
+                .ok_or(FredProductionPublicationError::Capacity)?;
+            retain_binding(evidence)?;
+            input_ordinal = input_ordinal
+                .checked_add(1)
+                .ok_or(FredProductionPublicationError::Capacity)?;
+        }
+        if expected_object.row_count() != object_rows {
+            return Err(FredProductionPublicationError::RestartVerificationMismatch);
+        }
+        row_count = row_count
+            .checked_add(object_rows)
+            .ok_or(FredProductionPublicationError::Capacity)?;
+    }
+    if input_ordinal != selected_bindings.len() {
+        return Err(FredProductionPublicationError::RestartVerificationMismatch);
+    }
+    Ok(VerifiedFredOwnedGeneration {
+        metadata_revision: metadata_revision
+            .ok_or(FredProductionPublicationError::RestartVerificationMismatch)?,
+        row_count,
+    })
 }
 
 fn validate_fred_binding_coordinates_in_provider_order(
