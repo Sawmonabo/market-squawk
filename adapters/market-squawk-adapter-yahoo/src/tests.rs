@@ -299,6 +299,7 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
     assert_eq!(sealed_binding, publication_binding);
     drop(token);
 
+    session.fail_next_scripted_post_send_clock().await;
     let second = session
         .execute(plan.requests[1].clone(), limits, &cancellation)
         .await

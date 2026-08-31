@@ -216,6 +216,10 @@ impl YahooClockObservation {
     pub(crate) const fn wall_unix_ms(self) -> i64 {
         self.wall_unix_ms
     }
+
+    pub(crate) const fn monotonic(self) -> Instant {
+        self.monotonic
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

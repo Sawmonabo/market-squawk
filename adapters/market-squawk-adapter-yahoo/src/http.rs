@@ -653,6 +653,7 @@ impl WireClient {
 struct ScriptedWireState {
     responses: VecDeque<ScriptedHttpResponse>,
     observed_targets: Vec<String>,
+    fail_next_post_send_clock: bool,
 }
 
 #[cfg(test)]
@@ -1545,9 +1546,9 @@ impl YahooHttpSession {
         let client = client
             .production()
             .ok_or(YahooHttpFailureKind::InvalidConfiguration)?;
-        let started_at_unix_ms =
-            wall_time_ms().map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
-        let started = Instant::now();
+        let started_at = clock_observation().map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
+        let started_at_unix_ms = started_at.wall_unix_ms();
+        let started = started_at.monotonic();
         let kind = spec.kind;
         let target = spec.target;
         let observation_units = spec.observation_units;
@@ -1577,8 +1578,7 @@ impl YahooHttpSession {
                     kind,
                     target,
                     observation_units,
-                    started_at_unix_ms,
-                    started,
+                    started_at,
                     YahooHttpFailureKind::Network,
                 )?;
                 return Err(YahooHttpFailureKind::Network);
@@ -1590,8 +1590,7 @@ impl YahooHttpSession {
                     kind,
                     target,
                     observation_units,
-                    started_at_unix_ms,
-                    started,
+                    started_at,
                     kind_error.clone(),
                 )?;
                 return Err(kind_error);
@@ -1603,9 +1602,8 @@ impl YahooHttpSession {
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let header_observed_at =
-            clock_observation().map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
         let recovery = provider_recovery_from_headers(response.headers());
+        let header_observed_at = post_send_clock_observation(started_at, clock_observation());
         let final_url = response.url().clone();
         if response_requires_immediate_backoff(status, recovery) {
             let wire = WireResponse {
@@ -1636,8 +1634,7 @@ impl YahooHttpSession {
                 kind,
                 target,
                 observation_units,
-                started_at_unix_ms,
-                started,
+                started_at,
                 YahooHttpFailureKind::UnsupportedEncoding,
             )?;
             return Err(YahooHttpFailureKind::UnsupportedEncoding);
@@ -1655,8 +1652,7 @@ impl YahooHttpSession {
                 kind,
                 target,
                 observation_units,
-                started_at_unix_ms,
-                started,
+                started_at,
                 YahooHttpFailureKind::ResponseTooLarge,
             )?;
             return Err(YahooHttpFailureKind::ResponseTooLarge);
@@ -1672,8 +1668,7 @@ impl YahooHttpSession {
                     kind,
                     target,
                     observation_units,
-                    started_at_unix_ms,
-                    started,
+                    started_at,
                     kind_error.clone(),
                 )?;
                 return Err(kind_error);
@@ -1688,8 +1683,7 @@ impl YahooHttpSession {
                         kind,
                         target,
                         observation_units,
-                        started_at_unix_ms,
-                        started,
+                        started_at,
                         YahooHttpFailureKind::Network,
                     )?;
                     return Err(YahooHttpFailureKind::Network);
@@ -1706,8 +1700,7 @@ impl YahooHttpSession {
                     kind,
                     target,
                     observation_units,
-                    started_at_unix_ms,
-                    started,
+                    started_at,
                     YahooHttpFailureKind::ResponseTooLarge,
                 )?;
                 return Err(YahooHttpFailureKind::ResponseTooLarge);
@@ -1725,8 +1718,7 @@ impl YahooHttpSession {
             recovery,
             final_url,
             started_at_unix_ms,
-            completed_at: clock_observation()
-                .map_err(|_| YahooHttpFailureKind::StateUnavailable)?,
+            completed_at: post_send_clock_observation(started_at, clock_observation()),
             latency_ms: duration_ms(started.elapsed()),
             observation_units,
         })
@@ -1740,9 +1732,9 @@ impl YahooHttpSession {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<WireResponse, YahooHttpFailureKind> {
-        let started = Instant::now();
-        let started_at_unix_ms =
-            wall_time_ms().map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
+        let started_at = clock_observation().map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
+        let started_at_unix_ms = started_at.wall_unix_ms();
+        let started = started_at.monotonic();
         let remaining = remaining(deadline)?;
         let mut state = tokio::select! {
             biased;
@@ -1756,12 +1748,17 @@ impl YahooHttpSession {
             .responses
             .pop_front()
             .ok_or(YahooHttpFailureKind::Network)?;
-        let completed_at =
-            clock_observation().map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
         let recovery = provider_recovery_from_values(
             response.retry_after.iter().copied(),
             response.rate_limit_reset.iter().copied(),
         );
+        let observed_at = if state.fail_next_post_send_clock {
+            state.fail_next_post_send_clock = false;
+            Err(())
+        } else {
+            clock_observation()
+        };
+        let completed_at = post_send_clock_observation(started_at, observed_at);
         let immediate_backoff = response_requires_immediate_backoff(response.status, recovery);
         if !immediate_backoff && response.body.len() > spec.maximum_bytes {
             return Err(YahooHttpFailureKind::ResponseTooLarge);
@@ -1797,8 +1794,7 @@ impl YahooHttpSession {
         kind: AttemptKind,
         target: YahooAttemptTarget,
         observation_units: usize,
-        started_at_unix_ms: i64,
-        started: Instant,
+        started_at: YahooClockObservation,
         failure: YahooHttpFailureKind,
     ) -> Result<(), YahooHttpFailureKind> {
         let disposition = match failure {
@@ -1819,8 +1815,8 @@ impl YahooHttpSession {
             | YahooHttpFailureKind::ResponseTooLarge
             | YahooHttpFailureKind::UnsupportedEncoding => AttemptDisposition::TransportFailure,
         };
-        let completed_at = clock_observation()
-            .unwrap_or_else(|_| YahooClockObservation::new(started_at_unix_ms, Instant::now()));
+        let completed_at = post_send_clock_observation(started_at, clock_observation());
+        let started_at_unix_ms = started_at.wall_unix_ms();
         let completed_at_unix_ms = completed_at.wall_unix_ms();
         self.push_attempt(
             permit,
@@ -1833,7 +1829,7 @@ impl YahooHttpSession {
                 response_sha256_hex: None,
                 started_at_unix_ms,
                 completed_at_unix_ms,
-                latency_ms: duration_ms(started.elapsed()),
+                latency_ms: duration_ms(started_at.monotonic().elapsed()),
                 disposition,
             },
             0,
@@ -2626,6 +2622,28 @@ fn clock_observation() -> Result<YahooClockObservation, ()> {
     Ok(YahooClockObservation::new(wall_unix_ms, Instant::now()))
 }
 
+fn post_send_clock_observation(
+    started_at: YahooClockObservation,
+    observed_at: Result<YahooClockObservation, ()>,
+) -> YahooClockObservation {
+    if let Ok(observed_at) = observed_at {
+        return observed_at;
+    }
+    // A physical send must remain accountable even if the wall clock becomes unreadable after
+    // I/O. Extend the paired pre-send coordinate along the process monotonic timeline; saturating
+    // wall evidence may overstate the recovery interval but cannot make the active circuit expire
+    // before its monotonic deadline.
+    let monotonic = Instant::now();
+    let elapsed = monotonic
+        .checked_duration_since(started_at.monotonic())
+        .unwrap_or(Duration::ZERO);
+    let elapsed_ms = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
+    YahooClockObservation::new(
+        started_at.wall_unix_ms().saturating_add(elapsed_ms),
+        monotonic,
+    )
+}
+
 fn duration_ms(value: Duration) -> u64 {
     u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
 }
@@ -3091,6 +3109,7 @@ impl YahooHttpSession {
                     client: WireClient::Scripted(AsyncMutex::new(ScriptedWireState {
                         responses: responses.into(),
                         observed_targets: Vec::new(),
+                        fail_next_post_send_clock: false,
                     })),
                     _cookie_jar: cookie_jar,
                     crumb: None,
@@ -3106,5 +3125,13 @@ impl YahooHttpSession {
             return Vec::new();
         };
         state.lock().await.observed_targets.clone()
+    }
+
+    pub(crate) async fn fail_next_scripted_post_send_clock(&self) {
+        let network = self.inner.network.lock().await;
+        let WireClient::Scripted(state) = &network.client else {
+            return;
+        };
+        state.lock().await.fail_next_post_send_clock = true;
     }
 }
