@@ -33,10 +33,10 @@ pub(super) fn canonical_records(
     response: &BlsResponse,
     exact_source_payload: &[u8],
     first_observed_at: Timestamp,
-    response_received_at: Timestamp,
+    locally_available_at: Timestamp,
     ingested_at: Timestamp,
 ) -> Result<Vec<CanonicalBlsRecord>, BlsSourceError> {
-    if first_observed_at > response_received_at || response_received_at > ingested_at {
+    if first_observed_at > locally_available_at || locally_available_at > ingested_at {
         return Err(BlsSourceError::Protocol);
     }
     let source_digest: [u8; 32] = Sha256::digest(exact_source_payload).into();
@@ -58,7 +58,7 @@ pub(super) fn canonical_records(
                     observation,
                     payload_reference,
                     first_observed_at,
-                    response_received_at,
+                    locally_available_at,
                     ingested_at,
                     source_digest,
                 )
@@ -78,7 +78,7 @@ fn canonical_record(
     observation: &crate::BlsObservation,
     payload_reference: &PayloadReference,
     first_observed_at: Timestamp,
-    response_received_at: Timestamp,
+    locally_available_at: Timestamp,
     ingested_at: Timestamp,
     source_digest: [u8; 32],
 ) -> Result<CanonicalBlsRecord, BlsSourceError> {
@@ -108,7 +108,7 @@ fn canonical_record(
         venue_id: None,
         source_identifier: revision.clone(),
         source_timestamp: None,
-        received_at: response_received_at,
+        received_at: locally_available_at,
         ingested_at,
         quality: DataQuality::OfficialDelayed,
         payload_reference: payload_reference.clone(),

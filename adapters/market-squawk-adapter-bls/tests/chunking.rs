@@ -1,3 +1,6 @@
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
 use bytes::Bytes;
 use market_squawk_adapter_bls::{
     BlsAccessTier, BlsAuthorization, BlsParseError, BlsRegistrationKey, BlsRequestPlan,
@@ -7,9 +10,54 @@ use market_squawk_adapter_bls::{
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, SourceIdentifier,
 };
+use market_squawk_platform::{
+    EncryptedFileSecretStore, SecretCancellation, SecretGeneration, SecretInteractionPolicy,
+    SecretKey, SecretOperationControl, SecretRef, SecretStore, SecretValue,
+};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+struct TemporarySecretRoot(PathBuf);
+
+impl TemporarySecretRoot {
+    fn new() -> Self {
+        Self(std::env::temp_dir().join(format!(
+            "market-squawk-bls-chunking-secret-{}",
+            Uuid::new_v4()
+        )))
+    }
+}
+
+impl Drop for TemporarySecretRoot {
+    fn drop(&mut self) {
+        let _ignored = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn managed_credential_reference()
+-> Result<(TemporarySecretRoot, SecretRef), Box<dyn std::error::Error>> {
+    let root = TemporarySecretRoot::new();
+    let store = EncryptedFileSecretStore::try_open(
+        &root.0,
+        SecretValue::new("bls-chunking-test-unlock".to_owned())?,
+    )?;
+    let control = SecretOperationControl::try_new(
+        "bls-chunking-test",
+        Instant::now() + Duration::from_secs(60),
+        0,
+        SecretInteractionPolicy::Forbid,
+        SecretCancellation::new(),
+    )?;
+    let reference = store.create(
+        &SecretKey::try_new("market-squawk.bls", "registered-v2")?,
+        SecretGeneration::new(1)?,
+        SecretValue::new("fake-fake-fake-fake-fake-fake-fake-fake".to_owned())?,
+        &control,
+    )?;
+    Ok((root, reference))
+}
 
 fn metadata(series_id: &str, unit: &str) -> Result<BlsSeriesMetadata, BlsSourceError> {
     let payload = Bytes::from(format!(
@@ -199,6 +247,7 @@ fn registered_key_is_validated_and_debug_redacted() -> TestResult {
 
 #[test]
 fn source_dataset_identity_binds_tier_series_and_year_window() -> TestResult {
+    let (_credential_root, credential_reference) = managed_credential_reference()?;
     let public = BlsSourceConfig::try_new(
         BlsAuthorization::public_v1(),
         vec![metadata("LNS14000000", "percent")?],
@@ -214,7 +263,7 @@ fn source_dataset_identity_binds_tier_series_and_year_window() -> TestResult {
     let registered = BlsSourceConfig::try_new(
         BlsAuthorization::registered_v2(
             BlsRegistrationKey::try_new("fake-fake-fake-fake-fake-fake-fake-fake".to_owned())?,
-            EvidenceDigest::new(DigestAlgorithm::Sha256, [43; 32]),
+            &credential_reference,
         )?,
         vec![metadata("LNS14000000", "percent")?],
         2020,

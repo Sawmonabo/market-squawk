@@ -410,10 +410,10 @@ impl BlsActivationCandidate {
         plan.validate()?;
         validate_doctor_capture(&plan, &doctor, &sealed_doctor_capture, &runtime_instance)?;
         let expires_at = doctor
-            .received_at()
+            .locally_available_at()
             .checked_add_nanos(BLS_DOCTOR_ACTIVATION_TTL_NANOS)
             .map_err(|_| BlsSourceError::InvalidPublication)?;
-        if activated_at < doctor.received_at() || activated_at >= expires_at {
+        if activated_at < doctor.locally_available_at() || activated_at >= expires_at {
             return Err(BlsSourceError::InvalidPublication);
         }
         let candidate_digest = activation_candidate_digest(
@@ -538,7 +538,7 @@ fn validate_doctor_capture(
         || capture.total_body_bytes() != doctor.response_bytes()
         || page.ordinal() != 0
         || page.http_status() != 200
-        || page.received_at() != doctor.received_at()
+        || page.received_at() != doctor.locally_available_at()
         || page.body_digest() != doctor.response_content_digest()
         || sealed.receipt_digest().bytes() == [0; 32]
         || !doctor.matches_runtime_instance(runtime_instance)

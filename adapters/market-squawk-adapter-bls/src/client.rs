@@ -5,6 +5,7 @@ use bytes::{Bytes, BytesMut};
 use futures_util::future::BoxFuture;
 use futures_util::{Stream, StreamExt};
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, Timestamp};
+use market_squawk_platform::SecretRef;
 use market_squawk_sources::{
     ExtractionAuthority, ExtractionAuthorityError, ExtractionRequestPermit, ExtractionSourceError,
     NetworkAccessPolicy, SourceError, SourceMetadata,
@@ -36,13 +37,14 @@ impl BlsRegistrationKey {
     ///
     /// Rejects empty, oversized, whitespace-containing, or non-ASCII credentials.
     pub fn try_new(value: String) -> Result<Self, BlsSourceError> {
+        let value = Zeroizing::new(value);
         if value.is_empty()
             || value.len() > MAX_REGISTRATION_KEY_BYTES
             || !value.bytes().all(|byte| byte.is_ascii_graphic())
         {
             return Err(BlsSourceError::InvalidRegistrationKey);
         }
-        Ok(Self(Zeroizing::new(value)))
+        Ok(Self(value))
     }
 
     pub(crate) fn expose(&self) -> &str {
@@ -100,13 +102,18 @@ impl BlsAuthorization {
         }
     }
 
-    /// Binds one zeroizing registered-v2 key to its exact protected root generation.
+    /// Binds one zeroizing registered-v2 key to its exact managed-store reference.
+    ///
+    /// The adapter derives its secret-free generation coordinate from the complete opaque
+    /// [`SecretRef`]. Callers cannot substitute a dataset identity, provider response digest, or
+    /// another freely chosen digest for protected-store authority.
     pub fn registered_v2(
         registration_key: BlsRegistrationKey,
-        credential_generation_digest: EvidenceDigest,
+        credential_reference: &SecretRef,
     ) -> Result<Self, BlsSourceError> {
-        let credential_rejoin =
-            BlsCredentialRejoin::RegisteredGeneration(credential_generation_digest);
+        let credential_rejoin = BlsCredentialRejoin::RegisteredGeneration(
+            protected_registration_generation_digest(credential_reference)?,
+        );
         credential_rejoin.validate()?;
         Ok(Self {
             tier: BlsAccessTier::RegisteredV2,
@@ -151,6 +158,25 @@ impl BlsAuthorization {
             _ => Err(BlsSourceError::InvalidRegistrationKey),
         }
     }
+}
+
+fn protected_registration_generation_digest(
+    credential_reference: &SecretRef,
+) -> Result<EvidenceDigest, BlsSourceError> {
+    let encoded = serde_json::to_vec(credential_reference)
+        .map_err(|_| BlsSourceError::InvalidRegistrationKey)?;
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/bls-protected-registration-generation/v1\0");
+    digest.update(
+        u64::try_from(encoded.len())
+            .map_err(|_| BlsSourceError::InvalidRegistrationKey)?
+            .to_be_bytes(),
+    );
+    digest.update(encoded);
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
 }
 
 impl std::fmt::Debug for BlsAuthorization {
@@ -207,6 +233,14 @@ struct BlsProviderRequest<'a> {
     seriesid: &'a [String],
     startyear: String,
     endyear: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catalog: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    calculations: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annualaverage: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aspects: Option<bool>,
     #[serde(rename = "registrationkey", skip_serializing_if = "Option::is_none")]
     registration_key: Option<&'a str>,
 }
@@ -215,8 +249,28 @@ struct BlsProviderRequest<'a> {
 pub(crate) struct RetrievedBlsPage {
     pub(crate) bytes: Bytes,
     pub(crate) response: BlsResponse,
-    pub(crate) received_at: Timestamp,
+    pub(crate) response_received_at: Timestamp,
+    pub(crate) locally_available_at: Timestamp,
     pub(crate) sha256_hex: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct RetainedBlsPage {
+    pub(crate) bytes: Bytes,
+    pub(crate) response_received_at: Timestamp,
+    pub(crate) locally_available_at: Timestamp,
+    pub(crate) sha256_hex: String,
+}
+
+impl RetrievedBlsPage {
+    pub(crate) fn into_retained(self) -> RetainedBlsPage {
+        RetainedBlsPage {
+            bytes: self.bytes,
+            response_received_at: self.response_received_at,
+            locally_available_at: self.locally_available_at,
+            sha256_hex: self.sha256_hex,
+        }
+    }
 }
 
 pub(crate) struct BlsHttpClient {
@@ -325,6 +379,14 @@ impl BlsHttpClient {
             seriesid: chunk.series(),
             startyear: chunk.start_year().to_string(),
             endyear: chunk.end_year().to_string(),
+            // This adapter currently admits the authenticated base-timeseries v2 shape only.
+            // Explicit false values prevent registered mode from silently changing response
+            // semantics if provider defaults evolve; enrichment requires a separately bounded
+            // parser and provider-native publication contract.
+            catalog: (self.tier == BlsAccessTier::RegisteredV2).then_some(false),
+            calculations: (self.tier == BlsAccessTier::RegisteredV2).then_some(false),
+            annualaverage: (self.tier == BlsAccessTier::RegisteredV2).then_some(false),
+            aspects: (self.tier == BlsAccessTier::RegisteredV2).then_some(false),
             registration_key: authorization.registration_key(),
         };
         let request_body = Zeroizing::new(
@@ -349,6 +411,9 @@ impl BlsHttpClient {
                 cancellation.clone(),
             )
             .await?;
+        if response.response_received_at > response.locally_available_at {
+            return Err(SourceError::InvalidProtocolState.into());
+        }
         if response.status == 429 || response.status == 503 {
             let deadline =
                 in_flight.apply_retry_after_header(response.retry_after.as_deref(), 0)?;
@@ -388,7 +453,8 @@ impl BlsHttpClient {
         let page = RetrievedBlsPage {
             bytes: response.body,
             response: parsed,
-            received_at: response.received_at,
+            response_received_at: response.response_received_at,
+            locally_available_at: response.locally_available_at,
             sha256_hex: format!("{digest:x}"),
         };
         in_flight.record_success()?;
@@ -418,7 +484,8 @@ pub(crate) struct BlsHttpResponse {
     pub(crate) content_encoding: Option<Vec<u8>>,
     pub(crate) content_type: Option<Vec<u8>>,
     pub(crate) body: Bytes,
-    pub(crate) received_at: Timestamp,
+    pub(crate) response_received_at: Timestamp,
+    pub(crate) locally_available_at: Timestamp,
 }
 
 pub(crate) trait BlsTransport: std::fmt::Debug + Send + Sync {
@@ -480,6 +547,8 @@ impl BlsTransport for ReqwestBlsTransport {
                     .send()
                     .await
                     .map_err(|_| SourceError::Network)?;
+                let response_received_at =
+                    system_timestamp().map_err(|_| SourceError::TrustedTimeUnavailable)?;
                 if response.content_length().is_some_and(|length| {
                     usize::try_from(length).map_or(true, |length| length > max_bytes)
                 }) {
@@ -501,14 +570,16 @@ impl BlsTransport for ReqwestBlsTransport {
                 let body = collect_bounded_stream(response.bytes_stream(), max_bytes)
                     .await
                     .map_err(|error| map_source_error(error, max_bytes))?;
+                let locally_available_at =
+                    system_timestamp().map_err(|_| SourceError::TrustedTimeUnavailable)?;
                 Ok(BlsHttpResponse {
                     status,
                     retry_after,
                     content_encoding,
                     content_type,
                     body,
-                    received_at: system_timestamp()
-                        .map_err(|_| SourceError::TrustedTimeUnavailable)?,
+                    response_received_at,
+                    locally_available_at,
                 })
             };
             tokio::select! {
@@ -640,10 +711,71 @@ fn remaining_timeout(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
     use bytes::Bytes;
     use futures_util::stream;
+    use market_squawk_platform::{
+        EncryptedFileSecretStore, SecretCancellation, SecretGeneration, SecretInteractionPolicy,
+        SecretKey, SecretOperationControl, SecretStore, SecretValue,
+    };
+    use uuid::Uuid;
 
-    use super::{BlsProviderRequest, collect_bounded_stream};
+    use super::{BlsAuthorization, BlsProviderRequest, BlsRegistrationKey, collect_bounded_stream};
+
+    #[test]
+    fn registered_generation_is_derived_from_the_exact_protected_reference()
+    -> Result<(), Box<dyn std::error::Error>> {
+        struct TemporarySecretRoot(PathBuf);
+
+        impl Drop for TemporarySecretRoot {
+            fn drop(&mut self) {
+                let _ignored = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = TemporarySecretRoot(
+            std::env::temp_dir().join(format!("market-squawk-bls-secret-{}", Uuid::new_v4())),
+        );
+        let store = EncryptedFileSecretStore::try_open(
+            &root.0,
+            SecretValue::new("bls-test-unlock".to_owned())?,
+        )?;
+        let key = SecretKey::try_new("market-squawk.bls", "registered-v2")?;
+        let control = SecretOperationControl::try_new(
+            "bls-adapter-test",
+            Instant::now() + Duration::from_secs(60),
+            0,
+            SecretInteractionPolicy::Forbid,
+            SecretCancellation::new(),
+        )?;
+        let first_reference = store.create(
+            &key,
+            SecretGeneration::new(7)?,
+            SecretValue::new("same-provider-key".to_owned())?,
+            &control,
+        )?;
+        let second_reference = store.replace(
+            &key,
+            &first_reference,
+            SecretGeneration::new(8)?,
+            SecretValue::new("same-provider-key".to_owned())?,
+            &control,
+        )?;
+
+        let first = BlsAuthorization::registered_v2(
+            BlsRegistrationKey::try_new("same-provider-key".to_owned())?,
+            &first_reference,
+        )?;
+        let second = BlsAuthorization::registered_v2(
+            BlsRegistrationKey::try_new("same-provider-key".to_owned())?,
+            &second_reference,
+        )?;
+
+        assert_ne!(first.credential_rejoin(), second.credential_rejoin());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn response_body_limit_applies_across_streamed_chunks() {
@@ -661,10 +793,18 @@ mod tests {
             seriesid: &series,
             startyear: "2020".to_owned(),
             endyear: "2026".to_owned(),
+            catalog: Some(false),
+            calculations: Some(false),
+            annualaverage: Some(false),
+            aspects: Some(false),
             registration_key: Some("secret"),
         };
         let value = serde_json::to_value(request)?;
         assert_eq!(value["registrationkey"], "secret");
+        assert_eq!(value["catalog"], false);
+        assert_eq!(value["calculations"], false);
+        assert_eq!(value["annualaverage"], false);
+        assert_eq!(value["aspects"], false);
         assert!(value.get("registrationKey").is_none());
         Ok(())
     }

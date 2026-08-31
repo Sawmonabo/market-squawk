@@ -11,7 +11,7 @@ use market_squawk_sources::{
     SourceObject, SourceObjectCaptureIdentity, payload_matches_exact_evidence,
 };
 
-use crate::client::RetrievedBlsPage;
+use crate::client::RetainedBlsPage;
 use crate::contract::BlsRuntimeInstanceCapability;
 use crate::{BlsActivationCandidate, BlsSourceError};
 
@@ -24,7 +24,7 @@ use crate::{BlsActivationCandidate, BlsSourceError};
 pub struct BlsDiscoveryOutput {
     batch: DiscoveryBatch,
     capture_material: ProviderCaptureMaterial,
-    retained_pages: Box<[RetrievedBlsPage]>,
+    retained_pages: Box<[RetainedBlsPage]>,
     source_generation_digest: EvidenceDigest,
 }
 
@@ -32,7 +32,7 @@ impl BlsDiscoveryOutput {
     pub(crate) fn new(
         batch: DiscoveryBatch,
         capture_material: ProviderCaptureMaterial,
-        retained_pages: Vec<RetrievedBlsPage>,
+        retained_pages: Vec<RetainedBlsPage>,
         source_generation_digest: EvidenceDigest,
     ) -> Self {
         Self {
@@ -57,7 +57,7 @@ impl BlsDiscoveryOutput {
         self.source_generation_digest
     }
 
-    pub(crate) fn retained_pages(&self) -> &[RetrievedBlsPage] {
+    pub(crate) fn retained_pages(&self) -> &[RetainedBlsPage] {
         &self.retained_pages
     }
 
@@ -92,7 +92,7 @@ pub struct BlsPendingDiscovery {
     batch: DiscoveryBatch,
     capture_expectation: ProviderCaptureSealExpectation,
     component_scoped: bool,
-    retained_pages: Box<[RetrievedBlsPage]>,
+    retained_pages: Box<[RetainedBlsPage]>,
     source_generation_digest: EvidenceDigest,
 }
 
@@ -321,7 +321,8 @@ impl BlsDiscoveryAdmission {
                 || object.expected_bytes() != Some(page.body_bytes())
                 || object.effective_interval().starts_at() != page.received_at()
                 || component_request_identity != page.request_identity()
-                || retained_page.received_at != page.received_at()
+                || retained_page.locally_available_at != page.received_at()
+                || retained_page.response_received_at > retained_page.locally_available_at
                 || retained_page.sha256_hex != object_digest
                 || u64::try_from(retained_page.bytes.len()).ok() != Some(page.body_bytes())
                 || !payload_matches_exact_evidence(&retained_page.bytes, object.evidence())
@@ -335,7 +336,8 @@ impl BlsDiscoveryAdmission {
                 component_request_identity,
                 component_content_digest,
                 component_observation_digest,
-                response_received_at: page.received_at(),
+                response_received_at: retained_page.response_received_at,
+                locally_available_at: page.received_at(),
                 capture_token,
                 retained_page,
                 runtime_instance: Arc::clone(expected_runtime_instance),
@@ -369,8 +371,9 @@ pub struct BlsDiscoveryObjectAdmission {
     component_content_digest: EvidenceDigest,
     component_observation_digest: EvidenceDigest,
     response_received_at: Timestamp,
+    locally_available_at: Timestamp,
     capture_token: BlsDiscoveryCaptureToken,
-    retained_page: RetrievedBlsPage,
+    retained_page: RetainedBlsPage,
     runtime_instance: Arc<BlsRuntimeInstanceCapability>,
     activation_candidate_digest: EvidenceDigest,
     source_generation_digest: EvidenceDigest,
@@ -414,11 +417,15 @@ impl BlsDiscoveryObjectAdmission {
         self.response_received_at
     }
 
+    pub(crate) const fn locally_available_at(&self) -> Timestamp {
+        self.locally_available_at
+    }
+
     pub(crate) fn sealed_discovery_capture(&self) -> &SealedProviderCaptureSetReceipt {
         self.capture_token.persisted_receipt()
     }
 
-    pub(crate) const fn retained_page(&self) -> &RetrievedBlsPage {
+    pub(crate) const fn retained_page(&self) -> &RetainedBlsPage {
         &self.retained_page
     }
 
@@ -483,9 +490,11 @@ fn validate_object_component(
         || observation != admission.component_observation_digest
         || page.request_identity() != admission.component_request_identity
         || page.body_digest() != admission.object.evidence().content_digest()
-        || page.received_at() != admission.response_received_at
-        || admission.object.effective_interval().starts_at() != admission.response_received_at
-        || admission.retained_page.received_at != admission.response_received_at
+        || admission.response_received_at > admission.locally_available_at
+        || page.received_at() != admission.locally_available_at
+        || admission.object.effective_interval().starts_at() != admission.locally_available_at
+        || admission.retained_page.response_received_at != admission.response_received_at
+        || admission.retained_page.locally_available_at != admission.locally_available_at
         || admission.retained_page.sha256_hex
             != admission
                 .object

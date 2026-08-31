@@ -48,7 +48,8 @@ pub struct BlsDoctorReport {
     footnotes: u32,
     provider_messages: u16,
     provider_response_time_millis: u64,
-    received_at: Timestamp,
+    response_received_at: Timestamp,
+    locally_available_at: Timestamp,
     response_bytes: u64,
     response_content_digest: EvidenceDigest,
     capture_content_digest: EvidenceDigest,
@@ -82,7 +83,8 @@ impl BlsDoctorReport {
         footnotes: u32,
         provider_messages: u16,
         provider_response_time_millis: u64,
-        received_at: Timestamp,
+        response_received_at: Timestamp,
+        locally_available_at: Timestamp,
         response_bytes: u64,
         response_content_digest: EvidenceDigest,
         capture_content_digest: EvidenceDigest,
@@ -109,7 +111,8 @@ impl BlsDoctorReport {
             footnotes,
             provider_messages,
             provider_response_time_millis,
-            received_at,
+            response_received_at,
+            locally_available_at,
             response_bytes,
             response_content_digest,
             capture_content_digest,
@@ -200,9 +203,14 @@ impl BlsDoctorReport {
         self.provider_response_time_millis
     }
 
-    /// Returns the socket-boundary receipt time for the exact response bytes.
-    pub const fn received_at(&self) -> Timestamp {
-        self.received_at
+    /// Returns when provider response headers first became available to the transport.
+    pub const fn response_received_at(&self) -> Timestamp {
+        self.response_received_at
+    }
+
+    /// Returns when the exact bounded response became completely available locally.
+    pub const fn locally_available_at(&self) -> Timestamp {
+        self.locally_available_at
     }
 
     /// Returns the exact bounded response byte count.
@@ -260,6 +268,7 @@ impl BlsDoctorReport {
             || self.dataset.as_str().is_empty()
             || self.series_id.as_str().is_empty()
             || self.year == 0
+            || self.response_received_at > self.locally_available_at
             || self.response_bytes == 0
             || self.response_content_digest.bytes() == [0; 32]
             || self.capture_content_digest.bytes() == [0; 32]
@@ -275,7 +284,7 @@ impl BlsDoctorReport {
 
     fn compute_digest(&self) -> Result<EvidenceDigest, BlsSourceError> {
         let mut digest = Sha256::new();
-        digest.update(b"market-squawk/bls-doctor-report/v3\0");
+        digest.update(b"market-squawk/bls-doctor-report/v4\0");
         hash_report_field(&mut digest, self.source_id.as_str().as_bytes())?;
         hash_report_field(
             &mut digest,
@@ -310,7 +319,8 @@ impl BlsDoctorReport {
         digest.update(self.footnotes.to_be_bytes());
         digest.update(self.provider_messages.to_be_bytes());
         digest.update(self.provider_response_time_millis.to_be_bytes());
-        digest.update(self.received_at.unix_nanos().to_be_bytes());
+        digest.update(self.response_received_at.unix_nanos().to_be_bytes());
+        digest.update(self.locally_available_at.unix_nanos().to_be_bytes());
         digest.update(self.response_bytes.to_be_bytes());
         for value in [
             self.response_content_digest,
@@ -398,7 +408,7 @@ impl BlsDoctorOutput {
             || !capture.request_graph_components().is_empty()
             || capture.total_body_bytes() != report.response_bytes
             || page.body_digest() != report.response_content_digest
-            || page.received_at() != report.received_at
+            || page.received_at() != report.locally_available_at
             || capture.content_digest() != report.capture_content_digest
             || capture.observation_digest() != report.capture_observation_digest
             || capture.request_set_identity() != report.request_set_identity

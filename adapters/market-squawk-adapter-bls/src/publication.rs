@@ -179,6 +179,7 @@ pub struct BlsCanonicalObservationSemantics {
     effective_time: ResearchTemporalCoordinate,
     first_observed_at: Timestamp,
     response_received_at: Timestamp,
+    locally_available_at: Timestamp,
     canonical_ingested_at: Timestamp,
     canonical_revision: SourceIdentifier,
     canonical_payload_digest: EvidenceDigest,
@@ -226,8 +227,8 @@ impl BlsCanonicalProviderSemantics {
         config: &BlsSourceConfig,
         response: &BlsResponse,
         batch: &ExtractionBatch,
-        first_observed_at: Timestamp,
         response_received_at: Timestamp,
+        locally_available_at: Timestamp,
         canonical_ingested_at: Timestamp,
     ) -> Result<Self, BlsSourceError> {
         let mut series_manifests = Vec::new();
@@ -284,13 +285,15 @@ impl BlsCanonicalProviderSemantics {
                 } else {
                     Box::default()
                 };
-                if record.schema().as_str() != CURRENT_RESEARCH_RECORD_SCHEMA
-                    || record.available_at() != Some(first_observed_at)
+                if response_received_at > locally_available_at
+                    || locally_available_at > canonical_ingested_at
+                    || record.schema().as_str() != CURRENT_RESEARCH_RECORD_SCHEMA
+                    || record.available_at() != Some(locally_available_at)
                     || record.effective_time() != canonical.context().time().effective()
                     || record.revision() != canonical.context().provenance().source_identifier()
                     || canonical.series().as_str() != series.series_id()
                     || canonical.unit() != metadata.unit()
-                    || canonical.context().provenance().received_at() != response_received_at
+                    || canonical.context().provenance().received_at() != locally_available_at
                     || canonical.context().provenance().ingested_at() != canonical_ingested_at
                     || canonical.value().observed_value() != observation.value()
                 {
@@ -312,8 +315,9 @@ impl BlsCanonicalProviderSemantics {
                     footnotes,
                     missing_explanations,
                     effective_time: record.effective_time().clone(),
-                    first_observed_at,
+                    first_observed_at: locally_available_at,
                     response_received_at,
+                    locally_available_at,
                     canonical_ingested_at,
                     canonical_revision: record.revision().clone(),
                     canonical_payload_digest: record.evidence().content_digest(),
@@ -374,6 +378,11 @@ impl BlsCanonicalProviderSemantics {
                                 || record.evidence().content_digest()
                                     != observation.canonical_payload_digest
                                 || record.available_at() != Some(observation.first_observed_at)
+                                || observation.first_observed_at != observation.locally_available_at
+                                || observation.response_received_at
+                                    > observation.locally_available_at
+                                || observation.locally_available_at
+                                    > observation.canonical_ingested_at
                         })
                 })
             || self.semantics_digest != self.compute_digest()?
@@ -431,6 +440,9 @@ impl BlsCanonicalProviderSemantics {
                         preliminary: observation.preliminary,
                         footnotes: &observation.footnotes,
                         missing_explanations: &observation.missing_explanations,
+                        response_received_at: observation.response_received_at,
+                        locally_available_at: observation.locally_available_at,
+                        canonical_ingested_at: observation.canonical_ingested_at,
                     },
                 })
                 .map_err(|_| BlsSourceError::InvalidPublication)?;
@@ -471,6 +483,9 @@ struct BlsNativeLineageObservationV1<'a> {
     preliminary: bool,
     footnotes: &'a [BlsCanonicalFootnote],
     missing_explanations: &'a [Box<str>],
+    response_received_at: Timestamp,
+    locally_available_at: Timestamp,
+    canonical_ingested_at: Timestamp,
 }
 
 /// Checked typed view of one persisted `BlsTimeseriesV1` provider-native row.
@@ -576,6 +591,8 @@ impl BlsTimeseriesNativeLineageRowV1 {
             || self.observation.period_label.len() > 64
             || self.observation.value != expected_value
             || self.observation.preliminary != expected_preliminary
+            || self.observation.response_received_at > self.observation.locally_available_at
+            || self.observation.locally_available_at > self.observation.canonical_ingested_at
             || self
                 .observation
                 .missing_explanations
@@ -646,6 +663,9 @@ pub struct BlsTimeseriesNativeLineageObservationV1 {
     preliminary: bool,
     footnotes: Box<[BlsCanonicalFootnote]>,
     missing_explanations: Box<[Box<str>]>,
+    response_received_at: Timestamp,
+    locally_available_at: Timestamp,
+    canonical_ingested_at: Timestamp,
 }
 
 impl BlsTimeseriesNativeLineageObservationV1 {
@@ -692,6 +712,21 @@ impl BlsTimeseriesNativeLineageObservationV1 {
     /// Returns explicit missing-value explanations derived from provider footnotes.
     pub fn missing_explanations(&self) -> &[Box<str>] {
         &self.missing_explanations
+    }
+
+    /// Returns when provider response headers first became available to the transport.
+    pub const fn response_received_at(&self) -> Timestamp {
+        self.response_received_at
+    }
+
+    /// Returns when the complete bounded response became available for point-in-time use.
+    pub const fn locally_available_at(&self) -> Timestamp {
+        self.locally_available_at
+    }
+
+    /// Returns when canonical normalization completed locally.
+    pub const fn canonical_ingested_at(&self) -> Timestamp {
+        self.canonical_ingested_at
     }
 }
 
@@ -916,6 +951,7 @@ pub struct BlsPublicationCandidate {
     canonical_record_count: u32,
     first_observed_at: Timestamp,
     response_received_at: Timestamp,
+    locally_available_at: Timestamp,
     canonical_ingested_at: Timestamp,
     discovery_request_set_identity: EvidenceDigest,
     discovery_capture_content_digest: EvidenceDigest,
@@ -970,7 +1006,8 @@ impl BlsPublicationCandidate {
         let canonical_record_count =
             u32::try_from(batch.records().len()).map_err(|_| BlsSourceError::InvalidPublication)?;
         let first_observed_at = object.effective_interval().starts_at();
-        let response_received_at = page.received_at();
+        let response_received_at = discovery_admission.response_received_at();
+        let locally_available_at = page.received_at();
         let canonical_schema = SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)
             .map_err(|_| BlsSourceError::InvalidPublication)?;
         let canonical_schema_version = SchemaVersion::CURRENT;
@@ -980,7 +1017,7 @@ impl BlsPublicationCandidate {
             &batch,
             page.body_digest(),
             first_observed_at,
-            response_received_at,
+            locally_available_at,
             &canonical_schema,
         )?;
         provider_semantics.validate(&batch)?;
@@ -1013,8 +1050,14 @@ impl BlsPublicationCandidate {
             || object.evidence().content_digest() != page.body_digest()
             || object.expected_bytes() != Some(page.body_bytes())
             || batch.request().deadline() >= activation.expires_at()
-            || first_observed_at > response_received_at
-            || response_received_at > canonical_ingested_at
+            || response_received_at > locally_available_at
+            || first_observed_at != locally_available_at
+            || locally_available_at > canonical_ingested_at
+            || provider_semantics.observations.iter().any(|observation| {
+                observation.response_received_at != response_received_at
+                    || observation.locally_available_at != locally_available_at
+                    || observation.canonical_ingested_at != canonical_ingested_at
+            })
             || usize::from(chunk_index) >= config.chunk_count()
             || canonical_record_count == 0
             || extraction_content.record_count() != batch.records().len()
@@ -1068,6 +1111,7 @@ impl BlsPublicationCandidate {
             canonical_record_count,
             first_observed_at,
             response_received_at,
+            locally_available_at,
             canonical_ingested_at,
             discovery_request_set_identity,
             discovery_capture_content_digest,
@@ -1140,7 +1184,7 @@ impl BlsPublicationCandidate {
             batch,
             page.body_digest(),
             self.first_observed_at,
-            self.response_received_at,
+            self.locally_available_at,
             &self.canonical_schema,
         )?;
         self.provider_semantics.validate(batch)?;
@@ -1156,8 +1200,10 @@ impl BlsPublicationCandidate {
             || self.discovery_request_id != object.discovery_request_id()
             || self.object_id != *object.object_id()
             || self.first_observed_at != object.effective_interval().starts_at()
-            || self.response_received_at != page.received_at()
-            || self.response_received_at > self.canonical_ingested_at
+            || self.response_received_at > self.locally_available_at
+            || self.locally_available_at != page.received_at()
+            || self.first_observed_at != self.locally_available_at
+            || self.locally_available_at > self.canonical_ingested_at
             || batch.request().deadline() >= activation.expires_at()
             || self.canonical_schema.as_str() != CURRENT_RESEARCH_RECORD_SCHEMA
             || self.canonical_schema_version != SchemaVersion::CURRENT
@@ -1192,6 +1238,15 @@ impl BlsPublicationCandidate {
             || extraction.digest() != self.extraction_content_digest
             || canonical_content_digest(batch)? != self.canonical_content_digest
             || self.provider_semantics.semantics_digest() != self.provider_semantics_digest
+            || self
+                .provider_semantics
+                .observations
+                .iter()
+                .any(|observation| {
+                    observation.response_received_at != self.response_received_at
+                        || observation.locally_available_at != self.locally_available_at
+                        || observation.canonical_ingested_at != self.canonical_ingested_at
+                })
             || native_lineage.batch_digest() != self.native_lineage_digest
             || self.credential_rejoin != config.credential_rejoin()
             || self.provider_rate_declaration_digest != rate.declaration_digest()
@@ -1252,8 +1307,10 @@ impl BlsPublicationCandidate {
             || self.provider_dataset != *object.dataset()
             || self.object_id != *object.object_id()
             || self.first_observed_at != object.effective_interval().starts_at()
-            || self.response_received_at != page.received_at()
-            || self.response_received_at > self.canonical_ingested_at
+            || self.response_received_at > self.locally_available_at
+            || self.locally_available_at != page.received_at()
+            || self.first_observed_at != self.locally_available_at
+            || self.locally_available_at > self.canonical_ingested_at
             || self.discovery_request_set_identity != capture.request_set_identity()
             || self.discovery_capture_content_digest != capture.content_digest()
             || self.discovery_capture_observation_digest != capture.observation_digest()
@@ -1265,6 +1322,15 @@ impl BlsPublicationCandidate {
                     .schema_requirement()
                     .requirement_digest()
             || self.provider_semantics_digest != self.provider_semantics.semantics_digest()
+            || self
+                .provider_semantics
+                .observations
+                .iter()
+                .any(|observation| {
+                    observation.response_received_at != self.response_received_at
+                        || observation.locally_available_at != self.locally_available_at
+                        || observation.canonical_ingested_at != self.canonical_ingested_at
+                })
             || self.native_lineage_digest != native_lineage.batch_digest()
             || !validate_discovery_component(
                 capture,
@@ -1341,9 +1407,14 @@ impl BlsPublicationCandidate {
         self.first_observed_at
     }
 
-    /// Returns the socket-boundary receipt time of the physically sealed response.
+    /// Returns when provider response headers first became available to the transport.
     pub const fn response_received_at(&self) -> Timestamp {
         self.response_received_at
+    }
+
+    /// Returns when the complete bounded response became available for point-in-time use.
+    pub const fn locally_available_at(&self) -> Timestamp {
+        self.locally_available_at
     }
 
     /// Returns when canonical normalization completed locally.
@@ -1538,7 +1609,7 @@ fn validate_canonical_batch(
     batch: &ExtractionBatch,
     raw_body_digest: EvidenceDigest,
     first_observed_at: Timestamp,
-    response_received_at: Timestamp,
+    locally_available_at: Timestamp,
     canonical_schema: &SourceIdentifier,
 ) -> Result<Timestamp, BlsSourceError> {
     let mut canonical_ingested_at = None;
@@ -1572,8 +1643,8 @@ fn validate_canonical_batch(
             || provenance.venue_id().is_some()
             || provenance.source_identifier() != record.revision()
             || provenance.source_timestamp().is_some()
-            || provenance.received_at() != response_received_at
-            || ingested_at < response_received_at
+            || provenance.received_at() != locally_available_at
+            || ingested_at < locally_available_at
             || provenance.quality() != DataQuality::OfficialDelayed
             || provenance.availability().conservative_available_at() != Some(first_observed_at)
             || !raw_reference_matches
@@ -1617,7 +1688,7 @@ fn canonical_content_digest(batch: &ExtractionBatch) -> Result<EvidenceDigest, B
 
 fn candidate_digest(candidate: &BlsPublicationCandidate) -> Result<EvidenceDigest, BlsSourceError> {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk/bls-publication-candidate/v3\0");
+    digest.update(b"market-squawk/bls-publication-candidate/v4\0");
     digest.update(candidate.schema_version.to_be_bytes());
     hash_field(&mut digest, candidate.source_id.as_str().as_bytes())?;
     hash_field(
@@ -1647,6 +1718,7 @@ fn candidate_digest(candidate: &BlsPublicationCandidate) -> Result<EvidenceDiges
     digest.update(candidate.canonical_record_count.to_be_bytes());
     digest.update(candidate.first_observed_at.unix_nanos().to_be_bytes());
     digest.update(candidate.response_received_at.unix_nanos().to_be_bytes());
+    digest.update(candidate.locally_available_at.unix_nanos().to_be_bytes());
     digest.update(candidate.canonical_ingested_at.unix_nanos().to_be_bytes());
     for value in [
         candidate.schema_extension_requirement_digest,

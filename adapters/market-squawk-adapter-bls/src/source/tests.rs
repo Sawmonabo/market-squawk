@@ -2,17 +2,21 @@ use std::collections::VecDeque;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
-    DigestAlgorithm, EffectiveInterval, EvidenceDigest, MetadataRevision, ResearchObservation,
+    EffectiveInterval, EvidenceDigest, MetadataRevision, ResearchObservation,
     RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId, SourceIdentifier,
     Timestamp,
 };
-use market_squawk_platform::LocalPaths;
+use market_squawk_platform::{
+    EncryptedFileSecretStore, LocalPaths, SecretCancellation, SecretGeneration,
+    SecretInteractionPolicy, SecretKey, SecretOperationControl, SecretRef, SecretStore,
+    SecretValue,
+};
 use market_squawk_sources::{
     ApiEndpointRule, AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy, BudgetScope,
@@ -25,11 +29,13 @@ use market_squawk_sources::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::{BlsSource, PageCache, RetrievedBlsPage, exact_evidence, parse_object_id};
-use crate::client::{BlsHttpRequest, BlsHttpResponse, BlsTransport, system_timestamp};
+use super::{BlsSource, PageRetentionBudget, exact_evidence, parse_object_id};
+use crate::client::{
+    BlsHttpRequest, BlsHttpResponse, BlsTransport, RetainedBlsPage, system_timestamp,
+};
 use crate::{
-    BlsAccessTier, BlsAuthorization, BlsDoctorReadiness, BlsResponse, BlsSeriesMetadata,
-    BlsSourceConfig, BlsSourceError,
+    BlsAccessTier, BlsAuthorization, BlsDoctorReadiness, BlsSeriesMetadata, BlsSourceConfig,
+    BlsSourceError,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -99,11 +105,19 @@ impl BlsTransport for ScriptedTransport {
                 .map_err(|_| market_squawk_sources::SourceError::InvalidProtocolState)?;
             let authorization_matches = if request.url == BlsAuthorization::public_v1().endpoint() {
                 body.get("registrationkey").is_none()
+                    && body.get("catalog").is_none()
+                    && body.get("calculations").is_none()
+                    && body.get("annualaverage").is_none()
+                    && body.get("aspects").is_none()
             } else {
                 request.url == "https://api.bls.gov/publicAPI/v2/timeseries/data/"
                     && body["registrationkey"]
                         .as_str()
                         .is_some_and(|value| !value.is_empty())
+                    && body["catalog"] == false
+                    && body["calculations"] == false
+                    && body["annualaverage"] == false
+                    && body["aspects"] == false
             };
             if !authorization_matches
                 || body["seriesid"][0] != "LNS14000000"
@@ -132,8 +146,10 @@ async fn authority_bound_source_emits_canonical_period_precision() -> TestResult
     let first_received_at = now.checked_add_nanos(1)?;
     let second_received_at = now.checked_add_nanos(2)?;
     let restarted_doctor_received_at = now.checked_add_nanos(3)?;
-    let credential_generation = EvidenceDigest::new(DigestAlgorithm::Sha256, [7; 32]);
     let secret = "fake-fake-fake-fake-fake-fake-fake-fake";
+    let credential_root = TemporaryDirectory::new();
+    let (credential_reference, replacement_reference) =
+        managed_credential_references(credential_root.path(), secret)?;
     let transport = Arc::new(ScriptedTransport {
         responses: Mutex::new(VecDeque::from([
             complete_http_response(now),
@@ -143,17 +159,15 @@ async fn authority_bound_source_emits_canonical_period_precision() -> TestResult
         ])),
         request_count: Mutex::new(0),
     });
-    let config = registered_source_config(credential_generation, secret)?;
+    let config = registered_source_config(&credential_reference, secret)?;
+    let credential_rejoin = config.credential_rejoin();
     let metadata = source_metadata(now, &config, true)?;
     let source = BlsSource::try_new_with_transport(metadata.clone(), config, transport.clone())?;
     let activation_plan = source.activation_plan()?;
     assert_eq!(activation_plan.source_id(), metadata.source_id());
     assert_eq!(activation_plan.metadata_revision(), metadata.revision());
     assert_eq!(activation_plan.provider_dataset(), source.dataset());
-    assert_eq!(
-        activation_plan.credential_rejoin(),
-        crate::BlsCredentialRejoin::RegisteredGeneration(credential_generation)
-    );
+    assert_eq!(activation_plan.credential_rejoin(), credential_rejoin);
     assert!(
         activation_plan
             .rate()
@@ -317,7 +331,7 @@ async fn authority_bound_source_emits_canonical_period_precision() -> TestResult
     drop(source);
     drop(registry);
 
-    let restarted_config = registered_source_config(credential_generation, secret)?;
+    let restarted_config = registered_source_config(&credential_reference, secret)?;
     let restarted_metadata = source_metadata(now, &restarted_config, true)?;
     let restarted_source = BlsSource::try_new_with_transport(
         restarted_metadata.clone(),
@@ -332,11 +346,12 @@ async fn authority_bound_source_emits_canonical_period_precision() -> TestResult
         restarted_source.activation_plan()?.plan_digest(),
         activation_plan.plan_digest()
     );
-    let different_generation = registered_source_config(
-        EvidenceDigest::new(DigestAlgorithm::Sha256, [8; 32]),
-        secret,
-    )?;
-    assert_ne!(different_generation.dataset(), restarted_source.dataset());
+    let different_generation = registered_source_config(&replacement_reference, secret)?;
+    assert_eq!(different_generation.dataset(), restarted_source.dataset());
+    assert_ne!(
+        different_generation.credential_rejoin(),
+        activation_plan.credential_rejoin()
+    );
 
     let mut restarted_registry = AuthoritativeSourceRegistry::
         try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(Arc::new(
@@ -401,6 +416,11 @@ async fn authority_bound_source_emits_canonical_period_precision() -> TestResult
     assert_eq!(first_publication.total_chunks(), 1);
     assert_eq!(first_publication.canonical_record_count(), 1);
     assert_eq!(first_publication.first_observed_at(), first_received_at);
+    assert_eq!(first_publication.locally_available_at(), first_received_at);
+    assert_eq!(
+        first_publication.response_received_at(),
+        first_received_at.checked_sub_nanos(1)?
+    );
     assert_eq!(second_publication.first_observed_at(), second_received_at);
     assert_eq!(
         first_publication.capture_content_digest(),
@@ -586,14 +606,17 @@ async fn source_harness(
     Ok((source, registry, authority, activation, deadline))
 }
 
-fn complete_http_response(received_at: Timestamp) -> BlsHttpResponse {
+fn complete_http_response(locally_available_at: Timestamp) -> BlsHttpResponse {
     BlsHttpResponse {
         status: 200,
         retry_after: None,
         content_encoding: None,
         content_type: Some(b"application/json".to_vec()),
         body: Bytes::from_static(COMPLETE_RESPONSE),
-        received_at,
+        response_received_at: Timestamp::from_unix_nanos(
+            locally_available_at.unix_nanos().saturating_sub(1),
+        ),
+        locally_available_at,
     }
 }
 
@@ -697,7 +720,7 @@ fn source_config_for_years(
 }
 
 fn registered_source_config(
-    credential_generation: EvidenceDigest,
+    credential_reference: &SecretRef,
     secret: &str,
 ) -> Result<BlsSourceConfig, BlsSourceError> {
     const METADATA: &[u8] = br#"{
@@ -718,12 +741,41 @@ fn registered_source_config(
     BlsSourceConfig::try_new(
         BlsAuthorization::registered_v2(
             crate::BlsRegistrationKey::try_new(secret.to_owned())?,
-            credential_generation,
+            credential_reference,
         )?,
         vec![series],
         2026,
         2026,
     )
+}
+
+fn managed_credential_references(root: &Path, secret: &str) -> TestResult<(SecretRef, SecretRef)> {
+    let store = EncryptedFileSecretStore::try_open(
+        root.join("managed-secrets"),
+        SecretValue::new("bls-source-test-unlock".to_owned())?,
+    )?;
+    let key = SecretKey::try_new("market-squawk.bls", "registered-v2")?;
+    let control = SecretOperationControl::try_new(
+        "bls-source-test",
+        Instant::now() + Duration::from_secs(60),
+        0,
+        SecretInteractionPolicy::Forbid,
+        SecretCancellation::new(),
+    )?;
+    let first = store.create(
+        &key,
+        SecretGeneration::new(1)?,
+        SecretValue::new(secret.to_owned())?,
+        &control,
+    )?;
+    let second = store.replace(
+        &key,
+        &first,
+        SecretGeneration::new(2)?,
+        SecretValue::new(secret.to_owned())?,
+        &control,
+    )?;
+    Ok((first, second))
 }
 
 fn source_metadata(
@@ -822,50 +874,31 @@ fn object_id_requires_exact_lowercase_sha256() -> TestResult {
     Ok(())
 }
 
-fn page(bytes: &'static [u8], digest: &str) -> TestResult<RetrievedBlsPage> {
-    Ok(RetrievedBlsPage {
+fn page(bytes: &'static [u8], digest: &str) -> RetainedBlsPage {
+    RetainedBlsPage {
         bytes: Bytes::from_static(bytes),
-        response: BlsResponse::parse(
-            include_bytes!("../../fixtures/series.json"),
-            BlsAccessTier::PublicV1,
-        )?,
-        received_at: Timestamp::from_unix_nanos(1),
+        response_received_at: Timestamp::from_unix_nanos(0),
+        locally_available_at: Timestamp::from_unix_nanos(1),
         sha256_hex: digest.to_owned(),
-    })
+    }
 }
 
 #[test]
-fn full_cache_skips_new_pages_without_crossing_its_bound() -> TestResult {
+fn full_retention_budget_charges_repeated_responses_without_crossing_its_bound() -> TestResult {
     let first_id = SourceIdentifier::try_from("bls:first")?;
     let second_id = SourceIdentifier::try_from("bls:second")?;
-    let request_identity = EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]);
-    let observation_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, [2; 32]);
-    let source_generation = EvidenceDigest::new(DigestAlgorithm::Sha256, [3; 32]);
-    let first_cache_key = "first-receipt";
-    let second_cache_key = "second-receipt";
+    let first_retention_key = "first-receipt";
+    let second_retention_key = "second-receipt";
 
-    let first = page(b"1234", "first")?;
-    let first_charge = PageCache::retained_charge(first_cache_key, &first_id, &first, true)?;
-    let mut cache = PageCache::with_limit(first_charge);
+    let first = page(b"1234", "same");
+    let first_charge =
+        PageRetentionBudget::retained_charge(first_retention_key, &first_id, &first)?;
+    let mut cache = PageRetentionBudget::with_limit(first_charge);
 
-    assert!(cache.insert(
-        first_cache_key,
-        &first_id,
-        request_identity,
-        observation_digest,
-        source_generation,
-        &first,
-    )?);
-    assert!(!cache.insert(
-        second_cache_key,
-        &second_id,
-        request_identity,
-        observation_digest,
-        source_generation,
-        &page(b"5", "second")?,
-    )?);
+    assert!(cache.insert(first_retention_key, &first_id, &first)?);
+    assert!(!cache.insert(second_retention_key, &second_id, &page(b"1234", "same"),)?);
     assert_eq!(cache.retained_bytes, first_charge);
-    assert!(cache.pages.contains_key(first_cache_key));
-    assert!(!cache.pages.contains_key(second_cache_key));
+    assert!(cache.receipts.contains(first_retention_key));
+    assert!(!cache.receipts.contains(second_retention_key));
     Ok(())
 }

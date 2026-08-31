@@ -42,7 +42,7 @@ mod normalize;
 mod state;
 
 use normalize::canonical_records;
-use state::PageCache;
+use state::PageRetentionBudget;
 pub use state::{BlsNormalizedPage, BlsSourceHealth};
 
 /// Exact, deterministic BLS source configuration bound into its dataset identity.
@@ -516,7 +516,8 @@ impl BlsSource {
             footnotes,
             provider_messages,
             page.response.response_time_millis(),
-            page.received_at,
+            page.response_received_at,
+            page.locally_available_at,
             response_bytes,
             response_content_digest,
             capture.content_digest(),
@@ -575,7 +576,7 @@ impl BlsSource {
         let mut discovered = Vec::with_capacity(self.config.plan().chunks().len());
         let mut capture_components = Vec::with_capacity(self.config.plan().chunks().len());
         let mut retained_pages = Vec::with_capacity(self.config.plan().chunks().len());
-        let mut retention_budget = PageCache::new();
+        let mut retention_budget = PageRetentionBudget::new();
         let source_generation_digest = activation.plan().plan_digest();
         for (index, chunk) in self.config.plan().chunks().iter().enumerate() {
             let page = self
@@ -587,7 +588,7 @@ impl BlsSource {
             let evidence = exact_evidence(&page.bytes);
             let object_id = SourceIdentifier::try_from(format!("bls:{index}:{}", page.sha256_hex))
                 .map_err(|_| SourceError::InvalidProtocolState)?;
-            let effective = EffectiveInterval::new(page.received_at, None)
+            let effective = EffectiveInterval::new(page.locally_available_at, None)
                 .map_err(|_| SourceError::InvalidProtocolState)?;
             let expected_bytes =
                 u64::try_from(page.bytes.len()).map_err(|_| SourceError::InvalidProtocolState)?;
@@ -600,26 +601,14 @@ impl BlsSource {
                 chunk,
             )?;
             let capture_material = self.capture_material_for_request(request_identity, &page)?;
-            let cache_key = page_cache_key(
+            let retention_key = page_retention_key(
                 &object_id,
                 request_identity,
                 capture_material.receipt().observation_digest(),
+                page.response_received_at,
                 source_generation_digest,
             )
             .map_err(|_| SourceError::InvalidProtocolState)?;
-            if !retention_budget.insert(
-                &cache_key,
-                &object_id,
-                request_identity,
-                capture_material.receipt().observation_digest(),
-                source_generation_digest,
-                &page,
-            )? {
-                return Err(SourceError::FrameTooLarge {
-                    max: market_squawk_sources::MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES as usize,
-                }
-                .into());
-            }
             let capture_identity =
                 SourceObjectCaptureIdentity::try_from_capture(capture_material.receipt())
                     .map_err(|_| SourceError::InvalidProtocolState)?;
@@ -635,12 +624,19 @@ impl BlsSource {
                 effective,
                 None,
                 AvailabilityEvidence::LocalFirstObserved {
-                    observed_at: page.received_at,
+                    observed_at: page.locally_available_at,
                 },
                 Some(expected_bytes),
             )?);
             capture_components.push(capture_material);
-            retained_pages.push(page);
+            let retained_page = page.into_retained();
+            if !retention_budget.insert(&retention_key, &object_id, &retained_page)? {
+                return Err(SourceError::FrameTooLarge {
+                    max: market_squawk_sources::MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES as usize,
+                }
+                .into());
+            }
+            retained_pages.push(retained_page);
         }
         if cancellation.is_cancelled() {
             return Err(ExtractionSourceError::Cancelled);
@@ -749,13 +745,15 @@ impl BlsSource {
         let page = RetrievedBlsPage {
             bytes,
             response,
-            received_at: retained_page.received_at,
+            response_received_at: retained_page.response_received_at,
+            locally_available_at: retained_page.locally_available_at,
             sha256_hex: retained_page.sha256_hex.clone(),
         };
         if page.response.is_partial()
             || page.sha256_hex != object_digest
             || !payload_matches_exact_evidence(&page.bytes, request.object().evidence())
-            || page.received_at != discovery_admission.response_received_at()
+            || page.response_received_at != discovery_admission.response_received_at()
+            || page.locally_available_at != discovery_admission.locally_available_at()
         {
             return Err(SourceError::GenerationResynchronizationRequired.into());
         }
@@ -771,7 +769,7 @@ impl BlsSource {
             &page.response,
             &page.bytes,
             observed_at,
-            page.received_at,
+            page.locally_available_at,
             ingested_at,
         )
         .map_err(|_| SourceError::InvalidProtocolState)?;
@@ -803,8 +801,8 @@ impl BlsSource {
         self.apply_test_publication_action()?;
         authority.validate_current()?;
         Ok(BlsNormalizedPage {
-            received_at: observed_at,
-            response_received_at: page.received_at,
+            locally_available_at: observed_at,
+            response_received_at: page.response_received_at,
             source_payload_sha256: page.sha256_hex,
             exact_payload: page.bytes,
             payloads,
@@ -841,7 +839,7 @@ impl BlsSource {
             )
             .await?;
         let BlsNormalizedPage {
-            received_at,
+            locally_available_at,
             response_received_at,
             response,
             canonical_ingested_at,
@@ -871,8 +869,8 @@ impl BlsSource {
             &self.config,
             &response,
             &batch,
-            received_at,
             response_received_at,
+            locally_available_at,
             canonical_ingested_at,
         )
         .map_err(|_| SourceError::InvalidProtocolState)?;
@@ -910,7 +908,7 @@ impl BlsSource {
             200,
             body_bytes,
             body_digest,
-            page.received_at,
+            page.locally_available_at,
         )
         .map_err(|_| SourceError::InvalidProtocolState)?;
         let receipt = ProviderCaptureSetReceipt::try_new(
@@ -935,7 +933,7 @@ impl BlsSource {
             connection_id,
             Some(0),
             None,
-            DateTime::<Utc>::from_timestamp_nanos(page.received_at.unix_nanos()),
+            DateTime::<Utc>::from_timestamp_nanos(page.locally_available_at.unix_nanos()),
             page.bytes.clone(),
         )
         .map_err(|_| SourceError::InvalidProtocolState)?;
@@ -998,7 +996,7 @@ impl BlsSource {
             .map_err(|_| SourceError::InvalidProtocolState)?;
         match result {
             Ok(page) => {
-                health.last_success_at = Some(page.received_at);
+                health.last_success_at = Some(page.locally_available_at);
                 health.last_payload_digest = Some(Sha256::digest(&page.bytes).into());
                 health.consecutive_failures = 0;
             }
@@ -1244,7 +1242,7 @@ fn validate_discovery_output(
             || page.request_page_token_digest().is_some()
             || page.response_next_page_token_digest().is_some()
             || page.http_status() != 200
-            || retained_page.received_at != page.received_at()
+            || retained_page.locally_available_at != page.received_at()
             || retained_page.sha256_hex != object_digest
             || u64::try_from(retained_page.bytes.len()).ok() != Some(page.body_bytes())
             || !payload_matches_exact_evidence(&retained_page.bytes, object.evidence())
@@ -1331,27 +1329,26 @@ fn hash_capture_digest(hash: &mut Sha256, value: EvidenceDigest) {
     hash.update(value.bytes());
 }
 
-fn page_cache_key(
+fn page_retention_key(
     object_id: &SourceIdentifier,
     request_identity: EvidenceDigest,
     observation_digest: EvidenceDigest,
+    response_received_at: Timestamp,
     source_generation_digest: EvidenceDigest,
 ) -> Result<String, BlsSourceError> {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/bls-receipt-cache-key/v1\0");
+    hash.update(b"market-squawk/bls-receipt-retention-key/v1\0");
     hash.update(
         u64::try_from(object_id.as_str().len())
             .map_err(|_| BlsSourceError::InvalidPublication)?
             .to_be_bytes(),
     );
     hash.update(object_id.as_str().as_bytes());
-    for digest in [
-        request_identity,
-        observation_digest,
-        source_generation_digest,
-    ] {
+    for digest in [request_identity, observation_digest] {
         hash_capture_digest(&mut hash, digest);
     }
+    hash.update(response_received_at.unix_nanos().to_be_bytes());
+    hash_capture_digest(&mut hash, source_generation_digest);
     Ok(format!("{:x}", hash.finalize()))
 }
 
@@ -1416,7 +1413,8 @@ impl BlsSourceConfig {
             BlsAccessTier::PublicV1 => b"public-v1".as_slice(),
             BlsAccessTier::RegisteredV2 => b"registered-v2".as_slice(),
         });
-        hash_config_credential_rejoin(&mut hash, authorization.credential_rejoin());
+        // A credential replacement changes activation authority, not the economic dataset. The
+        // protected generation remains bound separately by BlsActivationPlan and every capture.
         let chunk_count =
             u16::try_from(plan.chunks().len()).map_err(|_| BlsSourceError::InvalidConfiguration)?;
         hash.update(chunk_count.to_be_bytes());
@@ -1508,20 +1506,6 @@ fn hash_field(hash: &mut Sha256, value: &[u8]) -> Result<(), BlsSourceError> {
     hash.update(length.to_be_bytes());
     hash.update(value);
     Ok(())
-}
-
-fn hash_config_credential_rejoin(hash: &mut Sha256, value: crate::BlsCredentialRejoin) {
-    match value {
-        crate::BlsCredentialRejoin::PublicNoCredential => hash.update(b"public-no-credential"),
-        crate::BlsCredentialRejoin::RegisteredGeneration(generation) => {
-            hash.update(b"registered-generation");
-            hash.update(match generation.algorithm() {
-                DigestAlgorithm::Sha256 => b"sha256".as_slice(),
-                DigestAlgorithm::Blake3 => b"blake3".as_slice(),
-            });
-            hash.update(generation.bytes());
-        }
-    }
 }
 
 #[cfg(test)]

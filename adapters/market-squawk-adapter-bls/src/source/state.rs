@@ -1,37 +1,25 @@
 //! Bounded page retention and local BLS producer state.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::mem::size_of;
 
 use bytes::Bytes;
-use market_squawk_domain::{EvidenceDigest, SourceIdentifier, Timestamp};
+use market_squawk_domain::{SourceIdentifier, Timestamp};
 use market_squawk_sources::{MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, SourceError};
 
 use super::normalize::CanonicalBlsRecord;
-use crate::client::RetrievedBlsPage;
+use crate::client::{RetainedBlsPage, RetrievedBlsPage};
 
 const CACHE_ENTRY_OVERHEAD_BYTES: usize = 512;
 
 #[derive(Clone, Debug)]
-pub(super) struct PageCache {
+pub(super) struct PageRetentionBudget {
     pub(super) retained_bytes: u64,
-    pub(super) pages: BTreeMap<String, CachedBlsPage>,
-    payloads: BTreeMap<String, Bytes>,
+    pub(super) receipts: BTreeSet<String>,
     limit: u64,
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct CachedBlsPage {
-    pub(super) object_id: SourceIdentifier,
-    pub(super) request_identity: EvidenceDigest,
-    pub(super) observation_digest: EvidenceDigest,
-    pub(super) source_generation: EvidenceDigest,
-    pub(super) bytes: Bytes,
-    pub(super) received_at: Timestamp,
-    pub(super) sha256_hex: String,
-}
-
-impl PageCache {
+impl PageRetentionBudget {
     pub(super) fn new() -> Self {
         Self::with_limit(MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES)
     }
@@ -40,39 +28,23 @@ impl PageCache {
         Self {
             limit,
             retained_bytes: 0,
-            pages: BTreeMap::new(),
-            payloads: BTreeMap::new(),
+            receipts: BTreeSet::new(),
         }
     }
 
     pub(super) fn insert(
         &mut self,
-        cache_key: &str,
+        retention_key: &str,
         object_id: &SourceIdentifier,
-        request_identity: EvidenceDigest,
-        observation_digest: EvidenceDigest,
-        source_generation: EvidenceDigest,
-        page: &RetrievedBlsPage,
+        page: &RetainedBlsPage,
     ) -> Result<bool, SourceError> {
-        if let Some(existing) = self.pages.get(cache_key) {
-            return if existing.object_id == *object_id
-                && existing.request_identity == request_identity
-                && existing.observation_digest == observation_digest
-                && existing.source_generation == source_generation
-                && existing.received_at == page.received_at
-                && existing.sha256_hex == page.sha256_hex
-                && existing.bytes == page.bytes
-            {
-                Ok(true)
-            } else {
-                Err(SourceError::InvalidProtocolState)
-            };
-        }
-        let existing_payload = self.payloads.get(&page.sha256_hex);
-        if existing_payload.is_some_and(|payload| payload.as_ref() != page.bytes.as_ref()) {
+        if self.receipts.contains(retention_key) {
             return Err(SourceError::InvalidProtocolState);
         }
-        let bytes = Self::retained_charge(cache_key, object_id, page, existing_payload.is_none())?;
+        // Every provider response owns a separately received allocation until the corresponding
+        // sealed discovery admission consumes it. Equal payload digests do not prove shared
+        // allocation ownership, so repeated responses must each consume the retention budget.
+        let bytes = Self::retained_charge(retention_key, object_id, page)?;
         let next = self
             .retained_bytes
             .checked_add(bytes)
@@ -82,55 +54,34 @@ impl PageCache {
         if next > self.limit {
             return Ok(false);
         }
-        let payload = existing_payload
-            .cloned()
-            .unwrap_or_else(|| page.bytes.clone());
         self.retained_bytes = next;
-        self.payloads
-            .entry(page.sha256_hex.clone())
-            .or_insert_with(|| payload.clone());
-        self.pages.insert(
-            cache_key.to_owned(),
-            CachedBlsPage {
-                object_id: object_id.clone(),
-                request_identity,
-                observation_digest,
-                source_generation,
-                bytes: payload,
-                received_at: page.received_at,
-                sha256_hex: page.sha256_hex.clone(),
-            },
-        );
+        self.receipts.insert(retention_key.to_owned());
         Ok(true)
     }
 
     pub(super) fn retained_charge(
-        cache_key: &str,
+        retention_key: &str,
         object_id: &SourceIdentifier,
-        page: &RetrievedBlsPage,
-        new_payload: bool,
+        page: &RetainedBlsPage,
     ) -> Result<u64, SourceError> {
-        let occurrence = cache_key
+        let occurrence = retention_key
             .len()
             .checked_add(object_id.retained_bytes())
             .and_then(|bytes| bytes.checked_add(page.sha256_hex.len()))
-            .and_then(|bytes| bytes.checked_add(size_of::<CachedBlsPage>()))
+            .and_then(|bytes| bytes.checked_add(size_of::<RetainedBlsPage>()))
             .and_then(|bytes| bytes.checked_add(CACHE_ENTRY_OVERHEAD_BYTES))
             .ok_or(SourceError::FrameTooLarge {
                 max: MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES as usize,
             })?;
-        let payload = if new_payload {
-            page.bytes
-                .len()
-                .checked_add(page.sha256_hex.len())
-                .and_then(|bytes| bytes.checked_add(size_of::<Bytes>()))
-                .and_then(|bytes| bytes.checked_add(CACHE_ENTRY_OVERHEAD_BYTES))
-                .ok_or(SourceError::FrameTooLarge {
-                    max: MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES as usize,
-                })?
-        } else {
-            0
-        };
+        let payload = page
+            .bytes
+            .len()
+            .checked_add(page.sha256_hex.len())
+            .and_then(|bytes| bytes.checked_add(size_of::<Bytes>()))
+            .and_then(|bytes| bytes.checked_add(CACHE_ENTRY_OVERHEAD_BYTES))
+            .ok_or(SourceError::FrameTooLarge {
+                max: MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES as usize,
+            })?;
         let charge = occurrence
             .checked_add(payload)
             .ok_or(SourceError::FrameTooLarge {
@@ -147,7 +98,20 @@ impl std::fmt::Debug for RetrievedBlsPage {
         formatter
             .debug_struct("RetrievedBlsPage")
             .field("bytes", &self.bytes.len())
-            .field("received_at", &self.received_at)
+            .field("response_received_at", &self.response_received_at)
+            .field("locally_available_at", &self.locally_available_at)
+            .field("sha256_hex", &self.sha256_hex)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for RetainedBlsPage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedBlsPage")
+            .field("bytes", &self.bytes.len())
+            .field("response_received_at", &self.response_received_at)
+            .field("locally_available_at", &self.locally_available_at)
             .field("sha256_hex", &self.sha256_hex)
             .finish_non_exhaustive()
     }
@@ -156,7 +120,7 @@ impl std::fmt::Debug for RetrievedBlsPage {
 /// A normalized BLS response page retaining local availability and exact source evidence.
 #[derive(Debug)]
 pub struct BlsNormalizedPage {
-    pub(super) received_at: Timestamp,
+    pub(super) locally_available_at: Timestamp,
     pub(super) response_received_at: Timestamp,
     pub(super) source_payload_sha256: String,
     pub(super) exact_payload: Bytes,
@@ -167,15 +131,12 @@ pub struct BlsNormalizedPage {
 }
 
 impl BlsNormalizedPage {
-    /// Returns when this process first observed the exact source response.
-    pub const fn received_at(&self) -> Timestamp {
-        self.received_at
+    /// Returns when the exact bounded response became completely available locally.
+    pub const fn locally_available_at(&self) -> Timestamp {
+        self.locally_available_at
     }
 
-    /// Returns the socket-boundary time for the exact response bytes retained by this page.
-    ///
-    /// This equals the earlier physically sealed discovery response time; extraction never
-    /// replaces it with a later byte-identical refetch.
+    /// Returns when provider response headers first became available to the transport.
     pub const fn response_received_at(&self) -> Timestamp {
         self.response_received_at
     }
