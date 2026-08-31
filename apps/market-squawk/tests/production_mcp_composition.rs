@@ -2036,7 +2036,12 @@ fn assert_installed_macro_context(context: &Value) -> TestResult {
     assert_eq!(observations[9]["availability"], "missing");
     assert_eq!(observations[11]["indicatorId"], "us-unemployment-rate");
     assert_eq!(observations[11]["availability"], "unavailable");
-    let encoded = serde_json::to_string(context)?.to_ascii_lowercase();
+    assert_ordinary_investment_language(context, "economic context")?;
+    Ok(())
+}
+
+fn assert_ordinary_investment_language(value: &Value, label: &str) -> TestResult {
+    let encoded = serde_json::to_string(value)?.to_ascii_lowercase();
     for forbidden in [
         "federal reserve",
         "fred",
@@ -2046,10 +2051,17 @@ fn assert_installed_macro_context(context: &Value) -> TestResult {
         "source",
         "manifest",
         "digest",
+        "adapter",
+        "model",
+        "retry",
+        "readiness",
+        "implemented",
+        "deferred",
+        "fabricating",
     ] {
         assert!(
             !encoded.contains(forbidden),
-            "ordinary economic context exposed `{forbidden}`: {context}"
+            "ordinary {label} exposed `{forbidden}`: {value}"
         );
     }
     Ok(())
@@ -2111,6 +2123,18 @@ fn stable_installed_macro_context(context: &Value) -> Value {
         "selection": {
             "knowledgeCutoff": context["selection"]["knowledgeCutoff"],
             "effectiveDateCutoff": context["selection"]["effectiveDateCutoff"],
+            "complete": context["selection"]["complete"],
+        },
+        "confidence": context["confidence"],
+        "coverage": context["coverage"],
+        "observations": context["observations"],
+    })
+}
+
+fn stable_current_installed_macro_context(context: &Value) -> Value {
+    json!({
+        "availability": context["availability"],
+        "selection": {
             "complete": context["selection"]["complete"],
         },
         "confidence": context["confidence"],
@@ -3001,6 +3025,8 @@ async fn exercise_installed_relay_with_gate(
         .await
         .context("read installed relay initialize response")?;
     assert_eq!(initialized["result"]["protocolVersion"], "2026-07-28");
+    assert!(initialized["result"]["capabilities"]["tools"].is_object());
+    assert!(initialized["result"]["capabilities"]["resources"].is_object());
     write_message(
         &mut peer_writer,
         json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
@@ -3079,6 +3105,8 @@ async fn exercise_installed_relay_with_gate(
         let context = &response["result"]["structuredContent"]["data"];
         assert_installed_macro_context(context)?;
         assert_eq!(stable_installed_macro_context(context), expected.stable);
+        assert_installed_macro_context_resource(&mut peer_writer, &mut peer_reader, expected)
+            .await?;
     }
     if let Some(real_alpaca) = real_alpaca {
         write_message(
@@ -3116,11 +3144,73 @@ async fn exercise_installed_relay_with_gate(
     let resources = read_message(&mut peer_reader)
         .await
         .context("read installed relay resources-list response")?;
-    assert!(
-        resources["result"]["resources"]
-            .as_array()
-            .is_some_and(|resources| !resources.is_empty())
+    let resources = resources["result"]["resources"]
+        .as_array()
+        .context("installed relay resources/list omitted its resources")?;
+    let resource_uris = resources
+        .iter()
+        .map(|resource| {
+            resource["uri"]
+                .as_str()
+                .context("installed product resource omitted its URI")
+        })
+        .collect::<TestResult<Vec<_>>>()?;
+    assert_eq!(
+        resource_uris,
+        [
+            "market-squawk://market-overview",
+            "market-squawk://economic-context",
+            "market-squawk://forecasts",
+            "market-squawk://backtests",
+            "market-squawk://investment-analyses",
+        ]
     );
+    let economic_context = resources
+        .iter()
+        .find(|resource| resource["uri"] == "market-squawk://economic-context")
+        .context("installed product resources omitted economic context")?;
+    assert_eq!(economic_context["name"], "economic-context");
+    assert_eq!(economic_context["title"], "Economic context");
+    assert_eq!(economic_context["mimeType"], "application/json");
+    for resource in resources {
+        assert_ordinary_investment_language(resource, "product resource")?;
+    }
+    write_message(
+        &mut peer_writer,
+        json!({
+            "jsonrpc":"2.0","id":"installed-resource-templates",
+            "method":"resources/templates/list"
+        }),
+    )
+    .await
+    .context("write installed relay resource-templates request")?;
+    let templates = read_message(&mut peer_reader)
+        .await
+        .context("read installed relay resource-templates response")?;
+    let templates = templates["result"]["resourceTemplates"]
+        .as_array()
+        .context("installed relay resource templates were not an array")?;
+    let template_uris = templates
+        .iter()
+        .map(|template| {
+            template["uriTemplate"]
+                .as_str()
+                .context("installed product resource template omitted its URI")
+        })
+        .collect::<TestResult<Vec<_>>>()?;
+    assert_eq!(
+        template_uris,
+        [
+            "market-squawk://forecasts/{forecast_token}",
+            "market-squawk://forecasts/{forecast_token}/outcomes",
+            "market-squawk://backtests/{backtest_token}",
+            "market-squawk://investment-analyses/{action_token}",
+            "market-squawk://investment-analyses/{action_token}/track-record",
+        ]
+    );
+    for template in templates {
+        assert_ordinary_investment_language(template, "product resource template")?;
+    }
     peer_writer
         .shutdown()
         .await
@@ -3129,6 +3219,77 @@ async fn exercise_installed_relay_with_gate(
         .await
         .context("join installed stdio relay task")?
         .context("serve installed stdio relay protocol")?;
+    Ok(())
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+async fn assert_installed_macro_context_resource<W, R>(
+    writer: &mut W,
+    reader: &mut BufReader<R>,
+    expected: &InstalledMacroContextEvidence,
+) -> TestResult
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    write_message(
+        writer,
+        json!({
+            "jsonrpc":"2.0","id":"installed-economic-context-resource",
+            "method":"resources/read",
+            "params":{"uri":"market-squawk://economic-context"}
+        }),
+    )
+    .await
+    .context("write installed economic-context resource request")?;
+    let response = read_message(reader)
+        .await
+        .context("read installed economic-context resource response")?;
+    let contents = response["result"]["contents"]
+        .as_array()
+        .context("installed economic-context resource omitted its contents")?;
+    assert_eq!(contents.len(), 1);
+    let content = &contents[0];
+    assert_eq!(content["uri"], "market-squawk://economic-context");
+    assert_eq!(content["mimeType"], "application/json");
+    let text =
+        required_nonempty_string(&content["text"], "installed economic-context resource text")?;
+    assert!(text.len() <= 64 * 1024);
+    let document: Value = serde_json::from_str(&text)
+        .context("decode installed economic-context resource document")?;
+    assert_eq!(serde_json::to_string(&document)?, text);
+    let fields = document
+        .as_object()
+        .context("installed economic-context resource was not a product document")?;
+    assert_eq!(fields.len(), 2);
+    assert!(fields.contains_key("data"));
+    assert!(fields.contains_key("metadata"));
+    assert_eq!(
+        document["metadata"],
+        json!({
+            "completeness": "complete",
+            "returnedItems": 12,
+            "availableItems": 12,
+        })
+    );
+    assert_installed_macro_context(&document["data"])?;
+    assert_ordinary_investment_language(&document, "economic-context resource")?;
+    let normalized = json!({
+        "data": stable_current_installed_macro_context(&document["data"]),
+        "metadata": document["metadata"],
+    });
+    let expected = json!({
+        "data": stable_current_installed_macro_context(&expected.stable),
+        "metadata": {
+            "completeness": "complete",
+            "returnedItems": 12,
+            "availableItems": 12,
+        },
+    });
+    assert_eq!(
+        serde_json::to_vec(&normalized)?,
+        serde_json::to_vec(&expected)?
+    );
     Ok(())
 }
 
