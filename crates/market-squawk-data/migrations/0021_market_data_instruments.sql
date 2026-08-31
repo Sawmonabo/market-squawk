@@ -97,12 +97,29 @@ CREATE TABLE market_data_instrument_search_terms (
     display_term TEXT NOT NULL CHECK (
         length(CAST(display_term AS BLOB)) BETWEEN 1 AND 512
     ),
+    source_id TEXT CHECK (
+        source_id IS NULL
+        OR length(CAST(source_id AS BLOB)) BETWEEN 1 AND 128
+    ),
+    effective_start_ns INTEGER NOT NULL,
+    effective_end_ns INTEGER,
     PRIMARY KEY (revision_digest, term_kind, term_ordinal),
-    UNIQUE (revision_digest, term_kind, normalized_term, display_term)
+    UNIQUE (
+        revision_digest, term_kind, normalized_term, display_term,
+        source_id, effective_start_ns, effective_end_ns
+    ),
+    CHECK (effective_end_ns IS NULL OR effective_end_ns > effective_start_ns),
+    CHECK (
+        (term_kind = 'provider_symbol' AND source_id IS NOT NULL)
+        OR (term_kind <> 'provider_symbol' AND source_id IS NULL)
+    )
 ) STRICT, WITHOUT ROWID;
 
 CREATE INDEX market_data_instrument_search_lookup
-ON market_data_instrument_search_terms(normalized_term, term_kind, display_term);
+ON market_data_instrument_search_terms(
+    normalized_term, term_kind, source_id,
+    effective_start_ns, effective_end_ns, display_term
+);
 
 CREATE TRIGGER market_data_instrument_revisions_contiguous_insert
 BEFORE INSERT ON market_data_instrument_revisions

@@ -19,7 +19,8 @@ use market_squawk_data::{
     MarketDataInstrumentMatchKind, MarketDataInstrumentPopulationDisposition,
     MarketDataInstrumentPopulationExclusionReason, MarketDataInstrumentPopulationQuery,
     MarketDataInstrumentReadCapability, MarketDataInstrumentSynchronization,
-    MarketDataInstrumentSynchronizationCapability, ObjectStoreConfig, OnboardingAppendOutcome,
+    MarketDataInstrumentSynchronizationCapability, MarketDataProviderIdentityQuery,
+    MarketDataProviderIdentityResolutionOutcome, ObjectStoreConfig, OnboardingAppendOutcome,
     OnboardingReservationRequest, RightsBasis, RightsDecisionInput, RightsError,
     SecFundamentalIdentityAvailability, SecFundamentalIdentityQuery, SourceCursor, SourceOperation,
 };
@@ -1238,13 +1239,58 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
         unique_before_competitor.effective_at(),
         Some(Timestamp::from_unix_nanos(10))
     );
+    let provider_identity_query = MarketDataProviderIdentityQuery::try_new(
+        SourceId::try_from("nasdaq-symbol-directory")?,
+        ProviderInstrumentId::try_from("AAPL.US")?,
+        retained.published_at(),
+        Timestamp::from_unix_nanos(10),
+    )?;
+    let exact_provider_identity = reader.resolve_provider_identity_as_of(
+        provider_identity_query.clone(),
+        deadline(),
+        &cancellation,
+    )?;
+    let MarketDataProviderIdentityResolutionOutcome::Exact(exact_provider_receipt) =
+        exact_provider_identity.outcome()
+    else {
+        return Err("expected exact provider identity".into());
+    };
+    assert_eq!(exact_provider_receipt.instrument_id(), instrument_id);
+    assert_eq!(
+        exact_provider_receipt.definition_revision_digest(),
+        retained.revision_digest()
+    );
+    assert_eq!(
+        exact_provider_receipt.definition_published_at(),
+        retained.published_at()
+    );
+    assert_eq!(
+        exact_provider_receipt.provider_identity_payload_digest(),
+        digest(34)
+    );
+    assert!(exact_provider_receipt.matching_venues().is_empty());
+    assert_ne!(exact_provider_identity.receipt_digest().bytes(), [0; 32]);
+    let missing_provider_identity = reader.resolve_provider_identity_as_of(
+        MarketDataProviderIdentityQuery::try_new(
+            SourceId::try_from("nasdaq-symbol-directory")?,
+            ProviderInstrumentId::try_from("MISSING")?,
+            retained.published_at(),
+            Timestamp::from_unix_nanos(10),
+        )?,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(
+        missing_provider_identity.outcome(),
+        &MarketDataProviderIdentityResolutionOutcome::Missing
+    );
 
     let competing_definition = market_data_definition(
         other_id,
         10,
-        None,
+        Some(20),
         "Apple Depositary Interest",
-        "AAPL.OTHER",
+        "AAPL.US",
         51,
     )?;
     let competing_publication = publisher.synchronize(
@@ -1278,6 +1324,20 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
             .map(|candidate| candidate.record().definition().instrument_id())
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([instrument_id, other_id])
+    );
+    let ambiguous_provider_identity = reader.resolve_provider_identity_as_of(
+        MarketDataProviderIdentityQuery::try_new(
+            SourceId::try_from("nasdaq-symbol-directory")?,
+            ProviderInstrumentId::try_from("AAPL.US")?,
+            competing_record.published_at(),
+            Timestamp::from_unix_nanos(10),
+        )?,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(
+        ambiguous_provider_identity.outcome(),
+        &MarketDataProviderIdentityResolutionOutcome::Ambiguous
     );
     let canonical_population = MarketDataInstrumentPopulationQuery::try_new(
         vec![other_id, instrument_id],
@@ -1412,14 +1472,24 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
     let successor_effective_start =
         shift_timestamp(relationship.record().published_at(), 86_400_000_000_000)?;
     let successor_effective_end = shift_timestamp(successor_effective_start, 86_400_000_000_000)?;
+    let expired_alias_end = shift_timestamp(successor_effective_start, 1)?;
     std::thread::sleep(Duration::from_millis(1));
-    let successor = market_data_definition(
+    let successor = market_data_definition_with_provider_identities(
         instrument_id,
         successor_effective_start.unix_nanos(),
         Some(successor_effective_end.unix_nanos()),
         "Apple Inc.",
-        "AAPL.NEW",
         33,
+        &[
+            (
+                "AAPL.AAA",
+                EffectiveInterval::new(successor_effective_start, Some(expired_alias_end))?,
+            ),
+            (
+                "AAPL.NEW",
+                EffectiveInterval::new(successor_effective_start, Some(successor_effective_end))?,
+            ),
+        ],
     )?;
     let advanced = publisher.synchronize(
         MarketDataInstrumentSynchronization::try_new(vec![successor], 1)?,
@@ -1432,6 +1502,17 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
         .ok_or(CatalogError::InvalidRecord)?;
     assert!(future_parent.published_at() > retained.published_at());
     assert!(future_parent.published_at() < successor_effective_start);
+    let valid_lower_rank_at = shift_timestamp(expired_alias_end, 1)?;
+    let valid_lower_rank = reader.search_as_of(
+        "AAPL.",
+        future_parent.published_at(),
+        valid_lower_rank_at,
+        4,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(valid_lower_rank.matches().len(), 1);
+    assert_eq!(valid_lower_rank.matches()[0].matched_value(), "AAPL.NEW");
     let before_successor_query = MarketDataInstrumentPopulationQuery::try_new(
         vec![instrument_id],
         retained.published_at(),
@@ -1741,6 +1822,30 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
         )?,
         current_provider_alias
     );
+    assert_eq!(
+        reader.verify_provider_identity_restart(
+            &exact_provider_identity,
+            deadline(),
+            &cancellation,
+        )?,
+        exact_provider_identity
+    );
+    assert_eq!(
+        reader.verify_provider_identity_restart(
+            &missing_provider_identity,
+            deadline(),
+            &cancellation,
+        )?,
+        missing_provider_identity
+    );
+    assert_eq!(
+        reader.verify_provider_identity_restart(
+            &ambiguous_provider_identity,
+            deadline(),
+            &cancellation,
+        )?,
+        ambiguous_provider_identity
+    );
     Ok(())
 }
 
@@ -1751,6 +1856,28 @@ fn market_data_definition(
     display_name: &str,
     provider_symbol: &str,
     evidence_byte: u8,
+) -> TestResult<MarketDataInstrumentDefinition> {
+    let effective = EffectiveInterval::new(
+        Timestamp::from_unix_nanos(effective_start),
+        effective_end.map(Timestamp::from_unix_nanos),
+    )?;
+    market_data_definition_with_provider_identities(
+        instrument_id,
+        effective_start,
+        effective_end,
+        display_name,
+        evidence_byte,
+        &[(provider_symbol, effective)],
+    )
+}
+
+fn market_data_definition_with_provider_identities(
+    instrument_id: InstrumentId,
+    effective_start: i64,
+    effective_end: Option<i64>,
+    display_name: &str,
+    evidence_byte: u8,
+    provider_identities: &[(&str, EffectiveInterval)],
 ) -> TestResult<MarketDataInstrumentDefinition> {
     let effective = EffectiveInterval::new(
         Timestamp::from_unix_nanos(effective_start),
@@ -1789,21 +1916,28 @@ fn market_data_definition(
                 VenueId::try_from("XNAS")?,
                 VenueSymbol::try_from("AAPL")?,
             )],
-            provider_identities: vec![ProviderIdentityRecord::new(ProviderIdentityRecordInput {
-                instrument_id,
-                source_id: SourceId::try_from("nasdaq-symbol-directory")?,
-                provider_instrument_id: ProviderInstrumentId::try_from(provider_symbol)?,
-                evidence: ProviderIdentityEvidence::from_content_digest(digest(
-                    evidence_byte.saturating_add(3),
-                )),
-                source_timestamp: Some(Timestamp::from_unix_nanos(effective_start)),
-                observed_at: Timestamp::from_unix_nanos(effective_start + 1),
-                metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(format!(
-                    "provider-{evidence_byte}"
-                ))?),
-                validity: effective,
-                supersedes: None,
-            })],
+            provider_identities: provider_identities
+                .iter()
+                .enumerate()
+                .map(|(index, (provider_symbol, validity))| {
+                    let index_byte = u8::try_from(index)?;
+                    Ok(ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+                        instrument_id,
+                        source_id: SourceId::try_from("nasdaq-symbol-directory")?,
+                        provider_instrument_id: ProviderInstrumentId::try_from(*provider_symbol)?,
+                        evidence: ProviderIdentityEvidence::from_content_digest(digest(
+                            evidence_byte.saturating_add(3).saturating_add(index_byte),
+                        )),
+                        source_timestamp: Some(validity.starts_at()),
+                        observed_at: shift_timestamp(validity.starts_at(), 1)?,
+                        metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+                            format!("provider-{evidence_byte}-{index}"),
+                        )?),
+                        validity: *validity,
+                        supersedes: None,
+                    }))
+                })
+                .collect::<TestResult<Vec<_>>>()?,
             identifiers: vec![ExternalIdentifierRecord::new(
                 ExternalIdentifierRecordInput {
                     identifier: ExternalIdentifier::Cusip(Cusip::try_from("037833100")?),

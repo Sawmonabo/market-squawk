@@ -117,7 +117,11 @@ pub use ingest::{
 };
 pub(crate) use instrument_context::{
     InstrumentContext, InstrumentContextOutcome, InstrumentContextReadCapability,
-    InstrumentContextRequest,
+    InstrumentContextReadError, InstrumentContextRequest, InstrumentIdentityReadCapability,
+    InstrumentIdentityResolutionOutcome, InstrumentIdentityResolutionRead,
+    InstrumentIdentityResolutionRequest, InstrumentOfficialLifecycleEvidence,
+    InstrumentSearchCandidate, InstrumentSearchListing, InstrumentSearchMatchReason,
+    InstrumentSearchRead, InstrumentSearchRequest,
 };
 pub(crate) use macro_context::{
     MACRO_GET_CONTEXT, MacroContextOperation, MacroContextReadCapability,
@@ -346,9 +350,11 @@ impl ResearchApplicationServices {
             treasury_daily_latest_known.clone(),
         );
         let company_research = CompanyResearchReadCapability::new(Arc::clone(&service));
+        let instrument_identity =
+            InstrumentIdentityReadCapability::new(service.market_data_instruments());
         let product_identity = listing_reference.as_ref().cloned().map(|listings| {
             Arc::new(InstrumentContextReadCapability::new(
-                service.market_data_instruments(),
+                instrument_identity.clone(),
                 listings,
             ))
         });
@@ -371,6 +377,7 @@ impl ResearchApplicationServices {
                 ingest,
                 artifacts,
                 listing_reference,
+                instrument_identity,
                 company_research,
                 product_research,
                 fred_latest_known,
@@ -420,10 +427,15 @@ impl ResearchApplicationServices {
             .cloned()
             .map(|listings| {
                 InstrumentContextReadCapability::new(
-                    self.controller.authority.market_data_instruments(),
+                    self.controller.instrument_identity.clone(),
                     listings,
                 )
             })
+    }
+
+    /// Returns provider-neutral point-in-time identity search independently of directory setup.
+    pub(crate) fn instrument_identity_read_capability(&self) -> InstrumentIdentityReadCapability {
+        self.controller.instrument_identity.clone()
     }
 
     /// Returns canonical company and fund research reads over the rich local store.
@@ -720,6 +732,7 @@ struct ResearchController {
     ingest: Arc<dyn ResearchIngestCoordinator>,
     artifacts: Option<Arc<dyn ArtifactRepository>>,
     listing_reference: Option<ListingReferenceReadCapability>,
+    instrument_identity: InstrumentIdentityReadCapability,
     company_research: CompanyResearchReadCapability,
     product_research: ResearchProductReadCapability,
     fred_latest_known: FredLatestKnownOperation,

@@ -33,137 +33,28 @@ const MAX_RETAINED_AMBIGUOUS_LISTINGS: usize = 2;
 /// Product searches stay small even though the catalog admits a larger diagnostic bound.
 const MAX_INSTRUMENT_SEARCH_ROWS: usize = 32;
 
-/// Closed point-in-time request for one canonical investment identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct InstrumentContextRequest {
-    instrument_id: InstrumentId,
-    knowledge_at: Timestamp,
-    effective_at: Timestamp,
-}
-
-impl InstrumentContextRequest {
-    /// Constructs an identity-only request with independent knowledge and economic clocks.
-    pub(crate) fn try_new(
-        instrument_id: InstrumentId,
-        knowledge_at: Timestamp,
-        effective_at: Timestamp,
-    ) -> Result<Self, InstrumentContextReadError> {
-        if effective_at > knowledge_at {
-            return Err(InstrumentContextReadError::InvalidRequest);
-        }
-        Ok(Self {
-            instrument_id,
-            knowledge_at,
-            effective_at,
-        })
-    }
-
-    pub(crate) const fn instrument_id(self) -> InstrumentId {
-        self.instrument_id
-    }
-
-    pub(crate) const fn knowledge_at(self) -> Timestamp {
-        self.knowledge_at
-    }
-
-    pub(crate) const fn effective_at(self) -> Timestamp {
-        self.effective_at
-    }
-}
-
-/// Read-only composition of canonical identity and official-directory authorities.
-pub(crate) struct InstrumentContextReadCapability {
+/// Provider-neutral, read-only identity discovery composed independently of listing presentation.
+///
+/// Provider routing and catalog evidence remain private. This is the internal application seam
+/// that Desktop, CLI, and MCP operation registration can consume later without importing an
+/// adapter or a provider-specific DTO.
+#[derive(Clone)]
+pub(crate) struct InstrumentIdentityReadCapability {
     instruments: MarketDataInstrumentReadCapability,
-    listings: ListingReferenceReadCapability,
 }
 
-impl fmt::Debug for InstrumentContextReadCapability {
+impl fmt::Debug for InstrumentIdentityReadCapability {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("InstrumentContextReadCapability")
+            .debug_struct("InstrumentIdentityReadCapability")
             .field("instruments", &"[CANONICAL INSTRUMENT READ AUTHORITY]")
-            .field("listings", &"[OFFICIAL DIRECTORY READ AUTHORITY]")
             .finish()
     }
 }
 
-impl InstrumentContextReadCapability {
-    pub(crate) const fn new(
-        instruments: MarketDataInstrumentReadCapability,
-        listings: ListingReferenceReadCapability,
-    ) -> Self {
-        Self {
-            instruments,
-            listings,
-        }
-    }
-
-    /// Resolves one canonical instrument without ticker/name inference or current-time fallback.
-    pub(crate) fn read(
-        &self,
-        request: InstrumentContextRequest,
-        deadline: Instant,
-        cancellation: &CancellationToken,
-    ) -> Result<InstrumentContextRead, InstrumentContextReadError> {
-        check_operation(deadline, cancellation)?;
-        let mut instrument_ids = Vec::new();
-        instrument_ids
-            .try_reserve_exact(1)
-            .map_err(|_| InstrumentContextReadError::ResourceExhausted)?;
-        instrument_ids.push(request.instrument_id);
-        let query = MarketDataInstrumentPopulationQuery::try_new(
-            instrument_ids,
-            request.knowledge_at,
-            request.effective_at,
-        )
-        .map_err(map_instrument_error)?;
-        let definition_selection = self
-            .instruments
-            .pin_population_as_of(query, deadline, cancellation)
-            .map_err(map_instrument_error)?;
-        if definition_selection.disposition()
-            == MarketDataInstrumentPopulationDisposition::Unavailable
-        {
-            return Ok(InstrumentContextRead::new(
-                request,
-                InstrumentContextOutcome::Missing(
-                    InstrumentContextMissingReason::CanonicalDefinition,
-                ),
-                InstrumentContextEvidence::new(definition_selection)?,
-            ));
-        }
-        let [definition_record] = definition_selection.records() else {
-            return Err(InstrumentContextReadError::EvidenceConflict);
-        };
-        let definition = definition_record.definition().clone();
-        if definition.instrument_id() != request.instrument_id
-            || !interval_contains(definition.effective_interval(), request.effective_at)
-            || definition_record.published_at() > request.knowledge_at
-        {
-            return Err(InstrumentContextReadError::EvidenceConflict);
-        }
-
-        self.read_official_listing(
-            request,
-            definition_selection,
-            &definition,
-            deadline,
-            cancellation,
-        )
-    }
-
-    /// Repeats the complete as-of join and rejects any product or private-evidence drift.
-    pub(crate) fn verify_restart(
-        &self,
-        expected: &InstrumentContextRead,
-        deadline: Instant,
-        cancellation: &CancellationToken,
-    ) -> Result<InstrumentContextRead, InstrumentContextReadError> {
-        let replay = self.read(expected.request, deadline, cancellation)?;
-        if replay != *expected {
-            return Err(InstrumentContextReadError::RestartConflict);
-        }
-        Ok(replay)
+impl InstrumentIdentityReadCapability {
+    pub(crate) const fn new(instruments: MarketDataInstrumentReadCapability) -> Self {
+        Self { instruments }
     }
 
     /// Returns provider-neutral candidates at fixed knowledge and effective clocks.
@@ -234,6 +125,138 @@ impl InstrumentContextReadCapability {
         cancellation: &CancellationToken,
     ) -> Result<InstrumentIdentityResolutionRead, InstrumentContextReadError> {
         let replay = self.resolve_exact(expected.request(), deadline, cancellation)?;
+        if replay != *expected {
+            return Err(InstrumentContextReadError::RestartConflict);
+        }
+        Ok(replay)
+    }
+}
+
+/// Closed point-in-time request for one canonical investment identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InstrumentContextRequest {
+    instrument_id: InstrumentId,
+    knowledge_at: Timestamp,
+    effective_at: Timestamp,
+}
+
+impl InstrumentContextRequest {
+    /// Constructs an identity-only request with independent knowledge and economic clocks.
+    pub(crate) fn try_new(
+        instrument_id: InstrumentId,
+        knowledge_at: Timestamp,
+        effective_at: Timestamp,
+    ) -> Result<Self, InstrumentContextReadError> {
+        if effective_at > knowledge_at {
+            return Err(InstrumentContextReadError::InvalidRequest);
+        }
+        Ok(Self {
+            instrument_id,
+            knowledge_at,
+            effective_at,
+        })
+    }
+
+    pub(crate) const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    pub(crate) const fn knowledge_at(self) -> Timestamp {
+        self.knowledge_at
+    }
+
+    pub(crate) const fn effective_at(self) -> Timestamp {
+        self.effective_at
+    }
+}
+
+/// Read-only composition of canonical identity and official-directory authorities.
+pub(crate) struct InstrumentContextReadCapability {
+    identity: InstrumentIdentityReadCapability,
+    listings: ListingReferenceReadCapability,
+}
+
+impl fmt::Debug for InstrumentContextReadCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstrumentContextReadCapability")
+            .field("identity", &self.identity)
+            .field("listings", &"[OFFICIAL DIRECTORY READ AUTHORITY]")
+            .finish()
+    }
+}
+
+impl InstrumentContextReadCapability {
+    pub(crate) const fn new(
+        identity: InstrumentIdentityReadCapability,
+        listings: ListingReferenceReadCapability,
+    ) -> Self {
+        Self { identity, listings }
+    }
+
+    /// Resolves one canonical instrument without ticker/name inference or current-time fallback.
+    pub(crate) fn read(
+        &self,
+        request: InstrumentContextRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<InstrumentContextRead, InstrumentContextReadError> {
+        check_operation(deadline, cancellation)?;
+        let mut instrument_ids = Vec::new();
+        instrument_ids
+            .try_reserve_exact(1)
+            .map_err(|_| InstrumentContextReadError::ResourceExhausted)?;
+        instrument_ids.push(request.instrument_id);
+        let query = MarketDataInstrumentPopulationQuery::try_new(
+            instrument_ids,
+            request.knowledge_at,
+            request.effective_at,
+        )
+        .map_err(map_instrument_error)?;
+        let definition_selection = self
+            .identity
+            .instruments
+            .pin_population_as_of(query, deadline, cancellation)
+            .map_err(map_instrument_error)?;
+        if definition_selection.disposition()
+            == MarketDataInstrumentPopulationDisposition::Unavailable
+        {
+            return Ok(InstrumentContextRead::new(
+                request,
+                InstrumentContextOutcome::Missing(
+                    InstrumentContextMissingReason::CanonicalDefinition,
+                ),
+                InstrumentContextEvidence::new(definition_selection)?,
+            ));
+        }
+        let [definition_record] = definition_selection.records() else {
+            return Err(InstrumentContextReadError::EvidenceConflict);
+        };
+        let definition = definition_record.definition().clone();
+        if definition.instrument_id() != request.instrument_id
+            || !interval_contains(definition.effective_interval(), request.effective_at)
+            || definition_record.published_at() > request.knowledge_at
+        {
+            return Err(InstrumentContextReadError::EvidenceConflict);
+        }
+
+        self.read_official_listing(
+            request,
+            definition_selection,
+            &definition,
+            deadline,
+            cancellation,
+        )
+    }
+
+    /// Repeats the complete as-of join and rejects any product or private-evidence drift.
+    pub(crate) fn verify_restart(
+        &self,
+        expected: &InstrumentContextRead,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<InstrumentContextRead, InstrumentContextReadError> {
+        let replay = self.read(expected.request, deadline, cancellation)?;
         if replay != *expected {
             return Err(InstrumentContextReadError::RestartConflict);
         }

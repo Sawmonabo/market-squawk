@@ -111,10 +111,11 @@ use crate::application::{
     Application, ApplicationCompositionError, ApplicationDomainService,
     CompanyResearchReadCapability, FairValueDomainService, FairValueInputAuthorityError,
     FairValueInputAuthorityLimits, FairValueProducerSelectionAuthority, FredLatestKnownOperation,
-    InstrumentContextReadCapability, LiveFairValueObservationBuffer,
-    LiveFairValueObservationBufferError, MacroContextReadCapability, MarketHistoryReadCapability,
-    MarketReferenceSearchAuthority, MarketRuntimeRegistry, OptionsContextReadCapability,
-    PaperApplicationServices, PaperRuntimeActivityAuthority, PortfolioCandidateResolutionFactory,
+    InstrumentContextReadCapability, InstrumentIdentityReadCapability,
+    LiveFairValueObservationBuffer, LiveFairValueObservationBufferError,
+    MacroContextReadCapability, MarketHistoryReadCapability, MarketReferenceSearchAuthority,
+    MarketRuntimeRegistry, OptionsContextReadCapability, PaperApplicationServices,
+    PaperRuntimeActivityAuthority, PortfolioCandidateResolutionFactory,
     PreparedSchwabMarketRuntimeResolver, PrepublishedResearchSourceRegistration,
     ProductionFairValueInputAuthority, ProductionResearchIngestCoordinator,
     ResearchApplicationServices, ResearchExtractionLimits, ResearchIngestCompositionError,
@@ -1277,6 +1278,11 @@ impl LocalProduct {
         &self,
     ) -> Option<InstrumentContextReadCapability> {
         self.research_services.instrument_context_read_capability()
+    }
+
+    /// Returns provider-neutral point-in-time identity discovery without provider/runtime access.
+    pub(crate) fn instrument_identity_read_capability(&self) -> InstrumentIdentityReadCapability {
+        self.research_services.instrument_identity_read_capability()
     }
 
     /// Returns canonical company and fund research over the rich local data store.

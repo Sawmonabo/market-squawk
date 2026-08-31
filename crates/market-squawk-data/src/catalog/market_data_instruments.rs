@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use market_squawk_domain::{
-    AssignmentVerification, DigestAlgorithm, EvidenceDigest, InstrumentId,
-    MarketDataInstrumentDefinition, Timestamp,
+    AssignmentVerification, DigestAlgorithm, EffectiveInterval, EvidenceDigest, InstrumentId,
+    MarketDataInstrumentDefinition, MetadataRevision, ProviderInstrumentId, SourceId, Timestamp,
+    VenueId,
 };
 use rusqlite::{OptionalExtension as _, Row, Transaction, params};
 use sha2::{Digest as _, Sha256};
@@ -31,6 +32,10 @@ const POPULATION_QUERY_DOMAIN: &[u8] =
     b"market-squawk/market-data-instrument-population-query/v1\0";
 const POPULATION_RECEIPT_DOMAIN: &[u8] =
     b"market-squawk/market-data-instrument-population-receipt/v1\0";
+const PROVIDER_IDENTITY_QUERY_DOMAIN: &[u8] =
+    b"market-squawk/provider-instrument-identity-query/v1\0";
+const PROVIDER_IDENTITY_RECEIPT_DOMAIN: &[u8] =
+    b"market-squawk/provider-instrument-identity-receipt/v1\0";
 
 /// Complete caller-declared synchronization batch.
 ///
@@ -263,6 +268,182 @@ impl MarketDataInstrumentPopulationSelection {
     }
 
     /// Returns the SHA-256 receipt binding query, disposition, records, and exclusions.
+    pub const fn receipt_digest(&self) -> EvidenceDigest {
+        self.receipt_digest
+    }
+}
+
+/// Exact source-qualified point-in-time request for one provider-native instrument identity.
+///
+/// This backend request is deliberately separate from ordinary text search. It cannot infer a
+/// provider, venue, ticker, or current-time fallback from a bare symbol.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketDataProviderIdentityQuery {
+    source_id: SourceId,
+    provider_instrument_id: ProviderInstrumentId,
+    knowledge_at: Timestamp,
+    effective_at: Timestamp,
+    query_digest: EvidenceDigest,
+}
+
+impl MarketDataProviderIdentityQuery {
+    /// Constructs one exact source-qualified request at independent knowledge/effective clocks.
+    pub fn try_new(
+        source_id: SourceId,
+        provider_instrument_id: ProviderInstrumentId,
+        knowledge_at: Timestamp,
+        effective_at: Timestamp,
+    ) -> Result<Self, MarketDataInstrumentCatalogError> {
+        if effective_at > knowledge_at {
+            return Err(MarketDataInstrumentCatalogError::InvalidInput);
+        }
+        let query_digest = provider_identity_query_digest(
+            &source_id,
+            &provider_instrument_id,
+            knowledge_at,
+            effective_at,
+        );
+        Ok(Self {
+            source_id,
+            provider_instrument_id,
+            knowledge_at,
+            effective_at,
+            query_digest,
+        })
+    }
+
+    /// Returns the exact provider namespace; it is never inferred from the provider symbol.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Returns the exact provider-native identity; ticker guessing is not admitted.
+    pub const fn provider_instrument_id(&self) -> &ProviderInstrumentId {
+        &self.provider_instrument_id
+    }
+
+    /// Returns the inclusive durable-knowledge cutoff.
+    pub const fn knowledge_at(&self) -> Timestamp {
+        self.knowledge_at
+    }
+
+    /// Returns the instant at which the definition and provider assertion must be effective.
+    pub const fn effective_at(&self) -> Timestamp {
+        self.effective_at
+    }
+
+    /// Returns the canonical identity of the complete source-qualified request.
+    pub const fn query_digest(&self) -> EvidenceDigest {
+        self.query_digest
+    }
+}
+
+/// Non-forgeable exact definition/provider-identity/currentness receipt.
+///
+/// Construction is private to the digest-verifying catalog read. The receipt binds the immutable
+/// definition revision, source assertion revision and digest, independent clocks, and any venue
+/// symbols whose exact value agrees with the provider identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketDataProviderIdentityExactReceipt {
+    instrument_id: InstrumentId,
+    definition_revision_digest: EvidenceDigest,
+    definition_revision_sequence: u32,
+    definition_reference_revision: MetadataRevision,
+    definition_reference_payload_digest: EvidenceDigest,
+    definition_published_at: Timestamp,
+    provider_identity_revision: MetadataRevision,
+    provider_identity_payload_digest: EvidenceDigest,
+    provider_identity_validity: EffectiveInterval,
+    matching_venues: Box<[VenueId]>,
+}
+
+impl MarketDataProviderIdentityExactReceipt {
+    /// Returns the exact canonical instrument established by the source-qualified assertion.
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable serialized-definition digest.
+    pub const fn definition_revision_digest(&self) -> EvidenceDigest {
+        self.definition_revision_digest
+    }
+
+    /// Returns the monotonic definition revision position.
+    pub const fn definition_revision_sequence(&self) -> u32 {
+        self.definition_revision_sequence
+    }
+
+    /// Returns the source-authored reference revision bound by the definition.
+    pub const fn definition_reference_revision(&self) -> &MetadataRevision {
+        &self.definition_reference_revision
+    }
+
+    /// Returns the exact payload digest supporting the reference definition.
+    pub const fn definition_reference_payload_digest(&self) -> EvidenceDigest {
+        self.definition_reference_payload_digest
+    }
+
+    /// Returns when the selected immutable definition became locally durable.
+    pub const fn definition_published_at(&self) -> Timestamp {
+        self.definition_published_at
+    }
+
+    /// Returns the exact source assertion revision.
+    pub const fn provider_identity_revision(&self) -> &MetadataRevision {
+        &self.provider_identity_revision
+    }
+
+    /// Returns the exact source assertion payload digest.
+    pub const fn provider_identity_payload_digest(&self) -> EvidenceDigest {
+        self.provider_identity_payload_digest
+    }
+
+    /// Returns the half-open validity interval of the selected source assertion.
+    pub const fn provider_identity_validity(&self) -> EffectiveInterval {
+        self.provider_identity_validity
+    }
+
+    /// Returns exact venue mappings whose symbol equals the provider-native identity.
+    ///
+    /// An empty set is valid for provider products such as crypto pairs that do not reuse a
+    /// listing-venue symbol. Every retained venue is still bounded by the selected definition's
+    /// own effective interval.
+    pub fn matching_venues(&self) -> &[VenueId] {
+        &self.matching_venues
+    }
+}
+
+/// Closed terminal state for a source-qualified provider identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MarketDataProviderIdentityResolutionOutcome {
+    /// No knowable and effective exact source assertion exists.
+    Missing,
+    /// Exactly one immutable definition contains the exact source assertion.
+    Exact(MarketDataProviderIdentityExactReceipt),
+    /// More than one immutable definition contains the exact source assertion; no winner exists.
+    Ambiguous,
+}
+
+/// Digest-bound result of one least-authority source-qualified provider identity read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketDataProviderIdentityResolution {
+    query: MarketDataProviderIdentityQuery,
+    outcome: MarketDataProviderIdentityResolutionOutcome,
+    receipt_digest: EvidenceDigest,
+}
+
+impl MarketDataProviderIdentityResolution {
+    /// Returns the complete immutable query.
+    pub const fn query(&self) -> &MarketDataProviderIdentityQuery {
+        &self.query
+    }
+
+    /// Returns exact, ambiguous, or missing without implicit selection.
+    pub const fn outcome(&self) -> &MarketDataProviderIdentityResolutionOutcome {
+        &self.outcome
+    }
+
+    /// Returns the canonical digest binding request, outcome, and retained exact evidence.
     pub const fn receipt_digest(&self) -> EvidenceDigest {
         self.receipt_digest
     }
@@ -522,6 +703,40 @@ impl MarketDataInstrumentReadCapability {
                 cancellation,
             )
     }
+
+    /// Resolves one exact provider-native identity inside its explicit source namespace.
+    ///
+    /// This backend seam never guesses from a ticker or an unqualified symbol. Exact selection is
+    /// returned only when one digest-verified definition contains one effective accepted provider
+    /// assertion at the requested clocks; every collision remains ambiguous.
+    pub fn resolve_provider_identity_as_of(
+        &self,
+        query: MarketDataProviderIdentityQuery,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataProviderIdentityResolution, MarketDataInstrumentCatalogError> {
+        check_operation(deadline, cancellation)?;
+        self.authority
+            .try_lock()
+            .map_err(|_| MarketDataInstrumentCatalogError::AuthorityUnavailable)?
+            .resolve_market_data_provider_identity(query, deadline, cancellation)
+    }
+
+    /// Replays a source-qualified provider identity read and rejects any evidence/currentness
+    /// drift after process restart.
+    pub fn verify_provider_identity_restart(
+        &self,
+        expected: &MarketDataProviderIdentityResolution,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataProviderIdentityResolution, MarketDataInstrumentCatalogError> {
+        let replay =
+            self.resolve_provider_identity_as_of(expected.query().clone(), deadline, cancellation)?;
+        if replay != *expected {
+            return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
+        }
+        Ok(replay)
+    }
 }
 
 fn validate_search(
@@ -608,6 +823,9 @@ struct SearchTerm {
     ordinal: usize,
     normalized: String,
     display: String,
+    source_id: Option<String>,
+    effective_start_ns: i64,
+    effective_end_ns: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -826,6 +1044,128 @@ impl CatalogAuthority {
                 disposition,
                 records: records.into_boxed_slice(),
                 exclusions: exclusions.into_boxed_slice(),
+                receipt_digest,
+            })
+        })();
+        clear_progress_handler(connection)?;
+        classify_operation(result, deadline, cancellation)
+    }
+
+    fn resolve_market_data_provider_identity(
+        &self,
+        query: MarketDataProviderIdentityQuery,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataProviderIdentityResolution, MarketDataInstrumentCatalogError> {
+        const MAX_RETAINED_EXACT_MATCHES: usize = 2;
+        check_operation(deadline, cancellation)?;
+        let connection = &self.catalog().connection;
+        install_progress_handler(connection, deadline, cancellation)?;
+        let result = (|| {
+            let retrieval_limit = i64::try_from(MAX_RETAINED_EXACT_MATCHES.saturating_add(1))
+                .map_err(|_| MarketDataInstrumentCatalogError::InvalidLimit)?;
+            let mut statement = connection.prepare(PROVIDER_IDENTITY_AS_OF_SQL)?;
+            let rows = statement.query_map(
+                params![
+                    query.source_id().as_str(),
+                    query.provider_instrument_id().as_str(),
+                    query.knowledge_at().unix_nanos(),
+                    query.effective_at().unix_nanos(),
+                    retrieval_limit,
+                ],
+                |row| {
+                    Ok((
+                        decode_stored_row(row)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                    ))
+                },
+            )?;
+            let mut budget = ResultBudget::new(self.catalog().result_bytes);
+            let mut receipts = Vec::new();
+            receipts
+                .try_reserve_exact(MAX_RETAINED_EXACT_MATCHES.saturating_add(1))
+                .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+            for row in rows {
+                check_operation(deadline, cancellation)?;
+                let (stored, term_start_ns, term_end_ns) = row?;
+                charge_row(&stored, &mut budget)?;
+                let record = rebuild_record(stored)?;
+                let definition = record.definition();
+                if record.published_at() > query.knowledge_at()
+                    || !interval_contains(definition.effective_interval(), query.effective_at())
+                {
+                    return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
+                }
+                let provider_identity = definition
+                    .provider_identity_at(
+                        query.source_id(),
+                        query.provider_instrument_id(),
+                        query.effective_at(),
+                    )
+                    .ok_or(MarketDataInstrumentCatalogError::CorruptCatalog)?;
+                if provider_identity.instrument_id() != definition.instrument_id()
+                    || provider_identity.source_id() != query.source_id()
+                    || provider_identity.provider_instrument_id() != query.provider_instrument_id()
+                    || provider_identity.validity().starts_at().unix_nanos() != term_start_ns
+                    || provider_identity
+                        .validity()
+                        .ends_at()
+                        .map(Timestamp::unix_nanos)
+                        != term_end_ns
+                {
+                    return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
+                }
+                let mut matching_venues = Vec::new();
+                matching_venues
+                    .try_reserve_exact(definition.venue_mappings().len())
+                    .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+                for mapping in definition.venue_mappings() {
+                    if mapping.venue_symbol().as_str() == query.provider_instrument_id().as_str() {
+                        budget
+                            .charge([size_of::<VenueId>(), mapping.venue_id().as_str().len()])
+                            .map_err(|_| {
+                                MarketDataInstrumentCatalogError::ResultByteLimitExceeded
+                            })?;
+                        matching_venues.push(mapping.venue_id().clone());
+                    }
+                }
+                budget
+                    .charge([size_of::<MarketDataProviderIdentityExactReceipt>()])
+                    .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+                receipts.push(MarketDataProviderIdentityExactReceipt {
+                    instrument_id: definition.instrument_id(),
+                    definition_revision_digest: record.revision_digest(),
+                    definition_revision_sequence: record.revision_sequence(),
+                    definition_reference_revision: definition.reference_revision().clone(),
+                    definition_reference_payload_digest: definition
+                        .reference_payload_evidence()
+                        .content_digest(),
+                    definition_published_at: record.published_at(),
+                    provider_identity_revision: provider_identity.metadata_revision().clone(),
+                    provider_identity_payload_digest: provider_identity.evidence().content_digest(),
+                    provider_identity_validity: provider_identity.validity(),
+                    matching_venues: matching_venues.into_boxed_slice(),
+                });
+            }
+            let has_more = receipts.len() > MAX_RETAINED_EXACT_MATCHES;
+            receipts.truncate(MAX_RETAINED_EXACT_MATCHES);
+            let outcome = match receipts.as_slice() {
+                [] => MarketDataProviderIdentityResolutionOutcome::Missing,
+                [exact] if !has_more => {
+                    MarketDataProviderIdentityResolutionOutcome::Exact(exact.clone())
+                }
+                _ => MarketDataProviderIdentityResolutionOutcome::Ambiguous,
+            };
+            let receipt_digest = provider_identity_resolution_digest(
+                query.query_digest(),
+                &outcome,
+                &receipts,
+                has_more,
+            );
+            Ok(MarketDataProviderIdentityResolution {
+                query,
+                outcome,
                 receipt_digest,
             })
         })();
@@ -1196,8 +1536,9 @@ fn insert_definition(
     for term in &prepared.terms {
         transaction.execute(
             "INSERT INTO market_data_instrument_search_terms
-             (revision_digest, term_kind, term_ordinal, normalized_term, display_term)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (revision_digest, term_kind, term_ordinal, normalized_term, display_term,
+              source_id, effective_start_ns, effective_end_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 prepared.digest,
                 term.kind,
@@ -1205,6 +1546,9 @@ fn insert_definition(
                     .map_err(|_| MarketDataInstrumentCatalogError::CorruptCatalog)?,
                 term.normalized,
                 term.display,
+                term.source_id,
+                term.effective_start_ns,
+                term.effective_end_ns,
             ],
         )?;
     }
@@ -1243,31 +1587,53 @@ fn search_terms(
             &mut terms,
             "external_identifier",
             &identifier.identifier().to_string(),
+            None,
+            identifier.validity(),
         )?;
     }
     if let Some(name) = definition.display_name() {
-        push_term(&mut terms, "display_name", name.as_str())?;
+        push_term(
+            &mut terms,
+            "display_name",
+            name.as_str(),
+            None,
+            definition.effective_interval(),
+        )?;
     }
     for mapping in definition.venue_mappings() {
-        push_term(&mut terms, "venue_symbol", mapping.venue_symbol().as_str())?;
+        push_term(
+            &mut terms,
+            "venue_symbol",
+            mapping.venue_symbol().as_str(),
+            None,
+            definition.effective_interval(),
+        )?;
     }
     for identity in definition.provider_identities() {
         push_term(
             &mut terms,
             "provider_symbol",
             identity.provider_instrument_id().as_str(),
+            Some(identity.source_id()),
+            identity.validity(),
         )?;
     }
     terms.sort_by(|left, right| {
         left.kind
             .cmp(right.kind)
+            .then_with(|| left.source_id.cmp(&right.source_id))
             .then_with(|| left.normalized.cmp(&right.normalized))
             .then_with(|| left.display.cmp(&right.display))
+            .then_with(|| left.effective_start_ns.cmp(&right.effective_start_ns))
+            .then_with(|| left.effective_end_ns.cmp(&right.effective_end_ns))
     });
     terms.dedup_by(|left, right| {
         left.kind == right.kind
+            && left.source_id == right.source_id
             && left.normalized == right.normalized
             && left.display == right.display
+            && left.effective_start_ns == right.effective_start_ns
+            && left.effective_end_ns == right.effective_end_ns
     });
     let mut previous_kind = "";
     let mut ordinal = 0_usize;
@@ -1291,6 +1657,8 @@ fn push_term(
     terms: &mut Vec<SearchTerm>,
     kind: &'static str,
     display: &str,
+    source_id: Option<&SourceId>,
+    validity: EffectiveInterval,
 ) -> Result<(), MarketDataInstrumentCatalogError> {
     let normalized = normalize(display);
     if normalized.is_empty() || normalized.len() > MAX_SEARCH_QUERY_BYTES {
@@ -1301,6 +1669,9 @@ fn push_term(
         ordinal: 0,
         normalized,
         display: display.to_owned(),
+        source_id: source_id.map(ToString::to_string),
+        effective_start_ns: validity.starts_at().unix_nanos(),
+        effective_end_ns: validity.ends_at().map(Timestamp::unix_nanos),
     });
     Ok(())
 }
@@ -1479,6 +1850,83 @@ fn population_receipt_digest(
     digest(hasher.finalize().into())
 }
 
+fn provider_identity_query_digest(
+    source_id: &SourceId,
+    provider_instrument_id: &ProviderInstrumentId,
+    knowledge_at: Timestamp,
+    effective_at: Timestamp,
+) -> EvidenceDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(PROVIDER_IDENTITY_QUERY_DOMAIN);
+    hash_text(&mut hasher, source_id.as_str());
+    hash_text(&mut hasher, provider_instrument_id.as_str());
+    hasher.update(knowledge_at.unix_nanos().to_be_bytes());
+    hasher.update(effective_at.unix_nanos().to_be_bytes());
+    digest(hasher.finalize().into())
+}
+
+fn provider_identity_resolution_digest(
+    query_digest: EvidenceDigest,
+    outcome: &MarketDataProviderIdentityResolutionOutcome,
+    retained: &[MarketDataProviderIdentityExactReceipt],
+    has_more: bool,
+) -> EvidenceDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(PROVIDER_IDENTITY_RECEIPT_DOMAIN);
+    hash_evidence(&mut hasher, query_digest);
+    hasher.update([match outcome {
+        MarketDataProviderIdentityResolutionOutcome::Missing => 1,
+        MarketDataProviderIdentityResolutionOutcome::Exact(_) => 2,
+        MarketDataProviderIdentityResolutionOutcome::Ambiguous => 3,
+    }]);
+    hasher.update([u8::from(has_more)]);
+    hasher.update((retained.len() as u64).to_be_bytes());
+    for receipt in retained {
+        hasher.update(receipt.instrument_id.as_uuid().as_bytes());
+        hash_evidence(&mut hasher, receipt.definition_revision_digest);
+        hasher.update(receipt.definition_revision_sequence.to_be_bytes());
+        hash_text(
+            &mut hasher,
+            receipt
+                .definition_reference_revision
+                .as_source_identifier()
+                .as_str(),
+        );
+        hash_evidence(&mut hasher, receipt.definition_reference_payload_digest);
+        hasher.update(receipt.definition_published_at.unix_nanos().to_be_bytes());
+        hash_text(
+            &mut hasher,
+            receipt
+                .provider_identity_revision
+                .as_source_identifier()
+                .as_str(),
+        );
+        hash_evidence(&mut hasher, receipt.provider_identity_payload_digest);
+        hash_interval(&mut hasher, receipt.provider_identity_validity);
+        hasher.update((receipt.matching_venues.len() as u64).to_be_bytes());
+        for venue in &receipt.matching_venues {
+            hash_text(&mut hasher, venue.as_str());
+        }
+    }
+    digest(hasher.finalize().into())
+}
+
+fn hash_interval(hasher: &mut Sha256, interval: EffectiveInterval) {
+    hasher.update(interval.starts_at().unix_nanos().to_be_bytes());
+    match interval.ends_at() {
+        Some(end) => {
+            hasher.update([1]);
+            hasher.update(end.unix_nanos().to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn hash_text(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
+}
+
 fn hash_evidence(hasher: &mut Sha256, evidence: EvidenceDigest) {
     hasher.update([match evidence.algorithm() {
         DigestAlgorithm::Sha256 => 1,
@@ -1624,6 +2072,41 @@ SELECT EXISTS(
     WHERE revisions.instrument_id=?1 AND revisions.published_at_ns<=?2
 )";
 
+const PROVIDER_IDENTITY_AS_OF_SQL: &str = "
+WITH selectable_revisions AS (
+    SELECT revisions.revision_digest, revisions.instrument_id, revisions.revision_sequence,
+           revisions.effective_start_ns, revisions.effective_end_ns,
+           revisions.reference_revision, revisions.reference_algorithm,
+           revisions.reference_payload_digest, revisions.definition_json,
+           revisions.published_at_ns,
+           row_number() OVER (
+               PARTITION BY revisions.instrument_id
+               ORDER BY revisions.effective_start_ns DESC,
+                        revisions.published_at_ns DESC,
+                        revisions.revision_digest
+           ) AS revision_position
+    FROM market_data_instrument_revisions AS revisions
+    WHERE revisions.published_at_ns<=?3
+      AND revisions.effective_start_ns<=?4
+)
+SELECT revisions.revision_digest, revisions.instrument_id, revisions.revision_sequence,
+       revisions.effective_start_ns, revisions.effective_end_ns,
+       revisions.reference_revision, revisions.reference_algorithm,
+       revisions.reference_payload_digest, revisions.definition_json,
+       revisions.published_at_ns, terms.effective_start_ns, terms.effective_end_ns
+FROM selectable_revisions AS revisions
+JOIN market_data_instrument_search_terms AS terms
+  ON terms.revision_digest=revisions.revision_digest
+WHERE revisions.revision_position=1
+  AND (revisions.effective_end_ns IS NULL OR ?4<revisions.effective_end_ns)
+  AND terms.term_kind='provider_symbol'
+  AND terms.source_id=?1
+  AND terms.display_term=?2
+  AND terms.effective_start_ns<=?4
+  AND (terms.effective_end_ns IS NULL OR ?4<terms.effective_end_ns)
+ORDER BY revisions.instrument_id
+LIMIT ?5";
+
 const SEARCH_SQL: &str = "
 WITH matches AS (
     SELECT revisions.revision_digest, revisions.instrument_id, revisions.revision_sequence,
@@ -1703,6 +2186,8 @@ WITH selectable_revisions AS (
       ON terms.revision_digest=revisions.revision_digest
     WHERE revisions.revision_position=1
       AND (revisions.effective_end_ns IS NULL OR ?3<revisions.effective_end_ns)
+      AND terms.effective_start_ns<=?3
+      AND (terms.effective_end_ns IS NULL OR ?3<terms.effective_end_ns)
       AND ((?4=0 AND instr(terms.normalized_term, ?1)>0)
            OR (?4=1 AND terms.normalized_term=?1))
 ), ranked AS (
