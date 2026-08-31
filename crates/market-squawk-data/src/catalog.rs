@@ -85,7 +85,7 @@ pub use self::market_data_instruments::{
     MarketDataInstrumentSynchronization, MarketDataInstrumentSynchronizationCapability,
     MarketDataInstrumentSynchronizationReceipt, MarketDataProviderIdentityExactReceipt,
     MarketDataProviderIdentityQuery, MarketDataProviderIdentityResolution,
-    MarketDataProviderIdentityResolutionOutcome,
+    MarketDataProviderIdentityResolutionOutcome, MarketDataProviderIdentitySelection,
 };
 pub use self::official_options_reference::{
     MAX_OFFICIAL_OPTIONS_REFERENCE_ALIAS_ASSERTIONS,

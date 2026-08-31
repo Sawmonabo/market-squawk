@@ -1270,6 +1270,22 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
     );
     assert!(exact_provider_receipt.matching_venues().is_empty());
     assert_ne!(exact_provider_identity.receipt_digest().bytes(), [0; 32]);
+    let exact_provider_selection = reader
+        .select_provider_identity_as_of(provider_identity_query.clone(), deadline(), &cancellation)?
+        .ok_or(CatalogError::InvalidRecord)?;
+    assert_eq!(
+        exact_provider_selection.query(),
+        exact_provider_identity.query()
+    );
+    assert_eq!(
+        exact_provider_selection.exact_receipt()?,
+        exact_provider_receipt
+    );
+    assert_eq!(
+        exact_provider_selection.resolution_receipt_digest(),
+        exact_provider_identity.receipt_digest()
+    );
+    assert_ne!(exact_provider_selection.selection_digest().bytes(), [0; 32]);
     let missing_provider_identity = reader.resolve_provider_identity_as_of(
         MarketDataProviderIdentityQuery::try_new(
             SourceId::try_from("nasdaq-symbol-directory")?,
@@ -1325,19 +1341,29 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([instrument_id, other_id])
     );
+    let ambiguous_provider_identity_query = MarketDataProviderIdentityQuery::try_new(
+        SourceId::try_from("nasdaq-symbol-directory")?,
+        ProviderInstrumentId::try_from("AAPL.US")?,
+        competing_record.published_at(),
+        Timestamp::from_unix_nanos(10),
+    )?;
     let ambiguous_provider_identity = reader.resolve_provider_identity_as_of(
-        MarketDataProviderIdentityQuery::try_new(
-            SourceId::try_from("nasdaq-symbol-directory")?,
-            ProviderInstrumentId::try_from("AAPL.US")?,
-            competing_record.published_at(),
-            Timestamp::from_unix_nanos(10),
-        )?,
+        ambiguous_provider_identity_query.clone(),
         deadline(),
         &cancellation,
     )?;
     assert_eq!(
         ambiguous_provider_identity.outcome(),
         &MarketDataProviderIdentityResolutionOutcome::Ambiguous
+    );
+    assert!(
+        reader
+            .select_provider_identity_as_of(
+                ambiguous_provider_identity_query,
+                deadline(),
+                &cancellation,
+            )?
+            .is_none()
     );
     let canonical_population = MarketDataInstrumentPopulationQuery::try_new(
         vec![other_id, instrument_id],
@@ -1845,6 +1871,14 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
             &cancellation,
         )?,
         ambiguous_provider_identity
+    );
+    assert_eq!(
+        reader.verify_provider_identity_selection_restart(
+            &exact_provider_selection,
+            deadline(),
+            &cancellation,
+        )?,
+        exact_provider_selection
     );
     Ok(())
 }

@@ -36,6 +36,8 @@ const PROVIDER_IDENTITY_QUERY_DOMAIN: &[u8] =
     b"market-squawk/provider-instrument-identity-query/v1\0";
 const PROVIDER_IDENTITY_RECEIPT_DOMAIN: &[u8] =
     b"market-squawk/provider-instrument-identity-receipt/v1\0";
+const PROVIDER_IDENTITY_SELECTION_DOMAIN: &[u8] =
+    b"market-squawk/provider-instrument-identity-selection/v1\0";
 
 /// Complete caller-declared synchronization batch.
 ///
@@ -449,6 +451,83 @@ impl MarketDataProviderIdentityResolution {
     }
 }
 
+/// Catalog-minted authority to use one exact provider-native identity.
+///
+/// This value has no public constructor and no serialization contract. Provider-native payloads
+/// remain untrusted until the data publication boundary receives this exact selection. Historical
+/// value projections cannot recreate it after restart; callers must ask the catalog to replay and
+/// verify the complete source-qualified point-in-time resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketDataProviderIdentitySelection {
+    resolution: MarketDataProviderIdentityResolution,
+    selection_digest: EvidenceDigest,
+}
+
+impl MarketDataProviderIdentitySelection {
+    /// Returns the exact source, provider identity, and independent point-in-time cutoffs.
+    pub const fn query(&self) -> &MarketDataProviderIdentityQuery {
+        self.resolution.query()
+    }
+
+    /// Returns the catalog-owned exact definition and provider-identity evidence.
+    pub fn exact_receipt(
+        &self,
+    ) -> Result<&MarketDataProviderIdentityExactReceipt, MarketDataInstrumentCatalogError> {
+        self.verify_integrity()?;
+        self.exact_receipt_unchecked()
+    }
+
+    /// Returns the digest of the complete exact resolution.
+    pub const fn resolution_receipt_digest(&self) -> EvidenceDigest {
+        self.resolution.receipt_digest()
+    }
+
+    /// Returns the digest binding the query, exact receipt, and resolution receipt.
+    pub const fn selection_digest(&self) -> EvidenceDigest {
+        self.selection_digest
+    }
+
+    fn from_resolution(resolution: MarketDataProviderIdentityResolution) -> Option<Self> {
+        let MarketDataProviderIdentityResolutionOutcome::Exact(exact) = resolution.outcome() else {
+            return None;
+        };
+        let selection_digest = provider_identity_selection_digest(
+            resolution.query(),
+            exact,
+            resolution.receipt_digest(),
+        );
+        Some(Self {
+            resolution,
+            selection_digest,
+        })
+    }
+
+    fn verify_integrity(&self) -> Result<(), MarketDataInstrumentCatalogError> {
+        let exact = self.exact_receipt_unchecked()?;
+        if provider_identity_selection_digest(
+            self.resolution.query(),
+            exact,
+            self.resolution.receipt_digest(),
+        ) != self.selection_digest
+        {
+            return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
+        }
+        Ok(())
+    }
+
+    fn exact_receipt_unchecked(
+        &self,
+    ) -> Result<&MarketDataProviderIdentityExactReceipt, MarketDataInstrumentCatalogError> {
+        match self.resolution.outcome() {
+            MarketDataProviderIdentityResolutionOutcome::Exact(exact) => Ok(exact),
+            MarketDataProviderIdentityResolutionOutcome::Missing
+            | MarketDataProviderIdentityResolutionOutcome::Ambiguous => {
+                Err(MarketDataInstrumentCatalogError::CorruptCatalog)
+            }
+        }
+    }
+}
+
 /// Current reference field responsible for a search match.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarketDataInstrumentMatchKind {
@@ -722,6 +801,22 @@ impl MarketDataInstrumentReadCapability {
             .resolve_market_data_provider_identity(query, deadline, cancellation)
     }
 
+    /// Selects one exact source-qualified provider identity for data publication.
+    ///
+    /// Missing and ambiguous resolutions fail closed. The returned authority is catalog-minted,
+    /// opaque, and non-serializable; adapters and callers cannot promote provider-native values by
+    /// constructing a structurally similar claim.
+    pub fn select_provider_identity_as_of(
+        &self,
+        query: MarketDataProviderIdentityQuery,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<MarketDataProviderIdentitySelection>, MarketDataInstrumentCatalogError> {
+        Ok(MarketDataProviderIdentitySelection::from_resolution(
+            self.resolve_provider_identity_as_of(query, deadline, cancellation)?,
+        ))
+    }
+
     /// Replays a source-qualified provider identity read and rejects any evidence/currentness
     /// drift after process restart.
     pub fn verify_provider_identity_restart(
@@ -732,6 +827,26 @@ impl MarketDataInstrumentReadCapability {
     ) -> Result<MarketDataProviderIdentityResolution, MarketDataInstrumentCatalogError> {
         let replay =
             self.resolve_provider_identity_as_of(expected.query().clone(), deadline, cancellation)?;
+        if replay != *expected {
+            return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
+        }
+        Ok(replay)
+    }
+
+    /// Replays an exact provider-identity selection and rejects any evidence drift after restart.
+    ///
+    /// Persisted values are never deserialized into authority. This operation mints a new opaque
+    /// selection only after the catalog reproduces the complete original resolution and digest.
+    pub fn verify_provider_identity_selection_restart(
+        &self,
+        expected: &MarketDataProviderIdentitySelection,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataProviderIdentitySelection, MarketDataInstrumentCatalogError> {
+        expected.verify_integrity()?;
+        let replay = self
+            .select_provider_identity_as_of(expected.query().clone(), deadline, cancellation)?
+            .ok_or(MarketDataInstrumentCatalogError::CorruptCatalog)?;
         if replay != *expected {
             return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
         }
@@ -1882,33 +1997,57 @@ fn provider_identity_resolution_digest(
     hasher.update([u8::from(has_more)]);
     hasher.update((retained.len() as u64).to_be_bytes());
     for receipt in retained {
-        hasher.update(receipt.instrument_id.as_uuid().as_bytes());
-        hash_evidence(&mut hasher, receipt.definition_revision_digest);
-        hasher.update(receipt.definition_revision_sequence.to_be_bytes());
-        hash_text(
-            &mut hasher,
-            receipt
-                .definition_reference_revision
-                .as_source_identifier()
-                .as_str(),
-        );
-        hash_evidence(&mut hasher, receipt.definition_reference_payload_digest);
-        hasher.update(receipt.definition_published_at.unix_nanos().to_be_bytes());
-        hash_text(
-            &mut hasher,
-            receipt
-                .provider_identity_revision
-                .as_source_identifier()
-                .as_str(),
-        );
-        hash_evidence(&mut hasher, receipt.provider_identity_payload_digest);
-        hash_interval(&mut hasher, receipt.provider_identity_validity);
-        hasher.update((receipt.matching_venues.len() as u64).to_be_bytes());
-        for venue in &receipt.matching_venues {
-            hash_text(&mut hasher, venue.as_str());
-        }
+        hash_provider_identity_exact_receipt(&mut hasher, receipt);
     }
     digest(hasher.finalize().into())
+}
+
+fn provider_identity_selection_digest(
+    query: &MarketDataProviderIdentityQuery,
+    exact: &MarketDataProviderIdentityExactReceipt,
+    resolution_receipt_digest: EvidenceDigest,
+) -> EvidenceDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(PROVIDER_IDENTITY_SELECTION_DOMAIN);
+    hash_text(&mut hasher, query.source_id().as_str());
+    hash_text(&mut hasher, query.provider_instrument_id().as_str());
+    hasher.update(query.knowledge_at().unix_nanos().to_be_bytes());
+    hasher.update(query.effective_at().unix_nanos().to_be_bytes());
+    hash_evidence(&mut hasher, query.query_digest());
+    hash_provider_identity_exact_receipt(&mut hasher, exact);
+    hash_evidence(&mut hasher, resolution_receipt_digest);
+    digest(hasher.finalize().into())
+}
+
+fn hash_provider_identity_exact_receipt(
+    hasher: &mut Sha256,
+    receipt: &MarketDataProviderIdentityExactReceipt,
+) {
+    hasher.update(receipt.instrument_id.as_uuid().as_bytes());
+    hash_evidence(hasher, receipt.definition_revision_digest);
+    hasher.update(receipt.definition_revision_sequence.to_be_bytes());
+    hash_text(
+        hasher,
+        receipt
+            .definition_reference_revision
+            .as_source_identifier()
+            .as_str(),
+    );
+    hash_evidence(hasher, receipt.definition_reference_payload_digest);
+    hasher.update(receipt.definition_published_at.unix_nanos().to_be_bytes());
+    hash_text(
+        hasher,
+        receipt
+            .provider_identity_revision
+            .as_source_identifier()
+            .as_str(),
+    );
+    hash_evidence(hasher, receipt.provider_identity_payload_digest);
+    hash_interval(hasher, receipt.provider_identity_validity);
+    hasher.update((receipt.matching_venues.len() as u64).to_be_bytes());
+    for venue in &receipt.matching_venues {
+        hash_text(hasher, venue.as_str());
+    }
 }
 
 fn hash_interval(hasher: &mut Sha256, interval: EffectiveInterval) {
