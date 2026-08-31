@@ -459,15 +459,15 @@ async fn run_generation(
         if response.status().is_redirection() {
             return Err(KrakenLevel3RuntimeError::Transport);
         }
-        budget
-            .record_success()
-            .map_err(KrakenLevel3RuntimeError::BudgetUnavailable)?;
+        let connection_settlement = budget.record_success();
+        connection_permit.release();
+        connection_settlement.map_err(KrakenLevel3RuntimeError::BudgetUnavailable)?;
         let profile = IntegrityProfile::try_from_config(config)?;
         let mut decoder = KrakenL3Decoder::try_new(config)?;
         let actors = actors
             .as_mut()
             .ok_or(KrakenLevel3RuntimeError::ActorTopology)?;
-        let socket_result = run_socket(
+        run_socket(
             config,
             specs,
             &profile,
@@ -483,9 +483,7 @@ async fn run_generation(
             startup,
             &cancellation,
         )
-        .await;
-        drop(connection_permit);
-        socket_result
+        .await
     }
     .await;
 
