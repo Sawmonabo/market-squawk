@@ -12,6 +12,8 @@ use std::{
 use anyhow::Context as _;
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 use chrono::{Datelike as _, NaiveDate};
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+use clap::{Parser as _, error::ErrorKind};
 use futures_util::FutureExt as _;
 use market_squawk::service::{
     BootstrapRequirement, InstalledService, InstalledServiceBootstrapState,
@@ -19,8 +21,7 @@ use market_squawk::service::{
 };
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 use market_squawk::{
-    BoardInstalledFixtureBundle, cli::Command as CliCommand,
-    local_product::execute_installed_cli_command,
+    BoardInstalledFixtureBundle, cli::Cli, local_product::execute_installed_cli_command,
 };
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 use market_squawk_adapter_federal_reserve::{
@@ -232,7 +233,7 @@ async fn run_installed_service_authority_scenario() -> TestResult {
         #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
         {
             board_evidence = Some(
-                exercise_installed_board_vertical(&desktop, temporary.path(), &board_fixture)
+                exercise_installed_board_vertical(&desktop, &cli, temporary.path(), &board_fixture)
                     .await
                     .context("exercise installed Federal Reserve Board vertical")?,
             );
@@ -360,12 +361,17 @@ async fn run_installed_service_authority_scenario() -> TestResult {
                 desktop_timeout,
             )
             .context("admit desktop client after service restart")?;
+        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+        let restarted_cli = connector
+            .connect(NamedClient::Cli, None)
+            .context("admit CLI client after service restart")?;
         assert_owner_research_file_available(&restarted_desktop)
             .await
             .context("query guided owner research file after service restart")?;
         #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
         assert_installed_board_restored(
             &restarted_desktop,
+            &restarted_cli,
             temporary.path(),
             &board_fixture,
             board_counters_before_restart,
@@ -1486,6 +1492,7 @@ fn installed_board_csv<S: AsRef<str>>(
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 async fn exercise_installed_board_vertical(
     client: &LoopbackApplicationClient,
+    cli: &LoopbackApplicationClient,
     installation_root: &Path,
     fixture: &BoardInstalledFixtureBundle,
 ) -> TestResult<InstalledBoardEvidence> {
@@ -1732,7 +1739,8 @@ async fn exercise_installed_board_vertical(
     assert_eq!(dashboard["binding"]["manifest"], manifest["manifest"]);
     let dashboard_stable = stable_installed_board_dashboard(&dashboard);
     let macro_context = capture_installed_macro_context(client, &dashboard).await?;
-    assert_installed_cli_macro_context(client, &macro_context).await?;
+    assert_installed_cli_rejects_unpaired_macro_cutoff(&macro_context)?;
+    assert_installed_cli_macro_context(cli, &macro_context).await?;
     assert_installed_board_transport_counts(fixture.transport_counters(), 1, 1, 1, 1);
 
     let msj = new_installed_files(
@@ -1766,6 +1774,7 @@ async fn exercise_installed_board_vertical(
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 async fn assert_installed_board_restored(
     client: &LoopbackApplicationClient,
+    cli: &LoopbackApplicationClient,
     installation_root: &Path,
     fixture: &BoardInstalledFixtureBundle,
     counters_before_restart: BoardScriptedTransportCounters,
@@ -1847,7 +1856,7 @@ async fn assert_installed_board_restored(
         stable_installed_macro_context(&macro_context),
         evidence.macro_context.stable
     );
-    assert_installed_cli_macro_context(client, &evidence.macro_context).await?;
+    assert_installed_cli_macro_context(cli, &evidence.macro_context).await?;
     assert_installed_file_evidence(installation_root, &evidence.msj)?;
     assert_installed_file_evidence(installation_root, &evidence.parquet)?;
     assert_eq!(fixture.transport_counters(), counters_before_restart);
@@ -1945,25 +1954,48 @@ async fn assert_installed_cli_macro_context(
     client: &LoopbackApplicationClient,
     expected: &InstalledMacroContextEvidence,
 ) -> TestResult {
-    let result = execute_installed_cli_command(
-        client,
-        CliCommand::EconomicContext {
-            knowledge_cutoff: Some(required_nonempty_string(
-                &expected.arguments["knowledgeCutoff"],
-                "CLI economic-context knowledge cutoff",
-            )?),
-            effective_date_cutoff: Some(required_nonempty_string(
-                &expected.arguments["effectiveDateCutoff"],
-                "CLI economic-context effective-date cutoff",
-            )?),
-        },
-    )
-    .await
-    .context("read installed economic context through the CLI dispatcher")?;
+    let knowledge_cutoff = required_nonempty_string(
+        &expected.arguments["knowledgeCutoff"],
+        "CLI economic-context knowledge cutoff",
+    )?;
+    let effective_date_cutoff = required_nonempty_string(
+        &expected.arguments["effectiveDateCutoff"],
+        "CLI economic-context effective-date cutoff",
+    )?;
+    let cli = Cli::try_parse_from(vec![
+        "market-squawk".to_owned(),
+        "economic-context".to_owned(),
+        "--knowledge-cutoff".to_owned(),
+        knowledge_cutoff,
+        "--effective-date-cutoff".to_owned(),
+        effective_date_cutoff,
+    ])
+    .context("parse the installed economic-context CLI command")?;
+    let result = execute_installed_cli_command(client, cli.command)
+        .await
+        .context("read installed economic context through the CLI dispatcher")?;
     assert_eq!(result.summary(), "economic context read");
     let context = &result.value()["data"];
     assert_installed_macro_context(context)?;
     assert_eq!(stable_installed_macro_context(context), expected.stable);
+    Ok(())
+}
+
+fn assert_installed_cli_rejects_unpaired_macro_cutoff(
+    expected: &InstalledMacroContextEvidence,
+) -> TestResult {
+    let knowledge_cutoff = required_nonempty_string(
+        &expected.arguments["knowledgeCutoff"],
+        "unpaired CLI economic-context knowledge cutoff",
+    )?;
+    let error = Cli::try_parse_from(vec![
+        "market-squawk".to_owned(),
+        "economic-context".to_owned(),
+        "--knowledge-cutoff".to_owned(),
+        knowledge_cutoff,
+    ])
+    .expect_err("economic-context accepted an unpaired point-in-time cutoff");
+    assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     Ok(())
 }
 
