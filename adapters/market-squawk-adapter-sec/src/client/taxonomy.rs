@@ -252,7 +252,8 @@ impl TaxonomyClientSet {
         let maximum = request_bounds
             .max_response_bytes()
             .min(MAX_PROVIDER_CAPTURE_PAGE_BYTES)
-            .min(MAX_TAXONOMY_ARTIFACT_BYTES);
+            .min(MAX_TAXONOMY_ARTIFACT_BYTES)
+            .min(request.maximum_response_bytes());
         if let Some(length) = response.content_length() {
             if let Some(in_flight) = sec_in_flight.as_ref() {
                 in_flight.validate_response_size(length)?;

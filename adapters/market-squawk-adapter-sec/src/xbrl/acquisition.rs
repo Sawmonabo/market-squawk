@@ -18,6 +18,7 @@ use crate::{RetrievedSecBytes, SecParserLimits};
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct SecTaxonomyAcquisitionRequest {
     inner: SecXbrlTaxonomyArtifactRequest,
+    maximum_response_bytes: u64,
 }
 
 impl SecTaxonomyAcquisitionRequest {
@@ -31,6 +32,10 @@ impl SecTaxonomyAcquisitionRequest {
 
     pub(crate) fn authority(&self) -> Result<FilingTaxonomySourceAuthority, SecXbrlError> {
         self.inner.authority()
+    }
+
+    pub(crate) fn maximum_response_bytes(&self) -> u64 {
+        self.maximum_response_bytes
     }
 }
 
@@ -143,8 +148,18 @@ impl SecTaxonomyClosure {
                 self.scan_captured_request(&request, &artifact, cancellation)?;
                 continue;
             }
+            if self.captured_physical.len() >= MAX_TAXONOMY_ARTIFACTS {
+                return Err(SecXbrlError::RecordLimitExceeded);
+            }
+            let maximum_response_bytes = MAX_TAXONOMY_SET_BYTES
+                .checked_sub(self.physical_bytes)
+                .filter(|remaining| *remaining > 0)
+                .ok_or(SecXbrlError::ByteLimitExceeded)?;
             self.in_flight = Some(request.clone());
-            return Ok(Some(SecTaxonomyAcquisitionRequest { inner: request }));
+            return Ok(Some(SecTaxonomyAcquisitionRequest {
+                inner: request,
+                maximum_response_bytes,
+            }));
         }
         Ok(None)
     }

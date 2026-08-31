@@ -2347,10 +2347,16 @@ mod tests {
             &CancellationToken::new(),
         )?;
         let acquisition_cancellation = CancellationToken::new();
+        let mut retained_taxonomy_bytes = 0_u64;
         while let Some(request) = closure.next_request(&acquisition_cancellation)? {
+            assert_eq!(
+                request.maximum_response_bytes(),
+                MAX_TAXONOMY_SET_BYTES - retained_taxonomy_bytes
+            );
             let artifact = captured_by_locator
                 .remove(request.physical_locator())
                 .ok_or(SecXbrlError::InvalidTaxonomySet)?;
+            retained_taxonomy_bytes += u64::try_from(artifact.bytes().len())?;
             assert_eq!(
                 artifact
                     .capture_receipt()
@@ -2364,7 +2370,7 @@ mod tests {
         let artifacts = closure.finish(&acquisition_cancellation)?;
 
         let admitted = SecXbrlTaxonomyRegistry::code_owned().try_admit_captured(
-            store,
+            Arc::clone(&store),
             &sec_source,
             &sec_revision,
             &filing,
@@ -2403,6 +2409,54 @@ mod tests {
             })
             .collect::<BTreeSet<_>>();
         assert_eq!(source_revisions.len(), 4);
+
+        // A provider graph cannot emit request 65: the known artifact ceiling is admitted before
+        // transport, so the over-limit artifact cannot be fetched or published.
+        let mut references = String::from(
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"
+                xmlns:link="http://www.xbrl.org/2003/linkbase"
+                xmlns:xlink="http://www.w3.org/1999/xlink"><head>"#,
+        );
+        for ordinal in 0..=MAX_TAXONOMY_ARTIFACTS {
+            references.push_str(&format!(
+                r#"<link:schemaRef xlink:type="simple" xlink:href="artifact-{ordinal}.xsd"/>"#
+            ));
+        }
+        references.push_str("</head></html>");
+        let wide_filing = captured_artifact(
+            &store,
+            filing_locator,
+            references.as_bytes(),
+            sec_source.clone(),
+            sec_revision.clone(),
+            observed_at,
+        )?;
+        let mut bounded = SecTaxonomyClosure::try_start(
+            &wide_filing,
+            sec_source.clone(),
+            sec_revision.clone(),
+            SecParserLimits::production_defaults(),
+            &CancellationToken::new(),
+        )?;
+        for ordinal in 0..MAX_TAXONOMY_ARTIFACTS {
+            let request = bounded
+                .next_request(&acquisition_cancellation)?
+                .ok_or(SecXbrlError::InvalidTaxonomySet)?;
+            let artifact = captured_artifact(
+                &store,
+                request.physical_locator(),
+                br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="https://example.test/wide-fixture"/>"#,
+                sec_source.clone(),
+                sec_revision.clone(),
+                Timestamp::from_unix_nanos(200 + i64::try_from(ordinal)?),
+            )?;
+            bounded.accept_captured(request, artifact, &acquisition_cancellation)?;
+        }
+        assert!(matches!(
+            bounded.next_request(&acquisition_cancellation),
+            Err(SecXbrlError::RecordLimitExceeded)
+        ));
         Ok(())
     }
 }
