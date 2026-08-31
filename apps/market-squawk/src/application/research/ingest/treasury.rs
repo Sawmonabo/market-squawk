@@ -16,8 +16,9 @@ use market_squawk_adapter_treasury::TreasurySurface;
 use market_squawk_data::{
     AnalyticalGeneration, AnalyticalMacroLatestKnownOutput, AnalyticalMacroLatestKnownRequest,
     AnalyticalMacroSeriesAllowlist, AnalyticalReadError, DatasetId, DatasetManifestRef,
-    IngestError, IngestPrecommitAuthority, PersistedProviderCaptureBindingEvidence, PinnedDataset,
-    QueryLimits, RightsDecisionInput,
+    IngestError, IngestIdentity, IngestPrecommitAuthority, PersistedProviderCaptureBindingEvidence,
+    PinnedDataset, ProviderMacroPlanChunkInput, ProviderMacroPlanPublicationInput,
+    ProviderMacroPlanSemantics, QueryLimits, RightsDecisionInput, SourceOperation,
 };
 use market_squawk_domain::{
     CalendarDate, DigestAlgorithm, EvidenceDigest, ResearchObservation, SourceId, SourceIdentifier,
@@ -52,6 +53,7 @@ const MAX_DISCOVERY_RECEIPT_BYTES: usize = 512;
 const MAX_TREASURY_LATEST_KNOWN_SERIES: usize = 32;
 const TREASURY_PROVIDER: &str = "us-treasury";
 const TREASURY_NATIVE_IMPLEMENTATION: &str = "us_treasury_macro_v1";
+const TREASURY_MACRO_SEMANTICS_SCHEMA: &str = "us-treasury-macro-native-semantics-v1";
 const TREASURY_FISCAL_SOURCE_ID: &str = "treasury-treasury.fiscal-data";
 const TREASURY_DAILY_SOURCE_ID: &str = "treasury-treasury.daily-rates-xml";
 const FISCAL_PROVIDER_DATASET_PREFIX: &str = "treasury:fiscal-data:average-interest-rates-v2:";
@@ -401,7 +403,8 @@ impl TreasuryApplicationClosure {
         Ok(handoff)
     }
 
-    /// Atomically publishes one sealed Treasury object and proves catalog restart reconstruction.
+    /// Atomically publishes one sealed Treasury macro plan and proves catalog restart
+    /// reconstruction.
     pub(crate) async fn publish(
         &self,
         handoff: TreasurySealedPublicationHandoff,
@@ -414,11 +417,11 @@ impl TreasuryApplicationClosure {
         let TreasurySealedPublicationHandoff {
             surface,
             source,
-            rights,
+            mut rights,
             analytical_dataset,
             provider_dataset,
             revisions,
-            payload_digest: _,
+            payload_digest,
             binding,
             publication_lease,
         } = handoff;
@@ -448,15 +451,112 @@ impl TreasuryApplicationClosure {
             row_capture_page_ordinals.push(frame.capture_page_ordinal());
         }
         let source_id = source.source_id().clone();
-        let ingest = crate::ResearchIngestRequest::with_provider_publication(
-            source,
-            rights,
-            analytical_dataset,
+        let source_generation_digest = source
+            .revision_evidence()
+            .payload_evidence()
+            .content_digest();
+        let native_sidecar = binding
+            .native_lineage()
+            .batch_sidecar()
+            .ok_or(TreasuryApplicationError::InvalidAcquisition)?;
+        let candidate_digest = treasury_macro_candidate_digest(
+            surface,
+            &provider_dataset,
+            payload_digest,
+            binding_digest,
+            native_sidecar.semantic_payload_digest(),
+        )?;
+        let semantics = ProviderMacroPlanSemantics::try_new(
+            SourceIdentifier::try_from(TREASURY_MACRO_SEMANTICS_SCHEMA)
+                .map_err(|_error| TreasuryApplicationError::InvalidAcquisition)?,
+            native_schema_fingerprint,
+            native_sidecar.semantic_payload_digest(),
+            native_sidecar
+                .semantic_payload()
+                .to_vec()
+                .into_boxed_slice(),
+        )?;
+        let completion_digest = treasury_macro_completion_digest(
+            surface,
+            &analytical_dataset,
+            &provider_dataset,
+            source_generation_digest,
+            candidate_digest,
+            binding_digest,
+            record_count,
+        )?;
+        let expected_rows = u64::try_from(record_count)
+            .map_err(|_error| TreasuryApplicationError::InvalidAcquisition)?;
+        let chunk = ProviderMacroPlanChunkInput::try_new(
+            0,
+            1,
+            candidate_digest,
+            source_generation_digest,
+            semantics,
             binding,
             revisions,
-        )?
-        .with_precommit_authority(Arc::clone(&publication_lease));
-        let publication = self.research.ingest(ingest, operation.clone());
+        )?;
+        let input = ProviderMacroPlanPublicationInput::try_new(
+            analytical_dataset.clone(),
+            completion_digest,
+            expected_rows,
+            vec![chunk],
+        )?;
+        if input.source_id() != &source_id
+            || input.provider_dataset() != &provider_dataset
+            || input.source_generation_digest() != source_generation_digest
+            || input.total_chunks() != 1
+            || input.total_rows() != expected_rows
+        {
+            return Err(TreasuryApplicationError::InvalidAcquisition);
+        }
+        let publication_digest = input.publication_digest();
+        rights.payload_digest = publication_digest;
+        let identity = IngestIdentity::try_new(
+            source_id.clone(),
+            publication_digest,
+            SourceOperation::Persist,
+            treasury_macro_ingest_identity(
+                surface,
+                &analytical_dataset,
+                &provider_dataset,
+                source_generation_digest,
+                publication_digest,
+            )?,
+        )
+        .map_err(|_error| TreasuryApplicationError::InvalidAcquisition)?;
+        let registered_at = rights.retrieved_at;
+        let reservation = self.research.analytical().reserve_source_ingest(
+            &source,
+            registered_at,
+            rights,
+            &identity,
+            &operation,
+        );
+        tokio::pin!(reservation);
+        let reservation = tokio::select! {
+            biased;
+            () = context.cancellation().cancelled() => {
+                operation.cancel();
+                return Err(ServiceError::Cancelled.into());
+            }
+            () = tokio::time::sleep_until(deadline.into()) => {
+                operation.cancel();
+                return Err(ServiceError::DeadlineExceeded.into());
+            }
+            () = operation.cancelled() => return Err(ServiceError::Unavailable.into()),
+            result = reservation.as_mut() => result?,
+        };
+        publication_lease.validate_precommit()?;
+        let pending = self
+            .research
+            .analytical()
+            .prepare_provider_macro_plan_publication(reservation, input)?;
+        let publication = pending.commit(
+            self.research.analytical(),
+            operation.clone(),
+            Arc::clone(&publication_lease),
+        );
         tokio::pin!(publication);
         let committed = tokio::select! {
             biased;
@@ -472,6 +572,17 @@ impl TreasuryApplicationClosure {
             result = publication.as_mut() => result?,
         };
         publication_lease.validate_precommit()?;
+        let generic_restart = committed.restart_selector();
+        let reopened = self
+            .research
+            .analytical()
+            .verify_provider_macro_plan_restart(&generic_restart)?;
+        if reopened.manifest() != committed.manifest()
+            || generic_restart.total_chunks() != 1
+            || generic_restart.total_rows() != expected_rows
+        {
+            return Err(TreasuryApplicationError::RestartInvalid);
+        }
         let restart = TreasuryMacroRestartSelector::try_new(
             surface,
             committed.manifest().clone(),
@@ -1257,6 +1368,75 @@ fn surface_accepts_analytical_dataset(surface: TreasurySurface, dataset: &Datase
             .iter()
             .any(|prefix| dataset.as_str().starts_with(prefix)),
     }
+}
+
+fn treasury_macro_candidate_digest(
+    surface: TreasurySurface,
+    provider_dataset: &SourceIdentifier,
+    payload_digest: EvidenceDigest,
+    binding_digest: EvidenceDigest,
+    native_semantics_digest: EvidenceDigest,
+) -> Result<EvidenceDigest, TreasuryApplicationError> {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/treasury-macro-candidate/v1\0");
+    hash_treasury_component(&mut digest, surface.profile_id().as_bytes())?;
+    hash_treasury_component(&mut digest, provider_dataset.as_str().as_bytes())?;
+    digest.update(payload_digest.bytes());
+    digest.update(binding_digest.bytes());
+    digest.update(native_semantics_digest.bytes());
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the complete Treasury plan identity keeps every independent publication coordinate explicit"
+)]
+fn treasury_macro_completion_digest(
+    surface: TreasurySurface,
+    analytical_dataset: &DatasetId,
+    provider_dataset: &SourceIdentifier,
+    source_generation_digest: EvidenceDigest,
+    candidate_digest: EvidenceDigest,
+    binding_digest: EvidenceDigest,
+    record_count: usize,
+) -> Result<EvidenceDigest, TreasuryApplicationError> {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/treasury-macro-completion/v1\0");
+    hash_treasury_component(&mut digest, surface.profile_id().as_bytes())?;
+    hash_treasury_component(&mut digest, analytical_dataset.as_str().as_bytes())?;
+    hash_treasury_component(&mut digest, provider_dataset.as_str().as_bytes())?;
+    digest.update(source_generation_digest.bytes());
+    digest.update(candidate_digest.bytes());
+    digest.update(binding_digest.bytes());
+    digest.update(
+        u64::try_from(record_count)
+            .map_err(|_error| TreasuryApplicationError::InvalidAcquisition)?
+            .to_be_bytes(),
+    );
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
+}
+
+fn treasury_macro_ingest_identity(
+    surface: TreasurySurface,
+    analytical_dataset: &DatasetId,
+    provider_dataset: &SourceIdentifier,
+    source_generation_digest: EvidenceDigest,
+    publication_digest: EvidenceDigest,
+) -> Result<String, TreasuryApplicationError> {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/treasury-macro-ingest/v1\0");
+    hash_treasury_component(&mut digest, surface.profile_id().as_bytes())?;
+    hash_treasury_component(&mut digest, analytical_dataset.as_str().as_bytes())?;
+    hash_treasury_component(&mut digest, provider_dataset.as_str().as_bytes())?;
+    digest.update(source_generation_digest.bytes());
+    digest.update(publication_digest.bytes());
+    Ok(format!("treasury-macro-v1-{:x}", digest.finalize()))
 }
 
 fn surface_accepts_series(
