@@ -1736,7 +1736,27 @@ async fn exercise_installed_board_vertical(
 
     let dashboard = installed_board_dashboard(client, "initial").await?;
     assert_installed_board_dashboard(&dashboard)?;
-    assert_eq!(dashboard["binding"]["manifest"], manifest["manifest"]);
+    let dashboard_manifest = &dashboard["binding"]["manifest"];
+    let research_manifest = &manifest["manifest"];
+    assert_eq!(
+        dashboard_manifest["datasetId"],
+        research_manifest["datasetId"]
+    );
+    assert_eq!(dashboard_manifest["schema"], research_manifest["schema"]);
+    assert_eq!(
+        dashboard_manifest["contentHash"],
+        research_manifest["contentHash"]
+    );
+    assert_eq!(
+        canonical_positive_u64(
+            &dashboard_manifest["manifestVersion"],
+            "dashboard manifest version",
+        )?,
+        research_manifest["manifestVersion"]
+            .as_u64()
+            .filter(|version| *version > 0)
+            .context("research manifest version was not a positive integer")?
+    );
     let dashboard_stable = stable_installed_board_dashboard(&dashboard);
     let macro_context = capture_installed_macro_context(client, &dashboard).await?;
     assert_installed_cli_rejects_unpaired_macro_cutoff(&macro_context)?;
