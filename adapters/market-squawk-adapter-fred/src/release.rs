@@ -5,8 +5,10 @@ use serde::Deserialize;
 use std::cmp::Ordering;
 use url::Url;
 
-use crate::rights::validate_exact_series_id;
-use crate::series::{FredParseLimits, FredProtocolError, admit_body, parse_date, validate_strings};
+use crate::series::{
+    FredParseLimits, FredProtocolError, admit_body, parse_date, valid_exact_series_id,
+    validate_strings,
+};
 
 /// Documented maximum observations returned by one FRED API v2 release request.
 pub const MAX_FRED_V2_RELEASE_PAGE_OBSERVATIONS: usize = 500_000;
@@ -32,7 +34,7 @@ impl FredReleaseCursor {
         let date = fields
             .next()
             .ok_or(FredProtocolError::InvalidField("release cursor"))?;
-        if fields.next().is_some() || validate_exact_series_id(series_id).is_err() {
+        if fields.next().is_some() || !valid_exact_series_id(series_id) {
             return Err(FredProtocolError::InvalidField("release cursor"));
         }
         let series_id = SourceIdentifier::try_from(series_id)
@@ -192,7 +194,7 @@ impl FredReleaseSeries {
         self.last_updated
     }
 
-    /// Returns the exact provider rights/copyright notice for this series.
+    /// Returns the exact provider copyright/attribution notice for this series.
     pub fn copyright_id(&self) -> &str {
         &self.copyright_id
     }
@@ -285,8 +287,9 @@ impl FredReleaseObservationPage {
         let mut first_coordinate = None;
         let mut last_coordinate = None;
         for item in wire.series {
-            validate_exact_series_id(&item.series_id)
-                .map_err(|_| FredProtocolError::InvalidField("release series id"))?;
+            if !valid_exact_series_id(&item.series_id) {
+                return Err(FredProtocolError::InvalidField("release series id"));
+            }
             let series_id = SourceIdentifier::try_from(item.series_id)
                 .map_err(|_| FredProtocolError::InvalidField("release series id"))?;
             if previous_series

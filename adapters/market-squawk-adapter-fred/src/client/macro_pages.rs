@@ -10,9 +10,10 @@ use market_squawk_sources::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::series::valid_exact_series_id;
 use crate::{
-    FredOperation, FredParseLimits, FredReleaseCursor, FredReleaseObservationPage,
-    FredRightsDisposition, FredVintagePage, MAX_FRED_V2_RELEASE_PAGE_OBSERVATIONS,
+    FredParseLimits, FredReleaseCursor, FredReleaseObservationPage, FredVintagePage,
+    MAX_FRED_V2_RELEASE_PAGE_OBSERVATIONS,
 };
 
 use super::{
@@ -268,7 +269,7 @@ impl FredSource {
     /// and terminal exhaustion all agree; a truncated prefix is never returned as complete.
     #[allow(
         clippy::too_many_arguments,
-        reason = "provider dataset, page size/count, authority, deadline, operation, and cancellation are independent"
+        reason = "provider dataset, page size/count, authority, deadline, and cancellation are independent"
     )]
     pub async fn acquire_all_vintage_dates(
         &self,
@@ -277,7 +278,6 @@ impl FredSource {
         page_limit: NonZeroU16,
         maximum_pages: NonZeroU16,
         deadline: Timestamp,
-        operation: FredOperation,
         cancellation: CancellationToken,
     ) -> Result<FredVintageExtraction, ExtractionSourceError> {
         let maximum_pages = usize::from(maximum_pages.get());
@@ -307,7 +307,6 @@ impl FredSource {
                     offset,
                     page_limit,
                     deadline,
-                    operation,
                     cancellation.clone(),
                 )
                 .await?;
@@ -362,7 +361,7 @@ impl FredSource {
     /// budget, so this method cannot form an independent provider throttle.
     #[allow(
         clippy::too_many_arguments,
-        reason = "provider dataset, offset, limit, authority, deadline, operation, and cancellation are independent"
+        reason = "provider dataset, offset, limit, authority, deadline, and cancellation are independent"
     )]
     pub async fn acquire_vintage_page(
         &self,
@@ -371,23 +370,17 @@ impl FredSource {
         offset: usize,
         limit: NonZeroU16,
         deadline: Timestamp,
-        operation: FredOperation,
         cancellation: CancellationToken,
     ) -> Result<FredVintageExtractionPage, ExtractionSourceError> {
         self.validate_authority(authority)?;
-        if limit.get() > MAX_VINTAGE_PAGE_RECORDS
-            || !matches!(
-                operation,
-                FredOperation::RetrieveEphemeral | FredOperation::Persist
-            )
-        {
+        self.validate_provider_dataset(provider_dataset)?;
+        if limit.get() > MAX_VINTAGE_PAGE_RECORDS {
             return Err(ExtractionSourceError::Source(
                 SourceError::InvalidProtocolState,
             ));
         }
         let dataset = FredDataset::parse(provider_dataset)
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
-        self.authorize_series_operation(&dataset, operation)?;
         let mut public_url = url::Url::parse(VINTAGE_DATES_ENDPOINT)
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
         public_url
@@ -457,57 +450,42 @@ impl FredSource {
 
     /// Acquires one exact v2 release page using bearer-header authentication and cursor paging.
     ///
-    /// `authorized_series` is a closed, deduplicated page scope. Every series is authorized before
-    /// the request and every returned series must remain inside it. This prevents the bulk release
-    /// endpoint from silently widening an exact owner-authorized series scope.
+    /// `configured_series` is a closed, deduplicated page scope. Every returned series must remain
+    /// inside it, preventing the bulk release endpoint from widening the configured series set.
     #[allow(
         clippy::too_many_arguments,
-        reason = "release identity, cursor, series scope, limit, authority, deadline, operation, and cancellation are independent"
+        reason = "release identity, cursor, series scope, limit, authority, deadline, and cancellation are independent"
     )]
     pub async fn acquire_release_page(
         &self,
         authority: &ExtractionAuthority,
         release_id: NonZeroU32,
         requested_cursor: Option<&FredReleaseCursor>,
-        authorized_series: &[SourceIdentifier],
+        configured_series: &[SourceIdentifier],
         limit: NonZeroU32,
         deadline: Timestamp,
-        operation: FredOperation,
         cancellation: CancellationToken,
     ) -> Result<FredReleaseExtractionPage, ExtractionSourceError> {
         self.validate_authority(authority)?;
         let limit = usize::try_from(limit.get())
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
         if limit > MAX_FRED_V2_RELEASE_PAGE_OBSERVATIONS
-            || authorized_series.is_empty()
-            || authorized_series.len() > MAX_RELEASE_SCOPE_SERIES
-            || !matches!(
-                operation,
-                FredOperation::RetrieveEphemeral | FredOperation::Persist
-            )
+            || configured_series.is_empty()
+            || configured_series.len() > MAX_RELEASE_SCOPE_SERIES
         {
             return Err(ExtractionSourceError::Source(
                 SourceError::InvalidProtocolState,
             ));
         }
-        let exact_scope = authorized_series.iter().cloned().collect::<BTreeSet<_>>();
-        if exact_scope.len() != authorized_series.len() {
+        let exact_scope = configured_series.iter().cloned().collect::<BTreeSet<_>>();
+        if exact_scope.len() != configured_series.len()
+            || exact_scope
+                .iter()
+                .any(|series| !valid_exact_series_id(series.as_str()))
+        {
             return Err(ExtractionSourceError::Source(
                 SourceError::InvalidProtocolState,
             ));
-        }
-        for series in &exact_scope {
-            let decision = self
-                .rights
-                .assess(
-                    series,
-                    &[operation],
-                    system_timestamp().map_err(map_adapter_error)?,
-                )
-                .map_err(|_| ExtractionSourceError::Source(SourceError::Unauthorized))?;
-            if decision.disposition() != FredRightsDisposition::Permitted {
-                return Err(ExtractionSourceError::Source(SourceError::Unauthorized));
-            }
         }
         let mut public_url = url::Url::parse(RELEASE_OBSERVATIONS_V2_ENDPOINT)
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
@@ -573,25 +551,24 @@ impl FredSource {
 
     /// Acquires one complete v2 release chain under the same v1/v2 account budget.
     ///
-    /// The exact authorized series set is treated as the complete expected release membership.
-    /// Every member is rights-checked before every request; every returned member is checked again,
-    /// and terminal publication requires equality with the expected set. Cursor continuity,
+    /// The exact configured series set is treated as the complete expected release membership.
+    /// Every returned member is checked against it, and terminal publication requires equality
+    /// with the expected set. Cursor continuity,
     /// release/source attribution, split-series metadata, observation order, and total bounds are
     /// validated across pages. This method is therefore appropriate only for a release whose
-    /// complete membership has already been admitted by the owner authority.
+    /// complete membership has already been configured under the shared source authority.
     #[allow(
         clippy::too_many_arguments,
-        reason = "release/scope, page size/count, authority, deadline, operation, and cancellation are independent"
+        reason = "release/scope, page size/count, authority, deadline, and cancellation are independent"
     )]
     pub async fn acquire_complete_release(
         &self,
         authority: &ExtractionAuthority,
         release_id: NonZeroU32,
-        authorized_series: &[SourceIdentifier],
+        configured_series: &[SourceIdentifier],
         page_limit: NonZeroU32,
         maximum_pages: NonZeroU16,
         deadline: Timestamp,
-        operation: FredOperation,
         cancellation: CancellationToken,
     ) -> Result<FredReleaseExtraction, ExtractionSourceError> {
         let maximum_pages = usize::from(maximum_pages.get());
@@ -600,8 +577,13 @@ impl FredSource {
                 SourceError::InvalidProtocolState,
             ));
         }
-        let expected_series = authorized_series.iter().cloned().collect::<BTreeSet<_>>();
-        if expected_series.len() != authorized_series.len() || expected_series.is_empty() {
+        let expected_series = configured_series.iter().cloned().collect::<BTreeSet<_>>();
+        if expected_series.len() != configured_series.len()
+            || expected_series.is_empty()
+            || expected_series
+                .iter()
+                .any(|series| !valid_exact_series_id(series.as_str()))
+        {
             return Err(ExtractionSourceError::Source(
                 SourceError::InvalidProtocolState,
             ));
@@ -625,10 +607,9 @@ impl FredSource {
                     authority,
                     release_id,
                     cursor.as_ref(),
-                    authorized_series,
+                    configured_series,
                     page_limit,
                     deadline,
-                    operation,
                     cancellation.clone(),
                 )
                 .await?;
@@ -706,24 +687,6 @@ impl FredSource {
             raw_body_bytes,
             captures: captures.into_boxed_slice(),
         })
-    }
-
-    fn authorize_series_operation(
-        &self,
-        dataset: &FredDataset,
-        operation: FredOperation,
-    ) -> Result<(), ExtractionSourceError> {
-        let series = SourceIdentifier::try_from(dataset.series_id())
-            .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
-        let now = system_timestamp().map_err(map_adapter_error)?;
-        let decision = self
-            .rights
-            .assess(&series, &[operation], now)
-            .map_err(|_| ExtractionSourceError::Source(SourceError::Unauthorized))?;
-        if decision.disposition() != FredRightsDisposition::Permitted {
-            return Err(ExtractionSourceError::Source(SourceError::Unauthorized));
-        }
-        Ok(())
     }
 
     async fn execute_macro_request(

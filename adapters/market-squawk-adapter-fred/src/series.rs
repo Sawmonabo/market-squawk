@@ -5,6 +5,14 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use thiserror::Error;
 
+pub(crate) fn valid_exact_series_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 120
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
 /// Conservative parser admission limits for a FRED JSON page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FredParseLimits {

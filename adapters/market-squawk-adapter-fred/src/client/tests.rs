@@ -20,14 +20,7 @@ use market_squawk_sources::{
     SourceMetadataInput, SourceMetadataProvider, SourceObject, SourceProtocolProfile,
     payload_matches_exact_evidence,
 };
-use sha2::Digest;
 use tokio_util::sync::CancellationToken;
-
-use crate::{
-    FredOperation, FredOwnerAuthorizationEvidence, FredRightsArtifact, FredRightsPolicy,
-    FredSeriesRightsGrant, FredServicePermissionChannel, FredServicePermissionEvidence,
-    FredServicePermissionReview, FredTermsDocumentBytes, FredTermsDocumentRole, Sha256Digest,
-};
 
 use super::http::collect_bounded_stream;
 use super::{
@@ -82,6 +75,10 @@ fn dataset_identity_binds_series_and_closed_realtime_interval() -> TestResult {
         FredSource::analytical_dataset_identifier(&provider_dataset)?.as_str(),
         "alfred.series-observations.CPIAUCSL.2024-01-01.2024-02-01"
     );
+    assert_eq!(
+        FredSource::series_identifier(&provider_dataset)?.as_str(),
+        "CPIAUCSL"
+    );
     assert!(
         FredDataset::parse(&SourceIdentifier::try_from(
             "alfred:series-observations:CPIAUCSL:2024-02-01:2024-01-01",
@@ -124,6 +121,29 @@ async fn discovery_and_ephemeral_extraction_are_exact_source_request_and_payload
         incomplete_response,
         "fred-incomplete-discovery-test-user",
     )?;
+    assert_eq!(
+        incomplete.source.provider_dataset_identifier().as_str(),
+        "alfred:series-observations:CPIAUCSL:2024-01-01:2024-01-31"
+    );
+    let mismatched_request = market_squawk_sources::DiscoveryRequest::try_new(
+        SourceIdentifier::try_from("alfred:series-observations:CPIAUCSL:2024-01-01:2024-02-01")?,
+        None,
+        NonZeroU16::new(1).ok_or("nonzero result limit")?,
+        deadline,
+    )?;
+    assert!(matches!(
+        incomplete
+            .source
+            .discover(
+                incomplete.authority.clone(),
+                mismatched_request,
+                CancellationToken::new(),
+            )
+            .await,
+        Err(market_squawk_sources::ExtractionSourceError::Source(
+            SourceError::InvalidProtocolState
+        ))
+    ));
     let incomplete_request = market_squawk_sources::DiscoveryRequest::try_new(
         SourceIdentifier::try_from("alfred:series-observations:CPIAUCSL:2024-01-01:2024-01-31")?,
         None,
@@ -256,19 +276,6 @@ async fn discovery_and_ephemeral_extraction_are_exact_source_request_and_payload
         page.captures()[1].records()[0].payload(),
         complete_body.as_ref()
     );
-    assert!(matches!(
-        source
-            .source
-            .extract_with_capture(
-                source.authority.clone(),
-                extraction,
-                CancellationToken::new(),
-            )
-            .await,
-        Err(market_squawk_sources::ExtractionSourceError::Source(
-            SourceError::Unauthorized
-        ))
-    ));
     Ok(())
 }
 
@@ -297,7 +304,6 @@ async fn durable_extraction_emits_canonical_schema_v3_macro_observations() -> Te
             received_at: now,
         },
         "fred-durable-extraction-test-user",
-        true,
     )?;
     let deadline = now.checked_add_nanos(10_000_000_000)?;
     let discovery = market_squawk_sources::DiscoveryRequest::try_new(
@@ -495,7 +501,9 @@ async fn provider_refusals_apply_retry_after_to_the_shared_budget() -> TestResul
             subject,
         )?;
         let request = market_squawk_sources::DiscoveryRequest::try_new(
-            SourceIdentifier::try_from("fred:series-observations:CPIAUCSL:2024-01-01:2024-01-31")?,
+            SourceIdentifier::try_from(
+                "alfred:series-observations:CPIAUCSL:2024-01-01:2024-01-31",
+            )?,
             None,
             NonZeroU16::new(1).ok_or("nonzero result limit")?,
             now.checked_add_nanos(10_000_000_000)?,
@@ -571,7 +579,6 @@ async fn series_metadata_is_exact_request_bound_and_rejects_non_unique_identity(
             &dataset,
             now.checked_add_nanos(10_000_000_000)?,
             CancellationToken::new(),
-            FredOperation::RetrieveEphemeral,
         )
         .await?;
 
@@ -677,7 +684,6 @@ async fn series_metadata_is_exact_request_bound_and_rejects_non_unique_identity(
                 received_at: now,
             },
             subject,
-            false,
         )?;
         assert!(matches!(
             rejecting_source
@@ -687,7 +693,6 @@ async fn series_metadata_is_exact_request_bound_and_rejects_non_unique_identity(
                     &dataset,
                     now.checked_add_nanos(10_000_000_000)?,
                     CancellationToken::new(),
-                    FredOperation::RetrieveEphemeral,
                 )
                 .await,
             Err(market_squawk_sources::ExtractionSourceError::Source(
@@ -765,7 +770,6 @@ fn source(
             received_at: now,
         },
         authorization_subject,
-        false,
     )
 }
 
@@ -774,7 +778,6 @@ fn source_with_options(
     observations_response: FredHttpResponse,
     series_response: FredHttpResponse,
     authorization_subject: &'static str,
-    permit_persistence: bool,
 ) -> TestResult<TestFredSource> {
     let subject = SourceIdentifier::try_from(authorization_subject)?;
     let metadata = metadata(now, subject.clone())?;
@@ -782,10 +785,12 @@ fn source_with_options(
         Arc::new(TestSubjectResolver { subject }),
     )?;
     let registered = registry.register(metadata.clone(), now)?;
+    let provider_dataset =
+        SourceIdentifier::try_from("alfred:series-observations:CPIAUCSL:2024-01-01:2024-01-31")?;
     let source = FredSource::try_new_with_transport(
         metadata.clone(),
         FredApiKey::try_new("abcdefghijklmnopqrstuvwxyz123456".to_owned())?,
-        rights(now, permit_persistence)?,
+        provider_dataset,
         Arc::new(ScriptedTransport {
             observations_response,
             series_response,
@@ -871,145 +876,6 @@ fn metadata(now: Timestamp, authorization_subject: SourceIdentifier) -> TestResu
         ),
         SourceProtocolProfile::NotLive,
     ))?)
-}
-
-fn rights(now: Timestamp, permit_persistence: bool) -> TestResult<FredRightsPolicy> {
-    let assessed = now.checked_sub_nanos(1_000_000_000)?;
-    let review = now.checked_add_nanos(60_000_000_000)?;
-    let privacy_policy = concat!(
-        r#"<div class="component search-box col-12" id="a" data-properties='"#,
-        r#"{"endpoint":"//sxa/search/results/","#,
-        r#""suggestionEndpoint":"//sxa/search/suggestions/","suggestionsMode":"","#,
-        r#""resultPage":"/search","targetSignature":"siteResults","#,
-        r#""v":"{E22FB38C-3672-49E1-B145-563EEAEC4951}","#,
-        r#""s":"{A10D94E2-3F41-4100-A3BA-24E58460A483}","#,
-        r#""p":0,"l":"","languageSource":"AllLanguages","#,
-        r#""searchResultsSignature":"","itemid":"{679A23BE-3C34-4F6E-A98E-9A9246CFF1B5}"#,
-        r#"","minSuggestionsTriggerCharacterCount":2}'>"#
-    )
-    .as_bytes();
-    let artifact = format!(
-        r#"{{
-            "schema_version":5,
-            "series_scope":"exact_service_and_series_grants",
-            "terms_bundle_digest":"b3c33fd45878caee3c51ea1fafed95a1bed829432b49cd2a5c420e76df7aae3f",
-            "terms_documents":[
-                {{
-                    "role":"api_terms",
-                    "representation":"exact_raw",
-                    "url":"https://fred.stlouisfed.org/docs/api/terms_of_use.html",
-                    "sha256":"27d66951a524848e3777300299a69ef16f868ab2dbc9ca04a00ddea0b4db13bd",
-                    "byte_length":20
-                }},
-                {{
-                    "role":"fred_services_legal_terms",
-                    "representation":"exact_raw",
-                    "url":"https://fred.stlouisfed.org/legal/",
-                    "sha256":"97da0ed4fc87909604e691990b7344467c66e7b1bc9424a2bfbcf41dcf25b9e5",
-                    "byte_length":25
-                }},
-                {{
-                    "role":"privacy_policy",
-                    "representation":"privacy_sxa_search_item_canonical_v1",
-                    "url":"https://www.stlouisfed.org/about-us/privacy-policy/online-notice",
-                    "sha256":"6cd3afb454b4a8b7e6cfd026d43cede4ea7936cf081cd5a83bf803f846af7743",
-                    "byte_length":473
-                }}
-            ],
-            "assessed_at_unix_nanos":{},
-            "review_required_by_unix_nanos":{},
-            "operations":["persist"],
-            "disposition":"service_permission_required",
-            "confirmed_facts":["test"],
-            "engineering_inferences":["test"],
-            "sources":[
-                {{
-                    "url":"https://fred.stlouisfed.org/docs/api/terms_of_use.html",
-                    "accessed_on":"2026-07-21",
-                    "sha256":"27d66951a524848e3777300299a69ef16f868ab2dbc9ca04a00ddea0b4db13bd",
-                    "byte_length":20,
-                    "evidence_class":"confirmed"
-                }},
-                {{
-                    "url":"https://fred.stlouisfed.org/legal/",
-                    "accessed_on":"2026-07-21",
-                    "sha256":"97da0ed4fc87909604e691990b7344467c66e7b1bc9424a2bfbcf41dcf25b9e5",
-                    "byte_length":25,
-                    "evidence_class":"confirmed"
-                }},
-                {{
-                    "url":"https://www.stlouisfed.org/about-us/privacy-policy/online-notice",
-                    "accessed_on":"2026-07-21",
-                    "sha256":"8209e409687a552bea39fc7d01e7fe10e59b25ca03d0e8ffad59bafd12744749",
-                    "byte_length":481,
-                    "evidence_class":"confirmed"
-                }}
-            ]
-        }}"#,
-        assessed.unix_nanos(),
-        review.unix_nanos()
-    );
-    let terms_bytes = [
-        FredTermsDocumentBytes::try_new(FredTermsDocumentRole::ApiTerms, b"exact FRED API terms")?,
-        FredTermsDocumentBytes::try_new(
-            FredTermsDocumentRole::FredServicesLegalTerms,
-            b"exact FRED services terms",
-        )?,
-        FredTermsDocumentBytes::try_new(FredTermsDocumentRole::PrivacyPolicy, privacy_policy)?,
-    ];
-    let artifact = FredRightsArtifact::parse(artifact.as_bytes(), &terms_bytes)?;
-    let (service_permission, grants) = if permit_persistence {
-        let authorization_bytes = b"exact CPI series owner authorization";
-        let authorization = FredOwnerAuthorizationEvidence::try_new(
-            "https://owner.example.test/cpiaucsl-authorization".to_owned(),
-            Sha256Digest::from_bytes(sha2::Sha256::digest(authorization_bytes).into()),
-            authorization_bytes.len(),
-            authorization_bytes,
-        )?;
-        let grant = FredSeriesRightsGrant::try_new(
-            SourceIdentifier::try_from("CPIAUCSL")?,
-            SourceIdentifier::try_from("test-series-owner")?,
-            authorization,
-            artifact.terms_evidence().bundle_digest(),
-            vec![FredOperation::Persist],
-            assessed,
-            review,
-        )?;
-        let permission_bytes = b"exact St. Louis Fed persistence permission";
-        let channel = FredServicePermissionChannel::try_official_https(
-            "https://fred.stlouisfed.org/contactus/client-test-permission".to_owned(),
-            "https://fred.stlouisfed.org/contactus/".to_owned(),
-        )?;
-        let decision = FredServicePermissionReview::try_new(
-            SourceIdentifier::try_from("client-test-reviewer")?,
-            now,
-            SourceIdentifier::try_from("federal-reserve-bank-of-st-louis")?,
-            SourceIdentifier::try_from("market-squawk")?,
-            SourceIdentifier::try_from("fred-api")?,
-            vec![SourceIdentifier::try_from("CPIAUCSL")?],
-            vec![FredOperation::Persist],
-            Vec::new(),
-            assessed,
-            None,
-            review,
-        )?;
-        let permission = FredServicePermissionEvidence::try_new(
-            channel,
-            decision,
-            artifact.terms_evidence().bundle_digest(),
-            Sha256Digest::from_bytes(sha2::Sha256::digest(permission_bytes).into()),
-            permission_bytes.len(),
-            permission_bytes,
-        )?;
-        (Some(permission), vec![grant])
-    } else {
-        (None, Vec::new())
-    };
-    Ok(FredRightsPolicy::try_new(
-        artifact,
-        service_permission,
-        grants,
-    )?)
 }
 
 fn exact_evidence(bytes: &[u8]) -> ExactPayloadEvidence {
