@@ -32,10 +32,12 @@ use market_squawk_adapter_iex_hist::{
 use market_squawk_data::{
     AnalyticalMarketBarOutput, AnalyticalMarketBarReadLimit, AnalyticalMarketBarReadRequest,
     AnalyticalReadError, DatasetId, DatasetManifestRef, DatasetSchemaRegistry,
-    MarketBarEffectiveRange, QueryLimits,
+    MarketBarEffectiveRange, MarketDataInstrumentPopulationDisposition,
+    MarketDataInstrumentPopulationSelection, QueryLimits,
 };
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, InstrumentId, SourceId, Timestamp, VenueId,
+    DigestAlgorithm, EvidenceDigest, InstrumentId, ProviderInstrumentId, SourceId, Timestamp,
+    VenueId,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -770,7 +772,13 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
                 });
             }
         };
+        let restart = IexHistRestartSelector::from_publication(&receipt);
         if !receipt.validates_against(&self) {
+            let quarantine_error = quarantine_committed_publication(
+                authority,
+                &restart,
+                IexHistPublicationQuarantineReason::ReceiptMismatch,
+            );
             let settlement_error = self
                 .capacity_permit
                 .settle(IexHistCapacityDisposition::Quarantined(
@@ -779,6 +787,7 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
                 .err();
             return Err(IexHistPublicationError::InvalidReceipt {
                 receipt: Box::new(receipt),
+                quarantine_error,
                 settlement_error,
             });
         }
@@ -806,6 +815,11 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
             ),
         ] {
             if let Err(error) = capacity_permit.record_usage(category, bytes) {
+                let quarantine_error = quarantine_committed_publication(
+                    authority,
+                    &restart,
+                    IexHistPublicationQuarantineReason::CapacityMismatch,
+                );
                 let settlement_error = capacity_permit
                     .settle(IexHistCapacityDisposition::Quarantined(
                         IexHistTerminalReason::ResourceLimitExceeded,
@@ -814,42 +828,75 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
                 return Err(IexHistPublicationError::CapacityAfterCommit {
                     error,
                     receipt: Box::new(receipt),
+                    quarantine_error,
                     settlement_error,
                 });
             }
         }
-        let restart = IexHistRestartSelector {
-            publication: receipt,
-        };
-        let lineage = match authority.revalidate(&restart) {
-            Ok(lineage) => lineage,
+        let reconstruction = match authority.reopen_catalog_record(&restart) {
+            Ok(reconstruction) => reconstruction,
             Err(error) => {
+                let quarantine_error = quarantine_committed_publication(
+                    authority,
+                    &restart,
+                    IexHistPublicationQuarantineReason::RestartReconstructionFailed,
+                );
                 let settlement_error = capacity_permit
-                    .settle(IexHistCapacityDisposition::Failed)
+                    .settle(IexHistCapacityDisposition::Quarantined(
+                        IexHistTerminalReason::DownstreamIntegrityFault,
+                    ))
                     .err();
                 return Err(IexHistPublicationError::PostCommitRevalidation {
                     error,
-                    receipt: Box::new(restart.publication),
+                    receipt: Box::new(receipt),
+                    quarantine_error,
                     settlement_error,
                 });
             }
         };
-        if !restart.validates_restart_lineage(&lineage) {
+        if reconstruction.publication != receipt
+            || !restart.validates_restart_record(&reconstruction)
+        {
+            let quarantine_error = quarantine_committed_publication(
+                authority,
+                &restart,
+                IexHistPublicationQuarantineReason::RestartLineageMismatch,
+            );
             let settlement_error = capacity_permit
                 .settle(IexHistCapacityDisposition::Quarantined(
                     IexHistTerminalReason::DownstreamIntegrityFault,
                 ))
                 .err();
             return Err(IexHistPublicationError::InvalidReceipt {
-                receipt: Box::new(restart.publication),
+                receipt: Box::new(receipt),
+                quarantine_error,
                 settlement_error,
             });
         }
-        let receipt = restart.publication;
         if let Err(error) = capacity_permit.settle(IexHistCapacityDisposition::Completed) {
+            let quarantine_error = quarantine_committed_publication(
+                authority,
+                &restart,
+                IexHistPublicationQuarantineReason::CapacitySettlementFailed,
+            );
             return Err(IexHistPublicationError::SettlementAfterCommit {
                 error,
                 receipt: Box::new(receipt),
+                quarantine_error,
+            });
+        }
+        if let Err(error) = authority
+            .settle_pending_publication(&restart, IexHistPendingPublicationDisposition::Admitted)
+        {
+            let quarantine_error = quarantine_committed_publication(
+                authority,
+                &restart,
+                IexHistPublicationQuarantineReason::AdmissionFailed,
+            );
+            return Err(IexHistPublicationError::AdmissionAfterCommit {
+                error,
+                receipt: Box::new(receipt),
+                quarantine_error,
             });
         }
         Ok(IexHistPublishedBars {
@@ -862,6 +909,19 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
             receipt,
         })
     }
+}
+
+fn quarantine_committed_publication<A: IexHistRestartLineageAuthority>(
+    authority: &A,
+    selector: &IexHistRestartSelector,
+    reason: IexHistPublicationQuarantineReason,
+) -> Option<A::Error> {
+    authority
+        .settle_pending_publication(
+            selector,
+            IexHistPendingPublicationDisposition::Quarantined(reason),
+        )
+        .err()
 }
 
 /// Borrowed, permit-free view supplied to the shared publication authority.
@@ -920,6 +980,31 @@ impl<'a, R> IexHistCanonicalPublicationInput<'a, R> {
         self.physical
     }
 
+    /// Mints the only mapping receipt accepted by IEX publication from an opaque, catalog-issued
+    /// point-in-time population selection.
+    ///
+    /// This is the exact root-composition seam for the pending shared reverse resolver. The
+    /// resolver must first map the source-qualified IEX symbol to one stable identity and then pin
+    /// that identity through the common reference catalog. Provider code cannot replace the
+    /// selection with a caller-authored digest or `InstrumentId`.
+    pub(crate) fn try_reference_resolution_from_shared_reverse_resolver(
+        &self,
+        symbol: impl Into<String>,
+        first_effective_at: Timestamp,
+        last_effective_at: Timestamp,
+        selection: MarketDataInstrumentPopulationSelection,
+    ) -> Result<IexHistReferenceResolutionReceipt, IexHistApplicationError> {
+        IexHistReferenceResolutionReceipt::try_from_catalog_selection(
+            self.source_id.clone(),
+            symbol,
+            self.plan.selected_file().trade_date(),
+            self.plan.selected_file().feed(),
+            first_effective_at,
+            last_effective_at,
+            selection,
+        )
+    }
+
     /// Returns the sole accepted identity of a sorted date-effective symbol mapping set.
     ///
     /// The shared publisher uses this before its atomic commit so the returned receipt cannot
@@ -949,9 +1034,11 @@ impl<'a, R> IexHistCanonicalPublicationInput<'a, R> {
 /// Implementations must use the common provider-capture store, Arrow converter, Parquet store,
 /// manifest catalog, rights decision, and precommit authority. Returning `Ok` means the immutable
 /// manifest and every exact raw/native parent are already durably committed; an implementation
-/// must never substitute provider text for a date-effective canonical `InstrumentId`. The mapping
-/// set and persisted native binding returned by the input must be written in that same atomic
-/// commit and copied exactly into the immutable receipt.
+/// must leave that exact natural key `Pending` and unselectable until
+/// `settle_pending_publication` admits it, and must never substitute provider text for a
+/// date-effective canonical `InstrumentId`. The mapping set and persisted native binding returned
+/// by the input must be written in that same atomic commit and copied exactly into the immutable
+/// receipt.
 #[async_trait]
 pub(crate) trait IexHistCanonicalPublicationAuthority<R>:
     IexHistRestartLineageAuthority + Send + Sync
@@ -965,51 +1052,234 @@ where
     ) -> Result<IexHistImmutablePublicationReceipt, <Self as IexHistRestartLineageAuthority>::Error>;
 }
 
+/// Opaque proof that the common reference catalog resolved one source-qualified IEX symbol at the
+/// exact published date and effective range.
+///
+/// Fields are private and construction requires a catalog-issued population selection. The IEX
+/// publisher can carry and verify this receipt but cannot mint one from an arbitrary identity or
+/// digest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IexHistReferenceResolutionReceipt {
+    source_id: SourceId,
+    symbol: String,
+    instrument_id: InstrumentId,
+    trade_date: TradeDate,
+    feed: FeedKind,
+    first_effective_at: Timestamp,
+    last_effective_at: Timestamp,
+    catalog_knowledge_at: Timestamp,
+    catalog_selection_sha256: EvidenceDigest,
+    reference_revision_sha256: EvidenceDigest,
+    provider_identity_sha256: EvidenceDigest,
+    receipt_sha256: EvidenceDigest,
+}
+
+impl IexHistReferenceResolutionReceipt {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared reverse-resolution seam binds source, symbol, feed/date, range, and opaque catalog proof"
+    )]
+    fn try_from_catalog_selection(
+        source_id: SourceId,
+        symbol: impl Into<String>,
+        trade_date: TradeDate,
+        feed: FeedKind,
+        first_effective_at: Timestamp,
+        last_effective_at: Timestamp,
+        selection: MarketDataInstrumentPopulationSelection,
+    ) -> Result<Self, IexHistApplicationError> {
+        let symbol = symbol.into();
+        let provider_symbol = ProviderInstrumentId::try_from(symbol.as_str())
+            .map_err(|_| IexHistApplicationError::InvalidReferenceResolutionReceipt)?;
+        let [instrument_id] = selection.query().instrument_ids() else {
+            return Err(IexHistApplicationError::InvalidReferenceResolutionReceipt);
+        };
+        let [record] = selection.records() else {
+            return Err(IexHistApplicationError::InvalidReferenceResolutionReceipt);
+        };
+        let first_date = first_effective_at
+            .utc_calendar_date()
+            .map_err(|_| IexHistApplicationError::InvalidReferenceResolutionReceipt)?;
+        let last_date = last_effective_at
+            .utc_calendar_date()
+            .map_err(|_| IexHistApplicationError::InvalidReferenceResolutionReceipt)?;
+        let expected_date = (trade_date.year(), trade_date.month(), trade_date.day());
+        let first_mapping = record.definition().provider_identity_at(
+            &source_id,
+            &provider_symbol,
+            first_effective_at,
+        );
+        let last_mapping = record.definition().provider_identity_at(
+            &source_id,
+            &provider_symbol,
+            last_effective_at,
+        );
+        let (Some(first_mapping), Some(last_mapping)) = (first_mapping, last_mapping) else {
+            return Err(IexHistApplicationError::InvalidReferenceResolutionReceipt);
+        };
+        if symbol.is_empty()
+            || symbol.len() > 64
+            || first_effective_at > last_effective_at
+            || selection.disposition() != MarketDataInstrumentPopulationDisposition::Complete
+            || !selection.exclusions().is_empty()
+            || selection.query().effective_at() != first_effective_at
+            || record.definition().instrument_id() != *instrument_id
+            || !effective_interval_contains(
+                record.definition().effective_interval(),
+                last_effective_at,
+            )
+            || (first_date.year(), first_date.month(), first_date.day()) != expected_date
+            || (last_date.year(), last_date.month(), last_date.day()) != expected_date
+            || first_mapping.instrument_id() != *instrument_id
+            || last_mapping.instrument_id() != *instrument_id
+            || first_mapping.metadata_revision() != last_mapping.metadata_revision()
+            || first_mapping.evidence().content_digest() != last_mapping.evidence().content_digest()
+        {
+            return Err(IexHistApplicationError::InvalidReferenceResolutionReceipt);
+        }
+        let catalog_selection_sha256 = selection.receipt_digest();
+        let reference_revision_sha256 = record.revision_digest();
+        let provider_identity_sha256 = first_mapping.evidence().content_digest();
+        if !valid_sha256_evidence(catalog_selection_sha256)
+            || !valid_sha256_evidence(reference_revision_sha256)
+            || !valid_sha256_evidence(provider_identity_sha256)
+        {
+            return Err(IexHistApplicationError::InvalidReferenceResolutionReceipt);
+        }
+        let instrument_id = *instrument_id;
+        let catalog_knowledge_at = selection.query().knowledge_at();
+        let receipt_sha256 = reference_resolution_identity(
+            &source_id,
+            &symbol,
+            instrument_id,
+            trade_date,
+            feed,
+            first_effective_at,
+            last_effective_at,
+            catalog_knowledge_at,
+            catalog_selection_sha256,
+            reference_revision_sha256,
+            provider_identity_sha256,
+        );
+        Ok(Self {
+            source_id,
+            symbol,
+            instrument_id,
+            trade_date,
+            feed,
+            first_effective_at,
+            last_effective_at,
+            catalog_knowledge_at,
+            catalog_selection_sha256,
+            reference_revision_sha256,
+            provider_identity_sha256,
+            receipt_sha256,
+        })
+    }
+
+    fn validates_context(
+        &self,
+        source_id: &SourceId,
+        trade_date: TradeDate,
+        feed: FeedKind,
+    ) -> bool {
+        self.source_id == *source_id
+            && self.trade_date == trade_date
+            && self.feed == feed
+            && self.receipt_sha256
+                == reference_resolution_identity(
+                    &self.source_id,
+                    &self.symbol,
+                    self.instrument_id,
+                    self.trade_date,
+                    self.feed,
+                    self.first_effective_at,
+                    self.last_effective_at,
+                    self.catalog_knowledge_at,
+                    self.catalog_selection_sha256,
+                    self.reference_revision_sha256,
+                    self.provider_identity_sha256,
+                )
+    }
+}
+
+fn effective_interval_contains(
+    interval: market_squawk_domain::EffectiveInterval,
+    at: Timestamp,
+) -> bool {
+    interval.starts_at() <= at && interval.ends_at().is_none_or(|end| at < end)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mapping identity commits the complete date-effective common-catalog resolution"
+)]
+fn reference_resolution_identity(
+    source_id: &SourceId,
+    symbol: &str,
+    instrument_id: InstrumentId,
+    trade_date: TradeDate,
+    feed: FeedKind,
+    first_effective_at: Timestamp,
+    last_effective_at: Timestamp,
+    catalog_knowledge_at: Timestamp,
+    catalog_selection_sha256: EvidenceDigest,
+    reference_revision_sha256: EvidenceDigest,
+    provider_identity_sha256: EvidenceDigest,
+) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/iex-hist-reference-resolution/v1");
+    hash_length_prefixed(&mut hash, source_id.as_str().as_bytes());
+    hash_length_prefixed(&mut hash, symbol.as_bytes());
+    hash.update(instrument_id.as_uuid().as_bytes());
+    hash.update(trade_date.compact().as_bytes());
+    hash.update([feed_identity_tag(feed)]);
+    hash.update(first_effective_at.unix_nanos().to_le_bytes());
+    hash.update(last_effective_at.unix_nanos().to_le_bytes());
+    hash.update(catalog_knowledge_at.unix_nanos().to_le_bytes());
+    hash.update(catalog_selection_sha256.bytes());
+    hash.update(reference_revision_sha256.bytes());
+    hash.update(provider_identity_sha256.bytes());
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
 /// One source symbol's verified date-effective canonical identity and exact published row count.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IexHistPublishedInstrument {
-    symbol: String,
-    instrument_id: InstrumentId,
+    resolution: IexHistReferenceResolutionReceipt,
     bar_count: u64,
     first_effective_at: Timestamp,
     last_effective_at: Timestamp,
-    mapping_evidence: EvidenceDigest,
 }
 
 impl IexHistPublishedInstrument {
     pub(crate) fn try_new(
-        symbol: impl Into<String>,
-        instrument_id: InstrumentId,
+        resolution: IexHistReferenceResolutionReceipt,
         bar_count: u64,
         first_effective_at: Timestamp,
         last_effective_at: Timestamp,
-        mapping_evidence: EvidenceDigest,
     ) -> Result<Self, IexHistApplicationError> {
-        let symbol = symbol.into();
-        if symbol.is_empty()
-            || symbol.len() > 64
-            || bar_count == 0
+        if bar_count == 0
             || first_effective_at > last_effective_at
-            || !valid_sha256_evidence(mapping_evidence)
+            || resolution.first_effective_at != first_effective_at
+            || resolution.last_effective_at != last_effective_at
         {
             return Err(IexHistApplicationError::InvalidCanonicalPublicationReceipt);
         }
         Ok(Self {
-            symbol,
-            instrument_id,
+            resolution,
             bar_count,
             first_effective_at,
             last_effective_at,
-            mapping_evidence,
         })
     }
 
     pub(crate) fn symbol(&self) -> &str {
-        &self.symbol
+        &self.resolution.symbol
     }
 
     pub(crate) const fn instrument_id(&self) -> InstrumentId {
-        self.instrument_id
+        self.resolution.instrument_id
     }
 
     pub(crate) const fn bar_count(&self) -> u64 {
@@ -1021,7 +1291,7 @@ impl IexHistPublishedInstrument {
     }
 
     pub(crate) const fn mapping_evidence(&self) -> EvidenceDigest {
-        self.mapping_evidence
+        self.resolution.receipt_sha256
     }
 }
 
@@ -1110,12 +1380,18 @@ impl IexHistImmutablePublicationReceipt {
             || !valid_iex_sha256(derived_handoff_sha256)
             || instruments.iter().any(|entry| entry.bar_count == 0)
             || instruments.windows(2).any(|pair| {
-                pair[0].symbol >= pair[1].symbol || pair[0].instrument_id == pair[1].instrument_id
+                pair[0].symbol() >= pair[1].symbol()
+                    || pair[0].instrument_id() == pair[1].instrument_id()
             })
             || instruments.iter().enumerate().any(|(index, entry)| {
                 instruments[index + 1..]
                     .iter()
-                    .any(|later| later.instrument_id == entry.instrument_id)
+                    .any(|later| later.instrument_id() == entry.instrument_id())
+            })
+            || instruments.iter().any(|entry| {
+                !entry
+                    .resolution
+                    .validates_context(&source_id, trade_date, feed)
             })
             || instruments
                 .iter()
@@ -1213,11 +1489,11 @@ impl IexHistImmutablePublicationReceipt {
             && latest_completed_at
                 .is_some_and(|completed_at| self.locally_available_at >= completed_at)
             && self.instruments.iter().all(|entry| {
-                let first = bars.iter().find(|bar| bar.symbol() == entry.symbol);
-                let last = bars.iter().rev().find(|bar| bar.symbol() == entry.symbol);
+                let first = bars.iter().find(|bar| bar.symbol() == entry.symbol());
+                let last = bars.iter().rev().find(|bar| bar.symbol() == entry.symbol());
                 let count = bars
                     .iter()
-                    .filter(|bar| bar.symbol() == entry.symbol)
+                    .filter(|bar| bar.symbol() == entry.symbol())
                     .count();
                 u64::try_from(count).ok() == Some(entry.bar_count)
                     && first.is_some_and(|bar| {
@@ -1230,7 +1506,7 @@ impl IexHistImmutablePublicationReceipt {
             && bars.iter().all(|bar| {
                 self.instruments
                     .iter()
-                    .any(|entry| entry.symbol == bar.symbol())
+                    .any(|entry| entry.symbol() == bar.symbol())
             })
             && publication_receipt_identity(
                 &self.manifest,
@@ -1363,9 +1639,7 @@ impl<R> IexHistPublishedBars<R> {
     }
 
     pub(crate) fn restart_selector(&self) -> IexHistRestartSelector {
-        IexHistRestartSelector {
-            publication: self.receipt.clone(),
-        }
+        IexHistRestartSelector::from_publication(&self.receipt)
     }
 }
 
@@ -1386,6 +1660,7 @@ pub(crate) enum IexHistPublicationError<E> {
     },
     InvalidReceipt {
         receipt: Box<IexHistImmutablePublicationReceipt>,
+        quarantine_error: Option<E>,
         settlement_error: Option<IexHistCapacityError>,
     },
     /// The manifest commit returned, but its exact raw/native binding could not be reopened before
@@ -1393,16 +1668,24 @@ pub(crate) enum IexHistPublicationError<E> {
     PostCommitRevalidation {
         error: E,
         receipt: Box<IexHistImmutablePublicationReceipt>,
+        quarantine_error: Option<E>,
         settlement_error: Option<IexHistCapacityError>,
     },
     CapacityAfterCommit {
         error: IexHistCapacityError,
         receipt: Box<IexHistImmutablePublicationReceipt>,
+        quarantine_error: Option<E>,
         settlement_error: Option<IexHistCapacityError>,
     },
     SettlementAfterCommit {
         error: IexHistCapacityError,
         receipt: Box<IexHistImmutablePublicationReceipt>,
+        quarantine_error: Option<E>,
+    },
+    AdmissionAfterCommit {
+        error: E,
+        receipt: Box<IexHistImmutablePublicationReceipt>,
+        quarantine_error: Option<E>,
     },
 }
 
@@ -1416,19 +1699,19 @@ fn valid_iex_sha256(value: Sha256Digest) -> bool {
 
 fn published_mapping_set_identity(instruments: &[IexHistPublishedInstrument]) -> EvidenceDigest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/iex-hist-published-mapping-set/v1");
+    hash.update(b"market-squawk/iex-hist-published-mapping-set/v2");
     hash.update(
         u64::try_from(instruments.len())
             .unwrap_or(u64::MAX)
             .to_le_bytes(),
     );
     for instrument in instruments {
-        hash_length_prefixed(&mut hash, instrument.symbol.as_bytes());
-        hash.update(instrument.instrument_id.as_uuid().as_bytes());
+        hash_length_prefixed(&mut hash, instrument.symbol().as_bytes());
+        hash.update(instrument.instrument_id().as_uuid().as_bytes());
         hash.update(instrument.bar_count.to_le_bytes());
         hash.update(instrument.first_effective_at.unix_nanos().to_le_bytes());
         hash.update(instrument.last_effective_at.unix_nanos().to_le_bytes());
-        hash.update(instrument.mapping_evidence.bytes());
+        hash.update(instrument.mapping_evidence().bytes());
     }
     EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
 }
@@ -1438,7 +1721,7 @@ fn persisted_native_lineage_identity<R>(
     instruments: &[IexHistPublishedInstrument],
 ) -> EvidenceDigest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/iex-hist-persisted-native-lineage/v1");
+    hash.update(b"market-squawk/iex-hist-persisted-native-lineage/v2");
     hash_length_prefixed(&mut hash, input.source_id.as_str().as_bytes());
     hash_length_prefixed(&mut hash, input.analytical_dataset.as_str().as_bytes());
     for digest in [
@@ -1523,7 +1806,7 @@ fn publication_receipt_identity(
     manifest_and_atomic_bytes: u64,
 ) -> EvidenceDigest {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/iex-hist-canonical-publication/v1");
+    hash.update(b"market-squawk/iex-hist-canonical-publication/v2");
     hash.update(manifest.dataset_id().as_str().as_bytes());
     hash.update(manifest.manifest_version().to_le_bytes());
     hash.update(manifest.schema().name().as_bytes());
@@ -1559,12 +1842,12 @@ fn publication_receipt_identity(
             .to_le_bytes(),
     );
     for instrument in instruments {
-        hash.update(instrument.symbol.as_bytes());
-        hash.update(instrument.instrument_id.as_uuid().as_bytes());
+        hash.update(instrument.symbol().as_bytes());
+        hash.update(instrument.instrument_id().as_uuid().as_bytes());
         hash.update(instrument.bar_count.to_le_bytes());
         hash.update(instrument.first_effective_at.unix_nanos().to_le_bytes());
         hash.update(instrument.last_effective_at.unix_nanos().to_le_bytes());
-        hash.update(instrument.mapping_evidence.bytes());
+        hash.update(instrument.mapping_evidence().bytes());
     }
     hash.update(arrow_bytes.to_le_bytes());
     hash.update(parquet_bytes.to_le_bytes());
@@ -1703,29 +1986,113 @@ impl IexHistRestartLineageEvidence {
     }
 }
 
-/// Shared catalog authority needed to prove restart lineage independently of local coordinates.
+/// Complete catalog reconstruction of an immutable publication and its raw/native binding.
+///
+/// This value is intentionally returned by the shared authority rather than retained by the
+/// selector. A process restart must load both members from durable common-store state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IexHistRestartCatalogRecord {
+    publication: IexHistImmutablePublicationReceipt,
+    lineage: IexHistRestartLineageEvidence,
+}
+
+impl IexHistRestartCatalogRecord {
+    pub(crate) const fn new(
+        publication: IexHistImmutablePublicationReceipt,
+        lineage: IexHistRestartLineageEvidence,
+    ) -> Self {
+        Self {
+            publication,
+            lineage,
+        }
+    }
+}
+
+/// Required terminal transition for a shared-catalog publication that was committed pending.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IexHistPendingPublicationDisposition {
+    /// Exact catalog reconstruction and all application validation succeeded.
+    Admitted,
+    /// The committed generation failed an application-side postcommit integrity check and must
+    /// remain unselectable.
+    Quarantined(IexHistPublicationQuarantineReason),
+}
+
+/// Provider-owned reason supplied to the shared pending/admitted/quarantined state machine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IexHistPublicationQuarantineReason {
+    ReceiptMismatch,
+    CapacityMismatch,
+    RestartReconstructionFailed,
+    RestartLineageMismatch,
+    CapacitySettlementFailed,
+    AdmissionFailed,
+}
+
+/// Shared catalog authority needed to reconstruct restart lineage independently of all live
+/// publication/runtime objects and to settle the already-committed pending manifest.
+///
+/// `reopen_catalog_record` must resolve only the selector's exact manifest natural key and receipt
+/// digest, then reopen the persisted provider capture/native sidecar and canonical manifest.
+/// `settle_pending_publication` is a compare-and-set on that same pending row: `Admitted` makes it
+/// selectable and `Quarantined` keeps it nonselectable. This provider leaf deliberately owns no
+/// duplicate admission state or catalog table.
 pub(crate) trait IexHistRestartLineageAuthority {
     type Error: Send;
 
-    fn revalidate(
+    fn reopen_catalog_record(
         &self,
         selector: &IexHistRestartSelector,
-    ) -> Result<IexHistRestartLineageEvidence, Self::Error>;
+    ) -> Result<IexHistRestartCatalogRecord, Self::Error>;
+
+    fn settle_pending_publication(
+        &self,
+        selector: &IexHistRestartSelector,
+        disposition: IexHistPendingPublicationDisposition,
+    ) -> Result<(), Self::Error>;
 }
 
-/// Exact immutable manifest and raw/native coordinates for restart-safe PIT reads.
+/// Durable natural key for restart-safe PIT reads.
+///
+/// No publication receipt, physical object, native event, runtime handle, or authority object is
+/// retained here. The key is safe to retain across process composition and can only reopen the
+/// exact immutable manifest/receipt pair.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IexHistRestartSelector {
-    publication: IexHistImmutablePublicationReceipt,
+    manifest: DatasetManifestRef,
+    publication_receipt_sha256: EvidenceDigest,
 }
 
 impl IexHistRestartSelector {
+    fn from_publication(publication: &IexHistImmutablePublicationReceipt) -> Self {
+        Self {
+            manifest: publication.manifest.clone(),
+            publication_receipt_sha256: publication.receipt_sha256,
+        }
+    }
+
     pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
-        self.publication.manifest()
+        &self.manifest
     }
 
     pub(crate) const fn publication_receipt_sha256(&self) -> EvidenceDigest {
-        self.publication.receipt_sha256()
+        self.publication_receipt_sha256
+    }
+
+    /// Reconstructs and cross-validates the exact immutable publication and raw/native evidence
+    /// from the shared catalog. This is independently useful for restart recovery before a typed
+    /// analytical read is requested.
+    pub(crate) fn reconstruct<A: IexHistRestartLineageAuthority>(
+        &self,
+        authority: &A,
+    ) -> Result<IexHistRestartCatalogRecord, IexHistRestartError<A::Error>> {
+        let record = authority
+            .reopen_catalog_record(self)
+            .map_err(IexHistRestartError::Authority)?;
+        if !self.validates_restart_record(&record) {
+            return Err(IexHistRestartError::LineageMismatch);
+        }
+        Ok(record)
     }
 
     /// Revalidates the persisted raw/native parent, then runs the existing exact-manifest typed
@@ -1745,14 +2112,18 @@ impl IexHistRestartSelector {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<IexHistRestartReceipt, IexHistRestartError<A::Error>> {
-        if knowledge_cutoff < self.publication.locally_available_at {
+        let reconstruction = self.reconstruct(authority)?;
+        let IexHistRestartCatalogRecord {
+            publication,
+            lineage,
+        } = reconstruction;
+        if knowledge_cutoff < publication.locally_available_at {
             return Err(IexHistRestartError::NotYetAvailable);
         }
-        let instrument = self
-            .publication
+        let instrument = publication
             .instruments
             .iter()
-            .find(|entry| entry.instrument_id == instrument_id)
+            .find(|entry| entry.instrument_id() == instrument_id)
             .ok_or(IexHistRestartError::InstrumentNotPublished)?;
         let expected_rows = instrument.bar_count;
         let effective_range = MarketBarEffectiveRange::try_new(
@@ -1760,14 +2131,8 @@ impl IexHistRestartSelector {
             instrument.last_effective_at,
         )
         .map_err(IexHistRestartError::Analytical)?;
-        let lineage = authority
-            .revalidate(self)
-            .map_err(IexHistRestartError::Authority)?;
-        if !self.validates_restart_lineage(&lineage) {
-            return Err(IexHistRestartError::LineageMismatch);
-        }
         let request = AnalyticalMarketBarReadRequest::try_new(
-            self.publication.manifest.clone(),
+            publication.manifest.clone(),
             instrument_id,
             knowledge_cutoff,
             Some(effective_range),
@@ -1779,20 +2144,20 @@ impl IexHistRestartSelector {
             .read_market_bars(request, query_limits, deadline, cancellation)
             .await
             .map_err(IexHistRestartError::Analytical)?;
-        if bars.source_id() != &self.publication.source_id
-            || bars.output().manifest() != &self.publication.manifest
+        if bars.source_id() != &publication.source_id
+            || bars.output().manifest() != &publication.manifest
             || u64::try_from(bars.bars().len()).ok() != Some(expected_rows)
             || bars.bars().iter().any(|bar| {
-                bar.context().provenance().venue_id() != Some(&self.publication.venue_id)
-                    || bar.feed().as_str() != canonical_feed_identifier(self.publication.feed)
+                bar.context().provenance().venue_id() != Some(&publication.venue_id)
+                    || bar.feed().as_str() != canonical_feed_identifier(publication.feed)
                     || bar.interval().as_str()
-                        != canonical_interval_identifier(self.publication.interval)
+                        != canonical_interval_identifier(publication.interval)
             })
         {
             return Err(IexHistRestartError::TypedReadMismatch);
         }
         let history_handoff_sha256 = neutral_history_handoff_identity(
-            &self.publication,
+            &publication,
             &lineage,
             instrument_id,
             knowledge_cutoff,
@@ -1809,23 +2174,27 @@ impl IexHistRestartSelector {
         })
     }
 
-    fn validates_restart_lineage(&self, evidence: &IexHistRestartLineageEvidence) -> bool {
-        evidence.manifest == self.publication.manifest
-            && evidence.publication_receipt_sha256 == self.publication.receipt_sha256
-            && evidence.persisted_binding_sha256 == self.publication.persisted_binding_sha256
-            && evidence.source_id == self.publication.source_id
-            && evidence.venue_id == self.publication.venue_id
-            && evidence.catalog_seal_sha256 == self.publication.catalog_seal_sha256
-            && evidence.physical_seal_sha256 == self.publication.physical_seal_sha256
-            && evidence.plan_sha256 == self.publication.plan_sha256
-            && evidence.capture_receipt_sha256 == self.publication.capture_receipt_sha256
-            && evidence.decode_summary_sha256 == self.publication.decode_summary_sha256
-            && evidence.provider_content_sha256 == self.publication.provider_content_sha256
-            && evidence.derived_handoff_sha256 == self.publication.derived_handoff_sha256
-            && evidence.mapping_set_sha256 == self.publication.mapping_set_sha256
-            && evidence.canonical_content_sha256 == self.publication.canonical_content_sha256
-            && evidence.locally_available_at == self.publication.locally_available_at
-            && evidence.row_count == self.publication.row_count
+    fn validates_restart_record(&self, record: &IexHistRestartCatalogRecord) -> bool {
+        let publication = &record.publication;
+        let evidence = &record.lineage;
+        self.manifest == publication.manifest
+            && self.publication_receipt_sha256 == publication.receipt_sha256
+            && evidence.manifest == publication.manifest
+            && evidence.publication_receipt_sha256 == publication.receipt_sha256
+            && evidence.persisted_binding_sha256 == publication.persisted_binding_sha256
+            && evidence.source_id == publication.source_id
+            && evidence.venue_id == publication.venue_id
+            && evidence.catalog_seal_sha256 == publication.catalog_seal_sha256
+            && evidence.physical_seal_sha256 == publication.physical_seal_sha256
+            && evidence.plan_sha256 == publication.plan_sha256
+            && evidence.capture_receipt_sha256 == publication.capture_receipt_sha256
+            && evidence.decode_summary_sha256 == publication.decode_summary_sha256
+            && evidence.provider_content_sha256 == publication.provider_content_sha256
+            && evidence.derived_handoff_sha256 == publication.derived_handoff_sha256
+            && evidence.mapping_set_sha256 == publication.mapping_set_sha256
+            && evidence.canonical_content_sha256 == publication.canonical_content_sha256
+            && evidence.locally_available_at == publication.locally_available_at
+            && evidence.row_count == publication.row_count
     }
 }
 
@@ -2286,6 +2655,8 @@ pub(crate) enum IexHistApplicationError {
     InvalidPhysicalHandoff,
     #[error("IEX HIST canonical publication receipt is invalid")]
     InvalidCanonicalPublicationReceipt,
+    #[error("IEX HIST reference resolution receipt is invalid")]
+    InvalidReferenceResolutionReceipt,
     #[error("IEX HIST derived-bar preparation failed")]
     DerivedPreparation {
         error: IexHistDerivedPreparationError,
@@ -2303,4 +2674,218 @@ pub(crate) enum IexHistApplicationError {
     CompleteSeal(#[from] IexHistCompleteSealError),
     #[error(transparent)]
     Transport(#[from] IexHistTransportError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct RestartCatalogFixture {
+        record: Arc<IexHistRestartCatalogRecord>,
+        dispositions: Arc<Mutex<Vec<IexHistPendingPublicationDisposition>>>,
+    }
+
+    impl IexHistRestartLineageAuthority for RestartCatalogFixture {
+        type Error = &'static str;
+
+        fn reopen_catalog_record(
+            &self,
+            _selector: &IexHistRestartSelector,
+        ) -> Result<IexHistRestartCatalogRecord, Self::Error> {
+            Ok(self.record.as_ref().clone())
+        }
+
+        fn settle_pending_publication(
+            &self,
+            _selector: &IexHistRestartSelector,
+            disposition: IexHistPendingPublicationDisposition,
+        ) -> Result<(), Self::Error> {
+            self.dispositions
+                .lock()
+                .map_err(|_| "catalog disposition lock poisoned")?
+                .push(disposition);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn durable_restart_reconstructs_after_fresh_composition_and_quarantines_binding_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let publication = fixture_publication()?;
+        let selector = IexHistRestartSelector::from_publication(&publication);
+        let lineage = fixture_lineage(&publication)?;
+        let durable_record = Arc::new(IexHistRestartCatalogRecord::new(
+            publication.clone(),
+            lineage.clone(),
+        ));
+        let dispositions = Arc::new(Mutex::new(Vec::new()));
+
+        // Only the natural key survives the first composition. The live publication and authority
+        // are dropped before a fresh authority reconstructs the exact catalog record.
+        let first_composition = RestartCatalogFixture {
+            record: Arc::clone(&durable_record),
+            dispositions: Arc::clone(&dispositions),
+        };
+        drop(first_composition);
+        drop(publication);
+        let fresh_composition = RestartCatalogFixture {
+            record: Arc::clone(&durable_record),
+            dispositions: Arc::clone(&dispositions),
+        };
+        let reopened = selector.reconstruct(&fresh_composition).map_err(|_| {
+            std::io::Error::other("exact durable IEX publication did not reconstruct")
+        })?;
+        assert_eq!(reopened.publication.manifest(), selector.manifest());
+        assert_eq!(
+            reopened.publication.receipt_sha256(),
+            selector.publication_receipt_sha256()
+        );
+        drop(fresh_composition);
+        drop(reopened);
+
+        // A fresh composition that reopens a different persisted raw/native binding is rejected
+        // and the same pending natural key is explicitly quarantined before it can be selected.
+        let mut mismatched_lineage = lineage;
+        mismatched_lineage.persisted_binding_sha256 = evidence(99);
+        let adversarial_composition = RestartCatalogFixture {
+            record: Arc::new(IexHistRestartCatalogRecord::new(
+                durable_record.publication.clone(),
+                mismatched_lineage,
+            )),
+            dispositions: Arc::clone(&dispositions),
+        };
+        assert!(matches!(
+            selector.reconstruct(&adversarial_composition),
+            Err(IexHistRestartError::LineageMismatch)
+        ));
+        assert!(
+            quarantine_committed_publication(
+                &adversarial_composition,
+                &selector,
+                IexHistPublicationQuarantineReason::RestartLineageMismatch,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            dispositions.lock().map(|values| values.clone()).ok(),
+            Some(vec![IexHistPendingPublicationDisposition::Quarantined(
+                IexHistPublicationQuarantineReason::RestartLineageMismatch,
+            )])
+        );
+        Ok(())
+    }
+
+    fn fixture_publication()
+    -> Result<IexHistImmutablePublicationReceipt, Box<dyn std::error::Error>> {
+        let source_id = SourceId::try_from("iex-hist-reference-v1")?;
+        let venue_id = VenueId::try_from("iex")?;
+        let instrument_id = "10000000-0000-4000-8000-000000000001".parse::<InstrumentId>()?;
+        let first_effective_at = Timestamp::from_unix_nanos(1_750_000_000_000_000_000);
+        let last_effective_at = Timestamp::from_unix_nanos(1_750_000_060_000_000_000);
+        let date = first_effective_at.utc_calendar_date()?;
+        let trade_date = TradeDate::new(date.year(), date.month(), date.day())?;
+        let resolution_sha256 = reference_resolution_identity(
+            &source_id,
+            "AAPL",
+            instrument_id,
+            trade_date,
+            FeedKind::Tops,
+            first_effective_at,
+            last_effective_at,
+            Timestamp::from_unix_nanos(1_749_999_000_000_000_000),
+            evidence(31),
+            evidence(32),
+            evidence(33),
+        );
+        let resolution = IexHistReferenceResolutionReceipt {
+            source_id: source_id.clone(),
+            symbol: "AAPL".to_owned(),
+            instrument_id,
+            trade_date,
+            feed: FeedKind::Tops,
+            first_effective_at,
+            last_effective_at,
+            catalog_knowledge_at: Timestamp::from_unix_nanos(1_749_999_000_000_000_000),
+            catalog_selection_sha256: evidence(31),
+            reference_revision_sha256: evidence(32),
+            provider_identity_sha256: evidence(33),
+            receipt_sha256: resolution_sha256,
+        };
+        let instrument = IexHistPublishedInstrument::try_new(
+            resolution,
+            1,
+            first_effective_at,
+            last_effective_at,
+        )?;
+        let instruments = vec![instrument];
+        let mapping_set_sha256 = published_mapping_set_identity(&instruments);
+        let canonical_content_sha256 = evidence(41);
+        let schema = DatasetSchemaRegistry::local().canonical_research_observations()?;
+        let manifest = DatasetManifestRef::try_new_with_schema(
+            DatasetId::try_from("iex-hist-bars")?,
+            1,
+            schema,
+            market_squawk_data::Sha256Digest::new(canonical_content_sha256.bytes()),
+        )?;
+        Ok(IexHistImmutablePublicationReceipt::try_new(
+            manifest,
+            source_id,
+            venue_id,
+            trade_date,
+            FeedKind::Tops,
+            FeedVersion::Tops1_6,
+            TransportVersion::IexTp1,
+            IexHistBarInterval::OneMinute,
+            iex_digest(1),
+            iex_digest(2),
+            iex_digest(3),
+            iex_digest(4),
+            iex_digest(5),
+            iex_digest(6),
+            iex_digest(7),
+            mapping_set_sha256,
+            evidence(42),
+            canonical_content_sha256,
+            Timestamp::from_unix_nanos(1_750_001_000_000_000_000),
+            1,
+            instruments,
+            256,
+            512,
+            128,
+        )?)
+    }
+
+    fn fixture_lineage(
+        publication: &IexHistImmutablePublicationReceipt,
+    ) -> Result<IexHistRestartLineageEvidence, IexHistApplicationError> {
+        IexHistRestartLineageEvidence::try_new(
+            publication.manifest.clone(),
+            publication.receipt_sha256,
+            publication.persisted_binding_sha256,
+            publication.source_id.clone(),
+            publication.venue_id.clone(),
+            publication.catalog_seal_sha256,
+            publication.physical_seal_sha256,
+            publication.plan_sha256,
+            publication.capture_receipt_sha256,
+            publication.decode_summary_sha256,
+            publication.provider_content_sha256,
+            publication.derived_handoff_sha256,
+            publication.mapping_set_sha256,
+            publication.canonical_content_sha256,
+            publication.locally_available_at,
+            publication.row_count,
+        )
+    }
+
+    fn evidence(byte: u8) -> EvidenceDigest {
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [byte; 32])
+    }
+
+    fn iex_digest(byte: u8) -> Sha256Digest {
+        Sha256Digest::from_bytes([byte; 32])
+    }
 }
