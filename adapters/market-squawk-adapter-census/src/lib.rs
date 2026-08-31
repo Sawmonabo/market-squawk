@@ -18,9 +18,9 @@ mod source;
 pub use discovery::{
     CensusCatalogFailurePredicate, CensusDatasetCatalog, CensusDatasetMetadata,
     CensusDiscoveryDocument, CensusGeographyAdmission, CensusGeographyCatalog,
-    CensusGeographyFailurePredicate, CensusGeographyMetadata, CensusGroupCatalog,
-    CensusGroupMetadata, CensusMetadataEvidence, CensusPredicateType, CensusRequiredVariable,
-    CensusVariableCatalog, CensusVariableMetadata,
+    CensusGeographyFailurePredicate, CensusGeographyMetadata, CensusGeographyReferenceDate,
+    CensusGroupCatalog, CensusGroupMetadata, CensusMetadataEvidence, CensusPredicateType,
+    CensusRequiredVariable, CensusVariableCatalog, CensusVariableMetadata,
 };
 pub use doctor::{
     CENSUS_DOCTOR_MAX_RESPONSE_BYTES, CENSUS_DOCTOR_TIMEOUT, CensusDoctorOutput,

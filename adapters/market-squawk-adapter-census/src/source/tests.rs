@@ -105,7 +105,7 @@ const GEOGRAPHIES_RESPONSE: &[u8] = br#"{
   "fips": [{
     "name": "us",
     "geoLevelDisplay": "010",
-    "referenceDate": "2024-01-01"
+    "referenceDate": "2024"
   }]
 }"#;
 

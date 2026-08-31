@@ -46,8 +46,8 @@ use crate::{
     CensusDataQuery, CensusDatasetVintage, CensusDiscoveryDocument, CensusDiscoveryKind,
     CensusDiscoveryRequest, CensusGeography, CensusGeographyFailurePredicate,
     CensusMetadataEvidence, CensusMissingReason, CensusParseLimits, CensusPredicateType,
-    CensusRequiredVariable, CensusSelection, CensusTypedValue, CensusValueState,
-    CensusVariableCatalog,
+    CensusRequiredVariable, CensusSelection, CensusTimePoint, CensusTimePredicate,
+    CensusTypedValue, CensusValueState, CensusVariableCatalog,
 };
 
 /// Maximum exact Census query contracts retained by one source instance.
@@ -2419,13 +2419,13 @@ fn validate_metadata_bundle(
     for variable in selected_variables.variables() {
         let in_get = get_coordinates.contains(variable.name().as_str());
         let in_predicate = is_predicate_coordinate(variable);
-        let referenced = in_get || in_predicate;
-        if referenced && variable.provider_limit().is_some_and(|limit| limit != 0) {
-            return Err(CensusSourceError::Protocol);
-        }
+        let in_time = time_predicate_satisfies_required_coordinate(
+            contract.query().time(),
+            variable.name().as_str(),
+        );
         match variable.required() {
             CensusRequiredVariable::Required => {
-                if usize::from(in_get) + usize::from(in_predicate) != 1 {
+                if usize::from(in_get) + usize::from(in_predicate) + usize::from(in_time) != 1 {
                     return Err(CensusSourceError::Protocol);
                 }
             }
@@ -2447,19 +2447,13 @@ fn validate_metadata_bundle(
     for variable in full_variables.variables() {
         let in_get = get_coordinates.contains(variable.name().as_str());
         let in_predicate = is_predicate_coordinate(variable);
-        if (in_get
-            || in_predicate
-            || matches!(
-                variable.required(),
-                CensusRequiredVariable::Required | CensusRequiredVariable::RequiredPredicateOnly
-            ))
-            && variable.provider_limit().is_some_and(|limit| limit != 0)
-        {
-            return Err(CensusSourceError::Protocol);
-        }
+        let in_time = time_predicate_satisfies_required_coordinate(
+            contract.query().time(),
+            variable.name().as_str(),
+        );
         match variable.required() {
             CensusRequiredVariable::Required => {
-                if usize::from(in_get) + usize::from(in_predicate) != 1 {
+                if usize::from(in_get) + usize::from(in_predicate) + usize::from(in_time) != 1 {
                     return Err(CensusSourceError::Protocol);
                 }
             }
@@ -2501,6 +2495,15 @@ fn validate_metadata_bundle(
         if metadata.predicate_type() != predicate.predicate_type() {
             return Err(CensusSourceError::Protocol);
         }
+        // Census uses a nonzero discovery `limit` for the number of valid values exposed by
+        // categorical variables. It does not make that predicate unusable; it bounds how many
+        // values one query may select.
+        if metadata.provider_limit().is_some_and(|limit| {
+            limit != 0
+                && u64::try_from(predicate.values().len()).map_or(true, |count| count > limit)
+        }) {
+            return Err(CensusSourceError::Protocol);
+        }
     }
     if contract.query().time().is_some()
         && full_variables
@@ -2535,6 +2538,27 @@ fn validate_metadata_bundle(
         }
     }
     Ok(())
+}
+
+fn time_predicate_satisfies_required_coordinate(
+    time: Option<CensusTimePredicate>,
+    coordinate: &str,
+) -> bool {
+    let Some(time) = time else {
+        return false;
+    };
+    let point = match time {
+        CensusTimePredicate::At { point } => point,
+        CensusTimePredicate::From { start } => start,
+        CensusTimePredicate::To { end } => end,
+        CensusTimePredicate::Range { start, .. } => start,
+    };
+    match coordinate {
+        "year" => true,
+        "month" => matches!(point, CensusTimePoint::Month { .. }),
+        "quarter" => matches!(point, CensusTimePoint::Quarter { .. }),
+        _ => false,
+    }
 }
 
 fn metadata_bundle_digest(

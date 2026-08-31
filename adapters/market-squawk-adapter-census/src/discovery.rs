@@ -843,12 +843,25 @@ impl CensusGroupCatalog {
     }
 }
 
+/// Provider-native shape of the optional `referenceDate` geography metadata field.
+///
+/// Census currently emits either a four-digit reference vintage (for example QWI) or a complete
+/// civil date on other dataset families. Retaining that distinction avoids inventing a day for a
+/// year-only provider value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum CensusGeographyReferenceDate {
+    /// Provider supplied only the four-digit reference vintage.
+    Year(u16),
+    /// Provider supplied a complete civil date.
+    Date(CalendarDate),
+}
+
 /// One geography grammar entry from `geography.json`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CensusGeographyMetadata {
     name: String,
     geo_level_display: Option<SourceIdentifier>,
-    reference_date: Option<CalendarDate>,
+    reference_date: Option<CensusGeographyReferenceDate>,
     requires: Vec<String>,
     wildcard: Option<bool>,
     optional_with_wildcard_for: Vec<String>,
@@ -866,7 +879,7 @@ impl CensusGeographyMetadata {
     }
 
     /// Returns the dataset geography reference date when supplied.
-    pub const fn reference_date(&self) -> Option<CalendarDate> {
+    pub const fn reference_date(&self) -> Option<CensusGeographyReferenceDate> {
         self.reference_date
     }
 
@@ -1071,7 +1084,7 @@ impl CensusGeographyCatalog {
                 ));
             }
             let reference_date = optional_text(entry, "referenceDate", limits)
-                .and_then(|value| value.map(|value| parse_date(&value)).transpose())
+                .and_then(|value| value.map(|value| parse_reference_date(&value)).transpose())
                 .map_err(geography_failure(
                     CensusGeographyFailurePredicate::ReferenceDate,
                 ))?;
@@ -1462,7 +1475,7 @@ fn geography_grammar_digest(
     .map_err(|_| CensusAdapterError::SchemaDrift)?;
     let mut digest = sha2::Sha256::new();
     use sha2::Digest as _;
-    digest.update(b"market-squawk/census-geography-admission/v2");
+    digest.update(b"market-squawk/census-geography-admission/v3");
     digest.update(wire);
     Ok(digest.finalize().into())
 }
@@ -1623,6 +1636,17 @@ fn parse_date(value: &str) -> Result<CalendarDate, CensusAdapterError> {
         return Err(CensusAdapterError::SchemaDrift);
     }
     CalendarDate::new(year, month, day).map_err(|_| CensusAdapterError::SchemaDrift)
+}
+
+fn parse_reference_date(value: &str) -> Result<CensusGeographyReferenceDate, CensusAdapterError> {
+    if value.len() == 4 && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        let year = value
+            .parse::<u16>()
+            .map_err(|_| CensusAdapterError::SchemaDrift)?;
+        CalendarDate::new(year, 1, 1).map_err(|_| CensusAdapterError::SchemaDrift)?;
+        return Ok(CensusGeographyReferenceDate::Year(year));
+    }
+    parse_date(value).map(CensusGeographyReferenceDate::Date)
 }
 
 fn identifier(value: &str) -> Result<SourceIdentifier, CensusAdapterError> {
