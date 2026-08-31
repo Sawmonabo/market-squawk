@@ -797,7 +797,8 @@ mod tests {
         assert_eq!(restarted.output().observations().len(), 1);
         eprintln!(
             "CENSUS_LIVE_EVIDENCE manifest_version={} rows={} acquisition_requests=5 restart_rows=1",
-            manifest.manifest_version()
+            manifest.manifest_version(),
+            restarted.output().observations().len()
         );
         Ok(())
     }
