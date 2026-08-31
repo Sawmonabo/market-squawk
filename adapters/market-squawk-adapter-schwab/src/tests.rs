@@ -19,9 +19,9 @@ use market_squawk_domain::{
     RuleVersion, SourceId, SourceIdentifier, TickSize, Timestamp, VenueId,
 };
 use market_squawk_platform::{
-    EncryptedFileSecretStore, LocalPaths, SealedResearchJournalStore, SecretCancellation,
-    SecretGeneration, SecretInteractionPolicy, SecretKey, SecretOperationControl, SecretStore,
-    SecretValue,
+    EncryptedFileSecretStore, LocalPaths, LocalSecretStoreError, SealedResearchJournalStore,
+    SecretCancellation, SecretGeneration, SecretInteractionPolicy, SecretKey,
+    SecretOperationControl, SecretRef, SecretStore, SecretValue,
 };
 use market_squawk_sources::{
     AvailabilityEvidence, DiscoveryRequest, ExtractionRequest, OptionMarketBatchKind,
@@ -1446,6 +1446,120 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
 }
 
 #[tokio::test]
+async fn oauth_application_replacement_rejects_a_wrong_secret_series() {
+    let temporary = TemporaryDirectory::new();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|error| panic!("OAuth lifecycle clock: {error}"))
+        .as_secs();
+    let fixture = authorized_oauth_fixture(temporary.path().join("wrong-series"), now).await;
+    let replacement_ref = fixture
+        .secrets
+        .create(
+            &fixture.application_key,
+            SecretGeneration::new(2)
+                .unwrap_or_else(|error| panic!("wrong-series candidate generation: {error}")),
+            SecretValue::new(
+                r#"{"version":1,"app_key":"replacement-key","app_secret":"replacement-secret"}"#
+                    .to_owned(),
+            )
+            .unwrap_or_else(|error| panic!("wrong-series candidate: {error}")),
+            &fixture.control,
+        )
+        .unwrap_or_else(|error| panic!("wrong-series candidate storage: {error}"));
+    let replacement = SchwabApplicationCredentialReplacement::try_new(
+        SecretKey::try_new("market-squawk.schwab", "wrong-application-series")
+            .unwrap_or_else(|error| panic!("wrong application series: {error}")),
+        fixture.application_ref.clone(),
+        replacement_ref,
+    )
+    .unwrap_or_else(|error| panic!("wrong-series replacement input: {error}"));
+    let failure = match fixture
+        .authority
+        .replace_application_credential(replacement, SchwabOAuthInteraction::Background)
+        .await
+    {
+        Ok(_) => panic!("wrong application credential series must fail closed"),
+        Err(failure) => failure,
+    };
+    assert_eq!(
+        failure.binding(),
+        crate::SchwabApplicationCredentialReplacementBinding::Previous
+    );
+    let (authority, _, _) = failure.into_parts();
+    assert!(matches!(
+        authority
+            .status()
+            .await
+            .unwrap_or_else(|error| panic!("wrong-series OAuth status: {error}")),
+        SchwabOAuthAuthorityStatus::Active(_)
+    ));
+}
+
+#[tokio::test]
+async fn oauth_authority_durably_reauthorizes_unusable_token_state() {
+    let temporary = TemporaryDirectory::new();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|error| panic!("OAuth lifecycle clock: {error}"))
+        .as_secs();
+
+    let expired = authorized_oauth_fixture(
+        temporary.path().join("expired"),
+        now.checked_sub(604_800)
+            .unwrap_or_else(|| panic!("expired OAuth issue time underflow")),
+    )
+    .await;
+    assert!(matches!(
+        expired
+            .authority
+            .status()
+            .await
+            .unwrap_or_else(|error| panic!("expired OAuth status: {error}")),
+        SchwabOAuthAuthorityStatus::ReauthorizationRequired
+    ));
+    assert!(matches!(
+        expired.secrets.read(&expired.token_ref, &expired.control),
+        Err(LocalSecretStoreError::NotFound)
+    ));
+    let expired_root = expired.state_root.clone();
+    let expired_secrets = expired.secrets.clone();
+    let expired_application = expired.application_ref.clone();
+    drop(expired.authority);
+    let restarted = ProtectedSchwabOAuthAuthority::try_open(
+        expired_root,
+        test_oauth_configuration(expired_secrets, expired_application),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("restart expired OAuth authority: {error}"));
+    assert!(matches!(
+        restarted
+            .status()
+            .await
+            .unwrap_or_else(|error| panic!("restarted expired OAuth status: {error}")),
+        SchwabOAuthAuthorityStatus::ReauthorizationRequired
+    ));
+
+    let missing = authorized_oauth_fixture(temporary.path().join("missing"), now).await;
+    missing
+        .secrets
+        .delete(&missing.token_ref, &missing.control)
+        .unwrap_or_else(|error| panic!("delete protected token: {error}"));
+    assert!(matches!(
+        missing.authority.acquire().await,
+        Err(TokenAuthorityError::ReauthorizationRequired)
+    ));
+    assert!(matches!(
+        missing
+            .authority
+            .status()
+            .await
+            .unwrap_or_else(|error| panic!("missing token OAuth status: {error}")),
+        SchwabOAuthAuthorityStatus::ReauthorizationRequired
+    ));
+}
+
+#[tokio::test]
 async fn streamer_microbatch_retains_validated_application_frames_without_token_material() {
     let telemetry = SchwabTransportTelemetry::default();
     let token_admission = AccessTokenAdmission::new(nonzero(4 * 1024), Duration::from_secs(1));
@@ -2153,6 +2267,124 @@ fn seal_stream_microbatch(
     pending
         .try_rejoin(sealed)
         .unwrap_or_else(|error| panic!("sealed Streamer capture: {error}"))
+}
+
+struct AuthorizedOAuthFixture {
+    authority: ProtectedSchwabOAuthAuthority,
+    secrets: Arc<EncryptedFileSecretStore>,
+    control: SecretOperationControl,
+    application_key: SecretKey,
+    application_ref: SecretRef,
+    token_ref: SecretRef,
+    state_root: PathBuf,
+}
+
+async fn authorized_oauth_fixture(root: PathBuf, issued_at: u64) -> AuthorizedOAuthFixture {
+    let secrets = Arc::new(
+        EncryptedFileSecretStore::try_open(
+            root.join("secrets"),
+            SecretValue::new("schwab-lifecycle-test-unlock".to_owned())
+                .unwrap_or_else(|error| panic!("lifecycle OAuth unlock: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("lifecycle OAuth secret store: {error}")),
+    );
+    let control = SecretOperationControl::try_new(
+        "schwab-lifecycle-test",
+        Instant::now() + Duration::from_secs(60),
+        0,
+        SecretInteractionPolicy::Forbid,
+        SecretCancellation::new(),
+    )
+    .unwrap_or_else(|error| panic!("lifecycle OAuth secret control: {error}"));
+    let application_key = SecretKey::try_new("market-squawk.schwab", "lifecycle-application")
+        .unwrap_or_else(|error| panic!("lifecycle application key: {error}"));
+    let application_ref = secrets
+        .create(
+            &application_key,
+            SecretGeneration::new(1)
+                .unwrap_or_else(|error| panic!("lifecycle application generation: {error}")),
+            SecretValue::new(
+                r#"{"version":1,"app_key":"lifecycle-key","app_secret":"lifecycle-secret"}"#
+                    .to_owned(),
+            )
+            .unwrap_or_else(|error| panic!("lifecycle application value: {error}")),
+            &control,
+        )
+        .unwrap_or_else(|error| panic!("lifecycle application storage: {error}"));
+    let token_key = SecretKey::try_new("market-squawk.schwab", "oauth-token")
+        .unwrap_or_else(|error| panic!("lifecycle token key: {error}"));
+    let token_ref = secrets
+        .plan_create(
+            &token_key,
+            SecretGeneration::new(1)
+                .unwrap_or_else(|error| panic!("lifecycle token generation: {error}")),
+            &control,
+        )
+        .unwrap_or_else(|error| panic!("lifecycle token plan: {error}"))
+        .target()
+        .clone();
+    let state_root = root.join("state");
+    let authority = ProtectedSchwabOAuthAuthority::try_open(
+        &state_root,
+        test_oauth_configuration(secrets.clone(), application_ref.clone()),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("lifecycle OAuth authority: {error}"));
+    let authorization = authority
+        .authorization_request(
+            "authority-lifecycle",
+            admission(),
+            SchwabOAuthInteraction::Background,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("lifecycle authorization request: {error}"));
+    assert!(
+        authorization
+            .expose_url()
+            .contains("client_id=lifecycle-key")
+    );
+    let callback = match OAuthCallback::parse(
+        "https://127.0.0.1:8182/?code=lifecycle-code&state=authority-lifecycle",
+        "authority-lifecycle",
+        admission(),
+    ) {
+        Ok(CallbackOutcome::Authorized(callback)) => callback,
+        outcome => panic!("lifecycle OAuth callback: {outcome:?}"),
+    };
+    authority
+        .complete_authorization(&callback, issued_at, SchwabOAuthInteraction::Background)
+        .await
+        .unwrap_or_else(|error| panic!("lifecycle OAuth completion: {error}"));
+    secrets
+        .read(&token_ref, &control)
+        .unwrap_or_else(|error| panic!("lifecycle protected token: {error}"));
+    AuthorizedOAuthFixture {
+        authority,
+        secrets,
+        control,
+        application_key,
+        application_ref,
+        token_ref,
+        state_root,
+    }
+}
+
+fn test_oauth_configuration(
+    secrets: Arc<EncryptedFileSecretStore>,
+    application_ref: SecretRef,
+) -> SchwabOAuthAuthorityConfiguration {
+    let secret_authority: Arc<dyn SecretStore> = secrets;
+    SchwabOAuthAuthorityConfiguration::try_new(
+        secret_authority,
+        Arc::new(ShortLivedOAuthWire),
+        application_ref,
+        SchwabOAuthSecretPolicy::try_new(Duration::from_secs(30), 0)
+            .unwrap_or_else(|error| panic!("lifecycle OAuth secret policy: {error}")),
+        bounds(),
+        AccessTokenAdmission::new(nonzero(4 * 1024), Duration::from_secs(1)),
+        5,
+    )
+    .unwrap_or_else(|error| panic!("lifecycle OAuth configuration: {error}"))
 }
 
 fn mock_token(admission: AccessTokenAdmission) -> TransientAccessToken {
