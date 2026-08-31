@@ -1154,6 +1154,25 @@ pub(crate) enum SourceLifecycleAction {
     Remove,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DesktopInvalidationDomain {
+    Job,
+    Decision,
+    Operations,
+    Source,
+    Market,
+    Research,
+    Fundamental,
+    Macro,
+    Portfolio,
+    Analysis,
+    Model,
+    FairValue,
+    Bot,
+    Execution,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopEvent {
@@ -1171,45 +1190,37 @@ where
 }
 
 impl DesktopEvent {
-    pub(crate) const fn authority_changed(
+    pub(crate) fn invalidate(
         product_session_token: ProductSessionToken,
         sequence: u64,
-        domain: String,
-        operation: String,
-        request_id: String,
+        domains: Vec<DesktopInvalidationDomain>,
     ) -> Self {
         Self {
             product_session_token,
             sequence,
-            body: DesktopEventBody::AuthorityChanged {
-                domain,
-                operation,
-                request_id,
-            },
+            body: DesktopEventBody::Invalidate { domains },
         }
     }
 
     pub(crate) const fn resync_required(
         product_session_token: ProductSessionToken,
         sequence: u64,
-        reason: &'static str,
     ) -> Self {
         Self {
             product_session_token,
             sequence,
-            body: DesktopEventBody::ResyncRequired { reason },
+            body: DesktopEventBody::ResyncRequired,
         }
     }
 
     pub(crate) const fn stream_disconnected(
         product_session_token: ProductSessionToken,
         sequence: u64,
-        reason: &'static str,
     ) -> Self {
         Self {
             product_session_token,
             sequence,
-            body: DesktopEventBody::StreamDisconnected { reason },
+            body: DesktopEventBody::StreamDisconnected,
         }
     }
 }
@@ -1221,17 +1232,11 @@ impl DesktopEvent {
     tag = "type"
 )]
 enum DesktopEventBody {
-    AuthorityChanged {
-        domain: String,
-        operation: String,
-        request_id: String,
+    Invalidate {
+        domains: Vec<DesktopInvalidationDomain>,
     },
-    ResyncRequired {
-        reason: &'static str,
-    },
-    StreamDisconnected {
-        reason: &'static str,
-    },
+    ResyncRequired,
+    StreamDisconnected,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

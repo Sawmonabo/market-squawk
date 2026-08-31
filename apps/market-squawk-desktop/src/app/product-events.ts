@@ -1,16 +1,9 @@
-import type { DesktopEvent } from "@/lib/schemas"
+import type {
+  DesktopEvent,
+  DesktopInvalidationDomain,
+} from "@/lib/schemas"
 
 import type { ProductScope } from "./query-client"
-
-const SOURCE_MARKET_AUTHORITY_OPERATIONS = new Set([
-  "Source.Start",
-  "Source.Stop",
-  "Source.Retry",
-  "Source.Resynchronize",
-  "Source.Verify",
-  "Source.Reconfigure",
-  "Source.Remove",
-])
 
 export function sameProductSession(
   left: ProductScope,
@@ -26,20 +19,15 @@ export function rejectsProductEvent(
 ): boolean {
   if (
     !sameProductSession(scope, event.productSessionToken) ||
-    event.body.type !== "authority_changed"
+    event.body.type !== "invalidate"
   ) {
     return true
   }
   return BigInt(event.sequence) !== BigInt(previousSequence) + 1n
 }
 
-export function affectedDomains(event: DesktopEvent): readonly string[] {
-  if (event.body.type !== "authority_changed") return []
-  if (
-    event.body.domain === "source" &&
-    SOURCE_MARKET_AUTHORITY_OPERATIONS.has(event.body.operation)
-  ) {
-    return ["source", "market"]
-  }
-  return [event.body.domain]
+export function affectedDomains(
+  event: DesktopEvent,
+): readonly DesktopInvalidationDomain[] {
+  return event.body.type === "invalidate" ? event.body.domains : []
 }

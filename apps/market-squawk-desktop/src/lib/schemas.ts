@@ -391,33 +391,48 @@ const desktopEventSequenceSchema = z
     { message: "Expected a canonical unsigned 64-bit decimal" },
   )
 
-export const desktopEventSchema = z.object({
-  productSessionToken: desktopSystemBootstrapSchema.shape.productSessionToken,
-  sequence: desktopEventSequenceSchema,
-  body: z.discriminatedUnion("type", [
-    z.object({
-      type: z.literal("authority_changed"),
-      domain: z.string(),
-      operation: z.string(),
-      requestId: z.string(),
-    }),
-    z.object({
-      type: z.literal("resync_required"),
-      reason: z.string(),
-    }),
-    z.object({
-      type: z.literal("stream_disconnected"),
-      reason: z.string(),
-    }),
-  ]),
-})
+export const desktopInvalidationDomainSchema = z.enum([
+  "job",
+  "decision",
+  "operations",
+  "source",
+  "market",
+  "research",
+  "fundamental",
+  "macro",
+  "portfolio",
+  "analysis",
+  "model",
+  "fair_value",
+  "bot",
+  "execution",
+])
 
-export const desktopEventSubscriptionReceiptSchema = z.object({
-  subscriptionId: z.string().uuid(),
-  productSessionToken: desktopSystemBootstrapSchema.shape.productSessionToken,
-  sequence: desktopEventSequenceSchema,
-  resumed: z.boolean(),
-})
+export const desktopEventSchema = z
+  .object({
+    productSessionToken: desktopSystemBootstrapSchema.shape.productSessionToken,
+    sequence: desktopEventSequenceSchema,
+    body: z.discriminatedUnion("type", [
+      z
+        .object({
+          type: z.literal("invalidate"),
+          domains: z.array(desktopInvalidationDomainSchema).min(1).max(2),
+        })
+        .strict(),
+      z.object({ type: z.literal("resync_required") }).strict(),
+      z.object({ type: z.literal("stream_disconnected") }).strict(),
+    ]),
+  })
+  .strict()
+
+export const desktopEventSubscriptionReceiptSchema = z
+  .object({
+    subscriptionId: z.string().uuid(),
+    productSessionToken: desktopSystemBootstrapSchema.shape.productSessionToken,
+    sequence: desktopEventSequenceSchema,
+    resumed: z.boolean(),
+  })
+  .strict()
 
 export const desktopServiceBootstrapSchema = z.object({
   status: z.literal("bootstrap_required"),
@@ -448,6 +463,9 @@ export type DesktopSystemStartup = z.infer<
   typeof desktopSystemStartupSchema
 >
 export type DesktopEvent = z.infer<typeof desktopEventSchema>
+export type DesktopInvalidationDomain = z.infer<
+  typeof desktopInvalidationDomainSchema
+>
 export type DesktopEventSubscriptionReceipt = z.infer<
   typeof desktopEventSubscriptionReceiptSchema
 >

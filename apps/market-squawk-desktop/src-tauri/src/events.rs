@@ -19,7 +19,7 @@ use crate::{
     bridge::DesktopState,
     contracts::{
         DesktopCommandError, DesktopEvent, DesktopEventSubscriptionReceipt,
-        DesktopEventSubscriptionRequest, ProductSessionToken,
+        DesktopEventSubscriptionRequest, DesktopInvalidationDomain, ProductSessionToken,
     },
 };
 
@@ -96,7 +96,6 @@ pub(crate) async fn subscribe_service_events(
         let _ = on_event.send(DesktopEvent::resync_required(
             product_session_token,
             requested_sequence,
-            "service_event_cursor_unavailable",
         ));
         return Ok(DesktopEventSubscriptionReceipt::new(
             subscription_id,
@@ -220,7 +219,6 @@ async fn forward_service_events(
                 let _ = on_event.send(DesktopEvent::stream_disconnected(
                     product_session_token,
                     previous_sequence,
-                    "service_event_stream_unavailable",
                 ));
                 return;
             }
@@ -228,7 +226,6 @@ async fn forward_service_events(
                 let _ = on_event.send(DesktopEvent::resync_required(
                     product_session_token,
                     previous_sequence,
-                    "service_event_stream_changed",
                 ));
                 return;
             }
@@ -247,7 +244,6 @@ async fn forward_service_events(
                 let _ = on_event.send(DesktopEvent::resync_required(
                     product_session_token,
                     previous_sequence,
-                    "service_event_sequence_exhausted",
                 ));
                 return;
             };
@@ -257,7 +253,6 @@ async fn forward_service_events(
                 let _ = on_event.send(DesktopEvent::resync_required(
                     product_session_token,
                     previous_sequence,
-                    "invalid_service_event",
                 ));
                 return;
             };
@@ -278,7 +273,6 @@ async fn forward_service_events(
             let _ = on_event.send(DesktopEvent::resync_required(
                 product_session_token,
                 previous_sequence,
-                "service_event_cursor_unavailable",
             ));
             return;
         }
@@ -302,16 +296,53 @@ fn authority_changed(
         return None;
     }
     let operation = object.get("operation")?.as_str()?;
-    let domain = operations.get(operation)?.clone();
+    let domain = operations.get(operation)?;
     let request_id = object.get("requestId")?.as_str()?;
     if request_id.is_empty() {
         return None;
     }
-    Some(DesktopEvent::authority_changed(
+    // The original application event remains in the native event journal for diagnostics. Only
+    // its closed product-cache effect crosses into the ordinary WebView.
+    let domains = invalidation_domains(domain, operation)?;
+    Some(DesktopEvent::invalidate(
         product_session_token,
         sequence,
-        domain,
-        operation.to_owned(),
-        request_id.to_owned(),
+        domains,
     ))
+}
+
+fn invalidation_domains(domain: &str, operation: &str) -> Option<Vec<DesktopInvalidationDomain>> {
+    let primary = match domain {
+        "job" => DesktopInvalidationDomain::Job,
+        "decision" => DesktopInvalidationDomain::Decision,
+        "operations" => DesktopInvalidationDomain::Operations,
+        "source" => DesktopInvalidationDomain::Source,
+        "market" => DesktopInvalidationDomain::Market,
+        "research" => DesktopInvalidationDomain::Research,
+        "fundamental" => DesktopInvalidationDomain::Fundamental,
+        "macro" => DesktopInvalidationDomain::Macro,
+        "portfolio" => DesktopInvalidationDomain::Portfolio,
+        "analysis" => DesktopInvalidationDomain::Analysis,
+        "model" => DesktopInvalidationDomain::Model,
+        "fair_value" => DesktopInvalidationDomain::FairValue,
+        "bot" => DesktopInvalidationDomain::Bot,
+        "execution" => DesktopInvalidationDomain::Execution,
+        _ => return None,
+    };
+    let mut domains = vec![primary];
+    if primary == DesktopInvalidationDomain::Source
+        && matches!(
+            operation,
+            "Source.Start"
+                | "Source.Stop"
+                | "Source.Retry"
+                | "Source.Resynchronize"
+                | "Source.Verify"
+                | "Source.Reconfigure"
+                | "Source.Remove"
+        )
+    {
+        domains.push(DesktopInvalidationDomain::Market);
+    }
+    Some(domains)
 }
