@@ -12,6 +12,7 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{Array as _, BinaryArray, StringArray};
+use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use market_squawk_data::{
@@ -937,6 +938,14 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
             Arc::new(AllowProviderEventPublication),
         )
         .await?;
+    let macro_pinned = service.pinned(macro_receipt.manifest())?;
+    assert_eq!(macro_pinned.objects().len(), 3);
+    assert_eq!(macro_pinned.objects()[0], first.pinned().objects()[0]);
+    let published_batches = service
+        .object_store()
+        .read_pinned(&macro_pinned, &CancellationToken::new())?;
+    let published_capture_lineages = captured_extraction_lineages(&published_batches)?;
+    assert_eq!(published_capture_lineages.len(), 3);
     let replay_reservation = service
         .reserve_source_ingest(
             &source,
@@ -966,12 +975,17 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
         )
         .await?;
     assert_eq!(replay_receipt, macro_receipt);
+    assert_eq!(
+        captured_extraction_lineages(
+            &service
+                .object_store()
+                .read_pinned(&macro_pinned, &CancellationToken::new())?
+        )?,
+        published_capture_lineages,
+    );
     assert_eq!(macro_receipt.total_chunks(), 3);
     assert_eq!(macro_receipt.total_rows(), 3);
     assert_eq!(macro_receipt.manifest().manifest_version(), 2);
-    let macro_pinned = service.pinned(macro_receipt.manifest())?;
-    assert_eq!(macro_pinned.objects().len(), 3);
-    assert_eq!(macro_pinned.objects()[0], first.pinned().objects()[0]);
     let committed_recovery_now = Timestamp::from_unix_nanos(i64::try_from(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
     )?)
@@ -1003,6 +1017,75 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
         owned.objects()[0].object().object().content_hash(),
         owned.objects()[1].object().object().content_hash()
     );
+    for (lineage, input) in published_capture_lineages
+        .iter()
+        .zip(owned.objects().iter().flat_map(|object| object.inputs()))
+    {
+        let lineage: serde_json::Value = serde_json::from_slice(lineage)?;
+        let binding = input.binding();
+        let row = binding
+            .rows()
+            .first()
+            .ok_or("provider macro binding omitted its canonical row")?;
+        assert_eq!(lineage["binding"], serde_json::json!("extraction"));
+        assert_eq!(lineage["schema_version"], serde_json::json!(5));
+        assert_eq!(
+            lineage["source_id"],
+            serde_json::to_value(binding.capture().source_id())?
+        );
+        assert_eq!(
+            lineage["metadata_revision"],
+            serde_json::to_value(binding.capture().metadata_revision())?
+        );
+        assert_eq!(
+            lineage["dataset"],
+            serde_json::to_value(binding.capture().dataset())?
+        );
+        for field in [
+            "discovery_request_id",
+            "extraction_request_id",
+            "object_id",
+            "object_evidence",
+            "record_schema",
+            "record_evidence",
+            "revision_assignment",
+        ] {
+            assert_ne!(lineage[field], serde_json::Value::Null);
+        }
+        let capture = &lineage["provider_capture"];
+        assert_eq!(
+            capture["binding_digest"],
+            serde_json::to_value(binding.binding_digest())?
+        );
+        assert_eq!(
+            capture["capture_observation_digest"],
+            serde_json::to_value(binding.capture().observation_digest())?
+        );
+        assert_eq!(
+            capture["canonical_row_ordinal"],
+            serde_json::to_value(row.canonical_row_ordinal())?
+        );
+        assert_eq!(
+            capture["native_semantic_digest"],
+            serde_json::to_value(row.native_semantic_digest())?
+        );
+        assert_eq!(
+            capture["capture_page_ordinal"],
+            serde_json::to_value(row.capture_page_ordinal())?
+        );
+        assert_eq!(
+            capture["segment_ordinal"],
+            serde_json::to_value(row.segment_ordinal())?
+        );
+        assert_eq!(
+            capture["physical_frame_ordinal"],
+            serde_json::to_value(row.physical_frame_ordinal())?
+        );
+        assert_eq!(
+            capture["page_body_digest"],
+            serde_json::to_value(row.page_body_digest())?
+        );
+    }
     let macro_restart = macro_receipt.restart_selector();
     let backup_paths = LocalPaths::prepare(directory.path().join("multi-artifact-backup"))?;
     let backup_location = AnalyticalBackupLocation::try_new(
@@ -1126,6 +1209,14 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
     let restored_pinned = restored.pinned(macro_receipt.manifest())?;
     assert_eq!(restored_pinned, macro_pinned);
     assert_eq!(
+        captured_extraction_lineages(
+            &restored
+                .object_store()
+                .read_pinned(&restored_pinned, &CancellationToken::new())?
+        )?,
+        published_capture_lineages,
+    );
+    assert_eq!(
         restored.verify_provider_macro_plan_restart(&macro_restart)?,
         macro_pinned
     );
@@ -1168,6 +1259,14 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
     )?;
     let restarted_macro = service.verify_provider_macro_plan_restart(&macro_restart)?;
     assert_eq!(restarted_macro, source_pinned);
+    assert_eq!(
+        captured_extraction_lineages(
+            &service
+                .object_store()
+                .read_pinned(&restarted_macro, &CancellationToken::new())?
+        )?,
+        published_capture_lineages,
+    );
     drop(restarted_macro);
     let compacted = service
         .compact(reservation, compaction, CancellationToken::new())
@@ -1182,6 +1281,14 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
         source_pinned.plan().lineage_digest()
     );
     assert_eq!(compacted.pinned().objects().len(), 1);
+    assert_eq!(
+        captured_extraction_lineages(
+            &service
+                .object_store()
+                .read_pinned(compacted.pinned(), &CancellationToken::new())?
+        )?,
+        published_capture_lineages,
+    );
     assert!(
         !service
             .object_store()
@@ -3595,6 +3702,26 @@ async fn initialized_service_with_batch(
 
 fn extraction_batch() -> Result<ExtractionBatch, Box<dyn Error>> {
     extraction_batch_with_membership(false)
+}
+
+fn captured_extraction_lineages(batches: &[RecordBatch]) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+    let mut captured = Vec::new();
+    for batch in batches {
+        let lineages = batch
+            .column_by_name("extraction_lineage_json")
+            .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+            .ok_or("research batch omitted extraction lineage")?;
+        for lineage in lineages {
+            let lineage = lineage.ok_or("research batch retained a null extraction lineage")?;
+            let decoded: serde_json::Value = serde_json::from_slice(lineage)?;
+            if decoded["binding"] == serde_json::json!("extraction")
+                && decoded["provider_capture"] != serde_json::Value::Null
+            {
+                captured.push(lineage.to_vec());
+            }
+        }
+    }
+    Ok(captured)
 }
 
 fn provider_macro_plan_input(

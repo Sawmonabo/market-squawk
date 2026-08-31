@@ -947,6 +947,60 @@ impl ResearchArrowBatch {
         Self::try_from_record_batch(compacted)
     }
 
+    /// Groups already validated captured-extraction batches under one analytical dataset while
+    /// retaining every original row and extraction-lineage column unchanged.
+    pub(crate) fn try_rebind_provider_capture_batches(
+        provider_dataset: &SourceIdentifier,
+        analytical_dataset: SourceIdentifier,
+        publication_digest: EvidenceDigest,
+        batches: Vec<RecordBatch>,
+        max_additional_bytes_per_batch: usize,
+        control: &dyn ResearchObjectControl,
+    ) -> Result<Self, ArrowConversionError> {
+        if batches.is_empty() || max_additional_bytes_per_batch == 0 {
+            return Err(ArrowConversionError::EmptyBatch);
+        }
+        let target_schema = research_schema(&analytical_dataset, publication_digest)?;
+        let mut normalized = Vec::new();
+        normalized
+            .try_reserve_exact(batches.len())
+            .map_err(|_| ArrowConversionError::AllocationFailure)?;
+        let mut lineage = ResearchLineageDigestAccumulator::new();
+        for batch in batches {
+            let retained_dataset = batch
+                .schema()
+                .metadata()
+                .get(DATASET_KEY)
+                .cloned()
+                .ok_or(ArrowConversionError::InvalidSchemaMetadata)?;
+            if retained_dataset != provider_dataset.as_str() {
+                return Err(ArrowConversionError::ExtractionBindingMismatch);
+            }
+            let decoded = Self::decode_provider_capture_record_batch_bounded(
+                batch.clone(),
+                max_additional_bytes_per_batch,
+                &mut lineage,
+                control,
+            )?;
+            if decoded.observations.len() != batch.num_rows()
+                || decoded.coordinates.len() != batch.num_rows()
+            {
+                return Err(ArrowConversionError::ExtractionBindingMismatch);
+            }
+            normalized.push(RecordBatch::try_new(
+                Arc::clone(&target_schema),
+                batch.columns().to_vec(),
+            )?);
+        }
+        let source_lineage_digest = lineage.finish();
+        let grouped = concat_batches(&target_schema, &normalized)?;
+        let rebound = Self::try_from_record_batch(grouped)?;
+        if rebound.lineage_digest()? != source_lineage_digest {
+            return Err(ArrowConversionError::ExtractionBindingMismatch);
+        }
+        Ok(rebound)
+    }
+
     fn try_from_observations_with_requests(
         dataset: SourceIdentifier,
         batch_digest: EvidenceDigest,
@@ -1968,7 +2022,8 @@ fn validate_row_lineage(
                     | EXTRACTION_LINEAGE_SCHEMA_VERSION
                     | CAPTURED_EXTRACTION_LINEAGE_SCHEMA_VERSION
             ) && lineage.source_id == *provenance.source_id()
-                && lineage.dataset == *dataset
+                && (lineage.dataset == *dataset
+                    || lineage.schema_version == CAPTURED_EXTRACTION_LINEAGE_SCHEMA_VERSION)
                 && lineage.request_digest.algorithm() == DigestAlgorithm::Sha256
                 && lineage.request_digest.bytes() == request_digest
                 && lineage.record_schema.as_str() == RESEARCH_RECORD_SCHEMA

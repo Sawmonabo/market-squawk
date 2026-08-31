@@ -3431,7 +3431,7 @@ impl AnalyticalDataService {
             publication_digest,
             source_id,
             metadata_revision: _,
-            provider_dataset: _,
+            provider_dataset,
             request_set_identity,
             source_generation_digest,
             total_rows,
@@ -3517,7 +3517,7 @@ impl AnalyticalDataService {
         objects
             .try_reserve_exact(artifact_capacity)
             .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
-        let mut pending_observations = Vec::new();
+        let mut pending_batches = Vec::new();
         let mut published_rows = 0_u64;
         for (input_ordinal, (chunk, prepared)) in chunks
             .into_vec()
@@ -3559,22 +3559,26 @@ impl AnalyticalDataService {
             if converted.schema_ref() != &schema {
                 return Err(IngestError::InvalidProviderMacroPlan);
             }
-            let converted_observations = converted.observations()?;
-            pending_observations
-                .try_reserve_exact(converted_observations.len())
+            pending_batches
+                .try_reserve_exact(1)
                 .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
-            pending_observations.extend(converted_observations);
+            pending_batches.push(converted.record_batch().clone());
             let is_last_input = input_ordinal + 1 == prepared_captures.len();
             let pending_input_count = input_ordinal % STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT + 1;
             if pending_input_count < STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT && !is_last_input {
                 continue;
             }
-            // Provider-native capture identity was validated above; the durable canonical object
-            // belongs to the logical analytical dataset, with exact source mapping in the catalog.
-            let grouped = ResearchArrowBatch::try_from_observations(
+            let control = ProviderCaptureRecoveryControl {
+                cancellation: &cancellation,
+            };
+            let grouped = ResearchArrowBatch::try_rebind_provider_capture_batches(
+                &provider_dataset,
                 dataset_name.clone(),
                 publication_digest,
-                std::mem::take(&mut pending_observations),
+                std::mem::take(&mut pending_batches),
+                usize::try_from(MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES)
+                    .map_err(|_| IngestError::InvalidProviderMacroPlan)?,
+                &control,
             )?;
             let lineage = grouped.lineage_digest()?;
             let grouped = DatasetArrowBatch::from(grouped);
