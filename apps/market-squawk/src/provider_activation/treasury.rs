@@ -40,7 +40,7 @@ pub(crate) enum TreasuryDurableRecovery {
 /// Missing datasets are returned separately from exact existing receipts. Invalid
 /// manifest/raw/native evidence is an error and must remain unavailable rather than falling
 /// through to reacquisition or another generation.
-pub(crate) fn reopen_treasury_latest_known(
+pub(crate) async fn reopen_treasury_latest_known(
     closure: Arc<TreasuryApplicationClosure>,
     surface: TreasurySurface,
     provider_datasets: Vec<SourceIdentifier>,
@@ -70,6 +70,7 @@ pub(crate) fn reopen_treasury_latest_known(
                 deadline,
                 &cancellation,
             )
+            .await
             .map_err(|error| {
                 TreasuryPublicationActivationError::ExistingPublication(error.to_string())
             })?;

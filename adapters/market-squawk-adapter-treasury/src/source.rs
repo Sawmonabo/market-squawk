@@ -21,6 +21,7 @@ use market_squawk_sources::{
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -58,6 +59,7 @@ use normalize::{
 
 const MAX_DAILY_RATE_QUERIES: usize = 1_024;
 const MAX_DAILY_RATE_PAGES: usize = 1_024;
+const MAX_ALL_HISTORY_RESTORE_WORKERS: usize = 1;
 
 /// A bounded, immutable set of official Treasury daily-rate datasets.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -563,6 +565,7 @@ pub struct TreasurySource {
     config: TreasurySourceConfig,
     activation: crate::TreasuryActivationIntent,
     client: TreasuryHttpClient,
+    all_history_restore_admission: Arc<Semaphore>,
     health: Mutex<TreasurySourceHealth>,
 }
 
@@ -624,6 +627,9 @@ impl TreasurySource {
             config,
             activation,
             client,
+            all_history_restore_admission: Arc::new(Semaphore::new(
+                MAX_ALL_HISTORY_RESTORE_WORKERS,
+            )),
             health: Mutex::new(TreasurySourceHealth::new()),
         })
     }
@@ -644,6 +650,9 @@ impl TreasurySource {
             config,
             activation,
             client,
+            all_history_restore_admission: Arc::new(Semaphore::new(
+                MAX_ALL_HISTORY_RESTORE_WORKERS,
+            )),
             health: Mutex::new(TreasurySourceHealth::new()),
         })
     }
@@ -1794,6 +1803,7 @@ fn map_adapter_error(error: TreasurySourceError) -> ExtractionSourceError {
         | TreasurySourceError::Protocol(_)
         | TreasurySourceError::Rate(_)
         | TreasurySourceError::HealthUnavailable
+        | TreasurySourceError::RestoreWorkerUnavailable
         | TreasurySourceError::RevisionAuthority(_) => invalid_protocol(),
         TreasurySourceError::BodyTooLarge => ExtractionSourceError::Source(SourceError::Network),
     }
@@ -1833,6 +1843,9 @@ pub enum TreasurySourceError {
     /// Local source-health synchronization is unavailable.
     #[error("Treasury source health is unavailable")]
     HealthUnavailable,
+    /// The bounded retained-page replay worker could not be admitted or joined.
+    #[error("Treasury all-history restore worker is unavailable")]
+    RestoreWorkerUnavailable,
     /// Shared source transport or provider-budget failure.
     #[error("Treasury source failed: {0}")]
     Source(#[from] SourceError),

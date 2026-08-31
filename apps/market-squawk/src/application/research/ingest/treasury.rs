@@ -195,7 +195,7 @@ impl TreasuryApplicationClosure {
 
     /// Reopens the latest exact generation for one configured Treasury dataset without provider
     /// reacquisition. Absence is distinct from corrupt or cross-bound durable evidence.
-    pub(crate) fn reopen_latest_published(
+    pub(crate) async fn reopen_latest_published(
         &self,
         surface: TreasurySurface,
         provider_dataset: &SourceIdentifier,
@@ -216,7 +216,9 @@ impl TreasuryApplicationClosure {
         {
             let manifest = published_generation.manifest().clone();
             let restart = TreasuryMacroRestartSelector::all_history(manifest.clone())?;
-            restart.verify_for_runtime_generation(self, generation)?;
+            restart
+                .verify_for_runtime_generation(self, generation, deadline, cancellation)
+                .await?;
             return Ok(Some(TreasuryMacroPublicationReceipt { manifest, restart }));
         }
         let receipt = Self::reopen_generation(
@@ -227,7 +229,8 @@ impl TreasuryApplicationClosure {
         )?;
         receipt
             .restart_selector()
-            .verify_for_runtime_generation(self, generation)?;
+            .verify_for_runtime_generation(self, generation, deadline, cancellation)
+            .await?;
         Ok(Some(receipt))
     }
 
@@ -282,7 +285,14 @@ impl TreasuryApplicationClosure {
         common.ensure_live()?;
         let store = self.research.provider_capture_store();
         let (completed, observed_at) = if session.is_complete() {
-            let backfill = source.restore_all_history_backfill(session.checkpoint(), &store)?;
+            let backfill = source
+                .restore_all_history_backfill(
+                    session.checkpoint(),
+                    Arc::clone(&store),
+                    common.operation_deadline(),
+                    common.cancellation(),
+                )
+                .await?;
             let completion = backfill.acquisition_completion()?;
             validate_all_history_completion(
                 &completion,
@@ -297,7 +307,14 @@ impl TreasuryApplicationClosure {
                 .recover_completed_provider_macro_plan(session.session_id())?;
             (completed, observed_at)
         } else {
-            let mut backfill = source.restore_all_history_backfill(session.checkpoint(), &store)?;
+            let mut backfill = source
+                .restore_all_history_backfill(
+                    session.checkpoint(),
+                    Arc::clone(&store),
+                    common.operation_deadline(),
+                    common.cancellation(),
+                )
+                .await?;
             let discovery = DiscoveryRequest::try_new(
                 provider_dataset.clone(),
                 None,
@@ -419,7 +436,14 @@ impl TreasuryApplicationClosure {
             return Ok(None);
         };
         let restart = TreasuryMacroRestartSelector::all_history(committed.manifest().clone())?;
-        restart.verify_for_runtime_generation(self, generation)?;
+        restart
+            .verify_for_runtime_generation(
+                self,
+                generation,
+                common.operation_deadline(),
+                common.cancellation(),
+            )
+            .await?;
         Ok(Some(TreasuryMacroPublicationReceipt {
             manifest: committed.manifest().clone(),
             restart,
@@ -1147,11 +1171,19 @@ impl TreasuryMacroRestartSelector {
         }
     }
 
-    fn verify_for_runtime_generation(
+    async fn verify_for_runtime_generation(
         &self,
         closure: &TreasuryApplicationClosure,
         generation: &ResearchProviderRuntimeGeneration,
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<PinnedDataset, TreasuryApplicationError> {
+        if cancellation.is_cancelled() {
+            return Err(ServiceError::Cancelled.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(ServiceError::DeadlineExceeded.into());
+        }
         let research = closure.research.as_ref();
         let expected_source = self.source_id()?;
         if generation.profile().as_str() != self.surface().profile_id()
@@ -1186,8 +1218,11 @@ impl TreasuryMacroRestartSelector {
                         generation,
                         session.provider_dataset(),
                         session.checkpoint(),
-                        research.provider_capture_store().as_ref(),
-                    )?;
+                        research.provider_capture_store(),
+                        deadline,
+                        cancellation,
+                    )
+                    .await?;
                 validate_all_history_completion(
                     &completion,
                     session.analytical_dataset(),

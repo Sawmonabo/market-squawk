@@ -419,7 +419,7 @@ fn treasury_startup_configuration(
     })
 }
 
-fn reopen_treasury_startup_surface(
+async fn reopen_treasury_startup_surface(
     closure: Arc<TreasuryApplicationClosure>,
     domains: &ResearchApplicationServices,
     surface: TreasurySurface,
@@ -441,7 +441,9 @@ fn reopen_treasury_startup_surface(
         generation.clone(),
         deadline,
         cancellation,
-    ) {
+    )
+    .await
+    {
         Ok(TreasuryDurableRecovery::Complete { receipts }) => {
             install_treasury_startup_surface(closure, domains, surface, receipts);
             None
@@ -1053,39 +1055,22 @@ impl LocalProduct {
                 provider_dataset,
             )
         });
-        let (treasury_closure, pending_treasury_fiscal, pending_treasury_daily) =
+        let treasury_closure =
             if treasury_fiscal_datasets.is_some() || treasury_daily_datasets.is_some() {
-                let closure = Arc::new(
+                Some(Arc::new(
                     TreasuryApplicationClosure::try_new(
                         Arc::clone(&research_ingest),
                         Arc::clone(&research),
                     )
                     .map_err(|_| CliProviderActivationError::StateUnavailable)?,
-                );
-                let pending_fiscal = treasury_fiscal_datasets.and_then(|configuration| {
-                    reopen_treasury_startup_surface(
-                        Arc::clone(&closure),
-                        research_domains.as_ref(),
-                        TreasurySurface::FiscalData,
-                        configuration,
-                    )
-                });
-                let pending_daily = treasury_daily_datasets.and_then(|configuration| {
-                    reopen_treasury_startup_surface(
-                        Arc::clone(&closure),
-                        research_domains.as_ref(),
-                        TreasurySurface::DailyRatesXml,
-                        configuration,
-                    )
-                });
-                (Some(closure), pending_fiscal, pending_daily)
+                ))
             } else {
-                (None, None, None)
+                None
             };
 
         if pending_fred_dataset.is_some()
-            || pending_treasury_fiscal.is_some()
-            || pending_treasury_daily.is_some()
+            || treasury_fiscal_datasets.is_some()
+            || treasury_daily_datasets.is_some()
         {
             match tokio::runtime::Handle::try_current() {
                 Ok(runtime) => {
@@ -1096,38 +1081,56 @@ impl LocalProduct {
                             publish_fred_startup(coordinator, domains, provider_dataset).await;
                         });
                     }
-                    if let (Some(closure), Some(provider_datasets)) =
-                        (treasury_closure.as_ref(), pending_treasury_fiscal)
+                    if let (Some(closure), Some(configuration)) =
+                        (treasury_closure.as_ref(), treasury_fiscal_datasets)
                     {
                         let coordinator = Arc::clone(&research_ingest);
                         let closure = Arc::clone(closure);
                         let domains = Arc::clone(&research_domains);
                         runtime.spawn(async move {
-                            publish_treasury_startup_surface(
-                                coordinator,
-                                closure,
-                                domains,
+                            if let Some(pending) = reopen_treasury_startup_surface(
+                                Arc::clone(&closure),
+                                domains.as_ref(),
                                 TreasurySurface::FiscalData,
-                                provider_datasets,
+                                configuration,
                             )
-                            .await;
+                            .await
+                            {
+                                publish_treasury_startup_surface(
+                                    coordinator,
+                                    closure,
+                                    domains,
+                                    TreasurySurface::FiscalData,
+                                    pending,
+                                )
+                                .await;
+                            }
                         });
                     }
-                    if let (Some(closure), Some(provider_datasets)) =
-                        (treasury_closure.as_ref(), pending_treasury_daily)
+                    if let (Some(closure), Some(configuration)) =
+                        (treasury_closure.as_ref(), treasury_daily_datasets)
                     {
                         let coordinator = Arc::clone(&research_ingest);
                         let closure = Arc::clone(closure);
                         let domains = Arc::clone(&research_domains);
                         runtime.spawn(async move {
-                            publish_treasury_startup_surface(
-                                coordinator,
-                                closure,
-                                domains,
+                            if let Some(pending) = reopen_treasury_startup_surface(
+                                Arc::clone(&closure),
+                                domains.as_ref(),
                                 TreasurySurface::DailyRatesXml,
-                                provider_datasets,
+                                configuration,
                             )
-                            .await;
+                            .await
+                            {
+                                publish_treasury_startup_surface(
+                                    coordinator,
+                                    closure,
+                                    domains,
+                                    TreasurySurface::DailyRatesXml,
+                                    pending,
+                                )
+                                .await;
+                            }
                         });
                     }
                 }

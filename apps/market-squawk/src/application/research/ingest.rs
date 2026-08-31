@@ -1253,9 +1253,9 @@ pub(super) struct TreasuryAllHistoryOperationAuthority {
 impl TreasuryAllHistoryOperationAuthority {
     pub(super) fn source(
         &self,
-    ) -> Result<&market_squawk_adapter_treasury::TreasurySource, ServiceError> {
+    ) -> Result<&Arc<market_squawk_adapter_treasury::TreasurySource>, ServiceError> {
         self.common.ensure_live()?;
-        Ok(self.source.as_ref())
+        Ok(&self.source)
     }
 
     pub(super) const fn common(&self) -> &ProviderMacroOperationAuthority {
@@ -1576,54 +1576,73 @@ impl ProductionResearchIngestCoordinator {
 
     /// Reconstructs one completed Treasury acquisition only through the exact registered source
     /// generation and the application-owned sealed raw store.
-    pub(super) fn restore_treasury_all_history_completion(
+    pub(super) async fn restore_treasury_all_history_completion(
         &self,
         generation: &ResearchProviderRuntimeGeneration,
         provider_dataset: &SourceIdentifier,
         checkpoint: &[u8],
-        store: &SealedResearchJournalStore,
+        store: Arc<SealedResearchJournalStore>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<market_squawk_adapter_treasury::TreasuryAllHistoryAcquisitionCompletion, ServiceError>
     {
-        let source = {
-            let authority = self
-                .authority
-                .lock()
-                .map_err(|_error| ServiceError::Unavailable)?;
-            let registered = authority
-                .sources
-                .get(generation.profile())
-                .ok_or(ServiceError::NotFound)?;
-            if registered.generation.as_ref() != Some(generation)
-                || registered.metadata != *generation.metadata()
-                || registered.source.metadata() != generation.metadata()
-                || registered.registration.source_id() != generation.metadata().source_id()
-                || registered.registration.revision() != generation.metadata().revision()
-                || !registered
-                    .admission
-                    .admits_generation(generation)
-                    .map_err(|_error| ServiceError::Unavailable)?
-            {
-                return Err(ServiceError::Unavailable);
-            }
-            registered.rights.validate_at(system_timestamp()?)?;
-            let subject = registered
-                .source
-                .rights_subject(provider_dataset)
-                .map_err(|_error| ServiceError::InvalidRequest)?;
-            registered.rights.validate_subject(subject.as_ref())?;
-            let RegisteredTypedSourceCapability::TreasuryAllHistory(source) =
-                registered.typed_capability.clone()
-            else {
-                return Err(ServiceError::Unavailable);
-            };
-            source
-        };
+        if cancellation.is_cancelled() || Instant::now() >= deadline {
+            return Err(operation_state_error(deadline, cancellation));
+        }
+        let source = self.treasury_all_history_restore_source(generation, provider_dataset)?;
         let restored = source
-            .restore_all_history_backfill(checkpoint, store)
-            .map_err(|_error| ServiceError::Unavailable)?;
+            .restore_all_history_backfill(checkpoint, store, deadline, cancellation)
+            .await
+            .map_err(map_treasury_restore_error)?;
+        if cancellation.is_cancelled() || Instant::now() >= deadline {
+            return Err(operation_state_error(deadline, cancellation));
+        }
+        let current = self.treasury_all_history_restore_source(generation, provider_dataset)?;
+        if !Arc::ptr_eq(&source, &current) {
+            return Err(ServiceError::Unavailable);
+        }
         restored
             .acquisition_completion()
             .map_err(|_error| ServiceError::Unavailable)
+    }
+
+    fn treasury_all_history_restore_source(
+        &self,
+        generation: &ResearchProviderRuntimeGeneration,
+        provider_dataset: &SourceIdentifier,
+    ) -> Result<Arc<market_squawk_adapter_treasury::TreasurySource>, ServiceError> {
+        let authority = self
+            .authority
+            .lock()
+            .map_err(|_error| ServiceError::Unavailable)?;
+        let registered = authority
+            .sources
+            .get(generation.profile())
+            .ok_or(ServiceError::NotFound)?;
+        if registered.generation.as_ref() != Some(generation)
+            || registered.metadata != *generation.metadata()
+            || registered.source.metadata() != generation.metadata()
+            || registered.registration.source_id() != generation.metadata().source_id()
+            || registered.registration.revision() != generation.metadata().revision()
+            || !registered
+                .admission
+                .admits_generation(generation)
+                .map_err(|_error| ServiceError::Unavailable)?
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        registered.rights.validate_at(system_timestamp()?)?;
+        let subject = registered
+            .source
+            .rights_subject(provider_dataset)
+            .map_err(|_error| ServiceError::InvalidRequest)?;
+        registered.rights.validate_subject(subject.as_ref())?;
+        let RegisteredTypedSourceCapability::TreasuryAllHistory(source) =
+            registered.typed_capability.clone()
+        else {
+            return Err(ServiceError::Unavailable);
+        };
+        Ok(source)
     }
 
     async fn acquire_provider_macro_operation_with_registered_capability(
@@ -3028,6 +3047,28 @@ impl IntoProviderOperationDiagnostic for ManagedDiscoveryDiagnosticError {
         phase: ProviderOperationPhase,
     ) -> ProviderOperationDiagnostic {
         ProviderOperationDiagnostic::from_managed_discovery(phase, self)
+    }
+}
+
+fn operation_state_error(deadline: Instant, cancellation: &CancellationToken) -> ServiceError {
+    if cancellation.is_cancelled() {
+        ServiceError::Cancelled
+    } else if Instant::now() >= deadline {
+        ServiceError::DeadlineExceeded
+    } else {
+        ServiceError::Unavailable
+    }
+}
+
+fn map_treasury_restore_error(
+    error: market_squawk_adapter_treasury::TreasurySourceError,
+) -> ServiceError {
+    match error {
+        market_squawk_adapter_treasury::TreasurySourceError::Cancelled => ServiceError::Cancelled,
+        market_squawk_adapter_treasury::TreasurySourceError::DeadlineExceeded => {
+            ServiceError::DeadlineExceeded
+        }
+        _ => ServiceError::Unavailable,
     }
 }
 

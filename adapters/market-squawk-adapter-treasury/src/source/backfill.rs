@@ -1,6 +1,8 @@
 //! Restart-safe, page-sealed acquisition for Treasury daily-rate all-history feeds.
 
 use std::num::{NonZeroU32, NonZeroU64};
+use std::sync::Arc;
+use std::time::Instant;
 
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
@@ -15,6 +17,7 @@ use market_squawk_sources::{
 };
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::system_timestamp;
@@ -895,12 +898,71 @@ impl TreasurySource {
         })
     }
 
-    /// Restores progress only after reopening and reparsing every exact retained raw page.
-    pub fn restore_all_history_backfill(
+    /// Restores progress in one source-owned blocking-I/O lane after reopening and reparsing every
+    /// exact retained raw page.
+    ///
+    /// Caller cancellation and the same absolute deadline remain live during admission and are
+    /// checked between every retained page. If either wins after the worker starts, the worker is
+    /// joined after observing that same control before this method returns.
+    pub async fn restore_all_history_backfill(
+        self: &Arc<Self>,
+        encoded_checkpoint: &[u8],
+        store: Arc<SealedResearchJournalStore>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<TreasuryAllHistoryBackfill, TreasurySourceError> {
+        ensure_restore_open(deadline, cancellation)?;
+        let admission = Arc::clone(&self.all_history_restore_admission);
+        let permit = tokio::select! {
+            permit = admission.acquire_owned() => {
+                permit.map_err(|_error| TreasurySourceError::RestoreWorkerUnavailable)?
+            }
+            () = cancellation.cancelled() => return Err(TreasurySourceError::Cancelled),
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                return Err(TreasurySourceError::DeadlineExceeded);
+            }
+        };
+        ensure_restore_open(deadline, cancellation)?;
+        let mut checkpoint = Vec::new();
+        checkpoint
+            .try_reserve_exact(encoded_checkpoint.len())
+            .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
+        checkpoint.extend_from_slice(encoded_checkpoint);
+        let source = Arc::clone(self);
+        let worker_token = cancellation.clone();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            source.restore_all_history_backfill_blocking(
+                &checkpoint,
+                store.as_ref(),
+                deadline,
+                &worker_token,
+            )
+        });
+        tokio::select! {
+            result = &mut worker => {
+                let restored = result
+                    .map_err(|_error| TreasurySourceError::RestoreWorkerUnavailable)??;
+                ensure_restore_open(deadline, cancellation)?;
+                Ok(restored)
+            }
+            () = cancellation.cancelled() => {
+                stop_restore_worker(worker, TreasurySourceError::Cancelled).await
+            }
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                stop_restore_worker(worker, TreasurySourceError::DeadlineExceeded).await
+            }
+        }
+    }
+
+    fn restore_all_history_backfill_blocking(
         &self,
         encoded_checkpoint: &[u8],
         store: &SealedResearchJournalStore,
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<TreasuryAllHistoryBackfill, TreasurySourceError> {
+        ensure_restore_open(deadline, cancellation)?;
         let checkpoint = TreasuryAllHistoryCheckpoint::from_json(self, encoded_checkpoint)?;
         validate_checkpoint_source(self, &checkpoint)?;
         let query = all_history_query(self, checkpoint.descriptor.provider_dataset())?;
@@ -915,14 +977,17 @@ impl TreasurySource {
             .try_reserve_exact(checkpoint.pages.len())
             .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
         for persisted in &checkpoint.pages {
+            ensure_restore_open(deadline, cancellation)?;
             let reopened =
                 reopen_persisted_page(self, &checkpoint.descriptor, persisted, store, limits)?;
+            ensure_restore_open(deadline, cancellation)?;
             let terminal = tracker.accept(&reopened.page)?;
             if terminal != persisted.terminal {
                 return Err(TreasurySourceError::InvalidBackfillCheckpoint);
             }
             verified_seals.push(reopened.sealed);
         }
+        ensure_restore_open(deadline, cancellation)?;
         if tracker_terminal_matches_checkpoint(&checkpoint, &verified_seals) {
             Ok(TreasuryAllHistoryBackfill {
                 checkpoint,
@@ -1235,6 +1300,29 @@ struct ReopenedAllHistoryPage {
     page: TreasuryDailyRatePage,
     sealed: SealedProviderCaptureSetReceipt,
     canonical: Option<TreasuryAllHistoryCanonicalPage>,
+}
+
+async fn stop_restore_worker(
+    worker: JoinHandle<Result<TreasuryAllHistoryBackfill, TreasurySourceError>>,
+    terminal: TreasurySourceError,
+) -> Result<TreasuryAllHistoryBackfill, TreasurySourceError> {
+    let _outcome = worker
+        .await
+        .map_err(|_error| TreasurySourceError::RestoreWorkerUnavailable)?;
+    Err(terminal)
+}
+
+fn ensure_restore_open(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), TreasurySourceError> {
+    if cancellation.is_cancelled() {
+        Err(TreasurySourceError::Cancelled)
+    } else if Instant::now() >= deadline {
+        Err(TreasurySourceError::DeadlineExceeded)
+    } else {
+        Ok(())
+    }
 }
 
 fn reopen_persisted_page(

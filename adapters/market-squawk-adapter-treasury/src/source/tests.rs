@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -298,14 +298,17 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
         ])),
         requested_urls: Mutex::new(Vec::new()),
     });
-    let source =
-        TreasurySource::try_new_with_transport(source_metadata.clone(), config, transport)?;
+    let source = Arc::new(TreasurySource::try_new_with_transport(
+        source_metadata.clone(),
+        config,
+        transport,
+    )?);
     let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(source_metadata, now)?;
-    let authority = registry.extraction_authority(&registered, &source)?;
+    let authority = registry.extraction_authority(&registered, source.as_ref())?;
     let deadline = now.checked_add_nanos(60_000_000_000)?;
     let temporary = TemporaryDirectory::new();
-    let store = LocalPaths::prepare(temporary.path())?.sealed_research_journal_store()?;
+    let store = Arc::new(LocalPaths::prepare(temporary.path())?.sealed_research_journal_store()?);
 
     let mut backfill = source.start_all_history_backfill(query.dataset())?;
     tokio::time::sleep(TEST_PROVIDER_RATE_SETTLE).await;
@@ -352,7 +355,27 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
     assert!(backfill.acquisition_completion().is_err());
 
     let encoded = backfill.checkpoint().to_json()?;
-    let mut restored = source.restore_all_history_backfill(&encoded, &store)?;
+    let cancelled_restore = CancellationToken::new();
+    cancelled_restore.cancel();
+    assert!(matches!(
+        source
+            .restore_all_history_backfill(
+                &encoded,
+                Arc::clone(&store),
+                Instant::now() + Duration::from_secs(5),
+                &cancelled_restore,
+            )
+            .await,
+        Err(super::TreasurySourceError::Cancelled)
+    ));
+    let mut restored = source
+        .restore_all_history_backfill(
+            &encoded,
+            Arc::clone(&store),
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await?;
     tokio::time::sleep(TEST_PROVIDER_RATE_SETTLE).await;
     let terminal_request = DiscoveryRequest::try_new(
         query.dataset().clone(),
@@ -421,7 +444,14 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
     assert!(reopened_ordinals.iter().all(|ordinal| *ordinal == 0));
 
     let completed_checkpoint = restored.checkpoint().to_json()?;
-    let completed = source.restore_all_history_backfill(&completed_checkpoint, &store)?;
+    let completed = source
+        .restore_all_history_backfill(
+            &completed_checkpoint,
+            Arc::clone(&store),
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await?;
     assert_eq!(
         completed.acquisition_completion()?.completion_digest(),
         completion.completion_digest()

@@ -305,6 +305,7 @@ fn map_adapter_error(error: TreasurySourceError) -> ExtractionSourceError {
         | TreasurySourceError::Protocol(_)
         | TreasurySourceError::Rate(_)
         | TreasurySourceError::HealthUnavailable
+        | TreasurySourceError::RestoreWorkerUnavailable
         | TreasurySourceError::RevisionAuthority(_) => {
             ExtractionSourceError::Source(SourceError::InvalidProtocolState)
         }
