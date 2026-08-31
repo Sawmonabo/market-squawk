@@ -19,7 +19,7 @@ mod request;
 pub use admission::{
     AdmissionDecision, AdmissionPolicy, AdmissionRejection, AdmissionSnapshot, AttemptDisposition,
     AttemptKind, AttemptOutcome, AttemptPermit, CircuitSnapshot, YahooAdmission,
-    YahooRetryAfterDirective,
+    YahooProviderRecoveryDirective, YahooRetryAfterDirective,
 };
 pub use durable::{
     MAX_YAHOO_DURABLE_CACHE_BODY_BYTES, YahooDurableStateError, YahooDurableStateStore,

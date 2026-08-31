@@ -75,7 +75,7 @@ pub enum AttemptDisposition {
     Partial,
     ProviderBackoff {
         status: u16,
-        retry_after: Option<YahooRetryAfterDirective>,
+        recovery: Option<YahooProviderRecoveryDirective>,
     },
     TransportFailure,
     SchemaFailure,
@@ -92,6 +92,71 @@ pub enum AttemptDisposition {
 pub enum YahooRetryAfterDirective {
     DeltaSeconds { seconds: u64 },
     HttpDate { retry_at_unix_ms: i64 },
+}
+
+/// Complete usable server recovery evidence from one response.
+///
+/// `Retry-After` follows HTTP semantics. `RateLimit-Reset` follows the documented delay-seconds
+/// syntax from the HTTPAPI rate-limit specification. When both are present, the later deadline is
+/// the earliest safe next attempt: a client must not resume before either server instruction.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct YahooProviderRecoveryDirective {
+    retry_after: Option<YahooRetryAfterDirective>,
+    rate_limit_reset_seconds: Option<u64>,
+}
+
+impl YahooProviderRecoveryDirective {
+    pub fn try_new(
+        retry_after: Option<YahooRetryAfterDirective>,
+        rate_limit_reset_seconds: Option<u64>,
+    ) -> Option<Self> {
+        if retry_after.is_none() && rate_limit_reset_seconds.is_none() {
+            return None;
+        }
+        let retry_after_valid = match retry_after {
+            Some(YahooRetryAfterDirective::DeltaSeconds { seconds }) => {
+                seconds.checked_mul(1_000).is_some()
+            }
+            Some(YahooRetryAfterDirective::HttpDate { .. }) | None => true,
+        };
+        if !retry_after_valid
+            || rate_limit_reset_seconds.is_some_and(|seconds| seconds.checked_mul(1_000).is_none())
+        {
+            return None;
+        }
+        Some(Self {
+            retry_after,
+            rate_limit_reset_seconds,
+        })
+    }
+
+    pub const fn retry_after(self) -> Option<YahooRetryAfterDirective> {
+        self.retry_after
+    }
+
+    pub const fn rate_limit_reset_seconds(self) -> Option<u64> {
+        self.rate_limit_reset_seconds
+    }
+
+    fn minimum_next_attempt_at(self, completed_at_unix_ms: i64) -> Option<i64> {
+        let retry_after_at = match self.retry_after {
+            Some(YahooRetryAfterDirective::DeltaSeconds { seconds }) => seconds
+                .checked_mul(1_000)
+                .map(|delay_ms| add_millis(completed_at_unix_ms, delay_ms)),
+            Some(YahooRetryAfterDirective::HttpDate { retry_at_unix_ms })
+                if retry_at_unix_ms > completed_at_unix_ms =>
+            {
+                Some(retry_at_unix_ms)
+            }
+            Some(YahooRetryAfterDirective::HttpDate { .. }) | None => None,
+        };
+        let rate_limit_reset_at = self
+            .rate_limit_reset_seconds
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .map(|delay_ms| add_millis(completed_at_unix_ms, delay_ms));
+        retry_after_at.into_iter().chain(rate_limit_reset_at).max()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -545,16 +610,13 @@ fn record_actual_attempt(
             false
         }
         AttemptDisposition::Partial => active.half_open_probe,
-        AttemptDisposition::ProviderBackoff {
-            status,
-            retry_after,
-        } => {
+        AttemptDisposition::ProviderBackoff { status, recovery } => {
             state.snapshot.provider_backoff_total =
                 checked_add(state.snapshot.provider_backoff_total, 1)?;
             if status == 429 {
                 state.snapshot.http_429_total = checked_add(state.snapshot.http_429_total, 1)?;
             }
-            open_circuit(state, completed_at_unix_ms, retry_after);
+            open_circuit(state, completed_at_unix_ms, recovery);
             false
         }
         AttemptDisposition::TransportFailure => {
@@ -641,19 +703,9 @@ fn increment_failure(state: &mut AdmissionState) -> Result<bool, AdmissionReject
 fn open_circuit(
     state: &mut AdmissionState,
     now_unix_ms: i64,
-    retry_after: Option<YahooRetryAfterDirective>,
+    recovery: Option<YahooProviderRecoveryDirective>,
 ) {
-    let provider_retry_at = match retry_after {
-        Some(YahooRetryAfterDirective::DeltaSeconds { seconds }) => seconds
-            .checked_mul(1_000)
-            .map(|delay_ms| add_millis(now_unix_ms, delay_ms)),
-        Some(YahooRetryAfterDirective::HttpDate { retry_at_unix_ms })
-            if retry_at_unix_ms > now_unix_ms =>
-        {
-            Some(retry_at_unix_ms)
-        }
-        Some(YahooRetryAfterDirective::HttpDate { .. }) | None => None,
-    };
+    let provider_retry_at = recovery.and_then(|value| value.minimum_next_attempt_at(now_unix_ms));
     let retry_at_unix_ms = provider_retry_at.unwrap_or_else(|| {
         let cooldown = fallback_cooldown_with_jitter(state, now_unix_ms);
         state.snapshot.fallback_backoff_exponent = state

@@ -43,10 +43,11 @@ use crate::{
     AttemptKind, AttemptOutcome, AttemptPermit, ChartInterval, ChartWindow, ExplicitDemand,
     LookupKind, ParseContext, YAHOO_SOURCE_ID, YahooAdapterError, YahooAdmission, YahooAssetClass,
     YahooChart, YahooDurableStateStore, YahooEnrichment, YahooFundData, YahooHttpMethod,
-    YahooHttpRequest, YahooLocale, YahooLookupHint, YahooOptionChain, YahooQuote, YahooReference,
-    YahooRequestFamily, YahooRequestPlan, YahooRequestPlanner, YahooRetryAfterDirective,
-    YahooReturnedDisposition, YahooSymbol, YahooTarget, parse_chart_response, parse_fund_response,
-    parse_lookup_response, parse_option_response, parse_quote_response, parse_reference_response,
+    YahooHttpRequest, YahooLocale, YahooLookupHint, YahooOptionChain,
+    YahooProviderRecoveryDirective, YahooQuote, YahooReference, YahooRequestFamily,
+    YahooRequestPlan, YahooRequestPlanner, YahooRetryAfterDirective, YahooReturnedDisposition,
+    YahooSymbol, YahooTarget, parse_chart_response, parse_fund_response, parse_lookup_response,
+    parse_option_response, parse_quote_response, parse_reference_response,
 };
 
 const FALLBACK_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
@@ -661,7 +662,8 @@ struct ScriptedWireState {
 pub(crate) struct ScriptedHttpResponse {
     pub status: u16,
     pub content_type: &'static str,
-    pub retry_after: Option<YahooRetryAfterDirective>,
+    pub retry_after: Option<&'static str>,
+    pub rate_limit_reset: Option<&'static str>,
     pub body: Bytes,
 }
 
@@ -1560,13 +1562,9 @@ impl YahooHttpSession {
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let retry_after = response
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_retry_after);
+        let recovery = provider_recovery_from_headers(response.headers());
         let final_url = response.url().clone();
-        if response_requires_immediate_backoff(status, retry_after) {
+        if response_requires_immediate_backoff(status, recovery) {
             let completed_at_unix_ms =
                 wall_time_ms().map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
             let wire = WireResponse {
@@ -1576,7 +1574,7 @@ impl YahooHttpSession {
                 response_sha256_hex: None,
                 bytes: Bytes::new(),
                 content_type,
-                retry_after,
+                recovery,
                 final_url,
                 started_at_unix_ms,
                 completed_at_unix_ms,
@@ -1683,7 +1681,7 @@ impl YahooHttpSession {
             response_sha256_hex: Some(sha256_hex(&bytes)),
             bytes,
             content_type,
-            retry_after,
+            recovery,
             final_url,
             started_at_unix_ms,
             completed_at_unix_ms: wall_time_ms()
@@ -1717,8 +1715,9 @@ impl YahooHttpSession {
             .responses
             .pop_front()
             .ok_or(YahooHttpFailureKind::Network)?;
-        let immediate_backoff =
-            response_requires_immediate_backoff(response.status, response.retry_after);
+        let recovery =
+            provider_recovery_from_values(response.retry_after, response.rate_limit_reset);
+        let immediate_backoff = response_requires_immediate_backoff(response.status, recovery);
         if !immediate_backoff && response.body.len() > spec.maximum_bytes {
             return Err(YahooHttpFailureKind::ResponseTooLarge);
         }
@@ -1736,7 +1735,7 @@ impl YahooHttpSession {
             response_sha256_hex: Some(sha256_hex(&bytes)),
             bytes,
             content_type: Some(response.content_type.to_owned()),
-            retry_after: response.retry_after,
+            recovery,
             final_url: spec.url,
             started_at_unix_ms,
             completed_at_unix_ms: wall_time_ms()
@@ -1803,7 +1802,7 @@ impl YahooHttpSession {
         permit: &mut AttemptPermit,
         attempts: &mut Vec<YahooHttpAttemptReceipt>,
     ) -> Result<YahooHttpFailureKind, YahooHttpFailureKind> {
-        let retry_after = wire.retry_after;
+        let recovery = wire.recovery;
         let status = wire.status;
         let completed_at = wire.completed_at_unix_ms;
         let units = wire.observation_units;
@@ -1814,10 +1813,7 @@ impl YahooHttpSession {
             0,
             units,
             0,
-            AttemptDisposition::ProviderBackoff {
-                status,
-                retry_after,
-            },
+            AttemptDisposition::ProviderBackoff { status, recovery },
         )?;
         let retry_at_unix_ms = self
             .inner
@@ -2638,6 +2634,35 @@ fn parse_retry_after(value: &str) -> Option<YahooRetryAfterDirective> {
     Some(YahooRetryAfterDirective::HttpDate { retry_at_unix_ms })
 }
 
+fn parse_rate_limit_reset(value: &str) -> Option<u64> {
+    let seconds = value.trim().parse::<u64>().ok()?;
+    seconds.checked_mul(1_000)?;
+    Some(seconds)
+}
+
+fn provider_recovery_from_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<YahooProviderRecoveryDirective> {
+    provider_recovery_from_values(
+        headers
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        headers
+            .get("ratelimit-reset")
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+fn provider_recovery_from_values(
+    retry_after: Option<&str>,
+    rate_limit_reset: Option<&str>,
+) -> Option<YahooProviderRecoveryDirective> {
+    YahooProviderRecoveryDirective::try_new(
+        retry_after.and_then(parse_retry_after),
+        rate_limit_reset.and_then(parse_rate_limit_reset),
+    )
+}
+
 fn bytes_contain_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack
@@ -2650,7 +2675,7 @@ fn bytes_contain_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool 
 }
 
 fn wire_indicates_rate_limit(wire: &WireResponse) -> bool {
-    response_requires_immediate_backoff(wire.status, wire.retry_after)
+    response_requires_immediate_backoff(wire.status, wire.recovery)
         || [
             b"too many requests".as_slice(),
             b"rate limit".as_slice(),
@@ -2664,9 +2689,9 @@ fn wire_indicates_rate_limit(wire: &WireResponse) -> bool {
 
 const fn response_requires_immediate_backoff(
     status: u16,
-    retry_after: Option<YahooRetryAfterDirective>,
+    recovery: Option<YahooProviderRecoveryDirective>,
 ) -> bool {
-    status == 429 || (status == 503 && retry_after.is_some())
+    status == 429 || (status == 503 && recovery.is_some())
 }
 
 fn parse_consent_fields(
@@ -2813,7 +2838,7 @@ struct WireResponse {
     response_sha256_hex: Option<String>,
     bytes: Bytes,
     content_type: Option<String>,
-    retry_after: Option<YahooRetryAfterDirective>,
+    recovery: Option<YahooProviderRecoveryDirective>,
     final_url: Url,
     started_at_unix_ms: i64,
     completed_at_unix_ms: i64,

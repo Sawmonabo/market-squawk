@@ -39,7 +39,7 @@ pub(super) const YAHOO_SURFACE: &str = "yahoo-finance.experimental-enrichment";
 const YAHOO_AUTHORITY_DIRECTORY: &str = "provider-yahoo-enrichment-v1";
 
 // Product safety bounds, not claimed Yahoo quotas. The adaptive admission authority records actual
-// attempts and exact provider Retry-After instructions independently of these ceilings.
+// attempts and exact provider recovery instructions independently of these ceilings.
 const MAX_SYMBOLS_PER_OPERATION: usize = 16;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECORDS_PER_RESPONSE: usize = 20_000;

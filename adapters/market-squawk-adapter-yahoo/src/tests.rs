@@ -17,8 +17,8 @@ use crate::{
     YahooChartActionScope, YahooChartAdjustmentMode, YahooChartEventKind, YahooChartSessionScope,
     YahooDurableStateStore, YahooExecutionDisposition, YahooExecutionLimits, YahooHttpFailureKind,
     YahooHttpSession, YahooHttpSessionConfig, YahooLocale, YahooParsedResponse,
-    YahooPublicationBinding, YahooPublicationBridgeError, YahooRequestPlanner,
-    YahooRetryAfterDirective, YahooSymbol, YahooTarget,
+    YahooProviderRecoveryDirective, YahooPublicationBinding, YahooPublicationBridgeError,
+    YahooRequestPlanner, YahooRetryAfterDirective, YahooSymbol, YahooTarget,
 };
 
 fn bounds(maximum_symbols: usize) -> AdapterBounds {
@@ -87,24 +87,28 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
                 status: 200,
                 content_type: "text/plain",
                 retry_after: None,
+                rate_limit_reset: None,
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
                 retry_after: None,
+                rate_limit_reset: None,
                 body: Bytes::from_static(b"local-crumb"),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "application/json",
                 retry_after: None,
+                rate_limit_reset: None,
                 body: chart.clone(),
             },
             ScriptedHttpResponse {
                 status: 429,
                 content_type: "text/plain",
-                retry_after: Some(YahooRetryAfterDirective::DeltaSeconds { seconds: 2 }),
+                retry_after: Some("2"),
+                rate_limit_reset: Some("5"),
                 body: Bytes::from_static(b"Too Many Requests"),
             },
         ],
@@ -295,16 +299,28 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
         .await
         .expect_err("second ticker must exercise the mock 429");
     let YahooHttpFailureKind::CircuitOpen { retry_at_unix_ms } = &second.kind else {
-        return Err("429 with Retry-After must open the exact provider circuit".into());
+        return Err(
+            "429 with server recovery evidence must open the exact provider circuit".into(),
+        );
     };
     assert_eq!(second.attempts.len(), 1);
     assert_eq!(second.attempts[0].status, Some(429));
     assert_eq!(second.attempts[0].response_bytes, 0);
     assert_eq!(
+        second.attempts[0].disposition,
+        AttemptDisposition::ProviderBackoff {
+            status: 429,
+            recovery: YahooProviderRecoveryDirective::try_new(
+                Some(YahooRetryAfterDirective::DeltaSeconds { seconds: 2 }),
+                Some(5),
+            ),
+        }
+    );
+    assert_eq!(
         *retry_at_unix_ms,
         second.attempts[0]
             .completed_at_unix_ms
-            .checked_add(2_000)
+            .checked_add(5_000)
             .ok_or("retry coordinate overflow")?
     );
     let rejected = session
@@ -384,9 +400,12 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
             latency_ms: 1,
             disposition: AttemptDisposition::ProviderBackoff {
                 status: 429,
-                retry_after: Some(YahooRetryAfterDirective::HttpDate {
-                    retry_at_unix_ms: 50_000,
-                }),
+                recovery: YahooProviderRecoveryDirective::try_new(
+                    Some(YahooRetryAfterDirective::HttpDate {
+                        retry_at_unix_ms: 50_000,
+                    }),
+                    None,
+                ),
             },
         },
         20_000,
@@ -417,9 +436,12 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
             latency_ms: 1,
             disposition: AttemptDisposition::ProviderBackoff {
                 status: 429,
-                retry_after: Some(YahooRetryAfterDirective::HttpDate {
-                    retry_at_unix_ms: 19_999,
-                }),
+                recovery: YahooProviderRecoveryDirective::try_new(
+                    Some(YahooRetryAfterDirective::HttpDate {
+                        retry_at_unix_ms: 19_999,
+                    }),
+                    None,
+                ),
             },
         },
         20_000,
@@ -448,7 +470,7 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
             latency_ms: 1,
             disposition: AttemptDisposition::ProviderBackoff {
                 status: 429,
-                retry_after: None,
+                recovery: None,
             },
         },
         retry_at_unix_ms + 1,
@@ -475,18 +497,21 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
                 status: 200,
                 content_type: "text/plain",
                 retry_after: None,
+                rate_limit_reset: None,
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
                 retry_after: None,
+                rate_limit_reset: None,
                 body: Bytes::from_static(b"bounded-crumb"),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "application/json",
                 retry_after: None,
+                rate_limit_reset: None,
                 body: chart.clone(),
             },
         ],
@@ -521,18 +546,21 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
                 status: 200,
                 content_type: "text/plain",
                 retry_after: None,
+                rate_limit_reset: None,
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
                 retry_after: None,
+                rate_limit_reset: None,
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/html",
                 retry_after: None,
+                rate_limit_reset: None,
                 body: Bytes::from_static(
                     br#"<input name="csrfToken" value="csrf"><input name="sessionId" value="session">"#,
                 ),
@@ -541,24 +569,28 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
                 status: 200,
                 content_type: "text/plain",
                 retry_after: None,
+                rate_limit_reset: None,
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
                 retry_after: None,
+                rate_limit_reset: None,
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
                 retry_after: None,
+                rate_limit_reset: None,
                 body: Bytes::from_static(b"csrf-crumb"),
             },
             ScriptedHttpResponse {
                 status: 500,
                 content_type: "application/json",
                 retry_after: None,
+                rate_limit_reset: None,
                 body: Bytes::from_static(b"{}"),
             },
         ],
