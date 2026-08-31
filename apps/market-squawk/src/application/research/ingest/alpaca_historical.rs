@@ -1,5 +1,7 @@
 //! One generation-bound Alpaca historical source with bounded immutable click-plan admission.
 
+mod market;
+
 use std::{
     fmt,
     future::Future,
