@@ -68,8 +68,9 @@ pub(crate) use account::ProviderAccountRuntimeCurrentness;
 pub use account::{ProviderAccountActivationError, ProviderAccountBinding, ProviderMarketAccount};
 pub use alpaca::{AlpacaBasicAccountActivation, AlpacaBasicActivationError};
 pub(crate) use bea::{
-    BeaProductAvailability, BeaProductError, BeaProductStatus, BeaRegionalProductOutput,
-    BeaRegionalProductRequest, BeaRegionalRestartOutput, BeaRegionalRestartRead,
+    BEA_SOURCE_ID, BEA_SURFACE, BeaProductAvailability, BeaProductError, BeaProductStatus,
+    BeaRegionalProductOutput, BeaRegionalProductRequest, BeaRegionalRestartOutput,
+    BeaRegionalRestartRead, fixed_regional_source_config,
 };
 pub(crate) use bls::{
     MacroProviderPeriodLatestKnownOutput, MacroProviderPeriodLatestKnownRequest,
@@ -103,12 +104,13 @@ pub(crate) use reference_identity::{
 pub(crate) use schwab::{PreparedSchwabMarketRuntimeStart, SchwabMarketRuntimeStartError};
 pub use schwab::{SchwabMarketDataAccountActivation, SchwabMarketDataActivationError};
 pub use specs::{
-    BlsAdapterActivation, BoardAdapterActivation, COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS,
-    CoinbaseDirectActivationSpecError, CoinbaseDirectAdapterActivation,
-    CoinbaseDirectProductActivation, ControlledLocalFileAdapterActivation, FredAdapterActivation,
-    LocalFileAdapterActivation, PortfolioAdapterActivation, ProviderAdapterActivationError,
-    ProviderAdapterActivationRequest, SecAdapterActivation, TiingoAdapterActivation,
-    TreasuryAdapterActivation, YahooAdapterActivation,
+    BeaAdapterActivation, BlsAdapterActivation, BoardAdapterActivation,
+    COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS, CoinbaseDirectActivationSpecError,
+    CoinbaseDirectAdapterActivation, CoinbaseDirectProductActivation,
+    ControlledLocalFileAdapterActivation, FredAdapterActivation, LocalFileAdapterActivation,
+    PortfolioAdapterActivation, ProviderAdapterActivationError, ProviderAdapterActivationRequest,
+    SecAdapterActivation, TiingoAdapterActivation, TreasuryAdapterActivation,
+    YahooAdapterActivation,
 };
 pub(crate) use tiingo::{
     TIINGO_EOD_OPERATION, TIINGO_FUND_NAV_OPERATION, TiingoCanonicalFamily, TiingoLatestOperation,
@@ -888,6 +890,18 @@ impl ProviderAdapterActivation {
                     retained.take();
                 }
             }
+            if expected.profile().as_str() == bea::BEA_SURFACE {
+                let mut retained = self
+                    .bea
+                    .write()
+                    .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+                if retained
+                    .as_ref()
+                    .is_some_and(|current| current.generation() == expected)
+                {
+                    retained.take();
+                }
+            }
         }
         Ok(())
     }
@@ -1090,6 +1104,19 @@ impl ProviderAdapterActivation {
             .ok_or(ProviderAdapterActivationError::SourceBinding)?;
         let profile = lease.surface_id().clone();
         let specialized_authority = match committed.specialized.as_ref() {
+            Some(SpecializedReplacementKind::Bea(activation)) => {
+                if activation.generation() != committed.candidate()
+                    || !self
+                        .bea
+                        .read()
+                        .map_err(|_| ProviderAdapterActivationError::SourceBinding)?
+                        .as_ref()
+                        .is_some_and(|current| current.generation() == committed.expected())
+                {
+                    return Err(ProviderAdapterActivationError::SourceBinding);
+                }
+                Some(SpecializedReplacementAuthority::Bea(Arc::clone(activation)))
+            }
             Some(SpecializedReplacementKind::Bls(activation)) => {
                 Some(SpecializedReplacementAuthority::Bls(Arc::clone(activation)))
             }
@@ -1135,6 +1162,22 @@ impl ProviderAdapterActivation {
             return Err(ProviderAdapterActivationError::SourceBinding);
         }
         match specialized_authority {
+            Some(SpecializedReplacementAuthority::Bea(activation)) => {
+                if activation.generation() != &generation {
+                    return Err(ProviderAdapterActivationError::SourceBinding);
+                }
+                let mut retained = self
+                    .bea
+                    .write()
+                    .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+                if !retained
+                    .as_ref()
+                    .is_some_and(|current| current.generation() == committed.expected())
+                {
+                    return Err(ProviderAdapterActivationError::SourceBinding);
+                }
+                *retained = Some(activation);
+            }
             Some(SpecializedReplacementAuthority::Bls(activation)) => {
                 if activation.generation() != &generation {
                     return Err(ProviderAdapterActivationError::SourceBinding);
@@ -1186,6 +1229,10 @@ impl ProviderAdapterActivation {
                 provider_research_rights(lease, spec.metadata.source_id())?,
             ),
             ProviderAdapterActivationRequest::Bls(spec) => (
+                &spec.metadata,
+                provider_research_rights(lease, spec.metadata.source_id())?,
+            ),
+            ProviderAdapterActivationRequest::Bea(spec) => (
                 &spec.metadata,
                 provider_research_rights(lease, spec.metadata.source_id())?,
             ),
@@ -1241,6 +1288,22 @@ impl ProviderAdapterActivation {
         let candidate = self.runtime_generation_for_request(&lease, &request)?;
         self.bind_authorization_subject(candidate.metadata())?;
         let (prepared, specialized) = match request {
+            ProviderAdapterActivationRequest::Bea(spec) => {
+                let (replacement, activation) = self
+                    .prepare_bea_regional_replacement(
+                        lease.clone(),
+                        spec,
+                        expected,
+                        candidate.clone(),
+                        cancellation.clone(),
+                    )
+                    .await
+                    .map_err(|_| ProviderAdapterActivationError::Bea)?;
+                (
+                    replacement,
+                    Some(SpecializedReplacementKind::Bea(activation)),
+                )
+            }
             ProviderAdapterActivationRequest::Bls(spec) => {
                 require_surface(&lease, BLS_REGISTERED_SURFACE)?;
                 let BlsAdapterActivation {
@@ -1524,6 +1587,10 @@ impl ProviderAdapterActivation {
                 .activate_bls(lease, spec, cancellation)
                 .await
                 .map(Into::into),
+            ProviderAdapterActivationRequest::Bea(spec) => self
+                .activate_bea(lease, spec, cancellation)
+                .await
+                .map(Into::into),
             ProviderAdapterActivationRequest::Treasury(spec) => {
                 self.activate_treasury(lease, spec).map(Into::into)
             }
@@ -1571,6 +1638,10 @@ impl ProviderAdapterActivation {
             }
             ProviderAdapterActivationRequest::Bls(spec) => {
                 self.restore_bls(lease, spec).map(Into::into)
+            }
+            ProviderAdapterActivationRequest::Bea(_spec) => {
+                require_surface(&lease, bea::BEA_SURFACE)?;
+                Err(ProviderAdapterActivationError::ExplicitResumeRequired)
             }
             ProviderAdapterActivationRequest::Treasury(spec) => {
                 self.activate_treasury(lease, spec).map(Into::into)
@@ -1697,6 +1768,23 @@ impl ProviderAdapterActivation {
             lease,
             profile,
             generation,
+        })
+    }
+
+    async fn activate_bea(
+        &self,
+        lease: ProviderActivationLease,
+        spec: BeaAdapterActivation,
+        cancellation: CancellationToken,
+    ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
+        let activation = self
+            .prepare_bea_regional(lease.clone(), spec, cancellation)
+            .await
+            .map_err(|_| ProviderAdapterActivationError::Bea)?;
+        Ok(ActivatedResearchProvider {
+            profile: activation.generation().profile().clone(),
+            generation: activation.generation().clone(),
+            lease,
         })
     }
 
@@ -2237,12 +2325,14 @@ pub(crate) struct CommittedProviderAdapterReplacement {
 }
 
 enum SpecializedReplacementKind {
+    Bea(Arc<bea::BeaProductActivation>),
     Bls(Arc<bls::BlsProductActivation>),
     Yahoo,
     Tiingo,
 }
 
 enum SpecializedReplacementAuthority {
+    Bea(Arc<bea::BeaProductActivation>),
     Bls(Arc<bls::BlsProductActivation>),
     Yahoo(Arc<yahoo::YahooProductActivation>),
     Tiingo(Arc<tiingo::TiingoProductActivation>),

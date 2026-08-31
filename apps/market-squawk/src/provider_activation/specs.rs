@@ -264,6 +264,30 @@ pub struct BlsAdapterActivation {
     pub(super) configuration: BlsAdapterConfiguration,
 }
 
+/// Exact protected metadata and code-owned dataset identity for the BEA Regional lane.
+#[derive(Debug)]
+pub struct BeaAdapterActivation {
+    pub(super) metadata: SourceMetadata,
+    provider_dataset: SourceIdentifier,
+}
+
+impl BeaAdapterActivation {
+    /// Retains only non-secret activation authority. The BEA user ID is resolved from the active
+    /// onboarding lease when the foreground activation or replacement is admitted.
+    #[must_use]
+    pub fn new(metadata: SourceMetadata, provider_dataset: SourceIdentifier) -> Self {
+        Self {
+            metadata,
+            provider_dataset,
+        }
+    }
+
+    /// Returns the exact code-owned Regional contract identity bound to this activation.
+    pub(crate) const fn provider_dataset_identifier(&self) -> &SourceIdentifier {
+        &self.provider_dataset
+    }
+}
+
 /// Public BLS retains the exact adapter configuration; registered BLS defers secret binding.
 #[derive(Debug)]
 pub(super) enum BlsAdapterConfiguration {
@@ -547,6 +571,8 @@ pub enum ProviderAdapterActivationRequest {
     Sec(SecAdapterActivation),
     /// BLS public-v1 or registered-v2 research extraction.
     Bls(BlsAdapterActivation),
+    /// Protected BEA Regional extraction under one fixed code-owned dataset contract.
+    Bea(BeaAdapterActivation),
     /// Treasury Fiscal Data or daily-rate XML extraction.
     Treasury(TreasuryAdapterActivation),
     /// FRED/ALFRED extraction under the shared source authority.
@@ -570,6 +596,7 @@ impl ProviderAdapterActivationRequest {
     pub(crate) fn provider_dataset_identifier(&self) -> Option<&SourceIdentifier> {
         match self {
             Self::Bls(specification) => specification.provider_dataset_identifier(),
+            Self::Bea(specification) => Some(specification.provider_dataset_identifier()),
             Self::Board(specification) => Some(specification.provider_dataset_identifier()),
             Self::Fred(specification) => Some(specification.provider_dataset_identifier()),
             Self::Live(_)
@@ -615,6 +642,9 @@ pub enum ProviderAdapterActivationError {
     /// BLS construction rejected metadata, authorization, or request scope.
     #[error(transparent)]
     Bls(#[from] market_squawk_adapter_bls::BlsSourceError),
+    /// BEA construction or protected Regional application composition was rejected.
+    #[error("BEA protected Regional activation failed")]
+    Bea,
     /// Treasury construction rejected metadata or provider profile.
     #[error(transparent)]
     Treasury(#[from] market_squawk_adapter_treasury::TreasurySourceError),

@@ -24,19 +24,22 @@ use market_squawk_services::RequestContext;
 use market_squawk_sources::{AuthorizationMode, SourceMetadata};
 use tokio_util::sync::CancellationToken;
 
-use super::{ProviderAdapterActivation, provider_research_rights, runtime_generation};
+use super::{
+    BeaAdapterActivation, ProviderAdapterActivation, provider_research_rights, runtime_generation,
+};
 use crate::application::{
     BEA_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION, BeaLivePublicationError, BeaMacroApplicationError,
     BeaMacroCapabilityState, BeaProviderPeriodLatestKnownDto, BeaProviderPeriodLatestKnownRequest,
     BeaRegionalLiveComposition, BeaRegionalLiveOutcome, BeaRegionalLiveRequest,
-    BeaRegionalLiveRuntime, ResearchIngestCompositionError, ResearchProviderRuntimeGeneration,
+    BeaRegionalLiveRuntime, ManagedResearchExtractionSource, ResearchIngestCompositionError,
+    ResearchProviderRuntimeGeneration, ResearchProviderRuntimeReplacement, ResearchRightsAuthority,
 };
 use crate::{ProviderActivationLease, ProviderOnboardingError};
 
-pub(super) const BEA_SURFACE: &str = "bea.api-data";
+pub(crate) const BEA_SURFACE: &str = "bea.api-data";
 
 const REGIONAL_DATASET: &str = "Regional";
-const BEA_SOURCE_ID: &str = "us-bea";
+pub(crate) const BEA_SOURCE_ID: &str = "us-bea";
 const REGIONAL_TABLE: &str = "SAINC1";
 const REGIONAL_LINE_CODE: &str = "3";
 const REGIONAL_GEO_FIPS: &str = "DE";
@@ -499,30 +502,16 @@ impl ProviderAdapterActivation {
     pub(crate) async fn prepare_bea_regional(
         &self,
         lease: ProviderActivationLease,
-        metadata: SourceMetadata,
+        spec: BeaAdapterActivation,
         cancellation: CancellationToken,
     ) -> Result<Arc<BeaProductActivation>, BeaProductError> {
-        if cancellation.is_cancelled()
-            || lease.surface_id().as_str() != BEA_SURFACE
-            || lease.generation().is_none()
-            || lease.secret_reference().is_none()
-            || metadata.source_id().as_str() != BEA_SOURCE_ID
-            || metadata.authorization().mode() != AuthorizationMode::UserAuthorized
-        {
-            return Err(BeaProductError::InvalidOperation);
-        }
-        let rights = provider_research_rights(&lease, metadata.source_id())
-            .map_err(|_| BeaProductError::AuthorityUnavailable)?;
-        let generation = runtime_generation(&lease, metadata.clone(), rights.clone())
-            .map_err(|_| BeaProductError::AuthorityUnavailable)?;
-        self.bind_authorization_subject(&metadata)
-            .map_err(|_| BeaProductError::AuthorityUnavailable)?;
+        let (rights, generation) = self.bea_regional_authority(&lease, &spec, &cancellation)?;
         if let Some(current) = self
             .bea
             .read()
             .map_err(|_| BeaProductError::Unavailable)?
             .as_ref()
-            .filter(|current| current.matches(&lease, &metadata))
+            .filter(|current| current.matches(&lease, &spec.metadata))
             .cloned()
             && matches!(
                 self.research
@@ -532,38 +521,9 @@ impl ProviderAdapterActivation {
         {
             return Ok(current);
         }
-
-        let secret = self
-            .onboarding
-            .read_secret_for_activation_request(&lease, cancellation)
+        let (activation, registered_source) = self
+            .build_bea_regional_candidate(lease.clone(), spec, generation.clone(), cancellation)
             .await?;
-        let user_id = BeaUserId::try_new(secret.expose_secret().to_owned())?;
-        let generation_digest = generation.generation_digest()?;
-        let contract = fixed_regional_contract()?;
-        let provider_dataset = contract.dataset_id().clone();
-        let config = BeaSourceConfig::try_new(vec![contract], fixed_parse_limits()?)?;
-        let source = BeaSource::try_new(metadata.clone(), user_id, config, generation_digest)?;
-        let configured = BeaConfiguredEvidence {
-            source_id: metadata.source_id().clone(),
-            provider_dataset,
-            runtime_generation_digest: generation_digest,
-            source_binding_digest: source.source_binding().binding_digest(),
-            quota_declaration_digest: source.quota_declaration().declaration_digest(),
-        };
-        let composition = BeaRegionalLiveComposition::try_new(
-            Arc::clone(&self.research),
-            source,
-            generation.clone(),
-        )?;
-        let (registered_source, runtime) = composition.into_parts();
-        let activation = Arc::new(BeaProductActivation {
-            lease: lease.clone(),
-            metadata,
-            generation: generation.clone(),
-            runtime,
-            configured,
-            ready: RwLock::new(None),
-        });
 
         let onboarding = self.onboarding.try_acquire_runtime_mutation_authority()?;
         onboarding.require_active(&lease)?;
@@ -584,6 +544,133 @@ impl ProviderAdapterActivation {
             .register_provider_source(generation, registered_source, rights)?;
         *retained = Some(Arc::clone(&activation));
         Ok(activation)
+    }
+
+    /// Constructs a non-callable replacement candidate while the exact predecessor remains owned
+    /// by the serialized research runtime transaction.
+    pub(super) async fn prepare_bea_regional_replacement(
+        &self,
+        lease: ProviderActivationLease,
+        spec: BeaAdapterActivation,
+        expected: ResearchProviderRuntimeGeneration,
+        candidate: ResearchProviderRuntimeGeneration,
+        cancellation: CancellationToken,
+    ) -> Result<
+        (
+            ResearchProviderRuntimeReplacement,
+            Arc<BeaProductActivation>,
+        ),
+        BeaProductError,
+    > {
+        let (rights, derived_candidate) =
+            self.bea_regional_authority(&lease, &spec, &cancellation)?;
+        if candidate != derived_candidate || expected.profile() != candidate.profile() {
+            return Err(BeaProductError::AuthorityUnavailable);
+        }
+        if !self
+            .bea
+            .read()
+            .map_err(|_| BeaProductError::Unavailable)?
+            .as_ref()
+            .is_some_and(|current| current.generation() == &expected)
+        {
+            return Err(BeaProductError::Unavailable);
+        }
+        let (activation, registered_source) = self
+            .build_bea_regional_candidate(lease.clone(), spec, candidate.clone(), cancellation)
+            .await?;
+        self.require_runtime_replacement_authority(&lease, &expected)
+            .await
+            .map_err(|_| BeaProductError::AuthorityUnavailable)?;
+        let replacement = self.research_mutation.prepare_provider_replacement(
+            expected,
+            candidate,
+            registered_source,
+            rights,
+        )?;
+        Ok((replacement, activation))
+    }
+
+    fn bea_regional_authority(
+        &self,
+        lease: &ProviderActivationLease,
+        spec: &BeaAdapterActivation,
+        cancellation: &CancellationToken,
+    ) -> Result<(ResearchRightsAuthority, ResearchProviderRuntimeGeneration), BeaProductError> {
+        if cancellation.is_cancelled()
+            || lease.surface_id().as_str() != BEA_SURFACE
+            || lease.generation().is_none()
+            || lease.secret_reference().is_none()
+            || spec.metadata.source_id().as_str() != BEA_SOURCE_ID
+            || spec.metadata.authorization().mode() != AuthorizationMode::UserAuthorized
+        {
+            return Err(BeaProductError::InvalidOperation);
+        }
+        let config = fixed_regional_source_config()?;
+        if config.contracts().len() != 1
+            || config.contracts()[0].dataset_id() != spec.provider_dataset_identifier()
+        {
+            return Err(BeaProductError::InvalidOperation);
+        }
+        let rights = provider_research_rights(lease, spec.metadata.source_id())
+            .map_err(|_| BeaProductError::AuthorityUnavailable)?;
+        let generation = runtime_generation(lease, spec.metadata.clone(), rights.clone())
+            .map_err(|_| BeaProductError::AuthorityUnavailable)?;
+        self.bind_authorization_subject(&spec.metadata)
+            .map_err(|_| BeaProductError::AuthorityUnavailable)?;
+        Ok((rights, generation))
+    }
+
+    async fn build_bea_regional_candidate(
+        &self,
+        lease: ProviderActivationLease,
+        spec: BeaAdapterActivation,
+        generation: ResearchProviderRuntimeGeneration,
+        cancellation: CancellationToken,
+    ) -> Result<
+        (
+            Arc<BeaProductActivation>,
+            impl ManagedResearchExtractionSource,
+        ),
+        BeaProductError,
+    > {
+        let provider_dataset = spec.provider_dataset_identifier().clone();
+        let secret = self
+            .onboarding
+            .read_secret_for_activation_request(&lease, cancellation)
+            .await?;
+        let user_id = BeaUserId::try_new(secret.expose_secret().to_owned())?;
+        let generation_digest = generation.generation_digest()?;
+        let source = BeaSource::try_new(
+            spec.metadata.clone(),
+            user_id,
+            fixed_regional_source_config()?,
+            generation_digest,
+        )?;
+        let configured = BeaConfiguredEvidence {
+            source_id: spec.metadata.source_id().clone(),
+            provider_dataset,
+            runtime_generation_digest: generation_digest,
+            source_binding_digest: source.source_binding().binding_digest(),
+            quota_declaration_digest: source.quota_declaration().declaration_digest(),
+        };
+        let composition = BeaRegionalLiveComposition::try_new(
+            Arc::clone(&self.research),
+            source,
+            generation.clone(),
+        )?;
+        let (registered_source, runtime) = composition.into_parts();
+        Ok((
+            Arc::new(BeaProductActivation {
+                lease,
+                metadata: spec.metadata,
+                generation,
+                runtime,
+                configured,
+                ready: RwLock::new(None),
+            }),
+            registered_source,
+        ))
     }
 
     /// Returns only exact current BEA product state and non-secret durable evidence.
@@ -692,6 +779,15 @@ fn fixed_regional_contract() -> Result<BeaDatasetContract, BeaProductError> {
     )?)
 }
 
+/// Returns the sole code-owned BEA configuration used by activation metadata and runtime
+/// construction. Callers cannot add datasets, selectors, or parser capacity.
+pub(crate) fn fixed_regional_source_config() -> Result<BeaSourceConfig, BeaProductError> {
+    Ok(BeaSourceConfig::try_new(
+        vec![fixed_regional_contract()?],
+        fixed_parse_limits()?,
+    )?)
+}
+
 fn fixed_parse_limits() -> Result<BeaParseLimits, BeaProductError> {
     Ok(BeaParseLimits::try_new(
         usize::try_from(MAXIMUM_PROVIDER_ROWS).map_err(|_| BeaProductError::InvalidOperation)?,
@@ -760,6 +856,7 @@ mod tests {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
+    use chrono::{Datelike as _, Utc};
     use market_squawk_adapter_bea::{bea_api_endpoint_rule, bea_provider_rate_declaration};
     use market_squawk_data::{
         CatalogConfig, CatalogResultLimits, ObjectStoreConfig, SqliteProviderRateStore,
@@ -868,19 +965,29 @@ mod tests {
             .await?;
         let lease = onboarding.commit_prepared_activation(&prepared).await?;
         let metadata = source_metadata(&lease)?;
+        let config = fixed_regional_source_config()?;
+        let provider_dataset = config
+            .contracts()
+            .first()
+            .filter(|_| config.contracts().len() == 1)
+            .ok_or("fixed BEA Regional contract is unavailable")?
+            .dataset_id()
+            .clone();
         activation
-            .prepare_bea_regional(lease, metadata, CancellationToken::new())
+            .activate_ready_profile(
+                lease.session_id(),
+                crate::ProviderAdapterActivationRequest::Bea(BeaAdapterActivation::new(
+                    metadata,
+                    provider_dataset,
+                )),
+                CancellationToken::new(),
+            )
             .await?;
 
         let now = current_timestamp()?;
         let provider_deadline = now.checked_add_nanos(120_000_000_000)?;
         let knowledge_cutoff = now.checked_add_nanos(120_000_000_000)?;
-        let period = ResearchPeriod::try_new(
-            SourceIdentifier::try_from(BEA_ANNUAL_PERIOD_SCHEME)?,
-            2026,
-            NonZeroU16::MIN,
-            SourceIdentifier::try_from("2026")?,
-        )?;
+        let period = current_provider_annual_period()?;
         let operation_deadline = Instant::now() + Duration::from_secs(120);
         let outcome = activation
             .execute_bea_regional(
@@ -954,8 +1061,7 @@ mod tests {
     }
 
     fn source_metadata(lease: &ProviderActivationLease) -> TestResult<SourceMetadata> {
-        let contract = fixed_regional_contract()?;
-        let config = BeaSourceConfig::try_new(vec![contract], fixed_parse_limits()?)?;
+        let config = fixed_regional_source_config()?;
         let effective = EffectiveInterval::new(
             lease.authority_effective_at(),
             lease.verification_expires_at(),
@@ -1042,5 +1148,15 @@ mod tests {
     fn current_timestamp() -> TestResult<Timestamp> {
         let nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
         Ok(Timestamp::from_unix_nanos(nanos))
+    }
+
+    fn current_provider_annual_period() -> TestResult<ResearchPeriod> {
+        let year = u16::try_from(Utc::now().year())?;
+        Ok(ResearchPeriod::try_new(
+            SourceIdentifier::try_from(BEA_ANNUAL_PERIOD_SCHEME)?,
+            year,
+            NonZeroU16::MIN,
+            SourceIdentifier::try_from(year.to_string())?,
+        )?)
     }
 }

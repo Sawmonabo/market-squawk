@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cap_fs_ext::DirExt as _;
 use cap_std::fs::Dir;
+use market_squawk_adapter_bea::{bea_api_endpoint_rule, bea_provider_rate_declaration};
 use market_squawk_adapter_bls::{BlsAccessTier, BlsRequestPlan, BlsSeriesMetadata};
 use market_squawk_adapter_federal_reserve::{
     BOARD_DDP_SOURCE_ID, BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT,
@@ -67,9 +68,10 @@ use uuid::Uuid;
 
 use crate::application::ResearchProviderRuntimeGeneration;
 use crate::provider_activation::{
-    BoardAdapterActivation, CommittedProviderAdapterReplacement,
-    ControlledLocalFileAdapterActivation, PreparedProviderAdapterReplacement,
-    TiingoAdapterActivation, YahooAdapterActivation,
+    BEA_SOURCE_ID, BEA_SURFACE, BeaAdapterActivation, BoardAdapterActivation,
+    CommittedProviderAdapterReplacement, ControlledLocalFileAdapterActivation,
+    PreparedProviderAdapterReplacement, TiingoAdapterActivation, YahooAdapterActivation,
+    fixed_regional_source_config,
 };
 use crate::provider_onboarding::SecCikInput;
 use crate::provider_onboarding::{
@@ -2665,6 +2667,21 @@ fn build_research_activation(
                     .map_err(|_error| CliProviderActivationError::ProviderConfiguration)?,
             )
         }
+        ProviderRequest::BeaRegional => {
+            let config = fixed_regional_source_config()
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            let provider_dataset = config
+                .contracts()
+                .first()
+                .filter(|_| config.contracts().len() == 1)
+                .map(|contract| contract.dataset_id().clone())
+                .ok_or(CliProviderActivationError::ProviderConfiguration)?;
+            let metadata = bea_metadata(lease, activation_evidence, metadata_effective, &config)?;
+            ProviderAdapterActivationRequest::Bea(BeaAdapterActivation::new(
+                metadata,
+                provider_dataset,
+            ))
+        }
         ProviderRequest::TreasuryFiscal {
             first_record_date,
             last_record_date,
@@ -2844,6 +2861,7 @@ enum ProviderRequest {
         start_year: u16,
         end_year: u16,
     },
+    BeaRegional,
     TreasuryFiscal {
         first_record_date: CalendarDate,
         last_record_date: CalendarDate,
@@ -2886,6 +2904,7 @@ impl ProviderRequest {
         match self {
             Self::Sec { .. } => ProviderSurface::Exact(SEC_EDGAR_PROFILE_ID),
             Self::Bls { .. } => ProviderSurface::Either(BLS_PUBLIC_SURFACE, BLS_REGISTERED_SURFACE),
+            Self::BeaRegional => ProviderSurface::Exact(BEA_SURFACE),
             Self::TreasuryFiscal { .. } => ProviderSurface::Exact(TREASURY_FISCAL_SURFACE),
             Self::TreasuryDailyRates => ProviderSurface::Exact(TREASURY_XML_SURFACE),
             Self::FredAlfred { .. } => ProviderSurface::Exact(FRED_SURFACE),
@@ -3439,6 +3458,7 @@ fn evidence_references(
         }
         ProviderRequest::TreasuryFiscal { .. }
         | ProviderRequest::TreasuryDailyRates
+        | ProviderRequest::BeaRegional
         | ProviderRequest::FederalReserveBoardH15
         | ProviderRequest::YahooEnrichment
         | ProviderRequest::TiingoStarterEodNav
@@ -3540,6 +3560,7 @@ fn decode_request(bytes: &[u8]) -> Result<ActivationRequest, CliProviderActivati
                 || matches!(
                     &request.provider,
                     ProviderRequest::FredAlfred { .. }
+                        | ProviderRequest::BeaRegional
                         | ProviderRequest::YahooEnrichment
                         | ProviderRequest::TiingoStarterEodNav
                 )
@@ -3556,6 +3577,7 @@ fn decode_request(bytes: &[u8]) -> Result<ActivationRequest, CliProviderActivati
                 || matches!(
                     &request.provider,
                     ProviderRequest::FredAlfred { .. }
+                        | ProviderRequest::BeaRegional
                         | ProviderRequest::FederalReserveBoardH15
                         | ProviderRequest::YahooEnrichment
                         | ProviderRequest::TiingoStarterEodNav
@@ -4074,6 +4096,7 @@ fn authorization_subject(
 ) -> Result<SourceIdentifier, CliProviderActivationError> {
     let provider = match lease.surface_id().as_str() {
         BLS_REGISTERED_SURFACE => "us-bls",
+        BEA_SURFACE => "bea",
         FRED_SURFACE => "fred",
         TIINGO_SURFACE => TIINGO_SOURCE_ID,
         _ => return Err(CliProviderActivationError::InvalidMetadata),
@@ -4354,6 +4377,37 @@ fn treasury_metadata(
             .provider_budget_policy()
             .cloned()
             .ok_or(CliProviderActivationError::InvalidMetadata)?,
+    )
+}
+
+fn bea_metadata(
+    lease: &ProviderActivationLease,
+    evidence: EvidenceDigest,
+    effective: EffectiveInterval,
+    config: &market_squawk_adapter_bea::BeaSourceConfig,
+) -> Result<SourceMetadata, CliProviderActivationError> {
+    let rule =
+        bea_api_endpoint_rule(config).map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    let network = EndpointPolicy::try_from_api_rules(vec![rule], request_bounds(64 * 1024 * 1024)?)
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?;
+    let budget = bea_provider_rate_declaration()
+        .map_err(|_| CliProviderActivationError::InvalidMetadata)?
+        .policy()
+        .clone();
+    metadata_with_source_id(
+        lease,
+        evidence,
+        activation_revision_evidence(evidence)?,
+        SourceId::try_from(BEA_SOURCE_ID)
+            .map_err(|_| CliProviderActivationError::InvalidMetadata)?,
+        "bea",
+        SourceClass::OfficialAgency,
+        CoverageDomain::Macroeconomic,
+        AuthorizationMode::UserAuthorized,
+        HistoricalCapability::Historical,
+        effective,
+        network,
+        budget,
     )
 }
 

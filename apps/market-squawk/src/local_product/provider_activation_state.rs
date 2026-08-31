@@ -44,7 +44,7 @@ const MAXIMUM_PROVIDER_METADATA_BACKUP_BYTES: usize = 160 * 1024 * 1024;
 const MAXIMUM_BACKUP_EVIDENCE_OBJECT_BYTES: u64 = 1024 * 1024;
 const RESTORED_REQUIREMENT_SCHEMA_VERSION: u16 = 1;
 
-pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 10] = [
+pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 11] = [
     SEC_EDGAR_PROFILE_ID,
     "bls.v1-unregistered",
     "bls.v2-registered",
@@ -55,8 +55,9 @@ pub(super) const RESTORABLE_RESEARCH_SURFACES: [&str; 10] = [
     "federal-reserve-board.data-download-program",
     "yahoo-finance.experimental-enrichment",
     "tiingo.starter-eod-nav",
+    "bea.api-data",
 ];
-pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 11] = [
+pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 12] = [
     SEC_EDGAR_PROFILE_ID,
     "bls.v1-unregistered",
     "bls.v2-registered",
@@ -68,6 +69,7 @@ pub(super) const SERIALIZED_RESEARCH_SURFACES: [&str; 11] = [
     "federal-reserve-board.data-download-program",
     "yahoo-finance.experimental-enrichment",
     "tiingo.starter-eod-nav",
+    "bea.api-data",
 ];
 
 const COINBASE_DIRECT_LIVE_SURFACE: &str = "coinbase.exchange-direct-market-data";
@@ -80,7 +82,7 @@ const SESSION_BACKED_LIVE_SURFACES: [&str; 4] = [
 ];
 
 // New lifecycle surfaces are appended so schema-v1 backups remain an exact prefix.
-const SERIALIZED_LIFECYCLE_SURFACES: [&str; 17] = [
+const SERIALIZED_LIFECYCLE_SURFACES: [&str; 18] = [
     "coinbase.public-market-data",
     COINBASE_DIRECT_LIVE_SURFACE,
     "kraken.spot-public-market-data",
@@ -98,6 +100,7 @@ const SERIALIZED_LIFECYCLE_SURFACES: [&str; 17] = [
     ProviderMarketAccount::SchwabMarketData.surface_id(),
     "yahoo-finance.experimental-enrichment",
     "tiingo.starter-eod-nav",
+    "bea.api-data",
 ];
 
 /// Least-authority owner seam for the protected provider-metadata component.
@@ -1881,6 +1884,7 @@ fn surface_key(surface_id: &str) -> Result<&'static str, DurableProviderActivati
         "federal-reserve-board.data-download-program" => Ok("federal-reserve-board-h15"),
         "yahoo-finance.experimental-enrichment" => Ok("yahoo-enrichment"),
         "tiingo.starter-eod-nav" => Ok("tiingo-starter-eod-nav"),
+        "bea.api-data" => Ok("bea-api-data"),
         _ => Err(DurableProviderActivationStateError::UnknownSurface),
     }
 }
