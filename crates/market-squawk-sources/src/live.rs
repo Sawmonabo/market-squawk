@@ -514,6 +514,25 @@ pub enum SinkError {
     CaptureIncomplete,
 }
 
+/// Closed payload-free provider-response failure retained only by internal diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceProtocolViolation {
+    /// A bounded metadata response declared an unsupported transport encoding.
+    MetadataEncoding,
+    /// A bounded metadata response violated its selected schema.
+    MetadataSchema,
+    /// A bounded metadata response did not preserve the requested effective interval.
+    MetadataInterval,
+    /// A bounded observation response declared an unsupported transport encoding.
+    ObservationsEncoding,
+    /// A bounded observation response violated its selected schema.
+    ObservationsSchema,
+    /// A bounded observation response did not bind to its exact request.
+    ObservationsRequestBinding,
+    /// Exact response evidence could not bind to the bounded raw-capture contract.
+    CaptureBinding,
+}
+
 /// Live source lifecycle or bounded-input failure.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum SourceError {

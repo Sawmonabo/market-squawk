@@ -108,7 +108,7 @@ impl FredTransport for ReqwestFredTransport {
                     .content_length()
                     .is_some_and(|length| usize::try_from(length).map_or(true, |n| n > max_bytes))
                 {
-                    return Err(FredSourceError::BodyTooLarge);
+                    return Err(FredSourceError::BodyTooLarge { max: max_bytes });
                 }
                 let status = response.status().as_u16();
                 let retry_after = response
@@ -152,9 +152,9 @@ where
         let next = body
             .len()
             .checked_add(chunk.len())
-            .ok_or(FredSourceError::BodyTooLarge)?;
+            .ok_or(FredSourceError::BodyTooLarge { max: max_bytes })?;
         if next > max_bytes {
-            return Err(FredSourceError::BodyTooLarge);
+            return Err(FredSourceError::BodyTooLarge { max: max_bytes });
         }
         body.extend_from_slice(&chunk);
     }

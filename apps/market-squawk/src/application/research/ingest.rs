@@ -31,7 +31,7 @@ use market_squawk_sources::{
     ProviderCaptureSealRequest, ProviderNativeLineageBatch, ProviderNativeLineageImplementation,
     RegisteredSource, RegistryError, SealedProviderCaptureBinding, SealedProviderCaptureMaterial,
     SourceClass, SourceError, SourceMetadata, SourceObject, SourceObjectCaptureIdentity,
-    built_in_provider_profiles,
+    SourceProtocolViolation, built_in_provider_profiles,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -629,6 +629,31 @@ pub struct ManagedDiscovery {
     capture_material: Option<ProviderCaptureMaterial>,
 }
 
+/// Source-neutral extraction failure plus an optional closed protocol reason for internal logs.
+pub struct ManagedDiscoveryDiagnosticError {
+    source: ExtractionSourceError,
+    protocol: Option<SourceProtocolViolation>,
+}
+
+impl From<ExtractionSourceError> for ManagedDiscoveryDiagnosticError {
+    fn from(source: ExtractionSourceError) -> Self {
+        Self {
+            source,
+            protocol: None,
+        }
+    }
+}
+
+impl From<market_squawk_adapter_fred::FredDiscoveryError> for ManagedDiscoveryDiagnosticError {
+    fn from(error: market_squawk_adapter_fred::FredDiscoveryError) -> Self {
+        let protocol = error.protocol_violation();
+        Self {
+            source: error.into_source_error(),
+            protocol,
+        }
+    }
+}
+
 impl ManagedDiscovery {
     fn inspection_only(batch: DiscoveryBatch) -> Self {
         Self {
@@ -673,6 +698,21 @@ pub trait ManagedResearchExtractionSource: ExtractionSource + Send + Sync + 'sta
     ) -> BoxFuture<'_, Result<ManagedDiscovery, ExtractionSourceError>> {
         let discovered = self.discover(authority, request, cancellation);
         Box::pin(async move { discovered.await.map(ManagedDiscovery::inspection_only) })
+    }
+
+    /// Discovers source objects while retaining only a closed payload-free diagnostic reason.
+    fn discover_managed_diagnostic(
+        &self,
+        authority: market_squawk_sources::ExtractionAuthority,
+        request: DiscoveryRequest,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<ManagedDiscovery, ManagedDiscoveryDiagnosticError>> {
+        let discovered = self.discover_managed(authority, request, cancellation);
+        Box::pin(async move {
+            discovered
+                .await
+                .map_err(ManagedDiscoveryDiagnosticError::from)
+        })
     }
 
     /// Extracts one analytical batch with source-specific reference metadata from the same bytes.
@@ -885,6 +925,21 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_sec::SecEdgarSour
 }
 
 impl ManagedResearchExtractionSource for market_squawk_adapter_fred::FredSource {
+    fn discover_managed_diagnostic(
+        &self,
+        authority: market_squawk_sources::ExtractionAuthority,
+        request: DiscoveryRequest,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<ManagedDiscovery, ManagedDiscoveryDiagnosticError>> {
+        let discovered = self.discover_with_diagnostic(authority, request, cancellation);
+        Box::pin(async move {
+            discovered
+                .await
+                .map(ManagedDiscovery::inspection_only)
+                .map_err(ManagedDiscoveryDiagnosticError::from)
+        })
+    }
+
     fn extract_managed_with_native(
         &self,
         _capture: ManagedProviderCaptureAuthority,
@@ -2805,11 +2860,33 @@ enum ProviderOperationFailureClass {
 pub(crate) struct ProviderOperationDiagnostic {
     phase: ProviderOperationPhase,
     failure: ProviderOperationFailureClass,
+    protocol: Option<SourceProtocolViolation>,
 }
 
 impl ProviderOperationDiagnostic {
     const fn new(phase: ProviderOperationPhase, failure: ProviderOperationFailureClass) -> Self {
-        Self { phase, failure }
+        Self {
+            phase,
+            failure,
+            protocol: None,
+        }
+    }
+
+    fn from_extraction(phase: ProviderOperationPhase, error: ExtractionSourceError) -> Self {
+        Self {
+            phase,
+            failure: classify_extraction_error(error),
+            protocol: None,
+        }
+    }
+
+    fn from_managed_discovery(
+        phase: ProviderOperationPhase,
+        error: ManagedDiscoveryDiagnosticError,
+    ) -> Self {
+        let mut diagnostic = Self::from_extraction(phase, error.source);
+        diagnostic.protocol = error.protocol;
+        diagnostic
     }
 
     const fn from_service(phase: ProviderOperationPhase, error: ServiceError) -> Self {
@@ -2863,15 +2940,43 @@ impl fmt::Display for ProviderOperationDiagnostic {
 
 impl fmt::Debug for ProviderOperationDiagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ProviderOperationDiagnostic")
+        let mut diagnostic = formatter.debug_struct("ProviderOperationDiagnostic");
+        diagnostic
             .field("phase", &self.phase)
-            .field("failure", &self.failure)
-            .finish()
+            .field("failure", &self.failure);
+        if let Some(protocol) = self.protocol {
+            diagnostic.field("protocol", &protocol);
+        }
+        diagnostic.finish()
     }
 }
 
 impl std::error::Error for ProviderOperationDiagnostic {}
+
+trait IntoProviderOperationDiagnostic {
+    fn into_provider_operation_diagnostic(
+        self,
+        phase: ProviderOperationPhase,
+    ) -> ProviderOperationDiagnostic;
+}
+
+impl IntoProviderOperationDiagnostic for ExtractionSourceError {
+    fn into_provider_operation_diagnostic(
+        self,
+        phase: ProviderOperationPhase,
+    ) -> ProviderOperationDiagnostic {
+        ProviderOperationDiagnostic::from_extraction(phase, self)
+    }
+}
+
+impl IntoProviderOperationDiagnostic for ManagedDiscoveryDiagnosticError {
+    fn into_provider_operation_diagnostic(
+        self,
+        phase: ProviderOperationPhase,
+    ) -> ProviderOperationDiagnostic {
+        ProviderOperationDiagnostic::from_managed_discovery(phase, self)
+    }
+}
 
 async fn await_extraction<T>(
     future: impl Future<Output = Result<T, ExtractionSourceError>>,
@@ -2892,14 +2997,17 @@ async fn await_extraction<T>(
     .map_err(ProviderOperationDiagnostic::service_error)
 }
 
-async fn await_extraction_diagnostic<T>(
-    future: impl Future<Output = Result<T, ExtractionSourceError>>,
+async fn await_extraction_diagnostic<T, Error>(
+    future: impl Future<Output = Result<T, Error>>,
     context: &RequestContext,
     operation: &CancellationToken,
     admission: &ResearchProviderAdmission,
     operation_deadline: Instant,
     phase: ProviderOperationPhase,
-) -> Result<T, ProviderOperationDiagnostic> {
+) -> Result<T, ProviderOperationDiagnostic>
+where
+    Error: IntoProviderOperationDiagnostic,
+{
     if Instant::now() >= operation_deadline {
         operation.cancel();
         return Err(ProviderOperationDiagnostic::new(
@@ -2935,7 +3043,7 @@ async fn await_extraction_diagnostic<T>(
             ))
         }
         result = future => result.map_err(|error| {
-            ProviderOperationDiagnostic::new(phase, classify_extraction_error(error))
+            error.into_provider_operation_diagnostic(phase)
         }),
     }
 }

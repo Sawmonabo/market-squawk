@@ -1053,7 +1053,7 @@ impl ProductionResearchIngestCoordinator {
             wall_deadline,
         )?;
         let discovery = await_extraction_diagnostic(
-            prepared.source.discover_managed(
+            prepared.source.discover_managed_diagnostic(
                 prepared.authority.clone(),
                 discovery_request,
                 operation.clone(),

@@ -7,6 +7,7 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     ApiEndpointRule, ExtractionAuthority, ExtractionSourceError, NetworkPolicyError, PathScope,
     ProviderCaptureMaterial, QueryParameterRule, QuerySensitivity, SourceError,
+    SourceProtocolViolation,
 };
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -17,8 +18,8 @@ use crate::series::{admit_body, parse_date, validate_strings};
 use super::http::system_timestamp;
 use super::lineage::{evidence_for_payload, map_adapter_error};
 use super::{
-    FredDataset, FredHttpAuthorization, FredHttpRequest, FredSource, FredSourceError,
-    acquire_request_permit, standalone_capture_material,
+    FredDataset, FredDiscoveryError, FredHttpAuthorization, FredHttpRequest, FredSource,
+    FredSourceError, acquire_request_permit, protocol_violation, standalone_capture_material,
 };
 
 const SERIES_ENDPOINT: &str = "https://api.stlouisfed.org/fred/series";
@@ -258,16 +259,28 @@ impl FredSource {
         deadline: Timestamp,
         cancellation: CancellationToken,
     ) -> Result<FredSeriesMetadataDocument, ExtractionSourceError> {
+        self.acquire_series_metadata_with_diagnostic(authority, dataset, deadline, cancellation)
+            .await
+            .map_err(FredDiscoveryError::into_source_error)
+    }
+
+    pub(super) async fn acquire_series_metadata_with_diagnostic(
+        &self,
+        authority: &ExtractionAuthority,
+        dataset: &SourceIdentifier,
+        deadline: Timestamp,
+        cancellation: CancellationToken,
+    ) -> Result<FredSeriesMetadataDocument, FredDiscoveryError> {
         self.validate_authority(authority)?;
         self.validate_provider_dataset(dataset)?;
         if cancellation.is_cancelled() {
-            return Err(ExtractionSourceError::Cancelled);
+            return Err(ExtractionSourceError::Cancelled.into());
         }
         let dataset_identity = FredDataset::parse(dataset)
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
         let now = system_timestamp().map_err(map_adapter_error)?;
         if deadline <= now {
-            return Err(ExtractionSourceError::DeadlineExceeded);
+            return Err(ExtractionSourceError::DeadlineExceeded.into());
         }
         let mut public_url = url::Url::parse(SERIES_ENDPOINT)
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
@@ -323,21 +336,24 @@ impl FredSource {
             .as_deref()
             .is_some_and(|value| !value.eq_ignore_ascii_case(b"identity"))
         {
-            return Err(ExtractionSourceError::Source(
-                SourceError::InvalidProtocolState,
+            return Err(protocol_violation(
+                SourceProtocolViolation::MetadataEncoding,
             ));
         }
         match response.status {
             200 => {}
-            401 | 403 => return Err(ExtractionSourceError::Source(SourceError::Unauthorized)),
+            401 | 403 => {
+                return Err(ExtractionSourceError::Source(SourceError::Unauthorized).into());
+            }
             429 | 503 => {
                 let deadline =
                     in_flight.apply_retry_after_header(response.retry_after.as_deref(), 0)?;
-                return Err(ExtractionSourceError::Source(
-                    SourceError::BudgetWaitUntil { deadline },
-                ));
+                return Err(ExtractionSourceError::Source(SourceError::BudgetWaitUntil {
+                    deadline,
+                })
+                .into());
             }
-            _ => return Err(ExtractionSourceError::Source(SourceError::Network)),
+            _ => return Err(ExtractionSourceError::Source(SourceError::Network).into()),
         }
 
         let limits = FredParseLimits::try_new(
@@ -345,15 +361,16 @@ impl FredSource {
             self.response_limit,
             self.response_limit.min(MAX_METADATA_STRING_BYTES),
         )
-        .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+        .map_err(|_| protocol_violation(SourceProtocolViolation::MetadataSchema))?;
         let series = parse_series_metadata(&response.body, &dataset_identity, limits)
-            .map_err(map_adapter_error)?;
+            .map_err(protocol_violation)?;
         let response_length = u64::try_from(response.body.len())
-            .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
-        let evidence =
-            evidence_for_payload(&response.body, &public_url).map_err(map_adapter_error)?;
+            .map_err(|_| protocol_violation(SourceProtocolViolation::CaptureBinding))?;
+        let evidence = evidence_for_payload(&response.body, &public_url)
+            .map_err(|_| protocol_violation(SourceProtocolViolation::CaptureBinding))?;
         let capture =
-            standalone_capture_material(&self.metadata, dataset.clone(), &public_url, &response)?;
+            standalone_capture_material(&self.metadata, dataset.clone(), &public_url, &response)
+                .map_err(|_| protocol_violation(SourceProtocolViolation::CaptureBinding))?;
         in_flight.record_success()?;
         Ok(FredSeriesMetadataDocument {
             source_id: self.metadata.source_id().clone(),
@@ -373,12 +390,13 @@ fn parse_series_metadata(
     bytes: &[u8],
     dataset: &FredDataset,
     limits: FredParseLimits,
-) -> Result<FredSeriesMetadata, FredSourceError> {
-    let series = parse_series_metadata_for_series(bytes, dataset.series_id(), limits)?;
+) -> Result<FredSeriesMetadata, SourceProtocolViolation> {
+    let series = parse_series_metadata_for_series(bytes, dataset.series_id(), limits)
+        .map_err(|_| SourceProtocolViolation::MetadataSchema)?;
     if series.realtime_start != dataset.realtime_start()
         || series.realtime_end != dataset.realtime_end()
     {
-        return Err(FredSourceError::Protocol);
+        return Err(SourceProtocolViolation::MetadataInterval);
     }
     Ok(series)
 }

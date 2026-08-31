@@ -19,7 +19,7 @@ use market_squawk_sources::{
     ObservedRevisionError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
     ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition, ProviderNativeLineageBatch,
     SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceObject,
-    payload_matches_exact_evidence,
+    SourceProtocolViolation, payload_matches_exact_evidence,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -91,7 +91,10 @@ pub enum FredSourceError {
     /// Dataset identity is outside the bounded FRED/ALFRED observation grammar.
     InvalidDataset,
     /// Provider response crossed the configured byte ceiling.
-    BodyTooLarge,
+    BodyTooLarge {
+        /// Exact configured response-body byte ceiling.
+        max: usize,
+    },
     /// The allowlisted transport failed without retaining sensitive request data.
     Network,
     /// Provider data or canonical normalization violated its exact schema.
@@ -111,7 +114,9 @@ impl std::fmt::Display for FredSourceError {
         match self {
             Self::InvalidApiKey => formatter.write_str("invalid FRED API key"),
             Self::InvalidDataset => formatter.write_str("invalid FRED/ALFRED dataset identity"),
-            Self::BodyTooLarge => formatter.write_str("FRED response exceeded its byte limit"),
+            Self::BodyTooLarge { .. } => {
+                formatter.write_str("FRED response exceeded its byte limit")
+            }
             Self::Network => formatter.write_str("FRED network operation failed"),
             Self::Protocol => formatter.write_str("invalid FRED protocol data"),
             Self::InvalidConfiguration => formatter.write_str("invalid FRED source configuration"),
@@ -130,7 +135,7 @@ impl std::error::Error for FredSourceError {
             Self::RevisionAuthority(error) => Some(error),
             Self::InvalidApiKey
             | Self::InvalidDataset
-            | Self::BodyTooLarge
+            | Self::BodyTooLarge { .. }
             | Self::Network
             | Self::Protocol
             | Self::InvalidConfiguration
@@ -139,6 +144,69 @@ impl std::error::Error for FredSourceError {
         }
     }
 }
+
+/// Generic extraction failure paired only with an optional closed protocol reason.
+pub struct FredDiscoveryError {
+    source: ExtractionSourceError,
+    protocol: Option<SourceProtocolViolation>,
+}
+
+impl FredDiscoveryError {
+    fn protocol(protocol: SourceProtocolViolation) -> Self {
+        Self {
+            source: SourceError::InvalidProtocolState.into(),
+            protocol: Some(protocol),
+        }
+    }
+
+    /// Returns the closed protocol reason when provider response validation failed.
+    pub const fn protocol_violation(&self) -> Option<SourceProtocolViolation> {
+        self.protocol
+    }
+
+    /// Discards internal diagnostic detail at the generic source boundary.
+    pub fn into_source_error(self) -> ExtractionSourceError {
+        self.source
+    }
+}
+
+impl From<ExtractionSourceError> for FredDiscoveryError {
+    fn from(source: ExtractionSourceError) -> Self {
+        Self {
+            source,
+            protocol: None,
+        }
+    }
+}
+
+impl From<ExtractionAuthorityError> for FredDiscoveryError {
+    fn from(error: ExtractionAuthorityError) -> Self {
+        ExtractionSourceError::from(error).into()
+    }
+}
+
+impl From<market_squawk_sources::ExtractionError> for FredDiscoveryError {
+    fn from(error: market_squawk_sources::ExtractionError) -> Self {
+        ExtractionSourceError::from(error).into()
+    }
+}
+
+impl std::fmt::Debug for FredDiscoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DiscoveryDiagnosticError")
+            .field("protocol", &self.protocol)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for FredDiscoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("source discovery failed")
+    }
+}
+
+impl std::error::Error for FredDiscoveryError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FredNamespace {
@@ -374,6 +442,10 @@ fn update_fred_graph_field(digest: &mut Sha256, value: &[u8]) -> Result<(), Extr
 
 fn invalid_protocol_state() -> ExtractionSourceError {
     ExtractionSourceError::Source(SourceError::InvalidProtocolState)
+}
+
+fn protocol_violation(reason: SourceProtocolViolation) -> FredDiscoveryError {
+    FredDiscoveryError::protocol(reason)
 }
 
 /// Registry-bound FRED and ALFRED extraction source.
@@ -656,7 +728,8 @@ impl FredSource {
                 },
                 cancellation,
             )
-            .await?;
+            .await
+            .map_err(FredDiscoveryError::into_source_error)?;
         if fetched.digest != object.page_digest()
             || fetched.page.offset() != object.offset()
             || fetched.page.limit() != object.limit()
@@ -720,23 +793,27 @@ impl FredSource {
         })
     }
 
-    async fn discover_impl(
+    /// Discovers one exact page chain while retaining only a closed protocol failure reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns a generic extraction failure and, only for selected response-contract failures, a
+    /// closed reason containing no provider payload or request material.
+    pub async fn discover_with_diagnostic(
         &self,
         authority: ExtractionAuthority,
         request: DiscoveryRequest,
         cancellation: CancellationToken,
-    ) -> Result<DiscoveryBatch, ExtractionSourceError> {
+    ) -> Result<DiscoveryBatch, FredDiscoveryError> {
         self.validate_authority(&authority)?;
         if request.effective_at().is_some() {
-            return Err(ExtractionSourceError::Source(
-                SourceError::InvalidProtocolState,
-            ));
+            return Err(ExtractionSourceError::Source(SourceError::InvalidProtocolState).into());
         }
         let dataset = FredDataset::parse(request.dataset())
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
         self.validate_provider_dataset(request.dataset())?;
         let series_metadata = self
-            .acquire_series_metadata(
+            .acquire_series_metadata_with_diagnostic(
                 &authority,
                 request.dataset(),
                 request.deadline(),
@@ -769,24 +846,24 @@ impl FredSource {
                 || fetched.page.realtime_end() != dataset.realtime_end()
                 || expected_count.is_some_and(|count| count != fetched.page.count())
             {
-                return Err(ExtractionSourceError::Source(
-                    SourceError::InvalidProtocolState,
+                return Err(protocol_violation(
+                    SourceProtocolViolation::ObservationsRequestBinding,
                 ));
             }
             expected_count = Some(fetched.page.count());
             for observation in fetched.page.observations() {
                 let observation_date = observation.observation_date();
                 if previous_observation_date.is_some_and(|previous| observation_date < previous) {
-                    return Err(ExtractionSourceError::Source(
-                        SourceError::InvalidProtocolState,
+                    return Err(protocol_violation(
+                        SourceProtocolViolation::ObservationsSchema,
                     ));
                 }
                 if previous_observation_date == Some(observation_date) {
                     if previous_realtime_start
                         .is_some_and(|previous| observation.realtime_start() <= previous)
                     {
-                        return Err(ExtractionSourceError::Source(
-                            SourceError::InvalidProtocolState,
+                        return Err(protocol_violation(
+                            SourceProtocolViolation::ObservationsSchema,
                         ));
                     }
                 } else {
@@ -795,7 +872,7 @@ impl FredSource {
                 previous_realtime_start = Some(observation.realtime_start());
             }
             let evidence = evidence_for_payload(&fetched.response.body, &fetched.public_url)
-                .map_err(map_adapter_error)?;
+                .map_err(|_| protocol_violation(SourceProtocolViolation::CaptureBinding))?;
             let object_id = page_object_id(
                 offset,
                 self.discovery_page_records,
@@ -805,24 +882,23 @@ impl FredSource {
                 fetched.digest,
                 metadata_digest,
             )
-            .map_err(map_adapter_error)?;
+            .map_err(|_| protocol_violation(SourceProtocolViolation::CaptureBinding))?;
             let effective = EffectiveInterval::new(fetched.response.received_at, None)
-                .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+                .map_err(|_| protocol_violation(SourceProtocolViolation::CaptureBinding))?;
             objects.push(SourceObject::try_new(
                 self.metadata.source_id().clone(),
                 self.metadata.revision().clone(),
                 &request,
                 object_id,
                 SourceIdentifier::try_from("application/vnd.market-squawk.fred-page+json")
-                    .map_err(|_| {
-                        ExtractionSourceError::Source(SourceError::InvalidProtocolState)
-                    })?,
+                    .map_err(|_| protocol_violation(SourceProtocolViolation::CaptureBinding))?,
                 evidence,
                 effective,
                 None,
-                Some(u64::try_from(fetched.response.body.len()).map_err(|_| {
-                    ExtractionSourceError::Source(SourceError::InvalidProtocolState)
-                })?),
+                Some(
+                    u64::try_from(fetched.response.body.len())
+                        .map_err(|_| protocol_violation(SourceProtocolViolation::CaptureBinding))?,
+                ),
             )?);
             let Some(next) = fetched.page.next_offset() else {
                 complete = true;
@@ -835,9 +911,12 @@ impl FredSource {
                 market_squawk_sources::ExtractionError::DiscoveryLimitExceeded {
                     requested: request.max_results(),
                 },
-            ));
+            )
+            .into());
         }
-        DiscoveryBatch::try_new(&request, objects).map_err(ExtractionSourceError::from)
+        DiscoveryBatch::try_new(&request, objects)
+            .map_err(ExtractionSourceError::from)
+            .map_err(FredDiscoveryError::from)
     }
 
     /// Refetches one discovered page and returns canonical observations together with the exact
@@ -885,7 +964,8 @@ impl FredSource {
                 },
                 cancellation,
             )
-            .await?;
+            .await
+            .map_err(FredDiscoveryError::into_source_error)?;
         if fetched.digest != object.page_digest()
             || fetched.page.offset() != object.offset()
             || fetched.page.limit() != object.limit()
@@ -963,7 +1043,7 @@ impl FredSource {
         authority: &ExtractionAuthority,
         request: FredPageRequest<'_>,
         cancellation: CancellationToken,
-    ) -> Result<FetchedPage, ExtractionSourceError> {
+    ) -> Result<FetchedPage, FredDiscoveryError> {
         let FredPageRequest {
             dataset,
             offset,
@@ -972,11 +1052,11 @@ impl FredSource {
         } = request;
         self.validate_authority(authority)?;
         if cancellation.is_cancelled() {
-            return Err(ExtractionSourceError::Cancelled);
+            return Err(ExtractionSourceError::Cancelled.into());
         }
         let now = system_timestamp().map_err(map_adapter_error)?;
         if deadline <= now {
-            return Err(ExtractionSourceError::DeadlineExceeded);
+            return Err(ExtractionSourceError::DeadlineExceeded.into());
         }
         let mut public_url = url::Url::parse(OBSERVATIONS_ENDPOINT)
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
@@ -1034,28 +1114,31 @@ impl FredSource {
             .as_deref()
             .is_some_and(|value| !value.eq_ignore_ascii_case(b"identity"))
         {
-            return Err(ExtractionSourceError::Source(
-                SourceError::InvalidProtocolState,
+            return Err(protocol_violation(
+                SourceProtocolViolation::ObservationsEncoding,
             ));
         }
         match response.status {
             200 => {}
-            401 | 403 => return Err(ExtractionSourceError::Source(SourceError::Unauthorized)),
+            401 | 403 => {
+                return Err(ExtractionSourceError::Source(SourceError::Unauthorized).into());
+            }
             429 | 503 => {
                 let deadline =
                     in_flight.apply_retry_after_header(response.retry_after.as_deref(), 0)?;
-                return Err(ExtractionSourceError::Source(
-                    SourceError::BudgetWaitUntil { deadline },
-                ));
+                return Err(ExtractionSourceError::Source(SourceError::BudgetWaitUntil {
+                    deadline,
+                })
+                .into());
             }
-            _ => return Err(ExtractionSourceError::Source(SourceError::Network)),
+            _ => return Err(ExtractionSourceError::Source(SourceError::Network).into()),
         }
         let page = FredObservationPage::parse(
             &response.body,
             FredParseLimits::try_new(limit, self.response_limit, 8 * 1024)
-                .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?,
+                .map_err(|_| protocol_violation(SourceProtocolViolation::ObservationsSchema))?,
         )
-        .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+        .map_err(|_| protocol_violation(SourceProtocolViolation::ObservationsSchema))?;
         let digest = Sha256::digest(&response.body).into();
         let capture = standalone_capture_material(
             &self.metadata,
@@ -1069,10 +1152,11 @@ impl FredSource {
                     dataset.series_id, dataset.realtime_start, dataset.realtime_end
                 ),
             })
-            .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?,
+            .map_err(|_| protocol_violation(SourceProtocolViolation::CaptureBinding))?,
             &public_url,
             &response,
-        )?;
+        )
+        .map_err(|_| protocol_violation(SourceProtocolViolation::CaptureBinding))?;
         in_flight.record_success()?;
         Ok(FetchedPage {
             response,
@@ -1122,7 +1206,11 @@ impl ExtractionSource for FredSource {
         request: DiscoveryRequest,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<DiscoveryBatch, ExtractionSourceError>> {
-        Box::pin(self.discover_impl(authority, request, cancellation))
+        Box::pin(async move {
+            self.discover_with_diagnostic(authority, request, cancellation)
+                .await
+                .map_err(FredDiscoveryError::into_source_error)
+        })
     }
 
     fn extract(
@@ -1195,8 +1283,7 @@ fn standalone_capture_material(
     response: &FredHttpResponse,
 ) -> Result<ProviderCaptureMaterial, ExtractionSourceError> {
     let request_identity = secret_free_request_identity(public_url);
-    let body_bytes = u64::try_from(response.body.len())
-        .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+    let body_bytes = u64::try_from(response.body.len()).map_err(|_| invalid_protocol_state())?;
     let body_digest = EvidenceDigest::new(
         DigestAlgorithm::Sha256,
         Sha256::digest(&response.body).into(),
@@ -1211,7 +1298,7 @@ fn standalone_capture_material(
         body_digest,
         response.received_at,
     )
-    .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+    .map_err(|_| invalid_protocol_state())?;
     let receipt = ProviderCaptureSetReceipt::try_new(
         metadata.source_id().clone(),
         metadata.revision().clone(),
@@ -1220,7 +1307,7 @@ fn standalone_capture_material(
         ProviderCaptureTerminalDisposition::StandaloneResponse,
         vec![page],
     )
-    .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+    .map_err(|_| invalid_protocol_state())?;
     let record = RawCaptureRecord::try_new_live(
         deterministic_capture_uuid(b"event", &receipt),
         Arc::from(metadata.source_id().as_str()),
@@ -1230,9 +1317,8 @@ fn standalone_capture_material(
         DateTime::<Utc>::from_timestamp_nanos(response.received_at.unix_nanos()),
         response.body.clone(),
     )
-    .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
-    ProviderCaptureMaterial::try_new(receipt, vec![record])
-        .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))
+    .map_err(|_| invalid_protocol_state())?;
+    ProviderCaptureMaterial::try_new(receipt, vec![record]).map_err(|_| invalid_protocol_state())
 }
 
 fn secret_free_request_identity(public_url: &url::Url) -> EvidenceDigest {
