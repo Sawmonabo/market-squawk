@@ -470,7 +470,7 @@ impl DurableProviderActivationState {
             let recovered = match self.restored_requirements(surface_id) {
                 Ok(requirements) if !requirements.is_empty() => Vec::new(),
                 Err(_) => Vec::new(),
-                Ok(_) => match self.load_recipe(surface_id) {
+                Ok(_) => match self.load_recipe_for_lifecycle(surface_id) {
                     Ok(DurableActivationRecipeState::Desired(recipe)) => {
                         vec![recipe.session_id]
                     }

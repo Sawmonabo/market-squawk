@@ -522,7 +522,7 @@ impl ProviderResearchActivationService {
                     }
                     if RESTORABLE_RESEARCH_SURFACES.contains(&surface_id.as_str()) {
                         match state
-                            .load_recipe(&surface_id)
+                            .load_recipe_for_lifecycle(&surface_id)
                             .map_err(|_error| CliProviderActivationError::StateUnavailable)?
                         {
                             DurableActivationRecipeState::Desired(recipe)
@@ -1408,7 +1408,7 @@ async fn reconcile_failed_replacement(
         Desired,
     }
 
-    let durable_phase = match state.load_recipe(expected.profile().as_str()) {
+    let durable_phase = match state.load_recipe_for_lifecycle(expected.profile().as_str()) {
         Ok(DurableActivationRecipeState::Staged(recipe))
             if replacement_recipe_is_exact(
                 &recipe,
@@ -1982,7 +1982,7 @@ pub(super) fn restore_research_providers(
         );
     }
     for surface_id in RESTORABLE_RESEARCH_SURFACES {
-        let recipe = match state.load_recipe(surface_id) {
+        let recipe = match state.load_recipe_for_lifecycle(surface_id) {
             Ok(DurableActivationRecipeState::Missing) => continue,
             Ok(DurableActivationRecipeState::Quarantined(quarantine)) => {
                 enforce_recovery_quarantine(
@@ -5547,7 +5547,7 @@ mod tests {
             same_session_candidate_digest,
         )?;
         assert!(matches!(
-            state.load_recipe(TREASURY_FISCAL_SURFACE)?,
+            state.load_recipe_for_lifecycle(TREASURY_FISCAL_SURFACE)?,
             DurableActivationRecipeState::Staged(recipe)
                 if recipe.session_id == predecessor_lease.session_id()
                     && recipe.runtime_generation_digest == same_session_candidate_digest
@@ -5740,7 +5740,7 @@ mod tests {
         let recovery_cutover =
             state.commit_staged_cutover(TREASURY_FISCAL_SURFACE, recovery_staged)?;
         assert!(matches!(
-            state.load_recipe(TREASURY_FISCAL_SURFACE)?,
+            state.load_recipe_for_lifecycle(TREASURY_FISCAL_SURFACE)?,
             DurableActivationRecipeState::Cutover(recipe)
                 if recipe.session_id == recovery_lease.session_id()
                     && recipe.state_digest == recovery_cutover
@@ -5762,7 +5762,7 @@ mod tests {
             &recovery_lease,
         )?;
         assert!(matches!(
-            state.load_recipe(TREASURY_FISCAL_SURFACE)?,
+            state.load_recipe_for_lifecycle(TREASURY_FISCAL_SURFACE)?,
             DurableActivationRecipeState::Cutover(recipe)
                 if recipe.session_id == recovery_lease.session_id()
                     && recipe.state_digest == recovery_cutover
@@ -5839,7 +5839,7 @@ mod tests {
         assert!(matches!(
             recovered
                 .provider_activation_state()
-                .load_recipe(TREASURY_FISCAL_SURFACE)?,
+                .load_recipe_for_lifecycle(TREASURY_FISCAL_SURFACE)?,
             DurableActivationRecipeState::Quarantined(quarantine)
                 if quarantine.session_id == Some(recovery_lease.session_id())
                     && quarantine.reason == DurableActivationQuarantineReason::Cancelled
