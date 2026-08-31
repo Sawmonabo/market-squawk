@@ -774,7 +774,7 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
         };
         let restart = IexHistRestartSelector::from_publication(&receipt);
         if !receipt.validates_against(&self) {
-            let quarantine_error = quarantine_committed_publication(
+            let terminalization_error = quarantine_committed_publication(
                 authority,
                 &restart,
                 IexHistPublicationQuarantineReason::ReceiptMismatch,
@@ -786,8 +786,7 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
                 ))
                 .err();
             return Err(IexHistPublicationError::InvalidReceipt {
-                receipt: Box::new(receipt),
-                quarantine_error,
+                terminalization_error,
                 settlement_error,
             });
         }
@@ -815,7 +814,7 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
             ),
         ] {
             if let Err(error) = capacity_permit.record_usage(category, bytes) {
-                let quarantine_error = quarantine_committed_publication(
+                let terminalization_error = quarantine_committed_publication(
                     authority,
                     &restart,
                     IexHistPublicationQuarantineReason::CapacityMismatch,
@@ -827,8 +826,7 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
                     .err();
                 return Err(IexHistPublicationError::CapacityAfterCommit {
                     error,
-                    receipt: Box::new(receipt),
-                    quarantine_error,
+                    terminalization_error,
                     settlement_error,
                 });
             }
@@ -836,7 +834,7 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
         let reconstruction = match authority.reopen_catalog_record(&restart) {
             Ok(reconstruction) => reconstruction,
             Err(error) => {
-                let quarantine_error = quarantine_committed_publication(
+                let terminalization_error = quarantine_committed_publication(
                     authority,
                     &restart,
                     IexHistPublicationQuarantineReason::RestartReconstructionFailed,
@@ -848,8 +846,7 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
                     .err();
                 return Err(IexHistPublicationError::PostCommitRevalidation {
                     error,
-                    receipt: Box::new(receipt),
-                    quarantine_error,
+                    terminalization_error,
                     settlement_error,
                 });
             }
@@ -857,7 +854,7 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
         if reconstruction.publication != receipt
             || !restart.validates_restart_record(&reconstruction)
         {
-            let quarantine_error = quarantine_committed_publication(
+            let terminalization_error = quarantine_committed_publication(
                 authority,
                 &restart,
                 IexHistPublicationQuarantineReason::RestartLineageMismatch,
@@ -868,35 +865,59 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
                 ))
                 .err();
             return Err(IexHistPublicationError::InvalidReceipt {
-                receipt: Box::new(receipt),
-                quarantine_error,
+                terminalization_error,
+                settlement_error,
+            });
+        }
+
+        // This is the sole transition that can make the generation selectable. The shared
+        // authority is required to return an exact durable readback, never an ambiguous `Result`.
+        // Capacity cannot be completed and neither the receipt nor selector can escape until this
+        // state is proven.
+        let terminalization = authority.terminalize_pending_publication(
+            &restart,
+            IexHistPendingPublicationDisposition::Admitted,
+        );
+        if !terminalization.validates_selector(&restart) {
+            let terminalization_error = quarantine_committed_publication(
+                authority,
+                &restart,
+                IexHistPublicationQuarantineReason::AdmissionFailed,
+            );
+            let settlement_error = capacity_permit
+                .settle(IexHistCapacityDisposition::Quarantined(
+                    IexHistTerminalReason::DownstreamIntegrityFault,
+                ))
+                .err();
+            return Err(IexHistPublicationError::TerminalizationAfterCommit {
+                error: IexHistTerminalizationError::ReadbackMismatch,
+                terminalization_error,
+                settlement_error,
+            });
+        }
+        if let IexHistPendingPublicationDisposition::Quarantined(reason) =
+            terminalization.disposition()
+        {
+            let settlement_error = capacity_permit
+                .settle(IexHistCapacityDisposition::Quarantined(
+                    IexHistTerminalReason::DownstreamIntegrityFault,
+                ))
+                .err();
+            return Err(IexHistPublicationError::TerminalizationAfterCommit {
+                error: IexHistTerminalizationError::AdmissionQuarantined(reason),
+                terminalization_error: None,
                 settlement_error,
             });
         }
         if let Err(error) = capacity_permit.settle(IexHistCapacityDisposition::Completed) {
-            let quarantine_error = quarantine_committed_publication(
+            let terminalization_error = quarantine_committed_publication(
                 authority,
                 &restart,
                 IexHistPublicationQuarantineReason::CapacitySettlementFailed,
             );
             return Err(IexHistPublicationError::SettlementAfterCommit {
                 error,
-                receipt: Box::new(receipt),
-                quarantine_error,
-            });
-        }
-        if let Err(error) = authority
-            .settle_pending_publication(&restart, IexHistPendingPublicationDisposition::Admitted)
-        {
-            let quarantine_error = quarantine_committed_publication(
-                authority,
-                &restart,
-                IexHistPublicationQuarantineReason::AdmissionFailed,
-            );
-            return Err(IexHistPublicationError::AdmissionAfterCommit {
-                error,
-                receipt: Box::new(receipt),
-                quarantine_error,
+                terminalization_error,
             });
         }
         Ok(IexHistPublishedBars {
@@ -907,6 +928,7 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
             telemetry,
             physical,
             receipt,
+            terminalization,
         })
     }
 }
@@ -915,13 +937,11 @@ fn quarantine_committed_publication<A: IexHistRestartLineageAuthority>(
     authority: &A,
     selector: &IexHistRestartSelector,
     reason: IexHistPublicationQuarantineReason,
-) -> Option<A::Error> {
-    authority
-        .settle_pending_publication(
-            selector,
-            IexHistPendingPublicationDisposition::Quarantined(reason),
-        )
-        .err()
+) -> Option<IexHistTerminalizationError> {
+    let expected = IexHistPendingPublicationDisposition::Quarantined(reason);
+    let receipt = authority.terminalize_pending_publication(selector, expected);
+    (!receipt.validates(selector, expected))
+        .then_some(IexHistTerminalizationError::ReadbackMismatch)
 }
 
 /// Borrowed, permit-free view supplied to the shared publication authority.
@@ -1035,10 +1055,12 @@ impl<'a, R> IexHistCanonicalPublicationInput<'a, R> {
 /// manifest catalog, rights decision, and precommit authority. Returning `Ok` means the immutable
 /// manifest and every exact raw/native parent are already durably committed; an implementation
 /// must leave that exact natural key `Pending` and unselectable until
-/// `settle_pending_publication` admits it, and must never substitute provider text for a
-/// date-effective canonical `InstrumentId`. The mapping set and persisted native binding returned
-/// by the input must be written in that same atomic commit and copied exactly into the immutable
-/// receipt.
+/// `terminalize_pending_publication` returns an exact admitted readback, and must never substitute
+/// provider text for a date-effective canonical `InstrumentId`. The mapping set and persisted
+/// native binding returned by the input must be written in that same atomic commit and copied
+/// exactly into the immutable receipt. `Err` is permitted only after authoritative proof that no
+/// natural key was committed; an ambiguous commit acknowledgement must be recovered by natural
+/// key and returned as the pending `Ok` receipt so terminalization cannot be bypassed.
 #[async_trait]
 pub(crate) trait IexHistCanonicalPublicationAuthority<R>:
     IexHistRestartLineageAuthority + Send + Sync
@@ -1595,6 +1617,7 @@ pub(crate) struct IexHistPublishedBars<R> {
     telemetry: TransportTelemetry,
     physical: IexHistCompletePhysicalSeal<R>,
     receipt: IexHistImmutablePublicationReceipt,
+    terminalization: IexHistPublicationTerminalizationReceipt,
 }
 
 impl<R> std::fmt::Debug for IexHistPublishedBars<R> {
@@ -1603,6 +1626,7 @@ impl<R> std::fmt::Debug for IexHistPublishedBars<R> {
             .debug_struct("IexHistPublishedBars")
             .field("manifest", self.receipt.manifest())
             .field("receipt_sha256", &self.receipt.receipt_sha256())
+            .field("terminalization", &self.terminalization.disposition())
             .field("plan_sha256", &self.plan.plan_sha256())
             .field("physical_seal_sha256", &self.physical.seal_sha256())
             .finish_non_exhaustive()
@@ -1639,7 +1663,7 @@ impl<R> IexHistPublishedBars<R> {
     }
 
     pub(crate) fn restart_selector(&self) -> IexHistRestartSelector {
-        IexHistRestartSelector::from_publication(&self.receipt)
+        self.terminalization.selector.clone()
     }
 }
 
@@ -1659,34 +1683,41 @@ pub(crate) enum IexHistPublicationError<E> {
         settlement_error: Option<IexHistCapacityError>,
     },
     InvalidReceipt {
-        receipt: Box<IexHistImmutablePublicationReceipt>,
-        quarantine_error: Option<E>,
+        terminalization_error: Option<IexHistTerminalizationError>,
         settlement_error: Option<IexHistCapacityError>,
     },
     /// The manifest commit returned, but its exact raw/native binding could not be reopened before
     /// the original selected-file capacity lease was released.
     PostCommitRevalidation {
         error: E,
-        receipt: Box<IexHistImmutablePublicationReceipt>,
-        quarantine_error: Option<E>,
+        terminalization_error: Option<IexHistTerminalizationError>,
         settlement_error: Option<IexHistCapacityError>,
     },
     CapacityAfterCommit {
         error: IexHistCapacityError,
-        receipt: Box<IexHistImmutablePublicationReceipt>,
-        quarantine_error: Option<E>,
+        terminalization_error: Option<IexHistTerminalizationError>,
         settlement_error: Option<IexHistCapacityError>,
     },
     SettlementAfterCommit {
         error: IexHistCapacityError,
-        receipt: Box<IexHistImmutablePublicationReceipt>,
-        quarantine_error: Option<E>,
+        terminalization_error: Option<IexHistTerminalizationError>,
     },
-    AdmissionAfterCommit {
-        error: E,
-        receipt: Box<IexHistImmutablePublicationReceipt>,
-        quarantine_error: Option<E>,
+    TerminalizationAfterCommit {
+        error: IexHistTerminalizationError,
+        terminalization_error: Option<IexHistTerminalizationError>,
+        settlement_error: Option<IexHistCapacityError>,
     },
+}
+
+/// Fail-closed terminalization fault. No committed receipt or restart selector is exposed through
+/// this error surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IexHistTerminalizationError {
+    /// The shared authority returned a receipt for a different natural key or a self-inconsistent
+    /// readback. The caller immediately requests quarantine and cannot release a published handle.
+    ReadbackMismatch,
+    /// The shared authority safely converged an admission request to a quarantined state.
+    AdmissionQuarantined(IexHistPublicationQuarantineReason),
 }
 
 fn valid_sha256_evidence(value: EvidenceDigest) -> bool {
@@ -2018,6 +2049,73 @@ pub(crate) enum IexHistPendingPublicationDisposition {
     Quarantined(IexHistPublicationQuarantineReason),
 }
 
+/// Exact authoritative readback of the shared catalog's terminal state for one natural key.
+///
+/// Production code receives this value only from [`IexHistRestartLineageAuthority`]. Its private
+/// fields prevent the provider publication path from substituting its requested state for the
+/// shared catalog's observed durable state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IexHistPublicationTerminalizationReceipt {
+    selector: IexHistRestartSelector,
+    disposition: IexHistPendingPublicationDisposition,
+    catalog_state_revision: u64,
+    catalog_readback_sha256: EvidenceDigest,
+    receipt_sha256: EvidenceDigest,
+}
+
+impl IexHistPublicationTerminalizationReceipt {
+    /// Constructor for the shared catalog implementation from its opaque persisted readback.
+    /// Production publication still receives this value only through the authority seam.
+    pub(crate) fn try_from_shared_catalog_readback(
+        selector: IexHistRestartSelector,
+        disposition: IexHistPendingPublicationDisposition,
+        catalog_state_revision: u64,
+        catalog_readback_sha256: EvidenceDigest,
+    ) -> Option<Self> {
+        if catalog_state_revision == 0 || !valid_sha256_evidence(catalog_readback_sha256) {
+            return None;
+        }
+        let receipt_sha256 = publication_terminalization_identity(
+            &selector,
+            disposition,
+            catalog_state_revision,
+            catalog_readback_sha256,
+        );
+        Some(Self {
+            selector,
+            disposition,
+            catalog_state_revision,
+            catalog_readback_sha256,
+            receipt_sha256,
+        })
+    }
+
+    pub(crate) const fn disposition(&self) -> IexHistPendingPublicationDisposition {
+        self.disposition
+    }
+
+    fn validates_selector(&self, selector: &IexHistRestartSelector) -> bool {
+        self.selector == *selector
+            && self.catalog_state_revision != 0
+            && valid_sha256_evidence(self.catalog_readback_sha256)
+            && self.receipt_sha256
+                == publication_terminalization_identity(
+                    &self.selector,
+                    self.disposition,
+                    self.catalog_state_revision,
+                    self.catalog_readback_sha256,
+                )
+    }
+
+    fn validates(
+        &self,
+        selector: &IexHistRestartSelector,
+        expected: IexHistPendingPublicationDisposition,
+    ) -> bool {
+        self.disposition == expected && self.validates_selector(selector)
+    }
+}
+
 /// Provider-owned reason supplied to the shared pending/admitted/quarantined state machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IexHistPublicationQuarantineReason {
@@ -2030,13 +2128,19 @@ pub(crate) enum IexHistPublicationQuarantineReason {
 }
 
 /// Shared catalog authority needed to reconstruct restart lineage independently of all live
-/// publication/runtime objects and to settle the already-committed pending manifest.
+/// publication/runtime objects and to terminalize the already-committed pending manifest.
 ///
 /// `reopen_catalog_record` must resolve only the selector's exact manifest natural key and receipt
-/// digest, then reopen the persisted provider capture/native sidecar and canonical manifest.
-/// `settle_pending_publication` is a compare-and-set on that same pending row: `Admitted` makes it
-/// selectable and `Quarantined` keeps it nonselectable. This provider leaf deliberately owns no
-/// duplicate admission state or catalog table.
+/// digest, then reopen the persisted provider capture/native sidecar and canonical manifest. The
+/// terminalizer deliberately does not return `Result`: it is one idempotent shared-catalog
+/// convergence operation plus authoritative readback, not an acknowledgement whose error could be
+/// ambiguous after compare-and-set. It must not return while the key is pending or its state is
+/// unknown. An admission request may return `Admitted` only after exact durable readback; every
+/// internal failure must instead converge to `Quarantined(AdmissionFailed)`. A quarantine request
+/// must make quarantine dominate either pending or a prior provisional admission and return the
+/// exact requested quarantine reason. The shared implementation must resume/retry by natural key
+/// across ambiguous storage errors. This provider leaf deliberately owns no duplicate admission
+/// state or catalog table.
 pub(crate) trait IexHistRestartLineageAuthority {
     type Error: Send;
 
@@ -2045,11 +2149,11 @@ pub(crate) trait IexHistRestartLineageAuthority {
         selector: &IexHistRestartSelector,
     ) -> Result<IexHistRestartCatalogRecord, Self::Error>;
 
-    fn settle_pending_publication(
+    fn terminalize_pending_publication(
         &self,
         selector: &IexHistRestartSelector,
         disposition: IexHistPendingPublicationDisposition,
-    ) -> Result<(), Self::Error>;
+    ) -> IexHistPublicationTerminalizationReceipt;
 }
 
 /// Durable natural key for restart-safe PIT reads.
@@ -2195,6 +2299,43 @@ impl IexHistRestartSelector {
             && evidence.canonical_content_sha256 == publication.canonical_content_sha256
             && evidence.locally_available_at == publication.locally_available_at
             && evidence.row_count == publication.row_count
+    }
+}
+
+fn publication_terminalization_identity(
+    selector: &IexHistRestartSelector,
+    disposition: IexHistPendingPublicationDisposition,
+    catalog_state_revision: u64,
+    catalog_readback_sha256: EvidenceDigest,
+) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/iex-hist-publication-terminalization/v1");
+    hash_length_prefixed(
+        &mut hash,
+        selector.manifest.dataset_id().as_str().as_bytes(),
+    );
+    hash.update(selector.manifest.manifest_version().to_le_bytes());
+    hash.update(selector.manifest.content_hash().bytes());
+    hash.update(selector.publication_receipt_sha256.bytes());
+    hash.update(catalog_state_revision.to_le_bytes());
+    hash.update(catalog_readback_sha256.bytes());
+    match disposition {
+        IexHistPendingPublicationDisposition::Admitted => hash.update([0]),
+        IexHistPendingPublicationDisposition::Quarantined(reason) => {
+            hash.update([1, publication_quarantine_reason_tag(reason)]);
+        }
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+const fn publication_quarantine_reason_tag(reason: IexHistPublicationQuarantineReason) -> u8 {
+    match reason {
+        IexHistPublicationQuarantineReason::ReceiptMismatch => 0,
+        IexHistPublicationQuarantineReason::CapacityMismatch => 1,
+        IexHistPublicationQuarantineReason::RestartReconstructionFailed => 2,
+        IexHistPublicationQuarantineReason::RestartLineageMismatch => 3,
+        IexHistPublicationQuarantineReason::CapacitySettlementFailed => 4,
+        IexHistPublicationQuarantineReason::AdmissionFailed => 5,
     }
 }
 
@@ -2686,6 +2827,7 @@ mod tests {
     struct RestartCatalogFixture {
         record: Arc<IexHistRestartCatalogRecord>,
         dispositions: Arc<Mutex<Vec<IexHistPendingPublicationDisposition>>>,
+        terminal_state: Arc<Mutex<Option<IexHistPendingPublicationDisposition>>>,
     }
 
     impl IexHistRestartLineageAuthority for RestartCatalogFixture {
@@ -2698,16 +2840,31 @@ mod tests {
             Ok(self.record.as_ref().clone())
         }
 
-        fn settle_pending_publication(
+        fn terminalize_pending_publication(
             &self,
-            _selector: &IexHistRestartSelector,
+            selector: &IexHistRestartSelector,
             disposition: IexHistPendingPublicationDisposition,
-        ) -> Result<(), Self::Error> {
-            self.dispositions
+        ) -> IexHistPublicationTerminalizationReceipt {
+            let catalog_state_revision = {
+                let mut dispositions = self
+                    .dispositions
+                    .lock()
+                    .expect("catalog disposition lock must remain available");
+                dispositions.push(disposition);
+                u64::try_from(dispositions.len()).expect("test catalog revision must fit in u64")
+            };
+            *self
+                .terminal_state
                 .lock()
-                .map_err(|_| "catalog disposition lock poisoned")?
-                .push(disposition);
-            Ok(())
+                .expect("catalog terminal-state lock must remain available") = Some(disposition);
+            let readback_byte = u8::try_from(catalog_state_revision).unwrap_or(u8::MAX);
+            IexHistPublicationTerminalizationReceipt::try_from_shared_catalog_readback(
+                selector.clone(),
+                disposition,
+                catalog_state_revision,
+                EvidenceDigest::new(DigestAlgorithm::Sha256, [readback_byte; 32]),
+            )
+            .expect("test catalog readback must be valid")
         }
     }
 
@@ -2722,18 +2879,21 @@ mod tests {
             lineage.clone(),
         ));
         let dispositions = Arc::new(Mutex::new(Vec::new()));
+        let terminal_state = Arc::new(Mutex::new(None));
 
         // Only the natural key survives the first composition. The live publication and authority
         // are dropped before a fresh authority reconstructs the exact catalog record.
         let first_composition = RestartCatalogFixture {
             record: Arc::clone(&durable_record),
             dispositions: Arc::clone(&dispositions),
+            terminal_state: Arc::clone(&terminal_state),
         };
         drop(first_composition);
         drop(publication);
         let fresh_composition = RestartCatalogFixture {
             record: Arc::clone(&durable_record),
             dispositions: Arc::clone(&dispositions),
+            terminal_state: Arc::clone(&terminal_state),
         };
         let reopened = selector.reconstruct(&fresh_composition).map_err(|_| {
             std::io::Error::other("exact durable IEX publication did not reconstruct")
@@ -2756,11 +2916,21 @@ mod tests {
                 mismatched_lineage,
             )),
             dispositions: Arc::clone(&dispositions),
+            terminal_state: Arc::clone(&terminal_state),
         };
         assert!(matches!(
             selector.reconstruct(&adversarial_composition),
             Err(IexHistRestartError::LineageMismatch)
         ));
+
+        // Model the exact ambiguous-ack adversary: admission reached durable state before the old
+        // fallible acknowledgement was lost. The new total terminalizer must still let quarantine
+        // dominate that provisional admission and return an exact readback for the same key.
+        let admitted = adversarial_composition.terminalize_pending_publication(
+            &selector,
+            IexHistPendingPublicationDisposition::Admitted,
+        );
+        assert!(admitted.validates(&selector, IexHistPendingPublicationDisposition::Admitted,));
         assert!(
             quarantine_committed_publication(
                 &adversarial_composition,
@@ -2771,9 +2941,18 @@ mod tests {
         );
         assert_eq!(
             dispositions.lock().map(|values| values.clone()).ok(),
-            Some(vec![IexHistPendingPublicationDisposition::Quarantined(
+            Some(vec![
+                IexHistPendingPublicationDisposition::Admitted,
+                IexHistPendingPublicationDisposition::Quarantined(
+                    IexHistPublicationQuarantineReason::RestartLineageMismatch,
+                ),
+            ])
+        );
+        assert_eq!(
+            terminal_state.lock().map(|value| *value).ok(),
+            Some(Some(IexHistPendingPublicationDisposition::Quarantined(
                 IexHistPublicationQuarantineReason::RestartLineageMismatch,
-            )])
+            )))
         );
         Ok(())
     }
