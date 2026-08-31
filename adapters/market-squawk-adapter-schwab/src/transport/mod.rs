@@ -524,6 +524,7 @@ impl ResponseHeaderEvidence {
 pub struct RawRestResponseReceipt {
     route: ReadOnlyRoute,
     token_generation: AccessTokenGeneration,
+    credential_authority: SchwabCredentialAuthorityBinding,
     request_url: Box<str>,
     request_sha256: [u8; 32],
     request_target_bytes: u64,
@@ -540,6 +541,7 @@ impl RawRestResponseReceipt {
     pub(crate) fn new(
         request: &ReadOnlyRequest,
         token_generation: AccessTokenGeneration,
+        credential_authority: SchwabCredentialAuthorityBinding,
         status: u16,
         received_at_unix_millis: u64,
         body: &[u8],
@@ -555,6 +557,7 @@ impl RawRestResponseReceipt {
         Ok(Self {
             route: request.route(),
             token_generation,
+            credential_authority,
             request_url,
             request_sha256,
             request_target_bytes,
@@ -574,6 +577,11 @@ impl RawRestResponseReceipt {
 
     pub const fn token_generation(&self) -> AccessTokenGeneration {
         self.token_generation
+    }
+
+    /// Exact secret-free application-credential series that minted the transient token.
+    pub const fn credential_authority(&self) -> SchwabCredentialAuthorityBinding {
+        self.credential_authority
     }
 
     pub fn request_url(&self) -> &str {

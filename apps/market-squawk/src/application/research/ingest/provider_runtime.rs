@@ -2376,8 +2376,8 @@ mod tests {
         RestExecutionOutcome, RestTransportBounds, SchwabHttpWire, SchwabHttpWireRequest,
         SchwabHttpWireResponse, SchwabOAuthAuthorityConfiguration, SchwabOAuthInteraction,
         SchwabOAuthSecretPolicy, SchwabOAuthWire, SchwabOAuthWireError, SchwabOAuthWireRequest,
-        SchwabOAuthWireResponse, SchwabRestDelayEvidence, SchwabRestExecutor,
-        SchwabTransportTelemetry, TransientAccessToken,
+        SchwabOAuthWireResponse, SchwabRestExecutor, SchwabTransportTelemetry,
+        TransientAccessToken,
     };
     use market_squawk_data::{
         CatalogConfig, CatalogResultLimits, ObjectStoreConfig, RightsBasis, SourceOperation,
@@ -2765,7 +2765,7 @@ mod tests {
         let source_id = SourceId::try_from("schwab-trader-api")?;
         let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
         let product = ProviderProduct::new(SourceIdentifier::try_from("schwab-rest")?);
-        let channel = ProviderChannel::new(SourceIdentifier::try_from("quotes")?);
+        let channel = ProviderChannel::new(SourceIdentifier::try_from("schwab-rest-quotes")?);
         let metadata = quote_metadata(
             source_id.clone(),
             instrument_id,
@@ -2813,21 +2813,13 @@ mod tests {
             research,
             generation,
             rights,
-            doctor,
+            doctor.clone(),
             oauth,
             oauth_receipt,
             Duration::from_secs(5),
         )?;
-        let evidence = SchwabRestQuoteSourceEvidence::try_new(
-            metadata,
-            SourceIdentifier::try_from("schwab-rest-quotes")?,
-            VenueId::try_from("schwab")?,
-            SchwabRestDelayEvidence::RealTime,
-            DataQuality::DirectUnverified,
-            product,
-            channel,
-            digest(35),
-        )?;
+        let evidence =
+            SchwabRestQuoteSourceEvidence::try_new(metadata, VenueId::try_from("schwab")?, doctor)?;
         Ok((durable, evidence, binding))
     }
 
@@ -3018,6 +3010,9 @@ mod tests {
                 surface_id: SourceIdentifier::try_from(SCHWAB_MARKET_DATA_SURFACE_ID)?,
                 session_identifier: SourceIdentifier::try_from(session_id.to_string())?,
                 application_credential_generation: SecretGeneration::new(1)?,
+                application_credential_reference_sha256: oauth
+                    .credential_authority()
+                    .application_credential_reference_sha256(),
                 capability_revision: ProviderCapabilityRevision::new(1)?,
                 capability_digest,
                 public_configuration_digest: digest(22),

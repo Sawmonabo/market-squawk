@@ -20,15 +20,16 @@ use market_squawk_adapter_schwab::{
     PriceHistoryRequest, ProductionSchwabStreamerConnector, ProviderIdentifier, QuoteField,
     QuoteRequest, RawRestResponseReceipt, ReadOnlyRequest, ReadOnlyRoute, RequestAdmission,
     RestExecutionOutcome, RestItemAccounting, RestTransportBounds, SchwabAccessTokenSource,
-    SchwabAdapterError, SchwabCaptureCoordinates, SchwabRestExecutor, SchwabRestFamily,
-    SchwabRestFamilyDoctorInput, SchwabRestPayload, SchwabSealedRawRestCapture,
-    SchwabSealedRestResponse, SchwabSealedStreamerCapture, SchwabStreamerConnectionControl,
-    SchwabStreamerConnectionControlSource, SchwabStreamerConnector, SchwabStreamerExecutor,
-    SchwabStreamerFamilyDoctorAccumulator, SchwabStreamerFamilyDoctorHandoff, SchwabTransportError,
-    SchwabTransportTelemetry, SchwabUserPreferenceEvidence, SchwabVerticalError, StreamerAdmission,
-    StreamerCaptureSink, StreamerCaptureSinkError, StreamerMicrobatch, StreamerSubscription,
-    StreamerTransportBounds, TokenAuthorityError, build_instrument_search_request,
-    build_market_hours_request, build_movers_request,
+    SchwabAdapterError, SchwabCaptureCoordinates, SchwabCredentialAuthorityBinding,
+    SchwabRestExecutor, SchwabRestFamily, SchwabRestFamilyDoctorInput, SchwabRestPayload,
+    SchwabSealedRawRestCapture, SchwabSealedRestResponse, SchwabSealedStreamerCapture,
+    SchwabStreamerConnectionControl, SchwabStreamerConnectionControlSource,
+    SchwabStreamerConnector, SchwabStreamerExecutor, SchwabStreamerFamilyDoctorAccumulator,
+    SchwabStreamerFamilyDoctorHandoff, SchwabTransportError, SchwabTransportTelemetry,
+    SchwabUserPreferenceEvidence, SchwabVerticalError, StreamerAdmission, StreamerCaptureSink,
+    StreamerCaptureSinkError, StreamerMicrobatch, StreamerSubscription, StreamerTransportBounds,
+    TokenAuthorityError, build_instrument_search_request, build_market_hours_request,
+    build_movers_request,
 };
 use market_squawk_domain::{
     CoverageDelay, DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier,
@@ -490,6 +491,7 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
             .await?
             .map_err(map_token_error)?;
         let token_generation = token.generation().get();
+        let credential_authority = token.credential_authority();
         let outcome = bounded(
             self.rest_executor.execute(
                 &self.user_preference_request,
@@ -505,6 +507,9 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
         match outcome {
             RestExecutionOutcome::AcceptedUserPreference(provider) => {
                 let receipt = provider.receipt();
+                if receipt.credential_authority() != credential_authority {
+                    return Err(SchwabMarketDataDoctorError::AuthorityChanged);
+                }
                 let observed_at = timestamp_from_millis(receipt.received_at_unix_millis())?;
                 let rate_observation = SchwabMarketDoctorRateObservation::try_new(
                     SchwabMarketDoctorProbeScope::UserPreference,
@@ -547,11 +552,21 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
             }
             RestExecutionOutcome::UserPreferenceRejected(receipt) => {
                 *self.user_preference.lock().await = None;
-                setup_required(token_generation, receipt, b"provider-rejected")
+                setup_required(
+                    token_generation,
+                    credential_authority,
+                    receipt,
+                    b"provider-rejected",
+                )
             }
             RestExecutionOutcome::InvalidUserPreference { receipt, error } => {
                 *self.user_preference.lock().await = None;
-                setup_required(token_generation, receipt, adapter_error_tag(&error))
+                setup_required(
+                    token_generation,
+                    credential_authority,
+                    receipt,
+                    adapter_error_tag(&error),
+                )
             }
             RestExecutionOutcome::Accepted(_)
             | RestExecutionOutcome::ProviderRejected(_)
@@ -580,6 +595,7 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
             .await?
             .map_err(map_token_error)?;
         let token_generation = token.generation().get();
+        let credential_authority = token.credential_authority();
         let outcome = bounded(
             self.rest_executor
                 .execute(&probe.request, &token, cancellation.child_token()),
@@ -627,6 +643,7 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
                 accepted_rest_evidence(
                     family,
                     token_generation,
+                    credential_authority,
                     receipt,
                     accounting,
                     sealed,
@@ -637,6 +654,7 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
                 rejected_rest_evidence(
                     family,
                     token_generation,
+                    credential_authority,
                     probe.coordinates.clone(),
                     capture,
                     b"provider-rejected",
@@ -650,6 +668,7 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
                 rejected_rest_evidence(
                     family,
                     token_generation,
+                    credential_authority,
                     probe.coordinates.clone(),
                     capture,
                     adapter_error_tag(&error),
@@ -688,7 +707,9 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
         let current = bounded(authority.current_receipt(), &cancellation, deadline)
             .await?
             .map_err(|_| SchwabMarketDataDoctorError::AuthorityUnavailable)?;
-        if retained.token_generation != current.generation().get() {
+        if retained.token_generation != current.generation().get()
+            || retained.provider.receipt().credential_authority() != current.credential_authority()
+        {
             return Err(SchwabMarketDataDoctorError::AuthorityChanged);
         }
         let mut executor = SchwabStreamerExecutor::try_new(
@@ -1179,9 +1200,13 @@ fn probe_contract_digest(
 
 fn setup_required(
     token_generation: u64,
+    credential_authority: SchwabCredentialAuthorityBinding,
     receipt: RawRestResponseReceipt,
     reason: &[u8],
 ) -> Result<SchwabMarketDoctorUserPreferenceOutcome, SchwabMarketDataDoctorError> {
+    if receipt.credential_authority() != credential_authority {
+        return Err(SchwabMarketDataDoctorError::AuthorityChanged);
+    }
     let observed_at = timestamp_from_millis(receipt.received_at_unix_millis())?;
     let rate_observation = SchwabMarketDoctorRateObservation::try_new(
         SchwabMarketDoctorProbeScope::UserPreference,
@@ -1226,6 +1251,7 @@ fn quote_delay_qualification(
 fn accepted_rest_evidence(
     family: SchwabMarketDataFamily,
     token_generation: u64,
+    credential_authority: SchwabCredentialAuthorityBinding,
     receipt: RawRestResponseReceipt,
     accounting: RestItemAccounting,
     sealed: SchwabSealedRestResponse,
@@ -1251,6 +1277,7 @@ fn accepted_rest_evidence(
         family,
         disposition,
         token_generation,
+        credential_authority,
         &receipt,
         accounting,
         sealed.persisted_receipt().receipt_digest(),
@@ -1267,6 +1294,7 @@ fn accepted_rest_evidence(
 async fn rejected_rest_evidence(
     family: SchwabMarketDataFamily,
     token_generation: u64,
+    credential_authority: SchwabCredentialAuthorityBinding,
     coordinates: SchwabCaptureCoordinates,
     capture: market_squawk_adapter_schwab::CapturedRestResponse,
     reason: &[u8],
@@ -1290,6 +1318,7 @@ async fn rejected_rest_evidence(
         family,
         RuntimeCapabilityDisposition::Unavailable,
         token_generation,
+        credential_authority,
         &receipt,
         accounting,
         sealed.persisted_receipt().receipt_digest(),
@@ -1318,6 +1347,7 @@ fn rest_probe_evidence(
     family: SchwabMarketDataFamily,
     disposition: RuntimeCapabilityDisposition,
     token_generation: u64,
+    credential_authority: SchwabCredentialAuthorityBinding,
     receipt: &RawRestResponseReceipt,
     accounting: RestItemAccounting,
     sealed_capture_receipt_sha256: EvidenceDigest,
@@ -1325,7 +1355,9 @@ fn rest_probe_evidence(
     declared_limitation_sha256: Option<EvidenceDigest>,
     outcome: &[u8],
 ) -> Result<SchwabMarketDoctorFamilyProbeEvidence, SchwabMarketDataDoctorError> {
-    if token_generation != receipt.token_generation().get() {
+    if token_generation != receipt.token_generation().get()
+        || credential_authority != receipt.credential_authority()
+    {
         return Err(SchwabMarketDataDoctorError::AuthorityChanged);
     }
     let observed_at = timestamp_from_millis(receipt.received_at_unix_millis())?;
@@ -1561,6 +1593,19 @@ fn rest_observation_digest(
     hasher.update(REST_OBSERVATION_DOMAIN);
     hasher.update([family_tag(family)]);
     hasher.update(receipt.token_generation().get().to_be_bytes());
+    hasher.update(
+        receipt
+            .credential_authority()
+            .application_credential_generation()
+            .get()
+            .to_be_bytes(),
+    );
+    hasher.update(
+        receipt
+            .credential_authority()
+            .application_credential_reference_sha256()
+            .bytes(),
+    );
     hasher.update(receipt.request_sha256());
     hasher.update(receipt.status().to_be_bytes());
     hasher.update(receipt.received_at_unix_millis().to_be_bytes());

@@ -133,6 +133,8 @@ impl SchwabMarketDataQualification {
             || doctor.access_token_generation() != token_generation.get()
             || doctor.application_credential_generation()
                 != credential_authority.application_credential_generation()
+            || doctor.application_credential_reference_sha256()
+                != credential_authority.application_credential_reference_sha256()
             || family_observed_at > doctor.verified_at()
             || family_observed_at > response_observed_at
             || !matches!(
@@ -282,6 +284,7 @@ impl SchwabMarketDataQualification {
         self.family == family
             && self.rest_service().is_some()
             && receipt.token_generation() == self.token_generation
+            && receipt.credential_authority() == self.credential_authority
             && millis_timestamp(receipt.received_at_unix_millis())
                 .is_some_and(|received_at| received_at == self.response_observed_at)
     }
@@ -1171,6 +1174,8 @@ impl SchwabPriceHistoryCapabilityObservation {
             || expires_at_unix_seconds > oauth_authority.access_expires_at_unix_seconds()
             || oauth_authority.generation() != preference_receipt.token_generation()
             || oauth_authority.generation() != history_receipt.token_generation()
+            || oauth_authority.credential_authority() != preference_receipt.credential_authority()
+            || oauth_authority.credential_authority() != history_receipt.credential_authority()
             || preference_receipt.route() != ReadOnlyRoute::UserPreference
             || history_receipt.route() != ReadOnlyRoute::PriceHistory
             || preference_receipt.token_generation() != history_receipt.token_generation()
@@ -1273,6 +1278,11 @@ impl SchwabPriceHistoryCapabilityObservation {
             || receipt.token_generation() != oauth_authority.generation()
         {
             return SchwabCapabilityCurrentness::TokenGenerationChanged;
+        }
+        if preference_receipt.credential_authority() != oauth_authority.credential_authority()
+            || receipt.credential_authority() != oauth_authority.credential_authority()
+        {
+            return SchwabCapabilityCurrentness::OAuthAuthorityChanged;
         }
         if oauth_authority != self.oauth_authority {
             return SchwabCapabilityCurrentness::OAuthAuthorityChanged;
@@ -1399,6 +1409,19 @@ fn receipt_digest(
     hasher.update(b"market-squawk/schwab-rest-observation/v1");
     hasher.update([route_tag(receipt.route())]);
     hasher.update(receipt.token_generation().get().to_be_bytes());
+    hasher.update(
+        receipt
+            .credential_authority()
+            .application_credential_generation()
+            .get()
+            .to_be_bytes(),
+    );
+    hasher.update(
+        receipt
+            .credential_authority()
+            .application_credential_reference_sha256()
+            .bytes(),
+    );
     hasher.update(receipt.request_sha256());
     hasher.update(receipt.status().to_be_bytes());
     hasher.update(receipt.received_at_unix_millis().to_be_bytes());

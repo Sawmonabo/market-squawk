@@ -1077,6 +1077,7 @@ pub struct SchwabMarketDataDoctorReceiptInput {
     pub surface_id: SourceIdentifier,
     pub session_identifier: SourceIdentifier,
     pub application_credential_generation: SecretGeneration,
+    pub application_credential_reference_sha256: EvidenceDigest,
     pub capability_revision: ProviderCapabilityRevision,
     pub capability_digest: EvidenceDigest,
     pub public_configuration_digest: EvidenceDigest,
@@ -1152,6 +1153,9 @@ impl SchwabMarketDataDoctorReceiptV1 {
     }
     pub const fn application_credential_generation(&self) -> SecretGeneration {
         self.input.application_credential_generation
+    }
+    pub const fn application_credential_reference_sha256(&self) -> EvidenceDigest {
+        self.input.application_credential_reference_sha256
     }
     pub const fn access_token_generation(&self) -> u64 {
         self.input.observation.access_token_generation
@@ -1253,6 +1257,8 @@ impl SchwabMarketDataDoctorReceiptV1 {
             && self.input.session_identifier == prior.input.session_identifier
             && self.input.application_credential_generation
                 == prior.input.application_credential_generation
+            && self.input.application_credential_reference_sha256
+                == prior.input.application_credential_reference_sha256
             && self.market_data_principal_sha256() == prior.market_data_principal_sha256()
             && self.input.capability_revision == prior.input.capability_revision
             && self.input.capability_digest == prior.input.capability_digest
@@ -1296,6 +1302,7 @@ fn validate_schwab_receipt_input(
 ) -> Result<(), RuntimeVerificationEvidenceError> {
     input.observation.validate()?;
     for digest in [
+        input.application_credential_reference_sha256,
         input.capability_digest,
         input.public_configuration_digest,
         input.rights_decision_digest,

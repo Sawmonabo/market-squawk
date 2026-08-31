@@ -746,6 +746,25 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
         Duration::from_secs(10),
     )
     .unwrap_or_else(|error| panic!("history capability: {error}"));
+    let different_series_oauth = SchwabOAuthAuthorityReceipt::for_test(
+        oauth_receipt.generation(),
+        SchwabCredentialAuthorityBinding::for_test(
+            oauth_receipt
+                .credential_authority()
+                .application_credential_generation(),
+            92,
+        ),
+    );
+    assert_eq!(
+        SchwabPriceHistoryCapabilityObservation::try_observe(
+            different_series_oauth,
+            &preference,
+            &history,
+            observed_at,
+            Duration::from_secs(10),
+        ),
+        Err(crate::SchwabVerticalError::InvalidCapabilityEvidence)
+    );
 
     assert_eq!(
         SchwabPriceHistoryCapabilityObservation::try_observe(
@@ -3078,6 +3097,9 @@ fn test_market_data_qualification_for_authority(
         application_credential_generation: oauth_authority
             .credential_authority()
             .application_credential_generation(),
+        application_credential_reference_sha256: oauth_authority
+            .credential_authority()
+            .application_credential_reference_sha256(),
         capability_revision: ProviderCapabilityRevision::new(1)
             .unwrap_or_else(|error| panic!("test capability revision: {error}")),
         capability_digest: digest(73),

@@ -1200,6 +1200,7 @@ impl SchwabRestExecutor {
         let receipt = RawRestResponseReceipt::new(
             request,
             token.generation(),
+            token.credential_authority(),
             status,
             received_at_unix_millis,
             &body,

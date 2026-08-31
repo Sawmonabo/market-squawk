@@ -26,6 +26,7 @@ use market_squawk_adapter_schwab::{
     TransientAccessToken,
 };
 use market_squawk_domain::Timestamp;
+use market_squawk_platform::SecretKey;
 use thiserror::Error;
 use tokio::sync::{Mutex, MutexGuard, Notify, OwnedMutexGuard};
 use tokio::task::JoinHandle;
@@ -752,7 +753,17 @@ impl SchwabOAuthRuntime {
         {
             return Err(SchwabOAuthRuntimeError::AuthorizationExchangeInFlight);
         }
+        let application_credential_series = SecretKey::try_new(
+            "provider-onboarding",
+            &format!(
+                "{}.{}",
+                current.bootstrap.surface_id().as_str(),
+                current.bootstrap.session_id().simple()
+            ),
+        )
+        .map_err(|_| SchwabOAuthRuntimeError::InvalidConfiguration)?;
         let replacement = SchwabApplicationCredentialReplacement::try_new(
+            application_credential_series,
             current.bootstrap.application_secret_reference().clone(),
             replacement_lease.application_secret_reference().clone(),
         )?;

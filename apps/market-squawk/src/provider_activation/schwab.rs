@@ -2,22 +2,22 @@
 
 use std::{
     collections::BTreeSet,
-    num::{NonZeroU64, NonZeroUsize},
+    num::NonZeroUsize,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use market_squawk_adapter_schwab::{
     AccessTokenAdmission, ParseBounds, ProviderIdentifier, RequestAdmission, RestTransportBounds,
-    SchwabRestDelayEvidence, SchwabTransportTelemetry, TransientAccessToken,
+    SchwabTransportTelemetry, TransientAccessToken,
 };
 use market_squawk_data::{
     DatasetId, ListingReferenceGenerationReceipt, ListingReferenceReadCapability,
     ListingReferenceRightsState,
 };
 use market_squawk_domain::{
-    AssignmentVerification, CoverageDelay, DataQuality, EffectiveInterval, IdentifierEntitlement,
-    LiveEventClass, SourceIdentifier, Timestamp, TradingStatus, VenueId,
+    AssignmentVerification, DataQuality, EffectiveInterval, IdentifierEntitlement, LiveEventClass,
+    Timestamp, TradingStatus, VenueId,
 };
 use market_squawk_sources::{
     ProviderRateAuthority, SCHWAB_MARKET_DATA_SURFACE_ID, SchwabMarketDataDoctorReceiptV1,
@@ -48,8 +48,7 @@ use super::{
 const SCHWAB_QUOTE_SOURCE_ID: &str = "schwab-trader-api";
 const SCHWAB_QUOTE_PROVIDER: &str = "schwab-trader-api";
 const SCHWAB_QUOTE_PRODUCT: &str = "schwab-rest";
-const SCHWAB_QUOTE_CHANNEL: &str = "quotes";
-const SCHWAB_QUOTE_FEED: &str = "schwab-rest-quotes";
+const SCHWAB_QUOTE_CHANNEL: &str = "schwab-rest-quotes";
 const SCHWAB_QUOTE_VENUE: &str = "schwab";
 const SCHWAB_QUOTE_MAXIMUM_SYMBOLS: usize = 50;
 const SCHWAB_QUOTE_MAXIMUM_REQUEST_BYTES: usize = 16 * 1024;
@@ -449,7 +448,6 @@ impl ProviderAdapterActivation {
         if metadata.coverage().delay() != doctor_delay {
             return Err(SchwabMarketRuntimeStartError::QuoteDelayUnknown);
         }
-        let delay = exact_schwab_quote_delay(doctor_delay)?;
         let live = metadata
             .coverage()
             .live()
@@ -485,17 +483,6 @@ impl ProviderAdapterActivation {
             now,
         )?;
         validate_schwab_display_bindings(&bindings, &display_bindings, now)?;
-        let evidence = SchwabRestQuoteSourceEvidence::try_new(
-            metadata.clone(),
-            SourceIdentifier::try_from(SCHWAB_QUOTE_FEED)
-                .map_err(|_error| SchwabMarketRuntimeStartError::SourceEvidence)?,
-            venue,
-            delay,
-            metadata.quality_ceiling(),
-            live.provider_product().clone(),
-            live.provider_channel().clone(),
-            doctor.receipt_sha256(),
-        )?;
         let bounds = schwab_quote_runtime_bounds()?;
         let oauth = activation.oauth_authority();
         let oauth_receipt = tokio::select! {
@@ -505,9 +492,20 @@ impl ProviderAdapterActivation {
             }
             receipt = oauth.current_receipt() => receipt?,
         };
-        if oauth_receipt.generation().get() != doctor.access_token_generation() {
+        if oauth_receipt.generation().get() != doctor.access_token_generation()
+            || oauth_receipt
+                .credential_authority()
+                .application_credential_generation()
+                != doctor.application_credential_generation()
+            || oauth_receipt
+                .credential_authority()
+                .application_credential_reference_sha256()
+                != doctor.application_credential_reference_sha256()
+        {
             return Err(SchwabMarketRuntimeStartError::AuthorityMismatch);
         }
+        let evidence =
+            SchwabRestQuoteSourceEvidence::try_new(metadata.clone(), venue, doctor.clone())?;
         let analytical_dataset = DatasetId::try_from(super::MARKET_EVENT_ANALYTICAL_DATASET)
             .map_err(|_error| SchwabMarketRuntimeStartError::InvalidControls)?;
         let publication = self
@@ -540,17 +538,6 @@ impl ProviderAdapterActivation {
             request_timeout: SCHWAB_QUOTE_REQUEST_TIMEOUT,
             poll_interval,
         })
-    }
-}
-
-fn exact_schwab_quote_delay(
-    delay: CoverageDelay,
-) -> Result<SchwabRestDelayEvidence, SchwabMarketRuntimeStartError> {
-    match delay {
-        CoverageDelay::RealTime => Ok(SchwabRestDelayEvidence::RealTime),
-        CoverageDelay::Delayed(nanos) => NonZeroU64::new(nanos)
-            .map(SchwabRestDelayEvidence::Delayed)
-            .ok_or(SchwabMarketRuntimeStartError::QuoteDelayUnknown),
     }
 }
 

@@ -15,7 +15,7 @@ use bytes::Bytes;
 use market_squawk_adapter_schwab::{
     ExecutedRestResponse, NativeField, NativeScalar, ParsedNative, ProviderIdentifier,
     QuoteComponentField, QuoteResponse, RawRestResponseReceipt, ReadOnlyRoute, RestItemAccounting,
-    SchwabQuote, SchwabRestDelayEvidence, SchwabRestPayload,
+    SchwabMarketDataDelay, SchwabQuote, SchwabRestPayload,
 };
 use market_squawk_domain::{
     CaptureIntegrityState, ConnectionGeneration, CoverageDelay, ExactPayloadEvidence,
@@ -105,7 +105,7 @@ pub(crate) struct SchwabRestQuoteCurrentRequest<'a> {
     response: &'a SchwabRestQuoteCurrentEvidence,
     metadata: &'a SourceMetadata,
     venue_id: &'a VenueId,
-    delay: SchwabRestDelayEvidence,
+    delay: SchwabMarketDataDelay,
     instruments: &'a [SchwabRestQuoteCurrentInstrument],
     deadline: Instant,
 }
@@ -115,7 +115,7 @@ impl<'a> SchwabRestQuoteCurrentRequest<'a> {
         response: &'a SchwabRestQuoteCurrentEvidence,
         metadata: &'a SourceMetadata,
         venue_id: &'a VenueId,
-        delay: SchwabRestDelayEvidence,
+        delay: SchwabMarketDataDelay,
         instruments: &'a [SchwabRestQuoteCurrentInstrument],
         deadline: Instant,
     ) -> Self {
@@ -807,11 +807,11 @@ fn decode_quotes(
 
 fn realtime_delay_conflicts(
     quote: &SchwabQuote,
-    delay: SchwabRestDelayEvidence,
+    delay: SchwabMarketDataDelay,
 ) -> Result<bool, SchwabRestQuoteCurrentUnavailable> {
     Ok(match quote.realtime() {
-        NativeField::Value(true) => delay != SchwabRestDelayEvidence::RealTime,
-        NativeField::Value(false) => delay == SchwabRestDelayEvidence::RealTime,
+        NativeField::Value(true) => delay != SchwabMarketDataDelay::RealTime,
+        NativeField::Value(false) => delay == SchwabMarketDataDelay::RealTime,
         NativeField::Absent | NativeField::Null => false,
     })
 }
@@ -968,10 +968,10 @@ fn copy_exact_body(body: &[u8]) -> Result<Bytes, SchwabRestQuoteCurrentUnavailab
     Ok(Bytes::from(owned))
 }
 
-fn delay_matches(declared: CoverageDelay, observed: SchwabRestDelayEvidence) -> bool {
+fn delay_matches(declared: CoverageDelay, observed: SchwabMarketDataDelay) -> bool {
     match (declared, observed) {
-        (CoverageDelay::RealTime, SchwabRestDelayEvidence::RealTime) => true,
-        (CoverageDelay::Delayed(expected), SchwabRestDelayEvidence::Delayed(actual)) => {
+        (CoverageDelay::RealTime, SchwabMarketDataDelay::RealTime) => true,
+        (CoverageDelay::Delayed(expected), SchwabMarketDataDelay::Delayed(actual)) => {
             expected == actual.get()
         }
         _ => false,

@@ -550,16 +550,18 @@ impl OnboardingCatalogCapability {
 
     /// Consumes one provider-observed Schwab market-data doctor result into a durable receipt.
     ///
-    /// The caller selects the intended application-credential generation but supplies no receipt
-    /// authority. While holding the catalog writer mutex, this method recovers the canonical
-    /// session, configuration, capability, credential verification, rights, rate policy, quality,
-    /// and renewal predecessor. OAuth token deadlines shorten the source-owned doctor-validity
-    /// window, and the lifecycle rejects a receipt that is not current at the catalog commit time.
+    /// The caller supplies the intended credential generation and the exact secret-free reference
+    /// digest derived from its active bootstrap lease. While holding the catalog writer mutex,
+    /// this method recovers the canonical session, configuration, capability, credential
+    /// verification, rights, rate policy, quality, and renewal predecessor. OAuth token deadlines
+    /// shorten the source-owned doctor-validity window, and the lifecycle rejects a receipt that
+    /// is not current at the catalog commit time.
     pub fn append_schwab_market_data_doctor_observation(
         &self,
         reservation: &OnboardingReservation,
         sequence: u64,
         generation: SecretGeneration,
+        application_credential_reference_sha256: EvidenceDigest,
         observation: SchwabMarketDataDoctorObservation,
     ) -> Result<OnboardingAppendOutcome, CatalogError> {
         let authority = self.lock()?;
@@ -625,6 +627,7 @@ impl OnboardingCatalogCapability {
                 surface_id: lifecycle.surface_id().clone(),
                 session_identifier: context.session_identifier().clone(),
                 application_credential_generation: generation,
+                application_credential_reference_sha256,
                 capability_revision: lifecycle.capability_revision(),
                 capability_digest: lifecycle.capability_digest(),
                 public_configuration_digest: context.public_configuration_digest(),

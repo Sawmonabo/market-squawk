@@ -17,9 +17,9 @@ use std::{
 
 use market_squawk_adapter_schwab::{
     CapturedRestResponse, NativeScalar, ProviderIdentifier, QuoteComponentField, ReadOnlyRoute,
-    RestItemAccounting, SchwabOAuthAuthorityReceipt, SchwabResolvedProviderIdentity,
-    SchwabRestDelayEvidence, SchwabRestFamily, SchwabRestPayload,
-    SchwabRestQuoteMarketDataEvidence, SchwabRestQuotePublicationOutcome,
+    RestItemAccounting, SchwabMarketDataDelay, SchwabMarketDataQualification,
+    SchwabOAuthAuthorityReceipt, SchwabResolvedProviderIdentity, SchwabRestFamily,
+    SchwabRestPayload, SchwabRestQuoteMarketDataEvidence, SchwabRestQuotePublicationOutcome,
     SchwabRestQuotePublicationRequest, SchwabRestQuoteRecordRequest,
     SchwabSealedRestQuotePublication, SchwabSealedRestResponse, SchwabTransportTelemetry,
 };
@@ -30,12 +30,12 @@ use market_squawk_data::{
 use market_squawk_domain::{
     CanonicalStateDigest, CanonicalizationRule, ConnectionGeneration, CoverageStatus, DataQuality,
     DecodedLiveProvenanceInput, DigestAlgorithm, EvidenceDigest, LiveEventClass,
-    LiveEvidenceBinding, LiveProvenance, MarketDepth, MarketEvent, PayloadHash, PayloadReference,
+    LiveEvidenceBinding, LiveProvenance, MarketEvent, PayloadHash, PayloadReference,
     RecordedLiveProvenanceInput, RuleVersion, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
     BudgetUnavailableReason, InstrumentCoverageMembership, ProviderNativeLineageImplementation,
-    ProviderRateAuthority, SourceMetadata,
+    ProviderRateAuthority, SchwabMarketDataFamily, SourceMetadata,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::sync::oneshot;
@@ -842,7 +842,13 @@ impl SchwabRestQuoteSealFirstSink {
     async fn publish_accepted(
         &self,
         sealed: SchwabSealedRestResponse,
-        request: Result<SchwabRestQuotePublicationRequest, SchwabRestQuoteSinkError>,
+        request: Result<
+            (
+                SchwabRestQuotePublicationRequest,
+                SchwabMarketDataQualification,
+            ),
+            SchwabRestQuoteSinkError,
+        >,
         evidence: &SchwabRestQuoteSourceEvidence,
         bindings: &[SchwabRestQuoteInstrumentBinding],
         oauth_epoch: SchwabOAuthPublicationEpoch,
@@ -872,13 +878,12 @@ impl SchwabRestQuoteSealFirstSink {
             evidence,
             oauth,
             accounting,
-            sealed.receipt().token_generation().get(),
-            sealed.route(),
+            sealed.receipt(),
             sealed.accounting(),
         ) {
             return self.accepted_failure(payload_digest, Some(sealed_receipt_digest), error);
         }
-        let request = match request {
+        let (request, qualification) = match request {
             Ok(request) => request,
             Err(error) => {
                 return self.accepted_failure(payload_digest, Some(sealed_receipt_digest), error);
@@ -915,6 +920,7 @@ impl SchwabRestQuoteSealFirstSink {
                     &publication,
                     self.authority.metadata(),
                     evidence,
+                    &qualification,
                     bindings,
                     connection_generation,
                     payload_digest,
@@ -937,6 +943,7 @@ impl SchwabRestQuoteSealFirstSink {
                     deadline,
                     current_evidence,
                     evidence,
+                    &qualification,
                     bindings,
                 )
                 .await
@@ -960,6 +967,7 @@ impl SchwabRestQuoteSealFirstSink {
         deadline: Instant,
         current_evidence: Result<SchwabRestQuoteCurrentEvidence, SchwabRestQuoteCurrentUnavailable>,
         evidence: &SchwabRestQuoteSourceEvidence,
+        qualification: &SchwabMarketDataQualification,
         bindings: &[SchwabRestQuoteInstrumentBinding],
     ) -> Result<SchwabRestQuotePublicationReceipt, SchwabRestQuoteSinkError> {
         let oauth = oauth_epoch.receipt();
@@ -1041,9 +1049,13 @@ impl SchwabRestQuoteSealFirstSink {
             SchwabRestQuoteDurableReadInstall::AuthorityBoundaryOnly => {}
         }
         let current = match current_evidence {
-            Ok(current_evidence) => {
-                self.publish_current(&current_evidence, evidence, bindings, deadline)
-            }
+            Ok(current_evidence) => self.publish_current(
+                &current_evidence,
+                evidence,
+                qualification,
+                bindings,
+                deadline,
+            ),
             Err(reason) => SchwabRestQuoteCurrentPublication::Unavailable(reason),
         };
         if matches!(current, SchwabRestQuoteCurrentPublication::NotApplicable)
@@ -1124,8 +1136,6 @@ impl SchwabRestQuoteSealFirstSink {
         outcome: NoncanonicalOutcome,
     ) -> Result<SchwabRestQuotePublicationReceipt, SchwabRestQuoteSinkError> {
         let oauth = oauth_epoch.receipt();
-        let token_generation = capture.receipt().token_generation().get();
-        let route = capture.receipt().route();
         let status = capture.receipt().status();
         let payload_digest = evidence_digest(capture.receipt().body_sha256());
         let captured_accounting = capture.accounting();
@@ -1149,8 +1159,7 @@ impl SchwabRestQuoteSealFirstSink {
             evidence,
             oauth,
             accounting,
-            token_generation,
-            route,
+            sealed.receipt(),
             captured_accounting,
         )?;
         if sealed.coordinates() != &self.authority.coordinates()
@@ -1191,6 +1200,7 @@ impl SchwabRestQuoteSealFirstSink {
         &self,
         response: &SchwabRestQuoteCurrentEvidence,
         evidence: &SchwabRestQuoteSourceEvidence,
+        qualification: &SchwabMarketDataQualification,
         bindings: &[SchwabRestQuoteInstrumentBinding],
         deadline: Instant,
     ) -> SchwabRestQuoteCurrentPublication {
@@ -1203,7 +1213,7 @@ impl SchwabRestQuoteSealFirstSink {
                 response,
                 evidence.metadata(),
                 evidence.venue_id(),
-                evidence.delay(),
+                qualification.delay(),
                 &instruments,
                 deadline,
             ))
@@ -1238,7 +1248,13 @@ fn build_publication_request(
     session_id: &SourceIdentifier,
     oauth: SchwabOAuthAuthorityReceipt,
     connection_generation: ConnectionGeneration,
-) -> Result<SchwabRestQuotePublicationRequest, SchwabRestQuoteSinkError> {
+) -> Result<
+    (
+        SchwabRestQuotePublicationRequest,
+        SchwabMarketDataQualification,
+    ),
+    SchwabRestQuoteSinkError,
+> {
     if response.capture().receipt().route() != ReadOnlyRoute::Quotes
         || response.payload().family() != SchwabRestFamily::Quotes
         || response.capture().receipt().token_generation() != oauth.generation()
@@ -1251,6 +1267,28 @@ fn build_publication_request(
     };
     let received_at =
         timestamp_from_unix_millis(response.capture().receipt().received_at_unix_millis())?;
+    let qualification = SchwabMarketDataQualification::try_from_doctor_receipt(
+        evidence.doctor_receipt(),
+        SchwabMarketDataFamily::Quotes,
+        received_at,
+        oauth,
+    )
+    .map_err(|_error| SchwabRestQuoteSinkError::InvalidReceipt)?;
+    let live = evidence
+        .metadata()
+        .coverage()
+        .live()
+        .ok_or(SchwabRestQuoteSinkError::InvalidReceipt)?;
+    if live.provider_product() != qualification.provider_product()
+        || live.provider_channel() != qualification.provider_channel()
+        || evidence.metadata().quality_ceiling() != qualification.quality()
+        || !delay_matches(
+            evidence.metadata().coverage().delay(),
+            qualification.delay(),
+        )
+    {
+        return Err(SchwabRestQuoteSinkError::InvalidReceipt);
+    }
     let observed_at = wall_timestamp()?;
     if observed_at < received_at {
         return Err(SchwabRestQuoteSinkError::InvalidReceipt);
@@ -1303,8 +1341,8 @@ fn build_publication_request(
             evidence.venue_id().clone(),
             binding.instrument_id(),
             connection_generation,
-            evidence.provider_product().clone(),
-            evidence.provider_channel().clone(),
+            qualification.provider_product().clone(),
+            qualification.provider_channel().clone(),
             LiveEventClass::Quote,
             source_identifier.clone(),
             payload_digest,
@@ -1312,18 +1350,18 @@ fn build_publication_request(
             None,
         )
         .map_err(|_error| SchwabRestQuoteSinkError::InvalidReceipt)?;
-        let coverage = quote_coverage_status(evidence, binding.instrument_id());
-        let provenance = if evidence.quality() == DataQuality::DirectVerified {
+        let coverage = quote_coverage_status(evidence, &qualification, binding.instrument_id());
+        let provenance = if qualification.quality() == DataQuality::DirectVerified {
             LiveProvenance::recorded(RecordedLiveProvenanceInput::new(
                 live_binding,
                 quote_source_timestamp(quote)?,
                 received_at,
                 observed_at,
                 observed_at,
-                evidence.quality(),
+                qualification.quality(),
                 coverage,
                 payload_reference.clone(),
-                qualification_reference(evidence.qualification_evidence())?,
+                qualification_reference(qualification.observation_evidence())?,
             ))
         } else {
             LiveProvenance::decoded(DecodedLiveProvenanceInput::new(
@@ -1332,7 +1370,7 @@ fn build_publication_request(
                 received_at,
                 observed_at,
                 observed_at,
-                evidence.quality(),
+                qualification.quality(),
                 coverage,
                 payload_reference.clone(),
             ))
@@ -1342,14 +1380,8 @@ fn build_publication_request(
         let market_data = SchwabRestQuoteMarketDataEvidence::try_new(
             session_id.clone(),
             connection_generation,
-            evidence.feed().clone(),
             evidence.venue_id().clone(),
-            MarketDepth::TopOfBook,
-            evidence.delay(),
-            evidence.quality(),
-            evidence.provider_product().clone(),
-            evidence.provider_channel().clone(),
-            evidence.qualification_evidence(),
+            qualification.clone(),
         )
         .map_err(|_error| SchwabRestQuoteSinkError::InvalidReceipt)?;
         records.push(SchwabRestQuoteRecordRequest::new(
@@ -1362,7 +1394,10 @@ fn build_publication_request(
             market_data,
         ));
     }
-    Ok(SchwabRestQuotePublicationRequest::new(records))
+    Ok((
+        SchwabRestQuotePublicationRequest::new(records),
+        qualification,
+    ))
 }
 
 fn current_instruments(
@@ -1407,14 +1442,14 @@ fn validate_dispatch(
     evidence: &SchwabRestQuoteSourceEvidence,
     oauth: SchwabOAuthAuthorityReceipt,
     accounting: RestItemAccounting,
-    token_generation: u64,
-    route: ReadOnlyRoute,
+    receipt: &market_squawk_adapter_schwab::RawRestResponseReceipt,
     captured_accounting: RestItemAccounting,
 ) -> Result<(), SchwabRestQuoteSinkError> {
     if evidence.metadata() != metadata
         || !metadata.is_effective_at(wall_timestamp()?)
-        || token_generation != oauth.generation().get()
-        || route != ReadOnlyRoute::Quotes
+        || receipt.token_generation() != oauth.generation()
+        || receipt.credential_authority() != oauth.credential_authority()
+        || receipt.route() != ReadOnlyRoute::Quotes
         || captured_accounting != accounting
         || accounting.requested == 0
         || accounting.returned.checked_add(accounting.missing) != Some(accounting.requested)
@@ -1433,6 +1468,7 @@ fn validate_publication(
     publication: &SchwabSealedRestQuotePublication,
     metadata: &SourceMetadata,
     evidence: &SchwabRestQuoteSourceEvidence,
+    qualification: &SchwabMarketDataQualification,
     bindings: &[SchwabRestQuoteInstrumentBinding],
     connection_generation: ConnectionGeneration,
     payload_digest: EvidenceDigest,
@@ -1474,11 +1510,11 @@ fn validate_publication(
             || event_binding.metadata_revision() != metadata.revision()
             || event_binding.connection_generation() != connection_generation
             || event_binding.venue_id() != evidence.venue_id()
-            || event_binding.provider_product() != evidence.provider_product()
-            || event_binding.provider_channel() != evidence.provider_channel()
+            || event_binding.provider_product() != qualification.provider_product()
+            || event_binding.provider_channel() != qualification.provider_channel()
             || event_binding.event_class() != LiveEventClass::Quote
             || event_binding.payload_digest() != payload_digest
-            || provenance.recorded_quality() != evidence.quality()
+            || provenance.recorded_quality() != qualification.quality()
         {
             return Err(SchwabRestQuoteSinkError::InvalidReceipt);
         }
@@ -1488,25 +1524,18 @@ fn validate_publication(
 
 fn quote_coverage_status(
     evidence: &SchwabRestQuoteSourceEvidence,
+    qualification: &SchwabMarketDataQualification,
     instrument_id: market_squawk_domain::InstrumentId,
 ) -> CoverageStatus {
     let coverage = evidence.metadata().coverage();
     let Some(live) = coverage.live() else {
         return CoverageStatus::Unknown;
     };
-    let delay_matches = match (coverage.delay(), evidence.delay()) {
-        (market_squawk_domain::CoverageDelay::RealTime, SchwabRestDelayEvidence::RealTime) => true,
-        (
-            market_squawk_domain::CoverageDelay::Delayed(declared),
-            SchwabRestDelayEvidence::Delayed(observed),
-        ) => declared == observed.get(),
-        _ => false,
-    };
-    if live.provider_product() != evidence.provider_product()
-        || live.provider_channel() != evidence.provider_channel()
+    if live.provider_product() != qualification.provider_product()
+        || live.provider_channel() != qualification.provider_channel()
         || live.rule_for(LiveEventClass::Quote, None).is_none()
         || !coverage.topology().contains_venue(evidence.venue_id())
-        || !delay_matches
+        || !delay_matches(coverage.delay(), qualification.delay())
     {
         return CoverageStatus::Insufficient;
     }
@@ -1516,6 +1545,20 @@ fn quote_coverage_status(
         InstrumentCoverageMembership::PartialUnproven | InstrumentCoverageMembership::Outside => {
             CoverageStatus::Insufficient
         }
+    }
+}
+
+fn delay_matches(
+    declared: market_squawk_domain::CoverageDelay,
+    observed: SchwabMarketDataDelay,
+) -> bool {
+    match (declared, observed) {
+        (market_squawk_domain::CoverageDelay::RealTime, SchwabMarketDataDelay::RealTime) => true,
+        (
+            market_squawk_domain::CoverageDelay::Delayed(expected),
+            SchwabMarketDataDelay::Delayed(actual),
+        ) => expected == actual.get(),
+        _ => false,
     }
 }
 

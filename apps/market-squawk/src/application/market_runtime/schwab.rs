@@ -16,18 +16,18 @@ use market_squawk_adapter_schwab::{
     AccessTokenAdmission, AdaptiveAssessment, CapacityCounters, CapacityObservation, CapacityUnit,
     CapturedRestResponse, ExecutedRestResponse, ParseBounds, ProviderIdentifier, QuoteField,
     QuoteRequest, ReadOnlyRoute, RequestAdmission, RestExecutionOutcome, RestItemAccounting,
-    RestTransportBounds, SchwabAdapterError, SchwabRestDelayEvidence, SchwabRestExecutor,
-    SchwabRestFamily, SchwabTransportError, SchwabTransportTelemetry,
+    RestTransportBounds, SchwabAdapterError, SchwabRestExecutor, SchwabRestFamily,
+    SchwabTransportError, SchwabTransportTelemetry,
 };
 use market_squawk_data::{ListingReferenceGenerationReceipt, ListingReferenceReadCapability};
 use market_squawk_domain::{
-    ConnectionGeneration, DataQuality, EvidenceDigest, InstrumentId, ProviderChannel,
-    ProviderProduct, SourceId, SourceIdentifier, Timestamp, VenueId,
+    ConnectionGeneration, InstrumentId, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{
     BudgetDecision, BudgetDispatchDecision, BudgetReservationDecision, BudgetUnavailableReason,
     ProviderRateAuthority, ProviderRateDeclaration, RuntimeCapabilityDisposition,
-    SchwabMarketDataFamily, SharedProviderBudget, SourceMetadata, apply_http_retry_after,
+    SchwabMarketDataDoctorReceiptV1, SchwabMarketDataFamily, SharedProviderBudget, SourceMetadata,
+    apply_http_retry_after,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -58,52 +58,32 @@ pub(crate) trait SchwabRestQuoteEventSink: std::fmt::Debug + Send + Sync {
     fn publish(&self, batch: SchwabRestQuoteBatch) -> SinkFuture<'_>;
 }
 
-/// Explicit source semantics retained across REST capture, canonicalization, and display ingress.
+/// Exact durable doctor authority retained until response-time qualification.
 #[derive(Clone, Debug)]
 pub(crate) struct SchwabRestQuoteSourceEvidence {
     metadata: SourceMetadata,
-    feed: SourceIdentifier,
     venue_id: VenueId,
-    delay: SchwabRestDelayEvidence,
-    quality: DataQuality,
-    provider_product: ProviderProduct,
-    provider_channel: ProviderChannel,
-    qualification_evidence: EvidenceDigest,
+    doctor_receipt: SchwabMarketDataDoctorReceiptV1,
 }
 
 impl SchwabRestQuoteSourceEvidence {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the complete provider/feed/venue qualification is one atomic publication input"
-    )]
     pub(crate) fn try_new(
         metadata: SourceMetadata,
-        feed: SourceIdentifier,
         venue_id: VenueId,
-        delay: SchwabRestDelayEvidence,
-        quality: DataQuality,
-        provider_product: ProviderProduct,
-        provider_channel: ProviderChannel,
-        qualification_evidence: EvidenceDigest,
+        doctor_receipt: SchwabMarketDataDoctorReceiptV1,
     ) -> Result<Self, SchwabRestQuoteRuntimeError> {
         if metadata.provider().as_str() != SCHWAB_PROVIDER
             || !metadata.capabilities().live()
             || metadata.budget_policy().is_none()
-            || quality != metadata.quality_ceiling()
-            || qualification_evidence.bytes() == [0; 32]
             || metadata.coverage().live().is_none()
+            || !doctor_receipt.admits_source_start()
         {
             return Err(SchwabRestQuoteRuntimeError::SourceEvidence);
         }
         Ok(Self {
             metadata,
-            feed,
             venue_id,
-            delay,
-            quality,
-            provider_product,
-            provider_channel,
-            qualification_evidence,
+            doctor_receipt,
         })
     }
 
@@ -111,32 +91,12 @@ impl SchwabRestQuoteSourceEvidence {
         &self.metadata
     }
 
-    pub(crate) const fn feed(&self) -> &SourceIdentifier {
-        &self.feed
-    }
-
     pub(crate) const fn venue_id(&self) -> &VenueId {
         &self.venue_id
     }
 
-    pub(crate) const fn delay(&self) -> SchwabRestDelayEvidence {
-        self.delay
-    }
-
-    pub(crate) const fn quality(&self) -> DataQuality {
-        self.quality
-    }
-
-    pub(crate) const fn provider_product(&self) -> &ProviderProduct {
-        &self.provider_product
-    }
-
-    pub(crate) const fn provider_channel(&self) -> &ProviderChannel {
-        &self.provider_channel
-    }
-
-    pub(crate) const fn qualification_evidence(&self) -> EvidenceDigest {
-        self.qualification_evidence
+    pub(crate) const fn doctor_receipt(&self) -> &SchwabMarketDataDoctorReceiptV1 {
+        &self.doctor_receipt
     }
 }
 

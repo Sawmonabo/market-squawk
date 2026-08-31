@@ -34,8 +34,8 @@ use market_squawk_adapter_fred::{
 };
 use market_squawk_adapter_schwab::{
     AccessTokenAdmission, ParseBounds, SchwabApplicationCredentialEnvelope,
-    SchwabOAuthAuthorityConfiguration, SchwabOAuthAuthorityError, SchwabOAuthSecretPolicy,
-    SchwabOAuthWire,
+    SchwabCredentialAuthorityBinding, SchwabOAuthAuthorityConfiguration, SchwabOAuthAuthorityError,
+    SchwabOAuthSecretPolicy, SchwabOAuthWire,
 };
 use market_squawk_adapter_tiingo::TiingoApiToken;
 use market_squawk_adapter_treasury::{
@@ -733,10 +733,19 @@ impl ProviderOnboardingService {
         {
             return Err(ProviderOnboardingError::InvalidSessionState);
         }
+        let credential_authority =
+            SchwabCredentialAuthorityBinding::try_from_application_credential(
+                lease.application_secret_reference(),
+            )
+            .map_err(|_| ProviderOnboardingError::InvalidSessionState)?;
+        if credential_authority.application_credential_generation() != generation {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
         SchwabMarketDoctorAuthorityBinding::try_new(
             lifecycle.surface_id().clone(),
             resumed.reservation().session_id(),
             generation,
+            credential_authority.application_credential_reference_sha256(),
             lifecycle.capability_revision(),
             lifecycle.capability_digest(),
             resumed.reservation().public_configuration_digest(),
@@ -797,6 +806,14 @@ impl ProviderOnboardingService {
             return Err(ProviderOnboardingError::OperationCancelled);
         }
         let (resumed, _profile) = self.current_schwab_oauth_bootstrap_session(lease)?;
+        let credential_authority =
+            SchwabCredentialAuthorityBinding::try_from_application_credential(
+                lease.application_secret_reference(),
+            )
+            .map_err(|_| ProviderOnboardingError::InvalidSessionState)?;
+        if credential_authority.application_credential_generation() != lease.generation() {
+            return Err(ProviderOnboardingError::InvalidSessionState);
+        }
         if cancellation.is_cancelled() {
             return Err(ProviderOnboardingError::OperationCancelled);
         }
@@ -805,6 +822,7 @@ impl ProviderOnboardingService {
                 resumed.reservation(),
                 resumed.next_sequence(),
                 lease.generation(),
+                credential_authority.application_credential_reference_sha256(),
                 observation,
             )
             .map_err(ProviderOnboardingError::Catalog)?;

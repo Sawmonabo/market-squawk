@@ -79,6 +79,7 @@ pub(crate) struct SchwabMarketDoctorAuthorityBinding {
     surface_id: SourceIdentifier,
     session_id: Uuid,
     application_credential_generation: SecretGeneration,
+    application_credential_reference_sha256: EvidenceDigest,
     capability_revision: ProviderCapabilityRevision,
     capability_digest: EvidenceDigest,
     public_configuration_digest: EvidenceDigest,
@@ -96,6 +97,7 @@ impl SchwabMarketDoctorAuthorityBinding {
         surface_id: SourceIdentifier,
         session_id: Uuid,
         application_credential_generation: SecretGeneration,
+        application_credential_reference_sha256: EvidenceDigest,
         capability_revision: ProviderCapabilityRevision,
         capability_digest: EvidenceDigest,
         public_configuration_digest: EvidenceDigest,
@@ -107,6 +109,7 @@ impl SchwabMarketDoctorAuthorityBinding {
             return Err(SchwabMarketDataDoctorError::InvalidAuthority);
         }
         for digest in [
+            application_credential_reference_sha256,
             capability_digest,
             public_configuration_digest,
             rights_decision_digest,
@@ -121,6 +124,7 @@ impl SchwabMarketDoctorAuthorityBinding {
             surface_id,
             session_id,
             application_credential_generation,
+            application_credential_reference_sha256,
             capability_revision,
             capability_digest,
             public_configuration_digest,
@@ -626,6 +630,17 @@ impl SchwabMarketDataDoctorExecutor {
         let oauth = await_bounded(authority.current_receipt(), &cancellation, deadline)
             .await?
             .map_err(|_| SchwabMarketDataDoctorError::AuthorityUnavailable)?;
+        if binding.application_credential_generation
+            != oauth
+                .credential_authority()
+                .application_credential_generation()
+            || binding.application_credential_reference_sha256
+                != oauth
+                    .credential_authority()
+                    .application_credential_reference_sha256()
+        {
+            return Err(SchwabMarketDataDoctorError::AuthorityChanged);
+        }
 
         let mut preference_permit = self
             .acquire_rate(
@@ -766,6 +781,8 @@ impl SchwabMarketDataDoctorExecutor {
                 session_identifier: SourceIdentifier::try_from(binding.session_id.to_string())
                     .map_err(|_| SchwabMarketDataDoctorError::InvalidAuthority)?,
                 application_credential_generation: binding.application_credential_generation,
+                application_credential_reference_sha256: binding
+                    .application_credential_reference_sha256,
                 capability_revision: binding.capability_revision,
                 capability_digest: binding.capability_digest,
                 public_configuration_digest: binding.public_configuration_digest,
@@ -887,6 +904,7 @@ fn family_receipt_evidence(
         surface_id: &'a SourceIdentifier,
         session_id: Uuid,
         application_credential_generation: u64,
+        application_credential_reference_sha256: EvidenceDigest,
         capability_revision: u64,
         capability_digest: EvidenceDigest,
         public_configuration_digest: EvidenceDigest,
@@ -902,6 +920,7 @@ fn family_receipt_evidence(
         surface_id: &binding.surface_id,
         session_id: binding.session_id,
         application_credential_generation: binding.application_credential_generation.get(),
+        application_credential_reference_sha256: binding.application_credential_reference_sha256,
         capability_revision: binding.capability_revision.get(),
         capability_digest: binding.capability_digest,
         public_configuration_digest: binding.public_configuration_digest,
