@@ -1568,3 +1568,45 @@ generations; SEC/macro/fund/options lanes; Yahoo and IEX HIST specialized lanes;
 recommendations, portfolio/risk, and virtual paper over those same typed reads. An enabled flag,
 successful HTTP response, or published dataset cannot enable a workflow until its typed read,
 frontend composition, degradation behavior, and focused restart journey pass.
+
+## 2026-08-31 source-completion vocabulary and first completed product vertical
+
+Source status must never again collapse durable data delivery and complete product delivery into
+one ambiguous word. Every progress report, delivery decision, and review uses these two explicit
+levels:
+
+1. **Durable data-source complete** means the source is configured and entitled where required,
+   produces real official data, seals bounded raw evidence, publishes closed canonical rows into an
+   immutable Parquet generation and manifest, supports the required point-in-time or exact selector,
+   and returns the same typed data after process restart.
+2. **Full product vertical complete** means the durable source above also flows through the
+   provider-neutral rich store or selector, its intended feature/model/forecast/valuation/backtest
+   and recommendation or research consumers, provider-neutral Desktop/CLI/MCP operations, and an
+   installed shutdown/restart journey. Provider names, retry state, quotas, endpoints, adapter
+   terminology, and technical readiness language remain confined to setup, settings, logs, and
+   diagnostics.
+
+A report must state both levels separately. It must not say that no source is complete when a
+source has crossed the durable data-source boundary, and it must not call an adapter, HTTP probe,
+credential check, published dataset, or restartable dataset a complete product vertical.
+
+At the accepted 2026-08-31 audit base `9f5a45d673b6ef44278398c8db79505df2ab07fa`,
+Federal Reserve Board H.15 is the first durable data-source-complete baseline: official live pull,
+sealed raw capture, immutable canonical/Parquet publication, typed application read, and read after
+restart are established. H.15 is not yet a full product vertical. Its remaining provider-neutral
+macro/rates selection, regime/valuation/backtest evidence, Desktop/CLI/MCP composition, and
+installed restart journey are mandatory last-mile work.
+
+H.15 owns the first full-product-completion lane until that last mile is accepted. Disjoint provider
+foundation and remediation lanes may continue in parallel, but they may not repeatedly displace the
+H.15 last-mile lane or turn another provider into the sole global agenda. If a shared application,
+manifest, or Desktop hotspot conflicts with that lane, serialize the hotspot and finish the H.15
+product edge first unless a substantiated correctness or authority defect makes progress unsafe.
+Always keep at least one source on a last-mile product-completion path; do not allow every active
+lane to end at an adapter, catalog, contract, or review checkpoint.
+
+The selected providers' personal-use permission and credential-use decisions are settled for this
+goal. Do not reopen licensing, permission, or resale analysis absent new provider-specific evidence,
+a material scope change beyond personal use, or an explicit owner request. Implementation still
+retains exact provenance, source quality, capacity, point-in-time, and rights evidence; those
+technical facts do not authorize repeated policy churn.
