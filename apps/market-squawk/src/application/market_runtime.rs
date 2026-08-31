@@ -44,6 +44,10 @@ use std::{
 
 use market_squawk_adapter_alpaca::AlpacaHistoricalEquityPreflightPlan;
 use market_squawk_adapter_schwab::SchwabOAuthAuthorityReceipt;
+use market_squawk_data::{
+    MarketDataInstrumentPopulationDisposition, MarketDataInstrumentPopulationQuery,
+    MarketDataInstrumentReadCapability, MarketDataInstrumentRecord,
+};
 use market_squawk_domain::{
     ConnectionGeneration, CoverageDelay, CoverageStatus, DataQuality, EvidenceDigest, InstrumentId,
     MarketDataInstrumentDefinition, MarketDepth, SourceId, SourceIdentifier, StreamIntegrityState,
@@ -284,6 +288,7 @@ pub(crate) struct MarketRuntimeRegistry {
     config: AppConfig,
     provider_rate: ProviderRateAuthority,
     provider_activation: Arc<ProviderAdapterActivation>,
+    market_data_instruments: MarketDataInstrumentReadCapability,
     alpaca_historical_source: AlpacaHistoricalSourceMutationAuthority,
     prepared_configuration: Arc<dyn PreparedMarketProviderConfigurationResolver>,
     prepared_schwab: Arc<dyn PreparedSchwabMarketRuntimeResolver>,
@@ -330,6 +335,7 @@ impl MarketRuntimeRegistry {
         config: AppConfig,
         provider_rate: ProviderRateAuthority,
         provider_activation: Arc<ProviderAdapterActivation>,
+        market_data_instruments: MarketDataInstrumentReadCapability,
         alpaca_historical_source: AlpacaHistoricalSourceMutationAuthority,
         prepared_configuration: Arc<dyn PreparedMarketProviderConfigurationResolver>,
         prepared_schwab: Arc<dyn PreparedSchwabMarketRuntimeResolver>,
@@ -376,6 +382,7 @@ impl MarketRuntimeRegistry {
             config,
             provider_rate,
             provider_activation,
+            market_data_instruments,
             alpaca_historical_source,
             prepared_configuration,
             prepared_schwab,
@@ -783,10 +790,13 @@ impl MarketRuntimeRegistry {
                 provider: provider_kind,
                 session_id,
             } => {
+                let market_data_records =
+                    self.coinbase_market_data_records(provider_kind, deadline, cancellation)?;
                 let composition = local_live_market_with_provider_rate(
                     self.config.clone(),
                     provider_kind,
                     self.provider_rate.clone(),
+                    &market_data_records,
                 )
                 .map_err(|error| {
                     tracing::error!(provider = ?provider_kind, %error, "market source composition failed");
@@ -918,6 +928,11 @@ impl MarketRuntimeRegistry {
                 }
             }
             MarketSurface::CoinbaseDirect { session_id } => {
+                let market_data_records = self.coinbase_market_data_records(
+                    ProductionSourceProvider::Coinbase,
+                    deadline,
+                    cancellation,
+                )?;
                 let composition = await_before(
                     deadline,
                     cancellation,
@@ -925,6 +940,7 @@ impl MarketRuntimeRegistry {
                         self.config.clone(),
                         session_id,
                         self.provider_activation.as_ref(),
+                        &market_data_records,
                         runtime_cancellation.clone(),
                     ),
                 )
@@ -1034,6 +1050,44 @@ impl MarketRuntimeRegistry {
                 Err(error)
             }
         }
+    }
+
+    fn coinbase_market_data_records(
+        &self,
+        provider: ProductionSourceProvider,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<MarketDataInstrumentRecord>, ServiceError> {
+        if provider != ProductionSourceProvider::Coinbase {
+            return Ok(Vec::new());
+        }
+        let source = self.config.coinbase().ok_or(ServiceError::Unavailable)?;
+        let selected_at = market_runtime_timestamp()?;
+        let instrument_ids = source
+            .instruments()
+            .iter()
+            .map(|mapping| mapping.definition().instrument_id())
+            .collect();
+        let query =
+            MarketDataInstrumentPopulationQuery::try_new(instrument_ids, selected_at, selected_at)
+                .map_err(|error| {
+                    tracing::error!(%error, "Coinbase canonical identity population query failed");
+                    ServiceError::Unavailable
+                })?;
+        let selection = self
+            .market_data_instruments
+            .pin_population_as_of(query, deadline, cancellation)
+            .map_err(|error| {
+                tracing::error!(%error, "Coinbase canonical identity population read failed");
+                ServiceError::Unavailable
+            })?;
+        if selection.disposition() != MarketDataInstrumentPopulationDisposition::Complete
+            || !selection.exclusions().is_empty()
+            || selection.records().len() != source.instruments().len()
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        Ok(selection.records().to_vec())
     }
 
     pub(crate) async fn verify(

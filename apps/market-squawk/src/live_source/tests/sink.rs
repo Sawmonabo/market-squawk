@@ -40,7 +40,7 @@ use super::super::{
     subscription_state::{GenerationIdentity, SubscriptionLimits, SubscriptionStateMachine},
     supervisor::{ProductionSupervisorError, route_worker_cleanup_error},
 };
-use super::budget_free_metadata;
+use super::{budget_free_metadata, coinbase_market_data_record};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -76,7 +76,12 @@ async fn pre_acknowledgement_snapshot_is_bounded_and_published_only_after_exact_
         .coinbase()
         .ok_or("Coinbase configuration missing")?;
     let now = system_timestamp()?;
-    let profile = ProductionCoinbaseProfile::try_from_at(source_config, now)?;
+    let market_data_record = coinbase_market_data_record(source_config)?;
+    let profile = ProductionCoinbaseProfile::try_from_at(
+        source_config,
+        std::slice::from_ref(&market_data_record),
+        now,
+    )?;
     let definition = source_config
         .instruments()
         .first()
@@ -212,7 +217,12 @@ async fn acknowledged_frames_reach_the_immutable_live_book_without_execution_qua
         .coinbase()
         .ok_or("Coinbase configuration missing")?;
     let now = system_timestamp()?;
-    let profile = ProductionCoinbaseProfile::try_from_at(source_config, now)?;
+    let market_data_record = coinbase_market_data_record(source_config)?;
+    let profile = ProductionCoinbaseProfile::try_from_at(
+        source_config,
+        std::slice::from_ref(&market_data_record),
+        now,
+    )?;
     assert_eq!(
         profile.metadata().quality_ceiling(),
         DataQuality::DirectUnverified

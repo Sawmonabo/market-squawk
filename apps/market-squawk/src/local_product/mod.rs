@@ -163,7 +163,7 @@ const FORECAST_AUTHORITY_DIRECTORY: &str = "model/forecasts";
 const BATCH_FEATURE_REVISION: &str = "market-squawk-batch-features-v1";
 const LOCAL_MAXIMUM_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 const MAXIMUM_CONFIGURED_LIVE_INSTRUMENTS: usize = 101;
-const COINBASE_LIVE_AUTHORITY_KEY: &str = "coinbase-exchange-public";
+const COINBASE_LIVE_AUTHORITY_KEY: &str = crate::live_source::instruments::COINBASE_PUBLIC_SOURCE;
 const KRAKEN_LIVE_AUTHORITY_KEY: &str = "kraken-public-book-v2";
 const SCHWAB_OAUTH_AUTHORITY_DIRECTORY: &str = "sources/schwab-oauth-v1";
 const SCHWAB_OAUTH_MAXIMUM_AUTHORIZATION_BYTES: usize = 16 * 1024;
@@ -826,6 +826,7 @@ impl LocalProduct {
             config.clone(),
             provider_rate.clone(),
             Arc::clone(&provider_activation),
+            research.market_data_instruments(),
             alpaca_historical_source,
             prepared_market_configuration,
             prepared_schwab_service,

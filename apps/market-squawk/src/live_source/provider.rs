@@ -350,7 +350,7 @@ impl ProductionConnectorProfile {
 
     const fn source_key(&self) -> &'static str {
         match self {
-            Self::Coinbase(_) => "coinbase-exchange-public",
+            Self::Coinbase(_) => super::instruments::COINBASE_PUBLIC_SOURCE,
             Self::Kraken(profile) => profile.source_key(),
             Self::AlpacaIex { .. } => "alpaca-basic-iex-live",
             Self::AlpacaOptions { .. } => "alpaca-basic-indicative-options-live",

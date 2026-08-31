@@ -63,11 +63,13 @@ pub struct CoinbaseProductMapping {
 }
 
 impl CoinbaseProductMapping {
-    /// Constructs a syntactically valid Coinbase product mapping.
+    /// Binds one syntactically valid Coinbase product to an exact durable native-identity
+    /// attestation selected before source construction.
     ///
     /// # Errors
     ///
-    /// Rejects product identifiers outside the bounded Exchange grammar.
+    /// Rejects product identifiers outside the bounded Exchange grammar or attestations whose
+    /// source-native product, Coinbase venue symbol, or validity does not match that product.
     pub fn try_new(
         product: ProviderProduct,
         instrument_attestation: ProviderNativeInstrumentAttestation,

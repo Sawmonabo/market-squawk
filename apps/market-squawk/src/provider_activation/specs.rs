@@ -17,8 +17,8 @@ use market_squawk_adapter_portfolio::PortfolioImportLimits;
 use market_squawk_adapter_sec::{RawEvidenceStore, SecParserLimits, SecRepresentationRegistry};
 use market_squawk_adapter_treasury::TreasurySourceConfig;
 use market_squawk_adapter_yahoo::YAHOO_SOURCE_ID;
-use market_squawk_data::ImportedUserInputEvidence;
-use market_squawk_domain::{ProviderIdentityRegistry, ProviderProduct, SourceIdentifier};
+use market_squawk_data::{ImportedUserInputEvidence, MarketDataInstrumentRecord};
+use market_squawk_domain::{ProviderIdentityRegistry, ProviderProduct, SourceId, SourceIdentifier};
 use market_squawk_live::LiveRouteConfig;
 use market_squawk_platform::{
     BoundedInput, ControlledImportInputRoot, LocalAuthorityStateStore, SecretReference,
@@ -27,6 +27,7 @@ use market_squawk_platform::{
 use market_squawk_sources::{FreshnessPolicy, SourceMetadata};
 
 use crate::application::ResearchIngestCompositionError;
+use crate::live_source::instruments::{direct_source_id, select_product_mapping};
 
 const TIINGO_SOURCE_ID: &str = "tiingo-starter";
 
@@ -37,6 +38,7 @@ const COINBASE_EXCHANGE_VENUE: &str = "coinbase-exchange";
 /// Closed configuration for one Coinbase Direct product and its sole live route.
 #[derive(Clone, Debug)]
 pub struct CoinbaseDirectProductActivation {
+    pub(super) source_id: SourceId,
     pub(super) mapping: CoinbaseProductMapping,
     pub(super) route: LiveRouteConfig,
     pub(super) freshness: FreshnessPolicy,
@@ -48,15 +50,26 @@ impl CoinbaseDirectProductActivation {
     ///
     /// # Errors
     ///
-    /// Rejects a product outside the pinned Coinbase Exchange grammar or a route whose current
-    /// Coinbase venue symbol does not name that exact product.
+    /// Rejects a product outside the pinned Coinbase Exchange grammar, a route whose current
+    /// Coinbase venue symbol does not name that exact product, or a catalog record without the
+    /// exact source-qualified Direct identity effective when its immutable record was published.
     pub fn try_new(
         product: ProviderProduct,
         route: LiveRouteConfig,
+        market_data_record: &MarketDataInstrumentRecord,
         freshness: FreshnessPolicy,
         limits: CoinbaseDirectLimits,
     ) -> Result<Self, CoinbaseDirectActivationSpecError> {
-        let mapping = CoinbaseProductMapping::try_new(product, route.route().instrument())?;
+        let source_id = direct_source_id(&product)
+            .map_err(|_error| CoinbaseDirectActivationSpecError::NativeIdentity)?;
+        let mapping = select_product_mapping(
+            product,
+            route.definition(),
+            &source_id,
+            market_data_record,
+            market_data_record.published_at(),
+        )
+        .map_err(|_error| CoinbaseDirectActivationSpecError::NativeIdentity)?;
         let venue_mapping = route
             .definition()
             .venue_mappings()
@@ -70,6 +83,7 @@ impl CoinbaseDirectProductActivation {
             return Err(CoinbaseDirectActivationSpecError::RouteMismatch);
         }
         Ok(Self {
+            source_id,
             mapping,
             route,
             freshness,
@@ -80,6 +94,11 @@ impl CoinbaseDirectProductActivation {
     /// Returns the exact provider product reserved by this connection.
     pub const fn product(&self) -> &ProviderProduct {
         self.mapping.product()
+    }
+
+    /// Returns the exact source namespace selected before native identity attestation.
+    pub const fn source_id(&self) -> &SourceId {
+        &self.source_id
     }
 
     /// Returns the sole internal live route for the product.
@@ -166,6 +185,9 @@ impl CoinbaseDirectAdapterActivation {
 /// Invalid Coinbase Direct account activation topology.
 #[derive(Clone, Debug, thiserror::Error, Eq, PartialEq)]
 pub enum CoinbaseDirectActivationSpecError {
+    /// The durable record did not prove the exact source-qualified native product identity.
+    #[error("Coinbase Direct durable native identity is invalid")]
+    NativeIdentity,
     /// Coinbase product syntax or mapping construction violated the pinned adapter contract.
     #[error(transparent)]
     Coinbase(#[from] CoinbaseConfigError),
@@ -539,8 +561,11 @@ impl fmt::Debug for PortfolioAdapterActivation {
 /// Activation input for one closed provider family.
 #[derive(Debug)]
 pub enum ProviderAdapterActivationRequest {
-    /// Coinbase or Kraken live routes, selected by the lease surface.
-    Live(Vec<market_squawk_live::LiveRouteConfig>),
+    /// Coinbase or Kraken live routes plus exact catalog identity records, selected by the lease.
+    Live {
+        routes: Vec<market_squawk_live::LiveRouteConfig>,
+        market_data_records: Vec<MarketDataInstrumentRecord>,
+    },
     /// Authenticated Coinbase Direct account runtime with one bounded connection per product.
     CoinbaseDirect(CoinbaseDirectAdapterActivation),
     /// SEC EDGAR research extraction.
@@ -572,7 +597,7 @@ impl ProviderAdapterActivationRequest {
             Self::Bls(specification) => specification.provider_dataset_identifier(),
             Self::Board(specification) => Some(specification.provider_dataset_identifier()),
             Self::Fred(specification) => Some(specification.provider_dataset_identifier()),
-            Self::Live(_)
+            Self::Live { .. }
             | Self::CoinbaseDirect(_)
             | Self::Sec(_)
             | Self::Treasury(_)

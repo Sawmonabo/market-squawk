@@ -3,7 +3,7 @@
 mod composition;
 mod direct;
 pub(crate) mod display_market;
-mod instruments;
+pub(crate) mod instruments;
 mod kraken;
 mod kraken_level3;
 mod kraken_publication;

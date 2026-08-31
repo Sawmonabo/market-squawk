@@ -2,13 +2,24 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use bytes::Bytes;
-use market_squawk_domain::{
-    ConnectionGeneration, DataQuality, LiveEventClass, SourceIdentifier, Timestamp,
+use market_squawk_data::{
+    CatalogAuthority, CatalogConfig, CatalogLimit, CatalogResultLimits,
+    MarketDataInstrumentReadCapability, MarketDataInstrumentRecord,
+    MarketDataInstrumentSynchronization, MarketDataInstrumentSynchronizationCapability,
 };
-use market_squawk_platform::{ConfigOverrides, ConfigSources};
+use market_squawk_domain::{
+    AssetClass, ConnectionGeneration, DataQuality, DigestAlgorithm, EvidenceDigest,
+    ExactPayloadEvidence, LiveEventClass, MarketDataInstrumentDefinition,
+    MarketDataInstrumentDefinitionInput, MetadataRevision, ProviderIdentityEvidence,
+    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderInstrumentId,
+    RevisionBoundPayloadEvidence, SourceIdentifier, Timestamp,
+};
+use market_squawk_platform::{CoinbaseSourceConfig, ConfigOverrides, ConfigSources, LocalPaths};
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, CurrentSourceSession,
     DecodeOutcome, MarketDecoder, NetworkAccessPolicy, RawFrameFactory, SessionId, SourceClass,
@@ -16,6 +27,7 @@ use market_squawk_sources::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use super::composition::ProductionCoinbaseProfile;
 use crate::AppConfig;
@@ -91,8 +103,13 @@ pub(crate) fn run_coinbase_release_evidence() -> Result<CoinbaseReleaseEvidence>
         .coinbase()
         .context("production Coinbase release profile is absent")?;
     let now = Timestamp::from_unix_nanos(1_800_000_000_000_000_000);
-    let profile = ProductionCoinbaseProfile::try_from_at(source, now)
-        .context("production Coinbase release profile admission failed")?;
+    let market_data_record = release_market_data_record(source)?;
+    let profile = ProductionCoinbaseProfile::try_from_at(
+        source,
+        std::slice::from_ref(&market_data_record),
+        now,
+    )
+    .context("production Coinbase release profile admission failed")?;
     if profile.metadata().quality_ceiling() != DataQuality::DirectUnverified {
         bail!("public Coinbase profile changed its execution-quality ceiling");
     }
@@ -154,6 +171,67 @@ pub(crate) fn run_coinbase_release_evidence() -> Result<CoinbaseReleaseEvidence>
         delta_sha256: digest(DELTA),
         trade_sha256: digest(TRADE),
     })
+}
+
+fn release_market_data_record(source: &CoinbaseSourceConfig) -> Result<MarketDataInstrumentRecord> {
+    let configured = source
+        .instruments()
+        .first()
+        .context("release Coinbase instrument is absent")?;
+    let execution = configured.definition();
+    let digest = |byte| EvidenceDigest::new(DigestAlgorithm::Sha256, [byte; 32]);
+    let effective = source.authorization().effective_interval();
+    let definition =
+        MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
+            instrument_id: execution.instrument_id(),
+            reference_evidence: RevisionBoundPayloadEvidence::new(
+                MetadataRevision::new(SourceIdentifier::try_from(
+                    "coinbase-release-fixture-reference-v1",
+                )?),
+                ExactPayloadEvidence::from_content_digest(digest(71)),
+            ),
+            effective_interval: effective,
+            asset_class: AssetClass::Crypto,
+            display_name: None,
+            quote_currency: execution.quote_currency(),
+            quote_currency_evidence: ExactPayloadEvidence::from_content_digest(digest(72)),
+            venue_mappings: execution.venue_mappings().to_vec(),
+            provider_identities: vec![ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+                instrument_id: execution.instrument_id(),
+                source_id: super::instruments::public_source_id()?,
+                provider_instrument_id: ProviderInstrumentId::try_from(configured.product())?,
+                evidence: ProviderIdentityEvidence::from_content_digest(digest(73)),
+                source_timestamp: None,
+                observed_at: effective.starts_at(),
+                metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+                    "coinbase-release-fixture-public-identity-v1",
+                )?),
+                validity: effective,
+                supersedes: None,
+            })],
+            identifiers: Vec::new(),
+        })?;
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("coinbase-release-identity"))?;
+    let catalog = CatalogConfig::try_new(
+        paths.catalog()?.clone(),
+        Duration::from_millis(750),
+        CatalogLimit::new(32)?,
+        CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+    )?;
+    let authority = Arc::new(Mutex::new(CatalogAuthority::open(catalog)?));
+    let writer = MarketDataInstrumentSynchronizationCapability::new(Arc::clone(&authority));
+    let reader = MarketDataInstrumentReadCapability::new(authority);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let cancellation = CancellationToken::new();
+    writer.synchronize(
+        MarketDataInstrumentSynchronization::try_new(vec![definition], 1)?,
+        deadline,
+        &cancellation,
+    )?;
+    reader
+        .latest(execution.instrument_id(), deadline, &cancellation)?
+        .context("release Coinbase durable identity record is absent")
 }
 
 fn decode_count(

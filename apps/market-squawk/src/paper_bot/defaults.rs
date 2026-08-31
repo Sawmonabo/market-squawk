@@ -16,7 +16,9 @@ use market_squawk_adapter_paper::{
     PaperVenueSessionCalendar,
 };
 use market_squawk_analytics::{ExactFeatureRatio, RequiredLiveFeature};
-use market_squawk_data::{DatasetId, DatasetManifestRef, DatasetSchemaRegistry, Sha256Digest};
+use market_squawk_data::{
+    DatasetId, DatasetManifestRef, DatasetSchemaRegistry, MarketDataInstrumentRecord, Sha256Digest,
+};
 use market_squawk_domain::RevisionNumber;
 use market_squawk_domain::{
     AccountId, BasisPoints, ClientOrderId, Currency, InstrumentDefinition, Money, OrderId,
@@ -113,6 +115,7 @@ const LOCAL_PAPER_MATCHING_WORK_QUANTUM: usize = 256;
 pub fn local_paper_bot(
     config: AppConfig,
     provider: ProductionSourceProvider,
+    market_data_records: &[MarketDataInstrumentRecord],
     initial_cash: Decimal,
     fee_basis_points: u32,
 ) -> Result<ProductionPaperBotComposition> {
@@ -121,6 +124,7 @@ pub fn local_paper_bot(
     local_paper_bot_with_provider_rate(
         config,
         provider,
+        market_data_records,
         initial_cash,
         fee_basis_points,
         provider_rate,
@@ -130,6 +134,7 @@ pub fn local_paper_bot(
 pub(crate) fn local_paper_bot_with_provider_rate(
     config: AppConfig,
     provider: ProductionSourceProvider,
+    market_data_records: &[MarketDataInstrumentRecord],
     initial_cash: Decimal,
     fee_basis_points: u32,
     provider_rate: ProviderRateAuthority,
@@ -137,6 +142,7 @@ pub(crate) fn local_paper_bot_with_provider_rate(
     local_paper_bot_with_provider_rate_and_strategy_mode(
         config,
         provider,
+        market_data_records,
         initial_cash,
         fee_basis_points,
         provider_rate,
@@ -148,6 +154,7 @@ pub(crate) fn local_paper_bot_with_provider_rate(
 pub(crate) fn local_paper_bot_with_provider_rate_and_strategy_mode(
     config: AppConfig,
     provider: ProductionSourceProvider,
+    market_data_records: &[MarketDataInstrumentRecord],
     initial_cash: Decimal,
     fee_basis_points: u32,
     provider_rate: ProviderRateAuthority,
@@ -161,6 +168,7 @@ pub(crate) fn local_paper_bot_with_provider_rate_and_strategy_mode(
             provider_rate,
         },
         source,
+        market_data_records,
         initial_cash,
         fee_basis_points,
         0,
@@ -184,6 +192,7 @@ pub(crate) fn local_paper_bot_on_existing_public_market_with_strategy_mode(
             direct: false,
         },
         source,
+        &[],
         initial_cash,
         fee_basis_points,
         0,
@@ -207,6 +216,7 @@ pub(crate) fn local_coinbase_direct_paper_bot_on_existing_market_with_strategy_m
             direct: true,
         },
         source,
+        &[],
         initial_cash,
         fee_basis_points,
         0,
@@ -299,6 +309,7 @@ pub(crate) fn local_live_market_with_provider_rate(
     config: AppConfig,
     provider: ProductionSourceProvider,
     provider_rate: ProviderRateAuthority,
+    market_data_records: &[MarketDataInstrumentRecord],
 ) -> Result<ProductionLiveMarketComposition> {
     let configured = configured_source(&config, provider)?;
     let maximum_action_hook_bytes_per_route =
@@ -313,6 +324,7 @@ pub(crate) fn local_live_market_with_provider_rate(
         configured.routes,
         provider,
         provider_rate,
+        market_data_records,
     )?;
     Ok(ProductionLiveMarketComposition {
         source,
@@ -325,10 +337,11 @@ pub(crate) async fn local_coinbase_direct_live_market_with_activation(
     config: AppConfig,
     provider_session_id: Uuid,
     provider_activation: &ProviderAdapterActivation,
+    market_data_records: &[MarketDataInstrumentRecord],
     cancellation: CancellationToken,
 ) -> Result<CoinbaseDirectLiveMarketComposition> {
     let source = configured_source(&config, ProductionSourceProvider::Coinbase)?;
-    let request = coinbase_direct_activation_request(&config, &source)?;
+    let request = coinbase_direct_activation_request(&config, &source, market_data_records)?;
     let activation = provider_activation
         .activate_ready_profile(provider_session_id, request, cancellation)
         .await?;
@@ -348,15 +361,17 @@ pub(crate) async fn local_coinbase_direct_live_market_with_activation(
     })
 }
 
-/// Backward-compatible Coinbase selection for existing application callers.
+/// Builds the Coinbase public paper service from an exact durable identity record set.
 pub fn local_coinbase_paper_bot(
     config: AppConfig,
+    market_data_records: &[MarketDataInstrumentRecord],
     initial_cash: Decimal,
     fee_basis_points: u32,
 ) -> Result<ProductionPaperBotComposition> {
     local_paper_bot(
         config,
         ProductionSourceProvider::Coinbase,
+        market_data_records,
         initial_cash,
         fee_basis_points,
     )
@@ -637,11 +652,14 @@ fn configured_paper_source(
 fn coinbase_direct_activation_request(
     config: &AppConfig,
     source: &ConfiguredPaperSource,
+    market_data_records: &[MarketDataInstrumentRecord],
 ) -> Result<ProviderAdapterActivationRequest> {
     let coinbase = config
         .coinbase()
         .ok_or_else(|| anyhow!("production Coinbase configuration is required"))?;
-    if coinbase.instruments().len() != source.routes.len() {
+    if coinbase.instruments().len() != source.routes.len()
+        || market_data_records.len() != source.routes.len()
+    {
         bail!("Coinbase Direct route topology differs from configured products");
     }
     let freshness = FreshnessPolicy::try_new(
@@ -672,9 +690,19 @@ fn coinbase_direct_activation_request(
     let mut products = Vec::new();
     products.try_reserve_exact(source.routes.len())?;
     for (mapping, route) in coinbase.instruments().iter().zip(&source.routes) {
+        let mut records = market_data_records
+            .iter()
+            .filter(|record| record.definition().instrument_id() == route.route().instrument());
+        let record = records
+            .next()
+            .ok_or_else(|| anyhow!("Coinbase Direct canonical identity is unavailable"))?;
+        if records.next().is_some() {
+            bail!("Coinbase Direct canonical identity is ambiguous");
+        }
         products.push(CoinbaseDirectProductActivation::try_new(
             ProviderProduct::new(SourceIdentifier::try_from(mapping.product())?),
             route.clone(),
+            record,
             freshness,
             limits,
         )?);
@@ -695,6 +723,7 @@ fn build_local_paper_bot<F>(
     config: AppConfig,
     build_source: PaperBotBuildSource,
     source_profile: ConfiguredPaperSource,
+    market_data_records: &[MarketDataInstrumentRecord],
     initial_cash: Decimal,
     fee_basis_points: u32,
     action_hook_overhead_bytes: usize,
@@ -858,6 +887,7 @@ where
                 routes,
                 provider,
                 provider_rate,
+                market_data_records,
             )?;
             Ok(ProductionPaperBotComposition::try_new(
                 source,
@@ -913,6 +943,7 @@ where
             60_000_000_000,
             ContinuousPaperSessionAuthority::RELEASE_BENCHMARK,
         )?,
+        &[],
         Decimal::new(1_000_000, 0),
         0,
         action_hook_overhead_bytes,
@@ -1075,6 +1106,7 @@ pub(crate) fn local_kraken_paper_bot_with_strategy_for_test(
             provider_rate,
         },
         source,
+        &[],
         initial_cash,
         fee_basis_points,
         0,

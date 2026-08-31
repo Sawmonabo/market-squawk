@@ -11,6 +11,7 @@ use market_squawk_adapter_coinbase::{
     CoinbaseChannel, CoinbaseConfigError, CoinbaseExchangeConfig, CoinbaseExchangeDecoder,
     CoinbaseExchangeSource, CoinbaseTransportLimits,
 };
+use market_squawk_data::MarketDataInstrumentRecord;
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, IdentityError, InstrumentDefinition,
     MetadataRevision, RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp,
@@ -44,7 +45,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::live_runtime::{LiveRuntimeComposition, LiveRuntimeCompositionError};
 use super::super::provider_rate::open_provider_rate_authority;
-use super::instruments::ProductionInstrumentSet;
+use super::instruments::{ProductionInstrumentSet, narrow_effective_interval, public_source_id};
 use super::kraken::{
     KrakenPublicChannel, KrakenPublicCurrentnessObserver, KrakenPublicSupervisorSet,
     KrakenPublicSupervisorSetError, ProductionKrakenProfileError, ProductionKrakenProfileSet,
@@ -66,7 +67,6 @@ pub(in crate::live_source) use coinbase_publication_supervisor::{
 use kraken_publication_supervisor::KrakenPublicationSupervisor;
 pub(in crate::live_source) use live_runtime::ProductionLiveRuntimeOwner;
 
-const SOURCE_ID: &str = "coinbase-exchange-public";
 const PROVISIONAL_METADATA_REVISION: &str = "coinbase-advanced-trade-v1-provisional";
 const COINBASE_PROVIDER: &str = "coinbase-exchange";
 const IMPLEMENTATION_PROFILE_VERSION: &str = "coinbase-advanced-trade-v1-profile-2026-08-08";
@@ -264,28 +264,43 @@ impl ProductionLiveSourceComposition {
     /// # Errors
     ///
     /// Returns a typed error when Coinbase is absent, the production provider profile is invalid,
-    /// or routes omit, duplicate, add, or alter a configured instrument definition.
+    /// the digest-verified catalog records do not exactly cover the configured instruments, or
+    /// routes omit, duplicate, add, or alter a configured instrument definition.
     pub fn try_new(
         config: AppConfig,
         routes: Vec<LiveRouteConfig>,
+        market_data_records: &[MarketDataInstrumentRecord],
     ) -> Result<Self, ProductionLiveSourceCompositionError> {
-        Self::try_for_provider(config, routes, ProductionSourceProvider::Coinbase)
+        Self::try_for_provider(
+            config,
+            routes,
+            ProductionSourceProvider::Coinbase,
+            market_data_records,
+        )
     }
 
     /// Validates and seals one explicitly selected production provider.
     ///
     /// # Errors
     ///
-    /// Rejects an absent selected profile, route mismatch, or any provider/profile invariant
-    /// failure before capture, live actors, or networking start.
+    /// Rejects an absent selected profile, route mismatch, incomplete or mismatched durable native
+    /// identity evidence, or any provider/profile invariant failure before capture, live actors,
+    /// or networking start.
     pub fn try_for_provider(
         config: AppConfig,
         routes: Vec<LiveRouteConfig>,
         provider: ProductionSourceProvider,
+        market_data_records: &[MarketDataInstrumentRecord],
     ) -> Result<Self, ProductionLiveSourceCompositionError> {
         let paths = LocalPaths::prepare(config.data_dir())?;
         let provider_rate = open_provider_rate_authority(paths.control_root()?.root())?;
-        Self::try_for_provider_with_rate_authority(config, routes, provider, provider_rate)
+        Self::try_for_provider_with_rate_authority(
+            config,
+            routes,
+            provider,
+            provider_rate,
+            market_data_records,
+        )
     }
 
     pub(crate) fn try_for_provider_with_rate_authority(
@@ -293,6 +308,7 @@ impl ProductionLiveSourceComposition {
         routes: Vec<LiveRouteConfig>,
         provider: ProductionSourceProvider,
         provider_rate: ProviderRateAuthority,
+        market_data_records: &[MarketDataInstrumentRecord],
     ) -> Result<Self, ProductionLiveSourceCompositionError> {
         let installation = match provider {
             ProductionSourceProvider::Coinbase => {
@@ -301,7 +317,11 @@ impl ProductionLiveSourceComposition {
                     .ok_or(ProductionLiveSourceCompositionError::MissingCoinbaseConfiguration)?;
                 validate_coinbase_routes(source, &routes)?;
                 ProductionSourceInstallation::Single(ProductionSourceProfile::coinbase(
-                    ProductionCoinbaseProfile::try_from(source)?,
+                    ProductionCoinbaseProfile::try_from_at(
+                        source,
+                        market_data_records,
+                        system_timestamp()?,
+                    )?,
                     source,
                     PRE_ACKNOWLEDGEMENT_DATA_MESSAGE_CAPACITY,
                     PRE_ACKNOWLEDGEMENT_DATA_BYTE_CAPACITY,
@@ -1290,14 +1310,25 @@ impl ProductionCoinbaseProfile {
 
     pub(super) fn try_from_at(
         config: &CoinbaseSourceConfig,
+        market_data_records: &[MarketDataInstrumentRecord],
         at: Timestamp,
     ) -> Result<Self, ProductionCoinbaseProfileError> {
         let attestation = config.authorization();
         validate_authorization(attestation, at)?;
-        let instruments = ProductionInstrumentSet::try_from(config)?;
+        let source_id =
+            public_source_id().map_err(|_error| ProductionCoinbaseProfileError::NativeIdentity)?;
+        let instruments =
+            ProductionInstrumentSet::try_new(config, market_data_records, &source_id)?;
         let configuration = ProfileInputsEvidence::try_from(config)?;
         let configuration_evidence = exact_evidence(CONFIGURATION_EVIDENCE_DOMAIN, &configuration)?;
-        let effective = attestation.effective_interval();
+        let effective = narrow_effective_interval(
+            attestation.effective_interval(),
+            instruments.adapter_mappings(),
+        )
+        .map_err(|_error| ProductionCoinbaseProfileError::NativeIdentity)?;
+        if at < effective.starts_at() || effective.ends_at().is_some_and(|end| at >= end) {
+            return Err(ProductionCoinbaseProfileError::AuthorizationNotEffective);
+        }
         let authorization = AuthorizationGrant::new(
             AuthorizationMode::PublicInterface,
             attestation.basis().clone(),
@@ -1329,7 +1360,7 @@ impl ProductionCoinbaseProfile {
             config.subscription_ack_timeout(),
         )?;
         let provisional = CoinbaseExchangeConfig::try_new(
-            SourceId::try_from(SOURCE_ID)?,
+            source_id.clone(),
             RevisionBoundPayloadEvidence::new(
                 MetadataRevision::new(identifier(PROVISIONAL_METADATA_REVISION)?),
                 configuration_evidence.clone(),
@@ -1347,6 +1378,11 @@ impl ProductionCoinbaseProfile {
             implementation_profile_version: IMPLEMENTATION_PROFILE_VERSION,
             metadata_without_revision: metadata_without_revision(provisional.metadata())?,
             configuration,
+            native_instrument_identities: instruments
+                .adapter_mappings()
+                .iter()
+                .map(CoinbaseProductMapping::instrument_attestation)
+                .collect(),
             transport: TransportEvidence {
                 max_frame_bytes: transport_limits.max_frame_bytes(),
                 connect_timeout_nanos: duration_nanos(transport_limits.connect_timeout())?,
@@ -1359,7 +1395,7 @@ impl ProductionCoinbaseProfile {
         let (profile_evidence, digest) =
             exact_evidence_with_digest(PROFILE_EVIDENCE_DOMAIN, &complete_profile)?;
         let adapter_config = CoinbaseExchangeConfig::try_new(
-            SourceId::try_from(SOURCE_ID)?,
+            source_id,
             RevisionBoundPayloadEvidence::new(
                 MetadataRevision::new(content_addressed_revision(digest)?),
                 profile_evidence,
@@ -1378,14 +1414,6 @@ impl ProductionCoinbaseProfile {
             adapter_config,
             decoder,
         })
-    }
-}
-
-impl TryFrom<&CoinbaseSourceConfig> for ProductionCoinbaseProfile {
-    type Error = ProductionCoinbaseProfileError;
-
-    fn try_from(config: &CoinbaseSourceConfig) -> Result<Self, Self::Error> {
-        Self::try_from_at(config, system_timestamp()?)
     }
 }
 
@@ -1452,6 +1480,8 @@ struct CompleteProfileEvidence<'a> {
     implementation_profile_version: &'static str,
     metadata_without_revision: serde_json::Value,
     configuration: ProfileInputsEvidence<'a>,
+    native_instrument_identities:
+        Vec<&'a market_squawk_sources::ProviderNativeInstrumentAttestation>,
     transport: TransportEvidence,
     channels: [&'static str; 3],
     pre_acknowledgement_data_message_capacity: usize,
@@ -1567,6 +1597,8 @@ pub enum ProductionCoinbaseProfileError {
     Identity(#[from] IdentityError),
     #[error("Coinbase production profile instrument mapping is invalid")]
     InstrumentMapping(#[from] super::instruments::ProductionInstrumentError),
+    #[error("Coinbase production profile native identity is invalid")]
+    NativeIdentity,
     #[error("Coinbase production profile network policy is invalid")]
     NetworkPolicy(#[from] NetworkPolicyError),
     #[error("Coinbase production freshness policy is invalid")]

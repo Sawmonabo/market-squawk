@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, ffi::OsString};
 
-use market_squawk_domain::{DataQuality, Timestamp};
+use market_squawk_domain::{DataQuality, ProviderProduct, SourceIdentifier, Timestamp};
 use market_squawk_live::{DepthLimit, LiveRouteConfig, LiveRouteConfigInput, ShardKey};
 use market_squawk_platform::{AppConfig, ConfigOverrides, ConfigSources};
 use market_squawk_sources::{InstrumentCoverageMembership, SourceMetadataProvider};
@@ -10,8 +10,11 @@ use super::super::{
     composition::{
         ProductionCoinbaseProfile, ProductionCoinbaseProfileError, ProductionLiveSourceComposition,
     },
-    instruments::ProductionInstrumentSet,
+    instruments::{
+        ProductionInstrumentSet, direct_source_id, public_source_id, select_product_mapping,
+    },
 };
+use super::coinbase_market_data_record;
 
 #[test]
 fn typed_kraken_selection_builds_the_sealed_direct_unverified_profile()
@@ -78,6 +81,7 @@ fn typed_kraken_selection_builds_the_sealed_direct_unverified_profile()
         config,
         vec![route],
         ProductionSourceProvider::Kraken,
+        &[],
     )?;
     assert_eq!(composition.endpoint(), "wss://ws.kraken.com/v2");
     let metadata = composition.source_metadata()?;
@@ -167,8 +171,15 @@ fn validated_instruments_flow_to_adapter_mappings_without_identity_regeneration(
         ConfigOverrides::default(),
     ))?;
     let source = config.coinbase().ok_or("Coinbase source profile missing")?;
+    let market_data_record = coinbase_market_data_record(source)?;
+    let selected_at = Timestamp::from_unix_nanos(1_800_000_000_000_000_000);
 
-    let instruments = ProductionInstrumentSet::try_from(source)?;
+    let public_source = public_source_id()?;
+    let instruments = ProductionInstrumentSet::try_new(
+        source,
+        std::slice::from_ref(&market_data_record),
+        &public_source,
+    )?;
     let definition = source
         .instruments()
         .first()
@@ -181,17 +192,46 @@ fn validated_instruments_flow_to_adapter_mappings_without_identity_regeneration(
 
     assert_eq!(definition.instrument_id(), mapping.instrument());
     assert_eq!(mapping.product().as_source_identifier().as_str(), "BTC-USD");
+    assert_eq!(
+        mapping.instrument_attestation().provider_key().source_id(),
+        &public_source
+    );
+    assert_eq!(
+        mapping
+            .instrument_attestation()
+            .definition_revision_digest(),
+        market_data_record.revision_digest()
+    );
+
+    let direct_source = direct_source_id(mapping.product())?;
+    let direct_mapping = select_product_mapping(
+        ProviderProduct::new(SourceIdentifier::try_from("BTC-USD")?),
+        definition,
+        &direct_source,
+        &market_data_record,
+        selected_at,
+    )?;
+    assert_eq!(
+        direct_mapping
+            .instrument_attestation()
+            .provider_key()
+            .source_id(),
+        &direct_source
+    );
+    assert_ne!(public_source, direct_source);
 
     assert!(matches!(
         ProductionCoinbaseProfile::try_from_at(
             source,
+            std::slice::from_ref(&market_data_record),
             Timestamp::from_unix_nanos(1_900_000_000_000_000_000),
         ),
         Err(ProductionCoinbaseProfileError::AuthorizationNotEffective)
     ));
     let production = ProductionCoinbaseProfile::try_from_at(
         source,
-        Timestamp::from_unix_nanos(1_800_000_000_000_000_000),
+        std::slice::from_ref(&market_data_record),
+        selected_at,
     )?;
     assert_eq!(
         production.decoder().metadata().quality_ceiling(),
@@ -200,7 +240,8 @@ fn validated_instruments_flow_to_adapter_mappings_without_identity_regeneration(
     assert_eq!(production.metadata(), production.decoder().metadata());
     let reproduced = ProductionCoinbaseProfile::try_from_at(
         source,
-        Timestamp::from_unix_nanos(1_800_000_000_000_000_000),
+        std::slice::from_ref(&market_data_record),
+        selected_at,
     )?;
     assert_eq!(
         production.metadata().revision_evidence(),
@@ -234,7 +275,8 @@ fn validated_instruments_flow_to_adapter_mappings_without_identity_regeneration(
         .ok_or("changed Coinbase source profile missing")?;
     let changed_profile = ProductionCoinbaseProfile::try_from_at(
         changed_source,
-        Timestamp::from_unix_nanos(1_800_000_000_000_000_000),
+        std::slice::from_ref(&market_data_record),
+        selected_at,
     )?;
     assert_ne!(
         production.metadata().revision_evidence(),

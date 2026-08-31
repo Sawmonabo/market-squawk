@@ -1209,7 +1209,7 @@ impl ProviderAdapterActivation {
                 &spec.metadata,
                 controlled_local_file_rights(lease, spec.metadata.source_id(), &spec.evidence)?,
             ),
-            ProviderAdapterActivationRequest::Live(_)
+            ProviderAdapterActivationRequest::Live { .. }
             | ProviderAdapterActivationRequest::CoinbaseDirect(_)
             | ProviderAdapterActivationRequest::LocalFiles(_)
             | ProviderAdapterActivationRequest::Portfolio(_) => {
@@ -1392,7 +1392,7 @@ impl ProviderAdapterActivation {
                     )?;
                 (transaction, Some(SpecializedReplacementKind::Tiingo))
             }
-            ProviderAdapterActivationRequest::Live(_)
+            ProviderAdapterActivationRequest::Live { .. }
             | ProviderAdapterActivationRequest::CoinbaseDirect(_)
             | ProviderAdapterActivationRequest::Sec(_)
             | ProviderAdapterActivationRequest::Board(_)
@@ -1468,9 +1468,12 @@ impl ProviderAdapterActivation {
             return Err(ProviderAdapterActivationError::Cancelled);
         }
         match request {
-            ProviderAdapterActivationRequest::Live(routes) => {
-                self.activate_live(lease, routes).map(Into::into)
-            }
+            ProviderAdapterActivationRequest::Live {
+                routes,
+                market_data_records,
+            } => self
+                .activate_live(lease, routes, &market_data_records)
+                .map(Into::into),
             ProviderAdapterActivationRequest::CoinbaseDirect(spec) => {
                 let metadata = crate::live_source::coinbase_direct_publication_metadata(
                     &lease,
@@ -1551,9 +1554,12 @@ impl ProviderAdapterActivation {
         request: ProviderAdapterActivationRequest,
     ) -> Result<ProviderActivationOutcome, ProviderAdapterActivationError> {
         match request {
-            ProviderAdapterActivationRequest::Live(routes) => {
-                self.activate_live(lease, routes).map(Into::into)
-            }
+            ProviderAdapterActivationRequest::Live {
+                routes,
+                market_data_records,
+            } => self
+                .activate_live(lease, routes, &market_data_records)
+                .map(Into::into),
             ProviderAdapterActivationRequest::CoinbaseDirect(_spec) => {
                 require_surface(&lease, "coinbase.exchange-direct-market-data")?;
                 Err(ProviderAdapterActivationError::ExplicitResumeRequired)
@@ -1597,6 +1603,7 @@ impl ProviderAdapterActivation {
         &self,
         lease: ProviderActivationLease,
         routes: Vec<market_squawk_live::LiveRouteConfig>,
+        market_data_records: &[market_squawk_data::MarketDataInstrumentRecord],
     ) -> Result<LiveProviderActivation, ProviderAdapterActivationError> {
         let provider = match lease.surface_id().as_str() {
             COINBASE_SURFACE => ProductionSourceProvider::Coinbase,
@@ -1608,6 +1615,7 @@ impl ProviderAdapterActivation {
             routes,
             provider,
             self.provider_rate.clone(),
+            market_data_records,
         )?;
         Ok(LiveProviderActivation { lease, composition })
     }

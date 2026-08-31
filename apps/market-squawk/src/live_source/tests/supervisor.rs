@@ -17,8 +17,8 @@ use super::super::{
     route_actor::RouteBufferLimits,
     supervisor::{ProductionSourceSupervisor, activate_owned_capture},
 };
-use super::budget_free_metadata;
 use super::sink::{app_config, runtime_config};
+use super::{budget_free_metadata, coinbase_market_data_record};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -62,9 +62,14 @@ async fn activation_failure_keeps_capture_control_and_writer_under_cleanup_owner
     let source = config
         .coinbase()
         .ok_or("Coinbase production configuration missing")?;
-    let profile = ProductionCoinbaseProfile::try_from(source)?;
-    let profile = ProductionSourceProfile::coinbase(profile, source, 64, 32 * 1024 * 1024)?;
     let now = system_timestamp()?;
+    let market_data_record = coinbase_market_data_record(source)?;
+    let profile = ProductionCoinbaseProfile::try_from_at(
+        source,
+        std::slice::from_ref(&market_data_record),
+        now,
+    )?;
+    let profile = ProductionSourceProfile::coinbase(profile, source, 64, 32 * 1024 * 1024)?;
     let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(budget_free_metadata(profile.metadata())?, now)?;
     let session = registry.begin_next_session(
@@ -126,7 +131,13 @@ async fn run_cancelled_generation(root: &std::path::Path) -> TestResult<Connecti
     let source = config
         .coinbase()
         .ok_or("Coinbase production configuration missing")?;
-    let profile = ProductionCoinbaseProfile::try_from(source)?;
+    let now = system_timestamp()?;
+    let market_data_record = coinbase_market_data_record(source)?;
+    let profile = ProductionCoinbaseProfile::try_from_at(
+        source,
+        std::slice::from_ref(&market_data_record),
+        now,
+    )?;
     let profile = ProductionSourceProfile::coinbase(profile, source, 64, 32 * 1024 * 1024)?;
     let runtime_config = runtime_config()?;
     let route_buffer_limits = RouteBufferLimits::new(
