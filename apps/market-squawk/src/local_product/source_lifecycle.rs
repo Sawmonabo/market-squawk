@@ -1509,6 +1509,11 @@ impl ProductionSourceLifecycleAuthority {
             (Some(session_id), Some(public_configuration_digest)) => {
                 Ok((Some(session_id), Some(public_configuration_digest)))
             }
+            (Some(session_id), None) if !is_session_backed_live_surface(provider.as_str()) => self
+                .onboarding
+                .runtime_activation_target_public_configuration(session_id, provider)
+                .map(|digest| (Some(session_id), Some(digest)))
+                .map_err(map_onboarding_error),
             (None, None) if is_session_backed_live_surface(provider.as_str()) => self
                 .onboarding
                 .current_runtime_activation_target(provider)
