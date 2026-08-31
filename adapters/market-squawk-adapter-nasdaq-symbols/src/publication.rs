@@ -5,7 +5,7 @@ use market_squawk_sources::{
     CURRENT_RESEARCH_RECORD_SCHEMA, ExtractionBatch, ProviderCaptureError,
     ProviderCaptureMaterialSealError, ProviderCaptureSealExpectation, ProviderCaptureSealRequest,
     ProviderCaptureTerminalDisposition, SealedProviderCaptureMaterial,
-    SealedProviderCaptureSetReceipt,
+    SealedProviderCaptureSetReceipt, SourceObjectCaptureIdentity,
 };
 use thiserror::Error;
 
@@ -47,6 +47,7 @@ pub struct NasdaqSealedDirectoryComponent {
     family: NasdaqDirectoryKind,
     source_object_id: SourceIdentifier,
     source_reference: SourceIdentifier,
+    capture_identity: SourceObjectCaptureIdentity,
     file_creation_time: String,
     payload_evidence: ExactPayloadEvidence,
     source_last_modified_at: Timestamp,
@@ -204,13 +205,21 @@ impl NasdaqSealedDirectoryComponent {
             .pages()
             .get(usize::from(component.first_page_ordinal()))
             .ok_or(NasdaqDirectoryPublicationError::Protocol)?;
+        let expected_capture_identity = SourceObjectCaptureIdentity::Paged {
+            content_digest: component.content_digest(),
+            page_count: component.page_count(),
+            terminal: component.terminal(),
+        };
         if object_family != family
             || batch.request().object() != object
             || component.ordinal() != component_ordinal
+            || component.source_id() != object.source_id()
+            || component.metadata_revision() != object.metadata_revision()
+            || component.dataset() != object.dataset()
+            || object.capture_identity() != expected_capture_identity
             || component.page_count().get() != 1
             || component.first_page_ordinal() != component_ordinal
             || component.total_body_bytes() != page.body_bytes()
-            || component.content_digest() != object.evidence().content_digest()
             || page.ordinal() != component_ordinal
             || page.body_digest() != object.evidence().content_digest()
             || page.received_at() != response.received_at()
@@ -283,6 +292,7 @@ impl NasdaqSealedDirectoryComponent {
                 directory_locator(family).ok_or(NasdaqDirectoryPublicationError::Protocol)?,
             )
             .map_err(|_| NasdaqDirectoryPublicationError::Protocol)?,
+            capture_identity: expected_capture_identity,
             file_creation_time,
             payload_evidence: object.evidence().clone(),
             source_last_modified_at: response.last_modified_at(),
@@ -334,9 +344,13 @@ fn validate_sealed_components(
             .frames()
             .get(ordinal)
             .ok_or(NasdaqDirectoryPublicationError::Protocol)?;
+        let capture_content_digest = component
+            .capture_identity
+            .paged_content_digest()
+            .ok_or(NasdaqDirectoryPublicationError::Protocol)?;
         if graph.ordinal()
             != u16::try_from(ordinal).map_err(|_| NasdaqDirectoryPublicationError::Protocol)?
-            || graph.content_digest() != component.payload_evidence.content_digest()
+            || graph.content_digest() != capture_content_digest
             || frame.provider_payload_digest() != component.payload_evidence.content_digest()
             || frame.received_at() != component.received_at
         {
@@ -361,4 +375,165 @@ pub enum NasdaqDirectoryPublicationError {
     Seal(#[from] ProviderCaptureMaterialSealError),
     #[error("Nasdaq extraction failed: {0}")]
     Extraction(#[from] market_squawk_sources::ExtractionSourceError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use chrono::{DateTime, Utc};
+    use market_squawk_domain::{
+        DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, MetadataRevision, SourceId,
+        SourceIdentifier, Timestamp,
+    };
+    use market_squawk_platform::{LocalPaths, RawCaptureRecord};
+    use market_squawk_sources::{
+        ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
+    };
+    use sha2::{Digest, Sha256};
+    use uuid::Uuid;
+
+    use super::{
+        NasdaqDirectoryPublicationError, NasdaqSealedDirectoryComponent, validate_sealed_components,
+    };
+    use crate::NasdaqDirectoryKind;
+
+    #[test]
+    fn sealed_component_binds_capture_envelope_separately_from_raw_body()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source_id = SourceId::try_from("nasdaq-reference-test")?;
+        let revision = MetadataRevision::new(SourceIdentifier::try_from("nasdaq-reference-r1")?);
+        let dataset = SourceIdentifier::try_from("nasdaq.symbol-directory.us-listed.v1")?;
+        let first = capture_component(
+            &source_id,
+            revision.clone(),
+            dataset.clone(),
+            b"nasdaq-listed-body",
+            Timestamp::from_unix_nanos(10),
+            [1; 16],
+        )?;
+        let second = capture_component(
+            &source_id,
+            revision.clone(),
+            dataset.clone(),
+            b"other-listed-body",
+            Timestamp::from_unix_nanos(20),
+            [2; 16],
+        )?;
+        let capture = ProviderCaptureMaterial::try_combine_request_graph(
+            source_id,
+            revision,
+            dataset,
+            digest(b"complete-directory-graph"),
+            vec![first, second],
+        )?;
+        let temporary = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(temporary.path())?;
+        let store = paths.sealed_research_journal_store()?;
+        let (expectation, request) = capture.into_component_seal_parts()?;
+        let sealed = request.seal(&store)?;
+        let tokens = expectation.try_rejoin(sealed)?.try_into_components()?;
+        let sealed = tokens
+            .into_tokens()
+            .first()
+            .ok_or("sealed graph did not contain a first component")?
+            .persisted_receipt()
+            .clone();
+        let mut components = [
+            component(&sealed, NasdaqDirectoryKind::NasdaqListed, 0)?,
+            component(&sealed, NasdaqDirectoryKind::OtherListed, 1)?,
+        ];
+
+        validate_sealed_components(&sealed, &components)?;
+
+        let raw_body_digest = sealed.capture().pages()[0].body_digest();
+        let graph_component = &sealed.capture().request_graph_components()[0];
+        assert_ne!(graph_component.content_digest(), raw_body_digest);
+        components[0].capture_identity =
+            market_squawk_sources::SourceObjectCaptureIdentity::Paged {
+                content_digest: raw_body_digest,
+                page_count: graph_component.page_count(),
+                terminal: graph_component.terminal(),
+            };
+        assert!(matches!(
+            validate_sealed_components(&sealed, &components),
+            Err(NasdaqDirectoryPublicationError::Protocol)
+        ));
+        Ok(())
+    }
+
+    fn capture_component(
+        source_id: &SourceId,
+        revision: MetadataRevision,
+        dataset: SourceIdentifier,
+        body: &[u8],
+        received_at: Timestamp,
+        record_id: [u8; 16],
+    ) -> Result<ProviderCaptureMaterial, Box<dyn std::error::Error>> {
+        let body_digest = digest(body);
+        let receipt = ProviderCaptureSetReceipt::try_new(
+            source_id.clone(),
+            revision,
+            dataset,
+            digest(b"component-request"),
+            market_squawk_sources::ProviderCaptureTerminalDisposition::StandaloneResponse,
+            vec![ProviderCapturePageReceipt::try_new(
+                0,
+                digest(b"page-request"),
+                None,
+                None,
+                200,
+                u64::try_from(body.len())?,
+                body_digest,
+                received_at,
+            )?],
+        )?;
+        let record = RawCaptureRecord::try_new_live(
+            Uuid::from_bytes(record_id),
+            Arc::from(source_id.as_str()),
+            Uuid::from_bytes(record_id.map(|byte| byte.saturating_add(8))),
+            Some(0),
+            None,
+            DateTime::<Utc>::from_timestamp_nanos(received_at.unix_nanos()),
+            Bytes::copy_from_slice(body),
+        )?;
+        Ok(ProviderCaptureMaterial::try_new(receipt, vec![record])?)
+    }
+
+    fn component(
+        sealed: &market_squawk_sources::SealedProviderCaptureSetReceipt,
+        family: NasdaqDirectoryKind,
+        ordinal: usize,
+    ) -> Result<NasdaqSealedDirectoryComponent, Box<dyn std::error::Error>> {
+        let graph_component = sealed
+            .capture()
+            .request_graph_components()
+            .get(ordinal)
+            .ok_or("sealed graph component is absent")?;
+        let page = sealed
+            .capture()
+            .pages()
+            .get(ordinal)
+            .ok_or("sealed graph page is absent")?;
+        Ok(NasdaqSealedDirectoryComponent {
+            family,
+            source_object_id: SourceIdentifier::try_from(format!("object-{ordinal}"))?,
+            source_reference: SourceIdentifier::try_from(format!("reference-{ordinal}"))?,
+            capture_identity: market_squawk_sources::SourceObjectCaptureIdentity::Paged {
+                content_digest: graph_component.content_digest(),
+                page_count: graph_component.page_count(),
+                terminal: graph_component.terminal(),
+            },
+            file_creation_time: "08142026".to_owned(),
+            payload_evidence: ExactPayloadEvidence::from_content_digest(page.body_digest()),
+            source_last_modified_at: page.received_at(),
+            received_at: page.received_at(),
+            rows: Box::new([]),
+        })
+    }
+
+    fn digest(value: &[u8]) -> EvidenceDigest {
+        EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(value).into())
+    }
 }

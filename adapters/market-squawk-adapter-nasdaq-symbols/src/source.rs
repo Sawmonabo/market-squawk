@@ -506,6 +506,7 @@ impl NasdaqSymbolDirectorySource {
         ensure_deadline_open(request.deadline())?;
         let mut objects = Vec::with_capacity(2);
         let mut captures = Vec::with_capacity(2);
+        let mut component_capture_identities = Vec::with_capacity(2);
         let mut response_evidence = Vec::with_capacity(2);
         for kind in [
             NasdaqDirectoryKind::NasdaqListed,
@@ -514,7 +515,12 @@ impl NasdaqSymbolDirectorySource {
             let entry = self
                 .fetch_validated(&authority, kind, request.deadline(), &cancellation)
                 .await?;
-            captures.push(self.capture_material(&entry)?);
+            let capture = self.capture_material(&entry)?;
+            component_capture_identities.push(
+                SourceObjectCaptureIdentity::try_from_capture(capture.receipt())
+                    .map_err(|_| SourceError::InvalidProtocolState)?,
+            );
+            captures.push(capture);
             response_evidence.push(entry.retrieved.response_evidence.clone());
             self.cache
                 .lock()
@@ -529,21 +535,24 @@ impl NasdaqSymbolDirectorySource {
             captures,
         )
         .map_err(|_| SourceError::InvalidProtocolState)?;
-        let capture_identity =
-            SourceObjectCaptureIdentity::try_from_capture(capture_material.receipt())
-                .map_err(|_| SourceError::InvalidProtocolState)?;
         let cached = self
             .cache
             .lock()
             .map_err(|_| SourceError::InvalidProtocolState)?;
-        for kind in [
+        for (component_ordinal, kind) in [
             NasdaqDirectoryKind::NasdaqListed,
             NasdaqDirectoryKind::OtherListed,
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let entry = cached
                 .entries
                 .iter()
                 .find(|entry| entry.retrieved.kind == kind)
+                .ok_or(SourceError::InvalidProtocolState)?;
+            let capture_identity = *component_capture_identities
+                .get(component_ordinal)
                 .ok_or(SourceError::InvalidProtocolState)?;
             objects.push(self.source_object(&request, entry, capture_identity)?);
         }
@@ -705,8 +714,6 @@ impl NasdaqSymbolDirectorySource {
         &self,
         entry: &CachedDirectory,
     ) -> Result<ProviderCaptureMaterial, ExtractionSourceError> {
-        let locator =
-            directory_locator(entry.retrieved.kind).ok_or(SourceError::InvalidProtocolState)?;
         let request_identity = capture_request_identity(&self.metadata, entry.retrieved.kind)?;
         let body_digest = exact_evidence(&entry.retrieved.bytes).content_digest();
         let body_bytes = u64::try_from(entry.retrieved.bytes.len())
@@ -725,7 +732,7 @@ impl NasdaqSymbolDirectorySource {
         let receipt = ProviderCaptureSetReceipt::try_new(
             self.metadata.source_id().clone(),
             self.metadata.revision().clone(),
-            SourceIdentifier::try_from(locator).map_err(|_| SourceError::InvalidProtocolState)?,
+            self.config.dataset().clone(),
             request_identity,
             ProviderCaptureTerminalDisposition::StandaloneResponse,
             vec![page],

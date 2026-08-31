@@ -686,8 +686,8 @@ impl ReferenceModifiedObjectHandoff {
 ///
 /// Every selected surface appears exactly once in request order, every object has a final strict
 /// parse receipt, and aggregate bytes, rows, aliases, and conflicts are closed. This value still
-/// does not grant generation publication: the application must atomically rejoin it with the
-/// caller-owned staged canonical partitions and the forthcoming large-logical-object seal token.
+/// does not grant generation publication: the application must atomically bind its existing
+/// store-issued raw receipts to the caller-owned staged canonical partitions and catalog input.
 pub struct CompletedModifiedReferencePublicationCapture {
     request: PublicationRequest,
     objects: Box<[ReferenceModifiedObjectHandoff]>,
