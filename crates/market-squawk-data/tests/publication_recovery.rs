@@ -11,7 +11,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arrow::array::{BinaryArray, StringArray};
+use arrow::array::{Array as _, BinaryArray, StringArray};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use market_squawk_data::{
@@ -907,6 +907,21 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
     assert_eq!(retained_direct_binding_count, 0);
     rollback_probe.execute_batch("DROP TRIGGER reject_multi_artifact_manifest;")?;
     drop(rollback_probe);
+    let orphan_recovery_now = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?)
+    .checked_add_nanos(61_000_000_000)?;
+    let recovery = service
+        .recover_orphans(orphan_recovery_now, CancellationToken::new())
+        .await?;
+    assert_eq!(recovery.quarantined(), 2);
+    assert!(
+        !service
+            .object_store()
+            .read_pinned(first.pinned(), &CancellationToken::new())?
+            .is_empty(),
+        "the committed prefix must remain live while every failed group object is quarantined"
+    );
     let retry_input = provider_macro_plan_input(&raw_store, analytical_dataset)?;
     assert_eq!(retry_input.publication_digest(), macro_payload_digest);
     let macro_receipt = service
@@ -923,6 +938,18 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
     let macro_pinned = service.pinned(macro_receipt.manifest())?;
     assert_eq!(macro_pinned.objects().len(), 3);
     assert_eq!(macro_pinned.objects()[0], first.pinned().objects()[0]);
+    let committed_recovery_now = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?)
+    .checked_add_nanos(61_000_000_000)?;
+    assert_eq!(
+        service
+            .recover_orphans(committed_recovery_now, CancellationToken::new())
+            .await?
+            .quarantined(),
+        0,
+        "no object in the committed prefix plus two-object suffix may be quarantined"
+    );
     let owned =
         service.generation_owned_provider_capture_evidence(macro_receipt.manifest(), &raw_store)?;
     assert_eq!(owned.objects().len(), 2);
@@ -938,6 +965,10 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
     assert_eq!(owned.objects()[1].inputs().len(), 1);
     assert_eq!(owned.objects()[1].inputs()[0].input_ordinal(), 2);
     assert_eq!(owned.objects()[1].inputs()[0].object_input_ordinal(), 0);
+    assert_ne!(
+        owned.objects()[0].object().object().content_hash(),
+        owned.objects()[1].object().object().content_hash()
+    );
     let macro_restart = macro_receipt.restart_selector();
     let backup_paths = LocalPaths::prepare(directory.path().join("multi-artifact-backup"))?;
     let backup_location = AnalyticalBackupLocation::try_new(
@@ -961,7 +992,7 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
         .await?;
     let batches = service
         .object_store()
-        .read_pinned(first.pinned(), &CancellationToken::new())?;
+        .read_pinned(&macro_pinned, &CancellationToken::new())?;
     let observations = batches
         .into_iter()
         .map(ResearchArrowBatch::try_from_record_batch)
@@ -969,46 +1000,60 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
         .into_iter()
         .map(|batch| batch.observations())
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(observations.iter().map(Vec::len).sum::<usize>(), 1);
-    let Some(ResearchObservation::Macro(observation)) =
-        observations.first().and_then(|batch| batch.first())
-    else {
-        return Err("expected one rebound macro observation".into());
-    };
-    assert_eq!(observation.context().time().revision().get(), 1);
+    let direct_series = observations
+        .iter()
+        .flatten()
+        .map(|observation| match observation {
+            ResearchObservation::Macro(observation) => Ok(observation.series().as_str()),
+            _ => Err("expected only macro observations"),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(direct_series, ["GDP", "GDP-0", "GDP-1", "GDP-2"]);
     let query = ResearchQueryEngine::from_pinned_dataset(
-        first.pinned().clone(),
+        macro_pinned.clone(),
         "observations",
         service.object_store(),
         CancellationToken::new(),
     )
     .await?;
-    assert!(matches!(
-        query
-            .query(
-                QueryRequest::try_new(
-                    first.manifest().clone(),
-                    "SELECT source_id, effective_at FROM observations",
-                )?,
-                QueryLimits::try_new(
-                    10,
-                    64 * 1024,
-                    8 * 1024 * 1024,
-                    1,
-                    128,
-                    128,
-                    Duration::from_secs(1),
-                )?,
-                CancellationToken::new(),
-            )
-            .await?,
-        QueryResult::Inline { .. }
-    ));
+    let QueryResult::Inline { batches, .. } = query
+        .query(
+            QueryRequest::try_new(
+                macro_receipt.manifest().clone(),
+                "SELECT macro_series FROM observations",
+            )?,
+            QueryLimits::try_new(
+                10,
+                64 * 1024,
+                8 * 1024 * 1024,
+                1,
+                128,
+                128,
+                Duration::from_secs(1),
+            )?,
+            CancellationToken::new(),
+        )
+        .await?
+    else {
+        return Err("expected inline manifest-order macro query".into());
+    };
+    let mut queried_series = Vec::new();
+    queried_series.try_reserve_exact(4)?;
+    for batch in &batches {
+        let series = batch
+            .column_by_name("macro_series")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or("macro query omitted the series column")?;
+        for row in 0..series.len() {
+            queried_series.push(series.value(row));
+        }
+    }
+    assert_eq!(queried_series, ["GDP", "GDP-0", "GDP-1", "GDP-2"]);
     let pinned_memory = query
         .query(
             QueryRequest::try_new(
-                first.manifest().clone(),
-                "SELECT source_id, effective_at FROM observations",
+                macro_receipt.manifest().clone(),
+                "SELECT macro_series FROM observations",
             )?,
             QueryLimits::try_new(10, 8 * 1024, 8 * 1024, 1, 128, 128, Duration::from_secs(1))?,
             CancellationToken::new(),
@@ -1019,10 +1064,48 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
         Err(QueryError::MemoryLimitExceeded { limit: 8192 })
     ));
 
-    let source_pinned = macro_pinned;
+    let source_pinned = macro_pinned.clone();
     let compaction = CompactionRequest::new(macro_receipt.manifest().clone());
     drop(query);
-    drop(verified_backup);
+    let restored_paths = LocalPaths::prepare(directory.path().join("multi-artifact-restored"))?;
+    let restored_location = restored_paths.catalog()?.clone();
+    let restored_catalog_config = test_catalog_config(restored_location.clone())?;
+    let restored_object_config =
+        ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
+    let restored = verified_backup.restore(
+        AnalyticalRestoreTarget::try_new(
+            restored_catalog_config.clone(),
+            restored_paths.artifacts()?.clone(),
+            8,
+            restored_object_config,
+            AnalyticalRestoreMode::Fresh,
+        )?,
+        &CancellationToken::new(),
+    )?;
+    drop(restored);
+    let restored = AnalyticalDataService::open(
+        CatalogAuthority::open(restored_catalog_config)?,
+        AnalyticalManifestCatalog::open(&restored_location, 8)?,
+        restored_paths.artifacts()?.clone(),
+        restored_object_config,
+    )?;
+    let restored_pinned = restored.pinned(macro_receipt.manifest())?;
+    assert_eq!(restored_pinned, macro_pinned);
+    assert_eq!(
+        restored.verify_provider_macro_plan_restart(&macro_restart)?,
+        macro_pinned
+    );
+    let restored_owned = restored
+        .generation_owned_provider_capture_evidence(macro_receipt.manifest(), &raw_store)?;
+    assert_eq!(restored_owned, owned);
+    assert_eq!(restored_owned.receipt_digest(), owned.receipt_digest());
+    for object in restored_owned.objects() {
+        assert!(!object.inputs().is_empty());
+        for input in object.inputs() {
+            assert!(!input.binding().physical_claims().is_empty());
+        }
+    }
+    drop(restored);
     drop(service);
     let authority = CatalogAuthority::open(catalog_config)?;
     let rights = authority.admit_source_rights(RightsDecisionInput {
@@ -1055,7 +1138,7 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
     let compacted = service
         .compact(reservation, compaction, CancellationToken::new())
         .await?;
-    assert_eq!(compacted.manifest().manifest_version(), 2);
+    assert_eq!(compacted.manifest().manifest_version(), 3);
     assert_eq!(
         compacted.pinned().plan().row_count(),
         source_pinned.plan().row_count()
@@ -3558,7 +3641,7 @@ fn provider_macro_plan_input(
             NonZeroU64::new(1024 * 1024).ok_or("nonzero provider macro byte limit")?,
             Timestamp::from_unix_nanos(1_000),
         )?;
-        let payload = serde_json::to_vec(&macro_observation()?)?;
+        let payload = serde_json::to_vec(&macro_observation(Some(chunk_ordinal))?)?;
         let record = ExtractionRecord::try_new(
             &request,
             SourceIdentifier::try_from("market-squawk-research-v3")?,
@@ -5402,7 +5485,7 @@ fn extraction_batch_with_membership(
         NonZeroU64::new(1024 * 1024).ok_or("nonzero byte limit")?,
         Timestamp::from_unix_nanos(1_000),
     )?;
-    let payload = serde_json::to_vec(&macro_observation()?)?;
+    let payload = serde_json::to_vec(&macro_observation(None)?)?;
     let evidence = EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(&payload).into());
     let macro_record = ExtractionRecord::try_new(
         &request,
@@ -5637,13 +5720,22 @@ fn macro_snapshot_observation(
     )))
 }
 
-fn macro_observation() -> Result<ResearchObservation, Box<dyn Error>> {
+fn macro_observation(chunk_ordinal: Option<usize>) -> Result<ResearchObservation, Box<dyn Error>> {
+    let (source_identifier, series) = chunk_ordinal.map_or_else(
+        || ("GDP:2026Q1:v1".to_owned(), "GDP".to_owned()),
+        |value| {
+            (
+                format!("GDP:2026Q1:chunk-{value}:v1"),
+                format!("GDP-{value}"),
+            )
+        },
+    );
     let context = ResearchContext::new(
         ResearchProvenance::try_new(ResearchProvenanceInput {
             source_id: SourceId::try_from("fred-local-fixture")?,
             instrument_id: None,
             venue_id: None,
-            source_identifier: SourceIdentifier::try_from("GDP:2026Q1:v1")?,
+            source_identifier: SourceIdentifier::try_from(source_identifier.as_str())?,
             source_timestamp: None,
             received_at: Timestamp::from_unix_nanos(110),
             ingested_at: Timestamp::from_unix_nanos(120),
@@ -5665,8 +5757,13 @@ fn macro_observation() -> Result<ResearchObservation, Box<dyn Error>> {
     )?;
     Ok(ResearchObservation::Macro(MacroObservation::new(
         context,
-        SourceIdentifier::try_from("GDP")?,
-        Decimal::new(123_456, 2),
+        SourceIdentifier::try_from(series.as_str())?,
+        Decimal::new(
+            123_456_i64
+                .checked_add(i64::try_from(chunk_ordinal.unwrap_or_default())?)
+                .ok_or("provider macro value overflow")?,
+            2,
+        ),
         SourceIdentifier::try_from("USD")?,
     )))
 }

@@ -83,24 +83,6 @@ impl ProviderMarketEventSelectionCandidate {
         self.publication_digest
     }
 
-    pub(crate) fn source_id(&self) -> &str {
-        match self {
-            Self::ResponseMarketEvent(binding) => binding.evidence.capture.source_id().as_str(),
-            Self::EventMicrobatch(binding) => binding.evidence.capture.source_id().as_str(),
-            Self::CompositeResponseEvent { event, .. } => {
-                event.evidence.capture.source_id().as_str()
-            }
-        }
-    }
-
-    pub(crate) const fn publication_kind_name(&self) -> &'static str {
-        match self {
-            Self::ResponseMarketEvent(_) => "response_market_event",
-            Self::EventMicrobatch(_) => "event_microbatch",
-            Self::CompositeResponseEvent { .. } => "composite_response_event",
-        }
-    }
-
     pub(crate) fn publication_kind(&self) -> &str {
         &self.publication_kind
     }
@@ -1020,6 +1002,24 @@ impl PreparedProviderPublicationBinding {
                 composite_binding_digest,
                 ..
             } => *composite_binding_digest,
+        }
+    }
+
+    pub(crate) fn source_id(&self) -> &str {
+        match self {
+            Self::ResponseMarketEvent(binding) => binding.evidence.capture.source_id().as_str(),
+            Self::EventMicrobatch(binding) => binding.evidence.capture.source_id().as_str(),
+            Self::CompositeResponseEvent { event, .. } => {
+                event.evidence.capture.source_id().as_str()
+            }
+        }
+    }
+
+    pub(crate) const fn publication_kind_name(&self) -> &'static str {
+        match self {
+            Self::ResponseMarketEvent(_) => "response_market_event",
+            Self::EventMicrobatch(_) => "event_microbatch",
+            Self::CompositeResponseEvent { .. } => "composite_response_event",
         }
     }
 
