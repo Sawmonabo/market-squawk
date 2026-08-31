@@ -2410,6 +2410,65 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(source_revisions.len(), 4);
 
+        // Root authority is admitted before taxonomy parsing. This filing is intentionally not
+        // XML and has no retained source-qualified representation; the representation failure must
+        // win before any closure capability can exist or emit a request.
+        let submissions_bytes = include_bytes!("../../fixtures/submissions-recent.json");
+        let submissions_locator = crate::SecObjectLocator::submissions("0000320193")?
+            .url()
+            .to_owned();
+        let submissions_raw = captured_artifact(
+            &store,
+            &submissions_locator,
+            submissions_bytes,
+            sec_source.clone(),
+            sec_revision.clone(),
+            observed_at,
+        )?;
+        let submissions = crate::RetrievedSubmissions::new(
+            crate::SubmissionsDocument::parse(
+                submissions_bytes,
+                SecParserLimits::production_defaults(),
+            )?,
+            submissions_raw,
+            Vec::new(),
+        );
+        let root_locator = crate::SecObjectLocator::filing_document(
+            "0000320193",
+            "0000320193-25-000079",
+            "aapl-20250628.htm",
+        )?
+        .url()
+        .to_owned();
+        let unauthorized_root = captured_artifact(
+            &store,
+            &root_locator,
+            b"not XML; root admission must fail before parsing",
+            sec_source.clone(),
+            sec_revision.clone(),
+            observed_at,
+        )?;
+        let representations_path = temporary.path().join("root-representations");
+        std::fs::create_dir(&representations_path)?;
+        let empty_registry = Arc::new(crate::SecRepresentationRegistry::open(
+            Dir::open_ambient_dir(&representations_path, ambient_authority())?,
+            crate::SecRepresentationLimits::production_defaults(),
+        )?);
+        assert!(matches!(
+            crate::extraction::admit_filing_xbrl_root(
+                Arc::clone(&store),
+                empty_registry,
+                sec_source.clone(),
+                sec_revision.clone(),
+                SecParserLimits::production_defaults(),
+                &submissions,
+                "0000320193-25-000079",
+                &unauthorized_root,
+                &CancellationToken::new(),
+            ),
+            Err(crate::SecClientError::InvalidCompositeRepresentation)
+        ));
+
         // A provider graph cannot emit request 65: the known artifact ceiling is admitted before
         // transport, so the over-limit artifact cannot be fetched or published.
         let mut references = String::from(

@@ -79,6 +79,20 @@ struct DiscoveredSecMaterial {
     availability: ExtractionAvailabilityEvidence,
 }
 
+/// Non-serializable authority proving one filing root belongs to the requested captured
+/// submissions/accession and exactly matches this source's retained representation and raw bytes.
+pub(crate) struct AdmittedFilingXbrlRoot {
+    filing: SecFilingXbrlCoordinates,
+    filing_document: RetrievedSecBytes,
+    filing_representation: SecRepresentation,
+}
+
+impl AdmittedFilingXbrlRoot {
+    pub(crate) fn filing_document(&self) -> &RetrievedSecBytes {
+        &self.filing_document
+    }
+}
+
 /// Process-local filing-XBRL admission awaiting canonical extraction and physical sealing.
 ///
 /// This capability is intentionally non-cloneable and non-serializable. The application receives
@@ -555,8 +569,47 @@ pub(crate) fn prepare_filing_xbrl_capture_from_state(
     taxonomy_artifacts: Vec<RetrievedSecBytes>,
     cancellation: &CancellationToken,
 ) -> Result<SecFilingXbrlCaptureHandoff, SecClientError> {
-    let filing = SecFilingXbrlCoordinates::from_captured_current_submissions(
+    let admitted_root = admit_filing_xbrl_root(
+        Arc::clone(&raw_store),
+        Arc::clone(&representation_registry),
+        source_id.clone(),
+        metadata_revision.clone(),
+        parser_limits,
         &submissions,
+        accession,
+        &filing_document,
+        cancellation,
+    )?;
+    prepare_filing_xbrl_capture_from_admitted_root(
+        raw_store,
+        identities,
+        source_id,
+        metadata_revision,
+        parser_limits,
+        submissions,
+        admitted_root,
+        taxonomy_artifacts,
+        cancellation,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "captured filing, source authority, and parser bounds remain explicit"
+)]
+pub(crate) fn admit_filing_xbrl_root(
+    raw_store: Arc<RawEvidenceStore>,
+    representation_registry: Arc<SecRepresentationRegistry>,
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    parser_limits: SecParserLimits,
+    submissions: &RetrievedSubmissions,
+    accession: &str,
+    filing_document: &RetrievedSecBytes,
+    cancellation: &CancellationToken,
+) -> Result<AdmittedFilingXbrlRoot, SecClientError> {
+    let filing = SecFilingXbrlCoordinates::from_captured_current_submissions(
+        submissions,
         accession,
         &raw_store,
         &source_id,
@@ -581,6 +634,33 @@ pub(crate) fn prepare_filing_xbrl_capture_from_state(
         &metadata_revision,
         cancellation,
     )?;
+    Ok(AdmittedFilingXbrlRoot {
+        filing,
+        filing_document: filing_document.clone(),
+        filing_representation,
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "admitted filing authority, parser bounds, and exact taxonomy bodies remain explicit"
+)]
+pub(crate) fn prepare_filing_xbrl_capture_from_admitted_root(
+    raw_store: Arc<RawEvidenceStore>,
+    identities: Arc<ProviderIdentityRegistry>,
+    source_id: SourceId,
+    metadata_revision: MetadataRevision,
+    parser_limits: SecParserLimits,
+    submissions: RetrievedSubmissions,
+    admitted_root: AdmittedFilingXbrlRoot,
+    taxonomy_artifacts: Vec<RetrievedSecBytes>,
+    cancellation: &CancellationToken,
+) -> Result<SecFilingXbrlCaptureHandoff, SecClientError> {
+    let AdmittedFilingXbrlRoot {
+        filing,
+        filing_document,
+        filing_representation,
+    } = admitted_root;
     let taxonomy = SecXbrlTaxonomyRegistry::code_owned().try_admit_captured(
         Arc::clone(&raw_store),
         &source_id,

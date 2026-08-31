@@ -435,8 +435,32 @@ impl super::SecEdgarSource {
         ensure_before_deadline(deadline)?;
         let source_id = self.metadata.source_id().clone();
         let metadata_revision = self.metadata.revision().clone();
+        let admission_submissions = submissions.clone();
+        let admission_filing = filing_document.clone();
+        let admission_accession = accession.to_owned();
+        let admission_raw_store = Arc::clone(&self.raw_store);
+        let admission_representations = Arc::clone(&self.representation_registry);
+        let admission_source_id = source_id.clone();
+        let admission_revision = metadata_revision.clone();
+        let parser_limits = self.parser_limits;
+        let admitted_root = self
+            .run_validation_blocking(&cancellation, move |worker_token| {
+                crate::extraction::admit_filing_xbrl_root(
+                    admission_raw_store,
+                    admission_representations,
+                    admission_source_id,
+                    admission_revision,
+                    parser_limits,
+                    &admission_submissions,
+                    &admission_accession,
+                    &admission_filing,
+                    worker_token,
+                )
+            })
+            .await?;
+        ensure_before_deadline(deadline)?;
         let mut closure = SecTaxonomyClosure::try_start(
-            &filing_document,
+            admitted_root.filing_document(),
             source_id.clone(),
             metadata_revision.clone(),
             self.parser_limits,
@@ -465,22 +489,18 @@ impl super::SecEdgarSource {
         let operation_cancellation = cancellation.child_token();
         let worker_cancellation = operation_cancellation.clone();
         let raw_store = Arc::clone(&self.raw_store);
-        let representation_registry = Arc::clone(&self.representation_registry);
         let identities = Arc::clone(&self.identities);
         let parser_limits = self.parser_limits;
-        let accession = accession.to_owned();
         let preparation =
             self.run_validation_blocking(&operation_cancellation, move |worker_token| {
-                crate::extraction::prepare_filing_xbrl_capture_from_state(
+                crate::extraction::prepare_filing_xbrl_capture_from_admitted_root(
                     raw_store,
-                    representation_registry,
                     identities,
                     source_id,
                     metadata_revision,
                     parser_limits,
                     submissions,
-                    &accession,
-                    filing_document,
+                    admitted_root,
                     artifacts,
                     worker_token,
                 )
