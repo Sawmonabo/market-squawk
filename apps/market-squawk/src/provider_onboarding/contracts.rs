@@ -358,13 +358,8 @@ pub enum ProviderPortalActivationRequest {
         /// Bounded provider page size.
         page_size: u16,
     },
-    /// Treasury daily rates across all five official XML families.
-    TreasuryDailyRates {
-        /// Inclusive first observation year.
-        start_year: u16,
-        /// Inclusive final observation year.
-        end_year: u16,
-    },
+    /// Treasury daily rates across all five official XML families and their complete history.
+    TreasuryDailyRates,
     /// FRED/ALFRED using one exact configured series and vintage interval.
     FredAlfred {
         /// Exact provider discovery dataset retained through restart and immutable reads.
