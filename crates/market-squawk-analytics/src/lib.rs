@@ -58,12 +58,13 @@ pub use fundamentals::{
 };
 pub use harmonics::{
     HARMONIC_PATTERN_FEATURE_NAME, HARMONIC_PIVOT_CONFIRMATION_BARS, HARMONIC_PIVOT_COUNT,
-    HarmonicBar, HarmonicCompletionZone, HarmonicConfidenceAuthority, HarmonicDirection,
-    HarmonicEvidenceBinding, HarmonicExecutionAuthority, HarmonicFraction, HarmonicPatternError,
-    HarmonicPatternEvidence, HarmonicPatternInput, HarmonicPatternKind, HarmonicPatternQuality,
-    HarmonicPatternRule, HarmonicPivotEvidence, HarmonicPivotKind, HarmonicRatio,
-    HarmonicRatioBand, HarmonicRatioConstraint, HarmonicRatioMeasurement,
-    HarmonicRatioMeasurements, MAX_HARMONIC_BARS, MIN_HARMONIC_BARS, classify_harmonic_pattern,
+    HARMONIC_TARGET_COUNT, HarmonicBar, HarmonicCompletionZone, HarmonicConfidenceAuthority,
+    HarmonicDirection, HarmonicEvidenceBinding, HarmonicExecutionAuthority, HarmonicFraction,
+    HarmonicPatternError, HarmonicPatternEvidence, HarmonicPatternInput, HarmonicPatternKind,
+    HarmonicPatternQuality, HarmonicPatternRule, HarmonicPivotEvidence, HarmonicPivotKind,
+    HarmonicRatio, HarmonicRatioBand, HarmonicRatioConstraint, HarmonicRatioMeasurement,
+    HarmonicRatioMeasurements, MAX_HARMONIC_BARS, MAX_HARMONIC_PARENT_MANIFESTS, MIN_HARMONIC_BARS,
+    classify_harmonic_pattern,
 };
 pub use liquidity::{
     LiquidityBookView, LiquidityEstimate, LiquidityFeatureError, estimate_market_order,

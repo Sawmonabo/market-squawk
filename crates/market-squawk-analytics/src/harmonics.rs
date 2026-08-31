@@ -1247,7 +1247,8 @@ fn select_pivots(
     bars: &[HarmonicBar],
     decision_cutoff: Timestamp,
 ) -> Result<[HarmonicPivotEvidence; HARMONIC_PIVOT_COUNT], HarmonicPatternError> {
-    let mut canonical = [None; HARMONIC_PIVOT_COUNT];
+    let mut canonical: [Option<HarmonicPivotEvidence>; HARMONIC_PIVOT_COUNT] =
+        [None; HARMONIC_PIVOT_COUNT];
     let mut canonical_count = 0_usize;
     for pivot_index in HARMONIC_PIVOT_CONFIRMATION_BARS
         ..bars.len().saturating_sub(HARMONIC_PIVOT_CONFIRMATION_BARS)
