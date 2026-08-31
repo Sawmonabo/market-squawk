@@ -1241,14 +1241,14 @@ fn product_model_evidence(bundle: &ModelBundle) -> Result<Value, ServiceError> {
             "interpretation": if point_in_time_bound {
                 "The retained selection cutoff is at or after the complete training observation window."
             } else {
-                "The retained bundle does not prove a usable point-in-time training cutoff."
+                "The available history does not prove that only information known at the time was used."
             }
         }),
         json!({
             "label": "Held-out evaluation",
             "state": if out_of_sample_observations > 0 { "evaluated" } else { "unavailable" },
             "interpretation": if out_of_sample_observations > 0 {
-                "The admitted training run retains observations that were not used to fit the model."
+                "The model was evaluated on observations that were not used to fit it."
             } else {
                 "No held-out observations are retained for this model."
             }
@@ -1265,9 +1265,9 @@ fn product_model_evidence(bundle: &ModelBundle) -> Result<Value, ServiceError> {
             "interpretation": if forecast.is_none() {
                 "This model is not admitted as a forecast model, so no forecast-horizon evaluation is claimed."
             } else if forecast_evidence_complete {
-                "The admitted training run retains rolling evaluation folds for its forecast horizons."
+                "The model was evaluated across rolling historical periods for these forecast horizons."
             } else {
-                "The forecast bundle does not retain complete rolling horizon evidence."
+                "Complete rolling historical evidence is unavailable for these forecast horizons."
             }
         }),
     ];

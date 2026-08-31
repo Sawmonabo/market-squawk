@@ -45,7 +45,7 @@ class DesktopRootErrorBoundary extends Component<
             changed.
           </p>
           <p className="mt-4 rounded-lg border border-border bg-background/55 p-3 text-xs text-muted-foreground">
-            {this.state.error.message}
+            Reload the workspace. If the problem continues, review Logs &amp; Diagnostics.
           </p>
           <button
             className="mt-5 inline-flex h-9 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground"

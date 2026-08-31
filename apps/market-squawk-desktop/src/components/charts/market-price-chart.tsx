@@ -118,8 +118,7 @@ export function MarketPriceChart({
                 "No timestamped observed prices or complete forecast points were supplied."}
             </p>
             <p className="mt-3 text-xs leading-5 text-muted-foreground">
-              Market Squawk does not infer chart values from bundle identities or forecast
-              summaries.
+              Charts show only complete dated prices and forecast ranges.
             </p>
           </div>
         </div>
