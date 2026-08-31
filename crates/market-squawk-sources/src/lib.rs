@@ -142,8 +142,8 @@ pub use http_capture::{
 };
 pub use live::{
     FrameId, FrameSessionBinding, LiveMarketSource, MAX_RAW_FRAME_BYTES, RawMarketFrame,
-    RawMarketSink, SessionId, SinkError, SourceError, SourceMetadataProvider, TransportFrameKind,
-    ValidatedRawMarketFrame,
+    RawMarketSink, SessionId, SinkError, SourceError, SourceMetadataProvider,
+    SourceProtocolViolation, TransportFrameKind, ValidatedRawMarketFrame,
 };
 pub use metadata::{
     AuthorizationGrant, AuthorizationMode, AuthorizationSubjectResolutionError,
