@@ -36,7 +36,6 @@ use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::config::{COINBASE_PROVIDER, CoinbaseNativeProductCoordinate};
 use crate::{
     CoinbaseConfigError, CoinbaseDirectTradeEvidence, CoinbaseProductMapping,
     CoinbaseTransportLimits,
@@ -48,6 +47,8 @@ pub const COINBASE_DIRECT_WEBSOCKET_ENDPOINT: &str = "wss://ws-direct.exchange.c
 pub const COINBASE_DIRECT_VERIFY_ENDPOINT: &str =
     "https://api.exchange.coinbase.com/users/self/verify";
 const COINBASE_REST_ORIGIN: &str = "https://api.exchange.coinbase.com";
+const COINBASE_VENUE: &str = "coinbase-exchange";
+const COINBASE_PROVIDER: &str = "coinbase-exchange";
 const DIRECT_CHANNEL: &str = "full";
 const WEBSOCKET_AUTH_PATH: &str = "/users/self/verify";
 const MAX_SIGNING_FIELD_BYTES: usize = 1_024;
@@ -296,7 +297,8 @@ fn direct_memory_product(count: usize, bytes: u64) -> Result<u64, CoinbaseConfig
 #[derive(Clone, Debug)]
 pub struct CoinbaseDirectConfig {
     metadata: SourceMetadata,
-    coordinate: CoinbaseNativeProductCoordinate,
+    mapping: CoinbaseProductMapping,
+    venue: VenueId,
     terms: InstrumentExecutionTerms,
     limits: CoinbaseDirectLimits,
     publication_depth: MarketDepth,
@@ -412,12 +414,7 @@ impl CoinbaseDirectConfig {
             return Err(CoinbaseConfigError::InvalidDirectInstrumentTerms);
         }
         validate_direct_budget(&budget)?;
-        let coordinate = CoinbaseNativeProductCoordinate::try_new(
-            mapping,
-            source_id.clone(),
-            &revision_evidence,
-        )?;
-        let product = coordinate.product().as_source_identifier().as_str();
+        let product = mapping.product().as_source_identifier().as_str();
         let snapshot_base = format!("{COINBASE_REST_ORIGIN}/products/{product}/book");
         let snapshot_url = format!("{snapshot_base}?level=3");
         let product_url = format!("{COINBASE_REST_ORIGIN}/products/{product}");
@@ -477,17 +474,17 @@ impl CoinbaseDirectConfig {
             ]);
         }
         let live = LiveCoverageDeclaration::try_new(
-            coordinate.product().clone(),
+            mapping.product().clone(),
             ProviderChannel::new(SourceIdentifier::try_from(DIRECT_CHANNEL)?),
             live_rules,
         )?;
-        let venue = coordinate.venue().clone();
+        let venue = VenueId::try_from(COINBASE_VENUE)?;
         let coverage = SourceCoverage::try_instrument(
             coverage_evidence,
             effective,
             vec![AssetClass::Crypto],
             CoverageTopology::single_venue(venue.clone()),
-            InstrumentCoverage::enumerated(vec![coordinate.instrument()])?,
+            InstrumentCoverage::enumerated(vec![mapping.instrument()])?,
             Some(live),
             CoverageDelay::RealTime,
             DeliveryEvidence::DirectVenue,
@@ -532,10 +529,10 @@ impl CoinbaseDirectConfig {
                 ProviderNumericPolicy::ExactDecimalLexeme,
             ))),
         ))?;
-        coordinate.validate_metadata(&metadata)?;
         Ok(Self {
             metadata,
-            coordinate,
+            mapping,
+            venue,
             terms,
             limits,
             publication_depth,
@@ -566,52 +563,17 @@ impl CoinbaseDirectConfig {
 
     /// Returns the sole product on this bounded connection.
     pub const fn product(&self) -> &ProviderProduct {
-        self.coordinate.product()
+        self.mapping.product()
     }
 
     /// Returns the stable mapped instrument.
     pub const fn instrument(&self) -> market_squawk_domain::InstrumentId {
-        self.coordinate.instrument()
-    }
-
-    /// Returns the source-qualified provider-native product identity.
-    pub const fn provider_identity_key(&self) -> &market_squawk_domain::ProviderIdentityKey {
-        self.coordinate.provider_identity_key()
-    }
-
-    /// Returns the exact profile revision that bound this product coordinate.
-    pub const fn provider_identity_revision(&self) -> &market_squawk_domain::MetadataRevision {
-        self.coordinate.identity_revision()
-    }
-
-    /// Returns the exact profile digest that bound this product coordinate.
-    pub const fn provider_identity_digest(&self) -> EvidenceDigest {
-        self.coordinate.identity_digest()
-    }
-
-    /// Returns the independently validated Coinbase Exchange venue symbol.
-    pub const fn venue_symbol(&self) -> &market_squawk_domain::VenueSymbol {
-        self.coordinate.venue_symbol()
-    }
-
-    pub(crate) fn validate_native_product_coordinate(
-        &self,
-        wire_product: &str,
-    ) -> Result<(), CoinbaseConfigError> {
-        self.coordinate.validate_metadata(&self.metadata)?;
-        if !self.coordinate.validates_wire_product(wire_product) {
-            return Err(CoinbaseConfigError::InvalidNativeProductCoordinate);
-        }
-        Ok(())
-    }
-
-    pub(crate) const fn native_coordinate(&self) -> &CoinbaseNativeProductCoordinate {
-        &self.coordinate
+        self.mapping.instrument()
     }
 
     /// Returns the direct venue bound into coverage and every derived quote.
     pub const fn venue(&self) -> &VenueId {
-        self.coordinate.venue()
+        &self.venue
     }
 
     /// Returns the immutable instrument terms used for exact Direct normalization.
@@ -693,7 +655,7 @@ impl CoinbaseDirectConfig {
         .map_err(CoinbaseDirectProductError::Capture)?;
         let wire: ProductWire = serde_json::from_reader(capture.reader())
             .map_err(|_| CoinbaseDirectProductError::Schema)?;
-        if self.validate_native_product_coordinate(&wire.id).is_err() {
+        if wire.id != self.product().as_source_identifier().as_str() {
             return Err(CoinbaseDirectProductError::WrongProduct);
         }
         let base_increment = parse_direct_quantity(&wire.base_increment)
@@ -721,7 +683,7 @@ impl CoinbaseDirectConfig {
             TradingStatus::Inactive
         };
         Ok(CoinbaseDirectProductEvidence {
-            coordinate: self.coordinate.clone(),
+            product: self.product().clone(),
             provider_status: status,
             trading_status,
             base_increment,
@@ -1108,32 +1070,11 @@ pub enum CoinbaseDirectDecodeOutcome {
 /// One Direct public-cursor event plus native match identity decoded from the same raw frame.
 #[derive(Debug, Eq, PartialEq)]
 pub struct CoinbaseDirectSequencedEvent {
-    coordinate: CoinbaseNativeProductCoordinate,
     event: ProviderOrderEvent,
     native_trade: Option<CoinbaseDirectTradeEvidence>,
 }
 
 impl CoinbaseDirectSequencedEvent {
-    /// Returns the source-qualified provider-native identity carried by this update.
-    pub const fn provider_identity_key(&self) -> &market_squawk_domain::ProviderIdentityKey {
-        self.coordinate.provider_identity_key()
-    }
-
-    /// Returns the exact profile revision that bound this update's product coordinate.
-    pub const fn provider_identity_revision(&self) -> &market_squawk_domain::MetadataRevision {
-        self.coordinate.identity_revision()
-    }
-
-    /// Returns the exact profile digest that bound this update's product coordinate.
-    pub const fn provider_identity_digest(&self) -> EvidenceDigest {
-        self.coordinate.identity_digest()
-    }
-
-    /// Returns the independently validated Coinbase Exchange venue symbol.
-    pub const fn venue_symbol(&self) -> &market_squawk_domain::VenueSymbol {
-        self.coordinate.venue_symbol()
-    }
-
     /// Returns the provider-neutral order mutation used by the synchronized Direct book.
     pub const fn provider_event(&self) -> &ProviderOrderEvent {
         &self.event
@@ -1336,7 +1277,9 @@ impl CoinbaseDirectActivation {
 /// Exact classifier for cursor-bearing and documented non-book Coinbase `full` messages.
 #[derive(Clone, Debug)]
 pub struct CoinbaseDirectDecoder {
-    coordinate: CoinbaseNativeProductCoordinate,
+    source_id: SourceId,
+    metadata_revision: market_squawk_domain::MetadataRevision,
+    product: ProviderProduct,
     terms: InstrumentExecutionTerms,
     decoder_rule: IntegrityRule,
     max_frame_bytes: usize,
@@ -1345,8 +1288,6 @@ pub struct CoinbaseDirectDecoder {
 impl CoinbaseDirectDecoder {
     /// Binds the decoder to one immutable Direct product profile.
     pub fn try_new(config: &CoinbaseDirectConfig) -> Result<Self, CoinbaseConfigError> {
-        config
-            .validate_native_product_coordinate(config.product().as_source_identifier().as_str())?;
         let live = match config.metadata().protocol_profile() {
             SourceProtocolProfile::Live(profile) => profile,
             SourceProtocolProfile::NotLive => {
@@ -1354,7 +1295,9 @@ impl CoinbaseDirectDecoder {
             }
         };
         Ok(Self {
-            coordinate: config.native_coordinate().clone(),
+            source_id: config.metadata().source_id().clone(),
+            metadata_revision: config.metadata().revision().clone(),
+            product: config.product().clone(),
             terms: config.execution_terms(),
             decoder_rule: live.decoder_rule().clone(),
             max_frame_bytes: config.limits.websocket().max_frame_bytes(),
@@ -1370,8 +1313,8 @@ impl CoinbaseDirectDecoder {
         validated: &ValidatedRawMarketFrame<'_>,
     ) -> Result<CoinbaseDirectDecodeOutcome, CoinbaseDirectDecodeError> {
         let frame = validated.frame();
-        if frame.source_id() != self.coordinate.provider_identity_key().source_id()
-            || frame.metadata_revision() != self.coordinate.identity_revision()
+        if frame.source_id() != &self.source_id
+            || frame.metadata_revision() != &self.metadata_revision
             || frame.transport() != TransportFrameKind::Text
         {
             return Err(CoinbaseDirectDecodeError::FrameAuthority);
@@ -1762,7 +1705,7 @@ impl CoinbaseDirectDecoder {
             _ => return Err(CoinbaseDirectDecodeError::UnsupportedMessage),
         };
         let product = required_text(object, "product_id")?;
-        if !self.coordinate.validates_wire_product(product) {
+        if product != self.product.as_source_identifier().as_str() {
             return Err(CoinbaseDirectDecodeError::WrongProduct);
         }
         let sequence = object
@@ -1772,7 +1715,7 @@ impl CoinbaseDirectDecoder {
             .ok_or(CoinbaseDirectDecodeError::Schema)?;
         let timestamp = parse_direct_timestamp(required_text(object, "time")?)?;
         let event = ProviderOrderEvent::try_new(
-            self.coordinate.product().clone(),
+            self.product.clone(),
             sequence,
             timestamp,
             event_kind,
@@ -1794,7 +1737,6 @@ impl CoinbaseDirectDecoder {
         });
         Ok(CoinbaseDirectDecodeOutcome::Sequenced(
             CoinbaseDirectSequencedEvent {
-                coordinate: self.coordinate.clone(),
                 event,
                 native_trade,
             },
@@ -1880,7 +1822,7 @@ impl CoinbaseDirectDecoder {
             return Err(CoinbaseDirectDecodeError::Numeric);
         }
         Ok(CoinbaseDirectActivation {
-            product: self.coordinate.product().clone(),
+            product: self.product.clone(),
             provider_timestamp,
             user_id: parse_order_id(object, "user_id")?,
             profile_id: parse_order_id(object, "profile_id")?,
@@ -1928,7 +1870,7 @@ impl CoinbaseDirectDecoder {
         validate_optional_identifier(object, "client_oid")?;
         validate_authenticated_identity(object)?;
         Ok(CoinbaseDirectReceivedLifecycle {
-            product: self.coordinate.product().clone(),
+            product: self.product.clone(),
             order_id: parse_order_id(object, "order_id")?,
         })
     }
@@ -1971,10 +1913,7 @@ impl CoinbaseDirectDecoder {
         &self,
         object: &Map<String, Value>,
     ) -> Result<(), CoinbaseDirectDecodeError> {
-        if self
-            .coordinate
-            .validates_wire_product(required_text(object, "product_id")?)
-        {
+        if required_text(object, "product_id")? == self.product.as_source_identifier().as_str() {
             Ok(())
         } else {
             Err(CoinbaseDirectDecodeError::WrongProduct)
@@ -2245,7 +2184,9 @@ pub enum CoinbaseDirectDecodeError {
 /// Streaming level-3 snapshot decoder bound to one exact Direct profile.
 #[derive(Clone, Debug)]
 pub struct CoinbaseDirectSnapshotDecoder {
-    coordinate: CoinbaseNativeProductCoordinate,
+    source_id: SourceId,
+    metadata_revision: market_squawk_domain::MetadataRevision,
+    product: ProviderProduct,
     terms: InstrumentExecutionTerms,
     snapshot_url: Box<str>,
     limits: CoinbaseDirectLimits,
@@ -2254,10 +2195,10 @@ pub struct CoinbaseDirectSnapshotDecoder {
 impl CoinbaseDirectSnapshotDecoder {
     /// Constructs the snapshot decoder from immutable direct configuration.
     pub fn try_new(config: &CoinbaseDirectConfig) -> Result<Self, CoinbaseConfigError> {
-        config
-            .validate_native_product_coordinate(config.product().as_source_identifier().as_str())?;
         Ok(Self {
-            coordinate: config.native_coordinate().clone(),
+            source_id: config.metadata().source_id().clone(),
+            metadata_revision: config.metadata().revision().clone(),
+            product: config.product().clone(),
             terms: config.execution_terms(),
             snapshot_url: config.snapshot_url().to_owned().into_boxed_str(),
             limits: config.limits(),
@@ -2310,7 +2251,7 @@ impl CoinbaseDirectSnapshotDecoder {
         owner: &mut DirectOrderBook,
         orders: Option<&mut Vec<ProviderOrderRecord>>,
     ) -> Result<CoinbaseDirectSnapshotCoordinates, CoinbaseDirectSnapshotError> {
-        if owner.product() != self.coordinate.product() {
+        if owner.product() != &self.product {
             owner.invalidate_generation();
             return Err(CoinbaseDirectSnapshotError::WrongProduct);
         }
@@ -2323,8 +2264,8 @@ impl CoinbaseDirectSnapshotDecoder {
         if let Err(error) = validate_http_capture(
             capture,
             &self.snapshot_url,
-            self.coordinate.provider_identity_key().source_id(),
-            self.coordinate.identity_revision(),
+            &self.source_id,
+            &self.metadata_revision,
             self.limits.max_snapshot_bytes,
             self.limits.max_snapshot_segments,
         ) {
@@ -2688,7 +2629,7 @@ struct ProductWire {
 /// Current provider-authored product status and precision evidence.
 #[derive(Clone, Debug)]
 pub struct CoinbaseDirectProductEvidence {
-    coordinate: CoinbaseNativeProductCoordinate,
+    product: ProviderProduct,
     provider_status: SourceIdentifier,
     trading_status: TradingStatus,
     base_increment: ProviderQuantity,
@@ -2704,27 +2645,7 @@ pub struct CoinbaseDirectProductEvidence {
 impl CoinbaseDirectProductEvidence {
     /// Returns the exact provider product.
     pub const fn product(&self) -> &ProviderProduct {
-        self.coordinate.product()
-    }
-
-    /// Returns the source-qualified provider-native identity carried by this response.
-    pub const fn provider_identity_key(&self) -> &market_squawk_domain::ProviderIdentityKey {
-        self.coordinate.provider_identity_key()
-    }
-
-    /// Returns the exact profile revision that bound this response's product coordinate.
-    pub const fn provider_identity_revision(&self) -> &market_squawk_domain::MetadataRevision {
-        self.coordinate.identity_revision()
-    }
-
-    /// Returns the exact profile digest that bound this response's product coordinate.
-    pub const fn provider_identity_digest(&self) -> EvidenceDigest {
-        self.coordinate.identity_digest()
-    }
-
-    /// Returns the independently validated Coinbase Exchange venue symbol.
-    pub const fn venue_symbol(&self) -> &market_squawk_domain::VenueSymbol {
-        self.coordinate.venue_symbol()
+        &self.product
     }
 
     /// Returns the exact provider status token.
@@ -3404,23 +3325,6 @@ mod tests {
             br#"{"id":"BTC-USD","status":"online","base_increment":"0.00000001","quote_increment":"0.01","trading_disabled":false,"cancel_only":false,"post_only":false,"limit_only":false,"auction_mode":false}"#,
         )?;
         let evidence = config.decode_product_evidence(&capture)?;
-        assert_eq!(
-            evidence.provider_identity_key().source_id().as_str(),
-            "coinbase-exchange-direct"
-        );
-        assert_eq!(
-            evidence.provider_identity_key(),
-            config.provider_identity_key()
-        );
-        assert_eq!(
-            evidence.provider_identity_revision(),
-            config.provider_identity_revision()
-        );
-        assert_eq!(
-            evidence.provider_identity_digest(),
-            config.provider_identity_digest()
-        );
-        assert_eq!(evidence.venue_symbol(), config.venue_symbol());
         assert_eq!(evidence.trading_status(), TradingStatus::Active);
         assert_eq!(evidence.base_increment().value().as_str(), "0.00000001");
         assert_eq!(evidence.quote_increment().value().as_str(), "0.01");
