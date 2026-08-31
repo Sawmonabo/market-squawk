@@ -13,7 +13,7 @@ use market_squawk_domain::{
 use market_squawk_platform::{SecretGeneration, SecretRef};
 use market_squawk_sources::{
     ProviderCapabilityRevision, SEC_EDGAR_PROFILE_ID, SEC_EDGAR_SOURCE_ID,
-    SchwabMarketDataDoctorReceiptV1, SourceMetadata,
+    SchwabMarketDataDoctorReceiptV1, SourceMetadata, SourceMetadataProvider,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -805,7 +805,7 @@ struct PreparedResearchProviderReplacement {
     token: Uuid,
     expected: ResearchProviderRuntimeGeneration,
     candidate: ResearchProviderRuntimeGeneration,
-    candidate_source: Option<Arc<dyn ManagedResearchExtractionSource>>,
+    candidate_capability: Option<super::RegisteredSourceCapability>,
     candidate_admission: ResearchProviderAdmission,
     completed: bool,
 }
@@ -929,8 +929,8 @@ impl PreparedResearchProviderReplacement {
             return Err(ResearchIngestCompositionError::RuntimeGenerationStillCallable);
         }
         drop(authority);
-        let candidate_source = self
-            .candidate_source
+        let candidate_capability = self
+            .candidate_capability
             .take()
             .ok_or(ResearchIngestCompositionError::InvalidRuntimeReplacement)?;
         self.completed = true;
@@ -940,7 +940,7 @@ impl PreparedResearchProviderReplacement {
             token: self.token,
             expected: self.expected.clone(),
             candidate: self.candidate.clone(),
-            candidate_source: Some(candidate_source),
+            candidate_capability: Some(candidate_capability),
             candidate_admission: self.candidate_admission.clone(),
             completed: false,
         })
@@ -984,7 +984,7 @@ struct CommittedResearchProviderReplacement {
     token: Uuid,
     expected: ResearchProviderRuntimeGeneration,
     candidate: ResearchProviderRuntimeGeneration,
-    candidate_source: Option<Arc<dyn ManagedResearchExtractionSource>>,
+    candidate_capability: Option<super::RegisteredSourceCapability>,
     candidate_admission: ResearchProviderAdmission,
     completed: bool,
 }
@@ -1068,8 +1068,8 @@ impl CommittedResearchProviderReplacement {
         {
             return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
         }
-        let candidate_source = self
-            .candidate_source
+        let candidate_capability = self
+            .candidate_capability
             .take()
             .ok_or(ResearchIngestCompositionError::InvalidRuntimeReplacement)?;
         let replacement_registration = if current.metadata == self.candidate.metadata {
@@ -1088,7 +1088,9 @@ impl CommittedResearchProviderReplacement {
                     )?,
             )
         };
-        current.source = candidate_source;
+        let super::RegisteredSourceCapability { erased, typed } = candidate_capability;
+        current.source = erased;
+        current.typed_capability = typed;
         current.metadata = self.candidate.metadata.clone();
         if let Some(registration) = replacement_registration {
             current.registration = Box::new(registration);
@@ -1509,6 +1511,7 @@ impl ResearchProviderRuntimeMutationAuthority {
             generation.profile().clone(),
             super::RegisteredExtractionSource {
                 source: source_erased,
+                typed_capability: super::RegisteredTypedSourceCapability::None,
                 metadata,
                 registration: Box::new(registration),
                 rights,
@@ -1721,6 +1724,30 @@ impl ResearchProviderRuntimeMutationAuthority {
         self.coordinator.register_source_inner(
             generation.profile().clone(),
             source,
+            rights,
+            Some(generation),
+        )
+    }
+
+    /// Registers one Treasury adapter while retaining its exact typed allocation beside the
+    /// erased extraction source.
+    pub(crate) fn register_treasury_provider_source(
+        &self,
+        generation: ResearchProviderRuntimeGeneration,
+        source: Arc<market_squawk_adapter_treasury::TreasurySource>,
+        rights: ResearchRightsAuthority,
+    ) -> Result<(), ResearchIngestCompositionError> {
+        if source.metadata() != generation.metadata()
+            || rights != generation.rights
+            || &rights.source_id != source.metadata().source_id()
+        {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeGeneration);
+        }
+        let metadata = source.metadata().clone();
+        self.coordinator.register_source_capability_inner(
+            generation.profile().clone(),
+            metadata,
+            super::RegisteredSourceCapability::treasury(source),
             rights,
             Some(generation),
         )
@@ -1988,16 +2015,46 @@ impl ResearchProviderRuntimeMutationAuthority {
     where
         S: ManagedResearchExtractionSource,
     {
+        self.prepare_provider_replacement_capability(
+            expected,
+            candidate,
+            super::RegisteredSourceCapability::erased(source),
+            rights,
+        )
+    }
+
+    /// Prepares an exact Treasury successor while retaining the candidate's one typed allocation.
+    pub(crate) fn prepare_treasury_provider_replacement(
+        &self,
+        expected: ResearchProviderRuntimeGeneration,
+        candidate: ResearchProviderRuntimeGeneration,
+        source: Arc<market_squawk_adapter_treasury::TreasurySource>,
+        rights: ResearchRightsAuthority,
+    ) -> Result<ResearchProviderRuntimeReplacement, ResearchIngestCompositionError> {
+        self.prepare_provider_replacement_capability(
+            expected,
+            candidate,
+            super::RegisteredSourceCapability::treasury(source),
+            rights,
+        )
+    }
+
+    fn prepare_provider_replacement_capability(
+        &self,
+        expected: ResearchProviderRuntimeGeneration,
+        candidate: ResearchProviderRuntimeGeneration,
+        candidate_capability: super::RegisteredSourceCapability,
+        rights: ResearchRightsAuthority,
+    ) -> Result<ResearchProviderRuntimeReplacement, ResearchIngestCompositionError> {
         if self.coordinator.lifecycle.shutdown_token().is_cancelled()
             || !candidate.is_exact_successor_of(&expected)?
-            || source.metadata() != candidate.metadata()
+            || candidate_capability.erased.metadata() != candidate.metadata()
             || rights != candidate.rights
         {
             return Err(ResearchIngestCompositionError::InvalidRuntimeReplacement);
         }
         let profile = candidate.profile().clone();
         let token = Uuid::new_v4();
-        let candidate_source: Arc<dyn ManagedResearchExtractionSource> = Arc::new(source);
         let candidate_admission = ResearchProviderAdmission::new_pending(&candidate)?;
         let mut authority = self
             .coordinator
@@ -2022,6 +2079,12 @@ impl ResearchProviderRuntimeMutationAuthority {
         {
             return Err(ResearchIngestCompositionError::StaleRuntimeGeneration);
         }
+        if !current
+            .typed_capability
+            .same_kind(&candidate_capability.typed)
+        {
+            return Err(ResearchIngestCompositionError::InvalidRuntimeReplacement);
+        }
         authority
             .pending_replacements
             .insert(profile.clone(), token);
@@ -2031,7 +2094,7 @@ impl ResearchProviderRuntimeMutationAuthority {
             token,
             expected: expected.clone(),
             candidate: candidate.clone(),
-            candidate_source: Some(candidate_source),
+            candidate_capability: Some(candidate_capability),
             candidate_admission,
             completed: false,
         };

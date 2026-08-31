@@ -1005,11 +1005,57 @@ impl ManagedResearchExtractionSource
 
 struct RegisteredExtractionSource {
     source: Arc<dyn ManagedResearchExtractionSource>,
+    typed_capability: RegisteredTypedSourceCapability,
     metadata: SourceMetadata,
     registration: Box<RegisteredSource>,
     rights: ResearchRightsAuthority,
     generation: Option<ResearchProviderRuntimeGeneration>,
     admission: ResearchProviderAdmission,
+}
+
+#[derive(Clone)]
+enum RegisteredTypedSourceCapability {
+    None,
+    TreasuryAllHistory(Arc<market_squawk_adapter_treasury::TreasurySource>),
+}
+
+impl RegisteredTypedSourceCapability {
+    const fn same_kind(&self, candidate: &Self) -> bool {
+        matches!(
+            (self, candidate),
+            (Self::None, Self::None) | (Self::TreasuryAllHistory(_), Self::TreasuryAllHistory(_))
+        )
+    }
+}
+
+/// Closed erased-plus-typed source pair moved as one runtime capability.
+struct RegisteredSourceCapability {
+    erased: Arc<dyn ManagedResearchExtractionSource>,
+    typed: RegisteredTypedSourceCapability,
+}
+
+impl RegisteredSourceCapability {
+    fn erased<S>(source: S) -> Self
+    where
+        S: ManagedResearchExtractionSource,
+    {
+        Self::erased_arc(Arc::new(source))
+    }
+
+    const fn erased_arc(source: Arc<dyn ManagedResearchExtractionSource>) -> Self {
+        Self {
+            erased: source,
+            typed: RegisteredTypedSourceCapability::None,
+        }
+    }
+
+    fn treasury(source: Arc<market_squawk_adapter_treasury::TreasurySource>) -> Self {
+        let erased: Arc<dyn ManagedResearchExtractionSource> = source.clone();
+        Self {
+            erased,
+            typed: RegisteredTypedSourceCapability::TreasuryAllHistory(source),
+        }
+    }
 }
 
 struct RegisteredPublicationSource {
@@ -1053,6 +1099,25 @@ pub(super) struct ProviderMacroOperationAuthority {
     cancellation: CancellationToken,
     watcher: JoinHandle<()>,
     operation_deadline: Instant,
+}
+
+/// One exact-generation Treasury source bundled with the common macro-operation authority.
+pub(super) struct TreasuryAllHistoryOperationAuthority {
+    source: Arc<market_squawk_adapter_treasury::TreasurySource>,
+    common: ProviderMacroOperationAuthority,
+}
+
+impl TreasuryAllHistoryOperationAuthority {
+    pub(super) fn source(
+        &self,
+    ) -> Result<&market_squawk_adapter_treasury::TreasurySource, ServiceError> {
+        self.common.ensure_live()?;
+        Ok(self.source.as_ref())
+    }
+
+    pub(super) const fn common(&self) -> &ProviderMacroOperationAuthority {
+        &self.common
+    }
 }
 
 impl ProviderMacroOperationAuthority {
@@ -1334,9 +1399,53 @@ impl ProductionResearchIngestCoordinator {
         provider_dataset: &SourceIdentifier,
         context: &RequestContext,
     ) -> Result<ProviderMacroOperationAuthority, ServiceError> {
+        self.acquire_provider_macro_operation_with_registered_capability(
+            generation,
+            provider_dataset,
+            context,
+        )
+        .await
+        .map(|(operation, _capability)| operation)
+    }
+
+    /// Acquires the exact registered Treasury allocation together with the common macro
+    /// operation authority. The typed source never crosses the ingestion boundary independently.
+    pub(super) async fn acquire_treasury_all_history_operation(
+        &self,
+        generation: &ResearchProviderRuntimeGeneration,
+        provider_dataset: &SourceIdentifier,
+        context: &RequestContext,
+    ) -> Result<TreasuryAllHistoryOperationAuthority, ServiceError> {
+        let (common, capability) = self
+            .acquire_provider_macro_operation_with_registered_capability(
+                generation,
+                provider_dataset,
+                context,
+            )
+            .await?;
+        let RegisteredTypedSourceCapability::TreasuryAllHistory(source) = capability else {
+            return Err(ServiceError::Unavailable);
+        };
+        let operation = TreasuryAllHistoryOperationAuthority { source, common };
+        operation.common.ensure_live()?;
+        Ok(operation)
+    }
+
+    async fn acquire_provider_macro_operation_with_registered_capability(
+        &self,
+        generation: &ResearchProviderRuntimeGeneration,
+        provider_dataset: &SourceIdentifier,
+        context: &RequestContext,
+    ) -> Result<
+        (
+            ProviderMacroOperationAuthority,
+            RegisteredTypedSourceCapability,
+        ),
+        ServiceError,
+    > {
         let call = DomainLifecycle::enter(&self.lifecycle, context)?;
         let operation_deadline = operation_deadline(context, self.limits.operation_duration)?;
-        let (extraction, rights, admission) = {
+        let (extraction, rights, admission, typed_capability) = {
             let authority = self
                 .authority
                 .lock()
@@ -1374,6 +1483,7 @@ impl ProductionResearchIngestCoordinator {
                 extraction,
                 registered.rights.clone(),
                 registered.admission.clone(),
+                registered.typed_capability.clone(),
             )
         };
         let cancellation = CancellationToken::new();
@@ -1454,7 +1564,31 @@ impl ProductionResearchIngestCoordinator {
             operation_deadline,
         };
         operation.ensure_live()?;
-        Ok(operation)
+        Ok((operation, typed_capability))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn treasury_all_history_source_identity_for_test(
+        &self,
+        generation: &ResearchProviderRuntimeGeneration,
+        provider_dataset: &SourceIdentifier,
+    ) -> Result<usize, ServiceError> {
+        let structure = market_squawk_services::JsonStructureLimits::try_new(16, 4096, 64, 64)
+            .map_err(|_error| ServiceError::InvalidRequest)?;
+        let limits = ServiceLimits::try_new(4096, 8, 4096, 8, structure)
+            .map_err(|_error| ServiceError::InvalidRequest)?;
+        let context = RequestContext::new(
+            market_squawk_services::RequestId::String(Arc::from(
+                "test.treasury-all-history-source-identity",
+            )),
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(5),
+            limits,
+        );
+        let operation = self
+            .acquire_treasury_all_history_operation(generation, provider_dataset, &context)
+            .await?;
+        Ok(Arc::as_ptr(&operation.source) as usize)
     }
 
     /// Consumes a bounded static adapter composition before publishing the coordinator.
@@ -1562,7 +1696,13 @@ impl ProductionResearchIngestCoordinator {
         S: ManagedResearchExtractionSource,
     {
         let metadata = source.metadata().clone();
-        self.register_source_arc_inner(profile, metadata, Arc::new(source), rights, generation)
+        self.register_source_capability_inner(
+            profile,
+            metadata,
+            RegisteredSourceCapability::erased(source),
+            rights,
+            generation,
+        )
     }
 
     fn register_prepublished_source(
@@ -1575,14 +1715,20 @@ impl ProductionResearchIngestCoordinator {
             source,
             rights,
         } = registration;
-        self.register_source_arc_inner(profile, metadata, Arc::from(source), rights, None)
+        self.register_source_capability_inner(
+            profile,
+            metadata,
+            RegisteredSourceCapability::erased_arc(Arc::from(source)),
+            rights,
+            None,
+        )
     }
 
-    fn register_source_arc_inner(
+    fn register_source_capability_inner(
         &self,
         profile: SourceIdentifier,
         metadata: SourceMetadata,
-        source: Arc<dyn ManagedResearchExtractionSource>,
+        capability: RegisteredSourceCapability,
         rights: ResearchRightsAuthority,
         generation: Option<ResearchProviderRuntimeGeneration>,
     ) -> Result<(), ResearchIngestCompositionError> {
@@ -1618,10 +1764,12 @@ impl ProductionResearchIngestCoordinator {
             .as_mut()
             .ok_or(ResearchIngestCompositionError::ShuttingDown)?
             .register_or_resume_exact(metadata.clone(), registered_at)?;
+        let RegisteredSourceCapability { erased, typed } = capability;
         authority.sources.insert(
             profile,
             RegisteredExtractionSource {
-                source,
+                source: erased,
+                typed_capability: typed,
                 metadata,
                 registration: Box::new(registration),
                 rights,

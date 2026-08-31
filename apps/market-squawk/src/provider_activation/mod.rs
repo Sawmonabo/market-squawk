@@ -1233,9 +1233,9 @@ impl ProviderAdapterActivation {
                     return Err(ProviderAdapterActivationError::SurfaceMismatch);
                 }
                 let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
-                let source = TreasurySource::try_new(spec.metadata, spec.config)?;
+                let source = Arc::new(TreasurySource::try_new(spec.metadata, spec.config)?);
                 (
-                    self.prepare_runtime_replacement(
+                    self.prepare_treasury_runtime_replacement(
                         &lease,
                         expected,
                         candidate.clone(),
@@ -1370,13 +1370,37 @@ impl ProviderAdapterActivation {
     where
         S: ManagedResearchExtractionSource,
     {
-        let onboarding_authority = self.onboarding.acquire_runtime_mutation_authority().await;
-        onboarding_authority.require_prepared_or_active(candidate_lease)?;
-        let predecessor = onboarding_authority.active_lease(expected.session_id())?;
-        require_runtime_lease(&expected, &predecessor)?;
+        self.require_runtime_replacement_authority(candidate_lease, &expected)
+            .await?;
         self.research_mutation
             .prepare_provider_replacement(expected, candidate, source, rights)
             .map_err(Into::into)
+    }
+
+    async fn prepare_treasury_runtime_replacement(
+        &self,
+        candidate_lease: &ProviderActivationLease,
+        expected: ResearchProviderRuntimeGeneration,
+        candidate: ResearchProviderRuntimeGeneration,
+        source: Arc<TreasurySource>,
+        rights: ResearchRightsAuthority,
+    ) -> Result<ResearchProviderRuntimeReplacement, ProviderAdapterActivationError> {
+        self.require_runtime_replacement_authority(candidate_lease, &expected)
+            .await?;
+        self.research_mutation
+            .prepare_treasury_provider_replacement(expected, candidate, source, rights)
+            .map_err(Into::into)
+    }
+
+    async fn require_runtime_replacement_authority(
+        &self,
+        candidate_lease: &ProviderActivationLease,
+        expected: &ResearchProviderRuntimeGeneration,
+    ) -> Result<(), ProviderAdapterActivationError> {
+        let onboarding_authority = self.onboarding.acquire_runtime_mutation_authority().await;
+        onboarding_authority.require_prepared_or_active(candidate_lease)?;
+        let predecessor = onboarding_authority.active_lease(expected.session_id())?;
+        require_runtime_lease(expected, &predecessor)
     }
 
     async fn activate_with_lease(
@@ -1692,8 +1716,8 @@ impl ProviderAdapterActivation {
             return Err(ProviderAdapterActivationError::SurfaceMismatch);
         }
         let rights = provider_research_rights(&lease, spec.metadata.source_id())?;
-        let source = TreasurySource::try_new(spec.metadata, spec.config)?;
-        self.register(lease, source, rights)
+        let source = Arc::new(TreasurySource::try_new(spec.metadata, spec.config)?);
+        self.register_treasury(lease, source, rights)
     }
 
     async fn activate_fred(
@@ -1933,18 +1957,48 @@ impl ProviderAdapterActivation {
     where
         S: ManagedResearchExtractionSource,
     {
-        let profile = lease.surface_id().clone();
-        let generation = runtime_generation(&lease, source.metadata().clone(), rights.clone())?;
-        self.bind_authorization_subject(generation.metadata())?;
-        let onboarding_authority = self.onboarding.try_acquire_runtime_mutation_authority()?;
-        onboarding_authority.require_active(&lease)?;
+        let generation =
+            self.runtime_registration_generation(&lease, source.metadata(), &rights)?;
         self.research_mutation
             .register_provider_source(generation.clone(), source, rights)?;
         Ok(ActivatedResearchProvider {
             lease,
-            profile,
+            profile: generation.profile().clone(),
             generation,
         })
+    }
+
+    fn register_treasury(
+        &self,
+        lease: ProviderActivationLease,
+        source: Arc<TreasurySource>,
+        rights: ResearchRightsAuthority,
+    ) -> Result<ActivatedResearchProvider, ProviderAdapterActivationError> {
+        let generation =
+            self.runtime_registration_generation(&lease, source.metadata(), &rights)?;
+        self.research_mutation.register_treasury_provider_source(
+            generation.clone(),
+            source,
+            rights,
+        )?;
+        Ok(ActivatedResearchProvider {
+            lease,
+            profile: generation.profile().clone(),
+            generation,
+        })
+    }
+
+    fn runtime_registration_generation(
+        &self,
+        lease: &ProviderActivationLease,
+        metadata: &SourceMetadata,
+        rights: &ResearchRightsAuthority,
+    ) -> Result<ResearchProviderRuntimeGeneration, ProviderAdapterActivationError> {
+        let generation = runtime_generation(lease, metadata.clone(), rights.clone())?;
+        self.bind_authorization_subject(generation.metadata())?;
+        let onboarding_authority = self.onboarding.try_acquire_runtime_mutation_authority()?;
+        onboarding_authority.require_active(lease)?;
+        Ok(generation)
     }
 
     fn bind_authorization_subject(

@@ -1092,6 +1092,7 @@ async fn publish_candidate(
                         profile.clone(),
                         RegisteredExtractionSource {
                             source: Arc::clone(&candidate.source),
+                            typed_capability: super::RegisteredTypedSourceCapability::None,
                             metadata: candidate.metadata.clone(),
                             registration: Box::new(registration),
                             rights: candidate.rights.clone(),

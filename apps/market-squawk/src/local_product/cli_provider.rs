@@ -5492,6 +5492,14 @@ mod tests {
     #[tokio::test]
     async fn post_staging_failure_restores_callable_predecessor_and_quarantines_candidate()
     -> TestResult {
+        Box::pin(
+            post_staging_failure_restores_callable_predecessor_and_quarantines_candidate_body(),
+        )
+        .await
+    }
+
+    async fn post_staging_failure_restores_callable_predecessor_and_quarantines_candidate_body()
+    -> TestResult {
         let temporary = tempfile::tempdir()?;
         let config = AppConfig::load(ConfigSources::new(
             None,
@@ -5529,11 +5537,16 @@ mod tests {
             .provider_activation()
             .research_runtime_generation(predecessor_lease.surface_id())?
             .ok_or("predecessor runtime was not published")?;
+        let fiscal_dataset = treasury_fiscal_release_query(state)?.0.dataset()?;
         assert!(
             product
                 .research_ingest()
                 .is_profile_registered(predecessor.profile())?
         );
+        let predecessor_source_identity = product
+            .research_ingest()
+            .treasury_all_history_source_identity_for_test(&predecessor, &fiscal_dataset)
+            .await?;
 
         let same_session_candidate_digest = EvidenceDigest::new(
             DigestAlgorithm::Sha256,
@@ -5619,6 +5632,13 @@ mod tests {
                 .research_ingest()
                 .is_profile_registered(predecessor.profile())?
         );
+        assert!(
+            product
+                .research_ingest()
+                .treasury_all_history_source_identity_for_test(&predecessor, &fiscal_dataset)
+                .await
+                .is_err()
+        );
 
         reconcile_failed_replacement(
             state,
@@ -5654,6 +5674,13 @@ mod tests {
             product
                 .research_ingest()
                 .is_profile_registered(predecessor.profile())?
+        );
+        assert_eq!(
+            product
+                .research_ingest()
+                .treasury_all_history_source_identity_for_test(&predecessor, &fiscal_dataset)
+                .await?,
+            predecessor_source_identity
         );
         require_same_activation_lease(
             &product
@@ -5717,7 +5744,7 @@ mod tests {
             .provider_activation()
             .revoke_replacement_predecessor(&mut prepared)
             .await?;
-        let committed = product
+        let mut committed = product
             .provider_activation()
             .commit_research_replacement(&mut prepared)
             .await?;
@@ -5751,6 +5778,21 @@ mod tests {
             .provider_activation()
             .retire_replacement_predecessor(&committed, recovery_cutover)
             .await?;
+        let activated = product
+            .provider_activation()
+            .finalize_research_replacement(&mut committed)
+            .await?;
+        assert_eq!(activated.generation(), &recovery_candidate);
+        assert_ne!(
+            product
+                .research_ingest()
+                .treasury_all_history_source_identity_for_test(
+                    &recovery_candidate,
+                    &fiscal_dataset,
+                )
+                .await?,
+            predecessor_source_identity
+        );
         assert!(
             product
                 .provider_onboarding()
@@ -5801,6 +5843,10 @@ mod tests {
                 .research_ingest()
                 .is_profile_registered(recovery_candidate.profile())?
         );
+        let _restarted_source_identity = recovered
+            .research_ingest()
+            .treasury_all_history_source_identity_for_test(&recovery_candidate, &fiscal_dataset)
+            .await?;
         assert_eq!(
             recovered
                 .provider_onboarding()
@@ -5830,6 +5876,16 @@ mod tests {
             .provider_activation()
             .revoke_research_runtime(&recovery_candidate)
             .await?;
+        assert!(
+            recovered
+                .research_ingest()
+                .treasury_all_history_source_identity_for_test(
+                    &recovery_candidate,
+                    &fiscal_dataset,
+                )
+                .await
+                .is_err()
+        );
         recovered
             .provider_activation_state()
             .complete_source_lifecycle_transition(
@@ -5874,6 +5930,16 @@ mod tests {
             !recovered
                 .research_ingest()
                 .is_profile_registered(recovery_candidate.profile())?
+        );
+        assert!(
+            recovered
+                .research_ingest()
+                .treasury_all_history_source_identity_for_test(
+                    &recovery_candidate,
+                    &fiscal_dataset,
+                )
+                .await
+                .is_err()
         );
         require_same_activation_lease(
             &recovered
