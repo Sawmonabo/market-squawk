@@ -6,6 +6,7 @@
 //! not register a Desktop operation or claim that Desktop composition is complete.
 
 use std::{
+    cmp::Ordering,
     num::{NonZeroU32, NonZeroU64},
     sync::Arc,
     time::Instant,
@@ -219,6 +220,7 @@ impl BlsMacroApplicationClosure {
         {
             return Err(BlsMacroApplicationError::RestartVerificationMismatch);
         }
+        let retained_request = analytical.clone();
         let output = self
             .research
             .analytical_reader()
@@ -229,15 +231,16 @@ impl BlsMacroApplicationClosure {
                 cancellation,
             )
             .await?;
-        if output.source_id() != restart_selector.source_id()
-            || output.output().manifest() != restart_selector.manifest()
-        {
-            return Err(BlsMacroApplicationError::InvalidReadResult);
+        if !validate_provider_period_consumer_read(&restart_selector, &retained_request, &output)? {
+            return Ok(BlsMacroCapabilityState::Unavailable(
+                BlsMacroUnavailableReason::IncompleteSeriesAtCutoff,
+            ));
         }
         Ok(BlsMacroCapabilityState::Available(
             BlsProviderPeriodLatestKnownDto {
                 restart_selector,
                 reopened,
+                analytical_request: retained_request,
                 output,
             },
         ))
@@ -483,13 +486,22 @@ pub(crate) enum BlsMacroUnavailableReason {
     ActivationRequired,
     /// No exact atomic generation/manifest selector is available for the typed read.
     ManifestRequired,
+    /// The exact cutoff did not yield one explicit observed-or-missing row for every series.
+    IncompleteSeriesAtCutoff,
 }
 
-/// Typed successful result for the fixed BLS provider-period operation.
+/// Typed successful result and provider-neutral consumer handoff for the fixed BLS operation.
+///
+/// The handoff retains the exact shared analytical request alongside its shared typed output, so
+/// macro context, feature, forecast, and backtest consumers can inherit one immutable manifest,
+/// source-qualified allowlist, knowledge cutoff, provider-period cutoff, and selection digest. It
+/// is produced only for a complete series set; provider-native missing rows remain data while an
+/// absent row yields [`BlsMacroUnavailableReason::IncompleteSeriesAtCutoff`].
 #[derive(Debug)]
 pub(crate) struct BlsProviderPeriodLatestKnownDto {
     restart_selector: ProviderMacroPlanRestartSelector,
     reopened: PinnedDataset,
+    analytical_request: AnalyticalMacroProviderPeriodLatestKnownRequest,
     output: AnalyticalMacroProviderPeriodLatestKnownOutput,
 }
 
@@ -509,6 +521,13 @@ impl BlsProviderPeriodLatestKnownDto {
         &self.reopened
     }
 
+    /// Returns the exact shared PIT request that produced the consumer handoff.
+    pub(crate) const fn analytical_request(
+        &self,
+    ) -> &AnalyticalMacroProviderPeriodLatestKnownRequest {
+        &self.analytical_request
+    }
+
     /// Returns typed Macro observations with exact SourcePeriod, missingness, and clock evidence.
     pub(crate) const fn output(&self) -> &AnalyticalMacroProviderPeriodLatestKnownOutput {
         &self.output
@@ -518,6 +537,79 @@ impl BlsProviderPeriodLatestKnownDto {
     pub(crate) const fn source_id(&self) -> &SourceId {
         self.output.source_id()
     }
+}
+
+/// Validates that one shared analytical read is safe to hand to every downstream macro consumer.
+///
+/// `Ok(false)` denotes an honest incomplete snapshot: unlike a BLS `-` row, an absent requested
+/// series has no canonical missingness evidence and cannot become a usable context silently.
+fn validate_provider_period_consumer_read(
+    restart_selector: &ProviderMacroPlanRestartSelector,
+    request: &AnalyticalMacroProviderPeriodLatestKnownRequest,
+    output: &AnalyticalMacroProviderPeriodLatestKnownOutput,
+) -> Result<bool, BlsMacroApplicationError> {
+    if request.manifest() != restart_selector.manifest()
+        || request.source_series().source_id() != restart_selector.source_id()
+        || output.source_id() != restart_selector.source_id()
+        || output.output().manifest() != restart_selector.manifest()
+        || output.period_scheme() != request.effective_period_cutoff().scheme()
+    {
+        return Err(BlsMacroApplicationError::InvalidReadResult);
+    }
+
+    let expected_series = request.source_series().series_allowlist().series();
+    let observations = output.observations();
+    if observations.len() > expected_series.len() {
+        return Err(BlsMacroApplicationError::InvalidReadResult);
+    }
+
+    for (index, observation) in observations.iter().enumerate() {
+        if expected_series.binary_search(observation.series()).is_err()
+            || observations[..index]
+                .iter()
+                .any(|prior| prior.series() == observation.series())
+        {
+            return Err(BlsMacroApplicationError::InvalidReadResult);
+        }
+
+        let context = observation.context();
+        let provenance = context.provenance();
+        let time = context.time();
+        let Some(effective_period) = time.effective().source_period_value() else {
+            return Err(BlsMacroApplicationError::InvalidReadResult);
+        };
+        if effective_period.scheme() != output.period_scheme()
+            || !matches!(
+                effective_period.partial_cmp(request.effective_period_cutoff()),
+                Some(Ordering::Less | Ordering::Equal)
+            )
+            || time.published().is_some()
+            || time.superseded().is_some()
+            || provenance.source_id() != restart_selector.source_id()
+            || provenance.instrument_id().is_some()
+            || provenance.venue_id().is_some()
+            || provenance.source_timestamp().is_some()
+            || provenance.received_at() > request.knowledge_cutoff()
+            || provenance.ingested_at() > request.knowledge_cutoff()
+        {
+            return Err(BlsMacroApplicationError::InvalidReadResult);
+        }
+        match provenance.availability().conservative_available_at() {
+            Some(available_at) if available_at <= request.knowledge_cutoff() => {}
+            Some(_) | None => return Err(BlsMacroApplicationError::InvalidReadResult),
+        }
+        match (
+            observation.value().observed_value(),
+            observation.value().missing_value(),
+        ) {
+            (Some(_), None) | (None, Some(_)) => {}
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(BlsMacroApplicationError::InvalidReadResult);
+            }
+        }
+    }
+
+    Ok(observations.len() == expected_series.len())
 }
 
 fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), BlsMacroApplicationError> {
