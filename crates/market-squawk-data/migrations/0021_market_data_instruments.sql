@@ -2565,3 +2565,481 @@ CREATE TRIGGER analytical_generation_market_bar_history_inputs_immutable_delete
 BEFORE DELETE ON analytical_generation_market_bar_history_inputs BEGIN
     SELECT RAISE(ABORT, 'analytical generation market-bar history inputs are immutable');
 END;
+
+-- Provider-neutral durable acquisition state for bounded multi-response macro publications.
+-- Checkpoint bytes remain opaque to common code; only their exact SHA-256 identity and CAS
+-- coordinate are interpreted here.
+CREATE TABLE provider_macro_plan_sessions (
+    session_id TEXT PRIMARY KEY CHECK (length(CAST(session_id AS BLOB)) = 36),
+    analytical_dataset TEXT NOT NULL CHECK (
+        length(CAST(analytical_dataset AS BLOB)) BETWEEN 1 AND 256
+    ),
+    source_id TEXT NOT NULL REFERENCES sources(source_id),
+    metadata_revision TEXT NOT NULL CHECK (
+        length(CAST(metadata_revision AS BLOB)) BETWEEN 1 AND 512
+    ),
+    provider_dataset TEXT NOT NULL CHECK (
+        length(CAST(provider_dataset AS BLOB)) BETWEEN 1 AND 512
+    ),
+    source_generation_digest BLOB NOT NULL CHECK (
+        length(source_generation_digest) = 32
+        AND source_generation_digest <> zeroblob(32)
+    ),
+    state TEXT NOT NULL CHECK (state IN ('acquiring', 'complete')),
+    state_version INTEGER NOT NULL CHECK (state_version BETWEEN 0 AND 1024),
+    checkpoint_digest BLOB NOT NULL CHECK (
+        length(checkpoint_digest) = 32 AND checkpoint_digest <> zeroblob(32)
+    ),
+    checkpoint_bytes BLOB NOT NULL CHECK (
+        length(checkpoint_bytes) BETWEEN 1 AND 16777216
+    ),
+    response_count INTEGER NOT NULL CHECK (response_count BETWEEN 0 AND 1024),
+    data_page_count INTEGER NOT NULL CHECK (data_page_count BETWEEN 0 AND 1023),
+    analytical_row_count INTEGER NOT NULL CHECK (
+        analytical_row_count BETWEEN 0 AND 102300000
+    ),
+    semantics_bytes INTEGER NOT NULL CHECK (semantics_bytes BETWEEN 0 AND 67108864),
+    created_at_ns INTEGER NOT NULL,
+    updated_at_ns INTEGER NOT NULL,
+    CHECK (updated_at_ns >= created_at_ns),
+    CHECK (
+        (state = 'acquiring'
+            AND response_count = data_page_count
+            AND state_version = response_count)
+        OR (state = 'complete'
+            AND response_count BETWEEN 2 AND 1024
+            AND data_page_count = response_count - 1
+            AND state_version = response_count)
+    )
+) STRICT;
+
+CREATE UNIQUE INDEX provider_macro_plan_one_acquiring_session
+ON provider_macro_plan_sessions(
+    analytical_dataset,
+    source_id,
+    provider_dataset,
+    source_generation_digest
+)
+WHERE state = 'acquiring';
+
+CREATE TABLE provider_macro_plan_staged_pages (
+    session_id TEXT NOT NULL REFERENCES provider_macro_plan_sessions(session_id),
+    page_ordinal INTEGER NOT NULL CHECK (page_ordinal BETWEEN 0 AND 1022),
+    candidate_digest BLOB NOT NULL CHECK (
+        length(candidate_digest) = 32 AND candidate_digest <> zeroblob(32)
+    ),
+    binding_digest BLOB NOT NULL UNIQUE
+        REFERENCES provider_capture_bindings(binding_digest),
+    capture_observation_digest BLOB NOT NULL UNIQUE
+        REFERENCES provider_raw_observations(capture_observation_digest),
+    canonical_record_count INTEGER NOT NULL CHECK (
+        canonical_record_count BETWEEN 1 AND 100000
+    ),
+    semantics_schema TEXT NOT NULL CHECK (
+        length(CAST(semantics_schema AS BLOB)) BETWEEN 1 AND 512
+    ),
+    semantics_schema_requirement_digest BLOB NOT NULL CHECK (
+        length(semantics_schema_requirement_digest) = 32
+        AND semantics_schema_requirement_digest <> zeroblob(32)
+    ),
+    semantics_digest BLOB NOT NULL CHECK (
+        length(semantics_digest) = 32 AND semantics_digest <> zeroblob(32)
+    ),
+    semantics_payload BLOB NOT NULL CHECK (
+        length(semantics_payload) BETWEEN 1 AND 16777216
+    ),
+    semantics_payload_digest BLOB NOT NULL CHECK (
+        length(semantics_payload_digest) = 32
+        AND semantics_payload_digest <> zeroblob(32)
+    ),
+    staged_at_ns INTEGER NOT NULL,
+    PRIMARY KEY (session_id, page_ordinal),
+    UNIQUE (session_id, candidate_digest),
+    UNIQUE (session_id, binding_digest)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_macro_plan_terminal_completions (
+    session_id TEXT PRIMARY KEY REFERENCES provider_macro_plan_sessions(session_id),
+    response_ordinal INTEGER NOT NULL CHECK (response_ordinal BETWEEN 1 AND 1023),
+    adapter_completion_digest BLOB NOT NULL CHECK (
+        length(adapter_completion_digest) = 32
+        AND adapter_completion_digest <> zeroblob(32)
+    ),
+    capture_observation_digest BLOB NOT NULL UNIQUE
+        REFERENCES provider_raw_observations(capture_observation_digest),
+    sealed_capture_receipt_digest BLOB NOT NULL UNIQUE CHECK (
+        length(sealed_capture_receipt_digest) = 32
+        AND sealed_capture_receipt_digest <> zeroblob(32)
+    ),
+    raw_claim_digest BLOB NOT NULL,
+    physical_receipt_digest BLOB NOT NULL CHECK (
+        length(physical_receipt_digest) = 32
+        AND physical_receipt_digest <> zeroblob(32)
+    ),
+    completed_at_ns INTEGER NOT NULL,
+    UNIQUE (session_id, response_ordinal),
+    FOREIGN KEY (
+        capture_observation_digest,
+        raw_claim_digest,
+        physical_receipt_digest
+    ) REFERENCES provider_raw_observation_objects(
+        capture_observation_digest,
+        raw_claim_digest,
+        physical_receipt_digest
+    )
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_macro_plan_publications (
+    publication_digest BLOB PRIMARY KEY CHECK (
+        length(publication_digest) = 32 AND publication_digest <> zeroblob(32)
+    ),
+    generation_sequence INTEGER NOT NULL UNIQUE
+        REFERENCES analytical_generations(generation_sequence),
+    session_id TEXT NOT NULL UNIQUE
+        REFERENCES provider_macro_plan_terminal_completions(session_id),
+    manifest_dataset_id TEXT NOT NULL CHECK (
+        length(CAST(manifest_dataset_id AS BLOB)) BETWEEN 1 AND 256
+    ),
+    manifest_version INTEGER NOT NULL CHECK (manifest_version > 0),
+    manifest_schema_name TEXT NOT NULL CHECK (
+        length(CAST(manifest_schema_name AS BLOB)) BETWEEN 1 AND 128
+    ),
+    manifest_schema_version INTEGER NOT NULL CHECK (manifest_schema_version > 0),
+    manifest_schema_fingerprint BLOB NOT NULL CHECK (
+        length(manifest_schema_fingerprint) = 32
+        AND manifest_schema_fingerprint <> zeroblob(32)
+    ),
+    manifest_content_hash BLOB NOT NULL CHECK (
+        length(manifest_content_hash) = 32 AND manifest_content_hash <> zeroblob(32)
+    ),
+    anchor_manifest_id TEXT NOT NULL UNIQUE REFERENCES dataset_manifests(manifest_id),
+    run_id TEXT NOT NULL UNIQUE REFERENCES ingest_runs(run_id),
+    source_id TEXT NOT NULL REFERENCES sources(source_id),
+    metadata_revision TEXT NOT NULL CHECK (
+        length(CAST(metadata_revision AS BLOB)) BETWEEN 1 AND 512
+    ),
+    provider_dataset TEXT NOT NULL CHECK (
+        length(CAST(provider_dataset AS BLOB)) BETWEEN 1 AND 512
+    ),
+    source_generation_digest BLOB NOT NULL CHECK (
+        length(source_generation_digest) = 32
+        AND source_generation_digest <> zeroblob(32)
+    ),
+    request_set_identity BLOB NOT NULL CHECK (
+        length(request_set_identity) = 32 AND request_set_identity <> zeroblob(32)
+    ),
+    adapter_completion_digest BLOB NOT NULL CHECK (
+        length(adapter_completion_digest) = 32
+        AND adapter_completion_digest <> zeroblob(32)
+    ),
+    terminal_seal_digest BLOB NOT NULL CHECK (
+        length(terminal_seal_digest) = 32 AND terminal_seal_digest <> zeroblob(32)
+    ),
+    catalog_receipt_digest BLOB NOT NULL UNIQUE CHECK (
+        length(catalog_receipt_digest) = 32
+        AND catalog_receipt_digest <> zeroblob(32)
+    ),
+    response_count INTEGER NOT NULL CHECK (response_count BETWEEN 2 AND 1024),
+    data_page_count INTEGER NOT NULL CHECK (data_page_count BETWEEN 1 AND 1023),
+    analytical_row_count INTEGER NOT NULL CHECK (
+        analytical_row_count BETWEEN 1 AND 102300000
+    ),
+    completed_checkpoint_version INTEGER NOT NULL CHECK (
+        completed_checkpoint_version BETWEEN 2 AND 1024
+    ),
+    completed_checkpoint_digest BLOB NOT NULL CHECK (
+        length(completed_checkpoint_digest) = 32
+        AND completed_checkpoint_digest <> zeroblob(32)
+    ),
+    predecessor_publication_digest BLOB REFERENCES provider_macro_plan_publications(
+        publication_digest
+    ),
+    predecessor_manifest_dataset_id TEXT,
+    predecessor_manifest_version INTEGER,
+    predecessor_checkpoint_version INTEGER,
+    predecessor_checkpoint_digest BLOB,
+    published_at_ns INTEGER NOT NULL,
+    UNIQUE (manifest_dataset_id, manifest_version),
+    CHECK (data_page_count = response_count - 1),
+    CHECK (completed_checkpoint_version = response_count),
+    CHECK (
+        (predecessor_publication_digest IS NULL
+            AND predecessor_manifest_dataset_id IS NULL
+            AND predecessor_manifest_version IS NULL
+            AND predecessor_checkpoint_version IS NULL
+            AND predecessor_checkpoint_digest IS NULL)
+        OR (predecessor_publication_digest IS NOT NULL
+            AND predecessor_manifest_dataset_id IS NOT NULL
+            AND predecessor_manifest_version IS NOT NULL
+            AND predecessor_manifest_version > 0
+            AND predecessor_checkpoint_version BETWEEN 2 AND 1024
+            AND length(predecessor_checkpoint_digest) = 32
+            AND predecessor_checkpoint_digest <> zeroblob(32))
+    )
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_macro_plan_published_heads (
+    analytical_dataset TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    provider_dataset TEXT NOT NULL,
+    publication_digest BLOB NOT NULL UNIQUE
+        REFERENCES provider_macro_plan_publications(publication_digest),
+    session_id TEXT NOT NULL UNIQUE REFERENCES provider_macro_plan_sessions(session_id),
+    generation_sequence INTEGER NOT NULL UNIQUE
+        REFERENCES analytical_generations(generation_sequence),
+    manifest_version INTEGER NOT NULL CHECK (manifest_version > 0),
+    completed_checkpoint_version INTEGER NOT NULL CHECK (
+        completed_checkpoint_version BETWEEN 2 AND 1024
+    ),
+    completed_checkpoint_digest BLOB NOT NULL CHECK (
+        length(completed_checkpoint_digest) = 32
+        AND completed_checkpoint_digest <> zeroblob(32)
+    ),
+    advanced_at_ns INTEGER NOT NULL,
+    PRIMARY KEY (analytical_dataset, source_id, provider_dataset)
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER provider_macro_plan_sessions_guarded_update
+BEFORE UPDATE ON provider_macro_plan_sessions
+WHEN OLD.state <> 'acquiring'
+    OR NEW.session_id <> OLD.session_id
+    OR NEW.analytical_dataset <> OLD.analytical_dataset
+    OR NEW.source_id <> OLD.source_id
+    OR NEW.metadata_revision <> OLD.metadata_revision
+    OR NEW.provider_dataset <> OLD.provider_dataset
+    OR NEW.source_generation_digest <> OLD.source_generation_digest
+    OR NEW.created_at_ns <> OLD.created_at_ns
+    OR NEW.updated_at_ns < OLD.updated_at_ns
+    OR NEW.checkpoint_digest = OLD.checkpoint_digest
+    OR NEW.checkpoint_bytes = OLD.checkpoint_bytes
+    OR NEW.state_version <> OLD.state_version + 1
+    OR NEW.response_count <> OLD.response_count + 1
+    OR (
+        NEW.state = 'acquiring'
+        AND (
+            NEW.data_page_count <> OLD.data_page_count + 1
+            OR NEW.analytical_row_count <= OLD.analytical_row_count
+            OR NEW.semantics_bytes <= OLD.semantics_bytes
+            OR NOT EXISTS (
+                SELECT 1 FROM provider_macro_plan_staged_pages AS page
+                WHERE page.session_id = OLD.session_id
+                  AND page.page_ordinal = OLD.data_page_count
+                  AND NEW.analytical_row_count =
+                      OLD.analytical_row_count + page.canonical_record_count
+                  AND NEW.semantics_bytes =
+                      OLD.semantics_bytes + length(page.semantics_payload)
+            )
+        )
+    )
+    OR (
+        NEW.state = 'complete'
+        AND (
+            NEW.data_page_count <> OLD.data_page_count
+            OR NEW.analytical_row_count <> OLD.analytical_row_count
+            OR NEW.semantics_bytes <> OLD.semantics_bytes
+            OR NOT EXISTS (
+                SELECT 1 FROM provider_macro_plan_terminal_completions AS terminal
+                WHERE terminal.session_id = OLD.session_id
+                  AND terminal.response_ordinal = OLD.response_count
+            )
+        )
+    )
+    OR NEW.state NOT IN ('acquiring', 'complete')
+BEGIN
+    SELECT RAISE(ABORT, 'invalid provider macro-plan session transition');
+END;
+
+CREATE TRIGGER provider_macro_plan_staged_pages_guarded_insert
+BEFORE INSERT ON provider_macro_plan_staged_pages
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM provider_macro_plan_sessions AS session
+    JOIN provider_capture_bindings AS binding
+      ON binding.binding_digest = NEW.binding_digest
+    JOIN provider_raw_observations AS capture
+      ON capture.capture_observation_digest = binding.capture_observation_digest
+    WHERE session.session_id = NEW.session_id
+      AND session.state = 'acquiring'
+      AND session.data_page_count = NEW.page_ordinal
+      AND session.response_count = NEW.page_ordinal
+      AND binding.capture_observation_digest = NEW.capture_observation_digest
+      AND binding.canonical_record_count = NEW.canonical_record_count
+      AND capture.source_id = session.source_id
+      AND capture.metadata_revision = session.metadata_revision
+      AND capture.provider_dataset = session.provider_dataset
+      AND capture.terminal_disposition = 'standalone_response'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid provider macro-plan staged page');
+END;
+
+CREATE TRIGGER provider_macro_plan_terminal_completions_guarded_insert
+BEFORE INSERT ON provider_macro_plan_terminal_completions
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM provider_macro_plan_sessions AS session
+    JOIN provider_raw_observations AS capture
+      ON capture.capture_observation_digest = NEW.capture_observation_digest
+    JOIN provider_raw_observation_objects AS object
+      ON object.capture_observation_digest = capture.capture_observation_digest
+     AND object.input_ordinal = 0
+     AND object.raw_claim_digest = NEW.raw_claim_digest
+     AND object.physical_receipt_digest = NEW.physical_receipt_digest
+    WHERE session.session_id = NEW.session_id
+      AND session.state = 'acquiring'
+      AND session.data_page_count BETWEEN 1 AND 1023
+      AND session.response_count = NEW.response_ordinal
+      AND capture.source_id = session.source_id
+      AND capture.metadata_revision = session.metadata_revision
+      AND capture.provider_dataset = session.provider_dataset
+      AND capture.terminal_disposition = 'standalone_response'
+      AND capture.page_count = 1
+      AND object.capture_receipt_digest = NEW.sealed_capture_receipt_digest
+      AND NOT EXISTS (
+          SELECT 1 FROM provider_capture_bindings AS binding
+          WHERE binding.capture_observation_digest = capture.capture_observation_digest
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid provider macro-plan terminal completion');
+END;
+
+CREATE TRIGGER provider_macro_plan_publications_guarded_insert
+BEFORE INSERT ON provider_macro_plan_publications
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM analytical_generations AS generation
+    JOIN analytical_generation_source_inputs AS source_input
+      ON source_input.generation_sequence = generation.generation_sequence
+    JOIN ingest_runs AS run ON run.run_id = source_input.run_id
+    JOIN provider_macro_plan_sessions AS session ON session.session_id = NEW.session_id
+    JOIN provider_macro_plan_terminal_completions AS terminal
+      ON terminal.session_id = session.session_id
+    WHERE generation.generation_sequence = NEW.generation_sequence
+      AND generation.dataset_id = NEW.manifest_dataset_id
+      AND generation.manifest_version = NEW.manifest_version
+      AND generation.schema_name = NEW.manifest_schema_name
+      AND generation.schema_version = NEW.manifest_schema_version
+      AND generation.schema_fingerprint = NEW.manifest_schema_fingerprint
+      AND generation.content_hash = NEW.manifest_content_hash
+      AND generation.anchor_manifest_id = NEW.anchor_manifest_id
+      AND generation.generation_kind = 'ingest'
+      AND generation.row_count = NEW.analytical_row_count
+      AND run.run_id = NEW.run_id
+      AND run.state = 'reserved'
+      AND run.operation = 'persist'
+      AND run.source_id = NEW.source_id
+      AND run.payload_digest = NEW.publication_digest
+      AND session.state = 'complete'
+      AND session.analytical_dataset = NEW.manifest_dataset_id
+      AND session.source_id = NEW.source_id
+      AND session.metadata_revision = NEW.metadata_revision
+      AND session.provider_dataset = NEW.provider_dataset
+      AND session.source_generation_digest = NEW.source_generation_digest
+      AND session.response_count = NEW.response_count
+      AND session.data_page_count = NEW.data_page_count
+      AND session.analytical_row_count = NEW.analytical_row_count
+      AND session.state_version = NEW.completed_checkpoint_version
+      AND session.checkpoint_digest = NEW.completed_checkpoint_digest
+      AND terminal.adapter_completion_digest = NEW.adapter_completion_digest
+      AND terminal.sealed_capture_receipt_digest = NEW.terminal_seal_digest
+      AND (SELECT COUNT(*) FROM provider_macro_plan_staged_pages AS page
+           WHERE page.session_id = session.session_id) = session.data_page_count
+      AND (SELECT COUNT(*) FROM ingest_run_provider_capture_bindings AS input
+           WHERE input.run_id = run.run_id) = session.data_page_count
+      AND (SELECT COUNT(*)
+           FROM analytical_generation_provider_capture_bindings AS input
+           WHERE input.generation_sequence = generation.generation_sequence
+             AND input.run_id = run.run_id) = session.data_page_count
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid provider macro-plan publication');
+END;
+
+CREATE TRIGGER provider_macro_plan_published_heads_guarded_insert
+BEFORE INSERT ON provider_macro_plan_published_heads
+WHEN NOT EXISTS (
+    SELECT 1 FROM provider_macro_plan_publications AS publication
+    WHERE publication.publication_digest = NEW.publication_digest
+      AND publication.predecessor_publication_digest IS NULL
+      AND publication.session_id = NEW.session_id
+      AND publication.generation_sequence = NEW.generation_sequence
+      AND publication.manifest_dataset_id = NEW.analytical_dataset
+      AND publication.source_id = NEW.source_id
+      AND publication.provider_dataset = NEW.provider_dataset
+      AND publication.manifest_version = NEW.manifest_version
+      AND publication.completed_checkpoint_version = NEW.completed_checkpoint_version
+      AND publication.completed_checkpoint_digest = NEW.completed_checkpoint_digest
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid initial provider macro-plan published head');
+END;
+
+CREATE TRIGGER provider_macro_plan_published_heads_guarded_update
+BEFORE UPDATE ON provider_macro_plan_published_heads
+WHEN NEW.analytical_dataset <> OLD.analytical_dataset
+    OR NEW.source_id <> OLD.source_id
+    OR NEW.provider_dataset <> OLD.provider_dataset
+    OR NEW.publication_digest = OLD.publication_digest
+    OR NEW.manifest_version <= OLD.manifest_version
+    OR NEW.advanced_at_ns < OLD.advanced_at_ns
+    OR NOT EXISTS (
+        SELECT 1 FROM provider_macro_plan_publications AS publication
+        WHERE publication.publication_digest = NEW.publication_digest
+          AND publication.predecessor_publication_digest = OLD.publication_digest
+          AND publication.predecessor_manifest_dataset_id = OLD.analytical_dataset
+          AND publication.predecessor_manifest_version = OLD.manifest_version
+          AND publication.predecessor_checkpoint_version = OLD.completed_checkpoint_version
+          AND publication.predecessor_checkpoint_digest = OLD.completed_checkpoint_digest
+          AND publication.session_id = NEW.session_id
+          AND publication.generation_sequence = NEW.generation_sequence
+          AND publication.manifest_dataset_id = NEW.analytical_dataset
+          AND publication.source_id = NEW.source_id
+          AND publication.provider_dataset = NEW.provider_dataset
+          AND publication.manifest_version = NEW.manifest_version
+          AND publication.completed_checkpoint_version = NEW.completed_checkpoint_version
+          AND publication.completed_checkpoint_digest = NEW.completed_checkpoint_digest
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid provider macro-plan published-head successor');
+END;
+
+CREATE TRIGGER provider_macro_plan_sessions_immutable_delete
+BEFORE DELETE ON provider_macro_plan_sessions BEGIN
+    SELECT RAISE(ABORT, 'provider macro-plan sessions are immutable');
+END;
+
+CREATE TRIGGER provider_macro_plan_staged_pages_immutable_update
+BEFORE UPDATE ON provider_macro_plan_staged_pages BEGIN
+    SELECT RAISE(ABORT, 'provider macro-plan staged pages are immutable');
+END;
+
+CREATE TRIGGER provider_macro_plan_staged_pages_immutable_delete
+BEFORE DELETE ON provider_macro_plan_staged_pages BEGIN
+    SELECT RAISE(ABORT, 'provider macro-plan staged pages are immutable');
+END;
+
+CREATE TRIGGER provider_macro_plan_terminal_completions_immutable_update
+BEFORE UPDATE ON provider_macro_plan_terminal_completions BEGIN
+    SELECT RAISE(ABORT, 'provider macro-plan terminal completions are immutable');
+END;
+
+CREATE TRIGGER provider_macro_plan_terminal_completions_immutable_delete
+BEFORE DELETE ON provider_macro_plan_terminal_completions BEGIN
+    SELECT RAISE(ABORT, 'provider macro-plan terminal completions are immutable');
+END;
+
+CREATE TRIGGER provider_macro_plan_publications_immutable_update
+BEFORE UPDATE ON provider_macro_plan_publications BEGIN
+    SELECT RAISE(ABORT, 'provider macro-plan publications are immutable');
+END;
+
+CREATE TRIGGER provider_macro_plan_publications_immutable_delete
+BEFORE DELETE ON provider_macro_plan_publications BEGIN
+    SELECT RAISE(ABORT, 'provider macro-plan publications are immutable');
+END;
+
+CREATE TRIGGER provider_macro_plan_published_heads_immutable_delete
+BEFORE DELETE ON provider_macro_plan_published_heads BEGIN
+    SELECT RAISE(ABORT, 'provider macro-plan published heads cannot be deleted');
+END;

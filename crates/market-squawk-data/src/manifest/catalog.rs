@@ -42,8 +42,11 @@ use super::{
 use crate::OptionMarketPointInTimeRequest;
 use crate::catalog::exact_catalog_file_binding;
 use crate::catalog::{
-    PreparedProviderCaptureBinding, PublicationSourceEvidence, complete_ingest_in_transaction,
-    publish_artifact_manifest_in_transaction, trusted_catalog_now,
+    PreparedProviderCaptureBinding, ProviderMacroPlanPublicationCommit,
+    ProviderMacroPlanPublishedHead, ProviderMacroPlanRestartProjection, PublicationSourceEvidence,
+    complete_ingest_in_transaction, load_provider_macro_plan_head,
+    publish_artifact_manifest_in_transaction, publish_provider_macro_plan_record,
+    reconstruct_provider_macro_plan_projection, trusted_catalog_now,
 };
 use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
 use crate::{
@@ -1069,6 +1072,130 @@ impl AnalyticalManifestCatalog {
         )?;
         transaction.commit()?;
         Ok((manifest, receipt_digest))
+    }
+
+    /// Atomically publishes one completed staged macro plan and advances its exact durable head.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the atomic publication keeps each independent catalog capability explicit"
+    )]
+    pub(crate) fn commit_staged_provider_macro_plan_publication(
+        &self,
+        catalog_session_id: Uuid,
+        result_limits: CatalogResultLimits,
+        reservation: &IngestReservation,
+        plan: &ManifestPlan,
+        artifact: &ArtifactRecord,
+        anchor: &DatasetManifestRecord,
+        schema: &DatasetSchemaRef,
+        source_input: &IngestRunRecord,
+        staged: &ProviderMacroPlanPublicationCommit,
+    ) -> Result<(DatasetManifestRef, EvidenceDigest), ManifestCatalogError> {
+        if reservation.catalog_id() != catalog_session_id
+            || reservation.run_id() != source_input.run_id()
+            || source_input.operation() != SourceOperation::Persist
+            || source_input.payload_digest() != staged.publication_digest()
+        {
+            return Err(ManifestCatalogError::ProviderMacroPlanMismatch);
+        }
+        DatasetSchemaRegistry::local().resolve(schema)?;
+        validate_generation_anchor(plan, artifact, anchor, schema)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let catalog_now = trusted_catalog_now(&transaction)?;
+        if artifact.created_at() > catalog_now
+            || anchor.created_at() > catalog_now
+            || catalog_now < reservation.requested_at()
+        {
+            return Err(ManifestCatalogError::CatalogAuthority(
+                CatalogError::PublicationTimeConflict,
+            ));
+        }
+        let artifact = ArtifactRecord::try_new(
+            artifact.relative_reference(),
+            artifact.content_digest(),
+            artifact.size_bytes(),
+            catalog_now,
+        )?;
+        let anchor = DatasetManifestRecord::try_new(
+            anchor.dataset_name().clone(),
+            anchor.schema_version(),
+            artifact.artifact_id(),
+            anchor.content_digest(),
+            catalog_now,
+        );
+        validate_generation_anchor(plan, &artifact, &anchor, schema)?;
+        let publication = publish_artifact_manifest_in_transaction(
+            &transaction,
+            result_limits,
+            reservation,
+            &artifact,
+            &anchor,
+            PublicationSourceEvidence::StagedProviderMacroPlan(staged),
+            catalog_now,
+        )?;
+        let manifest = commit_generation_in_transaction(
+            &transaction,
+            plan,
+            publication.artifact(),
+            publication.manifest(),
+            schema,
+            GenerationKind::Ingest,
+            Some(source_input),
+            None,
+            self.max_objects_per_generation,
+        )?;
+        let generation_sequence: i64 = transaction.query_row(
+            "SELECT generation_sequence FROM analytical_generations
+             WHERE dataset_id=?1 AND manifest_version=?2 AND schema_name=?3
+               AND schema_version=?4 AND schema_fingerprint=?5 AND content_hash=?6",
+            params![
+                manifest.dataset_id().as_str(),
+                to_i64(manifest.manifest_version())?,
+                manifest.schema().name(),
+                i64::from(manifest.schema().version().get()),
+                manifest.schema().fingerprint().as_slice(),
+                manifest.content_hash().bytes(),
+            ],
+            |row| row.get(0),
+        )?;
+        let receipt = publish_provider_macro_plan_record(
+            &transaction,
+            staged,
+            &manifest,
+            anchor.manifest_id(),
+            reservation.run_id(),
+            generation_sequence,
+            catalog_now,
+        )?;
+        complete_ingest_in_transaction(
+            &transaction,
+            reservation,
+            ContractCompletion::Succeeded,
+            None,
+            catalog_now,
+        )?;
+        transaction.commit()?;
+        Ok((manifest, receipt))
+    }
+
+    pub(crate) fn provider_macro_plan_published_head(
+        &self,
+        analytical_dataset: &DatasetId,
+        source_id: &SourceId,
+        provider_dataset: &market_squawk_domain::SourceIdentifier,
+    ) -> Result<Option<ProviderMacroPlanPublishedHead>, ManifestCatalogError> {
+        let connection = self.lock()?;
+        load_provider_macro_plan_head(&connection, analytical_dataset, source_id, provider_dataset)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn provider_macro_plan_restart_projection(
+        &self,
+        manifest: &DatasetManifestRef,
+    ) -> Result<ProviderMacroPlanRestartProjection, ManifestCatalogError> {
+        let connection = self.lock()?;
+        reconstruct_provider_macro_plan_projection(&connection, manifest).map_err(Into::into)
     }
 
     /// Reopens only the supplied immutable generation and verifies the exact whole-plan receipt.

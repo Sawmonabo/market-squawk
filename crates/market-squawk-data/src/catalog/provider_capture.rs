@@ -10,9 +10,10 @@ use market_squawk_sources::{
     MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES,
     ProviderCaptureBindingDigest, ProviderCaptureBindingLayout, ProviderCapturePageReceipt,
     ProviderCapturePhysicalClaimEvidenceRef, ProviderCaptureRowFrameEvidence, ProviderCaptureScope,
-    ProviderCaptureSetReceipt, ProviderNativeLineageBatchSidecarEvidenceRef,
-    ProviderNativeLineageImplementation, ProviderNativeLineageRowEvidenceRef,
-    SealedProviderCaptureBinding, SourceMetadata, verify_provider_native_lineage_batch_evidence,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+    ProviderNativeLineageBatchSidecarEvidenceRef, ProviderNativeLineageImplementation,
+    ProviderNativeLineageRowEvidenceRef, ProviderWholeCaptureToken, SealedProviderCaptureBinding,
+    SourceMetadata, verify_provider_native_lineage_batch_evidence,
 };
 use rusqlite::{Connection, OptionalExtension as _, params};
 use sha2::{Digest as _, Sha256};
@@ -593,6 +594,60 @@ impl PreparedProviderCaptureBinding {
     pub(crate) fn rows(&self) -> &[PersistedProviderCaptureBindingRow] {
         &self.evidence.rows
     }
+    pub(crate) const fn capture(&self) -> &ProviderCaptureSetReceipt {
+        &self.evidence.capture
+    }
+}
+
+/// Completion-only raw evidence. Construction consumes the original whole-capture authority and
+/// deliberately exposes no analytical batch, native lineage, revisions, or row mapping.
+#[derive(Debug)]
+pub(crate) struct ProviderMacroPlanCompletionCapture {
+    capture: ProviderCaptureSetReceipt,
+    sealed_capture_receipt_digest: EvidenceDigest,
+    physical_claim: PersistedProviderCapturePhysicalClaim,
+}
+
+impl ProviderMacroPlanCompletionCapture {
+    pub(crate) fn try_from_live(token: ProviderWholeCaptureToken) -> Result<Self, CatalogError> {
+        let receipt = token.persisted_receipt().clone();
+        let capture = receipt.capture().clone();
+        if capture.terminal() != ProviderCaptureTerminalDisposition::StandaloneResponse
+            || capture.pages().len() != 1
+            || receipt.segment().frames().len() != 1
+        {
+            return Err(CatalogError::ProviderCaptureMismatch);
+        }
+        let claim = receipt.segment().claim().clone();
+        let claim_json = journal_claim_json(&claim)?;
+        if claim_json.len() > MAX_PROVIDER_CLAIM_JSON_BYTES {
+            return Err(CatalogError::ResultByteLimitExceeded);
+        }
+        let physical_claim = PersistedProviderCapturePhysicalClaim {
+            raw_claim_digest: raw_claim_digest(claim_json.as_bytes()),
+            capture_content_digest: capture.content_digest(),
+            capture_observation_digest: capture.observation_digest(),
+            sealed_capture_receipt_digest: receipt.receipt_digest(),
+            claim,
+        };
+        Ok(Self {
+            capture,
+            sealed_capture_receipt_digest: receipt.receipt_digest(),
+            physical_claim,
+        })
+    }
+
+    pub(crate) const fn capture(&self) -> &ProviderCaptureSetReceipt {
+        &self.capture
+    }
+
+    pub(crate) const fn sealed_capture_receipt_digest(&self) -> EvidenceDigest {
+        self.sealed_capture_receipt_digest
+    }
+
+    pub(crate) const fn physical_claim(&self) -> &PersistedProviderCapturePhysicalClaim {
+        &self.physical_claim
+    }
 }
 
 impl Catalog {
@@ -691,6 +746,15 @@ impl Catalog {
                       SELECT 1 FROM official_options_reference_objects AS object
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
                         AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
+                    OR EXISTS (
+                      SELECT 1
+                      FROM provider_raw_observation_objects AS object
+                      JOIN provider_macro_plan_terminal_completions AS terminal
+                        ON terminal.capture_observation_digest=object.capture_observation_digest
+                       AND terminal.raw_claim_digest=object.raw_claim_digest
+                       AND terminal.physical_receipt_digest=object.physical_receipt_digest
+                      WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
                  ) ORDER BY raw_claim_digest LIMIT ?2",
             )?;
             let mut rows = statement.query(params![after.bytes().as_slice(), limit])?;
@@ -731,6 +795,15 @@ impl Catalog {
                         AND partition.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
                     OR EXISTS (
                       SELECT 1 FROM official_options_reference_objects AS object
+                      WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
+                        AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
+                    OR EXISTS (
+                      SELECT 1
+                      FROM provider_raw_observation_objects AS object
+                      JOIN provider_macro_plan_terminal_completions AS terminal
+                        ON terminal.capture_observation_digest=object.capture_observation_digest
+                       AND terminal.raw_claim_digest=object.raw_claim_digest
+                       AND terminal.physical_receipt_digest=object.physical_receipt_digest
                       WHERE object.raw_claim_digest=sealed_raw_objects.raw_claim_digest
                         AND object.physical_receipt_digest=sealed_raw_objects.physical_receipt_digest)
                  ORDER BY raw_claim_digest LIMIT ?1",
@@ -942,8 +1015,14 @@ pub(super) fn retain_prepared_provider_capture_binding_evidence(
         return Err(CatalogError::ProviderCaptureMismatch);
     }
     validate_source_revision(connection, &evidence.capture)?;
-    require_physical_claim_capacity(connection, evidence)?;
-    insert_raw_observation(connection, evidence, recorded_at)?;
+    require_physical_claim_capacity(connection, &evidence.physical_claims)?;
+    insert_raw_observation(
+        connection,
+        &evidence.capture,
+        &evidence.physical_claims,
+        &evidence.layout,
+        recorded_at,
+    )?;
     insert_binding(connection, evidence, recorded_at)?;
     let retained = load_provider_capture_binding_evidence(connection, evidence.binding_digest)?
         .ok_or(CatalogError::ProviderCaptureConflict)?;
@@ -953,9 +1032,50 @@ pub(super) fn retain_prepared_provider_capture_binding_evidence(
     Ok(())
 }
 
+pub(crate) fn retain_staged_provider_capture_binding(
+    connection: &rusqlite::Transaction<'_>,
+    prepared: &PreparedProviderCaptureBinding,
+    recorded_at: Timestamp,
+) -> Result<(), CatalogError> {
+    let evidence = &prepared.evidence;
+    evidence.verify_integrity()?;
+    validate_source_revision(connection, &evidence.capture)?;
+    require_physical_claim_capacity(connection, &evidence.physical_claims)?;
+    insert_raw_observation(
+        connection,
+        &evidence.capture,
+        &evidence.physical_claims,
+        &evidence.layout,
+        recorded_at,
+    )?;
+    insert_binding(connection, evidence, recorded_at)?;
+    let retained = load_provider_capture_binding_evidence(connection, evidence.binding_digest)?
+        .ok_or(CatalogError::ProviderCaptureConflict)?;
+    if retained != *evidence {
+        return Err(CatalogError::ProviderCaptureConflict);
+    }
+    Ok(())
+}
+
+pub(crate) fn retain_provider_macro_plan_completion_capture(
+    connection: &rusqlite::Transaction<'_>,
+    prepared: &ProviderMacroPlanCompletionCapture,
+    recorded_at: Timestamp,
+) -> Result<(), CatalogError> {
+    validate_source_revision(connection, &prepared.capture)?;
+    require_physical_claim_capacity(connection, std::slice::from_ref(&prepared.physical_claim))?;
+    insert_raw_observation(
+        connection,
+        &prepared.capture,
+        std::slice::from_ref(&prepared.physical_claim),
+        "whole_single_segment",
+        recorded_at,
+    )
+}
+
 fn require_physical_claim_capacity(
     connection: &Connection,
-    evidence: &PersistedProviderCaptureBindingEvidence,
+    physical_claims: &[PersistedProviderCapturePhysicalClaim],
 ) -> Result<(), CatalogError> {
     let (retained, retained_bytes): (i64, i64) = connection.query_row(
         "SELECT physical_claims, physical_bytes
@@ -972,10 +1092,10 @@ fn require_physical_claim_capacity(
     }
     let mut new_digests = Vec::new();
     new_digests
-        .try_reserve_exact(evidence.physical_claims.len())
+        .try_reserve_exact(physical_claims.len())
         .map_err(|_| CatalogError::Allocation)?;
     let mut new_bytes = 0u64;
-    for physical in &evidence.physical_claims {
+    for physical in physical_claims {
         if new_digests.contains(&physical.raw_claim_digest.bytes()) {
             continue;
         }
@@ -1031,10 +1151,11 @@ fn append_authoritative_raw_claim_rows(
 
 fn insert_raw_observation(
     connection: &Connection,
-    evidence: &PersistedProviderCaptureBindingEvidence,
+    capture: &ProviderCaptureSetReceipt,
+    physical_claims: &[PersistedProviderCapturePhysicalClaim],
+    layout: &str,
     recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
-    let capture = &evidence.capture;
     let capture_json = serde_json::to_string(capture)?;
     if capture_json.len() > MAX_PROVIDER_CLAIM_JSON_BYTES {
         return Err(CatalogError::ProviderCaptureMismatch);
@@ -1069,7 +1190,7 @@ fn insert_raw_observation(
     for page in capture.pages() {
         insert_page(connection, capture.observation_digest(), page)?;
     }
-    for (segment_ordinal, physical) in evidence.physical_claims.iter().enumerate() {
+    for (segment_ordinal, physical) in physical_claims.iter().enumerate() {
         let claim = &physical.claim;
         let claim_json = journal_claim_json(claim)?;
         if claim_json.len() > MAX_PROVIDER_CLAIM_JSON_BYTES {
@@ -1113,7 +1234,7 @@ fn insert_raw_observation(
             ],
         )?;
         for frame in claim.frames() {
-            let observation_ordinal = if evidence.layout == "ordered_segments" {
+            let observation_ordinal = if layout == "ordered_segments" {
                 segment_ordinal
             } else {
                 usize::try_from(frame.ordinal())
@@ -1234,7 +1355,7 @@ fn insert_binding(
     Ok(())
 }
 
-fn load_provider_capture_binding_evidence(
+pub(crate) fn load_provider_capture_binding_evidence(
     connection: &Connection,
     binding_digest: EvidenceDigest,
 ) -> Result<Option<PersistedProviderCaptureBindingEvidence>, CatalogError> {

@@ -5,6 +5,7 @@ use rusqlite::{OptionalExtension as _, Transaction, params};
 use uuid::Uuid;
 
 use super::provider_capture::retain_ordered_prepared_provider_capture_bindings;
+use super::provider_macro_plan::retain_completed_provider_macro_plan_for_run;
 use super::storage::{
     ResultBudget, append_audit, digest_columns, parse_digest, require_reserved_run,
     trusted_catalog_now,
@@ -27,6 +28,8 @@ pub(crate) enum PublicationSourceEvidence<'a> {
     Provider(&'a PreparedProviderCaptureBinding),
     /// One complete macro plan consumes every prepared capture in exact chunk order.
     ProviderMacroPlan(&'a [PreparedProviderCaptureBinding]),
+    /// One completed staged macro plan links its already retained ordered evidence atomically.
+    StagedProviderMacroPlan(&'a super::ProviderMacroPlanPublicationCommit),
     /// The provider publication consumes one exact typed event/composite binding.
     ProviderEvent(&'a PreparedProviderPublicationBinding),
     /// The provider publication consumes one exact sealed option-market binding.
@@ -274,6 +277,14 @@ pub(crate) fn publish_artifact_manifest_in_transaction(
                 transaction,
                 reservation.run_id,
                 bindings,
+                catalog_now,
+            )?;
+        }
+        PublicationSourceEvidence::StagedProviderMacroPlan(commit) => {
+            retain_completed_provider_macro_plan_for_run(
+                transaction,
+                reservation.run_id,
+                commit,
                 catalog_now,
             )?;
         }
