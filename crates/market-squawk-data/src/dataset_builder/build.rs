@@ -361,7 +361,7 @@ async fn read_inputs(
             let (observations, observation_bytes) =
                 ResearchArrowBatch::decode_record_batch_bounded(batch, budget.remaining()?)
                     .map_err(|error| match error {
-                        crate::ArrowConversionError::RetainedLimitExceeded
+                        crate::ArrowConversionError::RetainedLimitExceeded { .. }
                         | crate::ArrowConversionError::AllocationFailure
                         | crate::ArrowConversionError::RetainedSizeOverflow => {
                             DatasetBuildError::LimitExceeded

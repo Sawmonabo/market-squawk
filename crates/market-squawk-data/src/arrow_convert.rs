@@ -1513,7 +1513,10 @@ impl ResearchArrowBatch {
         let candidate = Self { schema_ref, batch };
         let (working_bytes, observation_bytes) = candidate.decode_admission(None)?;
         if working_bytes > max_additional_bytes {
-            return Err(ArrowConversionError::RetainedLimitExceeded);
+            return Err(ArrowConversionError::RetainedLimitExceeded {
+                required_bytes: working_bytes,
+                limit_bytes: max_additional_bytes,
+            });
         }
         let observations = candidate.decode_payloads(None)?;
         let request_digests = candidate.decode_request_digests(None)?;
@@ -1620,12 +1623,14 @@ impl ResearchArrowBatch {
         } else {
             0
         };
-        if working_bytes
+        let required_bytes = working_bytes
             .checked_add(coordinate_bytes)
-            .ok_or(ArrowConversionError::RetainedSizeOverflow)?
-            > max_additional_bytes
-        {
-            return Err(ArrowConversionError::RetainedLimitExceeded);
+            .ok_or(ArrowConversionError::RetainedSizeOverflow)?;
+        if required_bytes > max_additional_bytes {
+            return Err(ArrowConversionError::RetainedLimitExceeded {
+                required_bytes,
+                limit_bytes: max_additional_bytes,
+            });
         }
         let observations = candidate.decode_payloads(control.as_deref_mut())?;
         let request_digests = candidate.decode_request_digests(control.as_deref_mut())?;
@@ -2274,8 +2279,39 @@ pub enum ArrowConversionError {
     #[error("Arrow analytical projection does not match its canonical payload")]
     ProjectionMismatch,
     /// A caller-selected retained-memory ceiling cannot admit decoding and projection validation.
-    #[error("research Arrow decoding exceeds the retained-memory ceiling")]
-    RetainedLimitExceeded,
+    #[error(
+        "research Arrow decoding requires {required_bytes} retained bytes; limit is {limit_bytes}"
+    )]
+    RetainedLimitExceeded {
+        /// Exact checked retained bytes required at the rejecting boundary.
+        required_bytes: usize,
+        /// Exact caller or production retained-byte ceiling.
+        limit_bytes: usize,
+    },
+    /// A caller supplied an invalid retained-byte ceiling rather than exhausting a valid ceiling.
+    #[error("invalid retained-byte limit {requested_bytes}; production maximum is {maximum_bytes}")]
+    InvalidRetainedByteLimit {
+        /// Exact caller-supplied retained-byte ceiling.
+        requested_bytes: usize,
+        /// Exact production maximum retained-byte ceiling.
+        maximum_bytes: usize,
+    },
+    /// A caller supplied an invalid record ceiling.
+    #[error("invalid record limit {requested_records}; production maximum is {maximum_records}")]
+    InvalidRecordLimit {
+        /// Exact caller-supplied record ceiling.
+        requested_records: usize,
+        /// Exact production maximum record ceiling.
+        maximum_records: usize,
+    },
+    /// An exact result contained more records than its admitted ceiling.
+    #[error("result contains {observed_records} records; limit is {limit_records}")]
+    RecordLimitExceeded {
+        /// Exact observed result cardinality.
+        observed_records: usize,
+        /// Exact admitted result cardinality.
+        limit_records: usize,
+    },
     /// Fallible vector reservation failed before decoding.
     #[error("research Arrow decoding allocation reservation failed")]
     AllocationFailure,

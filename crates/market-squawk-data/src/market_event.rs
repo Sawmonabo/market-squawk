@@ -105,7 +105,10 @@ impl ProviderMarketEventArrowBatch {
             .verify_integrity()
             .map_err(|_| ArrowConversionError::InvalidMarketEventRow)?;
         if maximum_retained_bytes == 0 || maximum_retained_bytes > MAX_EVENT_RESTART_BYTES {
-            return Err(ArrowConversionError::RetainedLimitExceeded);
+            return Err(ArrowConversionError::InvalidRetainedByteLimit {
+                requested_bytes: maximum_retained_bytes,
+                maximum_bytes: MAX_EVENT_RESTART_BYTES,
+            });
         }
         let dataset = DatasetArrowBatch::try_from_record_batch(batch)?;
         if dataset.schema_ref().name()
@@ -116,8 +119,12 @@ impl ProviderMarketEventArrowBatch {
             return Err(ArrowConversionError::UnexpectedDatasetSchema);
         }
         let batch = dataset.record_batch();
-        if batch.get_array_memory_size() > maximum_retained_bytes {
-            return Err(ArrowConversionError::RetainedLimitExceeded);
+        let required_bytes = batch.get_array_memory_size();
+        if required_bytes > maximum_retained_bytes {
+            return Err(ArrowConversionError::RetainedLimitExceeded {
+                required_bytes,
+                limit_bytes: maximum_retained_bytes,
+            });
         }
         let metadata = batch.schema().metadata().clone();
         let publication_digest = metadata

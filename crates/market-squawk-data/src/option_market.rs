@@ -125,14 +125,21 @@ impl ProviderOptionMarketArrowBatch {
             .verify_integrity()
             .map_err(|_| ArrowConversionError::InvalidOptionMarketRow)?;
         if maximum_retained_bytes == 0 || maximum_retained_bytes > MAX_OPTION_RESTART_BYTES {
-            return Err(ArrowConversionError::RetainedLimitExceeded);
+            return Err(ArrowConversionError::InvalidRetainedByteLimit {
+                requested_bytes: maximum_retained_bytes,
+                maximum_bytes: MAX_OPTION_RESTART_BYTES,
+            });
         }
         let dataset = DatasetArrowBatch::try_from_record_batch(batch)?;
         if dataset.schema_ref().name() != OPTION_MARKET_SCHEMA_NAME {
             return Err(ArrowConversionError::UnexpectedDatasetSchema);
         }
-        if dataset.record_batch().get_array_memory_size() > maximum_retained_bytes {
-            return Err(ArrowConversionError::RetainedLimitExceeded);
+        let required_bytes = dataset.record_batch().get_array_memory_size();
+        if required_bytes > maximum_retained_bytes {
+            return Err(ArrowConversionError::RetainedLimitExceeded {
+                required_bytes,
+                limit_bytes: maximum_retained_bytes,
+            });
         }
         let metadata = dataset.record_batch().schema().metadata().clone();
         let publication_digest = metadata
@@ -327,11 +334,17 @@ impl OptionMarketPointInTimeRequest {
     ) -> Result<Self, ArrowConversionError> {
         if maximum_canonical_rows == 0
             || maximum_canonical_rows > MAX_PROVIDER_OPTION_MARKET_BATCH_ROWS
-            || exact_manifest
-                .as_ref()
-                .is_some_and(|manifest| manifest.dataset_id() != &dataset)
         {
-            return Err(ArrowConversionError::RetainedLimitExceeded);
+            return Err(ArrowConversionError::InvalidRecordLimit {
+                requested_records: maximum_canonical_rows,
+                maximum_records: MAX_PROVIDER_OPTION_MARKET_BATCH_ROWS,
+            });
+        }
+        if exact_manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.dataset_id() != &dataset)
+        {
+            return Err(ArrowConversionError::ExtractionBindingMismatch);
         }
         Ok(Self {
             dataset,

@@ -1646,9 +1646,10 @@ fn map_fund_data_error(error: IngestError) -> CanonicalResearchReadError {
         IngestError::Cancelled => CanonicalResearchReadError::Cancelled,
         IngestError::DeadlineExceeded => CanonicalResearchReadError::DeadlineExceeded,
         IngestError::AuthorityLockPoisoned => CanonicalResearchReadError::AuthorityUnavailable,
-        IngestError::Arrow(ArrowConversionError::RetainedLimitExceeded) => {
-            CanonicalResearchReadError::ResourceExhausted
-        }
+        IngestError::Arrow(
+            ArrowConversionError::RetainedLimitExceeded { .. }
+            | ArrowConversionError::RecordLimitExceeded { .. },
+        ) => CanonicalResearchReadError::ResourceExhausted,
         IngestError::ReplayConflict => CanonicalResearchReadError::RestartConflict,
         _ => CanonicalResearchReadError::EvidenceConflict,
     }

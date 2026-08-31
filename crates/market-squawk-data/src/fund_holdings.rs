@@ -47,8 +47,14 @@ impl FundHoldingsArrowBatch {
         dataset: SourceIdentifier,
         mut records: Vec<FundEvidenceRecord>,
     ) -> Result<Self, ArrowConversionError> {
-        if records.is_empty() || records.len() > MAX_FUND_HOLDINGS_BATCH_RECORDS {
-            return Err(ArrowConversionError::RetainedLimitExceeded);
+        if records.is_empty() {
+            return Err(ArrowConversionError::EmptyBatch);
+        }
+        if records.len() > MAX_FUND_HOLDINGS_BATCH_RECORDS {
+            return Err(ArrowConversionError::RecordLimitExceeded {
+                observed_records: records.len(),
+                limit_records: MAX_FUND_HOLDINGS_BATCH_RECORDS,
+            });
         }
         canonical_sort(&mut records);
         validate_unique_records(&records)?;
@@ -74,7 +80,10 @@ impl FundHoldingsArrowBatch {
                 .checked_add(payload.len())
                 .ok_or(ArrowConversionError::RetainedSizeOverflow)?;
             if retained_bytes > MAX_FUND_HOLDINGS_RETAINED_BYTES {
-                return Err(ArrowConversionError::RetainedLimitExceeded);
+                return Err(ArrowConversionError::RetainedLimitExceeded {
+                    required_bytes: retained_bytes,
+                    limit_bytes: MAX_FUND_HOLDINGS_RETAINED_BYTES,
+                });
             }
             payload_digests.push(sha256_evidence(&payload));
             payloads.push(payload);
@@ -263,8 +272,12 @@ impl FundHoldingsArrowBatch {
             )),
         ];
         let batch = RecordBatch::try_new(schema, arrays)?;
-        if batch.get_array_memory_size() > MAX_FUND_HOLDINGS_RETAINED_BYTES {
-            return Err(ArrowConversionError::RetainedLimitExceeded);
+        let required_bytes = batch.get_array_memory_size();
+        if required_bytes > MAX_FUND_HOLDINGS_RETAINED_BYTES {
+            return Err(ArrowConversionError::RetainedLimitExceeded {
+                required_bytes,
+                limit_bytes: MAX_FUND_HOLDINGS_RETAINED_BYTES,
+            });
         }
         let dataset = DatasetArrowBatch::try_from_record_batch(batch)?;
         let candidate = Self {
@@ -292,7 +305,10 @@ impl FundHoldingsArrowBatch {
     ) -> Result<Self, ArrowConversionError> {
         if maximum_retained_bytes == 0 || maximum_retained_bytes > MAX_FUND_HOLDINGS_RETAINED_BYTES
         {
-            return Err(ArrowConversionError::RetainedLimitExceeded);
+            return Err(ArrowConversionError::InvalidRetainedByteLimit {
+                requested_bytes: maximum_retained_bytes,
+                maximum_bytes: MAX_FUND_HOLDINGS_RETAINED_BYTES,
+            });
         }
         let dataset = DatasetArrowBatch::try_from_record_batch(batch)?;
         if dataset.schema_ref().name() != FUND_HOLDINGS_SCHEMA_NAME
@@ -313,7 +329,10 @@ impl FundHoldingsArrowBatch {
             .checked_add(additional_bytes)
             .ok_or(ArrowConversionError::RetainedSizeOverflow)?;
         if admitted_bytes > maximum_retained_bytes {
-            return Err(ArrowConversionError::RetainedLimitExceeded);
+            return Err(ArrowConversionError::RetainedLimitExceeded {
+                required_bytes: admitted_bytes,
+                limit_bytes: maximum_retained_bytes,
+            });
         }
 
         let mut records = Vec::new();
@@ -566,14 +585,17 @@ impl FundPointInTimeRequest {
         maximum_records: usize,
         exact_manifest: Option<DatasetManifestRef>,
     ) -> Result<Self, ArrowConversionError> {
-        if maximum_records == 0
-            || maximum_records > MAX_FUND_HOLDINGS_BATCH_RECORDS
-            || exact_manifest.as_ref().is_some_and(|manifest| {
-                manifest.dataset_id() != &dataset
-                    || manifest.schema().name() != FUND_HOLDINGS_SCHEMA_NAME
-            })
-        {
-            return Err(ArrowConversionError::RetainedLimitExceeded);
+        if maximum_records == 0 || maximum_records > MAX_FUND_HOLDINGS_BATCH_RECORDS {
+            return Err(ArrowConversionError::InvalidRecordLimit {
+                requested_records: maximum_records,
+                maximum_records: MAX_FUND_HOLDINGS_BATCH_RECORDS,
+            });
+        }
+        if exact_manifest.as_ref().is_some_and(|manifest| {
+            manifest.dataset_id() != &dataset
+                || manifest.schema().name() != FUND_HOLDINGS_SCHEMA_NAME
+        }) {
+            return Err(ArrowConversionError::ExtractionBindingMismatch);
         }
         Ok(Self {
             dataset,
@@ -685,7 +707,10 @@ impl FundPointInTimeSelection {
             .cloned()
             .collect::<Vec<_>>();
         if known.len() > request.maximum_records() {
-            return Err(ArrowConversionError::RetainedLimitExceeded);
+            return Err(ArrowConversionError::RecordLimitExceeded {
+                observed_records: known.len(),
+                limit_records: request.maximum_records(),
+            });
         }
         canonical_sort(&mut known);
 

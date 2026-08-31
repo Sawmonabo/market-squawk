@@ -136,7 +136,10 @@ impl SecFundPointInTimeReadRequest {
         maximum_records: usize,
     ) -> Result<Self, ArrowConversionError> {
         if maximum_records == 0 || maximum_records > MAX_FUND_HOLDINGS_BATCH_RECORDS {
-            return Err(ArrowConversionError::RetainedLimitExceeded);
+            return Err(ArrowConversionError::InvalidRecordLimit {
+                requested_records: maximum_records,
+                maximum_records: MAX_FUND_HOLDINGS_BATCH_RECORDS,
+            });
         }
         Ok(Self {
             fund_instrument_id,
