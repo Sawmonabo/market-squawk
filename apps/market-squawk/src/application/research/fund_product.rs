@@ -14,6 +14,7 @@ use market_squawk_domain::{
     FundNavFinality, FundNavMissingState, FundNavObservation, FundNavValue, FundReportedDecimal,
     FundReportedValue, FundRevisionStatus, InstrumentId, Money, Timestamp,
 };
+use rust_decimal::Decimal;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -23,8 +24,7 @@ use super::company_research::{
     FundResearchUnavailableReason,
 };
 use super::sec_fund_product::{
-    FundAnnualInformationData, FundHoldingData, FundResearchAvailability, FundResearchData,
-    FundResearchFilingState,
+    FundHoldingData, FundResearchAvailability, FundResearchData, FundResearchFilingState,
 };
 use crate::application::domain_support::{ProductTextCopyError, try_boxed_product_text};
 
@@ -88,6 +88,7 @@ pub(crate) struct FundProductResult {
     holdings: FundHoldingsProduct,
     annual_information: FundAnnualInformationProduct,
     current_research: FundCurrentResearchProduct,
+    portfolio_analysis: FundPortfolioAnalysisProduct,
     clocks: FundProductClocks,
     coverage: FundProductCoverage,
     limitations: Box<[FundProductLimitation]>,
@@ -132,6 +133,10 @@ impl FundProductResult {
         &self.current_research
     }
 
+    pub(crate) const fn portfolio_analysis(&self) -> &FundPortfolioAnalysisProduct {
+        &self.portfolio_analysis
+    }
+
     pub(crate) const fn clocks(&self) -> &FundProductClocks {
         &self.clocks
     }
@@ -142,6 +147,13 @@ impl FundProductResult {
 
     pub(crate) fn limitations(&self) -> &[FundProductLimitation] {
         &self.limitations
+    }
+
+    pub(crate) fn compare_overlap(
+        &self,
+        other: &Self,
+    ) -> Result<FundOverlapProduct, FundProductProjectionError> {
+        compare_fund_overlap(self, other)
     }
 }
 
@@ -258,6 +270,10 @@ pub(crate) struct FundHoldingProduct {
     #[serde(skip)]
     instrument_id: Option<InstrumentId>,
     identity: Option<ResearchProductIdentity>,
+    #[serde(skip)]
+    percentage_weight: Option<Decimal>,
+    #[serde(skip)]
+    percentage_weight_conflict: bool,
     quantity: FundProductValue<FundQuantityProduct>,
     value: FundProductValue<FundMoneyProduct>,
     percentage_of_net_assets: FundProductValue<Box<str>>,
@@ -391,6 +407,116 @@ pub(crate) enum FundNavProductMissingReason {
     NotReported,
     Invalid,
     Unavailable,
+}
+
+/// Reusable portfolio research derived only from exact point-in-time holdings.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FundPortfolioAnalysisProduct {
+    exposure: FundExposureProduct,
+    concentration: FundConcentrationProduct,
+}
+
+impl FundPortfolioAnalysisProduct {
+    pub(crate) const fn exposure(&self) -> &FundExposureProduct {
+        &self.exposure
+    }
+
+    pub(crate) const fn concentration(&self) -> &FundConcentrationProduct {
+        &self.concentration
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FundAnalysisState {
+    Reported,
+    Partial,
+    Missing,
+    Conflict,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FundExposureProduct {
+    state: FundAnalysisState,
+    net_reported_weight: Option<Decimal>,
+    gross_reported_weight: Option<Decimal>,
+    identified_gross_weight: Option<Decimal>,
+    weighted_holdings: usize,
+    identified_weighted_holdings: usize,
+}
+
+impl FundExposureProduct {
+    pub(crate) const fn state(&self) -> FundAnalysisState {
+        self.state
+    }
+
+    pub(crate) const fn net_reported_weight(&self) -> Option<Decimal> {
+        self.net_reported_weight
+    }
+
+    pub(crate) const fn gross_reported_weight(&self) -> Option<Decimal> {
+        self.gross_reported_weight
+    }
+
+    pub(crate) const fn identified_gross_weight(&self) -> Option<Decimal> {
+        self.identified_gross_weight
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FundConcentrationProduct {
+    state: FundAnalysisState,
+    largest_holding_weight: Option<Decimal>,
+    top_five_weight: Option<Decimal>,
+    top_ten_weight: Option<Decimal>,
+    herfindahl_index: Option<Decimal>,
+    analyzed_holdings: usize,
+}
+
+impl FundConcentrationProduct {
+    pub(crate) const fn state(&self) -> FundAnalysisState {
+        self.state
+    }
+
+    pub(crate) const fn largest_holding_weight(&self) -> Option<Decimal> {
+        self.largest_holding_weight
+    }
+
+    pub(crate) const fn herfindahl_index(&self) -> Option<Decimal> {
+        self.herfindahl_index
+    }
+}
+
+/// Pairwise same-instrument overlap with honest incomplete-identity coverage.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FundOverlapProduct {
+    state: FundAnalysisState,
+    gross_overlap_weight: Option<Decimal>,
+    matched_holdings: usize,
+    left_analyzed_holdings: usize,
+    right_analyzed_holdings: usize,
+    left_excluded_holdings: usize,
+    right_excluded_holdings: usize,
+    knowledge_cutoff: Timestamp,
+}
+
+impl FundOverlapProduct {
+    pub(crate) const fn state(&self) -> FundAnalysisState {
+        self.state
+    }
+
+    pub(crate) const fn gross_overlap_weight(&self) -> Option<Decimal> {
+        self.gross_overlap_weight
+    }
+
+    pub(crate) const fn matched_holdings(&self) -> usize {
+        self.matched_holdings
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -766,6 +892,7 @@ fn project_snapshot(
         return Err(FundProductProjectionError::InvalidEvidence);
     }
 
+    let portfolio_analysis = project_portfolio_analysis(&holdings, &coverage)?;
     let limitations = limitations_for(&coverage, annual, &nav)?;
     let availability = snapshot_availability(&coverage, annual, &nav);
     Ok(FundProductResult {
@@ -781,6 +908,7 @@ fn project_snapshot(
         current_research: FundCurrentResearchProduct {
             net_asset_value: nav,
         },
+        portfolio_analysis,
         clocks: FundProductClocks {
             knowledge_cutoff,
             latest_fund_information_known_at: latest_timestamp(
@@ -853,6 +981,7 @@ fn closed_snapshot_result(
         current_research: FundCurrentResearchProduct {
             net_asset_value: nav,
         },
+        portfolio_analysis: empty_portfolio_analysis(analysis_state_for_section(holdings_state)),
         clocks: FundProductClocks {
             knowledge_cutoff,
             latest_fund_information_known_at: latest_timestamp(
@@ -893,6 +1022,8 @@ fn project_holding(
     Ok(FundHoldingProduct {
         instrument_id: holding.instrument_id(),
         identity: None,
+        percentage_weight: reported_decimal(holding.percentage_of_net_assets())?,
+        percentage_weight_conflict: holding.percentage_of_net_assets().conflict().is_some(),
         quantity: project_quantity(holding.quantity(), coverage, budget)?,
         value: project_money(holding.value(), coverage, budget)?,
         percentage_of_net_assets: project_decimal(
@@ -1334,6 +1465,7 @@ fn empty_result(
         current_research: FundCurrentResearchProduct {
             net_asset_value: nav,
         },
+        portfolio_analysis: empty_portfolio_analysis(analysis_state_for_section(section_state)),
         clocks: FundProductClocks {
             knowledge_cutoff,
             latest_fund_information_known_at: annual_data.and_then(|value| value.latest_known_at()),
@@ -1577,6 +1709,341 @@ fn count_conflicting_weights(
         } else {
             Ok(count)
         }
+    })
+}
+
+fn reported_decimal(
+    value: &FundReportedValue<FundReportedDecimal>,
+) -> Result<Option<Decimal>, FundProductProjectionError> {
+    value
+        .reported()
+        .map(|reported| {
+            Decimal::from_str_exact(reported.as_str())
+                .map_err(|_| FundProductProjectionError::InvalidEvidence)
+        })
+        .transpose()
+}
+
+fn project_portfolio_analysis(
+    holdings: &[FundHoldingProduct],
+    coverage: &FundProductCoverage,
+) -> Result<FundPortfolioAnalysisProduct, FundProductProjectionError> {
+    let mut net_reported_weight = Decimal::ZERO;
+    let mut gross_reported_weight = Decimal::ZERO;
+    let mut identified_gross_weight = Decimal::ZERO;
+    let mut weighted_holdings = 0_usize;
+    let mut identified_weighted_holdings = 0_usize;
+    let mut conflicting_weight_holdings = 0_usize;
+    for holding in holdings {
+        if holding.percentage_weight_conflict {
+            conflicting_weight_holdings = increment(conflicting_weight_holdings)?;
+        }
+        let Some(weight) = holding.percentage_weight else {
+            continue;
+        };
+        weighted_holdings = increment(weighted_holdings)?;
+        net_reported_weight = net_reported_weight
+            .checked_add(weight)
+            .ok_or(FundProductProjectionError::InvalidEvidence)?;
+        gross_reported_weight = gross_reported_weight
+            .checked_add(weight.abs())
+            .ok_or(FundProductProjectionError::InvalidEvidence)?;
+        if holding.instrument_id.is_some() {
+            identified_weighted_holdings = increment(identified_weighted_holdings)?;
+            identified_gross_weight = identified_gross_weight
+                .checked_add(weight.abs())
+                .ok_or(FundProductProjectionError::InvalidEvidence)?;
+        }
+    }
+    if weighted_holdings != coverage.reported_weights
+        || identified_weighted_holdings > coverage.identified_holdings
+    {
+        return Err(FundProductProjectionError::InvalidEvidence);
+    }
+    let exposure_state = analysis_state(
+        holdings.len(),
+        weighted_holdings,
+        identified_weighted_holdings,
+        conflicting_weight_holdings,
+    );
+    let portfolio = weighted_portfolio(holdings)?;
+    let concentration_state = if portfolio.conflicting_weight_holdings > 0 {
+        FundAnalysisState::Conflict
+    } else if holdings.is_empty() {
+        FundAnalysisState::Missing
+    } else if portfolio.positions.is_empty() {
+        FundAnalysisState::Unavailable
+    } else if portfolio.excluded_holdings == 0 {
+        FundAnalysisState::Reported
+    } else {
+        FundAnalysisState::Partial
+    };
+    let mut absolute_weights = Vec::new();
+    absolute_weights
+        .try_reserve_exact(portfolio.positions.len())
+        .map_err(|_| FundProductProjectionError::ResourceExhausted)?;
+    for position in &portfolio.positions {
+        absolute_weights.push(position.weight.abs());
+    }
+    absolute_weights.sort_unstable_by(|left, right| right.cmp(left));
+    let largest_holding_weight = absolute_weights.first().copied();
+    let top_five_weight = sum_weights(absolute_weights.iter().take(5).copied())?;
+    let top_ten_weight = sum_weights(absolute_weights.iter().take(10).copied())?;
+    let mut herfindahl_index = Decimal::ZERO;
+    let hundred = Decimal::from(100_u8);
+    for weight in &absolute_weights {
+        let fraction = weight
+            .checked_div(hundred)
+            .ok_or(FundProductProjectionError::InvalidEvidence)?;
+        herfindahl_index = herfindahl_index
+            .checked_add(
+                fraction
+                    .checked_mul(fraction)
+                    .ok_or(FundProductProjectionError::InvalidEvidence)?,
+            )
+            .ok_or(FundProductProjectionError::InvalidEvidence)?;
+    }
+    Ok(FundPortfolioAnalysisProduct {
+        exposure: FundExposureProduct {
+            state: exposure_state,
+            net_reported_weight: (weighted_holdings > 0).then_some(net_reported_weight),
+            gross_reported_weight: (weighted_holdings > 0).then_some(gross_reported_weight),
+            identified_gross_weight: (identified_weighted_holdings > 0)
+                .then_some(identified_gross_weight),
+            weighted_holdings,
+            identified_weighted_holdings,
+        },
+        concentration: FundConcentrationProduct {
+            state: concentration_state,
+            largest_holding_weight,
+            top_five_weight,
+            top_ten_weight,
+            herfindahl_index: (!absolute_weights.is_empty()).then_some(herfindahl_index),
+            analyzed_holdings: portfolio.positions.len(),
+        },
+    })
+}
+
+fn analysis_state(
+    holdings: usize,
+    weighted_holdings: usize,
+    identified_weighted_holdings: usize,
+    conflicting_weight_holdings: usize,
+) -> FundAnalysisState {
+    if conflicting_weight_holdings > 0 {
+        FundAnalysisState::Conflict
+    } else if holdings == 0 {
+        FundAnalysisState::Missing
+    } else if weighted_holdings == 0 {
+        FundAnalysisState::Unavailable
+    } else if weighted_holdings == holdings && identified_weighted_holdings == holdings {
+        FundAnalysisState::Reported
+    } else {
+        FundAnalysisState::Partial
+    }
+}
+
+fn analysis_state_for_section(state: FundProductSectionState) -> FundAnalysisState {
+    match state {
+        FundProductSectionState::Reported => FundAnalysisState::Reported,
+        FundProductSectionState::Missing => FundAnalysisState::Missing,
+        FundProductSectionState::Conflict => FundAnalysisState::Conflict,
+        FundProductSectionState::Unavailable => FundAnalysisState::Unavailable,
+    }
+}
+
+fn empty_portfolio_analysis(state: FundAnalysisState) -> FundPortfolioAnalysisProduct {
+    FundPortfolioAnalysisProduct {
+        exposure: FundExposureProduct {
+            state,
+            net_reported_weight: None,
+            gross_reported_weight: None,
+            identified_gross_weight: None,
+            weighted_holdings: 0,
+            identified_weighted_holdings: 0,
+        },
+        concentration: FundConcentrationProduct {
+            state,
+            largest_holding_weight: None,
+            top_five_weight: None,
+            top_ten_weight: None,
+            herfindahl_index: None,
+            analyzed_holdings: 0,
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WeightedPosition {
+    instrument_id: InstrumentId,
+    weight: Decimal,
+}
+
+struct WeightedPortfolio {
+    positions: Vec<WeightedPosition>,
+    excluded_holdings: usize,
+    conflicting_weight_holdings: usize,
+}
+
+fn weighted_portfolio(
+    holdings: &[FundHoldingProduct],
+) -> Result<WeightedPortfolio, FundProductProjectionError> {
+    let mut positions = Vec::new();
+    positions
+        .try_reserve_exact(holdings.len())
+        .map_err(|_| FundProductProjectionError::ResourceExhausted)?;
+    let mut excluded_holdings = 0_usize;
+    let mut conflicting_weight_holdings = 0_usize;
+    for holding in holdings {
+        if holding.percentage_weight_conflict {
+            excluded_holdings = increment(excluded_holdings)?;
+            conflicting_weight_holdings = increment(conflicting_weight_holdings)?;
+            continue;
+        }
+        match (holding.instrument_id, holding.percentage_weight) {
+            (Some(instrument_id), Some(weight)) => {
+                positions.push(WeightedPosition {
+                    instrument_id,
+                    weight,
+                });
+            }
+            _ => excluded_holdings = increment(excluded_holdings)?,
+        }
+    }
+    positions.sort_unstable_by_key(|position| position.instrument_id);
+    let mut merged: Vec<WeightedPosition> = Vec::new();
+    merged
+        .try_reserve_exact(positions.len())
+        .map_err(|_| FundProductProjectionError::ResourceExhausted)?;
+    for position in positions {
+        if let Some(existing) = merged
+            .last_mut()
+            .filter(|existing| existing.instrument_id == position.instrument_id)
+        {
+            existing.weight = existing
+                .weight
+                .checked_add(position.weight)
+                .ok_or(FundProductProjectionError::InvalidEvidence)?;
+        } else {
+            merged.push(position);
+        }
+    }
+    Ok(WeightedPortfolio {
+        positions: merged,
+        excluded_holdings,
+        conflicting_weight_holdings,
+    })
+}
+
+fn sum_weights(
+    weights: impl Iterator<Item = Decimal>,
+) -> Result<Option<Decimal>, FundProductProjectionError> {
+    let mut total = Decimal::ZERO;
+    let mut count = 0_usize;
+    for weight in weights {
+        total = total
+            .checked_add(weight)
+            .ok_or(FundProductProjectionError::InvalidEvidence)?;
+        count = increment(count)?;
+    }
+    Ok((count > 0).then_some(total))
+}
+
+/// Compares two exact projected fund reads without exposing their private selector evidence.
+pub(crate) fn compare_fund_overlap(
+    left: &FundProductResult,
+    right: &FundProductResult,
+) -> Result<FundOverlapProduct, FundProductProjectionError> {
+    if left.clocks.knowledge_cutoff != right.clocks.knowledge_cutoff {
+        return Err(FundProductProjectionError::InvalidEvidence);
+    }
+    let knowledge_cutoff = left.clocks.knowledge_cutoff;
+    if left.holdings.state != FundProductSectionState::Reported
+        || right.holdings.state != FundProductSectionState::Reported
+    {
+        let state = if left.holdings.state == FundProductSectionState::Conflict
+            || right.holdings.state == FundProductSectionState::Conflict
+        {
+            FundAnalysisState::Conflict
+        } else if left.holdings.state == FundProductSectionState::Missing
+            || right.holdings.state == FundProductSectionState::Missing
+        {
+            FundAnalysisState::Missing
+        } else {
+            FundAnalysisState::Unavailable
+        };
+        return Ok(FundOverlapProduct {
+            state,
+            gross_overlap_weight: None,
+            matched_holdings: 0,
+            left_analyzed_holdings: 0,
+            right_analyzed_holdings: 0,
+            left_excluded_holdings: left.holdings.items.len(),
+            right_excluded_holdings: right.holdings.items.len(),
+            knowledge_cutoff,
+        });
+    }
+
+    let left_portfolio = weighted_portfolio(&left.holdings.items)?;
+    let right_portfolio = weighted_portfolio(&right.holdings.items)?;
+    if left_portfolio.conflicting_weight_holdings > 0
+        || right_portfolio.conflicting_weight_holdings > 0
+    {
+        return Ok(FundOverlapProduct {
+            state: FundAnalysisState::Conflict,
+            gross_overlap_weight: None,
+            matched_holdings: 0,
+            left_analyzed_holdings: left_portfolio.positions.len(),
+            right_analyzed_holdings: right_portfolio.positions.len(),
+            left_excluded_holdings: left_portfolio.excluded_holdings,
+            right_excluded_holdings: right_portfolio.excluded_holdings,
+            knowledge_cutoff,
+        });
+    }
+    let mut left_index = 0_usize;
+    let mut right_index = 0_usize;
+    let mut matched_holdings = 0_usize;
+    let mut gross_overlap_weight = Decimal::ZERO;
+    while left_index < left_portfolio.positions.len()
+        && right_index < right_portfolio.positions.len()
+    {
+        let left_position = left_portfolio.positions[left_index];
+        let right_position = right_portfolio.positions[right_index];
+        match left_position
+            .instrument_id
+            .cmp(&right_position.instrument_id)
+        {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Greater => right_index += 1,
+            std::cmp::Ordering::Equal => {
+                let left_weight = left_position.weight.abs();
+                let right_weight = right_position.weight.abs();
+                gross_overlap_weight = gross_overlap_weight
+                    .checked_add(left_weight.min(right_weight))
+                    .ok_or(FundProductProjectionError::InvalidEvidence)?;
+                matched_holdings = increment(matched_holdings)?;
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+    let analyzed = !left_portfolio.positions.is_empty() && !right_portfolio.positions.is_empty();
+    let excluded = left_portfolio.excluded_holdings > 0 || right_portfolio.excluded_holdings > 0;
+    Ok(FundOverlapProduct {
+        state: if !analyzed {
+            FundAnalysisState::Unavailable
+        } else if excluded {
+            FundAnalysisState::Partial
+        } else {
+            FundAnalysisState::Reported
+        },
+        gross_overlap_weight: analyzed.then_some(gross_overlap_weight),
+        matched_holdings,
+        left_analyzed_holdings: left_portfolio.positions.len(),
+        right_analyzed_holdings: right_portfolio.positions.len(),
+        left_excluded_holdings: left_portfolio.excluded_holdings,
+        right_excluded_holdings: right_portfolio.excluded_holdings,
+        knowledge_cutoff,
     })
 }
 
