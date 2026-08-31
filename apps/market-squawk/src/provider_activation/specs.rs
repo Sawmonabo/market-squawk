@@ -12,9 +12,7 @@ use market_squawk_adapter_coinbase::{
 };
 use market_squawk_adapter_federal_reserve::BoardDatasetProfile;
 use market_squawk_adapter_files::ExtractionLimits;
-use market_squawk_adapter_fred::{
-    FredOperation, FredRightsDisposition, FredRightsPolicy, FredSource,
-};
+use market_squawk_adapter_fred::FredSource;
 use market_squawk_adapter_portfolio::PortfolioImportLimits;
 use market_squawk_adapter_sec::{RawEvidenceStore, SecParserLimits, SecRepresentationRegistry};
 use market_squawk_adapter_treasury::TreasurySourceConfig;
@@ -337,68 +335,26 @@ impl TreasuryAdapterActivation {
     }
 }
 
-/// FRED construction inputs accepted only after an exact scope-specific active lease exists.
+/// FRED construction inputs accepted only after an exact active source lease exists.
 #[derive(Debug)]
 pub struct FredAdapterActivation {
     pub(super) metadata: SourceMetadata,
-    pub(super) policy: FredRightsPolicy,
-    pub(super) provider_dataset: SourceIdentifier,
+    provider_dataset: SourceIdentifier,
 }
 
 impl FredAdapterActivation {
-    /// Binds one exact provider dataset to its effective durable persistence policy.
+    /// Binds source metadata to one exact provider series and vintage interval.
     ///
     /// # Errors
     ///
-    /// Rejects an invalid provider dataset or a series without effective persistence authority.
+    /// Rejects any identity outside the adapter's closed series-observations grammar.
     pub fn try_new(
         metadata: SourceMetadata,
-        policy: FredRightsPolicy,
         provider_dataset: SourceIdentifier,
-        effective_at: market_squawk_domain::Timestamp,
     ) -> Result<Self, ProviderAdapterActivationError> {
-        Self::try_new_for_operation(
-            metadata,
-            policy,
-            provider_dataset,
-            effective_at,
-            FredOperation::Persist,
-        )
-    }
-
-    /// Binds one exact provider dataset to its non-persistent inspection policy.
-    pub(crate) fn try_new_for_ephemeral_inspection(
-        metadata: SourceMetadata,
-        policy: FredRightsPolicy,
-        provider_dataset: SourceIdentifier,
-        effective_at: market_squawk_domain::Timestamp,
-    ) -> Result<Self, ProviderAdapterActivationError> {
-        Self::try_new_for_operation(
-            metadata,
-            policy,
-            provider_dataset,
-            effective_at,
-            FredOperation::RetrieveEphemeral,
-        )
-    }
-
-    fn try_new_for_operation(
-        metadata: SourceMetadata,
-        policy: FredRightsPolicy,
-        provider_dataset: SourceIdentifier,
-        effective_at: market_squawk_domain::Timestamp,
-        operation: FredOperation,
-    ) -> Result<Self, ProviderAdapterActivationError> {
-        let series = FredSource::rights_subject_identifier(&provider_dataset)?;
-        let decision = policy
-            .assess(&series, &[operation], effective_at)
-            .map_err(|_| ProviderAdapterActivationError::InvalidRights)?;
-        if decision.disposition() != FredRightsDisposition::Permitted {
-            return Err(ProviderAdapterActivationError::InvalidRights);
-        }
+        FredSource::series_identifier(&provider_dataset)?;
         Ok(Self {
             metadata,
-            policy,
             provider_dataset,
         })
     }
@@ -593,7 +549,7 @@ pub enum ProviderAdapterActivationRequest {
     Bls(BlsAdapterActivation),
     /// Treasury Fiscal Data or daily-rate XML extraction.
     Treasury(TreasuryAdapterActivation),
-    /// FRED/ALFRED extraction under exact scope-specific rights.
+    /// FRED/ALFRED extraction under the shared source authority.
     Fred(FredAdapterActivation),
     /// Federal Reserve Board H.15 extraction from one exact no-key DDP package.
     Board(BoardAdapterActivation),
@@ -662,7 +618,7 @@ pub enum ProviderAdapterActivationError {
     /// Treasury construction rejected metadata or provider profile.
     #[error(transparent)]
     Treasury(#[from] market_squawk_adapter_treasury::TreasurySourceError),
-    /// FRED construction rejected exact key, rights, or metadata authority.
+    /// FRED construction rejected the exact key, dataset, or metadata authority.
     #[error(transparent)]
     Fred(#[from] market_squawk_adapter_fred::FredSourceError),
     /// Federal Reserve Board construction rejected exact metadata or the H.15 profile.

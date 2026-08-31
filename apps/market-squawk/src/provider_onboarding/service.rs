@@ -28,10 +28,7 @@ use market_squawk_adapter_federal_reserve::{
 use market_squawk_adapter_federal_reserve::{
     BoardFileFormat, BoardScriptedDoctorExecutor, BoardScriptedHttpRequest,
 };
-use market_squawk_adapter_fred::{
-    FredParseLimits, FredSeriesMetadata, FredTermsDocumentRole, MAX_FRED_SERVICE_PERMISSION_BYTES,
-    MAX_FRED_TERMS_DOCUMENT_BYTES,
-};
+use market_squawk_adapter_fred::{FredParseLimits, FredSeriesMetadata};
 use market_squawk_adapter_schwab::{
     AccessTokenAdmission, ParseBounds, SchwabApplicationCredentialEnvelope,
     SchwabCredentialAuthorityBinding, SchwabOAuthAuthorityConfiguration, SchwabOAuthAuthorityError,
@@ -91,14 +88,6 @@ const MAXIMUM_PENDING_SECRET_REAPS: usize = 64;
 const _: () = assert!(MAXIMUM_PENDING_SECRET_REAPS <= Semaphore::MAX_PERMITS);
 const MAX_PROBE_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CONTACT_BYTES: usize = 128;
-const FRED_TERMS_MEDIA_TYPE: &str = "text/html";
-const FRED_PERMISSION_MEDIA_TYPES: [&str; 5] = [
-    "application/octet-stream",
-    "application/pdf",
-    "message/rfc822",
-    "text/html",
-    "text/plain",
-];
 const BLS_REGISTRATION_VALIDITY_NANOS: i64 = 365 * 86_400 * 1_000_000_000;
 const COINBASE_DIRECT_VERIFICATION_VALIDITY_NANOS: i64 = 15 * 60 * 1_000_000_000;
 const SCHWAB_OAUTH_BOOTSTRAP_LEASE_DURATION: Duration = Duration::from_secs(15 * 60);
@@ -270,23 +259,6 @@ impl RetainedRuntimeVerificationEvidence {
 struct AlpacaRuntimeVerificationIssuance {
     generation: SecretGeneration,
     observation: AlpacaPaperIexDoctorObservation,
-}
-
-/// One exact, bounded FRED terms response acquired from its code-owned official URL.
-#[derive(Debug)]
-pub(crate) struct AcquiredFredTermsDocument {
-    role: FredTermsDocumentRole,
-    bytes: Arc<[u8]>,
-}
-
-impl AcquiredFredTermsDocument {
-    pub(crate) const fn role(&self) -> FredTermsDocumentRole {
-        self.role
-    }
-
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.bytes
-    }
 }
 
 /// Borrowed serialization authority for exact onboarding/runtime mutation.
@@ -1029,159 +1001,6 @@ impl ProviderOnboardingService {
         }
         service.reconcile_startup(CatalogLimit::new(32)?, &runtime_admissions)?;
         Ok(service)
-    }
-
-    /// Acquires the exact current FRED terms bundle from the three official, code-owned URLs.
-    ///
-    /// The responses remain raw: identity comparison and the narrowly scoped privacy-page
-    /// canonicalization are owned by the FRED rights contract.
-    pub(crate) async fn acquire_current_fred_terms(
-        &self,
-        cancellation: CancellationToken,
-    ) -> Result<[AcquiredFredTermsDocument; 3], ProviderOnboardingError> {
-        let api = self.acquire_fred_terms_document(
-            FredTermsDocumentRole::ApiTerms,
-            cancellation.child_token(),
-        );
-        let legal = self.acquire_fred_terms_document(
-            FredTermsDocumentRole::FredServicesLegalTerms,
-            cancellation.child_token(),
-        );
-        let privacy =
-            self.acquire_fred_terms_document(FredTermsDocumentRole::PrivacyPolicy, cancellation);
-        let (api, legal, privacy) = tokio::try_join!(api, legal, privacy)?;
-        Ok([api, legal, privacy])
-    }
-
-    async fn acquire_fred_terms_document(
-        &self,
-        role: FredTermsDocumentRole,
-        cancellation: CancellationToken,
-    ) -> Result<AcquiredFredTermsDocument, ProviderOnboardingError> {
-        let bytes = self
-            .acquire_exact_official_document(
-                role.canonical_url(),
-                &[FRED_TERMS_MEDIA_TYPE],
-                MAX_FRED_TERMS_DOCUMENT_BYTES,
-                cancellation,
-            )
-            .await?;
-        Ok(AcquiredFredTermsDocument { role, bytes })
-    }
-
-    /// Reacquires one caller-reviewed Bank permission from its exact official HTTPS URL.
-    pub(crate) async fn acquire_official_fred_permission_document(
-        &self,
-        value: &str,
-        cancellation: CancellationToken,
-    ) -> Result<Arc<[u8]>, ProviderOnboardingError> {
-        let url = url::Url::parse(value)
-            .map_err(|_| ProviderOnboardingError::OfficialDocumentUnavailable)?;
-        let host = url
-            .host_str()
-            .ok_or(ProviderOnboardingError::OfficialDocumentUnavailable)?;
-        if url.scheme() != "https"
-            || url.username() != ""
-            || url.password().is_some()
-            || url.fragment().is_some()
-            || url.query().is_some()
-            || (host != "stlouisfed.org" && !host.ends_with(".stlouisfed.org"))
-        {
-            return Err(ProviderOnboardingError::OfficialDocumentUnavailable);
-        }
-        self.acquire_exact_official_document(
-            url.as_str(),
-            &FRED_PERMISSION_MEDIA_TYPES,
-            MAX_FRED_SERVICE_PERMISSION_BYTES,
-            cancellation,
-        )
-        .await
-    }
-
-    async fn acquire_exact_official_document(
-        &self,
-        expected_url: &str,
-        accepted_media_types: &[&str],
-        maximum_bytes: usize,
-        cancellation: CancellationToken,
-    ) -> Result<Arc<[u8]>, ProviderOnboardingError> {
-        let response = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => {
-                return Err(ProviderOnboardingError::OperationCancelled);
-            }
-            response = self
-                .client
-                .get(expected_url)
-                .version(reqwest::Version::HTTP_11)
-                .header(reqwest::header::ACCEPT, FRED_TERMS_MEDIA_TYPE)
-                .header(reqwest::header::ACCEPT_ENCODING, "identity")
-                .header(reqwest::header::CACHE_CONTROL, "no-cache")
-                .send() => {
-                    response.map_err(|_| ProviderOnboardingError::OfficialDocumentUnavailable)?
-                }
-        };
-        if response.status() != reqwest::StatusCode::OK
-            || response.url().as_str() != expected_url
-            || response
-                .headers()
-                .get(reqwest::header::CONTENT_ENCODING)
-                .is_some_and(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
-        {
-            return Err(ProviderOnboardingError::OfficialDocumentUnavailable);
-        }
-        let valid_media_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .map(str::trim)
-            .is_some_and(|value| {
-                accepted_media_types
-                    .iter()
-                    .any(|accepted| value.eq_ignore_ascii_case(accepted))
-            });
-        if !valid_media_type {
-            return Err(ProviderOnboardingError::OfficialDocumentUnavailable);
-        }
-        if response.content_length().is_some_and(|length| {
-            usize::try_from(length).map_or(true, |length| length == 0 || length > maximum_bytes)
-        }) {
-            return Err(ProviderOnboardingError::OfficialDocumentUnavailable);
-        }
-
-        let mut body = Vec::with_capacity(
-            response
-                .content_length()
-                .and_then(|length| usize::try_from(length).ok())
-                .unwrap_or(0),
-        );
-        let mut stream = response.bytes_stream();
-        loop {
-            let next = tokio::select! {
-                biased;
-                () = cancellation.cancelled() => {
-                    return Err(ProviderOnboardingError::OperationCancelled);
-                }
-                next = stream.next() => next,
-            };
-            let Some(chunk) = next else {
-                break;
-            };
-            let chunk = chunk.map_err(|_| ProviderOnboardingError::OfficialDocumentUnavailable)?;
-            let length = body
-                .len()
-                .checked_add(chunk.len())
-                .ok_or(ProviderOnboardingError::OfficialDocumentUnavailable)?;
-            if length > maximum_bytes {
-                return Err(ProviderOnboardingError::OfficialDocumentUnavailable);
-            }
-            body.extend_from_slice(&chunk);
-        }
-        if body.is_empty() {
-            return Err(ProviderOnboardingError::OfficialDocumentUnavailable);
-        }
-        Ok(Arc::from(body))
     }
 
     /// Returns every built-in profile in stable identity order.
@@ -4028,9 +3847,6 @@ pub enum ProviderOnboardingError {
     /// The bounded verification request failed or returned an unexpected schema.
     #[error("provider onboarding verification is unavailable")]
     ProbeUnavailable,
-    /// An exact FRED terms or permission document could not be acquired from its official URL.
-    #[error("current FRED official-document acquisition is unavailable")]
-    OfficialDocumentUnavailable,
     /// The shared provider/account budget cannot admit this verification within its fixed bound.
     #[error("provider onboarding verification is rate limited")]
     ProbeRateLimited,
