@@ -2575,6 +2575,7 @@ async fn wait_until_ready(
                             );
                             let accepted = connector
                                 .bootstrap_unlock(
+                                    status,
                                     SecretValue::new(INSTALLED_SERVICE_TEST_UNLOCK.to_owned())
                                         .map_err(|_error| InstalledServiceError::SecretStore)?,
                                 )
