@@ -2626,6 +2626,14 @@ mod test_seam {
         pub(crate) body: Bytes,
         pub(crate) received_at: Timestamp,
         pub(crate) latency: Duration,
+        pub(crate) cancel_after_completion: bool,
+    }
+
+    impl EiaHttpResponseFixture {
+        pub(crate) const fn cancel_after_completion(mut self) -> Self {
+            self.cancel_after_completion = true;
+            self
+        }
     }
 
     #[derive(Debug)]
@@ -2640,7 +2648,7 @@ mod test_seam {
             &'a self,
             request: EiaHttpRequest,
             max_bytes: usize,
-            _timeout: Duration,
+            timeout: Duration,
             cancellation: CancellationToken,
             in_flight: &'a market_squawk_sources::InFlightExtractionRequest,
         ) -> BoxFuture<'a, Result<EiaHttpResponse, EiaSourceTransportError>> {
@@ -2676,7 +2684,8 @@ mod test_seam {
                     })
                     .into());
                 }
-                Ok(EiaHttpResponse {
+                let cancel_after_completion = fixture.cancel_after_completion;
+                let response = EiaHttpResponse {
                     status: fixture.status,
                     retry_after: fixture.retry_after,
                     content_encoding: fixture.content_encoding,
@@ -2684,7 +2693,17 @@ mod test_seam {
                     body: fixture.body,
                     received_at: fixture.received_at,
                     latency: fixture.latency,
-                })
+                };
+                if cancel_after_completion {
+                    cancellation.cancel();
+                    return await_capture_completion(
+                        timeout,
+                        cancellation,
+                        std::future::ready(Ok(response)),
+                    )
+                    .await;
+                }
+                Ok(response)
             })
         }
     }

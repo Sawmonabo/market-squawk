@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::transport::{EiaHttpResponseFixture, EiaMockTransport, await_capture_completion};
+use crate::transport::{EiaHttpResponseFixture, EiaMockTransport};
 use crate::{
     EiaAcquisition, EiaApiKey, EiaApplicationBudget, EiaCapacityGuidance, EiaDataFieldContract,
     EiaDataFieldContractInput, EiaDataPage, EiaDataPageTransition, EiaDataQuery, EiaDataQueryInput,
@@ -395,24 +395,12 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
         vec![price_row("2024-03", "12.50", "2024-04-01T15:00:00Z")],
         2,
     )?;
-    let completed_body = Bytes::from(first.clone());
-    let completion_cancellation = CancellationToken::new();
-    completion_cancellation.cancel();
-    assert_eq!(
-        await_capture_completion(
-            Duration::from_secs(1),
-            completion_cancellation,
-            std::future::ready(Ok(completed_body.clone())),
-        )
-        .await?,
-        completed_body
-    );
     let transport = Arc::new(EiaMockTransport {
         responses: Mutex::new(VecDeque::from([
             response_fixture(route_metadata_bytes()?, now),
             response_fixture(facet_metadata_bytes()?, now),
             response_fixture(first.clone(), now),
-            response_fixture(first.clone(), now),
+            response_fixture(first.clone(), now).cancel_after_completion(),
             response_fixture(second.clone(), now),
         ])),
         safe_urls: Mutex::new(Vec::new()),
@@ -479,12 +467,23 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
         sealed_doctor.push(sealed);
     }
     let provider = crate::EiaActivatedProvider::try_activate(pending_activation, sealed_doctor)?;
-    let cancellation = CancellationToken::new();
+    let rejoin_cancellation = CancellationToken::new();
+    let completed_capture_cancellation = CancellationToken::new();
+    let mut uses_completed_capture_cancellation = true;
     let mut cursor = provider.begin_retrieval(&authority, deadline)?;
     let retrieval = loop {
+        let page_cancellation = if uses_completed_capture_cancellation {
+            completed_capture_cancellation.clone()
+        } else {
+            CancellationToken::new()
+        };
         let pending = provider
-            .fetch_next_retrieval_page(&authority, cursor, deadline, CancellationToken::new())
+            .fetch_next_retrieval_page(&authority, cursor, deadline, page_cancellation)
             .await?;
+        if uses_completed_capture_cancellation {
+            assert!(completed_capture_cancellation.is_cancelled());
+            uses_completed_capture_cancellation = false;
+        }
         pending.page_material().root_journal_rejoin().validate(
             provider.source_metadata(),
             provider.contract(),
@@ -497,7 +496,7 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
             page_rejoin,
             sealed_page,
             deadline,
-            &cancellation,
+            &rejoin_cancellation,
         )? {
             EiaDataPageTransition::More(next) => cursor = next,
             EiaDataPageTransition::Complete(retrieval) => break retrieval,
@@ -564,8 +563,12 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
         );
     }
     let retrieval_rejoin = retrieval.into_publication_rejoin();
-    let publication_candidate =
-        provider.publication_candidate(&authority, retrieval_rejoin, deadline, &cancellation)?;
+    let publication_candidate = provider.publication_candidate(
+        &authority,
+        retrieval_rejoin,
+        deadline,
+        &rejoin_cancellation,
+    )?;
     assert_eq!(publication_candidate.observations().len(), 3);
     assert_eq!(publication_candidate.series().len(), 1);
     assert_eq!(publication_candidate.revision_plan().len(), 3);
@@ -878,6 +881,7 @@ fn response_fixture(body: Vec<u8>, received_at: Timestamp) -> EiaHttpResponseFix
         body: Bytes::from(body),
         received_at,
         latency: Duration::from_millis(5),
+        cancel_after_completion: false,
     }
 }
 
