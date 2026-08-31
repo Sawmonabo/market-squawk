@@ -1329,7 +1329,6 @@ struct InstalledBoardFileEvidence {
 struct InstalledMacroContextEvidence {
     arguments: Value,
     stable: Value,
-    parent_manifest: Value,
 }
 
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
@@ -1732,7 +1731,7 @@ async fn exercise_installed_board_vertical(
     assert_installed_board_dashboard(&dashboard)?;
     assert_eq!(dashboard["binding"]["manifest"], manifest["manifest"]);
     let dashboard_stable = stable_installed_board_dashboard(&dashboard);
-    let macro_context = capture_installed_macro_context(client, &manifest["manifest"]).await?;
+    let macro_context = capture_installed_macro_context(client, &dashboard).await?;
     assert_installed_cli_macro_context(client, &macro_context).await?;
     assert_installed_board_transport_counts(fixture.transport_counters(), 1, 1, 1, 1);
 
@@ -1813,7 +1812,6 @@ async fn assert_installed_board_restored(
     )
     .await?;
     assert_eq!(manifest, evidence.manifest);
-    assert_eq!(manifest["manifest"], evidence.macro_context.parent_manifest);
     let history = invoke_installed_board(
         client,
         "history-after-restart",
@@ -1844,6 +1842,7 @@ async fn assert_installed_board_restored(
     )
     .await?;
     assert_installed_macro_context(&macro_context)?;
+    assert_installed_macro_context_matches_dashboard(&macro_context, &dashboard)?;
     assert_eq!(
         stable_installed_macro_context(&macro_context),
         evidence.macro_context.stable
@@ -1903,10 +1902,11 @@ async fn installed_board_dashboard(
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 async fn capture_installed_macro_context(
     client: &LoopbackApplicationClient,
-    parent_manifest: &Value,
+    dashboard: &Value,
 ) -> TestResult<InstalledMacroContextEvidence> {
     let context = installed_macro_context(client, "initial", json!({})).await?;
     assert_installed_macro_context(&context)?;
+    assert_installed_macro_context_matches_dashboard(&context, dashboard)?;
     let knowledge_cutoff = required_nonempty_string(
         &context["selection"]["knowledgeCutoff"],
         "economic-context knowledge cutoff",
@@ -1921,7 +1921,6 @@ async fn capture_installed_macro_context(
             "effectiveDateCutoff": effective_date_cutoff,
         }),
         stable: stable_installed_macro_context(&context),
-        parent_manifest: parent_manifest.clone(),
     })
 }
 
@@ -1999,6 +1998,56 @@ fn assert_installed_macro_context(context: &Value) -> TestResult {
             !encoded.contains(forbidden),
             "ordinary economic context exposed `{forbidden}`: {context}"
         );
+    }
+    Ok(())
+}
+
+fn assert_installed_macro_context_matches_dashboard(
+    context: &Value,
+    dashboard: &Value,
+) -> TestResult {
+    let context_observations = context["observations"]
+        .as_array()
+        .context("economic context omitted its observations")?;
+    let dashboard_observations = dashboard["observations"]
+        .as_array()
+        .context("manifest-bound rate dashboard omitted its observations")?;
+    assert_eq!(dashboard_observations.len(), 11);
+    assert_eq!(context_observations.len(), 12);
+    for (dashboard_observation, context_observation) in dashboard_observations
+        .iter()
+        .zip(context_observations.iter())
+    {
+        let slot = required_nonempty_string(
+            &dashboard_observation["slot"],
+            "manifest-bound rate maturity",
+        )?;
+        assert_eq!(
+            context_observation["indicatorId"],
+            format!("us-government-yield-{slot}")
+        );
+        assert_eq!(
+            context_observation["effectiveDate"],
+            dashboard_observation["effectiveDate"]
+        );
+        match dashboard_observation["observation"]["state"].as_str() {
+            Some("observed") => {
+                assert_eq!(context_observation["availability"], "available");
+                assert_eq!(context_observation["value"]["state"], "observed");
+                assert_eq!(
+                    context_observation["value"]["decimal"],
+                    dashboard_observation["observation"]["decimal"]
+                );
+            }
+            Some("missing") => {
+                assert_eq!(context_observation["availability"], "missing");
+                assert_eq!(context_observation["value"]["state"], "missing");
+                assert!(context_observation["value"].get("decimal").is_none());
+            }
+            state => anyhow::bail!(
+                "manifest-bound rate dashboard returned unexpected observation state {state:?}"
+            ),
+        }
     }
     Ok(())
 }
