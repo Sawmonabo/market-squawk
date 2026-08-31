@@ -987,6 +987,26 @@ pub enum CensusSourceError {
     RateDeclaration(#[from] crate::CensusRateDeclarationError),
 }
 
+trait CensusProcessingClock: Send + Sync {
+    /// Samples local processing clocks only after the complete bounded page exists.
+    fn sample_after_complete_parse(
+        &self,
+        page: &CensusDataPage,
+    ) -> Result<(Timestamp, Timestamp), CensusSourceError>;
+}
+
+#[derive(Debug)]
+struct SystemCensusProcessingClock;
+
+impl CensusProcessingClock for SystemCensusProcessingClock {
+    fn sample_after_complete_parse(
+        &self,
+        _page: &CensusDataPage,
+    ) -> Result<(Timestamp, Timestamp), CensusSourceError> {
+        Ok((system_timestamp()?, system_timestamp()?))
+    }
+}
+
 /// Registry-authorized production Census source.
 pub struct CensusSource {
     metadata: SourceMetadata,
@@ -995,6 +1015,7 @@ pub struct CensusSource {
     transport: Arc<dyn CensusTransport>,
     response_limit: usize,
     request_timeout: Duration,
+    processing_clock: Arc<dyn CensusProcessingClock>,
     telemetry: CensusTelemetryState,
 }
 
@@ -1026,18 +1047,25 @@ impl CensusSource {
             NetworkAccessPolicy::Denied => return Err(CensusSourceError::InvalidMetadata),
         };
         let transport = Arc::new(ReqwestCensusTransport::try_new(bounds)?);
-        Self::try_new_inner(metadata, api_key, config, transport)
+        Self::try_new_inner(
+            metadata,
+            api_key,
+            config,
+            transport,
+            Arc::new(SystemCensusProcessingClock),
+        )
     }
 
     #[cfg(test)]
-    fn try_new_with_transport(
+    fn try_new_with_transport_and_processing_clock(
         metadata: SourceMetadata,
         api_key: CensusApiKey,
         config: CensusSourceConfig,
         transport: Arc<dyn CensusTransport>,
+        processing_clock: Arc<dyn CensusProcessingClock>,
     ) -> Result<Self, CensusSourceError> {
         Self::validate_metadata(&metadata, &config)?;
-        Self::try_new_inner(metadata, api_key, config, transport)
+        Self::try_new_inner(metadata, api_key, config, transport, processing_clock)
     }
 
     fn try_new_inner(
@@ -1045,6 +1073,7 @@ impl CensusSource {
         api_key: CensusApiKey,
         config: CensusSourceConfig,
         transport: Arc<dyn CensusTransport>,
+        processing_clock: Arc<dyn CensusProcessingClock>,
     ) -> Result<Self, CensusSourceError> {
         let bounds = match metadata.network_policy() {
             NetworkAccessPolicy::Allowlisted(policy) => policy.request_bounds(),
@@ -1067,6 +1096,7 @@ impl CensusSource {
             transport,
             response_limit,
             request_timeout: Duration::from_nanos(bounds.total_timeout_nanos()),
+            processing_clock,
             telemetry: CensusTelemetryState::default(),
         })
     }
@@ -1357,8 +1387,10 @@ impl CensusSource {
                 return Err(map_adapter_error(error));
             }
         };
-        let decoded_at = system_timestamp().map_err(map_source_error)?;
-        let ingested_at = system_timestamp().map_err(map_source_error)?;
+        let (decoded_at, ingested_at) = self
+            .processing_clock
+            .sample_after_complete_parse(&page)
+            .map_err(map_source_error)?;
         let page = page
             .try_with_completed_processing_clocks(decoded_at, ingested_at)
             .map_err(map_adapter_error)?;

@@ -9,7 +9,7 @@ use futures_util::future::BoxFuture;
 use market_squawk_domain::{
     AuthorizationBasis, ChecksumCapability, CoverageDelay, DeliveryEvidence, EffectiveInterval,
     MetadataRevision, ResearchObservation, ResearchTemporalPrecision, RevisionBoundPayloadEvidence,
-    SchemaVersion, SequenceCapability, SourceId,
+    SchemaVersion, SequenceCapability, SourceId, Timestamp,
 };
 use market_squawk_platform::LocalPaths;
 use market_squawk_sources::{
@@ -170,9 +170,76 @@ impl AuthorizationSubjectResolver for TestSubjectResolver {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedCensusClockInput {
+    receipt: Timestamp,
+    geography_digest: [u8; 32],
+    row_digest: [u8; 32],
+    family_digest: [u8; 32],
+    content_digest: [u8; 32],
+}
+
+#[derive(Debug)]
+struct DeterministicProcessingClock {
+    decoded_at: Timestamp,
+    ingested_at: Timestamp,
+    parsed: Mutex<Option<ParsedCensusClockInput>>,
+}
+
+impl DeterministicProcessingClock {
+    fn parsed_input(&self) -> TestResult<ParsedCensusClockInput> {
+        self.parsed
+            .lock()
+            .map_err(|_| "processing clock mutex poisoned")?
+            .clone()
+            .ok_or_else(|| "processing clock was not sampled".into())
+    }
+}
+
+impl CensusProcessingClock for DeterministicProcessingClock {
+    fn sample_after_complete_parse(
+        &self,
+        page: &CensusDataPage,
+    ) -> Result<(Timestamp, Timestamp), CensusSourceError> {
+        let [observation] = page.observations() else {
+            return Err(CensusSourceError::Protocol);
+        };
+        if !page.completeness().is_complete()
+            || page.clocks().received_at() != page.clocks().decoded_at()
+            || page.clocks().decoded_at() != page.clocks().ingested_at()
+            || observation.reported_time()
+                != Some(&CensusReportedTime::Quarter {
+                    year: 2024,
+                    quarter: 1,
+                })
+            || observation.geography().scope() != CensusGeographyScope::Aggregate
+        {
+            return Err(CensusSourceError::Protocol);
+        }
+        let input = ParsedCensusClockInput {
+            receipt: page.clocks().received_at(),
+            geography_digest: observation.geography().identity_digest(),
+            row_digest: observation.row_digest(),
+            family_digest: observation.revision_candidate().family_digest(),
+            content_digest: observation.revision_candidate().content_digest(),
+        };
+        let mut parsed = self
+            .parsed
+            .lock()
+            .map_err(|_| CensusSourceError::Protocol)?;
+        if parsed.replace(input).is_some() {
+            return Err(CensusSourceError::Protocol);
+        }
+        Ok((self.decoded_at, self.ingested_at))
+    }
+}
+
 #[tokio::test]
-async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() -> TestResult {
+async fn authorized_transport_samples_processing_clock_after_complete_parse_and_preserves_canonical_evidence()
+-> TestResult {
     let now = system_timestamp()?;
+    let decoded_at = now.checked_add_nanos(1)?;
+    let ingested_at = now.checked_add_nanos(2)?;
     let contract = contract()?;
     let config = CensusSourceConfig::try_new(
         [contract.clone()],
@@ -195,11 +262,17 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
         })),
         attempts: AtomicU64::new(0),
     });
-    let source = CensusSource::try_new_with_transport(
+    let processing_clock = Arc::new(DeterministicProcessingClock {
+        decoded_at,
+        ingested_at,
+        parsed: Mutex::new(None),
+    });
+    let source = CensusSource::try_new_with_transport_and_processing_clock(
         metadata.clone(),
         CensusApiKey::try_new("test-census-key".to_owned())?,
         config,
         transport.clone(),
+        processing_clock.clone(),
     )?;
     let public_metadata = contract.metadata_requests()[0].public_request()?;
     assert!(!public_metadata.is_credentialed());
@@ -226,6 +299,9 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
     assert_eq!(data.page().accounting().missing_requested_variables(), 0);
     assert_eq!(data.page().accounting().requested_geographies(), Some(1));
     assert_eq!(data.page().accounting().returned_geographies(), 1);
+    assert_eq!(data.page().clocks().received_at(), now);
+    assert_eq!(data.page().clocks().decoded_at(), decoded_at);
+    assert_eq!(data.page().clocks().ingested_at(), ingested_at);
     assert_eq!(
         data.page().observations()[0].reported_time(),
         Some(&CensusReportedTime::Quarter {
@@ -236,6 +312,28 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
     let geography = data.page().observations()[0].geography();
     assert_eq!(geography.scope(), CensusGeographyScope::Aggregate);
     assert_ne!(geography.identity_digest(), [0; 32]);
+    let parsed_clock_input = processing_clock.parsed_input()?;
+    assert_eq!(parsed_clock_input.receipt, now);
+    assert_eq!(
+        parsed_clock_input.geography_digest,
+        geography.identity_digest()
+    );
+    assert_eq!(
+        parsed_clock_input.row_digest,
+        data.page().observations()[0].row_digest()
+    );
+    assert_eq!(
+        parsed_clock_input.family_digest,
+        data.page().observations()[0]
+            .revision_candidate()
+            .family_digest()
+    );
+    assert_eq!(
+        parsed_clock_input.content_digest,
+        data.page().observations()[0]
+            .revision_candidate()
+            .content_digest()
+    );
     let retained_bytes = data.page().conservative_retained_bytes()?;
     assert!(retained_bytes > DATA_RESPONSE.len());
     assert!(retained_bytes <= CENSUS_OPERATION_MEMORY_LIMIT_BYTES);
@@ -284,6 +382,22 @@ async fn authorized_transport_preserves_typed_rows_accounting_and_raw_capture() 
         sha256(DATA_RESPONSE)
     );
     let binding = &output.publication_plan().observations()[0];
+    assert_eq!(
+        binding.geography().identity_digest(),
+        parsed_clock_input.geography_digest
+    );
+    assert_eq!(binding.row_digest().bytes(), parsed_clock_input.row_digest);
+    assert_eq!(
+        binding.family_digest().bytes(),
+        parsed_clock_input.family_digest
+    );
+    assert_eq!(
+        binding.content_digest().bytes(),
+        parsed_clock_input.content_digest
+    );
+    assert_eq!(binding.clocks().received_at(), now);
+    assert_eq!(binding.clocks().decoded_at(), decoded_at);
+    assert_eq!(binding.clocks().ingested_at(), ingested_at);
     assert_eq!(
         binding.reported_time(),
         Some(&CensusReportedTime::Quarter {
