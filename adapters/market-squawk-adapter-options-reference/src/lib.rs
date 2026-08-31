@@ -60,13 +60,14 @@ pub use transport::{
     OPTIONS_REFERENCE_MINIMUM_CONNECT_TIMEOUT_NANOS, OPTIONS_REFERENCE_MINIMUM_READ_TIMEOUT_NANOS,
     OPTIONS_REFERENCE_MINIMUM_TOTAL_TIMEOUT_NANOS, OfficialPublicationPlan,
     OfficialPublicationPolicy, OfficialReferenceRequest, OfficialReferenceStreamingClient,
-    PendingReferenceTypedHandoff, PendingUninterpretedMemoHandoff, ReferenceCancellation,
-    ReferenceFetchControl, ReferenceHeaderValue, ReferenceHttpReceipt, ReferenceNotModifiedReceipt,
-    ReferenceTransportError, ReferenceTypedHandoff, ReferenceUninterpretedMemoHandoff,
-    RetryAfterEvidence, SelectedReferenceDecoder, StreamedReferenceObject,
-    StreamingReferenceFetchOutcome, StrictReferenceParseReceipt,
+    OptionsReferenceSourceProfile, PendingReferenceTypedHandoff, PendingUninterpretedMemoHandoff,
+    ReferenceCancellation, ReferenceFetchControl, ReferenceHeaderValue, ReferenceHttpReceipt,
+    ReferenceNotModifiedReceipt, ReferenceTransportError, ReferenceTypedHandoff,
+    ReferenceUninterpretedMemoHandoff, RetryAfterEvidence, SelectedReferenceDecoder,
+    StreamedReferenceObject, StreamingReferenceFetchOutcome, StrictReferenceParseReceipt,
     StrictUninterpretedMemoDocumentReceipt, options_reference_application_budget_policy,
     options_reference_endpoint_policy, options_reference_provider_rate_declaration,
+    options_reference_source_profile,
 };
 
 #[cfg(all(test, unix))]
@@ -312,6 +313,24 @@ mod tests {
     #[cfg(unix)]
     async fn official_source_mock_proves_raw_reopen_and_conflict_preserving_typed_handoff()
     -> Result<(), Box<dyn Error>> {
+        for provider in [ReferenceProvider::Occ, ReferenceProvider::Cboe] {
+            let profile = options_reference_source_profile(provider)?;
+            assert_eq!(
+                profile.metadata().source_id().as_str(),
+                match provider {
+                    ReferenceProvider::Occ => OCC_OPTIONS_REFERENCE_SOURCE_ID,
+                    ReferenceProvider::Cboe => CBOE_OPTIONS_REFERENCE_SOURCE_ID,
+                }
+            );
+            assert_eq!(
+                profile.metadata().provider().as_str(),
+                match provider {
+                    ReferenceProvider::Occ => OCC_OPTIONS_REFERENCE_PROVIDER_ID,
+                    ReferenceProvider::Cboe => CBOE_OPTIONS_REFERENCE_PROVIDER_ID,
+                }
+            );
+            let (_metadata, _rate) = profile.into_parts();
+        }
         let cboe_bytes = b"Cboe Symbol,OSI Symbol,Underlying,Matching Unit,Closing Only\n000u56,ZVZZT 990101C00005000,SPY,25,False\n000u57,ZVZZT 990101C00005000,SPY,25,False\n";
         let occ_bytes = format!(
             "{:<6}\t{:<6}\t{:<50}\tABCIPX\t25000000\tEF\t\r\n",

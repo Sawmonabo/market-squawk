@@ -11,8 +11,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt as _;
 use market_squawk_domain::{
-    AssetClass, AvailabilityEvidence, CalendarDate, CoverageDelay, DataQuality, DeliveryEvidence,
-    DigestAlgorithm, EvidenceDigest, ResearchTemporalCoordinate, SourceIdentifier, Timestamp,
+    AssetClass, AuthorizationBasis, AvailabilityEvidence, CalendarDate, ChecksumCapability,
+    CoverageDelay, DataQuality, DeliveryEvidence, DigestAlgorithm, EffectiveInterval,
+    EvidenceDigest, ExactPayloadEvidence, MetadataRevision, ResearchTemporalCoordinate,
+    RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId, SourceIdentifier,
+    Timestamp, VenueId,
 };
 use market_squawk_platform::{
     ResearchObjectAdmission, ResearchObjectClaim, ResearchObjectControl,
@@ -20,12 +23,13 @@ use market_squawk_platform::{
     SealedResearchJournalStore, SealedResearchJournalStoreError, VerifiedResearchObject,
 };
 use market_squawk_sources::{
-    ApiEndpointRule, AuthorizationMode, BackoffPolicy, BudgetScope, BudgetWindowSemantics,
-    CoverageDomain, EndpointPolicy, ExtractionAuthority, ExtractionAuthorityError,
-    HistoricalCapability, HttpClientProfile, HttpRequestBounds, InFlightExtractionRequest,
-    NetworkAccessPolicy, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
-    ProviderRateDeclaration, QueryParameterRule, QuerySensitivity, SourceClass, SourceMetadata,
-    SourceProtocolProfile,
+    ApiEndpointRule, AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope,
+    BudgetWindowSemantics, CoverageDomain, CoverageTopology, EndpointPolicy, ExtractionAuthority,
+    ExtractionAuthorityError, FreshnessPolicy, HistoricalCapability, HttpClientProfile,
+    HttpRequestBounds, InFlightExtractionRequest, InstrumentCoverage, NetworkAccessPolicy,
+    PathScope, ProviderBudgetPolicy, ProviderBudgetWindow, ProviderRateDeclaration,
+    QueryParameterRule, QuerySensitivity, SourceCapabilities, SourceClass, SourceCoverage,
+    SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -87,6 +91,9 @@ pub const OPTIONS_REFERENCE_MINIMUM_READ_TIMEOUT_NANOS: u64 = 60 * 1_000_000_000
 pub const OPTIONS_REFERENCE_MINIMUM_TOTAL_TIMEOUT_NANOS: u64 = 5 * 60 * 1_000_000_000;
 
 const OPTIONS_REFERENCE_MAX_REDIRECTS: u8 = 0;
+const OPTIONS_REFERENCE_PROFILE_BACKOFF_INITIAL_NANOS: u64 = 1_000_000_000;
+const OPTIONS_REFERENCE_PROFILE_DELAY_NANOS: u64 = 24 * 60 * NANOS_PER_MINUTE;
+const OPTIONS_REFERENCE_PROFILE_CLOCK_SKEW_NANOS: u64 = NANOS_PER_MINUTE;
 const OPTIONS_REFERENCE_USER_AGENT: &str = concat!(
     "market-squawk/",
     env!("CARGO_PKG_VERSION"),
@@ -97,6 +104,34 @@ const MAX_OPERATION_DURATION: Duration = Duration::from_secs(10 * 60);
 const RAW_STREAM_CHANNEL_CAPACITY: usize = 8;
 const RAW_STREAM_WRITE_CHUNK_BYTES: usize = 64 * 1024;
 const LOGICAL_OBJECT_INTEGRITY_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+
+/// One code-owned official source declaration and its matching shared rate declaration.
+///
+/// Keeping these values together prevents root composition from independently rebuilding a
+/// broader endpoint allowlist, a faster queue, or different source semantics than the production
+/// transport validates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptionsReferenceSourceProfile {
+    metadata: SourceMetadata,
+    rate: ProviderRateDeclaration,
+}
+
+impl OptionsReferenceSourceProfile {
+    /// Returns the exact source metadata accepted by the production transport.
+    pub const fn metadata(&self) -> &SourceMetadata {
+        &self.metadata
+    }
+
+    /// Returns the matching product-wide rate declaration for shared registration.
+    pub const fn rate_declaration(&self) -> &ProviderRateDeclaration {
+        &self.rate
+    }
+
+    /// Separates the source declaration from its matching rate declaration for root composition.
+    pub fn into_parts(self) -> (SourceMetadata, ProviderRateDeclaration) {
+        (self.metadata, self.rate)
+    }
+}
 
 /// A closed set of reviewed Cboe `All Series` schemas eligible for one acquisition cycle.
 ///
@@ -2711,6 +2746,167 @@ pub(crate) const fn reference_budget_provider_id(provider: ReferenceProvider) ->
         ReferenceProvider::Occ => OCC_OPTIONS_REFERENCE_PROVIDER_ID,
         ReferenceProvider::Cboe => CBOE_OPTIONS_REFERENCE_PROVIDER_ID,
     }
+}
+
+/// Builds the complete code-owned source profile for one official option-reference provider.
+///
+/// The profile is intentionally configuration-free: these are public, read-only official files,
+/// and their source identities, schemas, endpoint authority, request bounds, delayed-publication
+/// semantics, and conservative provider queues are application contracts. Root composition only
+/// registers the returned metadata and rate declaration; it does not reconstruct provider policy.
+///
+/// # Errors
+///
+/// Returns a closed configuration failure if any exact metadata, endpoint, coverage, or budget
+/// invariant can no longer be represented by the shared source contracts.
+pub fn options_reference_source_profile(
+    provider: ReferenceProvider,
+) -> Result<OptionsReferenceSourceProfile, ReferenceTransportError> {
+    let evidence = options_reference_profile_evidence(provider);
+    let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)
+        .map_err(|_| ReferenceTransportError::InvalidAuthorityMetadata)?;
+    let bounds = HttpRequestBounds::try_new(
+        NonZeroU64::new(OPTIONS_REFERENCE_MINIMUM_CONNECT_TIMEOUT_NANOS)
+            .ok_or(ReferenceTransportError::InvalidAuthorityMetadata)?,
+        NonZeroU64::new(OPTIONS_REFERENCE_MINIMUM_READ_TIMEOUT_NANOS)
+            .ok_or(ReferenceTransportError::InvalidAuthorityMetadata)?,
+        NonZeroU64::new(OPTIONS_REFERENCE_MINIMUM_TOTAL_TIMEOUT_NANOS)
+            .ok_or(ReferenceTransportError::InvalidAuthorityMetadata)?,
+        OPTIONS_REFERENCE_MAX_REDIRECTS,
+        NonZeroU64::new(match provider {
+            ReferenceProvider::Occ => OCC_MINIMUM_RESPONSE_BYTES,
+            ReferenceProvider::Cboe => CBOE_MINIMUM_RESPONSE_BYTES,
+        })
+        .ok_or(ReferenceTransportError::InvalidAuthorityMetadata)?,
+    )
+    .map_err(|_| ReferenceTransportError::InvalidAuthorityMetadata)?;
+    let endpoint = options_reference_endpoint_policy(provider, bounds)?;
+    let backoff = BackoffPolicy::try_new(
+        NonZeroU64::new(OPTIONS_REFERENCE_PROFILE_BACKOFF_INITIAL_NANOS)
+            .ok_or(ReferenceTransportError::InvalidAuthorityMetadata)?,
+        NonZeroU64::new(OPTIONS_REFERENCE_APPLICATION_WINDOW_NANOS)
+            .ok_or(ReferenceTransportError::InvalidAuthorityMetadata)?,
+        2_000,
+    )
+    .map_err(|_| ReferenceTransportError::InvalidAuthorityMetadata)?;
+    let budget = options_reference_application_budget_policy(provider, backoff)?;
+    let rate = ProviderRateDeclaration::try_for_endpoint(budget.clone(), &endpoint)
+        .map_err(|_| ReferenceTransportError::InvalidAuthorityMetadata)?;
+    let (revision, topology, delivery, history) = match provider {
+        ReferenceProvider::Occ => (
+            "occ-options-reference-durable-v1",
+            CoverageTopology::not_applicable(),
+            DeliveryEvidence::Unknown,
+            HistoricalCapability::Historical,
+        ),
+        ReferenceProvider::Cboe => (
+            "cboe-options-reference-durable-v1",
+            CoverageTopology::partial_venues(
+                [
+                    CboeVenue::C1,
+                    CboeVenue::Bzx,
+                    CboeVenue::C2,
+                    CboeVenue::Edgx,
+                ]
+                .into_iter()
+                .map(|venue| {
+                    VenueId::try_from(venue.stable_label())
+                        .map_err(|_| ReferenceTransportError::InvalidAuthorityMetadata)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            )
+            .map_err(|_| ReferenceTransportError::InvalidAuthorityMetadata)?,
+            DeliveryEvidence::DirectVenue,
+            HistoricalCapability::None,
+        ),
+    };
+    let metadata = SourceMetadata::try_new(SourceMetadataInput::new(
+        SchemaVersion::CURRENT,
+        SourceId::try_from(reference_source_id(provider))
+            .map_err(|_| ReferenceTransportError::InvalidAuthorityMetadata)?,
+        RevisionBoundPayloadEvidence::new(
+            MetadataRevision::new(
+                SourceIdentifier::try_from(revision)
+                    .map_err(|_| ReferenceTransportError::InvalidAuthorityMetadata)?,
+            ),
+            evidence.clone(),
+        ),
+        SourceClass::Exchange,
+        SourceIdentifier::try_from(reference_budget_provider_id(provider))
+            .map_err(|_| ReferenceTransportError::InvalidAuthorityMetadata)?,
+        AuthorizationGrant::new(
+            AuthorizationMode::PublicInterface,
+            AuthorizationBasis::new(
+                SourceIdentifier::try_from("official-public-interface")
+                    .map_err(|_| ReferenceTransportError::InvalidAuthorityMetadata)?,
+            ),
+            evidence.clone(),
+            effective,
+        ),
+        SourceCoverage::try_instrument(
+            evidence,
+            effective,
+            vec![AssetClass::Option],
+            topology,
+            InstrumentCoverage::partial(),
+            None,
+            CoverageDelay::Delayed(OPTIONS_REFERENCE_PROFILE_DELAY_NANOS),
+            delivery,
+        )
+        .map_err(|_| ReferenceTransportError::InvalidAuthorityMetadata)?,
+        DataQuality::OfficialDelayed,
+        NetworkAccessPolicy::Allowlisted(endpoint),
+        FreshnessPolicy::try_new(
+            OPTIONS_REFERENCE_PROFILE_DELAY_NANOS,
+            OPTIONS_REFERENCE_PROFILE_DELAY_NANOS,
+            OPTIONS_REFERENCE_PROFILE_DELAY_NANOS,
+            OPTIONS_REFERENCE_PROFILE_DELAY_NANOS,
+            OPTIONS_REFERENCE_PROFILE_CLOCK_SKEW_NANOS,
+        )
+        .map_err(|_| ReferenceTransportError::InvalidAuthorityMetadata)?,
+        Some(budget),
+        SourceCapabilities::new(
+            false,
+            true,
+            SequenceCapability::Unsupported,
+            ChecksumCapability::Unsupported,
+            history,
+            false,
+        ),
+        SourceProtocolProfile::NotLive,
+    ))
+    .map_err(|_| ReferenceTransportError::InvalidAuthorityMetadata)?;
+    validate_reference_source_metadata(provider, &metadata)?;
+    Ok(OptionsReferenceSourceProfile { metadata, rate })
+}
+
+fn options_reference_profile_evidence(provider: ReferenceProvider) -> ExactPayloadEvidence {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/options-reference/source-profile/v1\0");
+    digest.update(reference_source_id(provider).as_bytes());
+    digest.update(b"\0official-public-interface\0delayed-daily\0strict-schema\0sealed-raw\0");
+    match provider {
+        ReferenceProvider::Occ => {
+            digest.update(OCC_DLP_SELECTED_LOCATOR.as_bytes());
+            digest.update(b"\0occ-dlp-selected-txt-v1\0");
+        }
+        ReferenceProvider::Cboe => {
+            for venue in [
+                CboeVenue::C1,
+                CboeVenue::Bzx,
+                CboeVenue::C2,
+                CboeVenue::Edgx,
+            ] {
+                digest.update(venue.all_series_locator().as_bytes());
+                digest.update(b"\0");
+            }
+            digest.update(b"cboe-daily-all-series-v1\0");
+        }
+    }
+    ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
 }
 
 /// Builds the conservative application budget for one independent OCC or Cboe public queue.
