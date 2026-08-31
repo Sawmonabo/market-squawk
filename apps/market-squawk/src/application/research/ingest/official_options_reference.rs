@@ -5,7 +5,7 @@
 //! sole physical authority, and phase-B catalog composition receives only non-forgeable store
 //! receipts after the same objects have been reverified immediately before commit.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::time::Instant;
 
@@ -14,22 +14,27 @@ use market_squawk_adapter_options_reference::{
     HttpLastModifiedEvidence, OccDlpPresence, OccExchangeCode, OccExchangeListingEvidence,
     OccPositionLimit, OccProductType, OptionsReferenceAliasDisposition,
     OptionsReferenceIdentityDisposition, OptionsReferenceValidityDisposition, PageTerminalState,
-    ReferenceAliasKey, ReferenceAliasResolution, ReferenceAliasResolutionState, ReferenceConflict,
-    ReferenceConflictKind, ReferenceExportRecord, ReferenceModifiedObjectHandoff,
-    ReferenceNativeSchemaIdentity, ReferenceObjectContext, ReferenceProvider, ReferenceSurface,
+    PublicationRequest, ReferenceAliasKey, ReferenceAliasResolution, ReferenceAliasResolutionState,
+    ReferenceConflict, ReferenceConflictKind, ReferenceExportRecord,
+    ReferenceModifiedObjectHandoff, ReferenceNativeSchemaIdentity, ReferenceObjectContext,
+    ReferenceProvider, ReferenceSurface,
 };
 use market_squawk_data::{
+    MAX_OFFICIAL_OPTIONS_REFERENCE_STAGE_BATCH_ROWS,
     OfficialOptionsReferenceAliasAssertionSetEvidence, OfficialOptionsReferenceAliasKey,
     OfficialOptionsReferenceAliasResolutionInput, OfficialOptionsReferenceAliasResolutionState,
     OfficialOptionsReferenceCboeSeries, OfficialOptionsReferenceConflictInput,
     OfficialOptionsReferenceConflictKind, OfficialOptionsReferenceConflictSetEvidence,
     OfficialOptionsReferenceError, OfficialOptionsReferenceGenerationHeader,
-    OfficialOptionsReferenceObjectInput, OfficialOptionsReferenceOccExchangeListingEvidence,
-    OfficialOptionsReferenceOccPositionLimit, OfficialOptionsReferenceOccProduct,
-    OfficialOptionsReferenceOccProductType, OfficialOptionsReferencePublicationCapability,
-    OfficialOptionsReferencePublicationReceipt, OfficialOptionsReferenceRecordInput,
-    OfficialOptionsReferenceRecordSetEvidence, OfficialOptionsReferenceRecordValue,
-    OfficialOptionsReferenceResolutionSetEvidence, OfficialOptionsReferenceSurface,
+    OfficialOptionsReferenceObjectBindingFields, OfficialOptionsReferenceObjectInput,
+    OfficialOptionsReferenceOccExchangeListingEvidence, OfficialOptionsReferenceOccPositionLimit,
+    OfficialOptionsReferenceOccProduct, OfficialOptionsReferenceOccProductType,
+    OfficialOptionsReferencePublicationCapability, OfficialOptionsReferencePublicationReceipt,
+    OfficialOptionsReferenceRecordInput, OfficialOptionsReferenceRecordSetEvidence,
+    OfficialOptionsReferenceRecordValue, OfficialOptionsReferenceRequestBinding,
+    OfficialOptionsReferenceResolutionSetEvidence, OfficialOptionsReferenceSealedStage,
+    OfficialOptionsReferenceStageCapability, OfficialOptionsReferenceStageProgress,
+    OfficialOptionsReferenceSurface, official_options_reference_object_binding_digest,
 };
 use market_squawk_domain::{
     AvailabilityEvidence, CalendarDate, EvidenceDigest, ResearchTemporalCoordinate, SourceId,
@@ -324,6 +329,146 @@ pub(crate) struct OfficialOptionsReferenceApplicationBinding {
     verified: Box<[VerifiedResearchObject]>,
 }
 
+/// Restart-resumable application mapper for one-pass provider records and reconciliation output.
+#[derive(Debug)]
+pub(crate) struct OfficialOptionsReferenceApplicationStage {
+    stage: OfficialOptionsReferenceStageCapability,
+    request_id: SourceIdentifier,
+    requested_at: Timestamp,
+    request_deadline: Timestamp,
+    object_ordinals: BTreeMap<ReferenceSurface, u16>,
+}
+
+impl OfficialOptionsReferenceApplicationStage {
+    /// Creates or resumes one typed stage bound to the exact selected request graph.
+    pub(crate) fn try_open(
+        publication: &OfficialOptionsReferencePublicationCapability,
+        request: &PublicationRequest,
+        stage_id: SourceIdentifier,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, OfficialOptionsReferenceApplicationError> {
+        let mut object_ordinals = BTreeMap::new();
+        let mut durable_surfaces = Vec::new();
+        durable_surfaces
+            .try_reserve_exact(request.surfaces().len())
+            .map_err(|_error| OfficialOptionsReferenceApplicationError::Capacity)?;
+        for (ordinal, surface) in request.surfaces().iter().enumerate() {
+            let ordinal = u16::try_from(ordinal)
+                .map_err(|_error| OfficialOptionsReferenceApplicationError::Capacity)?;
+            if object_ordinals.insert(surface.clone(), ordinal).is_some() {
+                return Err(OfficialOptionsReferenceApplicationError::InvalidBinding);
+            }
+            durable_surfaces.push(map_surface(surface)?);
+        }
+        if object_ordinals.is_empty() {
+            return Err(OfficialOptionsReferenceApplicationError::InvalidBinding);
+        }
+        let stage = publication.try_open_stage(
+            stage_id,
+            OfficialOptionsReferenceRequestBinding::try_new(
+                request.request_id().clone(),
+                request.requested_at(),
+                request.deadline(),
+                durable_surfaces,
+            )?,
+            deadline,
+            cancellation,
+        )?;
+        Ok(Self {
+            stage,
+            request_id: request.request_id().clone(),
+            requested_at: request.requested_at(),
+            request_deadline: request.deadline(),
+            object_ordinals,
+        })
+    }
+
+    /// Returns exact persisted cursors for deterministic provider acquisition resume.
+    pub(crate) fn progress(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<OfficialOptionsReferenceStageProgress, OfficialOptionsReferenceApplicationError>
+    {
+        Ok(self.stage.progress(deadline, cancellation)?)
+    }
+
+    /// Maps and appends one bounded one-pass batch without retaining the provider universe.
+    pub(crate) fn push_records(
+        &self,
+        records: &[ReferenceExportRecord],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), OfficialOptionsReferenceApplicationError> {
+        let mapped = map_bounded_stage_batch(records, |record| {
+            let context = record.object_context();
+            let official_request = context.transport_evidence().request();
+            let ordinal = self
+                .object_ordinals
+                .get(context.surface())
+                .copied()
+                .filter(|_ordinal| {
+                    context.provider() == context.surface().provider()
+                        && official_request.request_id() == &self.request_id
+                        && official_request.wall_started_at() == self.requested_at
+                        && official_request.wall_deadline() == self.request_deadline
+                })
+                .ok_or(OfficialOptionsReferenceApplicationError::InvalidBinding)?;
+            map_record(ordinal, object_binding_digest(context)?, record)
+        })?;
+        self.stage.push_records(&mapped, deadline, cancellation)?;
+        Ok(())
+    }
+
+    /// Maps and appends one bounded terminal alias-resolution batch.
+    pub(crate) fn push_resolutions(
+        &self,
+        resolutions: &[ReferenceAliasResolution],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), OfficialOptionsReferenceApplicationError> {
+        let mapped = map_bounded_stage_batch(resolutions, |resolution| {
+            map_resolution(&self.request_id, resolution)
+        })?;
+        self.stage
+            .push_resolutions(&mapped, deadline, cancellation)?;
+        Ok(())
+    }
+
+    /// Maps and appends one bounded preserved-conflict batch.
+    pub(crate) fn push_conflicts(
+        &self,
+        conflicts: &[ReferenceConflict],
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), OfficialOptionsReferenceApplicationError> {
+        let mapped = map_bounded_stage_batch(conflicts, |conflict| {
+            map_conflict(&self.request_id, conflict)
+        })?;
+        self.stage.push_conflicts(&mapped, deadline, cancellation)?;
+        Ok(())
+    }
+
+    /// Seals exact ordered-set evidence after all provider and reconciliation streams finish.
+    pub(crate) fn seal(
+        self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<OfficialOptionsReferenceSealedStage, OfficialOptionsReferenceApplicationError> {
+        Ok(self.stage.seal(deadline, cancellation)?)
+    }
+
+    /// Explicitly releases bounded disk capacity when this acquisition is abandoned.
+    pub(crate) fn discard(
+        self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), OfficialOptionsReferenceApplicationError> {
+        Ok(self.stage.discard(deadline, cancellation)?)
+    }
+}
+
 impl OfficialOptionsReferenceApplicationBinding {
     /// Reopens every store-issued receipt and binds it to the complete provider closure.
     pub(crate) fn try_new(
@@ -436,62 +581,12 @@ impl OfficialOptionsReferenceCatalogCommitInput {
         &self,
         record: &ReferenceExportRecord,
     ) -> Result<OfficialOptionsReferenceRecordInput, OfficialOptionsReferenceApplicationError> {
-        if record.identity() != OptionsReferenceIdentityDisposition::ProviderNativeReferenceOnly
-            || record.validity() != OptionsReferenceValidityDisposition::ExactSourceSnapshotOnly
-            || record.alias() != OptionsReferenceAliasDisposition::ProviderAliasCandidateOnly
-        {
-            return Err(OfficialOptionsReferenceApplicationError::InvalidBinding);
-        }
         let object_ordinal = self.object_ordinal(record.object_context())?;
-        let (provider_row_number, record_id, value) = match record {
-            ReferenceExportRecord::CboeSeries(series) => {
-                if series.listing_evidence() != CboeListingEvidence::PresentInVenuePublication {
-                    return Err(OfficialOptionsReferenceApplicationError::InvalidBinding);
-                }
-                let value = OfficialOptionsReferenceCboeSeries::try_new(
-                    cboe_venue(series.venue())?,
-                    series.cboe_symbol_id().as_str(),
-                    series.contract().osi().clone(),
-                    series.underlying().clone(),
-                    series.unit(),
-                    series.status() == CboeSeriesStatus::ClosingOnly,
-                )?;
-                (
-                    series.provider_row_number(),
-                    series.record_id().clone(),
-                    OfficialOptionsReferenceRecordValue::CboeSeries(value),
-                )
-            }
-            ReferenceExportRecord::OccProduct(product) => {
-                if product.presence() != OccDlpPresence::PresentInDirectoryPublication {
-                    return Err(OfficialOptionsReferenceApplicationError::InvalidBinding);
-                }
-                let mut exchange_codes = String::with_capacity(product.trading_exchanges().len());
-                for code in product.trading_exchanges() {
-                    exchange_codes.push(occ_exchange_code(*code));
-                }
-                let value = OfficialOptionsReferenceOccProduct::try_new(
-                    product.options_symbol().clone(),
-                    product.underlying_symbol().clone(),
-                    product.symbol_name(),
-                    exchange_codes,
-                    map_occ_exchange_listing(product.exchange_listing_evidence()),
-                    map_occ_position_limit(product.position_limit()),
-                    map_occ_product_type(product.product_type()),
-                )?;
-                (
-                    product.provider_row_number(),
-                    product.record_id().clone(),
-                    OfficialOptionsReferenceRecordValue::OccProduct(value),
-                )
-            }
-        };
-        Ok(OfficialOptionsReferenceRecordInput::try_new(
+        map_record(
             object_ordinal,
-            provider_row_number,
-            record_id,
-            value,
-        )?)
+            object_binding_digest(record.object_context())?,
+            record,
+        )
     }
 
     /// Maps one terminal request-scoped alias resolution without selecting a winner.
@@ -502,22 +597,7 @@ impl OfficialOptionsReferenceCatalogCommitInput {
         OfficialOptionsReferenceAliasResolutionInput,
         OfficialOptionsReferenceApplicationError,
     > {
-        if resolution.request_id() != self.closure.request_id() {
-            return Err(OfficialOptionsReferenceApplicationError::InvalidBinding);
-        }
-        Ok(OfficialOptionsReferenceAliasResolutionInput::try_new(
-            map_alias_key(resolution.key())?,
-            match resolution.state() {
-                ReferenceAliasResolutionState::Exact => {
-                    OfficialOptionsReferenceAliasResolutionState::Exact
-                }
-                ReferenceAliasResolutionState::Ambiguous => {
-                    OfficialOptionsReferenceAliasResolutionState::Ambiguous
-                }
-            },
-            resolution.observations(),
-            resolution.conflicts(),
-        )?)
+        map_resolution(self.closure.request_id(), resolution)
     }
 
     /// Maps one exact provider conflict while preserving both retained evidence identities.
@@ -526,28 +606,27 @@ impl OfficialOptionsReferenceCatalogCommitInput {
         conflict: &ReferenceConflict,
     ) -> Result<OfficialOptionsReferenceConflictInput, OfficialOptionsReferenceApplicationError>
     {
-        if conflict.request_id() != self.closure.request_id() {
-            return Err(OfficialOptionsReferenceApplicationError::InvalidBinding);
-        }
-        Ok(OfficialOptionsReferenceConflictInput::try_new(
-            map_alias_key(conflict.key())?,
-            match conflict.kind() {
-                ReferenceConflictKind::CboeSymbolMapsMultipleOsi => {
-                    OfficialOptionsReferenceConflictKind::CboeSymbolMapsMultipleOsi
-                }
-                ReferenceConflictKind::CboeOsiMapsMultipleSymbols => {
-                    OfficialOptionsReferenceConflictKind::CboeOsiMapsMultipleSymbols
-                }
-                ReferenceConflictKind::CboeSymbolMapsMultipleUnderlying => {
-                    OfficialOptionsReferenceConflictKind::CboeSymbolMapsMultipleUnderlying
-                }
-                ReferenceConflictKind::DuplicateProviderRecord => {
-                    OfficialOptionsReferenceConflictKind::DuplicateProviderRecord
-                }
-            },
-            conflict.first_evidence().clone(),
-            conflict.second_evidence().clone(),
-        )?)
+        map_conflict(self.closure.request_id(), conflict)
+    }
+
+    /// Publishes one sealed shared typed stage after rehydrating every raw-object receipt.
+    pub(crate) fn publish_staged(
+        self,
+        publication: &OfficialOptionsReferencePublicationCapability,
+        expected_previous_generation: Option<EvidenceDigest>,
+        stage: &OfficialOptionsReferenceSealedStage,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<OfficialOptionsReferencePublicationReceipt, OfficialOptionsReferenceApplicationError>
+    {
+        let header = self.generation_header(
+            expected_previous_generation,
+            stage.alias_assertions().clone(),
+            stage.records(),
+            stage.resolutions(),
+            stage.conflicts(),
+        )?;
+        Ok(publication.publish_staged(header, stage, deadline, cancellation)?)
     }
 
     /// Atomically publishes the complete externally staged and pre-digested request closure.
@@ -665,6 +744,8 @@ impl OfficialOptionsReferenceCatalogCommitInput {
                     source_id: SourceId::try_from(object.source_id().as_str()).map_err(
                         |_error| OfficialOptionsReferenceApplicationError::InvalidBinding,
                     )?,
+                    provider_id: object.provider_id().clone(),
+                    source_contract_digest: object.source_contract_digest(),
                     surface: map_surface(object.surface())?,
                     object_id: object.object_id().clone(),
                     native_schema: OfficialOptionsReferenceObjectInput::try_native_schema_identity(
@@ -674,6 +755,8 @@ impl OfficialOptionsReferenceCatalogCommitInput {
                     )?,
                     raw_receipt: receipt.clone(),
                     payload_digest: object.payload_digest(),
+                    request_digest: object.request_digest(),
+                    transport_receipt_digest: object.transport_receipt_digest(),
                     source_timestamp,
                     available_at,
                     received_at: object.received_at(),
@@ -681,6 +764,12 @@ impl OfficialOptionsReferenceCatalogCommitInput {
                     strict_row_count: object.strict().returned_records(),
                 },
             )?);
+        }
+        if conflicts.count()
+            != u64::try_from(self.closure.conflicts())
+                .map_err(|_error| OfficialOptionsReferenceApplicationError::Capacity)?
+        {
+            return Err(OfficialOptionsReferenceApplicationError::InvalidBinding);
         }
         let header = OfficialOptionsReferenceGenerationHeader::try_new(
             expected_previous_generation,
@@ -1085,6 +1174,169 @@ fn object_commitment(
         source_publication_date: context.source_publication_date(),
         native_schema: context.native_schema_identity().clone(),
     })
+}
+
+fn map_record(
+    object_ordinal: u16,
+    object_binding_digest: EvidenceDigest,
+    record: &ReferenceExportRecord,
+) -> Result<OfficialOptionsReferenceRecordInput, OfficialOptionsReferenceApplicationError> {
+    if record.identity() != OptionsReferenceIdentityDisposition::ProviderNativeReferenceOnly
+        || record.validity() != OptionsReferenceValidityDisposition::ExactSourceSnapshotOnly
+        || record.alias() != OptionsReferenceAliasDisposition::ProviderAliasCandidateOnly
+    {
+        return Err(OfficialOptionsReferenceApplicationError::InvalidBinding);
+    }
+    let (provider_row_number, record_id, value) = match record {
+        ReferenceExportRecord::CboeSeries(series) => {
+            if series.listing_evidence() != CboeListingEvidence::PresentInVenuePublication {
+                return Err(OfficialOptionsReferenceApplicationError::InvalidBinding);
+            }
+            let value = OfficialOptionsReferenceCboeSeries::try_new(
+                cboe_venue(series.venue())?,
+                series.cboe_symbol_id().as_str(),
+                series.contract().osi().clone(),
+                series.underlying().clone(),
+                series.unit(),
+                series.status() == CboeSeriesStatus::ClosingOnly,
+            )?;
+            (
+                series.provider_row_number(),
+                series.record_id().clone(),
+                OfficialOptionsReferenceRecordValue::CboeSeries(value),
+            )
+        }
+        ReferenceExportRecord::OccProduct(product) => {
+            if product.presence() != OccDlpPresence::PresentInDirectoryPublication {
+                return Err(OfficialOptionsReferenceApplicationError::InvalidBinding);
+            }
+            let mut exchange_codes = String::with_capacity(product.trading_exchanges().len());
+            for code in product.trading_exchanges() {
+                exchange_codes.push(occ_exchange_code(*code));
+            }
+            let value = OfficialOptionsReferenceOccProduct::try_new(
+                product.options_symbol().clone(),
+                product.underlying_symbol().clone(),
+                product.symbol_name(),
+                exchange_codes,
+                map_occ_exchange_listing(product.exchange_listing_evidence()),
+                map_occ_position_limit(product.position_limit()),
+                map_occ_product_type(product.product_type()),
+            )?;
+            (
+                product.provider_row_number(),
+                product.record_id().clone(),
+                OfficialOptionsReferenceRecordValue::OccProduct(value),
+            )
+        }
+    };
+    Ok(OfficialOptionsReferenceRecordInput::try_new(
+        object_ordinal,
+        object_binding_digest,
+        provider_row_number,
+        record_id,
+        value,
+    )?)
+}
+
+fn object_binding_digest(
+    context: &ReferenceObjectContext,
+) -> Result<EvidenceDigest, OfficialOptionsReferenceApplicationError> {
+    let request = context.transport_evidence().request();
+    let native_schema = OfficialOptionsReferenceObjectInput::try_native_schema_identity(
+        context.native_schema_identity().name(),
+        context.native_schema_identity().version(),
+        context.native_schema_identity().fingerprint(),
+    )?;
+    Ok(official_options_reference_object_binding_digest(
+        &OfficialOptionsReferenceObjectBindingFields {
+            source_id: SourceId::try_from(request.source_id().as_str())
+                .map_err(|_error| OfficialOptionsReferenceApplicationError::InvalidBinding)?,
+            provider_id: request.provider_id().clone(),
+            source_contract_digest: request.source_contract_digest(),
+            surface: map_surface(context.surface())?,
+            object_id: context.object_id().clone(),
+            native_schema,
+            payload_digest: context.payload_digest(),
+            payload_bytes: context.payload_bytes(),
+            request_digest: context.transport_evidence().request_digest(),
+            transport_receipt_digest: context.transport_evidence().receipt_digest(),
+        },
+    )?)
+}
+
+fn map_resolution(
+    request_id: &SourceIdentifier,
+    resolution: &ReferenceAliasResolution,
+) -> Result<OfficialOptionsReferenceAliasResolutionInput, OfficialOptionsReferenceApplicationError>
+{
+    if resolution.request_id() != request_id {
+        return Err(OfficialOptionsReferenceApplicationError::InvalidBinding);
+    }
+    Ok(OfficialOptionsReferenceAliasResolutionInput::try_new(
+        map_alias_key(resolution.key())?,
+        match resolution.state() {
+            ReferenceAliasResolutionState::Exact => {
+                OfficialOptionsReferenceAliasResolutionState::Exact
+            }
+            ReferenceAliasResolutionState::Ambiguous => {
+                OfficialOptionsReferenceAliasResolutionState::Ambiguous
+            }
+        },
+        resolution.observations(),
+        resolution.conflicts(),
+    )?)
+}
+
+fn map_conflict(
+    request_id: &SourceIdentifier,
+    conflict: &ReferenceConflict,
+) -> Result<OfficialOptionsReferenceConflictInput, OfficialOptionsReferenceApplicationError> {
+    if conflict.request_id() != request_id {
+        return Err(OfficialOptionsReferenceApplicationError::InvalidBinding);
+    }
+    Ok(OfficialOptionsReferenceConflictInput::try_new(
+        map_alias_key(conflict.key())?,
+        match conflict.kind() {
+            ReferenceConflictKind::CboeSymbolMapsMultipleOsi => {
+                OfficialOptionsReferenceConflictKind::CboeSymbolMapsMultipleOsi
+            }
+            ReferenceConflictKind::CboeOsiMapsMultipleSymbols => {
+                OfficialOptionsReferenceConflictKind::CboeOsiMapsMultipleSymbols
+            }
+            ReferenceConflictKind::CboeSymbolMapsMultipleUnderlying => {
+                OfficialOptionsReferenceConflictKind::CboeSymbolMapsMultipleUnderlying
+            }
+            ReferenceConflictKind::DuplicateProviderRecord => {
+                OfficialOptionsReferenceConflictKind::DuplicateProviderRecord
+            }
+        },
+        conflict.first_evidence().clone(),
+        conflict.second_evidence().clone(),
+    )?)
+}
+
+fn map_bounded_stage_batch<T, U, F>(
+    values: &[T],
+    mut map: F,
+) -> Result<Vec<U>, OfficialOptionsReferenceApplicationError>
+where
+    F: FnMut(&T) -> Result<U, OfficialOptionsReferenceApplicationError>,
+{
+    if values.is_empty() {
+        return Err(OfficialOptionsReferenceApplicationError::InvalidBinding);
+    }
+    if values.len() > MAX_OFFICIAL_OPTIONS_REFERENCE_STAGE_BATCH_ROWS {
+        return Err(OfficialOptionsReferenceApplicationError::Capacity);
+    }
+    let mut mapped = Vec::new();
+    mapped
+        .try_reserve_exact(values.len())
+        .map_err(|_error| OfficialOptionsReferenceApplicationError::Capacity)?;
+    for value in values {
+        mapped.push(map(value)?);
+    }
+    Ok(mapped)
 }
 
 /// Application binding, physical verification, or capacity failure.

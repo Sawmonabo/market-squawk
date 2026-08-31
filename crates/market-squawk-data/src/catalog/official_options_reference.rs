@@ -34,7 +34,6 @@ use super::CatalogAuthority;
 use super::provider_capture::raw_claim_digest as shared_raw_claim_digest;
 use super::storage::{ResultBudget, append_audit, now_timestamp, sha256, trusted_catalog_now};
 use super::types::CatalogError;
-use crate::RegisteredRightsGrant;
 
 /// Maximum official objects retained in one complete OCC/Cboe generation.
 pub const MAX_OFFICIAL_OPTIONS_REFERENCE_OBJECTS: usize = 64;
@@ -69,6 +68,10 @@ const MAX_SEARCH_QUERY_BYTES: usize = 256;
 const MAX_CURRENT_REFERENCE_DATASET_CANDIDATES: usize = 64;
 const MAX_GENERATIONS: u32 = 16_384;
 const SQLITE_PROGRESS_OPERATIONS: i32 = 1_000;
+const REQUEST_BINDING_DIGEST_DOMAIN: &[u8] =
+    b"market-squawk/official-options-reference-request-binding/v1";
+const OBJECT_BINDING_DIGEST_DOMAIN: &[u8] =
+    b"market-squawk/official-options-reference-object-binding/v1";
 
 const SOURCE_PAYLOAD_SET_DOMAIN: &[u8] =
     b"market-squawk/official-options-reference/source-payload-set/v1";
@@ -234,17 +237,148 @@ fn cboe_venue_rank(venue: &VenueId) -> Option<u8> {
     }
 }
 
+/// Exact request clocks and ordered official surfaces retained by a restartable typed stage.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfficialOptionsReferenceRequestBinding {
+    request_id: SourceIdentifier,
+    requested_at: Timestamp,
+    request_deadline: Timestamp,
+    surfaces: Box<[OfficialOptionsReferenceSurface]>,
+    digest: EvidenceDigest,
+}
+
+impl OfficialOptionsReferenceRequestBinding {
+    /// Constructs one exact, duplicate-free request graph in provider adapter order.
+    pub fn try_new(
+        request_id: SourceIdentifier,
+        requested_at: Timestamp,
+        request_deadline: Timestamp,
+        surfaces: Vec<OfficialOptionsReferenceSurface>,
+    ) -> Result<Self, OfficialOptionsReferenceError> {
+        if requested_at >= request_deadline
+            || surfaces.len() < OfficialOptionsReferenceProvider::ALL.len()
+            || surfaces.len() > MAX_OFFICIAL_OPTIONS_REFERENCE_OBJECTS
+            || surfaces
+                .windows(2)
+                .any(|pair| !matches!(pair[0].adapter_order_cmp(&pair[1]), Ok(Ordering::Less)))
+        {
+            return Err(OfficialOptionsReferenceError::InvalidInput);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(REQUEST_BINDING_DIGEST_DOMAIN);
+        hash_bytes(&mut hasher, request_id.as_str().as_bytes())?;
+        hasher.update(requested_at.unix_nanos().to_be_bytes());
+        hasher.update(request_deadline.unix_nanos().to_be_bytes());
+        hasher.update(to_u64(surfaces.len())?.to_be_bytes());
+        for surface in &surfaces {
+            hash_bytes(&mut hasher, &serde_json::to_vec(surface)?)?;
+        }
+        Ok(Self {
+            request_id,
+            requested_at,
+            request_deadline,
+            surfaces: surfaces.into_boxed_slice(),
+            digest: finalize(hasher),
+        })
+    }
+
+    pub const fn request_id(&self) -> &SourceIdentifier {
+        &self.request_id
+    }
+
+    pub const fn requested_at(&self) -> Timestamp {
+        self.requested_at
+    }
+
+    pub const fn request_deadline(&self) -> Timestamp {
+        self.request_deadline
+    }
+
+    pub fn surfaces(&self) -> &[OfficialOptionsReferenceSurface] {
+        &self.surfaces
+    }
+
+    pub const fn digest(&self) -> EvidenceDigest {
+        self.digest
+    }
+
+    pub(super) fn validate(&self) -> Result<(), OfficialOptionsReferenceError> {
+        let rebuilt = Self::try_new(
+            self.request_id.clone(),
+            self.requested_at,
+            self.request_deadline,
+            self.surfaces.to_vec(),
+        )?;
+        if &rebuilt == self {
+            Ok(())
+        } else {
+            Err(OfficialOptionsReferenceError::InvalidInput)
+        }
+    }
+}
+
+/// Complete common fields whose digest binds one staged row to one exact acquired object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfficialOptionsReferenceObjectBindingFields {
+    pub source_id: SourceId,
+    pub provider_id: SourceIdentifier,
+    pub source_contract_digest: EvidenceDigest,
+    pub surface: OfficialOptionsReferenceSurface,
+    pub object_id: SourceIdentifier,
+    pub native_schema: SourceIdentifier,
+    pub payload_digest: EvidenceDigest,
+    pub payload_bytes: u64,
+    pub request_digest: EvidenceDigest,
+    pub transport_receipt_digest: EvidenceDigest,
+}
+
+/// Computes the exact source, request, transport, decoder, and payload binding for one object.
+pub fn official_options_reference_object_binding_digest(
+    fields: &OfficialOptionsReferenceObjectBindingFields,
+) -> Result<EvidenceDigest, OfficialOptionsReferenceError> {
+    for digest in [
+        fields.source_contract_digest,
+        fields.payload_digest,
+        fields.request_digest,
+        fields.transport_receipt_digest,
+    ] {
+        validate_sha256(digest)?;
+    }
+    if fields.payload_bytes == 0 || fields.payload_bytes > MAX_TOTAL_PAYLOAD_BYTES {
+        return Err(OfficialOptionsReferenceError::InvalidInput);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(OBJECT_BINDING_DIGEST_DOMAIN);
+    hash_bytes(&mut hasher, fields.source_id.as_str().as_bytes())?;
+    hash_bytes(&mut hasher, fields.provider_id.as_str().as_bytes())?;
+    hash_evidence(&mut hasher, fields.source_contract_digest);
+    hash_bytes(&mut hasher, &serde_json::to_vec(&fields.surface)?)?;
+    hash_bytes(&mut hasher, fields.object_id.as_str().as_bytes())?;
+    hash_bytes(&mut hasher, fields.native_schema.as_str().as_bytes())?;
+    hash_evidence(&mut hasher, fields.payload_digest);
+    hasher.update(fields.payload_bytes.to_be_bytes());
+    hash_evidence(&mut hasher, fields.request_digest);
+    hash_evidence(&mut hasher, fields.transport_receipt_digest);
+    Ok(finalize(hasher))
+}
+
 /// Exact raw-object and strict-parser evidence for one selected surface.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OfficialOptionsReferenceObjectInput {
     object_ordinal: u16,
     source_id: SourceId,
+    provider_id: SourceIdentifier,
+    source_contract_digest: EvidenceDigest,
     surface: OfficialOptionsReferenceSurface,
     object_id: SourceIdentifier,
     native_schema: SourceIdentifier,
     raw_receipt: Option<ResearchObjectReceipt>,
     raw_claim: ResearchObjectClaim,
     payload_digest: EvidenceDigest,
+    request_digest: EvidenceDigest,
+    transport_receipt_digest: EvidenceDigest,
+    object_binding_digest: EvidenceDigest,
     source_timestamp: Option<Timestamp>,
     available_at: Timestamp,
     received_at: Timestamp,
@@ -259,6 +393,10 @@ pub struct OfficialOptionsReferenceObjectInputFields {
     pub object_ordinal: u16,
     /// Exact registered source owning the object.
     pub source_id: SourceId,
+    /// Exact shared-budget provider identity used for transport admission.
+    pub provider_id: SourceIdentifier,
+    /// Exact source-metadata revision payload digest used to seal the request.
+    pub source_contract_digest: EvidenceDigest,
     /// Exact selected surface.
     pub surface: OfficialOptionsReferenceSurface,
     /// Provider object identity.
@@ -269,6 +407,10 @@ pub struct OfficialOptionsReferenceObjectInputFields {
     pub raw_receipt: ResearchObjectReceipt,
     /// Exact provider response-body digest.
     pub payload_digest: EvidenceDigest,
+    /// Exact sealed request identity answered by the response.
+    pub request_digest: EvidenceDigest,
+    /// Exact complete admitted HTTP transport receipt identity.
+    pub transport_receipt_digest: EvidenceDigest,
     /// Source-authored object time when the surface supplied one.
     pub source_timestamp: Option<Timestamp>,
     /// Earliest exact local/provider availability instant retained for this object.
@@ -285,10 +427,15 @@ pub struct OfficialOptionsReferenceObjectInputFields {
 struct OfficialOptionsReferenceObjectCoordinates {
     object_ordinal: u16,
     source_id: SourceId,
+    provider_id: SourceIdentifier,
+    source_contract_digest: EvidenceDigest,
     surface: OfficialOptionsReferenceSurface,
     object_id: SourceIdentifier,
     native_schema: SourceIdentifier,
     payload_digest: EvidenceDigest,
+    request_digest: EvidenceDigest,
+    transport_receipt_digest: EvidenceDigest,
+    object_binding_digest: EvidenceDigest,
     source_timestamp: Option<Timestamp>,
     available_at: Timestamp,
     received_at: Timestamp,
@@ -338,11 +485,15 @@ impl OfficialOptionsReferenceObjectInput {
         let OfficialOptionsReferenceObjectInputFields {
             object_ordinal,
             source_id,
+            provider_id,
+            source_contract_digest,
             surface,
             object_id,
             native_schema,
             raw_receipt,
             payload_digest,
+            request_digest,
+            transport_receipt_digest,
             source_timestamp,
             available_at,
             received_at,
@@ -350,14 +501,33 @@ impl OfficialOptionsReferenceObjectInput {
             strict_row_count,
         } = fields;
         let raw_claim = raw_receipt.claim().clone();
+        let object_binding_digest = official_options_reference_object_binding_digest(
+            &OfficialOptionsReferenceObjectBindingFields {
+                source_id: source_id.clone(),
+                provider_id: provider_id.clone(),
+                source_contract_digest,
+                surface: surface.clone(),
+                object_id: object_id.clone(),
+                native_schema: native_schema.clone(),
+                payload_digest,
+                payload_bytes: raw_claim.size_bytes(),
+                request_digest,
+                transport_receipt_digest,
+            },
+        )?;
         Self::try_new_with_raw_authority(
             OfficialOptionsReferenceObjectCoordinates {
                 object_ordinal,
                 source_id,
+                provider_id,
+                source_contract_digest,
                 surface,
                 object_id,
                 native_schema,
                 payload_digest,
+                request_digest,
+                transport_receipt_digest,
+                object_binding_digest,
                 source_timestamp,
                 available_at,
                 received_at,
@@ -391,8 +561,29 @@ impl OfficialOptionsReferenceObjectInput {
             return Err(OfficialOptionsReferenceError::InvalidInput);
         }
         validate_sha256(fields.payload_digest)?;
+        validate_sha256(fields.source_contract_digest)?;
+        validate_sha256(fields.request_digest)?;
+        validate_sha256(fields.transport_receipt_digest)?;
+        validate_sha256(fields.object_binding_digest)?;
         validate_sha256(fields.strict_row_set_digest)?;
         validate_sha256(raw_claim.physical_receipt_digest())?;
+        let expected_binding = official_options_reference_object_binding_digest(
+            &OfficialOptionsReferenceObjectBindingFields {
+                source_id: fields.source_id.clone(),
+                provider_id: fields.provider_id.clone(),
+                source_contract_digest: fields.source_contract_digest,
+                surface: fields.surface.clone(),
+                object_id: fields.object_id.clone(),
+                native_schema: fields.native_schema.clone(),
+                payload_digest: fields.payload_digest,
+                payload_bytes: raw_claim.size_bytes(),
+                request_digest: fields.request_digest,
+                transport_receipt_digest: fields.transport_receipt_digest,
+            },
+        )?;
+        if fields.object_binding_digest != expected_binding {
+            return Err(OfficialOptionsReferenceError::InvalidInput);
+        }
         if raw_receipt
             .as_ref()
             .is_some_and(|receipt| receipt.claim() != &raw_claim)
@@ -402,12 +593,17 @@ impl OfficialOptionsReferenceObjectInput {
         Ok(Self {
             object_ordinal: fields.object_ordinal,
             source_id: fields.source_id,
+            provider_id: fields.provider_id,
+            source_contract_digest: fields.source_contract_digest,
             surface: fields.surface,
             object_id: fields.object_id,
             native_schema: fields.native_schema,
             raw_receipt,
             raw_claim,
             payload_digest: fields.payload_digest,
+            request_digest: fields.request_digest,
+            transport_receipt_digest: fields.transport_receipt_digest,
+            object_binding_digest: fields.object_binding_digest,
             source_timestamp: fields.source_timestamp,
             available_at: fields.available_at,
             received_at: fields.received_at,
@@ -426,9 +622,21 @@ impl OfficialOptionsReferenceObjectInput {
         &self.source_id
     }
 
+    pub const fn provider_id(&self) -> &SourceIdentifier {
+        &self.provider_id
+    }
+
+    pub const fn source_contract_digest(&self) -> EvidenceDigest {
+        self.source_contract_digest
+    }
+
     /// Returns the selected provider surface.
     pub const fn surface(&self) -> &OfficialOptionsReferenceSurface {
         &self.surface
+    }
+
+    pub const fn object_binding_digest(&self) -> EvidenceDigest {
+        self.object_binding_digest
     }
 
     fn raw_claim(&self) -> &ResearchObjectClaim {
@@ -549,6 +757,54 @@ pub enum OfficialOptionsReferenceOccExchangeListingEvidence {
     NotReportedInSelectedDirectory,
 }
 
+/// Validity established by one selected official reference object.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfficialOptionsReferenceValidityEvidence {
+    /// The row is present in this exact immutable source snapshot; no wider interval is inferred.
+    PresentInExactSourceSnapshotOnly,
+}
+
+/// Lifecycle-event evidence retained when the selected sources do not establish an event.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfficialOptionsReferenceLifecycleEventEvidence {
+    /// The selected source object does not establish this lifecycle event.
+    NotEstablishedBySelectedSource,
+}
+
+/// Honest validity and lifecycle limits shared by exact OCC and Cboe snapshot rows.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfficialOptionsReferenceLifecycleEvidence {
+    validity: OfficialOptionsReferenceValidityEvidence,
+    successor: OfficialOptionsReferenceLifecycleEventEvidence,
+    delisting: OfficialOptionsReferenceLifecycleEventEvidence,
+}
+
+impl OfficialOptionsReferenceLifecycleEvidence {
+    const EXACT_SNAPSHOT_ONLY: Self = Self {
+        validity: OfficialOptionsReferenceValidityEvidence::PresentInExactSourceSnapshotOnly,
+        successor: OfficialOptionsReferenceLifecycleEventEvidence::NotEstablishedBySelectedSource,
+        delisting: OfficialOptionsReferenceLifecycleEventEvidence::NotEstablishedBySelectedSource,
+    };
+
+    /// Returns the exact-snapshot validity disposition.
+    pub const fn validity(self) -> OfficialOptionsReferenceValidityEvidence {
+        self.validity
+    }
+
+    /// Returns the selected source's successor-event disposition.
+    pub const fn successor(self) -> OfficialOptionsReferenceLifecycleEventEvidence {
+        self.successor
+    }
+
+    /// Returns the selected source's delisting-event disposition.
+    pub const fn delisting(self) -> OfficialOptionsReferenceLifecycleEventEvidence {
+        self.delisting
+    }
+}
+
 /// One exact provider-native Cboe series value.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -559,6 +815,7 @@ pub struct OfficialOptionsReferenceCboeSeries {
     underlying_alias: ProviderInstrumentId,
     matching_unit: NonZeroU16,
     closing_only: bool,
+    lifecycle: OfficialOptionsReferenceLifecycleEvidence,
 }
 
 impl OfficialOptionsReferenceCboeSeries {
@@ -584,6 +841,7 @@ impl OfficialOptionsReferenceCboeSeries {
             underlying_alias,
             matching_unit,
             closing_only,
+            lifecycle: OfficialOptionsReferenceLifecycleEvidence::EXACT_SNAPSHOT_ONLY,
         };
         value
             .validate()
@@ -615,6 +873,11 @@ impl OfficialOptionsReferenceCboeSeries {
         self.closing_only
     }
 
+    /// Returns exact snapshot-only validity without treating `closing_only` as delisting.
+    pub const fn lifecycle(&self) -> OfficialOptionsReferenceLifecycleEvidence {
+        self.lifecycle
+    }
+
     fn validate(&self) -> Result<(), OfficialOptionsReferenceError> {
         if cboe_venue_rank(&self.venue).is_some()
             && self.cboe_symbol.len() == MAX_CBOE_SYMBOL_BYTES
@@ -628,6 +891,7 @@ impl OfficialOptionsReferenceCboeSeries {
                 .as_str()
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.')
+            && self.lifecycle == OfficialOptionsReferenceLifecycleEvidence::EXACT_SNAPSHOT_ONLY
         {
             Ok(())
         } else {
@@ -647,6 +911,7 @@ pub struct OfficialOptionsReferenceOccProduct {
     exchange_listing_evidence: OfficialOptionsReferenceOccExchangeListingEvidence,
     position_limit: OfficialOptionsReferenceOccPositionLimit,
     product_type: OfficialOptionsReferenceOccProductType,
+    lifecycle: OfficialOptionsReferenceLifecycleEvidence,
 }
 
 impl OfficialOptionsReferenceOccProduct {
@@ -668,6 +933,7 @@ impl OfficialOptionsReferenceOccProduct {
             exchange_listing_evidence,
             position_limit,
             product_type,
+            lifecycle: OfficialOptionsReferenceLifecycleEvidence::EXACT_SNAPSHOT_ONLY,
         };
         value
             .validate()
@@ -703,6 +969,11 @@ impl OfficialOptionsReferenceOccProduct {
 
     pub const fn product_type(&self) -> OfficialOptionsReferenceOccProductType {
         self.product_type
+    }
+
+    /// Returns exact snapshot-only validity and honest absent lifecycle events.
+    pub const fn lifecycle(&self) -> OfficialOptionsReferenceLifecycleEvidence {
+        self.lifecycle
     }
 
     fn validate(&self) -> Result<(), OfficialOptionsReferenceError> {
@@ -746,6 +1017,7 @@ impl OfficialOptionsReferenceOccProduct {
                     self.position_limit,
                     OfficialOptionsReferenceOccPositionLimit::EquityReported(_)
                 )
+            || self.lifecycle != OfficialOptionsReferenceLifecycleEvidence::EXACT_SNAPSHOT_ONLY
         {
             Err(OfficialOptionsReferenceError::CorruptCatalog)
         } else {
@@ -782,10 +1054,11 @@ impl OfficialOptionsReferenceRecordValue {
 }
 
 /// One exact staged identity row bound to an object and provider row coordinate.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OfficialOptionsReferenceRecordInput {
     object_ordinal: u16,
+    object_binding_digest: EvidenceDigest,
     provider_row_number: u32,
     record_id: SourceIdentifier,
     value: OfficialOptionsReferenceRecordValue,
@@ -795,6 +1068,7 @@ impl OfficialOptionsReferenceRecordInput {
     /// Constructs one exact staged row.
     pub fn try_new(
         object_ordinal: u16,
+        object_binding_digest: EvidenceDigest,
         provider_row_number: u32,
         record_id: SourceIdentifier,
         value: OfficialOptionsReferenceRecordValue,
@@ -805,11 +1079,13 @@ impl OfficialOptionsReferenceRecordInput {
         {
             return Err(OfficialOptionsReferenceError::InvalidInput);
         }
+        validate_sha256(object_binding_digest)?;
         value
             .validate()
             .map_err(|_| OfficialOptionsReferenceError::InvalidInput)?;
         Ok(Self {
             object_ordinal,
+            object_binding_digest,
             provider_row_number,
             record_id,
             value,
@@ -822,6 +1098,10 @@ impl OfficialOptionsReferenceRecordInput {
 
     pub const fn provider_row_number(&self) -> u32 {
         self.provider_row_number
+    }
+
+    pub const fn object_binding_digest(&self) -> EvidenceDigest {
+        self.object_binding_digest
     }
 
     pub const fn record_id(&self) -> &SourceIdentifier {
@@ -1197,7 +1477,7 @@ impl OfficialOptionsReferenceAliasResolutionState {
 }
 
 /// One complete request-scoped alias resolution produced by terminal reconciliation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OfficialOptionsReferenceAliasResolutionInput {
     key: OfficialOptionsReferenceAliasKey,
@@ -1296,7 +1576,7 @@ impl OfficialOptionsReferenceConflictKind {
 }
 
 /// One exact provider conflict and its two retained row-evidence identities.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OfficialOptionsReferenceConflictInput {
     key: OfficialOptionsReferenceAliasKey,
@@ -1560,6 +1840,7 @@ pub struct OfficialOptionsReferenceGenerationHeader {
     request_id: SourceIdentifier,
     requested_at: Timestamp,
     request_deadline: Timestamp,
+    request_binding: OfficialOptionsReferenceRequestBinding,
     strict_row_set_digest: EvidenceDigest,
     alias_assertions: u64,
     alias_assertion_closure_digest: EvidenceDigest,
@@ -1652,6 +1933,15 @@ impl OfficialOptionsReferenceGenerationHeader {
         }
         let strict_row_set_digest =
             strict_request_row_set_digest(&request_id, &objects, strict_row_count)?;
+        let request_binding = OfficialOptionsReferenceRequestBinding::try_new(
+            request_id.clone(),
+            requested_at,
+            request_deadline,
+            objects
+                .iter()
+                .map(|object| object.surface.clone())
+                .collect(),
+        )?;
         let alias_assertions = alias_assertion_set.assertions;
         let alias_assertion_closure_digest =
             alias_assertion_set.closure_digest(strict_row_set_digest)?;
@@ -1660,6 +1950,7 @@ impl OfficialOptionsReferenceGenerationHeader {
             request_id,
             requested_at,
             request_deadline,
+            request_binding,
             strict_row_set_digest,
             alias_assertions,
             alias_assertion_closure_digest,
@@ -1689,6 +1980,10 @@ impl OfficialOptionsReferenceGenerationHeader {
         self.request_deadline
     }
 
+    pub const fn request_binding(&self) -> &OfficialOptionsReferenceRequestBinding {
+        &self.request_binding
+    }
+
     pub fn objects(&self) -> &[OfficialOptionsReferenceObjectInput] {
         &self.objects
     }
@@ -1713,7 +2008,7 @@ impl OfficialOptionsReferenceGenerationHeader {
         self.strict_row_count
     }
 
-    /// Computes the exact provider-specific payload-set identity needed for rights admission.
+    /// Computes the exact provider-specific payload-set identity retained with this generation.
     pub fn source_payload_set_digest(
         &self,
         provider: OfficialOptionsReferenceProvider,
@@ -1748,12 +2043,11 @@ fn strict_request_row_set_digest(
     Ok(finalize(digest))
 }
 
-/// One provider/source/revision and its sealed persist/display grant.
+/// One exact provider/source/revision admitted by root source composition.
 #[derive(Clone)]
 pub struct OfficialOptionsReferenceSourceAuthority {
     provider: OfficialOptionsReferenceProvider,
     metadata: SourceMetadata,
-    rights: RegisteredRightsGrant,
 }
 
 impl fmt::Debug for OfficialOptionsReferenceSourceAuthority {
@@ -1762,23 +2056,14 @@ impl fmt::Debug for OfficialOptionsReferenceSourceAuthority {
             .debug_struct("OfficialOptionsReferenceSourceAuthority")
             .field("provider", &self.provider)
             .field("source_id", self.metadata.source_id())
-            .field("rights", &"[SEALED]")
             .finish()
     }
 }
 
 impl OfficialOptionsReferenceSourceAuthority {
-    /// Binds one registered provider source to one already admitted exact payload-set grant.
-    pub const fn new(
-        provider: OfficialOptionsReferenceProvider,
-        metadata: SourceMetadata,
-        rights: RegisteredRightsGrant,
-    ) -> Self {
-        Self {
-            provider,
-            metadata,
-            rights,
-        }
+    /// Binds one registered provider source to its exact official provider namespace.
+    pub const fn new(provider: OfficialOptionsReferenceProvider, metadata: SourceMetadata) -> Self {
+        Self { provider, metadata }
     }
 
     pub const fn provider(&self) -> OfficialOptionsReferenceProvider {
@@ -1797,7 +2082,6 @@ pub struct OfficialOptionsReferenceSourceEvidence {
     source_id: SourceId,
     source_revision: SourceIdentifier,
     source_revision_digest: EvidenceDigest,
-    rights_id: EvidenceDigest,
     source_payload_set_digest: EvidenceDigest,
 }
 
@@ -1818,10 +2102,6 @@ impl OfficialOptionsReferenceSourceEvidence {
         self.source_revision_digest
     }
 
-    pub const fn rights_id(&self) -> EvidenceDigest {
-        self.rights_id
-    }
-
     pub const fn source_payload_set_digest(&self) -> EvidenceDigest {
         self.source_payload_set_digest
     }
@@ -1833,12 +2113,17 @@ pub struct OfficialOptionsReferenceObjectEvidence {
     object_ordinal: u16,
     provider: OfficialOptionsReferenceProvider,
     source_id: SourceId,
+    provider_id: SourceIdentifier,
+    source_contract_digest: EvidenceDigest,
     surface: OfficialOptionsReferenceSurface,
     object_id: SourceIdentifier,
     native_schema: SourceIdentifier,
     raw_claim_digest: EvidenceDigest,
     physical_receipt_digest: EvidenceDigest,
     payload_digest: EvidenceDigest,
+    request_digest: EvidenceDigest,
+    transport_receipt_digest: EvidenceDigest,
+    object_binding_digest: EvidenceDigest,
     payload_bytes: u64,
     source_timestamp: Option<Timestamp>,
     available_at: Timestamp,
@@ -1858,6 +2143,14 @@ impl OfficialOptionsReferenceObjectEvidence {
 
     pub const fn source_id(&self) -> &SourceId {
         &self.source_id
+    }
+
+    pub const fn provider_id(&self) -> &SourceIdentifier {
+        &self.provider_id
+    }
+
+    pub const fn source_contract_digest(&self) -> EvidenceDigest {
+        self.source_contract_digest
     }
 
     pub const fn surface(&self) -> &OfficialOptionsReferenceSurface {
@@ -1882,6 +2175,18 @@ impl OfficialOptionsReferenceObjectEvidence {
 
     pub const fn payload_digest(&self) -> EvidenceDigest {
         self.payload_digest
+    }
+
+    pub const fn request_digest(&self) -> EvidenceDigest {
+        self.request_digest
+    }
+
+    pub const fn transport_receipt_digest(&self) -> EvidenceDigest {
+        self.transport_receipt_digest
+    }
+
+    pub const fn object_binding_digest(&self) -> EvidenceDigest {
+        self.object_binding_digest
     }
 
     pub const fn payload_bytes(&self) -> u64 {
@@ -2414,7 +2719,7 @@ impl OfficialOptionsReferenceSearchPage {
     }
 }
 
-/// Cloneable least-authority publisher bound to one dataset and exact OCC/Cboe grants.
+/// Cloneable least-authority publisher bound to one dataset and exact OCC/Cboe sources.
 #[derive(Clone)]
 pub struct OfficialOptionsReferencePublicationCapability {
     authority: Arc<Mutex<CatalogAuthority>>,
@@ -2437,7 +2742,7 @@ impl fmt::Debug for OfficialOptionsReferencePublicationCapability {
 }
 
 impl OfficialOptionsReferencePublicationCapability {
-    /// Binds publication to exactly one OCC and one Cboe source/grant pair.
+    /// Binds publication to exactly one registered OCC and one registered Cboe source.
     pub fn try_new(
         authority: Arc<Mutex<CatalogAuthority>>,
         dataset: SourceIdentifier,
@@ -2455,21 +2760,96 @@ impl OfficialOptionsReferencePublicationCapability {
         {
             return Err(OfficialOptionsReferenceError::InvalidSourceAuthority);
         }
-        let session_id = authority
-            .try_lock()
-            .map_err(|_| OfficialOptionsReferenceError::AuthorityUnavailable)?
-            .session_id();
-        if sources
-            .iter()
-            .any(|source| source.rights.catalog_id != session_id)
-        {
-            return Err(OfficialOptionsReferenceError::InvalidRightsCapability);
-        }
         Ok(Self {
             authority,
             dataset,
             sources: sources.into_boxed_slice(),
         })
+    }
+
+    /// Resumes bounded cleanup for abandoned stages and prunes bulky consumed stage rows.
+    ///
+    /// Consumed parent tombstones remain until the caller explicitly acknowledges the recovered
+    /// generation, so cleanup cannot erase a committed-but-unacknowledged publication result.
+    pub fn cleanup_reclaimable_stages(
+        &self,
+        maximum_stages: u64,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<u64, OfficialOptionsReferenceError> {
+        super::official_options_reference_stage::cleanup_reclaimable_stages(
+            &self.authority,
+            &self.dataset,
+            maximum_stages,
+            deadline,
+            cancellation,
+        )
+    }
+
+    /// Creates or resumes one bounded typed stage under this exact dataset authority.
+    pub fn try_open_stage(
+        &self,
+        stage_id: SourceIdentifier,
+        request_binding: OfficialOptionsReferenceRequestBinding,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        super::official_options_reference_stage::OfficialOptionsReferenceStageCapability,
+        OfficialOptionsReferenceError,
+    > {
+        super::official_options_reference_stage::OfficialOptionsReferenceStageCapability::try_open(
+            Arc::clone(&self.authority),
+            self.dataset.clone(),
+            stage_id,
+            request_binding,
+            deadline,
+            cancellation,
+        )
+    }
+
+    /// Recovers either a replayable sealed stage or its already committed generation tombstone.
+    pub fn try_restart_stage(
+        &self,
+        stage_id: SourceIdentifier,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        Option<
+            super::official_options_reference_stage::OfficialOptionsReferenceStageRestartDisposition,
+        >,
+        OfficialOptionsReferenceError,
+    >{
+        let disposition = super::official_options_reference_stage::try_restart_stage(
+            Arc::clone(&self.authority),
+            stage_id,
+            deadline,
+            cancellation,
+        )?;
+        if disposition
+            .as_ref()
+            .is_some_and(|disposition| disposition.dataset() != &self.dataset)
+        {
+            return Err(OfficialOptionsReferenceError::InvalidInput);
+        }
+        Ok(disposition)
+    }
+
+    /// Acknowledges a recovered publication result and releases its small stage tombstone.
+    pub fn acknowledge_published_stage(
+        &self,
+        stage_id: &SourceIdentifier,
+        generation_digest: EvidenceDigest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), OfficialOptionsReferenceError> {
+        super::official_options_reference_stage::acknowledge_published_stage(
+            &self.authority,
+            &self.dataset,
+            stage_id,
+            generation_digest,
+            deadline,
+            cancellation,
+        )
     }
 
     /// Streams one complete staged generation into an atomic immutable publication.
@@ -2480,9 +2860,9 @@ impl OfficialOptionsReferencePublicationCapability {
     pub fn publish<NR, NA, NC>(
         &self,
         header: OfficialOptionsReferenceGenerationHeader,
-        next_record: NR,
-        next_resolution: NA,
-        next_conflict: NC,
+        mut next_record: NR,
+        mut next_resolution: NA,
+        mut next_conflict: NC,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<OfficialOptionsReferencePublicationReceipt, OfficialOptionsReferenceError>
@@ -2508,12 +2888,72 @@ impl OfficialOptionsReferencePublicationCapability {
                 &self.dataset,
                 &self.sources,
                 header,
-                next_record,
-                next_resolution,
-                next_conflict,
+                |_| next_record(),
+                |_| next_resolution(),
+                |_| next_conflict(),
+                None,
                 deadline,
                 cancellation,
             )
+    }
+
+    /// Atomically publishes one sealed, restart-replayable provider-neutral typed stage.
+    ///
+    /// The stage is accepted only by the catalog session, dataset, request, and exact ordered-set
+    /// evidence that sealed it. Replay pages remain bounded by the stage facade; no complete
+    /// provider universe is materialized in memory.
+    pub fn publish_staged(
+        &self,
+        header: OfficialOptionsReferenceGenerationHeader,
+        stage: &super::official_options_reference_stage::OfficialOptionsReferenceSealedStage,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<OfficialOptionsReferencePublicationReceipt, OfficialOptionsReferenceError> {
+        check_operation(deadline, cancellation)?;
+        let catalog_id = self
+            .authority
+            .try_lock()
+            .map_err(|_| OfficialOptionsReferenceError::AuthorityUnavailable)?
+            .session_id();
+        if stage.catalog_id() != catalog_id
+            || stage.dataset() != &self.dataset
+            || stage.request_id() != header.request_id()
+            || stage.request_binding() != header.request_binding()
+            || stage.alias_assertions() != &header.alias_assertion_set
+            || stage.records() != header.records
+            || stage.resolutions() != header.resolutions
+            || stage.conflicts() != header.conflicts
+        {
+            return Err(OfficialOptionsReferenceError::InvalidInput);
+        }
+        let mut records = super::official_options_reference_stage::record_replay(stage);
+        let mut resolutions = super::official_options_reference_stage::resolution_replay(stage);
+        let mut conflicts = super::official_options_reference_stage::conflict_replay(stage);
+        let receipt = self
+            .authority
+            .try_lock()
+            .map_err(|_| OfficialOptionsReferenceError::AuthorityUnavailable)?
+            .publish_official_options_reference_generation(
+                &self.dataset,
+                &self.sources,
+                header,
+                |connection| records.next(connection),
+                |connection| resolutions.next(connection),
+                |connection| conflicts.next(connection),
+                Some(stage),
+                deadline,
+                cancellation,
+            )?;
+        // The canonical transaction retained a generation-correlated tombstone. Bulky child rows
+        // can be pruned opportunistically, but only explicit caller acknowledgement may remove
+        // the tombstone after the receipt has crossed the process boundary.
+        let _cleanup = super::official_options_reference_stage::prune_consumed_stage(
+            &self.authority,
+            stage,
+            deadline,
+            cancellation,
+        );
+        Ok(receipt)
     }
 }
 
@@ -2784,10 +3224,9 @@ impl OfficialOptionsReferenceCatalogReadCapability {
             Ok(resolution) => Ok(OfficialOptionsReferenceCatalogResolution::Selected(
                 resolution,
             )),
-            Err(
-                OfficialOptionsReferenceError::SourceUnavailable
-                | OfficialOptionsReferenceError::RightsUnavailable,
-            ) => Ok(OfficialOptionsReferenceCatalogResolution::Unavailable),
+            Err(OfficialOptionsReferenceError::SourceUnavailable) => {
+                Ok(OfficialOptionsReferenceCatalogResolution::Unavailable)
+            }
             Err(error) => Err(error),
         }
     }
@@ -2806,19 +3245,28 @@ impl CatalogAuthority {
         mut next_record: NR,
         mut next_resolution: NA,
         mut next_conflict: NC,
+        consumed_stage: Option<
+            &super::official_options_reference_stage::OfficialOptionsReferenceSealedStage,
+        >,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<OfficialOptionsReferencePublicationReceipt, OfficialOptionsReferenceError>
     where
-        NR: FnMut() -> Result<
+        NR: FnMut(
+            &Connection,
+        ) -> Result<
             Option<OfficialOptionsReferenceRecordInput>,
             OfficialOptionsReferenceError,
         >,
-        NA: FnMut() -> Result<
+        NA: FnMut(
+            &Connection,
+        ) -> Result<
             Option<OfficialOptionsReferenceAliasResolutionInput>,
             OfficialOptionsReferenceError,
         >,
-        NC: FnMut() -> Result<
+        NC: FnMut(
+            &Connection,
+        ) -> Result<
             Option<OfficialOptionsReferenceConflictInput>,
             OfficialOptionsReferenceError,
         >,
@@ -2831,7 +3279,7 @@ impl CatalogAuthority {
         {
             return Err(OfficialOptionsReferenceError::InvalidRawObjectAuthority);
         }
-        validate_source_authorities(self.session_id(), sources, &header)?;
+        validate_source_authorities(sources, &header)?;
         let source_manifest = prepare_source_manifest(sources, &header)?;
         let generation_digest = generation_digest(dataset, &source_manifest, &header)?;
         let connection = &self.catalog().connection;
@@ -2940,6 +3388,13 @@ impl CatalogAuthority {
                 )
                 .map_err(|_| OfficialOptionsReferenceError::CorruptCatalog)?;
             }
+            if let Some(stage) = consumed_stage {
+                super::official_options_reference_stage::mark_stage_consumed(
+                    &transaction,
+                    stage,
+                    generation_digest,
+                )?;
+            }
             transaction.commit()?;
             Ok(OfficialOptionsReferencePublicationReceipt {
                 disposition: if replay {
@@ -2961,12 +3416,10 @@ struct PreparedSourceAuthority {
     metadata: SourceMetadata,
     metadata_json: String,
     source_revision_digest: EvidenceDigest,
-    rights_id: EvidenceDigest,
     source_payload_set_digest: EvidenceDigest,
 }
 
 fn validate_source_authorities(
-    session_id: uuid::Uuid,
     sources: &[OfficialOptionsReferenceSourceAuthority],
     header: &OfficialOptionsReferenceGenerationHeader,
 ) -> Result<(), OfficialOptionsReferenceError> {
@@ -2980,15 +3433,21 @@ fn validate_source_authorities(
             .filter(|object| object.surface.provider() == source.provider)
             .collect();
         if source.provider != expected_provider
-            || source.rights.catalog_id != session_id
             || source.metadata.source_id()
                 != source_objects
                     .first()
                     .map(|object| &object.source_id)
                     .ok_or(OfficialOptionsReferenceError::InvalidSourceAuthority)?
-            || source_objects
-                .iter()
-                .any(|object| &object.source_id != source.metadata.source_id())
+            || source_objects.iter().any(|object| {
+                &object.source_id != source.metadata.source_id()
+                    || object.provider_id.as_str() != source.metadata.provider().as_str()
+                    || object.source_contract_digest
+                        != source
+                            .metadata
+                            .revision_evidence()
+                            .payload_evidence()
+                            .content_digest()
+            })
             || !source
                 .metadata
                 .coverage()
@@ -2996,10 +3455,6 @@ fn validate_source_authorities(
                 .contains(&AssetClass::Option)
         {
             return Err(OfficialOptionsReferenceError::InvalidSourceAuthority);
-        }
-        let expected_payload = header.source_payload_set_digest(source.provider)?;
-        if source.rights.payload_digest != expected_payload {
-            return Err(OfficialOptionsReferenceError::InvalidRightsCapability);
         }
     }
     Ok(())
@@ -3024,7 +3479,6 @@ fn prepare_source_manifest(
             metadata: source.metadata.clone(),
             metadata_json,
             source_revision_digest,
-            rights_id: digest(source.rights.rights_id),
             source_payload_set_digest: header.source_payload_set_digest(source.provider)?,
         });
     }
@@ -3053,29 +3507,6 @@ fn validate_durable_sources(
             .optional()?;
         if retained.as_deref() != Some(source.metadata_json.as_str()) {
             return Err(OfficialOptionsReferenceError::SourceUnavailable);
-        }
-        let rights_valid: bool = transaction.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM source_rights
-                 WHERE rights_id=?1 AND source_id=?2
-                   AND payload_algorithm=1 AND payload_digest=?3
-                   AND (operation_mask & 6)=6
-                   AND admitted_at_ns<=?4
-                   AND (
-                       authorization_expires_at_ns IS NULL
-                       OR authorization_expires_at_ns>?4
-                   )
-             )",
-            params![
-                source.rights_id.bytes().as_slice(),
-                source.metadata.source_id().as_str(),
-                source.source_payload_set_digest.bytes().as_slice(),
-                published_at.unix_nanos(),
-            ],
-            |row| row.get(0),
-        )?;
-        if !rights_valid {
-            return Err(OfficialOptionsReferenceError::RightsUnavailable);
         }
     }
     Ok(())
@@ -3159,15 +3590,14 @@ fn insert_generation_header(
         transaction.execute(
             "INSERT INTO official_options_reference_generation_sources
              (generation_digest, provider, source_id, source_revision, source_revision_digest,
-              rights_id, source_payload_set_digest)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+              source_payload_set_digest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 generation_digest.bytes().as_slice(),
                 source.provider.database_name(),
                 source.metadata.source_id().as_str(),
                 source.metadata.revision().as_source_identifier().as_str(),
                 source.source_revision_digest.bytes().as_slice(),
-                source.rights_id.bytes().as_slice(),
                 source.source_payload_set_digest.bytes().as_slice(),
             ],
         )?;
@@ -3176,17 +3606,21 @@ fn insert_generation_header(
         let surface_json = serde_json::to_string(&object.surface)?;
         transaction.execute(
             "INSERT INTO official_options_reference_objects
-             (generation_digest, object_ordinal, provider, source_id, surface_json, surface_key,
-              object_id, native_schema, raw_claim_digest, physical_receipt_digest,
-              payload_digest, payload_bytes, source_timestamp_ns, available_at_ns, received_at_ns,
-              strict_row_set_digest, strict_row_count)
+             (generation_digest, object_ordinal, provider, source_id, provider_id,
+              source_contract_digest, surface_json, surface_key, object_id, native_schema,
+              raw_claim_digest, physical_receipt_digest, payload_digest, request_digest,
+              transport_receipt_digest, object_binding_digest, payload_bytes,
+              source_timestamp_ns, available_at_ns, received_at_ns, strict_row_set_digest,
+              strict_row_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17)",
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 generation_digest.bytes().as_slice(),
                 i64::from(object.object_ordinal),
                 object.surface.provider().database_name(),
                 object.source_id.as_str(),
+                object.provider_id.as_str(),
+                object.source_contract_digest.bytes().as_slice(),
                 surface_json,
                 object.surface.stable_key()?,
                 object.object_id.as_str(),
@@ -3198,6 +3632,9 @@ fn insert_generation_header(
                     .bytes()
                     .as_slice(),
                 object.payload_digest.bytes().as_slice(),
+                object.request_digest.bytes().as_slice(),
+                object.transport_receipt_digest.bytes().as_slice(),
+                object.object_binding_digest.bytes().as_slice(),
                 to_i64(object.raw_claim.size_bytes())?,
                 object.source_timestamp.map(Timestamp::unix_nanos),
                 object.available_at.unix_nanos(),
@@ -3257,13 +3694,15 @@ fn stream_records<NR>(
     cancellation: &CancellationToken,
 ) -> Result<(), OfficialOptionsReferenceError>
 where
-    NR: FnMut()
+    NR: FnMut(
+        &Connection,
+    )
         -> Result<Option<OfficialOptionsReferenceRecordInput>, OfficialOptionsReferenceError>,
 {
     let mut builder = OfficialOptionsReferenceRecordSetDigestBuilder::new();
     let mut assertion_builder =
         OfficialOptionsReferenceAliasAssertionSetBuilder::new(header.request_id.clone());
-    while let Some(record) = next_record()? {
+    while let Some(record) = next_record(transaction)? {
         check_operation(deadline, cancellation)?;
         validate_record_object(transaction, generation_digest, &record)?;
         assertion_builder.try_observe(&record)?;
@@ -3288,19 +3727,19 @@ fn validate_record_object(
     record: &OfficialOptionsReferenceRecordInput,
 ) -> Result<(), OfficialOptionsReferenceError> {
     record.value.validate()?;
-    let retained: Option<(String, i64, String)> = transaction
+    let retained: Option<(String, i64, String, Vec<u8>)> = transaction
         .query_row(
-            "SELECT provider, strict_row_count, surface_json
+            "SELECT provider, strict_row_count, surface_json, object_binding_digest
              FROM official_options_reference_objects
              WHERE generation_digest=?1 AND object_ordinal=?2",
             params![
                 generation_digest.bytes().as_slice(),
                 i64::from(record.object_ordinal),
             ],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    let Some((provider, strict_rows, surface_json)) = retained else {
+    let Some((provider, strict_rows, surface_json, object_binding_digest)) = retained else {
         return Err(OfficialOptionsReferenceError::InvalidInput);
     };
     let surface: OfficialOptionsReferenceSurface = serde_json::from_str(&surface_json)
@@ -3309,6 +3748,7 @@ fn validate_record_object(
         u64::try_from(strict_rows).map_err(|_| OfficialOptionsReferenceError::CorruptCatalog)?;
     if provider != record.value.provider().database_name()
         || !record_value_matches_surface(&record.value, &surface)
+        || evidence_from_database(object_binding_digest)? != record.object_binding_digest
         || u64::from(record.provider_row_number) > strict_rows.saturating_add(1)
     {
         return Err(OfficialOptionsReferenceError::InvalidInput);
@@ -3421,7 +3861,9 @@ fn stream_resolutions<NA>(
     cancellation: &CancellationToken,
 ) -> Result<(), OfficialOptionsReferenceError>
 where
-    NA: FnMut() -> Result<
+    NA: FnMut(
+        &Connection,
+    ) -> Result<
         Option<OfficialOptionsReferenceAliasResolutionInput>,
         OfficialOptionsReferenceError,
     >,
@@ -3429,7 +3871,7 @@ where
     let mut builder = OfficialOptionsReferenceResolutionSetDigestBuilder::new();
     let mut observations = 0_u64;
     let mut conflicts = 0_u64;
-    while let Some(resolution) = next_resolution()? {
+    while let Some(resolution) = next_resolution(transaction)? {
         check_operation(deadline, cancellation)?;
         observations = observations
             .checked_add(resolution.observations)
@@ -3498,14 +3940,16 @@ fn stream_conflicts<NC>(
     cancellation: &CancellationToken,
 ) -> Result<(), OfficialOptionsReferenceError>
 where
-    NC: FnMut() -> Result<
+    NC: FnMut(
+        &Connection,
+    ) -> Result<
         Option<OfficialOptionsReferenceConflictInput>,
         OfficialOptionsReferenceError,
     >,
 {
     let mut builder = OfficialOptionsReferenceConflictSetDigestBuilder::new();
     let mut ordinal = 0_u64;
-    while let Some(conflict) = next_conflict()? {
+    while let Some(conflict) = next_conflict(transaction)? {
         check_operation(deadline, cancellation)?;
         builder.try_observe(&conflict)?;
         if !replay {
@@ -3967,9 +4411,12 @@ fn verify_stored_record_set(
 ) -> Result<(), OfficialOptionsReferenceError> {
     let mut builder = OfficialOptionsReferenceRecordSetDigestBuilder::new();
     let mut statement = connection.prepare(
-        "SELECT memberships.object_ordinal, memberships.provider_row_number,
-                memberships.record_id, values_.value_json
+        "SELECT memberships.object_ordinal, objects.object_binding_digest,
+                memberships.provider_row_number, memberships.record_id, values_.value_json
          FROM official_options_reference_memberships AS memberships
+         JOIN official_options_reference_objects AS objects
+           ON objects.generation_digest=memberships.generation_digest
+          AND objects.object_ordinal=memberships.object_ordinal
          JOIN official_options_reference_values AS values_
            ON values_.value_digest=memberships.value_digest
          WHERE memberships.generation_digest=?1
@@ -3979,17 +4426,19 @@ fn verify_stored_record_set(
     let rows = statement.query_map([generation_digest.bytes().as_slice()], |row| {
         Ok((
             row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, i64>(2)?,
             row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
         ))
     })?;
     for row in rows {
-        let (object, provider_row, record_id, value_json) = row?;
+        let (object, object_binding_digest, provider_row, record_id, value_json) = row?;
         let value: OfficialOptionsReferenceRecordValue = serde_json::from_str(&value_json)
             .map_err(|_| OfficialOptionsReferenceError::CorruptCatalog)?;
         let record = OfficialOptionsReferenceRecordInput::try_new(
             u16::try_from(object).map_err(|_| OfficialOptionsReferenceError::CorruptCatalog)?,
+            evidence_from_database(object_binding_digest)?,
             u32::try_from(provider_row)
                 .map_err(|_| OfficialOptionsReferenceError::CorruptCatalog)?,
             parse_source_identifier(record_id)?,
@@ -4272,7 +4721,7 @@ fn load_source_evidence(
     generation_digest: EvidenceDigest,
 ) -> Result<Box<[OfficialOptionsReferenceSourceEvidence]>, OfficialOptionsReferenceError> {
     let mut statement = connection.prepare(
-        "SELECT provider, source_id, source_revision, source_revision_digest, rights_id,
+        "SELECT provider, source_id, source_revision, source_revision_digest,
                 source_payload_set_digest
          FROM official_options_reference_generation_sources
          WHERE generation_digest=?1 ORDER BY provider DESC",
@@ -4284,18 +4733,16 @@ fn load_source_evidence(
             row.get::<_, String>(2)?,
             row.get::<_, Vec<u8>>(3)?,
             row.get::<_, Vec<u8>>(4)?,
-            row.get::<_, Vec<u8>>(5)?,
         ))
     })?;
     let mut sources = Vec::with_capacity(OfficialOptionsReferenceProvider::ALL.len());
     for row in rows {
-        let (provider, source_id, revision, revision_digest, rights_id, payload_digest) = row?;
+        let (provider, source_id, revision, revision_digest, payload_digest) = row?;
         sources.push(OfficialOptionsReferenceSourceEvidence {
             provider: OfficialOptionsReferenceProvider::from_database(&provider)?,
             source_id: parse_source_id(source_id)?,
             source_revision: parse_source_identifier(revision)?,
             source_revision_digest: evidence_from_database(revision_digest)?,
-            rights_id: evidence_from_database(rights_id)?,
             source_payload_set_digest: evidence_from_database(payload_digest)?,
         });
     }
@@ -4315,10 +4762,12 @@ fn load_object_evidence(
     generation_digest: EvidenceDigest,
 ) -> Result<Box<[OfficialOptionsReferenceObjectEvidence]>, OfficialOptionsReferenceError> {
     let mut statement = connection.prepare(
-        "SELECT object_ordinal, provider, source_id, surface_json, surface_key, object_id,
-                native_schema, raw_claim_digest, physical_receipt_digest, payload_digest,
-                payload_bytes, source_timestamp_ns, available_at_ns, received_at_ns,
-                strict_row_set_digest, strict_row_count
+        "SELECT object_ordinal, provider, source_id, provider_id, source_contract_digest,
+                surface_json, surface_key, object_id, native_schema, raw_claim_digest,
+                physical_receipt_digest, payload_digest, request_digest,
+                transport_receipt_digest, object_binding_digest, payload_bytes,
+                source_timestamp_ns, available_at_ns, received_at_ns, strict_row_set_digest,
+                strict_row_count
          FROM official_options_reference_objects WHERE generation_digest=?1
          ORDER BY object_ordinal",
     )?;
@@ -4328,18 +4777,23 @@ fn load_object_evidence(
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
+            row.get::<_, Vec<u8>>(4)?,
             row.get::<_, String>(5)?,
             row.get::<_, String>(6)?,
-            row.get::<_, Vec<u8>>(7)?,
-            row.get::<_, Vec<u8>>(8)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
             row.get::<_, Vec<u8>>(9)?,
-            row.get::<_, i64>(10)?,
-            row.get::<_, Option<i64>>(11)?,
-            row.get::<_, i64>(12)?,
-            row.get::<_, i64>(13)?,
+            row.get::<_, Vec<u8>>(10)?,
+            row.get::<_, Vec<u8>>(11)?,
+            row.get::<_, Vec<u8>>(12)?,
+            row.get::<_, Vec<u8>>(13)?,
             row.get::<_, Vec<u8>>(14)?,
             row.get::<_, i64>(15)?,
+            row.get::<_, Option<i64>>(16)?,
+            row.get::<_, i64>(17)?,
+            row.get::<_, i64>(18)?,
+            row.get::<_, Vec<u8>>(19)?,
+            row.get::<_, i64>(20)?,
         ))
     })?;
     let mut objects = Vec::new();
@@ -4348,6 +4802,8 @@ fn load_object_evidence(
             ordinal,
             provider,
             source_id,
+            provider_id,
+            source_contract_digest,
             surface_json,
             surface_key,
             object_id,
@@ -4355,6 +4811,9 @@ fn load_object_evidence(
             raw_claim_digest,
             physical_receipt_digest,
             payload_digest,
+            request_digest,
+            transport_receipt_digest,
+            object_binding_digest,
             payload_bytes,
             source_timestamp,
             available_at,
@@ -4377,17 +4836,49 @@ fn load_object_evidence(
         {
             return Err(OfficialOptionsReferenceError::CorruptCatalog);
         }
+        let source_id = parse_source_id(source_id)?;
+        let provider_id = parse_source_identifier(provider_id)?;
+        let source_contract_digest = evidence_from_database(source_contract_digest)?;
+        let object_id = parse_source_identifier(object_id)?;
+        let native_schema = parse_source_identifier(native_schema)?;
+        let payload_digest = evidence_from_database(payload_digest)?;
+        let request_digest = evidence_from_database(request_digest)?;
+        let transport_receipt_digest = evidence_from_database(transport_receipt_digest)?;
+        let object_binding_digest = evidence_from_database(object_binding_digest)?;
+        let payload_bytes = database_u64(payload_bytes, 1, MAX_TOTAL_PAYLOAD_BYTES)?;
+        if official_options_reference_object_binding_digest(
+            &OfficialOptionsReferenceObjectBindingFields {
+                source_id: source_id.clone(),
+                provider_id: provider_id.clone(),
+                source_contract_digest,
+                surface: surface.clone(),
+                object_id: object_id.clone(),
+                native_schema: native_schema.clone(),
+                payload_digest,
+                payload_bytes,
+                request_digest,
+                transport_receipt_digest,
+            },
+        )? != object_binding_digest
+        {
+            return Err(OfficialOptionsReferenceError::CorruptCatalog);
+        }
         objects.push(OfficialOptionsReferenceObjectEvidence {
             object_ordinal: ordinal,
             provider: surface.provider(),
-            source_id: parse_source_id(source_id)?,
+            source_id,
+            provider_id,
+            source_contract_digest,
             surface,
-            object_id: parse_source_identifier(object_id)?,
-            native_schema: parse_source_identifier(native_schema)?,
+            object_id,
+            native_schema,
             raw_claim_digest: evidence_from_database(raw_claim_digest)?,
             physical_receipt_digest: evidence_from_database(physical_receipt_digest)?,
-            payload_digest: evidence_from_database(payload_digest)?,
-            payload_bytes: database_u64(payload_bytes, 1, MAX_TOTAL_PAYLOAD_BYTES)?,
+            payload_digest,
+            request_digest,
+            transport_receipt_digest,
+            object_binding_digest,
+            payload_bytes,
             source_timestamp: source_timestamp.map(Timestamp::from_unix_nanos),
             available_at: Timestamp::from_unix_nanos(available_at),
             received_at: Timestamp::from_unix_nanos(received_at),
@@ -4418,6 +4909,17 @@ fn generation_digest_from_receipt(
     hash_bytes(&mut hasher, receipt.request_id.as_str().as_bytes())?;
     hasher.update(receipt.requested_at.unix_nanos().to_be_bytes());
     hasher.update(receipt.request_deadline.unix_nanos().to_be_bytes());
+    let request_binding = OfficialOptionsReferenceRequestBinding::try_new(
+        receipt.request_id.clone(),
+        receipt.requested_at,
+        receipt.request_deadline,
+        receipt
+            .objects
+            .iter()
+            .map(|object| object.surface.clone())
+            .collect(),
+    )?;
+    hash_evidence(&mut hasher, request_binding.digest());
     hash_evidence(&mut hasher, receipt.strict_row_set_digest);
     hasher.update(receipt.alias_assertions.to_be_bytes());
     hash_evidence(&mut hasher, receipt.alias_assertion_closure_digest);
@@ -4435,7 +4937,6 @@ fn generation_digest_from_receipt(
         hash_bytes(&mut hasher, source.source_id.as_str().as_bytes())?;
         hash_bytes(&mut hasher, source.source_revision.as_str().as_bytes())?;
         hash_evidence(&mut hasher, source.source_revision_digest);
-        hash_evidence(&mut hasher, source.rights_id);
         hash_evidence(&mut hasher, source.source_payload_set_digest);
     }
     hasher.update(to_u64(receipt.objects.len())?.to_be_bytes());
@@ -4443,11 +4944,16 @@ fn generation_digest_from_receipt(
         hasher.update(object.object_ordinal.to_be_bytes());
         hash_bytes(&mut hasher, &serde_json::to_vec(&object.surface)?)?;
         hash_bytes(&mut hasher, object.source_id.as_str().as_bytes())?;
+        hash_bytes(&mut hasher, object.provider_id.as_str().as_bytes())?;
+        hash_evidence(&mut hasher, object.source_contract_digest);
         hash_bytes(&mut hasher, object.object_id.as_str().as_bytes())?;
         hash_bytes(&mut hasher, object.native_schema.as_str().as_bytes())?;
         hash_evidence(&mut hasher, object.raw_claim_digest);
         hash_evidence(&mut hasher, object.physical_receipt_digest);
         hash_evidence(&mut hasher, object.payload_digest);
+        hash_evidence(&mut hasher, object.request_digest);
+        hash_evidence(&mut hasher, object.transport_receipt_digest);
+        hash_evidence(&mut hasher, object.object_binding_digest);
         hasher.update(object.payload_bytes.to_be_bytes());
         hash_optional_timestamp(&mut hasher, object.source_timestamp);
         hasher.update(object.available_at.unix_nanos().to_be_bytes());
@@ -4491,7 +4997,6 @@ fn generation_receipt_matches_header(
                 && stored.source_id == *input.metadata.source_id()
                 && stored.source_revision == *input.metadata.revision().as_source_identifier()
                 && stored.source_revision_digest == input.source_revision_digest
-                && stored.rights_id == input.rights_id
                 && stored.source_payload_set_digest == input.source_payload_set_digest
         })
         && receipt
@@ -4502,12 +5007,17 @@ fn generation_receipt_matches_header(
                 stored.object_ordinal == input.object_ordinal
                     && stored.provider == input.surface.provider()
                     && stored.source_id == input.source_id
+                    && stored.provider_id == input.provider_id
+                    && stored.source_contract_digest == input.source_contract_digest
                     && stored.surface == input.surface
                     && stored.object_id == input.object_id
                     && stored.native_schema == input.native_schema
                     && raw_claim_digest(&input.raw_claim).ok() == Some(stored.raw_claim_digest)
                     && stored.physical_receipt_digest == input.raw_claim.physical_receipt_digest()
                     && stored.payload_digest == input.payload_digest
+                    && stored.request_digest == input.request_digest
+                    && stored.transport_receipt_digest == input.transport_receipt_digest
+                    && stored.object_binding_digest == input.object_binding_digest
                     && stored.payload_bytes == input.raw_claim.size_bytes()
                     && stored.source_timestamp == input.source_timestamp
                     && stored.available_at == input.available_at
@@ -4672,10 +5182,7 @@ fn select_current_reference_dataset(
         }
         match require_generation_read_authority(connection, &generation, now) {
             Ok(()) => {}
-            Err(
-                OfficialOptionsReferenceError::SourceUnavailable
-                | OfficialOptionsReferenceError::RightsUnavailable,
-            ) => continue,
+            Err(OfficialOptionsReferenceError::SourceUnavailable) => continue,
             Err(error) => return Err(error),
         }
         eligible_dataset_count = eligible_dataset_count
@@ -4770,35 +5277,23 @@ fn require_generation_read_authority(
             metadata_json.ok_or(OfficialOptionsReferenceError::SourceUnavailable)?;
         let metadata: SourceMetadata = serde_json::from_str(&metadata_json)
             .map_err(|_| OfficialOptionsReferenceError::CorruptCatalog)?;
-        let authorized: bool = connection.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM source_rights
-                 WHERE rights_id=?1 AND source_id=?2 AND payload_algorithm=1
-                   AND payload_digest=?3 AND (operation_mask & 2)=2
-                   AND admitted_at_ns<=?4
-                   AND (authorization_expires_at_ns IS NULL
-                        OR authorization_expires_at_ns>?4)
-             )",
-            params![
-                source.rights_id.bytes().as_slice(),
-                source.source_id.as_str(),
-                source.source_payload_set_digest.bytes().as_slice(),
-                now.unix_nanos(),
-            ],
-            |row| row.get(0),
-        )?;
         if digest(sha256(metadata_json.as_bytes())) != source.source_revision_digest
             || serde_json::to_string(&metadata)? != metadata_json
             || metadata.source_id() != &source.source_id
             || metadata.revision().as_source_identifier() != &source.source_revision
             || !metadata.is_effective_at(now)
-            || !authorized
+            || generation.objects.iter().any(|object| {
+                object.provider == source.provider
+                    && (object.source_id != source.source_id
+                        || object.provider_id.as_str() != metadata.provider().as_str()
+                        || object.source_contract_digest
+                            != metadata
+                                .revision_evidence()
+                                .payload_evidence()
+                                .content_digest())
+            })
         {
-            return Err(if authorized {
-                OfficialOptionsReferenceError::SourceUnavailable
-            } else {
-                OfficialOptionsReferenceError::RightsUnavailable
-            });
+            return Err(OfficialOptionsReferenceError::SourceUnavailable);
         }
     }
     Ok(())
@@ -5124,6 +5619,7 @@ fn rebuild_provider_record(
     budget
         .charge([
             object.source_id.as_str().len(),
+            object.provider_id.as_str().len(),
             serde_json::to_vec(&object.surface)?.len(),
             object.object_id.as_str().len(),
             object.native_schema.as_str().len(),
@@ -5156,6 +5652,7 @@ fn rebuild_provider_record(
     }
     let input = OfficialOptionsReferenceRecordInput::try_new(
         object_ordinal,
+        object.object_binding_digest,
         provider_row_number,
         parse_source_identifier(record_id)?,
         value.clone(),
@@ -5774,10 +6271,15 @@ fn reconstruct_generation_header(
                 OfficialOptionsReferenceObjectCoordinates {
                     object_ordinal: stored.object_ordinal,
                     source_id: stored.source_id.clone(),
+                    provider_id: stored.provider_id.clone(),
+                    source_contract_digest: stored.source_contract_digest,
                     surface: stored.surface.clone(),
                     object_id: stored.object_id.clone(),
                     native_schema: stored.native_schema.clone(),
                     payload_digest: stored.payload_digest,
+                    request_digest: stored.request_digest,
+                    transport_receipt_digest: stored.transport_receipt_digest,
+                    object_binding_digest: stored.object_binding_digest,
                     source_timestamp: stored.source_timestamp,
                     available_at: stored.available_at,
                     received_at: stored.received_at,
@@ -5844,6 +6346,16 @@ fn reconstruct_source_manifest(
             || metadata.source_id() != &source.source_id
             || metadata.revision().as_source_identifier() != &source.source_revision
             || digest(sha256(metadata_json.as_bytes())) != source.source_revision_digest
+            || generation.objects.iter().any(|object| {
+                object.provider == source.provider
+                    && (object.source_id != source.source_id
+                        || object.provider_id.as_str() != metadata.provider().as_str()
+                        || object.source_contract_digest
+                            != metadata
+                                .revision_evidence()
+                                .payload_evidence()
+                                .content_digest())
+            })
         {
             return Err(OfficialOptionsReferenceError::CorruptCatalog);
         }
@@ -5852,7 +6364,6 @@ fn reconstruct_source_manifest(
             metadata,
             metadata_json,
             source_revision_digest: source.source_revision_digest,
-            rights_id: source.rights_id,
             source_payload_set_digest: source.source_payload_set_digest,
         });
     }
@@ -5904,7 +6415,7 @@ fn classify_operation<T>(
     }
 }
 
-fn record_sort_key(
+pub(super) fn record_sort_key(
     record: &OfficialOptionsReferenceRecordInput,
 ) -> Result<Vec<u8>, OfficialOptionsReferenceError> {
     let mut key = Vec::with_capacity(size_of::<u16>() + size_of::<u32>());
@@ -5913,7 +6424,7 @@ fn record_sort_key(
     Ok(key)
 }
 
-fn conflict_sort_key(
+pub(super) fn conflict_sort_key(
     conflict: &OfficialOptionsReferenceConflictInput,
 ) -> Result<Vec<u8>, OfficialOptionsReferenceError> {
     let mut key = alias_key_json(&conflict.key)?.into_bytes();
@@ -5926,7 +6437,7 @@ fn conflict_sort_key(
     Ok(key)
 }
 
-fn alias_key_json(
+pub(super) fn alias_key_json(
     key: &OfficialOptionsReferenceAliasKey,
 ) -> Result<String, OfficialOptionsReferenceError> {
     key.validate()?;
@@ -6025,6 +6536,7 @@ fn generation_digest(
     hash_bytes(&mut hasher, header.request_id.as_str().as_bytes())?;
     hasher.update(header.requested_at.unix_nanos().to_be_bytes());
     hasher.update(header.request_deadline.unix_nanos().to_be_bytes());
+    hash_evidence(&mut hasher, header.request_binding.digest());
     hash_evidence(&mut hasher, header.strict_row_set_digest);
     hasher.update(header.alias_assertions.to_be_bytes());
     hash_evidence(&mut hasher, header.alias_assertion_closure_digest);
@@ -6050,7 +6562,6 @@ fn generation_digest(
                 .as_bytes(),
         )?;
         hash_evidence(&mut hasher, source.source_revision_digest);
-        hash_evidence(&mut hasher, source.rights_id);
         hash_evidence(&mut hasher, source.source_payload_set_digest);
     }
     hasher.update(to_u64(header.objects.len())?.to_be_bytes());
@@ -6058,11 +6569,16 @@ fn generation_digest(
         hasher.update(object.object_ordinal.to_be_bytes());
         hash_bytes(&mut hasher, &serde_json::to_vec(&object.surface)?)?;
         hash_bytes(&mut hasher, object.source_id.as_str().as_bytes())?;
+        hash_bytes(&mut hasher, object.provider_id.as_str().as_bytes())?;
+        hash_evidence(&mut hasher, object.source_contract_digest);
         hash_bytes(&mut hasher, object.object_id.as_str().as_bytes())?;
         hash_bytes(&mut hasher, object.native_schema.as_str().as_bytes())?;
         hash_evidence(&mut hasher, raw_claim_digest(&object.raw_claim)?);
         hash_evidence(&mut hasher, object.raw_claim.physical_receipt_digest());
         hash_evidence(&mut hasher, object.payload_digest);
+        hash_evidence(&mut hasher, object.request_digest);
+        hash_evidence(&mut hasher, object.transport_receipt_digest);
+        hash_evidence(&mut hasher, object.object_binding_digest);
         hasher.update(object.raw_claim.size_bytes().to_be_bytes());
         hash_optional_timestamp(&mut hasher, object.source_timestamp);
         hasher.update(object.available_at.unix_nanos().to_be_bytes());
@@ -6167,12 +6683,8 @@ pub enum OfficialOptionsReferenceError {
     InvalidLimit,
     #[error("official options-reference source authority is invalid")]
     InvalidSourceAuthority,
-    #[error("official options-reference rights capability is invalid")]
-    InvalidRightsCapability,
     #[error("official options-reference source is unavailable")]
     SourceUnavailable,
-    #[error("official options-reference rights are unavailable")]
-    RightsUnavailable,
     #[error("official options-reference bound was exceeded")]
     CapacityExceeded,
     #[error("official options-reference staged stream is not strictly ordered")]

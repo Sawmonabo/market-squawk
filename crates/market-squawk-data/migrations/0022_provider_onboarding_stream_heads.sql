@@ -126,7 +126,6 @@ CREATE TABLE official_options_reference_generation_sources (
     source_revision_digest BLOB NOT NULL CHECK (
         length(source_revision_digest)=32 AND source_revision_digest<>zeroblob(32)
     ),
-    rights_id BLOB NOT NULL REFERENCES source_rights(rights_id),
     source_payload_set_digest BLOB NOT NULL CHECK (
         length(source_payload_set_digest)=32 AND source_payload_set_digest<>zeroblob(32)
     ),
@@ -142,6 +141,12 @@ CREATE TABLE official_options_reference_objects (
     object_ordinal INTEGER NOT NULL CHECK (object_ordinal BETWEEN 0 AND 63),
     provider TEXT NOT NULL CHECK (provider IN ('occ','cboe')),
     source_id TEXT NOT NULL,
+    provider_id TEXT NOT NULL CHECK (
+        length(CAST(provider_id AS BLOB)) BETWEEN 1 AND 512
+    ),
+    source_contract_digest BLOB NOT NULL CHECK (
+        length(source_contract_digest)=32 AND source_contract_digest<>zeroblob(32)
+    ),
     surface_json TEXT NOT NULL CHECK (
         length(CAST(surface_json AS BLOB)) BETWEEN 2 AND 1024 AND json_valid(surface_json)
     ),
@@ -156,6 +161,16 @@ CREATE TABLE official_options_reference_objects (
     ),
     payload_digest BLOB NOT NULL CHECK (
         length(payload_digest)=32 AND payload_digest<>zeroblob(32)
+    ),
+    request_digest BLOB NOT NULL CHECK (
+        length(request_digest)=32 AND request_digest<>zeroblob(32)
+    ),
+    transport_receipt_digest BLOB NOT NULL CHECK (
+        length(transport_receipt_digest)=32
+        AND transport_receipt_digest<>zeroblob(32)
+    ),
+    object_binding_digest BLOB NOT NULL CHECK (
+        length(object_binding_digest)=32 AND object_binding_digest<>zeroblob(32)
     ),
     payload_bytes INTEGER NOT NULL CHECK (payload_bytes BETWEEN 1 AND 2147483648),
     source_timestamp_ns INTEGER,
@@ -286,6 +301,93 @@ CREATE TABLE official_options_reference_conflicts (
         REFERENCES official_options_reference_memberships(generation_digest, record_id)
 ) STRICT, WITHOUT ROWID;
 
+CREATE TABLE official_options_reference_stages (
+    stage_id TEXT PRIMARY KEY CHECK (length(CAST(stage_id AS BLOB)) BETWEEN 1 AND 512),
+    dataset_id TEXT NOT NULL CHECK (length(CAST(dataset_id AS BLOB)) BETWEEN 1 AND 512),
+    request_id TEXT NOT NULL CHECK (length(CAST(request_id AS BLOB)) BETWEEN 1 AND 512),
+    request_binding_json TEXT NOT NULL CHECK (
+        length(CAST(request_binding_json AS BLOB)) BETWEEN 2 AND 65536
+        AND json_valid(request_binding_json)
+    ),
+    request_binding_digest BLOB NOT NULL CHECK (
+        length(request_binding_digest)=32 AND request_binding_digest<>zeroblob(32)
+    ),
+    state TEXT NOT NULL CHECK (state IN ('open','abandoning','sealed','consumed')),
+    record_count INTEGER NOT NULL CHECK (record_count BETWEEN 0 AND 12000000),
+    resolution_count INTEGER NOT NULL CHECK (resolution_count BETWEEN 0 AND 36000000),
+    conflict_count INTEGER NOT NULL CHECK (conflict_count BETWEEN 0 AND 100000),
+    encoded_bytes INTEGER NOT NULL CHECK (encoded_bytes BETWEEN 0 AND 8589934592),
+    created_at_ns INTEGER NOT NULL,
+    sealed_at_ns INTEGER,
+    record_set_digest BLOB,
+    resolution_set_digest BLOB,
+    conflict_set_digest BLOB,
+    consumed_generation_digest BLOB
+        REFERENCES official_options_reference_generations(generation_digest),
+    UNIQUE (dataset_id, request_id),
+    CHECK (
+        (state IN ('open','abandoning')
+            AND sealed_at_ns IS NULL AND consumed_generation_digest IS NULL
+            AND record_set_digest IS NULL
+            AND resolution_set_digest IS NULL
+            AND conflict_set_digest IS NULL)
+        OR
+        (state='sealed' AND sealed_at_ns IS NOT NULL AND consumed_generation_digest IS NULL
+            AND sealed_at_ns>=created_at_ns
+            AND length(record_set_digest)=32 AND record_set_digest<>zeroblob(32)
+            AND length(resolution_set_digest)=32 AND resolution_set_digest<>zeroblob(32)
+            AND length(conflict_set_digest)=32 AND conflict_set_digest<>zeroblob(32))
+        OR
+        (state='consumed' AND sealed_at_ns IS NOT NULL
+            AND sealed_at_ns>=created_at_ns
+            AND length(record_set_digest)=32 AND record_set_digest<>zeroblob(32)
+            AND length(resolution_set_digest)=32 AND resolution_set_digest<>zeroblob(32)
+            AND length(conflict_set_digest)=32 AND conflict_set_digest<>zeroblob(32)
+            AND length(consumed_generation_digest)=32
+            AND consumed_generation_digest<>zeroblob(32))
+    )
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE official_options_reference_stage_records (
+    stage_id TEXT NOT NULL REFERENCES official_options_reference_stages(stage_id),
+    stream_ordinal INTEGER NOT NULL CHECK (stream_ordinal BETWEEN 0 AND 11999999),
+    sort_key BLOB NOT NULL CHECK (length(sort_key) BETWEEN 1 AND 65536),
+    value_json TEXT NOT NULL CHECK (
+        length(CAST(value_json AS BLOB)) BETWEEN 2 AND 65536 AND json_valid(value_json)
+    ),
+    PRIMARY KEY (stage_id, stream_ordinal),
+    UNIQUE (stage_id, sort_key)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE official_options_reference_stage_resolutions (
+    stage_id TEXT NOT NULL REFERENCES official_options_reference_stages(stage_id),
+    stream_ordinal INTEGER NOT NULL CHECK (stream_ordinal BETWEEN 0 AND 35999999),
+    sort_key BLOB NOT NULL CHECK (length(sort_key) BETWEEN 1 AND 65536),
+    value_json TEXT NOT NULL CHECK (
+        length(CAST(value_json AS BLOB)) BETWEEN 2 AND 65536 AND json_valid(value_json)
+    ),
+    PRIMARY KEY (stage_id, stream_ordinal),
+    UNIQUE (stage_id, sort_key)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE official_options_reference_stage_conflicts (
+    stage_id TEXT NOT NULL REFERENCES official_options_reference_stages(stage_id),
+    stream_ordinal INTEGER NOT NULL CHECK (stream_ordinal BETWEEN 0 AND 99999),
+    sort_key BLOB NOT NULL CHECK (length(sort_key) BETWEEN 1 AND 65536),
+    value_json TEXT NOT NULL CHECK (
+        length(CAST(value_json AS BLOB)) BETWEEN 2 AND 65536 AND json_valid(value_json)
+    ),
+    PRIMARY KEY (stage_id, stream_ordinal),
+    UNIQUE (stage_id, sort_key)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX official_options_reference_stage_record_order
+ON official_options_reference_stage_records(stage_id, sort_key);
+CREATE INDEX official_options_reference_stage_resolution_order
+ON official_options_reference_stage_resolutions(stage_id, sort_key);
+CREATE INDEX official_options_reference_stage_conflict_order
+ON official_options_reference_stage_conflicts(stage_id, sort_key);
+
 CREATE INDEX official_options_reference_generation_current
 ON official_options_reference_generations(dataset_id, generation_sequence DESC);
 CREATE INDEX official_options_reference_generation_as_of
@@ -318,27 +420,6 @@ WHEN NEW.generation_sequence<>COALESCE(
     )
 BEGIN
     SELECT RAISE(ABORT, 'official options reference generation is not a contiguous successor');
-END;
-
-CREATE TRIGGER official_options_reference_source_rights_insert
-BEFORE INSERT ON official_options_reference_generation_sources
-WHEN NOT EXISTS (
-    SELECT 1 FROM source_rights AS rights
-    JOIN official_options_reference_generations AS generation
-      ON generation.generation_digest=NEW.generation_digest
-    WHERE rights.rights_id=NEW.rights_id
-      AND rights.source_id=NEW.source_id
-      AND rights.payload_algorithm=1
-      AND rights.payload_digest=NEW.source_payload_set_digest
-      AND (rights.operation_mask & 6)=6
-      AND rights.admitted_at_ns<=generation.published_at_ns
-      AND (
-          rights.authorization_expires_at_ns IS NULL
-          OR rights.authorization_expires_at_ns>generation.published_at_ns
-      )
-)
-BEGIN
-    SELECT RAISE(ABORT, 'official options reference source lacks persist and display rights');
 END;
 
 CREATE TRIGGER official_options_reference_generation_immutable_update
