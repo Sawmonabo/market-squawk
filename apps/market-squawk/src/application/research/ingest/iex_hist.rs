@@ -868,7 +868,6 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
 ///
 /// Keeping the lease out of this view prevents the shared publisher from independently settling
 /// or duplicating the selected-file admission.
-#[derive(Clone, Copy)]
 pub(crate) struct IexHistCanonicalPublicationInput<'a, R> {
     source_id: &'a SourceId,
     analytical_dataset: &'a DatasetId,
@@ -881,44 +880,67 @@ pub(crate) struct IexHistCanonicalPublicationInput<'a, R> {
 }
 
 impl<'a, R> IexHistCanonicalPublicationInput<'a, R> {
-    pub(crate) const fn source_id(self) -> &'a SourceId {
+    pub(crate) const fn source_id(&self) -> &'a SourceId {
         self.source_id
     }
 
-    pub(crate) const fn analytical_dataset(self) -> &'a DatasetId {
+    pub(crate) const fn analytical_dataset(&self) -> &'a DatasetId {
         self.analytical_dataset
     }
 
-    pub(crate) const fn plan(self) -> &'a ColdJobPlan {
+    pub(crate) const fn plan(&self) -> &'a ColdJobPlan {
         self.plan
     }
 
-    pub(crate) const fn catalog_physical_seal(self) -> IexHistCatalogPhysicalSealEvidence {
+    pub(crate) const fn catalog_physical_seal(&self) -> IexHistCatalogPhysicalSealEvidence {
         self.catalog_physical_seal
     }
 
-    pub(crate) const fn materialization(self) -> &'a PcapMaterializationReceipt {
+    pub(crate) const fn materialization(&self) -> &'a PcapMaterializationReceipt {
         self.materialization
     }
 
-    pub(crate) const fn summary(self) -> &'a DecodeSummary {
+    pub(crate) const fn summary(&self) -> &'a DecodeSummary {
         self.summary
     }
 
-    pub(crate) const fn derived(self) -> &'a IexHistDerivedBarsHandoff {
+    pub(crate) const fn derived(&self) -> &'a IexHistDerivedBarsHandoff {
         self.derived
     }
 
-    pub(crate) const fn canonical_feed_identifier(self) -> &'static str {
+    pub(crate) const fn canonical_feed_identifier(&self) -> &'static str {
         canonical_feed_identifier(self.plan.selected_file().feed())
     }
 
-    pub(crate) const fn canonical_interval_identifier(self) -> &'static str {
+    pub(crate) const fn canonical_interval_identifier(&self) -> &'static str {
         canonical_interval_identifier(self.derived.interval())
     }
 
-    pub(crate) const fn physical(self) -> &'a IexHistCompletePhysicalSeal<R> {
+    pub(crate) const fn physical(&self) -> &'a IexHistCompletePhysicalSeal<R> {
         self.physical
+    }
+
+    /// Returns the sole accepted identity of a sorted date-effective symbol mapping set.
+    ///
+    /// The shared publisher uses this before its atomic commit so the returned receipt cannot
+    /// substitute an opaque, authority-chosen mapping digest for the exact mappings it publishes.
+    pub(crate) fn expected_mapping_set_sha256(
+        &self,
+        instruments: &[IexHistPublishedInstrument],
+    ) -> EvidenceDigest {
+        published_mapping_set_identity(instruments)
+    }
+
+    /// Returns the exact raw/native/derived binding the shared publisher must persist.
+    ///
+    /// This identity includes every retained native event serialization and each bar's ordered
+    /// contributing-event digest. The publisher may write its objects in any supported physical
+    /// layout, but its durable lineage record and receipt must retain this value unchanged.
+    pub(crate) fn expected_persisted_binding_sha256(
+        &self,
+        instruments: &[IexHistPublishedInstrument],
+    ) -> EvidenceDigest {
+        persisted_native_lineage_identity(self, instruments)
     }
 }
 
@@ -927,7 +949,9 @@ impl<'a, R> IexHistCanonicalPublicationInput<'a, R> {
 /// Implementations must use the common provider-capture store, Arrow converter, Parquet store,
 /// manifest catalog, rights decision, and precommit authority. Returning `Ok` means the immutable
 /// manifest and every exact raw/native parent are already durably committed; an implementation
-/// must never substitute provider text for a date-effective canonical `InstrumentId`.
+/// must never substitute provider text for a date-effective canonical `InstrumentId`. The mapping
+/// set and persisted native binding returned by the input must be written in that same atomic
+/// commit and copied exactly into the immutable receipt.
 #[async_trait]
 pub(crate) trait IexHistCanonicalPublicationAuthority<R>:
     IexHistRestartLineageAuthority + Send + Sync
@@ -1073,6 +1097,7 @@ impl IexHistImmutablePublicationReceipt {
             || parquet_bytes == 0
             || manifest_and_atomic_bytes == 0
             || !valid_sha256_evidence(mapping_set_sha256)
+            || mapping_set_sha256 != published_mapping_set_identity(&instruments)
             || !valid_sha256_evidence(persisted_binding_sha256)
             || !valid_sha256_evidence(canonical_content_sha256)
             || manifest.content_hash().bytes() != canonical_content_sha256.bytes()
@@ -1158,6 +1183,7 @@ impl IexHistImmutablePublicationReceipt {
     fn validates_against<R>(&self, handoff: &IexHistCanonicalPublicationHandoff<R>) -> bool {
         let selected = handoff.plan.selected_file();
         let bars = handoff.derived.bars();
+        let publication_input = handoff.publication_input();
         let latest_completed_at = bars
             .iter()
             .map(|bar| bar.bucket_end_unix_nanos())
@@ -1177,6 +1203,10 @@ impl IexHistImmutablePublicationReceipt {
             && self.decode_summary_sha256 == handoff.summary.summary_sha256()
             && self.provider_content_sha256 == handoff.derived.provider_content_sha256()
             && self.derived_handoff_sha256 == handoff.derived.handoff_sha256()
+            && self.mapping_set_sha256
+                == publication_input.expected_mapping_set_sha256(&self.instruments)
+            && self.persisted_binding_sha256
+                == publication_input.expected_persisted_binding_sha256(&self.instruments)
             && u64::try_from(bars.len()).ok() == Some(self.row_count)
             && self.locally_available_at
                 >= Timestamp::from_unix_nanos(handoff.materialization.completed_at_unix_nanos())
@@ -1382,6 +1412,84 @@ fn valid_sha256_evidence(value: EvidenceDigest) -> bool {
 
 fn valid_iex_sha256(value: Sha256Digest) -> bool {
     value.as_bytes().iter().any(|byte| *byte != 0)
+}
+
+fn published_mapping_set_identity(instruments: &[IexHistPublishedInstrument]) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/iex-hist-published-mapping-set/v1");
+    hash.update(
+        u64::try_from(instruments.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    for instrument in instruments {
+        hash_length_prefixed(&mut hash, instrument.symbol.as_bytes());
+        hash.update(instrument.instrument_id.as_uuid().as_bytes());
+        hash.update(instrument.bar_count.to_le_bytes());
+        hash.update(instrument.first_effective_at.unix_nanos().to_le_bytes());
+        hash.update(instrument.last_effective_at.unix_nanos().to_le_bytes());
+        hash.update(instrument.mapping_evidence.bytes());
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+fn persisted_native_lineage_identity<R>(
+    input: &IexHistCanonicalPublicationInput<'_, R>,
+    instruments: &[IexHistPublishedInstrument],
+) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/iex-hist-persisted-native-lineage/v1");
+    hash_length_prefixed(&mut hash, input.source_id.as_str().as_bytes());
+    hash_length_prefixed(&mut hash, input.analytical_dataset.as_str().as_bytes());
+    for digest in [
+        input.plan.plan_sha256(),
+        input.catalog_physical_seal.seal_sha256(),
+        input.materialization.receipt_sha256(),
+        input.summary.summary_sha256(),
+        input.physical.seal_sha256(),
+        input.derived.source().provider_content_sha256(),
+        input.derived.source().physical_evidence_sha256(),
+        input.derived.calculation_sha256(),
+        input.derived.provider_content_sha256(),
+        input.derived.handoff_sha256(),
+    ] {
+        hash.update(digest.as_bytes());
+    }
+    hash.update([bar_interval_identity_tag(input.derived.interval())]);
+    hash.update(published_mapping_set_identity(instruments).bytes());
+    let events = input.derived.source().events();
+    hash.update(
+        u64::try_from(events.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    for event in events {
+        hash.update(event.ordinal().to_le_bytes());
+        hash.update(
+            u64::try_from(event.native_serialized_bytes().len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hash.update(event.native_serialized_sha256().as_bytes());
+        hash.update(event.provider_content_sha256().as_bytes());
+    }
+    let bars = input.derived.bars();
+    hash.update(u64::try_from(bars.len()).unwrap_or(u64::MAX).to_le_bytes());
+    for bar in bars {
+        hash_length_prefixed(&mut hash, bar.symbol().as_bytes());
+        hash.update(bar.bucket_start_unix_nanos().to_le_bytes());
+        hash.update(bar.bucket_end_unix_nanos().to_le_bytes());
+        hash.update(bar.bar_sha256().as_bytes());
+        hash.update(bar.contributing_event_count().to_le_bytes());
+        hash.update(bar.contributing_events_sha256().as_bytes());
+        hash.update(bar.source_provider_content_sha256().as_bytes());
+    }
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
+}
+
+fn hash_length_prefixed(hash: &mut Sha256, value: &[u8]) {
+    hash.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hash.update(value);
 }
 
 #[allow(
@@ -1683,7 +1791,22 @@ impl IexHistRestartSelector {
         {
             return Err(IexHistRestartError::TypedReadMismatch);
         }
-        Ok(IexHistRestartReceipt { lineage, bars })
+        let history_handoff_sha256 = neutral_history_handoff_identity(
+            &self.publication,
+            &lineage,
+            instrument_id,
+            knowledge_cutoff,
+            effective_range,
+            &bars,
+        );
+        Ok(IexHistRestartReceipt {
+            instrument_id,
+            knowledge_cutoff,
+            effective_range,
+            history_handoff_sha256,
+            lineage,
+            bars,
+        })
     }
 
     fn validates_restart_lineage(&self, evidence: &IexHistRestartLineageEvidence) -> bool {
@@ -1706,21 +1829,129 @@ impl IexHistRestartSelector {
     }
 }
 
-/// Raw/native restart evidence plus the exact manifest-pinned typed bar result.
+/// Raw/native restart evidence plus a provider-neutral, manifest-pinned typed history handoff.
 #[derive(Debug)]
 pub(crate) struct IexHistRestartReceipt {
+    instrument_id: InstrumentId,
+    knowledge_cutoff: Timestamp,
+    effective_range: MarketBarEffectiveRange,
+    history_handoff_sha256: EvidenceDigest,
     lineage: IexHistRestartLineageEvidence,
     bars: AnalyticalMarketBarOutput,
 }
 
 impl IexHistRestartReceipt {
+    /// Returns the stable canonical instrument selected for this history.
+    pub(crate) const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the inclusive point-in-time knowledge cutoff used by the exact read.
+    pub(crate) const fn knowledge_cutoff(&self) -> Timestamp {
+        self.knowledge_cutoff
+    }
+
+    /// Returns the exact inclusive effective-time range delivered to research consumers.
+    pub(crate) const fn effective_range(&self) -> MarketBarEffectiveRange {
+        self.effective_range
+    }
+
+    /// Returns the opaque immutable evidence identity for feature/backtest input pinning.
+    pub(crate) const fn history_handoff_sha256(&self) -> EvidenceDigest {
+        self.history_handoff_sha256
+    }
+
+    /// Returns diagnostic raw/native restart evidence. Ordinary feature and backtest consumers do
+    /// not need to interpret these provider coordinates.
     pub(crate) const fn lineage(&self) -> &IexHistRestartLineageEvidence {
         &self.lineage
+    }
+
+    /// Returns the existing provider-neutral analytical market-bar output.
+    pub(crate) const fn bars(&self) -> &AnalyticalMarketBarOutput {
+        &self.bars
+    }
+
+    /// Consumes the restart receipt into a provider-neutral history handoff for feature
+    /// construction or governed-backtest input preparation.
+    ///
+    /// Governed backtests still require the existing canonical feature-label publication and
+    /// pinned-input authority; this handoff deliberately does not bypass either boundary.
+    pub(crate) fn into_neutral_history(self) -> NeutralMarketBarHistoryHandoff {
+        NeutralMarketBarHistoryHandoff {
+            instrument_id: self.instrument_id,
+            knowledge_cutoff: self.knowledge_cutoff,
+            effective_range: self.effective_range,
+            history_handoff_sha256: self.history_handoff_sha256,
+            bars: self.bars,
+        }
+    }
+}
+
+/// Provider-neutral typed history and opaque lineage evidence for downstream research work.
+#[derive(Debug)]
+pub(crate) struct NeutralMarketBarHistoryHandoff {
+    instrument_id: InstrumentId,
+    knowledge_cutoff: Timestamp,
+    effective_range: MarketBarEffectiveRange,
+    history_handoff_sha256: EvidenceDigest,
+    bars: AnalyticalMarketBarOutput,
+}
+
+impl NeutralMarketBarHistoryHandoff {
+    pub(crate) const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    pub(crate) const fn knowledge_cutoff(&self) -> Timestamp {
+        self.knowledge_cutoff
+    }
+
+    pub(crate) const fn effective_range(&self) -> MarketBarEffectiveRange {
+        self.effective_range
+    }
+
+    /// Returns the raw/native/publication/query evidence identity downstream derived datasets
+    /// should retain as an input parent.
+    pub(crate) const fn history_handoff_sha256(&self) -> EvidenceDigest {
+        self.history_handoff_sha256
     }
 
     pub(crate) const fn bars(&self) -> &AnalyticalMarketBarOutput {
         &self.bars
     }
+
+    pub(crate) fn into_bars(self) -> AnalyticalMarketBarOutput {
+        self.bars
+    }
+}
+
+fn neutral_history_handoff_identity(
+    publication: &IexHistImmutablePublicationReceipt,
+    lineage: &IexHistRestartLineageEvidence,
+    instrument_id: InstrumentId,
+    knowledge_cutoff: Timestamp,
+    effective_range: MarketBarEffectiveRange,
+    bars: &AnalyticalMarketBarOutput,
+) -> EvidenceDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/neutral-market-bar-history-handoff/v1");
+    hash.update(publication.receipt_sha256.bytes());
+    hash.update(lineage.persisted_binding_sha256.bytes());
+    hash.update(lineage.canonical_content_sha256.bytes());
+    hash.update(instrument_id.as_uuid().as_bytes());
+    hash.update(knowledge_cutoff.unix_nanos().to_le_bytes());
+    hash.update(effective_range.start().unix_nanos().to_le_bytes());
+    hash.update(effective_range.end().unix_nanos().to_le_bytes());
+    hash.update(bars.output().object_graph_digest().bytes());
+    hash.update(bars.output().query_identity().bytes());
+    hash.update(bars.output().result_digest().bytes());
+    hash.update(
+        u64::try_from(bars.bars().len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    EvidenceDigest::new(DigestAlgorithm::Sha256, hash.finalize().into())
 }
 
 /// Exact restart/PIT failure; pre-availability absence is distinct from integrity failure.

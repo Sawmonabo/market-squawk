@@ -18,10 +18,10 @@ use crate::receipt::CaptureResponseMetadata;
 use crate::transport::{MockStreamChunk, materialize_mock_stream, resume_mock_stream};
 use crate::{
     ByteAdmissionLimits, CaptureChronologyDisposition, CaptureError, Catalog, CatalogFetch,
-    ColdJobPlan, ColdJobTrigger, DecodeLimits, ExactFileRequest, FeedKind, FeedVersion, IexEvent,
-    IexHistAuthorityClockSample, IexHistBarInterval, IexHistCapacityAuthority,
-    IexHistCapacityCategory, IexHistCapacityDisposition, IexHistCapacityError,
-    IexHistCapacityFootprint, IexHistCapacityLease, IexHistCapacityRequest,
+    ColdJobPlan, ColdJobTrigger, DecodeChannelRole, DecodeLimits, ExactFileRequest, FeedKind,
+    FeedVersion, IexEvent, IexHistAuthorityClockSample, IexHistBarInterval,
+    IexHistCapacityAuthority, IexHistCapacityCategory, IexHistCapacityDisposition,
+    IexHistCapacityError, IexHistCapacityFootprint, IexHistCapacityLease, IexHistCapacityRequest,
     IexHistCapacitySettlement, IexHistCheckpointStore, IexHistCheckpointStoreError,
     IexHistColdTransport, IexHistCompleteSealError, IexHistDownloadOutcome, IexHistDurableJob,
     IexHistJobPhase, IexHistPlanner, IexHistReactivationRequirement, IexHistRecoveryAction,
@@ -312,6 +312,22 @@ async fn selected_feed_date_resumes_decodes_and_hands_off_native_bars() {
     assert_eq!(decoded_plan, plan);
     assert_eq!(decoded_capture, capture);
     assert_eq!(summary.messages, 6);
+    assert_eq!(summary.channels, 1);
+    assert_eq!(summary.channel_sessions.len(), 1);
+    let channel = &summary.channel_sessions[0];
+    assert_eq!(channel.channel_id, 1);
+    assert_eq!(channel.session_id, 7);
+    assert_eq!(channel.next_sequence, 7);
+    assert!(channel.next_stream_offset > 0);
+    assert!(!channel.heartbeat_only);
+    assert_eq!(channel.role, DecodeChannelRole::Active);
+    assert!(
+        summary
+            .channel_sessions_sha256
+            .as_bytes()
+            .iter()
+            .any(|byte| *byte != 0)
+    );
     assert_eq!(
         summary.decode_attempt_sha256,
         capture.attempt().attempt_sha256()
