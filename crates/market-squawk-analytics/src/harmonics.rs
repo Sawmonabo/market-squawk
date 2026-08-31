@@ -337,7 +337,7 @@ impl HarmonicRatioBand {
         self.lower
     }
 
-    /// Returns the inclusive upper bound.
+    /// Returns the upper boundary; [`Self::upper_is_inclusive`] defines its inclusion semantics.
     #[must_use]
     pub const fn upper(self) -> HarmonicRatio {
         self.upper
