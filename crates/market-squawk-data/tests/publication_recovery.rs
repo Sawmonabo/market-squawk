@@ -3588,7 +3588,7 @@ fn provider_macro_plan_input(
         let capture = ProviderCaptureSetReceipt::try_new(
             source_id.clone(),
             metadata_revision.clone(),
-            provider_dataset.clone(),
+            analytical_source_dataset.clone(),
             digest(u8::try_from(180 + chunk_ordinal)?),
             ProviderCaptureTerminalDisposition::StandaloneResponse,
             vec![ProviderCapturePageReceipt::try_new(
