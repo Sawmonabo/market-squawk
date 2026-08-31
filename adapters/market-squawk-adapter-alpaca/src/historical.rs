@@ -34,6 +34,7 @@ use uuid::Uuid;
 use crate::config::{
     ALPACA_HISTORICAL_EXCLUSION_NANOS, ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS,
     ALPACA_STOCKS_BASE_ENDPOINT, AlpacaHistoricalEquityPreflightPlan,
+    AlpacaProviderInstrumentCoordinate,
 };
 use crate::historical_calendar::singleton_bounded_header;
 use crate::historical_transport::{AlpacaHistoricalEndpoint, AlpacaHistoricalTransport};
@@ -257,7 +258,7 @@ pub trait AlpacaHistoricalBarTimeAuthority: Send + Sync + 'static {
 
 #[derive(Clone, Debug)]
 struct HistoricalInstrumentAuthority {
-    provider_instrument_id: ProviderInstrumentId,
+    coordinate: AlpacaProviderInstrumentCoordinate,
     currency: Currency,
 }
 
@@ -487,29 +488,18 @@ impl AlpacaHistoricalEquitySource {
     /// Validates the exact FIGI-backed canonical provider mapping before any preflight network
     /// request is admitted.
     pub fn validate_one_preflight_instrument(
-        metadata: &SourceMetadata,
+        _metadata: &SourceMetadata,
         plan: &AlpacaHistoricalEquityPreflightPlan,
         canonical_instrument: &MarketDataInstrumentDefinition,
     ) -> Result<(), AlpacaError> {
-        let provider_instrument_id =
-            ProviderInstrumentId::try_from(try_owned_bounded(plan.mapping().symbol())?)?;
-        if canonical_instrument.instrument_id() != plan.mapping().instrument()
-            || canonical_instrument.asset_class() != plan.mapping().asset_class()
-            || !interval_covers(
-                canonical_instrument.effective_interval(),
-                plan.start(),
-                plan.end(),
-            )
-            || canonical_instrument
-                .provider_identity_at(metadata.source_id(), &provider_instrument_id, plan.start())
-                .is_none()
-            || canonical_instrument
-                .provider_identity_at(metadata.source_id(), &provider_instrument_id, plan.end())
-                .is_none()
-        {
-            return Err(AlpacaError::InvalidCoverage);
-        }
-        Ok(())
+        validate_definition_coordinate(
+            canonical_instrument,
+            plan.mapping().provider_coordinate(),
+            plan.mapping().asset_class(),
+            plan.start(),
+            plan.end(),
+        )
+        .map(|_currency| ())
     }
 
     /// Constructs a read-only source over the exact retained preflight graph after validating
@@ -575,11 +565,7 @@ impl AlpacaHistoricalEquitySource {
         let authority = authorities
             .get(dataset.dataset().as_str())
             .ok_or(AlpacaError::InvalidCoverage)?;
-        dataset.analytical_dataset_identifier(
-            config.metadata(),
-            &authority.provider_instrument_id,
-            authority.currency,
-        )
+        dataset.analytical_dataset_identifier(config.metadata(), authority.currency)
     }
 
     /// Validates one exact extraction batch against its secret-free one-plan configuration.
@@ -604,11 +590,7 @@ impl AlpacaHistoricalEquitySource {
             .get(dataset.dataset().as_str())
             .ok_or(AlpacaError::InvalidCoverage)?;
         validate_analytical_batch(batch, dataset, config.metadata().source_id(), authority)?;
-        dataset.analytical_dataset_identifier(
-            config.metadata(),
-            &authority.provider_instrument_id,
-            authority.currency,
-        )
+        dataset.analytical_dataset_identifier(config.metadata(), authority.currency)
     }
 
     /// Builds the source-honest revision plan for an exact one-plan batch without transport state.
@@ -656,11 +638,7 @@ impl AlpacaHistoricalEquitySource {
             self.config.metadata().source_id(),
             authority,
         )?;
-        dataset.analytical_dataset_identifier(
-            self.config.metadata(),
-            &authority.provider_instrument_id,
-            authority.currency,
-        )
+        dataset.analytical_dataset_identifier(self.config.metadata(), authority.currency)
     }
 
     /// Builds honest locally observed revision authority for one exact historical-bar batch.
@@ -972,28 +950,17 @@ fn validate_instrument_authorities(
         return Err(AlpacaError::InvalidCoverage);
     }
 
-    let source_id = config.metadata().source_id();
     let index_capacity = canonical_instruments
         .iter()
         .try_fold(0_usize, |count, definition| {
-            count.checked_add(
-                definition
-                    .provider_identities()
-                    .iter()
-                    .filter(|identity| identity.source_id() == source_id)
-                    .count(),
-            )
+            count.checked_add(definition.provider_identities().len())
         });
     let mut canonical_index = Vec::new();
     canonical_index
         .try_reserve_exact(index_capacity.ok_or(AlpacaError::Allocation)?)
         .map_err(|_| AlpacaError::Allocation)?;
     for (definition_index, definition) in canonical_instruments.iter().enumerate() {
-        for provider_identity in definition
-            .provider_identities()
-            .iter()
-            .filter(|identity| identity.source_id() == source_id)
-        {
+        for provider_identity in definition.provider_identities() {
             canonical_index.push(CanonicalInstrumentAuthorityIndexEntry {
                 instrument_id: definition.instrument_id(),
                 source_id: provider_identity.source_id(),
@@ -1018,53 +985,48 @@ fn validate_instrument_authorities(
         .try_reserve(dataset_count)
         .map_err(|_| AlpacaError::Allocation)?;
     for dataset in config.datasets() {
-        let provider_instrument_id =
-            ProviderInstrumentId::try_from(try_owned_bounded(dataset.mapping().symbol())?)?;
+        let coordinate = dataset.mapping().provider_coordinate();
+        let provider_instrument_id = coordinate.identity_key().provider_instrument_id();
+        let provider_identity_source = coordinate.identity_key().source_id();
         let instrument_id = dataset.mapping().instrument();
         let first = canonical_index.partition_point(|entry| {
-            compare_canonical_index_key(entry, instrument_id, source_id, &provider_instrument_id)
-                == Ordering::Less
+            compare_canonical_index_key(
+                entry,
+                instrument_id,
+                provider_identity_source,
+                provider_instrument_id,
+            ) == Ordering::Less
         });
         let last = first
             + canonical_index[first..].partition_point(|entry| {
                 compare_canonical_index_key(
                     entry,
                     instrument_id,
-                    source_id,
-                    &provider_instrument_id,
+                    provider_identity_source,
+                    provider_instrument_id,
                 ) == Ordering::Equal
             });
         let mut resolved = None;
         for entry in &canonical_index[first..last] {
             let definition = entry.definition;
-            if definition.asset_class() != dataset.mapping().asset_class()
-                || !interval_covers(
-                    definition.effective_interval(),
-                    dataset.start(),
-                    dataset.end(),
-                )
-            {
-                continue;
-            }
-            let Some(provider_identity) = definition.provider_identity_at(
-                source_id,
-                &provider_instrument_id,
+            let Ok(currency) = validate_definition_coordinate(
+                definition,
+                coordinate,
+                dataset.mapping().asset_class(),
                 dataset.start(),
+                dataset.end(),
             ) else {
                 continue;
             };
-            if provider_identity.instrument_id() != definition.instrument_id()
-                || !interval_covers(provider_identity.validity(), dataset.start(), dataset.end())
-                || resolved.is_some()
-            {
+            if resolved.is_some() {
                 return Err(AlpacaError::InvalidCoverage);
             }
-            resolved = Some((entry.definition_index, definition.quote_currency()));
+            resolved = Some((entry.definition_index, currency));
         }
         let (definition_index, currency) = resolved.ok_or(AlpacaError::InvalidCoverage)?;
         used_definitions[definition_index] = true;
         let authority = HistoricalInstrumentAuthority {
-            provider_instrument_id,
+            coordinate: coordinate.clone(),
             currency,
         };
         if authorities
@@ -1078,6 +1040,46 @@ fn validate_instrument_authorities(
         return Err(AlpacaError::InvalidCoverage);
     }
     Ok(authorities)
+}
+
+fn validate_definition_coordinate(
+    definition: &MarketDataInstrumentDefinition,
+    coordinate: &AlpacaProviderInstrumentCoordinate,
+    asset_class: market_squawk_domain::AssetClass,
+    start: Timestamp,
+    end: Timestamp,
+) -> Result<Currency, AlpacaError> {
+    let identity_key = coordinate.identity_key();
+    let selected = definition.provider_identity_at(
+        identity_key.source_id(),
+        identity_key.provider_instrument_id(),
+        start,
+    );
+    let selected_at_end = definition.provider_identity_at(
+        identity_key.source_id(),
+        identity_key.provider_instrument_id(),
+        end,
+    );
+    if definition.instrument_id() != coordinate.instrument()
+        || definition.asset_class() != asset_class
+        || !interval_covers(definition.effective_interval(), start, end)
+        || !definition.venue_mappings().iter().any(|mapping| {
+            mapping.venue_id() == coordinate.venue()
+                && mapping.venue_symbol() == coordinate.venue_symbol()
+        })
+        || selected.is_none()
+        || selected != selected_at_end
+        || selected.is_none_or(|identity| {
+            identity.instrument_id() != coordinate.instrument()
+                || identity.metadata_revision() != coordinate.provider_identity_revision()
+                || identity.evidence().content_digest() != coordinate.provider_identity_digest()
+                || identity.validity() != coordinate.provider_identity_validity()
+                || !interval_covers(identity.validity(), start, end)
+        })
+    {
+        return Err(AlpacaError::InvalidCoverage);
+    }
+    Ok(definition.quote_currency())
 }
 
 fn compare_canonical_index_entries(
@@ -1156,7 +1158,7 @@ fn validate_analytical_batch(
     if batch.records().is_empty() {
         return Err(AlpacaError::Protocol);
     }
-    let venue_id = VenueId::try_from("iex")?;
+    let venue_id = authority.coordinate.venue().clone();
     let feed = SourceIdentifier::try_from("iex")?;
     let interval = SourceIdentifier::try_from(dataset.timeframe().provider_value())?;
     let adjustment = market_bar_adjustment(dataset.adjustment());
@@ -1187,7 +1189,8 @@ fn validate_analytical_batch(
             || provenance.venue_id() != Some(&venue_id)
             || provenance.source_timestamp() != Some(effective_at)
             || provenance.quality() != DataQuality::Aggregated
-            || bar.provider_instrument_id() != &authority.provider_instrument_id
+            || bar.provider_instrument_id()
+                != authority.coordinate.identity_key().provider_instrument_id()
             || bar.feed() != &feed
             || bar.interval() != &interval
             || bar.adjustment() != adjustment
@@ -1220,12 +1223,16 @@ fn normalize_bar(
     if effective_at < dataset.start() || effective_at > dataset.end() {
         return Err(AlpacaError::Protocol);
     }
-    let venue_id = VenueId::try_from("iex")?;
+    let venue_id = authority.coordinate.venue().clone();
     let timeframe = SourceIdentifier::try_from(dataset.timeframe().provider_value())?;
     let request = AlpacaHistoricalBarTimeRequest::new(
         dataset.mapping().instrument(),
         venue_id.clone(),
-        authority.provider_instrument_id.clone(),
+        authority
+            .coordinate
+            .identity_key()
+            .provider_instrument_id()
+            .clone(),
         timeframe.clone(),
         effective_at,
     );
@@ -1287,7 +1294,11 @@ fn normalize_bar(
     let context = ResearchContext::new(provenance, time).map_err(|_| AlpacaError::Protocol)?;
     MarketBarObservation::new(
         context,
-        authority.provider_instrument_id.clone(),
+        authority
+            .coordinate
+            .identity_key()
+            .provider_instrument_id()
+            .clone(),
         SourceIdentifier::try_from("iex")?,
         timeframe,
         time_semantics,
@@ -1863,6 +1874,10 @@ fn preflight_receipt_digest(
     digest.update(b"market-squawk/alpaca-historical-preflight-receipt/v1\0");
     hash_preflight_text(&mut digest, plan.mapping().symbol())?;
     digest.update(plan.mapping().instrument().as_uuid().as_bytes());
+    hash_preflight_evidence(
+        &mut digest,
+        plan.mapping().provider_coordinate().binding_digest(),
+    );
     digest.update([match plan.mapping().asset_class() {
         market_squawk_domain::AssetClass::Equity => 1,
         market_squawk_domain::AssetClass::Fund => 2,
@@ -2010,7 +2025,10 @@ mod capture_tests {
         AlpacaHistoricalScriptedTransportFactory,
     };
     use crate::{AlpacaAuthenticatedCalendarRequest, AlpacaTradingApiEnvironment};
-    use market_squawk_domain::{AssetClass, MetadataRevision};
+    use market_squawk_domain::{
+        AssetClass, MetadataRevision, ProviderIdentityEvidence, ProviderIdentityRecord,
+        ProviderIdentityRecordInput, VenueMapping, VenueSymbol,
+    };
     use market_squawk_sources::{
         AuthorizationMode, BackoffPolicy, BudgetScope, PreparedProviderRateRegistrationBatch,
         ProviderBudgetPolicy, ProviderRateAuthority, ProviderRateDeclaration,
@@ -2222,9 +2240,12 @@ mod capture_tests {
     #[tokio::test]
     async fn scripted_historical_transport_is_shared_and_counts_only_dispatches()
     -> Result<(), Box<dyn Error>> {
+        let instrument = "00000001-0002-0003-0004-000000000001".parse()?;
+        let identity = provider_identity(instrument)?;
         let mapping = crate::AlpacaInstrumentMapping::try_new(
-            "AAPL".to_owned(),
-            "00000001-0002-0003-0004-000000000001".parse()?,
+            &identity,
+            &venue_mapping()?,
+            instrument,
             AssetClass::Equity,
         )?;
         let plan = AlpacaHistoricalEquityPreflightPlan::try_new(
@@ -2323,11 +2344,14 @@ mod capture_tests {
 
     #[test]
     fn historical_capture_preserves_terminal_pages_and_refuses_broken_token_chain() {
+        let instrument = "00000001-0002-0003-0004-000000000001"
+            .parse()
+            .expect("non-nil instrument identity");
+        let identity = provider_identity(instrument).expect("valid provider identity");
         let mapping = crate::AlpacaInstrumentMapping::try_new(
-            "AAPL".to_owned(),
-            "00000001-0002-0003-0004-000000000001"
-                .parse()
-                .expect("non-nil instrument identity"),
+            &identity,
+            &venue_mapping().expect("valid venue mapping"),
+            instrument,
             AssetClass::Equity,
         )
         .expect("valid exact provider mapping");
@@ -2447,5 +2471,33 @@ mod capture_tests {
             build_historical_capture_material(&source_id, &revision, &dataset, &preflight),
             Err(AlpacaError::CaptureMaterial)
         ));
+    }
+
+    fn provider_identity(
+        instrument_id: InstrumentId,
+    ) -> Result<ProviderIdentityRecord, Box<dyn Error>> {
+        Ok(ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+            instrument_id,
+            source_id: SourceId::try_from(crate::config::ALPACA_PROVIDER)?,
+            provider_instrument_id: ProviderInstrumentId::try_from("AAPL-ASSET-ID")?,
+            evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                [21; 32],
+            )),
+            source_timestamp: None,
+            observed_at: Timestamp::from_unix_nanos(0),
+            metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+                "alpaca-aapl-identity-v1",
+            )?),
+            validity: EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+            supersedes: None,
+        }))
+    }
+
+    fn venue_mapping() -> Result<VenueMapping, Box<dyn Error>> {
+        Ok(VenueMapping::new(
+            VenueId::try_from(crate::config::IEX_VENUE)?,
+            VenueSymbol::try_from("AAPL")?,
+        ))
     }
 }

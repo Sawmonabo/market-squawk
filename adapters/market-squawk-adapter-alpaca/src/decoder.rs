@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use chrono::DateTime;
 use market_squawk_domain::{
-    AggressorSide, HaltTransition, InstrumentId, IntegrityRule, SourceIdentifier, Timestamp,
-    VenueId,
+    AggressorSide, HaltTransition, IntegrityRule, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{
     ControlFrameKind, DecodeInternalError, DecodeOutcome, DecodedControlFrame, DecodedIgnoredFrame,
@@ -19,7 +19,10 @@ use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Number, Value};
 
-use crate::config::{ALPACA_BASIC_EQUITY_SYMBOL_LIMIT, IEX_VENUE, INDICATIVE_OPTIONS_VENUE};
+use crate::config::{
+    ALPACA_BASIC_EQUITY_SYMBOL_LIMIT, AlpacaProviderInstrumentCoordinate, IEX_VENUE,
+    INDICATIVE_OPTIONS_VENUE,
+};
 use crate::{AlpacaError, AlpacaIexLiveConfig, AlpacaOptionsLiveConfig};
 
 const MAX_MESSAGES_PER_FRAME: usize = market_squawk_sources::MAX_DECODED_EVENTS;
@@ -35,7 +38,12 @@ impl AlpacaIexDecoder {
         let symbols = config
             .mappings()
             .iter()
-            .map(|mapping| (mapping.symbol().to_owned(), mapping.instrument()))
+            .map(|mapping| {
+                (
+                    mapping.symbol().to_owned(),
+                    Arc::new(mapping.provider_coordinate().clone()),
+                )
+            })
             .collect::<Vec<_>>();
         Ok(Self(AlpacaDecoder::try_new(
             config.metadata(),
@@ -73,7 +81,12 @@ impl AlpacaOptionsDecoder {
         let symbols = config
             .mappings()
             .iter()
-            .map(|mapping| (mapping.symbol().to_owned(), mapping.instrument()))
+            .map(|mapping| {
+                (
+                    mapping.symbol().to_owned(),
+                    Arc::new(mapping.provider_coordinate().clone()),
+                )
+            })
             .collect::<Vec<_>>();
         Ok(Self(AlpacaDecoder::try_new(
             config.metadata(),
@@ -119,7 +132,7 @@ enum SessionState {
 #[derive(Clone, Debug)]
 struct AlpacaDecoder {
     metadata: SourceMetadata,
-    instruments: BTreeMap<String, InstrumentId>,
+    instruments: BTreeMap<String, Arc<AlpacaProviderInstrumentCoordinate>>,
     expected_symbol_order: Box<[String]>,
     expected_symbols: BTreeSet<String>,
     venue: VenueId,
@@ -138,7 +151,7 @@ struct AlpacaDecoder {
 impl AlpacaDecoder {
     fn try_new(
         metadata: &SourceMetadata,
-        ordered_instruments: Vec<(String, InstrumentId)>,
+        ordered_instruments: Vec<(String, Arc<AlpacaProviderInstrumentCoordinate>)>,
         venue: VenueId,
         surface: DecoderSurface,
         max_frame_bytes: usize,
@@ -572,7 +585,7 @@ impl AlpacaDecoder {
     fn decode_trade(&self, message: Value) -> Result<Option<ObservationInput>, QuarantineReason> {
         let wire: TradeWire =
             serde_json::from_value(message).map_err(|_| QuarantineReason::SchemaViolation)?;
-        let instrument = self.instrument(&wire.symbol)?;
+        let coordinate = self.instrument(&wire.symbol)?;
         let timestamp = parse_timestamp(&wire.timestamp)?;
         let price = parse_price(wire.price)?;
         let quantity = parse_quantity(wire.size, false)?;
@@ -590,7 +603,7 @@ impl AlpacaDecoder {
         );
         Ok(Some(ObservationInput {
             source_identifier,
-            instrument,
+            coordinate,
             timestamp,
             payload: ProviderObservationPayload::Trade {
                 trade_id: SourceIdentifier::try_from(trade_identity)
@@ -610,7 +623,7 @@ impl AlpacaDecoder {
     fn decode_quote(&self, message: Value) -> Result<Option<ObservationInput>, QuarantineReason> {
         let wire: QuoteWire =
             serde_json::from_value(message).map_err(|_| QuarantineReason::SchemaViolation)?;
-        let instrument = self.instrument(&wire.symbol)?;
+        let coordinate = self.instrument(&wire.symbol)?;
         let timestamp = parse_timestamp(&wire.timestamp)?;
         let bid = parse_quote_side(wire.bid_price, wire.bid_size)?;
         let ask = parse_quote_side(wire.ask_price, wire.ask_size)?;
@@ -627,7 +640,7 @@ impl AlpacaDecoder {
                 ask_exchange,
                 timestamp.unix_nanos()
             ),
-            instrument,
+            coordinate,
             timestamp,
             payload,
         }))
@@ -638,7 +651,7 @@ impl AlpacaDecoder {
         symbol: &str,
         wire: BootQuoteWire,
     ) -> Result<ObservationInput, QuarantineReason> {
-        let instrument = self.instrument(symbol)?;
+        let coordinate = self.instrument(symbol)?;
         let timestamp = parse_timestamp(&wire.timestamp)?;
         let bid = parse_quote_side(wire.bid_price, wire.bid_size)?;
         let ask = parse_quote_side(wire.ask_price, wire.ask_size)?;
@@ -653,7 +666,7 @@ impl AlpacaDecoder {
                 ask_exchange,
                 timestamp.unix_nanos()
             ),
-            instrument,
+            coordinate,
             timestamp,
             payload,
         })
@@ -664,7 +677,7 @@ impl AlpacaDecoder {
         symbol: &str,
         wire: BootTradeWire,
     ) -> Result<ObservationInput, QuarantineReason> {
-        let instrument = self.instrument(symbol)?;
+        let coordinate = self.instrument(symbol)?;
         let timestamp = parse_timestamp(&wire.timestamp)?;
         let price = parse_price(wire.price)?;
         let quantity = parse_quantity(wire.size, false)?;
@@ -681,7 +694,7 @@ impl AlpacaDecoder {
                 "alpaca:iex:trade:{symbol}:{}:{trade_identity}",
                 wire.exchange
             ),
-            instrument,
+            coordinate,
             timestamp,
             payload: ProviderObservationPayload::Trade {
                 trade_id: SourceIdentifier::try_from(trade_identity)
@@ -706,7 +719,7 @@ impl AlpacaDecoder {
             "3" | "Q" | "T" => HaltTransition::Resumed,
             _ => return Ok(None),
         };
-        let instrument = self.instrument(&wire.symbol)?;
+        let coordinate = self.instrument(&wire.symbol)?;
         let timestamp = parse_timestamp(&wire.timestamp)?;
         let reason = if wire.reason_code.is_empty() {
             wire.status_code.clone()
@@ -720,7 +733,7 @@ impl AlpacaDecoder {
                 wire.status_code,
                 timestamp.unix_nanos()
             ),
-            instrument,
+            coordinate,
             timestamp,
             payload: ProviderObservationPayload::TradingHalt {
                 status: ProviderStatusEvidence::new(
@@ -739,12 +752,17 @@ impl AlpacaDecoder {
         &self,
         input: ObservationInput,
     ) -> Result<ProviderNormalizedObservation, market_squawk_sources::DecodeError> {
+        if input.coordinate.venue() != &self.venue
+            || !input.coordinate.is_effective_at(input.timestamp)
+        {
+            return Err(market_squawk_sources::DecodeError::InvalidProviderEvidence);
+        }
         let source_identifier = SourceIdentifier::try_from(input.source_identifier)
             .map_err(|_| market_squawk_sources::DecodeError::InvalidProviderEvidence)?;
         ProviderNormalizedObservation::try_new(
             source_identifier,
             self.venue.clone(),
-            input.instrument,
+            input.coordinate.instrument(),
             ProviderTimestampEvidence::Provided {
                 value: input.timestamp,
                 rule: self.timestamp_rule.clone(),
@@ -760,17 +778,20 @@ impl AlpacaDecoder {
         )
     }
 
-    fn instrument(&self, symbol: &str) -> Result<InstrumentId, QuarantineReason> {
+    fn instrument(
+        &self,
+        symbol: &str,
+    ) -> Result<Arc<AlpacaProviderInstrumentCoordinate>, QuarantineReason> {
         self.instruments
             .get(symbol)
-            .copied()
+            .cloned()
             .ok_or(QuarantineReason::WrongProduct)
     }
 }
 
 struct ObservationInput {
     source_identifier: String,
-    instrument: InstrumentId,
+    coordinate: Arc<AlpacaProviderInstrumentCoordinate>,
     timestamp: Timestamp,
     payload: ProviderObservationPayload,
 }

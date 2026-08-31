@@ -7,8 +7,9 @@ use market_squawk_domain::{
     AssetClass, AuthorizationBasis, BarTimeSemantics, BarTimestampBasis, CoverageDelay, Currency,
     DataQuality, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
     InstrumentId, MarketBarSessionEvidence, MarketBarSessionKind, MetadataRevision,
+    ProviderIdentityEvidence, ProviderIdentityRecord, ProviderIdentityRecordInput,
     ProviderInstrumentId, RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp,
-    VenueId,
+    VenueId, VenueMapping, VenueSymbol,
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, FreshnessPolicy,
@@ -43,8 +44,61 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
         evidence(1),
         effective,
     );
-    let mapping =
-        AlpacaInstrumentMapping::try_new("AAPL".to_owned(), instrument(1)?, AssetClass::Equity)?;
+    let mapping_identity = provider_identity("AAPL-ASSET-ID", instrument(1)?, 10, 11)?;
+    let mapping = AlpacaInstrumentMapping::try_new(
+        &mapping_identity,
+        &venue_mapping("iex", "AAPL")?,
+        instrument(1)?,
+        AssetClass::Equity,
+    )?;
+    assert_eq!(
+        mapping
+            .provider_coordinate()
+            .identity_key()
+            .source_id()
+            .as_str(),
+        ALPACA_PROVIDER
+    );
+    assert_eq!(
+        mapping
+            .provider_coordinate()
+            .identity_key()
+            .provider_instrument_id()
+            .as_str(),
+        "AAPL-ASSET-ID"
+    );
+    assert_eq!(mapping.provider_coordinate().venue().as_str(), "iex");
+    assert_eq!(
+        mapping.provider_coordinate().venue_symbol().as_str(),
+        "AAPL"
+    );
+    assert_eq!(
+        mapping.provider_coordinate().provider_identity_revision(),
+        mapping_identity.metadata_revision()
+    );
+    assert_eq!(
+        mapping.provider_coordinate().provider_identity_digest(),
+        mapping_identity.evidence().content_digest()
+    );
+    let mismatched_identity = provider_identity("MSFT-ASSET-ID", instrument(2)?, 12, 13)?;
+    assert!(
+        AlpacaInstrumentMapping::try_new(
+            &mismatched_identity,
+            &venue_mapping("iex", "AAPL")?,
+            instrument(1)?,
+            AssetClass::Equity,
+        )
+        .is_err()
+    );
+    assert!(
+        AlpacaInstrumentMapping::try_new(
+            &mapping_identity,
+            &venue_mapping("nasdaq", "AAPL")?,
+            instrument(1)?,
+            AssetClass::Equity,
+        )
+        .is_err()
+    );
     let limits = AlpacaTransportLimits::try_new(
         1024 * 1024,
         Duration::from_secs(5),
@@ -77,9 +131,13 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
 
     let mut excessive = Vec::new();
     for index in 1..=ALPACA_BASIC_EQUITY_SYMBOL_LIMIT + 1 {
+        let symbol = format!("S{index}");
+        let instrument = instrument(u128::try_from(index)?)?;
+        let identity = provider_identity(&format!("ALPACA-ASSET-{index}"), instrument, 14, 15)?;
         excessive.push(AlpacaInstrumentMapping::try_new(
-            format!("S{index}"),
-            instrument(u128::try_from(index)?)?,
+            &identity,
+            &venue_mapping("iex", &symbol)?,
+            instrument,
             AssetClass::Equity,
         )?);
     }
@@ -98,8 +156,12 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
         .is_err()
     );
 
-    let option_mapping =
-        AlpacaOptionMapping::try_new("AAPL260116C00250000".to_owned(), instrument(100)?)?;
+    let option_identity = provider_identity("AAPL-OPTION-ASSET-ID", instrument(100)?, 16, 17)?;
+    let option_mapping = AlpacaOptionMapping::try_new(
+        &option_identity,
+        &venue_mapping("alpaca-indicative-options", "AAPL260116C00250000")?,
+        instrument(100)?,
+    )?;
     let options = AlpacaOptionsLiveConfig::try_new(
         SourceId::try_from("alpaca-basic-options-test")?,
         revision("alpaca-basic-options-test-v1", 6)?,
@@ -123,7 +185,14 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
     assert_eq!(option_subscription["quotes"][0], "AAPL260116C00250000");
     assert_eq!(option_subscription["trades"][0], "AAPL260116C00250000");
     let _decoder = AlpacaOptionsDecoder::try_new(&options)?;
-    assert!(AlpacaOptionMapping::try_new("*".to_owned(), instrument(101)?).is_err());
+    assert!(
+        AlpacaOptionMapping::try_new(
+            &option_identity,
+            &venue_mapping("alpaca-indicative-options", "*")?,
+            instrument(101)?,
+        )
+        .is_err()
+    );
 
     let session = MarketBarSessionEvidence::try_new(
         MarketBarSessionKind::Regular,
@@ -185,16 +254,15 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
         assert_eq!(provider_dataset.as_str().len(), 92);
         assert!(!provider_dataset.as_str().contains("AAPL"));
     }
-    let provider_instrument = ProviderInstrumentId::try_from("AAPL")?;
     let currency = Currency::try_from("USD")?;
     let first_analytical_dataset = historical
         .dataset(provider_datasets[0])
         .ok_or("registered historical dataset must exist")?
-        .analytical_dataset_identifier(historical.metadata(), &provider_instrument, currency)?;
+        .analytical_dataset_identifier(historical.metadata(), currency)?;
     let second_analytical_dataset = historical
         .dataset(provider_datasets[1])
         .ok_or("registered historical dataset must exist")?
-        .analytical_dataset_identifier(historical.metadata(), &provider_instrument, currency)?;
+        .analytical_dataset_identifier(historical.metadata(), currency)?;
     assert_eq!(first_analytical_dataset, second_analytical_dataset);
     assert!(
         first_analytical_dataset
@@ -203,6 +271,49 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
     );
     assert_eq!(first_analytical_dataset.as_str().len(), 92);
     assert!(!first_analytical_dataset.as_str().contains("AAPL"));
+
+    let changed_identity = provider_identity("AAPL-ASSET-ID", instrument(1)?, 18, 19)?;
+    let changed_identity_history = AlpacaHistoricalEquityConfig::try_new(
+        SourceId::try_from("alpaca-basic-history-test")?,
+        revision("alpaca-basic-history-test-v1", 8)?,
+        authorization.clone(),
+        evidence(9),
+        effective,
+        vec![AlpacaHistoricalEquityDatasetPlan::bind_preflight(
+            AlpacaHistoricalEquityPreflightPlan::try_new(
+                AlpacaInstrumentMapping::try_new(
+                    &changed_identity,
+                    &venue_mapping("iex", "AAPL")?,
+                    instrument(1)?,
+                    AssetClass::Equity,
+                )?,
+                AlpacaTimeframe::day(),
+                Timestamp::from_unix_nanos(1_735_690_500_000_000_000),
+                AlpacaHistoricalLookback::try_from_days(366)?,
+                AlpacaAdjustment::All,
+            )?,
+            AlpacaHistoricalSeriesSemantics::new(BarTimestampBasis::PeriodStart, session.clone()),
+        )],
+        freshness()?,
+        budget(&authorization)?,
+        HttpRequestBounds::default(),
+    )?;
+    let changed_identity_provider_dataset = changed_identity_history
+        .provider_dataset_identifiers()
+        .next()
+        .ok_or("changed identity dataset must exist")?;
+    assert!(
+        !provider_datasets.contains(&changed_identity_provider_dataset),
+        "provider identity revision and digest must change the provider dataset identity"
+    );
+    let changed_identity_analytical_dataset = changed_identity_history
+        .dataset(changed_identity_provider_dataset)
+        .ok_or("changed identity dataset must remain registered")?
+        .analytical_dataset_identifier(changed_identity_history.metadata(), currency)?;
+    assert_ne!(
+        first_analytical_dataset, changed_identity_analytical_dataset,
+        "provider identity revision and digest must change the analytical dataset identity"
+    );
 
     let changed_calendar_session = MarketBarSessionEvidence::try_new(
         MarketBarSessionKind::Regular,
@@ -218,7 +329,8 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
         vec![AlpacaHistoricalEquityDatasetPlan::bind_preflight(
             AlpacaHistoricalEquityPreflightPlan::try_new(
                 AlpacaInstrumentMapping::try_new(
-                    "AAPL".to_owned(),
+                    &mapping_identity,
+                    &venue_mapping("iex", "AAPL")?,
                     instrument(1)?,
                     AssetClass::Equity,
                 )?,
@@ -247,11 +359,7 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
     let changed_analytical_dataset = changed_calendar_history
         .dataset(changed_provider_dataset)
         .ok_or("changed calendar dataset must remain registered")?
-        .analytical_dataset_identifier(
-            changed_calendar_history.metadata(),
-            &provider_instrument,
-            currency,
-        )?;
+        .analytical_dataset_identifier(changed_calendar_history.metadata(), currency)?;
     assert_ne!(first_analytical_dataset, changed_analytical_dataset);
 
     let provider_timestamp = Timestamp::from_unix_nanos(1_704_067_200_000_000_000);
@@ -301,6 +409,37 @@ impl AlpacaHistoricalBarTimeAuthority for DeterministicBarTimeAuthority {
 fn instrument(value: u128) -> TestResult<InstrumentId> {
     let text = format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}", 1, 2, 3, 4, value);
     Ok(InstrumentId::from_str(&text)?)
+}
+
+fn provider_identity(
+    symbol: &str,
+    instrument_id: InstrumentId,
+    revision_byte: u8,
+    evidence_byte: u8,
+) -> TestResult<ProviderIdentityRecord> {
+    Ok(ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+        instrument_id,
+        source_id: SourceId::try_from(ALPACA_PROVIDER)?,
+        provider_instrument_id: ProviderInstrumentId::try_from(symbol)?,
+        evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            [evidence_byte; 32],
+        )),
+        source_timestamp: None,
+        observed_at: Timestamp::from_unix_nanos(0),
+        metadata_revision: MetadataRevision::new(identifier(&format!(
+            "alpaca-provider-identity-{revision_byte}"
+        ))?),
+        validity: EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+        supersedes: None,
+    }))
+}
+
+fn venue_mapping(venue: &str, symbol: &str) -> TestResult<VenueMapping> {
+    Ok(VenueMapping::new(
+        VenueId::try_from(venue)?,
+        VenueSymbol::try_from(symbol)?,
+    ))
 }
 
 fn identifier(value: &str) -> TestResult<SourceIdentifier> {

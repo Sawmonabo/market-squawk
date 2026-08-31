@@ -5,10 +5,11 @@ use std::time::Duration;
 use market_squawk_domain::{
     AssetClass, BarTimestampBasis, ChecksumCapability, CoverageDelay, DataQuality,
     DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
-    InstrumentId, IntegrityRule, LiveEventClass, MarketBarSessionEvidence, ProviderChannel,
-    ProviderInstrumentId, ProviderProduct, RevisionBoundPayloadEvidence, RuleVersion,
-    SchemaVersion, SequenceCapability, SnapshotApplicability, SourceId, SourceIdentifier,
-    Timestamp, VenueId,
+    InstrumentId, IntegrityRule, LiveEventClass, MarketBarSessionEvidence, MetadataRevision,
+    ProviderChannel, ProviderIdentityKey, ProviderIdentityRecord, ProviderProduct,
+    RevisionBoundPayloadEvidence, RuleVersion, SchemaVersion, SequenceCapability,
+    SnapshotApplicability, SourceId, SourceIdentifier, Timestamp, VenueId, VenueMapping,
+    VenueSymbol,
 };
 use market_squawk_sources::{
     ApiEndpointRule, AuthorizationGrant, AuthorizationMode, ChecksumValidationProfile,
@@ -68,11 +69,108 @@ const NANOS_PER_MINUTE: u64 = 60_000_000_000;
 const PROVIDER_DATASET_PREFIX: &str = "alpaca:historical-equity:v1:";
 const ANALYTICAL_DATASET_PREFIX: &str = "alpaca.historical-equity.v1.";
 
+/// Exact provider-native identity and venue coordinates retained by one Alpaca mapping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AlpacaProviderInstrumentCoordinate {
+    identity_key: ProviderIdentityKey,
+    venue: VenueId,
+    venue_symbol: VenueSymbol,
+    instrument: InstrumentId,
+    provider_identity_revision: MetadataRevision,
+    provider_identity_digest: EvidenceDigest,
+    provider_identity_validity: EffectiveInterval,
+}
+
+impl AlpacaProviderInstrumentCoordinate {
+    fn try_from_record(
+        provider_identity: &ProviderIdentityRecord,
+        venue_mapping: &VenueMapping,
+        instrument: InstrumentId,
+        expected_venue: &'static str,
+    ) -> Result<Self, AlpacaError> {
+        let venue = VenueId::try_from(expected_venue)?;
+        let provider_identity_digest = provider_identity.evidence().content_digest();
+        if provider_identity.source_id().as_str() != ALPACA_PROVIDER
+            || provider_identity.instrument_id() != instrument
+            || venue_mapping.venue_id() != &venue
+            || provider_identity_digest.bytes() == [0; 32]
+        {
+            return Err(AlpacaError::InvalidCoverage);
+        }
+        Ok(Self {
+            identity_key: provider_identity.key(),
+            venue,
+            venue_symbol: venue_mapping.venue_symbol().clone(),
+            instrument,
+            provider_identity_revision: provider_identity.metadata_revision().clone(),
+            provider_identity_digest,
+            provider_identity_validity: provider_identity.validity(),
+        })
+    }
+
+    pub(crate) const fn identity_key(&self) -> &ProviderIdentityKey {
+        &self.identity_key
+    }
+
+    pub(crate) const fn venue(&self) -> &VenueId {
+        &self.venue
+    }
+
+    pub(crate) const fn venue_symbol(&self) -> &VenueSymbol {
+        &self.venue_symbol
+    }
+
+    pub(crate) const fn instrument(&self) -> InstrumentId {
+        self.instrument
+    }
+
+    pub(crate) const fn provider_identity_revision(&self) -> &MetadataRevision {
+        &self.provider_identity_revision
+    }
+
+    pub(crate) const fn provider_identity_digest(&self) -> EvidenceDigest {
+        self.provider_identity_digest
+    }
+
+    pub(crate) const fn provider_identity_validity(&self) -> EffectiveInterval {
+        self.provider_identity_validity
+    }
+
+    pub(crate) fn is_effective_at(&self, at: Timestamp) -> bool {
+        at >= self.provider_identity_validity.starts_at()
+            && self
+                .provider_identity_validity
+                .ends_at()
+                .is_none_or(|end| at < end)
+    }
+
+    pub(crate) fn binding_digest(&self) -> EvidenceDigest {
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/alpaca-provider-instrument-coordinate/v1\0");
+        hash_str(&mut digest, self.identity_key.source_id().as_str());
+        hash_str(
+            &mut digest,
+            self.identity_key.provider_instrument_id().as_str(),
+        );
+        hash_str(&mut digest, self.venue.as_str());
+        hash_str(&mut digest, self.venue_symbol.as_str());
+        hash_str(
+            &mut digest,
+            self.provider_identity_revision
+                .as_source_identifier()
+                .as_str(),
+        );
+        hash_evidence(&mut digest, self.provider_identity_digest);
+        hash_effective_interval(&mut digest, self.provider_identity_validity);
+        digest.update(self.instrument.as_uuid().as_bytes());
+        EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into())
+    }
+}
+
 /// Stable provider symbol to internal instrument mapping for an equity or ETF.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AlpacaInstrumentMapping {
-    symbol: Box<str>,
-    instrument: InstrumentId,
+    coordinate: AlpacaProviderInstrumentCoordinate,
     asset_class: AssetClass,
 }
 
@@ -81,44 +179,53 @@ impl AlpacaInstrumentMapping {
     ///
     /// # Errors
     ///
-    /// Rejects symbols outside the bounded US-listed grammar and non-equity/fund asset classes.
+    /// Rejects venue symbols outside the bounded US-listed grammar, non-equity/fund asset classes,
+    /// and provider identity or venue records whose exact coordinates diverge.
     pub fn try_new(
-        symbol: String,
+        provider_identity: &ProviderIdentityRecord,
+        venue_mapping: &VenueMapping,
         instrument: InstrumentId,
         asset_class: AssetClass,
     ) -> Result<Self, AlpacaError> {
-        validate_equity_symbol(&symbol)?;
+        validate_equity_symbol(venue_mapping.venue_symbol().as_str())?;
         if !matches!(asset_class, AssetClass::Equity | AssetClass::Fund) {
             return Err(AlpacaError::InvalidCoverage);
         }
         Ok(Self {
-            symbol: symbol.into_boxed_str(),
-            instrument,
+            coordinate: AlpacaProviderInstrumentCoordinate::try_from_record(
+                provider_identity,
+                venue_mapping,
+                instrument,
+                IEX_VENUE,
+            )?,
             asset_class,
         })
     }
 
     /// Returns the exact provider symbol.
     pub fn symbol(&self) -> &str {
-        &self.symbol
+        self.coordinate.venue_symbol().as_str()
     }
 
     /// Returns the stable internal instrument.
     pub const fn instrument(&self) -> InstrumentId {
-        self.instrument
+        self.coordinate.instrument()
     }
 
     /// Returns whether the mapping is an equity or fund/ETF.
     pub const fn asset_class(&self) -> AssetClass {
         self.asset_class
     }
+
+    pub(crate) const fn provider_coordinate(&self) -> &AlpacaProviderInstrumentCoordinate {
+        &self.coordinate
+    }
 }
 
 /// Stable compact OCC-style option symbol to internal instrument mapping.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AlpacaOptionMapping {
-    symbol: Box<str>,
-    instrument: InstrumentId,
+    coordinate: AlpacaProviderInstrumentCoordinate,
 }
 
 impl AlpacaOptionMapping {
@@ -127,22 +234,34 @@ impl AlpacaOptionMapping {
     /// # Errors
     ///
     /// Rejects wildcard or non-compact OCC option symbols.
-    pub fn try_new(symbol: String, instrument: InstrumentId) -> Result<Self, AlpacaError> {
-        validate_option_symbol(&symbol)?;
+    pub fn try_new(
+        provider_identity: &ProviderIdentityRecord,
+        venue_mapping: &VenueMapping,
+        instrument: InstrumentId,
+    ) -> Result<Self, AlpacaError> {
+        validate_option_symbol(venue_mapping.venue_symbol().as_str())?;
         Ok(Self {
-            symbol: symbol.into_boxed_str(),
-            instrument,
+            coordinate: AlpacaProviderInstrumentCoordinate::try_from_record(
+                provider_identity,
+                venue_mapping,
+                instrument,
+                INDICATIVE_OPTIONS_VENUE,
+            )?,
         })
     }
 
     /// Returns the exact provider option symbol.
     pub fn symbol(&self) -> &str {
-        &self.symbol
+        self.coordinate.venue_symbol().as_str()
     }
 
     /// Returns the stable internal option instrument.
     pub const fn instrument(&self) -> InstrumentId {
-        self.instrument
+        self.coordinate.instrument()
+    }
+
+    pub(crate) const fn provider_coordinate(&self) -> &AlpacaProviderInstrumentCoordinate {
+        &self.coordinate
     }
 }
 
@@ -785,19 +904,13 @@ impl AlpacaHistoricalEquityDataset {
     pub(crate) fn analytical_dataset_identifier(
         &self,
         metadata: &SourceMetadata,
-        provider_instrument_id: &ProviderInstrumentId,
         currency: market_squawk_domain::Currency,
     ) -> Result<SourceIdentifier, AlpacaError> {
         self.verify_provider_identity(metadata)?;
-        if provider_instrument_id.as_str() != self.mapping.symbol() {
-            return Err(AlpacaError::InvalidCoverage);
-        }
         let mut digest = Sha256::new();
         digest.update(b"market-squawk/alpaca-historical-analytical-series/v1\0");
         hash_source_generation(&mut digest, metadata);
-        digest.update(self.mapping.instrument().as_uuid().as_bytes());
-        hash_str(&mut digest, provider_instrument_id.as_str());
-        hash_str(&mut digest, IEX_VENUE);
+        hash_provider_coordinate(&mut digest, self.mapping.provider_coordinate());
         hash_str(&mut digest, "iex");
         hash_str(&mut digest, &self.timeframe.provider_value());
         hash_str(&mut digest, self.adjustment.as_str());
@@ -1148,9 +1261,7 @@ fn provider_dataset_identifier_from_parts(
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/alpaca-historical-provider-dataset/v1\0");
     hash_source_generation(&mut digest, metadata);
-    digest.update(mapping.instrument().as_uuid().as_bytes());
-    hash_str(&mut digest, mapping.symbol());
-    hash_str(&mut digest, IEX_VENUE);
+    hash_provider_coordinate(&mut digest, mapping.provider_coordinate());
     hash_str(&mut digest, "iex");
     hash_str(&mut digest, &timeframe.provider_value());
     hash_str(&mut digest, adjustment.as_str());
@@ -1190,6 +1301,10 @@ fn hash_source_generation(hash: &mut Sha256, metadata: &SourceMetadata) {
     hash_str(hash, authorization.basis().as_source_identifier().as_str());
     hash_exact_evidence(hash, authorization.evidence());
     hash_effective_interval(hash, authorization.effective_interval());
+}
+
+fn hash_provider_coordinate(hash: &mut Sha256, coordinate: &AlpacaProviderInstrumentCoordinate) {
+    hash_evidence(hash, coordinate.binding_digest());
 }
 
 fn hash_effective_interval(hash: &mut Sha256, effective: EffectiveInterval) {
