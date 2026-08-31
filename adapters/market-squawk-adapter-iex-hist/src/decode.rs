@@ -1196,6 +1196,7 @@ impl IexHistTypedHandoff {
                     trade_id: *trade_id,
                     source_time: *source_time,
                     ordinal: event.ordinal,
+                    provider_event_content_sha256: event.provider_content_sha256,
                     broken: false,
                 }),
                 IexEvent::TradeBreak {
@@ -1374,6 +1375,8 @@ pub struct IexHistVenueTradeBar {
     last_source_time: EpochNanos,
     first_event_ordinal: u64,
     last_event_ordinal: u64,
+    contributing_event_count: u64,
+    contributing_events_sha256: Sha256Digest,
     source_provider_content_sha256: Sha256Digest,
     bar_sha256: Sha256Digest,
 }
@@ -1442,6 +1445,19 @@ impl IexHistVenueTradeBar {
     #[must_use]
     pub const fn last_event_ordinal(&self) -> u64 {
         self.last_event_ordinal
+    }
+
+    /// Returns the exact number of non-broken native trade events contributing to this bar.
+    #[must_use]
+    pub const fn contributing_event_count(&self) -> u64 {
+        self.contributing_event_count
+    }
+
+    /// Returns the ordered digest of every contributing event ordinal and provider-content
+    /// identity. This is the row-local native-lineage parent used by canonical publication.
+    #[must_use]
+    pub const fn contributing_events_sha256(&self) -> Sha256Digest {
+        self.contributing_events_sha256
     }
 
     #[must_use]
@@ -1527,6 +1543,7 @@ struct DerivedTrade<'a> {
     trade_id: i64,
     source_time: EpochNanos,
     ordinal: u64,
+    provider_event_content_sha256: Sha256Digest,
     broken: bool,
 }
 
@@ -1554,6 +1571,8 @@ struct DerivedBarAccumulator {
     last_source_time: EpochNanos,
     first_event_ordinal: u64,
     last_event_ordinal: u64,
+    contributing_event_count: u64,
+    contributing_events_hasher: Sha256,
 }
 
 impl DerivedBarAccumulator {
@@ -1563,6 +1582,12 @@ impl DerivedBarAccumulator {
             .try_reserve_exact(trade.symbol.len())
             .map_err(|_| IexHistDerivedBarError::Capacity)?;
         symbol.push_str(trade.symbol);
+        let mut contributing_events_hasher = Sha256::new();
+        hash_contributing_event(
+            &mut contributing_events_hasher,
+            trade.ordinal,
+            trade.provider_event_content_sha256,
+        );
         Ok(Self {
             symbol,
             bucket_start,
@@ -1576,6 +1601,8 @@ impl DerivedBarAccumulator {
             last_source_time: trade.source_time,
             first_event_ordinal: trade.ordinal,
             last_event_ordinal: trade.ordinal,
+            contributing_event_count: 1,
+            contributing_events_hasher,
         })
     }
 
@@ -1593,6 +1620,15 @@ impl DerivedBarAccumulator {
             .ok_or(IexHistDerivedBarError::Arithmetic)?;
         self.last_source_time = trade.source_time;
         self.last_event_ordinal = trade.ordinal;
+        self.contributing_event_count = self
+            .contributing_event_count
+            .checked_add(1)
+            .ok_or(IexHistDerivedBarError::Arithmetic)?;
+        hash_contributing_event(
+            &mut self.contributing_events_hasher,
+            trade.ordinal,
+            trade.provider_event_content_sha256,
+        );
         Ok(())
     }
 
@@ -1606,6 +1642,8 @@ impl DerivedBarAccumulator {
             .bucket_start
             .checked_add(interval.nanos())
             .ok_or(IexHistDerivedBarError::Arithmetic)?;
+        let contributing_events_sha256 =
+            Sha256Digest::from_bytes(self.contributing_events_hasher.finalize().into());
         let bar_sha256 = derived_bar_identity(
             &self.symbol,
             self.bucket_start,
@@ -1620,6 +1658,8 @@ impl DerivedBarAccumulator {
             self.last_source_time,
             self.first_event_ordinal,
             self.last_event_ordinal,
+            self.contributing_event_count,
+            contributing_events_sha256,
             source_provider_content_sha256,
             calculation_sha256,
         );
@@ -1637,10 +1677,22 @@ impl DerivedBarAccumulator {
             last_source_time: self.last_source_time,
             first_event_ordinal: self.first_event_ordinal,
             last_event_ordinal: self.last_event_ordinal,
+            contributing_event_count: self.contributing_event_count,
+            contributing_events_sha256,
             source_provider_content_sha256,
             bar_sha256,
         })
     }
+}
+
+fn hash_contributing_event(
+    hasher: &mut Sha256,
+    ordinal: u64,
+    provider_event_content_sha256: Sha256Digest,
+) {
+    hasher.update(b"market-squawk/iex-hist-derived-bar-contributing-event/v1");
+    hasher.update(ordinal.to_le_bytes());
+    hasher.update(provider_event_content_sha256.as_bytes());
 }
 
 fn derived_bar_calculation_identity(interval: IexHistBarInterval) -> Sha256Digest {
@@ -1673,6 +1725,8 @@ fn derived_bar_identity(
     last_source_time: EpochNanos,
     first_event_ordinal: u64,
     last_event_ordinal: u64,
+    contributing_event_count: u64,
+    contributing_events_sha256: Sha256Digest,
     source_provider_content_sha256: Sha256Digest,
     calculation_sha256: Sha256Digest,
 ) -> Sha256Digest {
@@ -1691,6 +1745,8 @@ fn derived_bar_identity(
         &last_source_time.value().to_le_bytes(),
         &first_event_ordinal.to_le_bytes(),
         &last_event_ordinal.to_le_bytes(),
+        &contributing_event_count.to_le_bytes(),
+        contributing_events_sha256.as_bytes(),
         source_provider_content_sha256.as_bytes(),
         calculation_sha256.as_bytes(),
     ])

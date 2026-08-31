@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use crc32fast::Hasher as Crc32;
+use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::catalog::CatalogTransportMetadata;
@@ -365,6 +366,13 @@ async fn selected_feed_date_resumes_decodes_and_hands_off_native_bars() {
             ..
         } if symbol == "AAPL"
     ));
+    let contributing_event = &handoff.events()[2];
+    let mut contributing_events = Sha256::new();
+    contributing_events.update(b"market-squawk/iex-hist-derived-bar-contributing-event/v1");
+    contributing_events.update(contributing_event.ordinal().to_le_bytes());
+    contributing_events.update(contributing_event.provider_content_sha256().as_bytes());
+    let expected_contributing_events =
+        Sha256Digest::from_bytes(contributing_events.finalize().into());
     let bars = handoff
         .try_into_derived_bars(IexHistBarInterval::OneMinute)
         .unwrap();
@@ -377,6 +385,11 @@ async fn selected_feed_date_resumes_decodes_and_hands_off_native_bars() {
     assert_eq!(bar.close(), bar.open());
     assert_eq!(bar.volume(), 25);
     assert_eq!(bar.trade_count(), 1);
+    assert_eq!(bar.contributing_event_count(), 1);
+    assert_eq!(
+        bar.contributing_events_sha256(),
+        expected_contributing_events
+    );
     assert_eq!(
         bar.source_provider_content_sha256(),
         bars.source().provider_content_sha256()

@@ -746,7 +746,10 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
         self,
         authority: &A,
         cancellation: CancellationToken,
-    ) -> Result<IexHistPublishedBars<R>, IexHistPublicationError<A::Error>>
+    ) -> Result<
+        IexHistPublishedBars<R>,
+        IexHistPublicationError<<A as IexHistRestartLineageAuthority>::Error>,
+    >
     where
         R: IexHistSharedPhysicalSealReceipt + Send + Sync,
         A: IexHistCanonicalPublicationAuthority<R>,
@@ -815,6 +818,34 @@ impl<R> IexHistCanonicalPublicationHandoff<R> {
                 });
             }
         }
+        let restart = IexHistRestartSelector {
+            publication: receipt,
+        };
+        let lineage = match authority.revalidate(&restart) {
+            Ok(lineage) => lineage,
+            Err(error) => {
+                let settlement_error = capacity_permit
+                    .settle(IexHistCapacityDisposition::Failed)
+                    .err();
+                return Err(IexHistPublicationError::PostCommitRevalidation {
+                    error,
+                    receipt: Box::new(restart.publication),
+                    settlement_error,
+                });
+            }
+        };
+        if !restart.validates_restart_lineage(&lineage) {
+            let settlement_error = capacity_permit
+                .settle(IexHistCapacityDisposition::Quarantined(
+                    IexHistTerminalReason::DownstreamIntegrityFault,
+                ))
+                .err();
+            return Err(IexHistPublicationError::InvalidReceipt {
+                receipt: Box::new(restart.publication),
+                settlement_error,
+            });
+        }
+        let receipt = restart.publication;
         if let Err(error) = capacity_permit.settle(IexHistCapacityDisposition::Completed) {
             return Err(IexHistPublicationError::SettlementAfterCommit {
                 error,
@@ -898,17 +929,16 @@ impl<'a, R> IexHistCanonicalPublicationInput<'a, R> {
 /// manifest and every exact raw/native parent are already durably committed; an implementation
 /// must never substitute provider text for a date-effective canonical `InstrumentId`.
 #[async_trait]
-pub(crate) trait IexHistCanonicalPublicationAuthority<R>: Send + Sync
+pub(crate) trait IexHistCanonicalPublicationAuthority<R>:
+    IexHistRestartLineageAuthority + Send + Sync
 where
     R: IexHistSharedPhysicalSealReceipt + Send + Sync,
 {
-    type Error: Send;
-
     async fn publish(
         &self,
         input: IexHistCanonicalPublicationInput<'_, R>,
         cancellation: CancellationToken,
-    ) -> Result<IexHistImmutablePublicationReceipt, Self::Error>;
+    ) -> Result<IexHistImmutablePublicationReceipt, <Self as IexHistRestartLineageAuthority>::Error>;
 }
 
 /// One source symbol's verified date-effective canonical identity and exact published row count.
@@ -1328,6 +1358,13 @@ pub(crate) enum IexHistPublicationError<E> {
         receipt: Box<IexHistImmutablePublicationReceipt>,
         settlement_error: Option<IexHistCapacityError>,
     },
+    /// The manifest commit returned, but its exact raw/native binding could not be reopened before
+    /// the original selected-file capacity lease was released.
+    PostCommitRevalidation {
+        error: E,
+        receipt: Box<IexHistImmutablePublicationReceipt>,
+        settlement_error: Option<IexHistCapacityError>,
+    },
     CapacityAfterCommit {
         error: IexHistCapacityError,
         receipt: Box<IexHistImmutablePublicationReceipt>,
@@ -1516,7 +1553,11 @@ impl IexHistRestartLineageEvidence {
         locally_available_at: Timestamp,
         row_count: u64,
     ) -> Result<Self, IexHistApplicationError> {
-        if row_count == 0
+        let canonical = DatasetSchemaRegistry::local()
+            .canonical_research_observations()
+            .map_err(|_| IexHistApplicationError::InvalidCanonicalPublicationReceipt)?;
+        if manifest.schema() != &canonical
+            || row_count == 0
             || !valid_sha256_evidence(publication_receipt_sha256)
             || !valid_sha256_evidence(persisted_binding_sha256)
             || !valid_sha256_evidence(mapping_set_sha256)
@@ -1556,7 +1597,7 @@ impl IexHistRestartLineageEvidence {
 
 /// Shared catalog authority needed to prove restart lineage independently of local coordinates.
 pub(crate) trait IexHistRestartLineageAuthority {
-    type Error;
+    type Error: Send;
 
     fn revalidate(
         &self,
