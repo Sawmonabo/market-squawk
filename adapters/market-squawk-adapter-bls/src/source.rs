@@ -26,7 +26,10 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::client::{BlsHttpClient, RetrievedBlsPage, ensure_deadline_open, system_timestamp};
+use crate::client::{
+    BlsHttpClient, BlsResponseShapePolicyV1, RetrievedBlsPage, ensure_deadline_open,
+    system_timestamp,
+};
 use crate::contract::BlsRuntimeInstanceCapability;
 use crate::discovery::{
     BlsDiscoveryAdmission, BlsDiscoveryObjectAdmission, BlsDiscoveryOutput, BlsPendingDiscovery,
@@ -1076,8 +1079,28 @@ fn capture_request_identity(
     chunk_index: usize,
     chunk: &crate::BlsRequestChunk,
 ) -> Result<EvidenceDigest, ExtractionSourceError> {
+    capture_request_identity_with_policy(
+        metadata,
+        config,
+        request,
+        source_generation_digest,
+        chunk_index,
+        chunk,
+        config.authorization().response_shape_policy(),
+    )
+}
+
+fn capture_request_identity_with_policy(
+    metadata: &SourceMetadata,
+    config: &BlsSourceConfig,
+    request: &DiscoveryRequest,
+    source_generation_digest: EvidenceDigest,
+    chunk_index: usize,
+    chunk: &crate::BlsRequestChunk,
+    response_shape_policy: BlsResponseShapePolicyV1,
+) -> Result<EvidenceDigest, ExtractionSourceError> {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/bls-provider-capture-request/v2");
+    hash.update(b"market-squawk/bls-current-provider-request/v1\0");
     hash_capture_field(&mut hash, metadata.source_id().as_str().as_bytes())?;
     hash_capture_field(
         &mut hash,
@@ -1089,6 +1112,7 @@ fn capture_request_identity(
     )?;
     hash_capture_field(&mut hash, config.dataset().as_str().as_bytes())?;
     hash_capture_field(&mut hash, config.authorization().endpoint().as_bytes())?;
+    hash_response_shape_policy_v1(&mut hash, response_shape_policy)?;
     let discovery_request_id =
         serde_json::to_vec(&request.request_id()).map_err(|_| SourceError::InvalidProtocolState)?;
     hash_capture_field(&mut hash, &discovery_request_id)?;
@@ -1123,8 +1147,24 @@ fn discovery_capture_graph_identity(
     if config.plan().chunks().len() < 2 {
         return Err(SourceError::InvalidProtocolState.into());
     }
+    discovery_capture_graph_identity_with_policy(
+        metadata,
+        config,
+        request,
+        source_generation_digest,
+        config.authorization().response_shape_policy(),
+    )
+}
+
+fn discovery_capture_graph_identity_with_policy(
+    metadata: &SourceMetadata,
+    config: &BlsSourceConfig,
+    request: &DiscoveryRequest,
+    source_generation_digest: EvidenceDigest,
+    response_shape_policy: BlsResponseShapePolicyV1,
+) -> Result<EvidenceDigest, ExtractionSourceError> {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/bls-discovery-request-graph/v1\0");
+    hash.update(b"market-squawk/bls-current-discovery-request-graph/v1\0");
     hash_capture_field(&mut hash, metadata.source_id().as_str().as_bytes())?;
     hash_capture_field(
         &mut hash,
@@ -1135,6 +1175,7 @@ fn discovery_capture_graph_identity(
             .as_bytes(),
     )?;
     hash_capture_field(&mut hash, config.dataset().as_str().as_bytes())?;
+    hash_response_shape_policy_v1(&mut hash, response_shape_policy)?;
     let discovery_request_id =
         serde_json::to_vec(&request.request_id()).map_err(|_| SourceError::InvalidProtocolState)?;
     hash_capture_field(&mut hash, &discovery_request_id)?;
@@ -1144,13 +1185,14 @@ fn discovery_capture_graph_identity(
             .to_be_bytes(),
     );
     for (index, chunk) in config.plan().chunks().iter().enumerate() {
-        let component = capture_request_identity(
+        let component = capture_request_identity_with_policy(
             metadata,
             config,
             request,
             source_generation_digest,
             index,
             chunk,
+            response_shape_policy,
         )?;
         hash.update(component.bytes());
     }
@@ -1292,7 +1334,7 @@ fn doctor_capture_request_identity(
     year: u16,
 ) -> Result<EvidenceDigest, ExtractionSourceError> {
     let mut hash = Sha256::new();
-    hash.update(b"market-squawk/bls-provider-doctor-request/v2");
+    hash.update(b"market-squawk/bls-current-provider-doctor-request/v1\0");
     hash_capture_field(&mut hash, metadata.source_id().as_str().as_bytes())?;
     hash_capture_field(
         &mut hash,
@@ -1304,6 +1346,7 @@ fn doctor_capture_request_identity(
     )?;
     hash_capture_field(&mut hash, config.dataset().as_str().as_bytes())?;
     hash_capture_field(&mut hash, config.authorization().endpoint().as_bytes())?;
+    hash_response_shape_policy_v1(&mut hash, config.authorization().response_shape_policy())?;
     hash_capture_digest(&mut hash, source_generation_digest);
     hash_capture_field(&mut hash, b"doctor")?;
     hash_capture_field(&mut hash, series_id.as_bytes())?;
@@ -1319,6 +1362,14 @@ fn hash_capture_field(hash: &mut Sha256, value: &[u8]) -> Result<(), ExtractionS
     hash.update(length.to_be_bytes());
     hash.update(value);
     Ok(())
+}
+
+fn hash_response_shape_policy_v1(
+    hash: &mut Sha256,
+    response_shape_policy: BlsResponseShapePolicyV1,
+) -> Result<(), ExtractionSourceError> {
+    hash_capture_field(hash, b"market-squawk/bls-response-shape-option-policy/v1\0")?;
+    hash_capture_field(hash, &response_shape_policy.identity_projection())
 }
 
 fn hash_capture_digest(hash: &mut Sha256, value: EvidenceDigest) {

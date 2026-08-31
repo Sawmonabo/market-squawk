@@ -29,7 +29,10 @@ use market_squawk_sources::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::{BlsSource, PageRetentionBudget, exact_evidence, parse_object_id};
+use super::{
+    BlsSource, PageRetentionBudget, capture_request_identity_with_policy,
+    discovery_capture_graph_identity_with_policy, exact_evidence, parse_object_id,
+};
 use crate::client::{
     BlsHttpRequest, BlsHttpResponse, BlsTransport, RetainedBlsPage, system_timestamp,
 };
@@ -319,6 +322,51 @@ async fn authority_bound_source_emits_canonical_period_precision() -> TestResult
             .capture_material()
             .receipt()
             .observation_digest()
+    );
+    let response_shape_policy = source.config.authorization().response_shape_policy();
+    let changed_response_shape_policy = response_shape_policy.with_aspects_for_test(Some(true));
+    let exact_component_identity = capture_request_identity_with_policy(
+        &source.metadata,
+        &source.config,
+        first_discovery.batch().request(),
+        activation_plan.plan_digest(),
+        0,
+        &source.config.plan().chunks()[0],
+        response_shape_policy,
+    )?;
+    let changed_component_identity = capture_request_identity_with_policy(
+        &source.metadata,
+        &source.config,
+        first_discovery.batch().request(),
+        activation_plan.plan_digest(),
+        0,
+        &source.config.plan().chunks()[0],
+        changed_response_shape_policy,
+    )?;
+    assert_eq!(
+        first_discovery.capture_material().receipt().pages()[0].request_identity(),
+        exact_component_identity
+    );
+    assert_eq!(
+        second_discovery.capture_material().receipt().pages()[0].request_identity(),
+        exact_component_identity
+    );
+    assert_ne!(exact_component_identity, changed_component_identity);
+    assert_ne!(
+        discovery_capture_graph_identity_with_policy(
+            &source.metadata,
+            &source.config,
+            first_discovery.batch().request(),
+            activation_plan.plan_digest(),
+            response_shape_policy,
+        )?,
+        discovery_capture_graph_identity_with_policy(
+            &source.metadata,
+            &source.config,
+            first_discovery.batch().request(),
+            activation_plan.plan_digest(),
+            changed_response_shape_policy,
+        )?
     );
     let first_object = first_discovery.batch().objects()[0].clone();
     let second_object = second_discovery.batch().objects()[0].clone();

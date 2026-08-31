@@ -440,9 +440,6 @@ impl BlsCanonicalProviderSemantics {
                         preliminary: observation.preliminary,
                         footnotes: &observation.footnotes,
                         missing_explanations: &observation.missing_explanations,
-                        response_received_at: observation.response_received_at,
-                        locally_available_at: observation.locally_available_at,
-                        canonical_ingested_at: observation.canonical_ingested_at,
                     },
                 })
                 .map_err(|_| BlsSourceError::InvalidPublication)?;
@@ -483,9 +480,6 @@ struct BlsNativeLineageObservationV1<'a> {
     preliminary: bool,
     footnotes: &'a [BlsCanonicalFootnote],
     missing_explanations: &'a [Box<str>],
-    response_received_at: Timestamp,
-    locally_available_at: Timestamp,
-    canonical_ingested_at: Timestamp,
 }
 
 /// Checked typed view of one persisted `BlsTimeseriesV1` provider-native row.
@@ -591,8 +585,6 @@ impl BlsTimeseriesNativeLineageRowV1 {
             || self.observation.period_label.len() > 64
             || self.observation.value != expected_value
             || self.observation.preliminary != expected_preliminary
-            || self.observation.response_received_at > self.observation.locally_available_at
-            || self.observation.locally_available_at > self.observation.canonical_ingested_at
             || self
                 .observation
                 .missing_explanations
@@ -663,9 +655,6 @@ pub struct BlsTimeseriesNativeLineageObservationV1 {
     preliminary: bool,
     footnotes: Box<[BlsCanonicalFootnote]>,
     missing_explanations: Box<[Box<str>]>,
-    response_received_at: Timestamp,
-    locally_available_at: Timestamp,
-    canonical_ingested_at: Timestamp,
 }
 
 impl BlsTimeseriesNativeLineageObservationV1 {
@@ -712,21 +701,6 @@ impl BlsTimeseriesNativeLineageObservationV1 {
     /// Returns explicit missing-value explanations derived from provider footnotes.
     pub fn missing_explanations(&self) -> &[Box<str>] {
         &self.missing_explanations
-    }
-
-    /// Returns when provider response headers first became available to the transport.
-    pub const fn response_received_at(&self) -> Timestamp {
-        self.response_received_at
-    }
-
-    /// Returns when the complete bounded response became available for point-in-time use.
-    pub const fn locally_available_at(&self) -> Timestamp {
-        self.locally_available_at
-    }
-
-    /// Returns when canonical normalization completed locally.
-    pub const fn canonical_ingested_at(&self) -> Timestamp {
-        self.canonical_ingested_at
     }
 }
 

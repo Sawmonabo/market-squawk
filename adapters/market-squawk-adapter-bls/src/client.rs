@@ -90,6 +90,64 @@ pub struct BlsAuthorization {
     tier: BlsAccessTier,
     registration_key: Option<BlsRegistrationKey>,
     credential_rejoin: BlsCredentialRejoin,
+    response_shape_policy: BlsResponseShapePolicyV1,
+}
+
+/// Exact response-shape-affecting option policy for the current BLS timeseries request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BlsResponseShapePolicyV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catalog: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    calculations: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annualaverage: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aspects: Option<bool>,
+}
+
+impl BlsResponseShapePolicyV1 {
+    const fn for_tier(tier: BlsAccessTier) -> Self {
+        match tier {
+            BlsAccessTier::PublicV1 => Self {
+                catalog: None,
+                calculations: None,
+                annualaverage: None,
+                aspects: None,
+            },
+            BlsAccessTier::RegisteredV2 => Self {
+                catalog: Some(false),
+                calculations: Some(false),
+                annualaverage: Some(false),
+                aspects: Some(false),
+            },
+        }
+    }
+
+    /// Returns the fixed-order, omission-preserving current V1 identity projection.
+    pub(crate) const fn identity_projection(self) -> [u8; 4] {
+        [
+            option_identity(self.catalog),
+            option_identity(self.calculations),
+            option_identity(self.annualaverage),
+            option_identity(self.aspects),
+        ]
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_aspects_for_test(mut self, aspects: Option<bool>) -> Self {
+        self.aspects = aspects;
+        self
+    }
+}
+
+const fn option_identity(value: Option<bool>) -> u8 {
+    match value {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    }
 }
 
 impl BlsAuthorization {
@@ -99,6 +157,7 @@ impl BlsAuthorization {
             tier: BlsAccessTier::PublicV1,
             registration_key: None,
             credential_rejoin: BlsCredentialRejoin::PublicNoCredential,
+            response_shape_policy: BlsResponseShapePolicyV1::for_tier(BlsAccessTier::PublicV1),
         }
     }
 
@@ -119,6 +178,7 @@ impl BlsAuthorization {
             tier: BlsAccessTier::RegisteredV2,
             registration_key: Some(registration_key),
             credential_rejoin,
+            response_shape_policy: BlsResponseShapePolicyV1::for_tier(BlsAccessTier::RegisteredV2),
         })
     }
 
@@ -140,6 +200,11 @@ impl BlsAuthorization {
         self.credential_rejoin
     }
 
+    /// Returns the exact response-shape option policy serialized for this authorization.
+    pub(crate) const fn response_shape_policy(&self) -> BlsResponseShapePolicyV1 {
+        self.response_shape_policy
+    }
+
     fn registration_key(&self) -> Option<&str> {
         self.registration_key
             .as_ref()
@@ -148,6 +213,9 @@ impl BlsAuthorization {
 
     fn validate(&self) -> Result<(), BlsSourceError> {
         self.credential_rejoin.validate()?;
+        if self.response_shape_policy != BlsResponseShapePolicyV1::for_tier(self.tier) {
+            return Err(BlsSourceError::InvalidRegistrationKey);
+        }
         match (self.tier, &self.registration_key, self.credential_rejoin) {
             (BlsAccessTier::PublicV1, None, BlsCredentialRejoin::PublicNoCredential)
             | (
@@ -233,14 +301,8 @@ struct BlsProviderRequest<'a> {
     seriesid: &'a [String],
     startyear: String,
     endyear: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    catalog: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    calculations: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    annualaverage: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    aspects: Option<bool>,
+    #[serde(flatten)]
+    response_shape_policy: BlsResponseShapePolicyV1,
     #[serde(rename = "registrationkey", skip_serializing_if = "Option::is_none")]
     registration_key: Option<&'a str>,
 }
@@ -383,10 +445,7 @@ impl BlsHttpClient {
             // Explicit false values prevent registered mode from silently changing response
             // semantics if provider defaults evolve; enrichment requires a separately bounded
             // parser and provider-native publication contract.
-            catalog: (self.tier == BlsAccessTier::RegisteredV2).then_some(false),
-            calculations: (self.tier == BlsAccessTier::RegisteredV2).then_some(false),
-            annualaverage: (self.tier == BlsAccessTier::RegisteredV2).then_some(false),
-            aspects: (self.tier == BlsAccessTier::RegisteredV2).then_some(false),
+            response_shape_policy: authorization.response_shape_policy(),
             registration_key: authorization.registration_key(),
         };
         let request_body = Zeroizing::new(
@@ -793,10 +852,9 @@ mod tests {
             seriesid: &series,
             startyear: "2020".to_owned(),
             endyear: "2026".to_owned(),
-            catalog: Some(false),
-            calculations: Some(false),
-            annualaverage: Some(false),
-            aspects: Some(false),
+            response_shape_policy: super::BlsResponseShapePolicyV1::for_tier(
+                crate::BlsAccessTier::RegisteredV2,
+            ),
             registration_key: Some("secret"),
         };
         let value = serde_json::to_value(request)?;
