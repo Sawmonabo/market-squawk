@@ -235,7 +235,7 @@ impl TiingoPendingLatestPublication {
 }
 
 impl TiingoSealedLatestPublication {
-    /// Consumes an exact `MF` metadata leaf into one canonical FundNav batch.
+    /// Consumes an exact `NMFQS` metadata leaf into one canonical FundNav batch.
     #[allow(
         clippy::too_many_arguments,
         reason = "identity, source contract, local clocks, and extraction authority remain explicit"
@@ -253,9 +253,7 @@ impl TiingoSealedLatestPublication {
             metadata,
             latest,
         } = self;
-        if metadata.metadata().ticker() != context.ticker() {
-            return Err(TiingoLatestPublicationError::WrongInstrumentFamily);
-        }
+        validate_fund_nav_authority(&metadata, &context)?;
         if matches!(metadata.metadata().coverage(), TiingoCoverage::Unsupported) {
             return Ok(TiingoLatestFundNavPublicationOutcome::Unavailable(
                 unavailable(
@@ -265,11 +263,6 @@ impl TiingoSealedLatestPublication {
                     0,
                 )?,
             ));
-        }
-        if metadata.metadata().exchange_code() != crate::nav::TIINGO_MUTUAL_FUND_EXCHANGE_CODE
-            || context.provider_exchange_code().as_str() != metadata.metadata().exchange_code()
-        {
-            return Err(TiingoLatestPublicationError::WrongInstrumentFamily);
         }
         let [row] = latest.rows() else {
             if latest.rows().is_empty() {
@@ -429,6 +422,19 @@ impl TiingoSealedLatestPublication {
             },
         ))
     }
+}
+
+pub(crate) fn validate_fund_nav_authority(
+    metadata: &TiingoMetadataReceipt,
+    context: &TiingoFundContext,
+) -> Result<(), TiingoLatestPublicationError> {
+    if metadata.metadata().ticker() != context.ticker()
+        || metadata.metadata().exchange_code() != crate::nav::TIINGO_MUTUAL_FUND_EXCHANGE_CODE
+        || context.provider_exchange_code().as_str() != metadata.metadata().exchange_code()
+    {
+        return Err(TiingoLatestPublicationError::WrongInstrumentFamily);
+    }
+    Ok(())
 }
 
 fn validate_latest_pair(

@@ -533,6 +533,10 @@ fn assert_distinct_eod_missing_nav_and_quota_contracts() -> Result<(), Box<dyn E
         classify_fund_support(&metadata),
         TiingoFundSupport::Unsupported
     );
+    assert!(matches!(
+        crate::publication::validate_fund_nav_authority(&metadata, &context(&ticker, "N/A")?),
+        Err(crate::TiingoLatestPublicationError::WrongInstrumentFamily)
+    ));
     let empty_body = b"[]";
     let latest_response = decoder.decode_eod(
         TiingoRequestSpec::latest(ticker.clone())?,
