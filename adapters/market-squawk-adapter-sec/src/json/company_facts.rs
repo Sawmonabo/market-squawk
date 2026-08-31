@@ -115,7 +115,7 @@ impl CompanyFactsDocument {
         let cik = parse_cik(required(object, "cik")?)?;
         let entity_name_source = required_string(object, "entityName")?;
         let entity_name = validated_metadata_text(entity_name_source, MAX_ENTITY_NAME_BYTES)?;
-        retained.admit::<CompanyFactsDocument>(
+        retained.admit_bytes(
             cik.retained_bytes()
                 .checked_add(entity_name.capacity())
                 .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
@@ -129,6 +129,7 @@ impl CompanyFactsDocument {
                 check_parser_cancelled(cancellation)?;
                 validate_component(concept)?;
                 let qualified = SourceIdentifier::try_from(format!("{taxonomy}:{concept}"))?;
+                retained.admit_bytes(qualified.retained_bytes())?;
                 let units = as_object(
                     required(as_object(concept_value, "concept")?, "units")?,
                     "concept units",
@@ -136,6 +137,7 @@ impl CompanyFactsDocument {
                 for (unit, facts_value) in units {
                     check_parser_cancelled(cancellation)?;
                     let unit = SourceIdentifier::try_from(unit.clone())?;
+                    retained.admit_bytes(unit.retained_bytes())?;
                     for (source_ordinal, fact_value) in
                         as_array(facts_value, "unit facts")?.iter().enumerate()
                     {
@@ -150,14 +152,12 @@ impl CompanyFactsDocument {
                             qualified.clone(),
                             unit.clone(),
                             source_ordinal,
+                            &mut retained,
                         )?;
-                        retained.admit::<CompanyFactOccurrence>(company_fact_dynamic_bytes(
-                            &occurrence,
-                        )?)?;
+                        validate_accession_owner(occurrence.accession(), &cik)?;
+                        retained.admit_bytes(company_fact_dynamic_bytes(&occurrence)?)?;
                         if occurrences.len() == occurrences.capacity() {
-                            occurrences
-                                .try_reserve(1)
-                                .map_err(|_| SecParserError::AllocationFailed)?;
+                            try_reserve_exact_bounded(&mut occurrences, 1, &mut retained)?;
                         }
                         occurrences.push(occurrence);
                     }
@@ -192,12 +192,14 @@ fn parse_company_fact(
     concept: SourceIdentifier,
     unit: SourceIdentifier,
     source_ordinal: u32,
+    retained: &mut RetainedJsonBudget,
 ) -> Result<CompanyFactOccurrence, SecParserError> {
     let object = as_object(value, "company fact occurrence")?;
     let lexical = match required(object, "val")? {
         Value::Number(value) => value.to_string(),
         _ => return Err(SecParserError::NonNumericCompanyFact),
     };
+    retained.admit_bytes(lexical.capacity())?;
     let value = lexical
         .parse::<Decimal>()
         .map_err(|_| SecParserError::InvalidDecimal)?

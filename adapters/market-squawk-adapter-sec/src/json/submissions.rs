@@ -218,7 +218,7 @@ impl SubmissionsDocument {
             parse_bounded_json_with_retained_budget(bytes, limits, cancellation)?;
         let object = as_object(&root, "submissions root")?;
         let cik = parse_cik(required(object, "cik")?)?;
-        retained.admit::<SubmissionsDocument>(cik.retained_bytes())?;
+        retained.admit_bytes(cik.retained_bytes())?;
         let company_metadata = parse_company_metadata(object, limits, cancellation, &mut retained)?;
         let filings_object = as_object(required(object, "filings")?, "filings")?;
         let filings = parse_filing_columns(
@@ -227,6 +227,9 @@ impl SubmissionsDocument {
             cancellation,
             &mut retained,
         )?;
+        for filing in &filings {
+            validate_accession_owner(filing.accession(), &cik)?;
+        }
         let companions = parse_companions(
             filings_object.get("files"),
             limits,
@@ -257,7 +260,6 @@ impl SubmissionsDocument {
     ) -> Result<SubmissionsArchive, SecParserError> {
         let (root, mut retained) =
             parse_bounded_json_with_retained_budget(bytes, limits, cancellation)?;
-        retained.admit::<SubmissionsArchive>(0)?;
         Ok(SubmissionsArchive {
             filings: parse_filing_columns(
                 as_object(&root, "archive root")?,
@@ -324,22 +326,12 @@ pub fn reconcile_submissions_with_cancellation(
         return Err(SecParserError::InvalidCompanionCoverage);
     }
     for (declaration, archive) in recent.companions.iter().zip(archives) {
-        validate_companion_coverage(declaration, archive)?;
+        validate_companion_coverage(declaration, archive, &recent.cik)?;
     }
     let mut retained = RetainedJsonBudget::new(limits);
-    retained.admit::<SubmissionsDocument>(recent.cik.retained_bytes())?;
-    admit_company_metadata(&mut retained, &recent.company_metadata)?;
-    for companion in &recent.companions {
-        retained.admit::<SecSubmissionsCompanion>(companion.name.retained_bytes())?;
-    }
-    for filing in &recent.filings {
-        retained.admit::<SecFiling>(filing_dynamic_bytes(filing)?)?;
-    }
+    admit_document_allocations(&mut retained, recent)?;
     for archive in archives {
-        retained.admit::<SubmissionsArchive>(0)?;
-        for filing in &archive.filings {
-            retained.admit::<SecFiling>(filing_dynamic_bytes(filing)?)?;
-        }
+        admit_archive_allocations(&mut retained, archive)?;
     }
     let mut filings = BTreeMap::new();
     for filing in recent
@@ -348,14 +340,14 @@ pub fn reconcile_submissions_with_cancellation(
         .chain(archives.iter().flat_map(|archive| archive.filings.iter()))
     {
         check_parser_cancelled(cancellation)?;
+        let accession = filing.accession.as_str().to_owned();
         retained.admit_btree_entry::<String, SecFiling>(
-            filing
-                .accession
-                .retained_bytes()
+            accession
+                .capacity()
                 .checked_add(filing_dynamic_bytes(filing)?)
                 .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
         )?;
-        match filings.entry(filing.accession.as_str().to_owned()) {
+        match filings.entry(accession) {
             Entry::Vacant(entry) => {
                 entry.insert(filing.clone());
             }
@@ -366,25 +358,29 @@ pub fn reconcile_submissions_with_cancellation(
             return Err(SecParserError::RecordLimitExceeded);
         }
     }
-    retained.admit::<SubmissionsDocument>(recent.cik.retained_bytes())?;
-    admit_company_metadata(&mut retained, &recent.company_metadata)?;
-    for companion in &recent.companions {
-        retained.admit::<SecSubmissionsCompanion>(companion.name.retained_bytes())?;
-    }
-    for _ in filings.values() {
-        retained.admit::<SecFiling>(0)?;
-    }
-    let mut filings: Vec<_> = filings.into_values().collect();
+    let mut reconciled_filings = Vec::new();
+    try_reserve_exact_bounded(&mut reconciled_filings, filings.len(), &mut retained)?;
+    reconciled_filings.extend(filings.into_values());
+    let mut filings = reconciled_filings;
     filings.sort_by(|left, right| {
         left.filed_on
             .cmp(&right.filed_on)
             .then_with(|| left.accession.cmp(&right.accession))
     });
+    let cik = recent.cik.clone();
+    retained.admit_bytes(cik.retained_bytes())?;
+    let company_metadata = recent.company_metadata.clone();
+    admit_company_metadata(&mut retained, &company_metadata)?;
+    let companions = recent.companions.clone();
+    admit_vec_allocation(&mut retained, &companions)?;
+    for companion in &companions {
+        retained.admit_bytes(companion.name.retained_bytes())?;
+    }
     Ok(SubmissionsDocument {
-        cik: recent.cik.clone(),
-        company_metadata: recent.company_metadata.clone(),
+        cik,
+        company_metadata,
         filings,
-        companions: recent.companions.clone(),
+        companions,
     })
 }
 
@@ -396,7 +392,7 @@ fn parse_company_metadata(
 ) -> Result<SecSubmissionCompanyMetadata, SecParserError> {
     let conformed_name =
         validated_metadata_text(required_string(object, "name")?, MAX_COMPANY_NAME_BYTES)?;
-    retained.admit::<SecSubmissionCompanyMetadata>(conformed_name.capacity())?;
+    retained.admit_bytes(conformed_name.capacity())?;
     let former_names =
         parse_former_names(object.get("formerNames"), limits, cancellation, retained)?;
     let entity_type = optional_metadata_text(object, "entityType", MAX_ENTITY_TYPE_BYTES)?;
@@ -404,7 +400,7 @@ fn parse_company_metadata(
     let sic_description =
         optional_metadata_text(object, "sicDescription", MAX_SIC_DESCRIPTION_BYTES)?;
     for value in [&entity_type, &sic, &sic_description].into_iter().flatten() {
-        retained.admit::<String>(value.capacity())?;
+        retained.admit_bytes(value.capacity())?;
     }
     let ticker_exchange_pairs =
         parse_ticker_exchange_pairs(object, limits, cancellation, retained)?;
@@ -432,9 +428,7 @@ fn parse_former_names(
         return Err(SecParserError::RecordLimitExceeded);
     }
     let mut former_names = Vec::new();
-    former_names
-        .try_reserve(entries.len())
-        .map_err(|_| SecParserError::AllocationFailed)?;
+    try_reserve_exact_bounded(&mut former_names, entries.len(), retained)?;
     let mut seen = BTreeMap::new();
     for value in entries {
         check_parser_cancelled(cancellation)?;
@@ -459,7 +453,7 @@ fn parse_former_names(
                 return Err(SecParserError::ConflictingMetadataAssociation);
             }
         }
-        retained.admit::<SecFormerName>(name.capacity())?;
+        retained.admit_bytes(name.capacity())?;
         former_names.push(SecFormerName {
             name,
             effective_from,
@@ -484,9 +478,7 @@ fn parse_ticker_exchange_pairs(
         return Err(SecParserError::RecordLimitExceeded);
     }
     let mut pairs = Vec::new();
-    pairs
-        .try_reserve(tickers.len())
-        .map_err(|_| SecParserError::AllocationFailed)?;
+    try_reserve_exact_bounded(&mut pairs, tickers.len(), retained)?;
     let mut seen = BTreeMap::new();
     for index in 0..tickers.len() {
         check_parser_cancelled(cancellation)?;
@@ -510,7 +502,7 @@ fn parse_ticker_exchange_pairs(
                 return Err(SecParserError::ConflictingMetadataAssociation);
             }
         }
-        retained.admit::<SecTickerExchangePair>(
+        retained.admit_bytes(
             ticker
                 .capacity()
                 .checked_add(exchange.capacity())
@@ -558,9 +550,7 @@ fn parse_filing_columns(
         }
     }
     let mut filings = Vec::new();
-    filings
-        .try_reserve(accessions.len())
-        .map_err(|_| SecParserError::AllocationFailed)?;
+    try_reserve_exact_bounded(&mut filings, accessions.len(), retained)?;
     let mut page_accessions = BTreeMap::new();
     for index in 0..accessions.len() {
         check_parser_cancelled(cancellation)?;
@@ -584,7 +574,7 @@ fn parse_filing_columns(
             is_inline_xbrl: optional_column_boolish(object, "isInlineXBRL", index)?
                 .unwrap_or(false),
         };
-        retained.admit::<SecFiling>(filing_dynamic_bytes(&filing)?)?;
+        retained.admit_bytes(filing_dynamic_bytes(&filing)?)?;
         retained.admit_btree_entry::<SourceIdentifier, ()>(filing.accession.retained_bytes())?;
         if page_accessions
             .insert(filing.accession.clone(), ())
@@ -611,9 +601,7 @@ fn parse_companions(
         return Err(SecParserError::RecordLimitExceeded);
     }
     let mut companions = Vec::new();
-    companions
-        .try_reserve(entries.len())
-        .map_err(|_| SecParserError::AllocationFailed)?;
+    try_reserve_exact_bounded(&mut companions, entries.len(), retained)?;
     let mut names = BTreeMap::new();
     for entry in entries {
         check_parser_cancelled(cancellation)?;
@@ -639,7 +627,7 @@ fn parse_companions(
         if filing_from > filing_to {
             return Err(SecParserError::InvalidCompanionCoverage);
         }
-        retained.admit::<SecSubmissionsCompanion>(name.retained_bytes())?;
+        retained.admit_bytes(name.retained_bytes())?;
         companions.push(SecSubmissionsCompanion {
             name,
             filing_count,
@@ -653,11 +641,13 @@ fn parse_companions(
 pub(crate) fn validate_companion_coverage(
     declaration: &SecSubmissionsCompanion,
     archive: &SubmissionsArchive,
+    cik: &SourceIdentifier,
 ) -> Result<(), SecParserError> {
     if u64::try_from(archive.filings.len()).ok() != Some(declaration.filing_count) {
         return Err(SecParserError::InvalidCompanionCoverage);
     }
     for filing in &archive.filings {
+        validate_accession_owner(filing.accession(), cik)?;
         if filing.filed_on < declaration.filing_from || filing.filed_on > declaration.filing_to {
             return Err(SecParserError::InvalidCompanionCoverage);
         }
@@ -669,9 +659,10 @@ fn admit_company_metadata(
     retained: &mut RetainedJsonBudget,
     metadata: &SecSubmissionCompanyMetadata,
 ) -> Result<(), SecParserError> {
-    retained.admit::<SecSubmissionCompanyMetadata>(metadata.conformed_name.capacity())?;
+    retained.admit_bytes(metadata.conformed_name.capacity())?;
+    admit_vec_allocation(retained, &metadata.former_names)?;
     for former in &metadata.former_names {
-        retained.admit::<SecFormerName>(former.name.capacity())?;
+        retained.admit_bytes(former.name.capacity())?;
     }
     for value in [
         &metadata.entity_type,
@@ -681,15 +672,56 @@ fn admit_company_metadata(
     .into_iter()
     .flatten()
     {
-        retained.admit::<String>(value.capacity())?;
+        retained.admit_bytes(value.capacity())?;
     }
+    admit_vec_allocation(retained, &metadata.ticker_exchange_pairs)?;
     for pair in &metadata.ticker_exchange_pairs {
-        retained.admit::<SecTickerExchangePair>(
+        retained.admit_bytes(
             pair.ticker
                 .capacity()
                 .checked_add(pair.exchange.capacity())
                 .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
         )?;
+    }
+    Ok(())
+}
+
+fn admit_vec_allocation<T>(
+    retained: &mut RetainedJsonBudget,
+    values: &Vec<T>,
+) -> Result<(), SecParserError> {
+    retained.admit_bytes(
+        values
+            .capacity()
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
+    )
+}
+
+fn admit_archive_allocations(
+    retained: &mut RetainedJsonBudget,
+    archive: &SubmissionsArchive,
+) -> Result<(), SecParserError> {
+    admit_vec_allocation(retained, &archive.filings)?;
+    for filing in &archive.filings {
+        retained.admit_bytes(filing_dynamic_bytes(filing)?)?;
+    }
+    Ok(())
+}
+
+fn admit_document_allocations(
+    retained: &mut RetainedJsonBudget,
+    document: &SubmissionsDocument,
+) -> Result<(), SecParserError> {
+    retained.admit_bytes(document.cik.retained_bytes())?;
+    admit_company_metadata(retained, &document.company_metadata)?;
+    admit_vec_allocation(retained, &document.filings)?;
+    for filing in &document.filings {
+        retained.admit_bytes(filing_dynamic_bytes(filing)?)?;
+    }
+    admit_vec_allocation(retained, &document.companions)?;
+    for companion in &document.companions {
+        retained.admit_bytes(companion.name.retained_bytes())?;
     }
     Ok(())
 }

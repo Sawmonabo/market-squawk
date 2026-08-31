@@ -866,6 +866,9 @@ fn extract_blocking(
                 parser_limits,
                 cancellation,
             )?;
+            if retrieved.document().cik().as_str() != dataset.cik() {
+                return Err(SecClientError::ResponseCikMismatch);
+            }
             let observations = normalize_filings_with_cancellation(
                 &source_id,
                 &identities,
@@ -905,6 +908,9 @@ fn extract_blocking(
                 parser_limits,
                 cancellation,
             )?;
+            if retrieved.document().cik().as_str() != dataset.cik() {
+                return Err(SecClientError::ResponseCikMismatch);
+            }
             let observations = normalize_company_facts_with_cancellation(
                 &source_id,
                 &identities,
@@ -1011,7 +1017,7 @@ fn submissions_row_capture_page_ordinals(
             parser_limits,
             cancellation,
         )?;
-        crate::json::validate_companion_coverage(declaration, &archive)?;
+        crate::json::validate_companion_coverage(declaration, &archive, current_document.cik())?;
         for filing in archive.filings() {
             match origins.get(filing.accession().as_str()) {
                 Some((existing, _)) if existing == filing => {}
