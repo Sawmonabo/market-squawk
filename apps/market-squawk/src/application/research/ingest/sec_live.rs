@@ -17,9 +17,10 @@ use std::{
 
 use market_squawk_adapter_sec::{
     SecAuthoritativeIdentifierNamespace, SecBulkError, SecBulkLayoutManifest, SecBulkParseLimits,
-    SecBulkSelection, SecClientError, SecEdgarSource, SecFundIdentityAuthority,
-    SecFundPartitionAdmissions, SecFundPublicationScope, SecGovernedIdentityReceipt,
-    SecNportHoldingRow, SecNportIdentifierRow, SecPreparedFundLogicalPublication,
+    SecBulkSelection, SecClientError, SecEdgarSource, SecFundHoldingIdentityInput,
+    SecFundIdentityAuthority, SecFundPartitionAdmissions, SecFundPublicationScope,
+    SecFundSecurityIdentifierKind, SecFundShareClassIdentityInput, SecGovernedIdentityReceipt,
+    SecPreparedFundLogicalPublication,
 };
 use market_squawk_data::{
     DatasetId, IngestError, IngestPrecommitAuthority, SecFundJobCatalogError, SecFundJobCommit,
@@ -723,9 +724,10 @@ impl SecLiveFundIdentityAuthority {
 impl SecFundIdentityAuthority for SecLiveFundIdentityAuthority {
     fn resolve_share_class(
         &mut self,
-        series_id: &SourceIdentifier,
+        input: &SecFundShareClassIdentityInput,
         cutoff: Timestamp,
     ) -> Result<FundShareClassIdentity, SecBulkError> {
+        let series_id = input.series_id();
         let authority = self.source.resolve_bulk_identity(
             SecAuthoritativeIdentifierNamespace::SecSeriesId,
             &self.authority_source_id,
@@ -749,21 +751,24 @@ impl SecFundIdentityAuthority for SecLiveFundIdentityAuthority {
 
     fn resolve_holding_security(
         &mut self,
-        holding: &SecNportHoldingRow,
-        identifiers: &[SecNportIdentifierRow],
+        input: &SecFundHoldingIdentityInput,
         cutoff: Timestamp,
     ) -> Result<FundHoldingSecurityIdentity, SecBulkError> {
         let mut resolved = Vec::new();
-        let isins = identifiers
+        let isins = input
+            .identifiers()
             .iter()
-            .filter_map(|row| row.isin.clone())
+            .filter(|identifier| identifier.kind() == SecFundSecurityIdentifierKind::Isin)
+            .map(|identifier| identifier.value().clone())
+            .collect::<BTreeSet<_>>();
+        let cusips = input
+            .identifiers()
+            .iter()
+            .filter(|identifier| identifier.kind() == SecFundSecurityIdentifierKind::Cusip)
+            .map(|identifier| identifier.value().clone())
             .collect::<BTreeSet<_>>();
         resolved
-            .try_reserve_exact(
-                isins
-                    .len()
-                    .saturating_add(usize::from(holding.cusip.is_some())),
-            )
+            .try_reserve_exact(isins.len().saturating_add(cusips.len()))
             .map_err(|_| SecBulkError::AllocationFailed)?;
         for source_identifier in isins {
             let Ok(isin) = Isin::try_from(source_identifier.as_str()) else {
@@ -778,11 +783,11 @@ impl SecFundIdentityAuthority for SecLiveFundIdentityAuthority {
                 resolved.push(candidate);
             }
         }
-        if let Some(source_identifier) = holding.cusip.as_ref() {
+        for source_identifier in cusips {
             if let Ok(cusip) = Cusip::try_from(source_identifier.as_str()) {
                 if let Some(candidate) = self.resolve_holding_identifier(
                     SecAuthoritativeIdentifierNamespace::Cusip,
-                    source_identifier,
+                    &source_identifier,
                     FundSecurityIdentifier::Cusip(cusip),
                     cutoff,
                 )? {
