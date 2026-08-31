@@ -12,7 +12,8 @@ use market_squawk_domain::{
     AuthorizationBasis, ConnectionGeneration, Currency, DataQuality, Denomination, DigestAlgorithm,
     EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentDefinitionRevision,
     InstrumentExecutionTerms, InstrumentId, LiveEventClass, LotSize, MarketDepth, MetadataRevision,
-    ProviderProduct, RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, TickSize, Timestamp,
+    ProviderIdentityKey, ProviderProduct, RevisionBoundPayloadEvidence, SourceId, SourceIdentifier,
+    TickSize, Timestamp, VenueSymbol,
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
@@ -377,7 +378,14 @@ impl CoinbaseDirectOutput for RecordingOutput {
         update
             .validate_current()
             .map_err(|_error| SinkError::CaptureIncomplete)?;
-        if update.market_depth() != MarketDepth::OrderLevel {
+        if update.market_depth() != MarketDepth::OrderLevel
+            || !is_direct_native_coordinate(
+                update.provider_identity_key(),
+                update.provider_identity_revision(),
+                update.provider_identity_digest(),
+                update.venue_symbol(),
+            )
+        {
             return Err(SinkError::CaptureIncomplete);
         }
         let recorded = match update.payload() {
@@ -423,6 +431,12 @@ impl CoinbaseDirectOutput for RecordingOutput {
         };
         if evidence.feed() != CoinbaseMarketFeed::ExchangeDirectFull
             || evidence.channel() != CoinbaseMarketChannel::Full
+            || !is_direct_native_coordinate(
+                evidence.provider_identity_key(),
+                evidence.provider_identity_revision(),
+                evidence.provider_identity_digest(),
+                evidence.venue_symbol(),
+            )
             || evidence.product().as_source_identifier().as_str() != "BTC-USD"
             || evidence.venue().as_str() != "coinbase-exchange"
             || evidence.event_class() != LiveEventClass::BookSnapshot
@@ -459,6 +473,14 @@ impl CoinbaseDirectOutput for RecordingOutput {
             .replay()
             .iter()
             .map(|frame| {
+                if !is_direct_native_coordinate(
+                    frame.provider_identity_key(),
+                    frame.provider_identity_revision(),
+                    frame.provider_identity_digest(),
+                    frame.venue_symbol(),
+                ) {
+                    return Err(SinkError::CaptureIncomplete);
+                }
                 let native_trade = frame.native_trade().map(|trade| RecordedNativeTrade {
                     trade_id: trade.trade_id(),
                     maker_order_id: trade.maker_order_id().as_str().to_owned(),
@@ -469,13 +491,13 @@ impl CoinbaseDirectOutput for RecordingOutput {
                     sequence: trade.sequence().get(),
                     provider_timestamp: trade.provider_timestamp().unix_nanos(),
                 });
-                RecordedReplayFrame {
+                Ok(RecordedReplayFrame {
                     sequence: frame.sequence().get(),
                     payload: frame.raw_payload().as_bytes().to_vec(),
                     native_trade,
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, SinkError>>()?;
         let observation = handoff
             .typed_batch()
             .observations()
@@ -805,7 +827,31 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
             },
         }]
     );
-    assert!(output.pending_handoff.is_some());
+    let pending_handoff = output
+        .pending_handoff
+        .take()
+        .ok_or("missing market handoff")?;
+    let (evidence, raw_lineage, _batch) = pending_handoff.into_parts();
+    assert!(is_direct_native_coordinate(
+        evidence.provider_identity_key(),
+        evidence.provider_identity_revision(),
+        evidence.provider_identity_digest(),
+        evidence.venue_symbol(),
+    ));
+    let crate::CoinbaseMarketRawLineage::DirectInitial(lineage) = raw_lineage else {
+        return Err("market handoff did not retain Direct lineage".into());
+    };
+    assert!(
+        lineage
+            .replay()
+            .iter()
+            .all(|frame| is_direct_native_coordinate(
+                frame.provider_identity_key(),
+                frame.provider_identity_revision(),
+                frame.provider_identity_digest(),
+                frame.venue_symbol(),
+            ))
+    );
     assert_eq!(direct.book.phase(), DirectSyncPhase::Quarantined);
     registry.end_session(&session, Timestamp::from_unix_nanos(2))?;
     Ok(())
@@ -970,6 +1016,19 @@ fn evidence(byte: u8) -> ExactPayloadEvidence {
         DigestAlgorithm::Sha256,
         [byte; 32],
     ))
+}
+
+fn is_direct_native_coordinate(
+    key: &ProviderIdentityKey,
+    revision: &MetadataRevision,
+    digest: EvidenceDigest,
+    venue_symbol: &VenueSymbol,
+) -> bool {
+    key.source_id().as_str() == "coinbase-exchange-direct"
+        && key.provider_instrument_id().as_str() == "BTC-USD"
+        && revision.as_source_identifier().as_str() == "coinbase-direct-transport-2026-07-24"
+        && digest.bytes() == [3; 32]
+        && venue_symbol.as_str() == "BTC-USD"
 }
 
 fn hex_digest(bytes: &[u8]) -> String {

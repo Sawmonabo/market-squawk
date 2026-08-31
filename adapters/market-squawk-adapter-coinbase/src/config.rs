@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use market_squawk_domain::{
@@ -111,7 +112,7 @@ impl CoinbaseProductMapping {
 /// provider key, provider-profile revision and digest, venue symbol, and canonical instrument
 /// together so public and Direct decoders cannot reconstruct any coordinate from a diagnostic
 /// message identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct CoinbaseNativeProductCoordinate {
     mapping: CoinbaseProductMapping,
     identity_key: ProviderIdentityKey,
@@ -143,6 +144,10 @@ impl CoinbaseNativeProductCoordinate {
 
     pub(crate) const fn product(&self) -> &ProviderProduct {
         self.mapping.product()
+    }
+
+    pub(crate) const fn mapping(&self) -> &CoinbaseProductMapping {
+        &self.mapping
     }
 
     pub(crate) const fn provider_identity_key(&self) -> &ProviderIdentityKey {
@@ -263,7 +268,7 @@ impl CoinbaseTransportLimits {
 #[derive(Clone, Debug)]
 pub struct CoinbaseExchangeConfig {
     metadata: SourceMetadata,
-    mappings: Box<[CoinbaseProductMapping]>,
+    coordinate: Arc<CoinbaseNativeProductCoordinate>,
     channels: Box<[CoinbaseChannel]>,
     limits: CoinbaseTransportLimits,
     subscriptions: Box<[Box<str>]>,
@@ -299,14 +304,14 @@ impl CoinbaseExchangeConfig {
         validate_mappings(&mappings)?;
         validate_channels(&channels)?;
 
-        let coordinate = CoinbaseNativeProductCoordinate::try_new(
+        let coordinate = Arc::new(CoinbaseNativeProductCoordinate::try_new(
             mappings
                 .first()
                 .ok_or(CoinbaseConfigError::InvalidMappingCount)?
                 .clone(),
             source_id.clone(),
             &revision_evidence,
-        )?;
+        )?);
 
         let venue = coordinate.venue().clone();
         let decoder_rule = rule("coinbase-advanced-trade-v1-decoder")?;
@@ -393,7 +398,7 @@ impl CoinbaseExchangeConfig {
         let subscriptions = subscription_payloads(&mappings, &channels)?;
         Ok(Self {
             metadata,
-            mappings: mappings.into_boxed_slice(),
+            coordinate,
             channels: channels.into_boxed_slice(),
             limits,
             subscriptions,
@@ -412,7 +417,11 @@ impl CoinbaseExchangeConfig {
 
     /// Returns configured product mappings in subscription order.
     pub fn mappings(&self) -> &[CoinbaseProductMapping] {
-        &self.mappings
+        std::slice::from_ref(self.coordinate.mapping())
+    }
+
+    pub(crate) const fn native_coordinate(&self) -> &Arc<CoinbaseNativeProductCoordinate> {
+        &self.coordinate
     }
 
     /// Returns the exact channel profile in subscription order.

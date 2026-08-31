@@ -10,6 +10,7 @@ use std::io::Read as _;
 use std::{
     collections::BTreeSet,
     mem::{size_of, size_of_val},
+    sync::Arc,
 };
 
 use bytes::Bytes;
@@ -34,6 +35,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::config::CoinbaseNativeProductCoordinate;
 use crate::{
     CoinbaseDirectTradeEvidence, CoinbaseMarketChannel, CoinbaseMarketContinuity,
     CoinbaseMarketFeed, CoinbaseMarketHandoff, CoinbaseMarketHandoffEvidence,
@@ -713,6 +715,7 @@ struct CoinbaseDirectSnapshotPublicationEvidence {
 
 #[derive(Debug)]
 struct CoinbaseDirectReplayPublicationEvidence {
+    native_coordinate: Arc<CoinbaseNativeProductCoordinate>,
     sequence: u64,
     provider_timestamp: Timestamp,
     received_at: Timestamp,
@@ -939,13 +942,14 @@ impl CoinbaseMarketHandoff {
                     .try_reserve_exact(replay.len())
                     .map_err(|_| CoinbaseMarketPublicationError::Allocation)?;
                 for (ordinal, frame) in replay.into_iter().enumerate() {
-                    let (event, payload, native_trade) = frame.into_parts();
+                    let (native_coordinate, event, payload, native_trade) = frame.into_parts();
                     let decoder = event.evidence();
                     let payload_digest = decoder.payload_digest();
                     let received_at = decoder.received_at();
                     let provider_timestamp = event.timestamp();
                     let sequence = event.sequence().get();
                     replay_evidence.push(CoinbaseDirectReplayPublicationEvidence {
+                        native_coordinate,
                         sequence,
                         provider_timestamp,
                         received_at,
@@ -1630,7 +1634,10 @@ fn validate_direct_replay_event(
         | LiveEventClass::InstrumentStatus
         | LiveEventClass::CorporateAction => None,
     };
-    if provenance.source_id() != handoff.typed_batch.evidence().binding().source_id()
+    if !Arc::ptr_eq(
+        &frame.native_coordinate,
+        handoff.evidence.native_coordinate(),
+    ) || provenance.source_id() != handoff.typed_batch.evidence().binding().source_id()
         || provenance.binding().metadata_revision()
             != handoff.typed_batch.evidence().binding().metadata_revision()
         || provenance.binding().session_id()
