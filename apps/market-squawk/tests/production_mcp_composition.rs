@@ -1981,6 +1981,7 @@ async fn assert_installed_cli_macro_context(
     Ok(())
 }
 
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 fn assert_installed_cli_rejects_unpaired_macro_cutoff(
     expected: &InstalledMacroContextEvidence,
 ) -> TestResult {
