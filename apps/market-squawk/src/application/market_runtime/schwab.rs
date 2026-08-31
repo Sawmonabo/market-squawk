@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use market_squawk_adapter_schwab::{
-    AccessTokenAdmission, AdaptiveAssessment, CapacityCounters, CapacityObservation, CapacityUnit,
+    AccessTokenAdmission, AdaptiveAssessment, CapacityCounters, CapacityObservation,
     CapturedRestResponse, ExecutedRestResponse, ParseBounds, ProviderIdentifier, QuoteField,
     QuoteRequest, ReadOnlyRoute, RequestAdmission, RestExecutionOutcome, RestItemAccounting,
     RestTransportBounds, SchwabAdapterError, SchwabRestExecutor, SchwabRestFamily,
@@ -630,6 +630,7 @@ impl SchwabRestQuoteProducer {
             ) => result,
         };
         let outcome = outcome?;
+        let capacity = outcome.capacity_observation()?;
         let (outcome, accounting, receipt) = classify_quote_outcome(outcome)?;
         if accounting.requested != bindings.len() as u64
             || accounting.returned.checked_add(accounting.missing) != Some(accounting.requested)
@@ -637,26 +638,6 @@ impl SchwabRestQuoteProducer {
             return Err(SchwabRestQuoteRuntimeError::Accounting);
         }
         self.next_binding = next_binding;
-        let capacity = CapacityObservation {
-            unit: CapacityUnit::Symbols,
-            requested: accounting.requested,
-            returned: accounting.returned,
-            missing: accounting.missing,
-            duplicates: 0,
-            malformed: 0,
-            unexpected: accounting.unexpected,
-            request_bytes: u64::try_from(receipt.request_url().len())
-                .map_err(|_error| SchwabRestQuoteRuntimeError::Accounting)?,
-            response_bytes: receipt.body_bytes(),
-            latency_ms: receipt.latency_ms(),
-            status: receipt.status(),
-            retry_after_present: receipt.retry_after_present(),
-            validation_failed: matches!(
-                &outcome,
-                SchwabRestQuoteBatchOutcome::InvalidPayload { .. }
-            ),
-        }
-        .validate()?;
         let budget_failure = if receipt.status() == 429 {
             let retry_after = receipt
                 .headers()
