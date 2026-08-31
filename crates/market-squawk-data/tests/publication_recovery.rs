@@ -3571,6 +3571,7 @@ fn provider_macro_plan_input(
     let source_id = SourceId::try_from("fred-local-fixture")?;
     let metadata_revision = MetadataRevision::new(SourceIdentifier::try_from("revision-1")?);
     let provider_dataset = SourceIdentifier::try_from("gdp-2026q1")?;
+    let analytical_source_dataset = SourceIdentifier::try_from(analytical_dataset.as_str())?;
     let mut chunks = Vec::new();
     chunks.try_reserve_exact(CHUNK_COUNT)?;
     for chunk_ordinal in 0..CHUNK_COUNT {
@@ -3614,7 +3615,7 @@ fn provider_macro_plan_input(
             )?],
         )?;
         let discovery = DiscoveryRequest::try_new(
-            provider_dataset.clone(),
+            analytical_source_dataset.clone(),
             Some(Timestamp::from_unix_nanos(90)),
             NonZeroU16::MIN,
             Timestamp::from_unix_nanos(1_000),

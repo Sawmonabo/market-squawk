@@ -368,6 +368,8 @@ impl ProviderMacroPlanPublicationInput {
             .first()
             .ok_or(IngestError::InvalidProviderMacroPlan)?;
         let first_capture = first.sealed_capture.capture_evidence();
+        let analytical_source_dataset = SourceIdentifier::try_from(analytical_dataset.as_str())
+            .map_err(|_| IngestError::InvalidDataset)?;
         let source_id = first_capture.source_id().clone();
         let metadata_revision = first_capture.metadata_revision().clone();
         let provider_dataset = first_capture.dataset().clone();
@@ -388,6 +390,8 @@ impl ProviderMacroPlanPublicationInput {
                 || capture.source_id() != &source_id
                 || capture.metadata_revision() != &metadata_revision
                 || capture.dataset() != &provider_dataset
+                || chunk.sealed_capture.batch().request().object().dataset()
+                    != &analytical_source_dataset
                 || chunk.source_generation_digest != source_generation_digest
                 || chunk.semantics.schema != semantics_schema
                 || chunk.semantics.schema_requirement_digest != schema_requirement_digest
@@ -3427,7 +3431,7 @@ impl AnalyticalDataService {
             publication_digest,
             source_id,
             metadata_revision: _,
-            provider_dataset,
+            provider_dataset: _,
             request_set_identity,
             source_generation_digest,
             total_rows,
@@ -3529,7 +3533,7 @@ impl AnalyticalDataService {
                 continue;
             }
             let grouped = ResearchArrowBatch::try_from_compaction_batches(
-                provider_dataset.clone(),
+                dataset_name.clone(),
                 publication_digest,
                 std::mem::take(&mut pending_batches),
             )?;
