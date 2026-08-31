@@ -1704,6 +1704,9 @@ pub(super) const fn native_implementation_name(
             "fred_alfred_series_observations_v1"
         }
         ProviderNativeLineageImplementation::KrakenSpotV1 => "kraken_spot_v1",
+        ProviderNativeLineageImplementation::NasdaqSymbolDirectoryV1 => {
+            "nasdaq_symbol_directory_v1"
+        }
         ProviderNativeLineageImplementation::SecEdgarV1 => "sec_edgar_v1",
         ProviderNativeLineageImplementation::AlpacaHistoricalBarV1 => "alpaca_historical_bar_v1",
         ProviderNativeLineageImplementation::SchwabRestMarketDataV1 => "schwab_rest_market_data_v1",
@@ -1735,6 +1738,9 @@ pub(super) fn parse_native_implementation(
             Ok(ProviderNativeLineageImplementation::FredAlfredSeriesObservationsV1)
         }
         "kraken_spot_v1" => Ok(ProviderNativeLineageImplementation::KrakenSpotV1),
+        "nasdaq_symbol_directory_v1" => {
+            Ok(ProviderNativeLineageImplementation::NasdaqSymbolDirectoryV1)
+        }
         "sec_edgar_v1" => Ok(ProviderNativeLineageImplementation::SecEdgarV1),
         "alpaca_historical_bar_v1" => {
             Ok(ProviderNativeLineageImplementation::AlpacaHistoricalBarV1)
@@ -1762,6 +1768,7 @@ mod tests {
     fn fred_and_treasury_native_implementations_round_trip_through_catalog_names() {
         for implementation in [
             ProviderNativeLineageImplementation::FredAlfredSeriesObservationsV1,
+            ProviderNativeLineageImplementation::NasdaqSymbolDirectoryV1,
             ProviderNativeLineageImplementation::UsTreasuryMacroV1,
         ] {
             assert!(matches!(
