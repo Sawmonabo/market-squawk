@@ -404,7 +404,6 @@ function macroContextResult(cutoffs = {
 }): ApplicationResult {
   return {
     data: {
-      schemaIdentity: "market-squawk-macro-context/v1",
       availability: "available",
       selection: {
         ...cutoffs,

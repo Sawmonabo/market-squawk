@@ -13,11 +13,14 @@ use anyhow::Context as _;
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 use chrono::{Datelike as _, NaiveDate};
 use futures_util::FutureExt as _;
-#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
-use market_squawk::BoardInstalledFixtureBundle;
 use market_squawk::service::{
     BootstrapRequirement, InstalledService, InstalledServiceBootstrapState,
     InstalledServiceConnector, InstalledServiceError, InstalledServiceRunOutcome,
+};
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+use market_squawk::{
+    BoardInstalledFixtureBundle, cli::Command as CliCommand,
+    local_product::execute_installed_cli_command,
 };
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 use market_squawk_adapter_federal_reserve::{
@@ -278,9 +281,23 @@ async fn run_installed_service_authority_scenario() -> TestResult {
                 .connect_mcp_relay(NamedClient::ClaudeCode)
                 .context("admit rotated Claude relay")?,
             real_alpaca_evidence.as_ref(),
+            {
+                #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+                {
+                    board_evidence
+                        .as_ref()
+                        .map(|evidence| &evidence.macro_context)
+                }
+                #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
+                {
+                    None
+                }
+            },
         )
         .await
         .context("exercise rotated Claude relay")?;
+        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+        assert_installed_board_transport_counts(board_fixture.transport_counters(), 1, 1, 1, 1);
         assert!(matches!(
             connector.connect_mcp_relay(NamedClient::Codex),
             Err(InstalledServiceError::AdmissionRejected)
@@ -370,9 +387,24 @@ async fn run_installed_service_authority_scenario() -> TestResult {
                 .connect_mcp_relay(NamedClient::ClaudeCode)
                 .context("admit persisted Claude relay after restart")?,
             restarted_real_alpaca_evidence.as_ref(),
+            {
+                #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+                {
+                    Some(&board_evidence.macro_context)
+                }
+                #[cfg(not(all(feature = "board-installed-fixture", debug_assertions)))]
+                {
+                    None
+                }
+            },
         )
         .await
         .context("exercise persisted Claude relay after restart")?;
+        #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+        assert_eq!(
+            board_fixture.transport_counters(),
+            board_counters_before_restart
+        );
         assert!(matches!(
             connector.connect_mcp_relay(NamedClient::Codex),
             Err(InstalledServiceError::AdmissionRejected)
@@ -1293,12 +1325,20 @@ struct InstalledBoardFileEvidence {
     sha256: String,
 }
 
+#[derive(Debug)]
+struct InstalledMacroContextEvidence {
+    arguments: Value,
+    stable: Value,
+    parent_manifest: Value,
+}
+
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
 #[derive(Debug)]
 struct InstalledBoardEvidence {
     manifest: Value,
     history_artifact: Value,
     dashboard_stable: Value,
+    macro_context: InstalledMacroContextEvidence,
     msj: Vec<InstalledBoardFileEvidence>,
     parquet: Vec<InstalledBoardFileEvidence>,
 }
@@ -1690,7 +1730,11 @@ async fn exercise_installed_board_vertical(
 
     let dashboard = installed_board_dashboard(client, "initial").await?;
     assert_installed_board_dashboard(&dashboard)?;
+    assert_eq!(dashboard["binding"]["manifest"], manifest["manifest"]);
     let dashboard_stable = stable_installed_board_dashboard(&dashboard);
+    let macro_context = capture_installed_macro_context(client, &manifest["manifest"]).await?;
+    assert_installed_cli_macro_context(client, &macro_context).await?;
+    assert_installed_board_transport_counts(fixture.transport_counters(), 1, 1, 1, 1);
 
     let msj = new_installed_files(
         &before_msj,
@@ -1714,6 +1758,7 @@ async fn exercise_installed_board_vertical(
         manifest,
         history_artifact,
         dashboard_stable,
+        macro_context,
         msj,
         parquet,
     })
@@ -1768,6 +1813,7 @@ async fn assert_installed_board_restored(
     )
     .await?;
     assert_eq!(manifest, evidence.manifest);
+    assert_eq!(manifest["manifest"], evidence.macro_context.parent_manifest);
     let history = invoke_installed_board(
         client,
         "history-after-restart",
@@ -1791,6 +1837,18 @@ async fn assert_installed_board_restored(
         stable_installed_board_dashboard(&dashboard),
         evidence.dashboard_stable
     );
+    let macro_context = installed_macro_context(
+        client,
+        "after-restart",
+        evidence.macro_context.arguments.clone(),
+    )
+    .await?;
+    assert_installed_macro_context(&macro_context)?;
+    assert_eq!(
+        stable_installed_macro_context(&macro_context),
+        evidence.macro_context.stable
+    );
+    assert_installed_cli_macro_context(client, &evidence.macro_context).await?;
     assert_installed_file_evidence(installation_root, &evidence.msj)?;
     assert_installed_file_evidence(installation_root, &evidence.parquet)?;
     assert_eq!(fixture.transport_counters(), counters_before_restart);
@@ -1840,6 +1898,123 @@ async fn installed_board_dashboard(
         }),
     )
     .await
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+async fn capture_installed_macro_context(
+    client: &LoopbackApplicationClient,
+    parent_manifest: &Value,
+) -> TestResult<InstalledMacroContextEvidence> {
+    let context = installed_macro_context(client, "initial", json!({})).await?;
+    assert_installed_macro_context(&context)?;
+    let knowledge_cutoff = required_nonempty_string(
+        &context["selection"]["knowledgeCutoff"],
+        "economic-context knowledge cutoff",
+    )?;
+    let effective_date_cutoff = required_nonempty_string(
+        &context["selection"]["effectiveDateCutoff"],
+        "economic-context effective-date cutoff",
+    )?;
+    Ok(InstalledMacroContextEvidence {
+        arguments: json!({
+            "knowledgeCutoff": knowledge_cutoff,
+            "effectiveDateCutoff": effective_date_cutoff,
+        }),
+        stable: stable_installed_macro_context(&context),
+        parent_manifest: parent_manifest.clone(),
+    })
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+async fn installed_macro_context(
+    client: &LoopbackApplicationClient,
+    request_suffix: &str,
+    mut arguments: Value,
+) -> TestResult<Value> {
+    arguments["resultLimits"] = json!({"maximumItems": 12, "maximumBytes": 1_048_576});
+    invoke_installed_board(
+        client,
+        &format!("economic-context-{request_suffix}"),
+        "Macro.GetContext",
+        arguments,
+    )
+    .await
+}
+
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+async fn assert_installed_cli_macro_context(
+    client: &LoopbackApplicationClient,
+    expected: &InstalledMacroContextEvidence,
+) -> TestResult {
+    let result = execute_installed_cli_command(
+        client,
+        CliCommand::EconomicContext {
+            knowledge_cutoff: Some(required_nonempty_string(
+                &expected.arguments["knowledgeCutoff"],
+                "CLI economic-context knowledge cutoff",
+            )?),
+            effective_date_cutoff: Some(required_nonempty_string(
+                &expected.arguments["effectiveDateCutoff"],
+                "CLI economic-context effective-date cutoff",
+            )?),
+        },
+    )
+    .await
+    .context("read installed economic context through the CLI dispatcher")?;
+    assert_eq!(result.summary(), "economic context read");
+    let context = &result.value()["data"];
+    assert_installed_macro_context(context)?;
+    assert_eq!(stable_installed_macro_context(context), expected.stable);
+    Ok(())
+}
+
+fn assert_installed_macro_context(context: &Value) -> TestResult {
+    assert_eq!(context["availability"], "partial");
+    assert_eq!(context["selection"]["complete"], false);
+    assert_eq!(context["coverage"]["requested"], 12);
+    assert_eq!(context["coverage"]["observed"], 10);
+    assert_eq!(context["coverage"]["missing"], 1);
+    assert_eq!(context["coverage"]["unavailable"], 1);
+    let observations = context["observations"]
+        .as_array()
+        .context("economic context omitted its observations")?;
+    assert_eq!(observations.len(), 12);
+    assert_eq!(observations[0]["indicatorId"], "us-government-yield-1m");
+    assert_eq!(observations[9]["indicatorId"], "us-government-yield-20y");
+    assert_eq!(observations[9]["availability"], "missing");
+    assert_eq!(observations[11]["indicatorId"], "us-unemployment-rate");
+    assert_eq!(observations[11]["availability"], "unavailable");
+    let encoded = serde_json::to_string(context)?.to_ascii_lowercase();
+    for forbidden in [
+        "federal reserve",
+        "fred",
+        "alfred",
+        "h15",
+        "provider",
+        "source",
+        "manifest",
+        "digest",
+    ] {
+        assert!(
+            !encoded.contains(forbidden),
+            "ordinary economic context exposed `{forbidden}`: {context}"
+        );
+    }
+    Ok(())
+}
+
+fn stable_installed_macro_context(context: &Value) -> Value {
+    json!({
+        "availability": context["availability"],
+        "selection": {
+            "knowledgeCutoff": context["selection"]["knowledgeCutoff"],
+            "effectiveDateCutoff": context["selection"]["effectiveDateCutoff"],
+            "complete": context["selection"]["complete"],
+        },
+        "confidence": context["confidence"],
+        "coverage": context["coverage"],
+        "observations": context["observations"],
+    })
 }
 
 #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
@@ -2551,15 +2726,16 @@ async fn exercise_installed_relay(
     client: NamedClient,
     transport: Arc<dyn market_squawk_mcp::McpRelayTransport>,
 ) -> TestResult {
-    exercise_installed_relay_with_gate(client, transport, None, None).await
+    exercise_installed_relay_with_gate(client, transport, None, None, None).await
 }
 
 async fn exercise_installed_relay_with_market(
     client: NamedClient,
     transport: Arc<dyn market_squawk_mcp::McpRelayTransport>,
     real_alpaca: Option<&RealAlpacaEvidence>,
+    macro_context: Option<&InstalledMacroContextEvidence>,
 ) -> TestResult {
-    exercise_installed_relay_with_gate(client, transport, None, real_alpaca).await
+    exercise_installed_relay_with_gate(client, transport, None, real_alpaca, macro_context).await
 }
 
 struct ConcurrentRelayGate {
@@ -2589,6 +2765,7 @@ async fn exercise_concurrent_installed_relays(
             .context("admit concurrent Claude Code relay")?,
         Some(claude_gate),
         None,
+        None,
     );
     let codex = exercise_installed_relay_with_gate(
         NamedClient::Codex,
@@ -2596,6 +2773,7 @@ async fn exercise_concurrent_installed_relays(
             .connect_mcp_relay(NamedClient::Codex)
             .context("admit concurrent Codex relay")?,
         Some(codex_gate),
+        None,
         None,
     );
     let collect_evidence = async {
@@ -2687,6 +2865,7 @@ async fn exercise_installed_relay_with_gate(
     transport: Arc<dyn market_squawk_mcp::McpRelayTransport>,
     concurrent_gate: Option<Arc<ConcurrentRelayGate>>,
     real_alpaca: Option<&RealAlpacaEvidence>,
+    macro_context: Option<&InstalledMacroContextEvidence>,
 ) -> TestResult {
     let relay = McpStdioRelay::try_new(
         client,
@@ -2750,6 +2929,7 @@ async fn exercise_installed_relay_with_gate(
         .collect::<Result<Vec<_>, _>>()?;
     assert!(names.contains(&"Analysis.Lookup"));
     assert!(names.contains(&"Market.GetOverview"));
+    assert!(names.contains(&"Macro.GetContext"));
     assert!(names.contains(&"Model.ListProductActivity"));
     assert!(names.iter().all(|name| {
         !name.starts_with("Source.")
@@ -2778,6 +2958,25 @@ async fn exercise_installed_relay_with_gate(
         jobs["error"].is_object(),
         "installed MCP accepted hidden Job.List authority: {jobs}"
     );
+    if let Some(expected) = macro_context {
+        let mut arguments = expected.arguments.clone();
+        arguments["resultLimits"] = json!({"maximumItems": 12, "maximumBytes": 1_048_576});
+        write_message(
+            &mut peer_writer,
+            json!({
+                "jsonrpc":"2.0","id":"installed-economic-context","method":"tools/call",
+                "params":{"name":"Macro.GetContext","arguments":arguments}
+            }),
+        )
+        .await
+        .context("write installed relay economic-context request")?;
+        let response = read_message(&mut peer_reader)
+            .await
+            .context("read installed relay economic-context response")?;
+        let context = &response["result"]["structuredContent"]["data"];
+        assert_installed_macro_context(context)?;
+        assert_eq!(stable_installed_macro_context(context), expected.stable);
+    }
     if let Some(real_alpaca) = real_alpaca {
         write_message(
             &mut peer_writer,

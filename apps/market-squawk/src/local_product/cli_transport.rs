@@ -172,6 +172,10 @@ async fn execute(
     match command {
         Command::Source { command } => source(authority, command).await,
         Command::Market { command } => market(authority, command).await,
+        Command::EconomicContext {
+            knowledge_cutoff,
+            effective_date_cutoff,
+        } => economic_context(authority, knowledge_cutoff, effective_date_cutoff).await,
         Command::Ingest { command } => ingest(authority, command).await,
         Command::Dataset { command } => dataset(authority, command).await,
         Command::Query { command } => query(authority, command).await,
@@ -196,6 +200,29 @@ async fn execute(
         | Command::Mock(_)
         | Command::Replay(_) => Err(CliProductError::WrongCommand),
     }
+}
+
+async fn economic_context(
+    authority: CliAuthority<'_>,
+    knowledge_cutoff: Option<String>,
+    effective_date_cutoff: Option<String>,
+) -> Result<CliProductResult, CliProductError> {
+    let mut arguments = match (knowledge_cutoff, effective_date_cutoff) {
+        (None, None) => Map::new(),
+        (Some(knowledge_cutoff), Some(effective_date_cutoff)) => json_object(json!({
+            "knowledgeCutoff": knowledge_cutoff,
+            "effectiveDateCutoff": effective_date_cutoff,
+        }))?,
+        (Some(_), None) | (None, Some(_)) => return Err(CliProductError::RequestShape),
+    };
+    invoke(
+        authority,
+        "Macro.GetContext",
+        &mut arguments,
+        Some(12),
+        "economic context read",
+    )
+    .await
 }
 
 async fn market(

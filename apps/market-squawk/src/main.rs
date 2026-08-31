@@ -141,6 +141,7 @@ async fn run() -> Result<()> {
         }
         command @ (Command::Source { .. }
         | Command::Market { .. }
+        | Command::EconomicContext { .. }
         | Command::Ingest { .. }
         | Command::Dataset { .. }
         | Command::Query { .. }

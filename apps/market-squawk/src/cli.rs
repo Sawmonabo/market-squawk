@@ -106,6 +106,16 @@ pub enum Command {
         command: MarketCommand,
     },
 
+    /// Show the economic and interest-rate backdrop at one optional point in time.
+    EconomicContext {
+        /// RFC 3339 instant defining what information was known.
+        #[arg(long, requires = "effective_date_cutoff")]
+        knowledge_cutoff: Option<String>,
+        /// Latest effective date admitted into the context, in YYYY-MM-DD form.
+        #[arg(long, requires = "knowledge_cutoff")]
+        effective_date_cutoff: Option<String>,
+    },
+
     /// Capture direct Coinbase Exchange data into the local journal.
     #[command(hide = true)]
     Capture(CaptureArguments),
