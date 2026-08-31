@@ -19,6 +19,7 @@ pub(super) fn evidence_digest(
     for artifact in artifacts {
         digest.update(artifact.artifact_id().as_bytes());
         digest.update(artifact.run_id().as_bytes());
+        digest.update(artifact.publication_ordinal().to_be_bytes());
         text(&mut digest, artifact.relative_reference())?;
         digest.update(artifact.content_hash().bytes());
         digest.update(artifact.size_bytes().to_be_bytes());

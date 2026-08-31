@@ -10,8 +10,9 @@ use uuid::Uuid;
 
 use super::provider_capture::{
     PersistedProviderCaptureBindingEvidence, PreparedProviderCaptureBinding,
-    ProviderMacroPlanCompletionCapture, load_provider_capture_binding_evidence,
-    retain_provider_macro_plan_completion_capture, retain_staged_provider_capture_binding,
+    ProviderArtifactInputCoordinate, ProviderMacroPlanCompletionCapture,
+    load_provider_capture_binding_evidence, retain_provider_macro_plan_completion_capture,
+    retain_staged_provider_capture_binding,
 };
 use super::storage::{append_audit, parse_digest, trusted_catalog_now};
 use super::{Catalog, CatalogError};
@@ -1440,6 +1441,7 @@ pub(crate) fn retain_completed_provider_macro_plan_for_run(
     transaction: &Transaction<'_>,
     run_id: Uuid,
     commit: &ProviderMacroPlanPublicationCommit,
+    coordinates: &[ProviderArtifactInputCoordinate],
     recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
     let completed = load_completed_session(transaction, commit.session.session_id)?;
@@ -1458,6 +1460,15 @@ pub(crate) fn retain_completed_provider_macro_plan_for_run(
         return Err(CatalogError::ProviderCaptureMismatch);
     }
     let pages = load_page_identities(transaction, commit.session.session_id)?;
+    if coordinates.len() != pages.len()
+        || coordinates.iter().enumerate().any(|(ordinal, coordinate)| {
+            coordinates[..ordinal]
+                .iter()
+                .any(|prior| prior == coordinate)
+        })
+    {
+        return Err(CatalogError::ProviderCaptureConflict);
+    }
     if transaction.query_row(
         "SELECT COUNT(*) FROM ingest_run_provider_capture_bindings WHERE run_id=?1",
         [run_id.to_string()],
@@ -1466,16 +1477,21 @@ pub(crate) fn retain_completed_provider_macro_plan_for_run(
     {
         return Err(CatalogError::ProviderCaptureConflict);
     }
-    for page in &pages {
+    for (page, coordinate) in pages.iter().zip(coordinates) {
         if load_provider_capture_binding_evidence(transaction, page.binding_digest)?.is_none() {
             return Err(CatalogError::CorruptCatalog);
         }
         transaction.execute(
             "INSERT INTO ingest_run_provider_capture_bindings
-             (run_id, input_ordinal, binding_digest, source_id) VALUES (?1, ?2, ?3, ?4)",
+             (run_id, input_ordinal, output_artifact_ordinal, object_input_ordinal,
+              binding_digest, source_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 run_id.to_string(),
                 i64::from(page.ordinal),
+                i64::try_from(coordinate.output_artifact_ordinal())
+                    .map_err(|_| CatalogError::ProviderCaptureConflict)?,
+                i64::try_from(coordinate.object_input_ordinal())
+                    .map_err(|_| CatalogError::ProviderCaptureConflict)?,
                 digest_bytes(page.binding_digest),
                 completed.key.source_id.as_str(),
             ],
@@ -2176,6 +2192,8 @@ mod tests {
         ordering.execute_batch(
             "CREATE TABLE ingest_run_provider_capture_bindings (
                  run_id TEXT NOT NULL, input_ordinal INTEGER NOT NULL,
+                 output_artifact_ordinal INTEGER NOT NULL,
+                 object_input_ordinal INTEGER NOT NULL,
                  binding_digest BLOB NOT NULL
              );
              CREATE TABLE analytical_generation_provider_capture_bindings (
@@ -2188,7 +2206,8 @@ mod tests {
         let page_zero_binding = EvidenceDigest::new(DigestAlgorithm::Sha256, [0xfe; 32]);
         let page_one_binding = EvidenceDigest::new(DigestAlgorithm::Sha256, [0x01; 32]);
         ordering.execute(
-            "INSERT INTO ingest_run_provider_capture_bindings VALUES (?1, 0, ?2), (?1, 1, ?3)",
+            "INSERT INTO ingest_run_provider_capture_bindings VALUES
+             (?1, 0, 0, 0, ?2), (?1, 1, 0, 1, ?3)",
             params![
                 run_id.to_string(),
                 digest_bytes(page_zero_binding),

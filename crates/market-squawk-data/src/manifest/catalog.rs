@@ -42,11 +42,12 @@ use super::{
 use crate::OptionMarketPointInTimeRequest;
 use crate::catalog::exact_catalog_file_binding;
 use crate::catalog::{
-    PreparedProviderCaptureBinding, ProviderMacroPlanPublicationCommit,
-    ProviderMacroPlanPublishedHead, ProviderMacroPlanRestartProjection, PublicationSourceEvidence,
-    complete_ingest_in_transaction, load_provider_macro_plan_head,
-    publish_artifact_manifest_in_transaction, publish_provider_macro_plan_record,
-    reconstruct_provider_macro_plan_projection, trusted_catalog_now,
+    PreparedProviderCaptureBinding, ProviderArtifactInputCoordinate,
+    ProviderMacroPlanPublicationCommit, ProviderMacroPlanPublishedHead,
+    ProviderMacroPlanRestartProjection, PublicationSourceEvidence, complete_ingest_in_transaction,
+    load_provider_macro_plan_head, publish_artifact_manifest_in_transaction,
+    publish_provider_macro_plan_record, reconstruct_provider_macro_plan_projection,
+    trusted_catalog_now,
 };
 use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
 use crate::{
@@ -779,7 +780,7 @@ impl AnalyticalManifestCatalog {
         &self,
         dataset_id: DatasetId,
         schema: &DatasetSchemaRef,
-        object: ManifestObject,
+        new_objects: Vec<ManifestObject>,
     ) -> Result<ManifestPlan, ManifestCatalogError> {
         DatasetSchemaRegistry::local().resolve(schema)?;
         let connection = self.lock()?;
@@ -788,7 +789,7 @@ impl AnalyticalManifestCatalog {
         ManifestPlan::append(
             dataset_id,
             previous.as_ref().map(PinnedDataset::plan),
-            object,
+            new_objects,
             self.max_objects_per_generation,
         )
         .map_err(Into::into)
@@ -823,7 +824,7 @@ impl AnalyticalManifestCatalog {
     pub(crate) fn commit_generation(
         &self,
         plan: &ManifestPlan,
-        artifact: &ArtifactRecord,
+        artifacts: &[ArtifactRecord],
         anchor: &DatasetManifestRecord,
         schema: &DatasetSchemaRef,
         kind: GenerationKind,
@@ -839,24 +840,13 @@ impl AnalyticalManifestCatalog {
             return Err(ManifestCatalogError::GenerationConflict);
         }
         DatasetSchemaRegistry::local().resolve(schema)?;
-        if anchor.artifact_id() != artifact.artifact_id()
-            || anchor.schema_version() != schema.version()
-            || sha256_from_evidence(anchor.content_digest())? != plan.content_hash
-            || sha256_from_evidence(artifact.content_digest())?
-                != plan
-                    .objects
-                    .last()
-                    .ok_or(ManifestCatalogError::CorruptCatalog)?
-                    .content_hash
-        {
-            return Err(ManifestCatalogError::AnchorMismatch);
-        }
+        validate_generation_anchor(plan, artifacts, anchor, schema)?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let manifest = commit_generation_in_transaction(
             &transaction,
             plan,
-            artifact,
+            artifacts,
             anchor,
             schema,
             kind,
@@ -868,20 +858,19 @@ impl AnalyticalManifestCatalog {
         Ok(manifest)
     }
 
-    /// Commits provider raw authority, artifact metadata, immutable generation, and successful
-    /// run completion in one SQLite transaction. No process-local provider authority is required
-    /// after this transition commits.
+    /// Commits source authority, the ordered artifact group, its immutable generation, and run
+    /// success in one SQLite transaction.
     #[allow(
         clippy::too_many_arguments,
         reason = "the atomic provider boundary keeps every independently verified input explicit"
     )]
-    pub(crate) fn commit_provider_ingest_publication(
+    pub(crate) fn commit_ingest_publication(
         &self,
         catalog_session_id: Uuid,
         result_limits: CatalogResultLimits,
         reservation: &IngestReservation,
         plan: &ManifestPlan,
-        artifact: &ArtifactRecord,
+        artifacts: &[ArtifactRecord],
         anchor: &DatasetManifestRecord,
         schema: &DatasetSchemaRef,
         source_input: &IngestRunRecord,
@@ -895,11 +884,13 @@ impl AnalyticalManifestCatalog {
             ));
         }
         DatasetSchemaRegistry::local().resolve(schema)?;
-        validate_generation_anchor(plan, artifact, anchor, schema)?;
+        validate_generation_anchor(plan, artifacts, anchor, schema)?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let catalog_now = trusted_catalog_now(&transaction)?;
-        if artifact.created_at() > catalog_now
+        if artifacts
+            .iter()
+            .any(|artifact| artifact.created_at() > catalog_now)
             || anchor.created_at() > catalog_now
             || catalog_now < reservation.requested_at()
         {
@@ -907,25 +898,23 @@ impl AnalyticalManifestCatalog {
                 CatalogError::PublicationTimeConflict,
             ));
         }
-        let artifact = ArtifactRecord::try_new(
-            artifact.relative_reference(),
-            artifact.content_digest(),
-            artifact.size_bytes(),
-            catalog_now,
-        )?;
+        let artifacts = retime_artifacts(artifacts, catalog_now)?;
+        let final_artifact = artifacts
+            .last()
+            .ok_or(ManifestCatalogError::AnchorMismatch)?;
         let anchor = DatasetManifestRecord::try_new(
             anchor.dataset_name().clone(),
             anchor.schema_version(),
-            artifact.artifact_id(),
+            final_artifact.artifact_id(),
             anchor.content_digest(),
             catalog_now,
         );
-        validate_generation_anchor(plan, &artifact, &anchor, schema)?;
+        validate_generation_anchor(plan, &artifacts, &anchor, schema)?;
         let publication = publish_artifact_manifest_in_transaction(
             &transaction,
             result_limits,
             reservation,
-            &artifact,
+            &artifacts,
             &anchor,
             source_evidence,
             catalog_now,
@@ -933,7 +922,7 @@ impl AnalyticalManifestCatalog {
         let manifest = commit_generation_in_transaction(
             &transaction,
             plan,
-            publication.artifact(),
+            publication.artifacts(),
             publication.manifest(),
             schema,
             GenerationKind::Ingest,
@@ -964,11 +953,12 @@ impl AnalyticalManifestCatalog {
         result_limits: CatalogResultLimits,
         reservation: &IngestReservation,
         plan: &ManifestPlan,
-        artifact: &ArtifactRecord,
+        artifacts: &[ArtifactRecord],
         anchor: &DatasetManifestRecord,
         schema: &DatasetSchemaRef,
         source_input: &IngestRunRecord,
         captures: &[PreparedProviderCaptureBinding],
+        capture_coordinates: &[ProviderArtifactInputCoordinate],
         completion_digest: EvidenceDigest,
         publication_digest: EvidenceDigest,
         total_rows: u64,
@@ -987,15 +977,27 @@ impl AnalyticalManifestCatalog {
             publication_digest,
             total_rows,
         )?;
-        if plan.objects.last().map(ManifestObject::row_count) != Some(total_rows) {
+        let suffix = plan
+            .objects()
+            .get(plan.objects().len().saturating_sub(artifacts.len())..)
+            .ok_or(ManifestCatalogError::ProviderMacroPlanMismatch)?;
+        if capture_coordinates.len() != captures.len()
+            || suffix.len() != artifacts.len()
+            || suffix
+                .iter()
+                .try_fold(0_u64, |total, object| total.checked_add(object.row_count()))
+                != Some(total_rows)
+        {
             return Err(ManifestCatalogError::ProviderMacroPlanMismatch);
         }
         DatasetSchemaRegistry::local().resolve(schema)?;
-        validate_generation_anchor(plan, artifact, anchor, schema)?;
+        validate_generation_anchor(plan, artifacts, anchor, schema)?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let catalog_now = trusted_catalog_now(&transaction)?;
-        if artifact.created_at() > catalog_now
+        if artifacts
+            .iter()
+            .any(|artifact| artifact.created_at() > catalog_now)
             || anchor.created_at() > catalog_now
             || catalog_now < reservation.requested_at()
         {
@@ -1003,33 +1005,31 @@ impl AnalyticalManifestCatalog {
                 CatalogError::PublicationTimeConflict,
             ));
         }
-        let artifact = ArtifactRecord::try_new(
-            artifact.relative_reference(),
-            artifact.content_digest(),
-            artifact.size_bytes(),
-            catalog_now,
-        )?;
+        let artifacts = retime_artifacts(artifacts, catalog_now)?;
+        let final_artifact = artifacts
+            .last()
+            .ok_or(ManifestCatalogError::AnchorMismatch)?;
         let anchor = DatasetManifestRecord::try_new(
             anchor.dataset_name().clone(),
             anchor.schema_version(),
-            artifact.artifact_id(),
+            final_artifact.artifact_id(),
             anchor.content_digest(),
             catalog_now,
         );
-        validate_generation_anchor(plan, &artifact, &anchor, schema)?;
+        validate_generation_anchor(plan, &artifacts, &anchor, schema)?;
         let publication = publish_artifact_manifest_in_transaction(
             &transaction,
             result_limits,
             reservation,
-            &artifact,
+            &artifacts,
             &anchor,
-            PublicationSourceEvidence::ProviderMacroPlan(captures),
+            PublicationSourceEvidence::ProviderMacroPlan(captures, capture_coordinates),
             catalog_now,
         )?;
         let manifest = commit_generation_in_transaction(
             &transaction,
             plan,
-            publication.artifact(),
+            publication.artifacts(),
             publication.manifest(),
             schema,
             GenerationKind::Ingest,
@@ -1085,25 +1085,29 @@ impl AnalyticalManifestCatalog {
         result_limits: CatalogResultLimits,
         reservation: &IngestReservation,
         plan: &ManifestPlan,
-        artifact: &ArtifactRecord,
+        artifacts: &[ArtifactRecord],
         anchor: &DatasetManifestRecord,
         schema: &DatasetSchemaRef,
         source_input: &IngestRunRecord,
         staged: &ProviderMacroPlanPublicationCommit,
+        capture_coordinates: &[ProviderArtifactInputCoordinate],
     ) -> Result<(DatasetManifestRef, EvidenceDigest), ManifestCatalogError> {
         if reservation.catalog_id() != catalog_session_id
             || reservation.run_id() != source_input.run_id()
             || source_input.operation() != SourceOperation::Persist
             || source_input.payload_digest() != staged.publication_digest()
+            || capture_coordinates.len() != usize::from(staged.data_page_count())
         {
             return Err(ManifestCatalogError::ProviderMacroPlanMismatch);
         }
         DatasetSchemaRegistry::local().resolve(schema)?;
-        validate_generation_anchor(plan, artifact, anchor, schema)?;
+        validate_generation_anchor(plan, artifacts, anchor, schema)?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let catalog_now = trusted_catalog_now(&transaction)?;
-        if artifact.created_at() > catalog_now
+        if artifacts
+            .iter()
+            .any(|artifact| artifact.created_at() > catalog_now)
             || anchor.created_at() > catalog_now
             || catalog_now < reservation.requested_at()
         {
@@ -1111,33 +1115,31 @@ impl AnalyticalManifestCatalog {
                 CatalogError::PublicationTimeConflict,
             ));
         }
-        let artifact = ArtifactRecord::try_new(
-            artifact.relative_reference(),
-            artifact.content_digest(),
-            artifact.size_bytes(),
-            catalog_now,
-        )?;
+        let artifacts = retime_artifacts(artifacts, catalog_now)?;
+        let final_artifact = artifacts
+            .last()
+            .ok_or(ManifestCatalogError::AnchorMismatch)?;
         let anchor = DatasetManifestRecord::try_new(
             anchor.dataset_name().clone(),
             anchor.schema_version(),
-            artifact.artifact_id(),
+            final_artifact.artifact_id(),
             anchor.content_digest(),
             catalog_now,
         );
-        validate_generation_anchor(plan, &artifact, &anchor, schema)?;
+        validate_generation_anchor(plan, &artifacts, &anchor, schema)?;
         let publication = publish_artifact_manifest_in_transaction(
             &transaction,
             result_limits,
             reservation,
-            &artifact,
+            &artifacts,
             &anchor,
-            PublicationSourceEvidence::StagedProviderMacroPlan(staged),
+            PublicationSourceEvidence::StagedProviderMacroPlan(staged, capture_coordinates),
             catalog_now,
         )?;
         let manifest = commit_generation_in_transaction(
             &transaction,
             plan,
-            publication.artifact(),
+            publication.artifacts(),
             publication.manifest(),
             schema,
             GenerationKind::Ingest,
@@ -1654,8 +1656,7 @@ impl AnalyticalManifestCatalog {
                  FROM analytical_generations AS generations
                  JOIN dataset_manifests AS manifests
                    ON manifests.manifest_id=generations.anchor_manifest_id
-                 JOIN artifacts ON artifacts.artifact_id=manifests.artifact_id
-                 WHERE artifacts.run_id=?1",
+                 WHERE manifests.run_id=?1",
                 [run_id.to_string()],
                 |row| {
                     Ok((
@@ -2893,23 +2894,56 @@ pub enum ManifestCatalogError {
 
 fn validate_generation_anchor(
     plan: &ManifestPlan,
-    artifact: &ArtifactRecord,
+    artifacts: &[ArtifactRecord],
     anchor: &DatasetManifestRecord,
     schema: &DatasetSchemaRef,
 ) -> Result<(), ManifestCatalogError> {
-    if anchor.artifact_id() != artifact.artifact_id()
+    let Some(final_artifact) = artifacts.last() else {
+        return Err(ManifestCatalogError::AnchorMismatch);
+    };
+    let suffix_start = plan
+        .objects()
+        .len()
+        .checked_sub(artifacts.len())
+        .ok_or(ManifestCatalogError::AnchorMismatch)?;
+    let suffix = &plan.objects()[suffix_start..];
+    for (artifact, object) in artifacts.iter().zip(suffix) {
+        if sha256_from_evidence(artifact.content_digest())? != object.content_hash()
+            || artifact.size_bytes() != object.size_bytes()
+        {
+            return Err(ManifestCatalogError::AnchorMismatch);
+        }
+    }
+    if artifacts.len() > 1024
+        || anchor.artifact_id() != final_artifact.artifact_id()
         || anchor.schema_version() != schema.version()
         || sha256_from_evidence(anchor.content_digest())? != plan.content_hash
-        || sha256_from_evidence(artifact.content_digest())?
-            != plan
-                .objects
-                .last()
-                .ok_or(ManifestCatalogError::CorruptCatalog)?
-                .content_hash
     {
         return Err(ManifestCatalogError::AnchorMismatch);
     }
     Ok(())
+}
+
+fn retime_artifacts(
+    artifacts: &[ArtifactRecord],
+    created_at: Timestamp,
+) -> Result<Vec<ArtifactRecord>, ManifestCatalogError> {
+    if artifacts.is_empty() || artifacts.len() > 1024 {
+        return Err(ManifestCatalogError::AnchorMismatch);
+    }
+    let mut retained = Vec::new();
+    retained
+        .try_reserve_exact(artifacts.len())
+        .map_err(|_| ManifestCatalogError::CountOverflow)?;
+    for artifact in artifacts {
+        retained.push(ArtifactRecord::try_new(
+            artifact.relative_reference(),
+            artifact.content_digest(),
+            artifact.size_bytes(),
+            created_at,
+        )?);
+    }
+    Ok(retained)
 }
 
 #[allow(
@@ -2919,7 +2953,7 @@ fn validate_generation_anchor(
 fn commit_generation_in_transaction(
     transaction: &Transaction<'_>,
     plan: &ManifestPlan,
-    artifact: &ArtifactRecord,
+    artifacts: &[ArtifactRecord],
     anchor: &DatasetManifestRecord,
     schema: &DatasetSchemaRef,
     kind: GenerationKind,
@@ -2936,7 +2970,7 @@ fn commit_generation_in_transaction(
         return Err(ManifestCatalogError::GenerationConflict);
     }
     DatasetSchemaRegistry::local().resolve(schema)?;
-    validate_generation_anchor(plan, artifact, anchor, schema)?;
+    validate_generation_anchor(plan, artifacts, anchor, schema)?;
     if let Some(existing) = manifest_for_anchor(transaction, anchor.manifest_id())? {
         let pinned = load_pinned(transaction, &existing, max_objects_per_generation)?;
         if pinned.plan == *plan
@@ -2957,7 +2991,13 @@ fn commit_generation_in_transaction(
         return Err(ManifestCatalogError::GenerationConflict);
     }
     let previous = load_latest(transaction, &plan.dataset_id, max_objects_per_generation)?;
-    let current_source = source_for_artifact(transaction, artifact.artifact_id())?;
+    let current_source = source_for_artifact(
+        transaction,
+        artifacts
+            .last()
+            .ok_or(ManifestCatalogError::AnchorMismatch)?
+            .artifact_id(),
+    )?;
     if let Some(previous) = previous.as_ref()
         && generation_source(transaction, previous.manifest())? != current_source
     {
@@ -2969,17 +3009,28 @@ fn commit_generation_in_transaction(
     {
         return Err(ManifestCatalogError::SchemaMismatch);
     }
+    let previous_object_count = previous
+        .as_ref()
+        .map(|value| value.plan().objects().len())
+        .unwrap_or(0);
+    let new_objects = plan
+        .objects()
+        .get(previous_object_count..)
+        .ok_or(ManifestCatalogError::GenerationConflict)?;
+    if new_objects.len() != artifacts.len() {
+        return Err(ManifestCatalogError::GenerationConflict);
+    }
     let expected = match kind {
         GenerationKind::Ingest => ManifestPlan::append(
             plan.dataset_id.clone(),
             previous.as_ref().map(PinnedDataset::plan),
-            plan.objects
-                .last()
-                .cloned()
-                .ok_or(ManifestCatalogError::CorruptCatalog)?,
+            new_objects.to_vec(),
             max_objects_per_generation,
         )?,
         GenerationKind::Compaction => {
+            if artifacts.len() != 1 {
+                return Err(ManifestCatalogError::GenerationConflict);
+            }
             let previous = previous
                 .as_ref()
                 .ok_or(ManifestCatalogError::GenerationConflict)?;
@@ -3032,7 +3083,6 @@ fn commit_generation_in_transaction(
         ],
     )?;
     let generation_sequence = transaction.last_insert_rowid();
-    insert_generation_source_input(transaction, generation_sequence, kind, source_input)?;
     let prior_objects = previous
         .as_ref()
         .map(PinnedDataset::objects)
@@ -3049,23 +3099,26 @@ fn commit_generation_in_transaction(
                     &prior.object,
                 )?;
             }
-            insert_generation_object(
-                transaction,
-                &plan.dataset_id,
-                version,
-                prior_objects.len(),
-                artifact.artifact_id(),
-                plan.objects
-                    .last()
-                    .ok_or(ManifestCatalogError::CorruptCatalog)?,
-            )?;
+            for (offset, (artifact, object)) in artifacts.iter().zip(new_objects).enumerate() {
+                insert_generation_object(
+                    transaction,
+                    &plan.dataset_id,
+                    version,
+                    prior_objects
+                        .len()
+                        .checked_add(offset)
+                        .ok_or(ManifestCatalogError::CountOverflow)?,
+                    artifact.artifact_id(),
+                    object,
+                )?;
+            }
         }
         GenerationKind::Compaction => insert_generation_object(
             transaction,
             &plan.dataset_id,
             version,
             0,
-            artifact.artifact_id(),
+            artifacts[0].artifact_id(),
             plan.objects
                 .last()
                 .ok_or(ManifestCatalogError::CorruptCatalog)?,
@@ -3075,13 +3128,16 @@ fn commit_generation_in_transaction(
     if let Some(parent) = parent.as_ref() {
         insert_generation_parent(transaction, &plan.dataset_id, version, 0, parent)?;
     }
+    insert_generation_source_input(transaction, generation_sequence, kind, source_input)?;
     propagate_generation_provider_capture_bindings(transaction, generation_sequence)?;
     propagate_generation_provider_publication_bindings(transaction, generation_sequence)?;
     insert_generation_market_bar_history_inputs(
         transaction,
         generation_sequence,
         plan,
-        artifact,
+        artifacts
+            .last()
+            .ok_or(ManifestCatalogError::AnchorMismatch)?,
         anchor,
         schema,
         source_input,
@@ -4051,8 +4107,7 @@ fn generation_source(
              FROM analytical_generations AS generations
              JOIN dataset_manifests AS manifests
                ON manifests.manifest_id=generations.anchor_manifest_id
-             JOIN artifacts ON artifacts.artifact_id=manifests.artifact_id
-             JOIN ingest_runs AS runs ON runs.run_id=artifacts.run_id
+             JOIN ingest_runs AS runs ON runs.run_id=manifests.run_id
              WHERE generations.dataset_id=?1 AND generations.manifest_version=?2",
             params![
                 manifest.dataset_id().as_str(),
@@ -4394,21 +4449,11 @@ mod tests {
         let dataset = DatasetId::try_from("schema-bound")?;
         let prior_object =
             ManifestObject::try_new(Sha256Digest::new([1; 32]), 1, 1, Sha256Digest::new([2; 32]))?;
-        let prior_plan = ManifestPlan::append(dataset.clone(), None, prior_object.clone(), 8)?;
+        let prior_plan =
+            ManifestPlan::append(dataset.clone(), None, vec![prior_object.clone()], 8)?;
         let artifact_id = uuid::Uuid::new_v4();
         let connection = Connection::open(location.path())?;
         connection.pragma_update(None, "foreign_keys", false)?;
-        connection.execute(
-            "INSERT INTO artifacts
-             (artifact_id, run_id, relative_reference, content_algorithm, content_digest,
-              size_bytes, created_at_ns)
-             VALUES (?1, ?2, 'objects/fixture.parquet', 1, ?3, 1, 1)",
-            params![
-                artifact_id.to_string(),
-                uuid::Uuid::new_v4().to_string(),
-                prior_object.content_hash().bytes().as_slice(),
-            ],
-        )?;
         connection.execute(
             "INSERT INTO analytical_generations
              (dataset_id, manifest_version, content_hash, lineage_hash, row_count, total_bytes,
@@ -4547,8 +4592,16 @@ mod tests {
             ManifestPlan::derive(output_dataset.clone(), vec![high.clone(), low.clone()], 8)?;
         let low_artifact = fixture_artifact(&low, 21)?;
         let high_artifact = fixture_artifact(&high, 22)?;
-        insert_artifact(&connection, &low_artifact)?;
-        insert_artifact(&connection, &high_artifact)?;
+        let low_run = insert_artifact(&connection, &low_artifact)?;
+        let high_run = insert_artifact(&connection, &high_artifact)?;
+        let high_anchor = DatasetManifestRecord::try_new(
+            SourceIdentifier::try_from("features.derived-object")?,
+            schema.version(),
+            high_artifact.artifact_id(),
+            high_artifact.content_digest(),
+            Timestamp::from_unix_nanos(22),
+        );
+        insert_manifest(&connection, high_run, &high_anchor)?;
         let anchor = DatasetManifestRecord::try_new(
             SourceIdentifier::try_from(output_dataset.as_str())?,
             schema.version(),
@@ -4556,7 +4609,7 @@ mod tests {
             plan.content_hash().evidence(),
             Timestamp::from_unix_nanos(21),
         );
-        insert_manifest(&connection, &anchor)?;
+        insert_manifest(&connection, low_run, &anchor)?;
         drop(connection);
 
         let parents =
@@ -4714,9 +4767,9 @@ mod tests {
         created_at_ns: i64,
     ) -> Result<DatasetManifestRef, Box<dyn Error>> {
         let dataset = DatasetId::try_from(dataset_name)?;
-        let plan = ManifestPlan::append(dataset.clone(), None, object.clone(), 8)?;
+        let plan = ManifestPlan::append(dataset.clone(), None, vec![object.clone()], 8)?;
         let artifact = fixture_artifact(&object, created_at_ns)?;
-        insert_artifact(connection, &artifact)?;
+        let run_id = insert_artifact(connection, &artifact)?;
         let anchor = DatasetManifestRecord::try_new(
             SourceIdentifier::try_from(dataset_name)?,
             schema.version(),
@@ -4724,7 +4777,7 @@ mod tests {
             plan.content_hash().evidence(),
             Timestamp::from_unix_nanos(created_at_ns),
         );
-        insert_manifest(connection, &anchor)?;
+        insert_manifest(connection, run_id, &anchor)?;
         connection.execute(
             "INSERT INTO analytical_generations
              (dataset_id, manifest_version, content_hash, lineage_hash, row_count, total_bytes,
@@ -4785,7 +4838,7 @@ mod tests {
     fn insert_artifact(
         connection: &Connection,
         artifact: &ArtifactRecord,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<uuid::Uuid, Box<dyn Error>> {
         let algorithm = match artifact.content_digest().algorithm() {
             DigestAlgorithm::Sha256 => 1_i64,
             DigestAlgorithm::Blake3 => 2_i64,
@@ -4837,7 +4890,7 @@ mod tests {
             "INSERT INTO ingest_runs
              (run_id, idempotency_key, source_id, payload_algorithm, payload_digest, operation,
               rights_id, state, requested_at_ns, completed_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'persist', ?6, 'succeeded', 2, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, 'persist', ?6, 'reserved', 2, NULL)",
             params![
                 run_id.to_string(),
                 artifact.artifact_id().to_string(),
@@ -4845,14 +4898,13 @@ mod tests {
                 algorithm,
                 artifact.content_digest().bytes(),
                 rights.fingerprint().as_slice(),
-                artifact.created_at().unix_nanos(),
             ],
         )?;
         connection.execute(
             "INSERT INTO artifacts
-             (artifact_id, run_id, relative_reference, content_algorithm, content_digest,
-              size_bytes, created_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (artifact_id, run_id, publication_ordinal, relative_reference, content_algorithm,
+              content_digest, size_bytes, created_at_ns)
+             VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7)",
             params![
                 artifact.artifact_id().to_string(),
                 run_id.to_string(),
@@ -4863,7 +4915,7 @@ mod tests {
                 artifact.created_at().unix_nanos(),
             ],
         )?;
-        Ok(())
+        Ok(run_id)
     }
 
     fn insert_control_fixture(connection: &Connection) -> Result<(), Box<dyn Error>> {
@@ -4886,6 +4938,7 @@ mod tests {
 
     fn insert_manifest(
         connection: &Connection,
+        run_id: uuid::Uuid,
         manifest: &DatasetManifestRecord,
     ) -> Result<(), Box<dyn Error>> {
         let algorithm = match manifest.content_digest().algorithm() {
@@ -4894,11 +4947,12 @@ mod tests {
         };
         connection.execute(
             "INSERT INTO dataset_manifests
-             (manifest_id, dataset_name, schema_version, artifact_id, content_algorithm,
+             (manifest_id, run_id, dataset_name, schema_version, artifact_id, content_algorithm,
               content_digest, created_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 manifest.manifest_id().to_string(),
+                run_id.to_string(),
                 manifest.dataset_name().as_str(),
                 i64::from(manifest.schema_version().get()),
                 manifest.artifact_id().to_string(),
@@ -4906,6 +4960,12 @@ mod tests {
                 manifest.content_digest().bytes(),
                 manifest.created_at().unix_nanos(),
             ],
+        )?;
+        connection.execute(
+            "UPDATE ingest_runs
+             SET state='succeeded', completed_at_ns=?2
+             WHERE run_id=?1",
+            params![run_id.to_string(), manifest.created_at().unix_nanos()],
         )?;
         Ok(())
     }

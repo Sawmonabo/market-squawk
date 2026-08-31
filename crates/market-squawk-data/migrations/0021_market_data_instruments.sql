@@ -1476,16 +1476,31 @@ END;
 CREATE TABLE ingest_run_provider_capture_bindings (
     run_id TEXT NOT NULL REFERENCES ingest_runs(run_id),
     input_ordinal INTEGER NOT NULL CHECK (input_ordinal BETWEEN 0 AND 4095),
+    output_artifact_ordinal INTEGER NOT NULL CHECK (
+        output_artifact_ordinal BETWEEN 0 AND 1023
+    ),
+    object_input_ordinal INTEGER NOT NULL CHECK (
+        object_input_ordinal BETWEEN 0 AND 4095
+    ),
     binding_digest BLOB NOT NULL UNIQUE
         REFERENCES provider_capture_bindings(binding_digest),
     source_id TEXT NOT NULL REFERENCES sources(source_id),
     PRIMARY KEY (run_id, input_ordinal),
-    UNIQUE (run_id, binding_digest)
+    UNIQUE (run_id, binding_digest),
+    UNIQUE (run_id, output_artifact_ordinal, object_input_ordinal),
+    FOREIGN KEY (run_id, output_artifact_ordinal)
+        REFERENCES artifacts(run_id, publication_ordinal)
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE ingest_run_provider_publication_bindings (
     run_id TEXT NOT NULL REFERENCES ingest_runs(run_id),
     input_ordinal INTEGER NOT NULL CHECK (input_ordinal BETWEEN 0 AND 4095),
+    output_artifact_ordinal INTEGER NOT NULL CHECK (
+        output_artifact_ordinal BETWEEN 0 AND 1023
+    ),
+    object_input_ordinal INTEGER NOT NULL CHECK (
+        object_input_ordinal BETWEEN 0 AND 4095
+    ),
     publication_digest BLOB NOT NULL UNIQUE CHECK (
         length(publication_digest) = 32 AND publication_digest <> zeroblob(32)
     ),
@@ -1511,6 +1526,9 @@ CREATE TABLE ingest_run_provider_publication_bindings (
         REFERENCES provider_logical_publication_bindings(binding_digest),
     PRIMARY KEY (run_id, input_ordinal),
     UNIQUE (run_id, publication_digest),
+    UNIQUE (run_id, output_artifact_ordinal, object_input_ordinal),
+    FOREIGN KEY (run_id, output_artifact_ordinal)
+        REFERENCES artifacts(run_id, publication_ordinal),
     CHECK (
         (publication_kind='response_market_event'
             AND response_binding_digest IS NOT NULL
@@ -3018,7 +3036,15 @@ WHEN NOT EXISTS (
       AND generation.content_hash = NEW.manifest_content_hash
       AND generation.anchor_manifest_id = NEW.anchor_manifest_id
       AND generation.generation_kind = 'ingest'
-      AND generation.row_count = NEW.analytical_row_count
+      AND NEW.analytical_row_count = (
+          SELECT SUM(object.row_count)
+          FROM artifacts AS output
+          JOIN analytical_generation_objects AS object
+            ON object.dataset_id = generation.dataset_id
+           AND object.manifest_version = generation.manifest_version
+           AND object.artifact_id = output.artifact_id
+          WHERE output.run_id = run.run_id
+      )
       AND run.run_id = NEW.run_id
       AND run.state = 'reserved'
       AND run.operation = 'persist'
@@ -3041,6 +3067,43 @@ WHEN NOT EXISTS (
            WHERE page.session_id = session.session_id) = session.data_page_count
       AND (SELECT COUNT(*) FROM ingest_run_provider_capture_bindings AS input
            WHERE input.run_id = run.run_id) = session.data_page_count
+      AND (SELECT MIN(input.input_ordinal)
+           FROM ingest_run_provider_capture_bindings AS input
+           WHERE input.run_id = run.run_id) = 0
+      AND (SELECT MAX(input.input_ordinal)
+           FROM ingest_run_provider_capture_bindings AS input
+           WHERE input.run_id = run.run_id) = session.data_page_count - 1
+      AND NOT EXISTS (
+          SELECT 1
+          FROM artifacts AS output
+          WHERE output.run_id = run.run_id
+            AND (
+                NOT EXISTS (
+                    SELECT 1
+                    FROM ingest_run_provider_capture_bindings AS input
+                    WHERE input.run_id = run.run_id
+                      AND input.output_artifact_ordinal = output.publication_ordinal
+                )
+                OR (SELECT MIN(input.object_input_ordinal)
+                    FROM ingest_run_provider_capture_bindings AS input
+                    WHERE input.run_id = run.run_id
+                      AND input.output_artifact_ordinal = output.publication_ordinal) <> 0
+                OR (SELECT MAX(input.object_input_ordinal)
+                    FROM ingest_run_provider_capture_bindings AS input
+                    WHERE input.run_id = run.run_id
+                      AND input.output_artifact_ordinal = output.publication_ordinal) <> (
+                    SELECT COUNT(*) - 1
+                    FROM ingest_run_provider_capture_bindings AS input
+                    WHERE input.run_id = run.run_id
+                      AND input.output_artifact_ordinal = output.publication_ordinal
+                )
+            )
+      )
+      AND (SELECT SUM(binding.canonical_record_count)
+           FROM ingest_run_provider_capture_bindings AS input
+           JOIN provider_capture_bindings AS binding
+             ON binding.binding_digest = input.binding_digest
+           WHERE input.run_id = run.run_id) = session.analytical_row_count
       AND (SELECT COUNT(*)
            FROM analytical_generation_provider_capture_bindings AS input
            WHERE input.generation_sequence = generation.generation_sequence
@@ -3048,6 +3111,177 @@ WHEN NOT EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'invalid provider macro-plan publication');
+END;
+
+CREATE TRIGGER ingest_runs_provider_capture_mapping_guarded_success
+BEFORE UPDATE ON ingest_runs
+WHEN NEW.state = 'succeeded'
+ AND EXISTS (
+     SELECT 1 FROM ingest_run_provider_capture_bindings AS input
+     WHERE input.run_id = NEW.run_id
+ )
+ AND (
+     NOT EXISTS (
+         SELECT 1 FROM analytical_generation_source_inputs AS source_input
+         WHERE source_input.run_id = NEW.run_id
+     )
+     OR (SELECT MIN(input.input_ordinal)
+         FROM ingest_run_provider_capture_bindings AS input
+         WHERE input.run_id = NEW.run_id) <> 0
+     OR (SELECT MAX(input.input_ordinal)
+         FROM ingest_run_provider_capture_bindings AS input
+         WHERE input.run_id = NEW.run_id) <> (
+         SELECT COUNT(*) - 1
+         FROM ingest_run_provider_capture_bindings AS input
+         WHERE input.run_id = NEW.run_id
+     )
+     OR EXISTS (
+         SELECT 1
+         FROM artifacts AS output
+         JOIN analytical_generation_source_inputs AS source_input
+           ON source_input.run_id = output.run_id
+         JOIN analytical_generations AS generation
+           ON generation.generation_sequence = source_input.generation_sequence
+         JOIN analytical_generation_objects AS object
+           ON object.dataset_id = generation.dataset_id
+          AND object.manifest_version = generation.manifest_version
+          AND object.artifact_id = output.artifact_id
+         WHERE output.run_id = NEW.run_id
+           AND (
+               NOT EXISTS (
+                   SELECT 1
+                   FROM ingest_run_provider_capture_bindings AS input
+                   WHERE input.run_id = output.run_id
+                     AND input.output_artifact_ordinal = output.publication_ordinal
+               )
+               OR (SELECT MIN(input.object_input_ordinal)
+                   FROM ingest_run_provider_capture_bindings AS input
+                   WHERE input.run_id = output.run_id
+                     AND input.output_artifact_ordinal = output.publication_ordinal) <> 0
+               OR (SELECT MAX(input.object_input_ordinal)
+                   FROM ingest_run_provider_capture_bindings AS input
+                   WHERE input.run_id = output.run_id
+                     AND input.output_artifact_ordinal = output.publication_ordinal) <> (
+                   SELECT COUNT(*) - 1
+                   FROM ingest_run_provider_capture_bindings AS input
+                   WHERE input.run_id = output.run_id
+                     AND input.output_artifact_ordinal = output.publication_ordinal
+               )
+               OR object.row_count <> COALESCE((
+                   SELECT SUM(binding.canonical_record_count)
+                   FROM ingest_run_provider_capture_bindings AS input
+                   JOIN provider_capture_bindings AS binding
+                     ON binding.binding_digest = input.binding_digest
+                   WHERE input.run_id = output.run_id
+                     AND input.output_artifact_ordinal = output.publication_ordinal
+               ), -1)
+           )
+     )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'provider capture inputs do not exactly cover output artifacts');
+END;
+
+CREATE TRIGGER ingest_runs_provider_publication_mapping_guarded_success
+BEFORE UPDATE ON ingest_runs
+WHEN NEW.state = 'succeeded'
+ AND EXISTS (
+     SELECT 1 FROM ingest_run_provider_publication_bindings AS input
+     WHERE input.run_id = NEW.run_id
+ )
+ AND (
+     NOT EXISTS (
+         SELECT 1 FROM analytical_generation_source_inputs AS source_input
+         WHERE source_input.run_id = NEW.run_id
+     )
+     OR (SELECT MIN(input.input_ordinal)
+         FROM ingest_run_provider_publication_bindings AS input
+         WHERE input.run_id = NEW.run_id) <> 0
+     OR (SELECT MAX(input.input_ordinal)
+         FROM ingest_run_provider_publication_bindings AS input
+         WHERE input.run_id = NEW.run_id) <> (
+         SELECT COUNT(*) - 1
+         FROM ingest_run_provider_publication_bindings AS input
+         WHERE input.run_id = NEW.run_id
+     )
+     OR EXISTS (
+         SELECT 1
+         FROM artifacts AS output
+         JOIN analytical_generation_source_inputs AS source_input
+           ON source_input.run_id = output.run_id
+         JOIN analytical_generations AS generation
+           ON generation.generation_sequence = source_input.generation_sequence
+         JOIN analytical_generation_objects AS object
+           ON object.dataset_id = generation.dataset_id
+          AND object.manifest_version = generation.manifest_version
+          AND object.artifact_id = output.artifact_id
+         WHERE output.run_id = NEW.run_id
+           AND (
+               NOT EXISTS (
+                   SELECT 1
+                   FROM ingest_run_provider_publication_bindings AS input
+                   WHERE input.run_id = output.run_id
+                     AND input.output_artifact_ordinal = output.publication_ordinal
+               )
+               OR (SELECT MIN(input.object_input_ordinal)
+                   FROM ingest_run_provider_publication_bindings AS input
+                   WHERE input.run_id = output.run_id
+                     AND input.output_artifact_ordinal = output.publication_ordinal) <> 0
+               OR (SELECT MAX(input.object_input_ordinal)
+                   FROM ingest_run_provider_publication_bindings AS input
+                   WHERE input.run_id = output.run_id
+                     AND input.output_artifact_ordinal = output.publication_ordinal) <> (
+                   SELECT COUNT(*) - 1
+                   FROM ingest_run_provider_publication_bindings AS input
+                   WHERE input.run_id = output.run_id
+                     AND input.output_artifact_ordinal = output.publication_ordinal
+               )
+               OR object.row_count <> COALESCE((
+                   SELECT SUM(
+                       CASE input.publication_kind
+                           WHEN 'response_market_event' THEN (
+                               SELECT binding.canonical_event_count
+                               FROM provider_response_market_event_bindings AS binding
+                               WHERE binding.response_event_binding_digest =
+                                     input.response_binding_digest
+                           )
+                           WHEN 'event_microbatch' THEN (
+                               SELECT binding.canonical_event_count
+                               FROM provider_event_bindings AS binding
+                               WHERE binding.event_binding_digest = input.event_binding_digest
+                           )
+                           WHEN 'composite_response_event' THEN (
+                               SELECT binding.response_row_count + binding.event_row_count
+                               FROM provider_composite_response_event_bindings AS binding
+                               WHERE binding.composite_binding_digest =
+                                     input.composite_binding_digest
+                           )
+                           WHEN 'option_snapshots' THEN 1 + (
+                               SELECT binding.canonical_row_count
+                               FROM provider_option_market_bindings AS binding
+                               WHERE binding.option_binding_digest = input.option_binding_digest
+                           )
+                           WHEN 'option_expirations' THEN 1 + (
+                               SELECT binding.canonical_row_count
+                               FROM provider_option_market_bindings AS binding
+                               WHERE binding.option_binding_digest = input.option_binding_digest
+                           )
+                           WHEN 'provider_logical' THEN (
+                               SELECT SUM(expected.row_count)
+                               FROM provider_logical_publication_canonical_expectations AS expected
+                               WHERE expected.binding_digest = input.logical_binding_digest
+                           )
+                       END
+                   )
+                   FROM ingest_run_provider_publication_bindings AS input
+                   WHERE input.run_id = output.run_id
+                     AND input.output_artifact_ordinal = output.publication_ordinal
+               ), -1)
+           )
+     )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'provider publications do not exactly cover output artifacts');
 END;
 
 CREATE TRIGGER provider_macro_plan_published_heads_guarded_insert

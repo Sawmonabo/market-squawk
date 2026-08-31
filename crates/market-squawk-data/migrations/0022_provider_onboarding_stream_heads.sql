@@ -547,6 +547,18 @@ WHEN NOT EXISTS (
      AND logical.publication_kind='provider_logical'
      AND logical.source_id='sec-edgar'
      AND logical.run_id=NEW.ingest_run_id
+    JOIN ingest_run_provider_publication_bindings AS direct
+      ON direct.run_id=logical.run_id
+     AND direct.publication_digest=logical.publication_digest
+     AND direct.publication_kind=logical.publication_kind
+     AND direct.source_id=logical.source_id
+    JOIN artifacts AS output
+      ON output.run_id=direct.run_id
+     AND output.publication_ordinal=direct.output_artifact_ordinal
+    JOIN analytical_generation_objects AS generation_object
+      ON generation_object.dataset_id=generation.dataset_id
+     AND generation_object.manifest_version=generation.manifest_version
+     AND generation_object.artifact_id=output.artifact_id
     JOIN provider_logical_publication_bindings AS binding
       ON binding.binding_digest=NEW.binding_digest
      AND binding.source_id='sec-edgar'
@@ -571,6 +583,8 @@ WHEN NOT EXISTS (
           WHERE object.dataset_id=generation.dataset_id
             AND object.manifest_version=generation.manifest_version
       )
+      AND direct.object_input_ordinal=0
+      AND generation_object.row_count=NEW.publication_row_count
       AND binding.object_count=NEW.logical_object_count
       AND CAST(json_extract(binding.terminal_json, '$.total_canonical_rows') AS INTEGER)
           =NEW.publication_row_count

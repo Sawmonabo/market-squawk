@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use super::provider_capture::raw_claim_digest;
+use super::provider_capture::{ProviderArtifactInputCoordinate, raw_claim_digest};
 use super::storage::{append_audit, parse_digest};
 use super::{Catalog, CatalogError};
 
@@ -395,6 +395,7 @@ pub(crate) fn retain_sealed_provider_logical_publication_binding(
     transaction: &Transaction<'_>,
     run_id: Uuid,
     binding: &SealedProviderLogicalPublicationBinding,
+    coordinate: ProviderArtifactInputCoordinate,
     recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
     let evidence = PersistedProviderLogicalPublicationBinding::try_from_live(binding)?;
@@ -422,12 +423,17 @@ pub(crate) fn retain_sealed_provider_logical_publication_binding(
     insert_logical_binding(transaction, &evidence, recorded_at)?;
     let inserted = transaction.execute(
         "INSERT INTO ingest_run_provider_publication_bindings
-         (run_id, input_ordinal, publication_digest, publication_kind, source_id,
-          response_binding_digest, event_binding_digest, composite_binding_digest,
-          option_binding_digest, logical_binding_digest)
-         VALUES (?1, 0, ?2, ?3, ?4, NULL, NULL, NULL, NULL, ?2)",
+         (run_id, input_ordinal, output_artifact_ordinal, object_input_ordinal,
+          publication_digest, publication_kind, source_id, response_binding_digest,
+          event_binding_digest, composite_binding_digest, option_binding_digest,
+          logical_binding_digest)
+         VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL, ?4)",
         params![
             run_id.to_string(),
+            i64::try_from(coordinate.output_artifact_ordinal())
+                .map_err(|_| CatalogError::ProviderLogicalConflict)?,
+            i64::try_from(coordinate.object_input_ordinal())
+                .map_err(|_| CatalogError::ProviderLogicalConflict)?,
             digest_bytes(evidence.binding_digest),
             PUBLICATION_KIND,
             evidence.terminal.source_id().as_str(),

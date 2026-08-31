@@ -354,14 +354,17 @@ fn a_v2_catalog_with_artifacts_cannot_fabricate_root_authority() -> TestResult {
     connection.execute(
         "INSERT INTO ingest_runs VALUES (
              '00000000-0000-0000-0000-000000000001', 'v2-artifact', 'v2-source',
-             1, zeroblob(32), 'persist', ?1, 'succeeded', 1, 2
+             1, zeroblob(32), 'persist', ?1, 'reserved', 1, NULL
          )",
         [rights_id.as_slice()],
     )?;
     connection.execute_batch(
-        "INSERT INTO artifacts VALUES (
+        "INSERT INTO artifacts
+         (artifact_id, run_id, publication_ordinal, relative_reference,
+          content_algorithm, content_digest, size_bytes, created_at_ns)
+         VALUES (
              '00000000-0000-0000-0000-000000000002',
-             '00000000-0000-0000-0000-000000000001',
+             '00000000-0000-0000-0000-000000000001', 0,
              'objects/sha256/00/fixture.parquet', 1, zeroblob(32), 1, 2
          );
          COMMIT;",

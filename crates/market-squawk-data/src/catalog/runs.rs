@@ -586,16 +586,32 @@ pub(crate) fn complete_ingest_in_transaction(
     if completion == ContractCompletion::Succeeded
         && matches!(operation.as_str(), "persist" | "cache")
     {
-        let has_manifest: bool = transaction.query_row(
+        let has_closed_group: bool = transaction.query_row(
             "SELECT EXISTS(
-                 SELECT 1 FROM artifacts
-                 JOIN dataset_manifests USING (artifact_id)
-                 WHERE artifacts.run_id=?1
+                 SELECT 1
+                 FROM dataset_manifests AS manifest
+                 JOIN artifacts AS anchor
+                   ON anchor.artifact_id=manifest.artifact_id
+                  AND anchor.run_id=manifest.run_id
+                 WHERE manifest.run_id=?1
+                   AND (SELECT COUNT(*) FROM artifacts AS member
+                        WHERE member.run_id=manifest.run_id) BETWEEN 1 AND 1024
+                   AND anchor.publication_ordinal=(
+                       SELECT COUNT(*) - 1 FROM artifacts AS member
+                       WHERE member.run_id=manifest.run_id
+                   )
+                   AND (SELECT MIN(member.publication_ordinal) FROM artifacts AS member
+                        WHERE member.run_id=manifest.run_id)=0
+                   AND (SELECT MAX(member.publication_ordinal) FROM artifacts AS member
+                        WHERE member.run_id=manifest.run_id)=(
+                       SELECT COUNT(*) - 1 FROM artifacts AS member
+                       WHERE member.run_id=manifest.run_id
+                   )
              )",
             [reservation.run_id.to_string()],
             |row| row.get(0),
         )?;
-        if !has_manifest {
+        if !has_closed_group {
             return Err(CatalogError::RunStateConflict);
         }
     }

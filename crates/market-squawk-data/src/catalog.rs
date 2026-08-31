@@ -136,8 +136,8 @@ pub use observed_revisions::StoredObservedRevision;
 pub(crate) use provider_capture::{
     MAX_PROVIDER_CAPTURE_PHYSICAL_BYTES, MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS,
     PROVIDER_CAPTURE_RECOVERY_ENTRY_BUDGET, PreparedProviderCaptureBinding,
-    ProviderMacroPlanCompletionCapture, load_provider_capture_for_run,
-    retain_prepared_provider_capture_binding,
+    ProviderArtifactInputCoordinate, ProviderMacroPlanCompletionCapture,
+    load_provider_capture_for_run, retain_prepared_provider_capture_binding,
 };
 pub use provider_capture::{
     PersistedProviderCaptureBindingEvidence, PersistedProviderCaptureBindingRow,

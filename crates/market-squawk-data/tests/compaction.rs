@@ -21,8 +21,8 @@ fn compaction_replaces_objects_without_changing_rows_or_lineage() -> TestResult 
         120,
         Sha256Digest::new([8; 32]),
     )?;
-    let appended = ManifestPlan::append(dataset.clone(), None, first, 2)?;
-    let appended = ManifestPlan::append(dataset, Some(&appended), second, 2)?;
+    let appended = ManifestPlan::append(dataset.clone(), None, vec![first], 2)?;
+    let appended = ManifestPlan::append(dataset, Some(&appended), vec![second], 2)?;
     let compacted_object = ManifestObject::try_new(
         Sha256Digest::new([3; 32]),
         5,
@@ -52,9 +52,9 @@ fn appending_beyond_the_small_file_ceiling_requires_compaction() -> TestResult {
         10,
         Sha256Digest::new([8; 32]),
     )?;
-    let plan = ManifestPlan::append(dataset, None, first, 1)?;
+    let plan = ManifestPlan::append(dataset, None, vec![first], 1)?;
     assert!(matches!(
-        ManifestPlan::append(plan.dataset_id().clone(), Some(&plan), second, 1),
+        ManifestPlan::append(plan.dataset_id().clone(), Some(&plan), vec![second], 1),
         Err(ManifestPlanError::SmallFileCeiling { max_objects: 1 })
     ));
     Ok(())

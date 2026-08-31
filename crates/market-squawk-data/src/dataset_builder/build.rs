@@ -237,11 +237,15 @@ pub(super) async fn build(
             EvidenceDigest::new(DigestAlgorithm::Sha256, plan.content_hash().bytes()),
             created_at,
         );
-        let durable = authority.publish_artifact_manifest(&reservation, &artifact, &anchor)?;
+        let durable = authority.publish_artifact_manifest(
+            &reservation,
+            std::slice::from_ref(&artifact),
+            &anchor,
+        )?;
         let bound = authority.bind_derived_output_object(
             &reservation,
             DerivedOutputObjectInput::try_new(
-                durable.artifact().artifact_id(),
+                durable.artifacts()[0].artifact_id(),
                 published.content_hash(),
                 published.row_count(),
                 published.size_bytes(),
@@ -253,7 +257,7 @@ pub(super) async fn build(
             schema,
             plan,
             vec![bound],
-            durable.artifact().artifact_id(),
+            durable.artifacts()[0].artifact_id(),
         )?;
         check_control(&cancellation, deadline)?;
         if let Some(precommit_authority) = precommit_authority.as_deref() {

@@ -425,7 +425,6 @@ def _insert_catalog_fixture(
     runs = [
         "018f3c2a-91ab-7ccd-b3de-123456789ab0",
         "018f3c2a-91ab-7ccd-b3de-123456789ab1",
-        "018f3c2a-91ab-7ccd-b3de-123456789ab2",
     ]
     artifacts = [
         ("018f3c2a-91ab-7ccd-b3de-123456789ab3", "control/parent.json", "61" * 32, 1),
@@ -437,32 +436,57 @@ def _insert_catalog_fixture(
             export["objects"][0]["size_bytes"],
         ),
     ]
-    for index, (run_id, artifact) in enumerate(zip(runs, artifacts, strict=True)):
+    artifact_groups = ((artifacts[0],), (artifacts[1], artifacts[2]))
+    for index, (run_id, group) in enumerate(zip(runs, artifact_groups, strict=True)):
         connection.execute(
             "INSERT INTO ingest_runs VALUES (?1, ?2, ?3, 2, ?4, 'persist', ?5, "
-            "'succeeded', 2, 3)",
+            "'reserved', 2, NULL)",
             (run_id, f"fixture-{index}", source_id, payload, rights),
         )
-        connection.execute(
-            "INSERT INTO artifacts VALUES (?1, ?2, ?3, 2, ?4, ?5, 4)",
-            (artifact[0], run_id, artifact[1], bytes.fromhex(artifact[2]), artifact[3]),
-        )
+        for ordinal, artifact in enumerate(group):
+            connection.execute(
+                """INSERT INTO artifacts (
+                       artifact_id, run_id, publication_ordinal, relative_reference,
+                       content_algorithm, content_digest, size_bytes, created_at_ns
+                   ) VALUES (?1, ?2, ?3, ?4, 2, ?5, ?6, 4)""",
+                (
+                    artifact[0],
+                    run_id,
+                    ordinal,
+                    artifact[1],
+                    bytes.fromhex(artifact[2]),
+                    artifact[3],
+                ),
+            )
     connection.execute(
-        "INSERT INTO dataset_manifests VALUES (?1, 'fixture-source', 3, ?2, 2, ?3, 4)",
+        """INSERT INTO dataset_manifests (
+               manifest_id, run_id, dataset_name, schema_version, artifact_id,
+               content_algorithm, content_digest, created_at_ns
+           ) VALUES (?1, ?2, 'fixture-source', 3, ?3, 2, ?4, 4)""",
         (
             "018f3c2a-91ab-7ccd-b3de-123456789ab5",
+            runs[0],
             artifacts[0][0],
             bytes.fromhex("41" * 32),
         ),
     )
     connection.execute(
-        "INSERT INTO dataset_manifests VALUES (?1, 'fixture-training', 3, ?2, 2, ?3, 4)",
+        """INSERT INTO dataset_manifests (
+               manifest_id, run_id, dataset_name, schema_version, artifact_id,
+               content_algorithm, content_digest, created_at_ns
+           ) VALUES (?1, ?2, 'fixture-training', 3, ?3, 2, ?4, 4)""",
         (
             "018f3c2a-91ab-7ccd-b3de-123456789ab6",
-            artifacts[1][0],
+            runs[1],
+            artifacts[2][0],
             bytes.fromhex(MANIFEST),
         ),
     )
+    for run_id in runs:
+        connection.execute(
+            "UPDATE ingest_runs SET state='succeeded', completed_at_ns=4 WHERE run_id=?1",
+            (run_id,),
+        )
     connection.execute(
         """INSERT INTO analytical_generations VALUES (
                1, 'fixture-source', 1, ?1, ?2, 1, 1,

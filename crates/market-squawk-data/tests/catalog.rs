@@ -287,7 +287,11 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
         reservation.requested_at(),
     );
     assert!(matches!(
-        catalog.publish_artifact_manifest(&reservation, &premature_artifact, &premature_manifest),
+        catalog.publish_artifact_manifest(
+            &reservation,
+            std::slice::from_ref(&premature_artifact),
+            &premature_manifest,
+        ),
         Err(CatalogError::PublicationTimeConflict)
     ));
     let manifest = DatasetManifestRecord::try_new(
@@ -297,8 +301,12 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
         digest(22),
         shift_timestamp(reservation.requested_at(), 2)?,
     );
-    let published = catalog.publish_artifact_manifest(&reservation, &artifact, &manifest)?;
-    assert_eq!(published.artifact(), &artifact);
+    let published = catalog.publish_artifact_manifest(
+        &reservation,
+        std::slice::from_ref(&artifact),
+        &manifest,
+    )?;
+    assert_eq!(published.artifacts(), std::slice::from_ref(&artifact));
     drop(catalog);
 
     let reopened = CatalogAuthority::open(config.clone())?;
@@ -317,11 +325,19 @@ fn catalog_enforces_rights_and_recovers_the_complete_control_record() -> TestRes
         manifest.content_digest(),
         shift_timestamp(reservation.requested_at(), 5)?,
     );
+    assert!(matches!(
+        reopened.publish_artifact_manifest(
+            resumed.reservation(),
+            std::slice::from_ref(&reconstructed_artifact),
+            &reconstructed_manifest,
+        ),
+        Err(CatalogError::EvidenceConflict)
+    ));
     assert_eq!(
         reopened.publish_artifact_manifest(
             resumed.reservation(),
-            &reconstructed_artifact,
-            &reconstructed_manifest,
+            std::slice::from_ref(&artifact),
+            &manifest,
         )?,
         published
     );
@@ -1161,7 +1177,7 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
     );
     catalog.publish_artifact_manifest(
         &company_reservation,
-        &company_artifact,
+        std::slice::from_ref(&company_artifact),
         &company_manifest,
     )?;
     catalog.complete_ingest(&company_reservation, ContractCompletion::Succeeded)?;

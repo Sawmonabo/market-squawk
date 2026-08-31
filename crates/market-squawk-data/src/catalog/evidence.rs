@@ -114,21 +114,25 @@ fn read_artifacts(
 ) -> Result<Vec<ArtifactEvidenceRow>, CatalogError> {
     let limit = limit_with_sentinel(maximum)?;
     let mut statement = connection.prepare(
-        "SELECT artifact_id, run_id, relative_reference, content_algorithm, content_digest, \
-                size_bytes FROM artifacts ORDER BY artifact_id LIMIT ?1",
+        "SELECT artifact_id, run_id, publication_ordinal, relative_reference,
+                content_algorithm, content_digest, size_bytes
+         FROM artifacts ORDER BY artifact_id LIMIT ?1",
     )?;
     let mut rows = statement.query([limit])?;
     let mut result = Vec::new();
     while let Some(row) = rows.next()? {
         require_capacity(&result, maximum)?;
-        let algorithm: i64 = row.get(3)?;
+        let ordinal =
+            u16::try_from(row.get::<_, i64>(2)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        let algorithm: i64 = row.get(4)?;
         result.push(
             ArtifactEvidenceRow::try_new(
                 parse_uuid(row.get::<_, String>(0)?)?,
                 parse_uuid(row.get::<_, String>(1)?)?,
-                row.get::<_, String>(2)?,
-                parse_sha256(algorithm, row.get::<_, Vec<u8>>(4)?)?,
-                parse_positive_u64(row.get(5)?)?,
+                ordinal,
+                row.get::<_, String>(3)?,
+                parse_sha256(algorithm, row.get::<_, Vec<u8>>(5)?)?,
+                parse_positive_u64(row.get(6)?)?,
             )
             .map_err(map_evidence_error)?,
         );
@@ -456,8 +460,106 @@ fn read_provider_relation_rows(
     read_sealed_raw_object_evidence(connection, maximum, &mut result)?;
     read_provider_logical_evidence(connection, maximum, &mut result)?;
     read_provider_option_evidence(connection, maximum, &mut result)?;
+    read_direct_provider_input_evidence(connection, maximum, &mut result)?;
     read_market_event_selection_evidence(connection, maximum, &mut result)?;
     Ok(result)
+}
+
+fn read_direct_provider_input_evidence(
+    connection: &Connection,
+    maximum: usize,
+    result: &mut Vec<ProviderRelationEvidenceRow>,
+) -> Result<(), CatalogError> {
+    const CAPTURE_RELATION: &str = "ingest_run_provider_capture_bindings";
+    let mut capture_statement = connection.prepare(
+        "SELECT run_id, input_ordinal, output_artifact_ordinal, object_input_ordinal,
+                binding_digest, source_id
+         FROM ingest_run_provider_capture_bindings
+         ORDER BY run_id, input_ordinal LIMIT ?1",
+    )?;
+    let mut rows = capture_statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let run = parse_uuid(row.get::<_, String>(0)?)?;
+        let input_ordinal: i64 = row.get(1)?;
+        let output_ordinal: i64 = row.get(2)?;
+        let object_input_ordinal: i64 = row.get(3)?;
+        let binding = parse_sha256(1, row.get::<_, Vec<u8>>(4)?)?;
+        let source: String = row.get(5)?;
+        if !(0..=4095).contains(&input_ordinal)
+            || !(0..=1023).contains(&output_ordinal)
+            || !(0..=4095).contains(&object_input_ordinal)
+            || SourceIdentifier::try_from(source.clone()).is_err()
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let mut digest = ProviderRowDigest::new(CAPTURE_RELATION)?;
+        digest.bytes(run.as_bytes())?;
+        digest.integer(input_ordinal);
+        digest.integer(output_ordinal);
+        digest.integer(object_input_ordinal);
+        digest.digest(binding);
+        digest.text(&source)?;
+        result.push(provider_relation_row(
+            CAPTURE_RELATION,
+            run_ordinal_primary_key(run, input_ordinal)?,
+            digest.finish(),
+            0,
+        ));
+    }
+
+    const PUBLICATION_RELATION: &str = "ingest_run_provider_publication_bindings";
+    let mut publication_statement = connection.prepare(
+        "SELECT run_id, input_ordinal, output_artifact_ordinal, object_input_ordinal,
+                publication_digest, publication_kind, source_id,
+                response_binding_digest, event_binding_digest, composite_binding_digest,
+                option_binding_digest, logical_binding_digest
+         FROM ingest_run_provider_publication_bindings
+         ORDER BY run_id, input_ordinal LIMIT ?1",
+    )?;
+    let mut rows = publication_statement.query([limit_with_sentinel(maximum)?])?;
+    while let Some(row) = rows.next()? {
+        require_capacity(result, maximum)?;
+        let run = parse_uuid(row.get::<_, String>(0)?)?;
+        let input_ordinal: i64 = row.get(1)?;
+        let output_ordinal: i64 = row.get(2)?;
+        let object_input_ordinal: i64 = row.get(3)?;
+        let publication = parse_sha256(1, row.get::<_, Vec<u8>>(4)?)?;
+        let kind: String = row.get(5)?;
+        let source: String = row.get(6)?;
+        let response: Option<Vec<u8>> = row.get(7)?;
+        let event: Option<Vec<u8>> = row.get(8)?;
+        let composite: Option<Vec<u8>> = row.get(9)?;
+        let option: Option<Vec<u8>> = row.get(10)?;
+        let logical: Option<Vec<u8>> = row.get(11)?;
+        if !(0..=4095).contains(&input_ordinal)
+            || !(0..=1023).contains(&output_ordinal)
+            || !(0..=4095).contains(&object_input_ordinal)
+            || SourceIdentifier::try_from(source.clone()).is_err()
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let mut digest = ProviderRowDigest::new(PUBLICATION_RELATION)?;
+        digest.bytes(run.as_bytes())?;
+        digest.integer(input_ordinal);
+        digest.integer(output_ordinal);
+        digest.integer(object_input_ordinal);
+        digest.digest(publication);
+        digest.text(&kind)?;
+        digest.text(&source)?;
+        digest.optional_bytes(response.as_deref())?;
+        digest.optional_bytes(event.as_deref())?;
+        digest.optional_bytes(composite.as_deref())?;
+        digest.optional_bytes(option.as_deref())?;
+        digest.optional_bytes(logical.as_deref())?;
+        result.push(provider_relation_row(
+            PUBLICATION_RELATION,
+            run_ordinal_primary_key(run, input_ordinal)?,
+            digest.finish(),
+            0,
+        ));
+    }
+    Ok(())
 }
 
 fn validate_provider_relation_integrity(connection: &Connection) -> Result<(), CatalogError> {
@@ -1328,6 +1430,14 @@ fn digest_ordinal_primary_key(
     let mut key = [0_u8; 40];
     key[..32].copy_from_slice(&digest.bytes());
     key[32..].copy_from_slice(&ordinal.to_be_bytes());
+    Ok(Box::from(key))
+}
+
+fn run_ordinal_primary_key(run: Uuid, ordinal: i64) -> Result<Box<[u8]>, CatalogError> {
+    let ordinal = u64::try_from(ordinal).map_err(|_| CatalogError::CorruptCatalog)?;
+    let mut key = [0_u8; 24];
+    key[..16].copy_from_slice(run.as_bytes());
+    key[16..].copy_from_slice(&ordinal.to_be_bytes());
     Ok(Box::from(key))
 }
 

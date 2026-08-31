@@ -13,7 +13,8 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use super::provider_capture::{
-    native_implementation_name, parse_source_sequence, raw_claim_digest, source_sequence_blob,
+    ProviderArtifactInputCoordinate, native_implementation_name, parse_source_sequence,
+    raw_claim_digest, source_sequence_blob,
 };
 use super::provider_event::{
     insert_response_capture, require_raw_claim_capacity, validate_response_capture_source_revision,
@@ -424,6 +425,7 @@ pub(crate) fn retain_prepared_provider_option_market_binding(
     connection: &Transaction<'_>,
     run_id: Uuid,
     prepared: &PreparedProviderOptionMarketBinding,
+    coordinate: ProviderArtifactInputCoordinate,
     recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
     let evidence = &prepared.evidence;
@@ -454,12 +456,16 @@ pub(crate) fn retain_prepared_provider_option_market_binding(
     }
     let inserted = connection.execute(
         "INSERT INTO ingest_run_provider_publication_bindings
-         (run_id, input_ordinal, publication_digest, publication_kind, source_id,
-          response_binding_digest, event_binding_digest, composite_binding_digest,
-          option_binding_digest)
-         VALUES (?1, 0, ?2, ?3, ?4, NULL, NULL, NULL, ?2)",
+         (run_id, input_ordinal, output_artifact_ordinal, object_input_ordinal,
+          publication_digest, publication_kind, source_id, response_binding_digest,
+          event_binding_digest, composite_binding_digest, option_binding_digest)
+         VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?4)",
         params![
             run_id.to_string(),
+            i64::try_from(coordinate.output_artifact_ordinal())
+                .map_err(|_| CatalogError::ProviderEventConflict)?,
+            i64::try_from(coordinate.object_input_ordinal())
+                .map_err(|_| CatalogError::ProviderEventConflict)?,
             evidence.binding_digest.bytes().as_slice(),
             evidence.publication_kind_name(),
             evidence.capture.source_id().as_str(),

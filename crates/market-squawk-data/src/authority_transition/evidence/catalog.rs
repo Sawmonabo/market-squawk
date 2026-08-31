@@ -35,6 +35,8 @@ pub(crate) enum ProviderCatalogRelation {
     OptionMarketNativeLineage,
     OptionMarketBindingRow,
     MarketEventSelectionIndex,
+    DirectProviderCaptureBinding,
+    DirectProviderPublicationBinding,
 }
 
 impl ProviderCatalogRelation {
@@ -50,6 +52,8 @@ impl ProviderCatalogRelation {
             Self::OptionMarketNativeLineage => 8,
             Self::OptionMarketBindingRow => 9,
             Self::MarketEventSelectionIndex => 10,
+            Self::DirectProviderCaptureBinding => 11,
+            Self::DirectProviderPublicationBinding => 12,
         }
     }
 
@@ -69,6 +73,8 @@ impl ProviderCatalogRelation {
             Self::OptionMarketNativeLineage => "provider_option_market_binding_native_lineage",
             Self::OptionMarketBindingRow => "provider_option_market_binding_rows",
             Self::MarketEventSelectionIndex => "provider_market_event_selection_index",
+            Self::DirectProviderCaptureBinding => "ingest_run_provider_capture_bindings",
+            Self::DirectProviderPublicationBinding => "ingest_run_provider_publication_bindings",
         }
     }
 
@@ -88,6 +94,8 @@ impl ProviderCatalogRelation {
             "provider_option_market_binding_native_lineage" => Self::OptionMarketNativeLineage,
             "provider_option_market_binding_rows" => Self::OptionMarketBindingRow,
             "provider_market_event_selection_index" => Self::MarketEventSelectionIndex,
+            "ingest_run_provider_capture_bindings" => Self::DirectProviderCaptureBinding,
+            "ingest_run_provider_publication_bindings" => Self::DirectProviderPublicationBinding,
             _ => return None,
         })
     }
@@ -223,6 +231,7 @@ impl EvidenceSnapshotRequest {
 pub(crate) struct ArtifactEvidenceRow {
     artifact_id: Uuid,
     run_id: Uuid,
+    publication_ordinal: u16,
     relative_reference: Box<str>,
     content_hash: Sha256Digest,
     size_bytes: u64,
@@ -232,6 +241,7 @@ impl ArtifactEvidenceRow {
     pub(crate) fn try_new(
         artifact_id: Uuid,
         run_id: Uuid,
+        publication_ordinal: u16,
         relative_reference: impl Into<Box<str>>,
         content_hash: Sha256Digest,
         size_bytes: u64,
@@ -239,6 +249,7 @@ impl ArtifactEvidenceRow {
         let relative_reference = relative_reference.into();
         if artifact_id.is_nil()
             || run_id.is_nil()
+            || publication_ordinal > 1023
             || size_bytes == 0
             || size_bytes > MAX_EVIDENCE_OBJECT_BYTES
             || !canonical_object_reference(&relative_reference, content_hash)
@@ -248,6 +259,7 @@ impl ArtifactEvidenceRow {
         Ok(Self {
             artifact_id,
             run_id,
+            publication_ordinal,
             relative_reference,
             content_hash,
             size_bytes,
@@ -260,6 +272,10 @@ impl ArtifactEvidenceRow {
 
     pub(super) const fn run_id(&self) -> Uuid {
         self.run_id
+    }
+
+    pub(super) const fn publication_ordinal(&self) -> u16 {
+        self.publication_ordinal
     }
 
     pub(crate) fn relative_reference(&self) -> &str {
@@ -802,8 +818,8 @@ fn validate_relational_evidence(
 ) -> Result<(), EvidenceError> {
     let limits = request.limits;
     let mut artifacts_by_id = BTreeMap::new();
+    let mut artifacts_by_run: BTreeMap<Uuid, BTreeMap<u16, &ArtifactEvidenceRow>> = BTreeMap::new();
     let mut physical_artifact_ids = BTreeSet::new();
-    let mut runs = BTreeSet::new();
     let mut references = BTreeSet::new();
     let mut total_bytes = 0_u64;
     for artifact in artifacts {
@@ -812,7 +828,11 @@ fn validate_relational_evidence(
                 .insert(artifact.artifact_id, artifact)
                 .is_some()
             || !physical_artifact_ids.insert(artifact.artifact_id)
-            || !runs.insert(artifact.run_id)
+            || artifacts_by_run
+                .entry(artifact.run_id)
+                .or_default()
+                .insert(artifact.publication_ordinal, artifact)
+                .is_some()
             || !references.insert(artifact.relative_reference.as_ref())
         {
             return Err(EvidenceError::InvalidCatalogEvidence);
@@ -824,10 +844,29 @@ fn validate_relational_evidence(
             return Err(EvidenceError::ResourceLimitExceeded);
         }
     }
+    if artifacts_by_run.values().any(|group| {
+        group.is_empty()
+            || group.len() > 1024
+            || group
+                .keys()
+                .copied()
+                .enumerate()
+                .any(|(expected, retained)| usize::from(retained) != expected)
+    }) {
+        return Err(EvidenceError::InvalidCatalogEvidence);
+    }
 
     let mut manifests_by_id = BTreeMap::new();
+    let mut manifest_runs = BTreeSet::new();
     for manifest in manifests {
-        if !artifacts_by_id.contains_key(&manifest.artifact_id)
+        let Some(anchor) = artifacts_by_id.get(&manifest.artifact_id) else {
+            return Err(EvidenceError::InvalidCatalogEvidence);
+        };
+        let group = artifacts_by_run
+            .get(&anchor.run_id)
+            .ok_or(EvidenceError::InvalidCatalogEvidence)?;
+        if usize::from(anchor.publication_ordinal) != group.len() - 1
+            || !manifest_runs.insert(anchor.run_id)
             || manifests_by_id
                 .insert(manifest.manifest_id, manifest)
                 .is_some()
@@ -873,7 +912,12 @@ fn validate_relational_evidence(
         validate_generation_parents(generation, &generations_by_dataset)?;
     }
     for versions in generations_by_dataset.values() {
-        validate_dataset_history(versions)?;
+        validate_dataset_history(
+            versions,
+            &manifests_by_id,
+            &artifacts_by_id,
+            &artifacts_by_run,
+        )?;
     }
 
     let mut query_reservations = BTreeSet::new();
@@ -964,6 +1008,9 @@ fn validate_generation_parents(
 
 fn validate_dataset_history(
     versions: &BTreeMap<u64, &GenerationEvidenceRow>,
+    manifests: &BTreeMap<Uuid, &ManifestEvidenceRow>,
+    artifacts: &BTreeMap<Uuid, &ArtifactEvidenceRow>,
+    artifacts_by_run: &BTreeMap<Uuid, BTreeMap<u16, &ArtifactEvidenceRow>>,
 ) -> Result<(), EvidenceError> {
     let mut previous_plan: Option<ManifestPlan> = None;
     let mut retained_schema: Option<&DatasetSchemaRef> = None;
@@ -976,15 +1023,37 @@ fn validate_dataset_history(
         }
         let plan = match generation.kind {
             GenerationKind::Ingest => {
-                let object = generation
+                let anchor = manifests
+                    .get(&generation.anchor_manifest_id)
+                    .and_then(|manifest| artifacts.get(&manifest.artifact_id))
+                    .ok_or(EvidenceError::GenerationSemanticMismatch)?;
+                let group = artifacts_by_run
+                    .get(&anchor.run_id)
+                    .ok_or(EvidenceError::GenerationSemanticMismatch)?;
+                let suffix = generation
                     .objects
-                    .last()
-                    .ok_or(EvidenceError::GenerationSemanticMismatch)?
-                    .manifest_object()?;
+                    .get(
+                        generation
+                            .objects
+                            .len()
+                            .checked_sub(group.len())
+                            .ok_or(EvidenceError::GenerationSemanticMismatch)?..,
+                    )
+                    .ok_or(EvidenceError::GenerationSemanticMismatch)?;
+                if suffix
+                    .iter()
+                    .zip(group.values())
+                    .any(|(object, artifact)| object.artifact_id != artifact.artifact_id)
+                {
+                    return Err(EvidenceError::GenerationSemanticMismatch);
+                }
                 ManifestPlan::append(
                     generation.dataset_id.clone(),
                     previous_plan.as_ref(),
-                    object,
+                    suffix
+                        .iter()
+                        .map(GenerationObjectEvidenceRow::manifest_object)
+                        .collect::<Result<Vec<_>, _>>()?,
                     generation.objects.len(),
                 )
                 .map_err(|_| EvidenceError::GenerationSemanticMismatch)?

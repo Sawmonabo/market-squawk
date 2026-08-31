@@ -405,6 +405,37 @@ pub(crate) struct PreparedProviderCaptureBinding {
     pub(crate) evidence: PersistedProviderCaptureBindingEvidence,
 }
 
+/// Exact run-local physical output coordinate for one direct provider input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderArtifactInputCoordinate {
+    output_artifact_ordinal: usize,
+    object_input_ordinal: usize,
+}
+
+impl ProviderArtifactInputCoordinate {
+    pub(crate) fn try_new(
+        output_artifact_ordinal: usize,
+        object_input_ordinal: usize,
+    ) -> Result<Self, CatalogError> {
+        if output_artifact_ordinal >= 1024 || object_input_ordinal >= MAX_PROVIDER_CAPTURE_INPUTS {
+            Err(CatalogError::ProviderCaptureConflict)
+        } else {
+            Ok(Self {
+                output_artifact_ordinal,
+                object_input_ordinal,
+            })
+        }
+    }
+
+    pub(crate) const fn output_artifact_ordinal(self) -> usize {
+        self.output_artifact_ordinal
+    }
+
+    pub(crate) const fn object_input_ordinal(self) -> usize {
+        self.object_input_ordinal
+    }
+}
+
 impl PreparedProviderCaptureBinding {
     pub(crate) fn try_from_live(
         binding: &SealedProviderCaptureBinding,
@@ -849,15 +880,18 @@ pub(crate) fn load_ordered_provider_captures_for_run(
     let limit = i64::try_from(MAX_PROVIDER_CAPTURE_INPUTS + 1)
         .map_err(|_| CatalogError::ProviderCaptureConflict)?;
     let mut statement = connection.prepare(
-        "SELECT input_ordinal, binding_digest, source_id
+        "SELECT input_ordinal, output_artifact_ordinal, object_input_ordinal,
+                binding_digest, source_id
          FROM ingest_run_provider_capture_bindings
          WHERE run_id=?1 ORDER BY input_ordinal LIMIT ?2",
     )?;
     let rows = statement.query_map(params![run_id.to_string(), limit], |row| {
         Ok((
             row.get::<_, i64>(0)?,
-            row.get::<_, Vec<u8>>(1)?,
-            row.get::<_, String>(2)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, String>(4)?,
         ))
     })?;
     let mut retained = Vec::new();
@@ -868,10 +902,15 @@ pub(crate) fn load_ordered_provider_captures_for_run(
         if retained.len() == MAX_PROVIDER_CAPTURE_INPUTS {
             return Err(CatalogError::ProviderCaptureConflict);
         }
-        let (ordinal, digest, source_id) = row?;
+        let (ordinal, output_ordinal, object_input_ordinal, digest, source_id) = row?;
         if ordinal != i64::try_from(retained.len()).map_err(|_| CatalogError::CorruptCatalog)? {
             return Err(CatalogError::CorruptCatalog);
         }
+        ProviderArtifactInputCoordinate::try_new(
+            usize::try_from(output_ordinal).map_err(|_| CatalogError::CorruptCatalog)?,
+            usize::try_from(object_input_ordinal).map_err(|_| CatalogError::CorruptCatalog)?,
+        )
+        .map_err(|_| CatalogError::CorruptCatalog)?;
         let digest = parse_digest(1, &digest)?;
         let evidence = load_provider_capture_binding_evidence(connection, digest)?
             .ok_or(CatalogError::CorruptCatalog)?;
@@ -891,12 +930,14 @@ pub(crate) fn retain_prepared_provider_capture_binding(
     connection: &rusqlite::Transaction<'_>,
     run_id: Uuid,
     prepared: &PreparedProviderCaptureBinding,
+    coordinate: ProviderArtifactInputCoordinate,
     recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
     retain_ordered_prepared_provider_capture_bindings(
         connection,
         run_id,
         std::slice::from_ref(prepared),
+        std::slice::from_ref(&coordinate),
         recorded_at,
     )
 }
@@ -907,9 +948,13 @@ pub(crate) fn retain_ordered_prepared_provider_capture_bindings(
     connection: &rusqlite::Transaction<'_>,
     run_id: Uuid,
     prepared: &[PreparedProviderCaptureBinding],
+    coordinates: &[ProviderArtifactInputCoordinate],
     recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
-    if prepared.is_empty() || prepared.len() > MAX_PROVIDER_CAPTURE_INPUTS {
+    if prepared.is_empty()
+        || prepared.len() > MAX_PROVIDER_CAPTURE_INPUTS
+        || coordinates.len() != prepared.len()
+    {
         return Err(CatalogError::ProviderCaptureConflict);
     }
     let source_id = prepared[0].source_id();
@@ -929,7 +974,14 @@ pub(crate) fn retain_ordered_prepared_provider_capture_bindings(
     if existing != 0 {
         return Err(CatalogError::ProviderCaptureConflict);
     }
-    for (input_ordinal, binding) in prepared.iter().enumerate() {
+    if coordinates.iter().enumerate().any(|(ordinal, coordinate)| {
+        coordinates[..ordinal]
+            .iter()
+            .any(|prior| prior == coordinate)
+    }) {
+        return Err(CatalogError::ProviderCaptureConflict);
+    }
+    for (input_ordinal, (binding, coordinate)) in prepared.iter().zip(coordinates).enumerate() {
         retain_prepared_provider_capture_binding_evidence(
             connection,
             run_id,
@@ -949,12 +1001,20 @@ pub(crate) fn retain_ordered_prepared_provider_capture_bindings(
         }
         let input_ordinal =
             i64::try_from(input_ordinal).map_err(|_| CatalogError::ProviderCaptureConflict)?;
+        let output_artifact_ordinal = i64::try_from(coordinate.output_artifact_ordinal())
+            .map_err(|_| CatalogError::ProviderCaptureConflict)?;
+        let object_input_ordinal = i64::try_from(coordinate.object_input_ordinal())
+            .map_err(|_| CatalogError::ProviderCaptureConflict)?;
         let inserted = connection.execute(
             "INSERT INTO ingest_run_provider_capture_bindings
-             (run_id, input_ordinal, binding_digest, source_id) VALUES (?1, ?2, ?3, ?4)",
+             (run_id, input_ordinal, output_artifact_ordinal, object_input_ordinal,
+              binding_digest, source_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 run_id.to_string(),
                 input_ordinal,
+                output_artifact_ordinal,
+                object_input_ordinal,
                 digest_bytes(evidence.binding_digest),
                 evidence.capture.source_id().as_str()
             ],
@@ -965,11 +1025,15 @@ pub(crate) fn retain_ordered_prepared_provider_capture_bindings(
         let exact_association: bool = connection.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM ingest_run_provider_capture_bindings
-                WHERE run_id=?1 AND input_ordinal=?2 AND binding_digest=?3 AND source_id=?4
+                WHERE run_id=?1 AND input_ordinal=?2
+                  AND output_artifact_ordinal=?3 AND object_input_ordinal=?4
+                  AND binding_digest=?5 AND source_id=?6
              )",
             params![
                 run_id.to_string(),
                 input_ordinal,
+                output_artifact_ordinal,
+                object_input_ordinal,
                 digest_bytes(evidence.binding_digest),
                 evidence.capture.source_id().as_str()
             ],

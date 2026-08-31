@@ -22,8 +22,8 @@ use uuid::Uuid;
 
 use super::provider_capture::{
     MAX_PROVIDER_CAPTURE_PHYSICAL_BYTES, MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS,
-    native_implementation_name, parse_native_implementation, parse_source_sequence,
-    raw_claim_digest, source_sequence_blob,
+    ProviderArtifactInputCoordinate, native_implementation_name, parse_native_implementation,
+    parse_source_sequence, raw_claim_digest, source_sequence_blob,
 };
 use super::storage::{append_audit, parse_digest, sha256};
 use super::{Catalog, CatalogError};
@@ -1603,6 +1603,7 @@ pub(crate) fn retain_prepared_provider_publication_binding(
     connection: &Transaction<'_>,
     run_id: Uuid,
     prepared: &PreparedProviderPublicationBinding,
+    coordinate: ProviderArtifactInputCoordinate,
     recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
     match prepared {
@@ -1617,6 +1618,7 @@ pub(crate) fn retain_prepared_provider_publication_binding(
                 Some(response.evidence.binding_digest),
                 None,
                 None,
+                coordinate,
                 recorded_at,
             )?;
             retain_provider_market_event_selection_rows(
@@ -1638,6 +1640,7 @@ pub(crate) fn retain_prepared_provider_publication_binding(
                 None,
                 Some(event.evidence.binding_digest),
                 None,
+                coordinate,
                 recorded_at,
             )?;
             retain_provider_market_event_selection_rows(
@@ -1683,6 +1686,7 @@ pub(crate) fn retain_prepared_provider_publication_binding(
                 Some(response.evidence.binding_digest),
                 Some(event.evidence.binding_digest),
                 Some(*composite_binding_digest),
+                coordinate,
                 recorded_at,
             )?;
             retain_provider_market_event_selection_rows(
@@ -2337,6 +2341,7 @@ fn associate_provider_publication(
     response_digest: Option<EvidenceDigest>,
     event_digest: Option<EvidenceDigest>,
     composite_digest: Option<EvidenceDigest>,
+    coordinate: ProviderArtifactInputCoordinate,
     recorded_at: Timestamp,
 ) -> Result<(), CatalogError> {
     let used: bool = connection.query_row(
@@ -2358,11 +2363,16 @@ fn associate_provider_publication(
     }
     let inserted = connection.execute(
         "INSERT INTO ingest_run_provider_publication_bindings
-         (run_id, input_ordinal, publication_digest, publication_kind, source_id,
-          response_binding_digest, event_binding_digest, composite_binding_digest)
-         VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7)",
+         (run_id, input_ordinal, output_artifact_ordinal, object_input_ordinal,
+          publication_digest, publication_kind, source_id, response_binding_digest,
+          event_binding_digest, composite_binding_digest)
+         VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             run_id.to_string(),
+            i64::try_from(coordinate.output_artifact_ordinal())
+                .map_err(|_| CatalogError::ProviderEventConflict)?,
+            i64::try_from(coordinate.object_input_ordinal())
+                .map_err(|_| CatalogError::ProviderEventConflict)?,
             digest_bytes(publication_digest),
             kind,
             source_id,

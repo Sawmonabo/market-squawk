@@ -372,14 +372,14 @@ pub struct ManifestPlan {
 }
 
 impl ManifestPlan {
-    /// Appends one immutable object while enforcing the configured small-file ceiling.
+    /// Appends one ordered nonempty immutable object group while enforcing the file ceiling.
     pub fn append(
         dataset_id: DatasetId,
         previous: Option<&Self>,
-        object: ManifestObject,
+        new_objects: Vec<ManifestObject>,
         max_objects: usize,
     ) -> Result<Self, ManifestPlanError> {
-        if max_objects == 0 {
+        if max_objects == 0 || new_objects.is_empty() || new_objects.len() > 1024 {
             return Err(ManifestPlanError::SmallFileCeiling { max_objects });
         }
         let previous_objects = match previous {
@@ -387,13 +387,13 @@ impl ManifestPlan {
             Some(_) => return Err(ManifestPlanError::DatasetMismatch),
             None => &[],
         };
-        if previous_objects.len() >= max_objects {
-            return Err(ManifestPlanError::SmallFileCeiling { max_objects });
-        }
         let object_count = previous_objects
             .len()
-            .checked_add(1)
+            .checked_add(new_objects.len())
             .ok_or(ManifestPlanError::CountOverflow)?;
+        if object_count > max_objects || object_count > 1024 {
+            return Err(ManifestPlanError::SmallFileCeiling { max_objects });
+        }
         let mut objects = Vec::new();
         objects
             .try_reserve_exact(object_count)
@@ -402,7 +402,7 @@ impl ManifestPlan {
             return Err(ManifestPlanError::AllocationContract);
         }
         objects.extend_from_slice(previous_objects);
-        objects.push(object);
+        objects.extend(new_objects);
         Self::from_objects(dataset_id, objects)
     }
 

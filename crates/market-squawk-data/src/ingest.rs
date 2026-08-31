@@ -44,7 +44,7 @@ use crate::catalog::{
 };
 use crate::catalog::{
     PreparedProviderCaptureBinding, PreparedProviderOptionMarketBinding,
-    PreparedProviderPublicationBinding, PublicationSourceEvidence,
+    PreparedProviderPublicationBinding, ProviderArtifactInputCoordinate, PublicationSourceEvidence,
 };
 use crate::manifest::MarketBarHistoryPublicationCandidate;
 use crate::parquet_store::MAX_SCAN_OBJECTS;
@@ -3215,7 +3215,7 @@ impl AnalyticalDataService {
         }
         let plan = self
             .manifests
-            .preview_append(analytical_dataset, &schema, object)?;
+            .preview_append(analytical_dataset, &schema, vec![object])?;
         self.commit_plan(
             &authority,
             &reservation,
@@ -3229,7 +3229,10 @@ impl AnalyticalDataService {
             company_identity.as_ref(),
             market_bar_history.as_ref(),
             match provider_binding {
-                Some(binding) => PublicationSourceEvidence::Provider(binding),
+                Some(binding) => PublicationSourceEvidence::Provider(
+                    binding,
+                    ProviderArtifactInputCoordinate::try_new(0, 0)?,
+                ),
                 None => PublicationSourceEvidence::NoNewRawInput,
             },
         )
@@ -3426,7 +3429,7 @@ impl AnalyticalDataService {
         }
         let plan = self
             .manifests
-            .preview_append(analytical_dataset, &schema, object)?;
+            .preview_append(analytical_dataset, &schema, vec![object])?;
         let authority = self.lock_authority()?;
         let run = self.validate_run(
             &authority,
@@ -3452,6 +3455,9 @@ impl AnalyticalDataService {
             plan.content_hash().evidence(),
             created_at,
         );
+        let capture_coordinates = (0..prepared_captures.len())
+            .map(|ordinal| ProviderArtifactInputCoordinate::try_new(0, ordinal))
+            .collect::<Result<Vec<_>, _>>()?;
         let (manifest, catalog_receipt_digest) = self
             .manifests
             .commit_provider_macro_plan_publication(
@@ -3459,11 +3465,12 @@ impl AnalyticalDataService {
                 authority.result_limits(),
                 &reservation,
                 &plan,
-                &artifact,
+                std::slice::from_ref(&artifact),
                 &anchor,
                 &schema,
                 &run,
                 &prepared_captures,
+                &capture_coordinates,
                 completion_digest,
                 publication_digest,
                 total_rows,
@@ -3586,7 +3593,7 @@ impl AnalyticalDataService {
         }
         let plan = self
             .manifests
-            .preview_append(analytical_dataset, &schema, object)?;
+            .preview_append(analytical_dataset, &schema, vec![object])?;
         let committed = self.commit_plan(
             &authority,
             &reservation,
@@ -3599,7 +3606,10 @@ impl AnalyticalDataService {
             Some(precommit_authority.as_ref()),
             None,
             None,
-            PublicationSourceEvidence::ProviderLogical(&binding),
+            PublicationSourceEvidence::ProviderLogical(
+                &binding,
+                ProviderArtifactInputCoordinate::try_new(0, 0)?,
+            ),
         )?;
         let persisted = authority
             .provider_logical_publication_binding(payload_digest)?
@@ -3680,9 +3690,9 @@ impl AnalyticalDataService {
         if run.state() != IngestRunState::Reserved {
             return Err(IngestError::TerminalRun);
         }
-        let plan = self
-            .manifests
-            .preview_append(analytical_dataset.clone(), &schema, object)?;
+        let plan =
+            self.manifests
+                .preview_append(analytical_dataset.clone(), &schema, vec![object])?;
         self.commit_plan(
             &authority,
             &reservation,
@@ -3696,7 +3706,10 @@ impl AnalyticalDataService {
             Some(precommit_authority.as_ref()),
             None,
             None,
-            PublicationSourceEvidence::ProviderEvent(&prepared),
+            PublicationSourceEvidence::ProviderEvent(
+                &prepared,
+                ProviderArtifactInputCoordinate::try_new(0, 0)?,
+            ),
         )
     }
 
@@ -3764,9 +3777,9 @@ impl AnalyticalDataService {
         if run.state() != IngestRunState::Reserved {
             return Err(IngestError::TerminalRun);
         }
-        let plan = self
-            .manifests
-            .preview_append(analytical_dataset.clone(), &schema, object)?;
+        let plan =
+            self.manifests
+                .preview_append(analytical_dataset.clone(), &schema, vec![object])?;
         self.commit_plan(
             &authority,
             &reservation,
@@ -3780,7 +3793,10 @@ impl AnalyticalDataService {
             Some(precommit_authority.as_ref()),
             None,
             None,
-            PublicationSourceEvidence::ProviderOptionMarket(&prepared),
+            PublicationSourceEvidence::ProviderOptionMarket(
+                &prepared,
+                ProviderArtifactInputCoordinate::try_new(0, 0)?,
+            ),
         )
     }
 
@@ -4189,24 +4205,16 @@ impl AnalyticalDataService {
             plan.content_hash().evidence(),
             created_at,
         );
-        if matches!(
-            source_evidence,
-            PublicationSourceEvidence::Provider(_)
-                | PublicationSourceEvidence::ProviderEvent(_)
-                | PublicationSourceEvidence::ProviderOptionMarket(_)
-                | PublicationSourceEvidence::ProviderLogical(_)
-        ) {
-            if kind != GenerationKind::Ingest {
-                return Err(IngestError::ProviderCaptureRequired);
-            }
+        if kind == GenerationKind::Ingest {
             let sec_fund_job = match (&source_evidence, precommit_authority) {
-                (PublicationSourceEvidence::ProviderLogical(binding), Some(authority)) => {
+                (PublicationSourceEvidence::ProviderLogical(binding, _), Some(authority)) => {
                     authority.claim_sec_fund_job_commit(binding.binding_digest())?
                 }
                 _ => None,
             };
             if let Some(sec_fund_job) = sec_fund_job.as_ref() {
-                let PublicationSourceEvidence::ProviderLogical(binding) = &source_evidence else {
+                let PublicationSourceEvidence::ProviderLogical(binding, _) = &source_evidence
+                else {
                     return Err(IngestError::ProviderLogicalFundRequired);
                 };
                 if binding.terminal().source_id().as_str() != SEC_FUND_SOURCE_ID
@@ -4220,12 +4228,12 @@ impl AnalyticalDataService {
             }
             let manifest = self
                 .manifests
-                .commit_provider_ingest_publication(
+                .commit_ingest_publication(
                     self.catalog_id,
                     authority.result_limits(),
                     reservation,
                     &plan,
-                    &artifact,
+                    std::slice::from_ref(&artifact),
                     &anchor,
                     &schema,
                     run,
@@ -4239,15 +4247,18 @@ impl AnalyticalDataService {
                 })?;
             return Ok(CommittedDataset::new(self.manifests.pinned(&manifest)?));
         }
+        if !matches!(source_evidence, PublicationSourceEvidence::NoNewRawInput) {
+            return Err(IngestError::ProviderCaptureRequired);
+        }
         let publication = authority.publish_artifact_manifest_with_source_evidence(
             reservation,
-            &artifact,
+            std::slice::from_ref(&artifact),
             &anchor,
             source_evidence,
         )?;
         let manifest = self.manifests.commit_generation(
             &plan,
-            publication.artifact(),
+            publication.artifacts(),
             publication.manifest(),
             &schema,
             kind,

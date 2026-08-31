@@ -197,21 +197,10 @@ fn schema_identity_is_causal_across_publication_pinning_and_restart() -> TestRes
     let dataset = DatasetId::try_from("schema-bound")?;
     let object =
         ManifestObject::try_new(Sha256Digest::new([1; 32]), 1, 1, Sha256Digest::new([2; 32]))?;
-    let plan = ManifestPlan::append(dataset.clone(), None, object.clone(), 8)?;
+    let plan = ManifestPlan::append(dataset.clone(), None, vec![object.clone()], 8)?;
     let artifact_id = uuid::Uuid::new_v4();
     let connection = Connection::open(location.path())?;
     connection.pragma_update(None, "foreign_keys", false)?;
-    connection.execute(
-        "INSERT INTO artifacts
-         (artifact_id, run_id, relative_reference, content_algorithm, content_digest,
-          size_bytes, created_at_ns)
-         VALUES (?1, ?2, 'objects/fixture.parquet', 1, ?3, 1, 1)",
-        params![
-            artifact_id.to_string(),
-            uuid::Uuid::new_v4().to_string(),
-            object.content_hash().bytes().as_slice(),
-        ],
-    )?;
     connection.execute(
         "INSERT INTO analytical_generations
          (dataset_id, manifest_version, content_hash, lineage_hash, row_count, total_bytes,

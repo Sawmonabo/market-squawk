@@ -246,7 +246,7 @@ pub async fn run_release_evidence_storage(
     .map_err(|_| ReleaseEvidenceStorageError::Parquet)?;
     let dataset_id = DatasetId::try_from("release-evidence-observations")
         .map_err(|_| ReleaseEvidenceStorageError::Parquet)?;
-    let plan = ManifestPlan::append(dataset_id.clone(), None, object.clone(), 1)
+    let plan = ManifestPlan::append(dataset_id.clone(), None, vec![object.clone()], 1)
         .map_err(|_| ReleaseEvidenceStorageError::Parquet)?;
     let manifest = DatasetManifestRef::try_new_with_schema(
         dataset_id,
