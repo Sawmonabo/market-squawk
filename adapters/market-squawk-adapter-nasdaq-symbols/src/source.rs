@@ -6,7 +6,8 @@ use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use market_squawk_domain::{
     AssetClass, CoverageDelay, DataQuality, DeliveryEvidence, DigestAlgorithm, EffectiveInterval,
-    EvidenceDigest, ExactPayloadEvidence, SourceIdentifier, Timestamp, VenueId,
+    EvidenceDigest, ExactPayloadEvidence, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
+    VenueId,
 };
 use market_squawk_platform::SealedResearchJournalStore;
 use market_squawk_sources::{
@@ -110,19 +111,6 @@ impl NasdaqSymbolDirectoryDiscovery {
         Box<[NasdaqHttpResponseEvidence]>,
     ) {
         (self.batch, self.capture_material, self.response_evidence)
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn directory_discovery_for_test(
-    batch: DiscoveryBatch,
-    capture_material: ProviderCaptureMaterial,
-    response_evidence: Box<[NasdaqHttpResponseEvidence]>,
-) -> NasdaqSymbolDirectoryDiscovery {
-    NasdaqSymbolDirectoryDiscovery {
-        batch,
-        capture_material,
-        response_evidence,
     }
 }
 
@@ -303,6 +291,342 @@ struct CachedDirectory {
     object_id: SourceIdentifier,
     retrieved: RetrievedDirectory,
     parsed: ParsedDirectory,
+}
+
+struct DirectoryAssembly<'a> {
+    source_id: &'a SourceId,
+    revision: &'a MetadataRevision,
+    dataset: &'a SourceIdentifier,
+}
+
+impl<'a> DirectoryAssembly<'a> {
+    const fn new(
+        source_id: &'a SourceId,
+        revision: &'a MetadataRevision,
+        dataset: &'a SourceIdentifier,
+    ) -> Self {
+        Self {
+            source_id,
+            revision,
+            dataset,
+        }
+    }
+
+    fn try_discovery(
+        &self,
+        request: &DiscoveryRequest,
+        entries: &[Arc<CachedDirectory>],
+    ) -> Result<NasdaqSymbolDirectoryDiscovery, ExtractionSourceError> {
+        self.validate_discovery_request(request)?;
+        if entries.len() != NasdaqDirectoryKind::EQUITY_DIRECTORIES.len()
+            || entries
+                .iter()
+                .zip(NasdaqDirectoryKind::EQUITY_DIRECTORIES)
+                .any(|(entry, family)| entry.retrieved.kind != family)
+        {
+            return Err(SourceError::InvalidProtocolState.into());
+        }
+        let mut captures = Vec::with_capacity(entries.len());
+        let mut identities = Vec::with_capacity(entries.len());
+        let mut objects = Vec::with_capacity(entries.len());
+        let mut responses = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let capture = self.capture_material(entry)?;
+            identities.push(
+                SourceObjectCaptureIdentity::try_from_capture(capture.receipt())
+                    .map_err(|_| SourceError::InvalidProtocolState)?,
+            );
+            responses.push(entry.retrieved.response_evidence.clone());
+            captures.push(capture);
+        }
+        let capture_material = ProviderCaptureMaterial::try_combine_request_graph(
+            self.source_id.clone(),
+            self.revision.clone(),
+            self.dataset.clone(),
+            request_graph_identity(self.source_id, self.revision, self.dataset)?,
+            captures,
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+        for (entry, identity) in entries.iter().zip(identities) {
+            objects.push(self.source_object(request, entry, identity)?);
+        }
+        Ok(NasdaqSymbolDirectoryDiscovery {
+            batch: DiscoveryBatch::try_new(request, objects)?,
+            capture_material,
+            response_evidence: responses.into_boxed_slice(),
+        })
+    }
+
+    fn validate_discovery_request(
+        &self,
+        request: &DiscoveryRequest,
+    ) -> Result<(), ExtractionSourceError> {
+        if request.dataset() != self.dataset
+            || request.effective_at().is_some()
+            || request.max_results()
+                < u16::try_from(NasdaqDirectoryKind::EQUITY_DIRECTORIES.len())
+                    .map_err(|_| SourceError::InvalidProtocolState)?
+        {
+            return Err(SourceError::InvalidProtocolState.into());
+        }
+        Ok(())
+    }
+
+    fn validate_extraction_request(
+        &self,
+        request: &ExtractionRequest,
+    ) -> Result<(), ExtractionSourceError> {
+        let object = request.object();
+        let availability_matches = matches!(
+            object.availability(),
+            AvailabilityEvidence::LocalFirstObserved { observed_at }
+                if *observed_at >= object.effective_interval().starts_at()
+        );
+        if object.source_id() != self.source_id
+            || object.metadata_revision() != self.revision
+            || object.dataset() != self.dataset
+            || object.media_type().as_str() != MEDIA_TYPE
+            || object.effective_interval().ends_at().is_some()
+            || object.published_at() != Some(object.effective_interval().starts_at())
+            || !availability_matches
+            || object.expected_bytes().is_none()
+        {
+            return Err(SourceError::InvalidProtocolState.into());
+        }
+        Ok(())
+    }
+
+    fn capture_material(
+        &self,
+        entry: &CachedDirectory,
+    ) -> Result<ProviderCaptureMaterial, ExtractionSourceError> {
+        let request_identity =
+            capture_request_identity(self.source_id, self.revision, entry.retrieved.kind)?;
+        let body_digest = exact_evidence(&entry.retrieved.bytes).content_digest();
+        let body_bytes = u64::try_from(entry.retrieved.bytes.len())
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        let page = ProviderCapturePageReceipt::try_new(
+            0,
+            request_identity,
+            None,
+            None,
+            200,
+            body_bytes,
+            body_digest,
+            entry.retrieved.received_at,
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+        let receipt = ProviderCaptureSetReceipt::try_new(
+            self.source_id.clone(),
+            self.revision.clone(),
+            self.dataset.clone(),
+            request_identity,
+            ProviderCaptureTerminalDisposition::StandaloneResponse,
+            vec![page],
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+        let record = market_squawk_platform::RawCaptureRecord::try_new_live(
+            deterministic_capture_uuid(b"event", &receipt),
+            Arc::from(self.source_id.as_str()),
+            deterministic_capture_uuid(b"connection", &receipt),
+            Some(0),
+            None,
+            DateTime::<Utc>::from_timestamp_nanos(entry.retrieved.received_at.unix_nanos()),
+            entry.retrieved.bytes.clone(),
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+        ProviderCaptureMaterial::try_new(receipt, vec![record])
+            .map_err(|_| SourceError::InvalidProtocolState.into())
+    }
+
+    fn source_object(
+        &self,
+        request: &DiscoveryRequest,
+        entry: &CachedDirectory,
+        capture_identity: SourceObjectCaptureIdentity,
+    ) -> Result<SourceObject, ExtractionSourceError> {
+        let effective = EffectiveInterval::new(entry.retrieved.last_modified_at, None)
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        let expected_bytes = u64::try_from(entry.retrieved.bytes.len())
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        SourceObject::try_new_with_capture_identity(
+            self.source_id.clone(),
+            self.revision.clone(),
+            request,
+            entry.object_id.clone(),
+            SourceIdentifier::try_from(MEDIA_TYPE)
+                .map_err(|_| SourceError::InvalidProtocolState)?,
+            exact_evidence(&entry.retrieved.bytes),
+            capture_identity,
+            effective,
+            Some(entry.retrieved.last_modified_at),
+            AvailabilityEvidence::LocalFirstObserved {
+                observed_at: entry.retrieved.received_at,
+            },
+            Some(expected_bytes),
+        )
+        .map_err(Into::into)
+    }
+
+    fn try_extraction_batch<F>(
+        &self,
+        request: &ExtractionRequest,
+        entry: &CachedDirectory,
+        mut checkpoint: F,
+    ) -> Result<ExtractionBatch, ExtractionSourceError>
+    where
+        F: FnMut(usize) -> Result<(), ExtractionSourceError>,
+    {
+        self.validate_extraction_request(request)?;
+        let (kind, object_digest) = parse_object_id(request.object().object_id())?;
+        if entry.retrieved.kind != kind
+            || entry.parsed.kind != kind
+            || entry.retrieved.sha256_hex.as_str() != object_digest
+            || request.object().evidence() != &exact_evidence(&entry.retrieved.bytes)
+            || !payload_matches_exact_evidence(&entry.retrieved.bytes, request.object().evidence())
+            || request.object().expected_bytes() != u64::try_from(entry.retrieved.bytes.len()).ok()
+        {
+            return Err(SourceError::GenerationResynchronizationRequired.into());
+        }
+        if entry.parsed.rows.len() > request.max_records() as usize {
+            return Err(
+                market_squawk_sources::ExtractionError::RecordLimitExceeded {
+                    requested: request.max_records(),
+                }
+                .into(),
+            );
+        }
+        let schema = SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        let source_last_modified_at = request
+            .object()
+            .published_at()
+            .ok_or(SourceError::InvalidProtocolState)?;
+        let first_observed_at = match request.object().availability() {
+            AvailabilityEvidence::LocalFirstObserved { observed_at } => *observed_at,
+            _ => return Err(SourceError::InvalidProtocolState.into()),
+        };
+        let source_evidence = request.object().evidence().clone();
+        let mut batch = ExtractionBatchAccumulator::try_new(request)?;
+        for (index, row) in entry.parsed.rows.iter().enumerate() {
+            checkpoint(index)?;
+            let normalized = NasdaqListingRecord::try_new(
+                row.row_number,
+                entry.parsed.file_creation_time.clone(),
+                source_last_modified_at,
+                first_observed_at,
+                source_evidence.clone(),
+                row.fields.clone(),
+            )
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+            let payload = serde_json::to_vec(&normalized)
+                .map(Bytes::from)
+                .map_err(|_| SourceError::InvalidProtocolState)?;
+            let record = ExtractionRecord::try_new(
+                request,
+                schema.clone(),
+                exact_evidence(&payload),
+                source_last_modified_at,
+                Some(source_last_modified_at),
+                request.object().availability().clone(),
+                SourceIdentifier::try_from(format!(
+                    "nasdaq-symbols:{}:row-{}:{object_digest}",
+                    kind.object_component(),
+                    row.row_number
+                ))
+                .map_err(|_| SourceError::InvalidProtocolState)?,
+                None,
+                payload,
+            )?;
+            batch.push(record)?;
+        }
+        batch.finish().map_err(Into::into)
+    }
+}
+
+fn validated_directory(
+    retrieved: RetrievedDirectory,
+    cancellation: &CancellationToken,
+) -> Result<Arc<CachedDirectory>, ExtractionSourceError> {
+    let parsed =
+        parse_directory(retrieved.kind, &retrieved.bytes, cancellation).map_err(map_parse_error)?;
+    validate_footer_clock(&parsed.file_creation_time, retrieved.last_modified_at)
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+    let object_id = SourceIdentifier::try_from(format!(
+        "nasdaq-symbols:{}:{}",
+        retrieved.kind.object_component(),
+        retrieved.sha256_hex
+    ))
+    .map_err(|_| SourceError::InvalidProtocolState)?;
+    Ok(Arc::new(CachedDirectory {
+        object_id,
+        retrieved,
+        parsed,
+    }))
+}
+
+#[cfg(test)]
+pub(crate) fn directory_journey_for_test(
+    source_id: &SourceId,
+    revision: &MetadataRevision,
+    dataset: &SourceIdentifier,
+    discovery_request: &DiscoveryRequest,
+    bodies: [(&[u8], Timestamp, Timestamp); 2],
+) -> Result<(NasdaqSymbolDirectoryDiscovery, Vec<ExtractionBatch>), ExtractionSourceError> {
+    use std::num::{NonZeroU32, NonZeroU64};
+
+    let cancellation = CancellationToken::new();
+    let mut entries = Vec::with_capacity(NasdaqDirectoryKind::EQUITY_DIRECTORIES.len());
+    for (kind, (body, last_modified_at, received_at)) in NasdaqDirectoryKind::EQUITY_DIRECTORIES
+        .into_iter()
+        .zip(bodies)
+    {
+        let bytes = Bytes::copy_from_slice(body);
+        let body_bytes =
+            u64::try_from(bytes.len()).map_err(|_| SourceError::InvalidProtocolState)?;
+        let digest = Sha256::digest(&bytes);
+        let response_evidence = NasdaqHttpResponseEvidence::try_new(
+            200,
+            MEDIA_TYPE.to_owned(),
+            Some("identity".to_owned()),
+            Some(body_bytes),
+            None,
+            1,
+            last_modified_at,
+            received_at,
+        )
+        .map_err(|_| SourceError::InvalidProtocolState)?;
+        entries.push(validated_directory(
+            RetrievedDirectory {
+                kind,
+                bytes,
+                received_at,
+                last_modified_at,
+                sha256_hex: format!("{digest:x}"),
+                response_evidence,
+            },
+            &cancellation,
+        )?);
+    }
+
+    let assembly = DirectoryAssembly::new(source_id, revision, dataset);
+    let discovery = assembly.try_discovery(discovery_request, &entries)?;
+    let mut batches = Vec::with_capacity(entries.len());
+    for (entry, object) in entries.iter().zip(discovery.batch().objects()) {
+        let max_records = NonZeroU32::new(
+            u32::try_from(entry.parsed.rows.len())
+                .map_err(|_| SourceError::InvalidProtocolState)?,
+        )
+        .ok_or(SourceError::InvalidProtocolState)?;
+        let request = ExtractionRequest::try_new(
+            object.clone(),
+            max_records,
+            NonZeroU64::new(1024 * 1024).ok_or(SourceError::InvalidProtocolState)?,
+            discovery_request.deadline(),
+        )?;
+        batches.push(assembly.try_extraction_batch(&request, entry, |_| Ok(()))?);
+    }
+    Ok((discovery, batches))
 }
 
 #[derive(Debug, Default)]
@@ -510,17 +834,14 @@ impl NasdaqSymbolDirectorySource {
         cancellation: CancellationToken,
     ) -> Result<NasdaqSymbolDirectoryDiscovery, ExtractionSourceError> {
         self.validate_authority(&authority)?;
-        if request.dataset() != self.config.dataset()
-            || request.effective_at().is_some()
-            || request.max_results() < 2
-        {
-            return Err(SourceError::InvalidProtocolState.into());
-        }
+        let assembly = DirectoryAssembly::new(
+            self.metadata.source_id(),
+            self.metadata.revision(),
+            self.config.dataset(),
+        );
+        assembly.validate_discovery_request(&request)?;
         ensure_deadline_open(request.deadline())?;
-        let mut objects = Vec::with_capacity(2);
-        let mut captures = Vec::with_capacity(2);
-        let mut component_capture_identities = Vec::with_capacity(2);
-        let mut response_evidence = Vec::with_capacity(2);
+        let mut entries = Vec::with_capacity(2);
         for kind in [
             NasdaqDirectoryKind::NasdaqListed,
             NasdaqDirectoryKind::OtherListed,
@@ -528,59 +849,21 @@ impl NasdaqSymbolDirectorySource {
             let entry = self
                 .fetch_validated(&authority, kind, request.deadline(), &cancellation)
                 .await?;
-            let capture = self.capture_material(&entry)?;
-            component_capture_identities.push(
-                SourceObjectCaptureIdentity::try_from_capture(capture.receipt())
-                    .map_err(|_| SourceError::InvalidProtocolState)?,
-            );
-            captures.push(capture);
-            response_evidence.push(entry.retrieved.response_evidence.clone());
+            entries.push(entry);
+        }
+        let discovery = assembly.try_discovery(&request, &entries)?;
+        for entry in entries {
             self.cache
                 .lock()
                 .map_err(|_| SourceError::InvalidProtocolState)?
                 .insert(entry);
         }
-        let capture_material = ProviderCaptureMaterial::try_combine_request_graph(
-            self.metadata.source_id().clone(),
-            self.metadata.revision().clone(),
-            self.config.dataset().clone(),
-            request_graph_identity(&self.metadata, &self.config)?,
-            captures,
-        )
-        .map_err(|_| SourceError::InvalidProtocolState)?;
-        let cached = self
-            .cache
-            .lock()
-            .map_err(|_| SourceError::InvalidProtocolState)?;
-        for (component_ordinal, kind) in [
-            NasdaqDirectoryKind::NasdaqListed,
-            NasdaqDirectoryKind::OtherListed,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let entry = cached
-                .entries
-                .iter()
-                .find(|entry| entry.retrieved.kind == kind)
-                .ok_or(SourceError::InvalidProtocolState)?;
-            let capture_identity = *component_capture_identities
-                .get(component_ordinal)
-                .ok_or(SourceError::InvalidProtocolState)?;
-            objects.push(self.source_object(&request, entry, capture_identity)?);
-        }
-        drop(cached);
         if cancellation.is_cancelled() {
             return Err(ExtractionSourceError::Cancelled);
         }
         ensure_deadline_open(request.deadline())?;
         authority.validate_current()?;
-        let batch = DiscoveryBatch::try_new(&request, objects)?;
-        Ok(NasdaqSymbolDirectoryDiscovery {
-            batch,
-            capture_material,
-            response_evidence: response_evidence.into_boxed_slice(),
-        })
+        Ok(discovery)
     }
 
     async fn extract_impl(
@@ -590,12 +873,17 @@ impl NasdaqSymbolDirectorySource {
         cancellation: CancellationToken,
     ) -> Result<ExtractionBatch, ExtractionSourceError> {
         self.validate_authority(&authority)?;
-        self.validate_extraction_request(&request)?;
+        let assembly = DirectoryAssembly::new(
+            self.metadata.source_id(),
+            self.metadata.revision(),
+            self.config.dataset(),
+        );
+        assembly.validate_extraction_request(&request)?;
         if cancellation.is_cancelled() {
             return Err(ExtractionSourceError::Cancelled);
         }
         ensure_deadline_open(request.deadline())?;
-        let (kind, object_digest) = parse_object_id(request.object().object_id())?;
+        let (kind, _) = parse_object_id(request.object().object_id())?;
         let cached = self
             .cache
             .lock()
@@ -617,38 +905,7 @@ impl NasdaqSymbolDirectorySource {
                 fetched
             }
         };
-        if entry.retrieved.kind != kind
-            || entry.parsed.kind != kind
-            || entry.retrieved.sha256_hex.as_str() != object_digest
-            || request.object().evidence() != &exact_evidence(&entry.retrieved.bytes)
-            || !payload_matches_exact_evidence(&entry.retrieved.bytes, request.object().evidence())
-            || request.object().expected_bytes() != u64::try_from(entry.retrieved.bytes.len()).ok()
-        {
-            return Err(SourceError::GenerationResynchronizationRequired.into());
-        }
-        let record_count = entry.parsed.rows.len();
-        if record_count > request.max_records() as usize {
-            return Err(
-                market_squawk_sources::ExtractionError::RecordLimitExceeded {
-                    requested: request.max_records(),
-                }
-                .into(),
-            );
-        }
-
-        let schema = SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)
-            .map_err(|_| SourceError::InvalidProtocolState)?;
-        let source_last_modified_at = request
-            .object()
-            .published_at()
-            .ok_or(SourceError::InvalidProtocolState)?;
-        let first_observed_at = match request.object().availability() {
-            AvailabilityEvidence::LocalFirstObserved { observed_at } => *observed_at,
-            _ => return Err(SourceError::InvalidProtocolState.into()),
-        };
-        let source_evidence = request.object().evidence().clone();
-        let mut batch = ExtractionBatchAccumulator::try_new(&request)?;
-        for (index, row) in entry.parsed.rows.iter().enumerate() {
+        let batch = assembly.try_extraction_batch(&request, &entry, |index| {
             if cancellation.is_cancelled() {
                 return Err(ExtractionSourceError::Cancelled);
             }
@@ -656,115 +913,11 @@ impl NasdaqSymbolDirectorySource {
                 ensure_deadline_open(request.deadline())?;
                 authority.validate_current()?;
             }
-            let normalized = NasdaqListingRecord::try_new(
-                row.row_number,
-                entry.parsed.file_creation_time.clone(),
-                source_last_modified_at,
-                first_observed_at,
-                source_evidence.clone(),
-                row.fields.clone(),
-            )
-            .map_err(|_| SourceError::InvalidProtocolState)?;
-            let payload = serde_json::to_vec(&normalized)
-                .map(Bytes::from)
-                .map_err(|_| SourceError::InvalidProtocolState)?;
-            let evidence = exact_evidence(&payload);
-            let revision = SourceIdentifier::try_from(format!(
-                "nasdaq-symbols:{}:row-{}:{object_digest}",
-                kind.object_component(),
-                row.row_number
-            ))
-            .map_err(|_| SourceError::InvalidProtocolState)?;
-            let record = ExtractionRecord::try_new(
-                &request,
-                schema.clone(),
-                evidence,
-                source_last_modified_at,
-                Some(source_last_modified_at),
-                request.object().availability().clone(),
-                revision,
-                None,
-                payload,
-            )?;
-            batch.push(record)?;
-        }
+            Ok(())
+        })?;
         ensure_deadline_open(request.deadline())?;
         authority.validate_current()?;
-        batch.finish().map_err(Into::into)
-    }
-
-    fn source_object(
-        &self,
-        request: &DiscoveryRequest,
-        entry: &CachedDirectory,
-        capture_identity: SourceObjectCaptureIdentity,
-    ) -> Result<SourceObject, ExtractionSourceError> {
-        let evidence = exact_evidence(&entry.retrieved.bytes);
-        let effective = EffectiveInterval::new(entry.retrieved.last_modified_at, None)
-            .map_err(|_| SourceError::InvalidProtocolState)?;
-        let expected_bytes = u64::try_from(entry.retrieved.bytes.len())
-            .map_err(|_| SourceError::InvalidProtocolState)?;
-        SourceObject::try_new_with_capture_identity(
-            self.metadata.source_id().clone(),
-            self.metadata.revision().clone(),
-            request,
-            entry.object_id.clone(),
-            SourceIdentifier::try_from(MEDIA_TYPE)
-                .map_err(|_| SourceError::InvalidProtocolState)?,
-            evidence,
-            capture_identity,
-            effective,
-            Some(entry.retrieved.last_modified_at),
-            AvailabilityEvidence::LocalFirstObserved {
-                observed_at: entry.retrieved.received_at,
-            },
-            Some(expected_bytes),
-        )
-        .map_err(Into::into)
-    }
-
-    fn capture_material(
-        &self,
-        entry: &CachedDirectory,
-    ) -> Result<ProviderCaptureMaterial, ExtractionSourceError> {
-        let request_identity = capture_request_identity(&self.metadata, entry.retrieved.kind)?;
-        let body_digest = exact_evidence(&entry.retrieved.bytes).content_digest();
-        let body_bytes = u64::try_from(entry.retrieved.bytes.len())
-            .map_err(|_| SourceError::InvalidProtocolState)?;
-        let page = ProviderCapturePageReceipt::try_new(
-            0,
-            request_identity,
-            None,
-            None,
-            200,
-            body_bytes,
-            body_digest,
-            entry.retrieved.received_at,
-        )
-        .map_err(|_| SourceError::InvalidProtocolState)?;
-        let receipt = ProviderCaptureSetReceipt::try_new(
-            self.metadata.source_id().clone(),
-            self.metadata.revision().clone(),
-            self.config.dataset().clone(),
-            request_identity,
-            ProviderCaptureTerminalDisposition::StandaloneResponse,
-            vec![page],
-        )
-        .map_err(|_| SourceError::InvalidProtocolState)?;
-        let connection_id = deterministic_capture_uuid(b"connection", &receipt);
-        let event_id = deterministic_capture_uuid(b"event", &receipt);
-        let record = market_squawk_platform::RawCaptureRecord::try_new_live(
-            event_id,
-            Arc::from(self.metadata.source_id().as_str()),
-            connection_id,
-            Some(0),
-            None,
-            DateTime::<Utc>::from_timestamp_nanos(entry.retrieved.received_at.unix_nanos()),
-            entry.retrieved.bytes.clone(),
-        )
-        .map_err(|_| SourceError::InvalidProtocolState)?;
-        ProviderCaptureMaterial::try_new(receipt, vec![record])
-            .map_err(|_| SourceError::InvalidProtocolState.into())
+        Ok(batch)
     }
 
     async fn fetch_validated(
@@ -781,49 +934,11 @@ impl NasdaqSymbolDirectorySource {
                 .http
                 .fetch(&self.metadata, authority, kind, deadline, cancellation)
                 .await?;
-            let parsed =
-                parse_directory(kind, &retrieved.bytes, cancellation).map_err(map_parse_error)?;
-            validate_footer_clock(&parsed.file_creation_time, retrieved.last_modified_at)
-                .map_err(|_| SourceError::InvalidProtocolState)?;
-            let object_id = SourceIdentifier::try_from(format!(
-                "nasdaq-symbols:{}:{}",
-                kind.object_component(),
-                retrieved.sha256_hex
-            ))
-            .map_err(|_| SourceError::InvalidProtocolState)?;
-            Ok(Arc::new(CachedDirectory {
-                object_id,
-                retrieved,
-                parsed,
-            }))
+            validated_directory(retrieved, cancellation)
         }
         .await;
         self.record_result(kind, &result)?;
         result
-    }
-
-    fn validate_extraction_request(
-        &self,
-        request: &ExtractionRequest,
-    ) -> Result<(), ExtractionSourceError> {
-        let object = request.object();
-        let availability_matches = matches!(
-            object.availability(),
-            AvailabilityEvidence::LocalFirstObserved { observed_at }
-                if *observed_at >= object.effective_interval().starts_at()
-        );
-        if object.source_id() != self.metadata.source_id()
-            || object.metadata_revision() != self.metadata.revision()
-            || object.dataset() != self.config.dataset()
-            || object.media_type().as_str() != MEDIA_TYPE
-            || object.effective_interval().ends_at().is_some()
-            || object.published_at() != Some(object.effective_interval().starts_at())
-            || !availability_matches
-            || object.expected_bytes().is_none()
-        {
-            return Err(SourceError::InvalidProtocolState.into());
-        }
-        Ok(())
     }
 
     fn validate_authority(
@@ -1000,19 +1115,16 @@ pub(crate) const fn directory_locator(kind: NasdaqDirectoryKind) -> Option<&'sta
 }
 
 fn capture_request_identity(
-    metadata: &SourceMetadata,
+    source_id: &SourceId,
+    revision: &MetadataRevision,
     kind: NasdaqDirectoryKind,
 ) -> Result<EvidenceDigest, ExtractionSourceError> {
     let mut hash = Sha256::new();
     hash.update(b"market-squawk/nasdaq-symbol-directory-http-request/v1");
-    hash_capture_field(&mut hash, metadata.source_id().as_str().as_bytes())?;
+    hash_capture_field(&mut hash, source_id.as_str().as_bytes())?;
     hash_capture_field(
         &mut hash,
-        metadata
-            .revision()
-            .as_source_identifier()
-            .as_str()
-            .as_bytes(),
+        revision.as_source_identifier().as_str().as_bytes(),
     )?;
     hash_capture_field(&mut hash, b"GET")?;
     let locator = directory_locator(kind).ok_or(SourceError::InvalidProtocolState)?;
@@ -1035,26 +1147,23 @@ fn capture_request_identity(
 }
 
 fn request_graph_identity(
-    metadata: &SourceMetadata,
-    config: &NasdaqSymbolDirectoryConfig,
+    source_id: &SourceId,
+    revision: &MetadataRevision,
+    dataset: &SourceIdentifier,
 ) -> Result<EvidenceDigest, ExtractionSourceError> {
     let mut hash = Sha256::new();
     hash.update(b"market-squawk/nasdaq-symbol-directory-request-graph/v1");
-    hash_capture_field(&mut hash, metadata.source_id().as_str().as_bytes())?;
+    hash_capture_field(&mut hash, source_id.as_str().as_bytes())?;
     hash_capture_field(
         &mut hash,
-        metadata
-            .revision()
-            .as_source_identifier()
-            .as_str()
-            .as_bytes(),
+        revision.as_source_identifier().as_str().as_bytes(),
     )?;
-    hash_capture_field(&mut hash, config.dataset().as_str().as_bytes())?;
+    hash_capture_field(&mut hash, dataset.as_str().as_bytes())?;
     for kind in [
         NasdaqDirectoryKind::NasdaqListed,
         NasdaqDirectoryKind::OtherListed,
     ] {
-        hash.update(capture_request_identity(metadata, kind)?.bytes());
+        hash.update(capture_request_identity(source_id, revision, kind)?.bytes());
     }
     Ok(EvidenceDigest::new(
         DigestAlgorithm::Sha256,

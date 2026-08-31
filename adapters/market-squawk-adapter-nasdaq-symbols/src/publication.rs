@@ -483,32 +483,17 @@ pub enum NasdaqDirectoryPublicationError {
 
 #[cfg(test)]
 mod tests {
-    use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
-    use std::sync::Arc;
+    use std::num::NonZeroU16;
 
-    use bytes::Bytes;
-    use chrono::{DateTime, Utc};
-    use market_squawk_domain::{
-        DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
-        SourceId, SourceIdentifier, Timestamp,
-    };
-    use market_squawk_platform::{LocalPaths, RawCaptureRecord};
-    use market_squawk_sources::{
-        AvailabilityEvidence, CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryBatch, DiscoveryRequest,
-        ExtractionBatch, ExtractionRecord, ExtractionRequest, ProviderCaptureMaterial,
-        ProviderCapturePageReceipt, ProviderCaptureSetReceipt, SourceObject,
-        SourceObjectCaptureIdentity,
-    };
-    use sha2::{Digest, Sha256};
-    use uuid::Uuid;
+    use market_squawk_domain::{MetadataRevision, SourceId, SourceIdentifier, Timestamp};
+    use market_squawk_platform::LocalPaths;
+    use market_squawk_sources::DiscoveryRequest;
 
-    use super::NasdaqPendingDirectoryPublication;
-    use crate::source::directory_discovery_for_test;
-    use crate::{
-        NasdaqDirectoryKind, NasdaqFileCreationTime, NasdaqFinancialStatus,
-        NasdaqHttpResponseEvidence, NasdaqListingRecord, NasdaqMarketCategory, NasdaqOtherExchange,
-        NasdaqProviderFields,
-    };
+    use super::{NasdaqDirectoryPublicationError, NasdaqPendingDirectoryPublication};
+    use crate::source::directory_journey_for_test;
+
+    const NASDAQ_LISTED_BODY: &[u8] = b"Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares\nNDAQ|NASDAQ INC|Q|N|N|100|N|N\nFile Creation Time: 0814202612:00|||||||\n";
+    const OTHER_LISTED_BODY: &[u8] = b"ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol\nIBM|INTERNATIONAL BUSINESS MACHINES|N|IBM|N|100|N|IBM\nFile Creation Time: 0814202612:00||||||\n";
 
     #[test]
     fn prepared_directory_rejoin_retains_each_component_capture_binding()
@@ -516,55 +501,65 @@ mod tests {
         let source_id = SourceId::try_from("nasdaq-reference-test")?;
         let revision = MetadataRevision::new(SourceIdentifier::try_from("nasdaq-reference-r1")?);
         let dataset = SourceIdentifier::try_from("nasdaq.symbol-directory.us-listed.v1")?;
-        let first = capture_component(
-            &source_id,
-            revision.clone(),
-            dataset.clone(),
-            b"nasdaq-listed-body",
-            Timestamp::from_unix_nanos(10),
-            [1; 16],
-        )?;
-        let second = capture_component(
-            &source_id,
-            revision.clone(),
-            dataset.clone(),
-            b"other-listed-body",
-            Timestamp::from_unix_nanos(20),
-            [2; 16],
-        )?;
-        let capture = ProviderCaptureMaterial::try_combine_request_graph(
-            source_id.clone(),
-            revision.clone(),
-            dataset.clone(),
-            digest(b"complete-directory-graph"),
-            vec![first, second],
-        )?;
         let discovery_request = DiscoveryRequest::try_new(
             dataset.clone(),
             None,
             NonZeroU16::new(2).ok_or("directory object count")?,
-            Timestamp::from_unix_nanos(1_000),
+            Timestamp::from_unix_nanos(1_786_666_000_000_000_000),
         )?;
-        let objects = NasdaqDirectoryKind::EQUITY_DIRECTORIES.map(|family| {
-            source_object(
-                &source_id,
-                revision.clone(),
-                &discovery_request,
-                &capture,
-                family,
-            )
-        });
-        let objects = objects.into_iter().collect::<Result<Vec<_>, _>>()?;
-        let discovery = directory_discovery_for_test(
-            DiscoveryBatch::try_new(&discovery_request, objects.clone())?,
-            capture,
-            responses(&objects)?,
+
+        let (rejected_discovery, rejected_batches) = directory_journey_for_test(
+            &source_id,
+            &revision,
+            &dataset,
+            &discovery_request,
+            [
+                (
+                    NASDAQ_LISTED_BODY,
+                    Timestamp::from_unix_nanos(1_786_665_600_000_000_000),
+                    Timestamp::from_unix_nanos(1_786_665_610_000_000_000),
+                ),
+                (
+                    OTHER_LISTED_BODY,
+                    Timestamp::from_unix_nanos(1_786_665_620_000_000_000),
+                    Timestamp::from_unix_nanos(1_786_665_630_000_000_000),
+                ),
+            ],
+        )?;
+        assert_ne!(
+            rejected_discovery.capture_material().receipt().pages()[0].request_identity(),
+            rejected_discovery.capture_material().receipt().pages()[1].request_identity(),
         );
-        let batches = objects
-            .iter()
-            .enumerate()
-            .map(|(ordinal, object)| batch(object, ordinal))
-            .collect::<Result<Vec<_>, _>>()?;
+        let (mut rejected_pending, rejected_request) =
+            NasdaqPendingDirectoryPublication::try_prepare(rejected_discovery, rejected_batches)?;
+        rejected_pending.components[0].row_capture_page_ordinals[0] = 1;
+        let rejected_temporary = tempfile::tempdir()?;
+        let rejected_paths = LocalPaths::prepare(rejected_temporary.path())?;
+        let rejected_store = rejected_paths.sealed_research_journal_store()?;
+        let rejected_sealed = rejected_request.seal(&rejected_store)?;
+        assert!(matches!(
+            rejected_pending.try_rejoin(rejected_sealed),
+            Err(NasdaqDirectoryPublicationError::Capture(_))
+        ));
+
+        let (discovery, batches) = directory_journey_for_test(
+            &source_id,
+            &revision,
+            &dataset,
+            &discovery_request,
+            [
+                (
+                    NASDAQ_LISTED_BODY,
+                    Timestamp::from_unix_nanos(1_786_665_600_000_000_000),
+                    Timestamp::from_unix_nanos(1_786_665_610_000_000_000),
+                ),
+                (
+                    OTHER_LISTED_BODY,
+                    Timestamp::from_unix_nanos(1_786_665_620_000_000_000),
+                    Timestamp::from_unix_nanos(1_786_665_630_000_000_000),
+                ),
+            ],
+        )?;
         let (pending, request) =
             NasdaqPendingDirectoryPublication::try_prepare(discovery, batches)?;
         let temporary = tempfile::tempdir()?;
@@ -597,204 +592,5 @@ mod tests {
             );
         }
         Ok(())
-    }
-
-    fn capture_component(
-        source_id: &SourceId,
-        revision: MetadataRevision,
-        dataset: SourceIdentifier,
-        body: &[u8],
-        received_at: Timestamp,
-        record_id: [u8; 16],
-    ) -> Result<ProviderCaptureMaterial, Box<dyn std::error::Error>> {
-        let body_digest = digest(body);
-        let receipt = ProviderCaptureSetReceipt::try_new(
-            source_id.clone(),
-            revision,
-            dataset,
-            digest(b"component-request"),
-            market_squawk_sources::ProviderCaptureTerminalDisposition::StandaloneResponse,
-            vec![ProviderCapturePageReceipt::try_new(
-                0,
-                digest(b"page-request"),
-                None,
-                None,
-                200,
-                u64::try_from(body.len())?,
-                body_digest,
-                received_at,
-            )?],
-        )?;
-        let record = RawCaptureRecord::try_new_live(
-            Uuid::from_bytes(record_id),
-            Arc::from(source_id.as_str()),
-            Uuid::from_bytes(record_id.map(|byte| byte.saturating_add(8))),
-            Some(0),
-            None,
-            DateTime::<Utc>::from_timestamp_nanos(received_at.unix_nanos()),
-            Bytes::copy_from_slice(body),
-        )?;
-        Ok(ProviderCaptureMaterial::try_new(receipt, vec![record])?)
-    }
-
-    fn source_object(
-        source_id: &SourceId,
-        revision: MetadataRevision,
-        request: &DiscoveryRequest,
-        capture: &ProviderCaptureMaterial,
-        family: NasdaqDirectoryKind,
-    ) -> Result<SourceObject, Box<dyn std::error::Error>> {
-        let ordinal = match family {
-            NasdaqDirectoryKind::NasdaqListed => 0,
-            NasdaqDirectoryKind::OtherListed => 1,
-            NasdaqDirectoryKind::Bonds | NasdaqDirectoryKind::Options => {
-                return Err("unsupported directory fixture".into());
-            }
-        };
-        let graph_component = capture
-            .receipt()
-            .request_graph_components()
-            .get(ordinal)
-            .ok_or("graph component")?;
-        let page = capture.receipt().pages().get(ordinal).ok_or("graph page")?;
-        let evidence = ExactPayloadEvidence::from_content_digest(page.body_digest());
-        let object_id = SourceIdentifier::try_from(format!(
-            "nasdaq-symbols:{}:{}",
-            family.object_component(),
-            hexadecimal(page.body_digest().bytes())
-        ))?;
-        SourceObject::try_new_with_capture_identity(
-            source_id.clone(),
-            revision,
-            request,
-            object_id,
-            SourceIdentifier::try_from("text/plain")?,
-            evidence,
-            SourceObjectCaptureIdentity::Paged {
-                content_digest: graph_component.content_digest(),
-                page_count: graph_component.page_count(),
-                terminal: graph_component.terminal(),
-            },
-            EffectiveInterval::new(page.received_at(), None)?,
-            Some(page.received_at()),
-            AvailabilityEvidence::LocalFirstObserved {
-                observed_at: page.received_at(),
-            },
-            Some(page.body_bytes()),
-        )
-        .map_err(Into::into)
-    }
-
-    fn responses(
-        objects: &[SourceObject],
-    ) -> Result<Box<[NasdaqHttpResponseEvidence]>, Box<dyn std::error::Error>> {
-        let mut responses = Vec::new();
-        responses.try_reserve_exact(objects.len())?;
-        for object in objects {
-            let received_at = object
-                .availability()
-                .conservative_available_at()
-                .ok_or("response received_at")?;
-            responses.push(NasdaqHttpResponseEvidence::try_new(
-                200,
-                "text/plain".to_owned(),
-                Some("identity".to_owned()),
-                object.expected_bytes(),
-                None,
-                1,
-                object.published_at().ok_or("response last_modified_at")?,
-                received_at,
-            )?);
-        }
-        Ok(responses.into_boxed_slice())
-    }
-
-    fn batch(
-        object: &SourceObject,
-        ordinal: usize,
-    ) -> Result<ExtractionBatch, Box<dyn std::error::Error>> {
-        let request = ExtractionRequest::try_new(
-            object.clone(),
-            NonZeroU32::new(1).ok_or("record limit")?,
-            NonZeroU64::new(1_000_000).ok_or("byte limit")?,
-            Timestamp::from_unix_nanos(1_000),
-        )?;
-        let family = match ordinal {
-            0 => NasdaqDirectoryKind::NasdaqListed,
-            1 => NasdaqDirectoryKind::OtherListed,
-            _ => return Err("component ordinal".into()),
-        };
-        let fields = match family {
-            NasdaqDirectoryKind::NasdaqListed => NasdaqProviderFields::try_nasdaq_listed(
-                "NDAQ".to_owned(),
-                "NASDAQ INC".to_owned(),
-                NasdaqMarketCategory::GlobalSelect,
-                false,
-                NasdaqFinancialStatus::Normal,
-                100,
-                false,
-                false,
-            )?,
-            NasdaqDirectoryKind::OtherListed => NasdaqProviderFields::try_other_listed(
-                "IBM".to_owned(),
-                "INTERNATIONAL BUSINESS MACHINES".to_owned(),
-                NasdaqOtherExchange::Nyse,
-                "IBM".to_owned(),
-                false,
-                100,
-                false,
-                "IBM".to_owned(),
-            )?,
-            NasdaqDirectoryKind::Bonds | NasdaqDirectoryKind::Options => {
-                return Err("unsupported directory fixture".into());
-            }
-        };
-        let received_at = object
-            .availability()
-            .conservative_available_at()
-            .ok_or("record received_at")?;
-        let record = NasdaqListingRecord::try_new(
-            2,
-            NasdaqFileCreationTime::try_from_provider_value("0814202612:00")?,
-            object.published_at().ok_or("record last_modified_at")?,
-            received_at,
-            object.evidence().clone(),
-            fields,
-        )?;
-        let payload = Bytes::from(serde_json::to_vec(&record)?);
-        let payload_evidence = ExactPayloadEvidence::from_content_digest(digest(&payload));
-        let (_, object_digest) = crate::source::parse_object_id(object.object_id())?;
-        let revision = SourceIdentifier::try_from(format!(
-            "nasdaq-symbols:{}:row-2:{object_digest}",
-            family.object_component()
-        ))?;
-        Ok(ExtractionBatch::try_new(
-            &request,
-            vec![ExtractionRecord::try_new(
-                &request,
-                SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)?,
-                payload_evidence,
-                object.published_at().ok_or("record effective_at")?,
-                Some(object.published_at().ok_or("record published_at")?),
-                object.availability().clone(),
-                revision,
-                None,
-                payload,
-            )?],
-        )?)
-    }
-
-    fn digest(value: &[u8]) -> EvidenceDigest {
-        EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(value).into())
-    }
-
-    fn hexadecimal(bytes: [u8; 32]) -> String {
-        let mut value = String::with_capacity(64);
-        for byte in bytes {
-            use std::fmt::Write as _;
-
-            write!(&mut value, "{byte:02x}").expect("writing into a string cannot fail");
-        }
-        value
     }
 }
