@@ -618,7 +618,7 @@ this work to pause. An adapter or a green provider-health light is not that outc
 | Funds and ETFs | SEC N-PORT/N-CEN holdings/metadata, exact fund/share-class identity, separately typed price history, and optional Tiingo `FundNavObservation` daily NAV | Mutual-fund NAV is unavailable when Tiingo is disabled, not yet published, or the symbol is unsupported; no fabricated intraday NAV and no market-price substitution |
 | Fundamentals and filings | SEC filing/company-fact observations, strict context-aware PIT selection, and lineage-bound statement/ratio projections | Missing fiscal/context/publication evidence produces unavailable/conflict, not guessed values |
 | Macro and rates | FRED/ALFRED plus direct-government vintage/release generations selectable at the model cutoff | Current revised macro values cannot be substituted for unavailable historical vintages |
-| Forecast, valuation, and backtest | Exact historical/current/fundamental/macro feature generations, model/implementation identities, complete artifacts, and latest-valid selectors | Unsupported probability, currency, cost, benchmark, or PIT evidence forces abstention |
+| Forecast, financial modeling/valuation, harmonic-pattern evidence, and backtest | Exact historical/current/fundamental/macro feature generations, model/implementation identities, complete artifacts, deterministic causal pattern evidence, and latest-valid selectors | Unsupported probability, currency, cost, benchmark, pattern confirmation, marketability, or PIT evidence forces abstention |
 | Opportunities and recommendations | Current eligible universe, selected market/features, ranking run, policy/profile, portfolio context, forecast/valuation/backtest/risk evidence, immutable proposal/no-action result, and currentness/supersession read | Append order is not rank/currentness; no button is enabled until the generation controller exists |
 | Portfolio and risk | Provider/broker symbol-to-`InstrumentId` resolver, explicit account/profile, positions/cash/settlement evidence, selected market data, candidate impact, and non-reserving risk advisory | Personal brokerage-data ingestion is not required; settlement cash and active breach state remain unavailable without exact producers |
 | Virtual paper | The same admitted Alpaca/Schwab market observations, supported-instrument set, central risk evidence, virtual ledger, fills/fees/slippage, reconciliation, and restart receipts | Schwab and Alpaca are market-data sources only here: no brokerage order endpoint, money movement, account data, or recommendation-to-order authority |
@@ -633,7 +633,7 @@ versioned analytical stages:
 flowchart LR
     Provider["Qualified provider/reference evidence"]
     PIT["PIT canonical generations\nidentity · clocks · revisions · completeness"]
-    Features["Versioned features + labels"]
+    Features["Versioned features + labels\nincluding causal harmonic patterns"]
     Research["Out-of-sample backtests\nmodels · forecasts · valuation"]
     Context["Portfolio impact · liquidity\nnon-reserving risk advisory"]
     Decision["Calibrated Buy · Add · Hold · Trim · Sell\nNo action or typed abstention"]
@@ -641,6 +641,15 @@ flowchart LR
 
     Provider --> PIT --> Features --> Research --> Context --> Decision --> Console
 ```
+
+Harmonic price patterns are derived analytical evidence, never provider-specific fields or
+frontend calculations. The closed V1 detector covers `AB=CD`, Gartley, Bat, Butterfly, Crab, Deep
+Crab, Cypher, and Shark patterns over exact selected adjusted-bar generations. It retains causal
+pivots, measured ratios and tolerances, completion zone, confirmation cutoff, expiry, invalidation,
+implementation identity, and parent manifests. A pivot confirmed after the decision cutoff cannot
+be backdated into an earlier signal. Harmonic evidence is evaluated through the same chronological,
+cost-adjusted out-of-sample backtest and calibration authorities as other features and cannot by
+itself produce confidence or a recommendation.
 
 The default workflow must bind the exact universe, source generations, availability cutoffs,
 feature/label implementations, train/validation/test partitions, benchmarks, transaction costs,

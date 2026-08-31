@@ -1610,3 +1610,57 @@ goal. Do not reopen licensing, permission, or resale analysis absent new provide
 a material scope change beyond personal use, or an explicit owner request. Implementation still
 retains exact provenance, source quality, capacity, point-in-time, and rights evidence; those
 technical facts do not authorize repeated policy churn.
+
+## 2026-08-31 forecasting, financial-modeling, signal, and harmonic-evidence contract
+
+The complete V1 investment workflow must do more than collect and chart data. It must turn exact
+provider-neutral, point-in-time generations into versioned features, multi-horizon forecasts,
+method-specific financial-model and valuation scenarios, cost-adjusted out-of-sample backtests,
+portfolio/liquidity/risk context, and an immutable `Buy`, `Add`, `Hold`, `Trim`, `Sell`, or
+`Abstain` decision. The plain-language result includes the decision horizon, entry range, expected
+price/return ranges where admitted, target/trim/sell range, sizing or portfolio impact where
+supported, reasons, risks, assumptions, expiry, invalidators, evidence coverage, calibration, and
+uncertainty. A model score, valuation output, or chart pattern alone is never confidence or an
+execution instruction.
+
+Harmonic price-pattern analysis is a required provider-neutral derived-feature family. Its initial
+closed taxonomy includes `AB=CD`, Gartley, Bat, Butterfly, Crab, Deep Crab, Cypher, and Shark
+patterns. Detection is backend-owned and deterministic over the exact selected adjusted-bar
+generation. Each result retains instrument and timeframe, causal pivot identities, direction,
+ratio measurements and tolerances, pattern-completion zone, observation and confirmation cutoffs,
+expiry, invalidation level, implementation identity, parent manifests, and an evidence digest.
+Ordinary product pages describe this as price-pattern evidence; exact ratios and algorithm evidence
+belong in an expandable provider-neutral analysis view, never in provider plumbing or frontend
+calculations.
+
+Harmonic evidence must be point-in-time safe. A detector may use only bars and pivot confirmations
+available at the decision cutoff; it may not backdate a pattern using a later-confirmed pivot.
+Adjustment, split, dividend, session, calendar, missing-bar, liquidity, and stale-data semantics
+remain explicit. Pattern rules and tolerances are selected on training/validation periods and
+measured on a separate chronological out-of-sample period with realistic fees, spread, slippage,
+latency, turnover, capacity, and delisting/survivorship treatment. If sample size, calibration,
+coverage, marketability, or conflicting fundamental/forecast/valuation/risk evidence is
+insufficient, the product returns low confidence, unavailable, or `Abstain` rather than forcing a
+trade.
+
+Forecasts must produce horizon-aligned central paths or conditional means plus calibrated ranges
+and retained rolling-origin evidence. Financial modeling must bind exact PIT fundamentals, macro
+and rate assumptions, model/method identity, currency, scenario inputs, sensitivity, and valuation
+range. The decision engine combines those independent evidence families with current market,
+options/liquidity where available, portfolio impact, and central risk; no provider and no single
+analytical family may feed a recommendation directly.
+
+In current V1, “signal execution” means an actionable entry/exit plan and execution through the
+isolated virtual-paper ledger only. A recommendation does not implicitly become an order. A user-
+approved or explicitly configured paper strategy must still pass supported-instrument, current-
+market, sizing, liquidity, and central-risk authority before a simulated order can be created,
+filled, reconciled, checkpointed, and recovered. Real brokerage orders, account trading, money
+movement, and recommendation-to-live-order authority remain outside this read-only product.
+
+The provider-neutral Desktop, CLI, and MCP must expose the same typed opportunity, investment-
+analysis, forecast/model, backtest, recommendation, and virtual-paper capabilities. Full product
+completion requires one thin critical journey from an exact immutable PIT input set through
+harmonic and non-harmonic features, forecast, financial model/valuation, realistic backtest,
+calibrated decision, virtual-paper action or honest abstention, clean shutdown, and identical
+restart reads. Do not create a broad pattern fixture matrix or a second analytical stack; extend
+the existing feature, forecast, decision, backtest, and paper authorities in place.
