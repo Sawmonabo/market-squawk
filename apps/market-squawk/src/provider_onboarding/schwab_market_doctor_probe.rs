@@ -272,6 +272,7 @@ impl SchwabStreamerConnectionControlSource for ProductionSchwabMarketDoctorStrea
             let generation = NonZeroU64::new(generation)
                 .map(ConnectionGeneration::new)
                 .ok_or(SchwabTransportError::Overflow)?;
+            let session_identifier = source_id.as_source_identifier().clone();
             let coordinates = SchwabCaptureCoordinates::try_new(
                 source_id,
                 metadata_revision,
@@ -285,6 +286,7 @@ impl SchwabStreamerConnectionControlSource for ProductionSchwabMarketDoctorStrea
             .map_err(|_| SchwabTransportError::CaptureMaterial)?;
             Ok(SchwabStreamerConnectionControl::new(
                 generation,
+                session_identifier,
                 coordinates,
                 stream_identity,
             ))

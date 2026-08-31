@@ -20,9 +20,7 @@ use market_squawk_adapter_schwab::{
     SchwabTransportError, SchwabTransportTelemetry,
 };
 use market_squawk_data::{ListingReferenceGenerationReceipt, ListingReferenceReadCapability};
-use market_squawk_domain::{
-    ConnectionGeneration, InstrumentId, SourceId, SourceIdentifier, Timestamp, VenueId,
-};
+use market_squawk_domain::{ConnectionGeneration, InstrumentId, SourceId, Timestamp, VenueId};
 use market_squawk_sources::{
     BudgetDecision, BudgetDispatchDecision, BudgetReservationDecision, BudgetUnavailableReason,
     ProviderRateAuthority, ProviderRateDeclaration, RuntimeCapabilityDisposition,
@@ -365,9 +363,9 @@ impl SchwabRestQuoteAdaptiveSchedule {
         publication_pressure: bool,
     ) -> Result<(), SchwabRestQuoteRuntimeError> {
         self.counters.record(observation)?;
-        let measured_pressure = observation.latency_ms >= self.latency_pressure_ms
-            || observation.request_bytes >= self.request_bytes_pressure
-            || observation.response_bytes >= self.response_bytes_pressure;
+        let measured_pressure = observation.latency_ms() >= self.latency_pressure_ms
+            || observation.request_bytes() >= self.request_bytes_pressure
+            || observation.response_bytes() >= self.response_bytes_pressure;
         match observation.assessment() {
             AdaptiveAssessment::Complete if !publication_pressure && !measured_pressure => {
                 self.batch_items = self

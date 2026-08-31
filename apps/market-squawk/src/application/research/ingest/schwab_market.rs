@@ -680,7 +680,7 @@ impl SchwabMarketPublicationClosure {
         microbatch: StreamerMicrobatch,
         event_ids: Vec<Uuid>,
         parse_bounds: ParseBounds,
-        request: SchwabStreamerQuotePublicationRequest,
+        request: SchwabStreamerQuotePublicationRequest<'_>,
         family: SchwabMarketDataFamily,
         oauth: SchwabOAuthAuthorityReceipt,
         observed_at: Timestamp,
