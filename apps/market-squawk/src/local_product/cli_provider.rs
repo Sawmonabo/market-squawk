@@ -30,9 +30,7 @@ use market_squawk_adapter_sec::{
     RawEvidenceStore, SecParserLimits, SecRepresentationLimits, SecRepresentationRegistry,
 };
 use market_squawk_adapter_tiingo::tiingo_provider_rate_declaration;
-use market_squawk_adapter_treasury::{
-    TreasuryDailyRateFamily, TreasuryFiscalQuery, TreasurySourceConfig,
-};
+use market_squawk_adapter_treasury::{TreasuryFiscalQuery, TreasurySourceConfig};
 use market_squawk_adapter_yahoo::YAHOO_SOURCE_ID;
 use market_squawk_data::ImportedUserInputEvidence;
 use market_squawk_domain::{
@@ -2685,9 +2683,12 @@ fn build_research_activation(
                 metadata, config,
             ))
         }
-        ProviderRequest::TreasuryDailyRates => {
-            let config = TreasurySourceConfig::daily_rates_all_history()
-                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+        ProviderRequest::TreasuryDailyRates {
+            year,
+            start_year,
+            end_year,
+        } => {
+            let config = treasury_daily_rates_config(year, start_year, end_year)?;
             let metadata =
                 treasury_metadata(lease, activation_evidence, metadata_effective, &config)?;
             ProviderAdapterActivationRequest::Treasury(TreasuryAdapterActivation::new(
@@ -2849,7 +2850,14 @@ enum ProviderRequest {
         last_record_date: CalendarDate,
         page_size: u16,
     },
-    TreasuryDailyRates,
+    TreasuryDailyRates {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        year: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_year: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_year: Option<u16>,
+    },
     FredAlfred {
         configuration: Box<FredProviderRequest>,
     },
@@ -2887,7 +2895,7 @@ impl ProviderRequest {
             Self::Sec { .. } => ProviderSurface::Exact(SEC_EDGAR_PROFILE_ID),
             Self::Bls { .. } => ProviderSurface::Either(BLS_PUBLIC_SURFACE, BLS_REGISTERED_SURFACE),
             Self::TreasuryFiscal { .. } => ProviderSurface::Exact(TREASURY_FISCAL_SURFACE),
-            Self::TreasuryDailyRates => ProviderSurface::Exact(TREASURY_XML_SURFACE),
+            Self::TreasuryDailyRates { .. } => ProviderSurface::Exact(TREASURY_XML_SURFACE),
             Self::FredAlfred { .. } => ProviderSurface::Exact(FRED_SURFACE),
             Self::FederalReserveBoardH15 => ProviderSurface::Exact(FEDERAL_RESERVE_BOARD_SURFACE),
             Self::YahooEnrichment => ProviderSurface::Exact(YAHOO_SURFACE),
@@ -2919,6 +2927,14 @@ enum LegacyProviderRequest {
         last_record_date: CalendarDate,
         page_size: u16,
     },
+    TreasuryDailyRates {
+        #[serde(default)]
+        year: Option<u16>,
+        #[serde(default)]
+        start_year: Option<u16>,
+        #[serde(default)]
+        end_year: Option<u16>,
+    },
 }
 
 impl From<LegacyProviderRequest> for ProviderRequest {
@@ -2944,6 +2960,15 @@ impl From<LegacyProviderRequest> for ProviderRequest {
                 first_record_date,
                 last_record_date,
                 page_size,
+            },
+            LegacyProviderRequest::TreasuryDailyRates {
+                year,
+                start_year,
+                end_year,
+            } => Self::TreasuryDailyRates {
+                year,
+                start_year,
+                end_year,
             },
         }
     }
@@ -3013,10 +3038,17 @@ fn portal_provider_request(
                 },
             ))
         }
-        ProviderPortalActivationRequest::TreasuryDailyRates => {
+        ProviderPortalActivationRequest::TreasuryDailyRates {
+            start_year,
+            end_year,
+        } => {
             require_surface(lease, ProviderSurface::Exact(TREASURY_XML_SURFACE))?;
             Ok((
-                ProviderRequest::TreasuryDailyRates,
+                ProviderRequest::TreasuryDailyRates {
+                    year: None,
+                    start_year: Some(start_year),
+                    end_year: Some(end_year),
+                },
                 LoadedActivationEvidence {
                     objects: BTreeMap::new(),
                 },
@@ -3201,9 +3233,25 @@ fn require_current_fred_revision(
     Ok(())
 }
 
-pub(super) fn treasury_daily_rate_all_history_datasets(
+fn treasury_daily_rates_config(
+    legacy_year: Option<u16>,
+    start_year: Option<u16>,
+    end_year: Option<u16>,
+) -> Result<TreasurySourceConfig, CliProviderActivationError> {
+    match (legacy_year, start_year, end_year) {
+        (Some(year), None, None) => TreasurySourceConfig::daily_par_yield_curve(year)
+            .map_err(|_| CliProviderActivationError::ProviderConfiguration),
+        (None, Some(start), Some(end)) if start <= end => {
+            TreasurySourceConfig::daily_rates_all_families(start, end)
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)
+        }
+        _ => Err(CliProviderActivationError::ProviderConfiguration),
+    }
+}
+
+pub(super) fn treasury_daily_rate_release_year(
     state: &DurableProviderActivationState,
-) -> Result<(Vec<SourceIdentifier>, EvidenceDigest), CliProviderActivationError> {
+) -> Result<u16, CliProviderActivationError> {
     let recipe = state
         .load_recipe(TREASURY_XML_SURFACE)
         .map_err(|_| CliProviderActivationError::StateUnavailable)?;
@@ -3214,35 +3262,17 @@ pub(super) fn treasury_daily_rate_all_history_datasets(
     if request.session_id != recipe.session_id {
         return Err(CliProviderActivationError::StateUnavailable);
     }
-    if !matches!(request.provider, ProviderRequest::TreasuryDailyRates) {
+    let ProviderRequest::TreasuryDailyRates {
+        year: None,
+        start_year: Some(start_year),
+        end_year: Some(end_year),
+    } = request.provider
+    else {
         return Err(CliProviderActivationError::ProviderConfiguration);
-    }
-    let config = TreasurySourceConfig::daily_rates_all_history()
+    };
+    TreasurySourceConfig::daily_rates_all_families(start_year, end_year)
         .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
-    let catalog = config
-        .dataset_catalog()
-        .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
-    if !catalog.complete_selected_family_coverage()
-        || catalog.datasets().len() != TreasuryDailyRateFamily::ALL.len()
-    {
-        return Err(CliProviderActivationError::ProviderConfiguration);
-    }
-    let datasets = catalog
-        .datasets()
-        .iter()
-        .map(|descriptor| descriptor.provider_dataset().clone())
-        .collect::<Vec<_>>();
-    if datasets
-        .iter()
-        .any(|dataset| !dataset.as_str().ends_with(":all"))
-        || datasets
-            .iter()
-            .enumerate()
-            .any(|(ordinal, dataset)| datasets[..ordinal].contains(dataset))
-    {
-        return Err(CliProviderActivationError::ProviderConfiguration);
-    }
-    Ok((datasets, recipe.runtime_generation_digest))
+    Ok(end_year)
 }
 
 pub(super) fn treasury_fiscal_release_query(
@@ -3438,7 +3468,7 @@ fn evidence_references(
             }
         }
         ProviderRequest::TreasuryFiscal { .. }
-        | ProviderRequest::TreasuryDailyRates
+        | ProviderRequest::TreasuryDailyRates { .. }
         | ProviderRequest::FederalReserveBoardH15
         | ProviderRequest::YahooEnrichment
         | ProviderRequest::TiingoStarterEodNav
