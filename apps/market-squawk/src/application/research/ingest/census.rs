@@ -748,16 +748,35 @@ impl CensusMacroApplicationError {
     }
 
     fn diagnosed_research(journey: &CensusDiagnosticJourney, source: ResearchServiceError) -> Self {
-        Self::DiagnosedResearch(CensusDiagnosedError::new(
-            source,
-            journey,
-            CensusDiagnosticFailureClass::CaptureSeal,
-        ))
+        let failure_class = research_service_failure_class(&source);
+        Self::DiagnosedResearch(CensusDiagnosedError::new(source, journey, failure_class))
     }
 
     fn diagnosed_service(journey: &CensusDiagnosticJourney, source: ServiceError) -> Self {
         let failure_class = service_failure_class(source);
         Self::DiagnosedService(CensusDiagnosedError::new(source, journey, failure_class))
+    }
+}
+
+fn research_service_failure_class(error: &ResearchServiceError) -> CensusDiagnosticFailureClass {
+    match error {
+        ResearchServiceError::Ingest(IngestError::DeadlineExceeded) => {
+            CensusDiagnosticFailureClass::Deadline
+        }
+        ResearchServiceError::Ingest(IngestError::Cancelled) => {
+            CensusDiagnosticFailureClass::Cancellation
+        }
+        ResearchServiceError::Path(_)
+        | ResearchServiceError::Catalog(_)
+        | ResearchServiceError::Manifest(_)
+        | ResearchServiceError::ProviderCaptureStore(_)
+        | ResearchServiceError::ProviderCaptureSealWorkerUnavailable
+        | ResearchServiceError::Ingest(_)
+        | ResearchServiceError::ProviderOnboarding(_)
+        | ResearchServiceError::Dataset(_)
+        | ResearchServiceError::IngestAuthorityMismatch
+        | ResearchServiceError::Rights(_)
+        | ResearchServiceError::IdentityOverflow => CensusDiagnosticFailureClass::CaptureSeal,
     }
 }
 
