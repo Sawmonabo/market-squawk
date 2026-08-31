@@ -242,12 +242,21 @@ impl TreasuryApplicationClosure {
         let owned = research
             .analytical()
             .generation_owned_provider_capture_evidence(&manifest, store.as_ref())?;
-        let [evidence] = owned.bindings() else {
+        let [object] = owned.objects() else {
             return Err(TreasuryApplicationError::RestartInvalid);
         };
+        let [input] = object.inputs() else {
+            return Err(TreasuryApplicationError::RestartInvalid);
+        };
+        let evidence = input.binding();
         if owned.pinned().manifest() != &manifest
             || owned.source_id() != &expected_source
-            || owned.anchor_object().object().row_count()
+            || object.publication_ordinal() != 0
+            || object.generation_object_ordinal().checked_add(1)
+                != Some(owned.pinned().objects().len())
+            || input.input_ordinal() != 0
+            || input.object_input_ordinal() != 0
+            || object.object().object().row_count()
                 != u64::try_from(evidence.record_count()).unwrap_or(u64::MAX)
         {
             return Err(TreasuryApplicationError::RestartInvalid);
@@ -855,12 +864,21 @@ impl TreasuryMacroRestartSelector {
         let owned = research
             .analytical()
             .generation_owned_provider_capture_evidence(&self.manifest, store.as_ref())?;
-        let [evidence] = owned.bindings() else {
+        let [object] = owned.objects() else {
             return Err(TreasuryApplicationError::RestartInvalid);
         };
+        let [input] = object.inputs() else {
+            return Err(TreasuryApplicationError::RestartInvalid);
+        };
+        let evidence = input.binding();
         if owned.pinned().manifest() != &self.manifest
             || owned.source_id() != &self.source_id
-            || owned.anchor_object().object().row_count()
+            || object.publication_ordinal() != 0
+            || object.generation_object_ordinal().checked_add(1)
+                != Some(owned.pinned().objects().len())
+            || input.input_ordinal() != 0
+            || input.object_input_ordinal() != 0
+            || object.object().object().row_count()
                 != u64::try_from(self.expected_input_records).unwrap_or(u64::MAX)
         {
             return Err(TreasuryApplicationError::RestartInvalid);
