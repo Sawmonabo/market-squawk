@@ -113,6 +113,19 @@ impl NasdaqSymbolDirectoryDiscovery {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn directory_discovery_for_test(
+    batch: DiscoveryBatch,
+    capture_material: ProviderCaptureMaterial,
+    response_evidence: Box<[NasdaqHttpResponseEvidence]>,
+) -> NasdaqSymbolDirectoryDiscovery {
+    NasdaqSymbolDirectoryDiscovery {
+        batch,
+        capture_material,
+        response_evidence,
+    }
+}
+
 /// Exact, fixed-endpoint Symbol Directory source configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NasdaqSymbolDirectoryConfig {

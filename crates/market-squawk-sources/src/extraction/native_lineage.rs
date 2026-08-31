@@ -45,6 +45,8 @@ pub enum ProviderNativeLineageImplementation {
     FredAlfredSeriesObservationsV1,
     /// Kraken Spot public market-data semantics encoder v1.
     KrakenSpotV1,
+    /// Nasdaq Trader Symbol Directory row semantics encoder v1.
+    NasdaqSymbolDirectoryV1,
     /// SEC EDGAR submissions, Company Facts, and filing-XBRL semantics encoder v1.
     SecEdgarV1,
     /// Schwab REST market-data response semantics encoder v1.
@@ -81,6 +83,9 @@ impl ProviderNativeLineageImplementation {
                 b"market-squawk/fred-alfred-series-observations/provider-native-lineage/v1"
             }
             Self::KrakenSpotV1 => b"market-squawk/kraken-spot/provider-native-lineage/v1",
+            Self::NasdaqSymbolDirectoryV1 => {
+                b"market-squawk/nasdaq-symbol-directory/provider-native-lineage/v1"
+            }
             Self::SecEdgarV1 => b"market-squawk/sec-edgar/provider-native-lineage/v1",
             Self::SchwabRestMarketDataV1 => {
                 b"market-squawk/schwab-rest-market-data/provider-native-lineage/v1"
@@ -110,6 +115,7 @@ impl ProviderNativeLineageImplementation {
             Self::EiaSeriesV1 => 4,
             Self::FredAlfredSeriesObservationsV1 => 20,
             Self::KrakenSpotV1 => 19,
+            Self::NasdaqSymbolDirectoryV1 => 22,
             Self::SecEdgarV1 => 8,
             Self::SchwabRestMarketDataV1 => 14,
             Self::SchwabStreamerMarketDataV1 => 15,
