@@ -204,11 +204,19 @@ impl MacroContextReadCapability {
         if std::time::Instant::now() >= deadline {
             return Err(ServiceError::DeadlineExceeded);
         }
-        let (board, fred, (treasury_fiscal, treasury_daily)) = tokio::try_join!(
-            self.read_board(cutoffs, deadline, cancellation.child_token()),
-            self.read_fred(cutoffs, deadline, cancellation.child_token()),
-            self.read_treasury(cutoffs, deadline, cancellation.child_token()),
-        )?;
+        let board_cancellation = cancellation.child_token();
+        let fred_cancellation = cancellation.child_token();
+        let treasury_cancellation = cancellation.child_token();
+        let board =
+            Box::pin(async move { self.read_board(cutoffs, deadline, board_cancellation).await });
+        let fred =
+            Box::pin(async move { self.read_fred(cutoffs, deadline, fred_cancellation).await });
+        let treasury = Box::pin(async move {
+            self.read_treasury(cutoffs, deadline, treasury_cancellation)
+                .await
+        });
+        let (board, fred, (treasury_fiscal, treasury_daily)) =
+            tokio::try_join!(board, fred, treasury)?;
         product_snapshot(cutoffs, board, fred, treasury_fiscal, treasury_daily)
     }
 
