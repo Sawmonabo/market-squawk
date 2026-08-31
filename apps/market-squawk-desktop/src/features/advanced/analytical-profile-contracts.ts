@@ -1,129 +1,66 @@
 import { z } from "zod"
 
-const canonicalUuidSchema = z
-  .string()
-  .regex(
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
-  )
-  .refine(
-    (value) => value !== "00000000-0000-0000-0000-000000000000",
-    "Expected a non-nil canonical UUID.",
-  )
-const digestSchema = z
-  .string()
-  .regex(/^[0-9a-f]{64}$/)
-  .refine((value) => /[1-9a-f]/.test(value), "Expected a nonzero digest.")
-const unsignedIntegerSchema = z.string().regex(/^(?:0|[1-9]\d*)$/)
-const positiveIntegerSchema = z.string().regex(/^[1-9]\d*$/)
-const nonemptyIdentitySchema = z.string().min(1).max(128)
+const unixNanosSchema = z.string().regex(/^[1-9]\d*$/)
+const opaqueToken = (prefix: string) =>
+  z.string().regex(new RegExp(`^${prefix}_[0-9a-f]{32}$`))
+
+const profileTokenSchema = opaqueToken("profile")
+const profileStateTokenSchema = opaqueToken("state")
+const validationTokenSchema = opaqueToken("validation")
+const activationTokenSchema = opaqueToken("activation")
+const historyTokenSchema = opaqueToken("history")
+const workflowTokenSchema = opaqueToken("workflow")
 
 export const analyticalProductProjectionSchema = z
   .object({
     label: z.string().min(1).max(64),
     kind: z.enum(["recommended", "custom"]),
-    activatedAt: unsignedIntegerSchema,
+    activatedAt: unixNanosSchema,
     workflowAvailability: z.literal("unavailable"),
     nextAction: z.string().min(1).max(256),
   })
   .strict()
 
-const profileComponentBindingSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("default_required") }).strict(),
-  z
-    .object({
-      kind: z.literal("exact"),
-      identity: nonemptyIdentitySchema,
-      version: z.string().min(1).max(64),
-      digest: digestSchema,
-    })
-    .strict(),
-])
-
-export const analyticalProfileConfigSchema = z
+const profileDifferenceSchema = z
   .object({
-    supportedInvestmentPolicy: profileComponentBindingSchema,
-    pointInTimeDatasetPolicy: profileComponentBindingSchema,
-    requiredFeatureSet: profileComponentBindingSchema,
-    modelBundlePolicy: profileComponentBindingSchema,
-    trainingCalibrationPolicy: profileComponentBindingSchema,
-    forecastHorizonPolicy: profileComponentBindingSchema,
-    valuationPolicy: profileComponentBindingSchema,
-    backtestCostPolicy: profileComponentBindingSchema,
-    recommendationPolicy: profileComponentBindingSchema,
-    riskFreshnessAbstentionPolicy: profileComponentBindingSchema,
+    label: z.string().min(1).max(64),
+    explanation: z.string().min(1).max(256),
   })
   .strict()
 
-const serviceResultReferenceSchema = z
+const profileValidationSchema = z
   .object({
-    operation: z.string().min(1).max(128),
-    resultId: z.string().min(1).max(256),
-    contentSha256: digestSchema,
-  })
-  .strict()
-
-const profileValidationReceiptSchema = z
-  .object({
-    receiptId: canonicalUuidSchema,
-    profileId: canonicalUuidSchema,
-    profileRevision: unsignedIntegerSchema,
-    configDigest: digestSchema,
-    validatedAt: unsignedIntegerSchema,
-    basis: z.enum([
-      "identical_to_immutable_default",
-      "backend_component_receipts",
-    ]),
-    backendReceipts: z.array(serviceResultReferenceSchema).max(128),
+    state: z.enum(["built_in", "needs_validation", "unavailable", "validated"]),
+    label: z.string().min(1).max(64),
+    explanation: z.string().min(1).max(256),
+    validatedAt: unixNanosSchema.nullable(),
   })
   .strict()
 
 export const analyticalProfileSchema = z
   .object({
-    profileId: canonicalUuidSchema,
-    ownerWorkspaceId: canonicalUuidSchema,
+    profileToken: profileTokenSchema,
+    profileStateToken: profileStateTokenSchema,
     displayName: z.string().min(1).max(64),
-    kind: z.enum(["default", "custom"]),
     version: z.number().int().positive(),
-    revision: unsignedIntegerSchema,
-    configDigest: digestSchema,
-    config: analyticalProfileConfigSchema,
-    validationState: z.enum([
-      "default_immutable",
-      "not_validated",
-      "blocked",
-      "validated",
-    ]),
-    lastValidation: profileValidationReceiptSchema.nullable(),
-    createdAt: unsignedIntegerSchema,
-    updatedAt: unsignedIntegerSchema,
+    mode: z.enum(["recommended", "custom"]),
+    active: z.boolean(),
+    validation: profileValidationSchema,
+    validationToken: validationTokenSchema.nullable(),
+    activationToken: activationTokenSchema.nullable(),
+    differencesFromRecommended: z.array(profileDifferenceSchema).max(10),
+    createdAt: unixNanosSchema,
+    updatedAt: unixNanosSchema,
+    activatedAt: unixNanosSchema.nullable(),
+    canValidate: z.boolean(),
+    canActivate: z.boolean(),
+    canRestoreRecommended: z.boolean(),
   })
   .strict()
 
-export const activeProfileBindingSchema = z
+const coverageSchema = z
   .object({
-    profileId: canonicalUuidSchema,
-    ownerWorkspaceId: canonicalUuidSchema,
-    displayName: z.string().min(1).max(64),
-    kind: z.enum(["default", "custom"]),
-    version: z.number().int().positive(),
-    profileRevision: unsignedIntegerSchema,
-    configDigest: digestSchema,
-    activationRevision: unsignedIntegerSchema,
-    activatedAt: unsignedIntegerSchema,
-  })
-  .strict()
-
-const serviceJobReferenceSchema = z
-  .object({
-    jobId: canonicalUuidSchema,
-    generation: positiveIntegerSchema,
-    terminalSequence: unsignedIntegerSchema.nullable(),
-    result: serviceResultReferenceSchema.nullable(),
-  })
-  .strict()
-
-const coverageCountsSchema = z
-  .object({
+    completeness: z.enum(["complete", "partial"]),
     searched: z.number().int().nonnegative(),
     completeEvidence: z.number().int().nonnegative(),
     excluded: z.number().int().nonnegative(),
@@ -134,190 +71,96 @@ const coverageCountsSchema = z
   })
   .strict()
 
-const workflowCheckpointSchema = z
+const workflowSchema = z
   .object({
-    sequence: unsignedIntegerSchema,
-    stage: z.enum([
-      "created",
-      "capability_completed",
-      "waiting_for_service_job",
-      "results_retained",
-      "coverage_closed",
-      "ranking_closed",
-      "terminal",
-    ]),
-    recordedAt: unsignedIntegerSchema,
-    childJob: serviceJobReferenceSchema.nullable(),
-    result: serviceResultReferenceSchema.nullable(),
-  })
-  .strict()
-
-const workflowRunSchema = z
-  .object({
-    runId: canonicalUuidSchema,
-    schemaVersion: z.literal(1),
-    ownerWorkspaceId: canonicalUuidSchema,
+    workflowToken: workflowTokenSchema,
     kind: z.enum([
-      "find_opportunities",
-      "analyze_investment",
-      "outcome_refresh",
+      "opportunity_discovery",
+      "investment_analysis",
+      "track_record_refresh",
     ]),
     state: z.enum([
-      "blocked",
-      "queued",
-      "running",
-      "waiting_for_service_job",
-      "completed",
+      "waiting",
+      "in_progress",
+      "complete",
       "cancelled",
-      "failed",
-      "stale",
+      "unavailable",
     ]),
-    targetInstrumentId: canonicalUuidSchema.nullable(),
-    profile: z
+    progress: z
       .object({
-        active: activeProfileBindingSchema,
-        resolvedComponentReceiptSha256: digestSchema,
+        stage: z.enum([
+          "preparing",
+          "gathering_evidence",
+          "building_results",
+          "finalizing",
+          "complete",
+          "unavailable",
+        ]),
+        completedSteps: z.number().int().nonnegative().max(64),
+        waitingForBackgroundWork: z.boolean(),
       })
       .strict(),
-    createdAt: unsignedIntegerSchema,
-    updatedAt: unsignedIntegerSchema,
-    checkpointJournal: z.array(workflowCheckpointSchema).max(64),
-    childJobs: z.array(serviceJobReferenceSchema).max(64),
-    resultReferences: z.array(serviceResultReferenceSchema).max(128),
-    coverageReceipt: z
-      .object({
-        receiptId: canonicalUuidSchema,
-        completeness: z.enum(["complete", "truncated"]),
-        counts: coverageCountsSchema,
-        contentSha256: digestSchema,
-      })
-      .strict()
-      .nullable(),
-    exclusionReceipt: z
-      .object({
-        receiptId: canonicalUuidSchema,
-        excludedCount: z.number().int().nonnegative(),
-        reasonsResult: serviceResultReferenceSchema,
-        contentSha256: digestSchema,
-      })
-      .strict()
-      .nullable(),
-    rankingReceipt: z
-      .object({
-        receiptId: canonicalUuidSchema,
-        orderedResultIds: z.array(z.string().min(1).max(256)).max(128),
-        policyResult: serviceResultReferenceSchema,
-        contentSha256: digestSchema,
-      })
-      .strict()
-      .nullable(),
-    executionEligibility: z.literal("execution_ineligible"),
-    lastError: z.string().min(1).max(1_024).nullable(),
+    coverage: coverageSchema.nullable(),
+    resultCount: z.number().int().nonnegative().max(128),
+    startedAt: unixNanosSchema,
+    updatedAt: unixNanosSchema,
+    explanation: z.string().min(1).max(256).nullable(),
   })
   .strict()
 
 const profileHistoryEntrySchema = z
   .object({
-    eventId: canonicalUuidSchema,
-    ownerWorkspaceId: canonicalUuidSchema,
-    controllerRevision: unsignedIntegerSchema,
+    historyToken: historyTokenSchema,
+    profileToken: profileTokenSchema,
+    profileName: z.string().min(1).max(64),
     action: z.enum([
-      "initialized_default",
-      "copied_default",
-      "updated_custom",
-      "validation_blocked",
-      "validated_custom",
-      "activated_custom",
-      "restored_default",
+      "recommended_initialized",
+      "custom_created",
+      "custom_updated",
+      "validation_unavailable",
+      "custom_validated",
+      "custom_activated",
+      "recommended_restored",
     ]),
-    profileId: canonicalUuidSchema,
-    profileVersion: z.number().int().positive(),
-    profileRevision: unsignedIntegerSchema,
-    configDigest: digestSchema,
-    config: analyticalProfileConfigSchema,
-    validationReceipt: profileValidationReceiptSchema.nullable(),
-    recordedAt: unsignedIntegerSchema,
-    supersedesProfileId: canonicalUuidSchema.nullable(),
+    recordedAt: unixNanosSchema,
+    differencesFromRecommended: z.array(profileDifferenceSchema).max(10),
   })
   .strict()
 
 export const analyticalControllerStatusSchema = z
   .object({
     kind: z.literal("status"),
-    controllerSchemaVersion: z.literal(1),
-    ownerWorkspaceId: canonicalUuidSchema,
-    controllerRevision: unsignedIntegerSchema,
-    activeProfile: activeProfileBindingSchema,
+    activeProfile: analyticalProfileSchema,
     profiles: z.array(analyticalProfileSchema).min(1).max(32),
-    workflowRuns: z.array(workflowRunSchema).max(256),
-    workflowReadiness: z
+    workflows: z.array(workflowSchema).max(256),
+    workflowAvailability: z
       .object({
-        state: z.literal("blocked"),
-        blockers: z
-          .array(
-            z
-              .object({
-                code: z.string().min(1).max(128),
-                detail: z.string().min(1).max(1_024),
-                owner: z.enum(["installed_application", "desktop"]),
-              })
-              .strict(),
-          )
-          .min(1)
-          .max(16),
+        state: z.literal("unavailable"),
+        explanation: z.string().min(1).max(512),
+        nextAction: z.string().min(1).max(256),
       })
       .strict(),
+    canCreateCustomProfile: z.boolean(),
   })
   .strict()
 
 export const analyticalControllerResponseSchema = z.discriminatedUnion("kind", [
   analyticalControllerStatusSchema,
   z.object({ kind: z.literal("profile"), profile: analyticalProfileSchema }).strict(),
-  z
-    .object({
-      kind: z.literal("validation"),
-      profile: analyticalProfileSchema,
-      receipt: profileValidationReceiptSchema.nullable(),
-      blockers: z
-        .array(
-          z
-            .object({
-              code: z.string().min(1).max(128),
-              detail: z.string().min(1).max(1_024),
-            })
-            .strict(),
-        )
-        .max(16),
-    })
-    .strict(),
+  z.object({ kind: z.literal("validation"), profile: analyticalProfileSchema }).strict(),
   z
     .object({
       kind: z.literal("comparison"),
-      defaultProfile: analyticalProfileSchema,
+      recommendedProfile: analyticalProfileSchema,
       selectedProfile: analyticalProfileSchema,
       equivalent: z.boolean(),
-      differentComponents: z
-        .array(
-          z.enum([
-            "supported_investment_policy",
-            "point_in_time_dataset_policy",
-            "required_feature_set",
-            "model_bundle_policy",
-            "training_calibration_policy",
-            "forecast_horizon_policy",
-            "valuation_policy",
-            "backtest_cost_policy",
-            "recommendation_policy",
-            "risk_freshness_abstention_policy",
-          ]),
-        )
-        .max(10),
+      differences: z.array(profileDifferenceSchema).max(10),
     })
     .strict(),
   z
     .object({
       kind: z.literal("activation"),
-      activeProfile: activeProfileBindingSchema,
+      activeProfile: analyticalProfileSchema,
     })
     .strict(),
   z
@@ -326,15 +169,12 @@ export const analyticalControllerResponseSchema = z.discriminatedUnion("kind", [
       completeness: z.enum(["complete", "truncated"]),
       returnedCount: z.number().int().nonnegative().max(100),
       availableCount: z.number().int().nonnegative().max(256),
-      nextAfterRevision: unsignedIntegerSchema.nullable(),
+      nextAfterToken: historyTokenSchema.nullable(),
       entries: z.array(profileHistoryEntrySchema).max(100),
     })
     .strict(),
 ])
 
-export type AnalyticalProfileConfig = z.infer<
-  typeof analyticalProfileConfigSchema
->
 export type AnalyticalProductProjection = z.infer<
   typeof analyticalProductProjectionSchema
 >
@@ -347,27 +187,18 @@ export type AnalyticalControllerResponse = z.infer<
 
 export type AnalyticalControllerRequest =
   | { action: "status" }
-  | { action: "copyDefault"; displayName: string }
+  | { action: "copyRecommended"; displayName: string }
   | {
-      action: "updateCustom"
-      profileId: string
-      expectedRevision: string
-      config: AnalyticalProfileConfig
+      action: "validateProfile"
+      profileToken: string
+      profileStateToken: string
     }
+  | { action: "compareWithRecommended"; profileToken: string }
   | {
-      action: "validateCustom"
-      profileId: string
-      expectedRevision: string
+      action: "activateProfile"
+      profileToken: string
+      profileStateToken: string
+      validationToken: string
     }
-  | { action: "compareWithDefault"; profileId: string }
-  | {
-      action: "activateCustom"
-      profileId: string
-      expectedRevision: string
-      validationReceiptId: string
-    }
-  | {
-      action: "restoreDefault"
-      expectedActivationRevision: string
-    }
-  | { action: "history"; afterRevision?: string; limit: number }
+  | { action: "restoreRecommended"; activationToken: string }
+  | { action: "history"; afterToken?: string; limit: number }

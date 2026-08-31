@@ -118,8 +118,7 @@ function transport(
       }
       return productResult({ activities: [] })
     },
-    analyticalController: async () =>
-      analyticalControllerStatus(TEST_WORKSPACE_ID),
+    analyticalController: async () => analyticalControllerStatus(),
     researchControl: async () =>
       systemResult(null),
     researchExport: async () =>
@@ -295,68 +294,41 @@ function transport(
   return { product, system }
 }
 
-function analyticalControllerStatus(workspaceId: string): AnalyticalControllerStatus {
-  const digest = "73ed06501d2693749c6966f0a8fdcf10c48b8f03632959c0c847ee8a4be9db54"
-  const profileId = "0467d4c9-befd-5b7d-b4b5-99b673662c86"
-  const config = {
-    supportedInvestmentPolicy: { kind: "default_required" as const },
-    pointInTimeDatasetPolicy: { kind: "default_required" as const },
-    requiredFeatureSet: { kind: "default_required" as const },
-    modelBundlePolicy: { kind: "default_required" as const },
-    trainingCalibrationPolicy: { kind: "default_required" as const },
-    forecastHorizonPolicy: { kind: "default_required" as const },
-    valuationPolicy: { kind: "default_required" as const },
-    backtestCostPolicy: { kind: "default_required" as const },
-    recommendationPolicy: { kind: "default_required" as const },
-    riskFreshnessAbstentionPolicy: { kind: "default_required" as const },
-  }
+function analyticalControllerStatus(): AnalyticalControllerStatus {
   const profile = {
-    profileId,
-    ownerWorkspaceId: workspaceId,
+    profileToken: "profile_11111111111111111111111111111111",
+    profileStateToken: "state_22222222222222222222222222222222",
     displayName: "Market Squawk Default V1",
-    kind: "default" as const,
     version: 1,
-    revision: "1",
-    configDigest: digest,
-    config,
-    validationState: "default_immutable" as const,
-    lastValidation: null,
+    mode: "recommended" as const,
+    active: true,
+    validation: {
+      state: "built_in" as const,
+      label: "Built-in recommended settings",
+      explanation: "Market Squawk's built-in recommended settings are fixed and ready to use.",
+      validatedAt: null,
+    },
+    validationToken: null,
+    activationToken: "activation_33333333333333333333333333333333",
+    differencesFromRecommended: [],
     createdAt: "1800000000000000000",
     updatedAt: "1800000000000000000",
+    activatedAt: "1800000000000000000",
+    canValidate: false,
+    canActivate: false,
+    canRestoreRecommended: false,
   }
   return {
     kind: "status",
-    controllerSchemaVersion: 1,
-    ownerWorkspaceId: workspaceId,
-    controllerRevision: "1",
-    activeProfile: {
-      profileId,
-      ownerWorkspaceId: workspaceId,
-      displayName: profile.displayName,
-      kind: "default",
-      version: 1,
-      profileRevision: "1",
-      configDigest: digest,
-      activationRevision: "1",
-      activatedAt: "1800000000000000000",
-    },
+    activeProfile: profile,
     profiles: [profile],
-    workflowRuns: [],
-    workflowReadiness: {
-      state: "blocked",
-      blockers: [
-        {
-          code: "canonical_data_and_backend_composition_required",
-          detail: "Required canonical data and pure backend operations are not composed.",
-          owner: "installed_application",
-        },
-        {
-          code: "desktop_start_resume_not_registered",
-          detail: "Find and Analyze start commands are intentionally absent.",
-          owner: "desktop",
-        },
-      ],
+    workflows: [],
+    workflowAvailability: {
+      state: "unavailable",
+      explanation: "New investment analysis is not available yet.",
+      nextAction: "Review saved investment analyses, or try again later.",
     },
+    canCreateCustomProfile: true,
   }
 }
 

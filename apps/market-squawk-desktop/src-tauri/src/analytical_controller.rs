@@ -5,7 +5,8 @@
 //! the installed application service. Until those pure capabilities are composed end to end, this
 //! controller exposes a truthful unavailable state and no Find/Analyze start command. Ordinary
 //! product pages receive only the closed investment-facing projection defined in this module;
-//! controller authority remains reserved for System, Settings, and Diagnostics.
+//! Advanced profile controls receive a separate closed presentation DTO. Exact controller
+//! receipts, operations, digests, job identities, and workspace authority remain native.
 
 use std::{
     collections::HashSet,
@@ -34,8 +35,12 @@ const MAXIMUM_CHECKPOINTS_PER_RUN: usize = 64;
 const MAXIMUM_CHILD_REFERENCES_PER_RUN: usize = 64;
 const MAXIMUM_RESULT_REFERENCES_PER_RUN: usize = 128;
 const DEFAULT_PROFILE_NAMESPACE: Uuid = Uuid::from_u128(0xd446_3dc7_70cf_56de_a09c_682b_e6d3_4691);
+const PRESENTATION_TOKEN_NAMESPACE: Uuid =
+    Uuid::from_u128(0x4560_08a1_f6f6_5a16_8345_70c8_4d16_fd13);
 const UNAVAILABLE_WORKFLOW_NEXT_ACTION: &str =
     "Review saved investment analyses, or try again later.";
+const UNAVAILABLE_WORKFLOW_EXPLANATION: &str = "New investment analysis is not available yet because the required market, research, forecast, valuation, historical-comparison, portfolio, and risk information cannot all be verified.";
+const UNAVAILABLE_CUSTOM_VALIDATION_EXPLANATION: &str = "These custom settings cannot be verified yet because one or more required analysis capabilities are unavailable.";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
@@ -849,46 +854,49 @@ impl DesktopAnalyticalController {
         }
         match request {
             AnalyticalControllerCommand::Status => self.status(),
-            AnalyticalControllerCommand::CopyDefault { display_name } => {
+            AnalyticalControllerCommand::CopyRecommended { display_name } => {
                 self.copy_default(display_name)
             }
-            AnalyticalControllerCommand::UpdateCustom {
-                profile_id,
-                expected_revision,
-                config,
-            } => self.update_custom(profile_id, &expected_revision, config),
-            AnalyticalControllerCommand::ValidateCustom {
-                profile_id,
-                expected_revision,
-            } => self.validate_custom(profile_id, &expected_revision),
-            AnalyticalControllerCommand::CompareWithDefault { profile_id } => {
-                self.compare(profile_id)
+            AnalyticalControllerCommand::ValidateProfile {
+                profile_token,
+                profile_state_token,
+            } => self.validate_custom(&profile_token, &profile_state_token),
+            AnalyticalControllerCommand::CompareWithRecommended { profile_token } => {
+                self.compare(&profile_token)
             }
-            AnalyticalControllerCommand::ActivateCustom {
-                profile_id,
-                expected_revision,
-                validation_receipt_id,
-            } => self.activate_custom(profile_id, &expected_revision, validation_receipt_id),
-            AnalyticalControllerCommand::RestoreDefault {
-                expected_activation_revision,
-            } => self.restore_default(&expected_activation_revision),
-            AnalyticalControllerCommand::History {
-                after_revision,
-                limit,
-            } => self.history(after_revision.as_deref(), limit),
+            AnalyticalControllerCommand::ActivateProfile {
+                profile_token,
+                profile_state_token,
+                validation_token,
+            } => self.activate_custom(&profile_token, &profile_state_token, &validation_token),
+            AnalyticalControllerCommand::RestoreRecommended { activation_token } => {
+                self.restore_default(&activation_token)
+            }
+            AnalyticalControllerCommand::History { after_token, limit } => {
+                self.history(after_token.as_deref(), limit)
+            }
         }
     }
 
     fn status(&self) -> Result<AnalyticalControllerResponse, DesktopCommandError> {
         let document = self.lock_document()?;
         Ok(AnalyticalControllerResponse::Status {
-            controller_schema_version: CONTROLLER_FORMAT_VERSION,
-            owner_workspace_id: self.owner_workspace_id,
-            controller_revision: document.revision,
-            active_profile: document.active_profile.clone(),
-            profiles: document.profiles.clone(),
-            workflow_runs: document.workflow_runs.clone(),
-            workflow_readiness: WorkflowReadiness::blocked(),
+            active_profile: profile_presentation(
+                &document,
+                document.profile(document.active_profile.profile_id)?,
+            )?,
+            profiles: document
+                .profiles
+                .iter()
+                .map(|profile| profile_presentation(&document, profile))
+                .collect::<Result<_, _>>()?,
+            workflows: document
+                .workflow_runs
+                .iter()
+                .map(workflow_presentation)
+                .collect::<Result<_, _>>()?,
+            workflow_availability: AnalyticalWorkflowAvailabilityPresentation::unavailable(),
+            can_create_custom_profile: document.profiles.len() < MAXIMUM_PROFILES,
         })
     }
 
@@ -958,91 +966,20 @@ impl DesktopAnalyticalController {
                 now,
             )?;
             document.profiles.push(custom.clone());
-            Ok(AnalyticalControllerResponse::Profile { profile: custom })
-        })
-    }
-
-    fn update_custom(
-        &self,
-        profile_id: Uuid,
-        expected_revision: &str,
-        config: AnalyticalProfileConfig,
-    ) -> Result<AnalyticalControllerResponse, DesktopCommandError> {
-        let expected_revision = parse_revision(expected_revision)?;
-        config.validate_shape()?;
-        self.mutate(|document, now| {
-            let index = document
-                .profiles
-                .iter()
-                .position(|profile| profile.profile_id == profile_id)
-                .ok_or_else(|| {
-                    DesktopCommandError::new(
-                        "profile_not_found",
-                        "The selected Desktop analytical profile was not found.",
-                    )
-                })?;
-            let current = document.profiles[index].clone();
-            if current.kind != AnalyticalProfileKind::Custom {
-                return Err(DesktopCommandError::new(
-                    "default_profile_immutable",
-                    "Market Squawk Default V1 is immutable. Create a custom copy before changing it.",
-                ));
-            }
-            if document.active_profile.profile_id == profile_id {
-                return Err(DesktopCommandError::new(
-                    "active_profile_revision_bound",
-                    "The active analytical profile revision is immutable. Create another custom copy before changing it.",
-                ));
-            }
-            if current.revision != expected_revision {
-                return Err(profile_conflict());
-            }
-            let next_profile_revision = current.revision.checked_add(1).ok_or_else(|| {
-                DesktopCommandError::new(
-                    "profile_revision_exhausted",
-                    "The Desktop analytical profile revision cannot advance.",
-                )
-            })?;
-            let config_digest = config.digest()?;
-            document.revision = document.next_revision()?;
-            let updated = AnalyticalProfile {
-                revision: next_profile_revision,
-                config,
-                config_digest,
-                validation_state: ProfileValidationState::NotValidated,
-                last_validation: None,
-                updated_at: now.clone(),
-                ..current
-            };
-            document.profiles[index] = updated.clone();
-            document.append_history(
-                ProfileHistoryAction::UpdatedCustom,
-                &updated,
-                Some(profile_id),
-                now,
-            )?;
-            Ok(AnalyticalControllerResponse::Profile { profile: updated })
+            Ok(AnalyticalControllerResponse::Profile {
+                profile: profile_presentation(document, &custom)?,
+            })
         })
     }
 
     fn validate_custom(
         &self,
-        profile_id: Uuid,
-        expected_revision: &str,
+        profile_token: &str,
+        profile_state_token: &str,
     ) -> Result<AnalyticalControllerResponse, DesktopCommandError> {
-        let expected_revision = parse_revision(expected_revision)?;
         self.mutate(|document, now| {
             let default = document.default_profile()?.clone();
-            let index = document
-                .profiles
-                .iter()
-                .position(|profile| profile.profile_id == profile_id)
-                .ok_or_else(|| {
-                    DesktopCommandError::new(
-                        "profile_not_found",
-                        "The selected Desktop analytical profile was not found.",
-                    )
-                })?;
+            let index = profile_index_from_token(document, profile_token)?;
             let current = document.profiles[index].clone();
             if current.kind != AnalyticalProfileKind::Custom {
                 return Err(DesktopCommandError::new(
@@ -1050,35 +987,30 @@ impl DesktopAnalyticalController {
                     "Market Squawk Default V1 is already immutable and does not need custom validation.",
                 ));
             }
-            if current.revision != expected_revision {
+            if opaque_profile_state_token(&current)? != profile_state_token {
                 return Err(profile_conflict());
             }
             document.revision = document.next_revision()?;
-            let (validation_state, receipt, blockers, action) =
+            let (validation_state, receipt, action) =
                 if current.config_digest == default.config_digest && current.config == default.config
                 {
                     (
                         ProfileValidationState::Validated,
                         Some(ProfileValidationReceipt {
                             receipt_id: Uuid::new_v4(),
-                            profile_id,
+                            profile_id: current.profile_id,
                             profile_revision: current.revision,
                             config_digest: current.config_digest.clone(),
                             validated_at: now.clone(),
                             basis: ProfileValidationBasis::IdenticalToImmutableDefault,
                             backend_receipts: Vec::new(),
                         }),
-                        Vec::new(),
                         ProfileHistoryAction::ValidatedCustom,
                     )
                 } else {
                     (
                         ProfileValidationState::Blocked,
                         None,
-                        vec![ProfileValidationBlocker {
-                            code: "backend_component_validation_required",
-                            detail: "One or more custom component bindings differ from Market Squawk Default V1. Their owning backend validators are not yet composed into this Desktop generation.",
-                        }],
                         ProfileHistoryAction::ValidationBlocked,
                     )
                 };
@@ -1091,46 +1023,48 @@ impl DesktopAnalyticalController {
             document.profiles[index] = updated.clone();
             document.append_history(action, &updated, Some(default.profile_id), now)?;
             Ok(AnalyticalControllerResponse::Validation {
-                profile: updated,
-                receipt,
-                blockers,
+                profile: profile_presentation(document, &updated)?,
             })
         })
     }
 
     fn compare(
         &self,
-        profile_id: Uuid,
+        profile_token: &str,
     ) -> Result<AnalyticalControllerResponse, DesktopCommandError> {
         let document = self.lock_document()?;
         let default = document.default_profile()?;
-        let selected = document.profile(profile_id)?;
+        let selected = &document.profiles[profile_index_from_token(&document, profile_token)?];
         let different_components = selected.config.differences_from(&default.config);
         Ok(AnalyticalControllerResponse::Comparison {
-            default_profile: default.clone(),
-            selected_profile: selected.clone(),
+            recommended_profile: profile_presentation(&document, default)?,
+            selected_profile: profile_presentation(&document, selected)?,
             equivalent: different_components.is_empty(),
-            different_components,
+            differences: different_components
+                .into_iter()
+                .map(profile_difference_presentation)
+                .collect(),
         })
     }
 
     fn activate_custom(
         &self,
-        profile_id: Uuid,
-        expected_revision: &str,
-        validation_receipt_id: Uuid,
+        profile_token: &str,
+        profile_state_token: &str,
+        validation_token: &str,
     ) -> Result<AnalyticalControllerResponse, DesktopCommandError> {
-        let expected_revision = parse_revision(expected_revision)?;
         self.mutate(|document, now| {
-            let selected = document.profile(profile_id)?.clone();
+            let selected =
+                document.profiles[profile_index_from_token(document, profile_token)?].clone();
             if selected.kind != AnalyticalProfileKind::Custom
-                || selected.revision != expected_revision
+                || opaque_profile_state_token(&selected)? != profile_state_token
             {
                 return Err(profile_conflict());
             }
             let validated = selected.last_validation.as_ref().is_some_and(|receipt| {
                 selected.validation_state == ProfileValidationState::Validated
-                    && receipt.receipt_id == validation_receipt_id
+                    && opaque_validation_token(receipt)
+                        .is_ok_and(|expected| expected == validation_token)
                     && receipt.profile_revision == selected.revision
                     && receipt.config_digest == selected.config_digest
             });
@@ -1160,23 +1094,23 @@ impl DesktopAnalyticalController {
                 now,
             )?;
             Ok(AnalyticalControllerResponse::Activation {
-                active_profile: document.active_profile.clone(),
+                active_profile: profile_presentation(document, &selected)?,
             })
         })
     }
 
     fn restore_default(
         &self,
-        expected_activation_revision: &str,
+        activation_token: &str,
     ) -> Result<AnalyticalControllerResponse, DesktopCommandError> {
-        let expected_activation_revision = parse_revision(expected_activation_revision)?;
         self.mutate(|document, now| {
-            if document.active_profile.activation_revision != expected_activation_revision {
+            if opaque_activation_token(&document.active_profile)? != activation_token {
                 return Err(profile_conflict());
             }
             if document.active_profile.kind == AnalyticalProfileKind::Default {
+                let default = document.default_profile()?;
                 return Ok(AnalyticalControllerResponse::Activation {
-                    active_profile: document.active_profile.clone(),
+                    active_profile: profile_presentation(document, default)?,
                 });
             }
             let previous = document.active_profile.profile_id;
@@ -1200,17 +1134,16 @@ impl DesktopAnalyticalController {
                 now,
             )?;
             Ok(AnalyticalControllerResponse::Activation {
-                active_profile: document.active_profile.clone(),
+                active_profile: profile_presentation(document, &default)?,
             })
         })
     }
 
     fn history(
         &self,
-        after_revision: Option<&str>,
+        after_token: Option<&str>,
         limit: u16,
     ) -> Result<AnalyticalControllerResponse, DesktopCommandError> {
-        let after_revision = after_revision.map(parse_revision).transpose()?.unwrap_or(0);
         let limit = usize::from(limit);
         if limit == 0 || limit > MAXIMUM_HISTORY_PAGE {
             return Err(DesktopCommandError::invalid_request(
@@ -1218,6 +1151,23 @@ impl DesktopAnalyticalController {
             ));
         }
         let document = self.lock_document()?;
+        let after_revision = match after_token {
+            Some(token) => document
+                .profile_history
+                .iter()
+                .find_map(|entry| {
+                    opaque_history_token(entry)
+                        .ok()
+                        .filter(|candidate| candidate == token)
+                        .map(|_candidate| entry.controller_revision)
+                })
+                .ok_or_else(|| {
+                    DesktopCommandError::invalid_request(
+                        "The selected profile-history page is no longer available.",
+                    )
+                })?,
+            None => 0,
+        };
         let available = document
             .profile_history
             .iter()
@@ -1230,19 +1180,26 @@ impl DesktopAnalyticalController {
             .take(limit)
             .cloned()
             .collect();
-        let next_after_revision = (available > entries.len())
-            .then(|| entries.last().map(|entry| entry.controller_revision))
-            .flatten();
+        let next_after_token = if available > entries.len() {
+            Some(opaque_history_token(
+                entries.last().ok_or_else(DesktopCommandError::internal)?,
+            )?)
+        } else {
+            None
+        };
         Ok(AnalyticalControllerResponse::History {
-            completeness: if next_after_revision.is_some() {
+            completeness: if next_after_token.is_some() {
                 HistoryCompleteness::Truncated
             } else {
                 HistoryCompleteness::Complete
             },
             returned_count: entries.len(),
             available_count: available,
-            next_after_revision,
-            entries,
+            next_after_token,
+            entries: entries
+                .iter()
+                .map(|entry| profile_history_presentation(&document, entry))
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -1303,50 +1260,173 @@ struct AnalyticalProductProjection {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum WorkflowReadinessState {
-    Blocked,
+enum AnalyticalProfileModePresentation {
+    Recommended,
+    Custom,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProfileValidationStatePresentation {
+    BuiltIn,
+    NeedsValidation,
+    Unavailable,
+    Validated,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct WorkflowBlocker {
-    code: &'static str,
-    detail: &'static str,
-    owner: &'static str,
+struct ProfileValidationPresentation {
+    state: ProfileValidationStatePresentation,
+    label: &'static str,
+    explanation: &'static str,
+    validated_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct WorkflowReadiness {
-    state: WorkflowReadinessState,
-    blockers: Vec<WorkflowBlocker>,
+struct AnalyticalProfileDifferencePresentation {
+    label: &'static str,
+    explanation: &'static str,
 }
 
-impl WorkflowReadiness {
-    fn blocked() -> Self {
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalyticalProfilePresentation {
+    profile_token: String,
+    profile_state_token: String,
+    display_name: String,
+    version: u32,
+    mode: AnalyticalProfileModePresentation,
+    active: bool,
+    validation: ProfileValidationPresentation,
+    validation_token: Option<String>,
+    activation_token: Option<String>,
+    differences_from_recommended: Vec<AnalyticalProfileDifferencePresentation>,
+    created_at: String,
+    updated_at: String,
+    activated_at: Option<String>,
+    can_validate: bool,
+    can_activate: bool,
+    can_restore_recommended: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AnalyticalWorkflowAvailabilityStatePresentation {
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalyticalWorkflowAvailabilityPresentation {
+    state: AnalyticalWorkflowAvailabilityStatePresentation,
+    explanation: &'static str,
+    next_action: &'static str,
+}
+
+impl AnalyticalWorkflowAvailabilityPresentation {
+    const fn unavailable() -> Self {
         Self {
-            state: WorkflowReadinessState::Blocked,
-            blockers: vec![
-                WorkflowBlocker {
-                    code: "canonical_data_and_backend_composition_required",
-                    detail: "The complete canonical market, feature, forecast, valuation, recommendation-ready backtest, portfolio/risk, proposal, and immutable-result path is not yet composed for this Desktop workflow.",
-                    owner: "installed_application",
-                },
-                WorkflowBlocker {
-                    code: "desktop_start_resume_not_registered",
-                    detail: "This Desktop generation intentionally exposes no Find opportunities or Analyze this investment start command until the required pure capabilities and restart journey exist.",
-                    owner: "desktop",
-                },
-            ],
+            state: AnalyticalWorkflowAvailabilityStatePresentation::Unavailable,
+            explanation: UNAVAILABLE_WORKFLOW_EXPLANATION,
+            next_action: UNAVAILABLE_WORKFLOW_NEXT_ACTION,
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AnalyticalWorkflowKindPresentation {
+    OpportunityDiscovery,
+    InvestmentAnalysis,
+    TrackRecordRefresh,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AnalyticalWorkflowStatePresentation {
+    Waiting,
+    InProgress,
+    Complete,
+    Cancelled,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AnalyticalWorkflowStagePresentation {
+    Preparing,
+    GatheringEvidence,
+    BuildingResults,
+    Finalizing,
+    Complete,
+    Unavailable,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ProfileValidationBlocker {
-    code: &'static str,
-    detail: &'static str,
+struct AnalyticalWorkflowProgressPresentation {
+    stage: AnalyticalWorkflowStagePresentation,
+    completed_steps: usize,
+    waiting_for_background_work: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CoverageCompletenessPresentation {
+    Complete,
+    Partial,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CoveragePresentation {
+    completeness: CoverageCompletenessPresentation,
+    searched: u32,
+    complete_evidence: u32,
+    excluded: u32,
+    deeply_analyzed: u32,
+    generated: u32,
+    no_action: u32,
+    unavailable: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalyticalWorkflowPresentation {
+    workflow_token: String,
+    kind: AnalyticalWorkflowKindPresentation,
+    state: AnalyticalWorkflowStatePresentation,
+    progress: AnalyticalWorkflowProgressPresentation,
+    coverage: Option<CoveragePresentation>,
+    result_count: usize,
+    started_at: String,
+    updated_at: String,
+    explanation: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProfileHistoryActionPresentation {
+    RecommendedInitialized,
+    CustomCreated,
+    CustomUpdated,
+    ValidationUnavailable,
+    CustomValidated,
+    CustomActivated,
+    RecommendedRestored,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileHistoryPresentation {
+    history_token: String,
+    profile_token: String,
+    profile_name: String,
+    action: ProfileHistoryActionPresentation,
+    recorded_at: String,
+    differences_from_recommended: Vec<AnalyticalProfileDifferencePresentation>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -1365,31 +1445,26 @@ enum HistoryCompleteness {
 )]
 pub(crate) enum AnalyticalControllerCommand {
     Status,
-    CopyDefault {
+    CopyRecommended {
         display_name: String,
     },
-    UpdateCustom {
-        profile_id: Uuid,
-        expected_revision: String,
-        config: AnalyticalProfileConfig,
+    ValidateProfile {
+        profile_token: String,
+        profile_state_token: String,
     },
-    ValidateCustom {
-        profile_id: Uuid,
-        expected_revision: String,
+    CompareWithRecommended {
+        profile_token: String,
     },
-    CompareWithDefault {
-        profile_id: Uuid,
+    ActivateProfile {
+        profile_token: String,
+        profile_state_token: String,
+        validation_token: String,
     },
-    ActivateCustom {
-        profile_id: Uuid,
-        expected_revision: String,
-        validation_receipt_id: Uuid,
-    },
-    RestoreDefault {
-        expected_activation_revision: String,
+    RestoreRecommended {
+        activation_token: String,
     },
     History {
-        after_revision: Option<String>,
+        after_token: Option<String>,
         limit: u16,
     },
 }
@@ -1398,7 +1473,7 @@ impl AnalyticalControllerCommand {
     const fn requires_confirmation(&self) -> bool {
         !matches!(
             self,
-            Self::Status | Self::CompareWithDefault { .. } | Self::History { .. }
+            Self::Status | Self::CompareWithRecommended { .. } | Self::History { .. }
         )
     }
 }
@@ -1411,39 +1486,33 @@ impl AnalyticalControllerCommand {
 )]
 enum AnalyticalControllerResponse {
     Status {
-        controller_schema_version: u32,
-        owner_workspace_id: Uuid,
-        #[serde(with = "decimal_u64")]
-        controller_revision: u64,
-        active_profile: ActiveProfileBinding,
-        profiles: Vec<AnalyticalProfile>,
-        workflow_runs: Vec<DesktopWorkflowRun>,
-        workflow_readiness: WorkflowReadiness,
+        active_profile: AnalyticalProfilePresentation,
+        profiles: Vec<AnalyticalProfilePresentation>,
+        workflows: Vec<AnalyticalWorkflowPresentation>,
+        workflow_availability: AnalyticalWorkflowAvailabilityPresentation,
+        can_create_custom_profile: bool,
     },
     Profile {
-        profile: AnalyticalProfile,
+        profile: AnalyticalProfilePresentation,
     },
     Validation {
-        profile: AnalyticalProfile,
-        receipt: Option<ProfileValidationReceipt>,
-        blockers: Vec<ProfileValidationBlocker>,
+        profile: AnalyticalProfilePresentation,
     },
     Comparison {
-        default_profile: AnalyticalProfile,
-        selected_profile: AnalyticalProfile,
+        recommended_profile: AnalyticalProfilePresentation,
+        selected_profile: AnalyticalProfilePresentation,
         equivalent: bool,
-        different_components: Vec<AnalyticalProfileComponent>,
+        differences: Vec<AnalyticalProfileDifferencePresentation>,
     },
     Activation {
-        active_profile: ActiveProfileBinding,
+        active_profile: AnalyticalProfilePresentation,
     },
     History {
         completeness: HistoryCompleteness,
         returned_count: usize,
         available_count: usize,
-        #[serde(serialize_with = "serialize_optional_u64_as_decimal")]
-        next_after_revision: Option<u64>,
-        entries: Vec<ProfileHistoryEntry>,
+        next_after_token: Option<String>,
+        entries: Vec<ProfileHistoryPresentation>,
     },
 }
 
@@ -1480,6 +1549,370 @@ pub(crate) async fn analytical_product(
             "availableItems": 1,
         },
     }))
+}
+
+fn profile_presentation(
+    document: &ControllerDocument,
+    profile: &AnalyticalProfile,
+) -> Result<AnalyticalProfilePresentation, DesktopCommandError> {
+    let recommended = document.default_profile()?;
+    let active = document.active_profile.profile_id == profile.profile_id;
+    let validation = match profile.validation_state {
+        ProfileValidationState::DefaultImmutable => ProfileValidationPresentation {
+            state: ProfileValidationStatePresentation::BuiltIn,
+            label: "Built-in recommended settings",
+            explanation: "Market Squawk's built-in recommended settings are fixed and ready to use.",
+            validated_at: None,
+        },
+        ProfileValidationState::NotValidated => ProfileValidationPresentation {
+            state: ProfileValidationStatePresentation::NeedsValidation,
+            label: "Validation needed",
+            explanation: "Review and validate this custom profile before activating it.",
+            validated_at: None,
+        },
+        ProfileValidationState::Blocked => ProfileValidationPresentation {
+            state: ProfileValidationStatePresentation::Unavailable,
+            label: "Validation unavailable",
+            explanation: UNAVAILABLE_CUSTOM_VALIDATION_EXPLANATION,
+            validated_at: None,
+        },
+        ProfileValidationState::Validated => ProfileValidationPresentation {
+            state: ProfileValidationStatePresentation::Validated,
+            label: "Validated",
+            explanation: "This exact custom profile has been validated and can be activated.",
+            validated_at: profile
+                .last_validation
+                .as_ref()
+                .map(|receipt| receipt.validated_at.clone()),
+        },
+    };
+    let validation_token = profile
+        .last_validation
+        .as_ref()
+        .map(opaque_validation_token)
+        .transpose()?;
+    let activation_token = active
+        .then(|| opaque_activation_token(&document.active_profile))
+        .transpose()?;
+    let differences_from_recommended = profile
+        .config
+        .differences_from(&recommended.config)
+        .into_iter()
+        .map(profile_difference_presentation)
+        .collect();
+
+    Ok(AnalyticalProfilePresentation {
+        profile_token: opaque_profile_token(profile)?,
+        profile_state_token: opaque_profile_state_token(profile)?,
+        display_name: profile.display_name.clone(),
+        version: profile.version,
+        mode: match profile.kind {
+            AnalyticalProfileKind::Default => AnalyticalProfileModePresentation::Recommended,
+            AnalyticalProfileKind::Custom => AnalyticalProfileModePresentation::Custom,
+        },
+        active,
+        validation,
+        validation_token,
+        activation_token,
+        differences_from_recommended,
+        created_at: profile.created_at.clone(),
+        updated_at: profile.updated_at.clone(),
+        activated_at: active.then(|| document.active_profile.activated_at.clone()),
+        can_validate: profile.kind == AnalyticalProfileKind::Custom && !active,
+        can_activate: profile.kind == AnalyticalProfileKind::Custom
+            && !active
+            && profile.validation_state == ProfileValidationState::Validated,
+        can_restore_recommended: active && profile.kind == AnalyticalProfileKind::Custom,
+    })
+}
+
+const fn profile_difference_presentation(
+    component: AnalyticalProfileComponent,
+) -> AnalyticalProfileDifferencePresentation {
+    match component {
+        AnalyticalProfileComponent::SupportedInvestmentPolicy => {
+            AnalyticalProfileDifferencePresentation {
+                label: "Investment coverage",
+                explanation: "Uses custom rules for which investments can be analyzed.",
+            }
+        }
+        AnalyticalProfileComponent::PointInTimeDatasetPolicy => {
+            AnalyticalProfileDifferencePresentation {
+                label: "Historical information",
+                explanation: "Uses a custom point-in-time information policy.",
+            }
+        }
+        AnalyticalProfileComponent::RequiredFeatureSet => AnalyticalProfileDifferencePresentation {
+            label: "Analysis signals",
+            explanation: "Uses a custom set of analytical signals.",
+        },
+        AnalyticalProfileComponent::ModelBundlePolicy => AnalyticalProfileDifferencePresentation {
+            label: "Forecast model",
+            explanation: "Uses a custom forecast-model selection.",
+        },
+        AnalyticalProfileComponent::TrainingCalibrationPolicy => {
+            AnalyticalProfileDifferencePresentation {
+                label: "Model validation",
+                explanation: "Uses custom training or calibration requirements.",
+            }
+        }
+        AnalyticalProfileComponent::ForecastHorizonPolicy => {
+            AnalyticalProfileDifferencePresentation {
+                label: "Forecast horizon",
+                explanation: "Uses custom forecast time horizons.",
+            }
+        }
+        AnalyticalProfileComponent::ValuationPolicy => AnalyticalProfileDifferencePresentation {
+            label: "Valuation",
+            explanation: "Uses custom valuation rules.",
+        },
+        AnalyticalProfileComponent::BacktestCostPolicy => AnalyticalProfileDifferencePresentation {
+            label: "Historical comparison",
+            explanation: "Uses custom historical-comparison or cost assumptions.",
+        },
+        AnalyticalProfileComponent::RecommendationPolicy => {
+            AnalyticalProfileDifferencePresentation {
+                label: "Recommendation rules",
+                explanation: "Uses custom recommendation rules.",
+            }
+        }
+        AnalyticalProfileComponent::RiskFreshnessAbstentionPolicy => {
+            AnalyticalProfileDifferencePresentation {
+                label: "Risk and freshness",
+                explanation: "Uses custom risk, freshness, or no-action rules.",
+            }
+        }
+    }
+}
+
+fn workflow_presentation(
+    run: &DesktopWorkflowRun,
+) -> Result<AnalyticalWorkflowPresentation, DesktopCommandError> {
+    let state = match run.state {
+        WorkflowRunState::Queued | WorkflowRunState::WaitingForServiceJob => {
+            AnalyticalWorkflowStatePresentation::Waiting
+        }
+        WorkflowRunState::Running => AnalyticalWorkflowStatePresentation::InProgress,
+        WorkflowRunState::Completed => AnalyticalWorkflowStatePresentation::Complete,
+        WorkflowRunState::Cancelled => AnalyticalWorkflowStatePresentation::Cancelled,
+        WorkflowRunState::Blocked | WorkflowRunState::Failed | WorkflowRunState::Stale => {
+            AnalyticalWorkflowStatePresentation::Unavailable
+        }
+    };
+    let stage = match run.state {
+        WorkflowRunState::Blocked | WorkflowRunState::Failed | WorkflowRunState::Stale => {
+            AnalyticalWorkflowStagePresentation::Unavailable
+        }
+        WorkflowRunState::Completed => AnalyticalWorkflowStagePresentation::Complete,
+        _ => match run
+            .checkpoint_journal
+            .last()
+            .map(|checkpoint| checkpoint.stage)
+        {
+            None | Some(WorkflowCheckpointStage::Created) => {
+                AnalyticalWorkflowStagePresentation::Preparing
+            }
+            Some(
+                WorkflowCheckpointStage::CapabilityCompleted
+                | WorkflowCheckpointStage::WaitingForServiceJob,
+            ) => AnalyticalWorkflowStagePresentation::GatheringEvidence,
+            Some(WorkflowCheckpointStage::ResultsRetained) => {
+                AnalyticalWorkflowStagePresentation::BuildingResults
+            }
+            Some(
+                WorkflowCheckpointStage::CoverageClosed | WorkflowCheckpointStage::RankingClosed,
+            ) => AnalyticalWorkflowStagePresentation::Finalizing,
+            Some(WorkflowCheckpointStage::Terminal) => {
+                AnalyticalWorkflowStagePresentation::Complete
+            }
+        },
+    };
+    let coverage = run.coverage_receipt.as_ref().map(|receipt| {
+        let counts = &receipt.counts;
+        CoveragePresentation {
+            completeness: match receipt.completeness {
+                CoverageCompleteness::Complete => CoverageCompletenessPresentation::Complete,
+                CoverageCompleteness::Truncated => CoverageCompletenessPresentation::Partial,
+            },
+            searched: counts.searched,
+            complete_evidence: counts.complete_evidence,
+            excluded: counts.excluded,
+            deeply_analyzed: counts.deeply_analyzed,
+            generated: counts.generated,
+            no_action: counts.no_action,
+            unavailable: counts.unavailable,
+        }
+    });
+    let explanation = match run.state {
+        WorkflowRunState::Blocked => {
+            Some("This analysis is waiting for enough verified information to continue.")
+        }
+        WorkflowRunState::Failed => Some(
+            "This analysis could not be completed. Try again; if the problem continues, review Operations or Logs.",
+        ),
+        WorkflowRunState::Stale => Some(
+            "This saved analysis no longer matches the current information and must be refreshed.",
+        ),
+        WorkflowRunState::Cancelled => Some("This analysis was cancelled before completion."),
+        _ => None,
+    };
+
+    Ok(AnalyticalWorkflowPresentation {
+        workflow_token: opaque_workflow_token(run)?,
+        kind: match run.kind {
+            WorkflowKind::FindOpportunities => {
+                AnalyticalWorkflowKindPresentation::OpportunityDiscovery
+            }
+            WorkflowKind::AnalyzeInvestment => {
+                AnalyticalWorkflowKindPresentation::InvestmentAnalysis
+            }
+            WorkflowKind::OutcomeRefresh => AnalyticalWorkflowKindPresentation::TrackRecordRefresh,
+        },
+        state,
+        progress: AnalyticalWorkflowProgressPresentation {
+            stage,
+            completed_steps: run.checkpoint_journal.len(),
+            waiting_for_background_work: matches!(
+                run.state,
+                WorkflowRunState::Queued | WorkflowRunState::WaitingForServiceJob
+            ),
+        },
+        coverage,
+        result_count: run.result_references.len(),
+        started_at: run.created_at.clone(),
+        updated_at: run.updated_at.clone(),
+        explanation,
+    })
+}
+
+fn profile_history_presentation(
+    document: &ControllerDocument,
+    entry: &ProfileHistoryEntry,
+) -> Result<ProfileHistoryPresentation, DesktopCommandError> {
+    let recommended = document.default_profile()?;
+    let profile_name = document
+        .profiles
+        .iter()
+        .find(|profile| profile.profile_id == entry.profile_id)
+        .map(|profile| profile.display_name.clone())
+        .ok_or_else(DesktopCommandError::internal)?;
+    Ok(ProfileHistoryPresentation {
+        history_token: opaque_history_token(entry)?,
+        profile_token: opaque_profile_token_from_id(entry.profile_id)?,
+        profile_name,
+        action: match entry.action {
+            ProfileHistoryAction::InitializedDefault => {
+                ProfileHistoryActionPresentation::RecommendedInitialized
+            }
+            ProfileHistoryAction::CopiedDefault => ProfileHistoryActionPresentation::CustomCreated,
+            ProfileHistoryAction::UpdatedCustom => ProfileHistoryActionPresentation::CustomUpdated,
+            ProfileHistoryAction::ValidationBlocked => {
+                ProfileHistoryActionPresentation::ValidationUnavailable
+            }
+            ProfileHistoryAction::ValidatedCustom => {
+                ProfileHistoryActionPresentation::CustomValidated
+            }
+            ProfileHistoryAction::ActivatedCustom => {
+                ProfileHistoryActionPresentation::CustomActivated
+            }
+            ProfileHistoryAction::RestoredDefault => {
+                ProfileHistoryActionPresentation::RecommendedRestored
+            }
+        },
+        recorded_at: entry.recorded_at.clone(),
+        differences_from_recommended: entry
+            .config
+            .differences_from(&recommended.config)
+            .into_iter()
+            .map(profile_difference_presentation)
+            .collect(),
+    })
+}
+
+fn profile_index_from_token(
+    document: &ControllerDocument,
+    token: &str,
+) -> Result<usize, DesktopCommandError> {
+    for (index, profile) in document.profiles.iter().enumerate() {
+        if opaque_profile_token(profile)? == token {
+            return Ok(index);
+        }
+    }
+    Err(DesktopCommandError::new(
+        "profile_not_found",
+        "The selected analysis profile was not found.",
+    ))
+}
+
+fn opaque_profile_token(profile: &AnalyticalProfile) -> Result<String, DesktopCommandError> {
+    opaque_profile_token_from_id(profile.profile_id)
+}
+
+fn opaque_profile_token_from_id(profile_id: Uuid) -> Result<String, DesktopCommandError> {
+    opaque_presentation_token("profile", &profile_id)
+}
+
+fn opaque_profile_state_token(profile: &AnalyticalProfile) -> Result<String, DesktopCommandError> {
+    opaque_presentation_token(
+        "state",
+        &(
+            profile.profile_id,
+            profile.revision,
+            profile.config_digest.as_str(),
+            profile.validation_state,
+            profile
+                .last_validation
+                .as_ref()
+                .map(|receipt| receipt.receipt_id),
+            profile.updated_at.as_str(),
+        ),
+    )
+}
+
+fn opaque_validation_token(
+    receipt: &ProfileValidationReceipt,
+) -> Result<String, DesktopCommandError> {
+    opaque_presentation_token(
+        "validation",
+        &(
+            receipt.receipt_id,
+            receipt.profile_id,
+            receipt.profile_revision,
+            receipt.config_digest.as_str(),
+        ),
+    )
+}
+
+fn opaque_activation_token(binding: &ActiveProfileBinding) -> Result<String, DesktopCommandError> {
+    opaque_presentation_token(
+        "activation",
+        &(
+            binding.profile_id,
+            binding.profile_revision,
+            binding.activation_revision,
+            binding.config_digest.as_str(),
+        ),
+    )
+}
+
+fn opaque_history_token(entry: &ProfileHistoryEntry) -> Result<String, DesktopCommandError> {
+    opaque_presentation_token(
+        "history",
+        &(entry.event_id, entry.controller_revision, entry.profile_id),
+    )
+}
+
+fn opaque_workflow_token(run: &DesktopWorkflowRun) -> Result<String, DesktopCommandError> {
+    opaque_presentation_token("workflow", &(run.run_id, run.schema_version))
+}
+
+fn opaque_presentation_token(
+    prefix: &'static str,
+    value: &impl Serialize,
+) -> Result<String, DesktopCommandError> {
+    let bytes = serde_json::to_vec(value).map_err(|_error| DesktopCommandError::internal())?;
+    let token = Uuid::new_v5(&PRESENTATION_TOKEN_NAMESPACE, &bytes);
+    Ok(format!("{prefix}_{}", token.simple()))
 }
 
 fn valid_validation_receipt(receipt: &ProfileValidationReceipt) -> bool {
@@ -1632,17 +2065,6 @@ fn valid_timestamp(value: &str) -> bool {
     valid_positive_decimal(value)
 }
 
-fn parse_revision(value: &str) -> Result<u64, DesktopCommandError> {
-    if !valid_unsigned_decimal(value) {
-        return Err(DesktopCommandError::invalid_request(
-            "The Desktop analytical revision is invalid.",
-        ));
-    }
-    value.parse().map_err(|_error| {
-        DesktopCommandError::invalid_request("The Desktop analytical revision is invalid.")
-    })
-}
-
 fn unix_nanos_now() -> Result<String, DesktopCommandError> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1659,19 +2081,6 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
         let _infallible = write!(&mut encoded, "{byte:02x}");
     }
     encoded
-}
-
-fn serialize_optional_u64_as_decimal<S>(
-    value: &Option<u64>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    match value {
-        Some(value) => serializer.serialize_some(&value.to_string()),
-        None => serializer.serialize_none(),
-    }
 }
 
 mod decimal_u64 {
@@ -1706,8 +2115,9 @@ mod tests {
     use std::fs;
 
     use super::{
-        AnalyticalControllerCommand, AnalyticalControllerResponse, AnalyticalProfileKind,
-        DesktopAnalyticalController,
+        AnalyticalControllerCommand, AnalyticalControllerResponse,
+        AnalyticalProfileModePresentation, DesktopAnalyticalController,
+        ProfileValidationStatePresentation,
     };
 
     #[test]
@@ -1721,8 +2131,27 @@ mod tests {
         let paths = market_squawk_platform::LocalPaths::prepare(&root)?;
 
         let controller = DesktopAnalyticalController::try_open(&paths, workspace_id)?;
+        let initial_status = controller.status()?;
+        let serialized_status = serde_json::to_string(&initial_status)?;
+        assert!(!serialized_status.contains(&workspace_id.to_string()));
+        for private_field in [
+            "ownerWorkspaceId",
+            "controllerRevision",
+            "profileId",
+            "configDigest",
+            "receiptId",
+            "jobId",
+            "resultId",
+            "contentSha256",
+            "operation",
+        ] {
+            assert!(!serialized_status.contains(private_field));
+        }
+        assert!(serialized_status.contains("profileToken"));
+        assert!(serialized_status.contains("workflowAvailability"));
+
         let custom = match controller.dispatch(
-            AnalyticalControllerCommand::CopyDefault {
+            AnalyticalControllerCommand::CopyRecommended {
                 display_name: "My validated copy".to_owned(),
             },
             true,
@@ -1730,31 +2159,39 @@ mod tests {
             AnalyticalControllerResponse::Profile { profile } => profile,
             _ => return Err("unexpected copy response".into()),
         };
-        let receipt = match controller.dispatch(
-            AnalyticalControllerCommand::ValidateCustom {
-                profile_id: custom.profile_id,
-                expected_revision: custom.revision.to_string(),
+        let validated = match controller.dispatch(
+            AnalyticalControllerCommand::ValidateProfile {
+                profile_token: custom.profile_token.clone(),
+                profile_state_token: custom.profile_state_token.clone(),
             },
             true,
         )? {
-            AnalyticalControllerResponse::Validation {
-                receipt: Some(receipt),
-                ..
-            } => receipt,
+            AnalyticalControllerResponse::Validation { profile } => profile,
             _ => return Err("unexpected validation response".into()),
         };
+        assert!(matches!(
+            validated.validation.state,
+            ProfileValidationStatePresentation::Validated
+        ));
+        let validation_token = validated
+            .validation_token
+            .clone()
+            .ok_or("missing opaque validation token")?;
         let active = match controller.dispatch(
-            AnalyticalControllerCommand::ActivateCustom {
-                profile_id: custom.profile_id,
-                expected_revision: custom.revision.to_string(),
-                validation_receipt_id: receipt.receipt_id,
+            AnalyticalControllerCommand::ActivateProfile {
+                profile_token: validated.profile_token.clone(),
+                profile_state_token: validated.profile_state_token.clone(),
+                validation_token,
             },
             true,
         )? {
             AnalyticalControllerResponse::Activation { active_profile } => active_profile,
             _ => return Err("unexpected activation response".into()),
         };
-        assert_eq!(active.kind, AnalyticalProfileKind::Custom);
+        assert!(matches!(
+            active.mode,
+            AnalyticalProfileModePresentation::Custom
+        ));
         drop(controller);
 
         let restarted = DesktopAnalyticalController::try_open(&paths, workspace_id)?;
@@ -1762,11 +2199,13 @@ mod tests {
             AnalyticalControllerResponse::Status { active_profile, .. } => active_profile,
             _ => return Err("unexpected status response".into()),
         };
-        assert_eq!(active_after_restart.profile_id, custom.profile_id);
+        assert_eq!(active_after_restart.profile_token, custom.profile_token);
+        let activation_token = active_after_restart
+            .activation_token
+            .clone()
+            .ok_or("missing opaque activation token")?;
         restarted.dispatch(
-            AnalyticalControllerCommand::RestoreDefault {
-                expected_activation_revision: active_after_restart.activation_revision.to_string(),
-            },
+            AnalyticalControllerCommand::RestoreRecommended { activation_token },
             true,
         )?;
         drop(restarted);
@@ -1774,8 +2213,12 @@ mod tests {
         let restored = DesktopAnalyticalController::try_open(&paths, workspace_id)?;
         match restored.status()? {
             AnalyticalControllerResponse::Status { active_profile, .. } => {
-                assert_eq!(active_profile.kind, AnalyticalProfileKind::Default);
-                assert_eq!(active_profile.activation_revision, 3);
+                assert!(matches!(
+                    active_profile.mode,
+                    AnalyticalProfileModePresentation::Recommended
+                ));
+                assert!(active_profile.active);
+                assert!(active_profile.activation_token.is_some());
             }
             _ => return Err("unexpected restored status response".into()),
         }
