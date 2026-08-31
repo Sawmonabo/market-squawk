@@ -1335,11 +1335,12 @@ impl CensusSource {
                 cancellation,
             )
             .await?;
-        let decoded_at = system_timestamp().map_err(map_source_error)?;
-        let ingested_at = system_timestamp().map_err(map_source_error)?;
-        let clocks =
-            CensusClocks::local_first_observed(response.received_at, decoded_at, ingested_at)
-                .map_err(map_adapter_error)?;
+        let provisional_clocks = CensusClocks::local_first_observed(
+            response.received_at,
+            response.received_at,
+            response.received_at,
+        )
+        .map_err(map_adapter_error)?;
         let page = match CensusDataPage::parse(
             contract.query(),
             metadata.selected_variables().map_err(map_source_error)?,
@@ -1348,7 +1349,7 @@ impl CensusSource {
                 .map_err(map_source_error)?,
             &response.body,
             self.effective_parse_limits(),
-            clocks,
+            provisional_clocks,
         ) {
             Ok(page) => page,
             Err(error) => {
@@ -1356,6 +1357,11 @@ impl CensusSource {
                 return Err(map_adapter_error(error));
             }
         };
+        let decoded_at = system_timestamp().map_err(map_source_error)?;
+        let ingested_at = system_timestamp().map_err(map_source_error)?;
+        let page = page
+            .try_with_completed_processing_clocks(decoded_at, ingested_at)
+            .map_err(map_adapter_error)?;
         let accounting = page.accounting();
         let telemetry = response.telemetry_with_data(
             accounting.requested_wire_variables(),

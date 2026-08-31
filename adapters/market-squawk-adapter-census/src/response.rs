@@ -929,6 +929,35 @@ impl CensusDataPage {
         Ok(page)
     }
 
+    /// Rebinds the local processing clocks after bounded decoding completes.
+    ///
+    /// The parser needs receipt/availability evidence while it constructs provider-native rows,
+    /// but only its caller can observe the instant decoding finishes. This consuming transition
+    /// preserves the exact receipt and availability authority while replacing the provisional
+    /// decode/ingest instants on the page and every aligned observation.
+    pub(crate) fn try_with_completed_processing_clocks(
+        mut self,
+        decoded_at: Timestamp,
+        ingested_at: Timestamp,
+    ) -> Result<Self, CensusAdapterError> {
+        if self.clocks.decoded_at() != self.clocks.received_at()
+            || self.clocks.ingested_at() != self.clocks.received_at()
+        {
+            return Err(CensusAdapterError::InvalidChronology);
+        }
+        let clocks = CensusClocks::try_new(
+            self.clocks.received_at(),
+            decoded_at,
+            ingested_at,
+            self.clocks.availability().clone(),
+        )?;
+        for observation in &mut self.observations {
+            observation.clocks = clocks.clone();
+        }
+        self.clocks = clocks;
+        Ok(self)
+    }
+
     /// Returns the exact dataset.
     pub const fn dataset(&self) -> &crate::CensusDataset {
         &self.dataset
@@ -2676,6 +2705,47 @@ mod tests {
             Timestamp::from_unix_nanos(101),
             Timestamp::from_unix_nanos(102),
         )
+    }
+
+    #[test]
+    fn completed_processing_rebinds_page_and_observation_clocks_after_complete_parse()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let metadata = metadata()?;
+        let query = query(&metadata)?;
+        let received_at = Timestamp::from_unix_nanos(100);
+        let page = CensusDataPage::parse(
+            &query,
+            &metadata,
+            &geography_admission()?,
+            br#"[
+              ["B01001_001E", "B01001_001EA", "NAME", "state"],
+              ["733391", null, "Alaska", "02"],
+              ["-666666666", "(X)", "Puerto Rico", "72"],
+              ["", "(X)", "Unknown", "99"]
+            ]"#,
+            CensusParseLimits::default(),
+            CensusClocks::local_first_observed(received_at, received_at, received_at)?,
+        )?
+        .try_with_completed_processing_clocks(
+            Timestamp::from_unix_nanos(101),
+            Timestamp::from_unix_nanos(102),
+        )?;
+
+        assert!(page.completeness().is_complete());
+        assert_eq!(page.clocks().received_at(), received_at);
+        assert_eq!(page.clocks().decoded_at(), Timestamp::from_unix_nanos(101));
+        assert_eq!(page.clocks().ingested_at(), Timestamp::from_unix_nanos(102));
+        assert_eq!(
+            page.clocks().availability().conservative_available_at(),
+            Some(received_at)
+        );
+        assert_eq!(page.observations().len(), 3);
+        assert!(
+            page.observations()
+                .iter()
+                .all(|observation| observation.clocks() == page.clocks())
+        );
+        Ok(())
     }
 
     #[test]
