@@ -1,6 +1,7 @@
 //! Transport-neutral, exact-generation U.S. Treasury Macro operations.
 
 use std::{
+    collections::BTreeSet,
     fmt,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
@@ -122,16 +123,26 @@ impl TreasuryLatestKnownOperation {
         closure: Arc<TreasuryApplicationClosure>,
         receipts: Vec<TreasuryMacroPublicationReceipt>,
     ) -> Result<(), ServiceError> {
-        if receipts.is_empty() || receipts.len() > MAX_SERIES {
+        let expected_generation_count = match self.surface {
+            TreasurySurface::FiscalData => 1,
+            TreasurySurface::DailyRatesXml => TreasuryDailyRateFamily::ALL.len(),
+        };
+        if receipts.len() != expected_generation_count || receipts.len() > MAX_SERIES {
             return Err(ServiceError::InvalidResult);
         }
         let mut generations = Vec::with_capacity(receipts.len());
+        let mut daily_families = BTreeSet::new();
         for receipt in receipts {
             closure
                 .verify_publication_receipt(&receipt)
                 .map_err(map_error)?;
             let selector = receipt.restart_selector().clone();
             if selector.surface() != self.surface || receipt.manifest() != selector.manifest() {
+                return Err(ServiceError::InvalidResult);
+            }
+            if self.surface == TreasurySurface::DailyRatesXml
+                && !daily_families.insert(daily_rate_family(selector.manifest())?)
+            {
                 return Err(ServiceError::InvalidResult);
             }
             let fixed_series = fixed_series_for_generation(self.surface, &selector)?;
@@ -150,6 +161,11 @@ impl TreasuryLatestKnownOperation {
         if generations
             .windows(2)
             .any(|pair| pair[0].selector.manifest() == pair[1].selector.manifest())
+            || (self.surface == TreasurySurface::DailyRatesXml
+                && (daily_families.len() != TreasuryDailyRateFamily::ALL.len()
+                    || TreasuryDailyRateFamily::ALL
+                        .into_iter()
+                        .any(|family| !daily_families.contains(&family))))
         {
             return Err(ServiceError::InvalidResult);
         }
@@ -253,7 +269,8 @@ impl TreasuryLatestKnownOperation {
                 return Err(ServiceError::DeadlineExceeded);
             }
             let selector = generation.selector.clone();
-            let fixed_series = generation.fixed_series.clone();
+            let fixed_series =
+                fixed_series_for_cutoff(self.surface, generation, effective_date_cutoff)?;
             let read = match self.surface {
                 TreasurySurface::FiscalData => {
                     let request = TreasuryFiscalDataLatestKnownRequest::try_new(
@@ -371,7 +388,8 @@ impl TreasuryLatestKnownOperation {
             .find(|item| generation_matches(&generation, item.selector.manifest()))
             .ok_or(ServiceError::NotFound)?;
         let selector = generation.selector.clone();
-        let allowlist = series_subset.intersect(&generation.fixed_series)?;
+        let fixed_series = fixed_series_for_cutoff(self.surface, generation, effective)?;
+        let allowlist = series_subset.intersect(&fixed_series)?;
         let output = match self.surface {
             TreasurySurface::FiscalData => {
                 let request = TreasuryFiscalDataLatestKnownRequest::try_new(
@@ -586,7 +604,8 @@ fn map_error(error: TreasuryApplicationError) -> ServiceError {
         | TreasuryApplicationError::InvalidAcquisition
         | TreasuryApplicationError::SurfaceMismatch
         | TreasuryApplicationError::RestartInvalid
-        | TreasuryApplicationError::Capture(_) => ServiceError::InvalidResult,
+        | TreasuryApplicationError::Capture(_)
+        | TreasuryApplicationError::AllHistory(_) => ServiceError::InvalidResult,
         TreasuryApplicationError::Composition(_)
         | TreasuryApplicationError::Research(_)
         | TreasuryApplicationError::Ingest(_) => ServiceError::Unavailable,
@@ -629,37 +648,56 @@ fn fixed_series_for_generation(
     selector: &TreasuryMacroRestartSelector,
 ) -> Result<AnalyticalMacroSeriesAllowlist, ServiceError> {
     match surface {
-        TreasurySurface::FiscalData => Ok(selector.published_series().clone()),
+        TreasurySurface::FiscalData => selector
+            .single_published_series()
+            .cloned()
+            .ok_or(ServiceError::InvalidResult),
         TreasurySurface::DailyRatesXml => {
-            let fixed = fixed_daily_rate_series(selector.manifest())?;
-            if selector.published_series() != &fixed {
+            if !selector.is_all_history() {
                 return Err(ServiceError::InvalidResult);
             }
-            Ok(fixed)
+            fixed_daily_rate_series(selector.manifest(), None)
+        }
+    }
+}
+
+fn fixed_series_for_cutoff(
+    surface: TreasurySurface,
+    generation: &TreasuryPublishedGeneration,
+    effective_date_cutoff: CalendarDate,
+) -> Result<AnalyticalMacroSeriesAllowlist, ServiceError> {
+    match surface {
+        TreasurySurface::FiscalData => Ok(generation.fixed_series.clone()),
+        TreasurySurface::DailyRatesXml => {
+            let selected = fixed_daily_rate_series(
+                generation.selector.manifest(),
+                Some(effective_date_cutoff.year()),
+            )?;
+            if selected.series().iter().any(|series| {
+                generation
+                    .fixed_series
+                    .series()
+                    .binary_search(series)
+                    .is_err()
+            }) {
+                return Err(ServiceError::InvalidResult);
+            }
+            Ok(selected)
         }
     }
 }
 
 fn fixed_daily_rate_series(
     manifest: &DatasetManifestRef,
+    effective_year: Option<u16>,
 ) -> Result<AnalyticalMacroSeriesAllowlist, ServiceError> {
-    let dataset = manifest.dataset_id().as_str();
-    let (family, period) = TreasuryDailyRateFamily::ALL
-        .into_iter()
-        .find_map(|family| {
-            let prefix = format!("treasury.{}.", family.dataset_family_token());
-            dataset.strip_prefix(&prefix).map(|period| (family, period))
-        })
-        .ok_or(ServiceError::InvalidResult)?;
-    let query = daily_rate_query(family, period)?;
-    if query.analytical_dataset().as_str() != dataset {
-        return Err(ServiceError::InvalidResult);
-    }
-    let period_year = query.period().year_value();
+    let family = daily_rate_family(manifest)?;
+    let query =
+        TreasuryDailyRateQuery::all_history(family).map_err(|_| ServiceError::InvalidResult)?;
     let series = family
         .dashboard_metrics()
         .into_iter()
-        .filter(|metric| period_year.is_none_or(|year| metric.first_schema_year() <= year))
+        .filter(|metric| effective_year.is_none_or(|year| metric.first_schema_year() <= year))
         .map(|metric| {
             SourceIdentifier::try_from(metric.canonical_series())
                 .map_err(|_| ServiceError::InvalidResult)
@@ -669,35 +707,17 @@ fn fixed_daily_rate_series(
         .map_err(|_| ServiceError::InvalidResult)
 }
 
-fn daily_rate_query(
-    family: TreasuryDailyRateFamily,
-    period: &str,
-) -> Result<TreasuryDailyRateQuery, ServiceError> {
-    if period == "all" {
-        return TreasuryDailyRateQuery::all_history(family)
-            .map_err(|_| ServiceError::InvalidResult);
-    }
-    if period.len() == 4 && period.bytes().all(|byte| byte.is_ascii_digit()) {
-        let year = period
-            .parse::<u16>()
-            .map_err(|_| ServiceError::InvalidResult)?;
-        return TreasuryDailyRateQuery::year(family, year).map_err(|_| ServiceError::InvalidResult);
-    }
-    let bytes = period.as_bytes();
-    if bytes.len() != 7
-        || bytes[4] != b'-'
-        || !bytes[..4].iter().all(u8::is_ascii_digit)
-        || !bytes[5..].iter().all(u8::is_ascii_digit)
-    {
-        return Err(ServiceError::InvalidResult);
-    }
-    let year = period[..4]
-        .parse::<u16>()
-        .map_err(|_| ServiceError::InvalidResult)?;
-    let month = period[5..]
-        .parse::<u8>()
-        .map_err(|_| ServiceError::InvalidResult)?;
-    TreasuryDailyRateQuery::month(family, year, month).map_err(|_| ServiceError::InvalidResult)
+fn daily_rate_family(
+    manifest: &DatasetManifestRef,
+) -> Result<TreasuryDailyRateFamily, ServiceError> {
+    TreasuryDailyRateFamily::ALL
+        .into_iter()
+        .find(|family| {
+            TreasuryDailyRateQuery::all_history(*family).is_ok_and(|query| {
+                query.analytical_dataset().as_str() == manifest.dataset_id().as_str()
+            })
+        })
+        .ok_or(ServiceError::InvalidResult)
 }
 
 fn evaluated_at() -> Result<Timestamp, ServiceError> {

@@ -10,15 +10,20 @@
 //! publication hook supplies a verified binding receipt. Restart always reopens the exact
 //! manifest and raw/native binding before executing the fixed latest-known Macro selector.
 
-use std::{sync::Arc, time::Instant};
+use std::{num::NonZeroU16, sync::Arc, time::Instant};
 
-use market_squawk_adapter_treasury::TreasurySurface;
+use market_squawk_adapter_treasury::{
+    TreasuryAllHistoryAcquisitionCompletion, TreasuryAllHistoryCanonicalPage, TreasurySource,
+    TreasurySourceError, TreasurySurface,
+};
 use market_squawk_data::{
     AnalyticalGeneration, AnalyticalMacroLatestKnownOutput, AnalyticalMacroLatestKnownRequest,
     AnalyticalMacroSeriesAllowlist, AnalyticalReadError, DatasetId, DatasetManifestRef,
     IngestError, IngestIdentity, IngestPrecommitAuthority, PersistedProviderCaptureBindingEvidence,
-    PinnedDataset, ProviderMacroPlanChunkInput, ProviderMacroPlanPublicationInput,
-    ProviderMacroPlanSemantics, QueryLimits, RightsDecisionInput, SourceOperation,
+    PinnedDataset, ProviderMacroPlanChunkInput, ProviderMacroPlanManifestSelector,
+    ProviderMacroPlanPublicationInput, ProviderMacroPlanSemantics, ProviderMacroPlanSessionInput,
+    ProviderMacroPlanSessionReceipt, ProviderMacroPlanStagedPage, ProviderMacroPlanTerminal,
+    QueryLimits, RightsDecisionInput, SourceOperation, StagedProviderMacroPlanRestartEvidence,
 };
 use market_squawk_domain::{
     CalendarDate, DigestAlgorithm, EvidenceDigest, ResearchObservation, SourceId, SourceIdentifier,
@@ -26,9 +31,9 @@ use market_squawk_domain::{
 };
 use market_squawk_services::{RequestContext, ServiceError};
 use market_squawk_sources::{
-    ExtractionBatch, ExtractionRevisionPlan, ProviderCaptureError,
+    DiscoveryRequest, ExtractionBatch, ExtractionRevisionPlan, ProviderCaptureError,
     ProviderCaptureTerminalDisposition, ProviderNativeLineageImplementation,
-    SealedProviderCaptureBinding, SourceClass, SourceMetadata,
+    ProviderWholeCaptureToken, SealedProviderCaptureBinding, SourceClass, SourceMetadata,
 };
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
@@ -37,7 +42,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     DomainLifecycle, ProductionResearchIngestCoordinator, ResearchIngestCompositionError,
-    ensure_operation_live, operation_deadline,
+    ResearchProviderRuntimeGeneration, TreasuryAllHistoryOperationAuthority, ensure_operation_live,
+    operation_deadline,
 };
 use crate::{ResearchService, ResearchServiceError};
 
@@ -54,6 +60,9 @@ const MAX_TREASURY_LATEST_KNOWN_SERIES: usize = 32;
 const TREASURY_PROVIDER: &str = "us-treasury";
 const TREASURY_NATIVE_IMPLEMENTATION: &str = "us_treasury_macro_v1";
 const TREASURY_MACRO_SEMANTICS_SCHEMA: &str = "us-treasury-macro-native-semantics-v1";
+const TREASURY_ALL_HISTORY_PLAN_SCHEMA: &[u8] = b"market-squawk/treasury-all-history-plan/v1\0";
+const TREASURY_ALL_HISTORY_PAGE_SCHEMA: &[u8] = b"market-squawk/treasury-all-history-page/v1\0";
+const TREASURY_ALL_HISTORY_INGEST_SCHEMA: &[u8] = b"market-squawk/treasury-all-history-ingest/v1\0";
 const TREASURY_FISCAL_SOURCE_ID: &str = "treasury-treasury.fiscal-data";
 const TREASURY_DAILY_SOURCE_ID: &str = "treasury-treasury.daily-rates-xml";
 const FISCAL_PROVIDER_DATASET_PREFIX: &str = "treasury:fiscal-data:average-interest-rates-v2:";
@@ -92,20 +101,6 @@ impl TreasurySelectedObjectRequest {
     ) -> Result<Self, TreasuryApplicationError> {
         Self::try_new(
             TreasurySurface::FiscalData,
-            provider_dataset,
-            object_id,
-            discovery_receipt,
-        )
-    }
-
-    /// Binds one daily-rate object to the exact built-in daily-rate runtime slot.
-    pub(crate) fn daily_rates(
-        provider_dataset: SourceIdentifier,
-        object_id: SourceIdentifier,
-        discovery_receipt: String,
-    ) -> Result<Self, TreasuryApplicationError> {
-        Self::try_new(
-            TreasurySurface::DailyRatesXml,
             provider_dataset,
             object_id,
             discovery_receipt,
@@ -195,7 +190,7 @@ impl TreasuryApplicationClosure {
         receipt
             .restart_selector()
             .verify(self.research.as_ref())
-            .map(|(_pinned, _evidence)| ())
+            .map(|_pinned| ())
     }
 
     /// Reopens the latest exact generation for one configured Treasury dataset without provider
@@ -204,11 +199,12 @@ impl TreasuryApplicationClosure {
         &self,
         surface: TreasurySurface,
         provider_dataset: &SourceIdentifier,
+        generation: &ResearchProviderRuntimeGeneration,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Option<TreasuryMacroPublicationReceipt>, TreasuryApplicationError> {
         let analytical_dataset = treasury_analytical_dataset(surface, provider_dataset)?;
-        let Some(generation) = self.research.analytical_reader().latest(
+        let Some(published_generation) = self.research.analytical_reader().latest(
             &analytical_dataset,
             deadline,
             cancellation,
@@ -216,13 +212,215 @@ impl TreasuryApplicationClosure {
         else {
             return Ok(None);
         };
-        Self::reopen_generation(
+        if surface == TreasurySurface::DailyRatesXml && provider_dataset.as_str().ends_with(":all")
+        {
+            let manifest = published_generation.manifest().clone();
+            let restart = TreasuryMacroRestartSelector::all_history(manifest.clone())?;
+            restart.verify_for_runtime_generation(self.research.as_ref(), generation)?;
+            return Ok(Some(TreasuryMacroPublicationReceipt { manifest, restart }));
+        }
+        let receipt = Self::reopen_generation(
             self.research.as_ref(),
             surface,
             provider_dataset,
-            generation,
+            published_generation,
+        )?;
+        receipt
+            .restart_selector()
+            .verify_for_runtime_generation(self.research.as_ref(), generation)?;
+        Ok(Some(receipt))
+    }
+
+    /// Resumes and publishes one exact daily-rate all-history family as one atomic generation.
+    pub(crate) async fn publish_daily_rates_all_history(
+        &self,
+        generation: &ResearchProviderRuntimeGeneration,
+        provider_dataset: &SourceIdentifier,
+        context: &RequestContext,
+    ) -> Result<Option<TreasuryMacroPublicationReceipt>, TreasuryApplicationError> {
+        if !provider_dataset.as_str().ends_with(":all")
+            || !surface_accepts_provider_dataset(TreasurySurface::DailyRatesXml, provider_dataset)
+        {
+            return Err(TreasuryApplicationError::InvalidSelection);
+        }
+        let operation = self
+            .coordinator
+            .acquire_treasury_all_history_operation(generation, provider_dataset, context)
+            .await?;
+        let source = operation.source()?;
+        let common = operation.common();
+        let initial = source.start_all_history_backfill(provider_dataset)?;
+        let initial_checkpoint = initial.checkpoint().to_json()?.into_boxed_slice();
+        let descriptor = source
+            .activation_intent()
+            .catalog()
+            .dataset(provider_dataset)
+            .ok_or(TreasuryApplicationError::InvalidSelection)?;
+        let analytical_dataset = DatasetId::try_from(descriptor.analytical_dataset().as_str())
+            .map_err(|_error| TreasuryApplicationError::InvalidSelection)?;
+        let source_generation_digest = generation.generation_digest()?;
+        let plan_identity = treasury_all_history_plan_identity(
+            &analytical_dataset,
+            provider_dataset,
+            source_generation_digest,
+            descriptor.query_digest(),
+            source.activation_intent().intent_digest(),
+        )?;
+        let input = ProviderMacroPlanSessionInput::try_new(
+            analytical_dataset.clone(),
+            generation.metadata().source_id().clone(),
+            generation.metadata().revision().clone(),
+            provider_dataset.clone(),
+            source_generation_digest,
+            plan_identity,
+            initial_checkpoint,
+        )?;
+        let session = self
+            .research
+            .analytical()
+            .begin_staged_provider_macro_plan(input)?;
+        common.ensure_live()?;
+        let store = self.research.provider_capture_store();
+        let (completed, observed_at) = if session.is_complete() {
+            let backfill = source.restore_all_history_backfill(session.checkpoint(), &store)?;
+            let completion = backfill.acquisition_completion()?;
+            validate_all_history_completion(
+                &completion,
+                &analytical_dataset,
+                provider_dataset,
+                &session,
+            )?;
+            let observed_at = all_history_terminal_received_at(&completion)?;
+            let completed = self
+                .research
+                .analytical()
+                .recover_completed_provider_macro_plan(session.session_id())?;
+            (completed, observed_at)
+        } else {
+            let mut backfill = source.restore_all_history_backfill(session.checkpoint(), &store)?;
+            let discovery = DiscoveryRequest::try_new(
+                provider_dataset.clone(),
+                None,
+                NonZeroU16::new(1).ok_or(TreasuryApplicationError::InvalidAcquisition)?,
+                common.provider_deadline()?,
+            )
+            .map_err(|_error| TreasuryApplicationError::InvalidAcquisition)?;
+            let fetched = source
+                .fetch_next_all_history_page(
+                    &backfill,
+                    common.extraction(),
+                    discovery,
+                    common.cancellation().clone(),
+                )
+                .await
+                .map_err(|_error| TreasuryApplicationError::InvalidAcquisition)?;
+            let terminal = fetched.terminal();
+            let (canonical, capture, admission) = fetched.into_parts();
+            let (expectation, seal_request) = capture.into_whole_seal_parts();
+            let sealed = self
+                .research
+                .seal_provider_capture(
+                    seal_request,
+                    common.cancellation(),
+                    common.operation_deadline(),
+                )
+                .await?;
+            let token = expectation.try_rejoin(sealed)?.try_into_whole()?;
+            let persisted = token.persisted_receipt().clone();
+            backfill.accept_sealed_page(admission, persisted)?;
+            let successor_checkpoint = backfill.checkpoint().to_json()?.into_boxed_slice();
+            if terminal {
+                if canonical.is_some() {
+                    return Err(TreasuryApplicationError::InvalidAcquisition);
+                }
+                let completion = backfill.acquisition_completion()?;
+                validate_all_history_completion(
+                    &completion,
+                    &analytical_dataset,
+                    provider_dataset,
+                    &session,
+                )?;
+                let observed_at = all_history_terminal_received_at(&completion)?;
+                let terminal = ProviderMacroPlanTerminal::try_new(
+                    completion.completion_digest(),
+                    token,
+                    successor_checkpoint,
+                )?;
+                let completed = self
+                    .research
+                    .analytical()
+                    .complete_staged_provider_macro_plan(
+                        &session,
+                        terminal,
+                        common.cancellation().clone(),
+                    )
+                    .await?;
+                (completed, observed_at)
+            } else {
+                let canonical = canonical.ok_or(TreasuryApplicationError::InvalidAcquisition)?;
+                let staged = treasury_all_history_staged_page(
+                    source,
+                    provider_dataset,
+                    session.data_page_count(),
+                    canonical,
+                    token,
+                    successor_checkpoint,
+                )?;
+                self.research
+                    .analytical()
+                    .stage_provider_macro_plan_page(&session, staged, common.cancellation().clone())
+                    .await?;
+                return Ok(None);
+            }
+        };
+        common.ensure_live()?;
+        if completed.session().analytical_dataset() != &analytical_dataset
+            || completed.session().provider_dataset() != provider_dataset
+            || completed.session().source_generation_digest() != source_generation_digest
+            || completed.session().plan_identity() != plan_identity
+        {
+            return Err(TreasuryApplicationError::InvalidAcquisition);
+        }
+        let rights = common.rights_decision(completed.publication_digest(), observed_at)?;
+        let identity = IngestIdentity::try_new(
+            generation.metadata().source_id().clone(),
+            completed.publication_digest(),
+            SourceOperation::Persist,
+            treasury_all_history_ingest_identity(
+                &analytical_dataset,
+                provider_dataset,
+                source_generation_digest,
+                completed.publication_digest(),
+            )?,
         )
-        .map(Some)
+        .map_err(|_error| TreasuryApplicationError::InvalidAcquisition)?;
+        let reservation = self
+            .research
+            .analytical()
+            .reserve_source_ingest(
+                generation.metadata(),
+                observed_at,
+                rights,
+                &identity,
+                common.cancellation(),
+            )
+            .await?;
+        let committed = self
+            .research
+            .analytical()
+            .publish_staged_provider_macro_plan(
+                reservation,
+                completed,
+                common.cancellation().clone(),
+                common.publication_authority(),
+            )
+            .await?;
+        let restart = TreasuryMacroRestartSelector::all_history(committed.manifest().clone())?;
+        restart.verify_for_runtime_generation(self.research.as_ref(), generation)?;
+        Ok(Some(TreasuryMacroPublicationReceipt {
+            manifest: committed.manifest().clone(),
+            restart,
+        }))
     }
 
     fn reopen_generation(
@@ -274,7 +472,7 @@ impl TreasuryApplicationClosure {
             provider_dataset,
             evidence,
         )?;
-        let restart = TreasuryMacroRestartSelector::try_new(
+        let restart = TreasurySingleMacroRestartSelector::try_new(
             surface,
             manifest.clone(),
             evidence.binding_digest(),
@@ -295,7 +493,10 @@ impl TreasuryApplicationClosure {
             published_series,
         )?;
         restart.verify(research)?;
-        Ok(TreasuryMacroPublicationReceipt { manifest, restart })
+        Ok(TreasuryMacroPublicationReceipt {
+            manifest,
+            restart: TreasuryMacroRestartSelector::Single(restart),
+        })
     }
 
     /// Runs one registered, receipt-selected, bounded Treasury acquisition and seals all exact
@@ -583,7 +784,7 @@ impl TreasuryApplicationClosure {
         {
             return Err(TreasuryApplicationError::RestartInvalid);
         }
-        let restart = TreasuryMacroRestartSelector::try_new(
+        let restart = TreasurySingleMacroRestartSelector::try_new(
             surface,
             committed.manifest().clone(),
             binding_digest,
@@ -602,7 +803,7 @@ impl TreasuryApplicationClosure {
         restart.verify(self.research.as_ref())?;
         Ok(TreasuryMacroPublicationReceipt {
             manifest: committed.manifest().clone(),
-            restart,
+            restart: TreasuryMacroRestartSelector::Single(restart),
         })
     }
 
@@ -645,18 +846,18 @@ impl TreasuryApplicationClosure {
             restart,
             analytical,
         } = request;
-        if analytical.manifest() != restart.manifest()
-            || analytical.source_id() != restart.source_id()
+        let expected_source = restart.source_id()?;
+        if analytical.manifest() != restart.manifest() || analytical.source_id() != &expected_source
         {
             return Err(TreasuryApplicationError::RestartInvalid);
         }
-        let (pinned, evidence) = restart.verify(self.research.as_ref())?;
+        let pinned = restart.verify(self.research.as_ref())?;
         let output = self
             .research
             .analytical_reader()
             .read_macro_latest_known_snapshot(analytical, limits, deadline, cancellation)
             .await?;
-        if output.source_id() != restart.source_id()
+        if output.source_id() != &expected_source
             || output.output().manifest() != restart.manifest()
         {
             return Err(TreasuryApplicationError::RestartInvalid);
@@ -664,7 +865,6 @@ impl TreasuryApplicationClosure {
         Ok(TreasuryLatestKnownReceipt {
             restart,
             pinned,
-            evidence,
             output,
         })
     }
@@ -748,7 +948,13 @@ impl TreasuryMacroPublicationReceipt {
 
 /// Exact immutable Treasury generation and raw/native binding needed after restart.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TreasuryMacroRestartSelector {
+pub(crate) enum TreasuryMacroRestartSelector {
+    Single(TreasurySingleMacroRestartSelector),
+    AllHistory(ProviderMacroPlanManifestSelector),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TreasurySingleMacroRestartSelector {
     surface: TreasurySurface,
     manifest: DatasetManifestRef,
     binding_digest: EvidenceDigest,
@@ -872,6 +1078,111 @@ struct TreasuryPersistedNativeRowV1 {
 }
 
 impl TreasuryMacroRestartSelector {
+    fn all_history(manifest: DatasetManifestRef) -> Result<Self, TreasuryApplicationError> {
+        if !manifest.dataset_id().as_str().ends_with(".all")
+            || !surface_accepts_analytical_dataset(
+                TreasurySurface::DailyRatesXml,
+                manifest.dataset_id(),
+            )
+        {
+            return Err(TreasuryApplicationError::RestartInvalid);
+        }
+        Ok(Self::AllHistory(ProviderMacroPlanManifestSelector::new(
+            manifest,
+        )))
+    }
+
+    /// Returns the independently configured Treasury product.
+    pub(crate) const fn surface(&self) -> TreasurySurface {
+        match self {
+            Self::Single(selector) => selector.surface,
+            Self::AllHistory(_) => TreasurySurface::DailyRatesXml,
+        }
+    }
+
+    /// Returns the exact immutable generation and sole all-history restart coordinate.
+    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
+        match self {
+            Self::Single(selector) => &selector.manifest,
+            Self::AllHistory(selector) => selector.manifest(),
+        }
+    }
+
+    /// Returns the bounded exact canonical series inventory when it is carried by the legacy
+    /// single-response Fiscal publication.
+    pub(crate) const fn single_published_series(&self) -> Option<&AnalyticalMacroSeriesAllowlist> {
+        match self {
+            Self::Single(selector) => Some(&selector.published_series),
+            Self::AllHistory(_) => None,
+        }
+    }
+
+    pub(crate) const fn is_all_history(&self) -> bool {
+        matches!(self, Self::AllHistory(_))
+    }
+
+    fn source_id(&self) -> Result<SourceId, TreasuryApplicationError> {
+        match self {
+            Self::Single(selector) => Ok(selector.source_id.clone()),
+            Self::AllHistory(_) => treasury_source_id(TreasurySurface::DailyRatesXml),
+        }
+    }
+
+    fn verify(
+        &self,
+        research: &ResearchService,
+    ) -> Result<PinnedDataset, TreasuryApplicationError> {
+        match self {
+            Self::Single(selector) => selector.verify(research).map(|(pinned, _evidence)| pinned),
+            Self::AllHistory(selector) => {
+                let evidence = research
+                    .analytical()
+                    .verify_staged_provider_macro_plan_restart(selector)?;
+                validate_all_history_restart(selector, &evidence)?;
+                Ok(evidence.pinned().clone())
+            }
+        }
+    }
+
+    fn verify_for_runtime_generation(
+        &self,
+        research: &ResearchService,
+        generation: &ResearchProviderRuntimeGeneration,
+    ) -> Result<PinnedDataset, TreasuryApplicationError> {
+        let expected_source = self.source_id()?;
+        if generation.profile().as_str() != self.surface().profile_id()
+            || generation.metadata().source_id() != &expected_source
+        {
+            return Err(TreasuryApplicationError::RestartInvalid);
+        }
+        match self {
+            Self::Single(selector) => {
+                if generation.metadata().revision().as_source_identifier()
+                    != &selector.metadata_revision
+                {
+                    return Err(TreasuryApplicationError::RestartInvalid);
+                }
+                selector.verify(research).map(|(pinned, _evidence)| pinned)
+            }
+            Self::AllHistory(selector) => {
+                let evidence = research
+                    .analytical()
+                    .verify_staged_provider_macro_plan_restart(selector)?;
+                let session = evidence.completed().session();
+                if session.source_id() != generation.metadata().source_id()
+                    || session.metadata_revision() != generation.metadata().revision()
+                    || session.source_generation_digest() != generation.generation_digest()?
+                {
+                    return Err(TreasuryApplicationError::RestartInvalid);
+                }
+                validate_all_history_restart(selector, &evidence)?;
+                Ok(evidence.pinned().clone())
+            }
+        }
+    }
+}
+
+impl TreasurySingleMacroRestartSelector {
     /// Binds one future Treasury publication receipt to exact durable read coordinates.
     #[allow(
         clippy::too_many_arguments,
@@ -1061,8 +1372,8 @@ impl TreasuryLatestKnownRequest {
         effective_date_cutoff: CalendarDate,
     ) -> Result<Self, TreasuryApplicationError> {
         let analytical = AnalyticalMacroLatestKnownRequest::try_new(
-            restart.manifest.clone(),
-            restart.source_id.clone(),
+            restart.manifest().clone(),
+            restart.source_id()?,
             knowledge_cutoff,
             effective_date_cutoff,
             series_allowlist,
@@ -1088,7 +1399,7 @@ impl TreasuryFiscalDataLatestKnownRequest {
         knowledge_cutoff: Timestamp,
         effective_date_cutoff: CalendarDate,
     ) -> Result<Self, TreasuryApplicationError> {
-        if restart.surface != TreasurySurface::FiscalData {
+        if restart.surface() != TreasurySurface::FiscalData {
             return Err(TreasuryApplicationError::SurfaceMismatch);
         }
         TreasuryLatestKnownRequest::try_new(
@@ -1125,7 +1436,7 @@ impl TreasuryDailyRatesLatestKnownRequest {
         knowledge_cutoff: Timestamp,
         effective_date_cutoff: CalendarDate,
     ) -> Result<Self, TreasuryApplicationError> {
-        if restart.surface != TreasurySurface::DailyRatesXml {
+        if restart.surface() != TreasurySurface::DailyRatesXml {
             return Err(TreasuryApplicationError::SurfaceMismatch);
         }
         TreasuryLatestKnownRequest::try_new(
@@ -1152,7 +1463,6 @@ impl TreasuryDailyRatesLatestKnownRequest {
 struct TreasuryLatestKnownReceipt {
     restart: TreasuryMacroRestartSelector,
     pinned: PinnedDataset,
-    evidence: PersistedProviderCaptureBindingEvidence,
     output: AnalyticalMacroLatestKnownOutput,
 }
 
@@ -1171,11 +1481,6 @@ impl TreasuryFiscalDataLatestKnownReceipt {
     /// Returns the exact immutable generation reopened for the query.
     pub(crate) const fn pinned(&self) -> &PinnedDataset {
         &self.common.pinned
-    }
-
-    /// Returns verified raw/native evidence for the generation input.
-    pub(crate) const fn evidence(&self) -> &PersistedProviderCaptureBindingEvidence {
-        &self.common.evidence
     }
 
     /// Returns the typed latest-known Macro selection and selection digest.
@@ -1204,11 +1509,6 @@ impl TreasuryDailyRatesLatestKnownReceipt {
     /// Returns the exact immutable generation reopened for the query.
     pub(crate) const fn pinned(&self) -> &PinnedDataset {
         &self.common.pinned
-    }
-
-    /// Returns verified raw/native evidence for the generation input.
-    pub(crate) const fn evidence(&self) -> &PersistedProviderCaptureBindingEvidence {
-        &self.common.evidence
     }
 
     /// Returns the typed latest-known Macro selection and selection digest.
@@ -1359,6 +1659,37 @@ fn validate_restored_treasury_evidence(
     Ok(())
 }
 
+fn validate_all_history_restart(
+    selector: &ProviderMacroPlanManifestSelector,
+    evidence: &StagedProviderMacroPlanRestartEvidence,
+) -> Result<(), TreasuryApplicationError> {
+    let session = evidence.completed().session();
+    let provider_dataset = session.provider_dataset();
+    let expected_source = treasury_source_id(TreasurySurface::DailyRatesXml)?;
+    let expected_analytical =
+        treasury_analytical_dataset(TreasurySurface::DailyRatesXml, provider_dataset)?;
+    if selector.manifest() != evidence.pinned().manifest()
+        || selector.manifest().dataset_id() != &expected_analytical
+        || session.analytical_dataset() != &expected_analytical
+        || session.source_id() != &expected_source
+        || !provider_dataset.as_str().ends_with(":all")
+        || !session.is_complete()
+        || session.data_page_count() == 0
+        || session.analytical_row_count() == 0
+        || session
+            .response_count()
+            .checked_sub(session.data_page_count())
+            != Some(1)
+        || session.source_generation_digest().bytes() == [0; 32]
+        || session.plan_identity().bytes() == [0; 32]
+        || evidence.completed().publication_digest().bytes() == [0; 32]
+        || evidence.catalog_receipt_digest().bytes() == [0; 32]
+    {
+        return Err(TreasuryApplicationError::RestartInvalid);
+    }
+    Ok(())
+}
+
 fn surface_accepts_analytical_dataset(surface: TreasurySurface, dataset: &DatasetId) -> bool {
     match surface {
         TreasurySurface::FiscalData => dataset
@@ -1388,6 +1719,171 @@ fn treasury_macro_candidate_digest(
         DigestAlgorithm::Sha256,
         digest.finalize().into(),
     ))
+}
+
+fn treasury_all_history_staged_page(
+    source: &TreasurySource,
+    provider_dataset: &SourceIdentifier,
+    page_ordinal: u16,
+    canonical: TreasuryAllHistoryCanonicalPage,
+    token: ProviderWholeCaptureToken,
+    successor_checkpoint: Box<[u8]>,
+) -> Result<ProviderMacroPlanStagedPage, TreasuryApplicationError> {
+    if canonical.batch().request().object().dataset() != provider_dataset
+        || canonical.content_identity().record_count() == 0
+    {
+        return Err(TreasuryApplicationError::InvalidAcquisition);
+    }
+    let revisions = source.revision_plan(canonical.batch())?;
+    let content_identity = canonical.content_identity().digest();
+    let (batch, native_lineage, row_capture_page_ordinals) = canonical.into_publication_parts();
+    let native_schema_fingerprint = native_lineage.schema().fingerprint();
+    let native_sidecar = native_lineage
+        .batch_sidecar()
+        .ok_or(TreasuryApplicationError::InvalidAcquisition)?;
+    let semantic_digest = native_sidecar.semantic_payload_digest();
+    let semantic_payload = native_sidecar
+        .semantic_payload()
+        .to_vec()
+        .into_boxed_slice();
+    let binding = SealedProviderCaptureBinding::try_whole(
+        token,
+        batch,
+        native_lineage,
+        row_capture_page_ordinals,
+    )?;
+    let binding_digest = binding.evidence_digest().evidence();
+    let candidate_digest = treasury_all_history_page_identity(
+        provider_dataset,
+        page_ordinal,
+        content_identity,
+        binding_digest,
+        semantic_digest,
+    )?;
+    let semantics = ProviderMacroPlanSemantics::try_new(
+        SourceIdentifier::try_from(TREASURY_MACRO_SEMANTICS_SCHEMA)
+            .map_err(|_error| TreasuryApplicationError::InvalidAcquisition)?,
+        native_schema_fingerprint,
+        semantic_digest,
+        semantic_payload,
+    )?;
+    ProviderMacroPlanStagedPage::try_new(
+        candidate_digest,
+        semantics,
+        binding,
+        revisions,
+        successor_checkpoint,
+    )
+    .map_err(Into::into)
+}
+
+fn validate_all_history_completion(
+    completion: &TreasuryAllHistoryAcquisitionCompletion,
+    analytical_dataset: &DatasetId,
+    provider_dataset: &SourceIdentifier,
+    session: &ProviderMacroPlanSessionReceipt,
+) -> Result<(), TreasuryApplicationError> {
+    let data_page_count = u16::try_from(completion.data_page_count())
+        .map_err(|_error| TreasuryApplicationError::InvalidAcquisition)?;
+    let response_count = u16::try_from(completion.response_count())
+        .map_err(|_error| TreasuryApplicationError::InvalidAcquisition)?;
+    let expected_response_count = if session.is_complete() {
+        session.response_count()
+    } else {
+        session
+            .response_count()
+            .checked_add(1)
+            .ok_or(TreasuryApplicationError::InvalidAcquisition)?
+    };
+    if completion.descriptor().analytical_dataset().as_str() != analytical_dataset.as_str()
+        || completion.descriptor().provider_dataset() != provider_dataset
+        || completion.source_id() != session.source_id()
+        || completion.metadata_revision() != session.metadata_revision()
+        || completion.provider_snapshot_isolation_claimed()
+        || data_page_count == 0
+        || data_page_count != session.data_page_count()
+        || response_count != expected_response_count
+        || response_count.checked_sub(data_page_count) != Some(1)
+        || completion.canonical_points() != session.analytical_row_count()
+        || completion
+            .observed_numeric_points()
+            .checked_add(completion.explicit_missing_points())
+            != Some(completion.canonical_points())
+        || completion.raw_body_bytes() == 0
+        || completion.payload_digests().len() != usize::from(response_count)
+        || completion.canonical_content_digests().count() != usize::from(data_page_count)
+        || completion.native_lineage_batch_digests().count() != usize::from(data_page_count)
+        || completion.sealed_pages().len() != usize::from(response_count)
+        || completion.terminal_source_object().is_none()
+        || completion.completion_digest().bytes() == [0; 32]
+    {
+        return Err(TreasuryApplicationError::InvalidAcquisition);
+    }
+    Ok(())
+}
+
+fn all_history_terminal_received_at(
+    completion: &TreasuryAllHistoryAcquisitionCompletion,
+) -> Result<Timestamp, TreasuryApplicationError> {
+    completion
+        .receive_window()
+        .map(|(_first, terminal)| terminal)
+        .ok_or(TreasuryApplicationError::InvalidAcquisition)
+}
+
+fn treasury_all_history_plan_identity(
+    analytical_dataset: &DatasetId,
+    provider_dataset: &SourceIdentifier,
+    source_generation_digest: EvidenceDigest,
+    query_digest: EvidenceDigest,
+    activation_intent_digest: EvidenceDigest,
+) -> Result<EvidenceDigest, TreasuryApplicationError> {
+    let mut digest = Sha256::new();
+    digest.update(TREASURY_ALL_HISTORY_PLAN_SCHEMA);
+    hash_treasury_component(&mut digest, analytical_dataset.as_str().as_bytes())?;
+    hash_treasury_component(&mut digest, provider_dataset.as_str().as_bytes())?;
+    digest.update(source_generation_digest.bytes());
+    digest.update(query_digest.bytes());
+    digest.update(activation_intent_digest.bytes());
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
+}
+
+fn treasury_all_history_page_identity(
+    provider_dataset: &SourceIdentifier,
+    page_ordinal: u16,
+    content_identity: EvidenceDigest,
+    binding_digest: EvidenceDigest,
+    semantic_digest: EvidenceDigest,
+) -> Result<EvidenceDigest, TreasuryApplicationError> {
+    let mut digest = Sha256::new();
+    digest.update(TREASURY_ALL_HISTORY_PAGE_SCHEMA);
+    hash_treasury_component(&mut digest, provider_dataset.as_str().as_bytes())?;
+    digest.update(page_ordinal.to_be_bytes());
+    digest.update(content_identity.bytes());
+    digest.update(binding_digest.bytes());
+    digest.update(semantic_digest.bytes());
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        digest.finalize().into(),
+    ))
+}
+
+fn treasury_all_history_ingest_identity(
+    analytical_dataset: &DatasetId,
+    provider_dataset: &SourceIdentifier,
+    source_generation_digest: EvidenceDigest,
+    publication_digest: EvidenceDigest,
+) -> Result<String, TreasuryApplicationError> {
+    let mut digest = Sha256::new();
+    digest.update(TREASURY_ALL_HISTORY_INGEST_SCHEMA);
+    hash_treasury_component(&mut digest, analytical_dataset.as_str().as_bytes())?;
+    hash_treasury_component(&mut digest, provider_dataset.as_str().as_bytes())?;
+    digest.update(source_generation_digest.bytes());
+    digest.update(publication_digest.bytes());
+    Ok(format!("treasury-all-history-v1-{:x}", digest.finalize()))
 }
 
 #[allow(
@@ -1572,6 +2068,9 @@ pub(crate) enum TreasuryApplicationError {
     /// Exact raw sealing and its one-use expectation did not rejoin.
     #[error("Treasury raw-capture sealing evidence failed")]
     Capture(#[from] ProviderCaptureError),
+    /// The typed Treasury all-history state machine rejected a page or checkpoint.
+    #[error("Treasury all-history acquisition state is invalid")]
+    AllHistory(#[from] TreasurySourceError),
     /// Durable manifest or provider-binding verification failed.
     #[error("Treasury immutable generation verification failed")]
     Ingest(#[from] IngestError),

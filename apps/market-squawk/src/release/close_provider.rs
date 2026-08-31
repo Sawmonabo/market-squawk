@@ -1007,7 +1007,6 @@ fn validate_treasury_publications(runtime: &Value) -> Result<()> {
     let mut families = BTreeSet::new();
     let mut provider_datasets = BTreeSet::new();
     let mut analytical_datasets = BTreeSet::new();
-    let mut acceptance_year = None;
     for publication in publications {
         let family_name = publication
             .get("family")
@@ -1019,30 +1018,9 @@ fn validate_treasury_publications(runtime: &Value) -> Result<()> {
             .get("provider_dataset")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("Treasury provider dataset is invalid"))?;
-        let year = treasury_dataset_year(family, provider_dataset)
-            .ok_or_else(|| anyhow::anyhow!("Treasury provider dataset is invalid"))?;
-        if acceptance_year
-            .replace(year)
-            .is_some_and(|other| other != year)
-        {
-            bail!("Treasury publications do not use one common configured acceptance year");
-        }
-        let query = TreasuryDailyRateQuery::year(family, year)?;
+        let query = TreasuryDailyRateQuery::all_history(family)?;
         if query.dataset().as_str() != provider_dataset {
             bail!("Treasury publication family is not bound to its canonical dataset");
-        }
-        let source_object = publication
-            .get("source_object_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Treasury source object identity is invalid"))?;
-        let payload_digest = publication
-            .get("source_payload_digest")
-            .and_then(evidence_digest_hex)
-            .ok_or_else(|| anyhow::anyhow!("Treasury source payload digest is absent"))?;
-        let request = query.page(0)?;
-        if !treasury_source_object_matches(source_object, request.request_digest(), &payload_digest)
-        {
-            bail!("Treasury source object is not bound to its dataset and exact payload");
         }
         let analytical_dataset = publication
             .get("analytical_dataset_id")
@@ -1053,11 +1031,64 @@ fn validate_treasury_publications(runtime: &Value) -> Result<()> {
         {
             bail!("Treasury analytical dataset is not bound to its provider selector");
         }
-        if source_object.is_empty()
+        let all_history = publication
+            .get("treasury_all_history")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("Treasury grouped restart evidence is absent"))?;
+        let response_count = all_history
+            .get("response_count")
+            .and_then(Value::as_u64)
+            .filter(|count| *count > 1)
+            .ok_or_else(|| anyhow::anyhow!("Treasury response count is invalid"))?;
+        let data_page_count = all_history
+            .get("data_page_count")
+            .and_then(Value::as_u64)
+            .filter(|count| *count > 0)
+            .ok_or_else(|| anyhow::anyhow!("Treasury data-page count is invalid"))?;
+        let analytical_row_count = all_history
+            .get("analytical_row_count")
+            .and_then(Value::as_u64)
+            .filter(|count| *count > 0)
+            .ok_or_else(|| anyhow::anyhow!("Treasury analytical row count is invalid"))?;
+        let pre_2025_selection_digest = all_history
+            .get("pre_2025_selection_digest")
+            .and_then(Value::as_str)
+            .filter(|value| valid_nonzero_sha256_text(value))
+            .ok_or_else(|| anyhow::anyhow!("Treasury pre-2025 selection digest is invalid"))?;
+        let post_2025_selection_digest = all_history
+            .get("post_2025_selection_digest")
+            .and_then(Value::as_str)
+            .filter(|value| valid_nonzero_sha256_text(value))
+            .ok_or_else(|| anyhow::anyhow!("Treasury post-2025 selection digest is invalid"))?;
+        if all_history.len() != 8
+            || all_history
+                .get("session_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || all_history
+                .get("publication_digest")
+                .and_then(evidence_digest_bytes)
+                .is_none()
+            || all_history
+                .get("catalog_receipt_digest")
+                .and_then(evidence_digest_bytes)
+                .is_none()
+            || response_count.checked_sub(data_page_count) != Some(1)
+            || pre_2025_selection_digest == post_2025_selection_digest
+            || analytical_row_count
+                > publication
+                    .get("row_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            || !publication
+                .get("source_object_id")
+                .is_some_and(Value::is_null)
+            || !publication
+                .get("source_payload_digest")
+                .is_some_and(Value::is_null)
             || !families.insert(family)
             || !provider_datasets.insert(provider_dataset)
             || !analytical_datasets.insert(analytical_dataset)
-            || publication.get("object_count").and_then(Value::as_u64) != Some(1)
             || publication
                 .get("temporal_semantics")
                 .and_then(Value::as_str)
@@ -1065,7 +1096,7 @@ fn validate_treasury_publications(runtime: &Value) -> Result<()> {
             || publication
                 .get("series_ids")
                 .and_then(Value::as_array)
-                .is_none_or(|series| !series.is_empty())
+                .is_none_or(|series| series.is_empty())
         {
             bail!("Treasury publication evidence is incomplete");
         }
@@ -1776,6 +1807,14 @@ fn validate_research_publication(
             && publication
                 .get("treasury_fiscal")
                 .is_none_or(|value| !value.is_null()))
+        || (expected_surface == "treasury.daily-rates-xml"
+            && publication
+                .get("treasury_all_history")
+                .is_none_or(Value::is_null))
+        || (expected_surface != "treasury.daily-rates-xml"
+            && publication
+                .get("treasury_all_history")
+                .is_none_or(|value| !value.is_null()))
     {
         bail!("research publication evidence is incomplete");
     }
@@ -1799,36 +1838,6 @@ fn treasury_family(value: &str) -> Option<TreasuryDailyRateFamily> {
         "real_long_term_rates" => Some(TreasuryDailyRateFamily::RealLongTermRates),
         _ => None,
     }
-}
-
-fn treasury_dataset_year(family: TreasuryDailyRateFamily, dataset: &str) -> Option<u16> {
-    let prefix = match family {
-        TreasuryDailyRateFamily::NominalParYieldCurve => "treasury:daily-par-yield-curve:",
-        TreasuryDailyRateFamily::BillRates => "treasury:daily-bill-rates:",
-        TreasuryDailyRateFamily::LongTermRates => "treasury:daily-long-term-rates:",
-        TreasuryDailyRateFamily::RealParYieldCurve => "treasury:daily-real-par-yield-curve:",
-        TreasuryDailyRateFamily::RealLongTermRates => "treasury:daily-real-long-term-rates:",
-    };
-    dataset
-        .strip_prefix(prefix)?
-        .parse::<u16>()
-        .ok()
-        .filter(|year| (family.start_year()..=9999).contains(year))
-}
-
-fn treasury_source_object_matches(
-    identity: &str,
-    request_digest: [u8; 32],
-    payload_digest: &str,
-) -> bool {
-    let request_digest = lower_hex(&request_digest);
-    let mut fields = identity.split(':');
-    fields.next() == Some("treasury-page")
-        && fields.next() == Some("daily-rate")
-        && fields.next() == Some("0")
-        && fields.next() == Some(request_digest.as_str())
-        && fields.next() == Some(payload_digest)
-        && fields.next().is_none()
 }
 
 fn treasury_fiscal_source_object_matches(

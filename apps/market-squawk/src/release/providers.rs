@@ -9,13 +9,15 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use chrono::{SecondsFormat, Utc};
+use chrono::{Datelike, SecondsFormat, Utc};
 use market_squawk_adapter_bls::BlsSource;
 use market_squawk_adapter_fred::FredSource;
 use market_squawk_adapter_treasury::{
     TreasuryDailyRateFamily, TreasuryDailyRateQuery, TreasuryFiscalQuery,
 };
-use market_squawk_data::{CatalogLimit, DatasetId, SourceOperation};
+use market_squawk_data::{
+    CatalogLimit, DatasetId, ProviderMacroPlanManifestSelector, SourceOperation,
+};
 use market_squawk_domain::{
     AvailabilityEvidence, CalendarDate, DataQuality, DigestAlgorithm, EvidenceDigest,
     FundamentalConsolidation, FundamentalRestatementStatus, PayloadReference, ResearchObservation,
@@ -176,8 +178,8 @@ struct ResearchPublicationEvidence {
     surface_id: String,
     family: String,
     provider_dataset: String,
-    source_object_id: String,
-    source_payload_digest: EvidenceDigest,
+    source_object_id: Option<String>,
+    source_payload_digest: Option<EvidenceDigest>,
     analytical_dataset_id: String,
     manifest_version: u64,
     manifest_content_hash: String,
@@ -192,6 +194,25 @@ struct ResearchPublicationEvidence {
     sec: Option<SecPublicationEvidence>,
     fred: Option<FredPublicationEvidence>,
     treasury_fiscal: Option<TreasuryFiscalPublicationEvidence>,
+    treasury_all_history: Option<TreasuryAllHistoryPublicationEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TreasuryAllHistoryPublicationEvidence {
+    session_id: String,
+    publication_digest: EvidenceDigest,
+    catalog_receipt_digest: EvidenceDigest,
+    response_count: u16,
+    data_page_count: u16,
+    analytical_row_count: u64,
+    pre_2025_selection_digest: String,
+    post_2025_selection_digest: String,
+}
+
+struct TreasuryTypedSelectionEvidence {
+    series: BTreeSet<String>,
+    selection_digest: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -472,10 +493,10 @@ async fn collect_provider_evidence(
                 .research_runtime_generation(&profile_id)?
                 .ok_or_else(|| anyhow!("provider research runtime is not active: {surface_id}"))?;
             let publications = if *surface_id == TREASURY_XML {
-                let acceptance_year = product
-                    .treasury_daily_rate_release_year()
-                    .context("Treasury daily-rate activation does not cover all five families")?;
-                exercise_treasury_research(product.application().as_ref(), acceptance_year).await?
+                let datasets = product
+                    .treasury_daily_rate_all_history_datasets()
+                    .context("Treasury daily-rate activation does not cover all five histories")?;
+                exercise_treasury_research(product, datasets).await?
             } else if *surface_id == TREASURY_FISCAL {
                 let query = product
                     .treasury_fiscal_release_query()
@@ -768,66 +789,187 @@ const fn source_operation_name(operation: SourceOperation) -> &'static str {
 }
 
 async fn exercise_treasury_research(
-    application: &Application,
-    acceptance_year: u16,
+    product: &LocalProduct,
+    datasets: Vec<SourceIdentifier>,
 ) -> Result<Vec<ResearchPublicationEvidence>> {
+    if datasets.len() != TreasuryDailyRateFamily::ALL.len() {
+        bail!("Treasury all-history activation does not contain all five families");
+    }
+    let application = product.application();
+    let research = product.research();
+    let now = Utc::now();
+    let knowledge_cutoff = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let post_2025_cutoff = now.date_naive().format("%Y-%m-%d").to_string();
+    let pre_2025_cutoff = "2024-12-31";
     let mut evidence = Vec::new();
-    for (family, dataset) in treasury_acceptance_datasets(acceptance_year)? {
-        let dataset_text = dataset.as_str();
-        let discovery = invoke(
-            application,
-            "Source.Discover",
-            json_object(json!({
-                "provider": TREASURY_XML,
-                "dataset": dataset_text,
-                "confirm": true,
-                "sourceCoverage": [TREASURY_XML],
-            }))?,
-            RESEARCH_ACCEPTANCE_TIMEOUT,
-        )
-        .await?;
-        let discovery = ResearchSourceDiscovery::from_publication(discovery)?;
-        if discovery.profile().as_str() != TREASURY_XML
-            || discovery.request().dataset() != &dataset
-            || discovery.objects().len() != 1
-            || !discovery.rights().persistence_operation_admitted()
+    for dataset in datasets {
+        let (family, query) = TreasuryDailyRateFamily::ALL
+            .into_iter()
+            .map(|family| TreasuryDailyRateQuery::all_history(family).map(|query| (family, query)))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .find(|(_family, query)| query.dataset() == &dataset)
+            .ok_or_else(|| anyhow!("Treasury all-history dataset is not canonical"))?;
+        let analytical_dataset = DatasetId::try_from(query.analytical_dataset().as_str())?;
+        let deadline = Instant::now()
+            .checked_add(RESEARCH_ACCEPTANCE_TIMEOUT)
+            .ok_or_else(|| anyhow!("Treasury acceptance deadline overflow"))?;
+        let cancellation = CancellationToken::new();
+        let generation = research
+            .analytical_reader()
+            .latest(&analytical_dataset, deadline, &cancellation)?
+            .ok_or_else(|| anyhow!("Treasury all-history generation is absent"))?;
+        let restart = research
+            .analytical()
+            .verify_staged_provider_macro_plan_restart(&ProviderMacroPlanManifestSelector::new(
+                generation.manifest().clone(),
+            ))?;
+        let session = restart.completed().session();
+        if restart.pinned().manifest() != generation.manifest()
+            || session.provider_dataset() != &dataset
+            || session.analytical_dataset() != &analytical_dataset
+            || !session.is_complete()
+            || session.data_page_count() == 0
+            || session
+                .response_count()
+                .checked_sub(session.data_page_count())
+                != Some(1)
+            || session.analytical_row_count() == 0
         {
-            bail!("Treasury discovery did not produce one persistence-authorized exact object");
+            bail!("Treasury all-history restart evidence is incomplete");
         }
-        let object = discovery
-            .objects()
-            .first()
-            .ok_or_else(|| anyhow!("Treasury discovery object is absent"))?;
-        let source_object = object.source_object();
-        let source_object_id = source_object.object_id().as_str().to_owned();
-        let source_payload_digest = source_object.evidence().content_digest();
-        let ingestion = invoke(
-            application,
-            "Research.IngestSource",
-            json_object(json!({
-                "provider": TREASURY_XML,
-                "object": source_object_id,
-                "dataset": dataset_text,
-                "discoveryReceipt": object.discovery_receipt(),
-                "confirm": true,
-                "sourceCoverage": [TREASURY_XML],
-            }))?,
-            RESEARCH_ACCEPTANCE_TIMEOUT,
+        let series_ids = family
+            .dashboard_metrics()
+            .into_iter()
+            .filter(|metric| metric.first_schema_year() <= u16::try_from(now.year()).unwrap_or(0))
+            .map(|metric| metric.canonical_series().to_owned())
+            .collect::<Vec<_>>();
+        let pre_2025_series_ids = family
+            .dashboard_metrics()
+            .into_iter()
+            .filter(|metric| metric.first_schema_year() <= 2024)
+            .map(|metric| metric.canonical_series().to_owned())
+            .collect::<Vec<_>>();
+        let manifest = generation.manifest();
+        let pre_2025_selection = read_treasury_latest_known_series(
+            application.as_ref(),
+            manifest,
+            &knowledge_cutoff,
+            pre_2025_cutoff,
+            &pre_2025_series_ids,
         )
         .await?;
-        let mut publication = parse_research_publication(
-            TREASURY_XML,
-            family,
-            dataset_text,
-            source_object_id,
-            source_payload_digest,
-            &ingestion,
-        )?;
-        publication.observation_query_row_count =
-            verify_queryable_publication(application, &publication).await?;
-        evidence.push(publication);
+        let post_2025_selection = read_treasury_latest_known_series(
+            application.as_ref(),
+            manifest,
+            &knowledge_cutoff,
+            &post_2025_cutoff,
+            &series_ids,
+        )
+        .await?;
+        if pre_2025_selection.series != pre_2025_series_ids.iter().cloned().collect()
+            || post_2025_selection.series != series_ids.iter().cloned().collect()
+            || pre_2025_selection.selection_digest == post_2025_selection.selection_digest
+        {
+            bail!("Treasury all-history PIT allowlist changed across the 2025 schema boundary");
+        }
+        let observation_query_row_count = u64::try_from(post_2025_selection.series.len())?;
+        evidence.push(ResearchPublicationEvidence {
+            surface_id: TREASURY_XML.to_owned(),
+            family: treasury_family_evidence_name(family).to_owned(),
+            provider_dataset: dataset.as_str().to_owned(),
+            source_object_id: None,
+            source_payload_digest: None,
+            analytical_dataset_id: analytical_dataset.as_str().to_owned(),
+            manifest_version: manifest.manifest_version(),
+            manifest_content_hash: lower_hex(manifest.content_hash().bytes()),
+            row_count: generation.row_count(),
+            total_bytes: generation.total_bytes(),
+            object_count: u64::try_from(generation.object_count())?,
+            lineage_digest: lower_hex(generation.lineage_digest().bytes()),
+            observation_query_row_count,
+            vintage_query_row_count: None,
+            series_ids,
+            temporal_semantics: ResearchPublicationTemporalSemantics::EffectiveObservations,
+            sec: None,
+            fred: None,
+            treasury_fiscal: None,
+            treasury_all_history: Some(TreasuryAllHistoryPublicationEvidence {
+                session_id: session.session_id().to_string(),
+                publication_digest: restart.completed().publication_digest(),
+                catalog_receipt_digest: restart.catalog_receipt_digest(),
+                response_count: session.response_count(),
+                data_page_count: session.data_page_count(),
+                analytical_row_count: session.analytical_row_count(),
+                pre_2025_selection_digest: pre_2025_selection.selection_digest,
+                post_2025_selection_digest: post_2025_selection.selection_digest,
+            }),
+        });
     }
     Ok(evidence)
+}
+
+async fn read_treasury_latest_known_series(
+    application: &Application,
+    manifest: &market_squawk_data::DatasetManifestRef,
+    knowledge_cutoff: &str,
+    effective_date_cutoff: &str,
+    series_ids: &[String],
+) -> Result<TreasuryTypedSelectionEvidence> {
+    let expected_generation = json!({
+        "manifestVersion": manifest.manifest_version().to_string(),
+        "schema": {
+            "name": manifest.schema().name(),
+            "version": manifest.schema().version().get(),
+            "fingerprint": lower_hex(manifest.schema().fingerprint()),
+        },
+        "contentHash": lower_hex(manifest.content_hash().bytes()),
+    });
+    let read = invoke(
+        application,
+        "Macro.GetTreasuryDailyRatesLatestKnown",
+        json_object(json!({
+            "generation": expected_generation.clone(),
+            "knowledgeCutoff": knowledge_cutoff,
+            "effectiveDateCutoff": effective_date_cutoff,
+            "seriesIds": series_ids,
+        }))?,
+        RESEARCH_ACCEPTANCE_TIMEOUT,
+    )
+    .await?;
+    if read.pointer("/result/generation") != Some(&expected_generation) {
+        bail!("Treasury all-history PIT read returned a different immutable generation");
+    }
+    let selection_digest = required_sha256(
+        read.pointer("/result/selectionDigest"),
+        "Treasury all-history PIT selection digest",
+    )?;
+    if !selection_digest.bytes().any(|byte| byte != b'0') {
+        bail!("Treasury all-history PIT selection digest is zero");
+    }
+    let observations = read
+        .pointer("/result/observations")
+        .and_then(Value::as_array)
+        .filter(|rows| !rows.is_empty())
+        .ok_or_else(|| anyhow!("Treasury all-history PIT read returned no observations"))?;
+    let selected = observations
+        .iter()
+        .map(|observation| {
+            observation
+                .get("series")
+                .and_then(Value::as_str)
+                .filter(|series| !series.is_empty())
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| anyhow!("Treasury PIT observation omitted its canonical series"))
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    if selected.len() != observations.len() {
+        bail!("Treasury PIT read returned duplicate canonical series");
+    }
+    Ok(TreasuryTypedSelectionEvidence {
+        series: selected,
+        selection_digest,
+    })
 }
 
 async fn exercise_treasury_fiscal_research(
@@ -934,8 +1076,8 @@ async fn exercise_treasury_fiscal_research(
     if publication.object_count
         != u64::try_from(pages.len()).context("Treasury Fiscal Data object count overflow")?
         || pages.last().is_none_or(|page| {
-            page.source_object_id != publication.source_object_id
-                || page.source_payload_digest != publication.source_payload_digest
+            publication.source_object_id.as_deref() != Some(page.source_object_id.as_str())
+                || publication.source_payload_digest != Some(page.source_payload_digest)
         })
     {
         bail!("Treasury Fiscal Data final manifest does not cover the discovered page chain");
@@ -1187,8 +1329,8 @@ async fn exercise_fred_research(
     if publication.row_count != provider_row_count
         || publication.object_count != u64::try_from(pages.len())?
         || pages.last().is_none_or(|page| {
-            page.source_object_id != publication.source_object_id
-                || page.source_payload_digest != publication.source_payload_digest
+            publication.source_object_id.as_deref() != Some(page.source_object_id.as_str())
+                || publication.source_payload_digest != Some(page.source_payload_digest)
                 || !page.terminal
         })
     {
@@ -1318,8 +1460,8 @@ fn parse_research_publication(
         surface_id: surface_id.to_owned(),
         family: family.to_owned(),
         provider_dataset: provider_dataset.to_owned(),
-        source_object_id,
-        source_payload_digest,
+        source_object_id: Some(source_object_id),
+        source_payload_digest: Some(source_payload_digest),
         analytical_dataset_id,
         manifest_version,
         manifest_content_hash,
@@ -1334,6 +1476,7 @@ fn parse_research_publication(
         sec: None,
         fred: None,
         treasury_fiscal: None,
+        treasury_all_history: None,
     })
 }
 
@@ -1476,8 +1619,9 @@ async fn verify_sec_publication(
         let payload_matches = matches!(
             provenance.payload_reference(),
             PayloadReference::ContentHash(hash)
-                if hash.algorithm() == publication.source_payload_digest.algorithm()
-                    && hash.digest() == publication.source_payload_digest.bytes()
+                if publication.source_payload_digest.is_some_and(|payload| {
+                    hash.algorithm() == payload.algorithm() && hash.digest() == payload.bytes()
+                })
         );
         let availability_matches = matches!(
             provenance.availability(),
@@ -1581,7 +1725,12 @@ async fn verify_bls_current_snapshot_publication(
     {
         bail!("BLS current-snapshot query did not return the exact published row set");
     }
-    let payload_digest = lower_hex(publication.source_payload_digest.bytes());
+    let payload_digest = lower_hex(
+        publication
+            .source_payload_digest
+            .ok_or_else(|| anyhow!("BLS source payload digest is absent"))?
+            .bytes(),
+    );
     for row in rows {
         let row = row
             .as_object()
@@ -2095,21 +2244,6 @@ fn query_row_evidence(result: &Value) -> Result<QueryRowEvidence> {
         content_sha256: lower_hex(Sha256::digest(canonical).into()),
         rows: rows.clone(),
     })
-}
-
-fn treasury_acceptance_datasets(
-    acceptance_year: u16,
-) -> Result<Vec<(&'static str, SourceIdentifier)>> {
-    TreasuryDailyRateFamily::ALL
-        .into_iter()
-        .map(|family| {
-            let query = TreasuryDailyRateQuery::year(family, acceptance_year)?;
-            Ok((
-                treasury_family_evidence_name(family),
-                query.dataset().clone(),
-            ))
-        })
-        .collect()
 }
 
 const fn treasury_family_evidence_name(family: TreasuryDailyRateFamily) -> &'static str {

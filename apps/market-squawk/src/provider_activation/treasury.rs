@@ -12,8 +12,8 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::application::{
-    ProductionResearchIngestCoordinator, TreasuryApplicationClosure,
-    TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
+    ProductionResearchIngestCoordinator, ResearchProviderRuntimeGeneration,
+    TreasuryApplicationClosure, TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
 };
 
 const MAXIMUM_DISCOVERY_OBJECTS: u16 = 64;
@@ -44,6 +44,7 @@ pub(crate) fn reopen_treasury_latest_known(
     closure: Arc<TreasuryApplicationClosure>,
     surface: TreasurySurface,
     provider_datasets: Vec<SourceIdentifier>,
+    generation: ResearchProviderRuntimeGeneration,
     deadline: Instant,
     cancellation: CancellationToken,
 ) -> Result<TreasuryDurableRecovery, TreasuryPublicationActivationError> {
@@ -62,7 +63,13 @@ pub(crate) fn reopen_treasury_latest_known(
             return Err(TreasuryPublicationActivationError::ExistingPublicationUnavailable);
         }
         let receipt = closure
-            .reopen_latest_published(surface, &provider_dataset, deadline, &cancellation)
+            .reopen_latest_published(
+                surface,
+                &provider_dataset,
+                &generation,
+                deadline,
+                &cancellation,
+            )
             .map_err(|error| {
                 TreasuryPublicationActivationError::ExistingPublication(error.to_string())
             })?;
@@ -98,6 +105,7 @@ pub(crate) async fn publish_treasury_latest_known(
     closure: Arc<TreasuryApplicationClosure>,
     surface: TreasurySurface,
     provider_datasets: Vec<SourceIdentifier>,
+    generation: ResearchProviderRuntimeGeneration,
     deadline: Instant,
     cancellation: CancellationToken,
 ) -> Result<Vec<TreasuryMacroPublicationReceipt>, TreasuryPublicationActivationError> {
@@ -121,6 +129,24 @@ pub(crate) async fn publish_treasury_latest_known(
         .try_reserve_exact(configured_dataset_count)
         .map_err(|_error| TreasuryPublicationActivationError::InvalidConfiguredDatasets)?;
     for provider_dataset in provider_datasets {
+        if surface == TreasurySurface::DailyRatesXml {
+            let receipt = loop {
+                if context.cancellation().is_cancelled() || Instant::now() >= deadline {
+                    return Err(TreasuryPublicationActivationError::ExistingPublicationUnavailable);
+                }
+                if let Some(receipt) = closure
+                    .publish_daily_rates_all_history(&generation, &provider_dataset, &context)
+                    .await
+                    .map_err(|error| {
+                        TreasuryPublicationActivationError::Publication(error.to_string())
+                    })?
+                {
+                    break receipt;
+                }
+            };
+            receipts.push(receipt);
+            continue;
+        }
         let discovery = coordinator
             .discover_registered_objects(
                 &profile,
@@ -136,18 +162,11 @@ pub(crate) async fn publish_treasury_latest_known(
         }
         let mut latest_receipt = None;
         for object in discovery.objects() {
-            let selected = match surface {
-                TreasurySurface::FiscalData => TreasurySelectedObjectRequest::fiscal_data(
-                    provider_dataset.clone(),
-                    object.source_object().object_id().clone(),
-                    object.discovery_receipt().to_owned(),
-                ),
-                TreasurySurface::DailyRatesXml => TreasurySelectedObjectRequest::daily_rates(
-                    provider_dataset.clone(),
-                    object.source_object().object_id().clone(),
-                    object.discovery_receipt().to_owned(),
-                ),
-            }
+            let selected = TreasurySelectedObjectRequest::fiscal_data(
+                provider_dataset.clone(),
+                object.source_object().object_id().clone(),
+                object.discovery_receipt().to_owned(),
+            )
             .map_err(|error| TreasuryPublicationActivationError::Publication(error.to_string()))?;
             let sealed = closure
                 .acquire_and_seal(selected, &context, deadline)

@@ -23,9 +23,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use market_squawk_adapter_schwab::{OAuthLoopbackBounds, SchwabOAuthWireBounds};
-use market_squawk_adapter_treasury::{
-    TreasuryDailyRateFamily, TreasuryDailyRateQuery, TreasuryFiscalQuery, TreasurySurface,
-};
+use market_squawk_adapter_treasury::{TreasuryFiscalQuery, TreasurySurface};
 use market_squawk_analytics::{
     BatchFeatureCatalog, BatchFeatureCatalogConfig, BatchFeaturePolicies, FeatureMetadataError,
     MissingValuePolicy, ShockComposition, VarianceConvention, WeightPolicy,
@@ -119,8 +117,9 @@ use crate::application::{
     PreparedSchwabMarketRuntimeResolver, PrepublishedResearchSourceRegistration,
     ProductionFairValueInputAuthority, ProductionResearchIngestCoordinator,
     ResearchApplicationServices, ResearchExtractionLimits, ResearchIngestCompositionError,
-    ResearchSourceDiscoveryCoordinator, SCHWAB_CURRENT_LIVE_AUTHORITY_KEY, SourceDomainService,
-    SourceLifecycleAuthority, TreasuryApplicationClosure, backup::ProductBackupError,
+    ResearchProviderRuntimeGeneration, ResearchSourceDiscoveryCoordinator,
+    SCHWAB_CURRENT_LIVE_AUTHORITY_KEY, SourceDomainService, SourceLifecycleAuthority,
+    TreasuryApplicationClosure, backup::ProductBackupError,
 };
 use crate::artifact_repository::{ControlledArtifactRepository, controlled_artifact_repository};
 use crate::backtest_service::{ProductionBacktestService, ProductionBacktestServiceError};
@@ -173,7 +172,7 @@ const SCHWAB_OAUTH_MAXIMUM_CALLBACK_BYTES: usize = 32 * 1024;
 const SCHWAB_OAUTH_MAXIMUM_CALLBACK_HEADERS: usize = 64;
 const SCHWAB_OAUTH_MAXIMUM_CALLBACK_CONNECTIONS: usize = 16;
 const FRED_ANALYTICAL_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-const TREASURY_ANALYTICAL_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+const TREASURY_ANALYTICAL_STARTUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Default)]
 struct RegistryBackedSchwabMarketDrain {
@@ -378,23 +377,68 @@ struct PendingTreasuryStartupPublication {
     configured_dataset_count: usize,
     existing_receipts: Vec<crate::application::TreasuryMacroPublicationReceipt>,
     provider_datasets: Vec<SourceIdentifier>,
+    generation: ResearchProviderRuntimeGeneration,
+}
+
+struct TreasuryStartupConfiguration {
+    provider_datasets: Vec<SourceIdentifier>,
+    generation: ResearchProviderRuntimeGeneration,
+}
+
+fn treasury_startup_configuration(
+    activation: &ProviderAdapterActivation,
+    surface: TreasurySurface,
+    provider_datasets: Vec<SourceIdentifier>,
+    expected_generation: market_squawk_domain::EvidenceDigest,
+) -> Result<TreasuryStartupConfiguration, CliProviderActivationError> {
+    if provider_datasets.is_empty()
+        || provider_datasets.len() > 32
+        || provider_datasets
+            .iter()
+            .enumerate()
+            .any(|(ordinal, dataset)| provider_datasets[..ordinal].contains(dataset))
+    {
+        return Err(CliProviderActivationError::ProviderConfiguration);
+    }
+    let profile = SourceIdentifier::try_from(surface.profile_id())
+        .map_err(|_| CliProviderActivationError::StateUnavailable)?;
+    let generation = activation
+        .research_runtime_generation(&profile)
+        .map_err(CliProviderActivationError::Activation)?
+        .ok_or(CliProviderActivationError::StateUnavailable)?;
+    if generation
+        .generation_digest()
+        .map_err(|_| CliProviderActivationError::StateUnavailable)?
+        != expected_generation
+    {
+        return Err(CliProviderActivationError::StateUnavailable);
+    }
+    Ok(TreasuryStartupConfiguration {
+        provider_datasets,
+        generation,
+    })
 }
 
 fn reopen_treasury_startup_surface(
     closure: Arc<TreasuryApplicationClosure>,
     domains: &ResearchApplicationServices,
     surface: TreasurySurface,
-    provider_datasets: Vec<SourceIdentifier>,
+    configuration: TreasuryStartupConfiguration,
 ) -> Option<PendingTreasuryStartupPublication> {
     let Some(deadline) = Instant::now().checked_add(TREASURY_ANALYTICAL_STARTUP_TIMEOUT) else {
         tracing::error!("Treasury startup reopening deadline could not be represented");
         return None;
     };
     let cancellation = tokio_util::sync::CancellationToken::new();
+    let TreasuryStartupConfiguration {
+        provider_datasets,
+        generation,
+    } = configuration;
     match reopen_treasury_latest_known(
         Arc::clone(&closure),
         surface,
         provider_datasets.clone(),
+        generation.clone(),
         deadline,
         cancellation,
     ) {
@@ -416,6 +460,7 @@ fn reopen_treasury_startup_surface(
                 configured_dataset_count,
                 existing_receipts,
                 provider_datasets,
+                generation,
             })
         }
         Err(error) => {
@@ -441,6 +486,7 @@ async fn publish_treasury_startup_surface(
         Arc::clone(&closure),
         surface,
         pending.provider_datasets,
+        pending.generation,
         deadline,
         tokio_util::sync::CancellationToken::new(),
     )
@@ -942,11 +988,18 @@ impl LocalProduct {
             .map_err(|_error| CliProviderActivationError::StateUnavailable)?
         {
             DurableActivationRecipeState::Desired(_) => {
-                let (query, _generation) =
+                let (query, expected_generation) =
                     cli_provider::treasury_fiscal_release_query(&provider_activation_state)?;
-                Some(vec![query.dataset().map_err(|_| {
-                    CliProviderActivationError::ProviderConfiguration
-                })?])
+                Some(treasury_startup_configuration(
+                    provider_activation.as_ref(),
+                    TreasurySurface::FiscalData,
+                    vec![
+                        query
+                            .dataset()
+                            .map_err(|_| CliProviderActivationError::ProviderConfiguration)?,
+                    ],
+                    expected_generation,
+                )?)
             }
             DurableActivationRecipeState::Missing
             | DurableActivationRecipeState::Staged(_)
@@ -958,18 +1011,16 @@ impl LocalProduct {
             .map_err(|_error| CliProviderActivationError::StateUnavailable)?
         {
             DurableActivationRecipeState::Desired(_) => {
-                let year =
-                    cli_provider::treasury_daily_rate_release_year(&provider_activation_state)?;
-                let mut datasets = Vec::with_capacity(TreasuryDailyRateFamily::ALL.len());
-                for family in TreasuryDailyRateFamily::ALL {
-                    datasets.push(
-                        TreasuryDailyRateQuery::year(family, year)
-                            .map_err(|_| CliProviderActivationError::ProviderConfiguration)?
-                            .dataset()
-                            .clone(),
-                    );
-                }
-                Some(datasets)
+                let (datasets, expected_generation) =
+                    cli_provider::treasury_daily_rate_all_history_datasets(
+                        &provider_activation_state,
+                    )?;
+                Some(treasury_startup_configuration(
+                    provider_activation.as_ref(),
+                    TreasurySurface::DailyRatesXml,
+                    datasets,
+                    expected_generation,
+                )?)
             }
             DurableActivationRecipeState::Missing
             | DurableActivationRecipeState::Staged(_)
@@ -1011,20 +1062,20 @@ impl LocalProduct {
                     )
                     .map_err(|_| CliProviderActivationError::StateUnavailable)?,
                 );
-                let pending_fiscal = treasury_fiscal_datasets.and_then(|provider_datasets| {
+                let pending_fiscal = treasury_fiscal_datasets.and_then(|configuration| {
                     reopen_treasury_startup_surface(
                         Arc::clone(&closure),
                         research_domains.as_ref(),
                         TreasurySurface::FiscalData,
-                        provider_datasets,
+                        configuration,
                     )
                 });
-                let pending_daily = treasury_daily_datasets.and_then(|provider_datasets| {
+                let pending_daily = treasury_daily_datasets.and_then(|configuration| {
                     reopen_treasury_startup_surface(
                         Arc::clone(&closure),
                         research_domains.as_ref(),
                         TreasurySurface::DailyRatesXml,
-                        provider_datasets,
+                        configuration,
                     )
                 });
                 (Some(closure), pending_fiscal, pending_daily)
@@ -1356,11 +1407,21 @@ impl LocalProduct {
         &self.provider_activation_state
     }
 
-    /// Returns one configured year covered by all five active Treasury daily-rate families.
-    pub(crate) fn treasury_daily_rate_release_year(
+    /// Returns the five all-history datasets owned by the active Treasury daily-rate generation.
+    pub(crate) fn treasury_daily_rate_all_history_datasets(
         &self,
-    ) -> Result<u16, CliProviderActivationError> {
-        cli_provider::treasury_daily_rate_release_year(&self.provider_activation_state)
+    ) -> Result<Vec<SourceIdentifier>, CliProviderActivationError> {
+        let (datasets, expected_generation) =
+            cli_provider::treasury_daily_rate_all_history_datasets(
+                &self.provider_activation_state,
+            )?;
+        treasury_startup_configuration(
+            self.provider_activation.as_ref(),
+            TreasurySurface::DailyRatesXml,
+            datasets,
+            expected_generation,
+        )
+        .map(|configuration| configuration.provider_datasets)
     }
 
     /// Returns the exact Fiscal Data query owned by the desired, currently published runtime.
