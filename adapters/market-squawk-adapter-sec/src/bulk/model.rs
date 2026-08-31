@@ -1847,7 +1847,7 @@ impl SecBulkRelatedTableRows {
     }
 }
 
-/// Complete provider-native C.9-C.12 supplement handoff for one N-PORT holding.
+/// Provider-native identifier and complete C.9-C.12 supplement handoff for one N-PORT holding.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SecNportHoldingSupplementSet {
     generation_evidence: EvidenceDigest,
@@ -1902,10 +1902,6 @@ impl SecNportHoldingSupplementSet {
                         || !row.joins.iter().any(|join| {
                             join.domain == SecBulkJoinDomain::Holding
                                 && join.value == holding_id.as_str()
-                        })
-                        || !row.joins.iter().any(|join| {
-                            join.domain == SecBulkJoinDomain::Accession
-                                && join.value == accession.as_str()
                         })
                 })
                 || matches!(
@@ -1969,7 +1965,7 @@ impl SecNportHoldingSupplementSet {
         &self.holding
     }
 
-    /// Returns all 19 holding-linked official table families in closed order.
+    /// Returns identifier evidence followed by all 19 holding supplements in closed order.
     pub fn tables(&self) -> &[SecBulkRelatedTableRows] {
         &self.tables
     }
@@ -2001,6 +1997,7 @@ pub(crate) const fn nport_holding_supplement_tables() -> &'static [SecBulkTableK
         SecBulkTableKind::NportOtherDerivative,
         SecBulkTableKind::NportOtherDerivativeNotionalAmount,
         SecBulkTableKind::NportSecuritiesLending,
+        SecBulkTableKind::NportExplanatoryNote,
     ]
 }
 

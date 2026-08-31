@@ -5,18 +5,19 @@ mod bulk {
     use cap_std::{ambient_authority, fs::Dir};
     use market_squawk_adapter_sec::{
         RawEvidenceStore, SecBulkCapture, SecBulkCoverage, SecBulkError, SecBulkFamily,
-        SecBulkMediaKind, SecBulkParseLimits, SecBulkProjectionDisposition,
-        SecBulkProviderProjection, SecBulkSelection, SecBulkTableKind, SecBulkTransportEvidence,
+        SecBulkMediaKind, SecBulkNativePublicationSession, SecBulkParseLimits,
+        SecBulkProjectionDisposition, SecBulkProviderProjection, SecBulkQueryLimits,
+        SecBulkRelatedRowsState, SecBulkSelection, SecBulkTableKind, SecBulkTransportEvidence,
         SecBulkTypedValue, SecFundIdentityAuthority, SecFundPartitionAdmissions,
         SecFundPendingLogicalRows, SecFundPublicationScope, SecHttpValidators,
         SecPendingBulkLogicalPublication, SecQuarter, SecRepresentationLimits,
-        SecRepresentationRegistry, inspect_bulk_archive, recover_bulk_archive,
-        scan_bulk_archive_typed,
+        SecRepresentationRegistry, inspect_bulk_archive, query_nport_holding_supplements,
+        recover_bulk_archive, scan_bulk_archive, scan_bulk_archive_typed,
     };
     use market_squawk_domain::{
         EvidenceDigest, ExactPayloadEvidence, FundEvidenceRecord, FundHoldingSecurityIdentity,
-        FundMissingState, FundShareClassIdentity, InstrumentId, MetadataRevision, SourceId,
-        SourceIdentifier, Timestamp,
+        FundMissingState, FundShareClassIdentity, FundSourceTable, FundSupplementDisposition,
+        InstrumentId, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
     };
     use market_squawk_platform::{
         LocalPaths, ResearchObjectAdmission, ResearchObjectControl, ResearchObjectControlError,
@@ -76,7 +77,7 @@ mod bulk {
     }
 
     #[test]
-    fn quarterly_bulk_is_exact_restart_safe_and_keeps_ncen_schema_gap_typed()
+    fn quarterly_bulk_fund_topology_is_restart_safe_and_keeps_ncen_schema_gap_typed()
     -> Result<(), Box<dyn Error>> {
         let temporary = tempfile::tempdir()?;
         let raw_path = temporary.path().join("raw");
@@ -372,6 +373,198 @@ mod bulk {
             scan.archive_capture().evidence(),
             scan.official_readme_capture().evidence()
         );
+        prove_nport_holding_topology(temporary.path())?;
+        Ok(())
+    }
+
+    fn prove_nport_holding_topology(root: &std::path::Path) -> Result<(), Box<dyn Error>> {
+        let raw_path = root.join("nport-raw");
+        let registry_path = root.join("nport-representations");
+        std::fs::create_dir(&raw_path)?;
+        std::fs::create_dir(&registry_path)?;
+        let store = RawEvidenceStore::new(Dir::open_ambient_dir(&raw_path, ambient_authority())?);
+        let registry = SecRepresentationRegistry::open(
+            Dir::open_ambient_dir(&registry_path, ambient_authority())?,
+            SecRepresentationLimits::production_defaults(),
+        )?;
+        let selection =
+            SecBulkSelection::current(SecBulkFamily::Nport, SecQuarter::try_new(2026, 2)?)?;
+        let archive_bytes = minimal_nport_archive()?;
+        let archive_evidence = store.persist(&archive_bytes)?;
+        let readme_bytes = b"official N-PORT readme evidence";
+        let readme_evidence = store.persist(readme_bytes)?;
+        let archive_representation = registry.record_success(
+            selection.archive_locator().as_str(),
+            archive_evidence,
+            u64::try_from(archive_bytes.len())?,
+            SecHttpValidators::default(),
+        )?;
+        let readme_representation = registry.record_success(
+            selection.readme_locator().as_str(),
+            readme_evidence,
+            u64::try_from(readme_bytes.len())?,
+            SecHttpValidators::default(),
+        )?;
+        let archive_received_at = archive_representation.first_observed_at();
+        let readme_received_at = readme_representation.first_observed_at();
+        let observed_at = archive_received_at.max(readme_received_at);
+        let archive_capture = SecBulkCapture::try_from_registry_representation(
+            selection.clone(),
+            archive_representation,
+            SecBulkTransportEvidence::try_new(
+                200,
+                SecBulkMediaKind::Zip,
+                Some("application/zip"),
+                SecHttpValidators::default(),
+                archive_received_at,
+            )?,
+        )?;
+        let readme_capture = SecBulkCapture::try_from_registry_representation(
+            selection,
+            readme_representation,
+            SecBulkTransportEvidence::try_new(
+                200,
+                SecBulkMediaKind::Pdf,
+                Some("application/pdf"),
+                SecHttpValidators::default(),
+                readme_received_at,
+            )?,
+        )?;
+        let cancellation = CancellationToken::new();
+        let limits = SecBulkParseLimits::production_defaults();
+        let deadline = Timestamp::from_unix_nanos(i64::MAX);
+        let manifest = inspect_bulk_archive(
+            &store,
+            archive_capture,
+            readme_capture,
+            limits,
+            deadline,
+            &cancellation,
+        )?;
+
+        let mut native = SecBulkNativePublicationSession::new(
+            &store,
+            manifest.clone(),
+            observed_at,
+            deadline,
+            cancellation.clone(),
+        )?;
+        scan_bulk_archive(
+            &store,
+            &manifest,
+            limits,
+            deadline,
+            &cancellation,
+            &mut native,
+        )?;
+        let native = native
+            .published_generation()
+            .cloned()
+            .ok_or(SecBulkError::PublicationNotReady)?;
+        let supplements = query_nport_holding_supplements(
+            &store,
+            &native,
+            &SourceIdentifier::try_from("0000000001-26-000001")?,
+            &SourceIdentifier::try_from("101")?,
+            SecBulkQueryLimits::try_new(1_000, 100)?,
+            deadline,
+            &cancellation,
+        )?;
+        assert_eq!(supplements.tables().len(), 20);
+        for table in [
+            SecBulkTableKind::NportIdentifiers,
+            SecBulkTableKind::NportDebtSecurity,
+            SecBulkTableKind::NportExplanatoryNote,
+        ] {
+            let related = supplements
+                .tables()
+                .iter()
+                .find(|related| related.table() == table)
+                .ok_or(SecBulkError::InvalidCanonicalMapping)?;
+            assert_eq!(related.state(), SecBulkRelatedRowsState::ReportedRows);
+            assert_eq!(related.rows().len(), 1);
+            assert_eq!(related.rows()[0].primary_key()[0].value(), "101");
+        }
+
+        let (archive_admission, readme_admission) =
+            SecPendingBulkLogicalPublication::logical_object_admissions(&manifest)?;
+        let sealed = LocalPaths::prepare(root.join("nport-sealed-journal"))?
+            .sealed_research_journal_store()?;
+        let control = AllowResearchObjects;
+        let mut archive_stage = sealed.begin_logical_object(archive_admission)?;
+        archive_stage.write_all(&archive_bytes)?;
+        let archive_verified = sealed.finish_logical_object(archive_stage, &control)?;
+        let mut readme_stage = sealed.begin_logical_object(readme_admission)?;
+        readme_stage.write_all(readme_bytes)?;
+        let readme_verified = sealed.finish_logical_object(readme_stage, &control)?;
+        let staged = SecPendingBulkLogicalPublication::try_new(manifest)?.verify_and_stage(
+            archive_verified,
+            readme_verified,
+            limits,
+            deadline,
+            &cancellation,
+            &control,
+            SecFundPendingLogicalRows::new(SecFundPublicationScope::try_nport(
+                SourceIdentifier::try_from("0000000001-26-000001")?,
+            )?),
+        )?;
+        let partition_admission = LogicalPartitionSetAdmission::try_new(
+            ResearchObjectAdmission::try_new(8 * 1024 * 1024, 64)?,
+            4,
+            100,
+            4 * 1024 * 1024,
+        )?;
+        let prepared = staged.prepare_fund_logical_publication(
+            &mut FixtureIdentityAuthority {
+                observed_at,
+                evidence: archive_evidence,
+            },
+            observed_at,
+            SecFundPartitionAdmissions::new(partition_admission, partition_admission),
+            &sealed,
+            &control,
+        )?;
+        let records = prepared
+            .canonical_partitions()
+            .iter()
+            .flat_map(|partition| partition.records())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 3);
+        let holding = records
+            .iter()
+            .find_map(|record| match record {
+                FundEvidenceRecord::PortfolioHolding(holding) => Some(holding.as_ref()),
+                _ => None,
+            })
+            .ok_or(SecBulkError::InvalidCanonicalMapping)?;
+        assert_eq!(holding.holding_id().as_str(), "101");
+        for table in [
+            FundSourceTable::NportIdentifiers,
+            FundSourceTable::NportDebtSecurity,
+            FundSourceTable::NportExplanatoryNote,
+        ] {
+            assert!(
+                holding
+                    .lineage()
+                    .rows()
+                    .iter()
+                    .any(|row| row.table() == table)
+            );
+        }
+        for table in [
+            FundSourceTable::NportDebtSecurity,
+            FundSourceTable::NportExplanatoryNote,
+        ] {
+            assert_eq!(
+                holding
+                    .supplements()
+                    .iter()
+                    .find(|supplement| supplement.table() == table)
+                    .ok_or(SecBulkError::InvalidCanonicalMapping)?
+                    .disposition(),
+                FundSupplementDisposition::Reported
+            );
+        }
         Ok(())
     }
 
@@ -386,6 +579,126 @@ mod bulk {
         archive[eocd + 8..eocd + 10].copy_from_slice(&entries.to_le_bytes());
         archive[eocd + 10..eocd + 12].copy_from_slice(&entries.to_le_bytes());
         Ok(archive)
+    }
+
+    fn minimal_nport_archive() -> Result<Vec<u8>, Box<dyn Error>> {
+        const SUBMISSION_HEADER: &str = "ACCESSION_NUMBER\tFILING_DATE\tSUB_TYPE\tREPORT_ENDING_PERIOD\tREPORT_DATE\tIS_LAST_FILING";
+        const REGISTRANT_HEADER: &str = "ACCESSION_NUMBER\tCIK\tREGISTRANT_NAME\tLEI";
+        const FUND_HEADER: &str = "ACCESSION_NUMBER\tSERIES_NAME\tSERIES_ID\tSERIES_LEI\tTOTAL_ASSETS\tTOTAL_LIABILITIES\tNET_ASSETS";
+        const HOLDING_HEADER: &str = "ACCESSION_NUMBER\tHOLDING_ID\tISSUER_NAME\tISSUER_LEI\tISSUER_TITLE\tISSUER_CUSIP\tBALANCE\tUNIT\tOTHER_UNIT_DESC\tCURRENCY_CODE\tCURRENCY_VALUE\tEXCHANGE_RATE\tPERCENTAGE\tPAYOFF_PROFILE\tASSET_CAT\tOTHER_ASSET\tISSUER_TYPE\tOTHER_ISSUER\tINVESTMENT_COUNTRY\tIS_RESTRICTED_SECURITY\tFAIR_VALUE_LEVEL\tDERIVATIVE_CAT";
+        const IDENTIFIER_HEADER: &str = "HOLDING_ID\tIDENTIFIERS_ID\tIDENTIFIER_ISIN\tIDENTIFIER_TICKER\tOTHER_IDENTIFIER\tOTHER_IDENTIFIER_DESC";
+        const RELATED_HEADER: &str = "HOLDING_ID\tDETAIL";
+        let tables = NPORT_TABLES
+            .iter()
+            .map(|name| match *name {
+                "SUBMISSION.tsv" => metadata_table_for(
+                    "nport_readme.htm",
+                    name,
+                    SUBMISSION_HEADER,
+                    &["ACCESSION_NUMBER"],
+                ),
+                "REGISTRANT.tsv" => metadata_table_for(
+                    "nport_readme.htm",
+                    name,
+                    REGISTRANT_HEADER,
+                    &["ACCESSION_NUMBER"],
+                ),
+                "FUND_REPORTED_INFO.tsv" => {
+                    metadata_table_for("nport_readme.htm", name, FUND_HEADER, &["ACCESSION_NUMBER"])
+                }
+                "FUND_REPORTED_HOLDING.tsv" => {
+                    metadata_table_for("nport_readme.htm", name, HOLDING_HEADER, &["HOLDING_ID"])
+                }
+                "IDENTIFIERS.tsv" => metadata_table_for(
+                    "nport_readme.htm",
+                    name,
+                    IDENTIFIER_HEADER,
+                    &["HOLDING_ID", "IDENTIFIERS_ID"],
+                ),
+                name if NPORT_HOLDING_SUPPLEMENTS.contains(&name) => {
+                    metadata_table_for("nport_readme.htm", name, RELATED_HEADER, &["HOLDING_ID"])
+                }
+                _ => metadata_table_for("nport_readme.htm", name, "ROW_ID", &["ROW_ID"]),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let metadata = format!(
+            r#"{{"@context":"http://www.w3.org/ns/csvw","dialect":{{"header":true,"headerRowCount":1,"delimiter":"\t"}},"tables":[{tables}]}}"#,
+        );
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        write_member(
+            &mut writer,
+            "nport_metadata.json",
+            metadata.as_bytes(),
+            options,
+        )?;
+        write_member(&mut writer, "nport_readme.htm", b"readme", options)?;
+        write_member(
+            &mut writer,
+            "SUBMISSION.tsv",
+            format!(
+                "{SUBMISSION_HEADER}\n0000000001-26-000001\t15-MAY-2026\tNPORT-P\t31-DEC-2025\t31-MAR-2026\tN\n0000000002-26-000002\t15-MAY-2026\tNPORT-P\t31-DEC-2025\t31-MAR-2026\tN\n"
+            )
+            .as_bytes(),
+            options,
+        )?;
+        write_member(
+            &mut writer,
+            "REGISTRANT.tsv",
+            format!(
+                "{REGISTRANT_HEADER}\n0000000001-26-000001\t0000000001\tSelected Fund\t54930000000000000001\n0000000002-26-000002\t0000000002\tOther Fund\t54930000000000000002\n"
+            )
+            .as_bytes(),
+            options,
+        )?;
+        write_member(
+            &mut writer,
+            "FUND_REPORTED_INFO.tsv",
+            format!(
+                "{FUND_HEADER}\n0000000001-26-000001\tSelected Fund\tS000000001\t54930000000000000011\t1000000\t10000\t990000\n0000000002-26-000002\tOther Fund\tS000000002\t54930000000000000012\t2000000\t20000\t1980000\n"
+            )
+            .as_bytes(),
+            options,
+        )?;
+        write_member(
+            &mut writer,
+            "FUND_REPORTED_HOLDING.tsv",
+            format!(
+                "{HOLDING_HEADER}\n0000000001-26-000001\t101\tApple Inc.\t54930000000000000101\tCommon Stock\t037833100\t10\tshares\t\tUSD\t1000\t1\t5\tLONG\tEC\t\tCORP\t\tUS\tN\t1\t\n0000000002-26-000002\t202\tOther Issuer\t54930000000000000202\tCommon Stock\t594918104\t20\tshares\t\tUSD\t2000\t1\t10\tLONG\tEC\t\tCORP\t\tUS\tN\t1\t\n"
+            )
+            .as_bytes(),
+            options,
+        )?;
+        write_member(
+            &mut writer,
+            "IDENTIFIERS.tsv",
+            format!(
+                "{IDENTIFIER_HEADER}\n101\t1\tUS0378331005\tAAPL\t\t\n202\t2\tUS5949181045\tMSFT\t\t\n"
+            )
+            .as_bytes(),
+            options,
+        )?;
+        for name in NPORT_TABLES.iter().copied().filter(|name| {
+            !matches!(
+                *name,
+                "SUBMISSION.tsv"
+                    | "REGISTRANT.tsv"
+                    | "FUND_REPORTED_INFO.tsv"
+                    | "FUND_REPORTED_HOLDING.tsv"
+                    | "IDENTIFIERS.tsv"
+            )
+        }) {
+            let contents = if matches!(name, "DEBT_SECURITY.tsv" | "EXPLANATORY_NOTE.tsv") {
+                format!("{RELATED_HEADER}\n101\tselected evidence\n202\tother evidence\n")
+            } else if NPORT_HOLDING_SUPPLEMENTS.contains(&name) {
+                format!("{RELATED_HEADER}\n")
+            } else {
+                "ROW_ID\n".to_owned()
+            };
+            write_member(&mut writer, name, contents.as_bytes(), options)?;
+        }
+        Ok(writer.finish()?.into_inner())
     }
 
     fn minimal_ncen_archive() -> Result<Vec<u8>, Box<dyn Error>> {
@@ -561,7 +874,66 @@ mod bulk {
         "REGISTRANT_HELDS_SECURITY.tsv",
     ];
 
+    const NPORT_HOLDING_SUPPLEMENTS: [&str; 19] = [
+        "DEBT_SECURITY.tsv",
+        "DEBT_SECURITY_REF_INSTRUMENT.tsv",
+        "CONVERTIBLE_SECURITY_CURRENCY.tsv",
+        "REPURCHASE_AGREEMENT.tsv",
+        "REPURCHASE_COUNTERPARTY.tsv",
+        "REPURCHASE_COLLATERAL.tsv",
+        "DERIVATIVE_COUNTERPARTY.tsv",
+        "SWAPTION_OPTION_WARNT_DERIV.tsv",
+        "DESC_REF_INDEX_BASKET.tsv",
+        "DESC_REF_INDEX_COMPONENT.tsv",
+        "DESC_REF_OTHER.tsv",
+        "FUT_FWD_NONFOREIGNCUR_CONTRACT.tsv",
+        "FWD_FOREIGNCUR_CONTRACT_SWAP.tsv",
+        "NONFOREIGN_EXCHANGE_SWAP.tsv",
+        "FLOATING_RATE_RESET_TENOR.tsv",
+        "OTHER_DERIV.tsv",
+        "OTHER_DERIV_NOTIONAL_AMOUNT.tsv",
+        "SECURITIES_LENDING.tsv",
+        "EXPLANATORY_NOTE.tsv",
+    ];
+
+    const NPORT_TABLES: [&str; 30] = [
+        "SUBMISSION.tsv",
+        "REGISTRANT.tsv",
+        "FUND_REPORTED_INFO.tsv",
+        "INTEREST_RATE_RISK.tsv",
+        "BORROWER.tsv",
+        "BORROW_AGGREGATE.tsv",
+        "MONTHLY_TOTAL_RETURN.tsv",
+        "MONTHLY_RETURN_CAT_INSTRUMENT.tsv",
+        "FUND_VAR_INFO.tsv",
+        "FUND_REPORTED_HOLDING.tsv",
+        "IDENTIFIERS.tsv",
+        "DEBT_SECURITY.tsv",
+        "DEBT_SECURITY_REF_INSTRUMENT.tsv",
+        "CONVERTIBLE_SECURITY_CURRENCY.tsv",
+        "REPURCHASE_AGREEMENT.tsv",
+        "REPURCHASE_COUNTERPARTY.tsv",
+        "REPURCHASE_COLLATERAL.tsv",
+        "DERIVATIVE_COUNTERPARTY.tsv",
+        "SWAPTION_OPTION_WARNT_DERIV.tsv",
+        "DESC_REF_INDEX_BASKET.tsv",
+        "DESC_REF_INDEX_COMPONENT.tsv",
+        "DESC_REF_OTHER.tsv",
+        "FUT_FWD_NONFOREIGNCUR_CONTRACT.tsv",
+        "FWD_FOREIGNCUR_CONTRACT_SWAP.tsv",
+        "NONFOREIGN_EXCHANGE_SWAP.tsv",
+        "FLOATING_RATE_RESET_TENOR.tsv",
+        "OTHER_DERIV.tsv",
+        "OTHER_DERIV_NOTIONAL_AMOUNT.tsv",
+        "SECURITIES_LENDING.tsv",
+        "EXPLANATORY_NOTE.tsv",
+    ];
+
     fn metadata_table(name: &str, header: &str, primary_key: &[&str]) -> String {
+        metadata_table_for("ncen_readme.htm", name, header, primary_key)
+    }
+
+    fn metadata_table_for(readme: &str, name: &str, header: &str, primary_key: &[&str]) -> String {
         let columns = header
             .split('\t')
             .map(metadata_column)
@@ -573,20 +945,29 @@ mod bulk {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            r#"{{"url":"{name}","tableSchema":{{"aboutUrl":"ncen_readme.htm","PrimaryKey":[{keys}],"columns":[{columns}]}}}}"#
+            r#"{{"url":"{name}","tableSchema":{{"aboutUrl":"{readme}","PrimaryKey":[{keys}],"columns":[{columns}]}}}}"#
         )
     }
 
     fn metadata_column(column: &str) -> String {
         let datatype = match column {
-            "FILING_DATE" | "REPORT_ENDING_PERIOD" => r#"{"base":"date (DD-MON-YYYY)"}"#.to_owned(),
-            "TOTAL_SERIES" => {
-                r#"{"base":"NUMBER","dataPrecision":8,"dataScale":0,"maxLength":22}"#.to_owned()
+            "FILING_DATE" | "REPORT_ENDING_PERIOD" | "REPORT_DATE" => {
+                r#"{"base":"date (DD-MON-YYYY)"}"#.to_owned()
+            }
+            "TOTAL_SERIES" | "HOLDING_ID" | "IDENTIFIERS_ID" => {
+                r#"{"base":"NUMBER","dataPrecision":38,"dataScale":0,"maxLength":22}"#.to_owned()
             }
             "MONTHLY_AVG_NET_ASSETS"
             | "DAILY_AVG_NET_ASSETS"
             | "NUM_SHARES_PER_CREATION_UNIT"
-            | "REDEEMED_SHARES_PER_CREATION_UNIT" => {
+            | "REDEEMED_SHARES_PER_CREATION_UNIT"
+            | "TOTAL_ASSETS"
+            | "TOTAL_LIABILITIES"
+            | "NET_ASSETS"
+            | "BALANCE"
+            | "CURRENCY_VALUE"
+            | "EXCHANGE_RATE"
+            | "PERCENTAGE" => {
                 r#"{"base":"NUMBER","dataPrecision":"NULL","dataScale":"NULL","maxLength":22}"#
                     .to_owned()
             }

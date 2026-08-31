@@ -1000,7 +1000,7 @@ pub fn query_native_rows_by_joins(
     )
 }
 
-/// Materializes the complete typed C.9-C.12 supplement set for one provider-native holding.
+/// Materializes identifier evidence and the complete C.9-C.12 supplement set for one holding.
 #[allow(clippy::too_many_arguments)]
 pub fn query_nport_holding_supplements(
     store: &RawEvidenceStore,
@@ -1014,7 +1014,7 @@ pub fn query_nport_holding_supplements(
     if generation.family() != SecBulkFamily::Nport {
         return Err(SecBulkError::InvalidCanonicalMapping);
     }
-    let filters = [
+    let holding_filters = [
         SecBulkNativeJoinFilter::try_new(SecBulkJoinDomain::Accession, accession.as_str())?,
         SecBulkNativeJoinFilter::try_new(SecBulkJoinDomain::Holding, holding_id.as_str())?,
     ];
@@ -1022,7 +1022,7 @@ pub fn query_nport_holding_supplements(
         store,
         generation,
         SecBulkTableKind::NportFundReportedHolding,
-        &filters,
+        &holding_filters,
         limits,
         None,
         deadline,
@@ -1045,13 +1045,17 @@ pub fn query_nport_holding_supplements(
         .map_err(|_| SecBulkError::AllocationFailed)?;
     let mut total_rows = 0_u64;
     let mut total_bytes = 0_u64;
+    let related_filters = [SecBulkNativeJoinFilter::try_new(
+        SecBulkJoinDomain::Holding,
+        holding_id.as_str(),
+    )?];
     for table in nport_holding_supplement_tables() {
         check_operation(deadline, cancellation)?;
         let page = query_native_rows_by_joins(
             store,
             generation,
             *table,
-            &filters,
+            &related_filters,
             limits,
             None,
             deadline,

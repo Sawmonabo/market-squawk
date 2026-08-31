@@ -112,38 +112,6 @@ impl SecFundPublicationScope {
             Self::Ncen { fund_id, .. } => Some(fund_id),
         }
     }
-
-    fn accepts(&self, row: &SecBulkLogicalRow) -> bool {
-        let accession_matches =
-            has_join(row, SecBulkJoinDomain::Accession, self.accession().as_str());
-        match self {
-            Self::Nport { .. } => {
-                row.table().family() == SecBulkFamily::Nport
-                    && accession_matches
-                    && fund_source_table(row.table()).is_some()
-            }
-            Self::Ncen { fund_id, .. } => {
-                if row.table().family() != SecBulkFamily::Ncen
-                    || fund_source_table(row.table()).is_none()
-                {
-                    return false;
-                }
-                match row.table() {
-                    SecBulkTableKind::NcenSubmission | SecBulkTableKind::NcenRegistrant => {
-                        accession_matches
-                    }
-                    SecBulkTableKind::NcenFundReportedInfo => {
-                        accession_matches
-                            && has_join(row, SecBulkJoinDomain::Fund, fund_id.as_str())
-                    }
-                    SecBulkTableKind::NcenEtf | SecBulkTableKind::NcenSecurityExchange => {
-                        has_join(row, SecBulkJoinDomain::Fund, fund_id.as_str())
-                    }
-                    _ => false,
-                }
-            }
-        }
-    }
 }
 
 /// Separately governed identity authority used during SEC canonical mapping.
@@ -199,6 +167,7 @@ impl SecFundPartitionAdmissions {
 pub struct SecFundPendingLogicalRows {
     scope: SecFundPublicationScope,
     rows: Vec<SecBulkLogicalRow>,
+    nport_holding_ids: BTreeSet<String>,
     accounted_native_bytes: u64,
     aborted: bool,
 }
@@ -209,6 +178,7 @@ impl SecFundPendingLogicalRows {
         Self {
             scope,
             rows: Vec::new(),
+            nport_holding_ids: BTreeSet::new(),
             accounted_native_bytes: 0,
             aborted: false,
         }
@@ -218,6 +188,71 @@ impl SecFundPendingLogicalRows {
     pub const fn scope(&self) -> &SecFundPublicationScope {
         &self.scope
     }
+
+    fn accepts(&mut self, row: &SecBulkLogicalRow) -> Result<bool, SecBulkError> {
+        let accession_matches = has_join(
+            row,
+            SecBulkJoinDomain::Accession,
+            self.scope.accession().as_str(),
+        );
+        match &self.scope {
+            SecFundPublicationScope::Nport { .. } => {
+                if row.table().family() != SecBulkFamily::Nport
+                    || fund_source_table(row.table()).is_none()
+                {
+                    return Ok(false);
+                }
+                match row.table() {
+                    SecBulkTableKind::NportSubmission
+                    | SecBulkTableKind::NportRegistrant
+                    | SecBulkTableKind::NportFundReportedInfo => Ok(accession_matches),
+                    SecBulkTableKind::NportFundReportedHolding => {
+                        if !accession_matches {
+                            return Ok(false);
+                        }
+                        let holding_id = join_value(row, SecBulkJoinDomain::Holding)
+                            .ok_or(SecBulkError::InvalidCanonicalMapping)?;
+                        if !self.nport_holding_ids.insert(holding_id.to_owned()) {
+                            return Err(SecBulkError::InvalidCanonicalMapping);
+                        }
+                        Ok(true)
+                    }
+                    // The closed manifest order places holdings before identifiers/supplements,
+                    // and archive validation proves HOLDING_ID uniqueness and referential
+                    // integrity across the complete quarter before this selection pass begins.
+                    SecBulkTableKind::NportIdentifiers => {
+                        Ok(join_value(row, SecBulkJoinDomain::Holding)
+                            .is_some_and(|holding_id| self.nport_holding_ids.contains(holding_id)))
+                    }
+                    table if is_canonical_holding_supplement(table) => {
+                        Ok(join_value(row, SecBulkJoinDomain::Holding)
+                            .is_some_and(|holding_id| self.nport_holding_ids.contains(holding_id)))
+                    }
+                    _ => Ok(false),
+                }
+            }
+            SecFundPublicationScope::Ncen { fund_id, .. } => {
+                if row.table().family() != SecBulkFamily::Ncen
+                    || fund_source_table(row.table()).is_none()
+                {
+                    return Ok(false);
+                }
+                Ok(match row.table() {
+                    SecBulkTableKind::NcenSubmission | SecBulkTableKind::NcenRegistrant => {
+                        accession_matches
+                    }
+                    SecBulkTableKind::NcenFundReportedInfo => {
+                        accession_matches
+                            && has_join(row, SecBulkJoinDomain::Fund, fund_id.as_str())
+                    }
+                    SecBulkTableKind::NcenEtf | SecBulkTableKind::NcenSecurityExchange => {
+                        has_join(row, SecBulkJoinDomain::Fund, fund_id.as_str())
+                    }
+                    _ => false,
+                })
+            }
+        }
+    }
 }
 
 impl SecBulkPendingLogicalRowSink for SecFundPendingLogicalRows {
@@ -225,7 +260,7 @@ impl SecBulkPendingLogicalRowSink for SecFundPendingLogicalRows {
         if self.aborted {
             return Err(SecBulkError::PublicationNotReady);
         }
-        if self.scope.accepts(&row) {
+        if self.accepts(&row)? {
             if self.rows.len() == MAX_FUND_SOURCE_ROWS {
                 return Err(SecBulkError::QueryLimitExceeded);
             }
@@ -249,6 +284,7 @@ impl SecBulkPendingLogicalRowSink for SecFundPendingLogicalRows {
 
     fn abort(&mut self) {
         self.rows.clear();
+        self.nport_holding_ids.clear();
         self.accounted_native_bytes = 0;
         self.aborted = true;
     }
@@ -773,6 +809,13 @@ fn map_nport<A: SecFundIdentityAuthority>(
             }
             _ => {}
         }
+    }
+    if holding_indices.len() != selected.nport_holding_ids.len()
+        || holding_indices
+            .keys()
+            .any(|holding_id| !selected.nport_holding_ids.contains(holding_id.as_str()))
+    {
+        return Err(SecBulkError::InvalidCanonicalMapping);
     }
     for (holding_id, holding_index) in holding_indices {
         let holding = nport_holding(&selected.rows[holding_index])?;
