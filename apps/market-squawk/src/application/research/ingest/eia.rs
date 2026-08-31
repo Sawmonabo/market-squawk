@@ -30,7 +30,7 @@ use market_squawk_data::{
 };
 use market_squawk_domain::{
     CalendarDate, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
-    ResearchPeriod, SourceId, SourceIdentifier, Timestamp,
+    MacroObservation, ResearchPeriod, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_services::{RequestContext, ServiceError};
 use market_squawk_sources::{
@@ -806,7 +806,7 @@ impl EiaMacroRestartSelector {
                     .read_macro_latest_known_snapshot(request, limits, deadline, cancellation)
                     .await?;
                 self.validate_calendar_output(&output)?;
-                Ok(EiaMacroRestartReceipt::Calendar { evidence, output })
+                Ok(EiaMacroRestartReceipt::calendar(evidence, output))
             }
             EiaMacroPointInTimeRequest::ProviderPeriod(request) => {
                 let output = research
@@ -819,7 +819,7 @@ impl EiaMacroRestartSelector {
                     )
                     .await?;
                 self.validate_provider_period_output(&output)?;
-                Ok(EiaMacroRestartReceipt::ProviderPeriod { evidence, output })
+                Ok(EiaMacroRestartReceipt::provider_period(evidence, output))
             }
         }
     }
@@ -979,7 +979,12 @@ impl EiaMacroPointInTimeRequest {
 
 /// Exact raw/native and typed PIT evidence reopened after publication or process restart.
 #[derive(Debug)]
-pub(crate) enum EiaMacroRestartReceipt {
+pub(crate) struct EiaMacroRestartReceipt {
+    inner: EiaMacroRestartReceiptInner,
+}
+
+#[derive(Debug)]
+enum EiaMacroRestartReceiptInner {
     Calendar {
         evidence: PersistedProviderCaptureBindingEvidence,
         output: AnalyticalMacroLatestKnownOutput,
@@ -991,10 +996,76 @@ pub(crate) enum EiaMacroRestartReceipt {
 }
 
 impl EiaMacroRestartReceipt {
+    fn calendar(
+        evidence: PersistedProviderCaptureBindingEvidence,
+        output: AnalyticalMacroLatestKnownOutput,
+    ) -> Self {
+        Self {
+            inner: EiaMacroRestartReceiptInner::Calendar { evidence, output },
+        }
+    }
+
+    fn provider_period(
+        evidence: PersistedProviderCaptureBindingEvidence,
+        output: AnalyticalMacroProviderPeriodLatestKnownOutput,
+    ) -> Self {
+        Self {
+            inner: EiaMacroRestartReceiptInner::ProviderPeriod { evidence, output },
+        }
+    }
+
+    /// Returns the fixed application operation that produced this exact analytical selection.
+    pub(crate) const fn operation_identity(&self) -> &'static str {
+        match &self.inner {
+            EiaMacroRestartReceiptInner::Calendar { .. } => {
+                EIA_MACRO_CALENDAR_POINT_IN_TIME_OPERATION
+            }
+            EiaMacroRestartReceiptInner::ProviderPeriod { .. } => {
+                EIA_MACRO_PROVIDER_PERIOD_POINT_IN_TIME_OPERATION
+            }
+        }
+    }
+
     /// Returns the exact sealed raw/native binding evidence common to either time precision.
     pub(crate) const fn evidence(&self) -> &PersistedProviderCaptureBindingEvidence {
-        match self {
-            Self::Calendar { evidence, .. } | Self::ProviderPeriod { evidence, .. } => evidence,
+        match &self.inner {
+            EiaMacroRestartReceiptInner::Calendar { evidence, .. }
+            | EiaMacroRestartReceiptInner::ProviderPeriod { evidence, .. } => evidence,
+        }
+    }
+
+    /// Returns the sole source-rights owner of the selected canonical Macro rows.
+    pub(crate) const fn source_id(&self) -> &SourceId {
+        match &self.inner {
+            EiaMacroRestartReceiptInner::Calendar { output, .. } => output.source_id(),
+            EiaMacroRestartReceiptInner::ProviderPeriod { output, .. } => output.source_id(),
+        }
+    }
+
+    /// Returns the exact immutable parent generation used by downstream research work.
+    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
+        match &self.inner {
+            EiaMacroRestartReceiptInner::Calendar { output, .. } => output.output().manifest(),
+            EiaMacroRestartReceiptInner::ProviderPeriod { output, .. } => {
+                output.output().manifest()
+            }
+        }
+    }
+
+    /// Returns provider-neutral latest-known Macro rows with exact values, units, clocks,
+    /// revisions, missingness, and effective-time precision.
+    pub(crate) fn observations(&self) -> &[MacroObservation] {
+        match &self.inner {
+            EiaMacroRestartReceiptInner::Calendar { output, .. } => output.observations(),
+            EiaMacroRestartReceiptInner::ProviderPeriod { output, .. } => output.observations(),
+        }
+    }
+
+    /// Returns the code-owned identity of the complete manifest-pinned PIT selection.
+    pub(crate) const fn selection_digest(&self) -> EvidenceDigest {
+        match &self.inner {
+            EiaMacroRestartReceiptInner::Calendar { output, .. } => output.selection_digest(),
+            EiaMacroRestartReceiptInner::ProviderPeriod { output, .. } => output.selection_digest(),
         }
     }
 }
