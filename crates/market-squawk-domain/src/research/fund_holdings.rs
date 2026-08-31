@@ -18,7 +18,7 @@ pub const FUND_HOLDINGS_SCHEMA_VERSION: u16 = 1;
 /// Maximum exact source rows bound to one canonical fund record.
 pub const MAX_FUND_SOURCE_ROWS: usize = 100_000;
 /// Exact number of N-PORT holding-supplement table states required per holding.
-pub const FUND_HOLDING_SUPPLEMENT_TABLE_COUNT: usize = 19;
+pub const FUND_HOLDING_SUPPLEMENT_TABLE_COUNT: usize = 18;
 /// Maximum source exchange/ticker associations retained for one share class.
 pub const MAX_FUND_EXCHANGE_ASSOCIATIONS: usize = 64;
 /// Maximum equally knowable accessions retained for one revision conflict.
@@ -901,7 +901,7 @@ pub enum FundSourceTable {
     NportOtherDerivativeNotionalAmount,
     /// N-PORT securities-lending supplement.
     NportSecuritiesLending,
-    /// N-PORT explanatory-note supplement.
+    /// N-PORT filing-level explanatory-note table.
     NportExplanatoryNote,
     /// N-CEN submission table.
     NcenSubmission,
@@ -928,7 +928,7 @@ impl FundSourceTable {
         }
     }
 
-    /// Returns whether this is one of the 19 holding supplement tables.
+    /// Returns whether this is one of the 18 holding supplement tables.
     pub const fn is_holding_supplement(self) -> bool {
         matches!(
             self,
@@ -950,7 +950,6 @@ impl FundSourceTable {
                 | Self::NportOtherDerivative
                 | Self::NportOtherDerivativeNotionalAmount
                 | Self::NportSecuritiesLending
-                | Self::NportExplanatoryNote
         )
     }
 }
@@ -2080,7 +2079,7 @@ impl FundPortfolioHoldingEvidence {
     pub const fn attributes(&self) -> &FundPortfolioHoldingAttributes {
         &self.attributes
     }
-    /// Returns all 19 supplement-table states.
+    /// Returns all 18 supplement-table states.
     pub fn supplements(&self) -> &[FundHoldingSupplementEvidence] {
         &self.supplements
     }
