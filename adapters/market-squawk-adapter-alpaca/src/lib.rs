@@ -15,17 +15,20 @@ mod historical;
 mod historical_calendar;
 mod historical_transport;
 mod live;
+mod market_publication;
+mod option_chain;
 
 pub use config::{
     ALPACA_APPLICATION_MAX_REQUESTS_PER_MINUTE, ALPACA_BASIC_EQUITY_SYMBOL_LIMIT,
-    ALPACA_BASIC_HISTORICAL_REQUESTS_PER_MINUTE, ALPACA_BASIC_OPTION_SYMBOL_LIMIT,
-    ALPACA_HISTORICAL_EXCLUSION_NANOS, ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS,
-    ALPACA_HISTORICAL_MIN_LOOKBACK_DAYS, ALPACA_RECURRING_TARGET_REQUESTS_PER_MINUTE,
-    AlpacaAdjustment, AlpacaHistoricalEquityConfig, AlpacaHistoricalEquityDataset,
-    AlpacaHistoricalEquityDatasetPlan, AlpacaHistoricalEquityPreflightPlan,
-    AlpacaHistoricalLookback, AlpacaHistoricalSeriesSemantics, AlpacaIexBootSnapshotPolicy,
-    AlpacaIexLiveConfig, AlpacaInstrumentMapping, AlpacaOptionMapping, AlpacaOptionsLiveConfig,
-    AlpacaTimeframe, AlpacaTransportLimits,
+    ALPACA_BASIC_HISTORICAL_REQUESTS_PER_MINUTE, ALPACA_BASIC_OPTION_CHAIN_PAGE_ROWS,
+    ALPACA_BASIC_OPTION_SYMBOL_LIMIT, ALPACA_HISTORICAL_EXCLUSION_NANOS,
+    ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS, ALPACA_HISTORICAL_MIN_LOOKBACK_DAYS,
+    ALPACA_OPTION_CHAIN_MAX_PAGES, ALPACA_RECURRING_TARGET_REQUESTS_PER_MINUTE, AlpacaAdjustment,
+    AlpacaHistoricalEquityConfig, AlpacaHistoricalEquityDataset, AlpacaHistoricalEquityDatasetPlan,
+    AlpacaHistoricalEquityPreflightPlan, AlpacaHistoricalLookback, AlpacaHistoricalSeriesSemantics,
+    AlpacaIexBootSnapshotPolicy, AlpacaIexLiveConfig, AlpacaInstrumentMapping,
+    AlpacaOptionChainConfig, AlpacaOptionMapping, AlpacaOptionsLiveConfig, AlpacaTimeframe,
+    AlpacaTransportLimits,
 };
 pub use credentials::AlpacaCredentials;
 pub use decoder::{AlpacaIexDecoder, AlpacaOptionsDecoder};
@@ -58,6 +61,15 @@ pub use historical_transport::{
     AlpacaHistoricalScriptedTransportCounters, AlpacaHistoricalScriptedTransportFactory,
 };
 pub use live::{AlpacaIexLiveSource, AlpacaOptionsLiveSource};
+pub use market_publication::{
+    AlpacaMarketEventPublicationParts, AlpacaMarketEventRecord, AlpacaMarketEventSurface,
+    AlpacaPreparedMarketEventPublication,
+};
+pub use option_chain::{
+    AlpacaOptionChainClient, AlpacaOptionChainContractAuthority,
+    AlpacaOptionChainPublicationRequest, AlpacaOptionChainSealRejoin,
+    AlpacaOptionMarketPublicationParts, AlpacaPreparedOptionMarketPublication,
+};
 
 #[cfg(test)]
 mod tests;

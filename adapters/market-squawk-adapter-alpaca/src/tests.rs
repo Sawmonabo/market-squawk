@@ -23,8 +23,8 @@ use crate::{
     AlpacaHistoricalBarTimeAuthority, AlpacaHistoricalBarTimeRequest, AlpacaHistoricalEquityConfig,
     AlpacaHistoricalEquityDatasetPlan, AlpacaHistoricalEquityPreflightPlan,
     AlpacaHistoricalLookback, AlpacaHistoricalSeriesSemantics, AlpacaIexDecoder,
-    AlpacaIexLiveConfig, AlpacaInstrumentMapping, AlpacaOptionMapping, AlpacaOptionsDecoder,
-    AlpacaOptionsLiveConfig, AlpacaTimeframe, AlpacaTransportLimits,
+    AlpacaIexLiveConfig, AlpacaInstrumentMapping, AlpacaOptionChainConfig, AlpacaOptionMapping,
+    AlpacaOptionsDecoder, AlpacaOptionsLiveConfig, AlpacaTimeframe, AlpacaTransportLimits,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -192,6 +192,55 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
             instrument(101)?,
         )
         .is_err()
+    );
+
+    let option_chain = AlpacaOptionChainConfig::try_new(
+        SourceId::try_from("alpaca-basic-option-chain-test")?,
+        revision("alpaca-basic-option-chain-test-v1", 18)?,
+        authorization.clone(),
+        evidence(19),
+        effective,
+        freshness()?,
+        budget(&authorization)?,
+    )?;
+    assert_eq!(
+        option_chain.metadata().quality_ceiling(),
+        DataQuality::Indicative
+    );
+    assert!(!option_chain.metadata().capabilities().live());
+    assert!(option_chain.metadata().capabilities().extraction());
+    assert!(option_chain.metadata().coverage().live().is_none());
+    assert_eq!(
+        option_chain
+            .provider_product()
+            .as_source_identifier()
+            .as_str(),
+        "alpaca-basic-indicative-option-snapshots-v1"
+    );
+    assert_eq!(
+        option_chain
+            .provider_channel()
+            .as_source_identifier()
+            .as_str(),
+        "rest-complete-chain-snapshots"
+    );
+    assert!(
+        option_chain
+            .metadata()
+            .network_policy()
+            .authorize(
+                "https://data.alpaca.markets/v1beta1/options/snapshots/AAPL?limit=1000&feed=indicative"
+            )
+            .is_ok()
+    );
+    assert!(
+        option_chain
+            .metadata()
+            .network_policy()
+            .authorize(
+                "https://data.alpaca.markets/v1beta1/options/snapshots/AAPL?limit=1000&feed=opra"
+            )
+            .is_err()
     );
 
     let session = MarketBarSessionEvidence::try_new(

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroU64};
 use std::time::Duration;
 
 use market_squawk_domain::{
@@ -30,6 +30,10 @@ use crate::boot_snapshot::AlpacaIexBootSnapshotContract;
 pub const ALPACA_BASIC_EQUITY_SYMBOL_LIMIT: usize = 30;
 /// Alpaca Basic indicative-option quote WebSocket symbol ceiling.
 pub const ALPACA_BASIC_OPTION_SYMBOL_LIMIT: usize = 200;
+/// Provider option-chain page ceiling used by the complete-chain REST lane.
+pub const ALPACA_BASIC_OPTION_CHAIN_PAGE_ROWS: u16 = 1_000;
+/// Application ceiling on pages retained by one complete option-chain observation.
+pub const ALPACA_OPTION_CHAIN_MAX_PAGES: u16 = 16;
 /// Alpaca Basic historical request ceiling.
 pub const ALPACA_BASIC_HISTORICAL_REQUESTS_PER_MINUTE: u32 = 200;
 /// Market Squawk hard application ceiling for recurring Alpaca REST work.
@@ -53,11 +57,16 @@ pub(crate) const ALPACA_PROVIDER: &str = "alpaca-market-data";
 pub(crate) const ALPACA_IEX_ENDPOINT: &str = "wss://stream.data.alpaca.markets/v2/iex";
 pub(crate) const ALPACA_OPTIONS_ENDPOINT: &str =
     "wss://stream.data.alpaca.markets/v1beta1/indicative";
+pub(crate) const ALPACA_OPTIONS_SNAPSHOTS_ENDPOINT: &str =
+    "https://data.alpaca.markets/v1beta1/options/snapshots";
 pub(crate) const ALPACA_STOCKS_BASE_ENDPOINT: &str = "https://data.alpaca.markets/v2/stocks";
 pub(crate) const ALPACA_STOCKS_SNAPSHOTS_ENDPOINT: &str =
     "https://data.alpaca.markets/v2/stocks/snapshots";
 pub(crate) const IEX_VENUE: &str = "iex";
 pub(crate) const INDICATIVE_OPTIONS_VENUE: &str = "alpaca-indicative-options";
+
+const ALPACA_OPTION_CHAIN_PRODUCT: &str = "alpaca-basic-indicative-option-snapshots-v1";
+const ALPACA_OPTION_CHAIN_CHANNEL: &str = "rest-complete-chain-snapshots";
 
 const MAX_SYMBOL_BYTES: usize = 32;
 const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -514,6 +523,105 @@ impl AlpacaOptionsLiveConfig {
 
     pub(crate) fn subscription(&self) -> &[u8] {
         &self.subscription
+    }
+}
+
+/// Immutable extraction-only profile for complete indicative option-chain snapshots.
+///
+/// This REST source is intentionally separate from [`AlpacaOptionsLiveConfig`]. The live source
+/// is an exact, enumerated subscription capped at 200 symbols; a complete-chain response is a
+/// paginated, evidence-backed partial universe whose returned contracts are resolved only after
+/// every raw page is sealed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AlpacaOptionChainConfig {
+    metadata: SourceMetadata,
+    provider_product: ProviderProduct,
+    provider_channel: ProviderChannel,
+    request_bounds: HttpRequestBounds,
+}
+
+impl AlpacaOptionChainConfig {
+    /// Constructs the bounded Alpaca Basic indicative option-chain REST profile.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "source evidence and provider-budget authority stay explicit"
+    )]
+    pub fn try_new(
+        source_id: SourceId,
+        revision_evidence: RevisionBoundPayloadEvidence,
+        authorization: AuthorizationGrant,
+        coverage_evidence: ExactPayloadEvidence,
+        effective: EffectiveInterval,
+        freshness: FreshnessPolicy,
+        budget: ProviderBudgetPolicy,
+    ) -> Result<Self, AlpacaError> {
+        validate_authorization_and_budget(&authorization, &budget)?;
+        let request_bounds = option_chain_request_bounds()?;
+        let provider_product =
+            ProviderProduct::new(SourceIdentifier::try_from(ALPACA_OPTION_CHAIN_PRODUCT)?);
+        let provider_channel =
+            ProviderChannel::new(SourceIdentifier::try_from(ALPACA_OPTION_CHAIN_CHANNEL)?);
+        let endpoint = market_squawk_sources::EndpointPolicy::try_from_api_rules(
+            vec![option_chain_endpoint_rule()?],
+            request_bounds,
+        )?;
+        let metadata = SourceMetadata::try_new(SourceMetadataInput::new(
+            SchemaVersion::CURRENT,
+            source_id,
+            revision_evidence,
+            SourceClass::Broker,
+            SourceIdentifier::try_from(ALPACA_PROVIDER)?,
+            authorization,
+            SourceCoverage::try_instrument(
+                coverage_evidence,
+                effective,
+                vec![AssetClass::Option],
+                CoverageTopology::single_venue(VenueId::try_from(INDICATIVE_OPTIONS_VENUE)?),
+                InstrumentCoverage::partial(),
+                None,
+                CoverageDelay::Delayed(ALPACA_HISTORICAL_EXCLUSION_NANOS),
+                DeliveryEvidence::Indirect,
+            )?,
+            DataQuality::Indicative,
+            NetworkAccessPolicy::Allowlisted(endpoint),
+            freshness,
+            Some(budget),
+            SourceCapabilities::new(
+                false,
+                true,
+                SequenceCapability::Unsupported,
+                ChecksumCapability::Unsupported,
+                HistoricalCapability::None,
+                true,
+            ),
+            SourceProtocolProfile::NotLive,
+        ))?;
+        Ok(Self {
+            metadata,
+            provider_product,
+            provider_channel,
+            request_bounds,
+        })
+    }
+
+    /// Returns immutable extraction-only metadata with an `Indicative` ceiling.
+    pub const fn metadata(&self) -> &SourceMetadata {
+        &self.metadata
+    }
+
+    /// Returns the exact provider product bound into option request scope.
+    pub const fn provider_product(&self) -> &ProviderProduct {
+        &self.provider_product
+    }
+
+    /// Returns the exact REST channel bound into option request scope.
+    pub const fn provider_channel(&self) -> &ProviderChannel {
+        &self.provider_channel
+    }
+
+    /// Returns the hardened per-page request bounds.
+    pub const fn request_bounds(&self) -> HttpRequestBounds {
+        self.request_bounds
     }
 }
 
@@ -1548,6 +1656,43 @@ fn live_metadata(
     ))?)
 }
 
+pub(crate) fn option_chain_request_bounds() -> Result<HttpRequestBounds, AlpacaError> {
+    HttpRequestBounds::try_new(
+        NonZeroU64::new(10_000_000_000).ok_or(AlpacaError::InvalidTransportLimits)?,
+        NonZeroU64::new(30_000_000_000).ok_or(AlpacaError::InvalidTransportLimits)?,
+        NonZeroU64::new(45_000_000_000).ok_or(AlpacaError::InvalidTransportLimits)?,
+        0,
+        NonZeroU64::new(16 * 1024 * 1024).ok_or(AlpacaError::InvalidTransportLimits)?,
+    )
+    .map_err(Into::into)
+}
+
+fn option_chain_endpoint_rule() -> Result<ApiEndpointRule, AlpacaError> {
+    ApiEndpointRule::try_new(
+        ALPACA_OPTIONS_SNAPSHOTS_ENDPOINT,
+        PathScope::Descendants,
+        vec![
+            QueryParameterRule::try_new_exact_public(
+                SourceIdentifier::try_from("limit")?,
+                SourceIdentifier::try_from("1000")?,
+            )?,
+            QueryParameterRule::try_new_exact_public(
+                SourceIdentifier::try_from("feed")?,
+                SourceIdentifier::try_from("indicative")?,
+            )?,
+            QueryParameterRule::try_new(
+                SourceIdentifier::try_from("page_token")?,
+                2_048,
+                false,
+                QuerySensitivity::Public,
+            )?,
+        ],
+        3,
+        4_096,
+    )
+    .map_err(Into::into)
+}
+
 fn distinct_assets(mappings: &[AlpacaInstrumentMapping]) -> Vec<AssetClass> {
     let mut assets = Vec::new();
     for mapping in mappings {
@@ -1608,7 +1753,7 @@ fn validate_option_mappings(mappings: &[AlpacaOptionMapping]) -> Result<(), Alpa
     Ok(())
 }
 
-fn validate_equity_symbol(symbol: &str) -> Result<(), AlpacaError> {
+pub(crate) fn validate_equity_symbol(symbol: &str) -> Result<(), AlpacaError> {
     if symbol.is_empty()
         || symbol.len() > MAX_SYMBOL_BYTES
         || symbol == "*"
@@ -1621,7 +1766,7 @@ fn validate_equity_symbol(symbol: &str) -> Result<(), AlpacaError> {
     Ok(())
 }
 
-fn validate_option_symbol(symbol: &str) -> Result<(), AlpacaError> {
+pub(crate) fn validate_option_symbol(symbol: &str) -> Result<(), AlpacaError> {
     if symbol.len() < 16 || symbol.len() > 21 || symbol == "*" {
         return Err(AlpacaError::InvalidCoverage);
     }
