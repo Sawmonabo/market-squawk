@@ -226,7 +226,7 @@ impl KrakenMarketDecoder {
             || !self
                 .decoder
                 .native_coordinates()
-                .is_valid_at(frame.frame().received_at())
+                .is_selected_at(frame.frame().received_at())
         {
             return Err(DecodeInternalError::InvariantViolation);
         }
@@ -895,6 +895,9 @@ impl KrakenDecoder {
             });
         }
         let timestamp = parse_timestamp(data.timestamp)?;
+        if !self.native_coordinates.is_valid_at(timestamp) {
+            return Err(DecodeError::InvalidProviderEvidence);
+        }
         match envelope.kind {
             "snapshot" => self.apply_snapshot(data, timestamp),
             "update" if self.state == KrakenDecoderState::Healthy => {
@@ -1058,12 +1061,19 @@ impl KrakenDecoder {
                 "market" => TradeTakerOrderType::Market,
                 _ => return Err(DecodeError::MalformedPayload),
             };
+            let source_timestamp = parse_timestamp(trade.timestamp)?;
+            if !self.native_coordinates.is_valid_at(source_timestamp) {
+                // Initial snapshots can contain events from before the selected definition or
+                // provider-identity interval. Reject the complete provider frame atomically; never
+                // relabel historical events under the current identity.
+                return Err(DecodeError::InvalidProviderEvidence);
+            }
             observations.push(ProviderNormalizedObservation::try_new(
                 source_identifier(&trade_id)?,
                 self.native_coordinates.venue().clone(),
                 self.native_coordinates.instrument(),
                 ProviderTimestampEvidence::Provided {
-                    value: parse_timestamp(trade.timestamp)?,
+                    value: source_timestamp,
                     rule: self.rules.timestamp.clone(),
                 },
                 ProviderSequenceEvidence::Unsupported {

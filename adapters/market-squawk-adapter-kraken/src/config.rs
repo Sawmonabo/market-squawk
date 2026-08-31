@@ -3,7 +3,7 @@
 use std::num::NonZeroUsize;
 
 use market_squawk_domain::{
-    DataQuality, EvidenceDigest, InstrumentDefinition, InstrumentDefinitionRevision, InstrumentId,
+    DataQuality, EffectiveInterval, EvidenceDigest, InstrumentDefinition, InstrumentId,
     LiveEventClass, MarketDepth, MetadataRevision, ProviderChannel, ProviderIdentityKey,
     ProviderProduct, SequenceCapability, SourceId, Timestamp, VenueId, VenueMapping, VenueSymbol,
 };
@@ -70,6 +70,90 @@ impl KrakenChannel {
     }
 }
 
+/// Exact durable reference-selection value evidence supplied by application composition.
+///
+/// This value is deliberately not reference authority. The installed application must construct
+/// it from a digest-verified catalog selection receipt; the adapter checks and carries every slot
+/// but cannot mint or query repository-owned reference records itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KrakenReferenceSelectionEvidence {
+    reference_revision: MetadataRevision,
+    reference_payload_digest: EvidenceDigest,
+    definition_revision_digest: EvidenceDigest,
+    definition_revision_sequence: u32,
+    definition_published_at: Timestamp,
+    definition_validity: EffectiveInterval,
+    selection_receipt_digest: EvidenceDigest,
+}
+
+impl KrakenReferenceSelectionEvidence {
+    /// Constructs checked value evidence copied from one exact durable catalog selection.
+    ///
+    /// This constructor cannot grant reference authority. Application composition must require the
+    /// opaque repository record whose private fields produced these values before calling it.
+    pub fn try_new(
+        reference_revision: MetadataRevision,
+        reference_payload_digest: EvidenceDigest,
+        definition_revision_digest: EvidenceDigest,
+        definition_revision_sequence: u32,
+        definition_published_at: Timestamp,
+        definition_validity: EffectiveInterval,
+        selection_receipt_digest: EvidenceDigest,
+    ) -> Result<Self, KrakenConfigError> {
+        if reference_payload_digest.bytes() == [0; 32]
+            || definition_revision_digest.bytes() == [0; 32]
+            || definition_revision_sequence == 0
+            || selection_receipt_digest.bytes() == [0; 32]
+        {
+            return Err(KrakenConfigError::NativeIdentity);
+        }
+        Ok(Self {
+            reference_revision,
+            reference_payload_digest,
+            definition_revision_digest,
+            definition_revision_sequence,
+            definition_published_at,
+            definition_validity,
+            selection_receipt_digest,
+        })
+    }
+
+    /// Returns the source-authored reference revision bound to the selected definition.
+    pub const fn reference_revision(&self) -> &MetadataRevision {
+        &self.reference_revision
+    }
+
+    /// Returns the exact reference-source payload digest.
+    pub const fn reference_payload_digest(&self) -> EvidenceDigest {
+        self.reference_payload_digest
+    }
+
+    /// Returns the digest of the complete immutable catalog definition revision.
+    pub const fn definition_revision_digest(&self) -> EvidenceDigest {
+        self.definition_revision_digest
+    }
+
+    /// Returns the repository-owned monotonic definition revision position.
+    pub const fn definition_revision_sequence(&self) -> u32 {
+        self.definition_revision_sequence
+    }
+
+    /// Returns when the selected immutable definition first became durable locally.
+    pub const fn definition_published_at(&self) -> Timestamp {
+        self.definition_published_at
+    }
+
+    /// Returns the full half-open effective interval of the selected definition.
+    pub const fn definition_validity(&self) -> EffectiveInterval {
+        self.definition_validity
+    }
+
+    /// Returns the digest of the exact catalog-selection receipt.
+    pub const fn selection_receipt_digest(&self) -> EvidenceDigest {
+        self.selection_receipt_digest
+    }
+}
+
 /// Exact Kraken-native instrument and public market-surface coordinates.
 ///
 /// This value preserves an accepted provider identity assertion independently from Kraken's
@@ -85,12 +169,18 @@ pub struct KrakenNativeMarketCoordinates {
     provider_identity_revision: MetadataRevision,
     provider_identity_digest: EvidenceDigest,
     venue_mapping: VenueMapping,
-    instrument_definition_revision: InstrumentDefinitionRevision,
+    reference_revision: MetadataRevision,
+    reference_payload_digest: EvidenceDigest,
+    definition_revision_digest: EvidenceDigest,
+    definition_revision_sequence: u32,
+    definition_published_at: Timestamp,
+    reference_selection_digest: EvidenceDigest,
     provider_product: ProviderProduct,
     provider_channel: ProviderChannel,
     instrument: InstrumentId,
     channel: KrakenChannel,
     selected_at: Timestamp,
+    valid_from: Timestamp,
     valid_until: Option<Timestamp>,
 }
 
@@ -140,9 +230,34 @@ impl KrakenNativeMarketCoordinates {
         &self.venue_mapping
     }
 
-    /// Returns the canonical instrument-definition revision that owns the venue mapping.
-    pub const fn instrument_definition_revision(&self) -> InstrumentDefinitionRevision {
-        self.instrument_definition_revision
+    /// Returns the source-authored reference revision bound to the catalog selection.
+    pub const fn reference_revision(&self) -> &MetadataRevision {
+        &self.reference_revision
+    }
+
+    /// Returns the exact reference-source payload digest.
+    pub const fn reference_payload_digest(&self) -> EvidenceDigest {
+        self.reference_payload_digest
+    }
+
+    /// Returns the digest of the complete immutable catalog definition revision.
+    pub const fn definition_revision_digest(&self) -> EvidenceDigest {
+        self.definition_revision_digest
+    }
+
+    /// Returns the repository-owned monotonic definition revision position.
+    pub const fn definition_revision_sequence(&self) -> u32 {
+        self.definition_revision_sequence
+    }
+
+    /// Returns when the immutable selected definition first became durable locally.
+    pub const fn definition_published_at(&self) -> Timestamp {
+        self.definition_published_at
+    }
+
+    /// Returns the digest of the exact application catalog-selection receipt.
+    pub const fn reference_selection_digest(&self) -> EvidenceDigest {
+        self.reference_selection_digest
     }
 
     /// Returns the exact provider product declared by source metadata.
@@ -170,6 +285,11 @@ impl KrakenNativeMarketCoordinates {
         self.selected_at
     }
 
+    /// Returns the inclusive start of the common definition/source/identity validity interval.
+    pub const fn valid_from(&self) -> Timestamp {
+        self.valid_from
+    }
+
     /// Returns the exclusive end of the common source/identity validity window, when finite.
     pub const fn valid_until(&self) -> Option<Timestamp> {
         self.valid_until
@@ -177,7 +297,12 @@ impl KrakenNativeMarketCoordinates {
 
     /// Returns whether these coordinates remain valid at an event or session instant.
     pub fn is_valid_at(&self, at: Timestamp) -> bool {
-        self.selected_at <= at && self.valid_until.is_none_or(|end| at < end)
+        self.valid_from <= at && self.valid_until.is_none_or(|end| at < end)
+    }
+
+    /// Returns whether the reference selection was already known and valid at local receipt time.
+    pub fn is_selected_at(&self, at: Timestamp) -> bool {
+        self.selected_at <= at && self.is_valid_at(at)
     }
 
     pub(crate) fn matches_surface(
@@ -205,7 +330,7 @@ impl KrakenNativeMarketCoordinates {
             && self.provider_channel == surface.provider_channel
             && self.channel == channel
             && metadata.is_effective_at(self.selected_at)
-            && self.is_valid_at(self.selected_at)
+            && self.is_selected_at(self.selected_at)
     }
 }
 
@@ -237,6 +362,7 @@ impl KrakenConfig {
         metadata: SourceMetadata,
         definition: &InstrumentDefinition,
         provider_identity_key: &ProviderIdentityKey,
+        reference_selection: &KrakenReferenceSelectionEvidence,
         selected_at: Timestamp,
         depth: KrakenDepth,
         max_message_bytes: NonZeroUsize,
@@ -245,6 +371,7 @@ impl KrakenConfig {
             metadata,
             definition,
             provider_identity_key,
+            reference_selection,
             selected_at,
             KrakenChannel::Book(depth),
             max_message_bytes,
@@ -256,6 +383,7 @@ impl KrakenConfig {
         metadata: SourceMetadata,
         definition: &InstrumentDefinition,
         provider_identity_key: &ProviderIdentityKey,
+        reference_selection: &KrakenReferenceSelectionEvidence,
         selected_at: Timestamp,
         max_message_bytes: NonZeroUsize,
     ) -> Result<Self, KrakenConfigError> {
@@ -263,6 +391,7 @@ impl KrakenConfig {
             metadata,
             definition,
             provider_identity_key,
+            reference_selection,
             selected_at,
             KrakenChannel::Trades,
             max_message_bytes,
@@ -273,6 +402,7 @@ impl KrakenConfig {
         metadata: SourceMetadata,
         definition: &InstrumentDefinition,
         provider_identity_key: &ProviderIdentityKey,
+        reference_selection: &KrakenReferenceSelectionEvidence,
         selected_at: Timestamp,
         channel: KrakenChannel,
         max_message_bytes: NonZeroUsize,
@@ -281,6 +411,7 @@ impl KrakenConfig {
             &metadata,
             definition,
             provider_identity_key,
+            reference_selection,
             selected_at,
             channel,
         )?;
@@ -496,6 +627,7 @@ fn native_market_coordinates(
     metadata: &SourceMetadata,
     definition: &InstrumentDefinition,
     provider_identity_key: &ProviderIdentityKey,
+    reference_selection: &KrakenReferenceSelectionEvidence,
     selected_at: Timestamp,
     channel: KrakenChannel,
 ) -> Result<KrakenNativeMarketCoordinates, KrakenConfigError> {
@@ -532,10 +664,18 @@ fn native_market_coordinates(
         instrument,
         channel,
     )?;
-    if surface.venue != *venue_mapping.venue_id() || !metadata.is_effective_at(selected_at) {
+    if surface.venue != *venue_mapping.venue_id()
+        || !metadata.is_effective_at(selected_at)
+        || reference_selection.definition_published_at() > selected_at
+    {
         return Err(KrakenConfigError::NativeIdentity);
     }
-    let valid_until = common_valid_until(metadata, record.validity(), selected_at)?;
+    let (valid_from, valid_until) = common_validity_interval(
+        metadata,
+        reference_selection.definition_validity(),
+        record.validity(),
+        selected_at,
+    )?;
     Ok(KrakenNativeMarketCoordinates {
         source_id: metadata.source_id().clone(),
         source_metadata_revision: metadata.revision().clone(),
@@ -547,30 +687,39 @@ fn native_market_coordinates(
         provider_identity_revision: record.metadata_revision().clone(),
         provider_identity_digest: record.evidence().content_digest(),
         venue_mapping,
-        instrument_definition_revision: definition.definition_revision(),
+        reference_revision: reference_selection.reference_revision().clone(),
+        reference_payload_digest: reference_selection.reference_payload_digest(),
+        definition_revision_digest: reference_selection.definition_revision_digest(),
+        definition_revision_sequence: reference_selection.definition_revision_sequence(),
+        definition_published_at: reference_selection.definition_published_at(),
+        reference_selection_digest: reference_selection.selection_receipt_digest(),
         provider_product: surface.provider_product,
         provider_channel: surface.provider_channel,
         instrument,
         channel,
         selected_at,
+        valid_from,
         valid_until,
     })
 }
 
-fn common_valid_until(
+fn common_validity_interval(
     metadata: &SourceMetadata,
+    definition: market_squawk_domain::EffectiveInterval,
     identity: market_squawk_domain::EffectiveInterval,
     selected_at: Timestamp,
-) -> Result<Option<Timestamp>, KrakenConfigError> {
+) -> Result<(Timestamp, Option<Timestamp>), KrakenConfigError> {
     let authorization = metadata.authorization().effective_interval();
     let coverage = metadata.coverage().effective_interval();
     let common_start = authorization
         .starts_at()
         .max(coverage.starts_at())
+        .max(definition.starts_at())
         .max(identity.starts_at());
     let valid_until = [
         authorization.ends_at(),
         coverage.ends_at(),
+        definition.ends_at(),
         identity.ends_at(),
     ]
     .into_iter()
@@ -579,7 +728,7 @@ fn common_valid_until(
     if selected_at < common_start || valid_until.is_some_and(|end| selected_at >= end) {
         return Err(KrakenConfigError::NativeIdentity);
     }
-    Ok(valid_until)
+    Ok((common_start, valid_until))
 }
 
 /// Kraken configuration error.

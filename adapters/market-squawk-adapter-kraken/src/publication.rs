@@ -810,7 +810,9 @@ fn validate_capture(
         || !config
             .native_coordinates()
             .matches_surface(metadata, channel)
-        || !config.native_coordinates().is_valid_at(raw.received_at())
+        || !config
+            .native_coordinates()
+            .is_selected_at(raw.received_at())
     {
         return Err(KrakenPublicationError::InvalidCapture);
     }
@@ -949,6 +951,8 @@ fn validate_disposition(
     for observation in observations {
         if observation.venue().as_str() != KRAKEN_PROVIDER
             || observation.instrument() != config.instrument()
+            || observation_timestamp(observation)
+                .is_none_or(|timestamp| !config.native_coordinates().is_valid_at(timestamp))
         {
             return Err(KrakenPublicationError::InvalidMarketEvidence);
         }
@@ -1030,8 +1034,14 @@ struct KrakenNativeRowV1<'a> {
     provider_identity_digest: EvidenceDigest,
     venue: &'a str,
     instrument_id: InstrumentId,
-    instrument_definition_revision: u64,
+    reference_revision: &'a str,
+    reference_payload_digest: EvidenceDigest,
+    definition_revision_digest: EvidenceDigest,
+    definition_revision_sequence: u32,
+    definition_published_at: Timestamp,
+    reference_selection_digest: EvidenceDigest,
     identity_selected_at: Timestamp,
+    identity_valid_from: Timestamp,
     identity_valid_until: Option<Timestamp>,
     generation_frame_ordinal: u64,
     microbatch_frame_ordinal: u16,
@@ -1117,8 +1127,14 @@ struct KrakenNativeBatchSidecarV1<'a> {
     provider_identity_digest: EvidenceDigest,
     venue: &'a str,
     instrument_id: InstrumentId,
-    instrument_definition_revision: u64,
+    reference_revision: &'a str,
+    reference_payload_digest: EvidenceDigest,
+    definition_revision_digest: EvidenceDigest,
+    definition_revision_sequence: u32,
+    definition_published_at: Timestamp,
+    reference_selection_digest: EvidenceDigest,
     identity_selected_at: Timestamp,
+    identity_valid_from: Timestamp,
     identity_valid_until: Option<Timestamp>,
     retained_depth: Option<usize>,
     session_id: &'a str,
@@ -1184,8 +1200,17 @@ fn native_material(
             provider_identity_digest: coordinates.provider_identity_digest(),
             venue: evidence.venue.as_str(),
             instrument_id: evidence.instrument_id,
-            instrument_definition_revision: coordinates.instrument_definition_revision().get(),
+            reference_revision: coordinates
+                .reference_revision()
+                .as_source_identifier()
+                .as_str(),
+            reference_payload_digest: coordinates.reference_payload_digest(),
+            definition_revision_digest: coordinates.definition_revision_digest(),
+            definition_revision_sequence: coordinates.definition_revision_sequence(),
+            definition_published_at: coordinates.definition_published_at(),
+            reference_selection_digest: coordinates.reference_selection_digest(),
             identity_selected_at: coordinates.selected_at(),
+            identity_valid_from: coordinates.valid_from(),
             identity_valid_until: coordinates.valid_until(),
             generation_frame_ordinal: evidence.generation_frame_ordinal,
             microbatch_frame_ordinal: evidence.microbatch_frame_ordinal,
@@ -1265,8 +1290,17 @@ fn native_material(
         provider_identity_digest: coordinates.provider_identity_digest(),
         venue: evidence.venue.as_str(),
         instrument_id: evidence.instrument_id,
-        instrument_definition_revision: coordinates.instrument_definition_revision().get(),
+        reference_revision: coordinates
+            .reference_revision()
+            .as_source_identifier()
+            .as_str(),
+        reference_payload_digest: coordinates.reference_payload_digest(),
+        definition_revision_digest: coordinates.definition_revision_digest(),
+        definition_revision_sequence: coordinates.definition_revision_sequence(),
+        definition_published_at: coordinates.definition_published_at(),
+        reference_selection_digest: coordinates.reference_selection_digest(),
         identity_selected_at: coordinates.selected_at(),
+        identity_valid_from: coordinates.valid_from(),
         identity_valid_until: coordinates.valid_until(),
         retained_depth: evidence.retained_depth.map(KrakenDepth::get),
         session_id: evidence.session_id.as_str(),

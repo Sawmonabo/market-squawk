@@ -12,6 +12,7 @@ mod subscription;
 
 pub use config::{
     KrakenChannel, KrakenConfig, KrakenConfigError, KrakenDepth, KrakenNativeMarketCoordinates,
+    KrakenReferenceSelectionEvidence,
 };
 pub use decoder::{
     KrakenDecodeOutcome, KrakenDecoder, KrakenDecoderState, KrakenMarketDecodeHandoff,

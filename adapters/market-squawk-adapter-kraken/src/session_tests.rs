@@ -40,7 +40,7 @@ use crate::{
     KrakenL3DecoderState, KrakenL3Depth, KrakenL3EstablishedSessionSender, KrakenL3MetadataInput,
     KrakenL3ProductMapping, KrakenL3SubscriptionDispatch, KrakenMarketContinuity,
     KrakenMarketDecodeHandoff, KrakenMarketEventHandoff, KrakenMetadataInput,
-    KrakenSubscriptionRequestEvidence,
+    KrakenReferenceSelectionEvidence, KrakenSubscriptionRequestEvidence,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -824,10 +824,20 @@ fn test_source(
     let registered = registry.register(metadata.clone(), Timestamp::from_unix_nanos(1))?;
     let definition = public_definition(instrument)?;
     let provider_identity_key = definition.provider_identities()[0].key();
+    let reference_selection = KrakenReferenceSelectionEvidence::try_new(
+        MetadataRevision::new(SourceIdentifier::try_from("kraken-test-reference-v1")?),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [21; 32]),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [22; 32]),
+        1,
+        Timestamp::from_unix_nanos(0),
+        EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [23; 32]),
+    )?;
     let config = KrakenConfig::try_new(
         metadata,
         &definition,
         &provider_identity_key,
+        &reference_selection,
         Timestamp::from_unix_nanos(1),
         KrakenDepth::Ten,
         NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,

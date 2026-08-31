@@ -2,6 +2,7 @@ use market_squawk_adapter_kraken::{
     KRAKEN_BOOK_SEQUENCE_RULE, KRAKEN_QUALIFICATION_POLICY_DIGEST,
     KRAKEN_QUALIFICATION_POLICY_VERSION, KrakenConfig, KrakenConfigError, KrakenDecodeOutcome,
     KrakenDecoder, KrakenDepth, KrakenMetadataInput, KrakenQualificationPolicy,
+    KrakenReferenceSelectionEvidence,
 };
 use market_squawk_adapter_paper::{
     FeeSchedule, PaperAccountBootstrap, PaperExposureValuation, PaperLedger, PaperLedgerConfig,
@@ -95,10 +96,13 @@ fn metadata_binds_the_reviewed_ceiling_and_contains_no_fabricated_sequence()
         "BTC/USD",
     )?;
     let selected_at = Timestamp::from_unix_nanos(1);
+    let reference_selection =
+        kraken_reference_selection(EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?)?;
     let book_config = KrakenConfig::try_new(
         metadata,
         &definition,
         &provider_identity_key,
+        &reference_selection,
         selected_at,
         KrakenDepth::Ten,
         NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
@@ -107,6 +111,7 @@ fn metadata_binds_the_reviewed_ceiling_and_contains_no_fabricated_sequence()
         trade_metadata,
         &definition,
         &provider_identity_key,
+        &reference_selection,
         selected_at,
         NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
     )?;
@@ -122,6 +127,7 @@ fn metadata_binds_the_reviewed_ceiling_and_contains_no_fabricated_sequence()
     );
     assert_eq!(book_coordinates.venue_symbol().as_str(), "BTC/USD");
     assert_eq!(book_coordinates.selected_at(), selected_at);
+    assert_eq!(book_coordinates.valid_from(), Timestamp::from_unix_nanos(0));
     assert_eq!(book_coordinates.valid_until(), None);
     assert_eq!(
         book_coordinates.provider_identity_revision(),
@@ -169,6 +175,25 @@ fn metadata_binds_the_reviewed_ceiling_and_contains_no_fabricated_sequence()
     assert_eq!(observations[0].venue(), book_coordinates.venue());
     let _trade_decoder = KrakenDecoder::try_trades(trade_coordinates)?;
 
+    let bounded_reference_selection =
+        kraken_reference_selection(EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?)?;
+    let bounded_trade_config = KrakenConfig::try_trades(
+        metadata_input(true)?.try_build()?,
+        &definition,
+        &provider_identity_key,
+        &bounded_reference_selection,
+        selected_at,
+        NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
+    )?;
+    let mut bounded_trade_decoder =
+        KrakenDecoder::try_trades(bounded_trade_config.native_coordinates().clone())?;
+    assert!(matches!(
+        bounded_trade_decoder.decode_payload(
+            br#"{"channel":"trade","type":"snapshot","data":[{"symbol":"BTC/USD","side":"buy","price":"1.0","qty":"1.0","ord_type":"market","trade_id":1,"timestamp":"1970-01-01T00:00:00Z"}]}"#,
+        ),
+        Err(DecodeError::InvalidProviderEvidence)
+    ));
+
     let expired = kraken_definition(
         instrument,
         vec![kraken_provider_identity(
@@ -189,6 +214,7 @@ fn metadata_binds_the_reviewed_ceiling_and_contains_no_fabricated_sequence()
             metadata_input(false)?.try_build()?,
             &expired,
             &provider_identity_key,
+            &reference_selection,
             selected_at,
             KrakenDepth::Ten,
             NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
@@ -212,6 +238,7 @@ fn metadata_binds_the_reviewed_ceiling_and_contains_no_fabricated_sequence()
             metadata_input(false)?.try_build()?,
             &future,
             &provider_identity_key,
+            &reference_selection,
             selected_at,
             KrakenDepth::Ten,
             NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
@@ -229,6 +256,7 @@ fn metadata_binds_the_reviewed_ceiling_and_contains_no_fabricated_sequence()
             metadata_input(false)?.try_build()?,
             &mismatched_venue,
             &provider_identity_key,
+            &reference_selection,
             selected_at,
             KrakenDepth::Ten,
             NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
@@ -267,6 +295,7 @@ fn metadata_binds_the_reviewed_ceiling_and_contains_no_fabricated_sequence()
         metadata_input(false)?.try_build()?,
         &revised,
         &provider_identity_key,
+        &reference_selection,
         superseded_at,
         KrakenDepth::Ten,
         NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
@@ -474,6 +503,20 @@ fn kraken_provider_identity(
         validity,
         supersedes,
     }))
+}
+
+fn kraken_reference_selection(
+    definition_validity: EffectiveInterval,
+) -> Result<KrakenReferenceSelectionEvidence, Box<dyn Error>> {
+    Ok(KrakenReferenceSelectionEvidence::try_new(
+        MetadataRevision::new(SourceIdentifier::try_from("kraken-reference-v1")?),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [21; 32]),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [22; 32]),
+        1,
+        definition_validity.starts_at(),
+        definition_validity,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [23; 32]),
+    )?)
 }
 
 fn kraken_definition(
