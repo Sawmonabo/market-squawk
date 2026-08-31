@@ -28,9 +28,10 @@ use market_squawk_sources::{
     ExtractionBatch, ExtractionRequest, ExtractionRevisionPlan, ExtractionSource,
     ExtractionSourceError, MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_RECORDS,
     MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, ProviderCaptureError, ProviderCaptureMaterial,
-    ProviderNativeLineageBatch, ProviderNativeLineageImplementation, RegisteredSource,
-    RegistryError, SealedProviderCaptureBinding, SourceClass, SourceError, SourceMetadata,
-    SourceObject, SourceObjectCaptureIdentity, built_in_provider_profiles,
+    ProviderCaptureSealRequest, ProviderNativeLineageBatch, ProviderNativeLineageImplementation,
+    RegisteredSource, RegistryError, SealedProviderCaptureBinding, SealedProviderCaptureMaterial,
+    SourceClass, SourceError, SourceMetadata, SourceObject, SourceObjectCaptureIdentity,
+    built_in_provider_profiles,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -521,8 +522,19 @@ struct ManagedProviderNativePublication {
 
 #[derive(Debug)]
 pub struct ManagedExtractionWithNative {
-    extraction: ManagedExtraction,
-    provider_native: Option<ManagedProviderNativePublication>,
+    handoff: ManagedExtractionHandoff,
+}
+
+#[derive(Debug)]
+enum ManagedExtractionHandoff {
+    Pending {
+        extraction: ManagedExtraction,
+        provider_native: Option<ManagedProviderNativePublication>,
+    },
+    Provider {
+        sealed_capture: SealedProviderCaptureBinding,
+        revisions: ExtractionRevisionPlan,
+    },
 }
 
 impl ManagedExtraction {
@@ -532,6 +544,80 @@ impl ManagedExtraction {
             company_identity: None,
             capture_material: None,
         }
+    }
+}
+
+impl ManagedExtractionWithNative {
+    fn pending(
+        extraction: ManagedExtraction,
+        provider_native: Option<ManagedProviderNativePublication>,
+    ) -> Self {
+        Self {
+            handoff: ManagedExtractionHandoff::Pending {
+                extraction,
+                provider_native,
+            },
+        }
+    }
+
+    fn provider(
+        sealed_capture: SealedProviderCaptureBinding,
+        revisions: ExtractionRevisionPlan,
+    ) -> Self {
+        Self {
+            handoff: ManagedExtractionHandoff::Provider {
+                sealed_capture,
+                revisions,
+            },
+        }
+    }
+}
+
+/// Least-privilege application capability for physically sealing provider capture material.
+///
+/// The capability cannot publish a dataset, read an existing raw object, or outlive the current
+/// bounded operation. Adapter composition receives it only while extraction remains under the
+/// coordinator's cancellation and deadline authority.
+#[derive(Clone)]
+pub struct ManagedProviderCaptureAuthority {
+    research: Arc<ResearchService>,
+    deadline: Instant,
+}
+
+impl ManagedProviderCaptureAuthority {
+    fn new(research: Arc<ResearchService>, deadline: Instant) -> Self {
+        Self { research, deadline }
+    }
+
+    async fn seal(
+        &self,
+        request: ProviderCaptureSealRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<SealedProviderCaptureMaterial, ExtractionSourceError> {
+        self.research
+            .seal_provider_capture(request, cancellation, self.deadline)
+            .await
+            .map_err(map_managed_capture_error)
+    }
+}
+
+impl fmt::Debug for ManagedProviderCaptureAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedProviderCaptureAuthority")
+            .field("research", &"[APPLICATION-OWNED CAPTURE AUTHORITY]")
+            .field("deadline", &self.deadline)
+            .finish()
+    }
+}
+
+fn map_managed_capture_error(error: ResearchServiceError) -> ExtractionSourceError {
+    match error {
+        ResearchServiceError::Ingest(IngestError::Cancelled) => ExtractionSourceError::Cancelled,
+        ResearchServiceError::Ingest(IngestError::DeadlineExceeded) => {
+            ExtractionSourceError::DeadlineExceeded
+        }
+        _ => invalid_capture_protocol(),
     }
 }
 
@@ -612,6 +698,7 @@ pub trait ManagedResearchExtractionSource: ExtractionSource + Send + Sync + 'sta
     /// map can be discarded between adapter extraction and application raw sealing.
     fn extract_managed_with_native(
         &self,
+        _capture: ManagedProviderCaptureAuthority,
         authority: market_squawk_sources::ExtractionAuthority,
         request: ExtractionRequest,
         cancellation: CancellationToken,
@@ -620,10 +707,7 @@ pub trait ManagedResearchExtractionSource: ExtractionSource + Send + Sync + 'sta
         Box::pin(async move {
             extracted
                 .await
-                .map(|extraction| ManagedExtractionWithNative {
-                    extraction,
-                    provider_native: None,
-                })
+                .map(|extraction| ManagedExtractionWithNative::pending(extraction, None))
         })
     }
 
@@ -665,20 +749,6 @@ fn invalid_capture_protocol() -> ExtractionSourceError {
     SourceError::InvalidProtocolState.into()
 }
 
-fn bind_single_provider_capture(
-    batch: ExtractionBatch,
-    capture_material: ProviderCaptureMaterial,
-) -> Result<ManagedExtraction, ExtractionSourceError> {
-    let batch = batch
-        .try_bind_provider_capture(capture_material.receipt())
-        .map_err(|_error| invalid_capture_protocol())?;
-    Ok(ManagedExtraction {
-        batch,
-        company_identity: None,
-        capture_material: Some(capture_material),
-    })
-}
-
 fn bind_managed_provider_native_capture(
     batch: ExtractionBatch,
     capture_material: ProviderCaptureMaterial,
@@ -694,17 +764,17 @@ fn bind_managed_provider_native_capture(
     {
         return Err(invalid_capture_protocol());
     }
-    Ok(ManagedExtractionWithNative {
-        extraction: ManagedExtraction {
+    Ok(ManagedExtractionWithNative::pending(
+        ManagedExtraction {
             batch,
             company_identity: None,
             capture_material: Some(capture_material),
         },
-        provider_native: Some(ManagedProviderNativePublication {
+        Some(ManagedProviderNativePublication {
             native_lineage,
             row_capture_page_ordinals,
         }),
-    })
+    ))
 }
 
 fn capture_material_matches_batch(
@@ -816,6 +886,7 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_sec::SecEdgarSour
 impl ManagedResearchExtractionSource for market_squawk_adapter_fred::FredSource {
     fn extract_managed_with_native(
         &self,
+        _capture: ManagedProviderCaptureAuthority,
         authority: market_squawk_sources::ExtractionAuthority,
         request: ExtractionRequest,
         cancellation: CancellationToken,
@@ -892,6 +963,7 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_bls::BlsSource {
 impl ManagedResearchExtractionSource for market_squawk_adapter_treasury::TreasurySource {
     fn extract_managed_with_native(
         &self,
+        _capture: ManagedProviderCaptureAuthority,
         authority: market_squawk_sources::ExtractionAuthority,
         request: ExtractionRequest,
         cancellation: CancellationToken,
@@ -932,30 +1004,28 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_treasury::Treasur
 }
 
 impl ManagedResearchExtractionSource for market_squawk_adapter_federal_reserve::BoardSource {
-    fn extract_managed(
+    fn extract_managed_with_native(
         &self,
+        capture: ManagedProviderCaptureAuthority,
         authority: market_squawk_sources::ExtractionAuthority,
         request: ExtractionRequest,
         cancellation: CancellationToken,
-    ) -> BoxFuture<'_, Result<ManagedExtraction, ExtractionSourceError>> {
-        let extracted = self.extract_with_evidence(authority, request, cancellation);
+    ) -> BoxFuture<'_, Result<ManagedExtractionWithNative, ExtractionSourceError>> {
         Box::pin(async move {
-            let output = extracted.await.map_err(|error| {
-                match error {
-                market_squawk_adapter_federal_reserve::BoardExtractionError::Source(error) => {
-                    error
-                }
-                market_squawk_adapter_federal_reserve::BoardExtractionError::Capture(_)
-                | market_squawk_adapter_federal_reserve::BoardExtractionError::CaptureBodyTooLarge {
-                    ..
-                }
-                | market_squawk_adapter_federal_reserve::BoardExtractionError::RawCapture(_) => {
-                    invalid_capture_protocol()
-                }
-            }
-            })?;
-            let (batch, _parsed, _receipt, capture_material) = output.into_parts();
-            bind_single_provider_capture(batch, capture_material)
+            let (pending, seal_request) = self
+                .extract_for_sealing(authority, request, cancellation.clone())
+                .await
+                .map_err(map_board_extraction_error)?;
+            let sealed = capture.seal(seal_request, &cancellation).await?;
+            let publication = pending
+                .try_rejoin(sealed)
+                .map_err(map_board_extraction_error)?;
+            let (_parsed, _receipt, revisions, sealed_capture) =
+                publication.into_root_publication_parts();
+            Ok(ManagedExtractionWithNative::provider(
+                sealed_capture,
+                revisions,
+            ))
         })
     }
 
@@ -980,6 +1050,22 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_federal_reserve::
         market_squawk_adapter_federal_reserve::BoardSource::revision_plan(self, batch)
             .map(Some)
             .map_err(|_error| ResearchRevisionPlanError)
+    }
+}
+
+fn map_board_extraction_error(
+    error: market_squawk_adapter_federal_reserve::BoardExtractionError,
+) -> ExtractionSourceError {
+    match error {
+        market_squawk_adapter_federal_reserve::BoardExtractionError::Source(error) => error,
+        market_squawk_adapter_federal_reserve::BoardExtractionError::Capture(_)
+        | market_squawk_adapter_federal_reserve::BoardExtractionError::NativeLineage(_)
+        | market_squawk_adapter_federal_reserve::BoardExtractionError::CaptureBodyTooLarge {
+            ..
+        }
+        | market_squawk_adapter_federal_reserve::BoardExtractionError::RawCapture(_) => {
+            invalid_capture_protocol()
+        }
     }
 }
 
@@ -2169,8 +2255,11 @@ impl ProductionResearchIngestCoordinator {
         let extraction_request =
             ExtractionRequest::try_new(object, self.limits.records, self.limits.bytes, deadline)
                 .map_err(|_error| ServiceError::InvalidRequest)?;
+        let capture =
+            ManagedProviderCaptureAuthority::new(Arc::clone(&self.research), operation_deadline);
         let managed = await_extraction(
             prepared.source.extract_managed_with_native(
+                capture,
                 prepared.authority,
                 extraction_request,
                 operation.clone(),
@@ -2181,45 +2270,75 @@ impl ProductionResearchIngestCoordinator {
             operation_deadline,
         )
         .await?;
-        let ManagedExtractionWithNative {
-            extraction:
-                ManagedExtraction {
-                    batch,
-                    company_identity,
-                    capture_material: extraction_capture,
-                },
-            provider_native,
-        } = managed;
-        let (batch, capture_material) = match (discovery_capture, extraction_capture) {
-            (Some(_), Some(_)) => return Err(ServiceError::InvalidResult),
-            (Some(capture_material), None) => {
-                let batch = batch
-                    .try_bind_provider_capture(capture_material.receipt())
-                    .map_err(|_error| ServiceError::InvalidResult)?;
-                (batch, Some(capture_material))
-            }
-            (None, capture_material) => (batch, capture_material),
-        };
         let local_source = matches!(
             prepared.metadata.source_class(),
             SourceClass::LocalFile | SourceClass::PortfolioExport
         );
-        if local_source == capture_material.is_some()
-            || !capture_material
-                .as_ref()
-                .is_none_or(|capture| capture_material_matches_batch(capture, &batch))
-        {
-            return Err(ServiceError::InvalidResult);
-        }
-        let revisions = prepared
-            .source
-            .revision_plan(&batch)
-            .map_err(|_error| ServiceError::InvalidResult)?;
+        let (publication, company_identity, revisions) = match managed.handoff {
+            ManagedExtractionHandoff::Pending {
+                extraction:
+                    ManagedExtraction {
+                        batch,
+                        company_identity,
+                        capture_material: extraction_capture,
+                    },
+                provider_native,
+            } => {
+                let (batch, capture_material) = match (discovery_capture, extraction_capture) {
+                    (Some(_), Some(_)) => return Err(ServiceError::InvalidResult),
+                    (Some(capture_material), None) => {
+                        let batch = batch
+                            .try_bind_provider_capture(capture_material.receipt())
+                            .map_err(|_error| ServiceError::InvalidResult)?;
+                        (batch, Some(capture_material))
+                    }
+                    (None, capture_material) => (batch, capture_material),
+                };
+                if local_source == capture_material.is_some()
+                    || !capture_material
+                        .as_ref()
+                        .is_none_or(|capture| capture_material_matches_batch(capture, &batch))
+                {
+                    return Err(ServiceError::InvalidResult);
+                }
+                let revisions = prepared
+                    .source
+                    .revision_plan(&batch)
+                    .map_err(|_error| ServiceError::InvalidResult)?;
+                let publication = match (local_source, capture_material, provider_native) {
+                    (true, None, None) => ManagedPublication::Local(batch),
+                    (false, Some(capture_material), provider_native) => {
+                        ManagedPublication::PendingProvider {
+                            batch,
+                            _capture_material: capture_material,
+                            _provider_native: provider_native,
+                        }
+                    }
+                    _ => return Err(ServiceError::InvalidResult),
+                };
+                (publication, company_identity, revisions)
+            }
+            ManagedExtractionHandoff::Provider {
+                sealed_capture,
+                revisions,
+            } => {
+                if local_source || discovery_capture.is_some() || sealed_capture.validate().is_err()
+                {
+                    return Err(ServiceError::InvalidResult);
+                }
+                (
+                    ManagedPublication::Provider(sealed_capture),
+                    None,
+                    Some(revisions),
+                )
+            }
+        };
+        let batch = publication.batch();
         let analytical_dataset = prepared
             .source
-            .analytical_dataset(&batch)
+            .analytical_dataset(batch)
             .map_err(|_error| ServiceError::InvalidResult)?;
-        let payload_digest = extraction_provider_payload_digest(&batch);
+        let payload_digest = extraction_provider_payload_digest(batch);
         let retrieved_at = system_timestamp()?;
         let rights = prepared.rights.decision(payload_digest, retrieved_at)?;
         ensure_operation_live(operation_deadline, operation)?;
@@ -2229,15 +2348,13 @@ impl ProductionResearchIngestCoordinator {
             .map_err(|_error| ServiceError::Unavailable)?;
         Ok(AuthorizedExtraction {
             metadata: prepared.metadata,
-            batch,
+            publication,
             company_identity,
-            capture_material,
             revisions,
             analytical_dataset,
             payload_digest,
             rights,
             admission: prepared.admission,
-            provider_native,
         })
     }
 
@@ -2352,17 +2469,34 @@ struct PreparedExtraction {
     admission: ResearchProviderAdmission,
 }
 
+enum ManagedPublication {
+    Local(ExtractionBatch),
+    PendingProvider {
+        batch: ExtractionBatch,
+        _capture_material: ProviderCaptureMaterial,
+        _provider_native: Option<ManagedProviderNativePublication>,
+    },
+    Provider(SealedProviderCaptureBinding),
+}
+
+impl ManagedPublication {
+    const fn batch(&self) -> &ExtractionBatch {
+        match self {
+            Self::Local(batch) | Self::PendingProvider { batch, .. } => batch,
+            Self::Provider(sealed_capture) => sealed_capture.batch(),
+        }
+    }
+}
+
 struct AuthorizedExtraction {
     metadata: SourceMetadata,
-    batch: ExtractionBatch,
+    publication: ManagedPublication,
     company_identity: Option<CompanyIdentityObservation>,
-    capture_material: Option<ProviderCaptureMaterial>,
     revisions: Option<ExtractionRevisionPlan>,
     analytical_dataset: DatasetId,
     payload_digest: EvidenceDigest,
     rights: RightsDecisionInput,
     admission: ResearchProviderAdmission,
-    provider_native: Option<ManagedProviderNativePublication>,
 }
 
 struct ChainedIngestPrecommitAuthority {
@@ -2415,15 +2549,13 @@ impl ProductionResearchIngestCoordinator {
             .await?;
         let AuthorizedExtraction {
             metadata: source_metadata,
-            batch,
+            publication,
             company_identity,
-            capture_material,
             revisions,
             analytical_dataset,
             payload_digest,
             rights,
             admission,
-            provider_native: _provider_native,
         } = extracted;
         let provider: Arc<dyn IngestPrecommitAuthority> = Arc::new(
             admission
@@ -2438,14 +2570,25 @@ impl ProductionResearchIngestCoordinator {
             }),
             None => provider,
         };
-        let ingest = match (revisions, capture_material) {
-            (Some(_revisions), Some(_capture_material)) => return Err(ServiceError::Unavailable),
-            (None, None) => ResearchIngestRequest::locally_observed(
+        let ingest = match (publication, revisions) {
+            (ManagedPublication::Provider(sealed_capture), Some(revisions)) => {
+                ResearchIngestRequest::with_provider_publication(
+                    source_metadata.clone(),
+                    rights,
+                    analytical_dataset,
+                    sealed_capture,
+                    revisions,
+                )
+            }
+            (ManagedPublication::Local(batch), None) => ResearchIngestRequest::locally_observed(
                 source_metadata.clone(),
                 rights,
                 analytical_dataset,
                 batch,
             ),
+            (ManagedPublication::PendingProvider { .. }, Some(_)) => {
+                return Err(ServiceError::Unavailable);
+            }
             _ => return Err(ServiceError::InvalidResult),
         }
         .map_err(map_research_error)?;

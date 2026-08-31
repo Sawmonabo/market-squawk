@@ -19,8 +19,10 @@ use market_squawk_sources::{
     AuthorizationMode, CoverageDomain, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority,
     ExtractionBatch, ExtractionBatchAccumulator, ExtractionRequest, ExtractionRevisionPlan,
     ExtractionSource, ExtractionSourceError, HistoricalCapability, ProviderCaptureMaterial,
-    SourceClass, SourceError, SourceMetadata, SourceMetadataProvider, SourceObject,
-    SourceProtocolProfile,
+    ProviderCaptureSealExpectation, ProviderCaptureSealRequest, ProviderNativeLineageBatch,
+    ProviderNativeLineageBatchBuilder, ProviderNativeLineageImplementation,
+    SealedProviderCaptureBinding, SealedProviderCaptureMaterial, SourceClass, SourceError,
+    SourceMetadata, SourceMetadataProvider, SourceObject, SourceProtocolProfile,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -38,10 +40,11 @@ use crate::transport::{
 use crate::transport::{BoardScriptedProductionTransport, BoardScriptedTransportFactory};
 use crate::{
     BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_DATE_COUNT,
-    BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT, BoardAdapterError,
-    BoardArtifactKind, BoardDatasetContract, BoardFileFormat, BoardH15AnalyticalCapability,
-    BoardParseLimits, BoardPeriod, BoardPeriodValue, BoardSeries, BoardValue, ParsedBoardDataset,
-    parse_csv, parse_sdmx_xml, parse_sdmx_zip,
+    BOARD_H15_TREASURY_CONSTANT_MATURITIES_ROLLING_DASHBOARD_OBSERVATION_COUNT,
+    BOARD_NATIVE_CONTRACT_VERSION, BoardAdapterError, BoardArtifactKind, BoardDatasetContract,
+    BoardFileFormat, BoardH15AnalyticalCapability, BoardParseLimits, BoardPeriod, BoardPeriodValue,
+    BoardRelease, BoardSeries, BoardValue, ParsedBoardDataset, parse_csv, parse_sdmx_xml,
+    parse_sdmx_zip,
 };
 
 const BOARD_PROVIDER_ID: &str = "federal-reserve-board";
@@ -283,19 +286,59 @@ impl BoardSourceHealth {
     }
 }
 
-/// Rich extraction result retaining parsed native evidence and its exact HTTP receipt.
+/// Seal-first Board publication handoff with one exclusive canonical/native/raw authority.
+///
+/// This value is deliberately non-cloneable. Canonical rows become observable to composition only
+/// after the exact provider response has been durably sealed and rejoined to those rows.
 #[derive(Debug)]
-pub struct BoardExtractionOutput {
-    batch: ExtractionBatch,
+pub struct BoardSealedPublication {
     parsed: ParsedBoardDataset,
     receipt: BoardHttpReceipt,
-    capture: ProviderCaptureMaterial,
+    revision_plan: ExtractionRevisionPlan,
+    sealed_capture_binding: SealedProviderCaptureBinding,
 }
 
-impl BoardExtractionOutput {
-    /// Returns the canonical shared extraction batch.
+/// Opaque Board extraction awaiting the exact physical result split from its raw material.
+///
+/// This continuation is non-cloneable and exposes no canonical batch. Only the matching opaque
+/// seal result can mint the final provider-publication authority.
+#[derive(Debug)]
+pub struct BoardPendingExtractionSeal {
+    parsed: ParsedBoardDataset,
+    receipt: BoardHttpReceipt,
+    revision_plan: ExtractionRevisionPlan,
+    batch: ExtractionBatch,
+    native_lineage: ProviderNativeLineageBatch,
+    row_capture_page_ordinals: Vec<u16>,
+    expectation: ProviderCaptureSealExpectation,
+}
+
+impl BoardPendingExtractionSeal {
+    /// Rejoins only the physical result split from this exact Board extraction.
+    pub fn try_rejoin(
+        self,
+        sealed: SealedProviderCaptureMaterial,
+    ) -> Result<BoardSealedPublication, BoardExtractionError> {
+        let capture_token = self.expectation.try_rejoin(sealed)?.try_into_whole()?;
+        let sealed_capture_binding = SealedProviderCaptureBinding::try_whole(
+            capture_token,
+            self.batch,
+            self.native_lineage,
+            self.row_capture_page_ordinals,
+        )?;
+        Ok(BoardSealedPublication {
+            parsed: self.parsed,
+            receipt: self.receipt,
+            revision_plan: self.revision_plan,
+            sealed_capture_binding,
+        })
+    }
+}
+
+impl BoardSealedPublication {
+    /// Returns the canonical shared extraction batch retained inside the one-use binding.
     pub const fn batch(&self) -> &ExtractionBatch {
-        &self.batch
+        self.sealed_capture_binding.batch()
     }
     /// Returns complete parsed source-native evidence.
     pub const fn parsed(&self) -> &ParsedBoardDataset {
@@ -305,22 +348,33 @@ impl BoardExtractionOutput {
     pub const fn receipt(&self) -> &BoardHttpReceipt {
         &self.receipt
     }
-    /// Returns the complete source-neutral exact-body material that must be sealed before the
-    /// canonical batch is admitted to durable publication.
-    pub const fn capture(&self) -> &ProviderCaptureMaterial {
-        &self.capture
+    /// Returns exact local-content revision evidence aligned to the canonical rows.
+    pub const fn revision_plan(&self) -> &ExtractionRevisionPlan {
+        &self.revision_plan
     }
-    /// Consumes the indivisible extraction handoff into canonical, native, transport, and raw
-    /// material parts. Composition must seal `capture` before publishing `batch`.
-    pub fn into_parts(
+    /// Returns exact bounded Board-native semantics aligned one-for-one with canonical rows.
+    pub const fn native_lineage(&self) -> &ProviderNativeLineageBatch {
+        self.sealed_capture_binding.native_lineage()
+    }
+    /// Returns the validated whole-response physical capture binding.
+    pub const fn sealed_capture_binding(&self) -> &SealedProviderCaptureBinding {
+        &self.sealed_capture_binding
+    }
+    /// Consumes this handoff into adapter evidence and the sole provider-publication authority.
+    pub fn into_root_publication_parts(
         self,
     ) -> (
-        ExtractionBatch,
         ParsedBoardDataset,
         BoardHttpReceipt,
-        ProviderCaptureMaterial,
+        ExtractionRevisionPlan,
+        SealedProviderCaptureBinding,
     ) {
-        (self.batch, self.parsed, self.receipt, self.capture)
+        (
+            self.parsed,
+            self.receipt,
+            self.revision_plan,
+            self.sealed_capture_binding,
+        )
     }
 }
 
@@ -472,17 +526,18 @@ impl BoardSource {
         }
     }
 
-    /// Produces the indivisible canonical/native/raw handoff for application composition.
+    /// Produces one opaque continuation and its exact raw-material seal request.
     ///
-    /// The caller must seal [`BoardExtractionOutput::capture`] successfully before admitting its
-    /// canonical batch to publication. The generic [`ExtractionSource::extract`] seam deliberately
-    /// fails closed because that trait cannot transfer required raw capture material.
-    pub async fn extract_with_evidence(
+    /// The generic [`ExtractionSource::extract`] seam deliberately fails closed because it cannot
+    /// transfer the consuming physical authority. Application composition must seal the returned
+    /// request and pass that opaque result to [`BoardPendingExtractionSeal::try_rejoin`].
+    pub async fn extract_for_sealing(
         &self,
         authority: ExtractionAuthority,
         request: ExtractionRequest,
         cancellation: CancellationToken,
-    ) -> Result<BoardExtractionOutput, BoardExtractionError> {
+    ) -> Result<(BoardPendingExtractionSeal, ProviderCaptureSealRequest), BoardExtractionError>
+    {
         self.validate_authority(&authority)?;
         validate_extraction_request(&self.metadata, &self.profile, &request)?;
         if cancellation.is_cancelled() {
@@ -522,14 +577,23 @@ impl BoardSource {
                 max: market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGE_BYTES,
             });
         }
+        let (bytes, parsed, receipt) = retrieved.into_parts();
+        let capture = capture_material(
+            &self.metadata,
+            self.profile.dataset().clone(),
+            &receipt,
+            bytes,
+        )?;
+        let capture_receipt = capture.receipt().clone();
+        if cancellation.is_cancelled() {
+            return Err(ExtractionSourceError::Cancelled.into());
+        }
+        ensure_deadline(request.deadline())?;
+        self.validate_authority(&authority)?;
+
         let ingested_at = system_timestamp().map_err(map_adapter_error)?;
         let mut accumulator = ExtractionBatchAccumulator::try_new(&request)?;
-        for record in canonical_records(
-            &self.metadata,
-            retrieved.parsed(),
-            retrieved.receipt(),
-            ingested_at,
-        )? {
+        for record in canonical_records(&self.metadata, &parsed, &receipt, ingested_at)? {
             accumulator.push(market_squawk_sources::ExtractionRecord::try_new_with_time(
                 &request,
                 SourceIdentifier::try_from(market_squawk_sources::CURRENT_RESEARCH_RECORD_SCHEMA)
@@ -543,20 +607,29 @@ impl BoardSource {
                 record.payload,
             )?)?;
         }
-        let batch = accumulator.finish()?;
-        let (bytes, parsed, receipt) = retrieved.into_parts();
-        let capture = capture_material(
-            &self.metadata,
-            self.profile.dataset().clone(),
-            &receipt,
-            bytes,
-        )?;
-        Ok(BoardExtractionOutput {
-            batch,
-            parsed,
-            receipt,
-            capture,
-        })
+        let batch = accumulator
+            .finish()?
+            .try_bind_provider_capture(&capture_receipt)?;
+        let native_lineage = board_h15_native_lineage(&parsed, &batch)?;
+        let mut row_capture_page_ordinals = Vec::new();
+        row_capture_page_ordinals
+            .try_reserve_exact(batch.records().len())
+            .map_err(|_| market_squawk_sources::ProviderNativeLineageError::AllocationFailure)?;
+        row_capture_page_ordinals.resize(batch.records().len(), 0);
+        let revision_plan = self.revision_plan(&batch).map_err(|_| invalid_protocol())?;
+        let (expectation, seal_request) = capture.into_whole_seal_parts();
+        Ok((
+            BoardPendingExtractionSeal {
+                parsed,
+                receipt,
+                revision_plan,
+                batch,
+                native_lineage,
+                row_capture_page_ordinals,
+                expectation,
+            },
+            seal_request,
+        ))
     }
 
     /// Board DDP has no provider vintage chronology; revisions are locally observed acquisitions.
@@ -569,7 +642,7 @@ impl BoardSource {
         {
             return Err(BoardSourceError::InvalidProfile);
         }
-        ExtractionRevisionPlan::locally_observed(batch.records().len())
+        ExtractionRevisionPlan::locally_observed_with_native_lineage(batch.records().len())
             .map_err(|_| BoardSourceError::CanonicalMapping)
     }
 
@@ -717,8 +790,8 @@ impl ExtractionSource for BoardSource {
         request: ExtractionRequest,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<ExtractionBatch, ExtractionSourceError>> {
-        // Canonical rows may not escape through a trait that cannot also transfer the exact raw
-        // provider body needed for MSJ1 sealing. Composition must use `extract_with_evidence`.
+        // Canonical rows may not escape through a trait that cannot also transfer exact physical
+        // provider authority. Composition must use `extract_for_sealing` and its opaque rejoin.
         let _ = (authority, request, cancellation);
         Box::pin(async { Err(SourceError::InvalidProtocolState.into()) })
     }
@@ -811,6 +884,9 @@ pub enum BoardExtractionError {
     /// The source-neutral capture receipt/material contract rejected exact body evidence.
     #[error("Federal Reserve Board capture material is invalid")]
     Capture(#[from] market_squawk_sources::ProviderCaptureError),
+    /// Exact Board-native semantics could not be aligned to every canonical row.
+    #[error("Federal Reserve Board native lineage is invalid")]
+    NativeLineage(#[from] market_squawk_sources::ProviderNativeLineageError),
     /// The exact provider body cannot fit one raw journal frame under the shared hard ceiling.
     #[error("Federal Reserve Board body size {body_bytes} exceeds capture-page limit {max}")]
     CaptureBodyTooLarge { body_bytes: u64, max: u64 },
@@ -831,6 +907,83 @@ struct CanonicalBoardRecord {
     revision: SourceIdentifier,
     evidence: ExactPayloadEvidence,
     payload: Bytes,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct BoardH15NativeLineageBatchV1<'a> {
+    native_contract_version: u16,
+    release: BoardRelease,
+    family: crate::BoardDatasetFamily,
+    format: BoardFileFormat,
+    frequency: crate::BoardFrequency,
+    route_lifecycle: &'a crate::BoardRouteLifecycle,
+    native_schema_digest: [u8; 32],
+    sdmx_header: Option<&'a crate::BoardSdmxHeader>,
+    artifacts: &'a [crate::BoardArtifactReceipt],
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct BoardH15NativeLineageRowV1<'a> {
+    series_unique_id: &'a str,
+    series_name: &'a str,
+    series_description: &'a str,
+    series_unit: &'a str,
+    #[serde(with = "rust_decimal::serde::str")]
+    series_multiplier: rust_decimal::Decimal,
+    series_currency: &'a str,
+    series_frequency: crate::BoardFrequency,
+    series_lifecycle: &'a crate::BoardSeriesLifecycle,
+    series_dimensions: &'a BTreeMap<Box<str>, Box<str>>,
+    period: &'a BoardPeriod,
+    value: &'a BoardValue,
+    observation_dimensions: &'a BTreeMap<Box<str>, Box<str>>,
+}
+
+fn board_h15_native_lineage(
+    parsed: &ParsedBoardDataset,
+    batch: &ExtractionBatch,
+) -> Result<ProviderNativeLineageBatch, BoardExtractionError> {
+    if parsed.release() != BoardRelease::H15SelectedInterestRates
+        || usize::try_from(parsed.observation_count()).ok() != Some(batch.records().len())
+    {
+        return Err(invalid_protocol().into());
+    }
+    let mut native_lineage = ProviderNativeLineageBatchBuilder::try_new(
+        ProviderNativeLineageImplementation::FederalReserveH15V1,
+        batch,
+    )?;
+    native_lineage.try_set_batch_sidecar(&BoardH15NativeLineageBatchV1 {
+        native_contract_version: BOARD_NATIVE_CONTRACT_VERSION,
+        release: parsed.release(),
+        family: parsed.family(),
+        format: parsed.format(),
+        frequency: parsed.frequency(),
+        route_lifecycle: parsed.route_lifecycle(),
+        native_schema_digest: parsed.native_schema_digest(),
+        sdmx_header: parsed.sdmx_header(),
+        artifacts: parsed.artifacts(),
+    })?;
+    for series in parsed.series() {
+        for observation in series.observations() {
+            native_lineage.try_push(&BoardH15NativeLineageRowV1 {
+                series_unique_id: series.unique_id(),
+                series_name: series.series_name(),
+                series_description: series.description(),
+                series_unit: series.unit(),
+                series_multiplier: series.multiplier(),
+                series_currency: series.currency(),
+                series_frequency: series.frequency(),
+                series_lifecycle: series.lifecycle(),
+                series_dimensions: series.dimensions(),
+                period: observation.period(),
+                value: observation.value(),
+                observation_dimensions: observation.dimensions(),
+            })?;
+        }
+    }
+    native_lineage.finish().map_err(Into::into)
 }
 
 fn canonical_records(

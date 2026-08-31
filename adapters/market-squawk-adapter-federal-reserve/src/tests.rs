@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::io::{Cursor, Write as _};
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use market_squawk_domain::{
     ResearchTemporalCoordinate, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability,
     SourceId, SourceIdentifier, Timestamp,
 };
+use market_squawk_platform::LocalPaths;
 use market_squawk_sources::{
     ApiEndpointRule, AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     BackoffPolicy, BudgetScope, CoverageDomain, DiscoveryRequest, EndpointPolicy,
@@ -42,6 +44,27 @@ const STRUCTURAL: [(&str, &[u8]); 3] = [
 ];
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+struct TemporaryDirectory(PathBuf);
+
+impl TemporaryDirectory {
+    fn new() -> Self {
+        Self(std::env::temp_dir().join(format!(
+            "market-squawk-federal-reserve-{}",
+            uuid::Uuid::new_v4()
+        )))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ignored = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 #[derive(Debug)]
 struct ScriptedBoardTransport {
@@ -487,7 +510,10 @@ async fn authority_transport_preserves_exact_repost_and_conditional_evidence() -
         last_modified: Some(b"Tue, 11 Aug 2026 16:00:00 GMT".to_vec()),
         body: first_body.clone(),
     })?;
-    let first = extract_once(&first_harness).await?;
+    let temporary = TemporaryDirectory::new();
+    let paths = LocalPaths::prepare(temporary.path())?;
+    let store = paths.sealed_research_journal_store()?;
+    let first = extract_once(&first_harness, &store).await?;
     assert_eq!(first.batch().records().len(), 2);
     assert_eq!(first.receipt().body_bytes(), first_body.len() as u64);
     assert_eq!(first.receipt().body_digest(), sha256(&first_body));
@@ -506,10 +532,17 @@ async fn authority_transport_preserves_exact_repost_and_conditional_evidence() -
         1
     );
 
-    assert_eq!(first.capture().records().len(), 1);
-    assert_eq!(first.capture().records()[0].payload(), first_body.as_ref());
+    let sealed_capture = first
+        .sealed_capture_binding()
+        .persisted_segment_receipt(0)
+        .ok_or("missing sealed Board capture")?;
+    let reopened = store.open_verified(sealed_capture.segment())?;
+    assert_eq!(reopened.records().len(), 1);
+    assert_eq!(reopened.records()[0].payload(), first_body.as_ref());
     assert_eq!(
-        first.capture().receipt().pages()[0].body_digest().bytes(),
+        first.sealed_capture_binding().capture_evidence().pages()[0]
+            .body_digest()
+            .bytes(),
         first.receipt().body_digest()
     );
     let repost = parse_csv(
@@ -570,7 +603,10 @@ async fn authority_transport_preserves_exact_repost_and_conditional_evidence() -
     Ok(())
 }
 
-async fn extract_once(harness: &BoardSourceHarness) -> TestResult<BoardExtractionOutput> {
+async fn extract_once(
+    harness: &BoardSourceHarness,
+    store: &market_squawk_platform::SealedResearchJournalStore,
+) -> TestResult<BoardSealedPublication> {
     let deadline = system_timestamp()?.checked_add_nanos(60_000_000_000)?;
     let discovery = harness
         .source
@@ -609,14 +645,15 @@ async fn extract_once(harness: &BoardSourceHarness) -> TestResult<BoardExtractio
             market_squawk_sources::SourceError::InvalidProtocolState
         ))
     ));
-    let output = harness
+    let (pending, seal_request) = harness
         .source
-        .extract_with_evidence(
+        .extract_for_sealing(
             harness.authority.clone(),
             extraction_request,
             CancellationToken::new(),
         )
         .await?;
+    let output = pending.try_rejoin(seal_request.seal(store)?)?;
     assert!(
         harness
             .source

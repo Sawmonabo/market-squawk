@@ -1821,6 +1821,7 @@ pub(super) const fn native_implementation_name(
             "coinbase_exchange_direct_v1"
         }
         ProviderNativeLineageImplementation::EiaSeriesV1 => "eia_series_v1",
+        ProviderNativeLineageImplementation::FederalReserveH15V1 => "federal_reserve_h15_v1",
         ProviderNativeLineageImplementation::FredAlfredSeriesObservationsV1 => {
             "fred_alfred_series_observations_v1"
         }
@@ -1855,6 +1856,7 @@ pub(super) fn parse_native_implementation(
             Ok(ProviderNativeLineageImplementation::CoinbaseExchangeDirectV1)
         }
         "eia_series_v1" => Ok(ProviderNativeLineageImplementation::EiaSeriesV1),
+        "federal_reserve_h15_v1" => Ok(ProviderNativeLineageImplementation::FederalReserveH15V1),
         "fred_alfred_series_observations_v1" => {
             Ok(ProviderNativeLineageImplementation::FredAlfredSeriesObservationsV1)
         }

@@ -41,6 +41,8 @@ pub enum ProviderNativeLineageImplementation {
     CoinbaseExchangeDirectV1,
     /// EIA series observation semantics encoder v1.
     EiaSeriesV1,
+    /// Federal Reserve Board H.15 observation semantics encoder v1.
+    FederalReserveH15V1,
     /// FRED/ALFRED series-observation semantics encoder v1.
     FredAlfredSeriesObservationsV1,
     /// Kraken Spot public market-data semantics encoder v1.
@@ -79,6 +81,9 @@ impl ProviderNativeLineageImplementation {
                 b"market-squawk/coinbase-exchange-direct/provider-native-lineage/v1"
             }
             Self::EiaSeriesV1 => b"market-squawk/eia/provider-native-lineage/v1",
+            Self::FederalReserveH15V1 => {
+                b"market-squawk/federal-reserve-h15/provider-native-lineage/v1"
+            }
             Self::FredAlfredSeriesObservationsV1 => {
                 b"market-squawk/fred-alfred-series-observations/provider-native-lineage/v1"
             }
@@ -113,6 +118,7 @@ impl ProviderNativeLineageImplementation {
             Self::CoinbaseAdvancedTradeV1 => 17,
             Self::CoinbaseExchangeDirectV1 => 18,
             Self::EiaSeriesV1 => 4,
+            Self::FederalReserveH15V1 => 23,
             Self::FredAlfredSeriesObservationsV1 => 20,
             Self::KrakenSpotV1 => 19,
             Self::NasdaqSymbolDirectoryV1 => 22,

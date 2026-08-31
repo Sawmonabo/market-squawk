@@ -3,7 +3,7 @@
 //!
 //! HTTPS acquisition is admitted only through application-issued shared extraction authority. The
 //! crate invents no generic API or numeric provider rate, and rich extraction retains exact bytes
-//! for the application's shared raw-capture seal before canonical publication.
+//! for a caller-owned shared raw-capture seal before any canonical publication handoff.
 
 mod authority;
 mod contract;
@@ -44,8 +44,8 @@ pub use publication::{
     BoardRevisionEvidence, BoardSeriesReplacement, BoardVintageCapability,
 };
 pub use source::{
-    BoardDatasetProfile, BoardExtractionError, BoardExtractionOutput, BoardSource,
-    BoardSourceError, BoardSourceHealth, BoardStructuralArtifact,
+    BoardDatasetProfile, BoardExtractionError, BoardPendingExtractionSeal, BoardSealedPublication,
+    BoardSource, BoardSourceError, BoardSourceHealth, BoardStructuralArtifact,
 };
 pub use transport::{
     BoardConditionalRequest, BoardHttpReceipt, BoardHttpValidators, BoardNotModifiedReceipt,
