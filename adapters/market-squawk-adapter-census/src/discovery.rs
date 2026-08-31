@@ -336,8 +336,7 @@ impl CensusDatasetCatalog {
                 // The global catalog also contains non-year catalog records. Their bounded path
                 // and optional API distribution are retained in the sealed source document, but
                 // cannot become a CensusDataset without inventing a vintage coordinate.
-                distribution_api_url(entry, limits)
-                    .map_err(catalog_failure(CensusCatalogFailurePredicate::Distribution))?;
+                validate_timeless_catalog_entry(entry, limits)?;
                 continue;
             };
             if expected_vintage
@@ -1173,6 +1172,36 @@ fn catalog_vintage_diagnosed(
     }
 }
 
+fn validate_timeless_catalog_entry(
+    object: &Map<String, Value>,
+    limits: CensusParseLimits,
+) -> Result<(), CensusCatalogParseFailure> {
+    optional_text(object, "title", limits)
+        .map_err(catalog_failure(CensusCatalogFailurePredicate::Title))?;
+    optional_text(object, "description", limits)
+        .map_err(catalog_failure(CensusCatalogFailurePredicate::Description))?;
+    distribution_api_url(object, limits)
+        .map_err(catalog_failure(CensusCatalogFailurePredicate::Distribution))?;
+    optional_text(object, "c_variablesLink", limits).map_err(catalog_failure(
+        CensusCatalogFailurePredicate::VariablesLink,
+    ))?;
+    optional_text(object, "c_groupsLink", limits)
+        .map_err(catalog_failure(CensusCatalogFailurePredicate::GroupsLink))?;
+    optional_text(object, "c_geographyLink", limits).map_err(catalog_failure(
+        CensusCatalogFailurePredicate::GeographyLink,
+    ))?;
+    optional_bool(object, "c_isAvailable").map_err(catalog_failure(
+        CensusCatalogFailurePredicate::AvailableFlag,
+    ))?;
+    optional_bool(object, "c_isAggregate").map_err(catalog_failure(
+        CensusCatalogFailurePredicate::AggregateFlag,
+    ))?;
+    optional_bool(object, "c_isTimeseries").map_err(catalog_failure(
+        CensusCatalogFailurePredicate::TimeSeriesFlag,
+    ))?;
+    Ok(())
+}
+
 fn optional_u64(object: &Map<String, Value>, key: &str) -> Result<Option<u64>, CensusAdapterError> {
     object
         .get(key)
@@ -1423,20 +1452,29 @@ fn distribution_api_url(
     if distributions.len() > limits.max_columns() {
         return Err(CensusAdapterError::ResourceLimitExceeded);
     }
+    let mut admitted_api_url = None;
     for distribution in distributions {
         let distribution = distribution
             .as_object()
             .ok_or(CensusAdapterError::SchemaDrift)?;
-        if distribution
+        let format = distribution
             .get("format")
-            .and_then(Value::as_str)
-            .is_some_and(|format| format.eq_ignore_ascii_case("api"))
-            && let Some(access_url) = distribution.get("accessURL")
+            .filter(|value| !value.is_null())
+            .map(|value| bounded_str(value, limits))
+            .transpose()?;
+        let access_url = distribution
+            .get("accessURL")
+            .filter(|value| !value.is_null())
+            .map(|value| bounded_str(value, limits))
+            .transpose()?;
+        if admitted_api_url.is_none()
+            && format.is_some_and(|format| format.eq_ignore_ascii_case("api"))
+            && let Some(access_url) = access_url
         {
-            return bounded_str(access_url, limits).map(|value| Some(value.to_owned()));
+            admitted_api_url = Some(access_url.to_owned());
         }
     }
-    Ok(None)
+    Ok(admitted_api_url)
 }
 
 fn parse_date(value: &str) -> Result<CalendarDate, CensusAdapterError> {
