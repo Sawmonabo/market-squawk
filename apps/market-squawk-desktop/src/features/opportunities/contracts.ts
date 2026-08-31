@@ -55,10 +55,6 @@ const nonnegativeIntegerSchema = canonicalIntegerSchema.refine(
   (value) => BigInt(value) >= 0n,
   "Expected a nonnegative integer.",
 )
-const positiveIntegerSchema = canonicalIntegerSchema.refine(
-  (value) => BigInt(value) > 0n,
-  "Expected a positive integer.",
-)
 const currencySchema = z.string().regex(/^[A-Z]{3}$/)
 const nonnegativeU32Schema = z.number().int().min(0).max(MAXIMUM_U32)
 const positiveU32Schema = z.number().int().min(1).max(MAXIMUM_U32)
@@ -211,11 +207,13 @@ const priceSummarySchema = z
 
 const coverageKinds = [
   "current_market",
-  "non_harmonic_features",
+  "broader_research",
   "price_pattern",
   "forecast",
+  "financial_model",
   "valuation",
   "historical_test",
+  "out_of_sample",
   "liquidity",
   "portfolio_risk",
 ] as const
@@ -351,12 +349,23 @@ const evidenceSummarySchema = z
   .object({
     coverage: coverageSchema,
     calibration: calibrationSchema,
-    outOfSample: z
-      .object({
-        state: z.literal("not_established"),
-        summary: productTextSchema,
-      })
-      .strict(),
+    outOfSample: z.discriminatedUnion("state", [
+      z
+        .object({
+          state: z.literal("available"),
+          completedObservations: positiveU32Schema,
+          totalSignals: positiveU32Schema,
+          folds: positiveU32Schema,
+          completionCoveragePercent: percentageSchema,
+          evaluatedFrom: canonicalRfc3339Schema,
+          evaluatedThrough: canonicalRfc3339Schema,
+          summary: productTextSchema,
+        })
+        .strict(),
+      z
+        .object({ state: z.literal("unavailable"), summary: productTextSchema })
+        .strict(),
+    ]),
     historicalTest: historicalTestSchema.nullable(),
     costs: costSummarySchema,
     uncertainty: uncertaintySchema,
@@ -375,11 +384,13 @@ const evidenceFamilySchema = z.discriminatedUnion("state", [
 const analyticalEvidenceSchema = z
   .object({
     currentMarket: evidenceFamilySchema,
-    nonHarmonicFeatures: evidenceFamilySchema,
+    broaderResearch: evidenceFamilySchema,
     pricePattern: evidenceFamilySchema,
     forecast: evidenceFamilySchema,
-    financialModelAndValuation: evidenceFamilySchema,
+    financialModel: evidenceFamilySchema,
+    valuation: evidenceFamilySchema,
     historicalTest: evidenceFamilySchema,
+    outOfSample: evidenceFamilySchema,
     liquidity: evidenceFamilySchema,
     portfolioRisk: evidenceFamilySchema,
     combination: z
@@ -405,7 +416,7 @@ const liquiditySchema = z.discriminatedUnion("state", [
     .strict(),
 ])
 
-const portfolioImpactSchema = z.discriminatedUnion("state", [
+const portfolioContextSchema = z.discriminatedUnion("state", [
   z
     .object({
       state: z.literal("available"),
@@ -548,8 +559,8 @@ const lotRangeSchema = z.union([
   z
     .object({
       kind: z.literal("available"),
-      lower: positiveIntegerSchema,
-      upper: positiveIntegerSchema,
+      lower: nonnegativeIntegerSchema,
+      upper: nonnegativeIntegerSchema,
     })
     .strict()
     .superRefine((value, context) => {
@@ -776,7 +787,7 @@ export const investmentAnalysisSchema = z
     evidenceSummary: evidenceSummarySchema,
     analyticalEvidence: analyticalEvidenceSchema,
     liquidity: liquiditySchema,
-    portfolioImpact: portfolioImpactSchema,
+    portfolioContext: portfolioContextSchema,
     outcomeProjection: outcomeProjectionSchema.nullable(),
     sizing: sizingSchema.nullable(),
     virtualPaperEligibility: virtualPaperEligibilitySchema,
@@ -838,22 +849,24 @@ export const investmentAnalysisSchema = z
       })
     }
     if (
-      analysis.portfolioImpact.state === "available" &&
-      analysis.portfolioImpact.portfolioLabel !== analysis.portfolioLabel
+      analysis.portfolioContext.state === "available" &&
+      analysis.portfolioContext.portfolioLabel !== analysis.portfolioLabel
     ) {
       context.addIssue({
         code: "custom",
-        path: ["portfolioImpact", "portfolioLabel"],
-        message: "The portfolio-impact advisory belongs to a different portfolio.",
+        path: ["portfolioContext", "portfolioLabel"],
+        message: "The portfolio context belongs to a different portfolio.",
       })
     }
     const evidenceFamilies = [
       ["current_market", analysis.analyticalEvidence.currentMarket],
-      ["non_harmonic_features", analysis.analyticalEvidence.nonHarmonicFeatures],
+      ["broader_research", analysis.analyticalEvidence.broaderResearch],
       ["price_pattern", analysis.analyticalEvidence.pricePattern],
       ["forecast", analysis.analyticalEvidence.forecast],
-      ["valuation", analysis.analyticalEvidence.financialModelAndValuation],
+      ["financial_model", analysis.analyticalEvidence.financialModel],
+      ["valuation", analysis.analyticalEvidence.valuation],
       ["historical_test", analysis.analyticalEvidence.historicalTest],
+      ["out_of_sample", analysis.analyticalEvidence.outOfSample],
       ["liquidity", analysis.analyticalEvidence.liquidity],
       ["portfolio_risk", analysis.analyticalEvidence.portfolioRisk],
     ] as const
@@ -882,7 +895,7 @@ export const investmentAnalysisSchema = z
       [analysis.priceSummary.current, analysis.analyticalEvidence.currentMarket.state],
       [
         analysis.priceSummary.fairValue,
-        analysis.analyticalEvidence.financialModelAndValuation.state,
+        analysis.analyticalEvidence.valuation.state,
       ],
       [analysis.priceSummary.scenarios, analysis.analyticalEvidence.forecast.state],
       [analysis.evidenceSummary.historicalTest, analysis.analyticalEvidence.historicalTest.state],
@@ -893,7 +906,8 @@ export const investmentAnalysisSchema = z
           (structured === null ? "unavailable" : "available") !== state,
       ) ||
       analysis.liquidity.state !== analysis.analyticalEvidence.liquidity.state ||
-      analysis.portfolioImpact.state !== analysis.analyticalEvidence.portfolioRisk.state
+      analysis.portfolioContext.state !== analysis.analyticalEvidence.portfolioRisk.state ||
+      analysis.evidenceSummary.outOfSample.state !== analysis.analyticalEvidence.outOfSample.state
     ) {
       context.addIssue({
         code: "custom",
@@ -906,8 +920,10 @@ export const investmentAnalysisSchema = z
       [
         analysis.analyticalEvidence.currentMarket,
         analysis.analyticalEvidence.forecast,
-        analysis.analyticalEvidence.financialModelAndValuation,
+        analysis.analyticalEvidence.financialModel,
+        analysis.analyticalEvidence.valuation,
         analysis.analyticalEvidence.historicalTest,
+        analysis.analyticalEvidence.outOfSample,
         analysis.analyticalEvidence.liquidity,
         analysis.analyticalEvidence.portfolioRisk,
       ].some((family) => family.state !== "available")

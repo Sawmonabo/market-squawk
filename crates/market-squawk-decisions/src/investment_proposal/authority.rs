@@ -11,7 +11,8 @@ use super::digest::{
     hash_policy, hash_proposal_id,
 };
 use super::evidence::{
-    CostAdjustedPitBacktestEvidence, InvestmentAnalysisEvidence, LiquidityEvidence,
+    ChronologicalOutOfSampleEvidence, CostAdjustedPitBacktestEvidence, FinancialModelEvidence,
+    HarmonicPatternEvidenceReceipt, InvestmentAnalysisEvidence, LiquidityEvidence,
     MarketReferenceEvidence, PortfolioPositionState, PortfolioRiskEvidence, PriceForecastEvidence,
     ProposalEvidenceWindow, ValuationEvidence,
 };
@@ -35,7 +36,10 @@ struct AdmittedEvidence<'a> {
     market: &'a MarketReferenceEvidence,
     forecast: &'a PriceForecastEvidence,
     valuation: &'a ValuationEvidence,
+    financial_model: &'a FinancialModelEvidence,
     backtest: &'a CostAdjustedPitBacktestEvidence,
+    out_of_sample: &'a ChronologicalOutOfSampleEvidence,
+    harmonic_pattern: Option<&'a HarmonicPatternEvidenceReceipt>,
     liquidity: &'a LiquidityEvidence,
     portfolio_risk: &'a PortfolioRiskEvidence,
 }
@@ -132,6 +136,24 @@ impl InvestmentProposalAuthority {
                 expires_at,
                 NoActionReason::BacktestBelowPolicy,
                 ProposalInvalidator::BacktestPolicyBreach,
+            );
+        }
+        if admitted.out_of_sample.completed_observations()
+            < policy.semantics.minimum_backtest_observations
+            || admitted.out_of_sample.fold_count() < policy.semantics.minimum_backtest_trials
+            || admitted.out_of_sample.completion_coverage_ppm()
+                < policy.semantics.minimum_oos_completion_coverage_ppm
+        {
+            return no_action(
+                evidence,
+                policy,
+                analysis_id,
+                evidence_digest,
+                confidence,
+                horizon_at,
+                expires_at,
+                NoActionReason::OutOfSampleBelowPolicy,
+                ProposalInvalidator::OutOfSamplePolicyBreach,
             );
         }
         if admitted.liquidity.quoted_spread > policy.semantics.maximum_liquidity_spread
@@ -402,8 +424,16 @@ fn effective_proposal_expiry(
             evidence.valuation.window,
         ),
         (
+            RecommendationEvidenceKind::FinancialModel,
+            evidence.financial_model.window(),
+        ),
+        (
             RecommendationEvidenceKind::Backtest,
             evidence.backtest.window,
+        ),
+        (
+            RecommendationEvidenceKind::OutOfSample,
+            evidence.out_of_sample.window(),
         ),
         (
             RecommendationEvidenceKind::Liquidity,
@@ -414,15 +444,29 @@ fn effective_proposal_expiry(
             evidence.portfolio_risk.window,
         ),
     ];
-    windows
-        .into_iter()
-        .try_fold(policy_expiry, |expires_at, (kind, window)| {
+    let expires_at =
+        windows
+            .into_iter()
+            .try_fold(policy_expiry, |expires_at, (kind, window)| {
+                let freshness_expiry = window
+                    .observed_at
+                    .checked_add_nanos(policy.maximum_age_nanos(kind))
+                    .map_err(|_| InvestmentProposalError::ArithmeticOverflow)?;
+                Ok(expires_at.min(window.expires_at).min(freshness_expiry))
+            })?;
+    match evidence.harmonic_pattern {
+        Some(pattern) => {
+            let window = pattern.window();
             let freshness_expiry = window
                 .observed_at
-                .checked_add_nanos(policy.maximum_age_nanos(kind))
+                .checked_add_nanos(
+                    policy.maximum_age_nanos(RecommendationEvidenceKind::HarmonicPattern),
+                )
                 .map_err(|_| InvestmentProposalError::ArithmeticOverflow)?;
             Ok(expires_at.min(window.expires_at).min(freshness_expiry))
-        })
+        }
+        None => Ok(expires_at),
+    }
 }
 
 fn admit_evidence<'a>(
@@ -506,6 +550,37 @@ fn admit_evidence<'a>(
         });
     }
 
+    let financial_model =
+        evidence
+            .financial_model
+            .as_ref()
+            .ok_or(ProposalUnavailableReason::MissingEvidence(
+                RecommendationEvidenceKind::FinancialModel,
+            ))?;
+    admit_binding(
+        evidence,
+        RecommendationEvidenceKind::FinancialModel,
+        financial_model.instrument_id(),
+        financial_model.range().central().currency(),
+        financial_model.window(),
+        policy,
+    )?;
+    if financial_model.account_id() != evidence.account_id {
+        return Err(ProposalUnavailableReason::AccountMismatch {
+            expected: evidence.account_id,
+            actual: financial_model.account_id(),
+        });
+    }
+    if financial_model.horizon_at() != horizon_at {
+        return Err(ProposalUnavailableReason::FinancialModelHorizonMismatch {
+            expected: horizon_at,
+            actual: financial_model.horizon_at(),
+        });
+    }
+    if financial_model.range().central() != valuation.fair_value {
+        return Err(ProposalUnavailableReason::FinancialModelValuationMismatch);
+    }
+
     let backtest = evidence
         .backtest
         .as_ref()
@@ -539,6 +614,52 @@ fn admit_evidence<'a>(
             required: policy.semantics.minimum_backtest_trials,
             actual: backtest.trials,
         });
+    }
+
+    let out_of_sample =
+        evidence
+            .out_of_sample
+            .as_ref()
+            .ok_or(ProposalUnavailableReason::MissingEvidence(
+                RecommendationEvidenceKind::OutOfSample,
+            ))?;
+    admit_binding(
+        evidence,
+        RecommendationEvidenceKind::OutOfSample,
+        out_of_sample.instrument_id(),
+        out_of_sample.currency(),
+        out_of_sample.window(),
+        policy,
+    )?;
+    if out_of_sample.outcome_horizon_nanos() != policy.semantics.horizon_nanos {
+        return Err(ProposalUnavailableReason::OutOfSampleHorizonMismatch {
+            expected_nanos: policy.semantics.horizon_nanos,
+            actual_nanos: out_of_sample.outcome_horizon_nanos(),
+        });
+    }
+    if out_of_sample.dataset_identity() != backtest.dataset_identity
+        || out_of_sample.signal_plan_identity() != backtest.command_identity
+        || out_of_sample.aggregate_identity() != backtest.terminal_identity
+        || out_of_sample.study_identity() != backtest.report_identity
+    {
+        return Err(ProposalUnavailableReason::OutOfSampleBacktestMismatch);
+    }
+
+    let harmonic_pattern = evidence.harmonic_pattern.as_ref();
+    if let Some(pattern) = harmonic_pattern {
+        admit_binding(
+            evidence,
+            RecommendationEvidenceKind::HarmonicPattern,
+            pattern.instrument_id(),
+            evidence.currency,
+            pattern.window(),
+            policy,
+        )?;
+        if pattern.decision_cutoff() > evidence.as_of {
+            return Err(ProposalUnavailableReason::NotAvailableAtCutoff(
+                RecommendationEvidenceKind::HarmonicPattern,
+            ));
+        }
     }
 
     let liquidity =
@@ -591,7 +712,10 @@ fn admit_evidence<'a>(
         market,
         forecast,
         valuation,
+        financial_model,
         backtest,
+        out_of_sample,
+        harmonic_pattern,
         liquidity,
         portfolio_risk,
     })

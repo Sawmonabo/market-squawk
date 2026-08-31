@@ -6,7 +6,8 @@ use market_squawk_domain::{
 use market_squawk_modeling::{ForecastCentralStatistic, ProductionFeatureRegistry};
 use market_squawk_portfolio::{PortfolioRevisionToken, RebalanceTarget};
 use market_squawk_valuation::{
-    DecisionId, FairValueSelectionReceiptHash, MeasurementId, ValuationAmountBasis,
+    AutomaticValuationMethod, DecisionId, FairValueSelectionReceiptHash, MeasurementId,
+    ValuationAmountBasis,
 };
 use rust_decimal::Decimal;
 use std::{
@@ -17,12 +18,13 @@ use std::{
 use crate::{
     AfterTaxPnlAvailability, AppendOutcome, AsOfSemantics, BenchmarkReturnAvailability,
     CandidateFlag, CandidateId, CandidateInput, CandidatePortfolioSizingState,
-    CandidateSizingConstraints, CapacityRange, ComparisonOperator, CostAdjustedPitBacktestEvidence,
-    DecisionActorId, DecisionAuthority, DecisionContentDigest, DecisionContractError,
-    DecisionDossier, DecisionRepository, DecisionRepositoryError, DecisionRepositoryLimits,
-    DecisionText, Dossier, DossierEvidence, DossierId, DossierReference, DossierSection,
-    ExactFinancialRatio, ExactPositionScale, ExpectedGrossPricePnlAvailability,
-    ExpectedReturnAvailability, FeasibleLotRangeAvailability, FeasibleNotionalRangeAvailability,
+    CandidateSizingConstraints, CapacityRange, ChronologicalOutOfSampleEvidence,
+    ComparisonOperator, CostAdjustedPitBacktestEvidence, DecisionActorId, DecisionAuthority,
+    DecisionContentDigest, DecisionContractError, DecisionDossier, DecisionRepository,
+    DecisionRepositoryError, DecisionRepositoryLimits, DecisionText, Dossier, DossierEvidence,
+    DossierId, DossierReference, DossierSection, ExactFinancialRatio, ExactPositionScale,
+    ExpectedGrossPricePnlAvailability, ExpectedReturnAvailability, FeasibleLotRangeAvailability,
+    FeasibleNotionalRangeAvailability, FinancialModelEvidence, FinancialModelValueRange,
     ForecastCalibrationSummary, ForecastPriceRanges, GeneratedInvestmentProposal,
     GovernedTargetSet, GrossPricePnlAvailability, InvestmentAnalysisEvidence,
     InvestmentAnalysisEvidenceInput, InvestmentOutcomeProjection, InvestmentProjectionAuthority,
@@ -193,6 +195,38 @@ fn proposal_evidence_for_position_with_expected_terminal(
             112,
         )?,
     )?;
+    let financial_model = FinancialModelEvidence::try_recover_projection(
+        instrument_id,
+        account_id,
+        AutomaticValuationMethod::DiscountedCashFlow,
+        FinancialModelValueRange::try_new(
+            money(fair_value_amount - 1_500, "USD")?,
+            money(fair_value_amount, "USD")?,
+            money(fair_value_amount + 1_500, "USD")?,
+        )?,
+        TargetPriceCases::try_new(
+            money(7_000, "USD")?,
+            money(fair_value_amount, "USD")?,
+            money(17_000, "USD")?,
+        )?,
+        TargetPriceRange::try_new(
+            money(fair_value_amount - 1_000, "USD")?,
+            money(fair_value_amount + 1_000, "USD")?,
+        )?,
+        forecast_horizon_at,
+        content_digest(125)?,
+        content_digest(126)?,
+        content_digest(127)?,
+        content_digest(128)?,
+        content_digest(129)?,
+        content_digest(130)?,
+        future_window(
+            as_of.checked_sub_nanos(5 * DAY_NANOS)?,
+            as_of.checked_sub_nanos(4 * DAY_NANOS)?,
+            60,
+            126,
+        )?,
+    )?;
     let backtest = CostAdjustedPitBacktestEvidence::try_new(
         instrument_id,
         Currency::try_from("USD")?,
@@ -212,6 +246,28 @@ fn proposal_evidence_for_position_with_expected_terminal(
         content_digest(116)?,
         content_digest(117)?,
         content_digest(118)?,
+        future_window(
+            as_of.checked_sub_nanos(30 * DAY_NANOS)?,
+            as_of.checked_sub_nanos(29 * DAY_NANOS)?,
+            365,
+            119,
+        )?,
+    )?;
+    let out_of_sample = ChronologicalOutOfSampleEvidence::try_new(
+        instrument_id,
+        Currency::try_from("USD")?,
+        365 * DAY_NANOS,
+        as_of.checked_sub_nanos(120 * DAY_NANOS)?,
+        as_of.checked_sub_nanos(32 * DAY_NANOS)?,
+        as_of.checked_sub_nanos(31 * DAY_NANOS)?,
+        NonZeroU32::new(900).ok_or(DecisionContractError::InvalidBound)?,
+        NonZeroU32::new(1_000).ok_or(DecisionContractError::InvalidBound)?,
+        NonZeroU32::new(10).ok_or(DecisionContractError::InvalidBound)?,
+        900_000,
+        content_digest(113)?,
+        content_digest(114)?,
+        content_digest(115)?,
+        content_digest(116)?,
         future_window(
             as_of.checked_sub_nanos(30 * DAY_NANOS)?,
             as_of.checked_sub_nanos(29 * DAY_NANOS)?,
@@ -257,7 +313,10 @@ fn proposal_evidence_for_position_with_expected_terminal(
             market: Some(market),
             price_forecast: Some(forecast),
             valuation: Some(valuation),
+            financial_model: Some(financial_model),
             backtest: Some(backtest),
+            out_of_sample: Some(out_of_sample),
+            harmonic_pattern: None,
             liquidity: Some(liquidity),
             portfolio_risk: Some(portfolio_risk),
         },

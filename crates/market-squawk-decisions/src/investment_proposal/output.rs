@@ -244,6 +244,11 @@ pub enum ProposalUnavailableReason {
         /// Valuation measurement horizon.
         actual: Timestamp,
     },
+    /// Financial-model evidence did not measure the exact policy horizon.
+    FinancialModelHorizonMismatch {
+        expected: Timestamp,
+        actual: Timestamp,
+    },
     /// Backtest outcomes evaluated a different horizon from the recommendation policy.
     BacktestHorizonMismatch {
         /// Policy-required horizon in nanoseconds.
@@ -251,6 +256,15 @@ pub enum ProposalUnavailableReason {
         /// Evaluated backtest outcome horizon in nanoseconds.
         actual_nanos: i64,
     },
+    /// Independent out-of-sample outcomes evaluated a different policy horizon.
+    OutOfSampleHorizonMismatch {
+        expected_nanos: i64,
+        actual_nanos: i64,
+    },
+    /// The financial-model central value does not match the independently governed valuation.
+    FinancialModelValuationMismatch,
+    /// The chronological OOS receipt does not bind the admitted backtest study identities.
+    OutOfSampleBacktestMismatch,
     /// Forecast calibration did not contain enough completed outcomes.
     InsufficientForecastOutcomes {
         /// Policy minimum.
@@ -292,6 +306,8 @@ pub enum NoActionReason {
     ConflictingForecastAndValuation,
     /// A valid backtest failed cost-adjusted performance, stability, or drawdown policy.
     BacktestBelowPolicy,
+    /// Complete chronological OOS evidence failed sample, fold, or completion-coverage policy.
+    OutOfSampleBelowPolicy,
     /// Complete liquidity evidence failed spread or capacity policy.
     LiquidityBelowPolicy,
     /// Complete portfolio evidence failed account-specific risk capacity policy.
@@ -311,6 +327,8 @@ pub enum ProposalInvalidator {
     ForecastValuationConflict,
     /// Backtest performance, stability, or drawdown is outside policy.
     BacktestPolicyBreach,
+    /// Independent chronological OOS evidence is outside policy.
+    OutOfSamplePolicyBreach,
     /// Liquidity spread or capacity is outside policy.
     LiquidityPolicyBreach,
     /// Portfolio risk capacity is outside policy.

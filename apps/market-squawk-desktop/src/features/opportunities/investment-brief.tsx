@@ -109,7 +109,7 @@ export function InvestmentBrief({
       <AnalyticalEvidence analysis={analysis} />
       <EvidenceSummary analysis={analysis} />
       <OutcomeProjection analysis={analysis} />
-      <PortfolioImpact analysis={analysis} />
+      <PortfolioContext analysis={analysis} />
       <SizingSummary analysis={analysis} />
       <VirtualPaperEligibility analysis={analysis} />
       <RealizedOutcome analysis={analysis} />
@@ -180,19 +180,21 @@ function AnalyticalEvidence({ analysis }: { analysis: InvestmentAnalysis }) {
       <dl className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
         <Fact label="Current market" value={evidenceFamily(evidence.currentMarket)} />
         <Fact
-          label="Other (non-harmonic) features"
-          value={evidenceFamily(evidence.nonHarmonicFeatures)}
+          label="Broader research evidence"
+          value={evidenceFamily(evidence.broaderResearch)}
         />
         <Fact
-          label="Harmonic price-pattern feature"
+          label="Price-pattern evidence"
           value={evidenceFamily(evidence.pricePattern)}
         />
         <Fact label="Forecast" value={evidenceFamily(evidence.forecast)} />
         <Fact
-          label="Financial model and valuation"
-          value={evidenceFamily(evidence.financialModelAndValuation)}
+          label="Financial model"
+          value={evidenceFamily(evidence.financialModel)}
         />
+        <Fact label="Governed valuation" value={evidenceFamily(evidence.valuation)} />
         <Fact label="Historical test" value={evidenceFamily(evidence.historicalTest)} />
+        <Fact label="Independent evaluation" value={evidenceFamily(evidence.outOfSample)} />
         <Fact label="Liquidity" value={evidenceFamily(evidence.liquidity)} />
         <Fact label="Portfolio risk" value={evidenceFamily(evidence.portfolioRisk)} />
         <Fact
@@ -215,7 +217,7 @@ function EvidenceSummary({ analysis }: { analysis: InvestmentAnalysis }) {
       <dl className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
         <Fact label="Evidence coverage" value={evidence.coverage.summary} />
         <Fact label="Forecast calibration" value={evidence.calibration.summary} />
-        <Fact label="Out-of-sample evidence" value={evidence.outOfSample.summary} />
+        <Fact label="Independent evaluation" value={evidence.outOfSample.summary} />
         <Fact label="Historical cost treatment" value={evidence.costs.summary} />
         <Fact label="Current liquidity" value={analysis.liquidity.summary} />
         <Fact label="Uncertainty" value={uncertainty.summary} />
@@ -290,7 +292,7 @@ function EvidenceSummary({ analysis }: { analysis: InvestmentAnalysis }) {
             value={formatPercent(analysis.liquidity.quotedSpreadPercent)}
           />
           <Fact
-            label="Usable policy-relative capacity"
+            label="Usable trading capacity"
             value={formatPercent(analysis.liquidity.policyRelativeCapacityPercent)}
           />
           <Fact label="Liquidity meaning" value={analysis.liquidity.summary} />
@@ -381,25 +383,25 @@ function OutcomeProjection({ analysis }: { analysis: InvestmentAnalysis }) {
   )
 }
 
-function PortfolioImpact({ analysis }: { analysis: InvestmentAnalysis }) {
-  const impact = analysis.portfolioImpact
+function PortfolioContext({ analysis }: { analysis: InvestmentAnalysis }) {
+  const context = analysis.portfolioContext
   return (
-    <Disclosure title="Portfolio impact">
-      {impact.state === "available" ? (
+    <Disclosure title="Portfolio and risk context">
+      {context.state === "available" ? (
         <dl className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-          <Fact label="Selected portfolio" value={impact.portfolioLabel} />
+          <Fact label="Selected portfolio" value={context.portfolioLabel} />
           <Fact
             label="Current position"
-            value={impact.positionState === "current_position" ? "Position held" : "No position"}
+            value={context.positionState === "current_position" ? "Position held" : "No position"}
           />
           <Fact
             label="Saved risk capacity"
-            value={formatPercent(impact.riskCapacityPercent)}
+            value={formatPercent(context.riskCapacityPercent)}
           />
-          <Fact label="Impact meaning" value={impact.summary} />
+          <Fact label="Context meaning" value={context.summary} />
         </dl>
       ) : (
-        <p className="text-xs leading-5 text-muted-foreground">{impact.summary}</p>
+        <p className="text-xs leading-5 text-muted-foreground">{context.summary}</p>
       )}
     </Disclosure>
   )

@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use market_squawk_analytics::HARMONIC_PATTERN_FEATURE_NAME;
 use market_squawk_data::{MarketDataInstrumentCatalogError, MarketDataInstrumentReadCapability};
 use market_squawk_decisions::{
     CostAdjustedPitBacktestEvidence, ExactFinancialRatio, ExpectedGrossPricePnlAvailability,
@@ -317,7 +316,7 @@ fn investment_analysis_value(
         "evidenceSummary": evidence_summary_value(decision),
         "analyticalEvidence": analytical_evidence_value(decision),
         "liquidity": liquidity_value(evidence),
-        "portfolioImpact": portfolio_impact_value(evidence, &portfolio_label),
+        "portfolioContext": portfolio_context_value(evidence, &portfolio_label),
         "outcomeProjection": read.outcome_projection.as_ref().map(outcome_projection_value),
         "sizing": read.sizing_projection.as_ref().map(sizing_projection_value),
         "virtualPaperEligibility": virtual_paper_eligibility_value(),
@@ -398,7 +397,7 @@ fn outcome_projection_value(value: &InvestmentOutcomeProjection) -> Value {
         "startingPrice": money_value(value.mark()),
         "endsAt": super::product_timestamp(value.horizon_at()),
         "positionScale": value.position_scale().map(|scale| json!({
-            "quantityLots": scale.quantity().get(),
+            "quantityLots": scale.quantity().get().to_string(),
             "summary": "Gross dollar ranges use this exact saved quantity and instrument scale."
         })),
         "downside": gross_range_value(value.downside()),
@@ -538,7 +537,7 @@ fn signed_money_value(money: Money) -> Value {
 fn sizing_projection_value(value: &InvestmentSizingProjection) -> Value {
     json!({
         "evaluatedAt": super::product_timestamp(value.inputs().evaluated_at()),
-        "currentLots": value.inputs().portfolio().current_lots().get(),
+        "currentLots": value.inputs().portfolio().current_lots().get().to_string(),
         "hardFeasibleLots": feasible_lots_value(value.hard_feasible_lots()),
         "preferredFeasibleLots": feasible_lots_value(value.preferred_feasible_lots()),
         "summary": "These are research sizing ranges, not an order or a selected target.",
@@ -549,8 +548,8 @@ fn feasible_lots_value(value: &FeasibleLotRangeAvailability) -> Value {
     match value {
         FeasibleLotRangeAvailability::Available(range) => json!({
             "kind": "available",
-            "lower": range.lower().get(),
-            "upper": range.upper().get(),
+            "lower": range.lower().get().to_string(),
+            "upper": range.upper().get().to_string(),
         }),
         FeasibleLotRangeAvailability::Unavailable(reasons) => json!({
             "kind": "unavailable",
@@ -775,10 +774,7 @@ fn evidence_summary_value(decision: &InvestmentProposalDecision) -> Value {
     json!({
         "coverage": coverage_summary_value(evidence),
         "calibration": calibration_summary_value(evidence),
-        "outOfSample": {
-            "state": "not_established",
-            "summary": "This saved analysis does not label any result as a separate out-of-sample test."
-        },
+        "outOfSample": out_of_sample_summary_value(evidence),
         "historicalTest": evidence.backtest().map(historical_test_summary_value),
         "costs": cost_summary_value(evidence.backtest()),
         "uncertainty": uncertainty_summary_value(decision),
@@ -787,7 +783,7 @@ fn evidence_summary_value(decision: &InvestmentProposalDecision) -> Value {
 
 fn analytical_evidence_value(decision: &InvestmentProposalDecision) -> Value {
     let evidence = decision.evidence();
-    let (non_harmonic_features, price_pattern) = feature_family_availability(evidence);
+    let broader_research = broader_research_availability(evidence);
     let combined = !matches!(decision, InvestmentProposalDecision::Unavailable(_));
     json!({
         "currentMarket": evidence_family_value(
@@ -795,22 +791,27 @@ fn analytical_evidence_value(decision: &InvestmentProposalDecision) -> Value {
             "An eligible current market observation anchored the saved analysis.",
             "An eligible current market observation was not available."
         ),
-        "nonHarmonicFeatures": evidence_family_value(
-            non_harmonic_features,
-            "Observed non-harmonic research inputs were retained with the selected candidate; no one input set the recommendation.",
-            "No observed non-harmonic screening contribution was retained with the selected candidate."
+        "broaderResearch": evidence_family_value(
+            broader_research,
+            "Broader research inputs were retained with the selected candidate; no one input set the recommendation.",
+            "No qualifying broader research contribution was retained with the selected candidate."
         ),
         "pricePattern": evidence_family_value(
-            price_pattern,
-            "An observed harmonic price-pattern research input was retained with the selected candidate; it did not set evidence reliability or create an action by itself.",
-            "No observed harmonic price-pattern screening contribution was retained with the selected candidate."
+            evidence.harmonic_pattern().is_some(),
+            "A confirmed price-pattern observation was retained; it did not set evidence reliability or create an action by itself.",
+            "No current valid price pattern was retained."
         ),
         "forecast": evidence_family_value(
             evidence.price_forecast().is_some(),
             "A horizon-aligned calibrated price forecast contributed to the decision.",
             "A horizon-aligned calibrated price forecast was not available."
         ),
-        "financialModelAndValuation": evidence_family_value(
+        "financialModel": evidence_family_value(
+            evidence.financial_model().is_some(),
+            "A financial model using information available at the time, explicit assumptions, scenarios, and sensitivity contributed to the decision.",
+            "A qualifying financial model using information available at the time was not available."
+        ),
+        "valuation": evidence_family_value(
             evidence.valuation().is_some(),
             "An independently governed per-investment valuation contributed to the decision.",
             "An independently governed valuation was not available."
@@ -820,20 +821,25 @@ fn analytical_evidence_value(decision: &InvestmentProposalDecision) -> Value {
             "A cost-adjusted point-in-time historical test contributed to the decision.",
             "A qualifying cost-adjusted point-in-time historical test was not available."
         ),
+        "outOfSample": evidence_family_value(
+            evidence.out_of_sample().is_some(),
+            "Chronological independent historical results contributed to the decision.",
+            "Qualifying independent historical results were not available."
+        ),
         "liquidity": evidence_family_value(
             evidence.liquidity().is_some(),
-            "Current spread and policy-relative liquidity capacity contributed to the decision.",
+            "Current spread and usable trading capacity contributed to the decision.",
             "Qualifying liquidity evidence was not available."
         ),
         "portfolioRisk": evidence_family_value(
             evidence.portfolio_risk().is_some(),
-            "The explicitly selected portfolio revision and non-reserving risk advisory contributed to the decision.",
+            "The saved portfolio position and remaining risk capacity contributed to the decision.",
             "Qualifying selected-portfolio risk evidence was not available."
         ),
         "combination": {
             "state": if combined { "multi_evidence" } else { "insufficient" },
             "summary": if combined {
-                "The saved decision combined forecast, valuation, historical testing, market integrity, liquidity, and portfolio risk. Research features can support selection but cannot produce evidence reliability on their own."
+                "The saved decision combined forecast, financial modeling, governed valuation, chronological historical testing, market integrity, liquidity, and portfolio risk. Research patterns can support interpretation but cannot produce evidence reliability on their own."
             } else {
                 "The independent evidence families could not support a recommendation. No model, feature, or market observation was promoted into confidence by itself."
             }
@@ -841,22 +847,13 @@ fn analytical_evidence_value(decision: &InvestmentProposalDecision) -> Value {
     })
 }
 
-fn feature_family_availability(evidence: &InvestmentAnalysisEvidence) -> (bool, bool) {
-    let mut non_harmonic = false;
-    let mut harmonic = false;
-    if let Some(candidate) = evidence.selected_candidate() {
-        for contribution in candidate.score_contributions() {
-            if contribution.observed().is_none() {
-                continue;
-            }
-            if contribution.binding().key().name() == HARMONIC_PATTERN_FEATURE_NAME {
-                harmonic = true;
-            } else {
-                non_harmonic = true;
-            }
-        }
-    }
-    (non_harmonic, harmonic)
+fn broader_research_availability(evidence: &InvestmentAnalysisEvidence) -> bool {
+    evidence.selected_candidate().is_some_and(|candidate| {
+        candidate
+            .score_contributions()
+            .iter()
+            .any(|contribution| contribution.observed().is_some())
+    })
 }
 
 fn evidence_family_value(
@@ -885,7 +882,7 @@ fn liquidity_value(evidence: &InvestmentAnalysisEvidence) -> Value {
     }
 }
 
-fn portfolio_impact_value(evidence: &InvestmentAnalysisEvidence, portfolio_label: &str) -> Value {
+fn portfolio_context_value(evidence: &InvestmentAnalysisEvidence, portfolio_label: &str) -> Value {
     match evidence.portfolio_risk() {
         Some(value) => {
             let position_state = match value.position_state() {
@@ -897,12 +894,12 @@ fn portfolio_impact_value(evidence: &InvestmentAnalysisEvidence, portfolio_label
                 "portfolioLabel": portfolio_label,
                 "positionState": position_state,
                 "riskCapacityPercent": percentage_from_ppm(value.risk_capacity_ppm()),
-                "summary": "This portfolio-impact estimate belongs to the exact saved portfolio snapshot. It does not change holdings or set aside risk."
+                "summary": "This is the exact saved portfolio position and remaining risk-capacity context. It is not a proposal-bound incremental impact calculation and does not change holdings or set aside risk."
             })
         }
         None => json!({
             "state": "unavailable",
-            "summary": "Portfolio impact is unavailable because no qualifying selected-portfolio risk advisory was retained."
+            "summary": "Portfolio and risk context is unavailable because no qualifying selected-portfolio risk advisory was retained."
         }),
     }
 }
@@ -918,14 +915,16 @@ fn virtual_paper_eligibility_value() -> Value {
 }
 
 fn coverage_summary_value(evidence: &InvestmentAnalysisEvidence) -> Value {
-    let (non_harmonic_features, price_pattern) = feature_family_availability(evidence);
+    let broader_research = broader_research_availability(evidence);
     let items = [
         ("current_market", evidence.market().is_some()),
-        ("non_harmonic_features", non_harmonic_features),
-        ("price_pattern", price_pattern),
+        ("broader_research", broader_research),
+        ("price_pattern", evidence.harmonic_pattern().is_some()),
         ("forecast", evidence.price_forecast().is_some()),
+        ("financial_model", evidence.financial_model().is_some()),
         ("valuation", evidence.valuation().is_some()),
         ("historical_test", evidence.backtest().is_some()),
+        ("out_of_sample", evidence.out_of_sample().is_some()),
         ("liquidity", evidence.liquidity().is_some()),
         ("portfolio_risk", evidence.portfolio_risk().is_some()),
     ];
@@ -956,6 +955,25 @@ fn calibration_summary_value(evidence: &InvestmentAnalysisEvidence) -> Value {
         None => json!({
             "state": "unavailable",
             "summary": "Forecast calibration was not available for this saved analysis."
+        }),
+    }
+}
+
+fn out_of_sample_summary_value(evidence: &InvestmentAnalysisEvidence) -> Value {
+    match evidence.out_of_sample() {
+        Some(value) => json!({
+            "state": "available",
+            "completedObservations": value.completed_observations().get(),
+            "totalSignals": value.total_signals().get(),
+            "folds": value.fold_count().get(),
+            "completionCoveragePercent": percentage_from_ppm(value.completion_coverage_ppm()),
+            "evaluatedFrom": super::product_timestamp(value.evaluation_starts_at()),
+            "evaluatedThrough": super::product_timestamp(value.evaluation_ends_at()),
+            "summary": "These results use chronological independent historical windows aligned to the recommendation horizon; they do not guarantee future profit."
+        }),
+        None => json!({
+            "state": "unavailable",
+            "summary": "Independent historical evidence aligned to the investment horizon was not available, so no investment action can be produced."
         }),
     }
 }
@@ -1087,8 +1105,16 @@ const fn unavailable_reason_summary(reason: ProposalUnavailableReason) -> &'stat
         }
         ProposalUnavailableReason::ForecastHorizonMismatch { .. }
         | ProposalUnavailableReason::ValuationHorizonMismatch { .. }
-        | ProposalUnavailableReason::BacktestHorizonMismatch { .. } => {
+        | ProposalUnavailableReason::FinancialModelHorizonMismatch { .. }
+        | ProposalUnavailableReason::BacktestHorizonMismatch { .. }
+        | ProposalUnavailableReason::OutOfSampleHorizonMismatch { .. } => {
             "Supporting information did not use the same investment horizon."
+        }
+        ProposalUnavailableReason::FinancialModelValuationMismatch => {
+            "The financial model and governed valuation did not describe the same saved value."
+        }
+        ProposalUnavailableReason::OutOfSampleBacktestMismatch => {
+            "The independent evaluation did not match the saved historical study."
         }
         ProposalUnavailableReason::InsufficientForecastOutcomes { .. } => {
             "Too few completed forecast outcomes were available."
@@ -1316,6 +1342,9 @@ const fn no_action_reason_summary(reason: NoActionReason) -> &'static str {
         NoActionReason::BacktestBelowPolicy => {
             "The historical test did not meet the required standard."
         }
+        NoActionReason::OutOfSampleBelowPolicy => {
+            "The independent historical evaluation did not meet the required coverage standard."
+        }
         NoActionReason::LiquidityBelowPolicy => {
             "Available liquidity did not meet the required standard."
         }
@@ -1341,6 +1370,9 @@ const fn invalidator_summary(invalidator: ProposalInvalidator) -> &'static str {
         }
         ProposalInvalidator::BacktestPolicyBreach => {
             "The historical result falls below the required standard."
+        }
+        ProposalInvalidator::OutOfSamplePolicyBreach => {
+            "Independent historical coverage falls below the required standard."
         }
         ProposalInvalidator::LiquidityPolicyBreach => {
             "Liquidity falls below the required standard."

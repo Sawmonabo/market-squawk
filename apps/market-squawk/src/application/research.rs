@@ -122,7 +122,10 @@ pub(crate) use instrument_context::{
 pub(crate) use macro_context::{
     MACRO_GET_CONTEXT, MacroContextOperation, MacroContextReadCapability,
 };
-pub(crate) use macro_features::{MacroFeatureVector, read_macro_feature_vector};
+pub(crate) use macro_features::{
+    MacroFeatureVector, MacroInvestmentContext, read_macro_feature_vector,
+    read_macro_investment_context,
+};
 pub(crate) use market_history::{
     LatestMarketHistoryReadRequest, MAX_MARKET_HISTORY_BARS, MarketHistoryAdjustmentPolicy,
     MarketHistoryBar, MarketHistoryCoverage, MarketHistoryMissingReason,

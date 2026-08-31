@@ -122,7 +122,10 @@ pub(super) fn hash_policy(policy: &RecommendationPolicySemantics) -> [u8; 32] {
     hash.i64(policy.market_max_age_nanos);
     hash.i64(policy.forecast_max_age_nanos);
     hash.i64(policy.valuation_max_age_nanos);
+    hash.i64(policy.financial_model_max_age_nanos);
     hash.i64(policy.backtest_max_age_nanos);
+    hash.i64(policy.out_of_sample_max_age_nanos);
+    hash.i64(policy.harmonic_pattern_max_age_nanos);
     hash.i64(policy.liquidity_max_age_nanos);
     hash.i64(policy.portfolio_risk_max_age_nanos);
     hash.basis_points(policy.bullish_threshold);
@@ -133,6 +136,7 @@ pub(super) fn hash_policy(policy: &RecommendationPolicySemantics) -> [u8; 32] {
     hash.u32(policy.minimum_backtest_observations.get());
     hash.u32(policy.minimum_backtest_trials.get());
     hash.u32(policy.minimum_backtest_stability_ppm);
+    hash.u32(policy.minimum_oos_completion_coverage_ppm);
     hash.basis_points(policy.minimum_cost_adjusted_return);
     hash.basis_points(policy.maximum_backtest_drawdown);
     hash.basis_points(policy.maximum_liquidity_spread);
@@ -168,7 +172,7 @@ pub(super) fn hash_policy(policy: &RecommendationPolicySemantics) -> [u8; 32] {
 }
 
 pub(super) fn hash_evidence(evidence: &InvestmentAnalysisEvidence) -> [u8; 32] {
-    let mut hash = CanonicalHasher::new(b"market-squawk/investment-analysis-evidence/v4");
+    let mut hash = CanonicalHasher::new(b"market-squawk/investment-analysis-evidence/v5");
     hash.instrument(evidence.instrument_id);
     hash.currency(evidence.currency);
     hash.account(evidence.account_id);
@@ -252,6 +256,28 @@ pub(super) fn hash_evidence(evidence: &InvestmentAnalysisEvidence) -> [u8; 32] {
         }
         None => hash.tag(0),
     }
+    match evidence.financial_model {
+        Some(value) => {
+            hash.tag(1);
+            hash.instrument(value.instrument_id());
+            hash.account(value.account_id());
+            hash.tag(automatic_valuation_method_tag(value.method()));
+            hash.money(value.range().lower());
+            hash.money(value.range().central());
+            hash.money(value.range().upper());
+            hash.target_cases(value.scenarios());
+            hash.target_range(value.sensitivity_range());
+            hash.timestamp(value.horizon_at());
+            hash.content(value.pit_input_set_identity());
+            hash.content(value.calculation_identity());
+            hash.content(value.assumptions_identity());
+            hash.content(value.scenario_identity());
+            hash.content(value.sensitivity_identity());
+            hash.content(value.macro_context_identity());
+            hash.window(value.window());
+        }
+        None => hash.tag(0),
+    }
     match evidence.backtest {
         Some(value) => {
             hash.tag(1);
@@ -274,6 +300,51 @@ pub(super) fn hash_evidence(evidence: &InvestmentAnalysisEvidence) -> [u8; 32] {
             hash.content(value.cohort_identity);
             hash.content(value.cost_model_identity);
             hash.window(value.window);
+        }
+        None => hash.tag(0),
+    }
+    match evidence.out_of_sample {
+        Some(value) => {
+            hash.tag(1);
+            hash.instrument(value.instrument_id());
+            hash.currency(value.currency());
+            hash.i64(value.outcome_horizon_nanos());
+            hash.timestamp(value.evaluation_starts_at());
+            hash.timestamp(value.evaluation_ends_at());
+            hash.timestamp(value.simulation_cutoff_at());
+            hash.u32(value.completed_observations().get());
+            hash.u32(value.total_signals().get());
+            hash.u32(value.fold_count().get());
+            hash.u32(value.completion_coverage_ppm());
+            hash.content(value.dataset_identity());
+            hash.content(value.signal_plan_identity());
+            hash.content(value.aggregate_identity());
+            hash.content(value.study_identity());
+            hash.window(value.window());
+        }
+        None => hash.tag(0),
+    }
+    match &evidence.harmonic_pattern {
+        Some(value) => {
+            hash.tag(1);
+            hash.instrument(value.instrument_id());
+            hash.u64(value.timeframe_nanos().get());
+            hash.tag(harmonic_pattern_kind_tag(value.kind()));
+            hash.tag(harmonic_direction_tag(value.direction()));
+            hash.tag(harmonic_quality_tag(value.quality()));
+            hash.i64(value.completion_lower().get());
+            hash.i64(value.completion_upper().get());
+            for target in value.targets() {
+                hash.i64(target.get());
+            }
+            hash.i64(value.invalidation().get());
+            hash.timestamp(value.observation_cutoff());
+            hash.timestamp(value.confirmation_cutoff());
+            hash.timestamp(value.decision_cutoff());
+            hash.timestamp(value.expires_at());
+            hash.0.update(value.implementation_identity().as_bytes());
+            hash.0.update(value.evidence_digest().bytes());
+            hash.window(value.window());
         }
         None => hash.tag(0),
     }
@@ -463,6 +534,44 @@ const fn valuation_amount_basis_tag(value: ValuationAmountBasis) -> u8 {
     }
 }
 
+const fn automatic_valuation_method_tag(
+    value: market_squawk_valuation::AutomaticValuationMethod,
+) -> u8 {
+    match value {
+        market_squawk_valuation::AutomaticValuationMethod::DiscountedCashFlow => 1,
+        market_squawk_valuation::AutomaticValuationMethod::ComparableCompanies => 2,
+        market_squawk_valuation::AutomaticValuationMethod::ResidualIncome => 3,
+        market_squawk_valuation::AutomaticValuationMethod::ForecastDistribution => 4,
+    }
+}
+
+const fn harmonic_pattern_kind_tag(value: market_squawk_analytics::HarmonicPatternKind) -> u8 {
+    match value {
+        market_squawk_analytics::HarmonicPatternKind::AbCd => 1,
+        market_squawk_analytics::HarmonicPatternKind::Gartley => 2,
+        market_squawk_analytics::HarmonicPatternKind::Bat => 3,
+        market_squawk_analytics::HarmonicPatternKind::Butterfly => 4,
+        market_squawk_analytics::HarmonicPatternKind::Crab => 5,
+        market_squawk_analytics::HarmonicPatternKind::DeepCrab => 6,
+        market_squawk_analytics::HarmonicPatternKind::Cypher => 7,
+        market_squawk_analytics::HarmonicPatternKind::Shark => 8,
+    }
+}
+
+const fn harmonic_direction_tag(value: market_squawk_analytics::HarmonicDirection) -> u8 {
+    match value {
+        market_squawk_analytics::HarmonicDirection::Bullish => 1,
+        market_squawk_analytics::HarmonicDirection::Bearish => 2,
+    }
+}
+
+const fn harmonic_quality_tag(value: market_squawk_analytics::HarmonicPatternQuality) -> u8 {
+    match value {
+        market_squawk_analytics::HarmonicPatternQuality::Valid => 1,
+        market_squawk_analytics::HarmonicPatternQuality::PreferredBatB => 2,
+    }
+}
+
 const fn data_quality_tag(value: DataQuality) -> u8 {
     match value {
         DataQuality::DirectVerified => 1,
@@ -502,11 +611,12 @@ const fn no_action_reason_tag(value: NoActionReason) -> u8 {
     match value {
         NoActionReason::ConflictingForecastAndValuation => 1,
         NoActionReason::BacktestBelowPolicy => 2,
-        NoActionReason::LiquidityBelowPolicy => 3,
-        NoActionReason::PortfolioRiskBelowPolicy => 4,
-        NoActionReason::ConfidenceBelowPolicy => 5,
-        NoActionReason::PositionStateNotActionable => 6,
-        NoActionReason::GeneratedPriceOrderCollapsed => 7,
+        NoActionReason::OutOfSampleBelowPolicy => 3,
+        NoActionReason::LiquidityBelowPolicy => 4,
+        NoActionReason::PortfolioRiskBelowPolicy => 5,
+        NoActionReason::ConfidenceBelowPolicy => 6,
+        NoActionReason::PositionStateNotActionable => 7,
+        NoActionReason::GeneratedPriceOrderCollapsed => 8,
     }
 }
 
@@ -514,10 +624,11 @@ const fn invalidator_tag(value: ProposalInvalidator) -> u8 {
     match value {
         ProposalInvalidator::ForecastValuationConflict => 1,
         ProposalInvalidator::BacktestPolicyBreach => 2,
-        ProposalInvalidator::LiquidityPolicyBreach => 3,
-        ProposalInvalidator::PortfolioRiskPolicyBreach => 4,
-        ProposalInvalidator::ConfidencePolicyBreach => 5,
-        ProposalInvalidator::PositionStateIncompatible => 6,
-        ProposalInvalidator::GeneratedPriceOrderCollapsed => 7,
+        ProposalInvalidator::OutOfSamplePolicyBreach => 3,
+        ProposalInvalidator::LiquidityPolicyBreach => 4,
+        ProposalInvalidator::PortfolioRiskPolicyBreach => 5,
+        ProposalInvalidator::ConfidencePolicyBreach => 6,
+        ProposalInvalidator::PositionStateIncompatible => 7,
+        ProposalInvalidator::GeneratedPriceOrderCollapsed => 8,
     }
 }

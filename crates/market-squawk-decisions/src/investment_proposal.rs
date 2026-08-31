@@ -16,11 +16,12 @@ mod policy;
 
 pub use authority::InvestmentProposalAuthority;
 pub use evidence::{
-    CostAdjustedPitBacktestEvidence, ForecastCalibrationSummary, ForecastPriceRanges,
-    InvestmentAnalysisEvidence, InvestmentAnalysisEvidenceInput, LiquidityEvidence,
-    MarketReferenceAdjustmentBasis, MarketReferenceEvidence, MarketReferencePriceKind,
-    PortfolioPositionState, PortfolioRiskEvidence, PriceForecastEvidence, ProposalEvidenceWindow,
-    ValuationEvidence,
+    ChronologicalOutOfSampleEvidence, CostAdjustedPitBacktestEvidence, FinancialModelEvidence,
+    FinancialModelValueRange, ForecastCalibrationSummary, ForecastPriceRanges,
+    HarmonicPatternEvidenceReceipt, InvestmentAnalysisEvidence, InvestmentAnalysisEvidenceInput,
+    LiquidityEvidence, MarketReferenceAdjustmentBasis, MarketReferenceEvidence,
+    MarketReferencePriceKind, PortfolioPositionState, PortfolioRiskEvidence, PriceForecastEvidence,
+    ProposalEvidenceWindow, ValuationEvidence,
 };
 pub use output::{
     GeneratedInvestmentProposal, GeneratedPriceLadder, InvestmentProposalDecision,
@@ -183,8 +184,14 @@ pub enum RecommendationEvidenceKind {
     PriceForecast,
     /// Independently governed valuation measurement.
     Valuation,
+    /// Evidence-closed financial model with exact inputs, assumptions, scenarios, and sensitivity.
+    FinancialModel,
     /// Cost-adjusted, point-in-time backtest result.
     Backtest,
+    /// Chronological independent out-of-sample study.
+    OutOfSample,
+    /// Optional causal harmonic-pattern evidence.
+    HarmonicPattern,
     /// Current market-liquidity assessment.
     Liquidity,
     /// Current account and portfolio-risk assessment.

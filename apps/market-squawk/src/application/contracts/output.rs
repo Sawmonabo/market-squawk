@@ -1353,10 +1353,20 @@ fn investment_analysis() -> Value {
         ),
         ("evidenceSummary", investment_analysis_evidence_summary()),
         (
+            "analyticalEvidence",
+            investment_analysis_analytical_evidence(),
+        ),
+        ("liquidity", investment_analysis_liquidity()),
+        ("portfolioContext", investment_analysis_portfolio_context()),
+        (
             "outcomeProjection",
             nullable(investment_analysis_outcome_projection()),
         ),
         ("sizing", nullable(investment_analysis_sizing_projection())),
+        (
+            "virtualPaperEligibility",
+            investment_analysis_virtual_paper_eligibility(),
+        ),
         (
             "realizedOutcome",
             nullable(recommendation_outcome_current()),
@@ -1460,13 +1470,7 @@ fn investment_analysis_evidence_summary() -> Value {
     closed_complete(vec![
         ("coverage", investment_analysis_coverage()),
         ("calibration", investment_analysis_calibration()),
-        (
-            "outOfSample",
-            closed_complete(vec![
-                ("state", constant("not_established")),
-                ("summary", investment_analysis_product_text()),
-            ]),
-        ),
+        ("outOfSample", investment_analysis_out_of_sample()),
         (
             "historicalTest",
             nullable(investment_analysis_historical_test()),
@@ -1478,9 +1482,12 @@ fn investment_analysis_evidence_summary() -> Value {
 
 fn investment_analysis_coverage() -> Value {
     closed_complete(vec![
-        ("availableCount", bounded_unsigned(6)),
-        ("possibleCount", constant_unsigned(6)),
-        ("items", fixed_array(investment_analysis_coverage_item(), 6)),
+        ("availableCount", bounded_unsigned(10)),
+        ("possibleCount", constant_unsigned(10)),
+        (
+            "items",
+            fixed_array(investment_analysis_coverage_item(), 10),
+        ),
         ("summary", investment_analysis_product_text()),
     ])
 }
@@ -1491,9 +1498,13 @@ fn investment_analysis_coverage_item() -> Value {
             "kind",
             enumeration(&[
                 "current_market",
+                "broader_research",
+                "price_pattern",
                 "forecast",
+                "financial_model",
                 "valuation",
                 "historical_test",
+                "out_of_sample",
                 "liquidity",
                 "portfolio_risk",
             ]),
@@ -1512,6 +1523,34 @@ fn investment_analysis_calibration() -> Value {
                 "completedOutcomes",
                 bounded_unsigned_range(1, u64::from(u32::MAX)),
             ),
+            ("summary", investment_analysis_product_text()),
+        ]),
+        closed_complete(vec![
+            ("state", constant("unavailable")),
+            ("summary", investment_analysis_product_text()),
+        ]),
+    ])
+}
+
+fn investment_analysis_out_of_sample() -> Value {
+    one_of(vec![
+        closed_complete(vec![
+            ("state", constant("available")),
+            (
+                "completedObservations",
+                bounded_unsigned_range(1, u64::from(u32::MAX)),
+            ),
+            (
+                "totalSignals",
+                bounded_unsigned_range(1, u64::from(u32::MAX)),
+            ),
+            ("folds", bounded_unsigned_range(1, u64::from(u32::MAX))),
+            (
+                "completionCoveragePercent",
+                investment_analysis_percentage(),
+            ),
+            ("evaluatedFrom", canonical_market_timestamp()),
+            ("evaluatedThrough", canonical_market_timestamp()),
             ("summary", investment_analysis_product_text()),
         ]),
         closed_complete(vec![
@@ -1593,13 +1632,119 @@ fn investment_analysis_uncertainty_component() -> Value {
     ])
 }
 
+fn investment_analysis_evidence_family() -> Value {
+    one_of(vec![
+        closed_complete(vec![
+            ("state", constant("available")),
+            ("summary", investment_analysis_product_text()),
+        ]),
+        closed_complete(vec![
+            ("state", constant("unavailable")),
+            ("summary", investment_analysis_product_text()),
+        ]),
+    ])
+}
+
+fn investment_analysis_analytical_evidence() -> Value {
+    closed_complete(vec![
+        ("currentMarket", investment_analysis_evidence_family()),
+        ("broaderResearch", investment_analysis_evidence_family()),
+        ("pricePattern", investment_analysis_evidence_family()),
+        ("forecast", investment_analysis_evidence_family()),
+        ("financialModel", investment_analysis_evidence_family()),
+        ("valuation", investment_analysis_evidence_family()),
+        ("historicalTest", investment_analysis_evidence_family()),
+        ("outOfSample", investment_analysis_evidence_family()),
+        ("liquidity", investment_analysis_evidence_family()),
+        ("portfolioRisk", investment_analysis_evidence_family()),
+        (
+            "combination",
+            closed_complete(vec![
+                ("state", enumeration(&["multi_evidence", "insufficient"])),
+                ("summary", investment_analysis_product_text()),
+            ]),
+        ),
+    ])
+}
+
+fn investment_analysis_liquidity() -> Value {
+    one_of(vec![
+        closed_complete(vec![
+            ("state", constant("available")),
+            ("quotedSpreadPercent", canonical_decimal_text()),
+            (
+                "policyRelativeCapacityPercent",
+                investment_analysis_percentage(),
+            ),
+            ("summary", investment_analysis_product_text()),
+        ]),
+        closed_complete(vec![
+            ("state", constant("unavailable")),
+            ("summary", investment_analysis_product_text()),
+        ]),
+    ])
+}
+
+fn investment_analysis_portfolio_context() -> Value {
+    one_of(vec![
+        closed_complete(vec![
+            ("state", constant("available")),
+            ("portfolioLabel", bounded_text(128)),
+            (
+                "positionState",
+                enumeration(&["no_position", "current_position"]),
+            ),
+            ("riskCapacityPercent", investment_analysis_percentage()),
+            ("summary", investment_analysis_product_text()),
+        ]),
+        closed_complete(vec![
+            ("state", constant("unavailable")),
+            ("summary", investment_analysis_product_text()),
+        ]),
+    ])
+}
+
+fn investment_analysis_virtual_paper_eligibility() -> Value {
+    closed_complete(vec![
+        ("state", constant("not_eligible")),
+        ("executionAuthority", constant("none")),
+        ("requiresExplicitPaperApproval", constant_bool(true)),
+        ("requiresFreshRiskCheck", constant_bool(true)),
+        ("summary", investment_analysis_product_text()),
+    ])
+}
+
 fn investment_analysis_outcome_projection() -> Value {
     closed_complete(vec![
         ("startingPrice", investment_analysis_money()),
         ("endsAt", canonical_market_timestamp()),
+        (
+            "positionScale",
+            nullable(closed_complete(vec![
+                ("quantityLots", unsigned_integer_text()),
+                ("summary", investment_analysis_product_text()),
+            ])),
+        ),
         ("downside", investment_analysis_price_change_range()),
         ("base", investment_analysis_price_change_range()),
         ("upside", investment_analysis_price_change_range()),
+        ("expectedReturn", investment_analysis_expected_return()),
+        (
+            "expectedGrossPricePnl",
+            investment_analysis_expected_gross_price_pnl(),
+        ),
+        (
+            "netPnl",
+            investment_analysis_unavailable_projection_metric(),
+        ),
+        (
+            "benchmarkReturn",
+            investment_analysis_unavailable_projection_metric(),
+        ),
+        (
+            "afterTaxPnl",
+            investment_analysis_unavailable_projection_metric(),
+        ),
         (
             "limitations",
             bounded_nonempty_array(investment_analysis_product_text(), 8),
@@ -1612,6 +1757,11 @@ fn investment_analysis_price_change_range() -> Value {
         vec![
             ("priceRange", investment_analysis_price_range()),
             (
+                "absolutePriceChange",
+                investment_analysis_signed_money_range(),
+            ),
+            ("grossPricePnl", investment_analysis_gross_price_pnl()),
+            (
                 "priceChangePercent",
                 closed_complete(vec![
                     ("lower", canonical_decimal_text()),
@@ -1619,8 +1769,81 @@ fn investment_analysis_price_change_range() -> Value {
                 ]),
             ),
         ],
-        &["priceRange"],
+        &["priceRange", "absolutePriceChange", "grossPricePnl"],
     )
+}
+
+fn investment_analysis_signed_money() -> Value {
+    closed_complete(vec![
+        ("amount", canonical_decimal_text()),
+        ("currency", investment_analysis_currency()),
+    ])
+}
+
+fn investment_analysis_signed_money_range() -> Value {
+    closed_complete(vec![
+        ("lower", investment_analysis_signed_money()),
+        ("upper", investment_analysis_signed_money()),
+    ])
+}
+
+fn investment_analysis_gross_price_pnl() -> Value {
+    one_of(vec![
+        closed_complete(vec![
+            ("state", constant("available")),
+            ("range", investment_analysis_signed_money_range()),
+            ("summary", investment_analysis_product_text()),
+        ]),
+        closed_complete(vec![
+            ("state", constant("unavailable")),
+            ("summary", investment_analysis_product_text()),
+        ]),
+    ])
+}
+
+fn investment_analysis_expected_return() -> Value {
+    one_of(vec![
+        closed_complete(vec![
+            ("state", constant("available")),
+            (
+                "grossPriceReturnPercent",
+                nullable(canonical_decimal_text()),
+            ),
+            (
+                "exactRatio",
+                closed_complete(vec![
+                    ("numerator", investment_analysis_signed_money()),
+                    ("denominator", investment_analysis_money()),
+                ]),
+            ),
+            ("summary", investment_analysis_product_text()),
+        ]),
+        closed_complete(vec![
+            ("state", constant("unavailable")),
+            ("summary", investment_analysis_product_text()),
+        ]),
+    ])
+}
+
+fn investment_analysis_expected_gross_price_pnl() -> Value {
+    one_of(vec![
+        closed_complete(vec![
+            ("state", constant("available")),
+            ("amount", investment_analysis_signed_money()),
+            ("summary", investment_analysis_product_text()),
+        ]),
+        closed_complete(vec![
+            ("state", constant("unavailable")),
+            ("summary", investment_analysis_product_text()),
+        ]),
+    ])
+}
+
+fn investment_analysis_unavailable_projection_metric() -> Value {
+    closed_complete(vec![
+        ("state", constant("unavailable")),
+        ("summary", investment_analysis_product_text()),
+    ])
 }
 
 fn investment_analysis_sizing_projection() -> Value {
@@ -1637,8 +1860,8 @@ fn investment_analysis_feasible_lots() -> Value {
     one_of(vec![
         closed_complete(vec![
             ("kind", constant("available")),
-            ("lower", positive_integer_text()),
-            ("upper", positive_integer_text()),
+            ("lower", unsigned_integer_text()),
+            ("upper", unsigned_integer_text()),
         ]),
         closed_complete(vec![
             ("kind", constant("unavailable")),

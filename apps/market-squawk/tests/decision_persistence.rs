@@ -1,13 +1,17 @@
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use market_squawk::application::decision::{DecisionApplication, DecisionApplicationError};
-use market_squawk_analytics::{FeatureOutputType, StatisticalF64};
+use market_squawk_analytics::{
+    FeatureImplementationDigest, FeatureOutputType, HarmonicDirection, HarmonicPatternKind,
+    HarmonicPatternQuality, StatisticalF64,
+};
 use market_squawk_decisions::{
     AnalyticalProfileBindingReference, AppendOutcome, AsOfSemantics, CandidateFlag, CandidateId,
-    CandidateInput, CandidatePortfolioSizingState, CandidateSizingConstraints, ComparisonOperator,
-    CostAdjustedPitBacktestEvidence, DecisionContentDigest, DecisionContractError,
-    DecisionRepositoryLimits, ForecastCalibrationSummary, ForecastPriceRanges,
-    InvestmentAnalysisEvidence, InvestmentAnalysisEvidenceInput,
+    CandidateInput, CandidatePortfolioSizingState, CandidateSizingConstraints,
+    ChronologicalOutOfSampleEvidence, ComparisonOperator, CostAdjustedPitBacktestEvidence,
+    DecisionContentDigest, DecisionContractError, DecisionRepositoryLimits, FinancialModelEvidence,
+    FinancialModelValueRange, ForecastCalibrationSummary, ForecastPriceRanges,
+    HarmonicPatternEvidenceReceipt, InvestmentAnalysisEvidence, InvestmentAnalysisEvidenceInput,
     InvestmentAnalysisWorkflowReference, InvestmentOutcomeProjection, InvestmentProposalAuthority,
     InvestmentProposalDecision, InvestmentProposalIndexOutcome, InvestmentSizingInputs,
     InvestmentSizingProjection, LiquidityEvidence, MarketReferenceAdjustmentBasis,
@@ -24,13 +28,14 @@ use market_squawk_decisions::{
 use market_squawk_domain::{
     AccountId, BasisPoints, Currency, DataQuality, Denomination, DigestAlgorithm, EvidenceDigest,
     InstrumentDefinitionRevision, InstrumentExecutionTerms, InstrumentId, LotSize, Money,
-    QuantityLots, RevisionNumber, SourceIdentifier, TickSize, Timestamp,
+    PriceTicks, QuantityLots, RevisionNumber, SourceIdentifier, TickSize, Timestamp,
 };
 use market_squawk_modeling::{ForecastCentralStatistic, ProductionFeatureRegistry};
 use market_squawk_platform::LocalPaths;
 use market_squawk_portfolio::PortfolioRevisionToken;
 use market_squawk_valuation::{
-    DecisionId, FairValueSelectionReceiptHash, MeasurementId, ValuationAmountBasis,
+    AutomaticValuationMethod, DecisionId, FairValueSelectionReceiptHash, MeasurementId,
+    ValuationAmountBasis,
 };
 use rusqlite::Connection;
 use rust_decimal::Decimal;
@@ -336,7 +341,28 @@ fn decision_append_is_durable_idempotent_and_recovers_under_one_writer_lease()
         recovered_screen.constraints().admitted_data_qualities(),
         &[DataQuality::DirectVerified, DataQuality::OfficialDelayed]
     );
-    assert_eq!(recovered.get_investment_proposal(analysis_id)?, generated);
+    let recovered_generated = recovered.get_investment_proposal(analysis_id)?;
+    assert_eq!(recovered_generated, generated);
+    assert_eq!(
+        recovered_generated
+            .evidence()
+            .harmonic_pattern()
+            .ok_or("typed price-pattern evidence was not recovered")?
+            .evidence_digest(),
+        generated
+            .evidence()
+            .harmonic_pattern()
+            .ok_or("typed price-pattern evidence was not persisted")?
+            .evidence_digest()
+    );
+    assert_eq!(
+        recovered_generated.evidence().out_of_sample(),
+        generated.evidence().out_of_sample()
+    );
+    assert_eq!(
+        recovered_generated.evidence().financial_model(),
+        generated.evidence().financial_model()
+    );
     assert_eq!(
         recovered.get_investment_proposal(no_action.analysis_id())?,
         no_action
@@ -554,6 +580,35 @@ fn generated_proposal() -> Result<InvestmentProposalDecision, Box<dyn std::error
             111,
         )?,
     )?;
+    let financial_model = FinancialModelEvidence::try_recover_projection(
+        instrument_id,
+        account_id,
+        AutomaticValuationMethod::DiscountedCashFlow,
+        FinancialModelValueRange::try_new(
+            money(11_000, currency),
+            money(12_500, currency),
+            money(14_000, currency),
+        )?,
+        TargetPriceCases::try_new(
+            money(8_000, currency),
+            money(12_500, currency),
+            money(16_000, currency),
+        )?,
+        TargetPriceRange::try_new(money(11_500, currency), money(13_500, currency))?,
+        forecast_horizon_at,
+        content_digest(125)?,
+        content_digest(126)?,
+        content_digest(127)?,
+        content_digest(128)?,
+        content_digest(129)?,
+        content_digest(130)?,
+        window(
+            as_of.checked_sub_nanos(5 * DAY_NANOS)?,
+            as_of.checked_sub_nanos(4 * DAY_NANOS)?,
+            60,
+            126,
+        )?,
+    )?;
     let backtest = CostAdjustedPitBacktestEvidence::try_new(
         instrument_id,
         currency,
@@ -578,6 +633,56 @@ fn generated_proposal() -> Result<InvestmentProposalDecision, Box<dyn std::error
             as_of.checked_sub_nanos(29 * DAY_NANOS)?,
             365,
             119,
+        )?,
+    )?;
+    let out_of_sample = ChronologicalOutOfSampleEvidence::try_new(
+        instrument_id,
+        currency,
+        365 * DAY_NANOS,
+        as_of.checked_sub_nanos(120 * DAY_NANOS)?,
+        as_of.checked_sub_nanos(32 * DAY_NANOS)?,
+        as_of.checked_sub_nanos(31 * DAY_NANOS)?,
+        NonZeroU32::new(900).ok_or(DecisionContractError::InvalidBound)?,
+        NonZeroU32::new(1_000).ok_or(DecisionContractError::InvalidBound)?,
+        NonZeroU32::new(10).ok_or(DecisionContractError::InvalidBound)?,
+        900_000,
+        content_digest(113)?,
+        content_digest(114)?,
+        content_digest(115)?,
+        content_digest(116)?,
+        window(
+            as_of.checked_sub_nanos(30 * DAY_NANOS)?,
+            as_of.checked_sub_nanos(29 * DAY_NANOS)?,
+            365,
+            119,
+        )?,
+    )?;
+    let harmonic_digest = EvidenceDigest::new(DigestAlgorithm::Sha256, [131; 32]);
+    let harmonic_pattern = HarmonicPatternEvidenceReceipt::try_recover_projection(
+        instrument_id,
+        NonZeroU64::new(u64::try_from(DAY_NANOS)?).ok_or(DecisionContractError::InvalidBound)?,
+        HarmonicPatternKind::Bat,
+        HarmonicDirection::Bullish,
+        HarmonicPatternQuality::PreferredBatB,
+        PriceTicks::new(9_500),
+        PriceTicks::new(10_000),
+        [
+            PriceTicks::new(11_000),
+            PriceTicks::new(12_000),
+            PriceTicks::new(13_000),
+        ],
+        PriceTicks::new(9_000),
+        as_of.checked_sub_nanos(2 * DAY_NANOS)?,
+        as_of.checked_sub_nanos(DAY_NANOS)?,
+        as_of.checked_sub_nanos(DAY_NANOS)?,
+        as_of.checked_add_nanos(3 * DAY_NANOS)?,
+        FeatureImplementationDigest::try_from_sha256([132; 32])?,
+        harmonic_digest,
+        ProposalEvidenceWindow::try_new(
+            as_of.checked_sub_nanos(2 * DAY_NANOS)?,
+            as_of.checked_sub_nanos(DAY_NANOS)?,
+            as_of.checked_add_nanos(3 * DAY_NANOS)?,
+            DecisionContentDigest::try_new(harmonic_digest)?,
         )?,
     )?;
     let liquidity = LiquidityEvidence::try_new(
@@ -617,7 +722,10 @@ fn generated_proposal() -> Result<InvestmentProposalDecision, Box<dyn std::error
         market: Some(market),
         price_forecast: Some(forecast),
         valuation: Some(valuation),
+        financial_model: Some(financial_model),
         backtest: Some(backtest),
+        out_of_sample: Some(out_of_sample),
+        harmonic_pattern: Some(harmonic_pattern),
         liquidity: Some(liquidity),
         portfolio_risk: Some(portfolio_risk),
     });
@@ -659,7 +767,10 @@ fn no_action_proposal(
             market: evidence.market().copied(),
             price_forecast: evidence.price_forecast().copied(),
             valuation: evidence.valuation().copied(),
+            financial_model: evidence.financial_model().copied(),
             backtest: evidence.backtest().copied(),
+            out_of_sample: evidence.out_of_sample().copied(),
+            harmonic_pattern: evidence.harmonic_pattern().cloned(),
             liquidity: Some(low_liquidity),
             portfolio_risk: evidence.portfolio_risk().cloned(),
         }),
@@ -684,7 +795,10 @@ fn unavailable_proposal(
             market: None,
             price_forecast: evidence.price_forecast().copied(),
             valuation: evidence.valuation().copied(),
+            financial_model: evidence.financial_model().copied(),
             backtest: evidence.backtest().copied(),
+            out_of_sample: evidence.out_of_sample().copied(),
+            harmonic_pattern: evidence.harmonic_pattern().cloned(),
             liquidity: evidence.liquidity().copied(),
             portfolio_risk: evidence.portfolio_risk().cloned(),
         }),

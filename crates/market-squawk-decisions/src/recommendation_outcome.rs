@@ -1515,11 +1515,12 @@ const fn no_action_reason_tag(value: NoActionReason) -> u8 {
     match value {
         NoActionReason::ConflictingForecastAndValuation => 0,
         NoActionReason::BacktestBelowPolicy => 1,
-        NoActionReason::LiquidityBelowPolicy => 2,
-        NoActionReason::PortfolioRiskBelowPolicy => 3,
-        NoActionReason::ConfidenceBelowPolicy => 4,
-        NoActionReason::PositionStateNotActionable => 5,
-        NoActionReason::GeneratedPriceOrderCollapsed => 6,
+        NoActionReason::OutOfSampleBelowPolicy => 2,
+        NoActionReason::LiquidityBelowPolicy => 3,
+        NoActionReason::PortfolioRiskBelowPolicy => 4,
+        NoActionReason::ConfidenceBelowPolicy => 5,
+        NoActionReason::PositionStateNotActionable => 6,
+        NoActionReason::GeneratedPriceOrderCollapsed => 7,
     }
 }
 
@@ -1535,12 +1536,16 @@ const fn proposal_unavailable_reason_tag(value: ProposalUnavailableReason) -> u1
         ProposalUnavailableReason::RejectedQuality { .. } => 7,
         ProposalUnavailableReason::ForecastHorizonMismatch { .. } => 8,
         ProposalUnavailableReason::ValuationHorizonMismatch { .. } => 9,
-        ProposalUnavailableReason::BacktestHorizonMismatch { .. } => 10,
-        ProposalUnavailableReason::InsufficientForecastOutcomes { .. } => 11,
-        ProposalUnavailableReason::UnsupportedForecastCoverage { .. } => 12,
-        ProposalUnavailableReason::InsufficientBacktestObservations { .. } => 13,
-        ProposalUnavailableReason::InsufficientBacktestTrials { .. } => 14,
-        ProposalUnavailableReason::ReservedPortfolioRevision => 15,
+        ProposalUnavailableReason::FinancialModelHorizonMismatch { .. } => 10,
+        ProposalUnavailableReason::BacktestHorizonMismatch { .. } => 11,
+        ProposalUnavailableReason::OutOfSampleHorizonMismatch { .. } => 12,
+        ProposalUnavailableReason::FinancialModelValuationMismatch => 13,
+        ProposalUnavailableReason::OutOfSampleBacktestMismatch => 14,
+        ProposalUnavailableReason::InsufficientForecastOutcomes { .. } => 15,
+        ProposalUnavailableReason::UnsupportedForecastCoverage { .. } => 16,
+        ProposalUnavailableReason::InsufficientBacktestObservations { .. } => 17,
+        ProposalUnavailableReason::InsufficientBacktestTrials { .. } => 18,
+        ProposalUnavailableReason::ReservedPortfolioRevision => 19,
     }
 }
 

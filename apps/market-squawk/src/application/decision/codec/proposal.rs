@@ -1,23 +1,32 @@
-use std::{num::NonZeroU32, str::FromStr as _};
+use std::{
+    num::{NonZeroU32, NonZeroU64},
+    str::FromStr as _,
+};
 
+use market_squawk_analytics::{
+    FeatureImplementationDigest, HarmonicDirection, HarmonicPatternKind, HarmonicPatternQuality,
+};
 use market_squawk_decisions::{
-    CostAdjustedPitBacktestEvidence, ForecastCalibrationSummary, ForecastPriceRanges,
-    InvestmentAnalysisEvidence, InvestmentAnalysisEvidenceInput, InvestmentAnalysisId,
-    InvestmentProposalAuthority, InvestmentProposalDecision, InvestmentProposalId,
-    LiquidityEvidence, MarketReferenceAdjustmentBasis, MarketReferenceEvidence,
-    MarketReferencePriceKind, PortfolioPositionState, PortfolioRiskEvidence, PriceForecastEvidence,
-    ProposalEvidenceWindow, ProposalForecastVintageId, ProposalUnavailableReason,
-    RecommendationDerivationDigest, RecommendationEvidenceKind, RecommendationPolicy,
-    RecommendationPolicyDigest, SelectedCandidateAnalysisEvidence, TargetPriceCases,
-    TargetPriceRange, ValuationEvidence,
+    ChronologicalOutOfSampleEvidence, CostAdjustedPitBacktestEvidence, FinancialModelEvidence,
+    FinancialModelValueRange, ForecastCalibrationSummary, ForecastPriceRanges,
+    HarmonicPatternEvidenceReceipt, InvestmentAnalysisEvidence, InvestmentAnalysisEvidenceInput,
+    InvestmentAnalysisId, InvestmentProposalAuthority, InvestmentProposalDecision,
+    InvestmentProposalId, LiquidityEvidence, MarketReferenceAdjustmentBasis,
+    MarketReferenceEvidence, MarketReferencePriceKind, PortfolioPositionState,
+    PortfolioRiskEvidence, PriceForecastEvidence, ProposalEvidenceWindow,
+    ProposalForecastVintageId, ProposalUnavailableReason, RecommendationDerivationDigest,
+    RecommendationEvidenceKind, RecommendationPolicy, RecommendationPolicyDigest,
+    SelectedCandidateAnalysisEvidence, TargetPriceCases, TargetPriceRange, ValuationEvidence,
 };
 use market_squawk_domain::{
-    AccountId, BasisPoints, Currency, DataQuality, EvidenceDigest, InstrumentId, Money, Timestamp,
+    AccountId, BasisPoints, Currency, DataQuality, EvidenceDigest, InstrumentId, Money, PriceTicks,
+    Timestamp,
 };
 use market_squawk_modeling::ForecastCentralStatistic;
 use market_squawk_portfolio::PortfolioRevisionToken;
 use market_squawk_valuation::{
-    DecisionId, FairValueSelectionReceiptHash, MeasurementId, ValuationAmountBasis,
+    AutomaticValuationMethod, DecisionId, FairValueSelectionReceiptHash, MeasurementId,
+    ValuationAmountBasis,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -220,7 +229,10 @@ struct InvestmentAnalysisEvidenceWire {
     market: RequiredOption<MarketReferenceEvidenceWire>,
     price_forecast: RequiredOption<PriceForecastEvidenceWire>,
     valuation: RequiredOption<ValuationEvidenceWire>,
+    financial_model: RequiredOption<FinancialModelEvidenceWire>,
     backtest: RequiredOption<CostAdjustedPitBacktestEvidenceWire>,
+    out_of_sample: RequiredOption<ChronologicalOutOfSampleEvidenceWire>,
+    harmonic_pattern: RequiredOption<HarmonicPatternEvidenceWire>,
     liquidity: RequiredOption<LiquidityEvidenceWire>,
     portfolio_risk: RequiredOption<PortfolioRiskEvidenceWire>,
 }
@@ -235,7 +247,10 @@ impl From<&InvestmentAnalysisEvidence> for InvestmentAnalysisEvidenceWire {
             market: RequiredOption(value.market().map(Into::into)),
             price_forecast: RequiredOption(value.price_forecast().map(Into::into)),
             valuation: RequiredOption(value.valuation().map(Into::into)),
+            financial_model: RequiredOption(value.financial_model().map(Into::into)),
             backtest: RequiredOption(value.backtest().map(Into::into)),
+            out_of_sample: RequiredOption(value.out_of_sample().map(Into::into)),
+            harmonic_pattern: RequiredOption(value.harmonic_pattern().map(Into::into)),
             liquidity: RequiredOption(value.liquidity().map(Into::into)),
             portfolio_risk: RequiredOption(value.portfolio_risk().map(Into::into)),
         }
@@ -265,10 +280,25 @@ impl InvestmentAnalysisEvidenceWire {
                     .0
                     .map(ValuationEvidenceWire::decode)
                     .transpose()?,
+                financial_model: self
+                    .financial_model
+                    .0
+                    .map(FinancialModelEvidenceWire::decode)
+                    .transpose()?,
                 backtest: self
                     .backtest
                     .0
                     .map(CostAdjustedPitBacktestEvidenceWire::decode)
+                    .transpose()?,
+                out_of_sample: self
+                    .out_of_sample
+                    .0
+                    .map(ChronologicalOutOfSampleEvidenceWire::decode)
+                    .transpose()?,
+                harmonic_pattern: self
+                    .harmonic_pattern
+                    .0
+                    .map(HarmonicPatternEvidenceWire::decode)
                     .transpose()?,
                 liquidity: self
                     .liquidity
@@ -692,6 +722,312 @@ impl From<ValuationAmountBasisWire> for ValuationAmountBasis {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AutomaticValuationMethodWire {
+    DiscountedCashFlow,
+    ComparableCompanies,
+    ResidualIncome,
+    ForecastDistribution,
+}
+
+impl From<AutomaticValuationMethod> for AutomaticValuationMethodWire {
+    fn from(value: AutomaticValuationMethod) -> Self {
+        match value {
+            AutomaticValuationMethod::DiscountedCashFlow => Self::DiscountedCashFlow,
+            AutomaticValuationMethod::ComparableCompanies => Self::ComparableCompanies,
+            AutomaticValuationMethod::ResidualIncome => Self::ResidualIncome,
+            AutomaticValuationMethod::ForecastDistribution => Self::ForecastDistribution,
+        }
+    }
+}
+
+impl From<AutomaticValuationMethodWire> for AutomaticValuationMethod {
+    fn from(value: AutomaticValuationMethodWire) -> Self {
+        match value {
+            AutomaticValuationMethodWire::DiscountedCashFlow => Self::DiscountedCashFlow,
+            AutomaticValuationMethodWire::ComparableCompanies => Self::ComparableCompanies,
+            AutomaticValuationMethodWire::ResidualIncome => Self::ResidualIncome,
+            AutomaticValuationMethodWire::ForecastDistribution => Self::ForecastDistribution,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FinancialModelEvidenceWire {
+    instrument_id: InstrumentId,
+    account_id: AccountId,
+    method: AutomaticValuationMethodWire,
+    range_lower: Money,
+    range_central: Money,
+    range_upper: Money,
+    scenario_downside: Money,
+    scenario_base: Money,
+    scenario_upside: Money,
+    sensitivity_lower: Money,
+    sensitivity_upper: Money,
+    horizon_at: Timestamp,
+    pit_input_set_identity: EvidenceDigest,
+    calculation_identity: EvidenceDigest,
+    assumptions_identity: EvidenceDigest,
+    scenario_identity: EvidenceDigest,
+    sensitivity_identity: EvidenceDigest,
+    macro_context_identity: EvidenceDigest,
+    window: ProposalEvidenceWindowWire,
+}
+
+impl From<&FinancialModelEvidence> for FinancialModelEvidenceWire {
+    fn from(value: &FinancialModelEvidence) -> Self {
+        Self {
+            instrument_id: value.instrument_id(),
+            account_id: value.account_id(),
+            method: value.method().into(),
+            range_lower: value.range().lower(),
+            range_central: value.range().central(),
+            range_upper: value.range().upper(),
+            scenario_downside: value.scenarios().downside(),
+            scenario_base: value.scenarios().base(),
+            scenario_upside: value.scenarios().upside(),
+            sensitivity_lower: value.sensitivity_range().lower(),
+            sensitivity_upper: value.sensitivity_range().upper(),
+            horizon_at: value.horizon_at(),
+            pit_input_set_identity: value.pit_input_set_identity().evidence_digest(),
+            calculation_identity: value.calculation_identity().evidence_digest(),
+            assumptions_identity: value.assumptions_identity().evidence_digest(),
+            scenario_identity: value.scenario_identity().evidence_digest(),
+            sensitivity_identity: value.sensitivity_identity().evidence_digest(),
+            macro_context_identity: value.macro_context_identity().evidence_digest(),
+            window: value.window().into(),
+        }
+    }
+}
+
+impl FinancialModelEvidenceWire {
+    fn decode(self) -> Result<FinancialModelEvidence, DecisionApplicationError> {
+        FinancialModelEvidence::try_recover_projection(
+            self.instrument_id,
+            self.account_id,
+            self.method.into(),
+            FinancialModelValueRange::try_new(
+                self.range_lower,
+                self.range_central,
+                self.range_upper,
+            )
+            .map_err(invalid_state)?,
+            TargetPriceCases::try_new(
+                self.scenario_downside,
+                self.scenario_base,
+                self.scenario_upside,
+            )
+            .map_err(invalid_state)?,
+            TargetPriceRange::try_new(self.sensitivity_lower, self.sensitivity_upper)
+                .map_err(invalid_state)?,
+            self.horizon_at,
+            content_digest(self.pit_input_set_identity)?,
+            content_digest(self.calculation_identity)?,
+            content_digest(self.assumptions_identity)?,
+            content_digest(self.scenario_identity)?,
+            content_digest(self.sensitivity_identity)?,
+            content_digest(self.macro_context_identity)?,
+            self.window.decode()?,
+        )
+        .map_err(invalid_state)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ChronologicalOutOfSampleEvidenceWire {
+    instrument_id: InstrumentId,
+    currency: Currency,
+    outcome_horizon_nanos: i64,
+    evaluation_starts_at: Timestamp,
+    evaluation_ends_at: Timestamp,
+    simulation_cutoff_at: Timestamp,
+    completed_observations: u32,
+    total_signals: u32,
+    fold_count: u32,
+    completion_coverage_ppm: u32,
+    dataset_identity: EvidenceDigest,
+    signal_plan_identity: EvidenceDigest,
+    aggregate_identity: EvidenceDigest,
+    study_identity: EvidenceDigest,
+    window: ProposalEvidenceWindowWire,
+}
+
+impl From<&ChronologicalOutOfSampleEvidence> for ChronologicalOutOfSampleEvidenceWire {
+    fn from(value: &ChronologicalOutOfSampleEvidence) -> Self {
+        Self {
+            instrument_id: value.instrument_id(),
+            currency: value.currency(),
+            outcome_horizon_nanos: value.outcome_horizon_nanos(),
+            evaluation_starts_at: value.evaluation_starts_at(),
+            evaluation_ends_at: value.evaluation_ends_at(),
+            simulation_cutoff_at: value.simulation_cutoff_at(),
+            completed_observations: value.completed_observations().get(),
+            total_signals: value.total_signals().get(),
+            fold_count: value.fold_count().get(),
+            completion_coverage_ppm: value.completion_coverage_ppm(),
+            dataset_identity: value.dataset_identity().evidence_digest(),
+            signal_plan_identity: value.signal_plan_identity().evidence_digest(),
+            aggregate_identity: value.aggregate_identity().evidence_digest(),
+            study_identity: value.study_identity().evidence_digest(),
+            window: value.window().into(),
+        }
+    }
+}
+
+impl ChronologicalOutOfSampleEvidenceWire {
+    fn decode(self) -> Result<ChronologicalOutOfSampleEvidence, DecisionApplicationError> {
+        ChronologicalOutOfSampleEvidence::try_new(
+            self.instrument_id,
+            self.currency,
+            self.outcome_horizon_nanos,
+            self.evaluation_starts_at,
+            self.evaluation_ends_at,
+            self.simulation_cutoff_at,
+            nonzero(self.completed_observations)?,
+            nonzero(self.total_signals)?,
+            nonzero(self.fold_count)?,
+            self.completion_coverage_ppm,
+            content_digest(self.dataset_identity)?,
+            content_digest(self.signal_plan_identity)?,
+            content_digest(self.aggregate_identity)?,
+            content_digest(self.study_identity)?,
+            self.window.decode()?,
+        )
+        .map_err(invalid_state)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HarmonicPatternKindWire {
+    AbCd,
+    Gartley,
+    Bat,
+    Butterfly,
+    Crab,
+    DeepCrab,
+    Cypher,
+    Shark,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HarmonicDirectionWire {
+    Bullish,
+    Bearish,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HarmonicPatternQualityWire {
+    Valid,
+    PreferredBatB,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HarmonicPatternEvidenceWire {
+    instrument_id: InstrumentId,
+    timeframe_nanos: u64,
+    kind: HarmonicPatternKindWire,
+    direction: HarmonicDirectionWire,
+    quality: HarmonicPatternQualityWire,
+    completion_lower: PriceTicks,
+    completion_upper: PriceTicks,
+    targets: [PriceTicks; 3],
+    invalidation: PriceTicks,
+    observation_cutoff: Timestamp,
+    confirmation_cutoff: Timestamp,
+    decision_cutoff: Timestamp,
+    expires_at: Timestamp,
+    implementation_identity: [u8; 32],
+    evidence_digest: EvidenceDigest,
+    window: ProposalEvidenceWindowWire,
+}
+
+impl From<&HarmonicPatternEvidenceReceipt> for HarmonicPatternEvidenceWire {
+    fn from(value: &HarmonicPatternEvidenceReceipt) -> Self {
+        Self {
+            instrument_id: value.instrument_id(),
+            timeframe_nanos: value.timeframe_nanos().get(),
+            kind: match value.kind() {
+                HarmonicPatternKind::AbCd => HarmonicPatternKindWire::AbCd,
+                HarmonicPatternKind::Gartley => HarmonicPatternKindWire::Gartley,
+                HarmonicPatternKind::Bat => HarmonicPatternKindWire::Bat,
+                HarmonicPatternKind::Butterfly => HarmonicPatternKindWire::Butterfly,
+                HarmonicPatternKind::Crab => HarmonicPatternKindWire::Crab,
+                HarmonicPatternKind::DeepCrab => HarmonicPatternKindWire::DeepCrab,
+                HarmonicPatternKind::Cypher => HarmonicPatternKindWire::Cypher,
+                HarmonicPatternKind::Shark => HarmonicPatternKindWire::Shark,
+            },
+            direction: match value.direction() {
+                HarmonicDirection::Bullish => HarmonicDirectionWire::Bullish,
+                HarmonicDirection::Bearish => HarmonicDirectionWire::Bearish,
+            },
+            quality: match value.quality() {
+                HarmonicPatternQuality::Valid => HarmonicPatternQualityWire::Valid,
+                HarmonicPatternQuality::PreferredBatB => HarmonicPatternQualityWire::PreferredBatB,
+            },
+            completion_lower: value.completion_lower(),
+            completion_upper: value.completion_upper(),
+            targets: value.targets(),
+            invalidation: value.invalidation(),
+            observation_cutoff: value.observation_cutoff(),
+            confirmation_cutoff: value.confirmation_cutoff(),
+            decision_cutoff: value.decision_cutoff(),
+            expires_at: value.expires_at(),
+            implementation_identity: value.implementation_identity().as_bytes(),
+            evidence_digest: value.evidence_digest(),
+            window: value.window().into(),
+        }
+    }
+}
+
+impl HarmonicPatternEvidenceWire {
+    fn decode(self) -> Result<HarmonicPatternEvidenceReceipt, DecisionApplicationError> {
+        HarmonicPatternEvidenceReceipt::try_recover_projection(
+            self.instrument_id,
+            NonZeroU64::new(self.timeframe_nanos)
+                .ok_or(DecisionApplicationError::InvalidPersistentState)?,
+            match self.kind {
+                HarmonicPatternKindWire::AbCd => HarmonicPatternKind::AbCd,
+                HarmonicPatternKindWire::Gartley => HarmonicPatternKind::Gartley,
+                HarmonicPatternKindWire::Bat => HarmonicPatternKind::Bat,
+                HarmonicPatternKindWire::Butterfly => HarmonicPatternKind::Butterfly,
+                HarmonicPatternKindWire::Crab => HarmonicPatternKind::Crab,
+                HarmonicPatternKindWire::DeepCrab => HarmonicPatternKind::DeepCrab,
+                HarmonicPatternKindWire::Cypher => HarmonicPatternKind::Cypher,
+                HarmonicPatternKindWire::Shark => HarmonicPatternKind::Shark,
+            },
+            match self.direction {
+                HarmonicDirectionWire::Bullish => HarmonicDirection::Bullish,
+                HarmonicDirectionWire::Bearish => HarmonicDirection::Bearish,
+            },
+            match self.quality {
+                HarmonicPatternQualityWire::Valid => HarmonicPatternQuality::Valid,
+                HarmonicPatternQualityWire::PreferredBatB => HarmonicPatternQuality::PreferredBatB,
+            },
+            self.completion_lower,
+            self.completion_upper,
+            self.targets,
+            self.invalidation,
+            self.observation_cutoff,
+            self.confirmation_cutoff,
+            self.decision_cutoff,
+            self.expires_at,
+            FeatureImplementationDigest::try_from_sha256(self.implementation_identity)
+                .map_err(invalid_state)?,
+            self.evidence_digest,
+            self.window.decode()?,
+        )
+        .map_err(invalid_state)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CostAdjustedPitBacktestEvidenceWire {
@@ -906,7 +1242,10 @@ enum RecommendationEvidenceKindWire {
     Market,
     PriceForecast,
     Valuation,
+    FinancialModel,
     Backtest,
+    OutOfSample,
+    HarmonicPattern,
     Liquidity,
     PortfolioRisk,
 }
@@ -917,7 +1256,10 @@ impl From<RecommendationEvidenceKind> for RecommendationEvidenceKindWire {
             RecommendationEvidenceKind::Market => Self::Market,
             RecommendationEvidenceKind::PriceForecast => Self::PriceForecast,
             RecommendationEvidenceKind::Valuation => Self::Valuation,
+            RecommendationEvidenceKind::FinancialModel => Self::FinancialModel,
             RecommendationEvidenceKind::Backtest => Self::Backtest,
+            RecommendationEvidenceKind::OutOfSample => Self::OutOfSample,
+            RecommendationEvidenceKind::HarmonicPattern => Self::HarmonicPattern,
             RecommendationEvidenceKind::Liquidity => Self::Liquidity,
             RecommendationEvidenceKind::PortfolioRisk => Self::PortfolioRisk,
         }
@@ -930,7 +1272,10 @@ impl From<RecommendationEvidenceKindWire> for RecommendationEvidenceKind {
             RecommendationEvidenceKindWire::Market => Self::Market,
             RecommendationEvidenceKindWire::PriceForecast => Self::PriceForecast,
             RecommendationEvidenceKindWire::Valuation => Self::Valuation,
+            RecommendationEvidenceKindWire::FinancialModel => Self::FinancialModel,
             RecommendationEvidenceKindWire::Backtest => Self::Backtest,
+            RecommendationEvidenceKindWire::OutOfSample => Self::OutOfSample,
+            RecommendationEvidenceKindWire::HarmonicPattern => Self::HarmonicPattern,
             RecommendationEvidenceKindWire::Liquidity => Self::Liquidity,
             RecommendationEvidenceKindWire::PortfolioRisk => Self::PortfolioRisk,
         }
@@ -978,10 +1323,20 @@ enum ProposalUnavailableReasonWire {
         expected: Timestamp,
         actual: Timestamp,
     },
+    FinancialModelHorizonMismatch {
+        expected: Timestamp,
+        actual: Timestamp,
+    },
     BacktestHorizonMismatch {
         expected_nanos: i64,
         actual_nanos: i64,
     },
+    OutOfSampleHorizonMismatch {
+        expected_nanos: i64,
+        actual_nanos: i64,
+    },
+    FinancialModelValuationMismatch,
+    OutOfSampleBacktestMismatch,
     InsufficientForecastOutcomes {
         required: u32,
         actual: u32,
@@ -1052,6 +1407,9 @@ impl From<ProposalUnavailableReason> for ProposalUnavailableReasonWire {
             ProposalUnavailableReason::ValuationHorizonMismatch { expected, actual } => {
                 Self::ValuationHorizonMismatch { expected, actual }
             }
+            ProposalUnavailableReason::FinancialModelHorizonMismatch { expected, actual } => {
+                Self::FinancialModelHorizonMismatch { expected, actual }
+            }
             ProposalUnavailableReason::BacktestHorizonMismatch {
                 expected_nanos,
                 actual_nanos,
@@ -1059,6 +1417,19 @@ impl From<ProposalUnavailableReason> for ProposalUnavailableReasonWire {
                 expected_nanos,
                 actual_nanos,
             },
+            ProposalUnavailableReason::OutOfSampleHorizonMismatch {
+                expected_nanos,
+                actual_nanos,
+            } => Self::OutOfSampleHorizonMismatch {
+                expected_nanos,
+                actual_nanos,
+            },
+            ProposalUnavailableReason::FinancialModelValuationMismatch => {
+                Self::FinancialModelValuationMismatch
+            }
+            ProposalUnavailableReason::OutOfSampleBacktestMismatch => {
+                Self::OutOfSampleBacktestMismatch
+            }
             ProposalUnavailableReason::InsufficientForecastOutcomes { required, actual } => {
                 Self::InsufficientForecastOutcomes {
                     required: required.get(),
@@ -1139,6 +1510,9 @@ impl ProposalUnavailableReasonWire {
             Self::ValuationHorizonMismatch { expected, actual } => {
                 ProposalUnavailableReason::ValuationHorizonMismatch { expected, actual }
             }
+            Self::FinancialModelHorizonMismatch { expected, actual } => {
+                ProposalUnavailableReason::FinancialModelHorizonMismatch { expected, actual }
+            }
             Self::BacktestHorizonMismatch {
                 expected_nanos,
                 actual_nanos,
@@ -1146,6 +1520,19 @@ impl ProposalUnavailableReasonWire {
                 expected_nanos,
                 actual_nanos,
             },
+            Self::OutOfSampleHorizonMismatch {
+                expected_nanos,
+                actual_nanos,
+            } => ProposalUnavailableReason::OutOfSampleHorizonMismatch {
+                expected_nanos,
+                actual_nanos,
+            },
+            Self::FinancialModelValuationMismatch => {
+                ProposalUnavailableReason::FinancialModelValuationMismatch
+            }
+            Self::OutOfSampleBacktestMismatch => {
+                ProposalUnavailableReason::OutOfSampleBacktestMismatch
+            }
             Self::InsufficientForecastOutcomes { required, actual } => {
                 ProposalUnavailableReason::InsufficientForecastOutcomes {
                     required: nonzero(required)?,

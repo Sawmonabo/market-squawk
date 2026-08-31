@@ -40,7 +40,10 @@ pub(super) struct RecommendationPolicySemantics {
     pub(super) market_max_age_nanos: i64,
     pub(super) forecast_max_age_nanos: i64,
     pub(super) valuation_max_age_nanos: i64,
+    pub(super) financial_model_max_age_nanos: i64,
     pub(super) backtest_max_age_nanos: i64,
+    pub(super) out_of_sample_max_age_nanos: i64,
+    pub(super) harmonic_pattern_max_age_nanos: i64,
     pub(super) liquidity_max_age_nanos: i64,
     pub(super) portfolio_risk_max_age_nanos: i64,
     pub(super) bullish_threshold: BasisPoints,
@@ -51,6 +54,7 @@ pub(super) struct RecommendationPolicySemantics {
     pub(super) minimum_backtest_observations: NonZeroU32,
     pub(super) minimum_backtest_trials: NonZeroU32,
     pub(super) minimum_backtest_stability_ppm: u32,
+    pub(super) minimum_oos_completion_coverage_ppm: u32,
     pub(super) minimum_cost_adjusted_return: BasisPoints,
     pub(super) maximum_backtest_drawdown: BasisPoints,
     pub(super) maximum_liquidity_spread: BasisPoints,
@@ -122,7 +126,10 @@ impl RecommendationPolicy {
             market_max_age_nanos: 60 * NANOS_PER_SECOND,
             forecast_max_age_nanos: 7 * NANOS_PER_DAY,
             valuation_max_age_nanos: 30 * NANOS_PER_DAY,
+            financial_model_max_age_nanos: 30 * NANOS_PER_DAY,
             backtest_max_age_nanos: 180 * NANOS_PER_DAY,
+            out_of_sample_max_age_nanos: 180 * NANOS_PER_DAY,
+            harmonic_pattern_max_age_nanos: 5 * NANOS_PER_DAY,
             liquidity_max_age_nanos: 60 * NANOS_PER_SECOND,
             portfolio_risk_max_age_nanos: 5 * 60 * NANOS_PER_SECOND,
             bullish_threshold: BasisPoints::new(1_000),
@@ -133,6 +140,7 @@ impl RecommendationPolicy {
             minimum_backtest_observations,
             minimum_backtest_trials,
             minimum_backtest_stability_ppm: 600_000,
+            minimum_oos_completion_coverage_ppm: 800_000,
             minimum_cost_adjusted_return: BasisPoints::new(200),
             maximum_backtest_drawdown: BasisPoints::new(4_000),
             maximum_liquidity_spread: BasisPoints::new(100),
@@ -244,7 +252,14 @@ impl RecommendationPolicy {
             RecommendationEvidenceKind::Market => self.semantics.market_max_age_nanos,
             RecommendationEvidenceKind::PriceForecast => self.semantics.forecast_max_age_nanos,
             RecommendationEvidenceKind::Valuation => self.semantics.valuation_max_age_nanos,
+            RecommendationEvidenceKind::FinancialModel => {
+                self.semantics.financial_model_max_age_nanos
+            }
             RecommendationEvidenceKind::Backtest => self.semantics.backtest_max_age_nanos,
+            RecommendationEvidenceKind::OutOfSample => self.semantics.out_of_sample_max_age_nanos,
+            RecommendationEvidenceKind::HarmonicPattern => {
+                self.semantics.harmonic_pattern_max_age_nanos
+            }
             RecommendationEvidenceKind::Liquidity => self.semantics.liquidity_max_age_nanos,
             RecommendationEvidenceKind::PortfolioRisk => {
                 self.semantics.portfolio_risk_max_age_nanos
@@ -370,7 +385,10 @@ pub(super) fn validate_policy(
             policy.market_max_age_nanos,
             policy.forecast_max_age_nanos,
             policy.valuation_max_age_nanos,
+            policy.financial_model_max_age_nanos,
             policy.backtest_max_age_nanos,
+            policy.out_of_sample_max_age_nanos,
+            policy.harmonic_pattern_max_age_nanos,
             policy.liquidity_max_age_nanos,
             policy.portfolio_risk_max_age_nanos,
         ]
@@ -386,6 +404,7 @@ pub(super) fn validate_policy(
         || price_weight_sum != 10_000
         || [
             policy.minimum_backtest_stability_ppm,
+            policy.minimum_oos_completion_coverage_ppm,
             policy.minimum_nominal_forecast_coverage_ppm,
             policy.maximum_nominal_forecast_coverage_ppm,
             policy.minimum_liquidity_capacity_ppm,
