@@ -8,7 +8,10 @@
 //! tick and lot terms. No route derives an [`InstrumentId`](market_squawk_domain::InstrumentId)
 //! from a ticker, listing row, or provider symbol.
 
-use std::num::NonZeroUsize;
+use std::{
+    num::{NonZeroU64, NonZeroUsize},
+    sync::Arc,
+};
 
 use market_squawk_adapter_alpaca::{
     ALPACA_BASIC_EQUITY_SYMBOL_LIMIT, ALPACA_BASIC_OPTION_SYMBOL_LIMIT, AlpacaError,
@@ -16,8 +19,8 @@ use market_squawk_adapter_alpaca::{
     AlpacaInstrumentMapping, AlpacaOptionMapping, AlpacaOptionsLiveConfig, AlpacaTransportLimits,
 };
 use market_squawk_adapter_kraken::{
-    KrakenL3ClientTier, KrakenL3Config, KrakenL3ConfigError, KrakenL3Depth, KrakenL3MetadataError,
-    KrakenL3MetadataInput, KrakenL3ProductMapping,
+    KrakenL3ClientTier, KrakenL3Config, KrakenL3ConfigError, KrakenL3CredentialAuthority,
+    KrakenL3Depth, KrakenL3MetadataError, KrakenL3MetadataInput, KrakenL3ProductMapping,
 };
 use market_squawk_data::{
     ListingReferenceRecord, ListingReferenceRightsState, MarketDataInstrumentRecord, RightsBasis,
@@ -912,6 +915,7 @@ impl PreparedAlpacaBasicMarketConfiguration {
 pub struct PreparedKrakenL3MarketConfiguration {
     lease: ProviderActivationLease,
     account: ProviderAccountBinding,
+    credential_authority: Arc<KrakenL3CredentialAuthority>,
     config: KrakenL3Config,
     instruments: Box<[MarketInstrumentBinding]>,
 }
@@ -927,6 +931,11 @@ impl PreparedKrakenL3MarketConfiguration {
 
     pub const fn config(&self) -> &KrakenL3Config {
         &self.config
+    }
+
+    /// Returns the exact protected credential allocation shared by config and token capabilities.
+    pub fn credential_authority(&self) -> &Arc<KrakenL3CredentialAuthority> {
+        &self.credential_authority
     }
 
     pub fn instruments(&self) -> &[MarketInstrumentBinding] {
@@ -946,10 +955,16 @@ impl PreparedKrakenL3MarketConfiguration {
         self,
     ) -> (
         ProviderActivationLease,
+        Arc<KrakenL3CredentialAuthority>,
         KrakenL3Config,
         Box<[MarketInstrumentBinding]>,
     ) {
-        (self.lease, self.config, self.instruments)
+        (
+            self.lease,
+            self.credential_authority,
+            self.config,
+            self.instruments,
+        )
     }
 }
 
@@ -1246,17 +1261,26 @@ fn prepare_kraken_l3(
         budget,
     )
     .try_build()?;
+    let authorization_generation = lease
+        .generation()
+        .and_then(|generation| NonZeroU64::new(generation.get()))
+        .ok_or(MarketProviderConfigurationError::LeaseBinding)?;
+    let credential_authority = Arc::new(KrakenL3CredentialAuthority::new(
+        account.subject().clone(),
+        authorization_generation,
+    ));
     let config = KrakenL3Config::try_new(
         metadata,
         products,
         input.retained_depth,
         input.client_tier,
-        account.subject().clone(),
+        credential_authority.as_ref(),
         input.max_message_bytes,
     )?;
     Ok(PreparedKrakenL3MarketConfiguration {
         lease: lease.clone(),
         account,
+        credential_authority,
         config,
         instruments: input.instruments.into_bindings().into_boxed_slice(),
     })

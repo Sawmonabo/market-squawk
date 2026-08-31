@@ -1120,12 +1120,17 @@ async fn start_kraken(
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<(KrakenLevel3LiveRuntime, ProviderAccountRuntimeCurrentness), ServiceError> {
-    let (lease, config, instruments) = prepared.into_parts();
+    let (lease, credential_authority, config, instruments) = prepared.into_parts();
     let mut activation_guard = StartupCancellation::new(group_cancellation.child_token());
     let activation = await_before(
         deadline,
         cancellation,
-        provider_activation.activate_kraken_l3_account(lease, config, activation_guard.token()),
+        provider_activation.activate_kraken_l3_account(
+            lease,
+            credential_authority,
+            config,
+            activation_guard.token(),
+        ),
     )
     .await?;
     activation_guard.disarm();

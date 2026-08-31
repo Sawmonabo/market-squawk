@@ -13,7 +13,7 @@ mod subscription;
 pub use config::{KrakenChannel, KrakenConfig, KrakenConfigError, KrakenDepth};
 pub use decoder::{
     KrakenDecodeOutcome, KrakenDecoder, KrakenDecoderState, KrakenMarketDecodeHandoff,
-    KrakenMarketDecoder, KrakenPublicationDecodeOutcome,
+    KrakenMarketDecoder, KrakenSocketHandoffConsumer,
 };
 pub use handoff::{
     KrakenAuthenticatedDiscontinuity, KrakenAuthenticatedLevel3MarketEventHandoff,
@@ -48,6 +48,7 @@ pub use qualification::{
     KrakenMetadataInput, KrakenQualificationPolicy,
 };
 pub use session::{
-    KrakenHealth, KrakenL3EstablishedSessionSender, KrakenSentSubscriptionReceipt, KrakenSource,
-    KrakenSubscriptionReceiptError, KrakenWrittenSubscription,
+    KrakenHealth, KrakenL3EstablishedSessionSender, KrakenL3SubscriptionDispatch,
+    KrakenSentSubscriptionReceipt, KrakenSource, KrakenSubscriptionReceiptError,
+    KrakenWrittenSubscription,
 };

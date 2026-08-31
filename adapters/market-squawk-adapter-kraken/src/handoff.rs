@@ -693,6 +693,15 @@ impl KrakenMarketEventHandoff {
             Self::ControlOrDiscontinuity(handoff) => handoff.native_payload(),
         }
     }
+
+    /// Returns the exact transport kind for every disposition.
+    pub const fn transport(&self) -> TransportFrameKind {
+        match self {
+            Self::Public(handoff) => handoff.transport(),
+            Self::AuthenticatedLevel3(handoff) => handoff.transport(),
+            Self::ControlOrDiscontinuity(handoff) => handoff.transport(),
+        }
+    }
 }
 
 pub(crate) fn from_public_outcome(

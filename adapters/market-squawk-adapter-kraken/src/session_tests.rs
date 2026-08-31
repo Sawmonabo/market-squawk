@@ -14,7 +14,7 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     ActiveLiveSourceGeneration, AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy,
-    BudgetReservationDecision, BudgetScope, FreshnessPolicy, LiveMarketSource,
+    BudgetReservationDecision, BudgetScope, DecodeOutcome, FreshnessPolicy, LiveMarketSource,
     LiveSourceGeneration, ProviderBudgetPolicy, RawMarketFrame, RawMarketSink, RegistryError,
     SessionId, SinkError, SourceError, SourceMetadata, SourceMetadataProvider, TransportFrameKind,
 };
@@ -28,12 +28,14 @@ use super::{
     KrakenDecoderState, KrakenEstablishedSubscriptionSender, KrakenSource,
     KrakenWrittenSubscription,
 };
+use crate::decoder::{KrakenSocketHandoffConsumer, KrakenSocketHandoffPublisher};
 use crate::{
     KRAKEN_L3_WEBSOCKET_ENDPOINT, KrakenAuthenticatedDiscontinuity, KrakenBookTransition,
     KrakenChecksumAvailability, KrakenConfig, KrakenControlOrDiscontinuityKind, KrakenDepth,
     KrakenGenerationRetirement, KrakenL3ClientTier, KrakenL3Config, KrakenL3CredentialAuthority,
     KrakenL3Decoder, KrakenL3DecoderState, KrakenL3Depth, KrakenL3EstablishedSessionSender,
-    KrakenL3MetadataInput, KrakenL3ProductMapping, KrakenMarketContinuity, KrakenMarketDecoder,
+    KrakenL3MetadataInput, KrakenL3ProductMapping, KrakenL3SubscriptionDispatch,
+    KrakenMarketContinuity, KrakenMarketDecodeHandoff, KrakenMarketDecoder,
     KrakenMarketEventHandoff, KrakenMetadataInput, KrakenPublicControl,
     KrakenSubscriptionRequestEvidence,
 };
@@ -149,6 +151,8 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
         instrument,
         KrakenDepth::Ten,
     )?;
+    let (public_handoff_publisher, mut public_handoff_consumer) =
+        KrakenSocketHandoffConsumer::channel(public_config.metadata().clone());
     let public_ack = receive_text(&mut public_socket).await?;
     let acknowledgement = decode_public_frame(
         &mut public_authority,
@@ -163,23 +167,24 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
             ..
         })
     ));
-    let public_snapshot_handoff = decode_public_frame(
+    let (public_continuity, public_snapshot_handoff) = decode_public_frame_through_socket_handoff(
         &mut public_authority,
         &mut public_decoder,
         receive_text(&mut public_socket).await?,
-        None,
+        &public_handoff_publisher,
+        &mut public_handoff_consumer,
     )?;
-    let KrakenMarketEventHandoff::Public(public_snapshot_handoff) = public_snapshot_handoff else {
-        return Err("public book escaped the market handoff".into());
-    };
     assert!(matches!(
-        public_snapshot_handoff.continuity(),
+        public_continuity,
         KrakenMarketContinuity::PriceLevelBook {
             transition: KrakenBookTransition::Snapshot,
             checksum: KrakenChecksumAvailability::Validated(3_310_070_434),
             ..
         }
     ));
+    let (public_snapshot, publication) = public_snapshot_handoff.into_parts();
+    assert!(matches!(public_snapshot, DecodeOutcome::Data(_)));
+    assert!(publication.is_some());
     let reset = decode_public_frame(
         &mut public_authority,
         &mut public_decoder,
@@ -248,6 +253,10 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
     )?;
     let level3_generation = live_generation(&mut level3_registry, &level3_session)?;
     let mut level3_authority = level3_generation.try_start(level3_config.metadata())?;
+    let level3_budget = level3_authority
+        .budget()?
+        .cloned()
+        .ok_or("level-3 session has no coordinated budget")?;
     let (mut level3_socket, _) =
         tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
     let level3_payload = level3_config.try_subscription_payload(
@@ -256,22 +265,26 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
         0,
         Some(7),
     )?;
-    let level3_written =
-        KrakenL3EstablishedSessionSender::try_new(&mut level3_authority, &mut level3_socket)?
-            .send_subscription(
-                level3_payload,
-                &CancellationToken::new(),
-                Duration::from_secs(1),
-            )
-            .await?;
+    let mut level3_dispatch = KrakenL3EstablishedSessionSender::try_new(
+        &mut level3_authority,
+        &mut level3_socket,
+        &level3_budget,
+    )?
+    .send_subscription(
+        level3_payload,
+        &CancellationToken::new(),
+        Duration::from_secs(1),
+    )
+    .await?;
     let mut level3_decoder = KrakenL3Decoder::try_new(&level3_config)?;
     let level3_ack = receive_text(&mut level3_socket).await?;
     decode_level3_frame(
         &mut level3_authority,
         &mut level3_decoder,
         level3_ack,
-        Some(level3_written),
+        Some(&mut level3_dispatch),
     )?;
+    assert!(level3_dispatch.is_settled());
     let level3_snapshot_handoff = decode_level3_frame(
         &mut level3_authority,
         &mut level3_decoder,
@@ -404,20 +417,51 @@ fn decode_public_frame(
     Ok(decoder.decode_captured(&validated)?)
 }
 
+fn decode_public_frame_through_socket_handoff(
+    authority: &mut ActiveLiveSourceGeneration,
+    decoder: &mut KrakenMarketDecoder,
+    payload: Bytes,
+    publisher: &KrakenSocketHandoffPublisher,
+    consumer: &mut KrakenSocketHandoffConsumer,
+) -> TestResult<(KrakenMarketContinuity, KrakenMarketDecodeHandoff)> {
+    let frame = authority
+        .frames_mut()?
+        .try_frame(TransportFrameKind::Text, payload)?;
+    let validated = authority.validate_live_frame(&frame)?;
+    let handoff = decoder.decode_captured(&validated)?;
+    let KrakenMarketEventHandoff::Public(public) = &handoff else {
+        return Err("public book escaped the socket-owned market handoff".into());
+    };
+    let continuity = public.continuity();
+    publisher.try_publish(handoff)?;
+    Ok((continuity, consumer.consume(&validated)?))
+}
+
 fn decode_level3_frame(
     authority: &mut ActiveLiveSourceGeneration,
     decoder: &mut KrakenL3Decoder,
     payload: Bytes,
-    written: Option<KrakenWrittenSubscription>,
+    mut dispatch: Option<&mut KrakenL3SubscriptionDispatch>,
 ) -> TestResult<KrakenMarketEventHandoff> {
     let frame = authority
         .frames_mut()?
         .try_frame(TransportFrameKind::Text, payload)?;
     let validated = authority.validate_live_frame(&frame)?;
-    if let Some(written) = written {
-        decoder.register_sent_subscription(written.bind_to_frame(&validated)?)?;
+    if let Some(dispatch) = dispatch.as_deref_mut() {
+        if let Some(sent) = dispatch.bind_to_frame(&validated)? {
+            decoder.register_sent_subscription(sent)?;
+        }
     }
-    Ok(decoder.decode_captured(&validated)?)
+    let handoff = decoder.decode_captured(&validated)?;
+    if let Some(dispatch) = dispatch {
+        if let KrakenMarketEventHandoff::ControlOrDiscontinuity(control) = &handoff {
+            if let KrakenControlOrDiscontinuityKind::AuthenticatedControl(control) = control.kind()
+            {
+                dispatch.apply_control(control)?;
+            }
+        }
+    }
+    Ok(handoff)
 }
 
 fn disposition_kind(

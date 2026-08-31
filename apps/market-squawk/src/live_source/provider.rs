@@ -11,7 +11,7 @@ use market_squawk_adapter_coinbase::{
     CoinbaseExchangeDecoder, CoinbaseExchangeSource, CoinbaseMarketDecodeOutcome,
 };
 use market_squawk_adapter_kraken::{
-    KrakenConfig, KrakenMarketDecodeHandoff, KrakenMarketDecoder, KrakenSource,
+    KrakenConfig, KrakenMarketDecodeHandoff, KrakenSocketHandoffConsumer, KrakenSource,
 };
 use market_squawk_sources::{
     DecodeInternalError, DecodeOutcome, LiveMarketSource, LiveSourceGeneration, MarketDecoder,
@@ -255,15 +255,11 @@ impl ProductionSourceProfile {
         self.startup_readiness_policy
     }
 
-    pub(super) fn decoder(&self) -> Result<ProductionMarketDecoder, ProductionProviderError> {
-        self.connector.decoder()
-    }
-
-    pub(super) fn try_source(
+    pub(super) fn try_generation(
         &self,
         generation: LiveSourceGeneration,
-    ) -> Result<ProductionLiveSource, ProductionProviderError> {
-        self.connector.try_source(generation)
+    ) -> Result<(ProductionLiveSource, ProductionMarketDecoder), ProductionProviderError> {
+        self.connector.try_generation(generation)
     }
 
     pub(super) const fn supports_display_output(&self) -> bool {
@@ -361,55 +357,47 @@ impl ProductionConnectorProfile {
         }
     }
 
-    fn decoder(&self) -> Result<ProductionMarketDecoder, ProductionProviderError> {
-        match self {
-            Self::Coinbase(profile) => {
-                Ok(ProductionMarketDecoder::Coinbase(profile.decoder().clone()))
-            }
-            Self::Kraken(profile) => Ok(ProductionMarketDecoder::Kraken {
-                decoder: profile.decoder()?,
-                publication_config: profile.publication_config(),
-            }),
-            Self::AlpacaIex { config, .. } => Ok(ProductionMarketDecoder::AlpacaIex(
-                AlpacaIexDecoder::try_new(config)?,
-            )),
-            Self::AlpacaOptions { config, .. } => Ok(ProductionMarketDecoder::AlpacaOptions(
-                AlpacaOptionsDecoder::try_new(config)?,
-            )),
-        }
-    }
-
-    fn try_source(
+    fn try_generation(
         &self,
         generation: LiveSourceGeneration,
-    ) -> Result<ProductionLiveSource, ProductionProviderError> {
+    ) -> Result<(ProductionLiveSource, ProductionMarketDecoder), ProductionProviderError> {
         match self {
-            Self::Coinbase(profile) => Ok(ProductionLiveSource::Coinbase(
-                profile.try_source(generation)?,
+            Self::Coinbase(profile) => Ok((
+                ProductionLiveSource::Coinbase(profile.try_source(generation)?),
+                ProductionMarketDecoder::Coinbase(profile.decoder().clone()),
             )),
-            Self::Kraken(profile) => Ok(ProductionLiveSource::Kraken(
-                profile.try_source(generation)?,
-            )),
+            Self::Kraken(profile) => {
+                let (source, handoff) = profile.try_source_with_publication_handoff(generation)?;
+                Ok((
+                    ProductionLiveSource::Kraken(source),
+                    ProductionMarketDecoder::Kraken {
+                        handoff,
+                        publication_config: profile.publication_config(),
+                    },
+                ))
+            }
             Self::AlpacaIex {
                 config,
                 credentials,
-            } => AlpacaIexLiveSource::try_new(
-                config.as_ref().clone(),
-                generation,
-                Arc::clone(credentials),
-            )
-            .map(ProductionLiveSource::AlpacaIex)
-            .map_err(Into::into),
+            } => Ok((
+                ProductionLiveSource::AlpacaIex(AlpacaIexLiveSource::try_new(
+                    config.as_ref().clone(),
+                    generation,
+                    Arc::clone(credentials),
+                )?),
+                ProductionMarketDecoder::AlpacaIex(AlpacaIexDecoder::try_new(config)?),
+            )),
             Self::AlpacaOptions {
                 config,
                 credentials,
-            } => AlpacaOptionsLiveSource::try_new(
-                config.as_ref().clone(),
-                generation,
-                Arc::clone(credentials),
-            )
-            .map(ProductionLiveSource::AlpacaOptions)
-            .map_err(Into::into),
+            } => Ok((
+                ProductionLiveSource::AlpacaOptions(AlpacaOptionsLiveSource::try_new(
+                    config.as_ref().clone(),
+                    generation,
+                    Arc::clone(credentials),
+                )?),
+                ProductionMarketDecoder::AlpacaOptions(AlpacaOptionsDecoder::try_new(config)?),
+            )),
         }
     }
 }
@@ -419,7 +407,7 @@ impl ProductionConnectorProfile {
 pub(super) enum ProductionMarketDecoder {
     Coinbase(CoinbaseExchangeDecoder),
     Kraken {
-        decoder: KrakenMarketDecoder,
+        handoff: KrakenSocketHandoffConsumer,
         publication_config: KrakenConfig,
     },
     AlpacaIex(AlpacaIexDecoder),
@@ -430,7 +418,7 @@ impl SourceMetadataProvider for ProductionMarketDecoder {
     fn metadata(&self) -> &SourceMetadata {
         match self {
             Self::Coinbase(decoder) => decoder.metadata(),
-            Self::Kraken { decoder, .. } => decoder.metadata(),
+            Self::Kraken { handoff, .. } => handoff.metadata(),
             Self::AlpacaIex(decoder) => decoder.metadata(),
             Self::AlpacaOptions(decoder) => decoder.metadata(),
         }
@@ -456,14 +444,14 @@ impl ProductionMarketDecoder {
                 .decode_market_handoff(frame)
                 .map(ProductionDecodeOutcome::Coinbase),
             Self::Kraken {
-                decoder,
+                handoff,
                 publication_config,
-            } => decoder.decode_publication_handoff(frame).map(|handoff| {
-                ProductionDecodeOutcome::Kraken {
+            } => handoff
+                .consume(frame)
+                .map(|handoff| ProductionDecodeOutcome::Kraken {
                     handoff,
                     publication_config: publication_config.clone(),
-                }
-            }),
+                }),
             Self::AlpacaIex(decoder) => {
                 decoder.decode(frame).map(ProductionDecodeOutcome::Standard)
             }
@@ -511,8 +499,6 @@ pub enum ProductionProviderError {
     StartupAcknowledgementTimeoutOverflow,
     #[error(transparent)]
     Source(#[from] SourceError),
-    #[error("production Kraken decoder could not be constructed")]
-    KrakenDecoder(#[from] market_squawk_sources::DecodeError),
     #[cfg(all(test, debug_assertions))]
     #[error("the deterministic connector override requires a Kraken profile")]
     TestConnectorMismatch,

@@ -6,7 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt as _;
 use market_squawk_adapter_kraken::{
-    KRAKEN_L3_WEBSOCKET_ENDPOINT, KrakenL3Config, KrakenL3WebSocketToken,
+    KRAKEN_L3_WEBSOCKET_ENDPOINT, KrakenL3Config, KrakenL3CredentialAuthority,
+    KrakenL3TokenCapability,
 };
 use market_squawk_domain::{DataQuality, MarketDepth, SequenceCapability, Timestamp};
 use market_squawk_sources::{
@@ -37,6 +38,7 @@ pub struct KrakenL3AccountActivation {
     signer: KrakenL3CredentialSigner,
     client: reqwest::Client,
     budget: SharedProviderBudget,
+    credential_authority: Arc<KrakenL3CredentialAuthority>,
     config: Option<KrakenL3Config>,
 }
 
@@ -151,7 +153,10 @@ impl KrakenL3AccountActivation {
         if result.expires == 0 || result.expires > MAX_TOKEN_VALIDITY_SECONDS {
             return Err(KrakenL3ActivationError::Response);
         }
-        KrakenL3WebSocketToken::try_new(result.token.as_str())?;
+        let capability = self
+            .credential_authority
+            .try_mint_subscription_capability(result.token.as_str().to_owned())?;
+        drop(capability);
         self.authority.require_current().await?;
         self.budget
             .record_success()
@@ -161,6 +166,7 @@ impl KrakenL3AccountActivation {
         Ok(KrakenL3WebSocketTokenMaterial {
             token: result.token.0,
             expires_at,
+            credential_authority: Arc::clone(&self.credential_authority),
         })
     }
 
@@ -181,16 +187,22 @@ impl std::fmt::Debug for KrakenL3AccountActivation {
     }
 }
 
-/// Owned short-lived token material whose only view is Kraken's borrowed redacted wrapper.
+/// Owned short-lived token material whose only output is an adapter-owned opaque capability.
 pub struct KrakenL3WebSocketTokenMaterial {
     token: Zeroizing<String>,
     expires_at: Timestamp,
+    credential_authority: Arc<KrakenL3CredentialAuthority>,
 }
 
 impl KrakenL3WebSocketTokenMaterial {
-    /// Borrows the token for one immediate authenticated subscription encoding.
-    pub fn token(&self) -> Result<KrakenL3WebSocketToken<'_>, KrakenL3ActivationError> {
-        KrakenL3WebSocketToken::try_new(self.token.as_str()).map_err(Into::into)
+    /// Mints one non-forgeable, one-use subscription capability for the exact protected
+    /// credential allocation retained by the configuration.
+    pub fn try_subscription_capability(
+        &self,
+    ) -> Result<KrakenL3TokenCapability, KrakenL3ActivationError> {
+        self.credential_authority
+            .try_mint_subscription_capability(self.token.as_str().to_owned())
+            .map_err(Into::into)
     }
 
     /// Returns the conservative local validity deadline from the provider response.
@@ -214,6 +226,7 @@ impl ProviderAdapterActivation {
     pub(crate) async fn activate_kraken_l3_account(
         &self,
         lease: ProviderActivationLease,
+        credential_authority: Arc<KrakenL3CredentialAuthority>,
         config: KrakenL3Config,
         cancellation: CancellationToken,
     ) -> Result<KrakenL3AccountActivation, KrakenL3ActivationError> {
@@ -222,7 +235,7 @@ impl ProviderAdapterActivation {
         }
         let binding =
             ProviderAccountBinding::try_from_lease(ProviderMarketAccount::KrakenLevel3, &lease)?;
-        validate_configuration(&lease, &binding, &config)?;
+        validate_configuration(&lease, &binding, &credential_authority, &config)?;
         let secret = self
             .onboarding
             .read_secret_for_activation_request(&lease, cancellation)
@@ -279,6 +292,7 @@ impl ProviderAdapterActivation {
             signer,
             client,
             budget,
+            credential_authority,
             config: Some(config),
         })
     }
@@ -287,6 +301,7 @@ impl ProviderAdapterActivation {
 fn validate_configuration(
     lease: &ProviderActivationLease,
     binding: &ProviderAccountBinding,
+    credential_authority: &KrakenL3CredentialAuthority,
     config: &KrakenL3Config,
 ) -> Result<(), KrakenL3ActivationError> {
     let metadata = config.metadata();
@@ -306,6 +321,7 @@ fn validate_configuration(
         || metadata.budget_policy() != Some(&expected_budget)
         || config.market_depth() != MarketDepth::OrderLevel
         || config.credential_record_id() != binding.subject()
+        || !config.shares_credential_authority_with(credential_authority)
         || config.endpoint().as_str() != KRAKEN_L3_WEBSOCKET_ENDPOINT
     {
         return Err(KrakenL3ActivationError::SourceBinding);

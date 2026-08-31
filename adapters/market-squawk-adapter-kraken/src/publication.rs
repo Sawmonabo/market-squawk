@@ -9,9 +9,9 @@ use std::mem::size_of;
 
 use bytes::Bytes;
 use market_squawk_domain::{
-    ConnectionGeneration, DataQuality, EvidenceDigest, InstrumentId, LiveEventClass,
-    LiveProvenance, MarketDepth, MarketEvent, MetadataRevision, SourceId, SourceIdentifier,
-    Timestamp, VenueId,
+    CapturePayload, ConnectionGeneration, DataQuality, EvidenceDigest, InstrumentId,
+    LiveEventClass, LiveProvenance, MarketDepth, MarketEvent, MetadataRevision, SourceId,
+    SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_live::CommittedResearchMarketObservation;
 use market_squawk_sources::{
@@ -27,9 +27,12 @@ use market_squawk_sources::{
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::decoder::{KrakenPublicationContext, KrakenPublicationDecodeOutcome};
 use crate::{
-    KrakenChannel, KrakenConfig, KrakenDecodeOutcome, KrakenDepth, KrakenPublicControl,
-    KrakenPublicationDecodeOutcome,
+    KrakenBookTransition, KrakenChannel, KrakenChecksumAvailability, KrakenConfig,
+    KrakenDecodeOutcome, KrakenDepth, KrakenMarketContinuity, KrakenPublicControl,
+    KrakenSequenceAvailability, KrakenSubscriptionAcknowledgementEvidence,
+    KrakenSubscriptionRequestEvidence,
 };
 
 const KRAKEN_VENUE: &str = "kraken";
@@ -88,6 +91,10 @@ pub struct KrakenPublicationEvidence {
     raw_payload_digest: EvidenceDigest,
     received_at: Timestamp,
     available_at: Timestamp,
+    subscription_request_id: Option<u64>,
+    subscription_request_payload: Option<CapturePayload>,
+    subscription_acknowledgement: Option<KrakenSubscriptionAcknowledgementEvidence>,
+    continuity: Option<KrakenMarketContinuity>,
 }
 
 impl KrakenPublicationEvidence {
@@ -185,6 +192,31 @@ impl KrakenPublicationEvidence {
     pub const fn available_at(&self) -> Timestamp {
         self.available_at
     }
+
+    /// Returns the exact public request identifier whose same-socket acknowledgement admitted
+    /// this frame.
+    pub const fn subscription_request_id(&self) -> Option<u64> {
+        self.subscription_request_id
+    }
+
+    /// Returns the exact public request bytes emitted on this socket generation.
+    pub fn subscription_request_payload(&self) -> Option<&[u8]> {
+        self.subscription_request_payload
+            .as_ref()
+            .map(CapturePayload::as_bytes)
+    }
+
+    /// Returns the exact captured same-socket acknowledgement evidence.
+    pub const fn subscription_acknowledgement(
+        &self,
+    ) -> Option<&KrakenSubscriptionAcknowledgementEvidence> {
+        self.subscription_acknowledgement.as_ref()
+    }
+
+    /// Returns the exact provider continuity admitted by the socket-owned decoder.
+    pub const fn continuity(&self) -> Option<KrakenMarketContinuity> {
+        self.continuity
+    }
 }
 
 #[derive(Debug)]
@@ -221,6 +253,7 @@ impl KrakenPendingPublication {
             capture,
             config,
             available_at,
+            None,
             PendingDisposition::Unavailable(reason),
         )
     }
@@ -230,10 +263,19 @@ impl KrakenPendingPublication {
         capture: ProviderEventMicrobatchMaterial,
         config: &KrakenConfig,
         available_at: Timestamp,
+        context: Option<KrakenPublicationContext>,
         disposition: PendingDisposition,
     ) -> Result<Self, KrakenPublicationError> {
-        let evidence = validate_capture(frame, &capture, config, available_at)?;
+        let evidence = validate_capture(frame, &capture, config, available_at, context)?;
         validate_disposition(&disposition, config)?;
+        validate_continuity(&disposition, &evidence)?;
+        if matches!(&disposition, PendingDisposition::Market { .. })
+            && (evidence.subscription_request_payload.is_none()
+                || evidence.subscription_acknowledgement.is_none()
+                || evidence.continuity.is_none())
+        {
+            return Err(KrakenPublicationError::InvalidMarketEvidence);
+        }
         let (expectation, seal_request) = capture.into_sealing_parts();
         Ok(Self {
             expectation,
@@ -266,7 +308,7 @@ impl KrakenPublicationDecodeOutcome {
         config: &KrakenConfig,
         available_at: Timestamp,
     ) -> Result<KrakenPendingPublication, KrakenPublicationError> {
-        let (outcome, decoded_retained_bytes) = self.into_parts();
+        let (outcome, decoded_retained_bytes, context) = self.into_parts();
         let disposition = match outcome {
             KrakenDecodeOutcome::Market(observations) => PendingDisposition::Market {
                 observations,
@@ -303,6 +345,7 @@ impl KrakenPublicationDecodeOutcome {
             capture,
             config,
             available_at,
+            Some(context),
             disposition,
         )
     }
@@ -496,7 +539,13 @@ impl KrakenSealedMarketPublicationMaterial {
             .checked_add(self.decoded_retained_bytes)?
             .checked_add(native_slots)?
             .checked_add(native_bytes)?
-            .checked_add(evidence_strings)
+            .checked_add(evidence_strings)?
+            .checked_add(
+                self.evidence
+                    .subscription_request_payload
+                    .as_ref()
+                    .map_or(0, |payload| payload.as_bytes().len()),
+            )
     }
 
     /// Consumes sealed Kraken material and committed live rows into the common durable binding.
@@ -581,7 +630,10 @@ fn validate_committed_row(
     let provenance = event_provenance(event);
     let binding = committed.qualification().binding();
     let source_timestamp = observation_timestamp(normalized);
-    if committed.qualification().recorded_quality() != DataQuality::DirectUnverified
+    if evidence.subscription_request_payload.is_none()
+        || evidence.subscription_acknowledgement.is_none()
+        || evidence.continuity.is_none()
+        || committed.qualification().recorded_quality() != DataQuality::DirectUnverified
         || provenance.recorded_quality() != DataQuality::DirectUnverified
         || provenance.execution_eligibility()
             != market_squawk_domain::ExecutionEligibility::Ineligible
@@ -684,6 +736,7 @@ fn validate_capture(
     capture: &ProviderEventMicrobatchMaterial,
     config: &KrakenConfig,
     available_at: Timestamp,
+    context: Option<KrakenPublicationContext>,
 ) -> Result<KrakenPublicationEvidence, KrakenPublicationError> {
     let raw = frame.frame();
     let metadata = config.metadata();
@@ -728,6 +781,66 @@ fn validate_capture(
     if live.provider_channel().as_source_identifier().as_str() != expected_feed {
         return Err(KrakenPublicationError::InvalidMarketEvidence);
     }
+    let (
+        subscription_request_id,
+        subscription_request_payload,
+        subscription_acknowledgement,
+        continuity,
+    ) = match context {
+        Some(context) => {
+            let (connection, instrument, acknowledgement, continuity) = context.into_parts();
+            let KrakenSubscriptionRequestEvidence::PublicExact {
+                request_id,
+                payload,
+                instrument_binding,
+                channel,
+            } = connection
+                .subscription_request()
+                .ok_or(KrakenPublicationError::InvalidMarketEvidence)?
+            else {
+                return Err(KrakenPublicationError::InvalidMarketEvidence);
+            };
+            let expected_payload =
+                crate::config::public_subscription_payload(config.symbol(), config.channel())
+                    .map_err(|_| KrakenPublicationError::InvalidMarketEvidence)?;
+            if connection.provider().as_str() != KRAKEN_VENUE
+                || connection.venue().as_str() != KRAKEN_VENUE
+                || connection
+                    .provider_product()
+                    .as_source_identifier()
+                    .as_str()
+                    != "kraken-spot"
+                || connection
+                    .provider_channel()
+                    .as_source_identifier()
+                    .as_str()
+                    != expected_feed
+                || *channel != config.channel()
+                || instrument.native_symbol().as_str() != config.symbol()
+                || instrument.externally_resolved_instrument() != config.instrument()
+                || instrument_binding.native_symbol() != instrument.native_symbol()
+                || instrument_binding.externally_resolved_instrument()
+                    != instrument.externally_resolved_instrument()
+                || payload.as_bytes() != expected_payload.as_bytes()
+                || acknowledgement.request_id() != Some(*request_id)
+                || !acknowledgement
+                    .binding()
+                    .shares_allocation_with(raw.binding())
+                || acknowledgement.frame_id().get() > raw.frame_id().get()
+                || acknowledgement.received_at() > raw.received_at()
+                || !continuity_matches_config(continuity, config.channel())
+            {
+                return Err(KrakenPublicationError::InvalidMarketEvidence);
+            }
+            (
+                Some(*request_id),
+                Some(payload.clone()),
+                Some(acknowledgement),
+                continuity,
+            )
+        }
+        None => (None, None, None, None),
+    };
     Ok(KrakenPublicationEvidence {
         source_id: raw.source_id().clone(),
         metadata_revision: raw.metadata_revision().clone(),
@@ -749,7 +862,37 @@ fn validate_capture(
         raw_payload_digest: raw_receipt.payload_digest(),
         received_at: raw.received_at(),
         available_at,
+        subscription_request_id,
+        subscription_request_payload,
+        subscription_acknowledgement,
+        continuity,
     })
+}
+
+fn continuity_matches_config(
+    continuity: Option<KrakenMarketContinuity>,
+    channel: KrakenChannel,
+) -> bool {
+    match (continuity, channel) {
+        (None, _) => true,
+        (
+            Some(KrakenMarketContinuity::PriceLevelBook {
+                checksum: KrakenChecksumAvailability::Validated(_),
+                sequence: KrakenSequenceAvailability::ProviderUnsupported,
+                ..
+            }),
+            KrakenChannel::Book(_),
+        ) => true,
+        (
+            Some(KrakenMarketContinuity::Trades {
+                checksum: KrakenChecksumAvailability::Unsupported,
+                sequence: KrakenSequenceAvailability::ProviderUnsupported,
+                ..
+            }),
+            KrakenChannel::Trades,
+        ) => true,
+        _ => false,
+    }
 }
 
 fn validate_disposition(
@@ -776,6 +919,52 @@ fn validate_disposition(
             (KrakenChannel::Trades, ProviderObservationPayload::Trade { .. }) => {}
             _ => return Err(KrakenPublicationError::InvalidMarketEvidence),
         }
+    }
+    Ok(())
+}
+
+fn validate_continuity(
+    disposition: &PendingDisposition,
+    evidence: &KrakenPublicationEvidence,
+) -> Result<(), KrakenPublicationError> {
+    let PendingDisposition::Market { observations, .. } = disposition else {
+        return Ok(());
+    };
+    match evidence.continuity {
+        Some(KrakenMarketContinuity::PriceLevelBook {
+            transition,
+            checksum: KrakenChecksumAvailability::Validated(expected_checksum),
+            sequence: KrakenSequenceAvailability::ProviderUnsupported,
+        }) => {
+            let expected_snapshot = matches!(transition, KrakenBookTransition::Snapshot);
+            let expected_checksum = expected_checksum.to_string();
+            if observations.iter().any(|observation| {
+                let snapshot_matches = matches!(
+                    observation.payload(),
+                    ProviderObservationPayload::BookSnapshot(_)
+                ) == expected_snapshot;
+                let checksum_matches = matches!(
+                    observation.checksum(),
+                    market_squawk_sources::ProviderChecksumEvidence::Provided { value, .. }
+                        if value.as_str() == expected_checksum
+                );
+                !snapshot_matches || !checksum_matches
+            }) {
+                return Err(KrakenPublicationError::InvalidMarketEvidence);
+            }
+        }
+        Some(KrakenMarketContinuity::Trades {
+            event_count,
+            checksum: KrakenChecksumAvailability::Unsupported,
+            sequence: KrakenSequenceAvailability::ProviderUnsupported,
+        }) if event_count == observations.len()
+            && observations.iter().all(|observation| {
+                matches!(
+                    observation.payload(),
+                    ProviderObservationPayload::Trade { .. }
+                )
+            }) => {}
+        _ => return Err(KrakenPublicationError::InvalidMarketEvidence),
     }
     Ok(())
 }
@@ -885,9 +1074,32 @@ struct KrakenNativeBatchSidecarV1<'a> {
     raw_payload_digest: EvidenceDigest,
     received_at: Timestamp,
     available_at: Timestamp,
+    subscription_request_id: u64,
+    subscription_request_payload: &'a str,
+    subscription_ack_frame_ordinal: u64,
+    subscription_ack_received_at: Timestamp,
+    subscription_ack_payload_digest: EvidenceDigest,
+    provider_request_received_at: Timestamp,
+    provider_response_sent_at: Timestamp,
+    continuity: KrakenNativeContinuityV1,
     provider_row_count: usize,
     quality_ceiling: DataQuality,
     execution_authority: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum KrakenNativeContinuityV1 {
+    PriceLevelBook {
+        transition: &'static str,
+        checksum: u32,
+        sequence: &'static str,
+    },
+    Trades {
+        event_count: usize,
+        checksum: &'static str,
+        sequence: &'static str,
+    },
 }
 
 fn native_material(
@@ -925,6 +1137,42 @@ fn native_material(
             serde_json::to_vec(&row).map_err(|_| KrakenPublicationError::NativeEncoding)?,
         ));
     }
+    let request_payload = evidence
+        .subscription_request_payload
+        .as_ref()
+        .and_then(|payload| std::str::from_utf8(payload.as_bytes()).ok())
+        .ok_or(KrakenPublicationError::InvalidMarketEvidence)?;
+    let acknowledgement = evidence
+        .subscription_acknowledgement
+        .as_ref()
+        .ok_or(KrakenPublicationError::InvalidMarketEvidence)?;
+    let continuity = match evidence
+        .continuity
+        .ok_or(KrakenPublicationError::InvalidMarketEvidence)?
+    {
+        KrakenMarketContinuity::PriceLevelBook {
+            transition,
+            checksum: KrakenChecksumAvailability::Validated(checksum),
+            sequence: KrakenSequenceAvailability::ProviderUnsupported,
+        } => KrakenNativeContinuityV1::PriceLevelBook {
+            transition: match transition {
+                KrakenBookTransition::Snapshot => "snapshot",
+                KrakenBookTransition::Update => "update",
+            },
+            checksum,
+            sequence: "provider_unsupported",
+        },
+        KrakenMarketContinuity::Trades {
+            event_count,
+            checksum: KrakenChecksumAvailability::Unsupported,
+            sequence: KrakenSequenceAvailability::ProviderUnsupported,
+        } => KrakenNativeContinuityV1::Trades {
+            event_count,
+            checksum: "provider_unsupported",
+            sequence: "provider_unsupported",
+        },
+        _ => return Err(KrakenPublicationError::InvalidMarketEvidence),
+    };
     let sidecar = KrakenNativeBatchSidecarV1 {
         version: 1,
         family: "kraken.spot.public-market-event",
@@ -946,6 +1194,16 @@ fn native_material(
         raw_payload_digest: evidence.raw_payload_digest,
         received_at: evidence.received_at,
         available_at: evidence.available_at,
+        subscription_request_id: evidence
+            .subscription_request_id
+            .ok_or(KrakenPublicationError::InvalidMarketEvidence)?,
+        subscription_request_payload: request_payload,
+        subscription_ack_frame_ordinal: acknowledgement.frame_id().get(),
+        subscription_ack_received_at: acknowledgement.received_at(),
+        subscription_ack_payload_digest: acknowledgement.payload_digest(),
+        provider_request_received_at: acknowledgement.provider_request_received_at(),
+        provider_response_sent_at: acknowledgement.provider_response_sent_at(),
+        continuity,
         provider_row_count: observations.len(),
         quality_ceiling: DataQuality::DirectUnverified,
         execution_authority: "none",

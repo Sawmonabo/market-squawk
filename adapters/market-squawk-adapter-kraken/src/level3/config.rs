@@ -149,7 +149,7 @@ impl KrakenL3CredentialAuthority {
     ///
     /// The coordinates are secret-free. Allocation identity, not reconstructable values alone,
     /// binds every capability minted by this authority.
-    pub(crate) fn new(
+    pub fn new(
         credential_record_id: SourceIdentifier,
         authorization_generation: NonZeroU64,
     ) -> Self {
@@ -553,6 +553,15 @@ impl KrakenL3Config {
         self.credential_authority.authorization_generation
     }
 
+    /// Reports whether this config and a protected credential authority share one exact
+    /// process-local allocation.
+    pub fn shares_credential_authority_with(
+        &self,
+        authority: &KrakenL3CredentialAuthority,
+    ) -> bool {
+        Arc::ptr_eq(&self.credential_authority, &authority.binding)
+    }
+
     pub(crate) fn credential_authority_binding(&self) -> Arc<KrakenL3CredentialAuthorityBinding> {
         Arc::clone(&self.credential_authority)
     }
@@ -573,8 +582,8 @@ impl KrakenL3Config {
     ///
     /// The returned payload is redacted in debug output and overwritten on drop. Callers should
     /// write it immediately and must not persist or log its bytes. Batches are ordered by the
-    /// configured product list; the connection supervisor must admit at most one batch in each
-    /// documented one-second subscription-rate window.
+    /// configured product list and every batch must be admitted through the shared durable
+    /// provider-rate authority before its socket write.
     ///
     /// # Errors
     ///

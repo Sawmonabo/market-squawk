@@ -12,9 +12,10 @@ use std::{
 use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
 use market_squawk_adapter_kraken::{
-    KRAKEN_L3_CHECKSUM_SCOPE_ID, KRAKEN_L3_WEBSOCKET_ENDPOINT, KrakenL3BatchKind,
-    KrakenL3BookBatch, KrakenL3Config, KrakenL3Control, KrakenL3DecodeError, KrakenL3DecodeOutcome,
-    KrakenL3Decoder, KrakenL3OrderEventKind, KrakenL3ScaleError,
+    KRAKEN_L3_CHECKSUM_SCOPE_ID, KRAKEN_L3_WEBSOCKET_ENDPOINT, KrakenControlOrDiscontinuityKind,
+    KrakenL3BatchKind, KrakenL3BookBatch, KrakenL3Config, KrakenL3Control, KrakenL3DecodeError,
+    KrakenL3Decoder, KrakenL3EstablishedSessionSender, KrakenL3OrderEventKind, KrakenL3ScaleError,
+    KrakenL3SubscriptionDispatch, KrakenMarketEventHandoff,
 };
 use market_squawk_domain::{
     ChecksumCapability, ChecksumEvidence, ChecksumScope, ChecksumValue, DataQuality, IdentityError,
@@ -70,7 +71,6 @@ use super::order_level::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const CURRENTNESS_INTERVAL: Duration = Duration::from_secs(1);
-const SUBSCRIPTION_RATE_WINDOW: Duration = Duration::from_secs(1);
 const LOCAL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 const CAPTURE_FLUSH_RECORDS: usize = 256;
 const ACTOR_INGRESS_COMMANDS: usize = 256;
@@ -602,7 +602,14 @@ where
     let mut acknowledged = vec![false; specs.len()];
     let mut market_at = vec![None; specs.len()];
     let mut batch_index = 0_usize;
-    let mut next_subscription = tokio::time::Instant::now();
+    let mut subscription_dispatches: Vec<KrakenL3SubscriptionDispatch> = Vec::new();
+    subscription_dispatches
+        .try_reserve_exact(config.subscription_batch_count())
+        .map_err(|_| KrakenLevel3RuntimeError::Allocation)?;
+    let budget = source
+        .budget()?
+        .cloned()
+        .ok_or(KrakenLevel3RuntimeError::MissingProviderBudget)?;
     let idle = Duration::from_nanos(
         config
             .metadata()
@@ -649,8 +656,9 @@ where
             } => {
                 return Err(KrakenLevel3RuntimeError::MarketStale);
             }
-            () = tokio::time::sleep_until(next_subscription),
-                if batch_index < config.subscription_batch_count() => {
+            () = std::future::ready(()),
+                if batch_index < config.subscription_batch_count()
+                    && subscription_dispatches.is_empty() => {
                 if system_timestamp()? >= token.expires_at() {
                     return Err(KrakenLevel3RuntimeError::TokenExpiredBeforeSubscription);
                 }
@@ -659,17 +667,21 @@ where
                     .and_then(|value| value.checked_add(1))
                     .ok_or(KrakenLevel3RuntimeError::ResourceAccounting)?;
                 let payload = config.try_subscription_payload(
-                    token.token()?,
+                    token.try_subscription_capability()?,
                     batch_index,
                     Some(request_id),
                 )?;
-                let text = std::str::from_utf8(payload.as_bytes())
-                    .map_err(|_error| KrakenLevel3RuntimeError::Protocol)?;
-                send_message(socket, Message::Text(text.into()), cancellation).await?;
+                let dispatch = KrakenL3EstablishedSessionSender::try_new(
+                    source,
+                    socket,
+                    &budget,
+                )?
+                .send_subscription(payload, cancellation, IO_TIMEOUT)
+                .await?;
+                subscription_dispatches.push(dispatch);
                 batch_index = batch_index
                     .checked_add(1)
                     .ok_or(KrakenLevel3RuntimeError::ResourceAccounting)?;
-                next_subscription = tokio::time::Instant::now() + SUBSCRIPTION_RATE_WINDOW;
             }
             message = socket.next() => {
                 let message = message
@@ -682,12 +694,22 @@ where
                         let frame = source.frames_mut()?.try_frame(TransportFrameKind::Text, payload)?;
                         let receipt = capture.try_publish(&frame)?;
                         let validated = source.validate_live_frame(&frame)?;
-                        let evidence = DecoderEvidence::from_validated_frame(
-                            &validated,
-                            profile.decoder_rule.clone(),
-                        );
-                        let outcome = decoder.decode_payload(frame.payload())?;
-                        process_outcome(
+                        for dispatch in &mut subscription_dispatches {
+                            if let Some(sent) = dispatch
+                                .bind_to_frame(&validated)
+                                .map_err(|_error| KrakenLevel3RuntimeError::Protocol)?
+                            {
+                                decoder.register_sent_subscription(sent)?;
+                            }
+                        }
+                        let handoff = decoder
+                            .decode_captured(&validated)
+                            .map_err(|_error| KrakenLevel3RuntimeError::Protocol)?;
+                        settle_subscription_dispatches(
+                            &mut subscription_dispatches,
+                            &handoff,
+                        )?;
+                        process_handoff(
                             config,
                             specs,
                             profile,
@@ -699,8 +721,7 @@ where
                             healthy,
                             &mut acknowledged,
                             &mut market_at,
-                            outcome,
-                            &evidence,
+                            handoff,
                             startup,
                             cancellation,
                         )
@@ -733,7 +754,7 @@ where
     clippy::too_many_arguments,
     reason = "capture evidence and every readiness owner must cross one atomic output boundary"
 )]
-async fn process_outcome(
+async fn process_handoff(
     config: &KrakenL3Config,
     specs: &[InstrumentSpec],
     profile: &IntegrityProfile,
@@ -745,23 +766,14 @@ async fn process_outcome(
     healthy: &Arc<AtomicBool>,
     acknowledged: &mut [bool],
     market_at: &mut [Option<tokio::time::Instant>],
-    outcome: KrakenL3DecodeOutcome,
-    evidence: &DecoderEvidence,
+    handoff: KrakenMarketEventHandoff,
     startup: &mut Option<oneshot::Sender<()>>,
     cancellation: &CancellationToken,
 ) -> Result<(), KrakenLevel3RuntimeError> {
-    match outcome {
-        KrakenL3DecodeOutcome::Control(KrakenL3Control::Subscribed { symbol, instrument }) => {
-            let index = spec_index(specs, symbol.as_str(), instrument)?;
-            if acknowledged[index] {
-                return Err(KrakenLevel3RuntimeError::Protocol);
-            }
-            acknowledged[index] = true;
-        }
-        KrakenL3DecodeOutcome::Control(
-            KrakenL3Control::Heartbeat | KrakenL3Control::Pong | KrakenL3Control::Online,
-        ) => {}
-        KrakenL3DecodeOutcome::Book(batch) => {
+    match handoff {
+        KrakenMarketEventHandoff::AuthenticatedLevel3(handoff) => {
+            let batch = handoff.batch();
+            let evidence = handoff.evidence();
             let index = spec_index(specs, batch.symbol().as_str(), batch.instrument())?;
             if !acknowledged[index] || batch.quality_ceiling() != DataQuality::DirectUnverified {
                 return Err(KrakenLevel3RuntimeError::Protocol);
@@ -781,6 +793,38 @@ async fn process_outcome(
             actors.ingresses[index].try_publish(canonical, deadline)?;
             market_at[index] = Some(tokio::time::Instant::now());
         }
+        KrakenMarketEventHandoff::ControlOrDiscontinuity(handoff) => match handoff.kind() {
+            KrakenControlOrDiscontinuityKind::AuthenticatedControl(
+                KrakenL3Control::Subscribed {
+                    symbol, instrument, ..
+                },
+            ) => {
+                let index = spec_index(specs, symbol.as_str(), *instrument)?;
+                if acknowledged[index] {
+                    return Err(KrakenLevel3RuntimeError::Protocol);
+                }
+                acknowledged[index] = true;
+            }
+            KrakenControlOrDiscontinuityKind::AuthenticatedControl(
+                KrakenL3Control::Heartbeat | KrakenL3Control::Pong { .. } | KrakenL3Control::Online,
+            ) => {}
+            KrakenControlOrDiscontinuityKind::AuthenticatedControl(
+                KrakenL3Control::SubscriptionRefused { .. } | KrakenL3Control::ProviderReset { .. },
+            )
+            | KrakenControlOrDiscontinuityKind::AuthenticatedDiscontinuity(_) => {
+                return Err(KrakenLevel3RuntimeError::Protocol);
+            }
+            KrakenControlOrDiscontinuityKind::PublicControl(_)
+            | KrakenControlOrDiscontinuityKind::PublicGenerationRetired(_)
+            | KrakenControlOrDiscontinuityKind::PublicIgnored(_)
+            | KrakenControlOrDiscontinuityKind::PublicResynchronize(_)
+            | KrakenControlOrDiscontinuityKind::PublicQuarantine(_) => {
+                return Err(KrakenLevel3RuntimeError::Protocol);
+            }
+        },
+        KrakenMarketEventHandoff::Public(_) => {
+            return Err(KrakenLevel3RuntimeError::Protocol);
+        }
     }
     if !healthy.load(Ordering::Acquire)
         && acknowledged.iter().all(|value| *value)
@@ -798,6 +842,23 @@ async fn process_outcome(
                 .map_err(|()| KrakenLevel3RuntimeError::StartupObserverDropped)?;
         }
     }
+    Ok(())
+}
+
+fn settle_subscription_dispatches(
+    dispatches: &mut Vec<KrakenL3SubscriptionDispatch>,
+    handoff: &KrakenMarketEventHandoff,
+) -> Result<(), KrakenLevel3RuntimeError> {
+    let KrakenMarketEventHandoff::ControlOrDiscontinuity(handoff) = handoff else {
+        return Ok(());
+    };
+    let KrakenControlOrDiscontinuityKind::AuthenticatedControl(control) = handoff.kind() else {
+        return Ok(());
+    };
+    for dispatch in dispatches.iter_mut() {
+        dispatch.apply_control(control)?;
+    }
+    dispatches.retain(|dispatch| !dispatch.is_settled());
     Ok(())
 }
 

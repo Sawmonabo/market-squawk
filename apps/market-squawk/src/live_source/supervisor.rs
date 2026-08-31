@@ -419,8 +419,7 @@ impl ProductionSourceSupervisor {
                 subscription_state_peak_bytes = subscription.estimated_peak_bytes().get(),
                 "prepared bounded production subscription state"
             );
-            let mut source = self.profile.try_source(source_generation)?;
-            let decoder = self.profile.decoder()?;
+            let (mut source, decoder) = self.profile.try_generation(source_generation)?;
             let mut sink = match prepared_output {
                 PreparedGenerationOutput::Live {
                     ingress,

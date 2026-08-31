@@ -881,10 +881,23 @@ impl ActiveLiveSourceGeneration {
 
     /// Returns the immutable connection-generation identity retained by this authority.
     ///
-    /// This is data identity only. It exposes no binding, lease, frame factory, or minting
-    /// capability.
+    /// This is data identity only. It exposes no lease, frame factory, or minting capability.
     pub fn generation(&self) -> market_squawk_domain::ConnectionGeneration {
         self.binding.connection_generation()
+    }
+
+    /// Returns the exact registry-issued frame-session allocation as read-only data identity.
+    ///
+    /// The O(1) clone cannot mint frames, extend the session lease, or access registry authority.
+    /// It exists so an adapter can bind a successful socket write to the same non-reconstructable
+    /// allocation later carried by the provider's captured response.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed under the same conditions as [`Self::validate_current`].
+    pub fn frame_binding(&self) -> Result<FrameSessionBinding, crate::SourceError> {
+        self.validate_current()?;
+        Ok(self.binding.clone())
     }
 
     /// Validates one frame minted by this exact active generation.

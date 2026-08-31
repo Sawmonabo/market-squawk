@@ -4,9 +4,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use market_squawk_domain::{
-    ConnectionGeneration, LiveEventClass, MetadataRevision, SourceId, Timestamp,
-};
+use market_squawk_domain::{LiveEventClass, SourceIdentifier, Timestamp};
 use market_squawk_sources::{
     ActiveLiveSourceGeneration, BudgetDispatchDecision, BudgetPermit, BudgetReservation,
     BudgetReservationDecision, FrameSessionBinding, LiveMarketSource, LiveSourceGeneration,
@@ -19,10 +17,11 @@ use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_util::sync::CancellationToken;
 
+use crate::decoder::{KrakenSocketHandoffConsumer, KrakenSocketHandoffPublisher};
 use crate::subscription::{KrakenPendingSubscriptionWrite, KrakenPublicSubscriptionRequest};
 use crate::{
     KrakenChannel, KrakenConfig, KrakenControlOrDiscontinuityKind, KrakenDecoderState,
-    KrakenMarketDecoder, KrakenMarketEventHandoff, KrakenPublicControl,
+    KrakenL3Control, KrakenMarketDecoder, KrakenMarketEventHandoff, KrakenPublicControl,
     KrakenSubscriptionRequestEvidence,
 };
 
@@ -107,6 +106,7 @@ pub struct KrakenSource {
     config: KrakenConfig,
     authority: ActiveLiveSourceGeneration,
     budget: SharedProviderBudget,
+    publication_handoff: Option<KrakenSocketHandoffPublisher>,
     generation_started: bool,
     health: KrakenHealth,
 }
@@ -122,6 +122,23 @@ impl KrakenSource {
         config: KrakenConfig,
         generation: LiveSourceGeneration,
     ) -> Result<Self, SourceError> {
+        Self::try_new_inner(config, generation, None)
+    }
+
+    /// Constructs one production source and the sole consumer of its socket-owned decode results.
+    pub fn try_new_with_publication_handoff(
+        config: KrakenConfig,
+        generation: LiveSourceGeneration,
+    ) -> Result<(Self, KrakenSocketHandoffConsumer), SourceError> {
+        let (publisher, consumer) = KrakenSocketHandoffConsumer::channel(config.metadata().clone());
+        Self::try_new_inner(config, generation, Some(publisher)).map(|source| (source, consumer))
+    }
+
+    fn try_new_inner(
+        config: KrakenConfig,
+        generation: LiveSourceGeneration,
+        publication_handoff: Option<KrakenSocketHandoffPublisher>,
+    ) -> Result<Self, SourceError> {
         let authority = generation.try_start(config.metadata())?;
         let budget = authority
             .budget()?
@@ -131,6 +148,7 @@ impl KrakenSource {
             config,
             authority,
             budget,
+            publication_handoff,
             generation_started: false,
             health: KrakenHealth {
                 state: KrakenDecoderState::AwaitingSnapshot,
@@ -391,15 +409,6 @@ impl KrakenSource {
                     .map_err(|_| SourceError::GenerationAuthorityMismatch)
             })
             .transpose()?;
-        drop(validated);
-        if let Err(error) = sink.try_publish(frame) {
-            return Err(SourceError::Sink(error));
-        }
-        self.health.captured_frames = self
-            .health
-            .captured_frames
-            .checked_add(1)
-            .ok_or(SourceError::InvalidProtocolState)?;
         if let Some(sent_subscription) = sent_subscription {
             if decoder
                 .register_sent_subscription(sent_subscription)
@@ -412,12 +421,27 @@ impl KrakenSource {
         let handoff = decoder
             .decode_admitted(captured)
             .map_err(|_| SourceError::InvalidProtocolState)?;
-        self.apply_handoff(handoff, decoder.state(), subscription_permit)
+        let operational = self.apply_handoff(&handoff, decoder.state(), subscription_permit);
+        if let Some(publication) = &self.publication_handoff {
+            publication
+                .try_publish(handoff)
+                .map_err(|_| SourceError::InvalidProtocolState)?;
+        }
+        drop(validated);
+        if let Err(error) = sink.try_publish(frame) {
+            return Err(SourceError::Sink(error));
+        }
+        self.health.captured_frames = self
+            .health
+            .captured_frames
+            .checked_add(1)
+            .ok_or(SourceError::InvalidProtocolState)?;
+        operational
     }
 
     fn apply_handoff(
         &mut self,
-        handoff: KrakenMarketEventHandoff,
+        handoff: &KrakenMarketEventHandoff,
         decoder_state: KrakenDecoderState,
         subscription_permit: &mut Option<BudgetPermit>,
     ) -> Result<(), SourceError> {
@@ -603,9 +627,7 @@ impl LiveMarketSource for KrakenSource {
 /// allocation. No constructor or minting operation is exported from this module.
 #[derive(Debug)]
 pub struct KrakenWrittenSubscription {
-    source_id: SourceId,
-    metadata_revision: MetadataRevision,
-    connection_generation: ConnectionGeneration,
+    binding: FrameSessionBinding,
     request: KrakenSubscriptionRequestEvidence,
 }
 
@@ -615,20 +637,18 @@ impl KrakenWrittenSubscription {
     ///
     /// # Errors
     ///
-    /// Rejects a different source, metadata revision, or connection generation.
+    /// Rejects every value-equal but separately allocated source session, including a reconstructed
+    /// source/revision/generation tuple.
     pub fn bind_to_frame(
         self,
         frame: &ValidatedRawMarketFrame<'_>,
     ) -> Result<KrakenSentSubscriptionReceipt, KrakenSubscriptionReceiptError> {
         let binding = frame.frame().binding();
-        if binding.source_id() != &self.source_id
-            || binding.metadata_revision() != &self.metadata_revision
-            || binding.connection_generation() != self.connection_generation
-        {
+        if !self.binding.shares_allocation_with(binding) {
             return Err(KrakenSubscriptionReceiptError::GenerationMismatch);
         }
         Ok(KrakenSentSubscriptionReceipt {
-            binding: binding.clone(),
+            binding: self.binding,
             request: self.request,
         })
     }
@@ -642,6 +662,7 @@ impl KrakenWrittenSubscription {
 pub struct KrakenL3EstablishedSessionSender<'a, S> {
     authority: &'a mut ActiveLiveSourceGeneration,
     socket: &'a mut WebSocketStream<S>,
+    budget: SharedProviderBudget,
 }
 
 impl<S> std::fmt::Debug for KrakenL3EstablishedSessionSender<'_, S> {
@@ -666,9 +687,20 @@ where
     pub fn try_new(
         authority: &'a mut ActiveLiveSourceGeneration,
         socket: &'a mut WebSocketStream<S>,
+        budget: &SharedProviderBudget,
     ) -> Result<Self, SourceError> {
         authority.validate_current()?;
-        Ok(Self { authority, socket })
+        let issued = authority
+            .budget()?
+            .ok_or(SourceError::GenerationAuthorityMismatch)?;
+        if !budget.shares_allocation_with(issued) {
+            return Err(SourceError::GenerationAuthorityMismatch);
+        }
+        Ok(Self {
+            authority,
+            socket,
+            budget: budget.clone(),
+        })
     }
 
     /// Sends one exact authenticated L3 subscription through this established session.
@@ -686,13 +718,145 @@ where
         payload: crate::KrakenL3SecretPayload,
         cancellation: &CancellationToken,
         deadline: Duration,
-    ) -> Result<KrakenWrittenSubscription, SourceError> {
+    ) -> Result<KrakenL3SubscriptionDispatch, SourceError> {
         let pending = payload
             .into_pending_write(self.authority.generation())
             .map_err(|_error| SourceError::InvalidProtocolState)?;
-        KrakenEstablishedSubscriptionSender::try_new(self.authority, self.socket)?
+        let permit = commit_budget_when_ready(&self.budget, cancellation).await?;
+        let written = KrakenEstablishedSubscriptionSender::try_new(self.authority, self.socket)?
             .send(pending, cancellation, deadline)
-            .await
+            .await?;
+        KrakenL3SubscriptionDispatch::try_new(self.budget.clone(), permit, written)
+    }
+}
+
+/// One exact authenticated subscription dispatch awaiting same-socket binding and provider
+/// settlement.
+///
+/// The request-window dispatch is already durably recorded by the shared provider authority. This
+/// value retains its in-flight permit until every symbol in the exact batch is acknowledged, a
+/// refusal is applied, or the connection generation is dropped.
+#[derive(Debug)]
+pub struct KrakenL3SubscriptionDispatch {
+    written: Option<KrakenWrittenSubscription>,
+    budget: SharedProviderBudget,
+    permit: Option<BudgetPermit>,
+    request_id: Option<u64>,
+    expected: Vec<(SourceIdentifier, market_squawk_domain::InstrumentId, bool)>,
+}
+
+impl KrakenL3SubscriptionDispatch {
+    fn try_new(
+        budget: SharedProviderBudget,
+        permit: BudgetPermit,
+        written: KrakenWrittenSubscription,
+    ) -> Result<Self, SourceError> {
+        let KrakenSubscriptionRequestEvidence::AuthenticatedSecretBearing { request_evidence } =
+            &written.request
+        else {
+            return Err(SourceError::InvalidProtocolState);
+        };
+        let mut expected = Vec::new();
+        expected
+            .try_reserve_exact(request_evidence.instrument_bindings().len())
+            .map_err(|_| SourceError::InvalidProtocolState)?;
+        for binding in request_evidence.instrument_bindings() {
+            expected.push((
+                binding.native_symbol().clone(),
+                binding.externally_resolved_instrument(),
+                false,
+            ));
+        }
+        if expected.is_empty() {
+            return Err(SourceError::InvalidProtocolState);
+        }
+        let request_id = request_evidence.request_id();
+        Ok(Self {
+            written: Some(written),
+            budget,
+            permit: Some(permit),
+            request_id,
+            expected,
+        })
+    }
+
+    /// Seals the successful write to the first captured frame from its exact socket allocation.
+    ///
+    /// Returns `None` after the one-use receipt has already been consumed by the decoder.
+    pub fn bind_to_frame(
+        &mut self,
+        frame: &ValidatedRawMarketFrame<'_>,
+    ) -> Result<Option<KrakenSentSubscriptionReceipt>, KrakenSubscriptionReceiptError> {
+        self.written
+            .take()
+            .map(|written| written.bind_to_frame(frame))
+            .transpose()
+    }
+
+    /// Applies one exact authenticated control to this durably admitted request.
+    ///
+    /// Returns `true` only when this call settles the complete batch successfully. Controls for a
+    /// different request are ignored. A refusal consumes this request's in-flight permit and
+    /// applies the shared provider cooldown before returning an error.
+    pub fn apply_control(&mut self, control: &KrakenL3Control) -> Result<bool, SourceError> {
+        match control {
+            KrakenL3Control::Subscribed {
+                symbol,
+                instrument,
+                request_id,
+                ..
+            } if request_id == &self.request_id => {
+                let (_, _, acknowledged) = self
+                    .expected
+                    .iter_mut()
+                    .find(|(expected_symbol, expected_instrument, _)| {
+                        expected_symbol == symbol && expected_instrument == instrument
+                    })
+                    .ok_or(SourceError::InvalidProtocolState)?;
+                if *acknowledged {
+                    return Err(SourceError::InvalidProtocolState);
+                }
+                *acknowledged = true;
+                if self.expected.iter().all(|(_, _, value)| *value) {
+                    self.settle_success()?;
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            KrakenL3Control::SubscriptionRefused { request_id, .. }
+                if request_id.is_none() || request_id == &self.request_id =>
+            {
+                let permit = self
+                    .permit
+                    .take()
+                    .ok_or(SourceError::InvalidProtocolState)?;
+                let refusal = SourceError::from_applied_budget_refusal(
+                    self.budget
+                        .apply_refusal(BACKOFF_JITTER_SAMPLE_BASIS_POINTS),
+                );
+                permit.release();
+                Err(refusal)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn settle_success(&mut self) -> Result<(), SourceError> {
+        let permit = self
+            .permit
+            .take()
+            .ok_or(SourceError::InvalidProtocolState)?;
+        let result = self
+            .budget
+            .record_success()
+            .map_err(|reason| SourceError::BudgetUnavailable { reason });
+        permit.release();
+        result
+    }
+
+    /// Returns whether every exact symbol acknowledgement settled this dispatch.
+    pub fn is_settled(&self) -> bool {
+        self.permit.is_none() && self.expected.iter().all(|(_, _, value)| *value)
     }
 }
 
@@ -780,6 +944,13 @@ where
         if generation != self.authority.generation() {
             return Err(SourceError::GenerationAuthorityMismatch);
         }
+        let binding = self.authority.frame_binding()?;
+        if binding.source_id() != &source_id
+            || binding.metadata_revision() != &revision
+            || binding.connection_generation() != generation
+        {
+            return Err(SourceError::GenerationAuthorityMismatch);
+        }
         tokio::select! {
             _ = cancellation.cancelled() => return Err(SourceError::Cancelled),
             result = tokio::time::timeout(deadline, self.socket.send(message)) => {
@@ -788,12 +959,51 @@ where
             }
         }
         self.authority.validate_current()?;
-        Ok(KrakenWrittenSubscription {
-            source_id,
-            metadata_revision: revision,
-            connection_generation: generation,
-            request,
-        })
+        if !binding.shares_allocation_with(&self.authority.frame_binding()?) {
+            return Err(SourceError::GenerationAuthorityMismatch);
+        }
+        Ok(KrakenWrittenSubscription { binding, request })
+    }
+}
+
+const BACKOFF_JITTER_SAMPLE_BASIS_POINTS: u16 = 1_000;
+
+async fn commit_budget_when_ready(
+    budget: &SharedProviderBudget,
+    cancellation: &CancellationToken,
+) -> Result<BudgetPermit, SourceError> {
+    loop {
+        let reservation = match budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => reservation,
+            BudgetReservationDecision::WaitUntil(deadline) => {
+                let wait = budget
+                    .remaining_wait(deadline)
+                    .map_err(|reason| SourceError::BudgetUnavailable { reason })?;
+                tokio::select! {
+                    _ = cancellation.cancelled() => return Err(SourceError::Cancelled),
+                    () = tokio::time::sleep(wait) => {}
+                }
+                continue;
+            }
+            BudgetReservationDecision::Unavailable(reason) => {
+                return Err(SourceError::BudgetUnavailable { reason });
+            }
+        };
+        match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => return Ok(permit),
+            BudgetDispatchDecision::WaitUntil(deadline) => {
+                let wait = budget
+                    .remaining_wait(deadline)
+                    .map_err(|reason| SourceError::BudgetUnavailable { reason })?;
+                tokio::select! {
+                    _ = cancellation.cancelled() => return Err(SourceError::Cancelled),
+                    () = tokio::time::sleep(wait) => {}
+                }
+            }
+            BudgetDispatchDecision::Unavailable(reason) => {
+                return Err(SourceError::BudgetUnavailable { reason });
+            }
+        }
     }
 }
 

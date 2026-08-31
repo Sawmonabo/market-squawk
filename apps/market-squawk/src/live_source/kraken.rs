@@ -8,8 +8,8 @@ use std::{
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use market_squawk_adapter_kraken::{
-    KrakenChannel, KrakenConfig, KrakenConfigError, KrakenDepth, KrakenMarketDecoder,
-    KrakenMetadataError, KrakenMetadataInput, KrakenSource,
+    KrakenChannel, KrakenConfig, KrakenConfigError, KrakenDepth, KrakenMetadataError,
+    KrakenMetadataInput, KrakenSocketHandoffConsumer, KrakenSource,
 };
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, IdentityError, MetadataRevision,
@@ -21,8 +21,8 @@ use market_squawk_live::{
 };
 use market_squawk_platform::{KrakenAuthorizationAttestation, KrakenSourceConfig};
 use market_squawk_sources::{
-    AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, DecodeError,
-    FreshnessPolicy, LiveSourceGeneration, ProviderBudgetPolicy, SourceError, SourceMetadata,
+    AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, FreshnessPolicy,
+    LiveSourceGeneration, ProviderBudgetPolicy, SourceError, SourceMetadata,
     SourceMetadataProvider,
 };
 use serde::Serialize;
@@ -229,27 +229,11 @@ impl ProductionKrakenProfile {
         }
     }
 
-    pub(super) fn decoder(&self) -> Result<KrakenMarketDecoder, DecodeError> {
-        match self.adapter_config.channel() {
-            KrakenChannel::Book(depth) => KrakenMarketDecoder::try_new(
-                self.metadata().clone(),
-                self.adapter_config.symbol(),
-                self.adapter_config.instrument(),
-                depth,
-            ),
-            KrakenChannel::Trades => KrakenMarketDecoder::try_trades(
-                self.metadata().clone(),
-                self.adapter_config.symbol(),
-                self.adapter_config.instrument(),
-            ),
-        }
-    }
-
-    pub(super) fn try_source(
+    pub(super) fn try_source_with_publication_handoff(
         &self,
         generation: LiveSourceGeneration,
-    ) -> Result<KrakenSource, SourceError> {
-        KrakenSource::try_new(self.adapter_config.clone(), generation)
+    ) -> Result<(KrakenSource, KrakenSocketHandoffConsumer), SourceError> {
+        KrakenSource::try_new_with_publication_handoff(self.adapter_config.clone(), generation)
     }
 
     #[cfg(all(test, debug_assertions))]
