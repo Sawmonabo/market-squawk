@@ -1642,6 +1642,9 @@ impl CensusSource {
         if metadata.query_digest != contract.query().request_digest() {
             return Err(invalid_protocol());
         }
+        let geography_admission = metadata
+            .geography_admission(contract.query())
+            .map_err(map_source_error)?;
         let mut response = self
             .fetch_authorized(
                 authority,
@@ -1665,9 +1668,7 @@ impl CensusSource {
         let page = match CensusDataPage::parse(
             contract.query(),
             metadata.selected_variables().map_err(map_source_error)?,
-            &metadata
-                .geography_admission(contract.query())
-                .map_err(map_source_error)?,
+            &geography_admission,
             &response.body,
             self.effective_parse_limits(),
             provisional_clocks,
