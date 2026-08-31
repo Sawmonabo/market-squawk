@@ -368,8 +368,6 @@ impl ProviderMacroPlanPublicationInput {
             .first()
             .ok_or(IngestError::InvalidProviderMacroPlan)?;
         let first_capture = first.sealed_capture.capture_evidence();
-        let analytical_source_dataset = SourceIdentifier::try_from(analytical_dataset.as_str())
-            .map_err(|_| IngestError::InvalidDataset)?;
         let source_id = first_capture.source_id().clone();
         let metadata_revision = first_capture.metadata_revision().clone();
         let provider_dataset = first_capture.dataset().clone();
@@ -390,8 +388,7 @@ impl ProviderMacroPlanPublicationInput {
                 || capture.source_id() != &source_id
                 || capture.metadata_revision() != &metadata_revision
                 || capture.dataset() != &provider_dataset
-                || chunk.sealed_capture.batch().request().object().dataset()
-                    != &analytical_source_dataset
+                || chunk.sealed_capture.batch().request().object().dataset() != &provider_dataset
                 || chunk.source_generation_digest != source_generation_digest
                 || chunk.semantics.schema != semantics_schema
                 || chunk.semantics.schema_requirement_digest != schema_requirement_digest
@@ -3402,7 +3399,10 @@ impl AnalyticalDataService {
                 input.publication_digest,
                 Some(&input.source_id),
             )?;
-            if run.state() != IngestRunState::Reserved {
+            if !matches!(
+                run.state(),
+                IngestRunState::Reserved | IngestRunState::Succeeded
+            ) {
                 return Err(IngestError::TerminalRun);
             }
         }
@@ -3442,10 +3442,14 @@ impl AnalyticalDataService {
         }
         let total_chunks =
             u16::try_from(chunks.len()).map_err(|_| IngestError::InvalidProviderMacroPlan)?;
-        let revision_deadline = Instant::now()
-            .checked_add(REVISION_ASSIGNMENT_DEADLINE)
-            .ok_or(IngestError::DeadlineExceeded)?;
-        let revision_authority = self.observed_revision_authority();
+        let capture_coordinates = (0..prepared_captures.len())
+            .map(|ordinal| {
+                ProviderArtifactInputCoordinate::try_new(
+                    ordinal / STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT,
+                    ordinal % STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let schema = crate::DatasetSchemaRegistry::local()
             .canonical_research_observations()
             .map_err(ArrowConversionError::from)?;
@@ -3458,7 +3462,7 @@ impl AnalyticalDataService {
             .acquire(&cancellation)
             .await
             .ok_or(IngestError::Cancelled)?;
-        {
+        let run_state = {
             let authority = self.lock_authority()?;
             let run = self.validate_run(
                 &authority,
@@ -3466,10 +3470,41 @@ impl AnalyticalDataService {
                 publication_digest,
                 Some(&source_id),
             )?;
-            if run.state() != IngestRunState::Reserved {
-                return Err(IngestError::TerminalRun);
-            }
+            run.state()
+        };
+        if run_state == IngestRunState::Succeeded {
+            let (manifest, catalog_receipt_digest) =
+                self.manifests.reconcile_provider_macro_plan_publication(
+                    reservation.run_id(),
+                    &analytical_dataset,
+                    &source_id,
+                    &prepared_captures,
+                    &capture_coordinates,
+                    completion_digest,
+                    publication_digest,
+                    total_rows,
+                )?;
+            let receipt = ProviderMacroPlanPublicationReceipt {
+                manifest,
+                completion_digest,
+                publication_digest,
+                catalog_receipt_digest,
+                source_id,
+                request_set_identity,
+                source_generation_digest,
+                total_chunks,
+                total_rows,
+            };
+            self.verify_provider_macro_plan_restart(&receipt.restart_selector())?;
+            return Ok(receipt);
         }
+        if run_state != IngestRunState::Reserved {
+            return Err(IngestError::TerminalRun);
+        }
+        let revision_deadline = Instant::now()
+            .checked_add(REVISION_ASSIGNMENT_DEADLINE)
+            .ok_or(IngestError::DeadlineExceeded)?;
+        let revision_authority = self.observed_revision_authority();
         let publication = self.objects.begin_publication(&cancellation).await?;
         let mut published = Vec::new();
         let artifact_capacity = chunks
@@ -3482,10 +3517,7 @@ impl AnalyticalDataService {
         objects
             .try_reserve_exact(artifact_capacity)
             .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
-        let mut pending_batches = Vec::new();
-        pending_batches
-            .try_reserve_exact(STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT)
-            .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
+        let mut pending_observations = Vec::new();
         let mut published_rows = 0_u64;
         for (input_ordinal, (chunk, prepared)) in chunks
             .into_vec()
@@ -3527,15 +3559,22 @@ impl AnalyticalDataService {
             if converted.schema_ref() != &schema {
                 return Err(IngestError::InvalidProviderMacroPlan);
             }
-            pending_batches.push(converted.record_batch().clone());
+            let converted_observations = converted.observations()?;
+            pending_observations
+                .try_reserve_exact(converted_observations.len())
+                .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
+            pending_observations.extend(converted_observations);
             let is_last_input = input_ordinal + 1 == prepared_captures.len();
-            if pending_batches.len() < STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT && !is_last_input {
+            let pending_input_count = input_ordinal % STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT + 1;
+            if pending_input_count < STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT && !is_last_input {
                 continue;
             }
-            let grouped = ResearchArrowBatch::try_from_compaction_batches(
+            // Provider-native capture identity was validated above; the durable canonical object
+            // belongs to the logical analytical dataset, with exact source mapping in the catalog.
+            let grouped = ResearchArrowBatch::try_from_observations(
                 dataset_name.clone(),
                 publication_digest,
-                std::mem::take(&mut pending_batches),
+                std::mem::take(&mut pending_observations),
             )?;
             let lineage = grouped.lineage_digest()?;
             let grouped = DatasetArrowBatch::from(grouped);
@@ -3553,11 +3592,6 @@ impl AnalyticalDataService {
                 Sha256Digest::new(lineage.bytes()),
             )?);
             published.push(published_object);
-            if !is_last_input {
-                pending_batches
-                    .try_reserve_exact(STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT)
-                    .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
-            }
         }
         if cancellation.is_cancelled() {
             return Err(IngestError::Cancelled);
@@ -3606,14 +3640,6 @@ impl AnalyticalDataService {
             plan.content_hash().evidence(),
             created_at,
         );
-        let capture_coordinates = (0..prepared_captures.len())
-            .map(|ordinal| {
-                ProviderArtifactInputCoordinate::try_new(
-                    ordinal / STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT,
-                    ordinal % STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let (manifest, catalog_receipt_digest) = self
             .manifests
             .commit_provider_macro_plan_publication(

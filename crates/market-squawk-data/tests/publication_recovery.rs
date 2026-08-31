@@ -874,6 +874,7 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
             &CancellationToken::new(),
         )
         .await?;
+    let macro_run_id = macro_reservation.run_id();
     let rejected_pending = service
         .prepare_provider_macro_plan_publication(macro_reservation.clone(), rejected_input)?;
     let rollback_probe = rusqlite::Connection::open(location.path())?;
@@ -922,8 +923,12 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
             .is_empty(),
         "the committed prefix must remain live while every failed group object is quarantined"
     );
-    let retry_input = provider_macro_plan_input(&raw_store, analytical_dataset)?;
+    let retry_input = provider_macro_plan_input(&raw_store, analytical_dataset.clone())?;
     assert_eq!(retry_input.publication_digest(), macro_payload_digest);
+    assert_ne!(
+        retry_input.provider_dataset().as_str(),
+        analytical_dataset.as_str()
+    );
     let macro_receipt = service
         .prepare_provider_macro_plan_publication(macro_reservation, retry_input)?
         .commit(
@@ -932,6 +937,35 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
             Arc::new(AllowProviderEventPublication),
         )
         .await?;
+    let replay_reservation = service
+        .reserve_source_ingest(
+            &source,
+            Timestamp::from_unix_nanos(10),
+            RightsDecisionInput {
+                source_id: source.source_id().clone(),
+                payload_digest: macro_payload_digest,
+                retrieved_at: Timestamp::from_unix_nanos(300),
+                basis: RightsBasis::reviewed_terms("https://example.test/terms/v1", digest(31))?,
+                authorization_evidence: digest(32),
+                authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+                permitted_operations: vec![SourceOperation::Persist],
+            },
+            &macro_identity,
+            &CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(replay_reservation.run_id(), macro_run_id);
+    let replay_input = provider_macro_plan_input(&raw_store, analytical_dataset)?;
+    assert_eq!(replay_input.publication_digest(), macro_payload_digest);
+    let replay_receipt = service
+        .prepare_provider_macro_plan_publication(replay_reservation, replay_input)?
+        .commit(
+            &service,
+            CancellationToken::new(),
+            Arc::new(AllowProviderEventPublication),
+        )
+        .await?;
+    assert_eq!(replay_receipt, macro_receipt);
     assert_eq!(macro_receipt.total_chunks(), 3);
     assert_eq!(macro_receipt.total_rows(), 3);
     assert_eq!(macro_receipt.manifest().manifest_version(), 2);
@@ -3571,7 +3605,6 @@ fn provider_macro_plan_input(
     let source_id = SourceId::try_from("fred-local-fixture")?;
     let metadata_revision = MetadataRevision::new(SourceIdentifier::try_from("revision-1")?);
     let provider_dataset = SourceIdentifier::try_from("gdp-2026q1")?;
-    let analytical_source_dataset = SourceIdentifier::try_from(analytical_dataset.as_str())?;
     let mut chunks = Vec::new();
     chunks.try_reserve_exact(CHUNK_COUNT)?;
     for chunk_ordinal in 0..CHUNK_COUNT {
@@ -3588,7 +3621,7 @@ fn provider_macro_plan_input(
         let capture = ProviderCaptureSetReceipt::try_new(
             source_id.clone(),
             metadata_revision.clone(),
-            analytical_source_dataset.clone(),
+            provider_dataset.clone(),
             digest(u8::try_from(180 + chunk_ordinal)?),
             ProviderCaptureTerminalDisposition::StandaloneResponse,
             vec![ProviderCapturePageReceipt::try_new(
@@ -3615,7 +3648,7 @@ fn provider_macro_plan_input(
             )?],
         )?;
         let discovery = DiscoveryRequest::try_new(
-            analytical_source_dataset.clone(),
+            provider_dataset.clone(),
             Some(Timestamp::from_unix_nanos(90)),
             NonZeroU16::MIN,
             Timestamp::from_unix_nanos(1_000),

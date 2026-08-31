@@ -1268,6 +1268,92 @@ impl AnalyticalManifestCatalog {
         Ok((manifest, receipt_digest))
     }
 
+    /// Reconciles one already-succeeded macro-plan run against its complete retained publication.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "replay must compare every independent plan identity and direct source input"
+    )]
+    pub(crate) fn reconcile_provider_macro_plan_publication(
+        &self,
+        run_id: Uuid,
+        analytical_dataset: &DatasetId,
+        source_id: &SourceId,
+        captures: &[PreparedProviderCaptureBinding],
+        capture_coordinates: &[ProviderArtifactInputCoordinate],
+        completion_digest: EvidenceDigest,
+        publication_digest: EvidenceDigest,
+        total_rows: u64,
+    ) -> Result<(DatasetManifestRef, EvidenceDigest), ManifestCatalogError> {
+        validate_provider_macro_plan_inputs(
+            captures,
+            source_id,
+            completion_digest,
+            publication_digest,
+            total_rows,
+        )?;
+        if captures.len() != capture_coordinates.len() {
+            return Err(ManifestCatalogError::ProviderMacroPlanMismatch);
+        }
+        let pinned = self
+            .for_run(run_id)?
+            .ok_or(ManifestCatalogError::ProviderMacroPlanMismatch)?;
+        if pinned.manifest().dataset_id() != analytical_dataset {
+            return Err(ManifestCatalogError::ProviderMacroPlanMismatch);
+        }
+        let owned = self.generation_owned_provider_captures(pinned.manifest())?;
+        if owned.pinned != pinned
+            || &owned.source_id != source_id
+            || owned.inputs.len() != captures.len()
+            || owned
+                .inputs
+                .iter()
+                .zip(captures.iter().zip(capture_coordinates))
+                .enumerate()
+                .any(|(ordinal, (retained, (capture, coordinate)))| {
+                    retained.input_ordinal != ordinal
+                        || retained.binding_digest != capture.binding_digest()
+                        || retained.record_count != capture.record_count()
+                        || retained.output_artifact_ordinal != coordinate.output_artifact_ordinal()
+                        || retained.object_input_ordinal != coordinate.object_input_ordinal()
+                })
+        {
+            return Err(ManifestCatalogError::ProviderMacroPlanMismatch);
+        }
+        let connection = self.lock()?;
+        let (retained_audits, receipt_digest): (i64, Option<Vec<u8>>) = connection.query_row(
+            "SELECT COUNT(*), MIN(audit.details_digest)
+             FROM dataset_manifests AS manifest
+             JOIN audit_events AS audit
+               ON audit.event_type=?1 AND audit.subject_id=manifest.manifest_id
+             WHERE manifest.run_id=?2",
+            params![PROVIDER_MACRO_PLAN_AUDIT_EVENT, run_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if retained_audits != 1 {
+            return Err(ManifestCatalogError::ProviderMacroPlanMismatch);
+        }
+        let receipt_digest = receipt_digest
+            .as_deref()
+            .map(parse_digest)
+            .transpose()?
+            .map(|digest| EvidenceDigest::new(DigestAlgorithm::Sha256, digest.bytes()))
+            .ok_or(ManifestCatalogError::ProviderMacroPlanMismatch)?;
+        drop(connection);
+        let verified = self.verify_provider_macro_plan_publication(
+            pinned.manifest(),
+            completion_digest,
+            publication_digest,
+            u16::try_from(captures.len())
+                .map_err(|_| ManifestCatalogError::ProviderMacroPlanMismatch)?,
+            total_rows,
+            receipt_digest,
+        )?;
+        if verified != pinned {
+            return Err(ManifestCatalogError::ProviderMacroPlanMismatch);
+        }
+        Ok((pinned.manifest().clone(), receipt_digest))
+    }
+
     /// Atomically publishes one completed staged macro plan and advances its exact durable head.
     #[allow(
         clippy::too_many_arguments,
