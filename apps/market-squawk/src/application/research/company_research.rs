@@ -17,7 +17,7 @@ use market_squawk_data::{
     SecResearchIdentitySelection, SecResearchReadError,
 };
 use market_squawk_domain::{
-    CalendarDate, FundSourceFamily, FundamentalAmendmentStatus, FundamentalCadence,
+    CalendarDate, EvidenceDigest, FundSourceFamily, FundamentalAmendmentStatus, FundamentalCadence,
     FundamentalConsolidation, FundamentalPeriod, FundamentalRestatementStatus, InstrumentId,
     ResearchContext, ResearchObservation, ResearchTemporalCoordinate, RevisionNumber,
     SourceIdentifier, Timestamp,
@@ -831,6 +831,7 @@ pub(crate) enum CompanyResearchRestatementState {
 /// One exact point-in-time fact stripped of provider and raw-object coordinates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CompanyResearchFact {
+    lineage: CompanyResearchFactLineage,
     scope: CompanyFactScope,
     revision: CompanyResearchRevisionState,
     metric: Box<str>,
@@ -851,6 +852,9 @@ pub(crate) struct CompanyResearchFact {
 }
 
 impl CompanyResearchFact {
+    pub(crate) const fn lineage(&self) -> &CompanyResearchFactLineage {
+        &self.lineage
+    }
     pub(crate) const fn scope(&self) -> CompanyFactScope {
         self.scope
     }
@@ -901,6 +905,23 @@ impl CompanyResearchFact {
     }
     pub(crate) const fn known_at(&self) -> Timestamp {
         self.known_at
+    }
+}
+
+/// Exact filing and immutable publication identity used only for safe calculation grouping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompanyResearchFactLineage {
+    filing_identity: Box<str>,
+    publication_identity: EvidenceDigest,
+}
+
+impl CompanyResearchFactLineage {
+    pub(crate) fn filing_identity(&self) -> &str {
+        &self.filing_identity
+    }
+
+    pub(crate) const fn publication_identity(&self) -> EvidenceDigest {
+        self.publication_identity
     }
 }
 
@@ -1242,6 +1263,10 @@ fn append_company_rows(
                     .try_reserve(1)
                     .map_err(|_| CanonicalResearchReadError::ResourceExhausted)?;
                 facts.push(CompanyResearchFact {
+                    lineage: CompanyResearchFactLineage {
+                        filing_identity: try_boxed_text(fact_context.accession().as_str())?,
+                        publication_identity: selection.origin().origin_digest(),
+                    },
                     scope: match family {
                         SecResearchFamily::CompanyFacts => CompanyFactScope::CompanyWide,
                         SecResearchFamily::FilingXbrl => CompanyFactScope::FilingDetail,

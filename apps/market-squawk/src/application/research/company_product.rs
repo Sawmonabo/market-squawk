@@ -4,6 +4,8 @@
 //! statement meaning, exact-input ratios, filing meaning, knowledge clocks, coverage, and honest
 //! limitations. Selection and persistence evidence remain private.
 
+use std::io::{self, Write};
+
 use market_squawk_domain::{
     CalendarDate, Currency, FundamentalAmendmentStatus, FundamentalCadence,
     FundamentalConsolidation, FundamentalPeriod, InstrumentId, ResearchTemporalCoordinate,
@@ -24,6 +26,7 @@ use crate::application::domain_support::{ProductTextCopyError, try_boxed_product
 const COMPANY_SOURCE_SURFACES: usize = 3;
 const COMPANY_PRODUCT_SECTIONS: usize = 4;
 const MAX_PRODUCT_FILING_FORM_BYTES: usize = 64;
+const MAX_COMPANY_PRODUCT_SERIALIZED_BYTES: usize = 128 * 1024 * 1024;
 
 /// One closed company-research result with no provider or storage vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -154,6 +157,8 @@ impl CompanyFactsProduct {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CompanyFactProduct {
+    #[serde(skip)]
+    lineage: CompanyFactPrivateLineage,
     scope: CompanyFactProductScope,
     revision: CompanyProductRevisionState,
     metric: CompanyFinancialMetric,
@@ -166,6 +171,12 @@ pub(crate) struct CompanyFactProduct {
     filed_on: Option<CalendarDate>,
     effective: CompanyProductTime,
     known_at: Timestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompanyFactPrivateLineage {
+    filing_identity: Box<str>,
+    publication_identity: [u8; 32],
 }
 
 impl CompanyFactProduct {
@@ -409,7 +420,19 @@ pub(crate) enum CompanyProductRevisionState {
     IncomparableHistory,
 }
 
-/// Exact reported facts grouped by code-owned financial-statement meaning.
+/// Exact reporting envelope shared by one statement group or ratio calculation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CompanyReportingEnvelopeProduct {
+    period: FundamentalPeriod,
+    fiscal_context: CompanyFactFiscalContext,
+    reporting_context: CompanyFactReportingContext,
+    filed_on: Option<CalendarDate>,
+    effective: CompanyProductTime,
+    known_at: Timestamp,
+}
+
+/// Exact reported facts grouped only inside one reporting and filing envelope.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CompanyStatementsProduct {
@@ -431,12 +454,17 @@ impl CompanyStatementsProduct {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CompanyStatementGroupProduct {
     statement: CompanyStatementKind,
+    envelope: CompanyReportingEnvelopeProduct,
     items: Box<[CompanyFactProduct]>,
 }
 
 impl CompanyStatementGroupProduct {
     pub(crate) const fn statement(&self) -> CompanyStatementKind {
         self.statement
+    }
+
+    pub(crate) const fn envelope(&self) -> CompanyReportingEnvelopeProduct {
+        self.envelope
     }
 
     pub(crate) fn items(&self) -> &[CompanyFactProduct] {
@@ -453,7 +481,7 @@ pub(crate) enum CompanyStatementKind {
     ShareData,
 }
 
-/// Deterministic ratios whose complete exact fact lineage remains attached.
+/// Deterministic ratios with an explicit outcome and complete exact input lineage.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CompanyRatiosProduct {
@@ -476,14 +504,10 @@ impl CompanyRatiosProduct {
 pub(crate) struct CompanyRatioProduct {
     metric: CompanyRatioMetric,
     display_name: &'static str,
-    value: Decimal,
+    state: CompanyRatioState,
+    value: Option<Decimal>,
     unit: CompanyRatioUnit,
-    period: FundamentalPeriod,
-    fiscal_context: CompanyFactFiscalContext,
-    reporting_context: CompanyFactReportingContext,
-    filed_on: Option<CalendarDate>,
-    effective: CompanyProductTime,
-    known_at: Timestamp,
+    envelope: Option<CompanyReportingEnvelopeProduct>,
     inputs: Box<[CompanyRatioInputProduct]>,
 }
 
@@ -492,8 +516,16 @@ impl CompanyRatioProduct {
         self.metric
     }
 
-    pub(crate) const fn value(&self) -> Decimal {
+    pub(crate) const fn state(&self) -> CompanyRatioState {
+        self.state
+    }
+
+    pub(crate) const fn value(&self) -> Option<Decimal> {
         self.value
+    }
+
+    pub(crate) const fn envelope(&self) -> Option<CompanyReportingEnvelopeProduct> {
+        self.envelope
     }
 
     pub(crate) fn inputs(&self) -> &[CompanyRatioInputProduct] {
@@ -525,6 +557,17 @@ impl CompanyRatioMetric {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CompanyRatioUnit {
     Ratio,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompanyRatioState {
+    Reported,
+    MissingInput,
+    ConflictingInput,
+    IncompatibleUnits,
+    ZeroDenominator,
+    Unavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -641,7 +684,8 @@ pub(crate) struct CompanyProductCoverage {
     reported_facts: usize,
     omitted_facts: usize,
     statement_lines: usize,
-    calculated_ratios: usize,
+    evaluated_ratios: usize,
+    reported_ratios: usize,
     filing_events: usize,
 }
 
@@ -666,8 +710,12 @@ impl CompanyProductCoverage {
         self.statement_lines
     }
 
-    pub(crate) const fn calculated_ratios(self) -> usize {
-        self.calculated_ratios
+    pub(crate) const fn evaluated_ratios(self) -> usize {
+        self.evaluated_ratios
+    }
+
+    pub(crate) const fn reported_ratios(self) -> usize {
+        self.reported_ratios
     }
 
     pub(crate) const fn filing_events(self) -> usize {
@@ -697,6 +745,79 @@ pub(crate) enum CompanyProductProjectionError {
     ResourceExhausted,
 }
 
+struct CompanySerializedBudget {
+    remaining: usize,
+}
+
+impl CompanySerializedBudget {
+    const fn new() -> Self {
+        Self {
+            remaining: MAX_COMPANY_PRODUCT_SERIALIZED_BYTES,
+        }
+    }
+
+    fn charge<T: Serialize>(&mut self, value: &T) -> Result<(), CompanyProductProjectionError> {
+        let bytes = serialized_bytes_with_limit(value, self.remaining)?;
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes)
+            .ok_or(CompanyProductProjectionError::ResourceExhausted)?;
+        Ok(())
+    }
+}
+
+struct BoundedCountingWriter {
+    remaining: usize,
+    written: usize,
+    exhausted: bool,
+}
+
+impl Write for BoundedCountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.len() > self.remaining {
+            self.exhausted = true;
+            return Err(io::Error::other(
+                "company product serialization bound exceeded",
+            ));
+        }
+        self.remaining -= buffer.len();
+        self.written = self
+            .written
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::other("company product serialization length overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_bytes_with_limit<T: Serialize>(
+    value: &T,
+    limit: usize,
+) -> Result<usize, CompanyProductProjectionError> {
+    let mut writer = BoundedCountingWriter {
+        remaining: limit,
+        written: 0,
+        exhausted: false,
+    };
+    if serde_json::to_writer(&mut writer, value).is_err() {
+        return Err(if writer.exhausted {
+            CompanyProductProjectionError::ResourceExhausted
+        } else {
+            CompanyProductProjectionError::InvalidEvidence
+        });
+    }
+    Ok(writer.written)
+}
+
+fn ensure_company_product_serialized_bound(
+    product: &CompanyProductResult,
+) -> Result<(), CompanyProductProjectionError> {
+    serialized_bytes_with_limit(product, MAX_COMPANY_PRODUCT_SERIALIZED_BYTES).map(|_| ())
+}
+
 /// Projects a verified canonical read without exposing its private evidence receipts.
 pub(crate) fn project_company_product(
     read: &CompanyResearchRead,
@@ -719,22 +840,22 @@ pub(crate) fn project_company_product(
             snapshot,
             true,
         ),
-        CompanyResearchOutcome::Missing => Ok(empty_result(
+        CompanyResearchOutcome::Missing => empty_result(
             request.instrument_id(),
             request.knowledge_at(),
             fact_effective_cutoff,
             CompanyProductAvailability::Missing,
             CompanyProductSectionState::Missing,
             CompanyProductLimitation::NoCompanyInformationAtCutoff,
-        )),
-        CompanyResearchOutcome::Ambiguous => Ok(empty_result(
+        ),
+        CompanyResearchOutcome::Ambiguous => empty_result(
             request.instrument_id(),
             request.knowledge_at(),
             fact_effective_cutoff,
             CompanyProductAvailability::Conflict,
             CompanyProductSectionState::Conflict,
             CompanyProductLimitation::IdentityAmbiguous,
-        )),
+        ),
         CompanyResearchOutcome::Unavailable(reason) => {
             let (availability, section, limitation) = match reason {
                 CompanyResearchUnavailableReason::ConflictingRevisionEvidence => (
@@ -750,17 +871,18 @@ pub(crate) fn project_company_product(
                     CompanyProductLimitation::IdentityUnavailable,
                 ),
             };
-            Ok(empty_result(
+            empty_result(
                 request.instrument_id(),
                 request.knowledge_at(),
                 fact_effective_cutoff,
                 availability,
                 section,
                 limitation,
-            ))
+            )
         }
     }?;
     result.bind_identity(request.instrument_id(), identity)?;
+    ensure_company_product_serialized_bound(&result)?;
     Ok(result)
 }
 
@@ -774,6 +896,7 @@ fn project_snapshot(
     if snapshot.instrument_id() != instrument_id || snapshot.as_of() != knowledge_cutoff {
         return Err(CompanyProductProjectionError::InvalidEvidence);
     }
+    let mut budget = CompanySerializedBudget::new();
 
     let mut facts = Vec::new();
     facts
@@ -782,6 +905,7 @@ fn project_snapshot(
     let mut omitted_facts = 0_usize;
     for fact in snapshot.facts() {
         if let Some(fact) = project_fact(fact, knowledge_cutoff)? {
+            budget.charge(&fact)?;
             facts.push(fact);
         } else {
             omitted_facts = omitted_facts
@@ -795,7 +919,9 @@ fn project_snapshot(
         .try_reserve_exact(snapshot.filing_events().len())
         .map_err(|_| CompanyProductProjectionError::ResourceExhausted)?;
     for filing in snapshot.filing_events() {
-        filings.push(project_filing(filing, knowledge_cutoff)?);
+        let filing = project_filing(filing, knowledge_cutoff)?;
+        budget.charge(&filing)?;
+        filings.push(filing);
     }
 
     let available_sections = [
@@ -829,8 +955,8 @@ fn project_snapshot(
         CompanyProductSectionState::Missing
     };
 
-    let statements = project_statements(&facts, facts_state)?;
-    let ratios = project_ratios(&facts, facts_state)?;
+    let statements = project_statements(&facts, facts_state, &mut budget)?;
+    let ratios = project_ratios(&facts, facts_state, &mut budget)?;
     let mut limitations = Vec::new();
     limitations
         .try_reserve_exact(4)
@@ -864,7 +990,12 @@ fn project_snapshot(
         .iter()
         .try_fold(0_usize, |count, group| count.checked_add(group.items.len()))
         .ok_or(CompanyProductProjectionError::ResourceExhausted)?;
-    let calculated_ratios = ratios.items.len();
+    let evaluated_ratios = ratios.items.len();
+    let reported_ratios = ratios
+        .items
+        .iter()
+        .filter(|ratio| ratio.state == CompanyRatioState::Reported)
+        .count();
     Ok(CompanyProductResult {
         instrument_id,
         identity: None,
@@ -890,7 +1021,8 @@ fn project_snapshot(
             reported_facts,
             omitted_facts,
             statement_lines,
-            calculated_ratios,
+            evaluated_ratios,
+            reported_ratios,
             filing_events: snapshot.filing_events().len(),
         },
         limitations: limitations.into_boxed_slice(),
@@ -900,6 +1032,7 @@ fn project_snapshot(
 fn project_statements(
     facts: &[CompanyFactProduct],
     source_state: CompanyProductSectionState,
+    budget: &mut CompanySerializedBudget,
 ) -> Result<CompanyStatementsProduct, CompanyProductProjectionError> {
     if source_state != CompanyProductSectionState::Reported {
         return Ok(CompanyStatementsProduct {
@@ -907,39 +1040,41 @@ fn project_statements(
             groups: Box::new([]),
         });
     }
-
-    let mut financial_position = Vec::new();
-    let mut operations = Vec::new();
-    let mut cash_flows = Vec::new();
-    let mut share_data = Vec::new();
-    for fact in facts {
-        let target = match statement_for_metric(fact.metric) {
-            CompanyStatementKind::FinancialPosition => &mut financial_position,
-            CompanyStatementKind::Operations => &mut operations,
-            CompanyStatementKind::CashFlows => &mut cash_flows,
-            CompanyStatementKind::ShareData => &mut share_data,
-        };
-        target
-            .try_reserve(1)
-            .map_err(|_| CompanyProductProjectionError::ResourceExhausted)?;
-        target.push(fact.clone());
-    }
     if facts.is_empty() {
         return Err(CompanyProductProjectionError::InvalidEvidence);
     }
 
-    let mut groups = Vec::new();
-    groups
-        .try_reserve_exact(4)
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(facts.len())
         .map_err(|_| CompanyProductProjectionError::ResourceExhausted)?;
-    append_statement_group(
-        &mut groups,
-        CompanyStatementKind::FinancialPosition,
-        financial_position,
-    );
-    append_statement_group(&mut groups, CompanyStatementKind::Operations, operations);
-    append_statement_group(&mut groups, CompanyStatementKind::CashFlows, cash_flows);
-    append_statement_group(&mut groups, CompanyStatementKind::ShareData, share_data);
+    for fact in facts {
+        candidates.push(EnvelopeFactRef {
+            key: fact_envelope_key(fact),
+            fact,
+        });
+    }
+    candidates.sort_unstable_by_key(|candidate| candidate.key);
+
+    let mut groups = Vec::new();
+    let mut start = 0_usize;
+    while start < candidates.len() {
+        let key = candidates[start].key;
+        let mut end = start + 1;
+        while end < candidates.len() && candidates[end].key == key {
+            end += 1;
+        }
+        let envelope = &candidates[start..end];
+        for statement in [
+            CompanyStatementKind::FinancialPosition,
+            CompanyStatementKind::Operations,
+            CompanyStatementKind::CashFlows,
+            CompanyStatementKind::ShareData,
+        ] {
+            append_statement_group(&mut groups, envelope, statement, budget)?;
+        }
+        start = end;
+    }
     Ok(CompanyStatementsProduct {
         state: CompanyProductSectionState::Reported,
         groups: groups.into_boxed_slice(),
@@ -948,15 +1083,34 @@ fn project_statements(
 
 fn append_statement_group(
     groups: &mut Vec<CompanyStatementGroupProduct>,
+    envelope: &[EnvelopeFactRef<'_>],
     statement: CompanyStatementKind,
-    items: Vec<CompanyFactProduct>,
-) {
-    if !items.is_empty() {
-        groups.push(CompanyStatementGroupProduct {
-            statement,
-            items: items.into_boxed_slice(),
-        });
+    budget: &mut CompanySerializedBudget,
+) -> Result<(), CompanyProductProjectionError> {
+    let mut items = Vec::new();
+    for candidate in envelope
+        .iter()
+        .filter(|candidate| statement_for_metric(candidate.fact.metric) == statement)
+    {
+        items
+            .try_reserve(1)
+            .map_err(|_| CompanyProductProjectionError::ResourceExhausted)?;
+        items.push(candidate.fact.clone());
     }
+    if items.is_empty() {
+        return Ok(());
+    }
+    let product = CompanyStatementGroupProduct {
+        statement,
+        envelope: reporting_envelope(envelope[0].fact),
+        items: items.into_boxed_slice(),
+    };
+    budget.charge(&product)?;
+    groups
+        .try_reserve(1)
+        .map_err(|_| CompanyProductProjectionError::ResourceExhausted)?;
+    groups.push(product);
+    Ok(())
 }
 
 const fn statement_for_metric(metric: CompanyFinancialMetric) -> CompanyStatementKind {
@@ -999,7 +1153,9 @@ const fn statement_for_metric(metric: CompanyFinancialMetric) -> CompanyStatemen
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct RatioLineageKey {
+struct CompanyFactEnvelopeKey<'fact> {
+    filing_identity: &'fact str,
+    publication_identity: [u8; 32],
     scope: u8,
     revision: u8,
     period_kind: u8,
@@ -1018,23 +1174,22 @@ struct RatioLineageKey {
     filed_on: i32,
     effective_kind: u8,
     effective_value: i64,
+    known_at: i64,
 }
 
 #[derive(Clone, Copy)]
-struct RatioFactRef<'fact> {
-    key: RatioLineageKey,
+struct EnvelopeFactRef<'fact> {
+    key: CompanyFactEnvelopeKey<'fact>,
     fact: &'fact CompanyFactProduct,
 }
 
 fn project_ratios(
     facts: &[CompanyFactProduct],
     source_state: CompanyProductSectionState,
+    budget: &mut CompanySerializedBudget,
 ) -> Result<CompanyRatiosProduct, CompanyProductProjectionError> {
     if source_state != CompanyProductSectionState::Reported {
-        return Ok(CompanyRatiosProduct {
-            state: source_state,
-            items: Box::new([]),
-        });
+        return unavailable_ratio_set(source_state, budget);
     }
 
     let mut candidates = Vec::new();
@@ -1042,17 +1197,17 @@ fn project_ratios(
         .try_reserve_exact(facts.len())
         .map_err(|_| CompanyProductProjectionError::ResourceExhausted)?;
     for fact in facts.iter().filter(|fact| ratio_metric(fact.metric)) {
-        candidates.push(RatioFactRef {
-            key: ratio_lineage_key(fact),
+        candidates.push(EnvelopeFactRef {
+            key: fact_envelope_key(fact),
             fact,
         });
     }
     candidates.sort_unstable_by_key(|candidate| candidate.key);
+    if candidates.is_empty() {
+        return unavailable_ratio_set(CompanyProductSectionState::Unavailable, budget);
+    }
 
     let mut ratios = Vec::new();
-    ratios
-        .try_reserve(facts.len().min(4_096))
-        .map_err(|_| CompanyProductProjectionError::ResourceExhausted)?;
     let mut start = 0_usize;
     while start < candidates.len() {
         let key = candidates[start].key;
@@ -1067,6 +1222,7 @@ fn project_ratios(
             CompanyRatioMetric::CurrentRatio,
             &[CompanyFinancialMetric::CurrentAssets],
             &[CompanyFinancialMetric::CurrentLiabilities],
+            budget,
         )?;
         append_ratio(
             &mut ratios,
@@ -1074,6 +1230,7 @@ fn project_ratios(
             CompanyRatioMetric::GrossMargin,
             &[CompanyFinancialMetric::GrossProfit],
             revenue_metrics(),
+            budget,
         )?;
         append_ratio(
             &mut ratios,
@@ -1081,6 +1238,7 @@ fn project_ratios(
             CompanyRatioMetric::OperatingMargin,
             &[CompanyFinancialMetric::OperatingIncome],
             revenue_metrics(),
+            budget,
         )?;
         append_ratio(
             &mut ratios,
@@ -1091,17 +1249,53 @@ fn project_ratios(
                 CompanyFinancialMetric::ProfitOrLossIncludingNoncontrollingInterests,
             ],
             revenue_metrics(),
+            budget,
         )?;
         start = end;
     }
-    let state = if ratios.is_empty() {
-        CompanyProductSectionState::Missing
-    } else {
+    let state = if ratios
+        .iter()
+        .any(|ratio| ratio.state == CompanyRatioState::Reported)
+    {
         CompanyProductSectionState::Reported
+    } else {
+        CompanyProductSectionState::Unavailable
     };
     Ok(CompanyRatiosProduct {
         state,
         items: ratios.into_boxed_slice(),
+    })
+}
+
+fn unavailable_ratio_set(
+    state: CompanyProductSectionState,
+    budget: &mut CompanySerializedBudget,
+) -> Result<CompanyRatiosProduct, CompanyProductProjectionError> {
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(4)
+        .map_err(|_| CompanyProductProjectionError::ResourceExhausted)?;
+    for metric in [
+        CompanyRatioMetric::CurrentRatio,
+        CompanyRatioMetric::GrossMargin,
+        CompanyRatioMetric::OperatingMargin,
+        CompanyRatioMetric::NetMargin,
+    ] {
+        let product = CompanyRatioProduct {
+            metric,
+            display_name: metric.display_name(),
+            state: CompanyRatioState::Unavailable,
+            value: None,
+            unit: CompanyRatioUnit::Ratio,
+            envelope: None,
+            inputs: Box::new([]),
+        };
+        budget.charge(&product)?;
+        items.push(product);
+    }
+    Ok(CompanyRatiosProduct {
+        state,
+        items: items.into_boxed_slice(),
     })
 }
 
@@ -1130,75 +1324,85 @@ const fn ratio_metric(metric: CompanyFinancialMetric) -> bool {
 
 fn append_ratio(
     ratios: &mut Vec<CompanyRatioProduct>,
-    group: &[RatioFactRef<'_>],
+    group: &[EnvelopeFactRef<'_>],
     metric: CompanyRatioMetric,
     numerator_metrics: &[CompanyFinancialMetric],
     denominator_metrics: &[CompanyFinancialMetric],
+    budget: &mut CompanySerializedBudget,
 ) -> Result<(), CompanyProductProjectionError> {
-    let Ok(Some(numerator)) = unique_preferred_fact(group, numerator_metrics) else {
-        return Ok(());
-    };
-    let Ok(Some(denominator)) = unique_preferred_fact(group, denominator_metrics) else {
-        return Ok(());
-    };
-    if numerator.unit != denominator.unit || denominator.value.is_zero() {
-        return Ok(());
-    }
-    let Some(value) = numerator.value.checked_div(denominator.value) else {
-        return Ok(());
-    };
-
     let mut inputs = Vec::new();
-    inputs
-        .try_reserve_exact(2)
-        .map_err(|_| CompanyProductProjectionError::ResourceExhausted)?;
-    inputs.push(CompanyRatioInputProduct {
-        role: CompanyRatioInputRole::Numerator,
-        fact: numerator.clone(),
-    });
-    inputs.push(CompanyRatioInputProduct {
-        role: CompanyRatioInputRole::Denominator,
-        fact: denominator.clone(),
-    });
+    append_ratio_inputs(
+        &mut inputs,
+        group,
+        numerator_metrics,
+        CompanyRatioInputRole::Numerator,
+    )?;
+    let numerator_count = inputs.len();
+    append_ratio_inputs(
+        &mut inputs,
+        group,
+        denominator_metrics,
+        CompanyRatioInputRole::Denominator,
+    )?;
+    let denominator_count = inputs.len() - numerator_count;
+    let numerator = (numerator_count == 1).then(|| &inputs[0].fact);
+    let denominator = (denominator_count == 1).then(|| &inputs[numerator_count].fact);
+    let (state, value) = if numerator_count == 0 || denominator_count == 0 {
+        (CompanyRatioState::MissingInput, None)
+    } else if numerator_count != 1 || denominator_count != 1 {
+        (CompanyRatioState::ConflictingInput, None)
+    } else {
+        let numerator = numerator.ok_or(CompanyProductProjectionError::InvalidEvidence)?;
+        let denominator = denominator.ok_or(CompanyProductProjectionError::InvalidEvidence)?;
+        if numerator.unit != denominator.unit {
+            (CompanyRatioState::IncompatibleUnits, None)
+        } else if denominator.value.is_zero() {
+            (CompanyRatioState::ZeroDenominator, None)
+        } else if let Some(value) = numerator.value.checked_div(denominator.value) {
+            (CompanyRatioState::Reported, Some(value))
+        } else {
+            (CompanyRatioState::Unavailable, None)
+        }
+    };
+    let product = CompanyRatioProduct {
+        metric,
+        display_name: metric.display_name(),
+        state,
+        value,
+        unit: CompanyRatioUnit::Ratio,
+        envelope: Some(reporting_envelope(group[0].fact)),
+        inputs: inputs.into_boxed_slice(),
+    };
+    budget.charge(&product)?;
     ratios
         .try_reserve(1)
         .map_err(|_| CompanyProductProjectionError::ResourceExhausted)?;
-    ratios.push(CompanyRatioProduct {
-        metric,
-        display_name: metric.display_name(),
-        value,
-        unit: CompanyRatioUnit::Ratio,
-        period: numerator.period,
-        fiscal_context: numerator.fiscal_context,
-        reporting_context: numerator.reporting_context,
-        filed_on: numerator.filed_on,
-        effective: numerator.effective,
-        known_at: numerator.known_at.max(denominator.known_at),
-        inputs: inputs.into_boxed_slice(),
-    });
+    ratios.push(product);
     Ok(())
 }
 
-fn unique_preferred_fact<'fact>(
-    group: &[RatioFactRef<'fact>],
+fn append_ratio_inputs(
+    inputs: &mut Vec<CompanyRatioInputProduct>,
+    group: &[EnvelopeFactRef<'_>],
     metrics: &[CompanyFinancialMetric],
-) -> Result<Option<&'fact CompanyFactProduct>, ()> {
-    for metric in metrics {
-        let mut matching = group
-            .iter()
-            .filter(|candidate| candidate.fact.metric == *metric);
-        let Some(candidate) = matching.next() else {
-            continue;
-        };
-        if matching.next().is_some() {
-            return Err(());
-        }
-        return Ok(Some(candidate.fact));
+    role: CompanyRatioInputRole,
+) -> Result<(), CompanyProductProjectionError> {
+    for candidate in group
+        .iter()
+        .filter(|candidate| metrics.contains(&candidate.fact.metric))
+    {
+        inputs
+            .try_reserve(1)
+            .map_err(|_| CompanyProductProjectionError::ResourceExhausted)?;
+        inputs.push(CompanyRatioInputProduct {
+            role,
+            fact: candidate.fact.clone(),
+        });
     }
-    Ok(None)
+    Ok(())
 }
 
-fn ratio_lineage_key(fact: &CompanyFactProduct) -> RatioLineageKey {
+fn fact_envelope_key(fact: &CompanyFactProduct) -> CompanyFactEnvelopeKey<'_> {
     let (period_kind, period_start, period_end) = match fact.period {
         FundamentalPeriod::Instant { instant } => (
             0,
@@ -1215,7 +1419,9 @@ fn ratio_lineage_key(fact: &CompanyFactProduct) -> RatioLineageKey {
         CompanyProductTime::Timestamp(timestamp) => (0, timestamp.unix_nanos()),
         CompanyProductTime::CalendarDate(date) => (1, i64::from(date.days_since_unix_epoch())),
     };
-    RatioLineageKey {
+    CompanyFactEnvelopeKey {
+        filing_identity: &fact.lineage.filing_identity,
+        publication_identity: fact.lineage.publication_identity,
         scope: match fact.scope {
             CompanyFactProductScope::CompanyWide => 0,
             CompanyFactProductScope::FilingDetail => 1,
@@ -1269,6 +1475,18 @@ fn ratio_lineage_key(fact: &CompanyFactProduct) -> RatioLineageKey {
         filed_on: fact.filed_on.map_or(0, CalendarDate::days_since_unix_epoch),
         effective_kind,
         effective_value,
+        known_at: fact.known_at.unix_nanos(),
+    }
+}
+
+const fn reporting_envelope(fact: &CompanyFactProduct) -> CompanyReportingEnvelopeProduct {
+    CompanyReportingEnvelopeProduct {
+        period: fact.period,
+        fiscal_context: fact.fiscal_context,
+        reporting_context: fact.reporting_context,
+        filed_on: fact.filed_on,
+        effective: fact.effective,
+        known_at: fact.known_at,
     }
 }
 
@@ -1292,6 +1510,11 @@ fn project_fact(
         return Ok(None);
     };
     Ok(Some(CompanyFactProduct {
+        lineage: CompanyFactPrivateLineage {
+            filing_identity: try_boxed_product_text(fact.lineage().filing_identity(), 256)
+                .map_err(map_product_text_error)?,
+            publication_identity: fact.lineage().publication_identity().bytes(),
+        },
         scope: match fact.scope() {
             CompanyFactScope::CompanyWide => CompanyFactProductScope::CompanyWide,
             CompanyFactScope::FilingDetail => CompanyFactProductScope::FilingDetail,
@@ -1515,8 +1738,10 @@ fn empty_result(
     availability: CompanyProductAvailability,
     section_state: CompanyProductSectionState,
     primary_limitation: CompanyProductLimitation,
-) -> CompanyProductResult {
-    CompanyProductResult {
+) -> Result<CompanyProductResult, CompanyProductProjectionError> {
+    let mut budget = CompanySerializedBudget::new();
+    let ratios = unavailable_ratio_set(section_state, &mut budget)?;
+    Ok(CompanyProductResult {
         instrument_id,
         identity: None,
         availability,
@@ -1528,10 +1753,7 @@ fn empty_result(
             state: section_state,
             groups: Box::new([]),
         },
-        ratios: CompanyRatiosProduct {
-            state: section_state,
-            items: Box::new([]),
-        },
+        ratios,
         filings: CompanyFilingsProduct {
             state: section_state,
             items: Box::new([]),
@@ -1547,11 +1769,12 @@ fn empty_result(
             reported_facts: 0,
             omitted_facts: 0,
             statement_lines: 0,
-            calculated_ratios: 0,
+            evaluated_ratios: 4,
+            reported_ratios: 0,
             filing_events: 0,
         },
         limitations: Box::new([primary_limitation]),
-    }
+    })
 }
 
 fn product_time(
@@ -1578,58 +1801,80 @@ mod tests {
     use super::*;
 
     #[test]
-    fn statement_and_ratio_projection_preserves_exact_point_in_time_inputs() -> anyhow::Result<()> {
+    fn statement_and_ratio_projection_requires_one_exact_filing_envelope() -> anyhow::Result<()> {
         let year_start = CalendarDate::new(2025, 1, 1)?;
         let year_end = CalendarDate::new(2025, 12, 31)?;
         let duration = FundamentalPeriod::duration(year_start, year_end)?;
         let instant = FundamentalPeriod::instant(year_end);
         let known_at = Timestamp::from_unix_nanos(1_800_000_000_000_000_000);
+        let usd = Currency::try_from("USD")?;
+        let eur = Currency::try_from("EUR")?;
         let facts = vec![
             fact(
                 CompanyFinancialMetric::CurrentAssets,
                 200,
+                usd,
                 instant,
                 year_end,
                 known_at,
+                "filing-a",
+                1,
             )?,
             fact(
                 CompanyFinancialMetric::CurrentLiabilities,
                 100,
+                usd,
                 instant,
                 year_end,
                 known_at,
+                "filing-a",
+                1,
             )?,
             fact(
                 CompanyFinancialMetric::CustomerRevenueExcludingAssessedTax,
                 100,
+                usd,
                 duration,
                 year_end,
                 known_at,
+                "filing-a",
+                1,
             )?,
             fact(
                 CompanyFinancialMetric::GrossProfit,
                 40,
+                usd,
                 duration,
                 year_end,
                 known_at,
+                "filing-a",
+                1,
             )?,
             fact(
                 CompanyFinancialMetric::OperatingIncome,
                 20,
+                usd,
                 duration,
                 year_end,
                 known_at,
+                "filing-a",
+                1,
             )?,
             fact(
                 CompanyFinancialMetric::NetIncome,
                 10,
+                usd,
                 duration,
                 year_end,
                 known_at,
+                "filing-a",
+                1,
             )?,
         ];
 
-        let statements = project_statements(&facts, CompanyProductSectionState::Reported)?;
+        let mut budget = CompanySerializedBudget::new();
+        let statements =
+            project_statements(&facts, CompanyProductSectionState::Reported, &mut budget)?;
         assert_eq!(statements.state(), CompanyProductSectionState::Reported);
         assert_eq!(
             statements
@@ -1639,18 +1884,33 @@ mod tests {
                 .sum::<usize>(),
             facts.len()
         );
-        let ratios = project_ratios(&facts, CompanyProductSectionState::Reported)?;
+        for group in statements.groups() {
+            let first = &group.items()[0].lineage;
+            assert!(group.items().iter().all(|item| {
+                item.lineage.filing_identity == first.filing_identity
+                    && item.lineage.publication_identity == first.publication_identity
+            }));
+        }
+
+        let ratios = project_ratios(&facts, CompanyProductSectionState::Reported, &mut budget)?;
         assert_eq!(ratios.state(), CompanyProductSectionState::Reported);
-        assert_eq!(ratios.items().len(), 4);
+        assert_eq!(ratios.items().len(), 8);
         assert_eq!(
             ratios
                 .items()
                 .iter()
-                .find(|ratio| ratio.metric() == CompanyRatioMetric::CurrentRatio)
+                .find(|ratio| {
+                    ratio.metric() == CompanyRatioMetric::CurrentRatio
+                        && ratio.state() == CompanyRatioState::Reported
+                })
                 .map(CompanyRatioProduct::value),
-            Some(Decimal::from(2_u8))
+            Some(Some(Decimal::from(2_u8)))
         );
-        for ratio in ratios.items() {
+        for ratio in ratios
+            .items()
+            .iter()
+            .filter(|ratio| ratio.state() == CompanyRatioState::Reported)
+        {
             assert_eq!(ratio.inputs().len(), 2);
             assert_eq!(ratio.inputs()[0].role(), CompanyRatioInputRole::Numerator);
             assert_eq!(ratio.inputs()[1].role(), CompanyRatioInputRole::Denominator);
@@ -1663,18 +1923,187 @@ mod tests {
                 assert_eq!(input.fact().filed_on(), Some(year_end));
             }
         }
+
+        let distinct_filings = vec![
+            fact(
+                CompanyFinancialMetric::CurrentAssets,
+                200,
+                usd,
+                instant,
+                year_end,
+                known_at,
+                "filing-a",
+                1,
+            )?,
+            fact(
+                CompanyFinancialMetric::CurrentLiabilities,
+                100,
+                usd,
+                instant,
+                year_end,
+                known_at,
+                "filing-b",
+                2,
+            )?,
+        ];
+        let distinct_ratios = project_ratios(
+            &distinct_filings,
+            CompanyProductSectionState::Reported,
+            &mut CompanySerializedBudget::new(),
+        )?;
+        assert_eq!(
+            ratio_states(&distinct_ratios, CompanyRatioMetric::CurrentRatio),
+            vec![
+                CompanyRatioState::MissingInput,
+                CompanyRatioState::MissingInput
+            ]
+        );
+
+        let conflict = vec![
+            fact(
+                CompanyFinancialMetric::CurrentAssets,
+                200,
+                usd,
+                instant,
+                year_end,
+                known_at,
+                "filing-a",
+                1,
+            )?,
+            fact(
+                CompanyFinancialMetric::CurrentAssets,
+                210,
+                usd,
+                instant,
+                year_end,
+                known_at,
+                "filing-a",
+                1,
+            )?,
+            fact(
+                CompanyFinancialMetric::CurrentLiabilities,
+                100,
+                usd,
+                instant,
+                year_end,
+                known_at,
+                "filing-a",
+                1,
+            )?,
+        ];
+        assert_eq!(
+            ratio_states(
+                &project_ratios(
+                    &conflict,
+                    CompanyProductSectionState::Reported,
+                    &mut CompanySerializedBudget::new(),
+                )?,
+                CompanyRatioMetric::CurrentRatio,
+            ),
+            vec![CompanyRatioState::ConflictingInput]
+        );
+
+        let incompatible = vec![
+            fact(
+                CompanyFinancialMetric::CurrentAssets,
+                200,
+                usd,
+                instant,
+                year_end,
+                known_at,
+                "filing-a",
+                1,
+            )?,
+            fact(
+                CompanyFinancialMetric::CurrentLiabilities,
+                100,
+                eur,
+                instant,
+                year_end,
+                known_at,
+                "filing-a",
+                1,
+            )?,
+        ];
+        assert_eq!(
+            ratio_states(
+                &project_ratios(
+                    &incompatible,
+                    CompanyProductSectionState::Reported,
+                    &mut CompanySerializedBudget::new(),
+                )?,
+                CompanyRatioMetric::CurrentRatio,
+            ),
+            vec![CompanyRatioState::IncompatibleUnits]
+        );
+
+        let zero_denominator = vec![
+            fact(
+                CompanyFinancialMetric::CurrentAssets,
+                200,
+                usd,
+                instant,
+                year_end,
+                known_at,
+                "filing-a",
+                1,
+            )?,
+            fact(
+                CompanyFinancialMetric::CurrentLiabilities,
+                0,
+                usd,
+                instant,
+                year_end,
+                known_at,
+                "filing-a",
+                1,
+            )?,
+        ];
+        assert_eq!(
+            ratio_states(
+                &project_ratios(
+                    &zero_denominator,
+                    CompanyProductSectionState::Reported,
+                    &mut CompanySerializedBudget::new(),
+                )?,
+                CompanyRatioMetric::CurrentRatio,
+            ),
+            vec![CompanyRatioState::ZeroDenominator]
+        );
         Ok(())
     }
 
+    fn ratio_states(
+        ratios: &CompanyRatiosProduct,
+        metric: CompanyRatioMetric,
+    ) -> Vec<CompanyRatioState> {
+        ratios
+            .items()
+            .iter()
+            .filter(|ratio| ratio.metric() == metric)
+            .map(CompanyRatioProduct::state)
+            .collect()
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one exact ratio-envelope fixture"
+    )]
     fn fact(
         metric: CompanyFinancialMetric,
         value: i64,
+        currency: Currency,
         period: FundamentalPeriod,
         filed_on: CalendarDate,
         known_at: Timestamp,
+        filing_identity: &str,
+        publication_byte: u8,
     ) -> anyhow::Result<CompanyFactProduct> {
-        let currency = Currency::try_from("USD")?;
         Ok(CompanyFactProduct {
+            lineage: CompanyFactPrivateLineage {
+                filing_identity: filing_identity.into(),
+                publication_identity: [publication_byte; 32],
+            },
             scope: CompanyFactProductScope::CompanyWide,
             revision: CompanyProductRevisionState::Current,
             metric,
