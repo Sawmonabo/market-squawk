@@ -922,10 +922,13 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
     .unwrap_or_else(|error| panic!("history extraction request: {error}"));
     let market_data = SchwabPriceHistoryMarketDataEvidence::try_new(
         venue_id.clone(),
-        test_market_data_qualification(
+        test_market_data_qualification_for_authority(
             SchwabMarketDataFamily::PriceHistory,
             received_at,
-            token_generation,
+            oauth_receipt,
+            SourceIdentifier::try_from("8d9bc9ee-fca2-4f1d-a077-5104408e3727")
+                .unwrap_or_else(|error| panic!("history qualification session: {error}")),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [80; 32]),
         ),
     )
     .unwrap_or_else(|error| panic!("history market-data evidence: {error}"));
