@@ -329,7 +329,7 @@ impl FredSource {
             .map_err(map_adapter_error)?;
         in_flight.validate_response_size(
             u64::try_from(response.body.len())
-                .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?,
+                .map_err(|_| protocol_violation(SourceProtocolViolation::CaptureBinding))?,
         )?;
         if response
             .content_encoding
