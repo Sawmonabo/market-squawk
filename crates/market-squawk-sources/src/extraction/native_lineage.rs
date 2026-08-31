@@ -29,6 +29,10 @@ pub const MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES: usize = 64 * 1024 * 1024;
 pub enum ProviderNativeLineageImplementation {
     /// Alpaca historical-bar response semantics encoder v1.
     AlpacaHistoricalBarV1,
+    /// Alpaca IEX current market-data response semantics encoder v1.
+    AlpacaIexMarketDataV1,
+    /// Alpaca indicative options response semantics encoder v1.
+    AlpacaIndicativeOptionsV1,
     /// BEA regional/table response semantics encoder v1.
     BeaRegionalV1,
     /// BLS timeseries observation semantics encoder v1.
@@ -71,6 +75,12 @@ impl ProviderNativeLineageImplementation {
             Self::AlpacaHistoricalBarV1 => {
                 b"market-squawk/alpaca-historical/provider-native-lineage/v1"
             }
+            Self::AlpacaIexMarketDataV1 => {
+                b"market-squawk/alpaca-iex-market-data/provider-native-lineage/v1"
+            }
+            Self::AlpacaIndicativeOptionsV1 => {
+                b"market-squawk/alpaca-indicative-options/provider-native-lineage/v1"
+            }
             Self::BeaRegionalV1 => b"market-squawk/bea/provider-native-lineage/v1",
             Self::BlsTimeseriesV1 => b"market-squawk/bls/provider-native-lineage/v1",
             Self::CensusTabularV1 => b"market-squawk/census/provider-native-lineage/v1",
@@ -112,6 +122,8 @@ impl ProviderNativeLineageImplementation {
     pub(crate) const fn tag(self) -> u8 {
         match self {
             Self::AlpacaHistoricalBarV1 => 5,
+            Self::AlpacaIexMarketDataV1 => 24,
+            Self::AlpacaIndicativeOptionsV1 => 25,
             Self::BeaRegionalV1 => 1,
             Self::BlsTimeseriesV1 => 2,
             Self::CensusTabularV1 => 3,

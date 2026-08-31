@@ -1887,6 +1887,10 @@ pub(super) const fn native_implementation_name(
     implementation: ProviderNativeLineageImplementation,
 ) -> &'static str {
     match implementation {
+        ProviderNativeLineageImplementation::AlpacaIexMarketDataV1 => "alpaca_iex_market_data_v1",
+        ProviderNativeLineageImplementation::AlpacaIndicativeOptionsV1 => {
+            "alpaca_indicative_options_v1"
+        }
         ProviderNativeLineageImplementation::BeaRegionalV1 => "bea_regional_v1",
         ProviderNativeLineageImplementation::BlsTimeseriesV1 => "bls_timeseries_v1",
         ProviderNativeLineageImplementation::CensusTabularV1 => "census_tabular_v1",
@@ -1922,6 +1926,12 @@ pub(super) fn parse_native_implementation(
     value: &str,
 ) -> Result<ProviderNativeLineageImplementation, CatalogError> {
     match value {
+        "alpaca_iex_market_data_v1" => {
+            Ok(ProviderNativeLineageImplementation::AlpacaIexMarketDataV1)
+        }
+        "alpaca_indicative_options_v1" => {
+            Ok(ProviderNativeLineageImplementation::AlpacaIndicativeOptionsV1)
+        }
         "bea_regional_v1" => Ok(ProviderNativeLineageImplementation::BeaRegionalV1),
         "bls_timeseries_v1" => Ok(ProviderNativeLineageImplementation::BlsTimeseriesV1),
         "census_tabular_v1" => Ok(ProviderNativeLineageImplementation::CensusTabularV1),
@@ -1966,6 +1976,8 @@ mod tests {
     #[test]
     fn fred_and_treasury_native_implementations_round_trip_through_catalog_names() {
         for implementation in [
+            ProviderNativeLineageImplementation::AlpacaIexMarketDataV1,
+            ProviderNativeLineageImplementation::AlpacaIndicativeOptionsV1,
             ProviderNativeLineageImplementation::FredAlfredSeriesObservationsV1,
             ProviderNativeLineageImplementation::NasdaqSymbolDirectoryV1,
             ProviderNativeLineageImplementation::UsTreasuryMacroV1,

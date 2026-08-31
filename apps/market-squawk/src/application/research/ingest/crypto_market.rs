@@ -1300,6 +1300,12 @@ const fn persisted_market_event_implementation(
     implementation: ProviderNativeLineageImplementation,
 ) -> Option<&'static str> {
     match implementation {
+        ProviderNativeLineageImplementation::AlpacaIexMarketDataV1 => {
+            Some("alpaca_iex_market_data_v1")
+        }
+        ProviderNativeLineageImplementation::AlpacaIndicativeOptionsV1 => {
+            Some("alpaca_indicative_options_v1")
+        }
         ProviderNativeLineageImplementation::CoinbaseAdvancedTradeV1 => {
             Some(COINBASE_ADVANCED_NATIVE_IMPLEMENTATION)
         }
