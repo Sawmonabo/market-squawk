@@ -37,7 +37,7 @@ use crate::application::model::forecast_preparation::{
 };
 
 use super::macro_context::MacroContextReadCapability;
-use super::macro_features::{MacroFeatureVector, read_macro_feature_vector};
+use super::macro_features::{MacroFeatureVector, MacroRateRegime, read_macro_feature_vector};
 
 const DATASET_PAGE: usize = 64;
 const MAX_DATASETS: usize = 4_096;
@@ -835,6 +835,11 @@ fn enrich_serving_materialization(
     {
         return Err(ForecastEvidenceReadError::InvalidEvidence);
     }
+    if macro_features.downstream_evidence_digest().algorithm() != DigestAlgorithm::Sha256
+        || macro_features.downstream_evidence_digest().bytes() == [0; 32]
+    {
+        return Err(ForecastEvidenceReadError::InvalidEvidence);
+    }
 
     let descriptors =
         FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnAnalysisV1
@@ -855,6 +860,49 @@ fn enrich_serving_materialization(
     digest.update(b"market-squawk/forecast-serving-price-macro-vector/v1\0");
     digest.update(serving.fence.feature_sha256().bytes());
     digest.update(macro_features.evidence_digest().bytes());
+    digest.update(macro_features.downstream_evidence_digest().bytes());
+    if let Some(investment) = macro_features.investment_context() {
+        if investment.knowledge_cutoff() != macro_features.knowledge_cutoff()
+            || investment.effective_date_cutoff() != effective_date_cutoff
+            || investment.parent_manifests() != macro_features.parent_manifests()
+            || investment.evidence_digest().algorithm() != DigestAlgorithm::Sha256
+            || investment.evidence_digest().bytes() == [0; 32]
+        {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        let regime = investment.regime();
+        let valuation_rates = investment.valuation_rates();
+        if regime.effective() != valuation_rates.effective()
+            || regime.evidence_digest().algorithm() != DigestAlgorithm::Sha256
+            || regime.evidence_digest().bytes() == [0; 32]
+            || valuation_rates.evidence_digest().algorithm() != DigestAlgorithm::Sha256
+            || valuation_rates.evidence_digest().bytes() == [0; 32]
+            || valuation_rates.unit().as_str() != "percent_per_year"
+        {
+            return Err(ForecastEvidenceReadError::InvalidEvidence);
+        }
+        digest.update([1]);
+        digest.update(investment.evidence_digest().bytes());
+        digest.update(regime.evidence_digest().bytes());
+        digest.update(valuation_rates.evidence_digest().bytes());
+        digest.update([match regime.regime() {
+            MacroRateRegime::UpwardSloping => 1,
+            MacroRateRegime::Flat => 2,
+            MacroRateRegime::Inverted => 3,
+            MacroRateRegime::Mixed => 4,
+        }]);
+        for value in [
+            regime.three_month_to_ten_year_spread(),
+            regime.two_year_to_ten_year_spread(),
+            valuation_rates.ten_year_government_yield(),
+            valuation_rates.thirty_year_government_yield(),
+        ] {
+            digest.update(value.mantissa().to_be_bytes());
+            digest.update(value.scale().to_be_bytes());
+        }
+    } else {
+        digest.update([0]);
+    }
     digest.update(macro_features.knowledge_cutoff().unix_nanos().to_be_bytes());
     digest.update(effective_date_cutoff.year().to_be_bytes());
     digest.update([effective_date_cutoff.month(), effective_date_cutoff.day()]);

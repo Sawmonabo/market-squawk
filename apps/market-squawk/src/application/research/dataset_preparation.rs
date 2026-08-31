@@ -1189,7 +1189,7 @@ async fn build_option(
             )
             .map_err(|_| DatasetPreparationError::InvalidEvidence)?,
         );
-        macro_evidence.push(macro_vector.evidence_digest());
+        macro_evidence.push(macro_vector.downstream_evidence_digest());
         feature_content.push(component_content_evidence(&feature_input));
         feature_audit.push(plan_audit_evidence(&feature_plan));
         label_content.push(component_content_evidence(&label_input));
