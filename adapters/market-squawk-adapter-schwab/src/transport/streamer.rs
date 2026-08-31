@@ -1215,6 +1215,68 @@ pub trait SchwabStreamerConnectionControlSource: fmt::Debug + Send + Sync {
     >;
 }
 
+/// Application-owned account-rate authority for one sole Streamer executor.
+///
+/// The adapter invokes this boundary at the exact wire-dispatch seam. The returned permit remains
+/// attached to the owned request until its exact same-generation acknowledgement is classified;
+/// dropping it after cancellation, disconnect, or transport failure is the conservative unknown
+/// completion path. Implementations must not expose bearer credentials or create another socket.
+pub trait SchwabStreamerRuntimeAuthority: fmt::Debug + Send + Sync {
+    fn observe(&self, event: SchwabStreamerRuntimeEvent) -> Result<(), SchwabTransportError>;
+
+    fn commit_request(
+        &self,
+        generation: ConnectionGeneration,
+        service: Option<crate::MarketDataService>,
+        command: &str,
+        request_id: &str,
+        request_payload_sha256: EvidenceDigest,
+        request_payload_bytes: u64,
+    ) -> Result<Box<dyn SchwabStreamerRequestPermit>, SchwabTransportError>;
+}
+
+/// Exact non-secret Streamer lifecycle evidence observed by the sole account-rate authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchwabStreamerRuntimeEvent {
+    ConnectAttempt {
+        reconnecting: bool,
+    },
+    Connected {
+        generation: ConnectionGeneration,
+    },
+    Frame {
+        generation: ConnectionGeneration,
+        bytes: u64,
+    },
+    QueuePressure,
+    Disconnected {
+        generation: ConnectionGeneration,
+        retrying: bool,
+    },
+}
+
+/// One dispatched Streamer command retained until its exact provider acknowledgement.
+pub trait SchwabStreamerRequestPermit: fmt::Debug + Send {
+    fn settle(
+        self: Box<Self>,
+        acknowledgement: SchwabStreamerRequestAcknowledgement,
+    ) -> Result<(), SchwabTransportError>;
+}
+
+/// Exact same-generation acknowledgement coordinates used to terminalize one command permit.
+#[derive(Debug, Eq, PartialEq)]
+pub struct SchwabStreamerRequestAcknowledgement {
+    pub generation: ConnectionGeneration,
+    pub service: Option<crate::MarketDataService>,
+    pub command: Box<str>,
+    pub request_id: Box<str>,
+    pub request_payload_sha256: EvidenceDigest,
+    pub request_payload_bytes: u64,
+    pub status_code: i64,
+    pub transport_ordinal: NonZeroU64,
+    pub round_trip_latency_ms: u64,
+}
+
 /// Sole Streamer connection owner around the frozen desired-state controller.
 pub struct SchwabStreamerExecutor {
     connector: Arc<dyn SchwabStreamerConnector>,
@@ -1225,6 +1287,7 @@ pub struct SchwabStreamerExecutor {
     parse_bounds: ParseBounds,
     token_admission: AccessTokenAdmission,
     telemetry: SchwabTransportTelemetry,
+    runtime_authority: Option<Arc<dyn SchwabStreamerRuntimeAuthority>>,
     last_generation: Option<ConnectionGeneration>,
     desired_state_sender: Option<mpsc::Sender<(StreamerCommand, StreamerSubscription)>>,
     desired_state_receiver: Option<mpsc::Receiver<(StreamerCommand, StreamerSubscription)>>,
@@ -1234,6 +1297,7 @@ pub struct SchwabStreamerExecutor {
 #[derive(Debug)]
 pub struct SchwabStreamerDesiredStateSender {
     sender: mpsc::Sender<(StreamerCommand, StreamerSubscription)>,
+    runtime_authority: Option<Arc<dyn SchwabStreamerRuntimeAuthority>>,
 }
 
 /// Exact desired-state queue pressure retaining the command that was not admitted.
@@ -1253,9 +1317,15 @@ impl SchwabStreamerDesiredStateSender {
     ) -> Result<(), SchwabStreamerDesiredStateSendError> {
         match self.sender.try_send((command, subscription)) {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full((command, subscription))) => Err(
-                SchwabStreamerDesiredStateSendError::Saturated(command, subscription),
-            ),
+            Err(mpsc::error::TrySendError::Full((command, subscription))) => {
+                if let Some(authority) = &self.runtime_authority {
+                    let _observed = authority.observe(SchwabStreamerRuntimeEvent::QueuePressure);
+                }
+                Err(SchwabStreamerDesiredStateSendError::Saturated(
+                    command,
+                    subscription,
+                ))
+            }
             Err(mpsc::error::TrySendError::Closed((command, subscription))) => Err(
                 SchwabStreamerDesiredStateSendError::Closed(command, subscription),
             ),
@@ -1297,16 +1367,18 @@ impl SchwabStreamerExecutor {
     pub fn try_production(
         token_source: Arc<dyn SchwabAccessTokenSource>,
         control_source: Arc<dyn SchwabStreamerConnectionControlSource>,
+        runtime_authority: Arc<dyn SchwabStreamerRuntimeAuthority>,
         admission: StreamerAdmission,
         transport_bounds: StreamerTransportBounds,
         parse_bounds: ParseBounds,
         token_admission: AccessTokenAdmission,
         telemetry: SchwabTransportTelemetry,
     ) -> Result<Self, SchwabTransportError> {
-        Self::try_new(
+        Self::try_new_inner(
             Arc::new(ProductionSchwabStreamerConnector),
             token_source,
             control_source,
+            Some(runtime_authority),
             admission,
             transport_bounds,
             parse_bounds,
@@ -1330,6 +1402,63 @@ impl SchwabStreamerExecutor {
         token_admission: AccessTokenAdmission,
         telemetry: SchwabTransportTelemetry,
     ) -> Result<Self, SchwabTransportError> {
+        Self::try_new_inner(
+            connector,
+            token_source,
+            control_source,
+            None,
+            admission,
+            transport_bounds,
+            parse_bounds,
+            token_admission,
+            telemetry,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the critical injected-transport proof retains production rate ownership"
+    )]
+    pub(crate) fn try_new_with_runtime_authority(
+        connector: Arc<dyn SchwabStreamerConnector>,
+        token_source: Arc<dyn SchwabAccessTokenSource>,
+        control_source: Arc<dyn SchwabStreamerConnectionControlSource>,
+        runtime_authority: Arc<dyn SchwabStreamerRuntimeAuthority>,
+        admission: StreamerAdmission,
+        transport_bounds: StreamerTransportBounds,
+        parse_bounds: ParseBounds,
+        token_admission: AccessTokenAdmission,
+        telemetry: SchwabTransportTelemetry,
+    ) -> Result<Self, SchwabTransportError> {
+        Self::try_new_inner(
+            connector,
+            token_source,
+            control_source,
+            Some(runtime_authority),
+            admission,
+            transport_bounds,
+            parse_bounds,
+            token_admission,
+            telemetry,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "transport, authority, lifecycle, and resource inputs remain explicit"
+    )]
+    fn try_new_inner(
+        connector: Arc<dyn SchwabStreamerConnector>,
+        token_source: Arc<dyn SchwabAccessTokenSource>,
+        control_source: Arc<dyn SchwabStreamerConnectionControlSource>,
+        runtime_authority: Option<Arc<dyn SchwabStreamerRuntimeAuthority>>,
+        admission: StreamerAdmission,
+        transport_bounds: StreamerTransportBounds,
+        parse_bounds: ParseBounds,
+        token_admission: AccessTokenAdmission,
+        telemetry: SchwabTransportTelemetry,
+    ) -> Result<Self, SchwabTransportError> {
         if parse_bounds.max_response_bytes() > transport_bounds.max_frame_bytes() {
             return Err(SchwabTransportError::InvalidConfiguration);
         }
@@ -1344,6 +1473,7 @@ impl SchwabStreamerExecutor {
             parse_bounds,
             token_admission,
             telemetry,
+            runtime_authority,
             last_generation: None,
             desired_state_sender: Some(desired_state_sender),
             desired_state_receiver: Some(desired_state_receiver),
@@ -1357,7 +1487,10 @@ impl SchwabStreamerExecutor {
     pub fn take_desired_state_sender(&mut self) -> Option<SchwabStreamerDesiredStateSender> {
         self.desired_state_sender
             .take()
-            .map(|sender| SchwabStreamerDesiredStateSender { sender })
+            .map(|sender| SchwabStreamerDesiredStateSender {
+                sender,
+                runtime_authority: self.runtime_authority.clone(),
+            })
     }
 
     /// Returns the currently desired read-only services.
@@ -1437,6 +1570,9 @@ impl SchwabStreamerExecutor {
                 wait_reconnect(self.transport_bounds.reconnect_delay(), &cancellation).await?;
             }
             self.telemetry.record_stream_connect_attempt(reconnecting)?;
+            if let Some(authority) = &self.runtime_authority {
+                authority.observe(SchwabStreamerRuntimeEvent::ConnectAttempt { reconnecting })?;
+            }
             let control = await_operation(
                 self.control_source.mint(),
                 self.transport_bounds.connect_timeout(),
@@ -1493,6 +1629,12 @@ impl SchwabStreamerExecutor {
                 }
                 Err(error) => {
                     self.controller.disconnected(generation)?;
+                    if let Some(authority) = &self.runtime_authority {
+                        authority.observe(SchwabStreamerRuntimeEvent::Disconnected {
+                            generation,
+                            retrying: false,
+                        })?;
+                    }
                     return Err(error);
                 }
             };
@@ -1517,11 +1659,23 @@ impl SchwabStreamerExecutor {
                 Ok(ConnectionExit::Cancelled) => {
                     self.controller.disconnected(generation)?;
                     self.telemetry.record_stream_clean_close()?;
+                    if let Some(authority) = &self.runtime_authority {
+                        authority.observe(SchwabStreamerRuntimeEvent::Disconnected {
+                            generation,
+                            retrying: false,
+                        })?;
+                    }
                     return Ok(StreamerRunExit::Cancelled);
                 }
                 Ok(ConnectionExit::Retry) => {
                     self.controller.disconnected(generation)?;
                     self.telemetry.record_stream_disconnect()?;
+                    if let Some(authority) = &self.runtime_authority {
+                        authority.observe(SchwabStreamerRuntimeEvent::Disconnected {
+                            generation,
+                            retrying: true,
+                        })?;
+                    }
                     consecutive_failures =
                         next_consecutive_failure(consecutive_failures, stable_health)?;
                     reconnecting = true;
@@ -1529,11 +1683,23 @@ impl SchwabStreamerExecutor {
                 Err(SchwabTransportError::Cancelled) => {
                     self.controller.disconnected(generation)?;
                     self.telemetry.record_stream_clean_close()?;
+                    if let Some(authority) = &self.runtime_authority {
+                        authority.observe(SchwabStreamerRuntimeEvent::Disconnected {
+                            generation,
+                            retrying: false,
+                        })?;
+                    }
                     return Ok(StreamerRunExit::Cancelled);
                 }
                 Err(error) if retryable(error) => {
                     self.controller.disconnected(generation)?;
                     self.telemetry.record_stream_disconnect()?;
+                    if let Some(authority) = &self.runtime_authority {
+                        authority.observe(SchwabStreamerRuntimeEvent::Disconnected {
+                            generation,
+                            retrying: true,
+                        })?;
+                    }
                     consecutive_failures =
                         next_consecutive_failure(consecutive_failures, stable_health)?;
                     reconnecting = true;
@@ -1581,6 +1747,8 @@ impl SchwabStreamerExecutor {
         let login_request = send_request(
             connection,
             login,
+            generation,
+            self.runtime_authority.as_deref(),
             &self.telemetry,
             self.transport_bounds.io_timeout(),
             cancellation,
@@ -1627,19 +1795,31 @@ impl SchwabStreamerExecutor {
             {
                 ProcessedFrame::Parsed {
                     frame,
-                    captured_ordinal: _,
+                    captured_ordinal,
                 } => {
                     if let Some(response) = frame.value().responses.iter().find(|response| {
                         response.service.as_ref() == "ADMIN"
                             && response.command.as_ref() == "LOGIN"
                             && response.request_id.as_ref() == login_request.request_id.as_ref()
                     }) {
+                        settle_streamer_request(
+                            login_request,
+                            None,
+                            streamer_response_code(response.code),
+                            captured_ordinal.ok_or(SchwabTransportError::Protocol)?,
+                        )?;
+                        // The login acknowledgement is part of the exact command evidence. Seal it
+                        // before service-family acknowledgements can enter the same microbatch.
+                        flush_batch(&mut batch, sink, &self.telemetry)?;
                         if response.code != StreamerResponseCode::Success {
-                            flush_batch(&mut batch, sink, &self.telemetry)?;
                             return Ok(ConnectionExit::Retry);
                         }
                         self.controller.login_accepted(generation)?;
                         self.telemetry.record_stream_connected()?;
+                        if let Some(authority) = &self.runtime_authority {
+                            authority
+                                .observe(SchwabStreamerRuntimeEvent::Connected { generation })?;
+                        }
                         break;
                     }
                 }
@@ -1657,6 +1837,8 @@ impl SchwabStreamerExecutor {
             let sent = send_request(
                 connection,
                 request,
+                generation,
+                self.runtime_authority.as_deref(),
                 &self.telemetry,
                 self.transport_bounds.io_timeout(),
                 cancellation,
@@ -1739,8 +1921,18 @@ impl SchwabStreamerExecutor {
                                     || response.command.as_ref() != sent.command.as_ref()
                                 {
                                     response_error.get_or_insert(SchwabTransportError::Protocol);
-                                } else if response.code != StreamerResponseCode::Success {
-                                    response_error.get_or_insert(SchwabTransportError::Adapter);
+                                } else {
+                                    let failed = response.code != StreamerResponseCode::Success;
+                                    if let Err(error) = settle_streamer_request(
+                                        sent,
+                                        Some(service),
+                                        streamer_response_code(response.code),
+                                        captured_ordinal,
+                                    ) {
+                                        response_error.get_or_insert(error);
+                                    } else if failed {
+                                        response_error.get_or_insert(SchwabTransportError::Adapter);
+                                    }
                                 }
                             }
                             if let Some(error) = response_error {
@@ -1776,6 +1968,8 @@ impl SchwabStreamerExecutor {
                     let sent = send_request(
                         connection,
                         request,
+                        generation,
+                        self.runtime_authority.as_deref(),
                         &self.telemetry,
                         self.transport_bounds.io_timeout(),
                         cancellation,
@@ -1834,9 +2028,12 @@ impl SchwabStreamerExecutor {
         let payload = match incoming {
             InboundStreamerFrame::Text(payload) => payload,
             InboundStreamerFrame::Ping(payload) => {
-                self.telemetry.record_stream_frame(
-                    u64::try_from(payload.len()).map_err(|_| SchwabTransportError::Overflow)?,
-                )?;
+                let bytes =
+                    u64::try_from(payload.len()).map_err(|_| SchwabTransportError::Overflow)?;
+                self.telemetry.record_stream_frame(bytes)?;
+                if let Some(authority) = &self.runtime_authority {
+                    authority.observe(SchwabStreamerRuntimeEvent::Frame { generation, bytes })?;
+                }
                 await_operation(
                     connection.send_pong(payload),
                     self.transport_bounds.io_timeout(),
@@ -1846,15 +2043,21 @@ impl SchwabStreamerExecutor {
                 return Ok(ProcessedFrame::Control);
             }
             InboundStreamerFrame::Pong(payload) => {
-                self.telemetry.record_stream_frame(
-                    u64::try_from(payload.len()).map_err(|_| SchwabTransportError::Overflow)?,
-                )?;
+                let bytes =
+                    u64::try_from(payload.len()).map_err(|_| SchwabTransportError::Overflow)?;
+                self.telemetry.record_stream_frame(bytes)?;
+                if let Some(authority) = &self.runtime_authority {
+                    authority.observe(SchwabStreamerRuntimeEvent::Frame { generation, bytes })?;
+                }
                 return Ok(ProcessedFrame::Control);
             }
             InboundStreamerFrame::Binary(payload) => {
-                self.telemetry.record_stream_frame(
-                    u64::try_from(payload.len()).map_err(|_| SchwabTransportError::Overflow)?,
-                )?;
+                let bytes =
+                    u64::try_from(payload.len()).map_err(|_| SchwabTransportError::Overflow)?;
+                self.telemetry.record_stream_frame(bytes)?;
+                if let Some(authority) = &self.runtime_authority {
+                    authority.observe(SchwabStreamerRuntimeEvent::Frame { generation, bytes })?;
+                }
                 if contains_account_activity(&payload) {
                     self.telemetry.record_validation_failure()?;
                     flush_batch(batch, sink, &self.telemetry)?;
@@ -1874,9 +2077,11 @@ impl SchwabStreamerExecutor {
             }
             InboundStreamerFrame::Close => return Ok(ProcessedFrame::Closed),
         };
-        self.telemetry.record_stream_frame(
-            u64::try_from(payload.len()).map_err(|_| SchwabTransportError::Overflow)?,
-        )?;
+        let bytes = u64::try_from(payload.len()).map_err(|_| SchwabTransportError::Overflow)?;
+        self.telemetry.record_stream_frame(bytes)?;
+        if let Some(authority) = &self.runtime_authority {
+            authority.observe(SchwabStreamerRuntimeEvent::Frame { generation, bytes })?;
+        }
         if contains_account_activity(&payload) {
             self.telemetry.record_validation_failure()?;
             flush_batch(batch, sink, &self.telemetry)?;
@@ -1917,11 +2122,7 @@ impl SchwabStreamerExecutor {
         {
             flush_batch(batch, sink, &self.telemetry)?;
         }
-        let captured_ordinal = if parsed
-            .value()
-            .responses
-            .iter()
-            .any(|response| response.service.as_ref() != "ADMIN")
+        let captured_ordinal = if !parsed.value().responses.is_empty()
             || !parsed.value().data.is_empty()
             || !parsed.value().notifications.is_empty()
         {
@@ -2209,17 +2410,21 @@ fn flush_batch(
 }
 
 struct SentStreamerRequest {
+    generation: ConnectionGeneration,
     service: Option<crate::MarketDataService>,
     command: Box<str>,
     request_id: Box<str>,
     request_payload_sha256: EvidenceDigest,
     request_payload_bytes: u64,
     dispatched_at: Instant,
+    rate_permit: Option<Box<dyn SchwabStreamerRequestPermit>>,
 }
 
 async fn send_request(
     connection: &mut dyn SchwabStreamerConnection,
     request: TransientStreamerRequest,
+    generation: ConnectionGeneration,
+    runtime_authority: Option<&dyn SchwabStreamerRuntimeAuthority>,
     telemetry: &SchwabTransportTelemetry,
     timeout: Duration,
     cancellation: &CancellationToken,
@@ -2228,14 +2433,32 @@ async fn send_request(
         DigestAlgorithm::Sha256,
         Sha256::digest(request.expose_body()).into(),
     );
+    let service = request.service();
+    let command = request.command().to_owned().into_boxed_str();
+    let request_id = request.request_id().get().to_string().into_boxed_str();
+    let request_payload_bytes =
+        u64::try_from(request.expose_body().len()).map_err(|_| SchwabTransportError::Overflow)?;
+    let rate_permit = runtime_authority
+        .map(|authority| {
+            authority.commit_request(
+                generation,
+                service,
+                command.as_ref(),
+                request_id.as_ref(),
+                request_payload_sha256,
+                request_payload_bytes,
+            )
+        })
+        .transpose()?;
     let sent = SentStreamerRequest {
-        service: request.service(),
-        command: request.command().to_owned().into_boxed_str(),
-        request_id: request.request_id().get().to_string().into_boxed_str(),
+        generation,
+        service,
+        command,
+        request_id,
         request_payload_sha256,
-        request_payload_bytes: u64::try_from(request.expose_body().len())
-            .map_err(|_| SchwabTransportError::Overflow)?,
+        request_payload_bytes,
         dispatched_at: Instant::now(),
+        rate_permit,
     };
     let bytes = request.into_shared_body();
     let length = u64::try_from(bytes.len()).map_err(|_| SchwabTransportError::Overflow)?;
@@ -2254,12 +2477,45 @@ pub(crate) async fn send_streamer_request_for_test(
     send_request(
         connection,
         request,
+        ConnectionGeneration::new(NonZeroU64::MIN),
+        None,
         &SchwabTransportTelemetry::default(),
         timeout,
         cancellation,
     )
     .await
     .map(|_| ())
+}
+
+fn settle_streamer_request(
+    mut sent: SentStreamerRequest,
+    service: Option<crate::MarketDataService>,
+    status_code: i64,
+    transport_ordinal: NonZeroU64,
+) -> Result<(), SchwabTransportError> {
+    let latency = duration_millis(sent.dispatched_at.elapsed())?;
+    let Some(permit) = sent.rate_permit.take() else {
+        return Ok(());
+    };
+    permit.settle(SchwabStreamerRequestAcknowledgement {
+        generation: sent.generation,
+        service,
+        command: sent.command,
+        request_id: sent.request_id,
+        request_payload_sha256: sent.request_payload_sha256,
+        request_payload_bytes: sent.request_payload_bytes,
+        status_code,
+        transport_ordinal,
+        round_trip_latency_ms: latency,
+    })
+}
+
+const fn streamer_response_code(code: StreamerResponseCode) -> i64 {
+    match code {
+        StreamerResponseCode::Success => 0,
+        StreamerResponseCode::SymbolLimit => 19,
+        StreamerResponseCode::Other(value) => value,
+    }
 }
 
 async fn acquire_token(

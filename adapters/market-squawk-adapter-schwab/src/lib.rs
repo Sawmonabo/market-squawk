@@ -115,11 +115,12 @@ pub use transport::{
     SchwabStreamerConnection, SchwabStreamerConnectionControl,
     SchwabStreamerConnectionControlSource, SchwabStreamerConnectionEvidence,
     SchwabStreamerConnector, SchwabStreamerDesiredStateSendError, SchwabStreamerDesiredStateSender,
-    SchwabStreamerExecutor, SchwabStreamerFrameSealEvidence, SchwabStreamerServiceResponseEvidence,
-    SchwabTransportError, SchwabTransportTelemetry, SchwabTransportTelemetrySnapshot,
-    SchwabUserPreferenceEvidence, StreamerCaptureSink, StreamerCaptureSinkError,
-    StreamerMicrobatch, StreamerMicrobatchReceipt, StreamerRunExit, StreamerTransportBounds,
-    TokenAuthorityError, TransientAccessToken,
+    SchwabStreamerExecutor, SchwabStreamerFrameSealEvidence, SchwabStreamerRequestAcknowledgement,
+    SchwabStreamerRequestPermit, SchwabStreamerRuntimeAuthority, SchwabStreamerRuntimeEvent,
+    SchwabStreamerServiceResponseEvidence, SchwabTransportError, SchwabTransportTelemetry,
+    SchwabTransportTelemetrySnapshot, SchwabUserPreferenceEvidence, StreamerCaptureSink,
+    StreamerCaptureSinkError, StreamerMicrobatch, StreamerMicrobatchReceipt, StreamerRunExit,
+    StreamerTransportBounds, TokenAuthorityError, TransientAccessToken,
 };
 pub use vertical::{
     SchwabCapabilityCurrentness, SchwabFamilyDoctorInput, SchwabMarketDataDelay,

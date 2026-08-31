@@ -289,7 +289,7 @@ impl SchwabMarketDataQualification {
                 .is_some_and(|received_at| received_at == self.response_observed_at)
     }
 
-    pub(crate) fn validates_streamer_publication_coordinate(
+    pub fn validates_streamer_publication_coordinate(
         &self,
         service: MarketDataService,
         handoff: &SchwabStreamerFamilyDoctorHandoff,

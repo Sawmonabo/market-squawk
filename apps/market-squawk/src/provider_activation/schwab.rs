@@ -10,11 +10,17 @@ use std::{
 };
 
 use market_squawk_adapter_schwab::{
-    AccessTokenAdmission, MarketDataService, ParseBounds, ProviderIdentifier,
+    AccessTokenAdmission, ConnectionGeneration, MarketDataService, ParseBounds, ProviderIdentifier,
     RawRestResponseReceipt, ReadOnlyRequest, ReadOnlyRoute, RequestAdmission, RestExecutionOutcome,
-    RestItemAccounting, RestTransportBounds, SchwabAccessTokenSource,
-    SchwabMarketDataQualification, SchwabRestFamily, SchwabSealedStreamerCapture,
-    SchwabTransportTelemetry, TokenAuthorityError, TransientAccessToken,
+    RestItemAccounting, RestTransportBounds, SchwabAccessTokenSource, SchwabAdapterError,
+    SchwabMarketDataQualification, SchwabOAuthAuthorityReceipt, SchwabRestFamily,
+    SchwabSealedStreamerCapture, SchwabStreamerConnectionControlSource,
+    SchwabStreamerDesiredStateSendError, SchwabStreamerDesiredStateSender, SchwabStreamerExecutor,
+    SchwabStreamerFamilyDoctorHandoff, SchwabStreamerRequestAcknowledgement,
+    SchwabStreamerRequestPermit, SchwabStreamerRuntimeAuthority, SchwabStreamerRuntimeEvent,
+    SchwabTransportError, SchwabTransportTelemetry, StreamerAdmission, StreamerBootstrap,
+    StreamerCaptureSink, StreamerCommand, StreamerRunExit, StreamerSubscription,
+    StreamerTransportBounds, TokenAuthorityError, TransientAccessToken,
 };
 use market_squawk_data::{
     DatasetId, ListingReferenceGenerationReceipt, ListingReferenceReadCapability,
@@ -25,8 +31,10 @@ use market_squawk_domain::{
     Timestamp, TradingStatus, VenueId,
 };
 use market_squawk_sources::{
-    ProviderRateAuthority, SCHWAB_MARKET_DATA_SURFACE_ID, SchwabMarketDataDoctorReceiptV1,
-    SchwabMarketDataFamily, SourceMetadata,
+    BudgetDecision, BudgetDispatchDecision, BudgetPermit, BudgetReservation,
+    BudgetReservationDecision, BudgetUnavailableReason, ProviderRateAuthority,
+    ProviderRateDeclaration, SCHWAB_MARKET_DATA_SURFACE_ID, SchwabMarketDataDoctorReceiptV1,
+    SchwabMarketDataFamily, SharedProviderBudget, SourceMetadata, apply_http_retry_after,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -80,6 +88,7 @@ pub struct SchwabMarketDataAccountActivation {
     oauth: SchwabOAuthMarketAuthority,
     doctor: SchwabMarketDataDoctorReceiptV1,
     doctor_generation: Arc<Mutex<SchwabDoctorGenerationDisposition>>,
+    rate_budget: Arc<SharedProviderBudget>,
     streamer_authority_issued: Mutex<bool>,
 }
 
@@ -123,6 +132,8 @@ pub(crate) struct SchwabReadOnlyRestAttempt {
     currentness: ProviderAccountRuntimeCurrentness,
     token: TransientAccessToken,
     oauth_epoch: SchwabOAuthPublicationEpoch,
+    budget: Arc<SharedProviderBudget>,
+    reservation: BudgetReservation,
 }
 
 impl SchwabReadOnlyRestAttempt {
@@ -130,7 +141,53 @@ impl SchwabReadOnlyRestAttempt {
         self.leaf
     }
 
-    /// Borrows the zeroizing bearer owner only for immediate adapter execution.
+    /// Consumes pre-dispatch admission at the exact transport seam. Dropping this value before
+    /// this transition releases concurrency without charging a provider request window.
+    pub(crate) fn dispatch(
+        self,
+    ) -> Result<SchwabDispatchedReadOnlyRestAttempt, SchwabMarketDataActivationError> {
+        let permit = match self.reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => permit,
+            BudgetDispatchDecision::WaitUntil(_deadline) => {
+                return Err(SchwabMarketDataActivationError::RateDeferred);
+            }
+            BudgetDispatchDecision::Unavailable(reason) => {
+                return Err(SchwabMarketDataActivationError::RateUnavailable(reason));
+            }
+        };
+        Ok(SchwabDispatchedReadOnlyRestAttempt {
+            leaf: self.leaf,
+            family: self.family,
+            route: self.route,
+            request_url: self.request_url,
+            requested_items: self.requested_items,
+            doctor: self.doctor,
+            currentness: self.currentness,
+            token: self.token,
+            oauth_epoch: self.oauth_epoch,
+            budget: self.budget,
+            permit,
+        })
+    }
+}
+
+/// One exact dispatched REST operation whose rate permit spans response classification.
+pub(crate) struct SchwabDispatchedReadOnlyRestAttempt {
+    leaf: ReadOnlyMarketDataLeaf,
+    family: SchwabMarketDataFamily,
+    route: ReadOnlyRoute,
+    request_url: Box<str>,
+    requested_items: u64,
+    doctor: SchwabMarketDataDoctorReceiptV1,
+    currentness: ProviderAccountRuntimeCurrentness,
+    token: TransientAccessToken,
+    oauth_epoch: SchwabOAuthPublicationEpoch,
+    budget: Arc<SharedProviderBudget>,
+    permit: BudgetPermit,
+}
+
+impl SchwabDispatchedReadOnlyRestAttempt {
+    /// Borrows the zeroizing bearer owner only for the already-charged adapter execution.
     pub(crate) const fn token(&self) -> &TransientAccessToken {
         &self.token
     }
@@ -163,6 +220,10 @@ impl SchwabReadOnlyRestAttempt {
         {
             return Err(SchwabMarketDataActivationError::AuthorityMismatch);
         }
+        // An exact provider response terminalizes the dispatched account-rate permit even when
+        // later OAuth, doctor, or currentness checks reject publication. Mismatched responses
+        // leave the permit to its conservative unknown-completion drop path.
+        settle_rest_rate(&self.budget, self.permit, receipt)?;
         self.oauth_epoch
             .validate_current(self.oauth_epoch.receipt())?;
         let observed_at = timestamp_from_millis(receipt.received_at_unix_millis())?;
@@ -184,6 +245,20 @@ impl SchwabReadOnlyRestAttempt {
             outcome,
             oauth_epoch: self.oauth_epoch,
         })
+    }
+}
+
+impl std::fmt::Debug for SchwabDispatchedReadOnlyRestAttempt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SchwabDispatchedReadOnlyRestAttempt")
+            .field("leaf", &self.leaf)
+            .field("family", &self.family)
+            .field("route", &self.route)
+            .field("request_url", &self.request_url)
+            .field("requested_items", &self.requested_items)
+            .field("token", &"[PROTECTED TOKEN]")
+            .finish()
     }
 }
 
@@ -237,110 +312,86 @@ impl std::fmt::Debug for SchwabReadOnlyRestHandoff {
     }
 }
 
-/// Sole doctor-bound token authority for one multiplexed Streamer owner.
-///
-/// The activation issues this value at most once. It implements no account activity service and
-/// every token acquisition rechecks the complete selected service set against the exact current
-/// doctor generation. A refresh that advances the token generation latches renewal-required and
-/// returns no callable token.
-pub(crate) struct SchwabReadOnlyStreamerAuthority {
-    services: Box<
-        [(
-            MarketDataService,
-            ReadOnlyMarketDataLeaf,
-            SchwabMarketDataFamily,
-        )],
-    >,
+type SchwabStreamerServiceSet = [(
+    MarketDataService,
+    ReadOnlyMarketDataLeaf,
+    SchwabMarketDataFamily,
+)];
+
+/// One-use application lease that can only be consumed into one multiplexed Streamer executor.
+pub(crate) struct SchwabReadOnlyStreamerLease {
+    services: Arc<SchwabStreamerServiceSet>,
+    currentness: ProviderAccountRuntimeCurrentness,
+    oauth: SchwabOAuthMarketAuthority,
+    doctor: SchwabMarketDataDoctorReceiptV1,
+    doctor_generation: Arc<Mutex<SchwabDoctorGenerationDisposition>>,
+    rate_budget: Arc<SharedProviderBudget>,
+}
+
+impl SchwabReadOnlyStreamerLease {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one consumed executor keeps transport, authority, and bounded resources explicit"
+    )]
+    pub(crate) fn into_executor(
+        self,
+        control_source: Arc<dyn SchwabStreamerConnectionControlSource>,
+        admission: StreamerAdmission,
+        transport_bounds: StreamerTransportBounds,
+        parse_bounds: ParseBounds,
+        token_admission: AccessTokenAdmission,
+        telemetry: SchwabTransportTelemetry,
+    ) -> Result<SchwabReadOnlyStreamerExecutor, SchwabTransportError> {
+        if self.services.len() > admission.max_services() {
+            return Err(SchwabTransportError::InvalidConfiguration);
+        }
+        let admitted_services = self
+            .services
+            .iter()
+            .map(|(service, _leaf, _family)| *service)
+            .collect::<BTreeSet<_>>();
+        let token_authority = Arc::new(SchwabReadOnlyStreamerTokenAuthority {
+            services: Arc::clone(&self.services),
+            currentness: self.currentness.clone(),
+            oauth: self.oauth,
+            doctor: self.doctor.clone(),
+            doctor_generation: Arc::clone(&self.doctor_generation),
+        });
+        let runtime_authority = Arc::new(SchwabStreamerAccountRateAuthority {
+            admitted_services: admitted_services.clone(),
+            currentness: self.currentness.clone(),
+            budget: self.rate_budget,
+            state: Mutex::new(SchwabStreamerRateState::default()),
+        });
+        let executor = SchwabStreamerExecutor::try_production(
+            token_authority.clone(),
+            control_source,
+            runtime_authority,
+            admission,
+            transport_bounds,
+            parse_bounds,
+            token_admission,
+            telemetry,
+        )?;
+        Ok(SchwabReadOnlyStreamerExecutor {
+            executor,
+            services: self.services,
+            admitted_services: Arc::new(admitted_services),
+            token_authority,
+        })
+    }
+}
+
+/// Private token source retained only inside the consumed executor lifetime.
+struct SchwabReadOnlyStreamerTokenAuthority {
+    services: Arc<SchwabStreamerServiceSet>,
     currentness: ProviderAccountRuntimeCurrentness,
     oauth: SchwabOAuthMarketAuthority,
     doctor: SchwabMarketDataDoctorReceiptV1,
     doctor_generation: Arc<Mutex<SchwabDoctorGenerationDisposition>>,
 }
 
-impl SchwabReadOnlyStreamerAuthority {
-    pub(crate) fn services(
-        &self,
-    ) -> impl ExactSizeIterator<Item = (MarketDataService, ReadOnlyMarketDataLeaf)> + '_ {
-        self.services
-            .iter()
-            .map(|(service, leaf, _family)| (*service, *leaf))
-    }
-
-    /// Revalidates the account lease, OAuth receipt, doctor generation, and every selected family.
-    /// A shared Streamer sink calls this before admitting or committing a sealed microbatch.
-    pub(crate) async fn require_current(&self) -> Result<(), SchwabMarketDataActivationError> {
-        if !self.currentness.is_active().await {
-            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
-        }
-        let current = self.oauth.current_receipt().await?;
-        require_doctor_generation(&self.doctor_generation, current.generation().get())?;
-        let observed_at = system_timestamp()
-            .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
-        for (_service, _leaf, family) in self.services.iter() {
-            SchwabMarketDataQualification::try_from_doctor_receipt(
-                &self.doctor,
-                *family,
-                observed_at,
-                current,
-            )
-            .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
-        }
-        if !self.currentness.is_active().await {
-            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
-        }
-        Ok(())
-    }
-
-    /// Qualifies one exact frame from an already physically sealed provider-native microbatch.
-    ///
-    /// The frame time and token/principal/session coordinates come only from the sealed capture;
-    /// callers cannot provide or relabel them. Service/content-coordinate validation remains in
-    /// the adapter's canonical mapper, and the shared publisher must still retain the connection's
-    /// exact successful subscription acknowledgement.
-    pub(crate) async fn qualify_sealed_frame(
-        &self,
-        service: MarketDataService,
-        capture: &SchwabSealedStreamerCapture,
-        frame_index: usize,
-    ) -> Result<SchwabMarketDataQualification, SchwabMarketDataActivationError> {
-        if !self.currentness.is_active().await {
-            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
-        }
-        let (_selected_service, _leaf, family) = self
-            .services
-            .iter()
-            .find(|(selected, _leaf, _family)| *selected == service)
-            .copied()
-            .ok_or(SchwabMarketDataActivationError::AuthorityMismatch)?;
-        let frame = capture
-            .frames()
-            .get(frame_index)
-            .ok_or(SchwabMarketDataActivationError::AuthorityMismatch)?;
-        let receipt = capture.streamer_receipt();
-        let current = self.oauth.current_receipt().await?;
-        require_doctor_generation(&self.doctor_generation, current.generation().get())?;
-        if receipt.token_generation() != current.generation()
-            || receipt.credential_authority() != current.credential_authority()
-            || receipt.session_identifier() != self.doctor.session_identifier()
-            || receipt.market_data_principal_sha256() != self.doctor.market_data_principal_sha256()
-            || frame.generation() != receipt.generation()
-        {
-            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
-        }
-        let observed_at = timestamp_from_millis(frame.received_at_unix_millis())?;
-        let qualification = SchwabMarketDataQualification::try_from_doctor_receipt(
-            &self.doctor,
-            family,
-            observed_at,
-            current,
-        )
-        .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
-        if !self.currentness.is_active().await {
-            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
-        }
-        Ok(qualification)
-    }
-
+impl SchwabReadOnlyStreamerTokenAuthority {
     async fn acquire_bound_token(&self) -> Result<TransientAccessToken, TokenAuthorityError> {
         if !self.currentness.is_active().await {
             return Err(TokenAuthorityError::Unavailable);
@@ -375,7 +426,7 @@ impl SchwabReadOnlyStreamerAuthority {
     }
 }
 
-impl SchwabAccessTokenSource for SchwabReadOnlyStreamerAuthority {
+impl SchwabAccessTokenSource for SchwabReadOnlyStreamerTokenAuthority {
     fn acquire(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<TransientAccessToken, TokenAuthorityError>> + Send + '_>>
@@ -384,14 +435,468 @@ impl SchwabAccessTokenSource for SchwabReadOnlyStreamerAuthority {
     }
 }
 
-impl std::fmt::Debug for SchwabReadOnlyStreamerAuthority {
+impl std::fmt::Debug for SchwabReadOnlyStreamerTokenAuthority {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("SchwabReadOnlyStreamerAuthority")
+            .debug_struct("SchwabReadOnlyStreamerTokenAuthority")
             .field("services", &self.services)
             .field("oauth", &"[PROTECTED TOKEN AUTHORITY]")
             .field("doctor_receipt", &self.doctor.receipt_sha256())
             .finish()
+    }
+}
+
+/// Sole application-owned executor. It exposes only selected-service desired state and bound
+/// publication handoffs; the raw token source and raw executor cannot be recovered or cloned.
+pub(crate) struct SchwabReadOnlyStreamerExecutor {
+    executor: SchwabStreamerExecutor,
+    services: Arc<SchwabStreamerServiceSet>,
+    admitted_services: Arc<BTreeSet<MarketDataService>>,
+    token_authority: Arc<SchwabReadOnlyStreamerTokenAuthority>,
+}
+
+impl SchwabReadOnlyStreamerExecutor {
+    pub(crate) fn services(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (MarketDataService, ReadOnlyMarketDataLeaf)> + '_ {
+        self.services
+            .iter()
+            .map(|(service, leaf, _family)| (*service, *leaf))
+    }
+
+    pub(crate) fn replace_desired(
+        &mut self,
+        subscription: StreamerSubscription,
+    ) -> Result<(), SchwabAdapterError> {
+        self.require_admitted(subscription.service())?;
+        self.executor.replace_desired(subscription)
+    }
+
+    pub(crate) fn add_desired(
+        &mut self,
+        subscription: StreamerSubscription,
+    ) -> Result<(), SchwabAdapterError> {
+        self.require_admitted(subscription.service())?;
+        self.executor.add_desired(subscription)
+    }
+
+    pub(crate) fn remove_desired(
+        &mut self,
+        subscription: StreamerSubscription,
+    ) -> Result<(), SchwabAdapterError> {
+        self.require_admitted(subscription.service())?;
+        self.executor.remove_desired(subscription)
+    }
+
+    pub(crate) fn take_desired_state_sender(
+        &mut self,
+    ) -> Option<SchwabReadOnlyStreamerDesiredStateSender> {
+        self.executor.take_desired_state_sender().map(|sender| {
+            SchwabReadOnlyStreamerDesiredStateSender {
+                sender,
+                admitted_services: Arc::clone(&self.admitted_services),
+            }
+        })
+    }
+
+    pub(crate) async fn run(
+        &mut self,
+        bootstrap: &StreamerBootstrap,
+        sink: &mut dyn StreamerCaptureSink,
+        cancellation: CancellationToken,
+    ) -> Result<StreamerRunExit, SchwabTransportError> {
+        self.require_current()
+            .await
+            .map_err(|_error| SchwabTransportError::TokenRefreshRequired)?;
+        self.executor.run(bootstrap, sink, cancellation).await
+    }
+
+    pub(crate) async fn require_current(&self) -> Result<(), SchwabMarketDataActivationError> {
+        require_streamer_current(&self.token_authority).await
+    }
+
+    pub(crate) async fn qualify_sealed_coordinate<'a>(
+        &self,
+        service: MarketDataService,
+        doctor_handoff: &'a SchwabStreamerFamilyDoctorHandoff,
+        capture: &'a SchwabSealedStreamerCapture,
+        frame_ordinal: u16,
+        data_batch_ordinal: u16,
+        content_ordinal: u16,
+    ) -> Result<SchwabReadOnlyStreamerPublicationHandoff<'a>, SchwabMarketDataActivationError> {
+        self.require_current().await?;
+        let (_selected_service, leaf, family) = self
+            .services
+            .iter()
+            .find(|(selected, _leaf, _family)| *selected == service)
+            .copied()
+            .ok_or(SchwabMarketDataActivationError::AuthorityMismatch)?;
+        let frame = capture
+            .frames()
+            .get(usize::from(frame_ordinal))
+            .ok_or(SchwabMarketDataActivationError::AuthorityMismatch)?;
+        let receipt = capture.streamer_receipt();
+        let current = self.token_authority.oauth.current_receipt().await?;
+        require_doctor_generation(
+            &self.token_authority.doctor_generation,
+            current.generation().get(),
+        )?;
+        if doctor_handoff.service() != service
+            || doctor_handoff.acknowledgement().status_code() != 0
+            || receipt.token_generation() != current.generation()
+            || receipt.credential_authority() != current.credential_authority()
+            || receipt.session_identifier() != self.token_authority.doctor.session_identifier()
+            || receipt.market_data_principal_sha256()
+                != self.token_authority.doctor.market_data_principal_sha256()
+            || frame.generation() != receipt.generation()
+        {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
+        let observed_at = timestamp_from_millis(frame.received_at_unix_millis())?;
+        let qualification = SchwabMarketDataQualification::try_from_doctor_receipt(
+            &self.token_authority.doctor,
+            family,
+            observed_at,
+            current,
+        )
+        .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
+        if !qualification.validates_streamer_publication_coordinate(
+            service,
+            doctor_handoff,
+            capture,
+            frame_ordinal,
+            data_batch_ordinal,
+            content_ordinal,
+        ) || !self.token_authority.currentness.is_active().await
+        {
+            return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+        }
+        Ok(SchwabReadOnlyStreamerPublicationHandoff {
+            leaf,
+            service,
+            qualification,
+            doctor_handoff,
+            capture,
+            frame_ordinal,
+            data_batch_ordinal,
+            content_ordinal,
+        })
+    }
+
+    fn require_admitted(&self, service: MarketDataService) -> Result<(), SchwabAdapterError> {
+        if self.admitted_services.contains(&service) {
+            Ok(())
+        } else {
+            Err(SchwabAdapterError::InvalidStreamerState)
+        }
+    }
+}
+
+pub(crate) struct SchwabReadOnlyStreamerDesiredStateSender {
+    sender: SchwabStreamerDesiredStateSender,
+    admitted_services: Arc<BTreeSet<MarketDataService>>,
+}
+
+impl SchwabReadOnlyStreamerDesiredStateSender {
+    pub(crate) fn try_send(
+        &self,
+        command: StreamerCommand,
+        subscription: StreamerSubscription,
+    ) -> Result<(), SchwabReadOnlyStreamerDesiredStateError> {
+        if !self.admitted_services.contains(&subscription.service()) {
+            return Err(SchwabReadOnlyStreamerDesiredStateError::NotAdmitted);
+        }
+        self.sender
+            .try_send(command, subscription)
+            .map_err(SchwabReadOnlyStreamerDesiredStateError::Queue)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum SchwabReadOnlyStreamerDesiredStateError {
+    NotAdmitted,
+    Queue(SchwabStreamerDesiredStateSendError),
+}
+
+/// Non-cloneable publication capability retaining the exact successful ACK and sealed coordinate.
+pub(crate) struct SchwabReadOnlyStreamerPublicationHandoff<'a> {
+    leaf: ReadOnlyMarketDataLeaf,
+    service: MarketDataService,
+    qualification: SchwabMarketDataQualification,
+    doctor_handoff: &'a SchwabStreamerFamilyDoctorHandoff,
+    capture: &'a SchwabSealedStreamerCapture,
+    frame_ordinal: u16,
+    data_batch_ordinal: u16,
+    content_ordinal: u16,
+}
+
+impl<'a> SchwabReadOnlyStreamerPublicationHandoff<'a> {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ReadOnlyMarketDataLeaf,
+        MarketDataService,
+        SchwabMarketDataQualification,
+        &'a SchwabStreamerFamilyDoctorHandoff,
+        &'a SchwabSealedStreamerCapture,
+        u16,
+        u16,
+        u16,
+    ) {
+        (
+            self.leaf,
+            self.service,
+            self.qualification,
+            self.doctor_handoff,
+            self.capture,
+            self.frame_ordinal,
+            self.data_batch_ordinal,
+            self.content_ordinal,
+        )
+    }
+}
+
+async fn require_streamer_current(
+    authority: &SchwabReadOnlyStreamerTokenAuthority,
+) -> Result<(), SchwabMarketDataActivationError> {
+    if !authority.currentness.is_active().await {
+        return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+    }
+    let current = authority.oauth.current_receipt().await?;
+    require_doctor_generation(&authority.doctor_generation, current.generation().get())?;
+    let observed_at =
+        system_timestamp().map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
+    for (_service, _leaf, family) in authority.services.iter() {
+        SchwabMarketDataQualification::try_from_doctor_receipt(
+            &authority.doctor,
+            *family,
+            observed_at,
+            current,
+        )
+        .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
+    }
+    if !authority.currentness.is_active().await {
+        return Err(SchwabMarketDataActivationError::AuthorityMismatch);
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct SchwabStreamerRateState {
+    generation: Option<ConnectionGeneration>,
+    connect_attempts: u64,
+    reconnect_attempts: u64,
+    frames: u64,
+    frame_bytes: u64,
+    queue_pressure: u64,
+    disconnects: u64,
+}
+
+struct SchwabStreamerAccountRateAuthority {
+    admitted_services: BTreeSet<MarketDataService>,
+    currentness: ProviderAccountRuntimeCurrentness,
+    budget: Arc<SharedProviderBudget>,
+    state: Mutex<SchwabStreamerRateState>,
+}
+
+impl std::fmt::Debug for SchwabStreamerAccountRateAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SchwabStreamerAccountRateAuthority")
+            .field("admitted_services", &self.admitted_services)
+            .field("budget", &"[SHARED ACCOUNT RATE AUTHORITY]")
+            .finish()
+    }
+}
+
+impl SchwabStreamerRuntimeAuthority for SchwabStreamerAccountRateAuthority {
+    fn observe(&self, event: SchwabStreamerRuntimeEvent) -> Result<(), SchwabTransportError> {
+        if !self.currentness.is_active_now() {
+            return Err(SchwabTransportError::TokenRefreshRequired);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_poisoned| SchwabTransportError::Protocol)?;
+        match event {
+            SchwabStreamerRuntimeEvent::ConnectAttempt { reconnecting } => {
+                state.connect_attempts = state
+                    .connect_attempts
+                    .checked_add(1)
+                    .ok_or(SchwabTransportError::Overflow)?;
+                if reconnecting {
+                    state.reconnect_attempts = state
+                        .reconnect_attempts
+                        .checked_add(1)
+                        .ok_or(SchwabTransportError::Overflow)?;
+                }
+            }
+            SchwabStreamerRuntimeEvent::Connected { generation } => {
+                if state.generation != Some(generation) {
+                    return Err(SchwabTransportError::Protocol);
+                }
+            }
+            SchwabStreamerRuntimeEvent::Frame { generation, bytes } => {
+                if state.generation != Some(generation) {
+                    return Err(SchwabTransportError::Protocol);
+                }
+                state.frames = state
+                    .frames
+                    .checked_add(1)
+                    .ok_or(SchwabTransportError::Overflow)?;
+                state.frame_bytes = state
+                    .frame_bytes
+                    .checked_add(bytes)
+                    .ok_or(SchwabTransportError::Overflow)?;
+            }
+            SchwabStreamerRuntimeEvent::QueuePressure => {
+                state.queue_pressure = state
+                    .queue_pressure
+                    .checked_add(1)
+                    .ok_or(SchwabTransportError::Overflow)?;
+            }
+            SchwabStreamerRuntimeEvent::Disconnected { generation, .. } => {
+                if state.generation != Some(generation) {
+                    return Err(SchwabTransportError::Protocol);
+                }
+                state.disconnects = state
+                    .disconnects
+                    .checked_add(1)
+                    .ok_or(SchwabTransportError::Overflow)?;
+                state.generation = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_request(
+        &self,
+        generation: ConnectionGeneration,
+        service: Option<MarketDataService>,
+        command: &str,
+        request_id: &str,
+        request_payload_sha256: market_squawk_domain::EvidenceDigest,
+        request_payload_bytes: u64,
+    ) -> Result<Box<dyn SchwabStreamerRequestPermit>, SchwabTransportError> {
+        if !self.currentness.is_active_now()
+            || request_id.is_empty()
+            || request_payload_bytes == 0
+            || request_payload_sha256.bytes() == [0; 32]
+            || match service {
+                None => command != "LOGIN",
+                Some(service) => {
+                    !self.admitted_services.contains(&service)
+                        || !matches!(command, "SUBS" | "ADD" | "UNSUBS")
+                }
+            }
+        {
+            return Err(SchwabTransportError::Protocol);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_poisoned| SchwabTransportError::Protocol)?;
+        match (state.generation, service) {
+            (None, None) => state.generation = Some(generation),
+            (Some(current), Some(_)) if current == generation => {}
+            _ => return Err(SchwabTransportError::Protocol),
+        }
+        drop(state);
+        let reservation = match self.budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => reservation,
+            BudgetReservationDecision::WaitUntil(_deadline) => {
+                return Err(SchwabTransportError::Deadline);
+            }
+            BudgetReservationDecision::Unavailable(reason) => {
+                return Err(map_streamer_budget_error(reason));
+            }
+        };
+        let permit = match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => permit,
+            BudgetDispatchDecision::WaitUntil(_deadline) => {
+                return Err(SchwabTransportError::Deadline);
+            }
+            BudgetDispatchDecision::Unavailable(reason) => {
+                return Err(map_streamer_budget_error(reason));
+            }
+        };
+        Ok(Box::new(SchwabStreamerAccountRatePermit {
+            generation,
+            service,
+            command: command.to_owned().into_boxed_str(),
+            request_id: request_id.to_owned().into_boxed_str(),
+            request_payload_sha256,
+            request_payload_bytes,
+            budget: Arc::clone(&self.budget),
+            permit,
+        }))
+    }
+}
+
+struct SchwabStreamerAccountRatePermit {
+    generation: ConnectionGeneration,
+    service: Option<MarketDataService>,
+    command: Box<str>,
+    request_id: Box<str>,
+    request_payload_sha256: market_squawk_domain::EvidenceDigest,
+    request_payload_bytes: u64,
+    budget: Arc<SharedProviderBudget>,
+    permit: BudgetPermit,
+}
+
+impl std::fmt::Debug for SchwabStreamerAccountRatePermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SchwabStreamerAccountRatePermit")
+            .field("generation", &self.generation)
+            .field("service", &self.service)
+            .field("permit", &"[DISPATCHED ACCOUNT RATE PERMIT]")
+            .finish()
+    }
+}
+
+impl SchwabStreamerRequestPermit for SchwabStreamerAccountRatePermit {
+    fn settle(
+        self: Box<Self>,
+        acknowledgement: SchwabStreamerRequestAcknowledgement,
+    ) -> Result<(), SchwabTransportError> {
+        if acknowledgement.generation != self.generation
+            || acknowledgement.service != self.service
+            || acknowledgement.command != self.command
+            || acknowledgement.request_id != self.request_id
+            || acknowledgement.request_payload_sha256 != self.request_payload_sha256
+            || acknowledgement.request_payload_bytes != self.request_payload_bytes
+        {
+            return Err(SchwabTransportError::Protocol);
+        }
+        self.permit.release();
+        if acknowledgement.status_code == 0 {
+            self.budget
+                .record_success()
+                .map_err(map_streamer_budget_error)
+        } else {
+            settle_streamer_budget_decision(self.budget.apply_refusal(0))
+        }
+    }
+}
+
+fn settle_streamer_budget_decision(decision: BudgetDecision) -> Result<(), SchwabTransportError> {
+    match decision {
+        BudgetDecision::Ready(unexpected) => {
+            unexpected.release();
+            Err(SchwabTransportError::Protocol)
+        }
+        BudgetDecision::WaitUntil(_deadline) => Ok(()),
+        BudgetDecision::Unavailable(reason) => Err(map_streamer_budget_error(reason)),
+    }
+}
+
+const fn map_streamer_budget_error(reason: BudgetUnavailableReason) -> SchwabTransportError {
+    match reason {
+        BudgetUnavailableReason::Disabled
+        | BudgetUnavailableReason::RetryAfterExceedsPolicy
+        | BudgetUnavailableReason::AvailabilityChanged => SchwabTransportError::Deadline,
+        _ => SchwabTransportError::Protocol,
     }
 }
 
@@ -518,8 +1023,15 @@ impl SchwabMarketDataAccountActivation {
         self.authority.binding()
     }
 
-    pub(crate) fn oauth_authority(&self) -> SchwabOAuthMarketAuthority {
-        self.oauth.clone()
+    /// Returns only the current non-secret receipt; ordinary runtimes cannot clone raw OAuth.
+    pub(crate) async fn current_oauth_receipt(
+        &self,
+    ) -> Result<SchwabOAuthAuthorityReceipt, SchwabMarketDataActivationError> {
+        self.authority.require_current().await?;
+        let receipt = self.oauth.current_receipt().await?;
+        self.require_doctor_generation(receipt.generation().get())?;
+        self.authority.require_current().await?;
+        Ok(receipt)
     }
 
     pub(crate) const fn doctor_receipt(&self) -> &SchwabMarketDataDoctorReceiptV1 {
@@ -555,6 +1067,15 @@ impl SchwabMarketDataAccountActivation {
         }
         let requested_items = u64::try_from(request.requested_items())
             .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
+        let reservation = match self.rate_budget.try_reserve_request() {
+            BudgetReservationDecision::Ready(reservation) => reservation,
+            BudgetReservationDecision::WaitUntil(_deadline) => {
+                return Err(SchwabMarketDataActivationError::RateDeferred);
+            }
+            BudgetReservationDecision::Unavailable(reason) => {
+                return Err(SchwabMarketDataActivationError::RateUnavailable(reason));
+            }
+        };
         let (token, oauth_epoch) = self.acquire_publication_attempt().await?;
         let observed_at = system_timestamp()
             .map_err(|_error| SchwabMarketDataActivationError::AuthorityMismatch)?;
@@ -575,6 +1096,8 @@ impl SchwabMarketDataAccountActivation {
             currentness: self.currentness(),
             token,
             oauth_epoch,
+            budget: Arc::clone(&self.rate_budget),
+            reservation,
         })
     }
 
@@ -583,10 +1106,10 @@ impl SchwabMarketDataAccountActivation {
     /// Every desired service must be one of the twelve market-data-only services and must have an
     /// available/degraded observation in this exact doctor receipt. Issuance is one-shot for this
     /// activation, so application composition cannot manufacture a second socket owner.
-    pub(crate) async fn issue_read_only_streamer_authority(
+    pub(crate) async fn issue_read_only_streamer_lease(
         &self,
         services: Vec<MarketDataService>,
-    ) -> Result<SchwabReadOnlyStreamerAuthority, SchwabMarketDataActivationError> {
+    ) -> Result<SchwabReadOnlyStreamerLease, SchwabMarketDataActivationError> {
         if services.is_empty() {
             return Err(SchwabMarketDataActivationError::AuthorityMismatch);
         }
@@ -623,12 +1146,13 @@ impl SchwabMarketDataAccountActivation {
         }
         *issued = true;
         drop(issued);
-        Ok(SchwabReadOnlyStreamerAuthority {
-            services: qualified.into_boxed_slice(),
+        Ok(SchwabReadOnlyStreamerLease {
+            services: Arc::from(qualified.into_boxed_slice()),
             currentness: self.currentness(),
             oauth: self.oauth.clone(),
             doctor: self.doctor.clone(),
             doctor_generation: Arc::clone(&self.doctor_generation),
+            rate_budget: Arc::clone(&self.rate_budget),
         })
     }
 
@@ -893,6 +1417,42 @@ fn rest_outcome_accounting(
     }
 }
 
+fn settle_rest_rate(
+    budget: &SharedProviderBudget,
+    permit: BudgetPermit,
+    receipt: &RawRestResponseReceipt,
+) -> Result<(), SchwabMarketDataActivationError> {
+    if (200..=299).contains(&receipt.status()) {
+        permit.release();
+        return budget
+            .record_success()
+            .map_err(SchwabMarketDataActivationError::RateUnavailable);
+    }
+    let decision = if receipt.status() == 429 {
+        let retry_after = receipt
+            .headers()
+            .iter()
+            .find(|header| header.name() == "retry-after")
+            .map(|header| header.value());
+        apply_http_retry_after(budget, retry_after, 0)
+    } else {
+        budget.apply_refusal(0)
+    };
+    permit.release();
+    match decision {
+        BudgetDecision::Ready(unexpected) => {
+            unexpected.release();
+            Err(SchwabMarketDataActivationError::RateUnavailable(
+                BudgetUnavailableReason::StateCorrupt,
+            ))
+        }
+        BudgetDecision::WaitUntil(_deadline) => Ok(()),
+        BudgetDecision::Unavailable(reason) => {
+            Err(SchwabMarketDataActivationError::RateUnavailable(reason))
+        }
+    }
+}
+
 fn timestamp_from_millis(millis: u64) -> Result<Timestamp, SchwabMarketDataActivationError> {
     millis
         .checked_mul(1_000_000)
@@ -920,6 +1480,9 @@ fn map_streamer_activation_error(error: SchwabMarketDataActivationError) -> Toke
             TokenAuthorityError::ReauthorizationRequired
         }
         SchwabMarketDataActivationError::Cancelled
+        | SchwabMarketDataActivationError::RateDeferred
+        | SchwabMarketDataActivationError::RateUnavailable(_)
+        | SchwabMarketDataActivationError::RatePool(_)
         | SchwabMarketDataActivationError::Account(_)
         | SchwabMarketDataActivationError::Onboarding(_)
         | SchwabMarketDataActivationError::OAuth(_) => TokenAuthorityError::Unavailable,
@@ -973,6 +1536,14 @@ impl ProviderAdapterActivation {
         {
             return Err(SchwabMarketDataActivationError::AuthorityMismatch);
         }
+        let rate_declaration = ProviderRateDeclaration::try_for_authorization_subject(
+            lease
+                .provider_budget_policy()
+                .cloned()
+                .ok_or(SchwabMarketDataActivationError::AuthorityMismatch)?,
+            binding.subject(),
+        )?;
+        let rate_budget = Arc::new(self.provider_rate.register_budget(rate_declaration)?);
         let authority = Arc::new(ProviderAccountRuntimeAuthority::try_acquire(
             ProviderMarketAccount::SchwabMarketData,
             lease,
@@ -987,6 +1558,7 @@ impl ProviderAdapterActivation {
             doctor_generation: Arc::new(Mutex::new(SchwabDoctorGenerationDisposition::Current(
                 current.generation().get(),
             ))),
+            rate_budget,
             streamer_authority_issued: Mutex::new(false),
         };
         activation.require_current().await?;
@@ -1089,7 +1661,9 @@ impl ProviderAdapterActivation {
         )?;
         validate_schwab_display_bindings(&bindings, &display_bindings, now)?;
         let bounds = schwab_quote_runtime_bounds()?;
-        let oauth = activation.oauth_authority();
+        // Provider-activation composition retains this protected authority internally; ordinary
+        // runtime code receives only receipt/publication capabilities.
+        let oauth = activation.oauth.clone();
         let oauth_receipt = tokio::select! {
             biased;
             () = cancellation.cancelled() => {
@@ -1496,6 +2070,12 @@ pub enum SchwabMarketDataActivationError {
     AuthorityMismatch,
     #[error("Schwab OAuth token rotation requires a serialized doctor renewal")]
     DoctorRenewalRequired,
+    #[error("Schwab shared account rate authority requires a later dispatch")]
+    RateDeferred,
+    #[error("Schwab shared account rate authority is unavailable: {0:?}")]
+    RateUnavailable(BudgetUnavailableReason),
+    #[error(transparent)]
+    RatePool(#[from] market_squawk_sources::BudgetPoolError),
     #[error(transparent)]
     Account(#[from] ProviderAccountActivationError),
     #[error(transparent)]

@@ -477,14 +477,13 @@ async fn current_oauth_receipt(
             current.map_err(SchwabRestQuoteRuntimeError::from)?;
         }
     }
-    let oauth = activation.oauth_authority();
     tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(SchwabRestQuoteSessionRuntimeError::Cancelled),
         () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
             Err(SchwabRestQuoteSessionRuntimeError::Deadline)
         }
-        receipt = oauth.current_receipt() => receipt
+        receipt = activation.current_oauth_receipt() => receipt
             .map_err(SchwabRestQuoteRuntimeError::from)
             .map_err(Into::into),
     }

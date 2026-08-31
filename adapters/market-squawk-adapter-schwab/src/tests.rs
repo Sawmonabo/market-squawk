@@ -67,13 +67,14 @@ use crate::{
     SchwabStreamerFamilyDoctorAccumulator, SchwabStreamerFieldDictionary,
     SchwabStreamerQuoteMarketDataEvidence, SchwabStreamerQuotePublicationOutcome,
     SchwabStreamerQuotePublicationRequest, SchwabStreamerQuoteRecordRequest,
-    SchwabStreamerSemanticField, SchwabTransportError, SchwabTransportTelemetry, StreamerAdmission,
-    StreamerCaptureSink, StreamerCaptureSinkError, StreamerMicrobatch, StreamerResponseCode,
-    StreamerSubscription, StreamerTransportBounds, TokenAuthorityError, TokenDecision,
-    TransientAccessToken, build_instrument_search_request, build_market_hours_request,
-    build_movers_request, canonicalize_option_chain, canonicalize_streamer_batch,
-    parse_option_chain_response, parse_quote_response, parse_streamer_frame, parse_token_response,
-    parse_user_preference,
+    SchwabStreamerRequestAcknowledgement, SchwabStreamerRequestPermit,
+    SchwabStreamerRuntimeAuthority, SchwabStreamerRuntimeEvent, SchwabStreamerSemanticField,
+    SchwabTransportError, SchwabTransportTelemetry, StreamerAdmission, StreamerCaptureSink,
+    StreamerCaptureSinkError, StreamerMicrobatch, StreamerResponseCode, StreamerSubscription,
+    StreamerTransportBounds, TokenAuthorityError, TokenDecision, TransientAccessToken,
+    build_instrument_search_request, build_market_hours_request, build_movers_request,
+    canonicalize_option_chain, canonicalize_streamer_batch, parse_option_chain_response,
+    parse_quote_response, parse_streamer_frame, parse_token_response, parse_user_preference,
 };
 
 use crate::canonical::{SchwabDailyPriceHistoryCandidateRequest, prepare_price_history_candidate};
@@ -1879,10 +1880,14 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
             stream_identity.clone(),
         )])),
     });
-    let mut streamer = SchwabStreamerExecutor::try_new(
+    let rate_state = Arc::new(MockStreamerRateState::default());
+    let mut streamer = SchwabStreamerExecutor::try_new_with_runtime_authority(
         connector,
         Arc::new(MockTokenSource { token_admission }),
         control_source,
+        Arc::new(MockStreamerRuntimeAuthority {
+            state: Arc::clone(&rate_state),
+        }),
         stream_admission,
         stream_bounds,
         bounds(),
@@ -1921,7 +1926,7 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     let cancellation = CancellationToken::new();
     let mut sink = CancellingCaptureSink {
         cancellation: cancellation.clone(),
-        cancel_after: 6,
+        cancel_after: 7,
         microbatches: Vec::new(),
     };
     let run_error = streamer
@@ -1929,7 +1934,15 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         .await
         .expect_err("malformed selected-service frame must close the typed Streamer run");
     assert_eq!(run_error, SchwabTransportError::Adapter);
-    assert_eq!(sink.microbatches.len(), 6);
+    assert_eq!(rate_state.commits.load(Ordering::SeqCst), 3);
+    assert_eq!(rate_state.settlements.load(Ordering::SeqCst), 3);
+    assert!(rate_state
+        .events
+        .lock()
+        .unwrap_or_else(|_| panic!("Streamer rate event audit poisoned"))
+        .iter()
+        .any(|event| matches!(event, SchwabStreamerRuntimeEvent::Connected { generation } if *generation == application_generation)));
+    assert_eq!(sink.microbatches.len(), 7);
     let temporary = TemporaryDirectory::new();
     let paths = LocalPaths::prepare(temporary.path().join("stream-raw-publication"))
         .unwrap_or_else(|error| panic!("Streamer publication paths: {error}"));
@@ -1937,6 +1950,14 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         .sealed_research_journal_store()
         .unwrap_or_else(|error| panic!("Streamer publication store: {error}"));
     let mut microbatches = sink.microbatches.into_iter();
+    let login_acknowledgement = seal_stream_microbatch(
+        microbatches
+            .next()
+            .unwrap_or_else(|| panic!("missing login acknowledgement microbatch")),
+        &store,
+    );
+    assert_eq!(login_acknowledgement.frames().len(), 1);
+    assert!(login_acknowledgement.service_responses().is_empty());
     let equities_acknowledgement = seal_stream_microbatch(
         microbatches
             .next()
@@ -2624,6 +2645,80 @@ impl SchwabStreamerConnectionControlSource for MockStreamerControlSource {
                 .pop_front()
                 .ok_or(SchwabTransportError::Protocol)
         })
+    }
+}
+
+#[derive(Debug, Default)]
+struct MockStreamerRateState {
+    commits: AtomicUsize,
+    settlements: AtomicUsize,
+    events: Mutex<Vec<SchwabStreamerRuntimeEvent>>,
+}
+
+#[derive(Debug)]
+struct MockStreamerRuntimeAuthority {
+    state: Arc<MockStreamerRateState>,
+}
+
+impl SchwabStreamerRuntimeAuthority for MockStreamerRuntimeAuthority {
+    fn observe(&self, event: SchwabStreamerRuntimeEvent) -> Result<(), SchwabTransportError> {
+        self.state
+            .events
+            .lock()
+            .map_err(|_| SchwabTransportError::Protocol)?
+            .push(event);
+        Ok(())
+    }
+
+    fn commit_request(
+        &self,
+        generation: ConnectionGeneration,
+        service: Option<MarketDataService>,
+        command: &str,
+        request_id: &str,
+        request_payload_sha256: EvidenceDigest,
+        request_payload_bytes: u64,
+    ) -> Result<Box<dyn SchwabStreamerRequestPermit>, SchwabTransportError> {
+        self.state.commits.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(MockStreamerRequestPermit {
+            state: Arc::clone(&self.state),
+            generation,
+            service,
+            command: command.to_owned().into_boxed_str(),
+            request_id: request_id.to_owned().into_boxed_str(),
+            request_payload_sha256,
+            request_payload_bytes,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct MockStreamerRequestPermit {
+    state: Arc<MockStreamerRateState>,
+    generation: ConnectionGeneration,
+    service: Option<MarketDataService>,
+    command: Box<str>,
+    request_id: Box<str>,
+    request_payload_sha256: EvidenceDigest,
+    request_payload_bytes: u64,
+}
+
+impl SchwabStreamerRequestPermit for MockStreamerRequestPermit {
+    fn settle(
+        self: Box<Self>,
+        acknowledgement: SchwabStreamerRequestAcknowledgement,
+    ) -> Result<(), SchwabTransportError> {
+        if acknowledgement.generation != self.generation
+            || acknowledgement.service != self.service
+            || acknowledgement.command != self.command
+            || acknowledgement.request_id != self.request_id
+            || acknowledgement.request_payload_sha256 != self.request_payload_sha256
+            || acknowledgement.request_payload_bytes != self.request_payload_bytes
+        {
+            return Err(SchwabTransportError::Protocol);
+        }
+        self.state.settlements.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
