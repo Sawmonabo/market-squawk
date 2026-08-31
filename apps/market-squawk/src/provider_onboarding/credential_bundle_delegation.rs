@@ -26,7 +26,7 @@ const ALPACA_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
 const SCHWAB_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "schwab.trader-api-market-data",
     capability_revision: 4,
-    release_state: ProfileReleaseState::RefreshRequired,
+    release_state: ProfileReleaseState::Available,
 };
 const YAHOO_FINANCE_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "yahoo-finance.experimental-enrichment",
@@ -51,7 +51,7 @@ const CBOE_OPTIONS_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
 const IEX_HIST_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "iex.hist-feed-files",
     capability_revision: 3,
-    release_state: ProfileReleaseState::RefreshRequired,
+    release_state: ProfileReleaseState::Available,
 };
 const BLS_REGISTERED_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "bls.v2-registered",
