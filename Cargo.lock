@@ -5229,7 +5229,6 @@ dependencies = [
  "axum",
  "http-body-util",
  "market-squawk-domain",
- "market-squawk-jobs",
  "market-squawk-runtime",
  "market-squawk-services",
  "rmcp",
