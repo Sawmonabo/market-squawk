@@ -31,6 +31,7 @@ impl CompanyFactPeriod {
 pub struct CompanyFactOccurrence {
     concept: SourceIdentifier,
     unit: SourceIdentifier,
+    source_ordinal: u32,
     value: Decimal,
     accession: SourceIdentifier,
     form: SourceIdentifier,
@@ -49,6 +50,10 @@ impl CompanyFactOccurrence {
     /// Returns the source unit key.
     pub const fn unit(&self) -> &SourceIdentifier {
         &self.unit
+    }
+    /// Returns the zero-based occurrence coordinate inside the exact concept/unit source array.
+    pub const fn source_ordinal(&self) -> u32 {
+        self.source_ordinal
     }
     /// Returns the exact normalized decimal.
     pub const fn value(&self) -> Decimal {
@@ -104,12 +109,16 @@ impl CompanyFactsDocument {
         limits: SecParserLimits,
         cancellation: &CancellationToken,
     ) -> Result<Self, SecParserError> {
-        let root = parse_bounded_json_with_cancellation(bytes, limits, cancellation)?;
+        let (root, mut retained) =
+            parse_bounded_json_with_retained_budget(bytes, limits, cancellation)?;
         let object = as_object(&root, "company facts root")?;
         let cik = parse_cik(required(object, "cik")?)?;
-        let entity_name = validated_metadata_text(
-            required_string(object, "entityName")?,
-            MAX_ENTITY_NAME_BYTES,
+        let entity_name_source = required_string(object, "entityName")?;
+        let entity_name = validated_metadata_text(entity_name_source, MAX_ENTITY_NAME_BYTES)?;
+        retained.admit::<CompanyFactsDocument>(
+            cik.retained_bytes()
+                .checked_add(entity_name.capacity())
+                .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
         )?;
         let taxonomies = as_object(required(object, "facts")?, "facts")?;
         let mut occurrences = Vec::new();
@@ -127,21 +136,30 @@ impl CompanyFactsDocument {
                 for (unit, facts_value) in units {
                     check_parser_cancelled(cancellation)?;
                     let unit = SourceIdentifier::try_from(unit.clone())?;
-                    for fact_value in as_array(facts_value, "unit facts")? {
+                    for (source_ordinal, fact_value) in
+                        as_array(facts_value, "unit facts")?.iter().enumerate()
+                    {
                         check_parser_cancelled(cancellation)?;
                         if occurrences.len() >= limits.max_records {
                             return Err(SecParserError::RecordLimitExceeded);
                         }
+                        let source_ordinal = u32::try_from(source_ordinal)
+                            .map_err(|_| SecParserError::RecordLimitExceeded)?;
+                        let occurrence = parse_company_fact(
+                            fact_value,
+                            qualified.clone(),
+                            unit.clone(),
+                            source_ordinal,
+                        )?;
+                        retained.admit::<CompanyFactOccurrence>(company_fact_dynamic_bytes(
+                            &occurrence,
+                        )?)?;
                         if occurrences.len() == occurrences.capacity() {
                             occurrences
                                 .try_reserve(1)
                                 .map_err(|_| SecParserError::AllocationFailed)?;
                         }
-                        occurrences.push(parse_company_fact(
-                            fact_value,
-                            qualified.clone(),
-                            unit.clone(),
-                        )?);
+                        occurrences.push(occurrence);
                     }
                 }
             }
@@ -173,6 +191,7 @@ fn parse_company_fact(
     value: &Value,
     concept: SourceIdentifier,
     unit: SourceIdentifier,
+    source_ordinal: u32,
 ) -> Result<CompanyFactOccurrence, SecParserError> {
     let object = as_object(value, "company fact occurrence")?;
     let lexical = match required(object, "val")? {
@@ -193,6 +212,7 @@ fn parse_company_fact(
     Ok(CompanyFactOccurrence {
         concept,
         unit,
+        source_ordinal,
         value,
         accession: SourceIdentifier::try_from(required_string(object, "accn")?)?,
         form: SourceIdentifier::try_from(required_string(object, "form")?)?,
@@ -203,6 +223,24 @@ fn parse_company_fact(
             .transpose()?,
         fiscal_year: parse_optional_fiscal_year(object)?,
         fiscal_period: parse_optional_fiscal_period(object)?,
+    })
+}
+
+fn company_fact_dynamic_bytes(occurrence: &CompanyFactOccurrence) -> Result<usize, SecParserError> {
+    [
+        Some(occurrence.concept()),
+        Some(occurrence.unit()),
+        Some(occurrence.accession()),
+        Some(occurrence.form()),
+        occurrence.frame(),
+        occurrence.fiscal_period(),
+    ]
+    .into_iter()
+    .flatten()
+    .try_fold(0usize, |total, value| {
+        total
+            .checked_add(value.retained_bytes())
+            .ok_or(SecParserError::RetainedOutputLimitExceeded)
     })
 }
 

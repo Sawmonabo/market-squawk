@@ -953,7 +953,7 @@ fn submissions_row_capture_page_ordinals(
     let components = retrieved.components();
     let expected_pages = retrieved
         .document()
-        .companion_files()
+        .companions()
         .len()
         .checked_add(1)
         .ok_or(SecClientError::InvalidCompositeRepresentation)?;
@@ -978,7 +978,7 @@ fn submissions_row_capture_page_ordinals(
         cancellation,
     )?;
     if current_document.cik() != retrieved.document().cik()
-        || current_document.companion_files() != retrieved.document().companion_files()
+        || current_document.companions() != retrieved.document().companions()
     {
         return Err(SecClientError::InvalidCompositeRepresentation);
     }
@@ -995,7 +995,12 @@ fn submissions_row_capture_page_ordinals(
             return Err(SecClientError::InvalidCompositeRepresentation);
         }
     }
-    for (component_ordinal, component) in components.iter().enumerate().skip(1) {
+    for ((component_ordinal, component), declaration) in components
+        .iter()
+        .enumerate()
+        .skip(1)
+        .zip(current_document.companions())
+    {
         if cancellation.is_cancelled() {
             return Err(SecClientError::Cancelled);
         }
@@ -1006,13 +1011,8 @@ fn submissions_row_capture_page_ordinals(
             parser_limits,
             cancellation,
         )?;
-        let reconciled = reconcile_submissions_with_cancellation(
-            &current_document,
-            std::slice::from_ref(&archive),
-            parser_limits,
-            cancellation,
-        )?;
-        for filing in reconciled.filings() {
+        crate::json::validate_companion_coverage(declaration, &archive)?;
+        for filing in archive.filings() {
             match origins.get(filing.accession().as_str()) {
                 Some((existing, _)) if existing == filing => {}
                 Some(_) => return Err(SecClientError::InvalidCompositeRepresentation),
@@ -1114,7 +1114,7 @@ struct SecSubmissionsNativeBatchV1<'a> {
     dataset: &'a SourceIdentifier,
     cik: &'a SourceIdentifier,
     company_metadata: &'a crate::SecSubmissionCompanyMetadata,
-    companion_files: &'a [SourceIdentifier],
+    companions: &'a [crate::SecSubmissionsCompanion],
 }
 
 #[derive(Serialize)]
@@ -1158,7 +1158,7 @@ fn submissions_native_lineage(
             dataset: request.object().dataset(),
             cik: document.cik(),
             company_metadata: document.company_metadata(),
-            companion_files: document.companion_files(),
+            companions: document.companions(),
         })
         .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
     for filing in ordered {
@@ -1685,6 +1685,7 @@ fn map_client_error(error: SecClientError) -> ExtractionSourceError {
         | SecClientError::ProviderCapture(_)
         | SecClientError::RawCapture(_)
         | SecClientError::RegistrationMismatch
+        | SecClientError::ResponseCikMismatch
         | SecClientError::InvalidCaptureMaterial
         | SecClientError::InvalidCompositeRepresentation
         | SecClientError::InvalidCompanionSet => SourceError::InvalidProtocolState,

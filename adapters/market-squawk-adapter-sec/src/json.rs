@@ -4,6 +4,7 @@ mod company_facts;
 mod submissions;
 
 use std::fmt;
+use std::mem::size_of;
 use std::str::FromStr as _;
 
 use chrono::{DateTime, Datelike as _, NaiveDate, NaiveDateTime};
@@ -14,11 +15,70 @@ use serde_json::{Map, Number, Value};
 use tokio_util::sync::CancellationToken;
 
 pub use company_facts::{CompanyFactOccurrence, CompanyFactPeriod, CompanyFactsDocument};
+pub(crate) use submissions::validate_companion_coverage;
 pub use submissions::{
-    SecFiling, SecFormerName, SecSubmissionCompanyMetadata, SecTickerExchangePair,
-    SubmissionsArchive, SubmissionsDocument, reconcile_submissions,
+    SecFiling, SecFormerName, SecSubmissionCompanyMetadata, SecSubmissionsCompanion,
+    SecTickerExchangePair, SubmissionsArchive, SubmissionsDocument, reconcile_submissions,
     reconcile_submissions_with_cancellation,
 };
+
+/// Conservative allowance for collection capacity, allocator rounding, and values retained while
+/// the bounded JSON tree is still alive. Charges are cumulative and deliberately never refunded.
+const RETAINED_CAPACITY_ALLOWANCE: usize = 2;
+const BTREE_LINK_WORDS_PER_ENTRY: usize = 4;
+
+pub(crate) struct RetainedJsonBudget {
+    admitted: usize,
+    limit: usize,
+}
+
+impl RetainedJsonBudget {
+    pub(crate) const fn new(limits: SecParserLimits) -> Self {
+        Self {
+            admitted: 0,
+            limit: limits.retained_output_bytes(),
+        }
+    }
+
+    pub(crate) fn admit<T>(&mut self, dynamic_bytes: usize) -> Result<(), SecParserError> {
+        let visible = size_of::<T>()
+            .checked_add(dynamic_bytes)
+            .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
+        self.admit_visible(visible)
+    }
+
+    fn admit_visible(&mut self, visible: usize) -> Result<(), SecParserError> {
+        let conservative = visible
+            .checked_mul(RETAINED_CAPACITY_ALLOWANCE)
+            .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
+        let admitted = self
+            .admitted
+            .checked_add(conservative)
+            .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
+        if admitted > self.limit {
+            return Err(SecParserError::RetainedOutputLimitExceeded);
+        }
+        self.admitted = admitted;
+        Ok(())
+    }
+
+    pub(crate) fn admit_btree_entry<K, V>(
+        &mut self,
+        dynamic_bytes: usize,
+    ) -> Result<(), SecParserError> {
+        let inline = size_of::<K>()
+            .checked_add(size_of::<V>())
+            .and_then(|bytes| {
+                bytes.checked_add(BTREE_LINK_WORDS_PER_ENTRY.checked_mul(size_of::<usize>())?)
+            })
+            .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
+        self.admit_visible(
+            inline
+                .checked_add(dynamic_bytes)
+                .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
+        )
+    }
+}
 
 /// Production parser ceilings applied before canonical construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,7 +133,7 @@ impl SecParserLimits {
         })
     }
 
-    /// Returns the aggregate retained-output ceiling for parsers that materialize owned results.
+    /// Returns the aggregate retained-allocation ceiling for decoded trees and owned results.
     pub const fn retained_output_bytes(self) -> usize {
         self.max_retained_output_bytes
     }
@@ -100,6 +160,14 @@ pub(crate) fn parse_bounded_json_with_cancellation(
     limits: SecParserLimits,
     cancellation: &CancellationToken,
 ) -> Result<Value, SecParserError> {
+    parse_bounded_json_with_retained_budget(bytes, limits, cancellation).map(|(value, _)| value)
+}
+
+pub(crate) fn parse_bounded_json_with_retained_budget(
+    bytes: &[u8],
+    limits: SecParserLimits,
+    cancellation: &CancellationToken,
+) -> Result<(Value, RetainedJsonBudget), SecParserError> {
     check_parser_cancelled(cancellation)?;
     if bytes.len() > limits.max_decoded_bytes {
         return Err(SecParserError::ByteLimitExceeded);
@@ -112,7 +180,7 @@ pub(crate) fn parse_bounded_json_with_cancellation(
     }
     .deserialize(&mut deserializer)?;
     deserializer.end()?;
-    Ok(value)
+    Ok((value, budget.retained))
 }
 
 struct JsonBudget {
@@ -121,6 +189,7 @@ struct JsonBudget {
     nodes: usize,
     max_nodes: usize,
     cancellation: CancellationToken,
+    retained: RetainedJsonBudget,
 }
 
 impl JsonBudget {
@@ -131,11 +200,13 @@ impl JsonBudget {
             nodes: 0,
             max_nodes: limits.max_records.saturating_mul(16),
             cancellation,
+            retained: RetainedJsonBudget::new(limits),
         }
     }
 
     fn charge_node(&mut self) -> Result<(), SecParserError> {
         check_parser_cancelled(&self.cancellation)?;
+        self.retained.admit::<Value>(0)?;
         self.nodes = self
             .nodes
             .checked_add(1)
@@ -159,7 +230,7 @@ impl JsonBudget {
         if self.total_string_bytes > self.limits.max_total_string_bytes {
             Err(SecParserError::StringLimitExceeded)
         } else {
-            Ok(())
+            self.retained.admit::<String>(text.len())
         }
     }
 }
@@ -600,6 +671,7 @@ pub enum SecParserError {
     NodeLimitExceeded,
     ByteCountOverflow,
     AllocationFailed,
+    RetainedOutputLimitExceeded,
     DuplicateKey,
     InvalidNumber,
     MissingField,
@@ -608,6 +680,7 @@ pub enum SecParserError {
     InvalidCik,
     InvalidAccession,
     InvalidCompanionName,
+    InvalidCompanionCoverage,
     InvalidConcept,
     InvalidDate,
     InvalidTimestamp,

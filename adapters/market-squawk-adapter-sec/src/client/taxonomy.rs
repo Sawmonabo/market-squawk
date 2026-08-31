@@ -356,6 +356,18 @@ impl TaxonomyClientSet {
         let retry_after_disposition = ProviderRateRetryAfterDisposition::parse_http(
             retry_after.as_ref().map(|value| value.as_bytes()),
         );
+        if matches!(status.as_u16(), 429 | 503) {
+            let retry_after_field = retry_after.as_ref().map(|value| value.as_bytes());
+            drop(response);
+            settle_response(
+                &mut in_flight,
+                0,
+                ProviderRateResponseClass::ProviderRefusal,
+                retry_after_field,
+                retry_after_disposition,
+            )?;
+            return Err(SecClientError::HttpStatus(status.as_u16()));
+        }
         let validators = if status.is_success() {
             Some(super::response_validators(response.headers()))
         } else {
@@ -449,16 +461,6 @@ impl TaxonomyClientSet {
                 retry_after_disposition,
             )?;
             return Err(SecClientError::InvalidRedirect);
-        }
-        if matches!(status.as_u16(), 429 | 503) {
-            settle_response(
-                &mut in_flight,
-                completed_response_bytes,
-                ProviderRateResponseClass::ProviderRefusal,
-                retry_after_field,
-                retry_after_disposition,
-            )?;
-            return Err(SecClientError::HttpStatus(status.as_u16()));
         }
         if !status.is_success() {
             settle_response(

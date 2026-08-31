@@ -8,7 +8,7 @@ pub use contracts::{
     SecClientError, SecContact, SecExtractionHealth, SecExtractionHealthState, SecObjectLocator,
 };
 pub(crate) use contracts::{deterministic_capture_uuid, system_timestamp};
-use contracts::{health_for_http_status, validation_health_for_error};
+use contracts::{health_for_http_status, normalized_cik, validation_health_for_error};
 pub use taxonomy::FilingTaxonomySharedRateBudgets;
 
 use std::sync::{Arc, Mutex};
@@ -192,10 +192,11 @@ impl SecEdgarSource {
         cancellation: CancellationToken,
     ) -> Result<RetrievedSubmissions, SecClientError> {
         self.validate_authority(authority)?;
+        let expected_cik = normalized_cik(cik)?;
         let raw = self
             .retrieve(
                 authority,
-                &SecObjectLocator::submissions(cik)?,
+                &SecObjectLocator::submissions(&expected_cik)?,
                 &cancellation,
             )
             .await?;
@@ -203,8 +204,15 @@ impl SecEdgarSource {
         let limits = self.parser_limits;
         let document = self
             .run_validation_blocking(&cancellation, move |worker_cancellation| {
-                SubmissionsDocument::parse_with_cancellation(&bytes, limits, worker_cancellation)
-                    .map_err(Into::into)
+                let document = SubmissionsDocument::parse_with_cancellation(
+                    &bytes,
+                    limits,
+                    worker_cancellation,
+                )?;
+                if document.cik().as_str() != expected_cik {
+                    return Err(SecClientError::ResponseCikMismatch);
+                }
+                Ok(document)
             })
             .await?;
         self.validate_authority(authority)?;
@@ -250,10 +258,11 @@ impl SecEdgarSource {
         cancellation: CancellationToken,
     ) -> Result<RetrievedCompanyFacts, SecClientError> {
         self.validate_authority(authority)?;
+        let expected_cik = normalized_cik(cik)?;
         let raw = self
             .retrieve(
                 authority,
-                &SecObjectLocator::company_facts(cik)?,
+                &SecObjectLocator::company_facts(&expected_cik)?,
                 &cancellation,
             )
             .await?;
@@ -261,8 +270,15 @@ impl SecEdgarSource {
         let limits = self.parser_limits;
         let document = self
             .run_validation_blocking(&cancellation, move |worker_cancellation| {
-                CompanyFactsDocument::parse_with_cancellation(&bytes, limits, worker_cancellation)
-                    .map_err(Into::into)
+                let document = CompanyFactsDocument::parse_with_cancellation(
+                    &bytes,
+                    limits,
+                    worker_cancellation,
+                )?;
+                if document.cik().as_str() != expected_cik {
+                    return Err(SecClientError::ResponseCikMismatch);
+                }
+                Ok(document)
             })
             .await?;
         self.validate_authority(authority)?;

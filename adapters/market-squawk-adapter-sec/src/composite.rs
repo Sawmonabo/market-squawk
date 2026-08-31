@@ -83,16 +83,16 @@ impl RetrievedSubmissions {
     ) -> Result<Self, SecClientError> {
         let bounds = SecCompositeBounds::production_defaults();
         let recent = SubmissionsDocument::parse(recent_bytes, parser_limits)?;
-        if recent.companion_files().len() != archive_bytes.len()
+        if recent.companions().len() != archive_bytes.len()
             || archive_bytes.len() > usize::from(bounds.max_companion_objects)
         {
             return Err(SecClientError::InvalidCompanionSet);
         }
         let expected_prefix = format!("CIK{}-submissions-", recent.cik());
         let mut unique_names = BTreeSet::new();
-        for name in recent.companion_files() {
-            if !name.as_str().starts_with(&expected_prefix)
-                || !unique_names.insert(name.as_str().to_owned())
+        for companion in recent.companions() {
+            if !companion.name().as_str().starts_with(&expected_prefix)
+                || !unique_names.insert(companion.name().as_str().to_owned())
             {
                 return Err(SecClientError::InvalidCompanionSet);
             }
@@ -115,7 +115,7 @@ impl RetrievedSubmissions {
             size_bytes: u64::try_from(recent_bytes.len())
                 .map_err(|_| SecClientError::CompositeByteLimitExceeded)?,
         });
-        for (name, bytes) in recent.companion_files().iter().zip(archive_bytes) {
+        for (companion, bytes) in recent.companions().iter().zip(archive_bytes) {
             total_bytes = total_bytes
                 .checked_add(
                     u64::try_from(bytes.len())
@@ -125,7 +125,7 @@ impl RetrievedSubmissions {
             ensure_total_bytes(total_bytes, bounds)?;
             archives.push(SubmissionsDocument::parse_archive(bytes, parser_limits)?);
             evidence_entries.push(OfflineCompositeRepresentation {
-                source_name: name.as_str().to_owned(),
+                source_name: companion.name().as_str().to_owned(),
                 evidence: raw_store.persist(bytes)?,
                 size_bytes: u64::try_from(bytes.len())
                     .map_err(|_| SecClientError::CompositeByteLimitExceeded)?,
@@ -189,7 +189,7 @@ fn complete_submissions_capture_material(
 ) -> Result<Option<ProviderCaptureMaterial>, SecClientError> {
     let expected_count = retrieved
         .document()
-        .companion_files()
+        .companions()
         .len()
         .checked_add(1)
         .ok_or(SecClientError::CompanionObjectLimitExceeded)?;
@@ -203,8 +203,12 @@ fn complete_submissions_capture_material(
         .try_reserve_exact(expected_count)
         .map_err(|_| SecClientError::AllocationFailed)?;
     expected_locators.push(current_locator.url().to_owned());
-    for name in retrieved.document().companion_files() {
-        expected_locators.push(SecObjectLocator::companion(name.as_str())?.url().to_owned());
+    for companion in retrieved.document().companions() {
+        expected_locators.push(
+            SecObjectLocator::companion(companion.name().as_str())?
+                .url()
+                .to_owned(),
+        );
     }
 
     let all_offline = retrieved
@@ -280,16 +284,17 @@ fn complete_submissions_capture_material(
         }
         let request_token = ordinal.checked_sub(1).map(|index| {
             companion_token_digest(
-                retrieved.document().companion_files()[index]
+                retrieved.document().companions()[index]
+                    .name()
                     .as_str()
                     .as_bytes(),
             )
         });
         let response_token = retrieved
             .document()
-            .companion_files()
+            .companions()
             .get(ordinal)
-            .map(|name| companion_token_digest(name.as_str().as_bytes()));
+            .map(|companion| companion_token_digest(companion.name().as_str().as_bytes()));
         let ordinal =
             u16::try_from(ordinal).map_err(|_| SecClientError::CompanionObjectLimitExceeded)?;
         request_set_hash.update(ordinal.to_be_bytes());
@@ -383,14 +388,14 @@ impl SecEdgarSource {
             }
         };
         let expected_prefix = format!("CIK{}-submissions-", recent.document().cik());
-        let companion_names = recent.document().companion_files();
-        if companion_names.len() > usize::from(bounds.max_companion_objects) {
+        let companions = recent.document().companions();
+        if companions.len() > usize::from(bounds.max_companion_objects) {
             return Err(SecClientError::CompanionObjectLimitExceeded);
         }
         let mut unique_names = BTreeSet::new();
-        for name in companion_names {
-            if !name.as_str().starts_with(&expected_prefix)
-                || !unique_names.insert(name.as_str().to_owned())
+        for companion in companions {
+            if !companion.name().as_str().starts_with(&expected_prefix)
+                || !unique_names.insert(companion.name().as_str().to_owned())
             {
                 return Err(SecClientError::InvalidCompanionSet);
             }
@@ -399,7 +404,7 @@ impl SecEdgarSource {
         let recent_document = recent.document().clone();
         let mut total_bytes = response_size(recent.raw())?;
         ensure_total_bytes(total_bytes, bounds)?;
-        let component_count = companion_names
+        let component_count = companions
             .len()
             .checked_add(1)
             .ok_or(SecClientError::CompanionObjectLimitExceeded)?;
@@ -410,16 +415,16 @@ impl SecEdgarSource {
         components.push(recent.raw().clone());
         let mut archives = Vec::<SubmissionsArchive>::new();
         archives
-            .try_reserve(companion_names.len())
+            .try_reserve(companions.len())
             .map_err(|_| SecClientError::AllocationFailed)?;
 
-        for name in companion_names {
+        for companion in companions {
             let attempt_cancellation = cancellation.child_token();
             let remaining = deadline_remaining(deadline)?;
             let (archive, raw) = tokio::select! {
                 result = self.fetch_submissions_archive(
                     authority,
-                    name.as_str(),
+                    companion.name().as_str(),
                     attempt_cancellation.clone(),
                 ) => result?,
                 () = tokio::time::sleep(remaining) => {
@@ -525,24 +530,24 @@ pub(crate) fn restore_online_submissions(
     if current_document.cik().as_str() != manifest.cik {
         return Err(SecClientError::InvalidCompositeRepresentation);
     }
-    if current_document.companion_files().len() > usize::from(bounds.max_companion_objects) {
+    if current_document.companions().len() > usize::from(bounds.max_companion_objects) {
         return Err(SecClientError::CompanionObjectLimitExceeded);
     }
     let mut components = Vec::new();
     components
-        .try_reserve(current_document.companion_files().len().saturating_add(1))
+        .try_reserve(current_document.companions().len().saturating_add(1))
         .map_err(|_| SecClientError::AllocationFailed)?;
     let mut available_at = current.first_observed_at;
     components.push(restored_component(current_bytes, current));
     let mut archives = Vec::new();
     archives
-        .try_reserve(current_document.companion_files().len())
+        .try_reserve(current_document.companions().len())
         .map_err(|_| SecClientError::AllocationFailed)?;
-    for name in current_document.companion_files() {
+    for companion in current_document.companions() {
         if cancellation.is_cancelled() {
             return Err(SecClientError::Cancelled);
         }
-        let locator = SecObjectLocator::companion(name.as_str())?;
+        let locator = SecObjectLocator::companion(companion.name().as_str())?;
         let representation = by_locator
             .remove(locator.url())
             .ok_or(SecClientError::InvalidCompositeRepresentation)?;

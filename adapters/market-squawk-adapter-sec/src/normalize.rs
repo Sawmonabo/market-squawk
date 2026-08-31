@@ -859,12 +859,13 @@ pub fn normalize_company_facts_with_cancellation(
         let end = occurrence.period().end().to_string();
         let revision = RevisionNumber::new(family_revision)?;
         let source_identifier = SourceIdentifier::try_from(format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}",
             occurrence.accession(),
             occurrence.concept(),
             occurrence.unit(),
             start.as_deref().unwrap_or("instant"),
             end,
+            occurrence.source_ordinal(),
         ))?;
         let provenance = ResearchProvenance::try_new(ResearchProvenanceInput {
             source_id: source_id.clone(),
@@ -947,6 +948,7 @@ pub(crate) fn compare_company_facts(
         .then_with(|| left.fiscal_year().cmp(&right.fiscal_year()))
         .then_with(|| left.fiscal_period().cmp(&right.fiscal_period()))
         .then_with(|| left.value().cmp(&right.value()))
+        .then_with(|| left.source_ordinal().cmp(&right.source_ordinal()))
 }
 
 fn same_company_fact_family(left: &CompanyFactOccurrence, right: &CompanyFactOccurrence) -> bool {

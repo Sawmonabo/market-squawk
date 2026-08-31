@@ -570,6 +570,7 @@ pub(super) const fn validation_health_for_error(
         | SecClientError::Normalization(_) => Some(SecExtractionHealthState::LocalFailure),
         SecClientError::Parser(_)
         | SecClientError::CompanyIdentity(_)
+        | SecClientError::ResponseCikMismatch
         | SecClientError::InvalidCompanionSet
         | SecClientError::InvalidCompositeRepresentation
         | SecClientError::InvalidCaptureMaterial
@@ -594,7 +595,7 @@ pub(crate) fn system_timestamp() -> Result<Timestamp, SecClientError> {
     Ok(Timestamp::from_unix_nanos(nanos))
 }
 
-fn normalized_cik(value: &str) -> Result<String, SecClientError> {
+pub(super) fn normalized_cik(value: &str) -> Result<String, SecClientError> {
     if value.is_empty() || value.len() > 10 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(SecClientError::InvalidLocator);
     }
@@ -694,6 +695,8 @@ pub enum SecClientError {
     InvalidValidatorHeader,
     #[error("SEC returned HTTP status {0}")]
     HttpStatus(u16),
+    #[error("SEC response CIK does not match the exact requested CIK")]
+    ResponseCikMismatch,
     #[error("SEC raw evidence did not match its computed identity")]
     RawEvidenceMismatch,
     #[error("system clock is outside the domain timestamp range")]

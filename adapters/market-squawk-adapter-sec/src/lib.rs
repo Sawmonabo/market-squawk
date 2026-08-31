@@ -58,8 +58,8 @@ pub use evidence_store::{RawEvidenceError, RawEvidenceStore};
 pub use extraction::{SecDiscoveryResult, SecExtractionResult, SecFilingXbrlCaptureHandoff};
 pub use json::{
     CompanyFactOccurrence, CompanyFactPeriod, CompanyFactsDocument, SecFiling, SecFormerName,
-    SecParserError, SecParserLimits, SecSubmissionCompanyMetadata, SecTickerExchangePair,
-    SubmissionsArchive, SubmissionsDocument, reconcile_submissions,
+    SecParserError, SecParserLimits, SecSubmissionCompanyMetadata, SecSubmissionsCompanion,
+    SecTickerExchangePair, SubmissionsArchive, SubmissionsDocument, reconcile_submissions,
     reconcile_submissions_with_cancellation,
 };
 pub use normalize::{

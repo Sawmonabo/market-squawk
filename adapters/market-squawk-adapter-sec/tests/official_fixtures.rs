@@ -46,6 +46,20 @@ fn official_json_shapes_preserve_accessions_amendments_periods_and_exact_values(
     assert_eq!(metadata.ticker_exchange_pairs().len(), 1);
     assert_eq!(metadata.ticker_exchange_pairs()[0].ticker(), "AAPL");
     assert_eq!(metadata.ticker_exchange_pairs()[0].exchange(), "Nasdaq");
+    assert_eq!(reconciled.companions().len(), 1);
+    assert_eq!(
+        reconciled.companions()[0].name().as_str(),
+        "CIK0000320193-submissions-001.json"
+    );
+    assert_eq!(reconciled.companions()[0].filing_count(), 2);
+    assert_eq!(
+        reconciled.companions()[0].filing_from().to_string(),
+        "2020-01-01"
+    );
+    assert_eq!(
+        reconciled.companions()[0].filing_to().to_string(),
+        "2025-07-31"
+    );
     let former_name_document = br#"{
         "cik":"0000320193","name":"Apple Inc.",
         "formerNames":[{"name":"APPLE COMPUTER INC","from":"1994-01-26T05:00:00.000Z","to":"2007-01-04T05:00:00.000Z"}],
@@ -86,6 +100,13 @@ fn official_json_shapes_preserve_accessions_amendments_periods_and_exact_values(
     assert_eq!(facts.cik().as_str(), "0000320193");
     assert_eq!(facts.entity_name(), "APPLE INC");
     assert_eq!(facts.occurrences().len(), 3);
+    let assets: Vec<_> = facts
+        .occurrences()
+        .iter()
+        .filter(|fact| fact.concept().as_str() == "us-gaap:Assets")
+        .collect();
+    assert_eq!(assets[0].source_ordinal(), 0);
+    assert_eq!(assets[1].source_ordinal(), 1);
     let loss = facts
         .occurrences()
         .iter()
@@ -178,6 +199,34 @@ fn malformed_columnar_shapes_and_record_limits_fail_closed() -> TestResult {
             &cancellation,
         ),
         Err(SecParserError::Cancelled)
+    ));
+    let false_companion_coverage = br#"{
+        "cik":"0000320193","name":"APPLE INC","tickers":[],"exchanges":[],
+        "filings":{
+            "recent":{"accessionNumber":[],"filingDate":[],"reportDate":[],"acceptanceDateTime":[],"form":[]},
+            "files":[{"name":"CIK0000320193-submissions-001.json","filingCount":2,"filingFrom":"2020-01-01","filingTo":"2020-12-31"}]
+        }
+    }"#;
+    let recent = SubmissionsDocument::parse(
+        false_companion_coverage,
+        SecParserLimits::production_defaults(),
+    )?;
+    let archive = SubmissionsDocument::parse_archive(
+        include_bytes!("../fixtures/submissions-archive.json"),
+        SecParserLimits::production_defaults(),
+    )?;
+    assert!(matches!(
+        reconcile_submissions(&recent, &[archive], SecParserLimits::production_defaults()),
+        Err(SecParserError::InvalidCompanionCoverage)
+    ));
+    let no_retained_output =
+        SecParserLimits::try_new(1024 * 1024, 10, 128, 256 * 1024, 512 * 1024, 1)?;
+    assert!(matches!(
+        CompanyFactsDocument::parse(
+            include_bytes!("../fixtures/company-facts.json"),
+            no_retained_output
+        ),
+        Err(SecParserError::RetainedOutputLimitExceeded)
     ));
     Ok(())
 }

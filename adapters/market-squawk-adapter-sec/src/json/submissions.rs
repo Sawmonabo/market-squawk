@@ -47,6 +47,37 @@ pub struct SecTickerExchangePair {
     exchange: String,
 }
 
+/// One provider-declared historical submissions object and its exact promised coverage.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SecSubmissionsCompanion {
+    name: SourceIdentifier,
+    filing_count: u64,
+    filing_from: CalendarDate,
+    filing_to: CalendarDate,
+}
+
+impl SecSubmissionsCompanion {
+    /// Returns the exact provider object name.
+    pub const fn name(&self) -> &SourceIdentifier {
+        &self.name
+    }
+
+    /// Returns the exact provider-declared row count.
+    pub const fn filing_count(&self) -> u64 {
+        self.filing_count
+    }
+
+    /// Returns the first provider-declared filing date.
+    pub const fn filing_from(&self) -> CalendarDate {
+        self.filing_from
+    }
+
+    /// Returns the last provider-declared filing date.
+    pub const fn filing_to(&self) -> CalendarDate {
+        self.filing_to
+    }
+}
+
 impl SecTickerExchangePair {
     /// Returns the source ticker without normalization or venue inference.
     pub fn ticker(&self) -> &str {
@@ -168,7 +199,7 @@ pub struct SubmissionsDocument {
     cik: SourceIdentifier,
     company_metadata: SecSubmissionCompanyMetadata,
     filings: Vec<SecFiling>,
-    companion_files: Vec<SourceIdentifier>,
+    companions: Vec<SecSubmissionsCompanion>,
 }
 
 impl SubmissionsDocument {
@@ -183,23 +214,30 @@ impl SubmissionsDocument {
         limits: SecParserLimits,
         cancellation: &CancellationToken,
     ) -> Result<Self, SecParserError> {
-        let root = parse_bounded_json_with_cancellation(bytes, limits, cancellation)?;
+        let (root, mut retained) =
+            parse_bounded_json_with_retained_budget(bytes, limits, cancellation)?;
         let object = as_object(&root, "submissions root")?;
         let cik = parse_cik(required(object, "cik")?)?;
-        let company_metadata = parse_company_metadata(object, limits, cancellation)?;
+        retained.admit::<SubmissionsDocument>(cik.retained_bytes())?;
+        let company_metadata = parse_company_metadata(object, limits, cancellation, &mut retained)?;
         let filings_object = as_object(required(object, "filings")?, "filings")?;
         let filings = parse_filing_columns(
             as_object(required(filings_object, "recent")?, "recent filings")?,
             limits,
             cancellation,
+            &mut retained,
         )?;
-        let companion_files =
-            parse_companion_files(filings_object.get("files"), limits, cancellation)?;
+        let companions = parse_companions(
+            filings_object.get("files"),
+            limits,
+            cancellation,
+            &mut retained,
+        )?;
         Ok(Self {
             cik,
             company_metadata,
             filings,
-            companion_files,
+            companions,
         })
     }
 
@@ -217,9 +255,16 @@ impl SubmissionsDocument {
         limits: SecParserLimits,
         cancellation: &CancellationToken,
     ) -> Result<SubmissionsArchive, SecParserError> {
-        let root = parse_bounded_json_with_cancellation(bytes, limits, cancellation)?;
+        let (root, mut retained) =
+            parse_bounded_json_with_retained_budget(bytes, limits, cancellation)?;
+        retained.admit::<SubmissionsArchive>(0)?;
         Ok(SubmissionsArchive {
-            filings: parse_filing_columns(as_object(&root, "archive root")?, limits, cancellation)?,
+            filings: parse_filing_columns(
+                as_object(&root, "archive root")?,
+                limits,
+                cancellation,
+                &mut retained,
+            )?,
         })
     }
     /// Returns the exact zero-padded ten-digit CIK.
@@ -240,9 +285,9 @@ impl SubmissionsDocument {
             .iter()
             .find(|filing| filing.accession.as_str() == accession)
     }
-    /// Returns provider-declared historical companion object names.
-    pub fn companion_files(&self) -> &[SourceIdentifier] {
-        &self.companion_files
+    /// Returns provider-declared historical objects with their promised count/date coverage.
+    pub fn companions(&self) -> &[SecSubmissionsCompanion] {
+        &self.companions
     }
 }
 
@@ -250,6 +295,13 @@ impl SubmissionsDocument {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubmissionsArchive {
     filings: Vec<SecFiling>,
+}
+
+impl SubmissionsArchive {
+    /// Returns the exact filings parsed from this one historical companion object.
+    pub fn filings(&self) -> &[SecFiling] {
+        &self.filings
+    }
 }
 
 /// Deduplicates accessions across recent and companion files without collapsing amendments.
@@ -268,6 +320,27 @@ pub fn reconcile_submissions_with_cancellation(
     limits: SecParserLimits,
     cancellation: &CancellationToken,
 ) -> Result<SubmissionsDocument, SecParserError> {
+    if recent.companions.len() != archives.len() {
+        return Err(SecParserError::InvalidCompanionCoverage);
+    }
+    for (declaration, archive) in recent.companions.iter().zip(archives) {
+        validate_companion_coverage(declaration, archive)?;
+    }
+    let mut retained = RetainedJsonBudget::new(limits);
+    retained.admit::<SubmissionsDocument>(recent.cik.retained_bytes())?;
+    admit_company_metadata(&mut retained, &recent.company_metadata)?;
+    for companion in &recent.companions {
+        retained.admit::<SecSubmissionsCompanion>(companion.name.retained_bytes())?;
+    }
+    for filing in &recent.filings {
+        retained.admit::<SecFiling>(filing_dynamic_bytes(filing)?)?;
+    }
+    for archive in archives {
+        retained.admit::<SubmissionsArchive>(0)?;
+        for filing in &archive.filings {
+            retained.admit::<SecFiling>(filing_dynamic_bytes(filing)?)?;
+        }
+    }
     let mut filings = BTreeMap::new();
     for filing in recent
         .filings
@@ -275,6 +348,13 @@ pub fn reconcile_submissions_with_cancellation(
         .chain(archives.iter().flat_map(|archive| archive.filings.iter()))
     {
         check_parser_cancelled(cancellation)?;
+        retained.admit_btree_entry::<String, SecFiling>(
+            filing
+                .accession
+                .retained_bytes()
+                .checked_add(filing_dynamic_bytes(filing)?)
+                .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
+        )?;
         match filings.entry(filing.accession.as_str().to_owned()) {
             Entry::Vacant(entry) => {
                 entry.insert(filing.clone());
@@ -286,13 +366,25 @@ pub fn reconcile_submissions_with_cancellation(
             return Err(SecParserError::RecordLimitExceeded);
         }
     }
+    retained.admit::<SubmissionsDocument>(recent.cik.retained_bytes())?;
+    admit_company_metadata(&mut retained, &recent.company_metadata)?;
+    for companion in &recent.companions {
+        retained.admit::<SecSubmissionsCompanion>(companion.name.retained_bytes())?;
+    }
+    for _ in filings.values() {
+        retained.admit::<SecFiling>(0)?;
+    }
     let mut filings: Vec<_> = filings.into_values().collect();
-    filings.sort_by_key(|filing| (filing.filed_on, filing.accession.as_str().to_owned()));
+    filings.sort_by(|left, right| {
+        left.filed_on
+            .cmp(&right.filed_on)
+            .then_with(|| left.accession.cmp(&right.accession))
+    });
     Ok(SubmissionsDocument {
         cik: recent.cik.clone(),
         company_metadata: recent.company_metadata.clone(),
         filings,
-        companion_files: recent.companion_files.clone(),
+        companions: recent.companions.clone(),
     })
 }
 
@@ -300,15 +392,22 @@ fn parse_company_metadata(
     object: &Map<String, Value>,
     limits: SecParserLimits,
     cancellation: &CancellationToken,
+    retained: &mut RetainedJsonBudget,
 ) -> Result<SecSubmissionCompanyMetadata, SecParserError> {
     let conformed_name =
         validated_metadata_text(required_string(object, "name")?, MAX_COMPANY_NAME_BYTES)?;
-    let former_names = parse_former_names(object.get("formerNames"), limits, cancellation)?;
+    retained.admit::<SecSubmissionCompanyMetadata>(conformed_name.capacity())?;
+    let former_names =
+        parse_former_names(object.get("formerNames"), limits, cancellation, retained)?;
     let entity_type = optional_metadata_text(object, "entityType", MAX_ENTITY_TYPE_BYTES)?;
     let sic = optional_metadata_text(object, "sic", MAX_SIC_BYTES)?;
     let sic_description =
         optional_metadata_text(object, "sicDescription", MAX_SIC_DESCRIPTION_BYTES)?;
-    let ticker_exchange_pairs = parse_ticker_exchange_pairs(object, limits, cancellation)?;
+    for value in [&entity_type, &sic, &sic_description].into_iter().flatten() {
+        retained.admit::<String>(value.capacity())?;
+    }
+    let ticker_exchange_pairs =
+        parse_ticker_exchange_pairs(object, limits, cancellation, retained)?;
     Ok(SecSubmissionCompanyMetadata {
         conformed_name,
         former_names,
@@ -323,6 +422,7 @@ fn parse_former_names(
     value: Option<&Value>,
     limits: SecParserLimits,
     cancellation: &CancellationToken,
+    retained: &mut RetainedJsonBudget,
 ) -> Result<Vec<SecFormerName>, SecParserError> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -347,6 +447,7 @@ fn parse_former_names(
             return Err(SecParserError::InvalidPeriod);
         }
         let interval = (effective_from, effective_to);
+        retained.admit_btree_entry::<String, (Timestamp, Timestamp)>(name.capacity())?;
         match seen.entry(name.clone()) {
             Entry::Vacant(entry) => {
                 entry.insert(interval);
@@ -358,6 +459,7 @@ fn parse_former_names(
                 return Err(SecParserError::ConflictingMetadataAssociation);
             }
         }
+        retained.admit::<SecFormerName>(name.capacity())?;
         former_names.push(SecFormerName {
             name,
             effective_from,
@@ -371,6 +473,7 @@ fn parse_ticker_exchange_pairs(
     object: &Map<String, Value>,
     limits: SecParserLimits,
     cancellation: &CancellationToken,
+    retained: &mut RetainedJsonBudget,
 ) -> Result<Vec<SecTickerExchangePair>, SecParserError> {
     let tickers = required_array(object, "tickers")?;
     let exchanges = required_array(object, "exchanges")?;
@@ -390,6 +493,12 @@ fn parse_ticker_exchange_pairs(
         let ticker = validated_metadata_text(array_string(tickers, index)?, MAX_TICKER_BYTES)?;
         let exchange =
             validated_metadata_text(array_string(exchanges, index)?, MAX_EXCHANGE_BYTES)?;
+        retained.admit_btree_entry::<String, String>(
+            ticker
+                .capacity()
+                .checked_add(exchange.capacity())
+                .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
+        )?;
         match seen.entry(ticker.clone()) {
             Entry::Vacant(entry) => {
                 entry.insert(exchange.clone());
@@ -401,6 +510,12 @@ fn parse_ticker_exchange_pairs(
                 return Err(SecParserError::ConflictingMetadataAssociation);
             }
         }
+        retained.admit::<SecTickerExchangePair>(
+            ticker
+                .capacity()
+                .checked_add(exchange.capacity())
+                .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
+        )?;
         pairs.push(SecTickerExchangePair { ticker, exchange });
     }
     Ok(pairs)
@@ -421,6 +536,7 @@ fn parse_filing_columns(
     object: &Map<String, Value>,
     limits: SecParserLimits,
     cancellation: &CancellationToken,
+    retained: &mut RetainedJsonBudget,
 ) -> Result<Vec<SecFiling>, SecParserError> {
     let accessions = required_array(object, "accessionNumber")?;
     if accessions.len() > limits.max_records {
@@ -445,11 +561,12 @@ fn parse_filing_columns(
     filings
         .try_reserve(accessions.len())
         .map_err(|_| SecParserError::AllocationFailed)?;
+    let mut page_accessions = BTreeMap::new();
     for index in 0..accessions.len() {
         check_parser_cancelled(cancellation)?;
         let accession = SourceIdentifier::try_from(array_string(accessions, index)?)?;
         validate_accession(accession.as_str())?;
-        filings.push(SecFiling {
+        let filing = SecFiling {
             accession,
             form: SourceIdentifier::try_from(column_string(object, "form", index)?)?,
             filed_on: parse_date(column_string(object, "filingDate", index)?)?,
@@ -466,16 +583,26 @@ fn parse_filing_columns(
             is_xbrl: optional_column_boolish(object, "isXBRL", index)?.unwrap_or(false),
             is_inline_xbrl: optional_column_boolish(object, "isInlineXBRL", index)?
                 .unwrap_or(false),
-        });
+        };
+        retained.admit::<SecFiling>(filing_dynamic_bytes(&filing)?)?;
+        retained.admit_btree_entry::<SourceIdentifier, ()>(filing.accession.retained_bytes())?;
+        if page_accessions
+            .insert(filing.accession.clone(), ())
+            .is_some()
+        {
+            return Err(SecParserError::ConflictingAccession);
+        }
+        filings.push(filing);
     }
     Ok(filings)
 }
 
-fn parse_companion_files(
+fn parse_companions(
     value: Option<&Value>,
     limits: SecParserLimits,
     cancellation: &CancellationToken,
-) -> Result<Vec<SourceIdentifier>, SecParserError> {
+    retained: &mut RetainedJsonBudget,
+) -> Result<Vec<SecSubmissionsCompanion>, SecParserError> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
@@ -487,13 +614,97 @@ fn parse_companion_files(
     companions
         .try_reserve(entries.len())
         .map_err(|_| SecParserError::AllocationFailed)?;
+    let mut names = BTreeMap::new();
     for entry in entries {
         check_parser_cancelled(cancellation)?;
-        let name = required_string(as_object(entry, "companion file")?, "name")?;
+        let object = as_object(entry, "companion file")?;
+        let name = required_string(object, "name")?;
         if name.contains('/') || name.contains('\\') || !name.ends_with(".json") {
             return Err(SecParserError::InvalidCompanionName);
         }
-        companions.push(SourceIdentifier::try_from(name)?);
+        let name = SourceIdentifier::try_from(name)?;
+        retained.admit_btree_entry::<SourceIdentifier, ()>(name.retained_bytes())?;
+        if names.insert(name.clone(), ()).is_some() {
+            return Err(SecParserError::InvalidCompanionCoverage);
+        }
+        let filing_count = required(object, "filingCount")?
+            .as_u64()
+            .filter(|count| *count > 0)
+            .ok_or(SecParserError::InvalidCompanionCoverage)?;
+        if filing_count > u64::try_from(limits.records()).unwrap_or(u64::MAX) {
+            return Err(SecParserError::RecordLimitExceeded);
+        }
+        let filing_from = parse_date(required_string(object, "filingFrom")?)?;
+        let filing_to = parse_date(required_string(object, "filingTo")?)?;
+        if filing_from > filing_to {
+            return Err(SecParserError::InvalidCompanionCoverage);
+        }
+        retained.admit::<SecSubmissionsCompanion>(name.retained_bytes())?;
+        companions.push(SecSubmissionsCompanion {
+            name,
+            filing_count,
+            filing_from,
+            filing_to,
+        });
     }
     Ok(companions)
+}
+
+pub(crate) fn validate_companion_coverage(
+    declaration: &SecSubmissionsCompanion,
+    archive: &SubmissionsArchive,
+) -> Result<(), SecParserError> {
+    if u64::try_from(archive.filings.len()).ok() != Some(declaration.filing_count) {
+        return Err(SecParserError::InvalidCompanionCoverage);
+    }
+    for filing in &archive.filings {
+        if filing.filed_on < declaration.filing_from || filing.filed_on > declaration.filing_to {
+            return Err(SecParserError::InvalidCompanionCoverage);
+        }
+    }
+    Ok(())
+}
+
+fn admit_company_metadata(
+    retained: &mut RetainedJsonBudget,
+    metadata: &SecSubmissionCompanyMetadata,
+) -> Result<(), SecParserError> {
+    retained.admit::<SecSubmissionCompanyMetadata>(metadata.conformed_name.capacity())?;
+    for former in &metadata.former_names {
+        retained.admit::<SecFormerName>(former.name.capacity())?;
+    }
+    for value in [
+        &metadata.entity_type,
+        &metadata.sic,
+        &metadata.sic_description,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        retained.admit::<String>(value.capacity())?;
+    }
+    for pair in &metadata.ticker_exchange_pairs {
+        retained.admit::<SecTickerExchangePair>(
+            pair.ticker
+                .capacity()
+                .checked_add(pair.exchange.capacity())
+                .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn filing_dynamic_bytes(filing: &SecFiling) -> Result<usize, SecParserError> {
+    [
+        Some(&filing.accession),
+        Some(&filing.form),
+        filing.primary_document.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .try_fold(0usize, |total, value| {
+        total
+            .checked_add(value.retained_bytes())
+            .ok_or(SecParserError::RetainedOutputLimitExceeded)
+    })
 }
