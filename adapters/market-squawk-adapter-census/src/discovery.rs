@@ -330,7 +330,16 @@ impl CensusDatasetCatalog {
                     CensusCatalogFailurePredicate::EntryObject,
                 )
             })?;
-            let vintage = required_vintage_diagnosed(entry, "c_vintage")?;
+            let path = required_string_array(entry, "c_dataset", limits)
+                .map_err(catalog_failure(CensusCatalogFailurePredicate::DatasetPath))?;
+            let Some(vintage) = catalog_vintage_diagnosed(entry, &path, expected_vintage)? else {
+                // The global catalog also contains non-year catalog records. Their bounded path
+                // and optional API distribution are retained in the sealed source document, but
+                // cannot become a CensusDataset without inventing a vintage coordinate.
+                distribution_api_url(entry, limits)
+                    .map_err(catalog_failure(CensusCatalogFailurePredicate::Distribution))?;
+                continue;
+            };
             if expected_vintage
                 .is_some_and(|expected| vintage != CensusDatasetVintage::Year(expected))
             {
@@ -339,8 +348,6 @@ impl CensusDatasetCatalog {
                     CensusCatalogFailurePredicate::VintageMismatch,
                 ));
             }
-            let path = required_string_array(entry, "c_dataset", limits)
-                .map_err(catalog_failure(CensusCatalogFailurePredicate::DatasetPath))?;
             let dataset = match vintage {
                 CensusDatasetVintage::Year(year) => CensusDataset::try_new(year, path.join("/")),
                 CensusDatasetVintage::TimeSeries => {
@@ -397,7 +404,7 @@ impl CensusDatasetCatalog {
         }
         datasets.sort_by(|left, right| left.dataset.cmp(&right.dataset));
         Ok(Self {
-            evidence: CensusMetadataEvidence::new(bytes, datasets.len()),
+            evidence: CensusMetadataEvidence::new(bytes, entries.len()),
             datasets,
         })
     }
@@ -1109,25 +1116,33 @@ fn bounded_str(value: &Value, limits: CensusParseLimits) -> Result<&str, CensusA
     Ok(value)
 }
 
-fn required_vintage_diagnosed(
+fn catalog_vintage_diagnosed(
     object: &Map<String, Value>,
-    key: &str,
-) -> Result<CensusDatasetVintage, CensusCatalogParseFailure> {
-    let value = object.get(key).ok_or_else(|| {
-        CensusCatalogParseFailure::new(
-            CensusAdapterError::SchemaDrift,
-            CensusCatalogFailurePredicate::VintageMissing,
-        )
-    })?;
+    path: &[String],
+    expected_vintage: Option<u16>,
+) -> Result<Option<CensusDatasetVintage>, CensusCatalogParseFailure> {
+    let Some(value) = object.get("c_vintage") else {
+        if expected_vintage.is_some() {
+            return Err(CensusCatalogParseFailure::new(
+                CensusAdapterError::SchemaDrift,
+                CensusCatalogFailurePredicate::VintageMissing,
+            ));
+        }
+        return Ok(path
+            .first()
+            .is_some_and(|segment| segment == "timeseries")
+            .then_some(CensusDatasetVintage::TimeSeries));
+    };
     match value {
         Value::Null => Err(CensusCatalogParseFailure::new(
             CensusAdapterError::SchemaDrift,
             CensusCatalogFailurePredicate::VintageNull,
         )),
-        Value::String(value) if value == "timeseries" => Ok(CensusDatasetVintage::TimeSeries),
+        Value::String(value) if value == "timeseries" => Ok(Some(CensusDatasetVintage::TimeSeries)),
         Value::String(value) => value
             .parse::<u16>()
             .map(CensusDatasetVintage::Year)
+            .map(Some)
             .map_err(|_| {
                 CensusCatalogParseFailure::new(
                     CensusAdapterError::SchemaDrift,
@@ -1143,6 +1158,7 @@ fn required_vintage_diagnosed(
             })?;
             u16::try_from(value)
                 .map(CensusDatasetVintage::Year)
+                .map(Some)
                 .map_err(|_| {
                     CensusCatalogParseFailure::new(
                         CensusAdapterError::SchemaDrift,
