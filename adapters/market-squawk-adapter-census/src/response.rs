@@ -2777,7 +2777,7 @@ mod tests {
                     .map_err(|_| crate::CensusAdapterError::InvalidComponent)?,
             ),
             requires: Box::new([]),
-            wildcard_parents: Box::new([]),
+            wildcard: Some(false),
             optional_with_wildcard_for: Box::new([]),
             for_is_wildcard: false,
             grammar_digest: query.request_digest(),

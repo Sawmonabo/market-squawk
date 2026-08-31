@@ -93,11 +93,11 @@ pub enum CensusGeographyFailurePredicate {
     DuplicateIdentity,
     /// A geography entry malformed its required parent list.
     Requires,
-    /// A geography entry malformed its wildcard parent list in one exact closed way.
-    Wildcard(CensusGeographyWildcardFailurePredicate),
+    /// A geography entry malformed its optional wildcard capability.
+    Wildcard,
     /// A geography entry malformed its optional wildcard-parent list.
     OptionalWildcard,
-    /// Wildcard metadata referred to a parent outside the entry's required set.
+    /// Optional-with-wildcard metadata referred to a parent outside the required set.
     ParentGrammar,
     /// A geography entry malformed its optional reference date.
     ReferenceDate,
@@ -105,35 +105,6 @@ pub enum CensusGeographyFailurePredicate {
     Closure,
     /// A non-geography request was supplied to the geography-only parser.
     RequestKind,
-}
-
-/// Closed, payload-free shape failure within optional geography wildcard metadata.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CensusGeographyWildcardFailurePredicate {
-    /// The present wildcard field was null.
-    Null,
-    /// The present wildcard field was a bounded string scalar rather than an array.
-    Scalar,
-    /// The present wildcard scalar exceeded bounds or contained a control character.
-    ScalarBound,
-    /// The wildcard array exceeded the configured column bound.
-    ArrayBound,
-    /// Bounded wildcard-array storage could not be allocated.
-    Allocation,
-    /// A wildcard-array member had a non-string JSON type.
-    MemberType,
-    /// A wildcard-array string exceeded bounds or contained a control character.
-    MemberBound,
-    /// A wildcard-array string was empty.
-    EmptyMember,
-    /// A wildcard-array parent occurred more than once.
-    DuplicateMember,
-    /// The present wildcard field was a boolean.
-    Boolean,
-    /// The present wildcard field was a number.
-    Number,
-    /// The present wildcard field was an object.
-    Object,
 }
 
 #[derive(Debug)]
@@ -879,7 +850,7 @@ pub struct CensusGeographyMetadata {
     geo_level_display: Option<SourceIdentifier>,
     reference_date: Option<CalendarDate>,
     requires: Vec<String>,
-    wildcard: Vec<String>,
+    wildcard: Option<bool>,
     optional_with_wildcard_for: Vec<String>,
 }
 
@@ -904,9 +875,9 @@ impl CensusGeographyMetadata {
         &self.requires
     }
 
-    /// Returns geography names for which wildcard selection is supported.
-    pub fn wildcard(&self) -> &[String] {
-        &self.wildcard
+    /// Returns whether the provider explicitly permits wildcard selection for this geography.
+    pub const fn wildcard(&self) -> Option<bool> {
+        self.wildcard
     }
 
     /// Returns optional containing geography names under wildcard `for` selection.
@@ -936,7 +907,7 @@ pub enum CensusGeographyAdmission {
         for_level: String,
         geo_level_display: Option<SourceIdentifier>,
         requires: Box<[String]>,
-        wildcard_parents: Box<[String]>,
+        wildcard: Option<bool>,
         optional_with_wildcard_for: Box<[String]>,
         for_is_wildcard: bool,
         grammar_digest: [u8; 32],
@@ -954,7 +925,7 @@ impl CensusGeographyAdmission {
                 Self::Standard {
                     for_level,
                     requires,
-                    wildcard_parents,
+                    wildcard,
                     optional_with_wildcard_for,
                     for_is_wildcard,
                     grammar_digest,
@@ -967,18 +938,11 @@ impl CensusGeographyAdmission {
             ) => {
                 let actual_for_wildcard = clause_is_wildcard(for_clause.codes())?;
                 let required_set = requires.iter().map(String::as_str).collect::<BTreeSet<_>>();
-                let wildcard_set = wildcard_parents
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<BTreeSet<_>>();
                 if for_clause.level() != for_level
                     || actual_for_wildcard != *for_is_wildcard
+                    || (actual_for_wildcard && *wildcard != Some(true))
                     || *grammar_digest == [0; 32]
                     || required_set.len() != requires.len()
-                    || wildcard_set.len() != wildcard_parents.len()
-                    || wildcard_set
-                        .iter()
-                        .any(|parent| !required_set.contains(parent))
                 {
                     return Err(CensusAdapterError::MetadataMismatch);
                 }
@@ -1007,11 +971,7 @@ impl CensusGeographyAdmission {
                     return Err(CensusAdapterError::MetadataMismatch);
                 }
                 for clause in in_clauses {
-                    if clause_is_wildcard(clause.codes())?
-                        && !wildcard_parents
-                            .iter()
-                            .any(|parent| parent == clause.level())
-                    {
+                    if clause_is_wildcard(clause.codes())? {
                         return Err(CensusAdapterError::MetadataMismatch);
                     }
                 }
@@ -1094,22 +1054,15 @@ impl CensusGeographyCatalog {
             }
             let requires = optional_string_array(entry, "requires", limits)
                 .map_err(geography_failure(CensusGeographyFailurePredicate::Requires))?;
-            let wildcard = optional_wildcard_array_diagnosed(entry, limits).map_err(
-                |(source, predicate)| {
-                    CensusGeographyParseFailure::new(
-                        source,
-                        CensusGeographyFailurePredicate::Wildcard(predicate),
-                    )
-                },
-            )?;
+            let wildcard = optional_bool(entry, "wildcard")
+                .map_err(geography_failure(CensusGeographyFailurePredicate::Wildcard))?;
             let optional_with_wildcard_for =
                 optional_string_array_or_scalar(entry, "optionalWithWCFor", limits).map_err(
                     geography_failure(CensusGeographyFailurePredicate::OptionalWildcard),
                 )?;
             let required_set = requires.iter().map(String::as_str).collect::<BTreeSet<_>>();
-            if wildcard
+            if optional_with_wildcard_for
                 .iter()
-                .chain(&optional_with_wildcard_for)
                 .any(|parent| !required_set.contains(parent.as_str()))
             {
                 return Err(CensusGeographyParseFailure::new(
@@ -1187,20 +1140,31 @@ impl CensusGeographyCatalog {
         geography: &CensusGeography,
     ) -> Result<CensusGeographyAdmission, CensusAdapterError> {
         let admission = match geography {
-            CensusGeography::Standard { for_clause, .. } => {
+            CensusGeography::Standard {
+                for_clause,
+                in_clauses,
+            } => {
                 let mut matches = self.named(for_clause.level());
                 let entry = matches.next().ok_or(CensusAdapterError::MetadataMismatch)?;
                 if matches.next().is_some() {
                     return Err(CensusAdapterError::MetadataMismatch);
                 }
                 let for_is_wildcard = clause_is_wildcard(for_clause.codes())?;
+                if for_is_wildcard && entry.wildcard != Some(true) {
+                    return Err(CensusAdapterError::MetadataMismatch);
+                }
+                for clause in in_clauses {
+                    if clause_is_wildcard(clause.codes())? {
+                        return Err(CensusAdapterError::MetadataMismatch);
+                    }
+                }
                 let grammar_digest =
                     geography_grammar_digest(&self.dataset, &self.evidence, entry, geography)?;
                 CensusGeographyAdmission::Standard {
                     for_level: entry.name.clone(),
                     geo_level_display: entry.geo_level_display.clone(),
                     requires: entry.requires.clone().into_boxed_slice(),
-                    wildcard_parents: entry.wildcard.clone().into_boxed_slice(),
+                    wildcard: entry.wildcard,
                     optional_with_wildcard_for: entry
                         .optional_with_wildcard_for
                         .clone()
@@ -1417,7 +1381,7 @@ fn optional_string_array(
     key: &str,
     limits: CensusParseLimits,
 ) -> Result<Vec<String>, CensusAdapterError> {
-    let Some(value) = object.get(key) else {
+    let Some(value) = object.get(key).filter(|value| !value.is_null()) else {
         return Ok(Vec::new());
     };
     let values = value.as_array().ok_or(CensusAdapterError::SchemaDrift)?;
@@ -1435,96 +1399,6 @@ fn optional_string_array(
             return Err(CensusAdapterError::SchemaDrift);
         }
         output.push(value.to_owned());
-    }
-    Ok(output)
-}
-
-fn optional_wildcard_array_diagnosed(
-    object: &Map<String, Value>,
-    limits: CensusParseLimits,
-) -> Result<Vec<String>, (CensusAdapterError, CensusGeographyWildcardFailurePredicate)> {
-    let Some(value) = object.get("wildcard") else {
-        return Ok(Vec::new());
-    };
-    let values = match value {
-        Value::Null => {
-            return Err((
-                CensusAdapterError::SchemaDrift,
-                CensusGeographyWildcardFailurePredicate::Null,
-            ));
-        }
-        Value::String(value) => {
-            if value.len() > limits.max_string_bytes() || value.chars().any(char::is_control) {
-                return Err((
-                    CensusAdapterError::ResourceLimitExceeded,
-                    CensusGeographyWildcardFailurePredicate::ScalarBound,
-                ));
-            }
-            return Err((
-                CensusAdapterError::SchemaDrift,
-                CensusGeographyWildcardFailurePredicate::Scalar,
-            ));
-        }
-        Value::Array(values) => values,
-        Value::Bool(_) => {
-            return Err((
-                CensusAdapterError::SchemaDrift,
-                CensusGeographyWildcardFailurePredicate::Boolean,
-            ));
-        }
-        Value::Number(_) => {
-            return Err((
-                CensusAdapterError::SchemaDrift,
-                CensusGeographyWildcardFailurePredicate::Number,
-            ));
-        }
-        Value::Object(_) => {
-            return Err((
-                CensusAdapterError::SchemaDrift,
-                CensusGeographyWildcardFailurePredicate::Object,
-            ));
-        }
-    };
-    if values.len() > limits.max_columns() {
-        return Err((
-            CensusAdapterError::ResourceLimitExceeded,
-            CensusGeographyWildcardFailurePredicate::ArrayBound,
-        ));
-    }
-    let mut output = Vec::new();
-    output.try_reserve_exact(values.len()).map_err(|_| {
-        (
-            CensusAdapterError::ResourceLimitExceeded,
-            CensusGeographyWildcardFailurePredicate::Allocation,
-        )
-    })?;
-    let mut identities = BTreeSet::new();
-    for value in values {
-        let Value::String(value) = value else {
-            return Err((
-                CensusAdapterError::SchemaDrift,
-                CensusGeographyWildcardFailurePredicate::MemberType,
-            ));
-        };
-        if value.len() > limits.max_string_bytes() || value.chars().any(char::is_control) {
-            return Err((
-                CensusAdapterError::ResourceLimitExceeded,
-                CensusGeographyWildcardFailurePredicate::MemberBound,
-            ));
-        }
-        if value.is_empty() {
-            return Err((
-                CensusAdapterError::SchemaDrift,
-                CensusGeographyWildcardFailurePredicate::EmptyMember,
-            ));
-        }
-        if !identities.insert(value.as_str()) {
-            return Err((
-                CensusAdapterError::DuplicateIdentity,
-                CensusGeographyWildcardFailurePredicate::DuplicateMember,
-            ));
-        }
-        output.push(value.clone());
     }
     Ok(output)
 }
