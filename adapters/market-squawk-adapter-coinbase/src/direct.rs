@@ -411,6 +411,7 @@ impl CoinbaseDirectConfig {
         if terms.instrument_id() != mapping.instrument() {
             return Err(CoinbaseConfigError::InvalidDirectInstrumentTerms);
         }
+        mapping.validate_source_scope(&source_id, &effective)?;
         validate_direct_budget(&budget)?;
         let product = mapping.product().as_source_identifier().as_str();
         let snapshot_base = format!("{COINBASE_REST_ORIGIN}/products/{product}/book");
@@ -2753,7 +2754,7 @@ mod tests {
         AuthorizationBasis, ChecksumCapability, ConnectionGeneration, Currency, Denomination,
         DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
         InstrumentDefinitionRevision, InstrumentExecutionTerms, InstrumentId, LotSize,
-        MetadataRevision, PriceTicks, ProviderProduct, QuantityLots, RevisionBoundPayloadEvidence,
+        MetadataRevision, PriceTicks, QuantityLots, RevisionBoundPayloadEvidence,
         SequenceCapability, SourceId, SourceIdentifier, TickSize, Timestamp, TradingStatus,
     };
     use market_squawk_sources::{
@@ -2773,8 +2774,7 @@ mod tests {
         CoinbaseDirectDecodeOutcome, CoinbaseDirectDecoder, CoinbaseDirectHmacSigner,
         CoinbaseDirectLimits, CoinbaseDirectNonBookKind, CoinbaseDirectSigningCapability,
         CoinbaseDirectSigningError, CoinbaseDirectSigningRequest, CoinbaseDirectSnapshotDecoder,
-        CoinbaseDirectSnapshotError, CoinbaseDirectStopType, CoinbaseProductMapping,
-        CoinbaseTransportLimits,
+        CoinbaseDirectSnapshotError, CoinbaseDirectStopType, CoinbaseTransportLimits,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -2901,7 +2901,7 @@ mod tests {
             authorization,
             evidence(4),
             effective,
-            CoinbaseProductMapping::try_new(ProviderProduct::new(id("BTC-USD")?), instrument)?,
+            crate::config::fixture_product_mapping("coinbase-exchange-direct", instrument)?,
             terms,
             FreshnessPolicy::try_new(
                 5_000_000_000,
@@ -3023,6 +3023,19 @@ mod tests {
     #[test]
     fn direct_profile_is_distinct_authenticated_sequenced_and_checksum_truthful() -> TestResult {
         let config = config()?;
+        let attestation = config.instrument_attestation();
+        assert_eq!(
+            attestation.provider_key().source_id().as_str(),
+            "coinbase-exchange-direct"
+        );
+        assert_eq!(
+            attestation.provider_key().provider_instrument_id().as_str(),
+            "BTC-USD"
+        );
+        assert_eq!(
+            attestation.venue_mapping().venue_id().as_str(),
+            "coinbase-exchange"
+        );
         assert_eq!(
             config.websocket_endpoint(),
             COINBASE_DIRECT_WEBSOCKET_ENDPOINT

@@ -7,8 +7,8 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use market_squawk_domain::{
     AuthorizationBasis, ConnectionGeneration, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
-    ExactPayloadEvidence, InstrumentId, MetadataRevision, ProviderProduct,
-    RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp,
+    ExactPayloadEvidence, InstrumentId, MetadataRevision, RevisionBoundPayloadEvidence, SourceId,
+    SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope,
@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use super::CoinbaseExchangeSource;
 use crate::{
     CoinbaseChannel, CoinbaseExchangeConfig, CoinbaseExchangeDecoder, CoinbaseMarketDecodeOutcome,
-    CoinbaseProductMapping, CoinbaseTransportLimits,
+    CoinbaseTransportLimits,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -306,8 +306,8 @@ fn config() -> TestResult<CoinbaseExchangeConfig> {
         authorization,
         evidence(4),
         effective,
-        vec![CoinbaseProductMapping::try_new(
-            ProviderProduct::new(identifier("BTC-USD")?),
+        vec![crate::config::fixture_product_mapping(
+            "coinbase-exchange-public",
             InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
         )?],
         vec![

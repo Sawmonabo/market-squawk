@@ -117,6 +117,26 @@ impl CoinbaseProductMapping {
     ) -> &Arc<ProviderNativeInstrumentAttestation> {
         &self.instrument_attestation
     }
+
+    pub(crate) fn validate_source_scope(
+        &self,
+        source_id: &SourceId,
+        effective: &EffectiveInterval,
+    ) -> Result<(), CoinbaseConfigError> {
+        let attestation = self.instrument_attestation();
+        let validity_contains_profile = match (effective.ends_at(), attestation.valid_until()) {
+            (Some(profile_end), Some(identity_end)) => profile_end <= identity_end,
+            (Some(_), None) | (None, None) => true,
+            (None, Some(_)) => false,
+        };
+        if attestation.provider_key().source_id() != source_id
+            || attestation.validate_at(effective.starts_at()).is_err()
+            || !validity_contains_profile
+        {
+            return Err(CoinbaseConfigError::InvalidNativeProductAttestation);
+        }
+        Ok(())
+    }
 }
 
 /// Count and deadline limits for one exact connection generation.
@@ -207,7 +227,7 @@ impl CoinbaseExchangeConfig {
         if authorization.mode() != AuthorizationMode::PublicInterface {
             return Err(CoinbaseConfigError::InvalidAuthorization);
         }
-        validate_mappings(&mappings)?;
+        validate_mappings(&mappings, &source_id, &effective)?;
         validate_channels(&channels)?;
 
         let venue = mappings
@@ -398,13 +418,18 @@ fn validate_product(value: &str) -> Result<(), CoinbaseConfigError> {
     Ok(())
 }
 
-fn validate_mappings(mappings: &[CoinbaseProductMapping]) -> Result<(), CoinbaseConfigError> {
+fn validate_mappings(
+    mappings: &[CoinbaseProductMapping],
+    source_id: &SourceId,
+    effective: &EffectiveInterval,
+) -> Result<(), CoinbaseConfigError> {
     if mappings.is_empty() || mappings.len() > MAX_PRODUCTS {
         return Err(CoinbaseConfigError::InvalidMappingCount);
     }
     let mut products = BTreeSet::new();
     let mut instruments = BTreeSet::new();
     for mapping in mappings {
+        mapping.validate_source_scope(source_id, effective)?;
         if !products.insert(mapping.product.as_source_identifier().as_str()) {
             return Err(CoinbaseConfigError::DuplicateProduct);
         }
@@ -434,6 +459,131 @@ fn rule(value: &str) -> Result<IntegrityRule, CoinbaseConfigError> {
         SourceIdentifier::try_from(value)?,
         version,
     ))
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_product_mapping(
+    source: &str,
+    instrument: InstrumentId,
+) -> Result<CoinbaseProductMapping, Box<dyn std::error::Error>> {
+    use market_squawk_domain::Timestamp;
+
+    fixture_product_mapping_with_effective(
+        source,
+        instrument,
+        EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+    )
+}
+
+#[cfg(test)]
+fn fixture_product_mapping_with_effective(
+    source: &str,
+    instrument: InstrumentId,
+    effective: EffectiveInterval,
+) -> Result<CoinbaseProductMapping, Box<dyn std::error::Error>> {
+    use market_squawk_domain::{
+        Currency, EvidenceDigest, MarketDataInstrumentDefinition,
+        MarketDataInstrumentDefinitionInput, MetadataRevision, ProviderIdentityEvidence,
+        ProviderIdentityKey, ProviderIdentityRecord, ProviderIdentityRecordInput,
+        ProviderInstrumentId, Timestamp, VenueId, VenueMapping, VenueSymbol,
+    };
+    use market_squawk_sources::ProviderNativeInstrumentAttestationInput;
+
+    let source_id = SourceId::try_from(source)?;
+    let provider_instrument_id = ProviderInstrumentId::try_from("BTC-USD")?;
+    let venue_mapping = VenueMapping::new(
+        VenueId::try_from(COINBASE_VENUE)?,
+        VenueSymbol::try_from("BTC-USD")?,
+    );
+    let digest =
+        |byte| EvidenceDigest::new(market_squawk_domain::DigestAlgorithm::Sha256, [byte; 32]);
+    let definition =
+        MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
+            instrument_id: instrument,
+            reference_evidence: RevisionBoundPayloadEvidence::new(
+                MetadataRevision::new(SourceIdentifier::try_from("coinbase-test-reference-v1")?),
+                ExactPayloadEvidence::from_content_digest(digest(41)),
+            ),
+            effective_interval: effective,
+            asset_class: AssetClass::Crypto,
+            display_name: None,
+            quote_currency: Currency::try_from("USD")?,
+            quote_currency_evidence: ExactPayloadEvidence::from_content_digest(digest(42)),
+            venue_mappings: vec![venue_mapping.clone()],
+            provider_identities: vec![ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+                instrument_id: instrument,
+                source_id: source_id.clone(),
+                provider_instrument_id: provider_instrument_id.clone(),
+                evidence: ProviderIdentityEvidence::from_content_digest(digest(43)),
+                source_timestamp: None,
+                observed_at: Timestamp::from_unix_nanos(0),
+                metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+                    "coinbase-test-provider-identity-v1",
+                )?),
+                validity: effective,
+                supersedes: None,
+            })],
+            identifiers: Vec::new(),
+        })?;
+    let attestation = ProviderNativeInstrumentAttestation::try_select(
+        ProviderNativeInstrumentAttestationInput {
+            definition: &definition,
+            definition_revision_digest: digest(44),
+            definition_published_at: Timestamp::from_unix_nanos(0),
+            provider_key: ProviderIdentityKey::new(source_id, provider_instrument_id),
+            venue_mapping,
+            selected_at: Timestamp::from_unix_nanos(0),
+        },
+    )?;
+    Ok(CoinbaseProductMapping::try_new(
+        ProviderProduct::new(SourceIdentifier::try_from("BTC-USD")?),
+        attestation,
+    )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use market_squawk_domain::Timestamp;
+
+    use super::*;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    #[test]
+    fn native_attestation_scope_must_cover_the_exact_source_profile() -> TestResult {
+        let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
+        let identity_end = Timestamp::from_unix_nanos(10);
+        let mapping = fixture_product_mapping_with_effective(
+            "coinbase-exchange-public",
+            instrument,
+            EffectiveInterval::new(Timestamp::from_unix_nanos(0), Some(identity_end))?,
+        )?;
+        let source = SourceId::try_from("coinbase-exchange-public")?;
+        assert_eq!(
+            mapping.validate_source_scope(
+                &source,
+                &EffectiveInterval::new(Timestamp::from_unix_nanos(0), Some(identity_end))?,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            mapping.validate_source_scope(
+                &source,
+                &EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+            ),
+            Err(CoinbaseConfigError::InvalidNativeProductAttestation)
+        );
+        assert_eq!(
+            mapping.validate_source_scope(
+                &SourceId::try_from("coinbase-other-source")?,
+                &EffectiveInterval::new(Timestamp::from_unix_nanos(0), Some(identity_end),)?,
+            ),
+            Err(CoinbaseConfigError::InvalidNativeProductAttestation)
+        );
+        Ok(())
+    }
 }
 
 /// Coinbase configuration invariant failure.

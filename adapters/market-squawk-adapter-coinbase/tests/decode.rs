@@ -162,8 +162,36 @@ fn decodes_exact_book_and_trade_evidence_without_promoting_integrity() -> TestRe
         snapshot_handoff.raw_payload_digest(),
         snapshot_handoff.typed_batch().evidence().payload_digest()
     );
+    let attestation = snapshot_handoff.evidence().instrument_attestation().clone();
+    assert_eq!(
+        attestation.provider_key().source_id().as_str(),
+        "coinbase-exchange-public"
+    );
+    assert_eq!(
+        attestation.provider_key().provider_instrument_id().as_str(),
+        "BTC-USD"
+    );
+    assert_eq!(
+        attestation.venue_mapping().venue_id().as_str(),
+        "coinbase-exchange"
+    );
+    assert_eq!(
+        attestation.venue_mapping().venue_symbol().as_str(),
+        "BTC-USD"
+    );
+    assert_eq!(
+        attestation
+            .provider_identity_revision()
+            .as_source_identifier()
+            .as_str(),
+        "coinbase-test-provider-identity-v1"
+    );
+    assert_eq!(attestation.provider_identity_digest().bytes(), [43; 32]);
+    assert_eq!(attestation.reference_digest().bytes(), [41; 32]);
+    assert_eq!(attestation.definition_revision_digest().bytes(), [44; 32]);
     let (_evidence, _raw_payload, snapshot) = snapshot_handoff.into_parts();
     let observation = &snapshot.observations()[0];
+    assert_eq!(observation.instrument_attestation(), &attestation);
     assert_eq!(observation.event_class(), LiveEventClass::BookSnapshot);
     assert_eq!(observation.depth(), Some(MarketDepth::PriceLevel));
     assert!(matches!(

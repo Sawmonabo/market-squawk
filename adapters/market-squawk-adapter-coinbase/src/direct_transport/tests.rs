@@ -12,7 +12,7 @@ use market_squawk_domain::{
     AuthorizationBasis, ConnectionGeneration, Currency, DataQuality, Denomination, DigestAlgorithm,
     EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentDefinitionRevision,
     InstrumentExecutionTerms, InstrumentId, LiveEventClass, LotSize, MarketDepth, MetadataRevision,
-    ProviderProduct, RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, TickSize, Timestamp,
+    RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, TickSize, Timestamp,
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
@@ -38,7 +38,7 @@ use crate::{
     CoinbaseDirectAuthentication, CoinbaseDirectConfig, CoinbaseDirectLimits,
     CoinbaseDirectNonBookEvent, CoinbaseDirectProductEvidence, CoinbaseDirectSigningCapability,
     CoinbaseDirectSigningError, CoinbaseDirectSigningRequest, CoinbaseMarketChannel,
-    CoinbaseMarketContinuity, CoinbaseMarketFeed, CoinbaseProductMapping, CoinbaseTransportLimits,
+    CoinbaseMarketContinuity, CoinbaseMarketFeed, CoinbaseTransportLimits,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -936,7 +936,7 @@ fn config() -> TestResult<CoinbaseDirectConfig> {
         authorization,
         evidence(4),
         effective,
-        CoinbaseProductMapping::try_new(ProviderProduct::new(identifier("BTC-USD")?), instrument)?,
+        crate::config::fixture_product_mapping("coinbase-exchange-direct", instrument)?,
         terms,
         FreshnessPolicy::try_new(
             5_000_000_000,

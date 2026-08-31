@@ -2,7 +2,7 @@ mod common;
 
 use std::collections::BTreeSet;
 
-use common::{TestResult, config, config_with_channels};
+use common::{TestResult, config, config_with_channels, config_with_sources};
 use market_squawk_adapter_coinbase::{
     COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT, CoinbaseChannel,
 };
@@ -77,6 +77,18 @@ fn configuration_rejects_duplicate_or_incomplete_subscriptions() -> TestResult {
             CoinbaseChannel::Heartbeats,
             CoinbaseChannel::Heartbeats,
         ],)
+        .is_err()
+    );
+    assert!(
+        config_with_sources(
+            vec![
+                CoinbaseChannel::Level2,
+                CoinbaseChannel::MarketTrades,
+                CoinbaseChannel::Heartbeats,
+            ],
+            "coinbase-other-source",
+            "coinbase-exchange-public",
+        )
         .is_err()
     );
     Ok(())
