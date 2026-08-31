@@ -3001,6 +3001,12 @@ async fn exercise_installed_relay_with_gate(
         .await
         .context("read installed relay initialize response")?;
     assert_eq!(initialized["result"]["protocolVersion"], "2026-07-28");
+    assert!(initialized["result"]["capabilities"]["tools"].is_object());
+    assert!(
+        initialized["result"]["capabilities"]
+            .get("resources")
+            .is_none()
+    );
     write_message(
         &mut peer_writer,
         json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
@@ -3107,20 +3113,6 @@ async fn exercise_installed_relay_with_gate(
             "MCP market overview omitted the native-read investment: {market}"
         );
     }
-    write_message(
-        &mut peer_writer,
-        json!({"jsonrpc":"2.0","id":"installed-resources","method":"resources/list"}),
-    )
-    .await
-    .context("write installed relay resources-list request")?;
-    let resources = read_message(&mut peer_reader)
-        .await
-        .context("read installed relay resources-list response")?;
-    assert!(
-        resources["result"]["resources"]
-            .as_array()
-            .is_some_and(|resources| !resources.is_empty())
-    );
     peer_writer
         .shutdown()
         .await
