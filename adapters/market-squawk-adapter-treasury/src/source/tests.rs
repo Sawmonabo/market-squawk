@@ -324,9 +324,21 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
         .await?;
     assert!(!first.terminal());
     let canonical = first.canonical().ok_or("missing canonical data page")?;
+    let first_content_identity = canonical.content_identity();
     assert_eq!(
         canonical.accounting().aggregate_canonical_points(),
         u64::try_from(canonical.batch().records().len())?
+    );
+    canonical.native_lineage().validate(canonical.batch())?;
+    assert_eq!(
+        canonical.row_capture_page_ordinals().len(),
+        canonical.batch().records().len()
+    );
+    assert!(
+        canonical
+            .row_capture_page_ordinals()
+            .iter()
+            .all(|ordinal| *ordinal == 0)
     );
     let (_, capture, admission) = first.into_parts();
     let (expectation, seal_request) = capture.into_whole_seal_parts();
@@ -381,6 +393,7 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
     restored.accept_sealed_page(admission, sealed)?;
     let completion = restored.acquisition_completion()?;
     assert_eq!(completion.response_count(), 2);
+    assert_eq!(completion.data_page_count(), 1);
     assert_eq!(completion.sealed_pages().len(), 2);
     assert!(completion.source_rows() > 0);
     assert!(completion.canonical_points() > completion.source_rows());
@@ -389,6 +402,23 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
         completion.canonical_content_digests().count(),
         completion.sealed_pages().len() - 1
     );
+    assert_eq!(
+        completion.native_lineage_batch_digests().count(),
+        completion.data_page_count()
+    );
+    let (reopened, reopened_seal) =
+        source.reopen_all_history_canonical_page(&completion, 0, &store)?;
+    assert_eq!(&reopened_seal, &completion.sealed_pages()[0]);
+    assert_eq!(reopened.content_identity(), first_content_identity);
+    reopened.native_lineage().validate(reopened.batch())?;
+    assert_eq!(
+        completion.native_lineage_batch_digests().next(),
+        Some(reopened.native_lineage().batch_digest())
+    );
+    let (reopened_batch, reopened_native, reopened_ordinals) = reopened.into_publication_parts();
+    reopened_native.validate(&reopened_batch)?;
+    assert_eq!(reopened_ordinals.len(), reopened_batch.records().len());
+    assert!(reopened_ordinals.iter().all(|ordinal| *ordinal == 0));
 
     let completed_checkpoint = restored.checkpoint().to_json()?;
     let completed = source.restore_all_history_backfill(&completed_checkpoint, &store)?;

@@ -11,7 +11,7 @@ use market_squawk_sources::{
     ExtractionContentIdentity, ExtractionRecord, ExtractionRequest, ExtractionSourceError,
     MAX_EXTRACTION_BATCH_BYTES, MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
     ProviderCaptureMaterial, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    SealedProviderCaptureSetReceipt, SourceObject,
+    ProviderNativeLineageBatch, SealedProviderCaptureSetReceipt, SourceObject,
 };
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
@@ -26,6 +26,7 @@ use crate::{
 };
 
 use super::lineage::{ObjectKind, ParsedObjectId, invalid_protocol, source_object};
+use super::native_lineage::TreasuryNativeLineagePlan;
 use super::normalize::{CanonicalRecordAdmission, canonical_daily_rate_records};
 use super::{TreasurySource, TreasurySourceConfig};
 
@@ -53,6 +54,7 @@ struct TreasuryAllHistoryPersistedPage {
     validated_at: Timestamp,
     terminal: bool,
     canonical_content_digest: Option<EvidenceDigest>,
+    native_lineage_batch_digest: Option<EvidenceDigest>,
     discovery_request: DiscoveryRequest,
     source_object: SourceObject,
     capture: ProviderCaptureSetReceipt,
@@ -327,7 +329,13 @@ impl TreasuryAllHistoryCheckpoint {
                         || page.explicit_missing_points != 0))
                 || (!page.terminal && page.canonical_points < page.returned_source_rows)
                 || page.terminal == page.canonical_content_digest.is_some()
+                || page.terminal == page.native_lineage_batch_digest.is_some()
                 || page.canonical_content_digest.is_some_and(|digest| {
+                    page.terminal
+                        || digest.algorithm() != DigestAlgorithm::Sha256
+                        || digest.bytes() == [0; 32]
+                })
+                || page.native_lineage_batch_digest.is_some_and(|digest| {
                     page.terminal
                         || digest.algorithm() != DigestAlgorithm::Sha256
                         || digest.bytes() == [0; 32]
@@ -579,6 +587,8 @@ pub struct TreasuryAllHistoryCanonicalPage {
     accounting: TreasuryExtractionAccounting,
     validated_at: Timestamp,
     content_identity: ExtractionContentIdentity,
+    native_lineage: ProviderNativeLineageBatch,
+    row_capture_page_ordinals: Box<[u16]>,
 }
 
 impl TreasuryAllHistoryCanonicalPage {
@@ -602,9 +612,28 @@ impl TreasuryAllHistoryCanonicalPage {
         self.content_identity
     }
 
-    /// Consumes the page for normal analytical staging.
-    pub fn into_batch(self) -> ExtractionBatch {
-        self.batch
+    /// Returns provider-native rate semantics aligned one-for-one with the canonical rows.
+    pub const fn native_lineage(&self) -> &ProviderNativeLineageBatch {
+        &self.native_lineage
+    }
+
+    /// Returns the page-local raw-capture ordinal for each canonical row.
+    pub fn row_capture_page_ordinals(&self) -> &[u16] {
+        &self.row_capture_page_ordinals
+    }
+
+    /// Consumes one replay-validated page into its canonical and native evidence parts.
+    ///
+    /// The exact raw response is already represented by the sealed receipt retained in the
+    /// acquisition completion. These parts preserve the same native-lineage requirement used by
+    /// ordinary Treasury extraction after a process restart. They do not recreate the separate
+    /// one-use application publication authority lost across a process boundary.
+    pub fn into_publication_parts(self) -> (ExtractionBatch, ProviderNativeLineageBatch, Vec<u16>) {
+        (
+            self.batch,
+            self.native_lineage,
+            self.row_capture_page_ordinals.into_vec(),
+        )
     }
 }
 
@@ -735,6 +764,15 @@ impl TreasuryAllHistoryAcquisitionCompletion {
         self.checkpoint.next_page
     }
 
+    /// Returns the number of sealed data-bearing pages, excluding terminal evidence.
+    pub fn data_page_count(&self) -> usize {
+        self.checkpoint
+            .pages
+            .iter()
+            .filter(|page| !page.terminal)
+            .count()
+    }
+
     /// Returns the exact source rows accepted across nonterminal pages.
     pub const fn source_rows(&self) -> u64 {
         self.checkpoint.accepted_source_rows
@@ -782,6 +820,14 @@ impl TreasuryAllHistoryAcquisitionCompletion {
             .pages
             .iter()
             .filter_map(|page| page.canonical_content_digest)
+    }
+
+    /// Returns deterministic provider-native lineage identities for data pages in provider order.
+    pub fn native_lineage_batch_digests(&self) -> impl Iterator<Item = EvidenceDigest> + '_ {
+        self.checkpoint
+            .pages
+            .iter()
+            .filter_map(|page| page.native_lineage_batch_digest)
     }
 
     /// Returns every exact discovered response object, including the empty terminal response.
@@ -869,82 +915,13 @@ impl TreasurySource {
             .try_reserve_exact(checkpoint.pages.len())
             .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
         for persisted in &checkpoint.pages {
-            let claim = persisted
-                .sealed_segment_claim
-                .as_ref()
-                .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)?;
-            let segment = store
-                .open_verified_claim(claim)
-                .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
-            let sealed = SealedProviderCaptureSetReceipt::try_bind(
-                persisted.capture.clone(),
-                segment.receipt().clone(),
-            )
-            .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
-            if Some(sealed.receipt_digest()) != persisted.sealed_receipt_digest
-                || segment.records().len() != 1
-                || ProviderCaptureMaterial::try_new(
-                    persisted.capture.clone(),
-                    segment.records().to_vec(),
-                )
-                .is_err()
-            {
-                return Err(TreasurySourceError::InvalidBackfillCheckpoint);
-            }
-            let page_number = usize::try_from(persisted.page_number)
-                .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
-            let request = query.page(page_number)?;
-            let raw = &segment.records()[0];
-            let page = TreasuryDailyRatePage::parse(raw.payload(), &request, limits)?;
-            validate_replayed_page(persisted, &page)?;
-            let expected_object = source_object(
-                &self.metadata,
-                &persisted.discovery_request,
-                &request,
-                raw.payload(),
-                persisted.received_at,
-                "application/atom+xml",
-                ObjectKind::DailyRate,
-            )
-            .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
-            if expected_object != persisted.source_object {
-                return Err(TreasurySourceError::InvalidBackfillCheckpoint);
-            }
-            if persisted.terminal {
-                if persisted.canonical_content_digest.is_some() {
-                    return Err(TreasurySourceError::InvalidBackfillCheckpoint);
-                }
-            } else {
-                let canonical = prepare_canonical_page(
-                    self,
-                    CanonicalPagePreparation {
-                        descriptor: &checkpoint.descriptor,
-                        object: expected_object,
-                        page: &page,
-                        received_at: persisted.received_at,
-                        validated_at: persisted.validated_at,
-                        raw_body_bytes: raw.payload().len(),
-                        deadline: persisted.discovery_request.deadline(),
-                        capture: &persisted.capture,
-                    },
-                )
-                .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
-                if Some(canonical.content_identity().digest()) != persisted.canonical_content_digest
-                    || u64::try_from(canonical.content_identity().record_count()).ok()
-                        != Some(persisted.canonical_points)
-                    || canonical.accounting().aggregate_observed_numeric_points()
-                        != persisted.observed_numeric_points
-                    || canonical.accounting().aggregate_explicit_missing_points()
-                        != persisted.explicit_missing_points
-                {
-                    return Err(TreasurySourceError::InvalidBackfillCheckpoint);
-                }
-            }
-            let terminal = tracker.accept(&page)?;
+            let reopened =
+                reopen_persisted_page(self, &checkpoint.descriptor, persisted, store, limits)?;
+            let terminal = tracker.accept(&reopened.page)?;
             if terminal != persisted.terminal {
                 return Err(TreasurySourceError::InvalidBackfillCheckpoint);
             }
-            verified_seals.push(sealed);
+            verified_seals.push(reopened.sealed);
         }
         if tracker_terminal_matches_checkpoint(&checkpoint, &verified_seals) {
             Ok(TreasuryAllHistoryBackfill {
@@ -955,6 +932,52 @@ impl TreasurySource {
         } else {
             Err(TreasurySourceError::InvalidBackfillCheckpoint)
         }
+    }
+
+    /// Reopens one exact data-bearing page from a completed acquisition without network access.
+    ///
+    /// The returned canonical batch, native lineage, row-to-capture alignment, and verified seal
+    /// are reproduced from the same retained response and validation clock. The empty terminal
+    /// response remains completion evidence and cannot be projected as an analytical page. The
+    /// verified seal is restart evidence, not recreated one-use application publication authority.
+    pub fn reopen_all_history_canonical_page(
+        &self,
+        completion: &TreasuryAllHistoryAcquisitionCompletion,
+        page_number: usize,
+        store: &SealedResearchJournalStore,
+    ) -> Result<
+        (
+            TreasuryAllHistoryCanonicalPage,
+            SealedProviderCaptureSetReceipt,
+        ),
+        TreasurySourceError,
+    > {
+        validate_checkpoint_source(self, &completion.checkpoint)?;
+        if !completion.checkpoint.terminal_observed
+            || completion.sealed_pages.len() != completion.checkpoint.pages.len()
+        {
+            return Err(TreasurySourceError::InvalidBackfillCheckpoint);
+        }
+        let persisted = completion
+            .checkpoint
+            .pages
+            .get(page_number)
+            .filter(|page| !page.terminal)
+            .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)?;
+        let reopened = reopen_persisted_page(
+            self,
+            &completion.checkpoint.descriptor,
+            persisted,
+            store,
+            FiscalDataParseLimits::production_defaults(),
+        )?;
+        if completion.sealed_pages.get(page_number) != Some(&reopened.sealed) {
+            return Err(TreasurySourceError::InvalidBackfillCheckpoint);
+        }
+        let canonical = reopened
+            .canonical
+            .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)?;
+        Ok((canonical, reopened.sealed))
     }
 
     /// Fetches and prepares exactly the next page without advancing durable progress.
@@ -1089,6 +1112,9 @@ impl TreasurySource {
             canonical_content_digest: canonical
                 .as_ref()
                 .map(|page| page.content_identity.digest()),
+            native_lineage_batch_digest: canonical
+                .as_ref()
+                .map(|page| page.native_lineage().batch_digest()),
             discovery_request: discovery,
             source_object: object,
             capture: expected_capture.clone(),
@@ -1182,11 +1208,121 @@ fn prepare_canonical_page(
     .map_err(|_| invalid_protocol())?;
     let batch = batch.finish()?.try_bind_provider_capture(capture)?;
     let content_identity = ExtractionContentIdentity::try_from_batch(&batch)?;
+    let native_plan =
+        TreasuryNativeLineagePlan::try_daily(descriptor.provider_dataset().clone(), page.clone())
+            .map_err(super::map_adapter_error)?;
+    let (native_lineage, row_capture_page_ordinals) = native_plan
+        .try_encode(&batch)
+        .map_err(super::map_adapter_error)?;
+    if row_capture_page_ordinals.len() != batch.records().len()
+        || row_capture_page_ordinals
+            .iter()
+            .any(|ordinal| *ordinal != 0)
+    {
+        return Err(invalid_protocol());
+    }
     Ok(TreasuryAllHistoryCanonicalPage {
         batch,
         accounting,
         validated_at,
         content_identity,
+        native_lineage,
+        row_capture_page_ordinals: row_capture_page_ordinals.into_boxed_slice(),
+    })
+}
+
+struct ReopenedAllHistoryPage {
+    page: TreasuryDailyRatePage,
+    sealed: SealedProviderCaptureSetReceipt,
+    canonical: Option<TreasuryAllHistoryCanonicalPage>,
+}
+
+fn reopen_persisted_page(
+    source: &TreasurySource,
+    descriptor: &TreasuryDatasetDescriptor,
+    persisted: &TreasuryAllHistoryPersistedPage,
+    store: &SealedResearchJournalStore,
+    limits: FiscalDataParseLimits,
+) -> Result<ReopenedAllHistoryPage, TreasurySourceError> {
+    let claim = persisted
+        .sealed_segment_claim
+        .as_ref()
+        .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)?;
+    let segment = store
+        .open_verified_claim(claim)
+        .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
+    let sealed = SealedProviderCaptureSetReceipt::try_bind(
+        persisted.capture.clone(),
+        segment.receipt().clone(),
+    )
+    .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
+    if Some(sealed.receipt_digest()) != persisted.sealed_receipt_digest
+        || segment.records().len() != 1
+        || ProviderCaptureMaterial::try_new(persisted.capture.clone(), segment.records().to_vec())
+            .is_err()
+    {
+        return Err(TreasurySourceError::InvalidBackfillCheckpoint);
+    }
+    let query = all_history_query(source, descriptor.provider_dataset())?;
+    let page_number = usize::try_from(persisted.page_number)
+        .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
+    let request = query.page(page_number)?;
+    let raw = &segment.records()[0];
+    let page = TreasuryDailyRatePage::parse(raw.payload(), &request, limits)?;
+    validate_replayed_page(persisted, &page)?;
+    let expected_object = source_object(
+        &source.metadata,
+        &persisted.discovery_request,
+        &request,
+        raw.payload(),
+        persisted.received_at,
+        "application/atom+xml",
+        ObjectKind::DailyRate,
+    )
+    .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
+    if expected_object != persisted.source_object {
+        return Err(TreasurySourceError::InvalidBackfillCheckpoint);
+    }
+    let canonical = if persisted.terminal {
+        if persisted.canonical_content_digest.is_some()
+            || persisted.native_lineage_batch_digest.is_some()
+        {
+            return Err(TreasurySourceError::InvalidBackfillCheckpoint);
+        }
+        None
+    } else {
+        let canonical = prepare_canonical_page(
+            source,
+            CanonicalPagePreparation {
+                descriptor,
+                object: expected_object,
+                page: &page,
+                received_at: persisted.received_at,
+                validated_at: persisted.validated_at,
+                raw_body_bytes: raw.payload().len(),
+                deadline: persisted.discovery_request.deadline(),
+                capture: &persisted.capture,
+            },
+        )
+        .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
+        if Some(canonical.content_identity().digest()) != persisted.canonical_content_digest
+            || u64::try_from(canonical.content_identity().record_count()).ok()
+                != Some(persisted.canonical_points)
+            || Some(canonical.native_lineage().batch_digest())
+                != persisted.native_lineage_batch_digest
+            || canonical.accounting().aggregate_observed_numeric_points()
+                != persisted.observed_numeric_points
+            || canonical.accounting().aggregate_explicit_missing_points()
+                != persisted.explicit_missing_points
+        {
+            return Err(TreasurySourceError::InvalidBackfillCheckpoint);
+        }
+        Some(canonical)
+    };
+    Ok(ReopenedAllHistoryPage {
+        page,
+        sealed,
+        canonical,
     })
 }
 
