@@ -409,6 +409,24 @@ impl BeaMacroApplicationClosure {
     }
 }
 
+impl ProductionResearchIngestCoordinator {
+    /// Reopens one exact BEA generation through the application-owned research service.
+    ///
+    /// This is deliberately credential-free: restart consumers supply only the immutable
+    /// selector and fixed typed point-in-time request assembled by the provider activation lane.
+    pub(crate) async fn read_bea_provider_period_latest_known(
+        &self,
+        request: BeaProviderPeriodLatestKnownRequest,
+        limits: QueryLimits,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<BeaMacroCapabilityState, BeaMacroApplicationError> {
+        BeaMacroApplicationClosure::new(Arc::clone(&self.research))
+            .read_provider_period_latest_known(request, limits, deadline, cancellation)
+            .await
+    }
+}
+
 /// Callable BEA Regional source through exact raw sealing, immutable publication, and PIT read.
 pub(crate) struct BeaRegionalLiveRuntime {
     coordinator: Arc<ProductionResearchIngestCoordinator>,

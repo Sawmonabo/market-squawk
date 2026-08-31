@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use super::{ProviderAdapterActivation, provider_research_rights, runtime_generation};
 use crate::application::{
     BEA_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION, BeaLivePublicationError, BeaMacroApplicationError,
-    BeaProviderPeriodLatestKnownDto, BeaProviderPeriodLatestKnownRequest,
+    BeaMacroCapabilityState, BeaProviderPeriodLatestKnownDto, BeaProviderPeriodLatestKnownRequest,
     BeaRegionalLiveComposition, BeaRegionalLiveOutcome, BeaRegionalLiveRequest,
     BeaRegionalLiveRuntime, ResearchIngestCompositionError, ResearchProviderRuntimeGeneration,
 };
@@ -651,6 +651,28 @@ impl ProviderAdapterActivation {
         drop(onboarding);
         activation.publish_and_read(request, context).await
     }
+
+    /// Reopens one caller-pinned immutable BEA generation without loading a credential or making
+    /// a provider request. This is the process-restart read path for Desktop, CLI, and MCP
+    /// composition once those shared surfaces register the fixed operation.
+    pub(crate) async fn read_bea_regional_restart(
+        &self,
+        request: BeaRegionalRestartRead,
+        cancellation: CancellationToken,
+    ) -> Result<BeaRegionalRestartOutput, BeaProductError> {
+        let (request, limits, deadline, completion) = request.into_parts();
+        let state = self
+            .research
+            .read_bea_provider_period_latest_known(request, limits, deadline, cancellation)
+            .await?;
+        let read = match state {
+            BeaMacroCapabilityState::Available(read) => read,
+            BeaMacroCapabilityState::SetupRequired(_) | BeaMacroCapabilityState::Unavailable(_) => {
+                return Err(BeaProductError::InvalidReadResult);
+            }
+        };
+        completion.complete(read)
+    }
 }
 
 fn fixed_regional_contract() -> Result<BeaDatasetContract, BeaProductError> {
@@ -726,4 +748,299 @@ pub(crate) enum BeaProductError {
     Query(#[from] QueryError),
     #[error(transparent)]
     Onboarding(#[from] ProviderOnboardingError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        ffi::OsString,
+        num::NonZeroU16,
+        sync::Arc,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    use market_squawk_adapter_bea::{bea_api_endpoint_rule, bea_provider_rate_declaration};
+    use market_squawk_data::{
+        CatalogConfig, CatalogResultLimits, ObjectStoreConfig, SqliteProviderRateStore,
+    };
+    use market_squawk_domain::{
+        AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
+        EffectiveInterval, ExactPayloadEvidence, MetadataRevision, RevisionBoundPayloadEvidence,
+        SchemaVersion, SequenceCapability,
+    };
+    use market_squawk_platform::{
+        AppConfig, ConfigOverrides, ConfigSources, EncryptedFileSecretStore,
+        LocalAuthorityStateStore, LocalPaths, SecretValue,
+    };
+    use market_squawk_services::{JsonStructureLimits, RequestId, ServiceLimits};
+    use market_squawk_sources::{
+        AuthoritativeSourceRegistry, AuthorizationGrant, CoverageDomain, EndpointPolicy,
+        FreshnessPolicy, HistoricalCapability, HttpRequestBounds, NetworkAccessPolicy,
+        ProviderRateAuthority, ProviderRateDeclaration, SourceCapabilities, SourceClass,
+        SourceCoverage, SourceMetadataInput, SourceProtocolProfile,
+    };
+
+    use super::*;
+    use crate::ResearchService;
+    use crate::application::ResearchExtractionLimits;
+    use crate::provider_onboarding::StartOnboardingRequest;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// One intentionally ignored live proof covers the only code-owned BEA response family and the
+    /// complete protected setup -> sealed raw -> immutable macro -> PIT -> restart journey. It is
+    /// ignored in normal test runs because it requires an operator credential and network access.
+    #[tokio::test]
+    #[ignore = "requires BEA_USER_ID and bounded live BEA access"]
+    async fn protected_regional_live_publication_and_restart_are_exact() -> TestResult {
+        let user_id = std::env::var("BEA_USER_ID")?;
+        BeaUserId::try_new(user_id.clone())?;
+
+        let temporary = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(temporary.path().join("product"))?;
+        let provider_rate =
+            ProviderRateAuthority::try_new(Arc::new(SqliteProviderRateStore::try_open(
+                paths.control_root()?.root().join("provider-rate.sqlite3"),
+            )?))?;
+        let secrets = Arc::new(EncryptedFileSecretStore::try_open(
+            paths.control_root()?.root().join("provider-secrets"),
+            SecretValue::new("bea-live-proof-local-unlock".to_owned())?,
+        )?);
+        let (research, onboarding, _publisher) =
+            ResearchService::open_or_initialize_with_provider_onboarding_service(
+                &paths,
+                catalog_config(&paths)?,
+                8,
+                object_store_config()?,
+                secrets,
+                provider_rate.clone(),
+            )?;
+        let research = Arc::new(research);
+        let onboarding = Arc::new(onboarding);
+        let registry = AuthoritativeSourceRegistry::try_new_durable_with_authorization_subject_resolver_and_provider_rate(
+            LocalAuthorityStateStore::try_open(
+                paths.control_root()?.root().join("source-authority"),
+            )?,
+            Arc::new(provider_rate.clone()),
+            provider_rate.clone(),
+        )?;
+        let (coordinator, mutation, alpaca) =
+            crate::application::ProductionResearchIngestCoordinator::try_new_with_runtime_authorities(
+                registry,
+                Arc::clone(&research),
+                ResearchExtractionLimits::standard(),
+                std::iter::empty(),
+            )?;
+        let coordinator = Arc::new(coordinator);
+        let app_config = AppConfig::load(ConfigSources::new(
+            None,
+            &BTreeMap::<OsString, OsString>::new(),
+            ConfigOverrides {
+                data_dir: Some(temporary.path().join("app-data")),
+                ..ConfigOverrides::default()
+            },
+        ))?;
+        let activation = ProviderAdapterActivation::new(
+            Arc::clone(&onboarding),
+            Arc::clone(&coordinator),
+            mutation,
+            app_config,
+            provider_rate,
+            paths.control_root()?.root().to_path_buf(),
+        );
+
+        let started = onboarding
+            .start(
+                StartOnboardingRequest::try_new(BEA_SURFACE, None, None)?,
+                CancellationToken::new(),
+            )
+            .await?;
+        let imported = onboarding
+            .submit_secret(
+                started.session_id(),
+                SecretValue::new(user_id)?,
+                CancellationToken::new(),
+            )
+            .await?;
+        let prepared = onboarding
+            .prepare_runtime_activation_target(imported.session_id(), CancellationToken::new())
+            .await?;
+        let lease = onboarding.commit_prepared_activation(&prepared).await?;
+        let metadata = source_metadata(&lease)?;
+        activation
+            .prepare_bea_regional(lease, metadata, CancellationToken::new())
+            .await?;
+
+        let now = current_timestamp()?;
+        let provider_deadline = now.checked_add_nanos(120_000_000_000)?;
+        let knowledge_cutoff = now.checked_add_nanos(120_000_000_000)?;
+        let period = ResearchPeriod::try_new(
+            SourceIdentifier::try_from(BEA_ANNUAL_PERIOD_SCHEME)?,
+            2026,
+            NonZeroU16::MIN,
+            SourceIdentifier::try_from("2026")?,
+        )?;
+        let operation_deadline = Instant::now() + Duration::from_secs(120);
+        let outcome = activation
+            .execute_bea_regional(
+                BeaRegionalProductRequest::try_new(
+                    provider_deadline,
+                    provider_deadline,
+                    operation_deadline,
+                    knowledge_cutoff,
+                    period.clone(),
+                    operation_deadline,
+                )?,
+                &request_context(operation_deadline)?,
+            )
+            .await?;
+        let restart_selector = outcome.ready().restart_selector().clone();
+        let selection_digest = outcome.ready().selection_digest();
+        let selected_observations = outcome.ready().selected_observations();
+        let manifest = restart_selector.manifest().clone();
+        assert!(selected_observations > 0);
+        assert_eq!(restart_selector.source_id().as_str(), BEA_SOURCE_ID);
+
+        drop(outcome);
+        drop(activation);
+        drop(onboarding);
+        drop(alpaca);
+        drop(coordinator);
+        drop(research);
+
+        let reopened = Arc::new(ResearchService::open_or_initialize(
+            &paths,
+            catalog_config(&paths)?,
+            8,
+            object_store_config()?,
+        )?);
+        reopened
+            .recover_provider_capture_store(&CancellationToken::new())
+            .await?;
+        let read = crate::application::BeaMacroApplicationClosure::new(reopened)
+            .read_provider_period_latest_known(
+                BeaProviderPeriodLatestKnownRequest::try_new(
+                    restart_selector.clone(),
+                    fixed_series_allowlist()?,
+                    knowledge_cutoff,
+                    period,
+                )?,
+                fixed_query_limits()?,
+                Instant::now() + Duration::from_secs(10),
+                CancellationToken::new(),
+            )
+            .await?;
+        let read = read
+            .available()
+            .ok_or("restarted BEA read is unavailable")?;
+        assert_eq!(read.reopened().manifest(), &manifest);
+        assert_eq!(read.output().selection_digest(), selection_digest);
+        assert_eq!(read.output().observations().len(), selected_observations);
+        eprintln!(
+            "BEA_LIVE_EVIDENCE source={} dataset={} table={} line={} geography={} period_scope={} canonical_rows={} selected_rows={} manifest_dataset={} manifest_version={} selection={selection_digest:?}",
+            BEA_SOURCE_ID,
+            REGIONAL_DATASET,
+            REGIONAL_TABLE,
+            REGIONAL_LINE_CODE,
+            REGIONAL_GEO_FIPS,
+            REGIONAL_YEAR_SCOPE,
+            restart_selector.total_rows(),
+            selected_observations,
+            manifest.dataset_id().as_str(),
+            manifest.manifest_version(),
+        );
+        Ok(())
+    }
+
+    fn source_metadata(lease: &ProviderActivationLease) -> TestResult<SourceMetadata> {
+        let contract = fixed_regional_contract()?;
+        let config = BeaSourceConfig::try_new(vec![contract], fixed_parse_limits()?)?;
+        let effective = EffectiveInterval::new(
+            lease.authority_effective_at(),
+            lease.verification_expires_at(),
+        )?;
+        let provider = SourceIdentifier::try_from("bea")?;
+        let evidence = ExactPayloadEvidence::from_content_digest(lease.capability_digest());
+        let authorization = AuthorizationGrant::new(
+            AuthorizationMode::UserAuthorized,
+            AuthorizationBasis::new(ProviderRateDeclaration::governed_provider_subject(
+                &provider,
+            )?),
+            evidence.clone(),
+            effective,
+        );
+        let network = EndpointPolicy::try_from_api_rules(
+            vec![bea_api_endpoint_rule(&config)?],
+            HttpRequestBounds::default(),
+        )?;
+        Ok(SourceMetadata::try_new(SourceMetadataInput::new(
+            SchemaVersion::CURRENT,
+            SourceId::try_from(BEA_SOURCE_ID)?,
+            RevisionBoundPayloadEvidence::new(
+                MetadataRevision::new(SourceIdentifier::try_from("bea-regional-v1")?),
+                evidence.clone(),
+            ),
+            SourceClass::OfficialAgency,
+            provider,
+            authorization,
+            SourceCoverage::try_non_instrument(
+                evidence,
+                effective,
+                CoverageDomain::Macroeconomic,
+                CoverageDelay::Delayed(1),
+                DeliveryEvidence::Unknown,
+            )?,
+            DataQuality::OfficialDelayed,
+            NetworkAccessPolicy::Allowlisted(network),
+            FreshnessPolicy::try_new(60, 60, 60, 60, 1)?,
+            Some(bea_provider_rate_declaration()?.policy().clone()),
+            SourceCapabilities::new(
+                false,
+                true,
+                SequenceCapability::Unsupported,
+                ChecksumCapability::Unsupported,
+                HistoricalCapability::Historical,
+                false,
+            ),
+            SourceProtocolProfile::NotLive,
+        ))?)
+    }
+
+    fn catalog_config(paths: &LocalPaths) -> TestResult<CatalogConfig> {
+        Ok(CatalogConfig::try_new(
+            paths.catalog()?.clone(),
+            Duration::from_millis(750),
+            market_squawk_data::CatalogLimit::new(64)?,
+            CatalogResultLimits::try_new(1_024 * 1_024, 8 * 1_024 * 1_024)?,
+        )?)
+    }
+
+    fn object_store_config() -> TestResult<ObjectStoreConfig> {
+        Ok(ObjectStoreConfig::try_new(
+            16 * 1_024 * 1_024,
+            1_024,
+            Duration::from_secs(60),
+        )?)
+    }
+
+    fn request_context(deadline: Instant) -> TestResult<RequestContext> {
+        Ok(RequestContext::new(
+            RequestId::String(Arc::from("test.bea-live-publication")),
+            CancellationToken::new(),
+            deadline,
+            ServiceLimits::try_new(
+                4_096,
+                8,
+                4_096,
+                8,
+                JsonStructureLimits::try_new(32, 8_192, 128, 128)?,
+            )?,
+        ))
+    }
+
+    fn current_timestamp() -> TestResult<Timestamp> {
+        let nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+        Ok(Timestamp::from_unix_nanos(nanos))
+    }
 }

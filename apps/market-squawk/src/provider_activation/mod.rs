@@ -2,6 +2,7 @@
 
 mod account;
 mod alpaca;
+mod bea;
 mod bls;
 pub(crate) mod credentials;
 mod direct;
@@ -66,6 +67,10 @@ use specs::BlsAdapterConfiguration;
 pub(crate) use account::ProviderAccountRuntimeCurrentness;
 pub use account::{ProviderAccountActivationError, ProviderAccountBinding, ProviderMarketAccount};
 pub use alpaca::{AlpacaBasicAccountActivation, AlpacaBasicActivationError};
+pub(crate) use bea::{
+    BeaProductAvailability, BeaProductError, BeaProductStatus, BeaRegionalProductOutput,
+    BeaRegionalProductRequest, BeaRegionalRestartOutput, BeaRegionalRestartRead,
+};
 pub(crate) use bls::{
     MacroProviderPeriodLatestKnownOutput, MacroProviderPeriodLatestKnownRequest,
     MacroProviderPeriodOperationError,
@@ -309,6 +314,7 @@ pub struct ProviderAdapterActivation {
     app_config: AppConfig,
     provider_rate: ProviderRateAuthority,
     provider_control_root: PathBuf,
+    bea: RwLock<Option<Arc<bea::BeaProductActivation>>>,
     bls: RwLock<Option<Arc<bls::BlsProductActivation>>>,
     sec_fund: RwLock<Option<Arc<SecFundProductActivation>>>,
     yahoo: RwLock<Option<Arc<yahoo::YahooProductActivation>>>,
@@ -551,6 +557,7 @@ impl ProviderAdapterActivation {
             app_config,
             provider_rate,
             provider_control_root,
+            bea: RwLock::new(None),
             bls: RwLock::new(None),
             sec_fund: RwLock::new(None),
             yahoo: RwLock::new(None),
@@ -577,6 +584,7 @@ impl ProviderAdapterActivation {
             app_config,
             provider_rate,
             provider_control_root,
+            bea: RwLock::new(None),
             bls: RwLock::new(None),
             sec_fund: RwLock::new(None),
             yahoo: RwLock::new(None),

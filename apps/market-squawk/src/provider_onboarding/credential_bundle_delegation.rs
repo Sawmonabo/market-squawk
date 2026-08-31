@@ -61,7 +61,7 @@ const BLS_REGISTERED_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
 const BEA_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "bea.api-data",
     capability_revision: 3,
-    release_state: ProfileReleaseState::RefreshRequired,
+    release_state: ProfileReleaseState::Available,
 };
 const CENSUS_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "census.data-api",
