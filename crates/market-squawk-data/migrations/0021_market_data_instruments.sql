@@ -3108,9 +3108,19 @@ BEFORE UPDATE ON provider_macro_plan_values BEGIN
     SELECT RAISE(ABORT, 'provider macro-plan values are immutable');
 END;
 
-CREATE TRIGGER provider_macro_plan_values_immutable_delete
-BEFORE DELETE ON provider_macro_plan_values BEGIN
-    SELECT RAISE(ABORT, 'provider macro-plan values are immutable');
+CREATE TRIGGER provider_macro_plan_values_guarded_delete
+BEFORE DELETE ON provider_macro_plan_values
+WHEN OLD.value_kind <> 'checkpoint'
+    OR EXISTS (
+        SELECT 1 FROM provider_macro_plan_sessions AS session
+        WHERE session.checkpoint_value_id = OLD.value_id
+    )
+    OR EXISTS (
+        SELECT 1 FROM provider_macro_plan_value_chunks AS chunk
+        WHERE chunk.value_id = OLD.value_id
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'provider macro-plan value cannot be retired');
 END;
 
 CREATE TRIGGER provider_macro_plan_value_chunks_immutable_update
@@ -3118,9 +3128,20 @@ BEFORE UPDATE ON provider_macro_plan_value_chunks BEGIN
     SELECT RAISE(ABORT, 'provider macro-plan value chunks are immutable');
 END;
 
-CREATE TRIGGER provider_macro_plan_value_chunks_immutable_delete
-BEFORE DELETE ON provider_macro_plan_value_chunks BEGIN
-    SELECT RAISE(ABORT, 'provider macro-plan value chunks are immutable');
+CREATE TRIGGER provider_macro_plan_value_chunks_guarded_delete
+BEFORE DELETE ON provider_macro_plan_value_chunks
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM provider_macro_plan_values AS value
+    WHERE value.value_id = OLD.value_id
+      AND value.value_kind = 'checkpoint'
+      AND NOT EXISTS (
+          SELECT 1 FROM provider_macro_plan_sessions AS session
+          WHERE session.checkpoint_value_id = value.value_id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'provider macro-plan value chunk cannot be retired');
 END;
 
 CREATE TRIGGER provider_macro_plan_staged_pages_immutable_update

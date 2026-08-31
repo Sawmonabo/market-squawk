@@ -610,7 +610,7 @@ impl Catalog {
                  analytical_row_count=analytical_row_count+?4,
                  semantics_bytes=semantics_bytes+?5, updated_at_ns=?6
              WHERE session_id=?7 AND state='acquiring' AND state_version=?8
-               AND checkpoint_digest=?9",
+               AND checkpoint_digest=?9 AND checkpoint_value_id=?10",
             params![
                 i64::from(next_version),
                 digest_bytes(successor_digest),
@@ -621,11 +621,18 @@ impl Catalog {
                 expected.session_id.to_string(),
                 i64::from(expected.state_version),
                 digest_bytes(expected.checkpoint_digest),
+                digest_bytes(session.checkpoint_value_id),
             ],
         )?;
         if updated != 1 {
             return Err(CatalogError::ProviderCaptureConflict);
         }
+        retire_superseded_checkpoint_value(
+            &transaction,
+            expected.session_id,
+            session.checkpoint_value_id,
+            checkpoint_value.value_id,
+        )?;
         transaction.commit()?;
         Ok(ProviderMacroPlanStageCoordinate {
             session_id: expected.session_id,
@@ -699,7 +706,7 @@ impl Catalog {
              SET state='complete', state_version=?1, checkpoint_digest=?2,
                  checkpoint_value_id=?3, response_count=response_count+1, updated_at_ns=?4
              WHERE session_id=?5 AND state='acquiring' AND state_version=?6
-               AND checkpoint_digest=?7",
+               AND checkpoint_digest=?7 AND checkpoint_value_id=?8",
             params![
                 i64::from(next_version),
                 digest_bytes(successor_digest),
@@ -708,11 +715,18 @@ impl Catalog {
                 expected.session_id.to_string(),
                 i64::from(expected.state_version),
                 digest_bytes(expected.checkpoint_digest),
+                digest_bytes(session.checkpoint_value_id),
             ],
         )?;
         if updated != 1 {
             return Err(CatalogError::ProviderCaptureConflict);
         }
+        retire_superseded_checkpoint_value(
+            &transaction,
+            expected.session_id,
+            session.checkpoint_value_id,
+            checkpoint_value.value_id,
+        )?;
         let completed = load_completed_session(&transaction, expected.session_id)?;
         transaction.commit()?;
         Ok(completed)
@@ -812,11 +826,67 @@ struct StoredSession {
     key: ProviderMacroPlanSessionKey,
     state: String,
     coordinate: ProviderMacroPlanStageCoordinate,
+    checkpoint_value_id: EvidenceDigest,
     checkpoint: Box<[u8]>,
     response_count: u16,
     data_page_count: u16,
     analytical_row_count: u64,
     semantics_bytes: u64,
+}
+
+fn retire_superseded_checkpoint_value(
+    transaction: &Transaction<'_>,
+    session_id: Uuid,
+    predecessor_value_id: EvidenceDigest,
+    successor_value_id: EvidenceDigest,
+) -> Result<(), CatalogError> {
+    if predecessor_value_id == successor_value_id {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    let predecessor_chunk_count: i64 = transaction
+        .query_row(
+            "SELECT chunk_count FROM provider_macro_plan_values
+             WHERE value_id=?1 AND session_id=?2 AND value_kind='checkpoint'",
+            params![digest_bytes(predecessor_value_id), session_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(CatalogError::CorruptCatalog)?;
+    let predecessor_chunk_count = usize::try_from(predecessor_chunk_count)
+        .ok()
+        .filter(|count| (1..=MAX_PROVIDER_MACRO_PLAN_VALUE_CHUNKS).contains(count))
+        .ok_or(CatalogError::CorruptCatalog)?;
+    let successor_is_current: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM provider_macro_plan_sessions
+             WHERE session_id=?1 AND checkpoint_value_id=?2
+         )",
+        params![session_id.to_string(), digest_bytes(successor_value_id)],
+        |row| row.get(0),
+    )?;
+    if !successor_is_current {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    let deleted_chunks = transaction.execute(
+        "DELETE FROM provider_macro_plan_value_chunks WHERE value_id=?1",
+        [digest_bytes(predecessor_value_id)],
+    )?;
+    if deleted_chunks != predecessor_chunk_count {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    let deleted_value = transaction.execute(
+        "DELETE FROM provider_macro_plan_values
+         WHERE value_id=?1 AND session_id=?2 AND value_kind='checkpoint'
+           AND NOT EXISTS (
+               SELECT 1 FROM provider_macro_plan_sessions
+               WHERE checkpoint_value_id=?1
+           )",
+        params![digest_bytes(predecessor_value_id), session_id.to_string()],
+    )?;
+    if deleted_value != 1 {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    Ok(())
 }
 
 fn retain_chunked_value(
@@ -1072,7 +1142,8 @@ fn load_session(connection: &Connection, session_id: Uuid) -> Result<StoredSessi
         .ok_or(CatalogError::ProviderCaptureConflict)?;
     let checkpoint_digest = parse_sha256(&row.7)?;
     let state_version = parse_u16(row.6)?;
-    let checkpoint = load_chunked_value(connection, parse_sha256(&row.8)?)?;
+    let checkpoint_value_id = parse_sha256(&row.8)?;
+    let checkpoint = load_chunked_value(connection, checkpoint_value_id)?;
     if checkpoint.session_id != session_id
         || checkpoint.kind != ProviderMacroPlanValueKind::Checkpoint
         || checkpoint.ordinal != state_version
@@ -1098,6 +1169,7 @@ fn load_session(connection: &Connection, session_id: Uuid) -> Result<StoredSessi
             state_version,
             checkpoint_digest,
         },
+        checkpoint_value_id,
         checkpoint: checkpoint.bytes,
         response_count: parse_u16(row.9)?,
         data_page_count: parse_u16(row.10)?,
@@ -1920,8 +1992,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ProviderMacroPlanSessionKey, ProviderMacroPlanValueKind, StoredPageIdentity, digest_bytes,
-        retain_chunked_value, verify_generation_page_bindings,
+        ProviderMacroPlanSessionKey, ProviderMacroPlanStageCoordinate, ProviderMacroPlanValueKind,
+        StoredPageIdentity, digest_bytes, load_session, retain_chunked_value,
+        retire_superseded_checkpoint_value, verify_generation_page_bindings,
     };
     use crate::{Catalog, CatalogConfig, CatalogLimit, CatalogResultLimits, DatasetId};
 
@@ -1970,47 +2043,134 @@ mod tests {
         assert_eq!(recovered.coordinate(), coordinate);
         assert_eq!(recovered.checkpoint(), checkpoint.as_ref());
 
-        let successor = vec![0xa5; 1024 * 1024 + 33].into_boxed_slice();
         let storage_chunk_bytes = catalog.provider_macro_plan_storage_chunk_bytes()?;
+        catalog
+            .connection
+            .execute_batch("DROP TRIGGER provider_macro_plan_sessions_guarded_update;")?;
+        let advance =
+            |expected: ProviderMacroPlanStageCoordinate,
+             successor: &[u8]|
+             -> Result<ProviderMacroPlanStageCoordinate, Box<dyn std::error::Error>> {
+                let transaction = Transaction::new_unchecked(
+                    &catalog.connection,
+                    TransactionBehavior::Immediate,
+                )?;
+                let session = load_session(&transaction, session_id)?;
+                assert_eq!(session.coordinate, expected);
+                let next_version = expected.state_version() + 1;
+                let successor_value = retain_chunked_value(
+                    &transaction,
+                    session_id,
+                    ProviderMacroPlanValueKind::Checkpoint,
+                    next_version,
+                    successor,
+                    storage_chunk_bytes,
+                    Timestamp::from_unix_nanos(i64::from(next_version) + 1),
+                )?;
+                let updated = transaction.execute(
+                    "UPDATE provider_macro_plan_sessions
+                 SET state_version=?1, checkpoint_digest=?2, checkpoint_value_id=?3,
+                     response_count=response_count+1, data_page_count=data_page_count+1,
+                     analytical_row_count=analytical_row_count+1,
+                     semantics_bytes=semantics_bytes+1, updated_at_ns=updated_at_ns+1
+                 WHERE session_id=?4 AND state='acquiring' AND state_version=?5
+                   AND checkpoint_digest=?6 AND checkpoint_value_id=?7",
+                    params![
+                        i64::from(next_version),
+                        digest_bytes(successor_value.value_digest),
+                        digest_bytes(successor_value.value_id),
+                        session_id.to_string(),
+                        i64::from(expected.state_version()),
+                        digest_bytes(expected.checkpoint_digest()),
+                        digest_bytes(session.checkpoint_value_id),
+                    ],
+                )?;
+                assert_eq!(updated, 1);
+                retire_superseded_checkpoint_value(
+                    &transaction,
+                    session_id,
+                    session.checkpoint_value_id,
+                    successor_value.value_id,
+                )?;
+                transaction.commit()?;
+                Ok(ProviderMacroPlanStageCoordinate {
+                    session_id,
+                    state_version: next_version,
+                    checkpoint_digest: successor_value.value_digest,
+                })
+            };
+
+        let first_successor = vec![0xa5; 1024 * 1024 + 33].into_boxed_slice();
+        let first_coordinate = advance(coordinate, &first_successor)?;
+        let second_successor = vec![0x3c; 1024 * 1024 + 65].into_boxed_slice();
+        let current_coordinate = advance(first_coordinate, &second_successor)?;
+        let current_inventory: (i64, i64) = catalog.connection.query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM provider_macro_plan_values
+                  WHERE session_id=?1 AND value_kind='checkpoint'),
+                 (SELECT COUNT(*) FROM provider_macro_plan_value_chunks AS chunk
+                  JOIN provider_macro_plan_values AS value ON value.value_id=chunk.value_id
+                  WHERE value.session_id=?1 AND value.value_kind='checkpoint')",
+            [session_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let expected_chunks: i64 = catalog.connection.query_row(
+            "SELECT value.chunk_count
+             FROM provider_macro_plan_sessions AS session
+             JOIN provider_macro_plan_values AS value
+               ON value.value_id=session.checkpoint_value_id
+             WHERE session.session_id=?1",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(current_inventory, (1, expected_chunks));
+        let recovered = catalog.provider_macro_plan_session_recovery(session_id)?;
+        assert_eq!(recovered.coordinate(), current_coordinate);
+        assert_eq!(recovered.checkpoint(), second_successor.as_ref());
+
+        let stale_successor = vec![0xe7; 1024 * 1024 + 97].into_boxed_slice();
         let stale =
             Transaction::new_unchecked(&catalog.connection, TransactionBehavior::Immediate)?;
         let successor_value = retain_chunked_value(
             &stale,
             session_id,
             ProviderMacroPlanValueKind::Checkpoint,
-            1,
-            &successor,
+            current_coordinate.state_version() + 1,
+            &stale_successor,
             storage_chunk_bytes,
-            Timestamp::from_unix_nanos(2),
+            Timestamp::from_unix_nanos(5),
         )?;
         let updated = stale.execute(
             "UPDATE provider_macro_plan_sessions
              SET checkpoint_digest=?1, checkpoint_value_id=?2
-             WHERE session_id=?3 AND state='acquiring' AND state_version=1
-               AND checkpoint_digest=?4",
+             WHERE session_id=?3 AND state='acquiring' AND state_version=?4
+               AND checkpoint_digest=?5",
             params![
                 digest_bytes(successor_value.value_digest),
                 digest_bytes(successor_value.value_id),
                 session_id.to_string(),
-                digest_bytes(coordinate.checkpoint_digest()),
+                i64::from(first_coordinate.state_version()),
+                digest_bytes(first_coordinate.checkpoint_digest()),
             ],
         )?;
         assert_eq!(updated, 0);
         stale.rollback()?;
         assert_eq!(
             catalog.connection.query_row(
-                "SELECT COUNT(*) FROM provider_macro_plan_values",
-                [],
-                |row| row.get::<_, i64>(0),
+                "SELECT
+                     (SELECT COUNT(*) FROM provider_macro_plan_values
+                      WHERE session_id=?1 AND value_kind='checkpoint'),
+                     (SELECT COUNT(*) FROM provider_macro_plan_value_chunks AS chunk
+                      JOIN provider_macro_plan_values AS value ON value.value_id=chunk.value_id
+                      WHERE value.session_id=?1 AND value.value_kind='checkpoint')",
+                [session_id.to_string()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )?,
-            1
+            current_inventory
         );
-        assert_eq!(
-            catalog
-                .provider_macro_plan_session_recovery(session_id)?
-                .checkpoint(),
-            checkpoint.as_ref()
-        );
+        let recovered = catalog.provider_macro_plan_session_recovery(session_id)?;
+        assert_eq!(recovered.coordinate(), current_coordinate);
+        assert_eq!(recovered.checkpoint(), second_successor.as_ref());
 
         let ordering = Connection::open_in_memory()?;
         ordering.execute_batch(
