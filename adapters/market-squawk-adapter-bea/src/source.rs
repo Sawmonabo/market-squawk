@@ -1321,6 +1321,8 @@ impl BeaSource {
             &self.user_id,
             self.effective_parse_limits(),
             capture_dataset,
+            deadline,
+            &cancellation,
         )?;
         let retained_body = match fetched.retained_body() {
             Ok(body) => body,
@@ -1399,6 +1401,8 @@ impl BeaSource {
             &self.user_id,
             self.effective_parse_limits(),
             contract.dataset_id().clone(),
+            deadline,
+            &cancellation,
         )?;
         let retained_body = match fetched.retained_body() {
             Ok(body) => body,
@@ -1890,6 +1894,8 @@ impl FetchedResponse {
         user_id: &BeaUserId,
         limits: BeaParseLimits,
         capture_dataset: SourceIdentifier,
+        deadline: Timestamp,
+        cancellation: &CancellationToken,
     ) -> Result<SanitizedFetchedResponse, ExtractionSourceError> {
         let Self {
             response,
@@ -1913,8 +1919,18 @@ impl FetchedResponse {
         } = response;
         let sanitized = (|| {
             let body = body
-                .sanitize_validated_echo(request, user_id, limits)
-                .map_err(|error| map_source_error(BeaSourceError::Adapter(error)))?;
+                .sanitize_validated_echo(request, user_id, limits, || {
+                    if cancellation.is_cancelled() {
+                        return Err(BeaError::SanitizationCancelled);
+                    }
+                    let now =
+                        system_timestamp().map_err(|_| BeaError::SanitizationClockUnavailable)?;
+                    if deadline.unix_nanos() <= now.unix_nanos() {
+                        return Err(BeaError::SanitizationDeadlineExceeded);
+                    }
+                    Ok(())
+                })
+                .map_err(map_sanitization_error)?;
             if u64::try_from(body.bytes().len()).map_err(|_| invalid_protocol())? != response_bytes
             {
                 return Err(invalid_protocol());
@@ -2019,6 +2035,9 @@ impl SanitizedFetchedResponse {
             | BeaError::RowLimitExceeded
             | BeaError::StringLimitExceeded
             | BeaError::Allocation
+            | BeaError::SanitizationCancelled
+            | BeaError::SanitizationDeadlineExceeded
+            | BeaError::SanitizationClockUnavailable
             | BeaError::InvalidJson
             | BeaError::InvalidField(_)
             | BeaError::RequestEchoMismatch
@@ -2824,6 +2843,15 @@ fn map_source_error(error: BeaSourceError) -> ExtractionSourceError {
         | BeaSourceError::Adapter(_)
         | BeaSourceError::Capture(_)
         | BeaSourceError::RawCapture(_) => invalid_protocol(),
+    }
+}
+
+fn map_sanitization_error(error: BeaError) -> ExtractionSourceError {
+    match error {
+        BeaError::SanitizationCancelled => ExtractionSourceError::Cancelled,
+        BeaError::SanitizationDeadlineExceeded => ExtractionSourceError::DeadlineExceeded,
+        BeaError::SanitizationClockUnavailable => SourceError::Network.into(),
+        error => map_source_error(BeaSourceError::Adapter(error)),
     }
 }
 

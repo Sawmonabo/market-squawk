@@ -403,20 +403,30 @@ pub(crate) fn sanitize_response_body(
     user_id: &BeaUserId,
     limits: BeaParseLimits,
 ) -> Result<BeaSanitizedBody, BeaError> {
+    sanitize_response_body_with_control(body, request, user_id, limits, || Ok(()))
+}
+
+pub(crate) fn sanitize_response_body_with_control(
+    body: BeaSensitiveBody,
+    request: &BeaRequest,
+    user_id: &BeaUserId,
+    limits: BeaParseLimits,
+    mut control: impl FnMut() -> Result<(), BeaError>,
+) -> Result<BeaSanitizedBody, BeaError> {
     if body.is_empty() || body.len() > limits.max_bytes() {
         return Err(BeaError::BodyTooLarge);
     }
+    control()?;
     let mut original = body.into_zeroizing();
-    let upstream_digest = Sha256::digest(original.as_slice()).into();
     let secret = user_id.expose_secret().as_bytes();
-    if find_json_string_sequence(original.as_slice(), BEA_REDACTED_USER_ID)?.is_some() {
-        return Err(BeaError::RequestEchoMismatch);
-    }
-    let occurrence = find_json_string_sequence(original.as_slice(), secret)?
-        .ok_or(BeaError::RequestEchoMismatch)?;
-    if occurrence.multiple {
-        return Err(BeaError::RequestEchoMismatch);
-    }
+    let occurrence = find_json_string_sequences(
+        original.as_slice(),
+        secret,
+        BEA_REDACTED_USER_ID,
+        &mut control,
+    )?
+    .ok_or(BeaError::RequestEchoMismatch)?;
+    let upstream_digest = digest_with_control(original.as_slice(), &mut control)?;
     redact_json_string_sequence(original.as_mut_slice(), occurrence.offset, secret)?;
     let mut wire: EnvelopeWire =
         serde_json::from_slice(original.as_slice()).map_err(|_| BeaError::InvalidJson)?;
@@ -454,77 +464,137 @@ pub(crate) fn sanitize_response_body(
 #[derive(Clone, Copy)]
 struct JsonStringSequenceOccurrence {
     offset: usize,
-    multiple: bool,
 }
 
-/// Finds a decoded ASCII sequence without allocating any decoded JSON string.
+const SANITIZATION_CONTROL_INTERVAL_BYTES: usize = 64 * 1024;
+
+fn digest_with_control(
+    body: &[u8],
+    control: &mut impl FnMut() -> Result<(), BeaError>,
+) -> Result<[u8; 32], BeaError> {
+    let mut digest = Sha256::new();
+    for chunk in body.chunks(SANITIZATION_CONTROL_INTERVAL_BYTES) {
+        control()?;
+        digest.update(chunk);
+    }
+    Ok(digest.finalize().into())
+}
+
+struct DecodedSequenceMatcher<'a> {
+    sequence: &'a [u8],
+    failure: [usize; BEA_REDACTED_USER_ID.len()],
+    offsets: [usize; BEA_REDACTED_USER_ID.len()],
+    matched: usize,
+    decoded_units: usize,
+}
+
+impl<'a> DecodedSequenceMatcher<'a> {
+    fn try_new(sequence: &'a [u8]) -> Result<Self, BeaError> {
+        if sequence.len() != BEA_REDACTED_USER_ID.len() || !sequence.is_ascii() {
+            return Err(BeaError::InvalidJson);
+        }
+        let mut failure = [0_usize; BEA_REDACTED_USER_ID.len()];
+        let mut matched = 0_usize;
+        for index in 1..sequence.len() {
+            while matched > 0 && sequence[index] != sequence[matched] {
+                matched = failure[matched - 1];
+            }
+            if sequence[index] == sequence[matched] {
+                matched += 1;
+            }
+            failure[index] = matched;
+        }
+        Ok(Self {
+            sequence,
+            failure,
+            offsets: [0_usize; BEA_REDACTED_USER_ID.len()],
+            matched: 0,
+            decoded_units: 0,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.matched = 0;
+        self.decoded_units = 0;
+    }
+
+    fn accept(&mut self, decoded: Option<u8>, offset: usize) -> Option<usize> {
+        let ring_index = self.decoded_units % self.sequence.len();
+        self.offsets[ring_index] = offset;
+        self.decoded_units += 1;
+        while self.matched > 0 && decoded != Some(self.sequence[self.matched]) {
+            self.matched = self.failure[self.matched - 1];
+        }
+        if decoded == Some(self.sequence[self.matched]) {
+            self.matched += 1;
+        }
+        if self.matched != self.sequence.len() {
+            return None;
+        }
+        let start = self.offsets[(self.decoded_units - self.sequence.len()) % self.sequence.len()];
+        self.matched = self.failure[self.matched - 1];
+        Some(start)
+    }
+}
+
+/// Finds decoded credential and redaction-marker sequences in one strictly linear lexical pass.
 ///
 /// BEA normally echoes `UserID` as literal unreserved ASCII, but JSON permits the same value to
 /// arrive through `\u00XX` escapes. A general-purpose parser would allocate that decoded secret
-/// before the adapter could redact it. This lexical pass recognizes literal, escaped, and mixed
-/// spellings inside JSON strings, so every complete credential copy is rejected or overwritten
-/// while the response is still held only by zeroizing storage.
-fn find_json_string_sequence(
+/// before the adapter could redact it. The two fixed-size prefix automata consume every decoded
+/// unit once, fail as soon as a forbidden marker or second credential is complete, and observe
+/// caller cancellation/deadline control at bounded byte intervals.
+fn find_json_string_sequences(
     body: &[u8],
-    sequence: &[u8],
+    credential: &[u8],
+    redaction_marker: &[u8],
+    control: &mut impl FnMut() -> Result<(), BeaError>,
 ) -> Result<Option<JsonStringSequenceOccurrence>, BeaError> {
-    if sequence.is_empty() || !sequence.is_ascii() {
-        return Err(BeaError::InvalidJson);
-    }
+    let mut credential_matcher = DecodedSequenceMatcher::try_new(credential)?;
+    let mut marker_matcher = DecodedSequenceMatcher::try_new(redaction_marker)?;
     let mut index = 0_usize;
     let mut in_string = false;
-    let mut occurrence: Option<JsonStringSequenceOccurrence> = None;
+    let mut occurrence = None;
+    let mut next_control = SANITIZATION_CONTROL_INTERVAL_BYTES;
     while index < body.len() {
+        if index >= next_control {
+            control()?;
+            next_control = next_control
+                .checked_add(SANITIZATION_CONTROL_INTERVAL_BYTES)
+                .ok_or(BeaError::InvalidJson)?;
+        }
         if !in_string {
             if body[index] == b'"' {
                 in_string = true;
+                credential_matcher.reset();
+                marker_matcher.reset();
             }
             index = index.checked_add(1).ok_or(BeaError::InvalidJson)?;
             continue;
         }
         if body[index] == b'"' {
             in_string = false;
+            credential_matcher.reset();
+            marker_matcher.reset();
             index = index.checked_add(1).ok_or(BeaError::InvalidJson)?;
             continue;
         }
         let (decoded, next) = json_string_ascii_unit(body, index)?;
-        if decoded == Some(sequence[0])
-            && json_string_sequence_end(body, index, sequence)?.is_some()
-        {
-            if let Some(found) = occurrence.as_mut() {
-                found.multiple = true;
-            } else {
-                occurrence = Some(JsonStringSequenceOccurrence {
-                    offset: index,
-                    multiple: false,
-                });
-            }
+        if marker_matcher.accept(decoded, index).is_some() {
+            return Err(BeaError::RequestEchoMismatch);
         }
-        // Advance by one decoded unit so overlapping occurrences cannot evade the count.
+        if let Some(offset) = credential_matcher.accept(decoded, index) {
+            if occurrence.is_some() {
+                return Err(BeaError::RequestEchoMismatch);
+            }
+            occurrence = Some(JsonStringSequenceOccurrence { offset });
+        }
         index = next;
     }
     if in_string {
         return Err(BeaError::InvalidJson);
     }
     Ok(occurrence)
-}
-
-fn json_string_sequence_end(
-    body: &[u8],
-    mut index: usize,
-    sequence: &[u8],
-) -> Result<Option<usize>, BeaError> {
-    for expected in sequence {
-        if body.get(index) == Some(&b'"') {
-            return Ok(None);
-        }
-        let (decoded, next) = json_string_ascii_unit(body, index)?;
-        if decoded != Some(*expected) {
-            return Ok(None);
-        }
-        index = next;
-    }
-    Ok(Some(index))
 }
 
 fn json_string_ascii_unit(body: &[u8], index: usize) -> Result<(Option<u8>, usize), BeaError> {

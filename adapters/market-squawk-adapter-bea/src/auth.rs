@@ -136,15 +136,17 @@ impl BeaSensitiveBody {
     ///
     /// The upstream body remains zeroizing until the parser has proved that the exact admitted
     /// request was echoed and that no additional decoded result field contains the credential.
-    /// The retained body replaces the one literal echo in place; it never formats or retains the
-    /// credential or a credential-bearing URL.
+    /// The retained body replaces the one decoded echo in place; it never formats or retains the
+    /// credential or a credential-bearing URL. `control` is observed at bounded intervals during
+    /// a large lexical scan.
     pub(crate) fn sanitize_validated_echo(
         self,
         request: &BeaRequest,
         user_id: &BeaUserId,
         limits: BeaParseLimits,
+        control: impl FnMut() -> Result<(), BeaError>,
     ) -> Result<BeaSanitizedBody, BeaError> {
-        crate::parser::sanitize_response_body(self, request, user_id, limits)
+        crate::parser::sanitize_response_body_with_control(self, request, user_id, limits, control)
     }
 
     pub(crate) fn into_zeroizing(mut self) -> Zeroizing<Vec<u8>> {

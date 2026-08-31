@@ -49,6 +49,15 @@ pub enum BeaError {
     /// A fallible retained allocation could not be admitted.
     #[error("BEA response allocation could not be admitted")]
     Allocation,
+    /// The caller cancelled bounded response sanitization.
+    #[error("BEA response sanitization was cancelled")]
+    SanitizationCancelled,
+    /// The caller's response-sanitization deadline elapsed.
+    #[error("BEA response sanitization deadline elapsed")]
+    SanitizationDeadlineExceeded,
+    /// The response-sanitization clock could not be observed.
+    #[error("BEA response sanitization clock is unavailable")]
+    SanitizationClockUnavailable,
     /// The response is not valid JSON.
     ///
     /// Provider parser detail is deliberately not retained because a malformed field name or

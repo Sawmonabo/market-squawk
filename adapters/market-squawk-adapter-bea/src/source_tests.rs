@@ -166,6 +166,38 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     ));
     assert!(!format!("{malformed_error}").contains(USER_ID));
     assert!(!format!("{malformed_error:?}").contains(USER_ID));
+    let mut adversarial = malformed[..malformed.len() - 1].as_bytes().to_vec();
+    adversarial.extend_from_slice(b",\"padding\":\"");
+    adversarial.resize(
+        BeaParseLimits::production_defaults()
+            .max_bytes()
+            .saturating_sub(2),
+        b'x',
+    );
+    adversarial.extend_from_slice(b"\"}");
+    let mut sanitization_observations = 0_u8;
+    let adversarial_error = match crate::parser::sanitize_response_body_with_control(
+        BeaSensitiveBody::from_vec(adversarial),
+        &malformed_request,
+        &user_id,
+        BeaParseLimits::production_defaults(),
+        || {
+            sanitization_observations = sanitization_observations.saturating_add(1);
+            if sanitization_observations > 1 {
+                Err(crate::BeaError::SanitizationCancelled)
+            } else {
+                Ok(())
+            }
+        },
+    ) {
+        Ok(_) => return Err("a second decoded credential must fail before a long suffix".into()),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        adversarial_error,
+        crate::BeaError::RequestEchoMismatch
+    ));
+    assert_eq!(sanitization_observations, 1);
     let escaped_echo = String::from_utf8(upstream_responses[0].to_vec())?
         .replace(USER_ID, escaped_user_id.as_str());
     let escaped_page = crate::parse_metadata_page(
