@@ -14,28 +14,34 @@ use crate::{FeatureImplementationDigest, KnownFeatureImplementation};
 
 /// Maximum adjusted bars admitted to one in-process harmonic classification.
 pub const MAX_HARMONIC_BARS: usize = 4_096;
+/// Maximum immutable adjusted-bar manifests bound to one harmonic evidence result.
+pub const MAX_HARMONIC_PARENT_MANIFESTS: usize = 16;
 /// Bars required after a candidate swing before the code-owned pivot rule confirms it.
 pub const HARMONIC_PIVOT_CONFIRMATION_BARS: usize = 1;
 /// Number of bars required to contain five independently confirmable pivots.
 pub const MIN_HARMONIC_BARS: usize = HARMONIC_PIVOT_COUNT + (2 * HARMONIC_PIVOT_CONFIRMATION_BARS);
 /// Number of ordered X, A, B, C, and D pivots in one evidence result.
 pub const HARMONIC_PIVOT_COUNT: usize = 5;
+/// Number of deterministic CD-retracement targets retained with one evidence result.
+pub const HARMONIC_TARGET_COUNT: usize = 3;
 /// Code-owned registry key for this derived-feature family.
 pub const HARMONIC_PATTERN_FEATURE_NAME: &str = "technical.harmonic-pattern";
 
 pub(crate) const HARMONIC_IMPLEMENTATION_IDENTITY: &str = concat!(
-    "market-squawk-analytics::harmonics@v2;",
-    "bounds-bars7to4096@v1;taxonomy-and-ordered-precedence@v1;",
-    "ratio-bands-and-tolerances-scale1000000ppm@v2;",
-    "bat-valid-b-exact-lt618000over1000000@v2;",
+    "market-squawk-analytics::harmonics@v1;",
+    "bounds-bars7to4096-parents1to16-fixed-pivot-memory@v1;",
+    "taxonomy-and-ordered-precedence@v1;ratio-scale1000000ppm@v1;",
+    "bat-valid-b-exact-lt618000over1000000@v1;",
     "selector-strict-local-radius1-outside-max-excursion-high-tie-",
     "same-kind-most-extreme-earlier-tie-latest-five@v1;",
     "confirmation-max-left-selected-right-observed-and-available@v1;",
-    "measurement-absolute-leg-reduced-rational-cd-over-xc-undefined-zero-xc@v2;",
+    "measurement-absolute-leg-reduced-rational-cd-over-xc-undefined-zero-xc@v1;",
     "completion-outward-floor-ceil@v1;",
     "invalidation-abcd-prz-d-other-x-prz-d@v1;",
-    "expiry-decision-plus-five-timeframes@v1;",
-    "bat-preference-382-or500-plusminus30000ppm@v1"
+    "targets-cd-retracement-382000-618000-1000000ppm-outward-ceil@v1;",
+    "expiry-confirmation-plus-five-timeframes@v1;",
+    "bar-policy-adjustment-session-calendar-completeness-marketability@v1;",
+    "bat-preference-382-or500-plusminus30000ppm@v1;evidence-sha256@v1"
 );
 
 const RATIO_SCALE: u32 = 1_000_000;
@@ -155,25 +161,56 @@ impl HarmonicBar {
 pub struct HarmonicEvidenceBinding {
     instrument_id: InstrumentId,
     timeframe_nanos: NonZeroU64,
-    parent_manifest: EvidenceDigest,
+    parent_manifests: [EvidenceDigest; MAX_HARMONIC_PARENT_MANIFESTS],
+    parent_manifest_count: u8,
     adjustment_identity: EvidenceDigest,
+    session_calendar_identity: EvidenceDigest,
+    completeness_identity: EvidenceDigest,
+    marketability_identity: EvidenceDigest,
 }
 
 impl HarmonicEvidenceBinding {
-    /// Constructs the immutable parent binding.
-    #[must_use]
-    pub const fn new(
+    /// Constructs the immutable input-generation and bar-policy binding.
+    ///
+    /// `parent_manifests` must be a nonempty, strictly byte-sorted, duplicate-free list of
+    /// nonzero SHA-256 identities. The four policy identities keep corporate-action adjustment,
+    /// session/calendar, missing-bar completeness, and liquidity/staleness semantics explicit
+    /// without leaking provider plumbing into this analytical family.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarmonicPatternError::InvalidParentIdentity`] for an invalid parent set or policy
+    /// identity.
+    pub fn new(
         instrument_id: InstrumentId,
         timeframe_nanos: NonZeroU64,
-        parent_manifest: EvidenceDigest,
+        parent_manifests: &[EvidenceDigest],
         adjustment_identity: EvidenceDigest,
-    ) -> Self {
-        Self {
+        session_calendar_identity: EvidenceDigest,
+        completeness_identity: EvidenceDigest,
+        marketability_identity: EvidenceDigest,
+    ) -> Result<Self, HarmonicPatternError> {
+        let Some(first_parent) = parent_manifests.first().copied() else {
+            return Err(HarmonicPatternError::InvalidParentIdentity);
+        };
+        if parent_manifests.len() > MAX_HARMONIC_PARENT_MANIFESTS {
+            return Err(HarmonicPatternError::InvalidParentIdentity);
+        }
+        let mut retained_parents = [first_parent; MAX_HARMONIC_PARENT_MANIFESTS];
+        retained_parents[..parent_manifests.len()].copy_from_slice(parent_manifests);
+        let binding = Self {
             instrument_id,
             timeframe_nanos,
-            parent_manifest,
+            parent_manifests: retained_parents,
+            parent_manifest_count: u8::try_from(parent_manifests.len())
+                .map_err(|_| HarmonicPatternError::InvalidParentIdentity)?,
             adjustment_identity,
-        }
+            session_calendar_identity,
+            completeness_identity,
+            marketability_identity,
+        };
+        validate_binding(binding)?;
+        Ok(binding)
     }
 
     /// Returns the provider-neutral instrument identity.
@@ -188,16 +225,34 @@ impl HarmonicEvidenceBinding {
         self.timeframe_nanos
     }
 
-    /// Returns the exact selected adjusted-bar manifest.
+    /// Returns every exact selected adjusted-bar manifest in canonical byte order.
     #[must_use]
-    pub const fn parent_manifest(self) -> EvidenceDigest {
-        self.parent_manifest
+    pub fn parent_manifests(&self) -> &[EvidenceDigest] {
+        &self.parent_manifests[..usize::from(self.parent_manifest_count)]
     }
 
-    /// Returns the exact adjustment/session policy identity applied to the bars.
+    /// Returns the exact split, dividend, and other corporate-action adjustment identity.
     #[must_use]
     pub const fn adjustment_identity(self) -> EvidenceDigest {
         self.adjustment_identity
+    }
+
+    /// Returns the exact exchange-session and calendar policy identity.
+    #[must_use]
+    pub const fn session_calendar_identity(self) -> EvidenceDigest {
+        self.session_calendar_identity
+    }
+
+    /// Returns the exact missing-bar and range-completeness policy identity.
+    #[must_use]
+    pub const fn completeness_identity(self) -> EvidenceDigest {
+        self.completeness_identity
+    }
+
+    /// Returns the exact liquidity and staleness-admission policy identity.
+    #[must_use]
+    pub const fn marketability_identity(self) -> EvidenceDigest {
+        self.marketability_identity
     }
 }
 
@@ -297,6 +352,12 @@ impl HarmonicRatio {
         self.parts_per_million
     }
 }
+
+const HARMONIC_TARGET_RETRACEMENTS: [HarmonicRatio; HARMONIC_TARGET_COUNT] = [
+    HarmonicRatio::new(382_000),
+    HarmonicRatio::new(618_000),
+    HarmonicRatio::new(1_000_000),
+];
 
 /// Code-owned ratio band with an inclusive lower and explicit upper boundary.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -563,7 +624,9 @@ pub struct HarmonicPatternEvidence {
     pivots: [HarmonicPivotEvidence; HARMONIC_PIVOT_COUNT],
     ratios: HarmonicRatioMeasurements,
     completion_zone: HarmonicCompletionZone,
+    targets: [PriceTicks; HARMONIC_TARGET_COUNT],
     quality: HarmonicPatternQuality,
+    observation_cutoff: Timestamp,
     confirmation_cutoff: Timestamp,
     decision_cutoff: Timestamp,
     expires_at: Timestamp,
@@ -575,8 +638,8 @@ pub struct HarmonicPatternEvidence {
 impl HarmonicPatternEvidence {
     /// Returns the immutable instrument, timeframe, and parent binding.
     #[must_use]
-    pub const fn binding(self) -> HarmonicEvidenceBinding {
-        self.binding
+    pub const fn binding(&self) -> &HarmonicEvidenceBinding {
+        &self.binding
     }
 
     /// Returns the classified pattern kind.
@@ -615,10 +678,39 @@ impl HarmonicPatternEvidence {
         self.completion_zone
     }
 
+    /// Returns the provider-neutral analytical entry range.
+    ///
+    /// This is the exact completion zone, not an order instruction or proof of marketability.
+    #[must_use]
+    pub const fn entry_range(self) -> HarmonicCompletionZone {
+        self.completion_zone
+    }
+
+    /// Returns deterministic 38.2%, 61.8%, and 100% CD-retracement price targets.
+    ///
+    /// These are analytical reference levels only. Forecast, valuation, calibrated out-of-sample
+    /// evidence, portfolio context, liquidity, and central risk remain separate requirements.
+    #[must_use]
+    pub const fn targets(self) -> [PriceTicks; HARMONIC_TARGET_COUNT] {
+        self.targets
+    }
+
+    /// Returns the exact CD retracement ratios corresponding to [`Self::targets`].
+    #[must_use]
+    pub const fn target_retracements(self) -> [HarmonicRatio; HARMONIC_TARGET_COUNT] {
+        HARMONIC_TARGET_RETRACEMENTS
+    }
+
     /// Returns code-owned ratio-quality evidence; it grants no confidence authority.
     #[must_use]
     pub const fn quality(self) -> HarmonicPatternQuality {
         self.quality
+    }
+
+    /// Returns the latest observation time admitted to this exact classification.
+    #[must_use]
+    pub const fn observation_cutoff(self) -> Timestamp {
+        self.observation_cutoff
     }
 
     /// Returns the final pivot confirmation time.
@@ -709,6 +801,9 @@ pub enum HarmonicPatternError {
     /// Exact completion-zone or invalidation arithmetic overflowed.
     #[error("harmonic exact arithmetic overflow")]
     ArithmeticOverflow,
+    /// The completion, invalidation, or target levels are nonpositive or not directionally ordered.
+    #[error("harmonic price plan is invalid")]
+    InvalidPricePlan,
     /// The code-owned feature implementation identity could not be represented.
     #[error("harmonic implementation identity is invalid")]
     InvalidImplementationIdentity,
@@ -1035,9 +1130,23 @@ pub fn classify_harmonic_pattern(
     if !completion_zone.contains(pivots[4].price) {
         return Err(HarmonicPatternError::NoMatchingPattern);
     }
+    let targets = analytical_targets(direction, pivots)?;
     let quality = pattern_quality(rule.kind, ratios);
     let invalidation = invalidation(rule.kind, direction, completion_zone, pivots)?;
-    let expires_at = evidence_expiry(input.binding, input.decision_cutoff)?;
+    validate_price_plan(
+        direction,
+        completion_zone,
+        pivots[4].price,
+        targets,
+        invalidation,
+    )?;
+    let observation_cutoff = input
+        .bars
+        .last()
+        .map(|bar| bar.observed_at)
+        .ok_or(HarmonicPatternError::InvalidBarCount)?;
+    let confirmation_cutoff = pivots[4].confirmed_at;
+    let expires_at = evidence_expiry(input.binding, confirmation_cutoff)?;
     let implementation_identity = KnownFeatureImplementation::BatchHarmonicPatterns
         .implementation_digest()
         .map_err(|_| HarmonicPatternError::InvalidImplementationIdentity)?;
@@ -1047,7 +1156,10 @@ pub fn classify_harmonic_pattern(
         pivots,
         ratios,
         completion_zone,
+        targets,
         quality,
+        observation_cutoff,
+        confirmation_cutoff,
         expires_at,
         invalidation,
         implementation_identity,
@@ -1060,8 +1172,10 @@ pub fn classify_harmonic_pattern(
         pivots,
         ratios,
         completion_zone,
+        targets,
         quality,
-        confirmation_cutoff: pivots[4].confirmed_at,
+        observation_cutoff,
+        confirmation_cutoff,
         decision_cutoff: input.decision_cutoff,
         expires_at,
         invalidation,
@@ -1071,7 +1185,21 @@ pub fn classify_harmonic_pattern(
 }
 
 fn validate_binding(binding: HarmonicEvidenceBinding) -> Result<(), HarmonicPatternError> {
-    for digest in [binding.parent_manifest, binding.adjustment_identity] {
+    let parents = binding.parent_manifests();
+    if parents.is_empty()
+        || parents.len() > MAX_HARMONIC_PARENT_MANIFESTS
+        || parents
+            .windows(2)
+            .any(|pair| pair[0].bytes() >= pair[1].bytes())
+    {
+        return Err(HarmonicPatternError::InvalidParentIdentity);
+    }
+    for digest in parents.iter().copied().chain([
+        binding.adjustment_identity,
+        binding.session_calendar_identity,
+        binding.completeness_identity,
+        binding.marketability_identity,
+    ]) {
         if digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32] {
             return Err(HarmonicPatternError::InvalidParentIdentity);
         }
@@ -1119,8 +1247,8 @@ fn select_pivots(
     bars: &[HarmonicBar],
     decision_cutoff: Timestamp,
 ) -> Result<[HarmonicPivotEvidence; HARMONIC_PIVOT_COUNT], HarmonicPatternError> {
-    let mut canonical: Vec<HarmonicPivotEvidence> =
-        Vec::with_capacity(bars.len().saturating_sub(2));
+    let mut canonical = [None; HARMONIC_PIVOT_COUNT];
+    let mut canonical_count = 0_usize;
     for pivot_index in HARMONIC_PIVOT_CONFIRMATION_BARS
         ..bars.len().saturating_sub(HARMONIC_PIVOT_CONFIRMATION_BARS)
     {
@@ -1156,24 +1284,36 @@ fn select_pivots(
                 HarmonicPivotKind::Low => bar.low,
             },
         };
-        if let Some(previous) = canonical.last_mut()
-            && previous.kind == candidate.kind
-        {
-            if is_more_extreme(candidate, *previous) {
-                *previous = candidate;
+        if canonical_count > 0 {
+            let previous = canonical[canonical_count - 1]
+                .as_mut()
+                .ok_or(HarmonicPatternError::InsufficientPivots)?;
+            if previous.kind == candidate.kind {
+                if is_more_extreme(candidate, *previous) {
+                    *previous = candidate;
+                }
+                continue;
             }
-            continue;
         }
-        canonical.push(candidate);
+        if canonical_count < HARMONIC_PIVOT_COUNT {
+            canonical[canonical_count] = Some(candidate);
+            canonical_count += 1;
+        } else {
+            canonical.rotate_left(1);
+            canonical[HARMONIC_PIVOT_COUNT - 1] = Some(candidate);
+        }
     }
 
-    let selected_start = canonical
-        .len()
-        .checked_sub(HARMONIC_PIVOT_COUNT)
-        .ok_or(HarmonicPatternError::InsufficientPivots)?;
-    let selected: [HarmonicPivotEvidence; HARMONIC_PIVOT_COUNT] = canonical[selected_start..]
-        .try_into()
-        .map_err(|_| HarmonicPatternError::InsufficientPivots)?;
+    if canonical_count < HARMONIC_PIVOT_COUNT {
+        return Err(HarmonicPatternError::InsufficientPivots);
+    }
+    let selected = [
+        canonical[0].ok_or(HarmonicPatternError::InsufficientPivots)?,
+        canonical[1].ok_or(HarmonicPatternError::InsufficientPivots)?,
+        canonical[2].ok_or(HarmonicPatternError::InsufficientPivots)?,
+        canonical[3].ok_or(HarmonicPatternError::InsufficientPivots)?,
+        canonical[4].ok_or(HarmonicPatternError::InsufficientPivots)?,
+    ];
     for pair in selected.windows(2) {
         if pair[0].bar_index >= pair[1].bar_index
             || pair[0].observed_at >= pair[1].observed_at
@@ -1350,9 +1490,65 @@ fn pattern_quality(
     }
 }
 
+fn analytical_targets(
+    direction: HarmonicDirection,
+    pivots: [HarmonicPivotEvidence; HARMONIC_PIVOT_COUNT],
+) -> Result<[PriceTicks; HARMONIC_TARGET_COUNT], HarmonicPatternError> {
+    let base = distance(pivots[3].price, pivots[4].price);
+    let anchor = i128::from(pivots[4].price.get());
+    let mut targets = [pivots[4].price; HARMONIC_TARGET_COUNT];
+    for (target, retracement) in targets.iter_mut().zip(HARMONIC_TARGET_RETRACEMENTS) {
+        let offset = scale_ceil(base, retracement.parts_per_million)?;
+        let projected = match direction {
+            HarmonicDirection::Bullish => anchor.checked_add(offset),
+            HarmonicDirection::Bearish => anchor.checked_sub(offset),
+        }
+        .ok_or(HarmonicPatternError::ArithmeticOverflow)?;
+        let projected =
+            i64::try_from(projected).map_err(|_| HarmonicPatternError::ArithmeticOverflow)?;
+        if projected <= 0 {
+            return Err(HarmonicPatternError::InvalidPricePlan);
+        }
+        *target = PriceTicks::new(projected);
+    }
+    Ok(targets)
+}
+
+fn validate_price_plan(
+    direction: HarmonicDirection,
+    entry: HarmonicCompletionZone,
+    completion: PriceTicks,
+    targets: [PriceTicks; HARMONIC_TARGET_COUNT],
+    invalidation: PriceTicks,
+) -> Result<(), HarmonicPatternError> {
+    if entry.lower.get() <= 0
+        || entry.upper.get() <= 0
+        || entry.lower > entry.upper
+        || invalidation.get() <= 0
+    {
+        return Err(HarmonicPatternError::InvalidPricePlan);
+    }
+    let valid = match direction {
+        HarmonicDirection::Bullish => {
+            invalidation < entry.lower
+                && completion < targets[0]
+                && targets.windows(2).all(|pair| pair[0] < pair[1])
+        }
+        HarmonicDirection::Bearish => {
+            invalidation > entry.upper
+                && completion > targets[0]
+                && targets.windows(2).all(|pair| pair[0] > pair[1])
+        }
+    };
+    if !valid {
+        return Err(HarmonicPatternError::InvalidPricePlan);
+    }
+    Ok(())
+}
+
 fn evidence_expiry(
     binding: HarmonicEvidenceBinding,
-    decision_cutoff: Timestamp,
+    confirmation_cutoff: Timestamp,
 ) -> Result<Timestamp, HarmonicPatternError> {
     let lifetime = binding
         .timeframe_nanos
@@ -1360,7 +1556,7 @@ fn evidence_expiry(
         .checked_mul(HARMONIC_EVIDENCE_EXPIRY_BARS)
         .and_then(|value| i64::try_from(value).ok())
         .ok_or(HarmonicPatternError::ArithmeticOverflow)?;
-    decision_cutoff
+    confirmation_cutoff
         .unix_nanos()
         .checked_add(lifetime)
         .map(Timestamp::from_unix_nanos)
@@ -1474,7 +1670,10 @@ struct DerivedEvidence {
     pivots: [HarmonicPivotEvidence; HARMONIC_PIVOT_COUNT],
     ratios: HarmonicRatioMeasurements,
     completion_zone: HarmonicCompletionZone,
+    targets: [PriceTicks; HARMONIC_TARGET_COUNT],
     quality: HarmonicPatternQuality,
+    observation_cutoff: Timestamp,
+    confirmation_cutoff: Timestamp,
     expires_at: Timestamp,
     invalidation: PriceTicks,
     implementation_identity: FeatureImplementationDigest,
@@ -1482,11 +1681,19 @@ struct DerivedEvidence {
 
 fn evidence_digest(input: HarmonicPatternInput<'_>, derived: &DerivedEvidence) -> EvidenceDigest {
     let mut hasher = Sha256::new();
-    hasher.update(b"market-squawk/harmonic-pattern-evidence/v2\0");
+    hasher.update(b"market-squawk/harmonic-pattern-evidence/v1\0");
     hasher.update(input.binding.instrument_id.as_uuid().as_bytes());
     hasher.update(input.binding.timeframe_nanos.get().to_be_bytes());
-    hash_digest(&mut hasher, input.binding.parent_manifest);
+    hasher.update(bounded_len(input.binding.parent_manifests().len()).to_be_bytes());
+    for parent_manifest in input.binding.parent_manifests() {
+        hash_digest(&mut hasher, *parent_manifest);
+    }
     hash_digest(&mut hasher, input.binding.adjustment_identity);
+    hash_digest(&mut hasher, input.binding.session_calendar_identity);
+    hash_digest(&mut hasher, input.binding.completeness_identity);
+    hash_digest(&mut hasher, input.binding.marketability_identity);
+    hasher.update(derived.observation_cutoff.unix_nanos().to_be_bytes());
+    hasher.update(derived.confirmation_cutoff.unix_nanos().to_be_bytes());
     hasher.update(input.decision_cutoff.unix_nanos().to_be_bytes());
     hasher.update(derived.expires_at.unix_nanos().to_be_bytes());
     hasher.update(bounded_len(input.bars.len()).to_be_bytes());
@@ -1499,6 +1706,7 @@ fn evidence_digest(input: HarmonicPatternInput<'_>, derived: &DerivedEvidence) -
     }
     hasher.update([pattern_code(derived.rule.kind)]);
     hasher.update([direction_code(derived.direction)]);
+    hash_rule(&mut hasher, derived.rule);
     for pivot in derived.pivots {
         hasher.update(pivot.bar_index.to_be_bytes());
         hasher.update([pivot_kind_code(pivot.kind)]);
@@ -1527,10 +1735,37 @@ fn evidence_digest(input: HarmonicPatternInput<'_>, derived: &DerivedEvidence) -
     }
     hasher.update(derived.completion_zone.lower.get().to_be_bytes());
     hasher.update(derived.completion_zone.upper.get().to_be_bytes());
+    for (retracement, target) in HARMONIC_TARGET_RETRACEMENTS
+        .into_iter()
+        .zip(derived.targets)
+    {
+        hasher.update(retracement.parts_per_million.to_be_bytes());
+        hasher.update(target.get().to_be_bytes());
+    }
     hasher.update([quality_code(derived.quality)]);
     hasher.update(derived.invalidation.get().to_be_bytes());
     hasher.update(derived.implementation_identity.as_bytes());
     EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
+}
+
+fn hash_rule(hasher: &mut Sha256, rule: HarmonicPatternRule) {
+    hasher.update(bounded_len(rule.constraints.len()).to_be_bytes());
+    for constraint in rule.constraints {
+        hasher.update([measurement_code(constraint.measurement)]);
+        hasher.update(constraint.tolerance.parts_per_million.to_be_bytes());
+        hasher.update(bounded_len(constraint.accepted.len()).to_be_bytes());
+        for band in constraint.accepted {
+            hasher.update(band.lower.parts_per_million.to_be_bytes());
+            hasher.update(band.upper.parts_per_million.to_be_bytes());
+            hasher.update([u8::from(band.upper_inclusive)]);
+        }
+    }
+    hasher.update([match rule.completion {
+        CompletionProjection::FromAOverXa => 0,
+        CompletionProjection::FromCOverAb => 1,
+        CompletionProjection::FromCOverXc => 2,
+    }]);
+    hasher.update(bounded_len(rule.completion_constraint).to_be_bytes());
 }
 
 fn hash_digest(hasher: &mut Sha256, digest: EvidenceDigest) {

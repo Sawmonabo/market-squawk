@@ -38,9 +38,12 @@ fn harmonic_pattern_is_causal_and_rejects_a_future_confirmation() -> TestResult 
     let binding = HarmonicEvidenceBinding::new(
         InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb")?,
         NonZeroU64::new(60_000_000_000).ok_or("invalid timeframe")?,
-        EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32]),
+        &[EvidenceDigest::new(DigestAlgorithm::Sha256, [1; 32])],
         EvidenceDigest::new(DigestAlgorithm::Sha256, [2; 32]),
-    );
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [3; 32]),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [4; 32]),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [5; 32]),
+    )?;
     let cutoff = Timestamp::from_unix_nanos(120);
     let evidence = classify_harmonic_pattern(HarmonicPatternInput::new(binding, &bars, cutoff))?;
 
@@ -48,14 +51,29 @@ fn harmonic_pattern_is_causal_and_rejects_a_future_confirmation() -> TestResult 
     assert_eq!(evidence.direction(), HarmonicDirection::Bullish);
     assert_eq!(evidence.quality(), HarmonicPatternQuality::Valid);
     assert!(evidence.completion_zone().contains(PriceTicks::new(1_114)));
+    assert_eq!(evidence.entry_range(), evidence.completion_zone());
+    assert_eq!(
+        evidence.targets().map(PriceTicks::get),
+        [1_325, 1_454, 1_664]
+    );
+    assert_eq!(evidence.invalidation(), PriceTicks::new(999));
     assert_eq!(
         evidence.pivots().map(|pivot| pivot.bar_index()),
         [1, 3, 5, 7, 9]
     );
     assert_eq!(
+        evidence.observation_cutoff(),
+        Timestamp::from_unix_nanos(110)
+    );
+    assert_eq!(
         evidence.confirmation_cutoff(),
         Timestamp::from_unix_nanos(111)
     );
+    assert_eq!(
+        evidence.expires_at(),
+        Timestamp::from_unix_nanos(300_000_000_111)
+    );
+    assert_eq!(evidence.binding().parent_manifests().len(), 1);
     assert_eq!(
         evidence.implementation_identity(),
         KnownFeatureImplementation::BatchHarmonicPatterns.implementation_digest()?
