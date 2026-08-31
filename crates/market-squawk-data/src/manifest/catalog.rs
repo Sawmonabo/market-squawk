@@ -709,8 +709,11 @@ impl AnalyticalManifestCatalog {
                 .objects()
                 .get(exact_generation_ordinal)
                 .ok_or(ManifestCatalogError::CorruptCatalog)?;
-            if retained_output_ordinal != to_i64(output_ordinal)?
-                || generation_ordinal != to_i64(exact_generation_ordinal)?
+            if retained_output_ordinal
+                != i64::try_from(output_ordinal).map_err(|_| ManifestCatalogError::CountOverflow)?
+                || generation_ordinal
+                    != i64::try_from(exact_generation_ordinal)
+                        .map_err(|_| ManifestCatalogError::CountOverflow)?
                 || Uuid::parse_str(&artifact_id)
                     .map_err(|_| ManifestCatalogError::CorruptCatalog)?
                     != pinned_object.artifact_id()
@@ -1287,7 +1290,6 @@ impl AnalyticalManifestCatalog {
             || reservation.run_id() != source_input.run_id()
             || source_input.operation() != SourceOperation::Persist
             || source_input.payload_digest() != staged.publication_digest()
-            || capture_coordinates.len() != usize::from(staged.data_page_count())
         {
             return Err(ManifestCatalogError::ProviderMacroPlanMismatch);
         }
@@ -2933,7 +2935,7 @@ fn ordered_provider_macro_plan_inputs(
         .ok_or(ManifestCatalogError::CaptureInputLimitExceeded {
             max: MAX_GENERATION_CAPTURE_INPUTS,
         })?;
-    let mut retained = Vec::new();
+    let mut retained: Vec<StoredProviderMacroPlanInput> = Vec::new();
     retained
         .try_reserve_exact(count)
         .map_err(|_| ManifestCatalogError::CountOverflow)?;

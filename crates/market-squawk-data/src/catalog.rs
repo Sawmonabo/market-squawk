@@ -136,8 +136,8 @@ pub use observed_revisions::StoredObservedRevision;
 pub(crate) use provider_capture::{
     MAX_PROVIDER_CAPTURE_PHYSICAL_BYTES, MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS,
     PROVIDER_CAPTURE_RECOVERY_ENTRY_BUDGET, PreparedProviderCaptureBinding,
-    ProviderArtifactInputCoordinate, ProviderMacroPlanCompletionCapture,
-    load_provider_capture_for_run, retain_prepared_provider_capture_binding,
+    ProviderArtifactInputCoordinate, load_provider_capture_for_run,
+    retain_prepared_provider_capture_binding,
 };
 pub use provider_capture::{
     PersistedProviderCaptureBindingEvidence, PersistedProviderCaptureBindingRow,
@@ -158,14 +158,9 @@ pub use provider_logical::{
     PersistedProviderLogicalPartitionClaim, PersistedProviderLogicalPublicationBinding,
 };
 pub(crate) use provider_macro_plan::{
-    CompletedProviderMacroPlanSession, ProviderMacroPlanPublicationCommit,
-    ProviderMacroPlanPublishedHead, ProviderMacroPlanReplayPageEvidence,
-    ProviderMacroPlanRestartProjection, ProviderMacroPlanSemanticsEvidence,
-    ProviderMacroPlanSessionKey, ProviderMacroPlanSessionRecovery,
-    ProviderMacroPlanStageCoordinate, ProviderMacroPlanStagedPageInput,
-    ProviderMacroPlanTerminalInput, load_provider_macro_plan_head,
+    ProviderMacroPlanPublicationCommit, ProviderMacroPlanPublishedHead,
+    ProviderMacroPlanRestartProjection, load_provider_macro_plan_head,
     publish_provider_macro_plan_record, reconstruct_provider_macro_plan_projection,
-    retain_completed_provider_macro_plan_for_run,
 };
 pub use provider_option::{
     PersistedProviderOptionMarketBindingEvidence, PersistedProviderOptionMarketBindingRow,
