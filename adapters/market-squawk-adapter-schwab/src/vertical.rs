@@ -264,41 +264,42 @@ impl SchwabMarketDataQualification {
                 .is_some_and(|received_at| received_at == self.response_observed_at)
     }
 
-    pub(crate) fn validates_streamer_publication(
+    pub(crate) fn validates_streamer_publication_coordinate(
         &self,
         service: MarketDataService,
         handoff: &SchwabStreamerFamilyDoctorHandoff,
         capture: &SchwabSealedStreamerCapture,
+        frame_ordinal: u16,
+        data_batch_ordinal: u16,
+        content_ordinal: u16,
     ) -> bool {
         let receipt = capture.streamer_receipt();
         let last_ack_ordinal = handoff
             .capture_frame_ordinals(handoff.capture_count().saturating_sub(1))
             .map(|(_, last)| last);
+        let coordinate = usize::from(frame_ordinal);
+        let Some((frame, Some(parsed))) = capture
+            .frames()
+            .get(coordinate)
+            .zip(capture.parsed_frames().get(coordinate))
+        else {
+            return false;
+        };
+        let Some(batch) = parsed.value().data.get(usize::from(data_batch_ordinal)) else {
+            return false;
+        };
         self.streamer_service() == Some(service)
             && handoff.service() == service
             && handoff.token_generation() == self.token_generation
             && receipt.token_generation() == self.token_generation
             && handoff.generation() == receipt.generation()
-            && last_ack_ordinal.is_some_and(|last| {
-                capture
-                    .frames()
-                    .first()
-                    .is_some_and(|frame| frame.transport_ordinal() > last)
-            })
+            && last_ack_ordinal.is_some_and(|last| frame.transport_ordinal() > last)
             && capture.service_responses().is_empty()
-            && capture.parsed_frames().iter().all(|frame| {
-                frame.as_ref().is_some_and(|frame| {
-                    frame
-                        .value()
-                        .data
-                        .iter()
-                        .all(|batch| batch.service == service)
-                })
-            })
-            && capture
-                .frames()
-                .last()
-                .and_then(|frame| millis_timestamp(frame.received_at_unix_millis()))
+            && capture.parsed_frames().iter().all(Option::is_some)
+            && parsed.raw_sha256() == frame.payload_digest().bytes()
+            && batch.service == service
+            && batch.content.get(usize::from(content_ordinal)).is_some()
+            && millis_timestamp(frame.received_at_unix_millis())
                 .is_some_and(|received_at| received_at == self.response_observed_at)
     }
 }
@@ -854,10 +855,10 @@ fn validate_data_capture(
             return Err(SchwabVerticalError::InvalidCapabilityEvidence);
         }
         for batch in &frame.value().data {
-            if batch.service != service
-                || batch.command.as_ref() != command
-                || batch.content.is_empty()
-            {
+            if batch.service != service {
+                continue;
+            }
+            if batch.command.as_ref() != command || batch.content.is_empty() {
                 return Err(SchwabVerticalError::InvalidCapabilityEvidence);
             }
             provider_records = provider_records
