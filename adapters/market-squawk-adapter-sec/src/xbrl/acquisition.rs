@@ -1,6 +1,6 @@
 //! Opaque bounded closure of one already captured filing's taxonomy graph.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::VecDeque;
 
 use market_squawk_domain::{MetadataRevision, SourceId};
 use market_squawk_sources::{FilingTaxonomySourceAuthority, SEC_EDGAR_AUTHORITY};
@@ -47,10 +47,8 @@ pub(crate) struct SecTaxonomyClosure {
     parser_limits: SecParserLimits,
     pending: VecDeque<SecXbrlTaxonomyArtifactRequest>,
     in_flight: Option<SecXbrlTaxonomyArtifactRequest>,
-    requests_by_logical: BTreeMap<String, SecXbrlTaxonomyArtifactRequest>,
-    requests_by_physical: BTreeMap<String, SecXbrlTaxonomyArtifactRequest>,
-    captured_physical: BTreeSet<String>,
-    artifacts_by_physical: BTreeMap<String, RetrievedSecBytes>,
+    retained_requests: Vec<SecXbrlTaxonomyArtifactRequest>,
+    artifacts: Vec<RetrievedSecBytes>,
     reference_count: usize,
     physical_bytes: u64,
     scanned_bytes: u64,
@@ -86,6 +84,14 @@ impl SecTaxonomyClosure {
             .try_reserve(seeds.len())
             .map_err(|_| SecXbrlError::RetainedOutputLimitExceeded)?;
         pending.extend(seeds);
+        let mut retained_requests = Vec::new();
+        retained_requests
+            .try_reserve_exact(MAX_TAXONOMY_REFERENCES)
+            .map_err(|_| SecXbrlError::RetainedOutputLimitExceeded)?;
+        let mut artifacts = Vec::new();
+        artifacts
+            .try_reserve_exact(MAX_TAXONOMY_ARTIFACTS)
+            .map_err(|_| SecXbrlError::RetainedOutputLimitExceeded)?;
         Ok(Self {
             filing_locator,
             root_source_id,
@@ -94,10 +100,8 @@ impl SecTaxonomyClosure {
             reference_count: pending.len(),
             pending,
             in_flight: None,
-            requests_by_logical: BTreeMap::new(),
-            requests_by_physical: BTreeMap::new(),
-            captured_physical: BTreeSet::new(),
-            artifacts_by_physical: BTreeMap::new(),
+            retained_requests,
+            artifacts,
             physical_bytes: 0,
             scanned_bytes: filing_bytes,
         })
@@ -113,29 +117,41 @@ impl SecTaxonomyClosure {
         }
         while let Some(request) = self.pending.pop_front() {
             check_cancelled(cancellation)?;
-            let logical = request.logical_locator().as_str().to_owned();
-            if let Some(existing) = self.requests_by_logical.get(&logical) {
-                if existing != &request {
-                    return Err(SecXbrlError::InvalidTaxonomySet);
+            let logical = request.logical_locator().as_str();
+            let logical_index = match self
+                .retained_requests
+                .binary_search_by(|candidate| candidate.logical_locator().as_str().cmp(logical))
+            {
+                Ok(index) => {
+                    if self.retained_requests[index] != request {
+                        return Err(SecXbrlError::InvalidTaxonomySet);
+                    }
+                    continue;
                 }
-                continue;
+                Err(index) => index,
+            };
+            let physical = request.physical_locator().as_str();
+            if let Some(existing) = self
+                .retained_requests
+                .iter()
+                .find(|candidate| candidate.physical_locator().as_str() == physical)
+                && !existing.same_physical_contract(&request)
+            {
+                return Err(SecXbrlError::InvalidTaxonomySet);
             }
-            let physical = request.physical_locator().as_str().to_owned();
-            if let Some(existing) = self.requests_by_physical.get(&physical) {
-                if !existing.same_physical_contract(&request) {
-                    return Err(SecXbrlError::InvalidTaxonomySet);
-                }
-            } else {
-                self.requests_by_physical
-                    .insert(physical.clone(), request.clone());
+            if self.retained_requests.len() >= MAX_TAXONOMY_REFERENCES {
+                return Err(SecXbrlError::RecordLimitExceeded);
             }
-            self.requests_by_logical.insert(logical, request.clone());
-            if self.captured_physical.contains(&physical) {
-                let artifact = self
-                    .artifacts_by_physical
-                    .get(&physical)
-                    .cloned()
-                    .ok_or(SecXbrlError::InvalidTaxonomySet)?;
+            if self.retained_requests.len() == self.retained_requests.capacity() {
+                return Err(SecXbrlError::RetainedOutputLimitExceeded);
+            }
+            self.retained_requests
+                .insert(logical_index, request.clone());
+            if let Ok(index) = self
+                .artifacts
+                .binary_search_by(|artifact| artifact.locator().cmp(&Some(physical)))
+            {
+                let artifact = self.artifacts[index].clone();
                 let scanned_bytes = self
                     .scanned_bytes
                     .checked_add(
@@ -148,7 +164,7 @@ impl SecTaxonomyClosure {
                 self.scan_captured_request(&request, &artifact, cancellation)?;
                 continue;
             }
-            if self.captured_physical.len() >= MAX_TAXONOMY_ARTIFACTS {
+            if self.artifacts.len() >= MAX_TAXONOMY_ARTIFACTS {
                 return Err(SecXbrlError::RecordLimitExceeded);
             }
             let maximum_response_bytes = MAX_TAXONOMY_SET_BYTES
@@ -175,12 +191,16 @@ impl SecTaxonomyClosure {
             .in_flight
             .take()
             .ok_or(SecXbrlError::InvalidTaxonomySet)?;
-        if expected != request.inner
-            || artifact.locator() != Some(request.physical_locator())
-            || self.captured_physical.contains(request.physical_locator())
-        {
+        if expected != request.inner || artifact.locator() != Some(request.physical_locator()) {
             return Err(SecXbrlError::InvalidTaxonomySet);
         }
+        let artifact_index = match self
+            .artifacts
+            .binary_search_by(|candidate| candidate.locator().cmp(&artifact.locator()))
+        {
+            Ok(_) => return Err(SecXbrlError::InvalidTaxonomySet),
+            Err(index) => index,
+        };
         let authority = request.authority()?;
         let expected_source = authority
             .canonical_source_id()
@@ -223,21 +243,16 @@ impl SecTaxonomyClosure {
             .ok_or(SecXbrlError::ByteLimitExceeded)?;
         if physical_bytes > MAX_TAXONOMY_SET_BYTES
             || scanned_bytes > MAX_TAXONOMY_GRAPH_SCAN_BYTES
-            || self.artifacts_by_physical.len() >= MAX_TAXONOMY_ARTIFACTS
+            || self.artifacts.len() >= MAX_TAXONOMY_ARTIFACTS
         {
             return Err(SecXbrlError::ByteLimitExceeded);
         }
+        if self.artifacts.len() == self.artifacts.capacity() {
+            return Err(SecXbrlError::RetainedOutputLimitExceeded);
+        }
         self.scanned_bytes = scanned_bytes;
         self.scan_captured_request(&request.inner, &artifact, cancellation)?;
-        self.captured_physical
-            .insert(request.physical_locator().to_owned());
-        if self
-            .artifacts_by_physical
-            .insert(request.physical_locator().to_owned(), artifact)
-            .is_some()
-        {
-            return Err(SecXbrlError::InvalidTaxonomySet);
-        }
+        self.artifacts.insert(artifact_index, artifact);
         self.physical_bytes = physical_bytes;
         Ok(())
     }
@@ -279,14 +294,10 @@ impl SecTaxonomyClosure {
         cancellation: &CancellationToken,
     ) -> Result<Vec<RetrievedSecBytes>, SecXbrlError> {
         check_cancelled(cancellation)?;
-        if self.in_flight.is_some()
-            || !self.pending.is_empty()
-            || self.artifacts_by_physical.is_empty()
-            || self.artifacts_by_physical.len() != self.captured_physical.len()
-        {
+        if self.in_flight.is_some() || !self.pending.is_empty() || self.artifacts.is_empty() {
             return Err(SecXbrlError::InvalidTaxonomySet);
         }
-        Ok(self.artifacts_by_physical.into_values().collect())
+        Ok(self.artifacts)
     }
 }
 
