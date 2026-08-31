@@ -106,8 +106,7 @@ pub(crate) use ingest::{
     TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
 };
 pub(crate) use ingest::{
-    BlsLivePublicationError, BlsRegisteredV2LiveComposition, BlsRegisteredV2LiveOutcome,
-    BlsRegisteredV2LiveRequest, BlsRegisteredV2LiveRuntime,
+    BlsLiveComposition, BlsLiveOutcome, BlsLivePublicationError, BlsLiveRequest, BlsLiveRuntime,
 };
 pub use ingest::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,

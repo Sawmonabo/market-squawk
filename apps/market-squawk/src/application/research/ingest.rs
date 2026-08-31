@@ -93,8 +93,8 @@ pub(crate) use bls::{
     BlsWholePlanApplicationHandoff,
 };
 pub(crate) use bls_live::{
-    BlsLivePublicationError, BlsRegisteredSource, BlsRegisteredV2LiveComposition,
-    BlsRegisteredV2LiveOutcome, BlsRegisteredV2LiveRequest, BlsRegisteredV2LiveRuntime,
+    BlsLiveComposition, BlsLiveOutcome, BlsLivePublicationError, BlsLiveRequest, BlsLiveRuntime,
+    BlsLiveSource,
 };
 pub(crate) use census::{
     CENSUS_QUARTERLY_POINT_IN_TIME_OPERATION, CensusLiveComposition, CensusMacroApplicationClosure,

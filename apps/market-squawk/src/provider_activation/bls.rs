@@ -1,8 +1,8 @@
 //! Current BLS activation and provider-neutral canonical macro operation.
 //!
-//! Public v1 and registered v2 occupy one application slot. Only the registered source retains
-//! the existing live producer runtime; the neutral operation never exposes provider transport,
-//! credentials, raw paths, or provider-specific frontend state.
+//! Public v1 and registered v2 occupy one application slot and retain the same live producer
+//! runtime. The neutral operation never exposes provider transport, credentials, raw paths, or
+//! provider-specific frontend state.
 
 use std::{
     num::{NonZeroU32, NonZeroU64},
@@ -21,16 +21,15 @@ use market_squawk_sources::SourceMetadataProvider;
 
 use super::{ActivatedResearchProvider, ProviderAdapterActivation, ProviderAdapterActivationError};
 use crate::application::{
-    BlsLivePublicationError, BlsRegisteredV2LiveComposition, BlsRegisteredV2LiveOutcome,
-    BlsRegisteredV2LiveRequest, BlsRegisteredV2LiveRuntime, ResearchProviderRuntimeGeneration,
-    ResearchProviderRuntimeReplacement, ResearchRightsAuthority,
+    BlsLiveComposition, BlsLiveOutcome, BlsLivePublicationError, BlsLiveRequest, BlsLiveRuntime,
+    ResearchProviderRuntimeGeneration, ResearchProviderRuntimeReplacement, ResearchRightsAuthority,
 };
 use crate::{ProviderActivationLease, ProviderOnboardingError};
 
 /// Provider-neutral bounded request for the current canonical provider-period macro source.
 #[derive(Clone, Debug)]
 pub(crate) struct MacroProviderPeriodLatestKnownRequest {
-    live: BlsRegisteredV2LiveRequest,
+    live: BlsLiveRequest,
 }
 
 impl MacroProviderPeriodLatestKnownRequest {
@@ -52,7 +51,7 @@ impl MacroProviderPeriodLatestKnownRequest {
         query_deadline: Instant,
     ) -> Self {
         Self {
-            live: BlsRegisteredV2LiveRequest::new(
+            live: BlsLiveRequest::new(
                 doctor_deadline,
                 acquisition_deadline,
                 seal_deadline,
@@ -71,7 +70,7 @@ impl MacroProviderPeriodLatestKnownRequest {
 /// Canonical macro observations and immutable restart/PIT evidence from the current source.
 #[derive(Debug)]
 pub(crate) struct MacroProviderPeriodLatestKnownOutput {
-    live: BlsRegisteredV2LiveOutcome,
+    live: BlsLiveOutcome,
 }
 
 impl MacroProviderPeriodLatestKnownOutput {
@@ -96,47 +95,29 @@ impl MacroProviderPeriodLatestKnownOutput {
     }
 }
 
-enum BlsCurrentRuntime {
-    PublicV1,
-    RegisteredV2(BlsRegisteredV2LiveRuntime),
-}
-
 /// One current BLS generation across the alternative public and registered access tiers.
 pub(super) struct BlsProductActivation {
     lease: ProviderActivationLease,
     generation: ResearchProviderRuntimeGeneration,
     tier: BlsAccessTier,
     source_plan_digest: EvidenceDigest,
-    runtime: BlsCurrentRuntime,
+    runtime: BlsLiveRuntime,
 }
 
 impl BlsProductActivation {
-    fn public_v1(
+    fn new(
         lease: ProviderActivationLease,
         generation: ResearchProviderRuntimeGeneration,
+        tier: BlsAccessTier,
         source_plan_digest: EvidenceDigest,
+        runtime: BlsLiveRuntime,
     ) -> Self {
         Self {
             lease,
             generation,
-            tier: BlsAccessTier::PublicV1,
+            tier,
             source_plan_digest,
-            runtime: BlsCurrentRuntime::PublicV1,
-        }
-    }
-
-    fn registered_v2(
-        lease: ProviderActivationLease,
-        generation: ResearchProviderRuntimeGeneration,
-        source_plan_digest: EvidenceDigest,
-        runtime: BlsRegisteredV2LiveRuntime,
-    ) -> Self {
-        Self {
-            lease,
-            generation,
-            tier: BlsAccessTier::RegisteredV2,
-            source_plan_digest,
-            runtime: BlsCurrentRuntime::RegisteredV2(runtime),
+            runtime,
         }
     }
 
@@ -157,11 +138,8 @@ impl BlsProductActivation {
             && self.source_plan_digest == source_plan_digest
     }
 
-    fn registered_runtime(&self) -> Option<&BlsRegisteredV2LiveRuntime> {
-        match &self.runtime {
-            BlsCurrentRuntime::PublicV1 => None,
-            BlsCurrentRuntime::RegisteredV2(runtime) => Some(runtime),
-        }
+    const fn runtime(&self) -> &BlsLiveRuntime {
+        &self.runtime
     }
 }
 
@@ -212,40 +190,19 @@ impl ProviderAdapterActivation {
             return Err(ProviderAdapterActivationError::SourceBinding);
         }
 
-        let activation = match tier {
-            BlsAccessTier::PublicV1 => {
-                self.research_mutation.register_provider_source(
-                    generation.clone(),
-                    source,
-                    rights,
-                )?;
-                BlsProductActivation::public_v1(
-                    lease.clone(),
-                    generation.clone(),
-                    source_plan_digest,
-                )
-            }
-            BlsAccessTier::RegisteredV2 => {
-                let composition = BlsRegisteredV2LiveComposition::try_new(
-                    Arc::clone(&self.research),
-                    source,
-                    generation.clone(),
-                )
+        let composition =
+            BlsLiveComposition::try_new(Arc::clone(&self.research), source, generation.clone())
                 .map_err(map_live_composition_error)?;
-                let (registered_source, runtime) = composition.into_parts();
-                self.research_mutation.register_provider_source(
-                    generation.clone(),
-                    registered_source,
-                    rights,
-                )?;
-                BlsProductActivation::registered_v2(
-                    lease.clone(),
-                    generation.clone(),
-                    source_plan_digest,
-                    runtime,
-                )
-            }
-        };
+        let (live_source, runtime) = composition.into_parts();
+        self.research_mutation
+            .register_provider_source(generation.clone(), live_source, rights)?;
+        let activation = BlsProductActivation::new(
+            lease.clone(),
+            generation.clone(),
+            tier,
+            source_plan_digest,
+            runtime,
+        );
         *retained = Some(Arc::new(activation));
         Ok(ActivatedResearchProvider {
             lease,
@@ -283,26 +240,24 @@ impl ProviderAdapterActivation {
         {
             return Err(ProviderAdapterActivationError::SourceBinding);
         }
-        let composition = BlsRegisteredV2LiveComposition::try_new(
-            Arc::clone(&self.research),
-            source,
-            candidate.clone(),
-        )
-        .map_err(map_live_composition_error)?;
-        let (registered_source, runtime) = composition.into_parts();
-        let activation = Arc::new(BlsProductActivation::registered_v2(
+        let composition =
+            BlsLiveComposition::try_new(Arc::clone(&self.research), source, candidate.clone())
+                .map_err(map_live_composition_error)?;
+        let (live_source, runtime) = composition.into_parts();
+        let activation = Arc::new(BlsProductActivation::new(
             lease.clone(),
             candidate.clone(),
+            BlsAccessTier::RegisteredV2,
             source_plan_digest,
             runtime,
         ));
         let replacement = self
-            .prepare_runtime_replacement(lease, expected, candidate, registered_source, rights)
+            .prepare_runtime_replacement(lease, expected, candidate, live_source, rights)
             .await?;
         Ok((replacement, activation))
     }
 
-    /// Executes the neutral canonical macro operation against the exact current registered source.
+    /// Executes the neutral canonical macro operation against the exact current BLS source.
     pub(crate) async fn execute_macro_provider_period_latest_known(
         &self,
         request: MacroProviderPeriodLatestKnownRequest,
@@ -315,9 +270,6 @@ impl ProviderAdapterActivation {
             .as_ref()
             .cloned()
             .ok_or(MacroProviderPeriodOperationError::SetupRequired)?;
-        let runtime = activation
-            .registered_runtime()
-            .ok_or(MacroProviderPeriodOperationError::RegisteredAccessRequired)?;
         let onboarding = self.onboarding.acquire_runtime_mutation_authority().await;
         onboarding.require_active(&activation.lease)?;
         if self
@@ -329,7 +281,10 @@ impl ProviderAdapterActivation {
             return Err(MacroProviderPeriodOperationError::Unavailable);
         }
         drop(onboarding);
-        let live = runtime.publish_and_read(request.live, context).await?;
+        let live = activation
+            .runtime()
+            .publish_and_read(request.live, context)
+            .await?;
         Ok(MacroProviderPeriodLatestKnownOutput { live })
     }
 }
@@ -344,8 +299,6 @@ fn map_live_composition_error(error: BlsLivePublicationError) -> ProviderAdapter
 pub(crate) enum MacroProviderPeriodOperationError {
     #[error("macro data setup is required")]
     SetupRequired,
-    #[error("the configured macro source does not admit the durable provider-period operation")]
-    RegisteredAccessRequired,
     #[error("the configured macro source is unavailable")]
     Unavailable,
     #[error(transparent)]

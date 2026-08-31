@@ -1,4 +1,4 @@
-//! Registered BLS v2 acquisition, durable macro publication, and exact PIT handoff.
+//! BLS acquisition, durable macro publication, and exact PIT handoff.
 //!
 //! This leaf pairs one concrete [`BlsSource`] with the generic source value published into the
 //! application registry. Production acquisition therefore uses the registry-minted extraction
@@ -35,9 +35,9 @@ use super::{
     ResearchProviderRuntimeGeneration, ResearchRevisionPlanError,
 };
 
-/// One exact BLS registered-v2 publication and fixed provider-period read request.
+/// One exact BLS publication and fixed provider-period read request.
 #[derive(Clone, Debug)]
-pub(crate) struct BlsRegisteredV2LiveRequest {
+pub(crate) struct BlsLiveRequest {
     doctor_deadline: Timestamp,
     acquisition_deadline: Timestamp,
     seal_deadline: Instant,
@@ -50,7 +50,7 @@ pub(crate) struct BlsRegisteredV2LiveRequest {
     query_deadline: Instant,
 }
 
-impl BlsRegisteredV2LiveRequest {
+impl BlsLiveRequest {
     /// Retains the independent provider, sealing, extraction, and typed-read bounds.
     #[allow(
         clippy::too_many_arguments,
@@ -85,18 +85,18 @@ impl BlsRegisteredV2LiveRequest {
 
 /// Paired generic-registration and concrete-production values for one exact BLS generation.
 ///
-/// The pair shares one source instance. Activation registers [`Self::registered_source`] through
+/// The pair shares one source instance. Activation registers [`Self::live_source`] through
 /// the ordinary provider runtime mutation authority and retains [`Self::runtime`] in application
 /// composition. Constructing another provider-rate authority or BLS cache is neither required nor
 /// possible through this capability.
-pub(crate) struct BlsRegisteredV2LiveComposition {
-    registered_source: BlsRegisteredSource,
-    runtime: BlsRegisteredV2LiveRuntime,
+pub(crate) struct BlsLiveComposition {
+    live_source: BlsLiveSource,
+    runtime: BlsLiveRuntime,
 }
 
-impl BlsRegisteredV2LiveComposition {
-    /// Binds an exact registered-v2 source to its current runtime generation and application
-    /// closure before either half is published.
+impl BlsLiveComposition {
+    /// Binds an exact public-v1 or registered-v2 source to its current runtime generation and
+    /// application closure before either half is published.
     pub(crate) fn try_new(
         coordinator: Arc<ProductionResearchIngestCoordinator>,
         source: BlsSource,
@@ -106,10 +106,10 @@ impl BlsRegisteredV2LiveComposition {
         validate_source_generation(source.as_ref(), &generation)?;
         let closure = BlsMacroApplicationClosure::new(Arc::clone(&coordinator.research));
         Ok(Self {
-            registered_source: BlsRegisteredSource {
+            live_source: BlsLiveSource {
                 source: Arc::clone(&source),
             },
-            runtime: BlsRegisteredV2LiveRuntime {
+            runtime: BlsLiveRuntime {
                 coordinator,
                 closure,
                 source,
@@ -119,42 +119,42 @@ impl BlsRegisteredV2LiveComposition {
     }
 
     /// Separates the generic registration value from its exact concrete production runtime.
-    pub(crate) fn into_parts(self) -> (BlsRegisteredSource, BlsRegisteredV2LiveRuntime) {
-        (self.registered_source, self.runtime)
+    pub(crate) fn into_parts(self) -> (BlsLiveSource, BlsLiveRuntime) {
+        (self.live_source, self.runtime)
     }
 }
 
-impl std::fmt::Debug for BlsRegisteredV2LiveComposition {
+impl std::fmt::Debug for BlsLiveComposition {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("BlsRegisteredV2LiveComposition")
-            .field("source", &self.registered_source)
+            .debug_struct("BlsLiveComposition")
+            .field("source", &self.live_source)
             .field("runtime", &self.runtime)
             .finish()
     }
 }
 
 /// Registry-facing wrapper sharing the exact concrete source with the typed BLS runtime.
-pub(crate) struct BlsRegisteredSource {
+pub(crate) struct BlsLiveSource {
     source: Arc<BlsSource>,
 }
 
-impl std::fmt::Debug for BlsRegisteredSource {
+impl std::fmt::Debug for BlsLiveSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("BlsRegisteredSource")
+            .debug_struct("BlsLiveSource")
             .field("source", self.source.as_ref())
             .finish()
     }
 }
 
-impl SourceMetadataProvider for BlsRegisteredSource {
+impl SourceMetadataProvider for BlsLiveSource {
     fn metadata(&self) -> &SourceMetadata {
         self.source.metadata()
     }
 }
 
-impl ExtractionSource for BlsRegisteredSource {
+impl ExtractionSource for BlsLiveSource {
     fn discover(
         &self,
         authority: ExtractionAuthority,
@@ -174,7 +174,7 @@ impl ExtractionSource for BlsRegisteredSource {
     }
 }
 
-impl ManagedResearchExtractionSource for BlsRegisteredSource {
+impl ManagedResearchExtractionSource for BlsLiveSource {
     fn discovery_dataset_identifier(&self) -> Option<&SourceIdentifier> {
         Some(self.source.dataset())
     }
@@ -213,16 +213,16 @@ impl ManagedResearchExtractionSource for BlsRegisteredSource {
     }
 }
 
-/// Callable registered-v2 BLS source through immutable publication and exact restart/PIT read.
-pub(crate) struct BlsRegisteredV2LiveRuntime {
+/// Callable BLS source through immutable publication and exact restart/PIT read.
+pub(crate) struct BlsLiveRuntime {
     coordinator: Arc<ProductionResearchIngestCoordinator>,
     closure: BlsMacroApplicationClosure,
     source: Arc<BlsSource>,
     generation: ResearchProviderRuntimeGeneration,
 }
 
-impl BlsRegisteredV2LiveRuntime {
-    /// Runs one complete bounded registered-v2 producer-to-consumer journey.
+impl BlsLiveRuntime {
+    /// Runs one complete bounded public-v1 or registered-v2 producer-to-consumer journey.
     ///
     /// Provider requests use only the registry-minted extraction authority. Doctor and discovery
     /// responses are physically sealed by the sole [`crate::ResearchService`] before canonical
@@ -231,9 +231,9 @@ impl BlsRegisteredV2LiveRuntime {
     /// period semantics pass through unchanged.
     pub(crate) async fn publish_and_read(
         &self,
-        request: BlsRegisteredV2LiveRequest,
+        request: BlsLiveRequest,
         context: &RequestContext,
-    ) -> Result<BlsRegisteredV2LiveOutcome, BlsLivePublicationError> {
+    ) -> Result<BlsLiveOutcome, BlsLivePublicationError> {
         validate_source_generation(self.source.as_ref(), &self.generation)?;
         let operation = self
             .coordinator
@@ -319,7 +319,7 @@ impl BlsRegisteredV2LiveRuntime {
         {
             return Err(BlsLivePublicationError::RestartMismatch);
         }
-        Ok(BlsRegisteredV2LiveOutcome {
+        Ok(BlsLiveOutcome {
             activation_plan_digest: self.source.activation_plan()?.plan_digest(),
             publication_digest,
             publication,
@@ -328,10 +328,10 @@ impl BlsRegisteredV2LiveRuntime {
     }
 }
 
-impl std::fmt::Debug for BlsRegisteredV2LiveRuntime {
+impl std::fmt::Debug for BlsLiveRuntime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("BlsRegisteredV2LiveRuntime")
+            .debug_struct("BlsLiveRuntime")
             .field("profile", self.generation.profile())
             .field("source_id", self.generation.metadata().source_id())
             .field("provider_dataset", self.source.dataset())
@@ -342,14 +342,14 @@ impl std::fmt::Debug for BlsRegisteredV2LiveRuntime {
 
 /// Exact immutable generation and provider-period rows returned by the live BLS journey.
 #[derive(Debug)]
-pub(crate) struct BlsRegisteredV2LiveOutcome {
+pub(crate) struct BlsLiveOutcome {
     activation_plan_digest: EvidenceDigest,
     publication_digest: EvidenceDigest,
     publication: BlsMacroPlanPublication,
     read: BlsProviderPeriodLatestKnownDto,
 }
 
-impl BlsRegisteredV2LiveOutcome {
+impl BlsLiveOutcome {
     /// Returns the adapter-owned identity of tier, credential generation, series, windows, and
     /// shared rate declaration used for acquisition.
     pub(crate) const fn activation_plan_digest(&self) -> EvidenceDigest {
@@ -406,13 +406,22 @@ fn validate_source_generation(
     generation: &ResearchProviderRuntimeGeneration,
 ) -> Result<(), BlsLivePublicationError> {
     let plan = source.activation_plan()?;
-    let credential_rejoin = BlsCredentialRejoin::for_registered_v2(
-        generation
-            .secret_reference()
-            .ok_or(BlsLivePublicationError::SourceGenerationMismatch)?,
-    )?;
-    if plan.rate().tier() != BlsAccessTier::RegisteredV2
-        || plan.credential_rejoin() != credential_rejoin
+    let credential_rejoin = match plan.rate().tier() {
+        BlsAccessTier::PublicV1 => {
+            if generation.credential_generation().is_some()
+                || generation.secret_reference().is_some()
+            {
+                return Err(BlsLivePublicationError::SourceGenerationMismatch);
+            }
+            BlsCredentialRejoin::PublicNoCredential
+        }
+        BlsAccessTier::RegisteredV2 => BlsCredentialRejoin::for_registered_v2(
+            generation
+                .secret_reference()
+                .ok_or(BlsLivePublicationError::SourceGenerationMismatch)?,
+        )?,
+    };
+    if plan.credential_rejoin() != credential_rejoin
         || plan.source_id() != generation.metadata().source_id()
         || plan.metadata_revision() != generation.metadata().revision()
         || plan.provider_dataset() != source.dataset()
@@ -503,53 +512,53 @@ fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), BlsLiveP
     }
 }
 
-/// Failure in the exact registered BLS producer-to-consumer path.
+/// Failure in the exact current BLS producer-to-consumer path.
 #[derive(Debug, Error)]
 pub(crate) enum BlsLivePublicationError {
     /// The BLS adapter rejected source, credential-generation, or provider evidence.
-    #[error("registered BLS source rejected live publication authority")]
+    #[error("BLS source rejected live publication authority")]
     Adapter(#[from] BlsSourceError),
     /// Existing BLS sealing, canonical publication, restart, or PIT selection failed.
-    #[error("registered BLS publication closure failed")]
+    #[error("BLS publication closure failed")]
     Application(#[from] BlsMacroApplicationError),
     /// The shared registry, provider generation, or publication lease is unavailable.
-    #[error("registered BLS runtime authority is unavailable")]
+    #[error("BLS runtime authority is unavailable")]
     Composition(#[from] ResearchIngestCompositionError),
     /// The registry could not mint current extraction authority for the exact source.
-    #[error("registered BLS extraction authority is unavailable")]
+    #[error("BLS extraction authority is unavailable")]
     Registry(#[from] market_squawk_sources::RegistryError),
     /// The fixed BLS request-plan discovery contract is invalid.
-    #[error("registered BLS discovery request is invalid")]
+    #[error("BLS discovery request is invalid")]
     Discovery(#[from] market_squawk_sources::ExtractionError),
     /// The shared analytical ingest authority rejected reservation or precommit.
-    #[error("registered BLS analytical publication failed")]
+    #[error("BLS analytical publication failed")]
     Ingest(#[from] IngestError),
     /// Exact source/payload/operation/idempotency identity is not reservation-safe.
-    #[error("registered BLS ingest identity is invalid")]
+    #[error("BLS ingest identity is invalid")]
     IngestIdentity(#[from] market_squawk_data::RightsError),
     /// The retained source rights no longer admit exact payload persistence.
-    #[error("registered BLS persistence rights are unavailable")]
+    #[error("BLS persistence rights are unavailable")]
     Rights(#[from] ServiceError),
-    /// The concrete source does not match the exact current registered-v2 generation.
-    #[error("registered BLS source generation does not match application authority")]
+    /// The concrete source does not match the exact current public-v1 or registered-v2 generation.
+    #[error("BLS source generation does not match application authority")]
     SourceGenerationMismatch,
     /// The adapter handoff does not match its configured source/dataset or is empty.
-    #[error("registered BLS prepared plan does not match source authority")]
+    #[error("BLS prepared plan does not match source authority")]
     PreparedPlanMismatch,
     /// Exact whole-plan restart and typed-read evidence changed manifest or source.
-    #[error("registered BLS restart or PIT read changed immutable identity")]
+    #[error("BLS restart or PIT read changed immutable identity")]
     RestartMismatch,
     /// The fixed producer-to-consumer journey did not return an available typed read.
-    #[error("registered BLS provider-period read is unavailable")]
+    #[error("BLS provider-period read is unavailable")]
     ReadUnavailable,
     /// A request-plan count or identity field exceeds the bounded representation.
-    #[error("registered BLS request exceeds application capacity")]
+    #[error("BLS request exceeds application capacity")]
     Capacity,
     /// Caller or exact runtime-generation cancellation won the operation.
-    #[error("registered BLS publication was cancelled")]
+    #[error("BLS publication was cancelled")]
     Cancelled,
     /// The process wall clock cannot produce a trusted publication coordinate.
-    #[error("registered BLS publication trusted time is unavailable")]
+    #[error("BLS publication trusted time is unavailable")]
     TrustedTimeUnavailable,
 }
 
@@ -620,44 +629,54 @@ mod tests {
     }"#;
 
     #[tokio::test]
-    async fn protected_registered_source_seals_publishes_and_reopens_exact_macro_plan() -> TestResult
+    async fn public_and_protected_sources_seal_publish_and_reopen_exact_macro_plans() -> TestResult
     {
         let temporary = tempfile::tempdir()?;
+        let secret_reference = protected_registration_key(temporary.path())?;
+        prove_live_journey(
+            &temporary.path().join("public-v1"),
+            BlsAccessTier::PublicV1,
+            None,
+        )
+        .await?;
+        prove_live_journey(
+            &temporary.path().join("registered-v2"),
+            BlsAccessTier::RegisteredV2,
+            Some(secret_reference),
+        )
+        .await
+    }
+
+    async fn prove_live_journey(
+        root: &std::path::Path,
+        tier: BlsAccessTier,
+        secret_reference: Option<SecretRef>,
+    ) -> TestResult {
         let now = current_timestamp()?;
         let observed_at = now.checked_sub_nanos(1_000_000)?;
-        let secret_reference = protected_registration_key(temporary.path())?;
-        let series = series_metadata()?;
-        let registered_config = BlsSourceConfig::try_new(
-            BlsAuthorization::registered_v2(
-                BlsRegistrationKey::try_new("fixture-registration-key".to_owned())?,
-                &secret_reference,
-            )?,
-            vec![series.clone()],
-            2026,
-            2026,
-        )?;
-        let registered_metadata = source_metadata(
-            BlsAccessTier::RegisteredV2,
-            now,
-            digest(1),
-            "bls-registered-v2-fixture",
-        )?;
-        let registered_plan_rejoin = BlsCredentialRejoin::for_registered_v2(&secret_reference)?;
-
-        let public_config =
-            BlsSourceConfig::try_new(BlsAuthorization::public_v1(), vec![series], 2026, 2026)?;
-        let public_metadata = source_metadata(
-            BlsAccessTier::PublicV1,
-            now,
-            digest(2),
-            "bls-public-v1-fixture",
-        )?;
-        let public_source =
-            market_squawk_adapter_bls::BlsSource::try_new(public_metadata, public_config)?;
-        assert_eq!(
-            public_source.activation_plan()?.credential_rejoin(),
-            BlsCredentialRejoin::PublicNoCredential
-        );
+        let (authorization, expected_rejoin, profile, evidence_byte, revision) =
+            match (tier, secret_reference.as_ref()) {
+                (BlsAccessTier::PublicV1, None) => (
+                    BlsAuthorization::public_v1(),
+                    BlsCredentialRejoin::PublicNoCredential,
+                    "bls.v1-unregistered",
+                    1,
+                    "bls-public-v1-fixture",
+                ),
+                (BlsAccessTier::RegisteredV2, Some(reference)) => (
+                    BlsAuthorization::registered_v2(
+                        BlsRegistrationKey::try_new("fixture-registration-key".to_owned())?,
+                        reference,
+                    )?,
+                    BlsCredentialRejoin::for_registered_v2(reference)?,
+                    "bls.v2-registered",
+                    2,
+                    "bls-registered-v2-fixture",
+                ),
+                _ => return Err("credential does not match BLS access tier".into()),
+            };
+        let config = BlsSourceConfig::try_new(authorization, vec![series_metadata()?], 2026, 2026)?;
+        let metadata = source_metadata(tier, now, digest(evidence_byte), revision)?;
 
         let fixture = BlsScriptedTransportFactory::try_new(vec![
             BlsScriptedResponse::try_new(
@@ -671,58 +690,59 @@ mod tests {
                 observed_at,
             )?,
         ])?;
-        let source = fixture.production_source(registered_metadata.clone(), registered_config)?;
+        let source = fixture.production_source(metadata.clone(), config)?;
         assert_eq!(
             source.activation_plan()?.credential_rejoin(),
-            registered_plan_rejoin
+            expected_rejoin
         );
 
-        let rights_subject = ProviderRateDeclaration::governed_provider_subject(
-            &SourceIdentifier::try_from("us-bls")?,
-        )?;
-        let rights = ResearchRightsAuthority::try_new_scoped(
-            registered_metadata.source_id().clone(),
-            RightsBasis::reviewed_terms("https://example.test/bls-terms", digest(3))?,
-            digest(4),
-            digest(5),
-            now.checked_add_nanos(60_000_000_000)?,
-            vec![rights_subject.clone()],
-            vec![SourceOperation::Persist],
-        )?;
+        let rights_subject = source
+            .activation_plan()?
+            .rate()
+            .authorization_subject()
+            .cloned();
+        let rights_basis =
+            RightsBasis::reviewed_terms("https://example.test/bls-terms", digest(3))?;
+        let rights = match rights_subject.as_ref() {
+            Some(subject) => ResearchRightsAuthority::try_new_scoped(
+                metadata.source_id().clone(),
+                rights_basis,
+                digest(4),
+                digest(5),
+                now.checked_add_nanos(60_000_000_000)?,
+                vec![subject.clone()],
+                vec![SourceOperation::Persist],
+            )?,
+            None => ResearchRightsAuthority::try_new(
+                metadata.source_id().clone(),
+                rights_basis,
+                digest(5),
+                Some(now.checked_add_nanos(60_000_000_000)?),
+            )?,
+        };
         let generation = ResearchProviderRuntimeGeneration::try_new(
-            SourceIdentifier::try_from("bls.v2-registered")?,
+            SourceIdentifier::try_from(profile)?,
             Uuid::new_v4(),
             ProviderCapabilityRevision::new(1)?,
             digest(6),
-            Some(secret_reference.generation()),
-            Some(secret_reference),
+            secret_reference.as_ref().map(SecretRef::generation),
+            secret_reference,
             now,
-            registered_metadata.clone(),
+            metadata.clone(),
             rights.clone(),
         )?;
-
-        assert!(
-            BlsRegisteredV2LiveComposition::try_new(
-                empty_coordinator(temporary.path().join("public-tier-check"))?.0,
-                public_source,
-                generation.clone(),
-            )
-            .is_err()
-        );
-
-        let paths = LocalPaths::prepare(temporary.path().join("research"))?;
+        let paths = LocalPaths::prepare(root.join("research"))?;
         let research = Arc::new(open_research(&paths)?);
         let provider_rate = ProviderRateAuthority::try_new(Arc::new(
-            SqliteProviderRateStore::try_open(temporary.path().join("provider-rate.sqlite3"))?,
+            SqliteProviderRateStore::try_open(root.join("provider-rate.sqlite3"))?,
         ))?;
-        provider_rate.bind_authorization_subject(
-            AuthorizationMode::UserAuthorized,
-            registered_metadata
-                .authorization()
-                .evidence()
-                .content_digest(),
-            &rights_subject,
-        )?;
+        if let Some(subject) = rights_subject {
+            provider_rate.bind_authorization_subject(
+                metadata.authorization().mode(),
+                metadata.authorization().evidence().content_digest(),
+                &subject,
+            )?;
+        }
         let registry = AuthoritativeSourceRegistry::try_new_in_memory_for_bounded_extraction(
             Arc::new(provider_rate.clone()),
             provider_rate,
@@ -734,13 +754,10 @@ mod tests {
                 ResearchExtractionLimits::standard(),
                 std::iter::empty(),
             )?;
-        let composition = BlsRegisteredV2LiveComposition::try_new(
-            Arc::clone(&coordinator),
-            source,
-            generation.clone(),
-        )?;
-        let (registered_source, runtime) = composition.into_parts();
-        register_source(&mutation, generation, registered_source, rights)?;
+        let composition =
+            BlsLiveComposition::try_new(Arc::clone(&coordinator), source, generation.clone())?;
+        let (live_source, runtime) = composition.into_parts();
+        register_source(&mutation, generation, live_source, rights)?;
 
         let cutoff = now.checked_add_nanos(30_000_000_000)?;
         let period = ResearchPeriod::try_new(
@@ -754,7 +771,7 @@ mod tests {
         let operation_deadline = Instant::now() + Duration::from_secs(15);
         let outcome = runtime
             .publish_and_read(
-                BlsRegisteredV2LiveRequest::new(
+                BlsLiveRequest::new(
                     now.checked_add_nanos(10_000_000_000)?,
                     now.checked_add_nanos(10_000_000_000)?,
                     operation_deadline,
@@ -809,36 +826,10 @@ mod tests {
     fn register_source(
         mutation: &ResearchProviderRuntimeMutationAuthority,
         generation: ResearchProviderRuntimeGeneration,
-        source: super::BlsRegisteredSource,
+        source: super::BlsLiveSource,
         rights: ResearchRightsAuthority,
     ) -> Result<(), ResearchIngestCompositionError> {
         mutation.register_provider_source(generation, source, rights)
-    }
-
-    fn empty_coordinator(
-        root: impl AsRef<std::path::Path>,
-    ) -> TestResult<(
-        Arc<ProductionResearchIngestCoordinator>,
-        ResearchProviderRuntimeMutationAuthority,
-    )> {
-        let root = root.as_ref();
-        let paths = LocalPaths::prepare(root.join("research"))?;
-        let research = Arc::new(open_research(&paths)?);
-        let rate = ProviderRateAuthority::try_new(Arc::new(SqliteProviderRateStore::try_open(
-            root.join("provider-rate.sqlite3"),
-        )?))?;
-        let registry = AuthoritativeSourceRegistry::try_new_in_memory_for_bounded_extraction(
-            Arc::new(rate.clone()),
-            rate,
-        )?;
-        let (coordinator, mutation, _alpaca) =
-            ProductionResearchIngestCoordinator::try_new_with_runtime_authorities(
-                registry,
-                research,
-                ResearchExtractionLimits::standard(),
-                std::iter::empty(),
-            )?;
-        Ok((coordinator, mutation))
     }
 
     fn open_research(paths: &LocalPaths) -> TestResult<ResearchService> {
