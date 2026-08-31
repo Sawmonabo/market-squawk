@@ -11,6 +11,79 @@ use crate::query::{
 use crate::response::CensusParseLimits;
 use crate::{CensusAdapterError, sha256};
 
+/// Closed, payload-free predicate identifying one failed dataset-catalog validation step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CensusCatalogFailurePredicate {
+    /// Exact response bytes exceeded the configured parser bound.
+    BodyBound,
+    /// Response bytes were not valid JSON.
+    JsonSyntax,
+    /// The JSON root was not an object.
+    RootObject,
+    /// The root omitted the required dataset array.
+    DatasetArray,
+    /// The dataset array exceeded the configured entry bound.
+    EntryBound,
+    /// Bounded dataset storage could not be allocated.
+    Allocation,
+    /// A dataset-array member was not an object.
+    EntryObject,
+    /// A dataset entry omitted or malformed its vintage.
+    Vintage,
+    /// A vintage-scoped catalog returned a different vintage.
+    VintageMismatch,
+    /// A dataset entry omitted or malformed its route path.
+    DatasetPath,
+    /// Two catalog entries resolved to the same dataset identity.
+    DuplicateDataset,
+    /// A dataset entry omitted or malformed its title.
+    Title,
+    /// A dataset entry omitted or malformed its description.
+    Description,
+    /// A dataset entry malformed its optional API distribution.
+    Distribution,
+    /// A dataset entry malformed its optional variables link.
+    VariablesLink,
+    /// A dataset entry malformed its optional groups link.
+    GroupsLink,
+    /// A dataset entry malformed its optional geography link.
+    GeographyLink,
+    /// A dataset entry malformed its optional availability flag.
+    AvailableFlag,
+    /// A dataset entry malformed its optional aggregate flag.
+    AggregateFlag,
+    /// A dataset entry malformed its optional time-series flag.
+    TimeSeriesFlag,
+    /// A non-catalog request was supplied to the catalog-only parser.
+    RequestKind,
+}
+
+#[derive(Debug)]
+pub(crate) struct CensusCatalogParseFailure {
+    source: CensusAdapterError,
+    predicate: CensusCatalogFailurePredicate,
+}
+
+impl CensusCatalogParseFailure {
+    fn new(source: CensusAdapterError, predicate: CensusCatalogFailurePredicate) -> Self {
+        Self { source, predicate }
+    }
+
+    pub(crate) const fn predicate(&self) -> CensusCatalogFailurePredicate {
+        self.predicate
+    }
+
+    pub(crate) fn into_source(self) -> CensusAdapterError {
+        self.source
+    }
+}
+
+fn catalog_failure(
+    predicate: CensusCatalogFailurePredicate,
+) -> impl FnOnce(CensusAdapterError) -> CensusCatalogParseFailure {
+    move |source| CensusCatalogParseFailure::new(source, predicate)
+}
+
 /// Exact payload identity and single-document accounting for discovery metadata.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CensusMetadataEvidence {
@@ -78,13 +151,17 @@ impl CensusDiscoveryDocument {
         bytes: &[u8],
         limits: CensusParseLimits,
     ) -> Result<Self, CensusAdapterError> {
+        if matches!(
+            request.kind(),
+            CensusDiscoveryKind::Datasets | CensusDiscoveryKind::VintageDatasets { .. }
+        ) {
+            return Self::parse_catalog_diagnosed(request, bytes, limits)
+                .map_err(CensusCatalogParseFailure::into_source);
+        }
         ensure_body_bound(bytes, limits)?;
         match request.kind() {
-            CensusDiscoveryKind::Datasets => {
-                CensusDatasetCatalog::parse_inner(bytes, None, limits).map(Self::Datasets)
-            }
-            CensusDiscoveryKind::VintageDatasets { vintage } => {
-                CensusDatasetCatalog::parse_inner(bytes, Some(*vintage), limits).map(Self::Datasets)
+            CensusDiscoveryKind::Datasets | CensusDiscoveryKind::VintageDatasets { .. } => {
+                Err(CensusAdapterError::InvalidQuery)
             }
             CensusDiscoveryKind::Variables { dataset } => {
                 CensusVariableCatalog::parse_inner(bytes, dataset.clone(), None, limits)
@@ -105,6 +182,27 @@ impl CensusDiscoveryDocument {
                     .map(Self::Geographies)
             }
         }
+    }
+
+    pub(crate) fn parse_catalog_diagnosed(
+        request: &CensusDiscoveryRequest,
+        bytes: &[u8],
+        limits: CensusParseLimits,
+    ) -> Result<Self, CensusCatalogParseFailure> {
+        ensure_body_bound(bytes, limits)
+            .map_err(catalog_failure(CensusCatalogFailurePredicate::BodyBound))?;
+        let expected_vintage = match request.kind() {
+            CensusDiscoveryKind::Datasets => None,
+            CensusDiscoveryKind::VintageDatasets { vintage } => Some(*vintage),
+            _ => {
+                return Err(CensusCatalogParseFailure::new(
+                    CensusAdapterError::InvalidQuery,
+                    CensusCatalogFailurePredicate::RequestKind,
+                ));
+            }
+        };
+        CensusDatasetCatalog::parse_inner_diagnosed(bytes, expected_vintage, limits)
+            .map(Self::Datasets)
     }
 }
 
@@ -183,51 +281,98 @@ pub struct CensusDatasetCatalog {
 }
 
 impl CensusDatasetCatalog {
-    fn parse_inner(
+    fn parse_inner_diagnosed(
         bytes: &[u8],
         expected_vintage: Option<u16>,
         limits: CensusParseLimits,
-    ) -> Result<Self, CensusAdapterError> {
-        let root = parse_object(bytes)?;
+    ) -> Result<Self, CensusCatalogParseFailure> {
+        let root = parse_object(bytes).map_err(|error| {
+            let predicate = if matches!(error, CensusAdapterError::InvalidJson) {
+                CensusCatalogFailurePredicate::JsonSyntax
+            } else {
+                CensusCatalogFailurePredicate::RootObject
+            };
+            CensusCatalogParseFailure::new(error, predicate)
+        })?;
         let entries = root
             .get("dataset")
             .and_then(Value::as_array)
-            .ok_or(CensusAdapterError::SchemaDrift)?;
-        ensure_entry_bound(entries.len(), limits)?;
+            .ok_or_else(|| {
+                CensusCatalogParseFailure::new(
+                    CensusAdapterError::SchemaDrift,
+                    CensusCatalogFailurePredicate::DatasetArray,
+                )
+            })?;
+        ensure_entry_bound(entries.len(), limits)
+            .map_err(catalog_failure(CensusCatalogFailurePredicate::EntryBound))?;
         let mut datasets = Vec::new();
-        datasets
-            .try_reserve_exact(entries.len())
-            .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+        datasets.try_reserve_exact(entries.len()).map_err(|_| {
+            CensusCatalogParseFailure::new(
+                CensusAdapterError::ResourceLimitExceeded,
+                CensusCatalogFailurePredicate::Allocation,
+            )
+        })?;
         let mut identities = BTreeSet::new();
         for entry in entries {
-            let entry = entry.as_object().ok_or(CensusAdapterError::SchemaDrift)?;
-            let vintage = required_vintage(entry, "c_vintage")?;
+            let entry = entry.as_object().ok_or_else(|| {
+                CensusCatalogParseFailure::new(
+                    CensusAdapterError::SchemaDrift,
+                    CensusCatalogFailurePredicate::EntryObject,
+                )
+            })?;
+            let vintage = required_vintage(entry, "c_vintage")
+                .map_err(catalog_failure(CensusCatalogFailurePredicate::Vintage))?;
             if expected_vintage
                 .is_some_and(|expected| vintage != CensusDatasetVintage::Year(expected))
             {
-                return Err(CensusAdapterError::MetadataMismatch);
+                return Err(CensusCatalogParseFailure::new(
+                    CensusAdapterError::MetadataMismatch,
+                    CensusCatalogFailurePredicate::VintageMismatch,
+                ));
             }
-            let path = required_string_array(entry, "c_dataset", limits)?;
+            let path = required_string_array(entry, "c_dataset", limits)
+                .map_err(catalog_failure(CensusCatalogFailurePredicate::DatasetPath))?;
             let dataset = match vintage {
-                CensusDatasetVintage::Year(year) => CensusDataset::try_new(year, path.join("/"))?,
+                CensusDatasetVintage::Year(year) => CensusDataset::try_new(year, path.join("/")),
                 CensusDatasetVintage::TimeSeries => {
                     let path = path
                         .first()
                         .is_some_and(|segment| segment == "timeseries")
                         .then_some(&path[1..])
                         .unwrap_or(path.as_slice());
-                    CensusDataset::try_time_series(path.join("/"))?
+                    CensusDataset::try_time_series(path.join("/"))
                 }
-            };
-            if !identities.insert(dataset.clone()) {
-                return Err(CensusAdapterError::DuplicateIdentity);
             }
-            let title = required_text(entry, "title", limits)?;
-            let description = required_text(entry, "description", limits)?;
-            let api_base_url = distribution_api_url(entry, limits)?;
-            let variables_url = optional_text(entry, "c_variablesLink", limits)?;
-            let groups_url = optional_text(entry, "c_groupsLink", limits)?;
-            let geography_url = optional_text(entry, "c_geographyLink", limits)?;
+            .map_err(catalog_failure(CensusCatalogFailurePredicate::DatasetPath))?;
+            if !identities.insert(dataset.clone()) {
+                return Err(CensusCatalogParseFailure::new(
+                    CensusAdapterError::DuplicateIdentity,
+                    CensusCatalogFailurePredicate::DuplicateDataset,
+                ));
+            }
+            let title = required_text(entry, "title", limits)
+                .map_err(catalog_failure(CensusCatalogFailurePredicate::Title))?;
+            let description = required_text(entry, "description", limits)
+                .map_err(catalog_failure(CensusCatalogFailurePredicate::Description))?;
+            let api_base_url = distribution_api_url(entry, limits)
+                .map_err(catalog_failure(CensusCatalogFailurePredicate::Distribution))?;
+            let variables_url = optional_text(entry, "c_variablesLink", limits).map_err(
+                catalog_failure(CensusCatalogFailurePredicate::VariablesLink),
+            )?;
+            let groups_url = optional_text(entry, "c_groupsLink", limits)
+                .map_err(catalog_failure(CensusCatalogFailurePredicate::GroupsLink))?;
+            let geography_url = optional_text(entry, "c_geographyLink", limits).map_err(
+                catalog_failure(CensusCatalogFailurePredicate::GeographyLink),
+            )?;
+            let available = optional_bool(entry, "c_isAvailable").map_err(catalog_failure(
+                CensusCatalogFailurePredicate::AvailableFlag,
+            ))?;
+            let aggregate = optional_bool(entry, "c_isAggregate").map_err(catalog_failure(
+                CensusCatalogFailurePredicate::AggregateFlag,
+            ))?;
+            let time_series = optional_bool(entry, "c_isTimeseries").map_err(catalog_failure(
+                CensusCatalogFailurePredicate::TimeSeriesFlag,
+            ))?;
             datasets.push(CensusDatasetMetadata {
                 dataset,
                 title,
@@ -236,9 +381,9 @@ impl CensusDatasetCatalog {
                 variables_url,
                 groups_url,
                 geography_url,
-                available: optional_bool(entry, "c_isAvailable")?,
-                aggregate: optional_bool(entry, "c_isAggregate")?,
-                time_series: optional_bool(entry, "c_isTimeseries")?,
+                available,
+                aggregate,
+                time_series,
             });
         }
         datasets.sort_by(|left, right| left.dataset.cmp(&right.dataset));

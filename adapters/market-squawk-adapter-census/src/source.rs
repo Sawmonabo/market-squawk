@@ -42,11 +42,11 @@ use crate::http::{
 use crate::query::CensusAuthorizedUrl;
 use crate::{
     CENSUS_APPLICATION_REQUESTS_PER_DAY, CENSUS_APPLICATION_REQUESTS_PER_SECOND,
-    CensusAdapterError, CensusApiKey, CensusClocks, CensusDataPage, CensusDataQuery,
-    CensusDatasetVintage, CensusDiscoveryDocument, CensusDiscoveryKind, CensusDiscoveryRequest,
-    CensusGeography, CensusMetadataEvidence, CensusMissingReason, CensusParseLimits,
-    CensusPredicateType, CensusRequiredVariable, CensusSelection, CensusTypedValue,
-    CensusValueState, CensusVariableCatalog,
+    CensusAdapterError, CensusApiKey, CensusCatalogFailurePredicate, CensusClocks, CensusDataPage,
+    CensusDataQuery, CensusDatasetVintage, CensusDiscoveryDocument, CensusDiscoveryKind,
+    CensusDiscoveryRequest, CensusGeography, CensusMetadataEvidence, CensusMissingReason,
+    CensusParseLimits, CensusPredicateType, CensusRequiredVariable, CensusSelection,
+    CensusTypedValue, CensusValueState, CensusVariableCatalog,
 };
 
 /// Maximum exact Census query contracts retained by one source instance.
@@ -647,6 +647,17 @@ pub enum CensusDiagnosticFailureClass {
     ApplicationAuthority,
 }
 
+/// Compact payload-free detail for the currently failing closed phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CensusDiagnosticSubreason {
+    /// The catalog failed before its body reached the catalog parser.
+    CatalogResponse,
+    /// The catalog parser rejected one exact closed validation predicate.
+    CatalogParse(CensusCatalogFailurePredicate),
+    /// Parsed catalog evidence failed bounded response/request accounting.
+    CatalogAccounting,
+}
+
 /// Bounded, payload-free failure evidence for one Census application journey.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CensusFailureDiagnostic {
@@ -654,6 +665,7 @@ pub struct CensusFailureDiagnostic {
     attempted_requests: u8,
     successful_requests: u8,
     failure_class: CensusDiagnosticFailureClass,
+    subreason: Option<CensusDiagnosticSubreason>,
 }
 
 impl CensusFailureDiagnostic {
@@ -676,6 +688,11 @@ impl CensusFailureDiagnostic {
     pub const fn failure_class(self) -> CensusDiagnosticFailureClass {
         self.failure_class
     }
+
+    /// Returns compact phase-local detail when one is available.
+    pub const fn subreason(self) -> Option<CensusDiagnosticSubreason> {
+        self.subreason
+    }
 }
 
 /// Operation-local diagnostic state for the application-owned Census journey.
@@ -687,6 +704,7 @@ pub struct CensusDiagnosticJourney {
     phase: CensusDiagnosticPhase,
     attempted_requests: u8,
     successful_requests: u8,
+    subreason: Option<CensusDiagnosticSubreason>,
 }
 
 impl CensusDiagnosticJourney {
@@ -696,46 +714,52 @@ impl CensusDiagnosticJourney {
             phase: CensusDiagnosticPhase::DoctorPreflight,
             attempted_requests: 0,
             successful_requests: 0,
+            subreason: None,
         }
     }
 
     /// Marks the local physical-seal rejoin before canonical extraction.
     pub fn enter_sealed_rejoin(&mut self) {
-        self.phase = CensusDiagnosticPhase::SealedRejoin;
+        self.enter(CensusDiagnosticPhase::SealedRejoin);
     }
 
     /// Marks physical doctor-response sealing.
     pub fn enter_doctor_seal(&mut self) {
-        self.phase = CensusDiagnosticPhase::DoctorSeal;
+        self.enter(CensusDiagnosticPhase::DoctorSeal);
     }
 
     /// Marks post-seal doctor activation-candidate construction.
     pub fn enter_doctor_activation(&mut self) {
-        self.phase = CensusDiagnosticPhase::DoctorActivation;
+        self.enter(CensusDiagnosticPhase::DoctorActivation);
     }
 
     /// Marks bounded discovery-request construction.
     pub fn enter_discovery_request(&mut self) {
-        self.phase = CensusDiagnosticPhase::DiscoveryRequest;
+        self.enter(CensusDiagnosticPhase::DiscoveryRequest);
     }
 
     /// Marks physical sealing of the complete provider capture graph.
     pub fn enter_capture_graph_seal(&mut self) {
-        self.phase = CensusDiagnosticPhase::CaptureGraphSeal;
+        self.enter(CensusDiagnosticPhase::CaptureGraphSeal);
     }
 
     /// Marks retrieval of the sole admitted sealed object.
     pub fn enter_admission_object(&mut self) {
-        self.phase = CensusDiagnosticPhase::AdmissionObject;
+        self.enter(CensusDiagnosticPhase::AdmissionObject);
     }
 
     /// Marks bounded extraction-request construction.
     pub fn enter_extraction_request(&mut self) {
-        self.phase = CensusDiagnosticPhase::ExtractionRequest;
+        self.enter(CensusDiagnosticPhase::ExtractionRequest);
     }
 
     fn enter(&mut self, phase: CensusDiagnosticPhase) {
         self.phase = phase;
+        self.subreason = None;
+    }
+
+    fn note_subreason(&mut self, subreason: CensusDiagnosticSubreason) {
+        self.subreason = Some(subreason);
     }
 
     fn record_attempt(&mut self) -> Result<(), ExtractionSourceError> {
@@ -766,6 +790,7 @@ impl CensusDiagnosticJourney {
             attempted_requests: self.attempted_requests,
             successful_requests: self.successful_requests,
             failure_class,
+            subreason: self.subreason,
         }
     }
 }
@@ -1481,6 +1506,13 @@ impl CensusSource {
         let mut telemetry = CensusSourceTelemetry::default();
         for request in contract.metadata_requests() {
             diagnostic.enter(metadata_diagnostic_phase(request.kind()));
+            let is_catalog = matches!(
+                request.kind(),
+                CensusDiscoveryKind::Datasets | CensusDiscoveryKind::VintageDatasets { .. }
+            );
+            if is_catalog {
+                diagnostic.note_subreason(CensusDiagnosticSubreason::CatalogResponse);
+            }
             let mut response = self
                 .fetch_authorized(
                     authority,
@@ -1492,17 +1524,37 @@ impl CensusSource {
                     diagnostic,
                 )
                 .await?;
-            let document = match CensusDiscoveryDocument::parse(
-                request,
-                &response.body,
-                self.effective_parse_limits(),
-            ) {
-                Ok(document) => document,
-                Err(error) => {
-                    self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
-                    return Err(map_adapter_error(error));
+            let document = if is_catalog {
+                match CensusDiscoveryDocument::parse_catalog_diagnosed(
+                    request,
+                    &response.body,
+                    self.effective_parse_limits(),
+                ) {
+                    Ok(document) => document,
+                    Err(failure) => {
+                        diagnostic.note_subreason(CensusDiagnosticSubreason::CatalogParse(
+                            failure.predicate(),
+                        ));
+                        self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
+                        return Err(map_adapter_error(failure.into_source()));
+                    }
+                }
+            } else {
+                match CensusDiscoveryDocument::parse(
+                    request,
+                    &response.body,
+                    self.effective_parse_limits(),
+                ) {
+                    Ok(document) => document,
+                    Err(error) => {
+                        self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
+                        return Err(map_adapter_error(error));
+                    }
                 }
             };
+            if is_catalog {
+                diagnostic.note_subreason(CensusDiagnosticSubreason::CatalogAccounting);
+            }
             let metadata_entries = discovery_evidence(&document).returned_entries();
             let response_telemetry = response
                 .telemetry_with_metadata(metadata_entries)

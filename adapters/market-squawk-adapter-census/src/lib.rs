@@ -16,10 +16,10 @@ mod runtime;
 mod source;
 
 pub use discovery::{
-    CensusDatasetCatalog, CensusDatasetMetadata, CensusDiscoveryDocument, CensusGeographyAdmission,
-    CensusGeographyCatalog, CensusGeographyMetadata, CensusGroupCatalog, CensusGroupMetadata,
-    CensusMetadataEvidence, CensusPredicateType, CensusRequiredVariable, CensusVariableCatalog,
-    CensusVariableMetadata,
+    CensusCatalogFailurePredicate, CensusDatasetCatalog, CensusDatasetMetadata,
+    CensusDiscoveryDocument, CensusGeographyAdmission, CensusGeographyCatalog,
+    CensusGeographyMetadata, CensusGroupCatalog, CensusGroupMetadata, CensusMetadataEvidence,
+    CensusPredicateType, CensusRequiredVariable, CensusVariableCatalog, CensusVariableMetadata,
 };
 pub use doctor::{
     CENSUS_DOCTOR_MAX_RESPONSE_BYTES, CENSUS_DOCTOR_TIMEOUT, CensusDoctorOutput,
@@ -49,12 +49,13 @@ pub use runtime::{
 pub use source::{
     CensusAnnotatedMissingRule, CensusAnnotationMatch, CensusCapturedData, CensusCapturedDiscovery,
     CensusDatasetAcquisition, CensusDatasetContract, CensusDiagnosticFailureClass,
-    CensusDiagnosticJourney, CensusDiagnosticPhase, CensusDiscoveryOutput,
-    CensusEffectiveTimePolicy, CensusFailureDiagnostic, CensusMetadataBundle,
-    CensusPendingDiscovery, CensusSealedDiscoveryAdmission, CensusSealedExtractionOutput,
-    CensusSource, CensusSourceConfig, CensusSourceError, CensusSourceTelemetry,
-    CensusVariableMapping, MAX_CENSUS_ANNOTATED_MISSING_RULES, MAX_CENSUS_ANNOTATION_RULE_BYTES,
-    MAX_CENSUS_ANNOTATIONS_PER_RULE, MAX_CENSUS_CONFIGURED_DATASETS, census_api_endpoint_rules,
+    CensusDiagnosticJourney, CensusDiagnosticPhase, CensusDiagnosticSubreason,
+    CensusDiscoveryOutput, CensusEffectiveTimePolicy, CensusFailureDiagnostic,
+    CensusMetadataBundle, CensusPendingDiscovery, CensusSealedDiscoveryAdmission,
+    CensusSealedExtractionOutput, CensusSource, CensusSourceConfig, CensusSourceError,
+    CensusSourceTelemetry, CensusVariableMapping, MAX_CENSUS_ANNOTATED_MISSING_RULES,
+    MAX_CENSUS_ANNOTATION_RULE_BYTES, MAX_CENSUS_ANNOTATIONS_PER_RULE,
+    MAX_CENSUS_CONFIGURED_DATASETS, census_api_endpoint_rules,
 };
 
 /// A Census contract, request, metadata, or response failure.
