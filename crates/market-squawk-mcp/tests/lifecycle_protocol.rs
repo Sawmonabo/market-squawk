@@ -18,19 +18,20 @@ use axum::{
 use market_squawk_mcp::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
     ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
-    AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditPhase, AuditSink,
-    AuthenticatedMcpClient, HttpMcpConfig, LocalProcessIdentityClass, McpHandlerFactory,
-    McpHttpAuthError, McpHttpAuthenticator, McpHttpService, McpLimitSpec, McpLimits, McpRelayError,
-    McpRelayExchange, McpRelayResponse, McpRelayTransport, McpRelayTransportError, McpServer,
-    McpStdioRelay, MutationAuditBundle, MutationAuditReservation, ServerError, ServerExit,
+    AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditOperation,
+    AuditPhase, AuditSink, AuthenticatedMcpClient, HttpMcpConfig, LocalProcessIdentityClass,
+    McpHandlerFactory, McpHttpAuthError, McpHttpAuthenticator, McpHttpService, McpLimitSpec,
+    McpLimits, McpRelayError, McpRelayExchange, McpRelayResponse, McpRelayTransport,
+    McpRelayTransportError, McpServer, McpStdioRelay, MutationAuditBundle,
+    MutationAuditReservation, ServerError, ServerExit,
 };
 use market_squawk_runtime::{ClientId, CredentialGeneration, NamedClient, WorkspaceId};
 use market_squawk_services::{
-    ProgressError, RequestContext, ScopeRequirement, ServiceCapabilities, ServiceCapabilityError,
-    ServiceDomain, ServiceError, SourceEvidencePolicy, TOOL_INSTRUMENT_IDS_FIELD,
-    TOOL_RESULT_LIMITS_FIELD, TOOL_SOURCE_COVERAGE_FIELD, TOOL_TIME_RANGE_FIELD,
-    ToolArtifactPolicy, ToolAuthorization, ToolContract, ToolDescriptor, ToolEffects,
-    ToolInputError, ToolResultMetadata, ToolResultPolicy, ToolScope, ToolServices,
+    ProgressError, RequestContext, RequestOrigin, ScopeRequirement, ServiceCapabilities,
+    ServiceCapabilityError, ServiceDomain, ServiceError, SourceEvidencePolicy,
+    TOOL_INSTRUMENT_IDS_FIELD, TOOL_RESULT_LIMITS_FIELD, TOOL_SOURCE_COVERAGE_FIELD,
+    TOOL_TIME_RANGE_FIELD, ToolArtifactPolicy, ToolAuthorization, ToolContract, ToolDescriptor,
+    ToolEffects, ToolInputError, ToolResultMetadata, ToolResultPolicy, ToolScope, ToolServices,
     TypedToolRequest, TypedToolResult,
 };
 use rmcp::model::{
@@ -1235,7 +1236,7 @@ async fn terminal_results_close_delayed_progress_for_normal_and_cancelled_calls(
 struct HttpProductServices {
     started: Notify,
     calls: AtomicUsize,
-    resource_calls: Mutex<Vec<(String, serde_json::Map<String, Value>)>>,
+    resource_calls: Mutex<Vec<(String, serde_json::Map<String, Value>, RequestOrigin)>>,
 }
 
 const PRODUCT_RESOURCE_OPERATIONS: [&str; 10] = [
@@ -1252,6 +1253,23 @@ const PRODUCT_RESOURCE_OPERATIONS: [&str; 10] = [
 ];
 
 fn http_product_schema(operation: &str) -> Value {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    if resource_requires_result_limits(operation) {
+        properties.insert(
+            "resultLimits".to_owned(),
+            json!({
+                "type":"object",
+                "properties":{
+                    "maximumItems":{"type":"integer","minimum":1,"maximum":100_000},
+                    "maximumBytes":{"type":"integer","minimum":1,"maximum":268_435_456}
+                },
+                "required":["maximumItems","maximumBytes"],
+                "additionalProperties":false
+            }),
+        );
+        required.push(Value::String("resultLimits".to_owned()));
+    }
     let property = match operation {
         "Model.GetForecast" | "Model.GetForecastOutcomes" => Some(("forecastToken", "string")),
         "Analysis.GetProductBacktest" => Some(("backtestToken", "string")),
@@ -1261,39 +1279,77 @@ fn http_product_schema(operation: &str) -> Value {
         "Decision.ListInvestmentAnalyses" => Some(("limit", "integer")),
         _ => None,
     };
-    match property {
-        Some((name, kind)) => json!({
-            "type":"object",
-            "properties":{name:{"type":kind}},
-            "required":[name],
-            "additionalProperties":false
-        }),
-        None => json!({"type":"object","properties":{},"additionalProperties":false}),
+    if let Some((name, kind)) = property {
+        properties.insert(name.to_owned(), json!({"type":kind}));
+        required.push(Value::String(name.to_owned()));
     }
+    let mut schema = serde_json::Map::from_iter([
+        ("type".to_owned(), Value::String("object".to_owned())),
+        ("properties".to_owned(), Value::Object(properties)),
+        ("additionalProperties".to_owned(), Value::Bool(false)),
+    ]);
+    if !required.is_empty() {
+        schema.insert("required".to_owned(), Value::Array(required));
+    }
+    Value::Object(schema)
 }
 
 fn admit_http_product(
     operation: &str,
     arguments: &serde_json::Map<String, Value>,
 ) -> Result<(), ToolInputError> {
+    let mut business_arguments = arguments.clone();
+    let result_limits = business_arguments.remove("resultLimits");
+    if resource_requires_result_limits(operation) {
+        let Some(limits) = result_limits.as_ref().and_then(Value::as_object) else {
+            return Err(ToolInputError::Invalid);
+        };
+        if limits.len() != 2
+            || limits.get("maximumItems").and_then(Value::as_u64) != Some(1_000)
+            || limits.get("maximumBytes").and_then(Value::as_u64) != Some(65_536)
+        {
+            return Err(ToolInputError::Invalid);
+        }
+    } else if result_limits.is_some() {
+        return Err(ToolInputError::Invalid);
+    }
     let valid = match operation {
         "Model.GetForecast" | "Model.GetForecastOutcomes" => {
-            canonical_uuid_argument(arguments, "forecastToken")
+            canonical_uuid_argument(&business_arguments, "forecastToken")
         }
-        "Analysis.GetProductBacktest" => canonical_uuid_argument(arguments, "backtestToken"),
+        "Analysis.GetProductBacktest" => {
+            canonical_uuid_argument(&business_arguments, "backtestToken")
+        }
         "Decision.GetInvestmentAnalysis" | "Decision.GetRecommendationTrackRecord" => {
-            canonical_uuid_argument(arguments, "actionToken")
+            canonical_uuid_argument(&business_arguments, "actionToken")
         }
         "Decision.ListInvestmentAnalyses" => {
-            arguments.len() == 1
-                && arguments
+            business_arguments.len() == 1
+                && business_arguments
                     .get("limit")
                     .and_then(Value::as_u64)
                     .is_some_and(|limit| (1..=1_000).contains(&limit))
         }
-        _ => arguments.is_empty(),
+        _ => business_arguments.is_empty(),
     };
     valid.then_some(()).ok_or(ToolInputError::Invalid)
+}
+
+fn resource_requires_result_limits(operation: &str) -> bool {
+    PRODUCT_RESOURCE_OPERATIONS.contains(&operation) && operation != "Market.GetOverview"
+}
+
+fn http_product_scope(operation: &str) -> ToolScope {
+    if resource_requires_result_limits(operation) {
+        ToolScope::new(
+            ScopeRequirement::NotApplicable,
+            ScopeRequirement::NotApplicable,
+            ScopeRequirement::Required,
+            ScopeRequirement::NotApplicable,
+        )
+    } else {
+        NO_SCOPE
+    }
 }
 
 fn canonical_uuid_argument(arguments: &serde_json::Map<String, Value>, name: &str) -> bool {
@@ -1321,7 +1377,7 @@ impl ToolServices for HttpProductServices {
                     "1",
                     "Read one bounded provider-neutral product result.",
                     http_product_schema(operation),
-                    read_only_contract(ServiceDomain::Analysis, NO_SCOPE),
+                    read_only_contract(ServiceDomain::Analysis, http_product_scope(operation)),
                     ToolEffects::read_only_closed_world(),
                     move |arguments: &serde_json::Map<String, Value>| {
                         admit_http_product(operation, arguments)
@@ -1351,29 +1407,31 @@ impl ToolServices for HttpProductServices {
             context.cancellation().cancelled().await;
             return Err(ServiceError::Cancelled);
         }
-        let item_count = if request.name() == "Market.GetOverview" {
-            2
-        } else {
-            1
+        let (item_count, metadata) = match request.name() {
+            "Market.GetOverview" => (2, ToolResultMetadata::complete_not_applicable()),
+            "Model.ListForecasts" => (
+                2,
+                ToolResultMetadata::try_truncated_not_applicable(3).map_err(ServiceError::from)?,
+            ),
+            _ => (1, ToolResultMetadata::complete_not_applicable()),
         };
         if PRODUCT_RESOURCE_OPERATIONS.contains(&request.name()) {
+            let origin = context.origin().ok_or(ServiceError::Unauthorized)?;
             self.resource_calls
                 .lock()
                 .map_err(|_| ServiceError::Internal)?
-                .push((request.name().to_owned(), request.arguments().clone()));
+                .push((
+                    request.name().to_owned(),
+                    request.arguments().clone(),
+                    origin,
+                ));
         }
         let value = if request.name() == "Bot.Test" {
             json!({"ok":true})
         } else {
             json!({"summary":"available","items":["first","second"]})
         };
-        TypedToolResult::try_new(
-            value,
-            item_count,
-            ToolResultMetadata::complete_not_applicable(),
-            context.limits(),
-        )
-        .map_err(Into::into)
+        TypedToolResult::try_new(value, item_count, metadata, context.limits()).map_err(Into::into)
     }
 }
 
@@ -1592,6 +1650,21 @@ async fn stateless_http_is_authenticated_bounded_and_has_only_stable_v1_capabili
                 .get("sourceCoverage")
                 .is_none()
         );
+        let forecasts = stateless_rpc(
+            &http,
+            token,
+            "resources/read",
+            json!({"uri":"market-squawk://forecasts"}),
+        )
+        .await?;
+        let forecasts_document: Value = serde_json::from_str(
+            forecasts["result"]["contents"][0]["text"]
+                .as_str()
+                .ok_or("forecast resource did not return its provider-neutral JSON document")?,
+        )?;
+        assert_eq!(forecasts_document["metadata"]["completeness"], "truncated");
+        assert_eq!(forecasts_document["metadata"]["returnedItems"], 2);
+        assert_eq!(forecasts_document["metadata"]["availableItems"], 3);
         let read = stateless_rpc(
             &http,
             token,
@@ -1830,9 +1903,27 @@ async fn stateless_http_is_authenticated_bounded_and_has_only_stable_v1_capabili
         .resource_calls
         .lock()
         .map_err(|_| "resource call log was poisoned")?;
-    assert!(resource_calls.iter().any(|(operation, arguments)| {
+    assert!(resource_calls.iter().any(|(operation, arguments, origin)| {
+        let result_limits = arguments.get("resultLimits").and_then(Value::as_object);
         operation == "Model.GetForecast"
             && arguments.get("forecastToken") == Some(&json!(forecast_token))
+            && result_limits.and_then(|limits| limits.get("maximumItems")) == Some(&json!(1_000))
+            && result_limits.and_then(|limits| limits.get("maximumBytes")) == Some(&json!(65_536))
+            && origin.workspace_id() == workspace_id.as_uuid()
+            && origin.client_id() == authenticator.beta.client_id().as_uuid()
+    }));
+    drop(resource_calls);
+    assert!(audit.events()?.iter().any(|event| {
+        matches!(
+            event.operation(),
+            AuditOperation::ReadResource {
+                name,
+                operation,
+                version,
+            } if name.as_ref() == "forecast"
+                && operation.as_ref() == "Model.GetForecast"
+                && version.as_ref() == "1"
+        )
     }));
     Ok(())
 }

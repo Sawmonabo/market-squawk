@@ -35,6 +35,8 @@ const DECISION_GET_INVESTMENT_ANALYSIS: &str = "Decision.GetInvestmentAnalysis";
 const DECISION_GET_RECOMMENDATION_TRACK_RECORD: &str = "Decision.GetRecommendationTrackRecord";
 
 const INVESTMENT_ANALYSIS_LIST_LIMIT: u64 = 100;
+const RESOURCE_MAXIMUM_ITEMS: u64 = 1_000;
+const RESOURCE_MAXIMUM_BYTES: u64 = 64 * 1024;
 
 /// One admitted resource in the closed ordinary-product namespace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,6 +98,15 @@ impl ProductResource {
 
     pub(crate) fn arguments(self) -> Map<String, Value> {
         let mut arguments = Map::new();
+        if !matches!(self, Self::MarketOverview) {
+            arguments.insert(
+                "resultLimits".to_owned(),
+                serde_json::json!({
+                    "maximumItems": RESOURCE_MAXIMUM_ITEMS,
+                    "maximumBytes": RESOURCE_MAXIMUM_BYTES,
+                }),
+            );
+        }
         match self {
             Self::Forecast(token) | Self::ForecastOutcomes(token) => {
                 arguments.insert("forecastToken".to_owned(), Value::String(token.to_string()));
