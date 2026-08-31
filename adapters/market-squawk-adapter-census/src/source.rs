@@ -60,6 +60,7 @@ pub const MAX_CENSUS_ANNOTATION_RULE_BYTES: usize = 4 * 1024;
 const CENSUS_JSON_MEDIA_TYPE: &str = "application/json";
 const CENSUS_DATASET_ID_PREFIX: &str = "census:data-v1:";
 const CENSUS_ANALYTICAL_ID_PREFIX: &str = "census.data-v1.";
+const MAX_CENSUS_DIAGNOSTIC_REQUESTS: u8 = 7;
 const ONE_SECOND_NANOS: u64 = 1_000_000_000;
 const ONE_DAY_NANOS: u64 = 86_400_000_000_000;
 
@@ -574,6 +575,131 @@ impl CensusSourceTelemetry {
             partial_responses: add!(partial_responses),
             failures: add!(failures),
         })
+    }
+}
+
+/// Closed provider-journey phase retained only when a Census application operation fails.
+///
+/// The phase carries no request target, credential, header, response body, provider text, or
+/// filesystem identity. Ordinary application and provider-neutral read DTOs never expose it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CensusDiagnosticPhase {
+    /// Local doctor authority, configuration, and request validation before transport execution.
+    DoctorPreflight,
+    /// Credentialed doctor transport and exact response validation.
+    DoctorResponse,
+    /// Dataset-catalog transport, parsing, and validation.
+    MetadataCatalog,
+    /// Dataset-group transport, parsing, and validation.
+    MetadataGroups,
+    /// Dataset or selected-group variable transport, parsing, and validation.
+    MetadataVariables,
+    /// Dataset-geography transport, parsing, and validation.
+    MetadataGeography,
+    /// Cross-document metadata closure after every required metadata response succeeds.
+    MetadataClosure,
+    /// Credentialed data transport, parsing, accounting, and completeness validation.
+    DataResponse,
+    /// Complete metadata-and-data capture graph and discovered-object construction.
+    CaptureGraph,
+    /// Physical capture receipt rejoin and exact retained-acquisition validation.
+    SealedRejoin,
+    /// Provider-neutral normalization, lineage, and publication-candidate construction.
+    Canonicalize,
+}
+
+/// Bounded, payload-free failure evidence for one Census application journey.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CensusFailureDiagnostic {
+    phase: CensusDiagnosticPhase,
+    attempted_requests: u8,
+    successful_requests: u8,
+    telemetry: CensusSourceTelemetry,
+}
+
+impl CensusFailureDiagnostic {
+    /// Returns the last closed phase entered before failure.
+    pub const fn phase(self) -> CensusDiagnosticPhase {
+        self.phase
+    }
+
+    /// Returns actual attempts, bounded by doctor plus the maximum metadata-and-data graph.
+    pub const fn attempted_requests(self) -> u8 {
+        self.attempted_requests
+    }
+
+    /// Returns responses fully validated and committed to request accounting.
+    pub const fn successful_requests(self) -> u8 {
+        self.successful_requests
+    }
+
+    /// Returns the existing closed source telemetry snapshot at failure.
+    pub const fn telemetry(self) -> CensusSourceTelemetry {
+        self.telemetry
+    }
+}
+
+/// Operation-local diagnostic state for the application-owned Census journey.
+///
+/// This value is deliberately neither serializable nor stored. It exists only to retain a closed
+/// phase and bounded counts when the ordinary generic extraction error has insufficient detail.
+#[derive(Debug)]
+pub struct CensusDiagnosticJourney {
+    phase: CensusDiagnosticPhase,
+    attempted_requests: u8,
+    successful_requests: u8,
+}
+
+impl CensusDiagnosticJourney {
+    /// Starts the fixed doctor-first application journey.
+    pub const fn new() -> Self {
+        Self {
+            phase: CensusDiagnosticPhase::DoctorPreflight,
+            attempted_requests: 0,
+            successful_requests: 0,
+        }
+    }
+
+    /// Marks the local physical-seal rejoin before canonical extraction.
+    pub fn enter_sealed_rejoin(&mut self) {
+        self.phase = CensusDiagnosticPhase::SealedRejoin;
+    }
+
+    fn enter(&mut self, phase: CensusDiagnosticPhase) {
+        self.phase = phase;
+    }
+
+    fn record_attempt(&mut self) -> Result<(), ExtractionSourceError> {
+        self.attempted_requests = self
+            .attempted_requests
+            .checked_add(1)
+            .filter(|attempts| *attempts <= MAX_CENSUS_DIAGNOSTIC_REQUESTS)
+            .ok_or_else(invalid_protocol)?;
+        Ok(())
+    }
+
+    fn record_success(&mut self) -> Result<(), ExtractionSourceError> {
+        self.successful_requests = self
+            .successful_requests
+            .checked_add(1)
+            .filter(|successes| *successes <= self.attempted_requests)
+            .ok_or_else(invalid_protocol)?;
+        Ok(())
+    }
+
+    fn failure(&self, telemetry: CensusSourceTelemetry) -> CensusFailureDiagnostic {
+        CensusFailureDiagnostic {
+            phase: self.phase,
+            attempted_requests: self.attempted_requests,
+            successful_requests: self.successful_requests,
+            telemetry,
+        }
+    }
+}
+
+impl Default for CensusDiagnosticJourney {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1196,13 +1322,16 @@ impl CensusSource {
         authority: &ExtractionAuthority,
         deadline: Timestamp,
         cancellation: CancellationToken,
+        diagnostic: &mut CensusDiagnosticJourney,
     ) -> Result<crate::CensusDoctorOutput, ExtractionSourceError> {
+        diagnostic.enter(CensusDiagnosticPhase::DoctorPreflight);
         self.validate_authority(authority)?;
         let query = crate::doctor::doctor_query().map_err(map_source_error)?;
         authorize_configured_target(&self.metadata, query.redacted_url(), true)
             .map_err(map_source_error)?;
         let provider_dataset =
             crate::doctor::doctor_dataset_identity().map_err(map_source_error)?;
+        diagnostic.enter(CensusDiagnosticPhase::DoctorResponse);
         let mut response = self
             .fetch_authorized_with_limits(
                 authority,
@@ -1213,6 +1342,7 @@ impl CensusSource {
                 cancellation.clone(),
                 crate::CENSUS_DOCTOR_MAX_RESPONSE_BYTES.min(self.response_limit),
                 crate::CENSUS_DOCTOR_TIMEOUT.min(self.request_timeout),
+                diagnostic,
             )
             .await?;
         let report = crate::doctor::build_doctor_report(
@@ -1228,6 +1358,7 @@ impl CensusSource {
         .map_err(map_source_error)?;
         let material = capture_material(&self.metadata, &response.capture, response.body.clone())?;
         response.record_success()?;
+        diagnostic.record_success()?;
         self.telemetry
             .successful_responses
             .fetch_add(1, Ordering::Relaxed);
@@ -1248,6 +1379,11 @@ impl CensusSource {
         self.telemetry.snapshot()
     }
 
+    /// Freezes one operation-local, payload-free failure diagnostic.
+    pub fn failure_diagnostic(&self, journey: &CensusDiagnosticJourney) -> CensusFailureDiagnostic {
+        journey.failure(self.telemetry())
+    }
+
     /// Returns the storage-safe analytical identity for an admitted provider dataset.
     pub fn analytical_dataset_identifier(
         &self,
@@ -1266,6 +1402,7 @@ impl CensusSource {
         provider_dataset: &SourceIdentifier,
         deadline: Timestamp,
         cancellation: CancellationToken,
+        diagnostic: &mut CensusDiagnosticJourney,
     ) -> Result<CensusMetadataBundle, ExtractionSourceError> {
         self.validate_authority(authority)?;
         let contract = self
@@ -1275,6 +1412,7 @@ impl CensusSource {
         let mut documents = Vec::new();
         let mut telemetry = CensusSourceTelemetry::default();
         for request in contract.metadata_requests() {
+            diagnostic.enter(metadata_diagnostic_phase(request.kind()));
             let mut response = self
                 .fetch_authorized(
                     authority,
@@ -1283,6 +1421,7 @@ impl CensusSource {
                     provider_dataset,
                     deadline,
                     cancellation.clone(),
+                    diagnostic,
                 )
                 .await?;
             let document = match CensusDiscoveryDocument::parse(
@@ -1304,6 +1443,7 @@ impl CensusSource {
                 .checked_add(response_telemetry)
                 .map_err(map_source_error)?;
             response.record_success()?;
+            diagnostic.record_success()?;
             self.telemetry
                 .successful_responses
                 .fetch_add(1, Ordering::Relaxed);
@@ -1319,6 +1459,7 @@ impl CensusSource {
                 latency: response.latency,
             });
         }
+        diagnostic.enter(CensusDiagnosticPhase::MetadataClosure);
         if let Err(error) = validate_metadata_bundle(contract, &documents) {
             self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
             return Err(map_source_error(error));
@@ -1343,7 +1484,9 @@ impl CensusSource {
         metadata: &CensusMetadataBundle,
         deadline: Timestamp,
         cancellation: CancellationToken,
+        diagnostic: &mut CensusDiagnosticJourney,
     ) -> Result<CensusCapturedData, ExtractionSourceError> {
+        diagnostic.enter(CensusDiagnosticPhase::DataResponse);
         self.validate_authority(authority)?;
         let contract = self
             .config
@@ -1363,6 +1506,7 @@ impl CensusSource {
                 contract.dataset_id(),
                 deadline,
                 cancellation,
+                diagnostic,
             )
             .await?;
         let provisional_clocks = CensusClocks::local_first_observed(
@@ -1405,6 +1549,7 @@ impl CensusSource {
             !page.completeness().is_complete(),
         )?;
         response.record_success()?;
+        diagnostic.record_success()?;
         self.telemetry
             .successful_responses
             .fetch_add(1, Ordering::Relaxed);
@@ -1436,12 +1581,19 @@ impl CensusSource {
         provider_dataset: &SourceIdentifier,
         deadline: Timestamp,
         cancellation: CancellationToken,
+        diagnostic: &mut CensusDiagnosticJourney,
     ) -> Result<CensusDatasetAcquisition, ExtractionSourceError> {
         let metadata = self
-            .acquire_metadata(authority, provider_dataset, deadline, cancellation.clone())
+            .acquire_metadata(
+                authority,
+                provider_dataset,
+                deadline,
+                cancellation.clone(),
+                diagnostic,
+            )
             .await?;
         let data = self
-            .acquire_data(authority, &metadata, deadline, cancellation)
+            .acquire_data(authority, &metadata, deadline, cancellation, diagnostic)
             .await?;
         if !data.page().completeness().is_complete() {
             self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
@@ -1464,6 +1616,7 @@ impl CensusSource {
         request: DiscoveryRequest,
         activation: crate::CensusActivationCandidate,
         cancellation: CancellationToken,
+        diagnostic: &mut CensusDiagnosticJourney,
     ) -> Result<CensusDiscoveryOutput, ExtractionSourceError> {
         self.validate_authority(&authority)?;
         if request.effective_at().is_some() || request.max_results() != 1 {
@@ -1480,8 +1633,10 @@ impl CensusSource {
                 request.dataset(),
                 request.deadline(),
                 cancellation,
+                diagnostic,
             )
             .await?;
+        diagnostic.enter(CensusDiagnosticPhase::CaptureGraph);
         let capture_material = combined_capture_material(&self.metadata, contract, &acquired)?;
         let object = source_object(
             &self.metadata,
@@ -1516,11 +1671,13 @@ impl CensusSource {
         request: DiscoveryRequest,
         activation: crate::CensusActivationCandidate,
         cancellation: CancellationToken,
+        diagnostic: &mut CensusDiagnosticJourney,
     ) -> Result<CensusDiscoveryOutput, ExtractionSourceError> {
+        diagnostic.enter(CensusDiagnosticPhase::MetadataCatalog);
         let operation_at = system_timestamp().map_err(map_source_error)?;
         self.validate_activation(&activation, operation_at)
             .map_err(map_source_error)?;
-        self.discover_impl(authority, request, activation, cancellation)
+        self.discover_impl(authority, request, activation, cancellation, diagnostic)
             .await
     }
 
@@ -1533,7 +1690,9 @@ impl CensusSource {
         request: ExtractionRequest,
         admission: CensusSealedDiscoveryAdmission,
         cancellation: CancellationToken,
+        diagnostic: &mut CensusDiagnosticJourney,
     ) -> Result<CensusSealedExtractionOutput, ExtractionSourceError> {
+        diagnostic.enter(CensusDiagnosticPhase::SealedRejoin);
         self.validate_authority(&authority)?;
         if cancellation.is_cancelled() {
             return Err(ExtractionSourceError::Cancelled);
@@ -1574,6 +1733,7 @@ impl CensusSource {
             &acquisition,
             capture_token.persisted_receipt().capture(),
         )?;
+        diagnostic.enter(CensusDiagnosticPhase::Canonicalize);
         let output = extraction_output(
             &self.metadata,
             &self.config,
@@ -1653,6 +1813,7 @@ impl CensusSource {
         provider_dataset: &SourceIdentifier,
         deadline: Timestamp,
         cancellation: CancellationToken,
+        diagnostic: &mut CensusDiagnosticJourney,
     ) -> Result<FetchedResponse, ExtractionSourceError> {
         self.fetch_authorized_with_limits(
             authority,
@@ -1663,6 +1824,7 @@ impl CensusSource {
             cancellation,
             self.response_limit,
             self.request_timeout,
+            diagnostic,
         )
         .await
     }
@@ -1681,6 +1843,7 @@ impl CensusSource {
         cancellation: CancellationToken,
         response_limit: usize,
         request_timeout: Duration,
+        diagnostic: &mut CensusDiagnosticJourney,
     ) -> Result<FetchedResponse, ExtractionSourceError> {
         self.validate_authority(authority)?;
         if request_digest != authorized.request_digest()
@@ -1707,6 +1870,7 @@ impl CensusSource {
         drop(target);
         let now = system_timestamp().map_err(map_source_error)?;
         let timeout = remaining_timeout(deadline, now, request_timeout)?;
+        diagnostic.record_attempt()?;
         let result = self
             .transport
             .execute(
@@ -1965,6 +2129,19 @@ fn discovery_evidence(document: &CensusDiscoveryDocument) -> &CensusMetadataEvid
         | CensusDiscoveryDocument::GroupVariables(value) => value.evidence(),
         CensusDiscoveryDocument::Groups(value) => value.evidence(),
         CensusDiscoveryDocument::Geographies(value) => value.evidence(),
+    }
+}
+
+fn metadata_diagnostic_phase(kind: &CensusDiscoveryKind) -> CensusDiagnosticPhase {
+    match kind {
+        CensusDiscoveryKind::Datasets | CensusDiscoveryKind::VintageDatasets { .. } => {
+            CensusDiagnosticPhase::MetadataCatalog
+        }
+        CensusDiscoveryKind::Groups { .. } => CensusDiagnosticPhase::MetadataGroups,
+        CensusDiscoveryKind::Variables { .. } | CensusDiscoveryKind::Group { .. } => {
+            CensusDiagnosticPhase::MetadataVariables
+        }
+        CensusDiscoveryKind::Geographies { .. } => CensusDiagnosticPhase::MetadataGeography,
     }
 }
 

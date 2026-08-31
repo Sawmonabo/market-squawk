@@ -284,12 +284,14 @@ async fn authorized_transport_samples_processing_clock_after_complete_parse_and_
     let authority = registry.extraction_authority(&registered, &source)?;
     let deadline = now.checked_add_nanos(60_000_000_000)?;
     let metadata_bundle = metadata_bundle(&metadata, &contract, now)?;
+    let mut diagnostic = CensusDiagnosticJourney::new();
     let data = source
         .acquire_data(
             &authority,
             &metadata_bundle,
             deadline,
             CancellationToken::new(),
+            &mut diagnostic,
         )
         .await?;
     assert!(data.page().completeness().is_complete());

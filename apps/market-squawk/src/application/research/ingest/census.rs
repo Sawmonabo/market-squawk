@@ -8,8 +8,8 @@ use std::{
 
 use futures_util::future::BoxFuture;
 use market_squawk_adapter_census::{
-    CENSUS_PROVIDER_SEMANTICS_SCHEMA, CensusPublicationCandidate, CensusSource, CensusSourceError,
-    CensusSourceTelemetry,
+    CENSUS_PROVIDER_SEMANTICS_SCHEMA, CensusDiagnosticJourney, CensusFailureDiagnostic,
+    CensusPublicationCandidate, CensusSource, CensusSourceError, CensusSourceTelemetry,
 };
 use market_squawk_data::{
     AnalyticalMacroProviderPeriodLatestKnownOutput,
@@ -200,10 +200,19 @@ impl CensusMacroApplicationClosure {
         let authority = operation.extraction();
         let provider_deadline = operation.provider_deadline()?;
         let cancellation = operation.cancellation().clone();
+        let mut diagnostic = CensusDiagnosticJourney::new();
 
         let doctor = census
-            .doctor(&authority, provider_deadline, cancellation.clone())
-            .await?;
+            .doctor(
+                &authority,
+                provider_deadline,
+                cancellation.clone(),
+                &mut diagnostic,
+            )
+            .await
+            .map_err(|error| {
+                CensusMacroApplicationError::diagnosed_extraction(census, &diagnostic, error)
+            })?;
         let (pending_doctor, doctor_seal) = doctor.into_sealing_parts();
         let raw_seal = CancellationToken::new();
         let sealed_doctor = self
@@ -222,8 +231,12 @@ impl CensusMacroApplicationClosure {
                 discovery,
                 activation,
                 cancellation.clone(),
+                &mut diagnostic,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                CensusMacroApplicationError::diagnosed_extraction(census, &diagnostic, error)
+            })?;
         let (pending_discovery, graph_seal) = discovered.into_sealing_parts();
         let raw_seal = CancellationToken::new();
         let sealed_graph = self
@@ -232,6 +245,7 @@ impl CensusMacroApplicationClosure {
             .seal_provider_capture(graph_seal, &raw_seal, operation.operation_deadline())
             .await?;
         operation.ensure_live()?;
+        diagnostic.enter_sealed_rejoin();
         let admission = pending_discovery.try_bind_sealed(sealed_graph)?;
         let extraction = ExtractionRequest::try_new(
             admission.object()?.clone(),
@@ -240,8 +254,17 @@ impl CensusMacroApplicationClosure {
             provider_deadline,
         )?;
         let extracted = census
-            .extract_sealed_discovery(authority, extraction, admission, cancellation)
-            .await?;
+            .extract_sealed_discovery(
+                authority,
+                extraction,
+                admission,
+                cancellation,
+                &mut diagnostic,
+            )
+            .await
+            .map_err(|error| {
+                CensusMacroApplicationError::diagnosed_extraction(census, &diagnostic, error)
+            })?;
         let (candidate, telemetry) = extracted.into_parts();
         self.publish_candidate(candidate, telemetry, &operation)
             .await
@@ -610,6 +633,12 @@ pub(crate) enum CensusMacroApplicationError {
     Adapter(#[from] CensusSourceError),
     #[error("Census bounded acquisition failed")]
     Extraction(#[from] ExtractionSourceError),
+    #[error("Census bounded acquisition failed")]
+    DiagnosedExtraction {
+        #[source]
+        source: ExtractionSourceError,
+        diagnostic: CensusFailureDiagnostic,
+    },
     #[error("Census extraction request is invalid")]
     ExtractionContract(#[from] ExtractionError),
     #[error("Census atomic macro publication failed")]
@@ -622,6 +651,19 @@ pub(crate) enum CensusMacroApplicationError {
     Research(#[from] ResearchServiceError),
     #[error("Census quarterly analytical read failed")]
     AnalyticalRead(#[from] AnalyticalReadError),
+}
+
+impl CensusMacroApplicationError {
+    fn diagnosed_extraction(
+        census: &CensusSource,
+        journey: &CensusDiagnosticJourney,
+        source: ExtractionSourceError,
+    ) -> Self {
+        Self::DiagnosedExtraction {
+            source,
+            diagnostic: census.failure_diagnostic(journey),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -746,6 +788,7 @@ mod tests {
         assert_eq!(publication.receipt().total_chunks(), 1);
         assert_eq!(publication.receipt().total_rows(), 1);
         assert_eq!(publication.telemetry().requests(), 5);
+        assert_eq!(closure.source.telemetry().requests(), 6);
         assert_eq!(publication.telemetry().returned_rows(), 1);
         assert_eq!(publication.series().len(), 1);
 
@@ -810,7 +853,7 @@ mod tests {
         assert_eq!(restarted.reopened().manifest(), &manifest);
         assert_eq!(restarted.output().observations().len(), 1);
         eprintln!(
-            "CENSUS_LIVE_EVIDENCE manifest_version={} rows={} acquisition_requests=5 restart_rows=1",
+            "CENSUS_LIVE_EVIDENCE manifest_version={} rows={} total_requests=6 acquisition_requests=5 restart_rows=1",
             manifest.manifest_version(),
             restarted.output().observations().len()
         );

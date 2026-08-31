@@ -48,8 +48,9 @@ pub use runtime::{
 };
 pub use source::{
     CensusAnnotatedMissingRule, CensusAnnotationMatch, CensusCapturedData, CensusCapturedDiscovery,
-    CensusDatasetAcquisition, CensusDatasetContract, CensusDiscoveryOutput,
-    CensusEffectiveTimePolicy, CensusMetadataBundle, CensusPendingDiscovery,
+    CensusDatasetAcquisition, CensusDatasetContract, CensusDiagnosticJourney,
+    CensusDiagnosticPhase, CensusDiscoveryOutput, CensusEffectiveTimePolicy,
+    CensusFailureDiagnostic, CensusMetadataBundle, CensusPendingDiscovery,
     CensusSealedDiscoveryAdmission, CensusSealedExtractionOutput, CensusSource, CensusSourceConfig,
     CensusSourceError, CensusSourceTelemetry, CensusVariableMapping,
     MAX_CENSUS_ANNOTATED_MISSING_RULES, MAX_CENSUS_ANNOTATION_RULE_BYTES,
