@@ -729,6 +729,17 @@ impl EiaMacroRestartSelector {
         self.binding.provider_dataset()
     }
 
+    /// Returns the complete sorted canonical series set available to neutral macro consumers.
+    ///
+    /// Provider route, facet, unit, and request details remain inside the persisted native
+    /// evidence. Callers receive only the canonical identifiers needed to construct a fixed typed
+    /// PIT request.
+    pub(crate) fn published_series(&self) -> impl ExactSizeIterator<Item = &SourceIdentifier> + '_ {
+        self.series_coordinates
+            .iter()
+            .map(|coordinate| &coordinate.canonical_series)
+    }
+
     /// Returns whether an exact published series uses provider-supplied calendar dates.
     pub(crate) fn is_calendar_date_series(&self, series: &SourceIdentifier) -> bool {
         self.series_coordinate(series).is_some_and(|coordinate| {
@@ -1109,4 +1120,455 @@ pub(crate) enum EiaMacroApplicationError {
     Research(#[from] ResearchServiceError),
     #[error("EIA exact-manifest typed read failed")]
     AnalyticalRead(#[from] AnalyticalReadError),
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use std::{
+        num::{NonZeroU16, NonZeroU32, NonZeroU64},
+        sync::Arc,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    use market_squawk_adapter_eia::{
+        EiaActivatedProvider, EiaApiKey, EiaClockField, EiaDataFieldContract,
+        EiaDataFieldContractInput, EiaDataQuery, EiaDataQueryInput, EiaDatasetProfile, EiaError,
+        EiaFacetFilter, EiaFacetValue, EiaFieldId, EiaMissingPolicy, EiaRoute, EiaSort,
+        EiaSortDirection, EiaSourceTransport, EiaTransportLimits, EiaUnitSource, EiaValueKind,
+        eia_api_endpoint_rules, eia_application_provider_budget, run_eia_doctor,
+    };
+    use market_squawk_data::{
+        AnalyticalMacroSeriesAllowlist, CatalogConfig, CatalogResultLimits, DatasetId,
+        ObjectStoreConfig, QueryLimits, RightsBasis, SourceOperation, SqliteProviderRateStore,
+    };
+    use market_squawk_domain::{
+        AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
+        DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
+        ResearchPeriod, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId,
+        SourceIdentifier, Timestamp,
+    };
+    use market_squawk_platform::LocalPaths;
+    use market_squawk_services::{JsonStructureLimits, RequestContext, RequestId, ServiceLimits};
+    use market_squawk_sources::{
+        AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, BackoffPolicy,
+        BudgetScope, CoverageDomain, EndpointPolicy, FreshnessPolicy, HistoricalCapability,
+        NetworkAccessPolicy, ProviderCapabilityRevision, ProviderRateAuthority, SourceCapabilities,
+        SourceClass, SourceCoverage, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
+    };
+    use sha2::{Digest as _, Sha256};
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use super::{
+        EIA_MACRO_PROVIDER_PERIOD_POINT_IN_TIME_OPERATION, EiaApplicationAcquisitionLimits,
+        EiaLiveComposition, EiaMacroEffectiveCutoff, EiaMacroRestartSelector, EiaRegisteredSource,
+        ProductionResearchIngestCoordinator, ResearchProviderRuntimeGeneration, evidence_digest,
+    };
+    use crate::ResearchService;
+    use crate::application::{
+        ResearchExtractionLimits, ResearchProviderRuntimeMutationAuthority, ResearchRightsAuthority,
+    };
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// One intentionally ignored credentialed journey proves the real EIA pull, every raw seal,
+    /// immutable canonical publication, manifest-pinned typed PIT selection, and same-root process
+    /// restart. It remains outside routine tests because it requires an operator-provided key and
+    /// consumes the shared one-request-per-second provider lane.
+    #[tokio::test]
+    #[ignore = "requires EIA_API_KEY and performs one bounded live EIA application journey"]
+    async fn live_eia_price_seals_publishes_reads_and_restarts() -> TestResult {
+        let key = std::env::var("EIA_API_KEY")?;
+        let now = current_timestamp()?;
+        let query = live_query()?;
+        let (metadata, subject) = live_source_metadata(now, &query, &key)?;
+        let transport = EiaSourceTransport::try_new(
+            metadata.clone(),
+            EiaApiKey::try_new(key)?,
+            EiaTransportLimits::try_new(
+                market_squawk_adapter_eia::EiaParseLimits::production_defaults(),
+                1024 * 1024,
+                1,
+                1024 * 1024,
+            )?,
+        )?;
+
+        let temporary = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(temporary.path().join("research"))?;
+        let research = Arc::new(open_research(&paths)?);
+        let provider_rate = ProviderRateAuthority::try_new(Arc::new(
+            SqliteProviderRateStore::try_open(temporary.path().join("provider-rate.sqlite3"))?,
+        ))?;
+        provider_rate.bind_authorization_subject(
+            metadata.authorization().mode(),
+            metadata.authorization().evidence().content_digest(),
+            &subject,
+        )?;
+        let mut doctor_registry =
+            AuthoritativeSourceRegistry::try_new_in_memory_for_bounded_extraction(
+                Arc::new(provider_rate.clone()),
+                provider_rate.clone(),
+            )?;
+        let doctor_registration = doctor_registry.register(metadata.clone(), now)?;
+        let doctor_authority =
+            doctor_registry.extraction_authority(&doctor_registration, &transport)?;
+        let provider_deadline = current_timestamp()?.checked_add_nanos(45_000_000_000)?;
+        let doctor = run_eia_doctor(
+            transport,
+            &doctor_authority,
+            EiaDatasetProfile::try_for_macro(
+                query,
+                vec![EiaDataFieldContract::new(EiaDataFieldContractInput {
+                    field: field("price")?,
+                    value_kind: EiaValueKind::Decimal,
+                    unit_source: EiaUnitSource::RowField,
+                    missing_policy: EiaMissingPolicy::try_new(
+                        ["NA".to_owned(), "--".to_owned()],
+                        true,
+                    )?,
+                })],
+                vec![field("stateDescription")?, field("sectorName")?],
+                Vec::<EiaClockField>::new(),
+            )?,
+            provider_deadline,
+            CancellationToken::new(),
+        )
+        .await?;
+        let capability_digest = evidence_digest(doctor.report().report_digest().bytes());
+        let authorization_expires_at = doctor.report().expires_at();
+        let (pending, seal_requests) = doctor.into_sealing_parts()?;
+        let mut sealed = Vec::with_capacity(seal_requests.len());
+        for request in seal_requests.into_vec() {
+            sealed.push(
+                research
+                    .seal_provider_capture(
+                        request,
+                        &CancellationToken::new(),
+                        Instant::now() + Duration::from_secs(15),
+                    )
+                    .await?,
+            );
+        }
+        let activated = EiaActivatedProvider::try_activate(pending, sealed)?;
+        drop(doctor_authority);
+        drop(doctor_registration);
+        drop(doctor_registry);
+
+        let rights = ResearchRightsAuthority::try_new_scoped(
+            metadata.source_id().clone(),
+            RightsBasis::reviewed_terms(
+                "https://www.eia.gov/opendata/documentation.php",
+                digest_bytes(b"eia-personal-research-rights-v1"),
+            )?,
+            digest_bytes(b"eia-personal-research-parent-authority-v1"),
+            metadata.authorization().evidence().content_digest(),
+            authorization_expires_at,
+            vec![subject],
+            vec![SourceOperation::Persist],
+        )?;
+        let generation = ResearchProviderRuntimeGeneration::try_new(
+            SourceIdentifier::try_from("eia.api-v2")?,
+            Uuid::new_v4(),
+            ProviderCapabilityRevision::new(1)?,
+            capability_digest,
+            None,
+            None,
+            now,
+            metadata,
+            rights.clone(),
+        )?;
+        let registry = AuthoritativeSourceRegistry::try_new_in_memory_for_bounded_extraction(
+            Arc::new(provider_rate.clone()),
+            provider_rate,
+        )?;
+        let (coordinator, mutation, alpaca) =
+            ProductionResearchIngestCoordinator::try_new_with_runtime_authorities(
+                registry,
+                Arc::clone(&research),
+                ResearchExtractionLimits::standard(),
+                std::iter::empty(),
+            )?;
+        let composition =
+            EiaLiveComposition::try_new(Arc::clone(&coordinator), activated, generation.clone())?;
+        let (source, runtime) = composition.into_parts();
+        register_source(&mutation, generation, source, rights)?;
+
+        let operation_deadline = Instant::now() + Duration::from_secs(45);
+        let publication = runtime
+            .acquire_seal_publish(
+                DatasetId::try_from("market_squawk.research_observations")?,
+                EiaApplicationAcquisitionLimits::try_new(
+                    NonZeroU16::new(1).ok_or("invalid EIA page bound")?,
+                    NonZeroU32::new(24).ok_or("invalid EIA record bound")?,
+                    NonZeroU64::new(16 * 1024 * 1024).ok_or("invalid EIA byte bound")?,
+                )?,
+                &request_context(operation_deadline)?,
+            )
+            .await?;
+        assert_eq!(publication.committed().pinned().plan().row_count(), 24);
+        assert_eq!(publication.transport().requests(), 1);
+        assert_eq!(publication.transport().returned_rows(), 24);
+        assert_eq!(publication.transport().observations(), 24);
+        let selector = publication.restart_selector().clone();
+        assert_eq!(selector.manifest(), publication.committed().manifest());
+        let mut published_series = selector.published_series();
+        let series = published_series
+            .next()
+            .ok_or("the exact EIA profile published no canonical series")?
+            .clone();
+        if published_series.next().is_some() {
+            return Err("the exact EIA profile must publish one canonical series".into());
+        }
+        let scheme = selector
+            .provider_period_scheme(&series)
+            .ok_or("EIA monthly series lost provider-period precision")?
+            .clone();
+        let allowlist =
+            AnalyticalMacroSeriesAllowlist::try_from_code_owned_identifiers(vec![series])?;
+        let expected_series = allowlist.series()[0].clone();
+        let cutoff = current_timestamp()?;
+        let effective = ResearchPeriod::try_new(
+            scheme,
+            2025,
+            NonZeroU16::new(12).ok_or("invalid EIA month")?,
+            SourceIdentifier::try_from("2025-12")?,
+        )?;
+        let request = selector.try_point_in_time_request(
+            allowlist.clone(),
+            cutoff,
+            EiaMacroEffectiveCutoff::ProviderPeriod(effective.clone()),
+        )?;
+        let query_limits = query_limits()?;
+        let read = selector
+            .reopen_point_in_time(
+                research.as_ref(),
+                request,
+                query_limits,
+                Instant::now() + Duration::from_secs(10),
+                CancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(read.evidence().binding_digest(), selector.binding_digest());
+        assert_eq!(read.evidence().record_count(), 24);
+        assert_eq!(read.evidence().physical_claims().len(), 1);
+        assert_eq!(
+            read.operation_identity(),
+            EIA_MACRO_PROVIDER_PERIOD_POINT_IN_TIME_OPERATION
+        );
+        assert_eq!(read.source_id(), selector.source_id());
+        assert_eq!(read.manifest(), selector.manifest());
+        assert_eq!(read.observations().len(), 1);
+        assert_eq!(read.observations()[0].series(), &expected_series);
+        let binding_evidence = read.evidence().clone();
+        let selected_observation = read.observations()[0].clone();
+        let selection_digest = read.selection_digest();
+        assert_eq!(selection_digest.algorithm(), DigestAlgorithm::Sha256);
+        assert_ne!(selection_digest.bytes(), [0; 32]);
+        let manifest = selector.manifest().clone();
+        let expected_source = selector.source_id().clone();
+
+        drop(read);
+        drop(selector);
+        drop(publication);
+        drop(runtime);
+        drop(mutation);
+        drop(alpaca);
+        drop(coordinator);
+        drop(research);
+
+        let reopened = Arc::new(open_research(&paths)?);
+        let selector = EiaMacroRestartSelector::try_reopen(
+            reopened.as_ref(),
+            manifest.clone(),
+            &expected_source,
+        )?;
+        assert_eq!(
+            selector.published_series().collect::<Vec<_>>(),
+            vec![&expected_series]
+        );
+        let request = selector.try_point_in_time_request(
+            allowlist,
+            cutoff,
+            EiaMacroEffectiveCutoff::ProviderPeriod(effective),
+        )?;
+        let read = selector
+            .reopen_point_in_time(
+                reopened.as_ref(),
+                request,
+                query_limits,
+                Instant::now() + Duration::from_secs(10),
+                CancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(selector.manifest(), &manifest);
+        assert_eq!(read.evidence(), &binding_evidence);
+        assert_eq!(read.source_id(), &expected_source);
+        assert_eq!(read.manifest(), &manifest);
+        assert_eq!(
+            read.observations(),
+            std::slice::from_ref(&selected_observation)
+        );
+        assert_eq!(read.selection_digest(), selection_digest);
+        Ok(())
+    }
+
+    fn live_query() -> TestResult<EiaDataQuery> {
+        Ok(EiaDataQuery::try_new(EiaDataQueryInput {
+            route: EiaRoute::try_from("electricity/retail-sales")?,
+            data_fields: vec![field("price")?],
+            facets: vec![
+                EiaFacetFilter::try_new(field("sectorid")?, vec![EiaFacetValue::try_from("RES")?])?,
+                EiaFacetFilter::try_new(field("stateid")?, vec![EiaFacetValue::try_from("US")?])?,
+            ],
+            frequency: field("monthly")?,
+            start: Some("2024-01".to_owned()),
+            end: Some("2025-12".to_owned()),
+            sorts: vec![
+                EiaSort::new(field("period")?, EiaSortDirection::Ascending),
+                EiaSort::new(field("stateid")?, EiaSortDirection::Ascending),
+                EiaSort::new(field("sectorid")?, EiaSortDirection::Ascending),
+                EiaSort::new(field("stateDescription")?, EiaSortDirection::Ascending),
+                EiaSort::new(field("sectorName")?, EiaSortDirection::Ascending),
+            ],
+            length: 24,
+        })?)
+    }
+
+    fn live_source_metadata(
+        now: Timestamp,
+        query: &EiaDataQuery,
+        key: &str,
+    ) -> TestResult<(SourceMetadata, SourceIdentifier)> {
+        let effective = EffectiveInterval::new(now.checked_sub_nanos(1_000_000_000)?, None)?;
+        let credential_evidence = digest_bytes(
+            [
+                b"market-squawk/eia-live-credential-generation/v1\0".as_slice(),
+                key.as_bytes(),
+            ]
+            .concat()
+            .as_slice(),
+        );
+        let evidence = ExactPayloadEvidence::from_content_digest(credential_evidence);
+        let provider = SourceIdentifier::try_from("us-eia")?;
+        let subject = SourceIdentifier::try_from("eia-personal-research-key")?;
+        let basis = AuthorizationBasis::new(subject.clone());
+        let authorization = AuthorizationGrant::new(
+            AuthorizationMode::UserAuthorized,
+            basis.clone(),
+            evidence.clone(),
+            effective,
+        );
+        let endpoint = EndpointPolicy::try_from_api_rules(
+            eia_api_endpoint_rules(query)?,
+            market_squawk_sources::HttpRequestBounds::default(),
+        )?;
+        let budget = eia_application_provider_budget(
+            BudgetScope::with_authorization_account(
+                provider.clone(),
+                basis.as_source_identifier().clone(),
+            ),
+            BackoffPolicy::try_new(
+                NonZeroU64::new(1_000_000_000).ok_or("invalid EIA backoff")?,
+                NonZeroU64::new(3_600_000_000_000).ok_or("invalid EIA max backoff")?,
+                0,
+            )?,
+        )?;
+        let metadata = SourceMetadata::try_new(SourceMetadataInput::new(
+            SchemaVersion::CURRENT,
+            SourceId::try_from("us-eia-api-v2")?,
+            RevisionBoundPayloadEvidence::new(
+                MetadataRevision::new(SourceIdentifier::try_from("eia-api-v2-live-v1")?),
+                evidence.clone(),
+            ),
+            SourceClass::OfficialAgency,
+            provider,
+            authorization,
+            SourceCoverage::try_non_instrument(
+                evidence,
+                effective,
+                CoverageDomain::Macroeconomic,
+                CoverageDelay::Delayed(1),
+                DeliveryEvidence::Unknown,
+            )?,
+            DataQuality::OfficialDelayed,
+            NetworkAccessPolicy::Allowlisted(endpoint),
+            FreshnessPolicy::try_new(
+                60_000_000_000,
+                60_000_000_000,
+                60_000_000_000,
+                60_000_000_000,
+                1_000_000_000,
+            )?,
+            Some(budget),
+            SourceCapabilities::new(
+                false,
+                true,
+                SequenceCapability::Unsupported,
+                ChecksumCapability::Unsupported,
+                HistoricalCapability::RevisionPreserving,
+                false,
+            ),
+            SourceProtocolProfile::NotLive,
+        ))?;
+        Ok((metadata, subject))
+    }
+
+    fn register_source(
+        mutation: &ResearchProviderRuntimeMutationAuthority,
+        generation: ResearchProviderRuntimeGeneration,
+        source: EiaRegisteredSource,
+        rights: ResearchRightsAuthority,
+    ) -> Result<(), super::super::ResearchIngestCompositionError> {
+        mutation.register_provider_source(generation, source, rights)
+    }
+
+    fn field(value: &str) -> Result<EiaFieldId, EiaError> {
+        EiaFieldId::try_from(value)
+    }
+
+    fn open_research(paths: &LocalPaths) -> TestResult<ResearchService> {
+        Ok(ResearchService::open_or_initialize(
+            paths,
+            CatalogConfig::try_new(
+                paths.catalog()?.clone(),
+                Duration::from_millis(750),
+                market_squawk_data::CatalogLimit::new(64)?,
+                CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+            )?,
+            8,
+            ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?,
+        )?)
+    }
+
+    fn query_limits() -> TestResult<QueryLimits> {
+        Ok(QueryLimits::try_new(
+            32,
+            1024 * 1024,
+            8 * 1024 * 1024,
+            8,
+            1024,
+            1024,
+            Duration::from_secs(10),
+        )?)
+    }
+
+    fn request_context(deadline: Instant) -> TestResult<RequestContext> {
+        let structure = JsonStructureLimits::try_new(16, 4096, 64, 64)?;
+        let limits = ServiceLimits::try_new(4096, 8, 4096, 8, structure)?;
+        Ok(RequestContext::new(
+            RequestId::String(Arc::from("test.eia-live-publication")),
+            CancellationToken::new(),
+            deadline,
+            limits,
+        ))
+    }
+
+    fn current_timestamp() -> TestResult<Timestamp> {
+        let nanos = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+        Ok(Timestamp::from_unix_nanos(nanos))
+    }
+
+    fn digest_bytes(bytes: &[u8]) -> EvidenceDigest {
+        EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(bytes).into())
+    }
 }

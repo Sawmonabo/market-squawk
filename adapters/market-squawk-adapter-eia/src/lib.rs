@@ -51,10 +51,10 @@ pub use request::{
 pub use transport::{
     EiaDataAcquisitionCursor, EiaDataPageMaterial, EiaDataPageSealRejoin, EiaDataPageTransition,
     EiaDataProbeRetrieval, EiaDataRetrieval, EiaDataRetrievalSealRejoin, EiaDataTransportReceipt,
-    EiaFacetMetadataRetrieval, EiaHttpReceipt, EiaPendingDataPage, EiaRawPageMaterial,
-    EiaRootPageJournalRejoin, EiaRouteMetadataRetrieval, EiaSourceTransport,
-    EiaSourceTransportError, EiaTransportLimits, eia_api_endpoint_rules,
-    eia_data_dataset_identifier,
+    EiaFacetMetadataRetrieval, EiaHttpFailureClass, EiaHttpFailureReceipt, EiaHttpReceipt,
+    EiaPendingDataPage, EiaRawPageMaterial, EiaRetryAfterPresence, EiaRootPageJournalRejoin,
+    EiaRouteMetadataRetrieval, EiaSourceTransport, EiaSourceTransportError, EiaTransportLimits,
+    eia_api_endpoint_rules, eia_data_dataset_identifier,
 };
 pub use types::{
     EIA_API_ROOT, EIA_MAX_JSON_PAGE_ROWS, EiaApiVersion, EiaDigest, EiaFacetValue, EiaFieldId,

@@ -746,6 +746,12 @@ pub enum EiaSourceTransportError {
     /// Registry, provider-rate, cancellation, deadline, or network source failure.
     #[error(transparent)]
     Extraction(#[from] ExtractionSourceError),
+    /// Complete non-contract HTTP response classified without retaining status or header values.
+    #[error("EIA provider returned a non-contract HTTP response: {receipt:?}")]
+    HttpFailure {
+        /// Closed payload-free response classification available before any later retry.
+        receipt: EiaHttpFailureReceipt,
+    },
     /// Source-neutral capture receipt rejected the response set.
     #[error(transparent)]
     Capture(#[from] ProviderCaptureError),
@@ -767,6 +773,68 @@ pub enum EiaSourceTransportError {
     /// Wall-clock or duration arithmetic was unavailable.
     #[error("EIA transport clock is unavailable")]
     ClockUnavailable,
+}
+
+/// Closed class for a complete EIA HTTP response that did not satisfy the endpoint status contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EiaHttpFailureClass {
+    /// An informational response unexpectedly terminated the request.
+    Informational,
+    /// A successful status other than the endpoint's required HTTP 200 was returned.
+    UnexpectedSuccess,
+    /// Redirect following is disabled and the provider returned a redirect response.
+    Redirection,
+    /// A non-authentication, non-rate-limit client refusal was returned.
+    ClientRefusal,
+    /// The provider returned a server-error response.
+    ProviderFailure,
+    /// The numeric status was outside the standard HTTP status classes.
+    Unrecognized,
+}
+
+/// Payload-free presence evidence for an unconsumed `Retry-After` response field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EiaRetryAfterPresence {
+    /// No `Retry-After` field was present.
+    Absent,
+    /// A `Retry-After` field was present; its value is deliberately not retained here.
+    Present,
+}
+
+/// Safe typed evidence for one complete non-contract EIA HTTP response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EiaHttpFailureReceipt {
+    class: EiaHttpFailureClass,
+    retry_after: EiaRetryAfterPresence,
+}
+
+impl EiaHttpFailureReceipt {
+    const fn from_response(status: u16, retry_after_present: bool) -> Self {
+        let class = match status {
+            100..=199 => EiaHttpFailureClass::Informational,
+            200..=299 => EiaHttpFailureClass::UnexpectedSuccess,
+            300..=399 => EiaHttpFailureClass::Redirection,
+            400..=499 => EiaHttpFailureClass::ClientRefusal,
+            500..=599 => EiaHttpFailureClass::ProviderFailure,
+            _ => EiaHttpFailureClass::Unrecognized,
+        };
+        let retry_after = if retry_after_present {
+            EiaRetryAfterPresence::Present
+        } else {
+            EiaRetryAfterPresence::Absent
+        };
+        Self { class, retry_after }
+    }
+
+    /// Returns the closed HTTP response class without exposing the numeric status.
+    pub const fn class(self) -> EiaHttpFailureClass {
+        self.class
+    }
+
+    /// Returns whether `Retry-After` was present without exposing its field value.
+    pub const fn retry_after(self) -> EiaRetryAfterPresence {
+        self.retry_after
+    }
 }
 
 impl From<ExtractionAuthorityError> for EiaSourceTransportError {
@@ -1633,7 +1701,12 @@ impl EiaSourceTransport {
             return Err(ExtractionSourceError::Source(SourceError::Unauthorized).into());
         }
         if response.status != 200 {
-            return Err(ExtractionSourceError::Source(SourceError::ProviderUnavailable).into());
+            return Err(EiaSourceTransportError::HttpFailure {
+                receipt: EiaHttpFailureReceipt::from_response(
+                    response.status,
+                    response.retry_after.is_some(),
+                ),
+            });
         }
         if response
             .content_encoding
