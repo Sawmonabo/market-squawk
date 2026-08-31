@@ -767,6 +767,7 @@ impl FredSource {
             &series_metadata,
             fetched.response.received_at,
             ingested_at,
+            request.max_records() as usize,
         )
         .map_err(map_adapter_error)?;
         let canonical_payloads = canonical
@@ -1003,6 +1004,7 @@ impl FredSource {
             &series_metadata,
             fetched.response.received_at,
             ingested_at,
+            request.max_records() as usize,
         )
         .map_err(map_adapter_error)?;
         let schema = SourceIdentifier::try_from(CURRENT_RESEARCH_RECORD_SCHEMA)

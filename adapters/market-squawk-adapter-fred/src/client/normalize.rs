@@ -33,6 +33,13 @@ pub(super) struct FredNativeLineagePlan {
     series_revisions: Box<[FredSeriesMetadata]>,
 }
 
+struct FredSemanticIntersection<'a> {
+    observation: &'a crate::FredObservation,
+    metadata_revision_ordinal: usize,
+    realtime_start: CalendarDate,
+    realtime_end: CalendarDate,
+}
+
 impl FredNativeLineagePlan {
     pub(super) fn try_new(
         provider_dataset: SourceIdentifier,
@@ -60,9 +67,15 @@ impl FredNativeLineagePlan {
         self,
         batch: &ExtractionBatch,
     ) -> Result<(ProviderNativeLineageBatch, Vec<u16>), FredSourceError> {
-        if batch.request().object().dataset() != &self.provider_dataset
-            || batch.records().len() != self.page.observations().len()
-        {
+        if batch.request().object().dataset() != &self.provider_dataset {
+            return Err(FredSourceError::Protocol);
+        }
+        let intersections = observation_metadata_intersections(
+            &self.page,
+            &self.series_revisions,
+            batch.records().len(),
+        )?;
+        if intersections.len() != batch.records().len() {
             return Err(FredSourceError::Protocol);
         }
         let mut builder = ProviderNativeLineageBatchBuilder::try_new(
@@ -109,6 +122,7 @@ impl FredNativeLineagePlan {
                     sort_order: "asc",
                 },
                 series_revisions: native_series_revisions,
+                semantic_rows: intersections.len(),
                 page: FredNativePageV1 {
                     realtime_start: self.page.realtime_start(),
                     realtime_end: self.page.realtime_end(),
@@ -126,15 +140,14 @@ impl FredNativeLineagePlan {
             .map_err(|_| FredSourceError::Protocol)?;
         let mut row_capture_page_ordinals = Vec::new();
         row_capture_page_ordinals
-            .try_reserve_exact(self.page.observations().len())
+            .try_reserve_exact(intersections.len())
             .map_err(|_| FredSourceError::Protocol)?;
-        for (record, observation) in batch.records().iter().zip(self.page.observations()) {
-            let (metadata_revision_ordinal, _series) =
-                applicable_metadata_revision(&self.series_revisions, observation.realtime_start())?;
+        for (record, intersection) in batch.records().iter().zip(intersections) {
+            let observation = intersection.observation;
             let expected_revision = source_revision_identifier(
                 &self.dataset,
                 observation.observation_date(),
-                observation.realtime_start(),
+                intersection.realtime_start,
             )?;
             if record.revision() != &expected_revision
                 || record.effective_time().calendar_date_value()
@@ -142,20 +155,29 @@ impl FredNativeLineagePlan {
                 || record
                     .published_time()
                     .and_then(ResearchTemporalCoordinate::calendar_date_value)
-                    != Some(observation.realtime_start())
+                    != Some(intersection.realtime_start)
+                || record
+                    .superseded_time()
+                    .and_then(ResearchTemporalCoordinate::calendar_date_value)
+                    != exclusive_superseded_at(intersection.realtime_end)?
+                        .and_then(|coordinate| coordinate.calendar_date_value())
             {
                 return Err(FredSourceError::Protocol);
             }
             builder
                 .try_push(&FredNativeLineageRowV1 {
-                    realtime_start: observation.realtime_start(),
-                    realtime_end: observation.realtime_end(),
+                    realtime_start: intersection.realtime_start,
+                    realtime_end: intersection.realtime_end,
+                    provider_realtime_start: observation.realtime_start(),
+                    provider_realtime_end: observation.realtime_end(),
                     observation_date: observation.observation_date(),
                     raw_value: observation.raw_value(),
                     value: observation.value(),
                     missing_marker: observation.value().is_none().then_some("."),
-                    metadata_revision_ordinal: u16::try_from(metadata_revision_ordinal)
-                        .map_err(|_| FredSourceError::Protocol)?,
+                    metadata_revision_ordinal: u16::try_from(
+                        intersection.metadata_revision_ordinal,
+                    )
+                    .map_err(|_| FredSourceError::Protocol)?,
                 })
                 .map_err(|_| FredSourceError::Protocol)?;
             row_capture_page_ordinals.push(1);
@@ -174,6 +196,7 @@ struct FredNativeLineageBatchV1<'a> {
     provider_dataset: &'a SourceIdentifier,
     response_mode: FredNativeResponseModeV1,
     series_revisions: Vec<FredNativeSeriesV1<'a>>,
+    semantic_rows: usize,
     page: FredNativePageV1<'a>,
 }
 
@@ -227,6 +250,8 @@ struct FredNativePageV1<'a> {
 struct FredNativeLineageRowV1<'a> {
     realtime_start: CalendarDate,
     realtime_end: CalendarDate,
+    provider_realtime_start: CalendarDate,
+    provider_realtime_end: CalendarDate,
     observation_date: CalendarDate,
     raw_value: &'a str,
     value: Option<rust_decimal::Decimal>,
@@ -242,6 +267,7 @@ pub(super) fn canonical_observation_payloads(
     series_metadata: &FredSeriesMetadataDocument,
     received_at: Timestamp,
     ingested_at: Timestamp,
+    max_records: usize,
 ) -> Result<Vec<CanonicalFredRecord>, FredSourceError> {
     let series =
         SourceIdentifier::try_from(dataset.series_id()).map_err(|_| FredSourceError::Protocol)?;
@@ -249,19 +275,20 @@ pub(super) fn canonical_observation_payloads(
         DigestAlgorithm::Sha256,
         page_context.payload_digest,
     ));
-    page.observations()
-        .iter()
-        .map(|observation| {
-            let (_metadata_revision_ordinal, metadata) = applicable_metadata_revision(
-                series_metadata.series_revisions(),
-                observation.realtime_start(),
-            )?;
+    observation_metadata_intersections(page, series_metadata.series_revisions(), max_records)?
+        .into_iter()
+        .map(|intersection| {
+            let observation = intersection.observation;
+            let metadata = series_metadata
+                .series_revisions()
+                .get(intersection.metadata_revision_ordinal)
+                .ok_or(FredSourceError::Protocol)?;
             let unit = fred_unit_identifier(metadata.units())?;
-            let revision_number = revision_number_for_vintage(observation.realtime_start())?;
+            let revision_number = revision_number_for_vintage(intersection.realtime_start)?;
             let source_revision = source_revision_identifier(
                 dataset,
                 observation.observation_date(),
-                observation.realtime_start(),
+                intersection.realtime_start,
             )?;
             let availability = ResearchAvailabilityEvidence::local_first_observed(received_at);
             let provenance = ResearchProvenance::try_new(ResearchProvenanceInput {
@@ -279,8 +306,8 @@ pub(super) fn canonical_observation_payloads(
             .map_err(|_| FredSourceError::Protocol)?;
             let effective =
                 ResearchTemporalCoordinate::calendar_date(observation.observation_date());
-            let published = ResearchTemporalCoordinate::calendar_date(observation.realtime_start());
-            let superseded = exclusive_superseded_at(observation.realtime_end())?;
+            let published = ResearchTemporalCoordinate::calendar_date(intersection.realtime_start);
+            let superseded = exclusive_superseded_at(intersection.realtime_end)?;
             let time = ResearchTime::try_new_with_coordinates(
                 effective.clone(),
                 Some(published.clone()),
@@ -362,6 +389,45 @@ fn applicable_metadata_revision(
     Ok((ordinal, revision))
 }
 
+fn observation_metadata_intersections<'a>(
+    page: &'a crate::FredObservationPage,
+    revisions: &'a [FredSeriesMetadata],
+    max_rows: usize,
+) -> Result<Vec<FredSemanticIntersection<'a>>, FredSourceError> {
+    if max_rows == 0 {
+        return Err(FredSourceError::Protocol);
+    }
+    let mut intersections = Vec::new();
+    intersections
+        .try_reserve_exact(page.observations().len().min(max_rows))
+        .map_err(|_| FredSourceError::Protocol)?;
+    for observation in page.observations() {
+        let mut realtime_start = observation.realtime_start();
+        loop {
+            let (metadata_revision_ordinal, metadata) =
+                applicable_metadata_revision(revisions, realtime_start)?;
+            let realtime_end = observation.realtime_end().min(metadata.realtime_end());
+            if realtime_start < metadata.realtime_start()
+                || realtime_end < realtime_start
+                || intersections.len() == max_rows
+            {
+                return Err(FredSourceError::Protocol);
+            }
+            intersections.push(FredSemanticIntersection {
+                observation,
+                metadata_revision_ordinal,
+                realtime_start,
+                realtime_end,
+            });
+            if realtime_end == observation.realtime_end() {
+                break;
+            }
+            realtime_start = next_calendar_date(realtime_end)?.ok_or(FredSourceError::Protocol)?;
+        }
+    }
+    Ok(intersections)
+}
+
 fn revision_number_for_vintage(
     realtime_start: CalendarDate,
 ) -> Result<RevisionNumber, FredSourceError> {
@@ -419,43 +485,41 @@ pub(super) struct CanonicalFredRecord {
 fn exclusive_superseded_at(
     inclusive_end: CalendarDate,
 ) -> Result<Option<ResearchTemporalCoordinate>, FredSourceError> {
-    if inclusive_end == CalendarDate::new(9999, 12, 31).map_err(|_| FredSourceError::Protocol)? {
+    Ok(next_calendar_date(inclusive_end)?.map(ResearchTemporalCoordinate::calendar_date))
+}
+
+fn next_calendar_date(date: CalendarDate) -> Result<Option<CalendarDate>, FredSourceError> {
+    if date == CalendarDate::new(9999, 12, 31).map_err(|_| FredSourceError::Protocol)? {
         return Ok(None);
     }
-    let last_day = match inclusive_end.month() {
+    let last_day = match date.month() {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 if inclusive_end.year().is_multiple_of(4)
-            && (!inclusive_end.year().is_multiple_of(100)
-                || inclusive_end.year().is_multiple_of(400)) =>
+        2 if date.year().is_multiple_of(4)
+            && (!date.year().is_multiple_of(100) || date.year().is_multiple_of(400)) =>
         {
             29
         }
         2 => 28,
         _ => return Err(FredSourceError::Protocol),
     };
-    let next = if inclusive_end.day() < last_day {
+    let next = if date.day() < last_day {
         CalendarDate::new(
-            inclusive_end.year(),
-            inclusive_end.month(),
-            inclusive_end
-                .day()
-                .checked_add(1)
-                .ok_or(FredSourceError::Protocol)?,
+            date.year(),
+            date.month(),
+            date.day().checked_add(1).ok_or(FredSourceError::Protocol)?,
         )
-    } else if inclusive_end.month() < 12 {
+    } else if date.month() < 12 {
         CalendarDate::new(
-            inclusive_end.year(),
-            inclusive_end
-                .month()
+            date.year(),
+            date.month()
                 .checked_add(1)
                 .ok_or(FredSourceError::Protocol)?,
             1,
         )
     } else {
         CalendarDate::new(
-            inclusive_end
-                .year()
+            date.year()
                 .checked_add(1)
                 .ok_or(FredSourceError::Protocol)?,
             1,
@@ -463,7 +527,7 @@ fn exclusive_superseded_at(
         )
     }
     .map_err(|_| FredSourceError::Protocol)?;
-    Ok(Some(ResearchTemporalCoordinate::calendar_date(next)))
+    Ok(Some(next))
 }
 
 #[cfg(test)]
@@ -474,8 +538,8 @@ mod tests {
 
     use super::{FredDataset, FredNamespace};
     use super::{
-        applicable_metadata_revision, exclusive_superseded_at, revision_number_for_vintage,
-        source_revision_identifier,
+        applicable_metadata_revision, exclusive_superseded_at, observation_metadata_intersections,
+        revision_number_for_vintage, source_revision_identifier,
     };
 
     #[test]
@@ -633,6 +697,39 @@ mod tests {
             .1
             .units(),
             "Percent"
+        );
+
+        let split_metadata = [
+            FredSeriesMetadata::parse_probe_response(
+                &metadata_response("2024-01-01", "2024-01-20", "Index")?,
+                &series_id,
+                limits,
+            )?,
+            FredSeriesMetadata::parse_probe_response(
+                &metadata_response("2024-01-21", "2024-01-31", "Percent")?,
+                &series_id,
+                limits,
+            )?,
+        ];
+        let intersections = observation_metadata_intersections(&narrow, &split_metadata, 2)?;
+        assert_eq!(intersections.len(), 2);
+        assert_eq!(intersections[0].metadata_revision_ordinal, 0);
+        assert_eq!(
+            intersections[0].realtime_start,
+            CalendarDate::new(2024, 1, 15)?
+        );
+        assert_eq!(
+            intersections[0].realtime_end,
+            CalendarDate::new(2024, 1, 20)?
+        );
+        assert_eq!(intersections[1].metadata_revision_ordinal, 1);
+        assert_eq!(
+            intersections[1].realtime_start,
+            CalendarDate::new(2024, 1, 21)?
+        );
+        assert_eq!(
+            intersections[1].realtime_end,
+            CalendarDate::new(2024, 1, 31)?
         );
 
         let divergent_same_version = serde_json::json!([

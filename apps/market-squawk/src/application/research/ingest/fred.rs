@@ -64,6 +64,7 @@ pub(crate) struct FredSealedDatasetPublication {
     provider_dataset: SourceIdentifier,
     analytical_dataset: DatasetId,
     provider_row_count: u64,
+    canonical_row_count: u64,
     pages: Box<[FredSealedPagePublication]>,
     publication_lease: Arc<dyn IngestPrecommitAuthority>,
 }
@@ -104,7 +105,8 @@ impl FredSealedDatasetPublication {
         FredPublishedGenerationExpectation {
             provider_dataset: self.provider_dataset.clone(),
             analytical_dataset: self.analytical_dataset.clone(),
-            row_count: self.provider_row_count,
+            provider_row_count: self.provider_row_count,
+            row_count: self.canonical_row_count,
             object_count: self.pages.len(),
             source_id: self.source_id.clone(),
         }
@@ -168,6 +170,7 @@ pub(crate) struct FredSealedPagePublicationParts {
 pub(crate) struct FredPublishedGenerationExpectation {
     provider_dataset: SourceIdentifier,
     analytical_dataset: DatasetId,
+    provider_row_count: u64,
     row_count: u64,
     object_count: usize,
     source_id: SourceId,
@@ -282,9 +285,14 @@ impl FredPublishedGenerationHandoff {
                 .ok_or(FredProductionPublicationError::Capacity)?;
             published_objects.push(object.object().object().clone());
         }
+        let provider_row_count = selected_bindings
+            .first()
+            .and_then(|binding| u64::try_from(binding.provider_page.total()).ok())
+            .ok_or(FredProductionPublicationError::RestartVerificationMismatch)?;
         let expectation = FredPublishedGenerationExpectation {
             provider_dataset,
             analytical_dataset: capability.analytical_dataset().clone(),
+            provider_row_count,
             row_count,
             object_count: selected_bindings.len(),
             source_id: generation.source_id().clone(),
@@ -337,6 +345,11 @@ impl FredPublishedGenerationHandoff {
         {
             return Err(FredProductionPublicationError::IncompletePublication);
         }
+        validate_fred_binding_coordinates_in_provider_order(
+            &selected_bindings,
+            expectation.provider_row_count,
+            expectation.row_count,
+        )?;
         let reopened = research
             .analytical()
             .verify_provider_macro_plan_restart(&receipt.restart_selector())?;
@@ -448,6 +461,7 @@ struct RestoredFredNativeBatchV1 {
     provider_dataset: SourceIdentifier,
     response_mode: RestoredFredResponseModeV1,
     series_revisions: Vec<RestoredFredSeriesV1>,
+    semantic_rows: usize,
     page: RestoredFredPageV1,
 }
 
@@ -492,7 +506,8 @@ impl RestoredFredNativeBatchV1 {
             || self.page.units.is_empty()
             || self.page.count == 0
             || self.page.limit == 0
-            || self.page.returned != record_count
+            || self.page.returned == 0
+            || self.semantic_rows != record_count
             || self.page.returned > self.page.limit
             || consumed > self.page.count
             || self.page.terminal != (consumed == self.page.count)
@@ -511,9 +526,12 @@ impl RestoredFredNativeBatchV1 {
                 .get(usize::from(restored.metadata_revision_ordinal))
                 .ok_or(FredProductionPublicationError::RestartVerificationMismatch)?;
             if restored.realtime_start > restored.realtime_end
+                || restored.provider_realtime_start > restored.provider_realtime_end
                 || restored.raw_value.is_empty()
                 || restored.realtime_start < metadata.realtime_start
-                || restored.realtime_start > metadata.realtime_end
+                || restored.realtime_end > metadata.realtime_end
+                || restored.realtime_start < restored.provider_realtime_start
+                || restored.realtime_end > restored.provider_realtime_end
                 || restored.value.is_none() != (restored.missing_marker.as_deref() == Some("."))
             {
                 return Err(FredProductionPublicationError::RestartVerificationMismatch);
@@ -594,6 +612,8 @@ struct RestoredFredSeriesV1 {
 struct RestoredFredNativeRowV1 {
     realtime_start: CalendarDate,
     realtime_end: CalendarDate,
+    provider_realtime_start: CalendarDate,
+    provider_realtime_end: CalendarDate,
     #[serde(rename = "observation_date")]
     _observation_date: CalendarDate,
     raw_value: String,
@@ -694,6 +714,7 @@ fn fred_plan_completion_digest(
     fred_hash_text(&mut digest, expectation.provider_dataset.as_str())?;
     fred_hash_text(&mut digest, expectation.analytical_dataset.as_str())?;
     digest.update(expectation.row_count.to_be_bytes());
+    digest.update(expectation.provider_row_count.to_be_bytes());
     digest.update(
         u16::try_from(expectation.object_count)
             .map_err(|_error| FredProductionPublicationError::Capacity)?
@@ -808,6 +829,7 @@ impl FredMacroRestartSelector {
         }
         validate_fred_binding_coordinates_in_provider_order(
             &selected_bindings,
+            expectation.provider_row_count,
             expectation.row_count,
         )?;
         let owned = research
@@ -983,18 +1005,19 @@ fn validate_fred_owned_generation(
 
 fn validate_fred_binding_coordinates_in_provider_order(
     bindings: &[FredPublishedBindingCoordinate],
-    expected_row_count: u64,
+    expected_provider_row_count: u64,
+    expected_canonical_row_count: u64,
 ) -> Result<(), FredProductionPublicationError> {
-    let expected_total = usize::try_from(expected_row_count)
+    let expected_provider_total = usize::try_from(expected_provider_row_count)
         .map_err(|_error| FredProductionPublicationError::Capacity)?;
     let mut expected_offset = 0_usize;
+    let mut canonical_rows = 0_u64;
     let mut expected_limit = None;
     let mut expected_metadata_digest = None;
     for (ordinal, binding) in bindings.iter().enumerate() {
         let page = binding.provider_page;
         if page.offset() != expected_offset
-            || page.returned() != binding.record_count
-            || page.total() != expected_total
+            || page.total() != expected_provider_total
             || page.terminal() != (ordinal + 1 == bindings.len())
             || expected_limit.is_some_and(|limit| limit != page.limit())
             || expected_metadata_digest.is_some_and(|digest| digest != page.metadata_digest())
@@ -1006,11 +1029,18 @@ fn validate_fred_binding_coordinates_in_provider_order(
         }
         expected_limit = Some(page.limit());
         expected_metadata_digest = Some(page.metadata_digest());
+        canonical_rows = canonical_rows
+            .checked_add(
+                u64::try_from(binding.record_count)
+                    .map_err(|_error| FredProductionPublicationError::Capacity)?,
+            )
+            .ok_or(FredProductionPublicationError::Capacity)?;
         expected_offset = expected_offset
             .checked_add(page.returned())
             .ok_or(FredProductionPublicationError::Capacity)?;
     }
-    if expected_offset != expected_total {
+    if expected_offset != expected_provider_total || canonical_rows != expected_canonical_row_count
+    {
         return Err(FredProductionPublicationError::RestartVerificationMismatch);
     }
     Ok(())
@@ -1198,7 +1228,7 @@ impl ProductionResearchIngestCoordinator {
                 || batch.request().object().object_id() != object.object_id()
                 || batch.request().object().evidence().content_digest()
                     != object.evidence().content_digest()
-                || batch.records().len() != identity.returned()
+                || batch.records().len() < identity.returned()
                 || revisions.len() != batch.records().len()
                 || !revisions.native_lineage_required()
                 || native_lineage.schema().implementation()
@@ -1255,7 +1285,10 @@ impl ProductionResearchIngestCoordinator {
                 .ok()
                 .and_then(|page_rows| rows.checked_add(page_rows))
         });
-        if observed_rows != Some(chain.provider_row_count) {
+        let canonical_row_count = observed_rows
+            .filter(|rows| *rows != 0)
+            .ok_or(FredProductionPublicationError::IncompletePageChain)?;
+        if chain.provider_row_count == 0 || canonical_row_count < chain.provider_row_count {
             return Err(FredProductionPublicationError::IncompletePageChain);
         }
         Ok(FredSealedDatasetPublication {
@@ -1264,6 +1297,7 @@ impl ProductionResearchIngestCoordinator {
             provider_dataset: provider_dataset.clone(),
             analytical_dataset,
             provider_row_count: chain.provider_row_count,
+            canonical_row_count,
             pages: pages.into_boxed_slice(),
             publication_lease,
         })
@@ -1285,6 +1319,7 @@ impl ProductionResearchIngestCoordinator {
             provider_dataset,
             analytical_dataset,
             provider_row_count,
+            canonical_row_count,
             pages,
             publication_lease,
         } = sealed;
@@ -1292,7 +1327,8 @@ impl ProductionResearchIngestCoordinator {
             || source_id != expectation.source_id
             || provider_dataset != expectation.provider_dataset
             || analytical_dataset != expectation.analytical_dataset
-            || provider_row_count != expectation.row_count
+            || provider_row_count != expectation.provider_row_count
+            || canonical_row_count != expectation.row_count
             || pages.len() != expectation.object_count
             || pages.is_empty()
         {
@@ -1362,7 +1398,7 @@ impl ProductionResearchIngestCoordinator {
                     .iter()
                     .any(|ordinal| usize::from(*ordinal) != FRED_OBSERVATION_CAPTURE_PAGE_ORDINAL)
                 || provider_page.offset() != expected_provider_offset
-                || provider_page.returned() != batch.records().len()
+                || batch.records().len() < provider_page.returned()
                 || provider_page.total() != expected_provider_total
                 || provider_page.terminal() != (page_ordinal + 1 == page_count)
                 || expected_provider_limit.is_some_and(|limit| limit != provider_page.limit())
@@ -1459,7 +1495,7 @@ impl ProductionResearchIngestCoordinator {
             selected_bindings.push(coordinate);
             candidate_digests.push(candidate_digest);
         }
-        if published_rows != provider_row_count
+        if published_rows != canonical_row_count
             || expected_provider_offset != expected_provider_total
             || selected_bindings.len() != expectation.object_count
             || chunks.len() != expectation.object_count
@@ -1468,6 +1504,7 @@ impl ProductionResearchIngestCoordinator {
         }
         validate_fred_binding_coordinates_in_provider_order(
             &selected_bindings,
+            expectation.provider_row_count,
             expectation.row_count,
         )?;
         let source_generation_digest = source_generation_digest
@@ -1481,14 +1518,14 @@ impl ProductionResearchIngestCoordinator {
         let input = ProviderMacroPlanPublicationInput::try_new(
             analytical_dataset.clone(),
             completion_digest,
-            provider_row_count,
+            canonical_row_count,
             chunks,
         )?;
         if input.source_id() != &source_id
             || input.provider_dataset() != &provider_dataset
             || input.source_generation_digest() != source_generation_digest
             || input.total_chunks() != total_chunks
-            || input.total_rows() != provider_row_count
+            || input.total_rows() != canonical_row_count
         {
             return Err(FredProductionPublicationError::IncompletePublication);
         }

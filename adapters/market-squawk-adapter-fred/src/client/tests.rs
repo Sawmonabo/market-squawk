@@ -373,10 +373,19 @@ async fn durable_extraction_emits_canonical_schema_v3_macro_observations() -> Te
     )?;
     assert_eq!(native_batch["family"], "fred_alfred_series_observations");
     assert_eq!(native_batch["namespace"], "alfred");
-    assert_eq!(native_batch["series"]["id"], "CPIAUCSL");
-    assert_eq!(native_batch["series"]["observation_start"]["year"], 1947);
-    assert_eq!(native_batch["series"]["observation_end"]["year"], 2023);
-    assert_eq!(native_batch["series"]["units"], "Index 1982-1984=100");
+    assert_eq!(native_batch["series_revisions"][0]["id"], "CPIAUCSL");
+    assert_eq!(
+        native_batch["series_revisions"][0]["observation_start"]["year"],
+        1947
+    );
+    assert_eq!(
+        native_batch["series_revisions"][0]["observation_end"]["year"],
+        2023
+    );
+    assert_eq!(
+        native_batch["series_revisions"][0]["units"],
+        "Index 1982-1984=100"
+    );
     assert_eq!(native_batch["page"]["units"], "lin");
     assert_eq!(native_batch["page"]["offset"], 0);
     assert_eq!(native_batch["page"]["returned"], 2);
@@ -386,6 +395,7 @@ async fn durable_extraction_emits_canonical_schema_v3_macro_observations() -> Te
     let second_native: serde_json::Value =
         serde_json::from_slice(native_lineage.rows()[1].semantic_payload())?;
     assert_eq!(first_native["raw_value"], "101.25");
+    assert_eq!(first_native["metadata_revision_ordinal"], 0);
     assert!(!first_native["value"].is_null());
     assert!(first_native["missing_marker"].is_null());
     assert_eq!(second_native["raw_value"], ".");
