@@ -1019,6 +1019,8 @@ mod bulk {
             "ACCESSION_NUMBER" => 20,
             "SUBMISSION_TYPE" | "CIK" | "INVESTMENT_COMPANY_TYPE" | "SERIES_ID" => 10,
             "IS_REPORT_PERIOD_LT_12MONTH"
+            | "IS_LAST_FILING"
+            | "IS_RESTRICTED_SECURITY"
             | "IS_ETF"
             | "IS_INDEX"
             | "IS_COLLATERAL_REQUIRED"
