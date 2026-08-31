@@ -230,7 +230,11 @@ impl StreamerMicrobatch {
         &self.connection
     }
 
-    /// Consumes exact validated frames into the common event-microbatch physical seal boundary.
+    /// Consumes exact bounded frames into the common event-microbatch physical seal boundary.
+    ///
+    /// Provider-native decoding is an aligned, non-authoritative disposition. A malformed,
+    /// unexpected, or binary frame remains physically sealable as raw-only evidence and cannot
+    /// acquire typed publication authority.
     pub fn into_pending_capture(
         self,
         event_ids: Vec<Uuid>,
@@ -268,13 +272,9 @@ impl StreamerMicrobatch {
             .try_reserve_exact(frames.len())
             .map_err(|_| SchwabTransportError::PayloadTooLarge)?;
         for (event_id, frame) in event_ids.into_iter().zip(frames.into_vec()) {
-            if frame.kind != RawStreamerFrameKind::Text {
+            if contains_account_activity(&frame.payload) {
                 return Err(SchwabTransportError::CaptureMaterial);
             }
-            parsed_frames.push(
-                parse_streamer_frame(&frame.payload, parse_bounds)
-                    .map_err(|_| SchwabTransportError::Adapter)?,
-            );
             let received_nanos = i64::try_from(frame.received_at_unix_millis)
                 .ok()
                 .and_then(|value| value.checked_mul(1_000_000))
@@ -288,6 +288,11 @@ impl StreamerMicrobatch {
                     .map_err(|_| SchwabTransportError::Overflow)?,
                 payload_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, frame.payload_sha256),
                 event_id,
+            });
+            parsed_frames.push(if frame.kind == RawStreamerFrameKind::Text {
+                parse_streamer_frame(&frame.payload, parse_bounds).ok()
+            } else {
+                None
             });
             records.push(
                 RawCaptureRecord::try_new_live(
@@ -508,7 +513,7 @@ pub struct SchwabPendingStreamerCapture {
     stream_identity: SourceIdentifier,
     streamer_receipt: StreamerMicrobatchReceipt,
     frames: Box<[SchwabStreamerFrameSealEvidence]>,
-    parsed_frames: Box<[ParsedNative<StreamerFrame>]>,
+    parsed_frames: Box<[Option<ParsedNative<StreamerFrame>>]>,
     service_responses: Box<[PendingStreamerServiceResponseEvidence]>,
 }
 
@@ -520,7 +525,10 @@ impl fmt::Debug for SchwabPendingStreamerCapture {
             .field("stream_identity", &self.stream_identity)
             .field("streamer_receipt", &self.streamer_receipt)
             .field("frame_count", &self.frames.len())
-            .field("parsed_frame_count", &self.parsed_frames.len())
+            .field(
+                "parsed_frame_count",
+                &self.parsed_frames.iter().flatten().count(),
+            )
             .field("service_response_count", &self.service_responses.len())
             .field("raw_frames", &"AWAITING COMMON PHYSICAL SEAL")
             .finish()
@@ -599,7 +607,7 @@ pub struct SchwabSealedStreamerCapture {
     stream_identity: SourceIdentifier,
     streamer_receipt: StreamerMicrobatchReceipt,
     frames: Box<[SchwabStreamerFrameSealEvidence]>,
-    parsed_frames: Box<[ParsedNative<StreamerFrame>]>,
+    parsed_frames: Box<[Option<ParsedNative<StreamerFrame>>]>,
     service_responses: Box<[SchwabStreamerServiceResponseEvidence]>,
 }
 
@@ -616,7 +624,10 @@ impl fmt::Debug for SchwabSealedStreamerCapture {
             .field("stream_identity", &self.stream_identity)
             .field("streamer_receipt", &self.streamer_receipt)
             .field("frame_count", &self.frames.len())
-            .field("parsed_frame_count", &self.parsed_frames.len())
+            .field(
+                "parsed_frame_count",
+                &self.parsed_frames.iter().flatten().count(),
+            )
             .field("service_response_count", &self.service_responses.len())
             .field("raw_frames", &"PHYSICALLY SEALED")
             .finish()
@@ -651,7 +662,7 @@ impl SchwabSealedStreamerCapture {
         &self.service_responses
     }
 
-    pub(crate) fn parsed_frames(&self) -> &[ParsedNative<StreamerFrame>] {
+    pub(crate) fn parsed_frames(&self) -> &[Option<ParsedNative<StreamerFrame>>] {
         &self.parsed_frames
     }
 
@@ -1788,6 +1799,21 @@ impl SchwabStreamerExecutor {
                 self.telemetry.record_stream_frame(
                     u64::try_from(payload.len()).map_err(|_| SchwabTransportError::Overflow)?,
                 )?;
+                if contains_account_activity(&payload) {
+                    self.telemetry.record_validation_failure()?;
+                    flush_batch(batch, sink, &self.telemetry)?;
+                    return Err(SchwabTransportError::Protocol);
+                }
+                append_frame(
+                    generation,
+                    RawStreamerFrameKind::Binary,
+                    payload,
+                    batch,
+                    sink,
+                    &self.telemetry,
+                )?;
+                self.telemetry.record_validation_failure()?;
+                flush_batch(batch, sink, &self.telemetry)?;
                 return Err(SchwabTransportError::Protocol);
             }
             InboundStreamerFrame::Close => return Ok(ProcessedFrame::Closed),
@@ -1795,10 +1821,23 @@ impl SchwabStreamerExecutor {
         self.telemetry.record_stream_frame(
             u64::try_from(payload.len()).map_err(|_| SchwabTransportError::Overflow)?,
         )?;
+        if contains_account_activity(&payload) {
+            self.telemetry.record_validation_failure()?;
+            flush_batch(batch, sink, &self.telemetry)?;
+            return Err(SchwabTransportError::Protocol);
+        }
         let parsed = match parse_streamer_frame(&payload, self.parse_bounds) {
             Ok(parsed) => parsed,
             Err(error) => {
                 self.telemetry.record_validation_failure()?;
+                append_frame(
+                    generation,
+                    RawStreamerFrameKind::Text,
+                    payload,
+                    batch,
+                    sink,
+                    &self.telemetry,
+                )?;
                 flush_batch(batch, sink, &self.telemetry)?;
                 return Err(error.into());
             }
@@ -2061,6 +2100,13 @@ fn append_frame(
         flush_batch(batch, sink, telemetry)?;
     }
     batch.push(kind, payload)
+}
+
+fn contains_account_activity(payload: &[u8]) -> bool {
+    const FORBIDDEN_SERVICE: &[u8] = b"ACCOUNT_ACTIVITY";
+    payload
+        .windows(FORBIDDEN_SERVICE.len())
+        .any(|window| window == FORBIDDEN_SERVICE)
 }
 
 fn flush_batch(

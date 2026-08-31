@@ -287,11 +287,13 @@ impl SchwabMarketDataQualification {
             })
             && capture.service_responses().is_empty()
             && capture.parsed_frames().iter().all(|frame| {
-                frame
-                    .value()
-                    .data
-                    .iter()
-                    .all(|batch| batch.service == service)
+                frame.as_ref().is_some_and(|frame| {
+                    frame
+                        .value()
+                        .data
+                        .iter()
+                        .all(|batch| batch.service == service)
+                })
             })
             && capture
                 .frames()
@@ -806,10 +808,11 @@ fn validate_ack_capture(
                 || frame.event_id() != response.event_id()
                 || frame.payload_digest() != response.payload_digest()
         })
-        || capture
-            .parsed_frames()
-            .iter()
-            .any(|frame| !frame.value().data.is_empty())
+        || capture.parsed_frames().iter().any(|frame| {
+            frame
+                .as_ref()
+                .is_none_or(|frame| !frame.value().data.is_empty())
+        })
     {
         return Err(SchwabVerticalError::InvalidCapabilityEvidence);
     }
@@ -844,6 +847,9 @@ fn validate_data_capture(
     }
     let mut provider_records = 0_u64;
     for frame in capture.parsed_frames() {
+        let Some(frame) = frame else {
+            return Err(SchwabVerticalError::InvalidCapabilityEvidence);
+        };
         if !frame.value().responses.is_empty() {
             return Err(SchwabVerticalError::InvalidCapabilityEvidence);
         }

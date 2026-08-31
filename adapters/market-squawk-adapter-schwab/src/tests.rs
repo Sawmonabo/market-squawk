@@ -30,6 +30,7 @@ use market_squawk_sources::{
     SchwabMarketDataDoctorReceiptV1, SchwabMarketDataFamily, SchwabMarketDataFamilyEvidence,
     SchwabUserPreferenceDoctorEvidence, SourceObject,
 };
+use sha2::Digest as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
@@ -1737,6 +1738,8 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     );
     let market_data: &'static [u8] =
         br#"{"data":[{"service":"LEVELONE_EQUITIES","command":"SUBS","timestamp":1710000000002,"content":[{"key":"AAPL","1":100.125,"2":100.25,"3":2,"4":3}]}]}"#;
+    let malformed_selected_service: &'static [u8] =
+        br#"{"data":[{"service":"LEVELONE_EQUITIES","command":"SUBS","content":[{"key":"AAPL","1":}]}]}"#;
     let connector_state = Arc::new(Mutex::new(MockStreamerState {
         connects: 0,
         inbound: Some(VecDeque::from([
@@ -1747,6 +1750,9 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
             MockStreamerInbound::FlushBoundary,
             MockStreamerInbound::Frame(InboundStreamerFrame::Text(Bytes::from_static(market_data))),
             MockStreamerInbound::FlushBoundary,
+            MockStreamerInbound::Frame(InboundStreamerFrame::Text(Bytes::from_static(
+                malformed_selected_service,
+            ))),
         ])),
         sent: Vec::new(),
     }));
@@ -1806,14 +1812,15 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     let cancellation = CancellationToken::new();
     let mut sink = CancellingCaptureSink {
         cancellation: cancellation.clone(),
-        cancel_after: 3,
+        cancel_after: 4,
         microbatches: Vec::new(),
     };
-    streamer
+    let run_error = streamer
         .run(bootstrap.value(), &mut sink, cancellation)
         .await
-        .unwrap_or_else(|error| panic!("stream run: {error}"));
-    assert_eq!(sink.microbatches.len(), 3);
+        .expect_err("malformed selected-service frame must close the typed Streamer run");
+    assert_eq!(run_error, SchwabTransportError::Adapter);
+    assert_eq!(sink.microbatches.len(), 4);
     let temporary = TemporaryDirectory::new();
     let paths = LocalPaths::prepare(temporary.path().join("stream-raw-publication"))
         .unwrap_or_else(|error| panic!("Streamer publication paths: {error}"));
@@ -1839,6 +1846,12 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
             .unwrap_or_else(|| panic!("missing publication microbatch")),
         &store,
     );
+    let raw_only = seal_stream_microbatch(
+        microbatches
+            .next()
+            .unwrap_or_else(|| panic!("missing malformed raw-only microbatch")),
+        &store,
+    );
     assert!(microbatches.next().is_none());
 
     let mut doctor = SchwabStreamerFamilyDoctorAccumulator::try_from_ack_capture(
@@ -1862,6 +1875,45 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         (stream_capacity.requested(), stream_capacity.returned()),
         (1, 1)
     );
+
+    let [raw_only_frame] = raw_only.frames() else {
+        panic!("malformed Streamer evidence must retain one exact raw frame");
+    };
+    assert_eq!(raw_only_frame.kind(), RawStreamerFrameKind::Text);
+    assert_eq!(
+        raw_only_frame.payload_bytes(),
+        u64::try_from(malformed_selected_service.len())
+            .unwrap_or_else(|error| panic!("malformed payload bytes: {error}"))
+    );
+    assert_eq!(
+        raw_only_frame.payload_digest().bytes(),
+        <[u8; 32]>::from(sha2::Sha256::digest(malformed_selected_service))
+    );
+    let raw_only_persisted = raw_only.persisted_receipt();
+    assert_ne!(raw_only_persisted.receipt_digest().bytes(), [0; 32]);
+    let raw_only_reopened = store
+        .open_verified(raw_only_persisted.segment())
+        .unwrap_or_else(|error| panic!("reopen malformed Streamer physical seal: {error}"));
+    let [raw_only_record] = raw_only_reopened.records() else {
+        panic!("malformed Streamer seal must contain one raw record");
+    };
+    assert_eq!(raw_only_record.payload(), malformed_selected_service);
+    let raw_only_received_at = Timestamp::from_unix_nanos(
+        i64::try_from(raw_only_frame.received_at_unix_millis())
+            .unwrap_or_else(|error| panic!("raw-only received milliseconds: {error}"))
+            .checked_mul(1_000_000)
+            .unwrap_or_else(|| panic!("raw-only received timestamp overflow")),
+    );
+    let raw_only_qualification = test_market_data_qualification(
+        SchwabMarketDataFamily::LevelOneEquities,
+        raw_only_received_at,
+        raw_only.streamer_receipt().token_generation(),
+    );
+    assert!(!raw_only_qualification.validates_streamer_publication(
+        MarketDataService::LevelOneEquities,
+        &streamer_doctor,
+        &raw_only,
+    ));
 
     assert_eq!(sealed.coordinates(), &coordinates);
     assert_eq!(sealed.stream_identity(), &stream_identity);

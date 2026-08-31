@@ -317,6 +317,9 @@ impl SchwabSealedStreamerCapture {
         let mut dispositions = Vec::new();
         let mut used = BTreeSet::new();
         for (frame_index, parsed) in self.parsed_frames().iter().enumerate() {
+            let Some(parsed) = parsed else {
+                return Err(SchwabStreamerPublicationError::InvalidEvidence);
+            };
             let frame_ordinal = u16::try_from(frame_index)
                 .map_err(|_| SchwabStreamerPublicationError::InvalidEvidence)?;
             let frame = self
@@ -819,6 +822,9 @@ fn encode_sidecar(
         .zip(capture.parsed_frames())
         .enumerate()
     {
+        let Some(parsed) = parsed else {
+            return Err(SchwabStreamerPublicationError::InvalidEvidence);
+        };
         let unknown = parsed.unknown_fields();
         frames.push(SchwabStreamerFrameNativeSidecarV1 {
             frame_ordinal: u16::try_from(frame_index)
