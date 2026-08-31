@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1213,6 +1214,71 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
         .latest(instrument_id, deadline(), &cancellation)?
         .ok_or(CatalogError::InvalidRecord)?;
     assert_eq!(retained.revision_sequence(), 1);
+    let unique_before_competitor = reader.resolve_exact_as_of(
+        "AAPL",
+        retained.published_at(),
+        Timestamp::from_unix_nanos(10),
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(unique_before_competitor.matches().len(), 1);
+    assert!(!unique_before_competitor.has_more());
+    assert_eq!(
+        unique_before_competitor.matches()[0]
+            .record()
+            .definition()
+            .instrument_id(),
+        instrument_id
+    );
+    assert_eq!(
+        unique_before_competitor.knowledge_at(),
+        Some(retained.published_at())
+    );
+    assert_eq!(
+        unique_before_competitor.effective_at(),
+        Some(Timestamp::from_unix_nanos(10))
+    );
+
+    let competing_definition = market_data_definition(
+        other_id,
+        10,
+        None,
+        "Apple Depositary Interest",
+        "AAPL.OTHER",
+        51,
+    )?;
+    let competing_publication = publisher.synchronize(
+        MarketDataInstrumentSynchronization::try_new(vec![competing_definition], 1)?,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(
+        (
+            competing_publication.inserted(),
+            competing_publication.replayed()
+        ),
+        (1, 0)
+    );
+    let competing_record = reader
+        .latest(other_id, deadline(), &cancellation)?
+        .ok_or(CatalogError::InvalidRecord)?;
+    let ambiguous_after_competitor = reader.resolve_exact_as_of(
+        "AAPL",
+        competing_record.published_at(),
+        Timestamp::from_unix_nanos(10),
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(ambiguous_after_competitor.matches().len(), 2);
+    assert!(!ambiguous_after_competitor.has_more());
+    assert_eq!(
+        ambiguous_after_competitor
+            .matches()
+            .iter()
+            .map(|candidate| candidate.record().definition().instrument_id())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([instrument_id, other_id])
+    );
     let canonical_population = MarketDataInstrumentPopulationQuery::try_new(
         vec![other_id, instrument_id],
         retained.published_at(),
@@ -1570,6 +1636,30 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
         !serde_json::to_string(provider_match.matches()[0].record().definition())?
             .contains("execution")
     );
+    let historical_provider_alias = reader.resolve_exact_as_of(
+        "AAPL.US",
+        future_parent.published_at(),
+        successor_effective_start,
+        deadline(),
+        &cancellation,
+    )?;
+    assert!(historical_provider_alias.matches().is_empty());
+    assert!(!historical_provider_alias.has_more());
+    let current_provider_alias = reader.resolve_exact_as_of(
+        "AAPL.NEW",
+        future_parent.published_at(),
+        successor_effective_start,
+        deadline(),
+        &cancellation,
+    )?;
+    assert_eq!(current_provider_alias.matches().len(), 1);
+    assert_eq!(
+        current_provider_alias.matches()[0]
+            .record()
+            .definition()
+            .instrument_id(),
+        instrument_id
+    );
     drop(reader);
     drop(publisher);
     drop(relationship_reader);
@@ -1610,6 +1700,46 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
             &cancellation
         )?,
         sec_identity
+    );
+    assert_eq!(
+        reader.resolve_exact_as_of(
+            "AAPL",
+            retained.published_at(),
+            Timestamp::from_unix_nanos(10),
+            deadline(),
+            &cancellation,
+        )?,
+        unique_before_competitor
+    );
+    assert_eq!(
+        reader.resolve_exact_as_of(
+            "AAPL",
+            competing_record.published_at(),
+            Timestamp::from_unix_nanos(10),
+            deadline(),
+            &cancellation,
+        )?,
+        ambiguous_after_competitor
+    );
+    assert_eq!(
+        reader.resolve_exact_as_of(
+            "AAPL.US",
+            future_parent.published_at(),
+            successor_effective_start,
+            deadline(),
+            &cancellation,
+        )?,
+        historical_provider_alias
+    );
+    assert_eq!(
+        reader.resolve_exact_as_of(
+            "AAPL.NEW",
+            future_parent.published_at(),
+            successor_effective_start,
+            deadline(),
+            &cancellation,
+        )?,
+        current_provider_alias
     );
     Ok(())
 }

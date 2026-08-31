@@ -13,13 +13,15 @@ use market_squawk_data::{
     ListingReferenceMembershipPageState, ListingReferenceMembershipSelectionReceipt,
     ListingReferenceReadCapability, ListingReferenceRecord, ListingReferenceRightsState,
     MAX_LISTING_REFERENCE_MEMBERSHIP_PAGE_ROWS, MAX_LISTING_REFERENCE_RECORDS,
-    MarketDataInstrumentCatalogError, MarketDataInstrumentPopulationDisposition,
+    MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS, MarketDataInstrumentCatalogError,
+    MarketDataInstrumentMatchKind, MarketDataInstrumentPopulationDisposition,
     MarketDataInstrumentPopulationQuery, MarketDataInstrumentPopulationSelection,
-    MarketDataInstrumentReadCapability,
+    MarketDataInstrumentReadCapability, MarketDataInstrumentSearchMatch,
+    MarketDataInstrumentSearchPage,
 };
 use market_squawk_domain::{
-    AssetClass, Currency, EffectiveInterval, InstrumentId, MarketDataInstrumentDefinition,
-    Timestamp, VenueId,
+    AssetClass, AssignmentVerification, Currency, EffectiveInterval, ExternalIdentifier,
+    InstrumentId, MarketDataInstrumentDefinition, Timestamp, VenueId,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -27,6 +29,9 @@ use tokio_util::sync::CancellationToken;
 const MAX_RETAINED_DIRECTORY_RECEIPTS: usize =
     MAX_LISTING_REFERENCE_RECORDS.div_ceil(MAX_LISTING_REFERENCE_MEMBERSHIP_PAGE_ROWS);
 const MAX_RETAINED_AMBIGUOUS_LISTINGS: usize = 2;
+
+/// Product searches stay small even though the catalog admits a larger diagnostic bound.
+const MAX_INSTRUMENT_SEARCH_ROWS: usize = 32;
 
 /// Closed point-in-time request for one canonical investment identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,6 +166,80 @@ impl InstrumentContextReadCapability {
         Ok(replay)
     }
 
+    /// Returns provider-neutral candidates at fixed knowledge and effective clocks.
+    ///
+    /// Candidate search never selects an instrument. The user or a separately authorized exact
+    /// resolution step must carry the stable [`InstrumentId`] into subsequent research reads.
+    pub(crate) fn search(
+        &self,
+        request: &InstrumentSearchRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<InstrumentSearchRead, InstrumentContextReadError> {
+        check_operation(deadline, cancellation)?;
+        let evidence = self
+            .instruments
+            .search_as_of(
+                request.query(),
+                request.knowledge_at(),
+                request.effective_at(),
+                request.maximum_rows(),
+                deadline,
+                cancellation,
+            )
+            .map_err(map_instrument_error)?;
+        build_search_read(request.clone(), evidence)
+    }
+
+    /// Resolves an exact admitted term while preserving every ambiguity as a terminal outcome.
+    pub(crate) fn resolve_exact(
+        &self,
+        request: &InstrumentIdentityResolutionRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<InstrumentIdentityResolutionRead, InstrumentContextReadError> {
+        check_operation(deadline, cancellation)?;
+        let evidence = self
+            .instruments
+            .resolve_exact_as_of(
+                request.query(),
+                request.knowledge_at(),
+                request.effective_at(),
+                deadline,
+                cancellation,
+            )
+            .map_err(map_instrument_error)?;
+        build_identity_resolution(request.clone(), evidence)
+    }
+
+    /// Replays one local point-in-time candidate search after process restart.
+    pub(crate) fn verify_search_restart(
+        &self,
+        expected: &InstrumentSearchRead,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<InstrumentSearchRead, InstrumentContextReadError> {
+        let replay = self.search(expected.request(), deadline, cancellation)?;
+        if replay != *expected {
+            return Err(InstrumentContextReadError::RestartConflict);
+        }
+        Ok(replay)
+    }
+
+    /// Replays one exact ambiguity-safe resolution after process restart.
+    pub(crate) fn verify_resolution_restart(
+        &self,
+        expected: &InstrumentIdentityResolutionRead,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<InstrumentIdentityResolutionRead, InstrumentContextReadError> {
+        let replay = self.resolve_exact(expected.request(), deadline, cancellation)?;
+        if replay != *expected {
+            return Err(InstrumentContextReadError::RestartConflict);
+        }
+        Ok(replay)
+    }
+
     fn read_official_listing(
         &self,
         request: InstrumentContextRequest,
@@ -272,6 +351,243 @@ impl InstrumentContextReadCapability {
     }
 }
 
+/// Bounded provider-neutral text search request at independent PIT coordinates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InstrumentSearchRequest {
+    query: Box<str>,
+    knowledge_at: Timestamp,
+    effective_at: Timestamp,
+    maximum_rows: usize,
+}
+
+impl InstrumentSearchRequest {
+    pub(crate) fn try_new(
+        query: &str,
+        knowledge_at: Timestamp,
+        effective_at: Timestamp,
+        maximum_rows: usize,
+    ) -> Result<Self, InstrumentContextReadError> {
+        validate_product_search(query, knowledge_at, effective_at, maximum_rows)?;
+        Ok(Self {
+            query: try_boxed_text(query.trim())?,
+            knowledge_at,
+            effective_at,
+            maximum_rows,
+        })
+    }
+
+    pub(crate) fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub(crate) const fn knowledge_at(&self) -> Timestamp {
+        self.knowledge_at
+    }
+
+    pub(crate) const fn effective_at(&self) -> Timestamp {
+        self.effective_at
+    }
+
+    pub(crate) const fn maximum_rows(&self) -> usize {
+        self.maximum_rows
+    }
+}
+
+/// Exact term-resolution request. It contains no provider or dataset route.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InstrumentIdentityResolutionRequest {
+    query: Box<str>,
+    knowledge_at: Timestamp,
+    effective_at: Timestamp,
+}
+
+impl InstrumentIdentityResolutionRequest {
+    pub(crate) fn try_new(
+        query: &str,
+        knowledge_at: Timestamp,
+        effective_at: Timestamp,
+    ) -> Result<Self, InstrumentContextReadError> {
+        validate_product_search(query, knowledge_at, effective_at, 1)?;
+        Ok(Self {
+            query: try_boxed_text(query.trim())?,
+            knowledge_at,
+            effective_at,
+        })
+    }
+
+    pub(crate) fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub(crate) const fn knowledge_at(&self) -> Timestamp {
+        self.knowledge_at
+    }
+
+    pub(crate) const fn effective_at(&self) -> Timestamp {
+        self.effective_at
+    }
+}
+
+/// Provider-neutral candidate-search result with private catalog restart evidence.
+#[derive(Eq, PartialEq)]
+pub(crate) struct InstrumentSearchRead {
+    request: InstrumentSearchRequest,
+    candidates: Box<[InstrumentSearchCandidate]>,
+    has_more: bool,
+    evidence: MarketDataInstrumentSearchPage,
+}
+
+impl InstrumentSearchRead {
+    pub(crate) const fn request(&self) -> &InstrumentSearchRequest {
+        &self.request
+    }
+
+    pub(crate) fn candidates(&self) -> &[InstrumentSearchCandidate] {
+        &self.candidates
+    }
+
+    pub(crate) const fn has_more(&self) -> bool {
+        self.has_more
+    }
+}
+
+impl fmt::Debug for InstrumentSearchRead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstrumentSearchRead")
+            .field("request", &self.request)
+            .field("candidates", &self.candidates)
+            .field("has_more", &self.has_more)
+            .field("evidence", &"[PRIVATE CANONICAL SEARCH EVIDENCE]")
+            .finish()
+    }
+}
+
+/// Terminal exact identity result. Ambiguity never carries an implicit winner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InstrumentIdentityResolutionOutcome {
+    Missing,
+    Exact(InstrumentSearchCandidate),
+    /// A symbol, name, or provider alias found candidates but cannot establish canonical identity.
+    CandidateOnly {
+        candidates: Box<[InstrumentSearchCandidate]>,
+        has_more: bool,
+    },
+    Ambiguous {
+        candidates: Box<[InstrumentSearchCandidate]>,
+        has_more: bool,
+    },
+}
+
+/// Provider-neutral exact-resolution result with private restart evidence.
+#[derive(Eq, PartialEq)]
+pub(crate) struct InstrumentIdentityResolutionRead {
+    request: InstrumentIdentityResolutionRequest,
+    outcome: InstrumentIdentityResolutionOutcome,
+    evidence: MarketDataInstrumentSearchPage,
+}
+
+impl InstrumentIdentityResolutionRead {
+    pub(crate) const fn request(&self) -> &InstrumentIdentityResolutionRequest {
+        &self.request
+    }
+
+    pub(crate) const fn outcome(&self) -> &InstrumentIdentityResolutionOutcome {
+        &self.outcome
+    }
+}
+
+impl fmt::Debug for InstrumentIdentityResolutionRead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstrumentIdentityResolutionRead")
+            .field("request", &self.request)
+            .field("outcome", &self.outcome)
+            .field("evidence", &"[PRIVATE CANONICAL RESOLUTION EVIDENCE]")
+            .finish()
+    }
+}
+
+/// Ordinary product reason explaining why a candidate was found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InstrumentSearchMatchReason {
+    ExternalIdentifier,
+    DisplayName,
+    ListedSymbol,
+    Alias,
+}
+
+/// Exchange-qualified symbol exposed without provider routing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InstrumentSearchListing {
+    venue: VenueId,
+    symbol: Box<str>,
+}
+
+impl InstrumentSearchListing {
+    pub(crate) const fn venue(&self) -> &VenueId {
+        &self.venue
+    }
+
+    pub(crate) fn symbol(&self) -> &str {
+        &self.symbol
+    }
+}
+
+/// Honest lifecycle limit of the selected official snapshot sources.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InstrumentOfficialLifecycleEvidence {
+    /// Nasdaq Trader, OCC, and Cboe snapshots do not establish delisting or successor events.
+    SuccessorAndDelistingNotEstablished,
+}
+
+/// Provider-neutral stable-ID candidate for ordinary product selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InstrumentSearchCandidate {
+    instrument_id: InstrumentId,
+    display_name: Option<Box<str>>,
+    asset_class: AssetClass,
+    quote_currency: Currency,
+    listings: Box<[InstrumentSearchListing]>,
+    validity: EffectiveInterval,
+    matched_by: InstrumentSearchMatchReason,
+    official_lifecycle: InstrumentOfficialLifecycleEvidence,
+}
+
+impl InstrumentSearchCandidate {
+    pub(crate) const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    pub(crate) fn display_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
+    }
+
+    pub(crate) const fn asset_class(&self) -> AssetClass {
+        self.asset_class
+    }
+
+    pub(crate) const fn quote_currency(&self) -> Currency {
+        self.quote_currency
+    }
+
+    pub(crate) fn listings(&self) -> &[InstrumentSearchListing] {
+        &self.listings
+    }
+
+    pub(crate) const fn validity(&self) -> EffectiveInterval {
+        self.validity
+    }
+
+    pub(crate) const fn matched_by(&self) -> InstrumentSearchMatchReason {
+        self.matched_by
+    }
+
+    pub(crate) const fn official_lifecycle(&self) -> InstrumentOfficialLifecycleEvidence {
+        self.official_lifecycle
+    }
+}
+
 /// Provider-neutral result plus private restart evidence.
 #[derive(Eq, PartialEq)]
 pub(crate) struct InstrumentContextRead {
@@ -336,6 +652,7 @@ pub(crate) struct InstrumentContext {
     official_directory_updated_at: Timestamp,
     exchange_traded_fund: bool,
     round_lot_size: u32,
+    official_lifecycle: InstrumentOfficialLifecycleEvidence,
 }
 
 impl InstrumentContext {
@@ -369,6 +686,8 @@ impl InstrumentContext {
             official_directory_updated_at: listing.effective_at(),
             exchange_traded_fund: listing.is_etf(),
             round_lot_size: listing.round_lot_size(),
+            official_lifecycle:
+                InstrumentOfficialLifecycleEvidence::SuccessorAndDelistingNotEstablished,
         })
     }
 
@@ -404,6 +723,9 @@ impl InstrumentContext {
     }
     pub(crate) const fn round_lot_size(&self) -> u32 {
         self.round_lot_size
+    }
+    pub(crate) const fn official_lifecycle(&self) -> InstrumentOfficialLifecycleEvidence {
+        self.official_lifecycle
     }
 }
 
@@ -525,6 +847,170 @@ fn interval_contains(interval: EffectiveInterval, at: Timestamp) -> bool {
             Some(end) => at < end,
             None => true,
         }
+}
+
+fn validate_product_search(
+    query: &str,
+    knowledge_at: Timestamp,
+    effective_at: Timestamp,
+    maximum_rows: usize,
+) -> Result<(), InstrumentContextReadError> {
+    const MAX_QUERY_BYTES: usize = 512;
+    let query = query.trim();
+    if effective_at > knowledge_at
+        || query.is_empty()
+        || query.len() > MAX_QUERY_BYTES
+        || query.chars().any(char::is_control)
+        || maximum_rows == 0
+        || maximum_rows > MAX_INSTRUMENT_SEARCH_ROWS
+        || maximum_rows > MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS
+    {
+        return Err(InstrumentContextReadError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn build_search_read(
+    request: InstrumentSearchRequest,
+    evidence: MarketDataInstrumentSearchPage,
+) -> Result<InstrumentSearchRead, InstrumentContextReadError> {
+    validate_search_evidence(&evidence, request.knowledge_at(), request.effective_at())?;
+    let candidates = build_search_candidates(&evidence)?;
+    Ok(InstrumentSearchRead {
+        request,
+        candidates,
+        has_more: evidence.has_more(),
+        evidence,
+    })
+}
+
+fn build_identity_resolution(
+    request: InstrumentIdentityResolutionRequest,
+    evidence: MarketDataInstrumentSearchPage,
+) -> Result<InstrumentIdentityResolutionRead, InstrumentContextReadError> {
+    validate_search_evidence(&evidence, request.knowledge_at(), request.effective_at())?;
+    let candidates = build_search_candidates(&evidence)?;
+    let outcome = if candidates.is_empty() && !evidence.has_more() {
+        InstrumentIdentityResolutionOutcome::Missing
+    } else if let [candidate] = candidates.as_ref()
+        && !evidence.has_more()
+        && evidence
+            .matches()
+            .first()
+            .is_some_and(match_establishes_canonical_identity)
+    {
+        InstrumentIdentityResolutionOutcome::Exact(candidate.clone())
+    } else if candidates.len() == 1 && !evidence.has_more() {
+        InstrumentIdentityResolutionOutcome::CandidateOnly {
+            candidates,
+            has_more: false,
+        }
+    } else {
+        InstrumentIdentityResolutionOutcome::Ambiguous {
+            candidates,
+            has_more: evidence.has_more(),
+        }
+    };
+    Ok(InstrumentIdentityResolutionRead {
+        request,
+        outcome,
+        evidence,
+    })
+}
+
+fn match_establishes_canonical_identity(matched: &MarketDataInstrumentSearchMatch) -> bool {
+    matched.match_kind() == MarketDataInstrumentMatchKind::ExternalIdentifier
+        && matched
+            .record()
+            .definition()
+            .identifiers()
+            .iter()
+            .any(|identifier| {
+                identifier.assignment_verification() == AssignmentVerification::VerifiedAssigned
+                    && !matches!(identifier.identifier(), ExternalIdentifier::Ticker(_))
+                    && identifier.identifier().to_string() == matched.matched_value()
+            })
+}
+
+fn validate_search_evidence(
+    evidence: &MarketDataInstrumentSearchPage,
+    knowledge_at: Timestamp,
+    effective_at: Timestamp,
+) -> Result<(), InstrumentContextReadError> {
+    if evidence.knowledge_at() != Some(knowledge_at)
+        || evidence.effective_at() != Some(effective_at)
+        || evidence.matches().iter().any(|candidate| {
+            candidate.record().published_at() > knowledge_at
+                || !interval_contains(
+                    candidate.record().definition().effective_interval(),
+                    effective_at,
+                )
+        })
+    {
+        return Err(InstrumentContextReadError::EvidenceConflict);
+    }
+    Ok(())
+}
+
+fn build_search_candidates(
+    evidence: &MarketDataInstrumentSearchPage,
+) -> Result<Box<[InstrumentSearchCandidate]>, InstrumentContextReadError> {
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(evidence.matches().len())
+        .map_err(|_| InstrumentContextReadError::ResourceExhausted)?;
+    for matched in evidence.matches() {
+        let candidate = build_search_candidate(matched)?;
+        if candidates
+            .iter()
+            .any(|existing: &InstrumentSearchCandidate| {
+                existing.instrument_id() == candidate.instrument_id()
+            })
+        {
+            return Err(InstrumentContextReadError::EvidenceConflict);
+        }
+        candidates.push(candidate);
+    }
+    Ok(candidates.into_boxed_slice())
+}
+
+fn build_search_candidate(
+    matched: &MarketDataInstrumentSearchMatch,
+) -> Result<InstrumentSearchCandidate, InstrumentContextReadError> {
+    let definition = matched.record().definition();
+    let display_name = definition
+        .display_name()
+        .map(|name| try_boxed_text(name.as_str()))
+        .transpose()?;
+    let mut listings = Vec::new();
+    listings
+        .try_reserve_exact(definition.venue_mappings().len())
+        .map_err(|_| InstrumentContextReadError::ResourceExhausted)?;
+    for mapping in definition.venue_mappings() {
+        listings.push(InstrumentSearchListing {
+            venue: mapping.venue_id().clone(),
+            symbol: try_boxed_text(mapping.venue_symbol().as_str())?,
+        });
+    }
+    let matched_by = match matched.match_kind() {
+        MarketDataInstrumentMatchKind::ExternalIdentifier => {
+            InstrumentSearchMatchReason::ExternalIdentifier
+        }
+        MarketDataInstrumentMatchKind::DisplayName => InstrumentSearchMatchReason::DisplayName,
+        MarketDataInstrumentMatchKind::VenueSymbol => InstrumentSearchMatchReason::ListedSymbol,
+        MarketDataInstrumentMatchKind::ProviderSymbol => InstrumentSearchMatchReason::Alias,
+    };
+    Ok(InstrumentSearchCandidate {
+        instrument_id: definition.instrument_id(),
+        display_name,
+        asset_class: definition.asset_class(),
+        quote_currency: definition.quote_currency(),
+        listings: listings.into_boxed_slice(),
+        validity: definition.effective_interval(),
+        matched_by,
+        official_lifecycle:
+            InstrumentOfficialLifecycleEvidence::SuccessorAndDelistingNotEstablished,
+    })
 }
 
 fn try_boxed_text(value: &str) -> Result<Box<str>, InstrumentContextReadError> {

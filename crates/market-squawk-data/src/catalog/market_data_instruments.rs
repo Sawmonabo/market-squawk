@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, InstrumentId, MarketDataInstrumentDefinition, Timestamp,
+    AssignmentVerification, DigestAlgorithm, EvidenceDigest, InstrumentId,
+    MarketDataInstrumentDefinition, Timestamp,
 };
 use rusqlite::{OptionalExtension as _, Row, Transaction, params};
 use sha2::{Digest as _, Sha256};
@@ -310,6 +311,8 @@ impl MarketDataInstrumentSearchMatch {
 pub struct MarketDataInstrumentSearchPage {
     matches: Box<[MarketDataInstrumentSearchMatch]>,
     has_more: bool,
+    knowledge_at: Option<Timestamp>,
+    effective_at: Option<Timestamp>,
 }
 
 impl MarketDataInstrumentSearchPage {
@@ -321,6 +324,20 @@ impl MarketDataInstrumentSearchPage {
     /// Reports whether another matching definition exists beyond this page.
     pub const fn has_more(&self) -> bool {
         self.has_more
+    }
+
+    /// Returns the inclusive durable-knowledge cutoff for a point-in-time search.
+    ///
+    /// Current-definition searches return `None`; callers that require restart-stable selection
+    /// must use [`MarketDataInstrumentReadCapability::search_as_of`] or
+    /// [`MarketDataInstrumentReadCapability::resolve_exact_as_of`].
+    pub const fn knowledge_at(&self) -> Option<Timestamp> {
+        self.knowledge_at
+    }
+
+    /// Returns the instant at which every selected definition and matched identity was effective.
+    pub const fn effective_at(&self) -> Option<Timestamp> {
+        self.effective_at
     }
 }
 
@@ -443,6 +460,85 @@ impl MarketDataInstrumentReadCapability {
             .map_err(|_| MarketDataInstrumentCatalogError::AuthorityUnavailable)?
             .search_market_data_instruments(query, maximum_rows, deadline, cancellation)
     }
+
+    /// Searches the uniquely latest definition knowable and effective at independent clocks.
+    ///
+    /// This is candidate discovery only. A ticker, name, identifier, venue symbol, or provider
+    /// alias never becomes a canonical identity merely because it appears first. Provider aliases
+    /// and external identifiers participate only inside their own asserted validity intervals.
+    pub fn search_as_of(
+        &self,
+        query: &str,
+        knowledge_at: Timestamp,
+        effective_at: Timestamp,
+        maximum_rows: usize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataInstrumentSearchPage, MarketDataInstrumentCatalogError> {
+        validate_search(query, maximum_rows)?;
+        check_operation(deadline, cancellation)?;
+        self.authority
+            .try_lock()
+            .map_err(|_| MarketDataInstrumentCatalogError::AuthorityUnavailable)?
+            .search_market_data_instruments_as_of(
+                query.trim(),
+                knowledge_at,
+                effective_at,
+                maximum_rows,
+                SearchMode::Candidate,
+                deadline,
+                cancellation,
+            )
+    }
+
+    /// Resolves an exact admitted search term without selecting through ambiguity.
+    ///
+    /// Zero matches means missing. Exactly one match with `has_more == false` proves only that the
+    /// admitted term is structurally unique; it does not turn a ticker, name, venue symbol, or
+    /// provider alias into canonical identity authority. Every multi-row or bounded-incomplete
+    /// result must be rejected. The fixed two-row result is sufficient to prove ordinary
+    /// ambiguity without exposing provider routing in a product contract.
+    pub fn resolve_exact_as_of(
+        &self,
+        query: &str,
+        knowledge_at: Timestamp,
+        effective_at: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataInstrumentSearchPage, MarketDataInstrumentCatalogError> {
+        const MAX_EXACT_CANDIDATES: usize = 2;
+        validate_search(query, MAX_EXACT_CANDIDATES)?;
+        check_operation(deadline, cancellation)?;
+        self.authority
+            .try_lock()
+            .map_err(|_| MarketDataInstrumentCatalogError::AuthorityUnavailable)?
+            .search_market_data_instruments_as_of(
+                query.trim(),
+                knowledge_at,
+                effective_at,
+                MAX_EXACT_CANDIDATES,
+                SearchMode::Exact,
+                deadline,
+                cancellation,
+            )
+    }
+}
+
+fn validate_search(
+    query: &str,
+    maximum_rows: usize,
+) -> Result<(), MarketDataInstrumentCatalogError> {
+    if maximum_rows == 0 || maximum_rows > MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS {
+        return Err(MarketDataInstrumentCatalogError::InvalidLimit);
+    }
+    let query = query.trim();
+    if query.is_empty()
+        || query.len() > MAX_SEARCH_QUERY_BYTES
+        || query.chars().any(char::is_control)
+    {
+        return Err(MarketDataInstrumentCatalogError::InvalidInput);
+    }
+    Ok(())
 }
 
 /// Market-data definition validation, publication, or bounded-read failure.
@@ -522,6 +618,12 @@ enum PublicationPlan {
         previous: Option<[u8; 32]>,
         identity_is_new: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchMode {
+    Candidate,
+    Exact,
 }
 
 #[derive(Debug)]
@@ -778,6 +880,99 @@ impl CatalogAuthority {
             Ok(MarketDataInstrumentSearchPage {
                 matches: matches.into_boxed_slice(),
                 has_more,
+                knowledge_at: None,
+                effective_at: None,
+            })
+        })();
+        clear_progress_handler(connection)?;
+        classify_operation(result, deadline, cancellation)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "point-in-time identity coordinates and operation controls stay explicit"
+    )]
+    fn search_market_data_instruments_as_of(
+        &self,
+        query: &str,
+        knowledge_at: Timestamp,
+        effective_at: Timestamp,
+        maximum_rows: usize,
+        mode: SearchMode,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataInstrumentSearchPage, MarketDataInstrumentCatalogError> {
+        check_operation(deadline, cancellation)?;
+        let connection = &self.catalog().connection;
+        install_progress_handler(connection, deadline, cancellation)?;
+        let result = (|| {
+            let retrieval_limit =
+                i64::try_from(MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS.saturating_add(1))
+                    .map_err(|_| MarketDataInstrumentCatalogError::InvalidLimit)?;
+            let exact_only = i64::from(mode == SearchMode::Exact);
+            let normalized_query = normalize(query);
+            let mut statement = connection.prepare(SEARCH_AS_OF_SQL)?;
+            let rows = statement.query_map(
+                params![
+                    normalized_query,
+                    knowledge_at.unix_nanos(),
+                    effective_at.unix_nanos(),
+                    exact_only,
+                    retrieval_limit,
+                ],
+                |row| {
+                    Ok((
+                        decode_stored_row(row)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
+                    ))
+                },
+            )?;
+            let mut budget = ResultBudget::new(self.catalog().result_bytes);
+            let mut matches = Vec::new();
+            matches
+                .try_reserve_exact(maximum_rows.saturating_add(1))
+                .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+            let mut candidate_rows = 0_usize;
+            for row in rows {
+                check_operation(deadline, cancellation)?;
+                candidate_rows = candidate_rows
+                    .checked_add(1)
+                    .ok_or(MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+                let (stored, kind, matched_value) = row?;
+                charge_row(&stored, &mut budget)?;
+                let record = rebuild_record(stored)?;
+                let match_kind = parse_match_kind(&kind)?;
+                if !matched_identity_is_effective(
+                    record.definition(),
+                    match_kind,
+                    &matched_value,
+                    effective_at,
+                ) {
+                    continue;
+                }
+                budget
+                    .charge([
+                        size_of::<MarketDataInstrumentSearchMatch>(),
+                        matched_value.len(),
+                    ])
+                    .map_err(|_| MarketDataInstrumentCatalogError::ResultByteLimitExceeded)?;
+                if matches.len() <= maximum_rows {
+                    matches.push(MarketDataInstrumentSearchMatch {
+                        record,
+                        match_kind,
+                        matched_value: matched_value.into_boxed_str(),
+                    });
+                }
+            }
+            let has_more = matches.len() > maximum_rows
+                || candidate_rows > MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS;
+            matches.truncate(maximum_rows);
+            Ok(MarketDataInstrumentSearchPage {
+                matches: matches.into_boxed_slice(),
+                has_more,
+                knowledge_at: Some(knowledge_at),
+                effective_at: Some(effective_at),
             })
         })();
         clear_progress_handler(connection)?;
@@ -1300,6 +1495,43 @@ fn normalize(value: &str) -> String {
     value.to_lowercase()
 }
 
+fn matched_identity_is_effective(
+    definition: &MarketDataInstrumentDefinition,
+    match_kind: MarketDataInstrumentMatchKind,
+    matched_value: &str,
+    effective_at: Timestamp,
+) -> bool {
+    if !interval_contains(definition.effective_interval(), effective_at) {
+        return false;
+    }
+    match match_kind {
+        MarketDataInstrumentMatchKind::ExternalIdentifier => {
+            definition.identifiers().iter().any(|identifier| {
+                identifier.assignment_verification() == AssignmentVerification::VerifiedAssigned
+                    && normalize(&identifier.identifier().to_string()) == normalize(matched_value)
+                    && interval_contains(identifier.validity(), effective_at)
+            })
+        }
+        MarketDataInstrumentMatchKind::DisplayName => definition
+            .display_name()
+            .is_some_and(|name| normalize(name.as_str()) == normalize(matched_value)),
+        MarketDataInstrumentMatchKind::VenueSymbol => definition
+            .venue_mappings()
+            .iter()
+            .any(|mapping| normalize(mapping.venue_symbol().as_str()) == normalize(matched_value)),
+        MarketDataInstrumentMatchKind::ProviderSymbol => {
+            definition.provider_identities().iter().any(|identity| {
+                normalize(identity.provider_instrument_id().as_str()) == normalize(matched_value)
+                    && interval_contains(identity.validity(), effective_at)
+            })
+        }
+    }
+}
+
+fn interval_contains(interval: market_squawk_domain::EffectiveInterval, at: Timestamp) -> bool {
+    interval.starts_at() <= at && interval.ends_at().is_none_or(|end| at < end)
+}
+
 fn parse_match_kind(
     value: &str,
 ) -> Result<MarketDataInstrumentMatchKind, MarketDataInstrumentCatalogError> {
@@ -1432,3 +1664,60 @@ FROM ranked
 WHERE match_position=1
 ORDER BY match_rank, instrument_id
 LIMIT ?2";
+
+const SEARCH_AS_OF_SQL: &str = "
+WITH selectable_revisions AS (
+    SELECT revisions.revision_digest, revisions.instrument_id, revisions.revision_sequence,
+           revisions.effective_start_ns, revisions.effective_end_ns,
+           revisions.reference_revision, revisions.reference_algorithm,
+           revisions.reference_payload_digest, revisions.definition_json,
+           revisions.published_at_ns,
+           row_number() OVER (
+               PARTITION BY revisions.instrument_id
+               ORDER BY revisions.effective_start_ns DESC,
+                        revisions.published_at_ns DESC,
+                        revisions.revision_digest
+           ) AS revision_position
+    FROM market_data_instrument_revisions AS revisions
+    WHERE revisions.published_at_ns<=?2
+      AND revisions.effective_start_ns<=?3
+), matches AS (
+    SELECT revisions.revision_digest, revisions.instrument_id, revisions.revision_sequence,
+           revisions.effective_start_ns, revisions.effective_end_ns,
+           revisions.reference_revision, revisions.reference_algorithm,
+           revisions.reference_payload_digest, revisions.definition_json,
+           revisions.published_at_ns, terms.term_kind, terms.display_term,
+           CASE
+             WHEN terms.normalized_term=?1 THEN
+               CASE terms.term_kind WHEN 'external_identifier' THEN 0 WHEN 'venue_symbol' THEN 1
+                    WHEN 'provider_symbol' THEN 2 ELSE 3 END
+             WHEN instr(terms.normalized_term, ?1)=1 THEN
+               10 + CASE terms.term_kind WHEN 'external_identifier' THEN 0 WHEN 'venue_symbol' THEN 1
+                    WHEN 'provider_symbol' THEN 2 ELSE 3 END
+             ELSE
+               20 + CASE terms.term_kind WHEN 'external_identifier' THEN 0 WHEN 'venue_symbol' THEN 1
+                    WHEN 'provider_symbol' THEN 2 ELSE 3 END
+           END AS match_rank
+    FROM selectable_revisions AS revisions
+    JOIN market_data_instrument_search_terms AS terms
+      ON terms.revision_digest=revisions.revision_digest
+    WHERE revisions.revision_position=1
+      AND (revisions.effective_end_ns IS NULL OR ?3<revisions.effective_end_ns)
+      AND ((?4=0 AND instr(terms.normalized_term, ?1)>0)
+           OR (?4=1 AND terms.normalized_term=?1))
+), ranked AS (
+    SELECT matches.*,
+           row_number() OVER (
+               PARTITION BY instrument_id
+               ORDER BY match_rank, term_kind, display_term
+           ) AS match_position
+    FROM matches
+)
+SELECT revision_digest, instrument_id, revision_sequence,
+       effective_start_ns, effective_end_ns, reference_revision, reference_algorithm,
+       reference_payload_digest, definition_json, published_at_ns,
+       term_kind, display_term
+FROM ranked
+WHERE match_position=1
+ORDER BY match_rank, instrument_id
+LIMIT ?5";
