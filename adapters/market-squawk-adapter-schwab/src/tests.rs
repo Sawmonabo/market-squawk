@@ -1745,7 +1745,7 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         br#"{"data":[{"service":"LEVELONE_EQUITIES","command":"SUBS","content":[{"key":"AAPL","1":}]}]}"#;
     let connector_state = Arc::new(Mutex::new(MockStreamerState {
         connects: 0,
-        inbound: Some(VecDeque::from([
+        inbound: VecDeque::from([VecDeque::from([
             MockStreamerInbound::Frame(InboundStreamerFrame::Text(login)),
             MockStreamerInbound::Frame(InboundStreamerFrame::Text(equities_subscribed.clone())),
             MockStreamerInbound::FlushBoundary,
@@ -1766,16 +1766,30 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
             MockStreamerInbound::Frame(InboundStreamerFrame::Text(Bytes::from_static(
                 malformed_selected_service,
             ))),
-        ])),
+        ])]),
         sent: Vec::new(),
     }));
     let connector = Arc::new(MockStreamerConnector {
         state: connector_state.clone(),
     });
+    assert_eq!(
+        StreamerTransportBounds::try_new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::ZERO,
+            0,
+            nonzero(64 * 1024),
+            nonzero(65),
+            nonzero(64 * 1024),
+            Duration::from_millis(1),
+        )
+        .expect_err("zero reconnect delay must not admit a hot reconnect loop"),
+        SchwabTransportError::InvalidConfiguration
+    );
     let stream_bounds = StreamerTransportBounds::try_new(
         Duration::from_secs(1),
         Duration::from_secs(1),
-        Duration::ZERO,
+        Duration::from_millis(1),
         0,
         nonzero(64 * 1024),
         nonzero(65),
@@ -2115,6 +2129,109 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
             ("LEVELONE_OPTIONS".to_owned(), "SUBS".to_owned()),
         ]
     );
+    drop(state);
+
+    let login_then_close = |request_id: u64| {
+        VecDeque::from([
+            MockStreamerInbound::Frame(InboundStreamerFrame::Text(Bytes::from(format!(
+                r#"{{"response":[{{"service":"ADMIN","command":"LOGIN","requestid":"{request_id}","timestamp":1710000000000,"content":{{"code":0,"msg":"OK"}}}}]}}"#
+            )))),
+            MockStreamerInbound::Frame(InboundStreamerFrame::Close),
+        ])
+    };
+    let reconnect_state = Arc::new(Mutex::new(MockStreamerState {
+        connects: 0,
+        inbound: VecDeque::from([
+            login_then_close(1),
+            login_then_close(3),
+            login_then_close(5),
+        ]),
+        sent: Vec::new(),
+    }));
+    let reconnect_controls = (51_u64..=53)
+        .map(|generation| {
+            SchwabStreamerConnectionControl::new(
+                ConnectionGeneration::new(
+                    NonZeroU64::new(generation)
+                        .unwrap_or_else(|| panic!("reconnect generation must be nonzero")),
+                ),
+                coordinates.clone(),
+                stream_identity.clone(),
+            )
+        })
+        .collect::<VecDeque<_>>();
+    let reconnect_bounds = StreamerTransportBounds::try_new(
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        Duration::from_millis(1),
+        2,
+        nonzero(64 * 1024),
+        nonzero(65),
+        nonzero(64 * 1024),
+        Duration::from_millis(1),
+    )
+    .unwrap_or_else(|error| panic!("reconnect bounds: {error}"));
+    let mut reconnecting_streamer = SchwabStreamerExecutor::try_new(
+        Arc::new(MockStreamerConnector {
+            state: reconnect_state.clone(),
+        }),
+        Arc::new(MockTokenSource { token_admission }),
+        Arc::new(MockStreamerControlSource {
+            controls: Mutex::new(reconnect_controls),
+        }),
+        stream_admission,
+        reconnect_bounds,
+        bounds(),
+        token_admission,
+        SchwabTransportTelemetry::default(),
+    )
+    .unwrap_or_else(|error| panic!("reconnecting executor: {error}"));
+    reconnecting_streamer
+        .replace_desired(
+            StreamerSubscription::try_new(
+                MarketDataService::LevelOneEquities,
+                vec![
+                    ProviderIdentifier::try_new("AAPL")
+                        .unwrap_or_else(|error| panic!("reconnect symbol: {error}")),
+                ],
+                vec![0, 1, 2, 3, 4],
+                stream_admission,
+            )
+            .unwrap_or_else(|error| panic!("reconnect subscription: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("reconnect desired state: {error}"));
+    let reconnect_cancellation = CancellationToken::new();
+    let mut reconnect_sink = CancellingCaptureSink {
+        cancellation: reconnect_cancellation.clone(),
+        cancel_after: usize::MAX,
+        microbatches: Vec::new(),
+    };
+    assert_eq!(
+        reconnecting_streamer
+            .run(
+                bootstrap.value(),
+                &mut reconnect_sink,
+                reconnect_cancellation.clone(),
+            )
+            .await,
+        Err(SchwabTransportError::ReconnectExhausted)
+    );
+    assert!(!reconnect_cancellation.is_cancelled());
+    let reconnect_state = reconnect_state
+        .lock()
+        .unwrap_or_else(|error| panic!("reconnect mock state: {error}"));
+    assert_eq!(reconnect_state.connects, 3);
+    assert_eq!(
+        reconnect_state.sent.as_slice(),
+        [
+            ("ADMIN".to_owned(), "LOGIN".to_owned()),
+            ("LEVELONE_EQUITIES".to_owned(), "SUBS".to_owned()),
+            ("ADMIN".to_owned(), "LOGIN".to_owned()),
+            ("LEVELONE_EQUITIES".to_owned(), "SUBS".to_owned()),
+            ("ADMIN".to_owned(), "LOGIN".to_owned()),
+            ("LEVELONE_EQUITIES".to_owned(), "SUBS".to_owned()),
+        ]
+    );
 }
 
 #[derive(Debug)]
@@ -2348,7 +2465,7 @@ impl SchwabStreamerConnectionControlSource for MockStreamerControlSource {
 #[derive(Debug)]
 struct MockStreamerState {
     connects: u64,
-    inbound: Option<VecDeque<MockStreamerInbound>>,
+    inbound: VecDeque<VecDeque<MockStreamerInbound>>,
     sent: Vec<(String, String)>,
 }
 
@@ -2385,7 +2502,10 @@ impl SchwabStreamerConnector for MockStreamerConnector {
                     .connects
                     .checked_add(1)
                     .ok_or(SchwabTransportError::Overflow)?;
-                state.inbound.take().ok_or(SchwabTransportError::Protocol)?
+                state
+                    .inbound
+                    .pop_front()
+                    .ok_or(SchwabTransportError::Protocol)?
             };
             Ok(Box::new(MockStreamerConnection {
                 state: self.state.clone(),

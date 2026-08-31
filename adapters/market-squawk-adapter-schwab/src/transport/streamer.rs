@@ -1451,6 +1451,7 @@ impl SchwabStreamerExecutor {
             self.controller.socket_connected(generation)?;
             let token_generation = token.generation();
             let refresh_deadline = token_refresh_deadline(&token, self.token_admission)?;
+            let mut stable_health = false;
             let outcome = self
                 .run_connection(
                     control,
@@ -1460,13 +1461,10 @@ impl SchwabStreamerExecutor {
                     bootstrap,
                     &mut *connection,
                     sink,
+                    &mut stable_health,
                     &cancellation,
                 )
                 .await;
-            let authenticated = matches!(
-                self.controller.state(),
-                ConnectionState::Active(current) if current == generation
-            );
             match outcome {
                 Ok(ConnectionExit::Cancelled) => {
                     self.controller.disconnected(generation)?;
@@ -1476,13 +1474,8 @@ impl SchwabStreamerExecutor {
                 Ok(ConnectionExit::Retry) => {
                     self.controller.disconnected(generation)?;
                     self.telemetry.record_stream_disconnect()?;
-                    consecutive_failures = if authenticated {
-                        0
-                    } else {
-                        consecutive_failures
-                            .checked_add(1)
-                            .ok_or(SchwabTransportError::Overflow)?
-                    };
+                    consecutive_failures =
+                        next_consecutive_failure(consecutive_failures, stable_health)?;
                     reconnecting = true;
                 }
                 Err(SchwabTransportError::Cancelled) => {
@@ -1493,13 +1486,8 @@ impl SchwabStreamerExecutor {
                 Err(error) if retryable(error) => {
                     self.controller.disconnected(generation)?;
                     self.telemetry.record_stream_disconnect()?;
-                    consecutive_failures = if authenticated {
-                        0
-                    } else {
-                        consecutive_failures
-                            .checked_add(1)
-                            .ok_or(SchwabTransportError::Overflow)?
-                    };
+                    consecutive_failures =
+                        next_consecutive_failure(consecutive_failures, stable_health)?;
                     reconnecting = true;
                 }
                 Err(error) => {
@@ -1523,6 +1511,7 @@ impl SchwabStreamerExecutor {
         bootstrap: &StreamerBootstrap,
         connection: &mut dyn SchwabStreamerConnection,
         sink: &mut dyn StreamerCaptureSink,
+        stable_health: &mut bool,
         cancellation: &CancellationToken,
     ) -> Result<ConnectionExit, SchwabTransportError> {
         let generation = control.generation();
@@ -1621,6 +1610,7 @@ impl SchwabStreamerExecutor {
         let mut idle_deadline = Instant::now()
             .checked_add(self.transport_bounds.io_timeout())
             .ok_or(SchwabTransportError::Overflow)?;
+        let mut observed_desired_data = false;
         loop {
             let flush_deadline = batch.flush_deadline();
             let mut next_deadline = idle_deadline.min(refresh_deadline).min(flush_deadline);
@@ -1697,6 +1687,13 @@ impl SchwabStreamerExecutor {
                             if let Some(error) = response_error {
                                 flush_batch(&mut batch, sink, &self.telemetry)?;
                                 return Err(error);
+                            }
+                            observed_desired_data |= frame.value().data.iter().any(|data| {
+                                !data.content.is_empty()
+                                    && self.controller.desired().contains_key(&data.service)
+                            });
+                            if pending.is_empty() && observed_desired_data {
+                                *stable_health = true;
                             }
                         }
                         ProcessedFrame::Control => {}
@@ -1890,6 +1887,19 @@ impl SchwabStreamerExecutor {
 enum ConnectionExit {
     Cancelled,
     Retry,
+}
+
+fn next_consecutive_failure(
+    consecutive_failures: usize,
+    stable_health: bool,
+) -> Result<usize, SchwabTransportError> {
+    if stable_health {
+        0
+    } else {
+        consecutive_failures
+    }
+    .checked_add(1)
+    .ok_or(SchwabTransportError::Overflow)
 }
 
 enum ActiveConnectionInput {

@@ -346,6 +346,7 @@ impl StreamerTransportBounds {
     ) -> Result<Self, SchwabTransportError> {
         if connect_timeout.is_zero()
             || io_timeout.is_zero()
+            || reconnect_delay.is_zero()
             || microbatch_flush_interval.is_zero()
             || max_frame_bytes.get() > max_microbatch_bytes.get()
         {
