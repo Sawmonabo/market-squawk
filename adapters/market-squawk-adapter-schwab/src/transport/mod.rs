@@ -15,7 +15,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use market_squawk_domain::{MetadataRevision, SourceId, SourceIdentifier};
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier,
+};
+use market_squawk_platform::{SecretGeneration, SecretRef};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -115,6 +118,79 @@ impl AccessTokenGeneration {
     }
 }
 
+const SCHWAB_CREDENTIAL_AUTHORITY_DOMAIN: &[u8] = b"market-squawk/schwab-credential-authority/v1\0";
+
+/// Secret-free identity of one exact protected Schwab application-credential reference.
+///
+/// The one-way reference digest distinguishes credential series even when two independent
+/// authorities issue the same local token-generation ordinal. The generation remains explicit so
+/// a doctor receipt cannot qualify a token minted before or after application-key replacement.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct SchwabCredentialAuthorityBinding {
+    application_credential_generation: SecretGeneration,
+    application_credential_reference_sha256: EvidenceDigest,
+}
+
+impl SchwabCredentialAuthorityBinding {
+    /// Derives an exact secret-free coordinate from the protected authority's opaque reference.
+    pub fn try_from_application_credential(
+        reference: &SecretRef,
+    ) -> Result<Self, SchwabTransportError> {
+        let encoded =
+            serde_json::to_vec(reference).map_err(|_| SchwabTransportError::InvalidToken)?;
+        let mut hasher = Sha256::new();
+        hasher.update(SCHWAB_CREDENTIAL_AUTHORITY_DOMAIN);
+        hasher.update(
+            u64::try_from(encoded.len())
+                .map_err(|_| SchwabTransportError::Overflow)?
+                .to_be_bytes(),
+        );
+        hasher.update(encoded);
+        Ok(Self {
+            application_credential_generation: reference.generation(),
+            application_credential_reference_sha256: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                hasher.finalize().into(),
+            ),
+        })
+    }
+
+    pub const fn application_credential_generation(self) -> SecretGeneration {
+        self.application_credential_generation
+    }
+
+    pub const fn application_credential_reference_sha256(self) -> EvidenceDigest {
+        self.application_credential_reference_sha256
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        application_credential_generation: SecretGeneration,
+        series: u8,
+    ) -> Self {
+        Self {
+            application_credential_generation,
+            application_credential_reference_sha256: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                [series; 32],
+            ),
+        }
+    }
+}
+
+impl fmt::Debug for SchwabCredentialAuthorityBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchwabCredentialAuthorityBinding")
+            .field(
+                "application_credential_generation",
+                &self.application_credential_generation,
+            )
+            .field("application_credential_reference", &"[ONE-WAY BINDING]")
+            .finish()
+    }
+}
+
 /// Caller-owned admission for transient bearer values.
 ///
 /// `max_token_bytes` is a local memory/header-safety bound, not a provider token-size claim.
@@ -151,6 +227,7 @@ impl AccessTokenAdmission {
 pub struct TransientAccessToken {
     bearer: Zeroizing<String>,
     generation: AccessTokenGeneration,
+    credential_authority: SchwabCredentialAuthorityBinding,
     issued_at_unix_seconds: u64,
     expires_at_unix_seconds: u64,
 }
@@ -160,6 +237,7 @@ impl TransientAccessToken {
     pub fn try_new(
         bearer: String,
         generation: AccessTokenGeneration,
+        credential_authority: SchwabCredentialAuthorityBinding,
         issued_at_unix_seconds: u64,
         expires_at_unix_seconds: u64,
         admission: AccessTokenAdmission,
@@ -176,6 +254,7 @@ impl TransientAccessToken {
         Ok(Self {
             bearer,
             generation,
+            credential_authority,
             issued_at_unix_seconds,
             expires_at_unix_seconds,
         })
@@ -184,6 +263,11 @@ impl TransientAccessToken {
     /// Opaque token generation safe for receipts and telemetry.
     pub const fn generation(&self) -> AccessTokenGeneration {
         self.generation
+    }
+
+    /// Exact secret-free protected application-credential binding for this token.
+    pub const fn credential_authority(&self) -> SchwabCredentialAuthorityBinding {
+        self.credential_authority
     }
 
     /// Secret-free issue time supplied by the OAuth authority.
@@ -226,6 +310,7 @@ impl fmt::Debug for TransientAccessToken {
             .debug_struct("TransientAccessToken")
             .field("bearer", &"[REDACTED]")
             .field("generation", &self.generation)
+            .field("credential_authority", &self.credential_authority)
             .field("issued_at_unix_seconds", &self.issued_at_unix_seconds)
             .field("expires_at_unix_seconds", &self.expires_at_unix_seconds)
             .finish()

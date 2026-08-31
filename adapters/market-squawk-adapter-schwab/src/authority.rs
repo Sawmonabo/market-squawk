@@ -34,8 +34,8 @@ use crate::{
     AuthorizationRequest, OAuthCallback, OAuthTokenHttpRequest, ParseBounds,
     REFRESH_TOKEN_LIFETIME_SECONDS, RefreshTokenGeneration, RequestAdmission,
     SCHWAB_TOKEN_ENDPOINT, SchwabAccessTokenSource, SchwabAdapterError,
-    SchwabApplicationCredentialEnvelope, TokenAuthorityError, TokenDecision, TokenGrant,
-    TransientAccessToken, parse_token_response,
+    SchwabApplicationCredentialEnvelope, SchwabCredentialAuthorityBinding, TokenAuthorityError,
+    TokenDecision, TokenGrant, TransientAccessToken, parse_token_response,
 };
 
 const AUTHORITY_STATE_VERSION: u16 = 1;
@@ -615,6 +615,7 @@ pub enum SchwabOAuthAuthorityStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SchwabOAuthAuthorityReceipt {
     generation: AccessTokenGeneration,
+    credential_authority: SchwabCredentialAuthorityBinding,
     access_issued_at_unix_seconds: u64,
     access_expires_at_unix_seconds: u64,
     refresh_authorized_at_unix_seconds: u64,
@@ -624,6 +625,9 @@ pub struct SchwabOAuthAuthorityReceipt {
 impl SchwabOAuthAuthorityReceipt {
     pub const fn generation(self) -> AccessTokenGeneration {
         self.generation
+    }
+    pub const fn credential_authority(self) -> SchwabCredentialAuthorityBinding {
+        self.credential_authority
     }
     pub const fn access_expires_at_unix_seconds(self) -> u64 {
         self.access_expires_at_unix_seconds
@@ -637,17 +641,37 @@ impl SchwabOAuthAuthorityReceipt {
     pub const fn refresh_authorized_at_unix_seconds(self) -> u64 {
         self.refresh_authorized_at_unix_seconds
     }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        generation: AccessTokenGeneration,
+        credential_authority: SchwabCredentialAuthorityBinding,
+    ) -> Self {
+        Self {
+            generation,
+            credential_authority,
+            access_issued_at_unix_seconds: 1,
+            access_expires_at_unix_seconds: u64::MAX - 1,
+            refresh_authorized_at_unix_seconds: 1,
+            refresh_expires_at_unix_seconds: u64::MAX,
+        }
+    }
 }
 
-impl TryFrom<&TokenMetadata> for SchwabOAuthAuthorityReceipt {
-    type Error = SchwabOAuthAuthorityError;
-
-    fn try_from(value: &TokenMetadata) -> Result<Self, Self::Error> {
+impl SchwabOAuthAuthorityReceipt {
+    fn try_from_current(
+        value: &TokenMetadata,
+        application_credential: &SecretRef,
+    ) -> Result<Self, SchwabOAuthAuthorityError> {
         value.validate()?;
         Ok(Self {
             generation: AccessTokenGeneration::new(
-                NonZeroU64::new(value.generation).ok_or(Self::Error::InvalidState)?,
+                NonZeroU64::new(value.generation).ok_or(SchwabOAuthAuthorityError::InvalidState)?,
             ),
+            credential_authority:
+                SchwabCredentialAuthorityBinding::try_from_application_credential(
+                    application_credential,
+                )?,
             access_issued_at_unix_seconds: value.access_issued_at_unix_seconds,
             access_expires_at_unix_seconds: value.access_expires_at_unix_seconds,
             refresh_authorized_at_unix_seconds: value.refresh_authorized_at_unix_seconds,
@@ -865,7 +889,7 @@ impl ProtectedSchwabOAuthAuthority {
                     Ok(SchwabOAuthAuthorityStatus::ReauthorizationRequired)
                 } else {
                     Ok(SchwabOAuthAuthorityStatus::Active(
-                        SchwabOAuthAuthorityReceipt::try_from(&current)?,
+                        SchwabOAuthAuthorityReceipt::try_from_current(&current, &application)?,
                     ))
                 }
             }
@@ -1117,12 +1141,12 @@ impl ProtectedSchwabOAuthAuthority {
         self.execute_plan(plan, secret, interaction.policy())
             .await?;
         self.store_state(DurablePhase::Active {
-            application,
+            application: application.clone(),
             current: candidate.clone(),
             retired: None,
         })
         .await?;
-        SchwabOAuthAuthorityReceipt::try_from(&candidate)
+        SchwabOAuthAuthorityReceipt::try_from_current(&candidate, &application)
     }
 
     /// Deletes all locally protected token generations and leaves an explicit unavailable state.
@@ -1227,6 +1251,7 @@ impl ProtectedSchwabOAuthAuthority {
                 NonZeroU64::new(current.generation)
                     .ok_or(SchwabOAuthAuthorityError::InvalidState)?,
             ),
+            SchwabCredentialAuthorityBinding::try_from_application_credential(&application)?,
             current.access_issued_at_unix_seconds,
             current.access_expires_at_unix_seconds,
             self.token_admission,

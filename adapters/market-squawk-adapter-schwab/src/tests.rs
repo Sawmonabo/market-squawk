@@ -48,9 +48,10 @@ use crate::{
     RequestAdmission, ResponseHeaderEvidence, RestExecutionOutcome, RestTransportBounds,
     SchwabAccessTokenSource, SchwabAdapterError, SchwabApplicationCredentialReplacement,
     SchwabCanonicalError, SchwabCanonicalField, SchwabCaptureCoordinates,
-    SchwabDailyPriceHistoryCalendarRangeReceipt, SchwabDailyPriceHistoryPublicationRequest,
-    SchwabHttpWire, SchwabHttpWireRequest, SchwabHttpWireResponse, SchwabMarketDataDelay,
-    SchwabMarketDataQualification, SchwabOAuthAuthorityConfiguration, SchwabOAuthAuthorityError,
+    SchwabCredentialAuthorityBinding, SchwabDailyPriceHistoryCalendarRangeReceipt,
+    SchwabDailyPriceHistoryPublicationRequest, SchwabHttpWire, SchwabHttpWireRequest,
+    SchwabHttpWireResponse, SchwabMarketDataDelay, SchwabMarketDataQualification,
+    SchwabOAuthAuthorityConfiguration, SchwabOAuthAuthorityError, SchwabOAuthAuthorityReceipt,
     SchwabOAuthAuthorityStatus, SchwabOAuthInteraction, SchwabOAuthSecretPolicy, SchwabOAuthWire,
     SchwabOAuthWireError, SchwabOAuthWireRequest, SchwabOAuthWireResponse,
     SchwabObservedCapabilityFamily, SchwabOptionCandidateOutcome,
@@ -1799,6 +1800,8 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     .unwrap_or_else(|error| panic!("stream bounds: {error}"));
     let stream_admission = StreamerAdmission::new(admission(), nonzero(4), nonzero(16));
     let coordinates = capture_coordinates();
+    let session_identifier = SourceIdentifier::try_from("8d9bc9ee-fca2-4f1d-a077-5104408e3727")
+        .unwrap_or_else(|error| panic!("Streamer authority session: {error}"));
     let stream_identity = SourceIdentifier::try_from("schwab-streamer-connection-41")
         .unwrap_or_else(|error| panic!("stream identity: {error}"));
     let application_generation = ConnectionGeneration::new(
@@ -1807,6 +1810,7 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
     let control_source = Arc::new(MockStreamerControlSource {
         controls: Mutex::new(VecDeque::from([SchwabStreamerConnectionControl::new(
             application_generation,
+            session_identifier.clone(),
             coordinates.clone(),
             stream_identity.clone(),
         )])),
@@ -1974,10 +1978,17 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
             .checked_mul(1_000_000)
             .unwrap_or_else(|| panic!("raw-only received timestamp overflow")),
     );
-    let raw_only_qualification = test_market_data_qualification(
+    let streamer_oauth_authority = SchwabOAuthAuthorityReceipt::for_test(
+        raw_only.streamer_receipt().token_generation(),
+        raw_only.streamer_receipt().credential_authority(),
+    );
+    let streamer_principal = raw_only.streamer_receipt().market_data_principal_sha256();
+    let raw_only_qualification = test_market_data_qualification_for_authority(
         SchwabMarketDataFamily::LevelOneEquities,
         raw_only_received_at,
-        raw_only.streamer_receipt().token_generation(),
+        streamer_oauth_authority,
+        session_identifier.clone(),
+        streamer_principal,
     );
     assert!(
         !raw_only_qualification.validates_streamer_publication_coordinate(
@@ -2026,13 +2037,87 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
             .checked_mul(1_000_000)
             .unwrap_or_else(|| panic!("received timestamp overflow")),
     );
+    assert_eq!(
+        sealed.streamer_receipt().credential_authority(),
+        streamer_oauth_authority.credential_authority()
+    );
+    assert_eq!(
+        sealed.streamer_receipt().session_identifier(),
+        &session_identifier
+    );
+    assert_eq!(
+        sealed.streamer_receipt().market_data_principal_sha256(),
+        streamer_principal
+    );
+    let equities_qualification = test_market_data_qualification_for_authority(
+        SchwabMarketDataFamily::LevelOneEquities,
+        received_at,
+        streamer_oauth_authority,
+        session_identifier.clone(),
+        streamer_principal,
+    );
+    let options_qualification = test_market_data_qualification_for_authority(
+        SchwabMarketDataFamily::LevelOneOptions,
+        received_at,
+        streamer_oauth_authority,
+        session_identifier.clone(),
+        streamer_principal,
+    );
+    let wrong_series_qualification = test_market_data_qualification_for_authority(
+        SchwabMarketDataFamily::LevelOneEquities,
+        received_at,
+        SchwabOAuthAuthorityReceipt::for_test(
+            sealed.streamer_receipt().token_generation(),
+            SchwabCredentialAuthorityBinding::for_test(
+                streamer_oauth_authority
+                    .credential_authority()
+                    .application_credential_generation(),
+                92,
+            ),
+        ),
+        session_identifier.clone(),
+        streamer_principal,
+    );
+    let wrong_principal_qualification = test_market_data_qualification_for_authority(
+        SchwabMarketDataFamily::LevelOneEquities,
+        received_at,
+        streamer_oauth_authority,
+        session_identifier.clone(),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [93; 32]),
+    );
+    let wrong_session_qualification = test_market_data_qualification_for_authority(
+        SchwabMarketDataFamily::LevelOneEquities,
+        received_at,
+        streamer_oauth_authority,
+        SourceIdentifier::try_from("d184e132-2f48-49df-98ff-d24898f8907a")
+            .unwrap_or_else(|error| panic!("wrong Streamer session: {error}")),
+        streamer_principal,
+    );
+    assert!(
+        [
+            wrong_series_qualification,
+            wrong_principal_qualification,
+            wrong_session_qualification,
+        ]
+        .iter()
+        .all(
+            |qualification| !qualification.validates_streamer_publication_coordinate(
+                MarketDataService::LevelOneEquities,
+                &equities_streamer_doctor,
+                &sealed,
+                0,
+                0,
+                0,
+            )
+        )
+    );
     let equities_record = test_streamer_quote_record_request(
         &coordinates,
         &stream_identity,
         frame_generation,
-        sealed.streamer_receipt().token_generation(),
         frame_digest,
         received_at,
+        equities_qualification,
         MarketDataService::LevelOneEquities,
         0,
         "AAPL",
@@ -2043,9 +2128,9 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
         &coordinates,
         &stream_identity,
         frame_generation,
-        sealed.streamer_receipt().token_generation(),
         frame_digest,
         received_at,
+        options_qualification,
         MarketDataService::LevelOneOptions,
         1,
         "AAPL_260116C100",
@@ -2155,6 +2240,7 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
                     NonZeroU64::new(generation)
                         .unwrap_or_else(|| panic!("reconnect generation must be nonzero")),
                 ),
+                session_identifier.clone(),
                 coordinates.clone(),
                 stream_identity.clone(),
             )
@@ -2762,6 +2848,11 @@ fn mock_token(admission: AccessTokenAdmission) -> TransientAccessToken {
     TransientAccessToken::try_new(
         "mock-access-token".to_owned(),
         AccessTokenGeneration::new(NonZeroU64::MIN),
+        SchwabCredentialAuthorityBinding::for_test(
+            SecretGeneration::new(1)
+                .unwrap_or_else(|error| panic!("mock credential generation: {error}")),
+            91,
+        ),
         now,
         now.checked_add(1_800)
             .unwrap_or_else(|| panic!("token expiry overflow")),
@@ -2778,27 +2869,20 @@ fn test_streamer_quote_record_request(
     coordinates: &SchwabCaptureCoordinates,
     stream_identity: &SourceIdentifier,
     frame_generation: ConnectionGeneration,
-    token_generation: AccessTokenGeneration,
     frame_digest: [u8; 32],
     received_at: Timestamp,
+    qualification: SchwabMarketDataQualification,
     service: MarketDataService,
     data_batch_ordinal: u16,
     symbol: &str,
     venue: &str,
     evidence_byte: u8,
 ) -> SchwabStreamerQuoteRecordRequest {
-    let (family, dictionary_version) = match service {
-        MarketDataService::LevelOneEquities => (
-            SchwabMarketDataFamily::LevelOneEquities,
-            "schwab-streamer-fields-level-one-equities-v1",
-        ),
-        MarketDataService::LevelOneOptions => (
-            SchwabMarketDataFamily::LevelOneOptions,
-            "schwab-streamer-fields-level-one-options-v1",
-        ),
+    let dictionary_version = match service {
+        MarketDataService::LevelOneEquities => "schwab-streamer-fields-level-one-equities-v1",
+        MarketDataService::LevelOneOptions => "schwab-streamer-fields-level-one-options-v1",
         _ => panic!("focused quote fixture requires an admitted Level-One service"),
     };
-    let qualification = test_market_data_qualification(family, received_at, token_generation);
     let venue_id =
         VenueId::try_from(venue).unwrap_or_else(|error| panic!("mixed-service venue: {error}"));
     let instrument_id = InstrumentId::try_from(Uuid::new_v4())
@@ -2891,6 +2975,29 @@ fn test_market_data_qualification(
     response_observed_at: Timestamp,
     token_generation: AccessTokenGeneration,
 ) -> SchwabMarketDataQualification {
+    let credential_authority = SchwabCredentialAuthorityBinding::for_test(
+        SecretGeneration::new(1)
+            .unwrap_or_else(|error| panic!("test application generation: {error}")),
+        91,
+    );
+    test_market_data_qualification_for_authority(
+        family,
+        response_observed_at,
+        SchwabOAuthAuthorityReceipt::for_test(token_generation, credential_authority),
+        SourceIdentifier::try_from("8d9bc9ee-fca2-4f1d-a077-5104408e3727")
+            .unwrap_or_else(|error| panic!("test qualification session: {error}")),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [80; 32]),
+    )
+}
+
+fn test_market_data_qualification_for_authority(
+    family: SchwabMarketDataFamily,
+    response_observed_at: Timestamp,
+    oauth_authority: SchwabOAuthAuthorityReceipt,
+    session_identifier: SourceIdentifier,
+    market_data_principal_sha256: EvidenceDigest,
+) -> SchwabMarketDataQualification {
+    let token_generation = oauth_authority.generation();
     let issued_at = Timestamp::from_unix_nanos(
         response_observed_at
             .unix_nanos()
@@ -2932,10 +3039,10 @@ fn test_market_data_qualification(
     let receipt = SchwabMarketDataDoctorReceiptV1::try_new(SchwabMarketDataDoctorReceiptInput {
         surface_id: SourceIdentifier::try_from(SCHWAB_MARKET_DATA_SURFACE_ID)
             .unwrap_or_else(|error| panic!("test qualification surface: {error}")),
-        session_identifier: SourceIdentifier::try_from("8d9bc9ee-fca2-4f1d-a077-5104408e3727")
-            .unwrap_or_else(|error| panic!("test qualification session: {error}")),
-        application_credential_generation: SecretGeneration::new(1)
-            .unwrap_or_else(|error| panic!("test application generation: {error}")),
+        session_identifier,
+        application_credential_generation: oauth_authority
+            .credential_authority()
+            .application_credential_generation(),
         capability_revision: ProviderCapabilityRevision::new(1)
             .unwrap_or_else(|error| panic!("test capability revision: {error}")),
         capability_digest: digest(73),
@@ -2960,7 +3067,7 @@ fn test_market_data_qualification(
                 response_bytes: 1,
                 received_at: response_observed_at,
                 latency_nanos: 1,
-                market_data_principal_sha256: digest(80),
+                market_data_principal_sha256,
                 streamer_bootstrap_sha256: digest(81),
                 market_data_offer_sha256: None,
             },
@@ -2977,7 +3084,7 @@ fn test_market_data_qualification(
         &receipt,
         family,
         response_observed_at,
-        token_generation,
+        oauth_authority,
     )
     .unwrap_or_else(|error| panic!("test market-data qualification: {error}"))
 }

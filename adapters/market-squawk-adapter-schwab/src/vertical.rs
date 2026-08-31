@@ -20,9 +20,9 @@ use thiserror::Error;
 
 use crate::{
     ACCESS_TOKEN_MAX_LIFETIME_SECONDS, AccessTokenGeneration, ConnectionGeneration,
-    ExecutedRestResponse, MarketDataService, ReadOnlyRoute, SchwabOAuthAuthorityReceipt,
-    SchwabRestPayload, SchwabSealedStreamerCapture, SchwabStreamerServiceResponseEvidence,
-    SchwabUserPreferenceEvidence,
+    ExecutedRestResponse, MarketDataService, ReadOnlyRoute, SchwabCredentialAuthorityBinding,
+    SchwabOAuthAuthorityReceipt, SchwabRestPayload, SchwabSealedStreamerCapture,
+    SchwabStreamerServiceResponseEvidence, SchwabUserPreferenceEvidence,
 };
 
 /// One independently probed read-only Schwab market-data family.
@@ -77,6 +77,9 @@ pub struct SchwabMarketDataQualification {
     response_observed_at: Timestamp,
     family_observed_at: Timestamp,
     token_generation: AccessTokenGeneration,
+    credential_authority: SchwabCredentialAuthorityBinding,
+    session_identifier: SourceIdentifier,
+    market_data_principal_sha256: EvidenceDigest,
     receipt_evidence: EvidenceDigest,
     observation_evidence: EvidenceDigest,
     disposition_evidence: EvidenceDigest,
@@ -95,8 +98,11 @@ impl SchwabMarketDataQualification {
         doctor: &SchwabMarketDataDoctorReceiptV1,
         family: SchwabMarketDataFamily,
         response_observed_at: Timestamp,
-        token_generation: AccessTokenGeneration,
+        oauth_authority: SchwabOAuthAuthorityReceipt,
     ) -> Result<Self, SchwabVerticalError> {
+        let token_generation = oauth_authority.generation();
+        let credential_authority = oauth_authority.credential_authority();
+        let market_data_principal_sha256 = doctor.market_data_principal_sha256();
         let evidence = doctor
             .observation()
             .families
@@ -118,11 +124,15 @@ impl SchwabMarketDataQualification {
             evidence.disposition_evidence_sha256,
             entitlement_evidence,
             capability_evidence,
+            credential_authority.application_credential_reference_sha256(),
+            market_data_principal_sha256,
         ] {
             require_qualification_digest(digest)?;
         }
         if !doctor.is_current_at(response_observed_at)
             || doctor.access_token_generation() != token_generation.get()
+            || doctor.application_credential_generation()
+                != credential_authority.application_credential_generation()
             || family_observed_at > doctor.verified_at()
             || family_observed_at > response_observed_at
             || !matches!(
@@ -166,6 +176,9 @@ impl SchwabMarketDataQualification {
             response_observed_at,
             family_observed_at,
             token_generation,
+            credential_authority,
+            session_identifier: doctor.session_identifier().clone(),
+            market_data_principal_sha256,
             receipt_evidence,
             observation_evidence,
             disposition_evidence: evidence.disposition_evidence_sha256,
@@ -194,6 +207,15 @@ impl SchwabMarketDataQualification {
     }
     pub const fn token_generation(&self) -> AccessTokenGeneration {
         self.token_generation
+    }
+    pub const fn credential_authority(&self) -> SchwabCredentialAuthorityBinding {
+        self.credential_authority
+    }
+    pub const fn session_identifier(&self) -> &SourceIdentifier {
+        &self.session_identifier
+    }
+    pub const fn market_data_principal_sha256(&self) -> EvidenceDigest {
+        self.market_data_principal_sha256
     }
     pub const fn receipt_evidence(&self) -> EvidenceDigest {
         self.receipt_evidence
@@ -291,7 +313,13 @@ impl SchwabMarketDataQualification {
         self.streamer_service() == Some(service)
             && handoff.service() == service
             && handoff.token_generation() == self.token_generation
+            && handoff.credential_authority() == self.credential_authority
+            && handoff.session_identifier() == &self.session_identifier
+            && handoff.market_data_principal_sha256() == self.market_data_principal_sha256
             && receipt.token_generation() == self.token_generation
+            && receipt.credential_authority() == self.credential_authority
+            && receipt.session_identifier() == &self.session_identifier
+            && receipt.market_data_principal_sha256() == self.market_data_principal_sha256
             && handoff.generation() == receipt.generation()
             && last_ack_ordinal.is_some_and(|last| frame.transport_ordinal() > last)
             && capture.service_responses().is_empty()
@@ -481,6 +509,9 @@ pub struct SchwabStreamerFamilyDoctorAccumulator {
     acknowledgement: SchwabStreamerServiceResponseEvidence,
     generation: ConnectionGeneration,
     token_generation: AccessTokenGeneration,
+    credential_authority: SchwabCredentialAuthorityBinding,
+    session_identifier: SourceIdentifier,
+    market_data_principal_sha256: EvidenceDigest,
     last_frame_ordinal: NonZeroU64,
     provider_records: u64,
 }
@@ -525,6 +556,10 @@ impl SchwabStreamerFamilyDoctorAccumulator {
                 }
                 let generation = capture.streamer_receipt().generation();
                 let token_generation = capture.streamer_receipt().token_generation();
+                let credential_authority = capture.streamer_receipt().credential_authority();
+                let session_identifier = capture.streamer_receipt().session_identifier().clone();
+                let market_data_principal_sha256 =
+                    capture.streamer_receipt().market_data_principal_sha256();
                 captures.push(capture);
                 Ok(Self {
                     service,
@@ -535,6 +570,9 @@ impl SchwabStreamerFamilyDoctorAccumulator {
                     acknowledgement,
                     generation,
                     token_generation,
+                    credential_authority,
+                    session_identifier,
+                    market_data_principal_sha256,
                     last_frame_ordinal,
                     provider_records: 0,
                 })
@@ -625,6 +663,9 @@ impl SchwabStreamerFamilyDoctorAccumulator {
             acknowledgement: self.acknowledgement,
             generation: self.generation,
             token_generation: self.token_generation,
+            credential_authority: self.credential_authority,
+            session_identifier: self.session_identifier,
+            market_data_principal_sha256: self.market_data_principal_sha256,
             capture_set_sha256,
             total_payload_bytes,
             provider_records: self.provider_records,
@@ -672,6 +713,9 @@ pub struct SchwabStreamerFamilyDoctorHandoff {
     acknowledgement: SchwabStreamerServiceResponseEvidence,
     generation: ConnectionGeneration,
     token_generation: AccessTokenGeneration,
+    credential_authority: SchwabCredentialAuthorityBinding,
+    session_identifier: SourceIdentifier,
+    market_data_principal_sha256: EvidenceDigest,
     capture_set_sha256: EvidenceDigest,
     total_payload_bytes: u64,
     provider_records: u64,
@@ -718,6 +762,18 @@ impl SchwabStreamerFamilyDoctorHandoff {
 
     pub const fn token_generation(&self) -> AccessTokenGeneration {
         self.token_generation
+    }
+
+    pub const fn credential_authority(&self) -> SchwabCredentialAuthorityBinding {
+        self.credential_authority
+    }
+
+    pub const fn session_identifier(&self) -> &SourceIdentifier {
+        &self.session_identifier
+    }
+
+    pub const fn market_data_principal_sha256(&self) -> EvidenceDigest {
+        self.market_data_principal_sha256
     }
 
     pub const fn provider_records(&self) -> u64 {
@@ -837,6 +893,12 @@ fn validate_data_capture(
         || capture.streamer_receipt().generation() != anchor.streamer_receipt().generation()
         || capture.streamer_receipt().token_generation()
             != anchor.streamer_receipt().token_generation()
+        || capture.streamer_receipt().credential_authority()
+            != anchor.streamer_receipt().credential_authority()
+        || capture.streamer_receipt().session_identifier()
+            != anchor.streamer_receipt().session_identifier()
+        || capture.streamer_receipt().market_data_principal_sha256()
+            != anchor.streamer_receipt().market_data_principal_sha256()
         || capture.coordinates() != anchor.coordinates()
         || capture.stream_identity() != anchor.stream_identity()
         || capture

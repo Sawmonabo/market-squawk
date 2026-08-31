@@ -37,8 +37,9 @@ use crate::{
 
 use super::{
     AccessTokenAdmission, AccessTokenGeneration, SchwabAccessTokenSource, SchwabCaptureCoordinates,
-    SchwabTransportError, SchwabTransportTelemetry, StreamerTransportBounds, TransientAccessToken,
-    duration_millis, hash_frame, hash_observation, unix_millis, unix_seconds,
+    SchwabCredentialAuthorityBinding, SchwabTransportError, SchwabTransportTelemetry,
+    StreamerTransportBounds, TransientAccessToken, duration_millis, hash_frame, hash_observation,
+    unix_millis, unix_seconds,
 };
 
 /// Exact application payload kind delivered by the WebSocket implementation.
@@ -141,6 +142,9 @@ impl RawStreamerFrame {
 pub struct StreamerMicrobatchReceipt {
     generation: ConnectionGeneration,
     token_generation: AccessTokenGeneration,
+    credential_authority: SchwabCredentialAuthorityBinding,
+    session_identifier: SourceIdentifier,
+    market_data_principal_sha256: EvidenceDigest,
     first_ordinal: NonZeroU64,
     last_ordinal: NonZeroU64,
     frame_count: u64,
@@ -158,6 +162,18 @@ impl StreamerMicrobatchReceipt {
 
     pub const fn token_generation(&self) -> AccessTokenGeneration {
         self.token_generation
+    }
+
+    pub const fn credential_authority(&self) -> SchwabCredentialAuthorityBinding {
+        self.credential_authority
+    }
+
+    pub const fn session_identifier(&self) -> &SourceIdentifier {
+        &self.session_identifier
+    }
+
+    pub const fn market_data_principal_sha256(&self) -> EvidenceDigest {
+        self.market_data_principal_sha256
     }
 
     pub const fn first_ordinal(&self) -> NonZeroU64 {
@@ -813,9 +829,17 @@ fn validate_streamer_microbatch(
     let mut observation = Sha256::new();
     let mut payload_bytes = 0_u64;
     let mut prior_ordinal = None;
-    if receipt.generation != connection.generation {
+    if receipt.generation != connection.generation
+        || receipt.session_identifier != connection.session_identifier
+    {
         return Err(SchwabTransportError::CaptureMaterial);
     }
+    hash_streamer_authority_observation(
+        &mut observation,
+        receipt.credential_authority,
+        &receipt.session_identifier,
+        receipt.market_data_principal_sha256,
+    )?;
     for frame in frames {
         let observed_payload_sha256: [u8; 32] = Sha256::digest(&frame.payload).into();
         if frame.generation != receipt.generation
@@ -851,6 +875,34 @@ fn validate_streamer_microbatch(
     {
         return Err(SchwabTransportError::CaptureMaterial);
     }
+    Ok(())
+}
+
+fn hash_streamer_authority_observation(
+    hasher: &mut Sha256,
+    credential_authority: SchwabCredentialAuthorityBinding,
+    session_identifier: &SourceIdentifier,
+    market_data_principal_sha256: EvidenceDigest,
+) -> Result<(), SchwabTransportError> {
+    hasher.update(b"market-squawk/schwab-streamer-authority-observation/v1\0");
+    hasher.update(
+        credential_authority
+            .application_credential_reference_sha256()
+            .bytes(),
+    );
+    hasher.update(
+        credential_authority
+            .application_credential_generation()
+            .get()
+            .to_be_bytes(),
+    );
+    hasher.update(
+        u64::try_from(session_identifier.as_str().len())
+            .map_err(|_| SchwabTransportError::Overflow)?
+            .to_be_bytes(),
+    );
+    hasher.update(session_identifier.as_str().as_bytes());
+    hasher.update(market_data_principal_sha256.bytes());
     Ok(())
 }
 
@@ -1081,6 +1133,7 @@ pub enum StreamerRunExit {
 /// microbatches. The control implements neither `Clone` nor serialization.
 pub struct SchwabStreamerConnectionControl {
     generation: ConnectionGeneration,
+    session_identifier: SourceIdentifier,
     coordinates: SchwabCaptureCoordinates,
     stream_identity: SourceIdentifier,
 }
@@ -1089,11 +1142,13 @@ impl SchwabStreamerConnectionControl {
     /// Binds one durable application generation to its exact raw-capture coordinates.
     pub fn new(
         generation: ConnectionGeneration,
+        session_identifier: SourceIdentifier,
         coordinates: SchwabCaptureCoordinates,
         stream_identity: SourceIdentifier,
     ) -> Self {
         Self {
             generation,
+            session_identifier,
             coordinates,
             stream_identity,
         }
@@ -1101,6 +1156,10 @@ impl SchwabStreamerConnectionControl {
 
     pub const fn generation(&self) -> ConnectionGeneration {
         self.generation
+    }
+
+    pub const fn session_identifier(&self) -> &SourceIdentifier {
+        &self.session_identifier
     }
 
     pub const fn coordinates(&self) -> &SchwabCaptureCoordinates {
@@ -1114,6 +1173,7 @@ impl SchwabStreamerConnectionControl {
     fn into_evidence(self) -> SchwabStreamerConnectionEvidence {
         SchwabStreamerConnectionEvidence {
             generation: self.generation,
+            session_identifier: self.session_identifier,
             coordinates: self.coordinates,
             stream_identity: self.stream_identity,
         }
@@ -1125,6 +1185,7 @@ impl fmt::Debug for SchwabStreamerConnectionControl {
         formatter
             .debug_struct("SchwabStreamerConnectionControl")
             .field("generation", &self.generation)
+            .field("session_identifier", &self.session_identifier)
             .field("coordinates", &self.coordinates)
             .field("stream_identity", &self.stream_identity)
             .finish()
@@ -1135,6 +1196,7 @@ impl fmt::Debug for SchwabStreamerConnectionControl {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SchwabStreamerConnectionEvidence {
     generation: ConnectionGeneration,
+    session_identifier: SourceIdentifier,
     coordinates: SchwabCaptureCoordinates,
     stream_identity: SourceIdentifier,
 }
@@ -1142,6 +1204,10 @@ pub struct SchwabStreamerConnectionEvidence {
 impl SchwabStreamerConnectionEvidence {
     pub const fn generation(&self) -> ConnectionGeneration {
         self.generation
+    }
+
+    pub const fn session_identifier(&self) -> &SourceIdentifier {
+        &self.session_identifier
     }
 
     pub const fn coordinates(&self) -> &SchwabCaptureCoordinates {
@@ -1515,7 +1581,18 @@ impl SchwabStreamerExecutor {
         cancellation: &CancellationToken,
     ) -> Result<ConnectionExit, SchwabTransportError> {
         let generation = control.generation();
-        let mut batch = MicrobatchBuilder::new(control, token_generation, self.transport_bounds);
+        let credential_authority = token.credential_authority();
+        let market_data_principal_sha256 = EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            bootstrap.market_data_principal_sha256(),
+        );
+        let mut batch = MicrobatchBuilder::new(
+            control,
+            token_generation,
+            credential_authority,
+            market_data_principal_sha256,
+            self.transport_bounds,
+        );
         let login = self
             .controller
             .login_request(bootstrap, token.expose_bearer())?;
@@ -1921,6 +1998,8 @@ enum ProcessedFrame {
 struct MicrobatchBuilder {
     connection: SchwabStreamerConnectionEvidence,
     token_generation: AccessTokenGeneration,
+    credential_authority: SchwabCredentialAuthorityBinding,
+    market_data_principal_sha256: EvidenceDigest,
     bounds: StreamerTransportBounds,
     frames: Vec<RawStreamerFrame>,
     service_responses: Vec<PendingStreamerServiceResponseEvidence>,
@@ -1933,11 +2012,15 @@ impl MicrobatchBuilder {
     fn new(
         control: SchwabStreamerConnectionControl,
         token_generation: AccessTokenGeneration,
+        credential_authority: SchwabCredentialAuthorityBinding,
+        market_data_principal_sha256: EvidenceDigest,
         bounds: StreamerTransportBounds,
     ) -> Self {
         Self {
             connection: control.into_evidence(),
             token_generation,
+            credential_authority,
+            market_data_principal_sha256,
             bounds,
             frames: Vec::new(),
             service_responses: Vec::new(),
@@ -2061,6 +2144,12 @@ impl MicrobatchBuilder {
         }
         let mut content = Sha256::new();
         let mut observation = Sha256::new();
+        hash_streamer_authority_observation(
+            &mut observation,
+            self.credential_authority,
+            &self.connection.session_identifier,
+            self.market_data_principal_sha256,
+        )?;
         for frame in &frames {
             hash_frame(&mut content, frame.kind.digest_tag(), &frame.payload)?;
             hash_observation(
@@ -2078,6 +2167,9 @@ impl MicrobatchBuilder {
         let receipt = StreamerMicrobatchReceipt {
             generation: self.connection.generation,
             token_generation: self.token_generation,
+            credential_authority: self.credential_authority,
+            session_identifier: self.connection.session_identifier.clone(),
+            market_data_principal_sha256: self.market_data_principal_sha256,
             first_ordinal: first.ordinal,
             last_ordinal: last.ordinal,
             frame_count,
