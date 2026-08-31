@@ -10,15 +10,36 @@ use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, InstrumentId, PriceT
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::{FeatureImplementationDigest, KnownFeatureImplementation};
+
 /// Maximum adjusted bars admitted to one in-process harmonic classification.
 pub const MAX_HARMONIC_BARS: usize = 4_096;
 /// Bars required after a candidate swing before the code-owned pivot rule confirms it.
 pub const HARMONIC_PIVOT_CONFIRMATION_BARS: usize = 1;
-
-/// Number of ordered X, A, B, C, and D pivots in the normalized input contract.
+/// Number of bars required to contain five independently confirmable pivots.
+pub const MIN_HARMONIC_BARS: usize = HARMONIC_PIVOT_COUNT + (2 * HARMONIC_PIVOT_CONFIRMATION_BARS);
+/// Number of ordered X, A, B, C, and D pivots in one evidence result.
 pub const HARMONIC_PIVOT_COUNT: usize = 5;
+/// Code-owned registry key for this derived-feature family.
+pub const HARMONIC_PATTERN_FEATURE_NAME: &str = "technical.harmonic-pattern";
+
+pub(crate) const HARMONIC_IMPLEMENTATION_IDENTITY: &str = concat!(
+    "market-squawk-analytics::harmonics@v1;",
+    "bounds-bars7to4096@v1;taxonomy-and-ordered-precedence@v1;",
+    "ratio-bands-and-tolerances-scale1000000ppm@v1;bat-valid-b-lt618000ppm@v1;",
+    "selector-strict-local-radius1-outside-max-excursion-high-tie-",
+    "same-kind-most-extreme-earlier-tie-latest-five@v1;",
+    "confirmation-max-left-selected-right-observed-and-available@v1;",
+    "measurement-absolute-leg-reduced-rational@v1;",
+    "completion-outward-floor-ceil@v1;",
+    "invalidation-abcd-prz-d-other-x-prz-d@v1;",
+    "expiry-decision-plus-five-timeframes@v1;",
+    "bat-preference-382-or500-plusminus30000ppm@v1"
+);
+
 const RATIO_SCALE: u32 = 1_000_000;
 const POINT_TOLERANCE: HarmonicRatio = HarmonicRatio::new(30_000);
+const HARMONIC_EVIDENCE_EXPIRY_BARS: u64 = 5;
 
 /// Closed V1 harmonic-pattern taxonomy.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -128,44 +149,6 @@ impl HarmonicBar {
     }
 }
 
-/// Caller-selected causal pivot referencing one exact bar.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HarmonicPivot {
-    bar_index: u32,
-    kind: HarmonicPivotKind,
-    confirmed_at: Timestamp,
-}
-
-impl HarmonicPivot {
-    /// Constructs a pivot reference and its causal confirmation time.
-    #[must_use]
-    pub const fn new(bar_index: u32, kind: HarmonicPivotKind, confirmed_at: Timestamp) -> Self {
-        Self {
-            bar_index,
-            kind,
-            confirmed_at,
-        }
-    }
-
-    /// Returns the zero-based selected-bar index.
-    #[must_use]
-    pub const fn bar_index(self) -> u32 {
-        self.bar_index
-    }
-
-    /// Returns the swing kind.
-    #[must_use]
-    pub const fn kind(self) -> HarmonicPivotKind {
-        self.kind
-    }
-
-    /// Returns the first time the pivot was causally confirmed.
-    #[must_use]
-    pub const fn confirmed_at(self) -> Timestamp {
-        self.confirmed_at
-    }
-}
-
 /// Exact parent identities and instrument/timeframe binding for one classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HarmonicEvidenceBinding {
@@ -222,9 +205,7 @@ impl HarmonicEvidenceBinding {
 pub struct HarmonicPatternInput<'a> {
     binding: HarmonicEvidenceBinding,
     bars: &'a [HarmonicBar],
-    pivots: [HarmonicPivot; HARMONIC_PIVOT_COUNT],
     decision_cutoff: Timestamp,
-    expires_at: Timestamp,
 }
 
 impl<'a> HarmonicPatternInput<'a> {
@@ -233,16 +214,12 @@ impl<'a> HarmonicPatternInput<'a> {
     pub const fn new(
         binding: HarmonicEvidenceBinding,
         bars: &'a [HarmonicBar],
-        pivots: [HarmonicPivot; HARMONIC_PIVOT_COUNT],
         decision_cutoff: Timestamp,
-        expires_at: Timestamp,
     ) -> Self {
         Self {
             binding,
             bars,
-            pivots,
             decision_cutoff,
-            expires_at,
         }
     }
 }
@@ -543,6 +520,15 @@ pub enum HarmonicConfidenceAuthority {
     None,
 }
 
+/// Code-owned validity evidence for the admitted ratio structure.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum HarmonicPatternQuality {
+    /// Every required ratio is valid, but a documented preferred Bat B ratio is absent.
+    Valid,
+    /// Every required ratio is valid and the Bat B ratio matches a documented preferred band.
+    PreferredBatB,
+}
+
 /// Immutable causal harmonic-pattern evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HarmonicPatternEvidence {
@@ -552,11 +538,12 @@ pub struct HarmonicPatternEvidence {
     pivots: [HarmonicPivotEvidence; HARMONIC_PIVOT_COUNT],
     ratios: HarmonicRatioMeasurements,
     completion_zone: HarmonicCompletionZone,
+    quality: HarmonicPatternQuality,
     confirmation_cutoff: Timestamp,
     decision_cutoff: Timestamp,
     expires_at: Timestamp,
     invalidation: PriceTicks,
-    implementation_identity: EvidenceDigest,
+    implementation_identity: FeatureImplementationDigest,
     evidence_digest: EvidenceDigest,
 }
 
@@ -603,6 +590,12 @@ impl HarmonicPatternEvidence {
         self.completion_zone
     }
 
+    /// Returns code-owned ratio-quality evidence; it grants no confidence authority.
+    #[must_use]
+    pub const fn quality(self) -> HarmonicPatternQuality {
+        self.quality
+    }
+
     /// Returns the final pivot confirmation time.
     #[must_use]
     pub const fn confirmation_cutoff(self) -> Timestamp {
@@ -629,7 +622,7 @@ impl HarmonicPatternEvidence {
 
     /// Returns the identity of the complete compiled V1 rule set.
     #[must_use]
-    pub const fn implementation_identity(self) -> EvidenceDigest {
+    pub const fn implementation_identity(self) -> FeatureImplementationDigest {
         self.implementation_identity
     }
 
@@ -667,12 +660,6 @@ pub enum HarmonicPatternError {
     /// A parent digest is not a nonzero SHA-256 identity.
     #[error("harmonic parent evidence identity is invalid")]
     InvalidParentIdentity,
-    /// Evidence expiry is not strictly after the decision cutoff.
-    #[error("harmonic evidence expiry is invalid")]
-    InvalidExpiry,
-    /// A pivot references a bar outside the supplied window.
-    #[error("harmonic pivot references an unavailable bar")]
-    PivotOutOfRange,
     /// A bar or pivot was observed, available, or confirmed after the decision cutoff.
     #[error("harmonic input exceeds the decision cutoff")]
     FutureInformation,
@@ -685,9 +672,9 @@ pub enum HarmonicPatternError {
     /// Pivot prices do not move in the direction declared by their alternating kinds.
     #[error("harmonic pivot price structure is invalid")]
     InvalidPivotStructure,
-    /// A selected pivot is not a strict local extremum under the code-owned confirmation rule.
-    #[error("harmonic pivot is not confirmed by the supplied adjusted bars")]
-    UnconfirmedPivot,
+    /// Fewer than five alternating code-owned pivots exist in the admitted bar window.
+    #[error("harmonic bar window contains too few confirmed pivots")]
+    InsufficientPivots,
     /// A ratio denominator is zero.
     #[error("harmonic pattern contains a zero-length leg")]
     ZeroLengthLeg,
@@ -697,6 +684,9 @@ pub enum HarmonicPatternError {
     /// Exact completion-zone or invalidation arithmetic overflowed.
     #[error("harmonic exact arithmetic overflow")]
     ArithmeticOverflow,
+    /// The code-owned feature implementation identity could not be represented.
+    #[error("harmonic implementation identity is invalid")]
+    InvalidImplementationIdentity,
 }
 
 const B_382: HarmonicRatioBand = HarmonicRatioBand::point(382_000);
@@ -707,6 +697,12 @@ const B_886: HarmonicRatioBand = HarmonicRatioBand::point(886_000);
 const B_1000: HarmonicRatioBand = HarmonicRatioBand::point(1_000_000);
 const B_1270: HarmonicRatioBand = HarmonicRatioBand::point(1_270_000);
 const B_1618: HarmonicRatioBand = HarmonicRatioBand::point(1_618_000);
+const BAT_PREFERRED_B_BANDS: &[HarmonicRatioBand] = &[B_382, B_500];
+const BAT_PREFERRED_B_CONSTRAINT: HarmonicRatioConstraint = constraint(
+    HarmonicRatioMeasurement::AbOverXa,
+    BAT_PREFERRED_B_BANDS,
+    POINT_TOLERANCE,
+);
 
 const ABCD_CONSTRAINTS: &[HarmonicRatioConstraint] = &[
     constraint(
@@ -755,8 +751,8 @@ const GARTLEY_CONSTRAINTS: &[HarmonicRatioConstraint] = &[
 const BAT_CONSTRAINTS: &[HarmonicRatioConstraint] = &[
     constraint(
         HarmonicRatioMeasurement::AbOverXa,
-        &[B_382, B_500],
-        POINT_TOLERANCE,
+        &[HarmonicRatioBand::range(0, 617_999)],
+        HarmonicRatio::new(0),
     ),
     constraint(
         HarmonicRatioMeasurement::BcOverAb,
@@ -987,11 +983,12 @@ const fn rule_for(kind: HarmonicPatternKind) -> &'static HarmonicPatternRule {
     }
 }
 
-/// Classifies one exact causal XABCD pivot structure using the closed V1 rule set.
+/// Selects and classifies one exact causal XABCD pivot structure using the closed V1 rule set.
 ///
 /// A successful result is derived research evidence only. It grants neither confidence nor order
-/// authority. The function rejects any selected bar or pivot whose observation, availability, or
-/// confirmation exceeds `decision_cutoff`.
+/// authority. Pivot selection, outside-bar resolution, confirmation, five-pivot precedence, and
+/// expiry are code-owned. The function rejects any bar or derived pivot whose observation,
+/// availability, or confirmation exceeds `decision_cutoff`.
 ///
 /// # Errors
 ///
@@ -1002,10 +999,7 @@ pub fn classify_harmonic_pattern(
 ) -> Result<HarmonicPatternEvidence, HarmonicPatternError> {
     validate_binding(input.binding)?;
     validate_bars(input.bars, input.decision_cutoff)?;
-    if input.expires_at <= input.decision_cutoff {
-        return Err(HarmonicPatternError::InvalidExpiry);
-    }
-    let pivots = resolve_pivots(input.bars, input.pivots, input.decision_cutoff)?;
+    let pivots = select_pivots(input.bars, input.decision_cutoff)?;
     let direction = validate_pivot_structure(pivots)?;
     let ratios = measure_ratios(pivots)?;
     let rule = RULES
@@ -1020,14 +1014,20 @@ pub fn classify_harmonic_pattern(
     if !completion_zone.contains(pivots[4].price) {
         return Err(HarmonicPatternError::NoMatchingPattern);
     }
-    let invalidation = invalidation(direction, completion_zone, pivots)?;
-    let implementation_identity = implementation_identity();
+    let quality = pattern_quality(rule.kind, ratios);
+    let invalidation = invalidation(rule.kind, direction, completion_zone, pivots)?;
+    let expires_at = evidence_expiry(input.binding, input.decision_cutoff)?;
+    let implementation_identity = KnownFeatureImplementation::BatchHarmonicPatterns
+        .implementation_digest()
+        .map_err(|_| HarmonicPatternError::InvalidImplementationIdentity)?;
     let derived = DerivedEvidence {
         rule: *rule,
         direction,
         pivots,
         ratios,
         completion_zone,
+        quality,
+        expires_at,
         invalidation,
         implementation_identity,
     };
@@ -1039,9 +1039,10 @@ pub fn classify_harmonic_pattern(
         pivots,
         ratios,
         completion_zone,
+        quality,
         confirmation_cutoff: pivots[4].confirmed_at,
         decision_cutoff: input.decision_cutoff,
-        expires_at: input.expires_at,
+        expires_at,
         invalidation,
         implementation_identity,
         evidence_digest,
@@ -1061,7 +1062,7 @@ fn validate_bars(
     bars: &[HarmonicBar],
     decision_cutoff: Timestamp,
 ) -> Result<(), HarmonicPatternError> {
-    if !(HARMONIC_PIVOT_COUNT..=MAX_HARMONIC_BARS).contains(&bars.len()) {
+    if !(MIN_HARMONIC_BARS..=MAX_HARMONIC_BARS).contains(&bars.len()) {
         return Err(HarmonicPatternError::InvalidBarCount);
     }
     let mut previous_observed = None;
@@ -1093,63 +1094,66 @@ fn validate_bars(
     Ok(())
 }
 
-fn resolve_pivots(
+fn select_pivots(
     bars: &[HarmonicBar],
-    pivots: [HarmonicPivot; HARMONIC_PIVOT_COUNT],
     decision_cutoff: Timestamp,
 ) -> Result<[HarmonicPivotEvidence; HARMONIC_PIVOT_COUNT], HarmonicPatternError> {
-    let mut resolved = [HarmonicPivotEvidence {
-        bar_index: 0,
-        kind: HarmonicPivotKind::Low,
-        observed_at: Timestamp::from_unix_nanos(0),
-        available_at: Timestamp::from_unix_nanos(0),
-        confirmed_at: Timestamp::from_unix_nanos(0),
-        price: PriceTicks::new(0),
-    }; HARMONIC_PIVOT_COUNT];
-    for (index, pivot) in pivots.into_iter().enumerate() {
-        let bar = bars
-            .get(
-                usize::try_from(pivot.bar_index)
-                    .map_err(|_| HarmonicPatternError::PivotOutOfRange)?,
-            )
-            .ok_or(HarmonicPatternError::PivotOutOfRange)?;
-        let pivot_index =
-            usize::try_from(pivot.bar_index).map_err(|_| HarmonicPatternError::PivotOutOfRange)?;
-        let left_index = pivot_index
-            .checked_sub(HARMONIC_PIVOT_CONFIRMATION_BARS)
-            .ok_or(HarmonicPatternError::UnconfirmedPivot)?;
-        let right_index = pivot_index
-            .checked_add(HARMONIC_PIVOT_CONFIRMATION_BARS)
-            .ok_or(HarmonicPatternError::PivotOutOfRange)?;
-        let left = bars
-            .get(left_index)
-            .ok_or(HarmonicPatternError::UnconfirmedPivot)?;
-        let right = bars
-            .get(right_index)
-            .ok_or(HarmonicPatternError::UnconfirmedPivot)?;
-        let is_confirmed_extremum = match pivot.kind {
-            HarmonicPivotKind::High => bar.high > left.high && bar.high > right.high,
-            HarmonicPivotKind::Low => bar.low < left.low && bar.low < right.low,
+    let mut canonical: Vec<HarmonicPivotEvidence> =
+        Vec::with_capacity(bars.len().saturating_sub(2));
+    for pivot_index in HARMONIC_PIVOT_CONFIRMATION_BARS
+        ..bars.len().saturating_sub(HARMONIC_PIVOT_CONFIRMATION_BARS)
+    {
+        let left = bars[pivot_index - HARMONIC_PIVOT_CONFIRMATION_BARS];
+        let bar = bars[pivot_index];
+        let right = bars[pivot_index + HARMONIC_PIVOT_CONFIRMATION_BARS];
+        let Some(kind) = selected_pivot_kind(left, bar, right) else {
+            continue;
         };
-        if !is_confirmed_extremum {
-            return Err(HarmonicPatternError::UnconfirmedPivot);
-        }
-        if pivot.confirmed_at < right.available_at || pivot.confirmed_at > decision_cutoff {
+        let confirmed_at = [
+            left.observed_at,
+            left.available_at,
+            bar.observed_at,
+            bar.available_at,
+            right.observed_at,
+            right.available_at,
+        ]
+        .into_iter()
+        .max()
+        .ok_or(HarmonicPatternError::ArithmeticOverflow)?;
+        if confirmed_at > decision_cutoff {
             return Err(HarmonicPatternError::FutureInformation);
         }
-        resolved[index] = HarmonicPivotEvidence {
-            bar_index: pivot.bar_index,
-            kind: pivot.kind,
+        let candidate = HarmonicPivotEvidence {
+            bar_index: u32::try_from(pivot_index)
+                .map_err(|_| HarmonicPatternError::ArithmeticOverflow)?,
+            kind,
             observed_at: bar.observed_at,
             available_at: bar.available_at,
-            confirmed_at: pivot.confirmed_at,
-            price: match pivot.kind {
+            confirmed_at,
+            price: match kind {
                 HarmonicPivotKind::High => bar.high,
                 HarmonicPivotKind::Low => bar.low,
             },
         };
+        if let Some(previous) = canonical.last_mut()
+            && previous.kind == candidate.kind
+        {
+            if is_more_extreme(candidate, *previous) {
+                *previous = candidate;
+            }
+            continue;
+        }
+        canonical.push(candidate);
     }
-    for pair in resolved.windows(2) {
+
+    let selected_start = canonical
+        .len()
+        .checked_sub(HARMONIC_PIVOT_COUNT)
+        .ok_or(HarmonicPatternError::InsufficientPivots)?;
+    let selected: [HarmonicPivotEvidence; HARMONIC_PIVOT_COUNT] = canonical[selected_start..]
+        .try_into()
+        .map_err(|_| HarmonicPatternError::InsufficientPivots)?;
+    for pair in selected.windows(2) {
         if pair[0].bar_index >= pair[1].bar_index
             || pair[0].observed_at >= pair[1].observed_at
             || pair[0].confirmed_at >= pair[1].confirmed_at
@@ -1160,7 +1164,48 @@ fn resolve_pivots(
             return Err(HarmonicPatternError::NonAlternatingPivots);
         }
     }
-    Ok(resolved)
+    Ok(selected)
+}
+
+fn selected_pivot_kind(
+    left: HarmonicBar,
+    selected: HarmonicBar,
+    right: HarmonicBar,
+) -> Option<HarmonicPivotKind> {
+    let is_high = selected.high > left.high && selected.high > right.high;
+    let is_low = selected.low < left.low && selected.low < right.low;
+    match (is_high, is_low) {
+        (true, false) => Some(HarmonicPivotKind::High),
+        (false, true) => Some(HarmonicPivotKind::Low),
+        (false, false) => None,
+        (true, true) => {
+            let high_excursion = selected
+                .high
+                .get()
+                .abs_diff(left.high.get())
+                .min(selected.high.get().abs_diff(right.high.get()));
+            let low_excursion = selected
+                .low
+                .get()
+                .abs_diff(left.low.get())
+                .min(selected.low.get().abs_diff(right.low.get()));
+            Some(if high_excursion >= low_excursion {
+                HarmonicPivotKind::High
+            } else {
+                HarmonicPivotKind::Low
+            })
+        }
+    }
+}
+
+const fn is_more_extreme(
+    candidate: HarmonicPivotEvidence,
+    previous: HarmonicPivotEvidence,
+) -> bool {
+    match candidate.kind {
+        HarmonicPivotKind::High => candidate.price.get() > previous.price.get(),
+        HarmonicPivotKind::Low => candidate.price.get() < previous.price.get(),
+    }
 }
 
 fn validate_pivot_structure(
@@ -1256,6 +1301,38 @@ fn completion_zone(
     project_zone(anchor, base, minimum, maximum, direction)
 }
 
+fn pattern_quality(
+    kind: HarmonicPatternKind,
+    ratios: HarmonicRatioMeasurements,
+) -> HarmonicPatternQuality {
+    if kind == HarmonicPatternKind::Bat
+        && ratios
+            .get(HarmonicRatioMeasurement::AbOverXa)
+            .is_within(BAT_PREFERRED_B_CONSTRAINT)
+    {
+        HarmonicPatternQuality::PreferredBatB
+    } else {
+        HarmonicPatternQuality::Valid
+    }
+}
+
+fn evidence_expiry(
+    binding: HarmonicEvidenceBinding,
+    decision_cutoff: Timestamp,
+) -> Result<Timestamp, HarmonicPatternError> {
+    let lifetime = binding
+        .timeframe_nanos
+        .get()
+        .checked_mul(HARMONIC_EVIDENCE_EXPIRY_BARS)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(HarmonicPatternError::ArithmeticOverflow)?;
+    decision_cutoff
+        .unix_nanos()
+        .checked_add(lifetime)
+        .map(Timestamp::from_unix_nanos)
+        .ok_or(HarmonicPatternError::ArithmeticOverflow)
+}
+
 fn project_zone(
     anchor: PriceTicks,
     base: u64,
@@ -1295,23 +1372,30 @@ fn project_zone(
 }
 
 fn invalidation(
+    kind: HarmonicPatternKind,
     direction: HarmonicDirection,
     completion_zone: HarmonicCompletionZone,
     pivots: [HarmonicPivotEvidence; HARMONIC_PIVOT_COUNT],
 ) -> Result<PriceTicks, HarmonicPatternError> {
     let value = match direction {
-        HarmonicDirection::Bullish => completion_zone
-            .lower
-            .get()
-            .min(pivots[0].price.get())
-            .min(pivots[4].price.get())
-            .checked_sub(1),
-        HarmonicDirection::Bearish => completion_zone
-            .upper
-            .get()
-            .max(pivots[0].price.get())
-            .max(pivots[4].price.get())
-            .checked_add(1),
+        HarmonicDirection::Bullish => {
+            let structural_low = completion_zone.lower.get().min(pivots[4].price.get());
+            let invalidation_base = if kind == HarmonicPatternKind::AbCd {
+                structural_low
+            } else {
+                structural_low.min(pivots[0].price.get())
+            };
+            invalidation_base.checked_sub(1)
+        }
+        HarmonicDirection::Bearish => {
+            let structural_high = completion_zone.upper.get().max(pivots[4].price.get());
+            let invalidation_base = if kind == HarmonicPatternKind::AbCd {
+                structural_high
+            } else {
+                structural_high.max(pivots[0].price.get())
+            };
+            invalidation_base.checked_add(1)
+        }
     }
     .ok_or(HarmonicPatternError::ArithmeticOverflow)?;
     Ok(PriceTicks::new(value))
@@ -1350,35 +1434,16 @@ fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
     left.max(1)
 }
 
-fn implementation_identity() -> EvidenceDigest {
-    let mut hasher = Sha256::new();
-    hasher.update(b"market-squawk/harmonic-pattern-rules/v1\0");
-    for rule in RULES {
-        hasher.update([pattern_code(rule.kind)]);
-        hasher.update([completion_code(rule.completion)]);
-        hasher.update(bounded_len(rule.completion_constraint).to_be_bytes());
-        hasher.update(bounded_len(rule.constraints.len()).to_be_bytes());
-        for constraint in rule.constraints {
-            hasher.update([measurement_code(constraint.measurement)]);
-            hasher.update(constraint.tolerance.parts_per_million.to_be_bytes());
-            hasher.update(bounded_len(constraint.accepted.len()).to_be_bytes());
-            for band in constraint.accepted {
-                hasher.update(band.lower.parts_per_million.to_be_bytes());
-                hasher.update(band.upper.parts_per_million.to_be_bytes());
-            }
-        }
-    }
-    EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
-}
-
 struct DerivedEvidence {
     rule: HarmonicPatternRule,
     direction: HarmonicDirection,
     pivots: [HarmonicPivotEvidence; HARMONIC_PIVOT_COUNT],
     ratios: HarmonicRatioMeasurements,
     completion_zone: HarmonicCompletionZone,
+    quality: HarmonicPatternQuality,
+    expires_at: Timestamp,
     invalidation: PriceTicks,
-    implementation_identity: EvidenceDigest,
+    implementation_identity: FeatureImplementationDigest,
 }
 
 fn evidence_digest(input: HarmonicPatternInput<'_>, derived: &DerivedEvidence) -> EvidenceDigest {
@@ -1389,7 +1454,7 @@ fn evidence_digest(input: HarmonicPatternInput<'_>, derived: &DerivedEvidence) -
     hash_digest(&mut hasher, input.binding.parent_manifest);
     hash_digest(&mut hasher, input.binding.adjustment_identity);
     hasher.update(input.decision_cutoff.unix_nanos().to_be_bytes());
-    hasher.update(input.expires_at.unix_nanos().to_be_bytes());
+    hasher.update(derived.expires_at.unix_nanos().to_be_bytes());
     hasher.update(bounded_len(input.bars.len()).to_be_bytes());
     for bar in input.bars {
         hasher.update(bar.observed_at.unix_nanos().to_be_bytes());
@@ -1424,8 +1489,9 @@ fn evidence_digest(input: HarmonicPatternInput<'_>, derived: &DerivedEvidence) -
     }
     hasher.update(derived.completion_zone.lower.get().to_be_bytes());
     hasher.update(derived.completion_zone.upper.get().to_be_bytes());
+    hasher.update([quality_code(derived.quality)]);
     hasher.update(derived.invalidation.get().to_be_bytes());
-    hash_digest(&mut hasher, derived.implementation_identity);
+    hasher.update(derived.implementation_identity.as_bytes());
     EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
 }
 
@@ -1468,6 +1534,13 @@ const fn pivot_kind_code(kind: HarmonicPivotKind) -> u8 {
     }
 }
 
+const fn quality_code(quality: HarmonicPatternQuality) -> u8 {
+    match quality {
+        HarmonicPatternQuality::Valid => 0,
+        HarmonicPatternQuality::PreferredBatB => 1,
+    }
+}
+
 const fn measurement_code(measurement: HarmonicRatioMeasurement) -> u8 {
     match measurement {
         HarmonicRatioMeasurement::AbOverXa => 0,
@@ -1477,14 +1550,6 @@ const fn measurement_code(measurement: HarmonicRatioMeasurement) -> u8 {
         HarmonicRatioMeasurement::AdOverXa => 4,
         HarmonicRatioMeasurement::XcOverXa => 5,
         HarmonicRatioMeasurement::CdOverXc => 6,
-    }
-}
-
-const fn completion_code(projection: CompletionProjection) -> u8 {
-    match projection {
-        CompletionProjection::FromAOverXa => 0,
-        CompletionProjection::FromCOverAb => 1,
-        CompletionProjection::FromCOverXc => 2,
     }
 }
 

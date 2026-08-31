@@ -10,7 +10,7 @@ use crate::{FeatureImplementationDigest, FeatureKey, FeatureMetadata, FeatureMet
 
 impl KnownFeatureImplementation {
     /// Every implementation identity compiled into this release.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::LiveSpread,
         Self::LiveMidpoint,
         Self::LiveMicroprice,
@@ -32,6 +32,7 @@ impl KnownFeatureImplementation {
         Self::BatchFundamentals,
         Self::BatchMacro,
         Self::BatchPortfolioScenarios,
+        Self::BatchHarmonicPatterns,
     ];
 
     /// Returns the SHA-256 digest of this source-owned implementation identity.
@@ -78,6 +79,7 @@ impl KnownFeatureImplementation {
             Self::BatchPortfolioScenarios => {
                 "market-squawk-analytics::batch::portfolio-scenarios@v1"
             }
+            Self::BatchHarmonicPatterns => crate::harmonics::HARMONIC_IMPLEMENTATION_IDENTITY,
         }
     }
 
@@ -174,6 +176,9 @@ impl KnownFeatureImplementation {
                     | "scenario.stress-contribution"
                     | "scenario.stress-total"
             ),
+            Self::BatchHarmonicPatterns => {
+                key.name() == crate::harmonics::HARMONIC_PATTERN_FEATURE_NAME
+            }
         }
     }
 }

@@ -14,7 +14,7 @@ use std::{num::NonZeroU64, str::FromStr};
 use market_squawk_analytics::{
     HarmonicBar, HarmonicConfidenceAuthority, HarmonicDirection, HarmonicEvidenceBinding,
     HarmonicExecutionAuthority, HarmonicPatternError, HarmonicPatternInput, HarmonicPatternKind,
-    HarmonicPivot, HarmonicPivotKind, classify_harmonic_pattern,
+    HarmonicPatternQuality, KnownFeatureImplementation, classify_harmonic_pattern,
 };
 use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, InstrumentId, PriceTicks, Timestamp};
 
@@ -23,24 +23,17 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 #[test]
 fn harmonic_pattern_is_causal_and_rejects_a_future_confirmation() -> TestResult {
     let bars = [
-        harmonic_bar(10, 11, 90, 86),
-        harmonic_bar(20, 21, 91, 85),
-        harmonic_bar(30, 31, 92, 90),
-        harmonic_bar(40, 41, 100, 99),
-        harmonic_bar(50, 51, 90, 85),
-        harmonic_bar(60, 61, 81, 80),
-        harmonic_bar(70, 71, 85, 84),
-        harmonic_bar(80, 81, 90, 89),
-        harmonic_bar(90, 91, 79, 75),
-        harmonic_bar(100, 101, 71, 70),
-        harmonic_bar(110, 111, 78, 74),
-    ];
-    let pivots = [
-        HarmonicPivot::new(1, HarmonicPivotKind::Low, Timestamp::from_unix_nanos(35)),
-        HarmonicPivot::new(3, HarmonicPivotKind::High, Timestamp::from_unix_nanos(55)),
-        HarmonicPivot::new(5, HarmonicPivotKind::Low, Timestamp::from_unix_nanos(75)),
-        HarmonicPivot::new(7, HarmonicPivotKind::High, Timestamp::from_unix_nanos(95)),
-        HarmonicPivot::new(9, HarmonicPivotKind::Low, Timestamp::from_unix_nanos(115)),
+        harmonic_bar(10, 11, 1_300, 1_100),
+        harmonic_bar(20, 21, 1_200, 1_000),
+        harmonic_bar(30, 31, 1_500, 1_300),
+        harmonic_bar(40, 41, 2_000, 1_200),
+        harmonic_bar(50, 51, 1_700, 1_500),
+        harmonic_bar(60, 61, 1_550, 1_450),
+        harmonic_bar(70, 71, 1_650, 1_600),
+        harmonic_bar(80, 81, 1_664, 1_600),
+        harmonic_bar(90, 91, 1_500, 1_300),
+        harmonic_bar(100, 101, 1_200, 1_114),
+        harmonic_bar(110, 111, 1_400, 1_200),
     ];
     let binding = HarmonicEvidenceBinding::new(
         InstrumentId::from_str("0187f5f1-6fc2-7fa2-bf05-2ce5354c55cb")?,
@@ -49,20 +42,23 @@ fn harmonic_pattern_is_causal_and_rejects_a_future_confirmation() -> TestResult 
         EvidenceDigest::new(DigestAlgorithm::Sha256, [2; 32]),
     );
     let cutoff = Timestamp::from_unix_nanos(120);
-    let evidence = classify_harmonic_pattern(HarmonicPatternInput::new(
-        binding,
-        &bars,
-        pivots,
-        cutoff,
-        Timestamp::from_unix_nanos(160),
-    ))?;
+    let evidence = classify_harmonic_pattern(HarmonicPatternInput::new(binding, &bars, cutoff))?;
 
-    assert_eq!(evidence.kind(), HarmonicPatternKind::AbCd);
+    assert_eq!(evidence.kind(), HarmonicPatternKind::Bat);
     assert_eq!(evidence.direction(), HarmonicDirection::Bullish);
-    assert!(evidence.completion_zone().contains(PriceTicks::new(70)));
+    assert_eq!(evidence.quality(), HarmonicPatternQuality::Valid);
+    assert!(evidence.completion_zone().contains(PriceTicks::new(1_114)));
+    assert_eq!(
+        evidence.pivots().map(|pivot| pivot.bar_index()),
+        [1, 3, 5, 7, 9]
+    );
     assert_eq!(
         evidence.confirmation_cutoff(),
-        Timestamp::from_unix_nanos(115)
+        Timestamp::from_unix_nanos(111)
+    );
+    assert_eq!(
+        evidence.implementation_identity(),
+        KnownFeatureImplementation::BatchHarmonicPatterns.implementation_digest()?
     );
     assert_eq!(
         evidence.execution_authority(),
@@ -73,17 +69,10 @@ fn harmonic_pattern_is_causal_and_rejects_a_future_confirmation() -> TestResult 
         HarmonicConfidenceAuthority::None
     );
 
-    let mut future_pivots = pivots;
-    future_pivots[4] =
-        HarmonicPivot::new(9, HarmonicPivotKind::Low, Timestamp::from_unix_nanos(121));
+    let mut future_bars = bars;
+    future_bars[10] = harmonic_bar(110, 121, 1_400, 1_200);
     assert_eq!(
-        classify_harmonic_pattern(HarmonicPatternInput::new(
-            binding,
-            &bars,
-            future_pivots,
-            cutoff,
-            Timestamp::from_unix_nanos(160),
-        )),
+        classify_harmonic_pattern(HarmonicPatternInput::new(binding, &future_bars, cutoff,)),
         Err(HarmonicPatternError::FutureInformation)
     );
     Ok(())
