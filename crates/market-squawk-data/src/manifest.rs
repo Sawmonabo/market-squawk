@@ -151,7 +151,7 @@ impl fmt::Debug for DatasetBuildSpecDigest {
 /// Typed semantic relationship from one generation to an exact prior generation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum GenerationParentRelation {
-    /// An ingest appends one object to its immediately preceding generation.
+    /// An ingest appends one ordered, nonempty object group to its immediate predecessor.
     AppendPredecessor,
     /// A compaction replaces its immediately preceding generation without changing semantics.
     CompactionPredecessor,

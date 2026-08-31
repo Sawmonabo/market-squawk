@@ -76,6 +76,7 @@ const PROVIDER_MACRO_PLAN_PUBLICATION_DOMAIN: &[u8] =
     b"market-squawk/provider-macro-plan-publication/v1";
 const PROVIDER_MACRO_PLAN_REQUEST_SET_DOMAIN: &[u8] =
     b"market-squawk/provider-macro-plan-request-set/v1";
+const STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT: usize = 2;
 
 struct ProviderCaptureRecoveryControl<'a> {
     cancellation: &'a CancellationToken,
@@ -1211,14 +1212,30 @@ pub struct AnalyticalDataService {
 
 /// Exact provider evidence owned by the ingest run that created one immutable generation.
 ///
-/// The bindings retain the run's publication order and exclude inherited provider lineage. The
-/// anchor object is the sole canonical object appended by that same run.
+/// The bindings retain the run's exact output grouping and exclude inherited provider lineage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerationOwnedProviderCaptureEvidence {
     pinned: PinnedDataset,
     source_id: SourceId,
-    anchor_object_ordinal: usize,
-    bindings: Box<[crate::PersistedProviderCaptureBindingEvidence]>,
+    objects: Box<[GenerationOwnedProviderCaptureObjectEvidence]>,
+    receipt_digest: EvidenceDigest,
+}
+
+/// One exact canonical output and its ordered direct provider inputs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenerationOwnedProviderCaptureObjectEvidence {
+    publication_ordinal: usize,
+    generation_object_ordinal: usize,
+    object: crate::PinnedManifestObject,
+    inputs: Box<[GenerationOwnedProviderCaptureInputEvidence]>,
+}
+
+/// One direct provider input at its global and object-local durable coordinates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenerationOwnedProviderCaptureInputEvidence {
+    input_ordinal: usize,
+    object_input_ordinal: usize,
+    binding: crate::PersistedProviderCaptureBindingEvidence,
 }
 
 impl GenerationOwnedProviderCaptureEvidence {
@@ -1232,14 +1249,53 @@ impl GenerationOwnedProviderCaptureEvidence {
         &self.source_id
     }
 
-    /// Returns the canonical object appended by the creating ingest run.
-    pub fn anchor_object(&self) -> &crate::PinnedManifestObject {
-        &self.pinned.objects()[self.anchor_object_ordinal]
+    /// Returns every canonical output appended by the creating run in publication order.
+    pub fn objects(&self) -> &[GenerationOwnedProviderCaptureObjectEvidence] {
+        &self.objects
     }
 
-    /// Returns the creating run's physically verified bindings in retained input order.
-    pub fn bindings(&self) -> &[crate::PersistedProviderCaptureBindingEvidence] {
-        &self.bindings
+    /// Returns the digest binding the exact generation, output group, and direct-input mapping.
+    pub const fn receipt_digest(&self) -> EvidenceDigest {
+        self.receipt_digest
+    }
+}
+
+impl GenerationOwnedProviderCaptureObjectEvidence {
+    /// Returns this output's run-local publication ordinal.
+    pub const fn publication_ordinal(&self) -> usize {
+        self.publication_ordinal
+    }
+
+    /// Returns this output's exact ordinal in the complete immutable generation.
+    pub const fn generation_object_ordinal(&self) -> usize {
+        self.generation_object_ordinal
+    }
+
+    /// Returns the exact immutable output identity and object metadata.
+    pub const fn object(&self) -> &crate::PinnedManifestObject {
+        &self.object
+    }
+
+    /// Returns the direct inputs assigned to this output in object-local order.
+    pub fn inputs(&self) -> &[GenerationOwnedProviderCaptureInputEvidence] {
+        &self.inputs
+    }
+}
+
+impl GenerationOwnedProviderCaptureInputEvidence {
+    /// Returns this input's ordinal across the complete creating run.
+    pub const fn input_ordinal(&self) -> usize {
+        self.input_ordinal
+    }
+
+    /// Returns this input's ordinal within its assigned canonical output.
+    pub const fn object_input_ordinal(&self) -> usize {
+        self.object_input_ordinal
+    }
+
+    /// Returns the physically verified direct provider binding.
+    pub const fn binding(&self) -> &crate::PersistedProviderCaptureBindingEvidence {
+        &self.binding
     }
 }
 
@@ -2188,48 +2244,91 @@ impl AnalyticalDataService {
         let owned = self
             .manifests
             .generation_owned_provider_captures(manifest)?;
-        let mut bindings = Vec::new();
-        bindings
-            .try_reserve_exact(owned.binding_digests.len())
+        let object_count = owned
+            .pinned
+            .objects()
+            .len()
+            .checked_sub(owned.suffix_start)
+            .filter(|count| (1..=1024).contains(count))
+            .ok_or(IngestError::ProviderCaptureRequired)?;
+        let mut grouped_inputs = Vec::new();
+        grouped_inputs
+            .try_reserve_exact(object_count)
             .map_err(|_| IngestError::ProviderCaptureRequired)?;
+        for _ in 0..object_count {
+            grouped_inputs.push(Vec::new());
+        }
         {
             let authority = self.lock_authority()?;
-            for binding_digest in owned.binding_digests {
+            for input in &owned.inputs {
                 let evidence = authority
-                    .provider_capture_binding_evidence(binding_digest)?
+                    .provider_capture_binding_evidence(input.binding_digest)?
                     .ok_or(IngestError::ProviderCaptureRequired)?;
-                if evidence.binding_digest() != binding_digest
+                if evidence.binding_digest() != input.binding_digest
                     || evidence.capture().source_id() != &owned.source_id
+                    || evidence.record_count() != input.record_count
                 {
                     return Err(IngestError::ProviderCaptureRequired);
                 }
-                bindings.push(evidence);
+                verify_persisted_provider_capture_binding(&evidence, store)?;
+                let output = grouped_inputs
+                    .get_mut(input.output_artifact_ordinal)
+                    .ok_or(IngestError::ProviderCaptureRequired)?;
+                if input.object_input_ordinal != output.len() {
+                    return Err(IngestError::ProviderCaptureRequired);
+                }
+                output.push(GenerationOwnedProviderCaptureInputEvidence {
+                    input_ordinal: input.input_ordinal,
+                    object_input_ordinal: input.object_input_ordinal,
+                    binding: evidence,
+                });
             }
         }
-        for evidence in &bindings {
-            verify_persisted_provider_capture_binding(evidence, store)?;
+        let mut objects = Vec::new();
+        objects
+            .try_reserve_exact(object_count)
+            .map_err(|_| IngestError::ProviderCaptureRequired)?;
+        let mut next_global_input = 0_usize;
+        for (publication_ordinal, inputs) in grouped_inputs.into_iter().enumerate() {
+            let generation_object_ordinal = owned
+                .suffix_start
+                .checked_add(publication_ordinal)
+                .ok_or(IngestError::ProviderCaptureRequired)?;
+            let object = owned
+                .pinned
+                .objects()
+                .get(generation_object_ordinal)
+                .ok_or(IngestError::ProviderCaptureRequired)?;
+            let canonical_rows = inputs.iter().try_fold(0_u64, |total, input| {
+                if input.input_ordinal != next_global_input {
+                    return Err(IngestError::ProviderCaptureRequired);
+                }
+                next_global_input += 1;
+                total
+                    .checked_add(
+                        u64::try_from(input.binding.record_count())
+                            .map_err(|_| IngestError::ProviderCaptureRequired)?,
+                    )
+                    .ok_or(IngestError::ProviderCaptureRequired)
+            })?;
+            if inputs.is_empty() || canonical_rows != object.object().row_count() {
+                return Err(IngestError::ProviderCaptureRequired);
+            }
+            objects.push(GenerationOwnedProviderCaptureObjectEvidence {
+                publication_ordinal,
+                generation_object_ordinal,
+                object: object.clone(),
+                inputs: inputs.into_boxed_slice(),
+            });
         }
-        let canonical_rows = bindings.iter().try_fold(0_u64, |total, binding| {
-            total
-                .checked_add(
-                    u64::try_from(binding.record_count())
-                        .map_err(|_| IngestError::ProviderCaptureRequired)?,
-                )
-                .ok_or(IngestError::ProviderCaptureRequired)
-        })?;
-        if bindings.is_empty()
-            || canonical_rows
-                != owned.pinned.objects()[owned.anchor_object_ordinal]
-                    .object()
-                    .row_count()
-        {
+        if next_global_input != owned.inputs.len() {
             return Err(IngestError::ProviderCaptureRequired);
         }
         Ok(GenerationOwnedProviderCaptureEvidence {
             pinned: owned.pinned,
             source_id: owned.source_id,
-            anchor_object_ordinal: owned.anchor_object_ordinal,
-            bindings: bindings.into_boxed_slice(),
+            objects: objects.into_boxed_slice(),
+            receipt_digest: owned.receipt_digest,
         })
     }
 
@@ -2974,7 +3073,7 @@ impl AnalyticalDataService {
             dataset_name,
             schema,
             plan,
-            published,
+            std::slice::from_ref(&published),
             GenerationKind::Compaction,
             None,
             None,
@@ -3080,11 +3179,14 @@ impl AnalyticalDataService {
             if run.state() == IngestRunState::Failed {
                 return Err(IngestError::TerminalRun);
             }
-            if provider_binding.is_some() && run.state() == IngestRunState::Succeeded {
+            if let Some(provider_binding) = provider_binding
+                && run.state() == IngestRunState::Succeeded
+            {
                 return self.reconcile_succeeded_provider_run(
                     &authority,
                     &reservation,
                     &analytical_dataset,
+                    provider_binding,
                     company_identity.as_ref(),
                 );
             }
@@ -3223,7 +3325,7 @@ impl AnalyticalDataService {
             dataset_name,
             schema,
             plan,
-            published,
+            std::slice::from_ref(&published),
             GenerationKind::Ingest,
             precommit_authority.as_deref(),
             company_identity.as_ref(),
@@ -3331,7 +3433,7 @@ impl AnalyticalDataService {
             total_rows,
             chunks,
         } = input;
-        if chunks.len() != prepared_captures.len() {
+        if chunks.len() != prepared_captures.len() || !(1..=1024).contains(&chunks.len()) {
             return Err(IngestError::InvalidProviderMacroPlan);
         }
         let total_chunks =
@@ -3340,11 +3442,53 @@ impl AnalyticalDataService {
             .checked_add(REVISION_ASSIGNMENT_DEADLINE)
             .ok_or(IngestError::DeadlineExceeded)?;
         let revision_authority = self.observed_revision_authority();
-        let mut canonical_batches = Vec::new();
-        canonical_batches
-            .try_reserve_exact(chunks.len())
+        let schema = crate::DatasetSchemaRegistry::local()
+            .canonical_research_observations()
+            .map_err(ArrowConversionError::from)?;
+        self.manifests
+            .validate_append_schema(&analytical_dataset, &schema)?;
+        let dataset_name = SourceIdentifier::try_from(analytical_dataset.as_str())
+            .map_err(|_| IngestError::InvalidDataset)?;
+        let _operation = self
+            .operation_gate
+            .acquire(&cancellation)
+            .await
+            .ok_or(IngestError::Cancelled)?;
+        {
+            let authority = self.lock_authority()?;
+            let run = self.validate_run(
+                &authority,
+                &reservation,
+                publication_digest,
+                Some(&source_id),
+            )?;
+            if run.state() != IngestRunState::Reserved {
+                return Err(IngestError::TerminalRun);
+            }
+        }
+        let publication = self.objects.begin_publication(&cancellation).await?;
+        let mut published = Vec::new();
+        let artifact_capacity = chunks
+            .len()
+            .div_ceil(STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT);
+        published
+            .try_reserve_exact(artifact_capacity)
             .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
-        for (chunk, prepared) in chunks.into_vec().into_iter().zip(prepared_captures.iter()) {
+        let mut objects = Vec::new();
+        objects
+            .try_reserve_exact(artifact_capacity)
+            .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
+        let mut pending_batches = Vec::new();
+        pending_batches
+            .try_reserve_exact(STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT)
+            .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
+        let mut published_rows = 0_u64;
+        for (input_ordinal, (chunk, prepared)) in chunks
+            .into_vec()
+            .into_iter()
+            .zip(prepared_captures.iter())
+            .enumerate()
+        {
             if cancellation.is_cancelled() {
                 return Err(IngestError::Cancelled);
             }
@@ -3376,60 +3520,50 @@ impl AnalyticalDataService {
                 assignments.as_slice(),
                 prepared,
             )?;
-            canonical_batches.push(converted.record_batch().clone());
-        }
-        let converted = ResearchArrowBatch::try_from_compaction_batches(
-            provider_dataset,
-            publication_digest,
-            canonical_batches,
-        )?;
-        if u64::try_from(converted.record_batch().num_rows()) != Ok(total_rows) {
-            return Err(IngestError::InvalidProviderMacroPlan);
-        }
-        let schema = converted.schema_ref().clone();
-        let lineage = converted.lineage_digest()?;
-        let converted = DatasetArrowBatch::from(converted);
-        self.manifests
-            .validate_append_schema(&analytical_dataset, &schema)?;
-        let dataset_name = SourceIdentifier::try_from(analytical_dataset.as_str())
-            .map_err(|_| IngestError::InvalidDataset)?;
-        let _operation = self
-            .operation_gate
-            .acquire(&cancellation)
-            .await
-            .ok_or(IngestError::Cancelled)?;
-        {
-            let authority = self.lock_authority()?;
-            let run = self.validate_run(
-                &authority,
-                &reservation,
+            if converted.schema_ref() != &schema {
+                return Err(IngestError::InvalidProviderMacroPlan);
+            }
+            pending_batches.push(converted.record_batch().clone());
+            let is_last_input = input_ordinal + 1 == prepared_captures.len();
+            if pending_batches.len() < STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT && !is_last_input {
+                continue;
+            }
+            let grouped = ResearchArrowBatch::try_from_compaction_batches(
+                provider_dataset.clone(),
                 publication_digest,
-                Some(&source_id),
+                std::mem::take(&mut pending_batches),
             )?;
-            if run.state() != IngestRunState::Reserved {
-                return Err(IngestError::TerminalRun);
+            let lineage = grouped.lineage_digest()?;
+            let grouped = DatasetArrowBatch::from(grouped);
+            let published_object = self
+                .objects
+                .publish_dataset_under_lease(&grouped, &cancellation, &publication)
+                .await?;
+            published_rows = published_rows
+                .checked_add(published_object.row_count())
+                .ok_or(IngestError::InvalidProviderMacroPlan)?;
+            objects.push(ManifestObject::try_new(
+                published_object.content_hash(),
+                published_object.row_count(),
+                published_object.size_bytes(),
+                Sha256Digest::new(lineage.bytes()),
+            )?);
+            published.push(published_object);
+            if !is_last_input {
+                pending_batches
+                    .try_reserve_exact(STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT)
+                    .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
             }
         }
-        let publication = self.objects.begin_publication(&cancellation).await?;
-        let published = self
-            .objects
-            .publish_dataset_under_lease(&converted, &cancellation, &publication)
-            .await?;
         if cancellation.is_cancelled() {
             return Err(IngestError::Cancelled);
         }
-        let object = ManifestObject::try_new(
-            published.content_hash(),
-            published.row_count(),
-            published.size_bytes(),
-            Sha256Digest::new(lineage.bytes()),
-        )?;
-        if object.row_count() != total_rows {
+        if published_rows != total_rows {
             return Err(IngestError::InvalidProviderMacroPlan);
         }
         let plan = self
             .manifests
-            .preview_append(analytical_dataset, &schema, vec![object])?;
+            .preview_append(analytical_dataset, &schema, objects)?;
         let authority = self.lock_authority()?;
         let run = self.validate_run(
             &authority,
@@ -3441,22 +3575,40 @@ impl AnalyticalDataService {
             return Err(IngestError::TerminalRun);
         }
         precommit_authority.validate_precommit()?;
-        let created_at = published.created_at().max(reservation.requested_at());
-        let artifact = ArtifactRecord::try_new(
-            published.relative_reference(),
-            published.content_hash().evidence(),
-            published.size_bytes(),
-            created_at,
-        )?;
+        let mut artifacts = Vec::new();
+        artifacts
+            .try_reserve_exact(published.len())
+            .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
+        for published in &published {
+            artifacts.push(ArtifactRecord::try_new(
+                published.relative_reference(),
+                published.content_hash().evidence(),
+                published.size_bytes(),
+                published.created_at().max(reservation.requested_at()),
+            )?);
+        }
+        let final_artifact = artifacts
+            .last()
+            .ok_or(IngestError::InvalidProviderMacroPlan)?;
+        let created_at = artifacts
+            .iter()
+            .map(ArtifactRecord::created_at)
+            .max()
+            .ok_or(IngestError::InvalidProviderMacroPlan)?;
         let anchor = DatasetManifestRecord::try_new(
             dataset_name,
             schema.version(),
-            artifact.artifact_id(),
+            final_artifact.artifact_id(),
             plan.content_hash().evidence(),
             created_at,
         );
         let capture_coordinates = (0..prepared_captures.len())
-            .map(|ordinal| ProviderArtifactInputCoordinate::try_new(0, ordinal))
+            .map(|ordinal| {
+                ProviderArtifactInputCoordinate::try_new(
+                    ordinal / STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT,
+                    ordinal % STREAMING_PUBLICATION_INPUTS_PER_ARTIFACT,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let (manifest, catalog_receipt_digest) = self
             .manifests
@@ -3465,7 +3617,7 @@ impl AnalyticalDataService {
                 authority.result_limits(),
                 &reservation,
                 &plan,
-                std::slice::from_ref(&artifact),
+                &artifacts,
                 &anchor,
                 &schema,
                 &run,
@@ -3601,7 +3753,7 @@ impl AnalyticalDataService {
             dataset_name,
             schema,
             plan,
-            published,
+            std::slice::from_ref(&published),
             GenerationKind::Ingest,
             Some(precommit_authority.as_ref()),
             None,
@@ -3701,7 +3853,7 @@ impl AnalyticalDataService {
                 .map_err(|_| IngestError::InvalidDataset)?,
             schema,
             plan,
-            published,
+            std::slice::from_ref(&published),
             GenerationKind::Ingest,
             Some(precommit_authority.as_ref()),
             None,
@@ -3788,7 +3940,7 @@ impl AnalyticalDataService {
                 .map_err(|_| IngestError::InvalidDataset)?,
             schema,
             plan,
-            published,
+            std::slice::from_ref(&published),
             GenerationKind::Ingest,
             Some(precommit_authority.as_ref()),
             None,
@@ -3971,6 +4123,15 @@ impl AnalyticalDataService {
             .provider_publication_bindings(existing.manifest())?;
         if existing.manifest().dataset_id() != dataset_id
             || !input.matches_persisted(&retained)
+            || !authority
+                .catalog()
+                .provider_publication_input_matches_for_run(
+                    reservation.run_id(),
+                    retained.publication_digest(),
+                    retained.publication_kind(),
+                    input.source_id(),
+                    ProviderArtifactInputCoordinate::try_new(0, 0)?,
+                )?
             || !generation.iter().any(|(digest, kind)| {
                 *digest == retained.publication_digest() && kind == retained.publication_kind()
             })
@@ -4012,6 +4173,15 @@ impl AnalyticalDataService {
             .provider_publication_bindings(existing.manifest())?;
         if existing.manifest().dataset_id() != dataset_id
             || !input.matches_persisted(&retained)
+            || !authority
+                .catalog()
+                .provider_publication_input_matches_for_run(
+                    reservation.run_id(),
+                    retained.binding_digest(),
+                    retained.publication_kind_name(),
+                    input.source_id().as_str(),
+                    ProviderArtifactInputCoordinate::try_new(0, 0)?,
+                )?
             || !generation.iter().any(|(digest, kind)| {
                 *digest == retained.binding_digest() && kind == retained.publication_kind_name()
             })
@@ -4040,6 +4210,15 @@ impl AnalyticalDataService {
             .provider_publication_bindings(existing.manifest())?;
         if existing.manifest().dataset_id() != dataset_id
             || retained.binding_digest() != binding_digest
+            || !authority
+                .catalog()
+                .provider_publication_input_matches_for_run(
+                    reservation.run_id(),
+                    binding_digest,
+                    "provider_logical",
+                    retained.terminal().source_id().as_str(),
+                    ProviderArtifactInputCoordinate::try_new(0, 0)?,
+                )?
             || !generation
                 .iter()
                 .any(|(digest, kind)| *digest == binding_digest && kind == "provider_logical")
@@ -4095,6 +4274,7 @@ impl AnalyticalDataService {
         authority: &CatalogAuthority,
         reservation: &IngestReservation,
         dataset_id: &DatasetId,
+        input: &PreparedProviderCaptureBinding,
         company_identity: Option<&CompanyIdentityObservation>,
     ) -> Result<CommittedDataset, IngestError> {
         let existing = self
@@ -4107,10 +4287,22 @@ impl AnalyticalDataService {
         let retained = authority
             .provider_capture_for_run(reservation.run_id())?
             .ok_or(IngestError::IncompleteSuccessfulRun)?;
+        let owned = self
+            .manifests
+            .generation_owned_provider_captures(existing.manifest())?;
         let generation_bindings = self
             .manifests
             .provider_capture_binding_digests(existing.manifest())?;
-        if !generation_bindings.contains(&retained.binding_digest()) {
+        if input.evidence != retained
+            || owned.suffix_start + owned.inputs.len() != owned.pinned.objects().len()
+            || owned.inputs.len() != 1
+            || owned.inputs[0].input_ordinal != 0
+            || owned.inputs[0].output_artifact_ordinal != 0
+            || owned.inputs[0].object_input_ordinal != 0
+            || owned.inputs[0].binding_digest != retained.binding_digest()
+            || owned.inputs[0].record_count != retained.record_count()
+            || !generation_bindings.contains(&retained.binding_digest())
+        {
             return Err(IngestError::ReplayConflict);
         }
         authority.validate_provider_company_identity_replay(reservation, company_identity)?;
@@ -4178,7 +4370,7 @@ impl AnalyticalDataService {
         dataset_name: SourceIdentifier,
         schema: DatasetSchemaRef,
         plan: ManifestPlan,
-        published: PublishedObject,
+        published: &[PublishedObject],
         kind: GenerationKind,
         precommit_authority: Option<&dyn IngestPrecommitAuthority>,
         company_identity: Option<&CompanyIdentityObservation>,
@@ -4191,17 +4383,31 @@ impl AnalyticalDataService {
         if let Some(precommit_authority) = precommit_authority {
             precommit_authority.validate_precommit()?;
         }
-        let created_at = published.created_at().max(reservation.requested_at());
-        let artifact = ArtifactRecord::try_new(
-            published.relative_reference(),
-            published.content_hash().evidence(),
-            published.size_bytes(),
-            created_at,
-        )?;
+        if published.is_empty() || published.len() > 1024 {
+            return Err(IngestError::InvalidDataset);
+        }
+        let mut artifacts = Vec::new();
+        artifacts
+            .try_reserve_exact(published.len())
+            .map_err(|_| IngestError::InvalidDataset)?;
+        for published in published {
+            artifacts.push(ArtifactRecord::try_new(
+                published.relative_reference(),
+                published.content_hash().evidence(),
+                published.size_bytes(),
+                published.created_at().max(reservation.requested_at()),
+            )?);
+        }
+        let final_artifact = artifacts.last().ok_or(IngestError::InvalidDataset)?;
+        let created_at = artifacts
+            .iter()
+            .map(ArtifactRecord::created_at)
+            .max()
+            .ok_or(IngestError::InvalidDataset)?;
         let anchor = DatasetManifestRecord::try_new(
             dataset_name,
             schema.version(),
-            artifact.artifact_id(),
+            final_artifact.artifact_id(),
             plan.content_hash().evidence(),
             created_at,
         );
@@ -4233,7 +4439,7 @@ impl AnalyticalDataService {
                     authority.result_limits(),
                     reservation,
                     &plan,
-                    std::slice::from_ref(&artifact),
+                    &artifacts,
                     &anchor,
                     &schema,
                     run,
@@ -4247,31 +4453,22 @@ impl AnalyticalDataService {
                 })?;
             return Ok(CommittedDataset::new(self.manifests.pinned(&manifest)?));
         }
-        if !matches!(source_evidence, PublicationSourceEvidence::NoNewRawInput) {
+        if !matches!(source_evidence, PublicationSourceEvidence::NoNewRawInput)
+            || kind != GenerationKind::Compaction
+        {
             return Err(IngestError::ProviderCaptureRequired);
         }
-        let publication = authority.publish_artifact_manifest_with_source_evidence(
+        if artifacts.len() != 1 {
+            return Err(IngestError::InvalidDataset);
+        }
+        let manifest = self.manifests.commit_compaction_publication(
+            self.catalog_id,
+            authority.result_limits(),
             reservation,
-            std::slice::from_ref(&artifact),
-            &anchor,
-            source_evidence,
-        )?;
-        let manifest = self.manifests.commit_generation(
             &plan,
-            publication.artifacts(),
-            publication.manifest(),
+            &artifacts[0],
+            &anchor,
             &schema,
-            kind,
-            match kind {
-                GenerationKind::Ingest => Some(run),
-                GenerationKind::Compaction | GenerationKind::Derived => None,
-            },
-            market_bar_history,
-        )?;
-        authority.complete_ingest_with_company_identity(
-            reservation,
-            ContractCompletion::Succeeded,
-            company_identity,
         )?;
         Ok(CommittedDataset::new(self.manifests.pinned(&manifest)?))
     }

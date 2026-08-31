@@ -192,7 +192,8 @@ pub use fund_holdings::{
 };
 pub use ingest::{
     AnalyticalDataService, CommittedDataset, CompactionRequest,
-    GenerationOwnedProviderCaptureEvidence, IngestError, IngestPrecommitAuthority,
+    GenerationOwnedProviderCaptureEvidence, GenerationOwnedProviderCaptureInputEvidence,
+    GenerationOwnedProviderCaptureObjectEvidence, IngestError, IngestPrecommitAuthority,
     ListingReferenceAdmissionCapability, PendingProviderMacroPlanPublication,
     PinnedArtifactQueryRequest, ProviderMacroPlanChunkInput, ProviderMacroPlanPublicationInput,
     ProviderMacroPlanPublicationReceipt, ProviderMacroPlanRestartSelector,

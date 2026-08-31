@@ -100,8 +100,12 @@ impl PinnedRegistrationAdmission {
         let object_inline = objects
             .checked_mul(size_of::<VerifiedPinnedObject>())
             .ok_or(QueryError::SizeOverflow)?;
+        let lookup_inline = objects
+            .checked_mul(size_of::<usize>())
+            .ok_or(QueryError::SizeOverflow)?;
         let retained = REGISTRATION_FIXED_RECEIPT
             .checked_add(object_inline)
+            .and_then(|value| value.checked_add(lookup_inline))
             .and_then(|value| value.checked_add(references))
             .and_then(|value| value.checked_add(capture_peak))
             .ok_or(QueryError::SizeOverflow)?;
@@ -110,6 +114,7 @@ impl PinnedRegistrationAdmission {
         let construction_peak = retained
             .checked_add(references)
             .and_then(|value| value.checked_add(object_inline))
+            .and_then(|value| value.checked_add(lookup_inline))
             .ok_or(QueryError::SizeOverflow)?;
         super::super::budget::reserve_memory(&reservation, construction_peak, limit)?;
         Ok(Self {
@@ -152,14 +157,25 @@ impl PinnedRegistrationBundle {
         for file in &mut verified {
             file.bind_reader_schema(Arc::clone(&schema))?;
         }
-        verified.sort_unstable_by(|left, right| {
-            left.relative_reference().cmp(right.relative_reference())
+        let mut lookup = Vec::new();
+        lookup
+            .try_reserve_exact(verified.len())
+            .map_err(|_| QueryError::DependencyAllocationContract)?;
+        lookup.extend(0..verified.len());
+        lookup.sort_unstable_by(|left, right| {
+            verified[*left]
+                .relative_reference()
+                .cmp(verified[*right].relative_reference())
         });
-        if verified
-            .windows(2)
-            .any(|pair| pair[0].relative_reference() >= pair[1].relative_reference())
-        {
+        if lookup.windows(2).any(|pair| {
+            verified[pair[0]].relative_reference() >= verified[pair[1]].relative_reference()
+        }) {
             return Err(QueryError::InvalidSource);
+        }
+        let lookup_allocation = lookup.as_ptr();
+        let lookup = lookup.into_boxed_slice();
+        if lookup.as_ptr() != lookup_allocation {
+            return Err(QueryError::DependencyAllocationContract);
         }
         let allocation = verified.as_ptr();
         let verified = verified.into_boxed_slice();
@@ -182,6 +198,7 @@ impl PinnedRegistrationBundle {
         )?);
         let store = Arc::new(PinnedReadOnlyObjectStore::new_exact(
             files,
+            lookup,
             memory_pool,
             supervisor,
             Arc::clone(&retained_metadata),
@@ -230,9 +247,14 @@ fn verified_retained_bytes(verified: &[VerifiedPinnedObject]) -> Result<usize, Q
         .len()
         .checked_mul(size_of::<VerifiedPinnedObject>())
         .ok_or(QueryError::SizeOverflow)?;
+    let lookup_inline = verified
+        .len()
+        .checked_mul(size_of::<usize>())
+        .ok_or(QueryError::SizeOverflow)?;
     verified.iter().try_fold(
         REGISTRATION_FIXED_RECEIPT
             .checked_add(inline)
+            .and_then(|value| value.checked_add(lookup_inline))
             .ok_or(QueryError::SizeOverflow)?,
         |total, object| {
             let file_bytes =

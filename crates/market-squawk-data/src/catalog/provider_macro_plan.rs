@@ -30,6 +30,7 @@ const PROVIDER_MACRO_PLAN_RECORD_OVERHEAD_BYTES: usize = 4 * 1024;
 const REQUEST_SET_DOMAIN: &[u8] = b"market-squawk/provider-macro-plan/request-set/v1";
 const PUBLICATION_DOMAIN: &[u8] = b"market-squawk/provider-macro-plan/publication/v1";
 const CATALOG_RECEIPT_DOMAIN: &[u8] = b"market-squawk/provider-macro-plan/catalog-receipt/v1";
+const CATALOG_OUTPUT_MAPPING_DOMAIN: &[u8] = b"market-squawk/provider-macro-plan/output-mapping/v1";
 const CHUNKED_VALUE_DOMAIN: &[u8] = b"market-squawk/provider-macro-plan/chunked-value/v1";
 const PUBLICATION_AUDIT_EVENT: &str = "provider-macro-plan.published";
 
@@ -1461,11 +1462,7 @@ pub(crate) fn retain_completed_provider_macro_plan_for_run(
     }
     let pages = load_page_identities(transaction, commit.session.session_id)?;
     if coordinates.len() != pages.len()
-        || coordinates.iter().enumerate().any(|(ordinal, coordinate)| {
-            coordinates[..ordinal]
-                .iter()
-                .any(|prior| prior == coordinate)
-        })
+        || !super::provider_capture::provider_artifact_input_coordinates_are_ordered(coordinates)
     {
         return Err(CatalogError::ProviderCaptureConflict);
     }
@@ -1504,6 +1501,54 @@ pub(crate) fn retain_completed_provider_macro_plan_for_run(
         commit.publication_digest.bytes(),
         recorded_at,
     )
+}
+
+pub(crate) fn completed_provider_macro_plan_inputs_match_run(
+    connection: &Connection,
+    run_id: Uuid,
+    commit: &ProviderMacroPlanPublicationCommit,
+    coordinates: &[ProviderArtifactInputCoordinate],
+) -> Result<bool, CatalogError> {
+    let completed = load_completed_session(connection, commit.session.session_id)?;
+    if completed.coordinate != commit.session
+        || completed.publication_digest != commit.publication_digest
+    {
+        return Ok(false);
+    }
+    let pages = load_page_identities(connection, commit.session.session_id)?;
+    if pages.len() != coordinates.len()
+        || !super::provider_capture::provider_artifact_input_coordinates_are_ordered(coordinates)
+    {
+        return Ok(false);
+    }
+    let mut statement = connection.prepare(
+        "SELECT input_ordinal, output_artifact_ordinal, object_input_ordinal,
+                binding_digest, source_id
+         FROM ingest_run_provider_capture_bindings
+         WHERE run_id=?1 ORDER BY input_ordinal LIMIT ?2",
+    )?;
+    let mut rows = statement.query(params![
+        run_id.to_string(),
+        i64::try_from(MAX_PROVIDER_MACRO_PLAN_DATA_PAGES + 1)
+            .map_err(|_| CatalogError::InvalidRecord)?,
+    ])?;
+    let mut ordinal = 0_usize;
+    while let Some(row) = rows.next()? {
+        if ordinal >= pages.len()
+            || row.get::<_, i64>(0)?
+                != i64::try_from(ordinal).map_err(|_| CatalogError::CorruptCatalog)?
+            || usize::try_from(row.get::<_, i64>(1)?).ok()
+                != Some(coordinates[ordinal].output_artifact_ordinal())
+            || usize::try_from(row.get::<_, i64>(2)?).ok()
+                != Some(coordinates[ordinal].object_input_ordinal())
+            || parse_sha256(&row.get::<_, Vec<u8>>(3)?)? != pages[ordinal].binding_digest
+            || row.get::<_, String>(4)? != completed.key.source_id.as_str()
+        {
+            return Ok(false);
+        }
+        ordinal += 1;
+    }
+    Ok(ordinal == pages.len())
 }
 
 pub(crate) fn load_provider_macro_plan_head(
@@ -1565,12 +1610,21 @@ pub(crate) fn publish_provider_macro_plan_record(
     if current_head != commit.expected_head {
         return Err(CatalogError::ProviderCaptureConflict);
     }
+    let pages = load_page_identities(transaction, commit.session.session_id)?;
+    verify_generation_page_bindings(transaction, generation_sequence, run_id, &pages)?;
+    let output_mapping_digest = provider_macro_plan_output_mapping_digest(
+        transaction,
+        generation_sequence,
+        run_id,
+        &pages,
+    )?;
     let receipt = catalog_receipt_digest(
         manifest,
         anchor_manifest_id,
         run_id,
         &completed,
         current_head.as_ref(),
+        output_mapping_digest,
     )?;
     transaction.execute(
         "INSERT INTO provider_macro_plan_publications
@@ -1814,13 +1868,21 @@ pub(crate) fn reconstruct_provider_macro_plan_projection(
     let anchor = Uuid::parse_str(&row.3).map_err(|_| CatalogError::CorruptCatalog)?;
     let run_id = Uuid::parse_str(&row.18).map_err(|_| CatalogError::CorruptCatalog)?;
     let generation_sequence = u64::try_from(row.0).map_err(|_| CatalogError::CorruptCatalog)?;
-    if catalog_receipt_digest(manifest, anchor, run_id, &completed, predecessor.as_ref())?
-        != catalog_receipt
+    let pages = load_page_identities(connection, session_id)?;
+    verify_generation_page_bindings(connection, row.0, run_id, &pages)?;
+    let output_mapping_digest =
+        provider_macro_plan_output_mapping_digest(connection, row.0, run_id, &pages)?;
+    if catalog_receipt_digest(
+        manifest,
+        anchor,
+        run_id,
+        &completed,
+        predecessor.as_ref(),
+        output_mapping_digest,
+    )? != catalog_receipt
     {
         return Err(CatalogError::CorruptCatalog);
     }
-    let pages = load_page_identities(connection, session_id)?;
-    verify_generation_page_bindings(connection, row.0, run_id, &pages)?;
     let successor = ProviderMacroPlanPublishedHead {
         publication_digest,
         manifest_dataset: manifest.dataset_id().clone(),
@@ -1847,7 +1909,7 @@ fn verify_generation_page_bindings(
     pages: &[StoredPageIdentity],
 ) -> Result<(), CatalogError> {
     let mut statement = connection.prepare(
-        "SELECT input_ordinal, binding_digest
+        "SELECT input_ordinal, output_artifact_ordinal, object_input_ordinal, binding_digest
          FROM ingest_run_provider_capture_bindings
          WHERE run_id=?1 ORDER BY input_ordinal LIMIT ?2",
     )?;
@@ -1857,14 +1919,28 @@ fn verify_generation_page_bindings(
             .map_err(|_| CatalogError::InvalidRecord)?,
     ])?;
     let mut ordinal = 0usize;
+    let mut prior_coordinate = None;
     while let Some(input) = inputs.next()? {
+        let output_ordinal =
+            usize::try_from(input.get::<_, i64>(1)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        let object_input_ordinal =
+            usize::try_from(input.get::<_, i64>(2)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        let follows = match prior_coordinate {
+            None => output_ordinal == 0 && object_input_ordinal == 0,
+            Some((prior_output, prior_local)) => {
+                (output_ordinal == prior_output && object_input_ordinal == prior_local + 1)
+                    || (output_ordinal == prior_output + 1 && object_input_ordinal == 0)
+            }
+        };
         if ordinal >= pages.len()
             || input.get::<_, i64>(0)?
                 != i64::try_from(ordinal).map_err(|_| CatalogError::CorruptCatalog)?
-            || parse_sha256(&input.get::<_, Vec<u8>>(1)?)? != pages[ordinal].binding_digest
+            || !follows
+            || parse_sha256(&input.get::<_, Vec<u8>>(3)?)? != pages[ordinal].binding_digest
         {
             return Err(CatalogError::CorruptCatalog);
         }
+        prior_coordinate = Some((output_ordinal, object_input_ordinal));
         ordinal += 1;
     }
     if ordinal != pages.len() {
@@ -1899,12 +1975,208 @@ fn verify_generation_page_bindings(
     Ok(())
 }
 
+fn provider_macro_plan_output_mapping_digest(
+    connection: &Connection,
+    generation_sequence: i64,
+    run_id: Uuid,
+    pages: &[StoredPageIdentity],
+) -> Result<EvidenceDigest, CatalogError> {
+    if generation_sequence <= 0 || pages.is_empty() {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    let artifact_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM artifacts WHERE run_id=?1",
+        [run_id.to_string()],
+        |row| row.get(0),
+    )?;
+    let artifact_count = usize::try_from(artifact_count)
+        .ok()
+        .filter(|count| (1..=1024).contains(count))
+        .ok_or(CatalogError::CorruptCatalog)?;
+    let generation_object_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM analytical_generation_objects AS object
+         JOIN analytical_generations AS generation
+           ON generation.dataset_id=object.dataset_id
+          AND generation.manifest_version=object.manifest_version
+         WHERE generation.generation_sequence=?1",
+        [generation_sequence],
+        |row| row.get(0),
+    )?;
+    let suffix_start = usize::try_from(generation_object_count)
+        .ok()
+        .and_then(|count| count.checked_sub(artifact_count))
+        .ok_or(CatalogError::CorruptCatalog)?;
+    let mut object_rows = Vec::new();
+    object_rows
+        .try_reserve_exact(artifact_count)
+        .map_err(|_| CatalogError::Allocation)?;
+    let mut hash = Sha256::new();
+    hash.update(CATALOG_OUTPUT_MAPPING_DOMAIN);
+    hash.update(
+        u64::try_from(generation_sequence)
+            .map_err(|_| CatalogError::CorruptCatalog)?
+            .to_be_bytes(),
+    );
+    hash.update(run_id.as_bytes());
+    hash.update(
+        u16::try_from(suffix_start)
+            .map_err(|_| CatalogError::CorruptCatalog)?
+            .to_be_bytes(),
+    );
+    hash.update(
+        u16::try_from(artifact_count)
+            .map_err(|_| CatalogError::CorruptCatalog)?
+            .to_be_bytes(),
+    );
+    let mut output_statement = connection.prepare(
+        "SELECT output.publication_ordinal, output.artifact_id,
+                output.content_algorithm, output.content_digest, output.size_bytes,
+                object.ordinal, object.content_hash, object.lineage_hash,
+                object.row_count, object.size_bytes
+         FROM artifacts AS output
+         JOIN analytical_generations AS generation
+           ON generation.generation_sequence=?1
+         JOIN analytical_generation_objects AS object
+           ON object.dataset_id=generation.dataset_id
+          AND object.manifest_version=generation.manifest_version
+          AND object.artifact_id=output.artifact_id
+         WHERE output.run_id=?2 ORDER BY output.publication_ordinal LIMIT 1025",
+    )?;
+    let mut outputs = output_statement.query(params![generation_sequence, run_id.to_string()])?;
+    let mut output_ordinal = 0_usize;
+    while let Some(output) = outputs.next()? {
+        if output_ordinal == artifact_count
+            || output.get::<_, i64>(0)?
+                != i64::try_from(output_ordinal).map_err(|_| CatalogError::CorruptCatalog)?
+            || output.get::<_, i64>(2)? != 1
+            || output.get::<_, i64>(5)?
+                != i64::try_from(suffix_start + output_ordinal)
+                    .map_err(|_| CatalogError::CorruptCatalog)?
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let artifact_id = Uuid::parse_str(&output.get::<_, String>(1)?)
+            .map_err(|_| CatalogError::CorruptCatalog)?;
+        let artifact_digest = parse_sha256(&output.get::<_, Vec<u8>>(3)?)?;
+        let artifact_size =
+            u64::try_from(output.get::<_, i64>(4)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        let object_digest = parse_sha256(&output.get::<_, Vec<u8>>(6)?)?;
+        let lineage_digest = parse_sha256(&output.get::<_, Vec<u8>>(7)?)?;
+        let row_count =
+            u64::try_from(output.get::<_, i64>(8)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        let object_size =
+            u64::try_from(output.get::<_, i64>(9)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        if artifact_digest != object_digest || artifact_size != object_size || row_count == 0 {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        hash.update(
+            u16::try_from(output_ordinal)
+                .map_err(|_| CatalogError::CorruptCatalog)?
+                .to_be_bytes(),
+        );
+        hash.update(
+            u16::try_from(suffix_start + output_ordinal)
+                .map_err(|_| CatalogError::CorruptCatalog)?
+                .to_be_bytes(),
+        );
+        hash.update(artifact_id.as_bytes());
+        hash.update(object_digest.bytes());
+        hash.update(lineage_digest.bytes());
+        hash.update(row_count.to_be_bytes());
+        hash.update(object_size.to_be_bytes());
+        object_rows.push(row_count);
+        output_ordinal += 1;
+    }
+    if output_ordinal != artifact_count {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    let mut mapped_rows = Vec::new();
+    mapped_rows
+        .try_reserve_exact(artifact_count)
+        .map_err(|_| CatalogError::Allocation)?;
+    mapped_rows.resize(artifact_count, 0_u64);
+    let mut input_statement = connection.prepare(
+        "SELECT input.input_ordinal, input.output_artifact_ordinal,
+                input.object_input_ordinal, input.binding_digest,
+                binding.canonical_record_count
+         FROM ingest_run_provider_capture_bindings AS input
+         JOIN provider_capture_bindings AS binding USING (binding_digest)
+         WHERE input.run_id=?1 ORDER BY input.input_ordinal LIMIT ?2",
+    )?;
+    let mut inputs = input_statement.query(params![
+        run_id.to_string(),
+        i64::try_from(MAX_PROVIDER_MACRO_PLAN_DATA_PAGES + 1)
+            .map_err(|_| CatalogError::InvalidRecord)?,
+    ])?;
+    let mut input_ordinal = 0_usize;
+    let mut prior_coordinate = None;
+    while let Some(input) = inputs.next()? {
+        if input_ordinal >= pages.len()
+            || input.get::<_, i64>(0)?
+                != i64::try_from(input_ordinal).map_err(|_| CatalogError::CorruptCatalog)?
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let output_ordinal =
+            usize::try_from(input.get::<_, i64>(1)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        let object_input_ordinal =
+            usize::try_from(input.get::<_, i64>(2)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        let binding_digest = parse_sha256(&input.get::<_, Vec<u8>>(3)?)?;
+        let row_count =
+            u64::try_from(input.get::<_, i64>(4)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        let follows = match prior_coordinate {
+            None => output_ordinal == 0 && object_input_ordinal == 0,
+            Some((prior_output, prior_local)) => {
+                (output_ordinal == prior_output && object_input_ordinal == prior_local + 1)
+                    || (output_ordinal == prior_output + 1 && object_input_ordinal == 0)
+            }
+        };
+        if !follows
+            || output_ordinal >= artifact_count
+            || binding_digest != pages[input_ordinal].binding_digest
+            || row_count != pages[input_ordinal].canonical_record_count
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        mapped_rows[output_ordinal] = mapped_rows[output_ordinal]
+            .checked_add(row_count)
+            .ok_or(CatalogError::InvalidRecord)?;
+        hash.update(
+            u16::try_from(input_ordinal)
+                .map_err(|_| CatalogError::CorruptCatalog)?
+                .to_be_bytes(),
+        );
+        hash.update(
+            u16::try_from(output_ordinal)
+                .map_err(|_| CatalogError::CorruptCatalog)?
+                .to_be_bytes(),
+        );
+        hash.update(
+            u16::try_from(object_input_ordinal)
+                .map_err(|_| CatalogError::CorruptCatalog)?
+                .to_be_bytes(),
+        );
+        hash.update(binding_digest.bytes());
+        hash.update(row_count.to_be_bytes());
+        prior_coordinate = Some((output_ordinal, object_input_ordinal));
+        input_ordinal += 1;
+    }
+    if input_ordinal != pages.len() || mapped_rows != object_rows {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        hash.finalize().into(),
+    ))
+}
+
 fn catalog_receipt_digest(
     manifest: &DatasetManifestRef,
     anchor_manifest_id: Uuid,
     run_id: Uuid,
     completed: &CompletedProviderMacroPlanSession,
     predecessor: Option<&ProviderMacroPlanPublishedHead>,
+    output_mapping_digest: EvidenceDigest,
 ) -> Result<EvidenceDigest, CatalogError> {
     let mut hash = Sha256::new();
     hash.update(CATALOG_RECEIPT_DOMAIN);
@@ -1929,6 +2201,7 @@ fn catalog_receipt_digest(
     hash.update(completed.analytical_row_count.to_be_bytes());
     hash.update(completed.coordinate.state_version.to_be_bytes());
     hash.update(completed.coordinate.checkpoint_digest.bytes());
+    hash.update(output_mapping_digest.bytes());
     if let Some(predecessor) = predecessor {
         hash.update([1]);
         hash.update(predecessor.publication_digest.bytes());

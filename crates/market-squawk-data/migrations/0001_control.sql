@@ -252,6 +252,10 @@ WHEN NOT EXISTS (
           SELECT COUNT(*) - 1 FROM artifacts AS member
           WHERE member.run_id = run.run_id
       )
+      AND NEW.created_at_ns >= (
+          SELECT MAX(member.created_at_ns) FROM artifacts AS member
+          WHERE member.run_id = run.run_id
+      )
 )
 BEGIN
     SELECT RAISE(ABORT, 'dataset manifest does not close an exact artifact group');

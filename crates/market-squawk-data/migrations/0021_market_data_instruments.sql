@@ -1733,6 +1733,25 @@ WHEN NOT EXISTS (
       AND run.state='reserved'
       AND run.operation='persist'
       AND run.source_id=NEW.source_id
+      AND NEW.input_ordinal=(
+          SELECT COUNT(*) FROM ingest_run_provider_publication_bindings AS retained
+          WHERE retained.run_id=NEW.run_id
+      )
+      AND (
+          (NEW.input_ordinal=0 AND NEW.output_artifact_ordinal=0
+           AND NEW.object_input_ordinal=0)
+          OR EXISTS (
+              SELECT 1 FROM ingest_run_provider_publication_bindings AS prior
+              WHERE prior.run_id=NEW.run_id
+                AND prior.input_ordinal=NEW.input_ordinal - 1
+                AND (
+                    (NEW.output_artifact_ordinal=prior.output_artifact_ordinal
+                     AND NEW.object_input_ordinal=prior.object_input_ordinal + 1)
+                    OR (NEW.output_artifact_ordinal=prior.output_artifact_ordinal + 1
+                        AND NEW.object_input_ordinal=0)
+                )
+          )
+      )
       AND (
           (NEW.publication_kind='response_market_event' AND EXISTS (
               SELECT 1
@@ -1862,6 +1881,25 @@ WHEN NOT EXISTS (
       AND run.state = 'reserved'
       AND run.operation = 'persist'
       AND run.source_id = NEW.source_id
+      AND NEW.input_ordinal = (
+          SELECT COUNT(*) FROM ingest_run_provider_capture_bindings AS retained
+          WHERE retained.run_id = NEW.run_id
+      )
+      AND (
+          (NEW.input_ordinal = 0 AND NEW.output_artifact_ordinal = 0
+           AND NEW.object_input_ordinal = 0)
+          OR EXISTS (
+              SELECT 1 FROM ingest_run_provider_capture_bindings AS prior
+              WHERE prior.run_id = NEW.run_id
+                AND prior.input_ordinal = NEW.input_ordinal - 1
+                AND (
+                    (NEW.output_artifact_ordinal = prior.output_artifact_ordinal
+                     AND NEW.object_input_ordinal = prior.object_input_ordinal + 1)
+                    OR (NEW.output_artifact_ordinal = prior.output_artifact_ordinal + 1
+                        AND NEW.object_input_ordinal = 0)
+                )
+          )
+      )
       AND capture.source_id = NEW.source_id
       AND native.row_count = binding.canonical_record_count
       AND (SELECT COUNT(*) FROM provider_capture_binding_rows AS row

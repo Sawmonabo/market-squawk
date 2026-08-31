@@ -436,6 +436,22 @@ impl ProviderArtifactInputCoordinate {
     }
 }
 
+pub(crate) fn provider_artifact_input_coordinates_are_ordered(
+    coordinates: &[ProviderArtifactInputCoordinate],
+) -> bool {
+    coordinates.iter().enumerate().all(|(ordinal, coordinate)| {
+        if ordinal == 0 {
+            coordinate.output_artifact_ordinal() == 0 && coordinate.object_input_ordinal() == 0
+        } else {
+            let prior = coordinates[ordinal - 1];
+            (coordinate.output_artifact_ordinal() == prior.output_artifact_ordinal()
+                && coordinate.object_input_ordinal() == prior.object_input_ordinal() + 1)
+                || (coordinate.output_artifact_ordinal() == prior.output_artifact_ordinal() + 1
+                    && coordinate.object_input_ordinal() == 0)
+        }
+    })
+}
+
 impl PreparedProviderCaptureBinding {
     pub(crate) fn try_from_live(
         binding: &SealedProviderCaptureBinding,
@@ -974,11 +990,7 @@ pub(crate) fn retain_ordered_prepared_provider_capture_bindings(
     if existing != 0 {
         return Err(CatalogError::ProviderCaptureConflict);
     }
-    if coordinates.iter().enumerate().any(|(ordinal, coordinate)| {
-        coordinates[..ordinal]
-            .iter()
-            .any(|prior| prior == coordinate)
-    }) {
+    if !provider_artifact_input_coordinates_are_ordered(coordinates) {
         return Err(CatalogError::ProviderCaptureConflict);
     }
     for (input_ordinal, (binding, coordinate)) in prepared.iter().zip(coordinates).enumerate() {

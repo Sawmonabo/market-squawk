@@ -126,7 +126,9 @@ impl Catalog {
         if artifacts
             .iter()
             .any(|artifact| artifact.created_at < reservation.requested_at)
-            || manifest.created_at < anchor.created_at
+            || artifacts
+                .iter()
+                .any(|artifact| manifest.created_at < artifact.created_at)
         {
             return Err(CatalogError::PublicationTimeConflict);
         }
@@ -147,6 +149,24 @@ impl Catalog {
 
     pub(crate) const fn result_limits(&self) -> CatalogResultLimits {
         self.result_bytes
+    }
+
+    pub(crate) fn provider_publication_input_matches_for_run(
+        &self,
+        run_id: Uuid,
+        publication_digest: market_squawk_domain::EvidenceDigest,
+        publication_kind: &str,
+        source_id: &str,
+        coordinate: ProviderArtifactInputCoordinate,
+    ) -> Result<bool, CatalogError> {
+        retained_publication_input_matches(
+            &self.connection,
+            run_id,
+            publication_digest,
+            publication_kind,
+            source_id,
+            coordinate,
+        )
     }
 
     /// Loads immutable manifest metadata by opaque identity.
@@ -277,7 +297,9 @@ pub(crate) fn publish_artifact_manifest_in_transaction(
     };
     if artifacts.len() > 1024
         || anchor.artifact_id != manifest.artifact_id
-        || manifest.created_at < anchor.created_at
+        || artifacts
+            .iter()
+            .any(|artifact| manifest.created_at < artifact.created_at)
         || manifest.created_at > catalog_now
         || artifacts.iter().enumerate().any(|(ordinal, artifact)| {
             artifact.created_at < reservation.requested_at
@@ -292,7 +314,12 @@ pub(crate) fn publish_artifact_manifest_in_transaction(
     }
     let mut budget = ResultBudget::new(result_limits);
     if let Some(existing) = publication_for_run(transaction, reservation.run_id, &mut budget)? {
-        return if existing.semantically_matches(artifacts, manifest) {
+        return if existing.semantically_matches(artifacts, manifest)
+            && publication_source_evidence_matches(
+                transaction,
+                reservation.run_id,
+                source_evidence,
+            )? {
             Ok(existing)
         } else {
             Err(CatalogError::EvidenceConflict)
@@ -450,6 +477,170 @@ pub(crate) fn publish_artifact_manifest_in_transaction(
         catalog_now,
     )?;
     Ok(PublishedIngest::new(artifacts.to_vec(), manifest.clone()))
+}
+
+fn publication_source_evidence_matches(
+    transaction: &Transaction<'_>,
+    run_id: Uuid,
+    source_evidence: PublicationSourceEvidence<'_>,
+) -> Result<bool, CatalogError> {
+    let capture_count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM ingest_run_provider_capture_bindings WHERE run_id=?1",
+        [run_id.to_string()],
+        |row| row.get(0),
+    )?;
+    let publication_count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM ingest_run_provider_publication_bindings WHERE run_id=?1",
+        [run_id.to_string()],
+        |row| row.get(0),
+    )?;
+    match source_evidence {
+        PublicationSourceEvidence::NoNewRawInput => {
+            Ok(capture_count == 0 && publication_count == 0)
+        }
+        PublicationSourceEvidence::Provider(binding, coordinate) => Ok(publication_count == 0
+            && capture_count == 1
+            && retained_capture_input_matches(
+                transaction,
+                run_id,
+                0,
+                binding.binding_digest(),
+                binding.source_id().as_str(),
+                binding.record_count(),
+                coordinate,
+            )?),
+        PublicationSourceEvidence::ProviderMacroPlan(bindings, coordinates) => {
+            if publication_count != 0
+                || usize::try_from(capture_count).ok() != Some(bindings.len())
+                || coordinates.len() != bindings.len()
+                || !super::provider_capture::provider_artifact_input_coordinates_are_ordered(
+                    coordinates,
+                )
+            {
+                return Ok(false);
+            }
+            for (ordinal, (binding, coordinate)) in bindings.iter().zip(coordinates).enumerate() {
+                if !retained_capture_input_matches(
+                    transaction,
+                    run_id,
+                    ordinal,
+                    binding.binding_digest(),
+                    binding.source_id().as_str(),
+                    binding.record_count(),
+                    *coordinate,
+                )? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        PublicationSourceEvidence::StagedProviderMacroPlan(commit, coordinates) => {
+            Ok(publication_count == 0
+                && usize::try_from(capture_count).ok() == Some(coordinates.len())
+                && super::provider_macro_plan::completed_provider_macro_plan_inputs_match_run(
+                    transaction,
+                    run_id,
+                    commit,
+                    coordinates,
+                )?)
+        }
+        PublicationSourceEvidence::ProviderEvent(binding, coordinate) => Ok(capture_count == 0
+            && publication_count == 1
+            && retained_publication_input_matches(
+                transaction,
+                run_id,
+                binding.publication_digest(),
+                binding.publication_kind_name(),
+                binding.source_id(),
+                coordinate,
+            )?),
+        PublicationSourceEvidence::ProviderOptionMarket(binding, coordinate) => Ok(capture_count
+            == 0
+            && publication_count == 1
+            && retained_publication_input_matches(
+                transaction,
+                run_id,
+                binding.publication_digest(),
+                binding.publication_kind_name(),
+                binding.source_id().as_str(),
+                coordinate,
+            )?),
+        PublicationSourceEvidence::ProviderLogical(binding, coordinate) => Ok(capture_count == 0
+            && publication_count == 1
+            && retained_publication_input_matches(
+                transaction,
+                run_id,
+                binding.binding_digest(),
+                "provider_logical",
+                binding.terminal().source_id().as_str(),
+                coordinate,
+            )?),
+    }
+}
+
+fn retained_capture_input_matches(
+    transaction: &Transaction<'_>,
+    run_id: Uuid,
+    input_ordinal: usize,
+    binding_digest: market_squawk_domain::EvidenceDigest,
+    source_id: &str,
+    record_count: usize,
+    coordinate: ProviderArtifactInputCoordinate,
+) -> Result<bool, CatalogError> {
+    transaction
+        .query_row(
+            "SELECT input.output_artifact_ordinal, input.object_input_ordinal,
+                    input.binding_digest, input.source_id, binding.canonical_record_count
+             FROM ingest_run_provider_capture_bindings AS input
+             JOIN provider_capture_bindings AS binding USING (binding_digest)
+             WHERE input.run_id=?1 AND input.input_ordinal=?2",
+            params![
+                run_id.to_string(),
+                i64::try_from(input_ordinal).map_err(|_| CatalogError::InvalidRecord)?,
+            ],
+            |row| {
+                Ok(usize::try_from(row.get::<_, i64>(0)?).ok()
+                    == Some(coordinate.output_artifact_ordinal())
+                    && usize::try_from(row.get::<_, i64>(1)?).ok()
+                        == Some(coordinate.object_input_ordinal())
+                    && row.get::<_, Vec<u8>>(2)? == binding_digest.bytes()
+                    && row.get::<_, String>(3)? == source_id
+                    && usize::try_from(row.get::<_, i64>(4)?).ok() == Some(record_count))
+            },
+        )
+        .optional()
+        .map(|value| value == Some(true))
+        .map_err(Into::into)
+}
+
+fn retained_publication_input_matches(
+    transaction: &rusqlite::Connection,
+    run_id: Uuid,
+    publication_digest: market_squawk_domain::EvidenceDigest,
+    publication_kind: &str,
+    source_id: &str,
+    coordinate: ProviderArtifactInputCoordinate,
+) -> Result<bool, CatalogError> {
+    transaction
+        .query_row(
+            "SELECT input_ordinal, output_artifact_ordinal, object_input_ordinal,
+                    publication_digest, publication_kind, source_id
+             FROM ingest_run_provider_publication_bindings WHERE run_id=?1",
+            [run_id.to_string()],
+            |row| {
+                Ok(row.get::<_, i64>(0)? == 0
+                    && usize::try_from(row.get::<_, i64>(1)?).ok()
+                        == Some(coordinate.output_artifact_ordinal())
+                    && usize::try_from(row.get::<_, i64>(2)?).ok()
+                        == Some(coordinate.object_input_ordinal())
+                    && row.get::<_, Vec<u8>>(3)? == publication_digest.bytes()
+                    && row.get::<_, String>(4)? == publication_kind
+                    && row.get::<_, String>(5)? == source_id)
+            },
+        )
+        .optional()
+        .map(|value| value == Some(true))
+        .map_err(Into::into)
 }
 
 pub(super) fn publication_for_run(
