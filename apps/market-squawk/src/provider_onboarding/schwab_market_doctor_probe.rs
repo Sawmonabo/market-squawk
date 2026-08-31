@@ -372,7 +372,7 @@ impl ProviderNativeSchwabMarketDoctorProbeExecutor {
         let streamer_bounds = StreamerTransportBounds::try_new(
             Duration::from_secs(5),
             Duration::from_secs(10),
-            Duration::ZERO,
+            Duration::from_millis(250),
             0,
             nonzero(4 * 1024 * 1024)?,
             nonzero(64)?,
