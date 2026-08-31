@@ -64,14 +64,16 @@ const QUERY_DURATION: Duration = Duration::from_secs(10);
 /// Closed lifecycle state for the fixed BEA Regional research product.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BeaProductAvailability {
-    /// The code-owned product is selected but no protected runtime is retained.
-    Desired,
-    /// The exact protected runtime is current and can perform its first bounded publication.
+    /// Credentials or a saved selection may exist, but activation/proof must be resumed.
+    ProbeRequired,
+    /// The exact protected runtime is current, but no durable product proof has completed yet.
     Configured,
+    /// The current product has completed immutable restart and typed-read proof.
+    Available,
+    /// A proven product remains callable with explicitly reduced current capability.
+    Degraded,
     /// The retained runtime no longer matches onboarding or shared runtime authority.
     Unavailable,
-    /// At least one exact immutable generation completed restart verification and a typed PIT read.
-    Ready,
 }
 
 /// Closed reason a previously configured BEA product is unavailable.
@@ -171,9 +173,9 @@ pub(crate) struct BeaProductStatus {
 }
 
 impl BeaProductStatus {
-    fn desired() -> Self {
+    fn probe_required() -> Self {
         Self {
-            availability: BeaProductAvailability::Desired,
+            availability: BeaProductAvailability::ProbeRequired,
             operation: BEA_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION,
             configured: None,
             ready: None,
@@ -444,7 +446,7 @@ impl BeaProductActivation {
         };
         BeaProductStatus {
             availability: if ready.is_some() {
-                BeaProductAvailability::Ready
+                BeaProductAvailability::Available
             } else {
                 availability
             },
@@ -701,7 +703,7 @@ impl ProviderAdapterActivation {
             }
         };
         let Some(activation) = activation else {
-            return BeaProductStatus::desired();
+            return BeaProductStatus::probe_required();
         };
         match self
             .onboarding
@@ -1014,7 +1016,7 @@ mod tests {
         let reopened = crate::LocalProduct::try_new(app_config)?;
         assert_eq!(
             reopened.provider_activation().bea_status().availability(),
-            BeaProductAvailability::Desired
+            BeaProductAvailability::ProbeRequired
         );
         assert_eq!(
             reopened

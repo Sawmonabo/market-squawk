@@ -406,7 +406,7 @@ fn validate_sealed_capture_sequence(
         || graph.dataset() != dataset_id
         || graph.request_set_identity() != expected_graph_identity
         || graph.terminal() != ProviderCaptureTerminalDisposition::CompleteRequestGraph
-        || graph.request_graph_components().len() != expected_count
+        || graph.request_graph_components().len() != expected.len()
         || !valid_digest(sealed_capture.receipt_digest())
         || !valid_digest(sealed_capture.segment().physical_receipt_digest())
     {

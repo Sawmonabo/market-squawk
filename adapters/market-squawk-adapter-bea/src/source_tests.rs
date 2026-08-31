@@ -33,9 +33,9 @@ use crate::auth::BeaSensitiveBody;
 use crate::source::bea_api_endpoint_rule;
 use crate::transport::{BeaHttpResponse, BeaSensitiveHeader, BeaTransport, system_timestamp};
 use crate::{
-    BeaAuthorizedRequest, BeaDatasetContract, BeaDatasetIdentity, BeaObservationValue,
-    BeaParseLimits, BeaRequiredSharedSettlement, BeaSource, BeaSourceConfig, BeaSourceError,
-    BeaUserId,
+    BeaAuthorizedRequest, BeaDatasetContract, BeaDatasetIdentity, BeaDoctorRefreshDisposition,
+    BeaObservationValue, BeaParseLimits, BeaRequiredSharedSettlement, BeaSource, BeaSourceConfig,
+    BeaSourceError, BeaUserId,
 };
 
 const USER_ID: &str = "11111111-2222-3333-4444-555555555555";
@@ -238,8 +238,10 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             .as_ref()
             .is_some_and(BeaSensitiveHeader::is_zeroized)
     );
+    let mut scripted_responses = upstream_responses.clone();
+    scripted_responses.extend(upstream_responses.iter().take(3).cloned());
     let transport = Arc::new(ScriptedTransport {
-        responses: Mutex::new(VecDeque::from(upstream_responses.clone())),
+        responses: Mutex::new(VecDeque::from(scripted_responses)),
     });
     let now = system_timestamp()?;
     let metadata = source_metadata(now, &config)?;
@@ -483,6 +485,36 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
         native_lineage,
     )?;
     assert_eq!(revision_batch.input_len(), 1);
+    let refreshed_run = source
+        .doctor(
+            &authority,
+            &provider_dataset,
+            deadline,
+            CancellationToken::new(),
+        )
+        .await?;
+    let (pending_refreshed, refreshed_seal_request) = refreshed_run.into_sealing_parts()?;
+    let refreshed = Arc::new(pending_refreshed.try_rejoin(
+        source.source_binding(),
+        refreshed_seal_request.seal(&store)?,
+    )?);
+    assert!(refreshed.verified_at() > admission.verified_at());
+    assert!(refreshed.expires_at() > admission.expires_at());
+    assert_eq!(
+        source.activate_doctor(Arc::clone(&refreshed))?,
+        BeaDoctorRefreshDisposition::RefreshedEvidence
+    );
+    assert!(matches!(
+        source.activate_doctor(Arc::clone(&admission)),
+        Err(BeaSourceError::StaleDoctorAdmission)
+    ));
+    assert_eq!(
+        source
+            .current_doctor_admission(&provider_dataset, refreshed.verified_at())?
+            .ok_or("missing monotonic BEA doctor admission")?
+            .admission_digest(),
+        refreshed.admission_digest()
+    );
     assert!(
         transport
             .responses

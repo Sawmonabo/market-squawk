@@ -70,6 +70,8 @@ pub enum BeaDoctorRefreshDisposition {
     ReusedCurrent,
     /// The prior admission reached its exclusive expiry and was replaced explicitly.
     RefreshedExpired,
+    /// A strictly newer physical doctor proof replaced a still-current matching generation.
+    RefreshedEvidence,
     /// Provider metadata changed and the exact newly sealed generation replaced the predecessor.
     RefreshedMetadataDrift,
 }
@@ -940,6 +942,8 @@ pub enum BeaSourceError {
     Clock,
     #[error("BEA extraction authority became unavailable")]
     Authority,
+    #[error("BEA doctor completion is older than the active sealed admission")]
+    StaleDoctorAdmission,
     #[error("BEA bounded allocation failed")]
     Allocation,
     #[error("BEA typed adapter contract failed: {0}")]
@@ -1230,10 +1234,19 @@ impl BeaSource {
             Some(current) if current.admission_digest() == admission.admission_digest() => {
                 return Ok(BeaDoctorRefreshDisposition::ReusedCurrent);
             }
+            Some(current)
+                if admission.verified_at() <= current.verified_at()
+                    || admission.expires_at() <= current.expires_at() =>
+            {
+                return Err(BeaSourceError::StaleDoctorAdmission);
+            }
             Some(current) if current.metadata_generation() != admission.metadata_generation() => {
                 BeaDoctorRefreshDisposition::RefreshedMetadataDrift
             }
-            Some(_) => BeaDoctorRefreshDisposition::RefreshedExpired,
+            Some(current) if observed_at >= current.expires_at() => {
+                BeaDoctorRefreshDisposition::RefreshedExpired
+            }
+            Some(_) => BeaDoctorRefreshDisposition::RefreshedEvidence,
         };
         active.insert(contract.dataset_id().clone(), admission);
         Ok(disposition)
@@ -2902,6 +2915,7 @@ fn map_source_error(error: BeaSourceError) -> ExtractionSourceError {
         | BeaSourceError::Protocol
         | BeaSourceError::InvalidMetadata
         | BeaSourceError::InvalidConfiguration
+        | BeaSourceError::StaleDoctorAdmission
         | BeaSourceError::Authority
         | BeaSourceError::Allocation
         | BeaSourceError::Adapter(_)
