@@ -2569,6 +2569,33 @@ END;
 -- Provider-neutral durable acquisition state for bounded multi-response macro publications.
 -- Checkpoint bytes remain opaque to common code; only their exact SHA-256 identity and CAS
 -- coordinate are interpreted here.
+CREATE TABLE provider_macro_plan_values (
+    value_id BLOB PRIMARY KEY CHECK (
+        length(value_id) = 32 AND value_id <> zeroblob(32)
+    ),
+    session_id TEXT NOT NULL CHECK (length(CAST(session_id AS BLOB)) = 36),
+    value_kind TEXT NOT NULL CHECK (value_kind IN ('checkpoint', 'semantics')),
+    value_ordinal INTEGER NOT NULL CHECK (value_ordinal BETWEEN 0 AND 1024),
+    value_digest BLOB NOT NULL CHECK (
+        length(value_digest) = 32 AND value_digest <> zeroblob(32)
+    ),
+    byte_length INTEGER NOT NULL CHECK (byte_length BETWEEN 1 AND 16777216),
+    chunk_count INTEGER NOT NULL CHECK (chunk_count BETWEEN 1 AND 4096),
+    retained_at_ns INTEGER NOT NULL,
+    UNIQUE (session_id, value_kind, value_ordinal),
+    UNIQUE (value_id, value_digest)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE provider_macro_plan_value_chunks (
+    value_id BLOB NOT NULL REFERENCES provider_macro_plan_values(value_id),
+    chunk_ordinal INTEGER NOT NULL CHECK (chunk_ordinal BETWEEN 0 AND 4095),
+    chunk_digest BLOB NOT NULL CHECK (
+        length(chunk_digest) = 32 AND chunk_digest <> zeroblob(32)
+    ),
+    chunk_bytes BLOB NOT NULL CHECK (length(chunk_bytes) BETWEEN 1 AND 524288),
+    PRIMARY KEY (value_id, chunk_ordinal)
+) STRICT, WITHOUT ROWID;
+
 CREATE TABLE provider_macro_plan_sessions (
     session_id TEXT PRIMARY KEY CHECK (length(CAST(session_id AS BLOB)) = 36),
     analytical_dataset TEXT NOT NULL CHECK (
@@ -2590,9 +2617,7 @@ CREATE TABLE provider_macro_plan_sessions (
     checkpoint_digest BLOB NOT NULL CHECK (
         length(checkpoint_digest) = 32 AND checkpoint_digest <> zeroblob(32)
     ),
-    checkpoint_bytes BLOB NOT NULL CHECK (
-        length(checkpoint_bytes) BETWEEN 1 AND 16777216
-    ),
+    checkpoint_value_id BLOB NOT NULL REFERENCES provider_macro_plan_values(value_id),
     response_count INTEGER NOT NULL CHECK (response_count BETWEEN 0 AND 1024),
     data_page_count INTEGER NOT NULL CHECK (data_page_count BETWEEN 0 AND 1023),
     analytical_row_count INTEGER NOT NULL CHECK (
@@ -2610,7 +2635,9 @@ CREATE TABLE provider_macro_plan_sessions (
             AND response_count BETWEEN 2 AND 1024
             AND data_page_count = response_count - 1
             AND state_version = response_count)
-    )
+    ),
+    FOREIGN KEY (checkpoint_value_id, checkpoint_digest)
+        REFERENCES provider_macro_plan_values(value_id, value_digest)
 ) STRICT;
 
 CREATE UNIQUE INDEX provider_macro_plan_one_acquiring_session
@@ -2645,9 +2672,7 @@ CREATE TABLE provider_macro_plan_staged_pages (
     semantics_digest BLOB NOT NULL CHECK (
         length(semantics_digest) = 32 AND semantics_digest <> zeroblob(32)
     ),
-    semantics_payload BLOB NOT NULL CHECK (
-        length(semantics_payload) BETWEEN 1 AND 16777216
-    ),
+    semantics_value_id BLOB NOT NULL REFERENCES provider_macro_plan_values(value_id),
     semantics_payload_digest BLOB NOT NULL CHECK (
         length(semantics_payload_digest) = 32
         AND semantics_payload_digest <> zeroblob(32)
@@ -2655,7 +2680,9 @@ CREATE TABLE provider_macro_plan_staged_pages (
     staged_at_ns INTEGER NOT NULL,
     PRIMARY KEY (session_id, page_ordinal),
     UNIQUE (session_id, candidate_digest),
-    UNIQUE (session_id, binding_digest)
+    UNIQUE (session_id, binding_digest),
+    FOREIGN KEY (semantics_value_id, semantics_payload_digest)
+        REFERENCES provider_macro_plan_values(value_id, value_digest)
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE provider_macro_plan_terminal_completions (
@@ -2799,6 +2826,32 @@ CREATE TABLE provider_macro_plan_published_heads (
     PRIMARY KEY (analytical_dataset, source_id, provider_dataset)
 ) STRICT, WITHOUT ROWID;
 
+CREATE TRIGGER provider_macro_plan_sessions_guarded_insert
+BEFORE INSERT ON provider_macro_plan_sessions
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM provider_macro_plan_values AS value
+    WHERE value.value_id = NEW.checkpoint_value_id
+      AND value.session_id = NEW.session_id
+      AND value.value_kind = 'checkpoint'
+      AND value.value_ordinal = NEW.state_version
+      AND value.value_digest = NEW.checkpoint_digest
+      AND (SELECT COUNT(*) FROM provider_macro_plan_value_chunks AS chunk
+           WHERE chunk.value_id = value.value_id) = value.chunk_count
+      AND (SELECT COALESCE(SUM(length(chunk.chunk_bytes)), 0)
+           FROM provider_macro_plan_value_chunks AS chunk
+           WHERE chunk.value_id = value.value_id) = value.byte_length
+      AND (SELECT MIN(chunk.chunk_ordinal)
+           FROM provider_macro_plan_value_chunks AS chunk
+           WHERE chunk.value_id = value.value_id) = 0
+      AND (SELECT MAX(chunk.chunk_ordinal)
+           FROM provider_macro_plan_value_chunks AS chunk
+           WHERE chunk.value_id = value.value_id) = value.chunk_count - 1
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid provider macro-plan initial checkpoint');
+END;
+
 CREATE TRIGGER provider_macro_plan_sessions_guarded_update
 BEFORE UPDATE ON provider_macro_plan_sessions
 WHEN OLD.state <> 'acquiring'
@@ -2811,9 +2864,29 @@ WHEN OLD.state <> 'acquiring'
     OR NEW.created_at_ns <> OLD.created_at_ns
     OR NEW.updated_at_ns < OLD.updated_at_ns
     OR NEW.checkpoint_digest = OLD.checkpoint_digest
-    OR NEW.checkpoint_bytes = OLD.checkpoint_bytes
+    OR NEW.checkpoint_value_id = OLD.checkpoint_value_id
     OR NEW.state_version <> OLD.state_version + 1
     OR NEW.response_count <> OLD.response_count + 1
+    OR NOT EXISTS (
+        SELECT 1
+        FROM provider_macro_plan_values AS value
+        WHERE value.value_id = NEW.checkpoint_value_id
+          AND value.session_id = NEW.session_id
+          AND value.value_kind = 'checkpoint'
+          AND value.value_ordinal = NEW.state_version
+          AND value.value_digest = NEW.checkpoint_digest
+          AND (SELECT COUNT(*) FROM provider_macro_plan_value_chunks AS chunk
+               WHERE chunk.value_id = value.value_id) = value.chunk_count
+          AND (SELECT COALESCE(SUM(length(chunk.chunk_bytes)), 0)
+               FROM provider_macro_plan_value_chunks AS chunk
+               WHERE chunk.value_id = value.value_id) = value.byte_length
+          AND (SELECT MIN(chunk.chunk_ordinal)
+               FROM provider_macro_plan_value_chunks AS chunk
+               WHERE chunk.value_id = value.value_id) = 0
+          AND (SELECT MAX(chunk.chunk_ordinal)
+               FROM provider_macro_plan_value_chunks AS chunk
+               WHERE chunk.value_id = value.value_id) = value.chunk_count - 1
+    )
     OR (
         NEW.state = 'acquiring'
         AND (
@@ -2827,7 +2900,11 @@ WHEN OLD.state <> 'acquiring'
                   AND NEW.analytical_row_count =
                       OLD.analytical_row_count + page.canonical_record_count
                   AND NEW.semantics_bytes =
-                      OLD.semantics_bytes + length(page.semantics_payload)
+                      OLD.semantics_bytes + (
+                          SELECT value.byte_length
+                          FROM provider_macro_plan_values AS value
+                          WHERE value.value_id = page.semantics_value_id
+                      )
             )
         )
     )
@@ -2858,6 +2935,8 @@ WHEN NOT EXISTS (
       ON binding.binding_digest = NEW.binding_digest
     JOIN provider_raw_observations AS capture
       ON capture.capture_observation_digest = binding.capture_observation_digest
+    JOIN provider_macro_plan_values AS value
+      ON value.value_id = NEW.semantics_value_id
     WHERE session.session_id = NEW.session_id
       AND session.state = 'acquiring'
       AND session.data_page_count = NEW.page_ordinal
@@ -2868,6 +2947,21 @@ WHEN NOT EXISTS (
       AND capture.metadata_revision = session.metadata_revision
       AND capture.provider_dataset = session.provider_dataset
       AND capture.terminal_disposition = 'standalone_response'
+      AND value.session_id = NEW.session_id
+      AND value.value_kind = 'semantics'
+      AND value.value_ordinal = NEW.page_ordinal
+      AND value.value_digest = NEW.semantics_payload_digest
+      AND (SELECT COUNT(*) FROM provider_macro_plan_value_chunks AS chunk
+           WHERE chunk.value_id = value.value_id) = value.chunk_count
+      AND (SELECT COALESCE(SUM(length(chunk.chunk_bytes)), 0)
+           FROM provider_macro_plan_value_chunks AS chunk
+           WHERE chunk.value_id = value.value_id) = value.byte_length
+      AND (SELECT MIN(chunk.chunk_ordinal)
+           FROM provider_macro_plan_value_chunks AS chunk
+           WHERE chunk.value_id = value.value_id) = 0
+      AND (SELECT MAX(chunk.chunk_ordinal)
+           FROM provider_macro_plan_value_chunks AS chunk
+           WHERE chunk.value_id = value.value_id) = value.chunk_count - 1
 )
 BEGIN
     SELECT RAISE(ABORT, 'invalid provider macro-plan staged page');
@@ -3007,6 +3101,26 @@ END;
 CREATE TRIGGER provider_macro_plan_sessions_immutable_delete
 BEFORE DELETE ON provider_macro_plan_sessions BEGIN
     SELECT RAISE(ABORT, 'provider macro-plan sessions are immutable');
+END;
+
+CREATE TRIGGER provider_macro_plan_values_immutable_update
+BEFORE UPDATE ON provider_macro_plan_values BEGIN
+    SELECT RAISE(ABORT, 'provider macro-plan values are immutable');
+END;
+
+CREATE TRIGGER provider_macro_plan_values_immutable_delete
+BEFORE DELETE ON provider_macro_plan_values BEGIN
+    SELECT RAISE(ABORT, 'provider macro-plan values are immutable');
+END;
+
+CREATE TRIGGER provider_macro_plan_value_chunks_immutable_update
+BEFORE UPDATE ON provider_macro_plan_value_chunks BEGIN
+    SELECT RAISE(ABORT, 'provider macro-plan value chunks are immutable');
+END;
+
+CREATE TRIGGER provider_macro_plan_value_chunks_immutable_delete
+BEFORE DELETE ON provider_macro_plan_value_chunks BEGIN
+    SELECT RAISE(ABORT, 'provider macro-plan value chunks are immutable');
 END;
 
 CREATE TRIGGER provider_macro_plan_staged_pages_immutable_update

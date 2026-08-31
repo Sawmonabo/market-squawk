@@ -23,10 +23,54 @@ pub(crate) const MAX_PROVIDER_MACRO_PLAN_DATA_PAGES: usize = 1_023;
 pub(crate) const MAX_PROVIDER_MACRO_PLAN_CHECKPOINT_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_PROVIDER_MACRO_PLAN_SEMANTICS_BYTES: usize = 64 * 1024 * 1024;
 
+const MAX_PROVIDER_MACRO_PLAN_VALUE_CHUNKS: usize = 4_096;
+const MAX_PROVIDER_MACRO_PLAN_STORAGE_CHUNK_BYTES: usize = 512 * 1024;
+const PROVIDER_MACRO_PLAN_RECORD_OVERHEAD_BYTES: usize = 4 * 1024;
 const REQUEST_SET_DOMAIN: &[u8] = b"market-squawk/provider-macro-plan/request-set/v1";
 const PUBLICATION_DOMAIN: &[u8] = b"market-squawk/provider-macro-plan/publication/v1";
 const CATALOG_RECEIPT_DOMAIN: &[u8] = b"market-squawk/provider-macro-plan/catalog-receipt/v1";
+const CHUNKED_VALUE_DOMAIN: &[u8] = b"market-squawk/provider-macro-plan/chunked-value/v1";
 const PUBLICATION_AUDIT_EVENT: &str = "provider-macro-plan.published";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderMacroPlanValueKind {
+    Checkpoint,
+    Semantics,
+}
+
+impl ProviderMacroPlanValueKind {
+    const fn database_name(self) -> &'static str {
+        match self {
+            Self::Checkpoint => "checkpoint",
+            Self::Semantics => "semantics",
+        }
+    }
+
+    const fn identity_tag(self) -> u8 {
+        match self {
+            Self::Checkpoint => 1,
+            Self::Semantics => 2,
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, CatalogError> {
+        match value {
+            "checkpoint" => Ok(Self::Checkpoint),
+            "semantics" => Ok(Self::Semantics),
+            _ => Err(CatalogError::CorruptCatalog),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StoredProviderMacroPlanValue {
+    value_id: EvidenceDigest,
+    session_id: Uuid,
+    kind: ProviderMacroPlanValueKind,
+    ordinal: u16,
+    value_digest: EvidenceDigest,
+    bytes: Box<[u8]>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProviderMacroPlanSessionKey {
@@ -427,6 +471,7 @@ impl Catalog {
     ) -> Result<ProviderMacroPlanStageCoordinate, CatalogError> {
         validate_checkpoint(&checkpoint)?;
         let checkpoint_digest = sha256_evidence(&checkpoint);
+        let storage_chunk_bytes = self.provider_macro_plan_storage_chunk_bytes()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let now = trusted_catalog_now(&transaction)?;
@@ -448,11 +493,20 @@ impl Catalog {
         if !source_matches {
             return Err(CatalogError::ProviderCaptureMismatch);
         }
+        let checkpoint_value = retain_chunked_value(
+            &transaction,
+            key.session_id,
+            ProviderMacroPlanValueKind::Checkpoint,
+            0,
+            &checkpoint,
+            storage_chunk_bytes,
+            now,
+        )?;
         transaction.execute(
             "INSERT INTO provider_macro_plan_sessions
              (session_id, analytical_dataset, source_id, metadata_revision, provider_dataset,
               source_generation_digest, state, state_version, checkpoint_digest,
-              checkpoint_bytes, response_count, data_page_count, analytical_row_count,
+              checkpoint_value_id, response_count, data_page_count, analytical_row_count,
               semantics_bytes, created_at_ns, updated_at_ns)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'acquiring', 0, ?7, ?8, 0, 0, 0, 0, ?9, ?9)",
             params![
@@ -463,7 +517,7 @@ impl Catalog {
                 key.provider_dataset.as_str(),
                 digest_bytes(key.source_generation_digest),
                 digest_bytes(checkpoint_digest),
-                checkpoint.as_ref(),
+                digest_bytes(checkpoint_value.value_id),
                 now.unix_nanos(),
             ],
         )?;
@@ -486,6 +540,7 @@ impl Catalog {
             return Err(CatalogError::ProviderCaptureConflict);
         }
         let successor_digest = sha256_evidence(&successor_checkpoint);
+        let storage_chunk_bytes = self.provider_macro_plan_storage_chunk_bytes()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let session = load_session(&transaction, expected.session_id)?;
@@ -504,11 +559,20 @@ impl Catalog {
         }
         let now = trusted_catalog_now(&transaction)?;
         retain_staged_provider_capture_binding(&transaction, &input.binding, now)?;
+        let semantics_value = retain_chunked_value(
+            &transaction,
+            expected.session_id,
+            ProviderMacroPlanValueKind::Semantics,
+            input.page_ordinal,
+            &input.semantics.payload,
+            storage_chunk_bytes,
+            now,
+        )?;
         transaction.execute(
             "INSERT INTO provider_macro_plan_staged_pages
              (session_id, page_ordinal, candidate_digest, binding_digest,
               capture_observation_digest, canonical_record_count, semantics_schema,
-              semantics_schema_requirement_digest, semantics_digest, semantics_payload,
+              semantics_schema_requirement_digest, semantics_digest, semantics_value_id,
               semantics_payload_digest, staged_at_ns)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
@@ -521,7 +585,7 @@ impl Catalog {
                 input.semantics.schema.as_str(),
                 digest_bytes(input.semantics.schema_requirement_digest),
                 digest_bytes(input.semantics.semantic_digest),
-                input.semantics.payload.as_ref(),
+                digest_bytes(semantics_value.value_id),
                 digest_bytes(input.semantics.payload_digest),
                 now.unix_nanos(),
             ],
@@ -530,9 +594,18 @@ impl Catalog {
             .state_version
             .checked_add(1)
             .ok_or(CatalogError::ProviderCaptureConflict)?;
+        let checkpoint_value = retain_chunked_value(
+            &transaction,
+            expected.session_id,
+            ProviderMacroPlanValueKind::Checkpoint,
+            next_version,
+            &successor_checkpoint,
+            storage_chunk_bytes,
+            now,
+        )?;
         let updated = transaction.execute(
             "UPDATE provider_macro_plan_sessions
-             SET state_version=?1, checkpoint_digest=?2, checkpoint_bytes=?3,
+             SET state_version=?1, checkpoint_digest=?2, checkpoint_value_id=?3,
                  response_count=response_count+1, data_page_count=data_page_count+1,
                  analytical_row_count=analytical_row_count+?4,
                  semantics_bytes=semantics_bytes+?5, updated_at_ns=?6
@@ -541,7 +614,7 @@ impl Catalog {
             params![
                 i64::from(next_version),
                 digest_bytes(successor_digest),
-                successor_checkpoint.as_ref(),
+                digest_bytes(checkpoint_value.value_id),
                 to_i64(input.binding.record_count())?,
                 to_i64(input.semantics.payload.len())?,
                 now.unix_nanos(),
@@ -569,6 +642,7 @@ impl Catalog {
     ) -> Result<CompletedProviderMacroPlanSession, CatalogError> {
         validate_checkpoint(&successor_checkpoint)?;
         let successor_digest = sha256_evidence(&successor_checkpoint);
+        let storage_chunk_bytes = self.provider_macro_plan_storage_chunk_bytes()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let session = load_session(&transaction, expected.session_id)?;
@@ -611,16 +685,25 @@ impl Catalog {
             .state_version
             .checked_add(1)
             .ok_or(CatalogError::ProviderCaptureConflict)?;
+        let checkpoint_value = retain_chunked_value(
+            &transaction,
+            expected.session_id,
+            ProviderMacroPlanValueKind::Checkpoint,
+            next_version,
+            &successor_checkpoint,
+            storage_chunk_bytes,
+            now,
+        )?;
         let updated = transaction.execute(
             "UPDATE provider_macro_plan_sessions
              SET state='complete', state_version=?1, checkpoint_digest=?2,
-                 checkpoint_bytes=?3, response_count=response_count+1, updated_at_ns=?4
+                 checkpoint_value_id=?3, response_count=response_count+1, updated_at_ns=?4
              WHERE session_id=?5 AND state='acquiring' AND state_version=?6
                AND checkpoint_digest=?7",
             params![
                 i64::from(next_version),
                 digest_bytes(successor_digest),
-                successor_checkpoint.as_ref(),
+                digest_bytes(checkpoint_value.value_id),
                 now.unix_nanos(),
                 expected.session_id.to_string(),
                 i64::from(expected.state_version),
@@ -669,7 +752,7 @@ impl Catalog {
             .query_row(
                 "SELECT candidate_digest, binding_digest, semantics_schema,
                     semantics_schema_requirement_digest, semantics_digest,
-                    semantics_payload, semantics_payload_digest
+                    semantics_value_id, semantics_payload_digest
              FROM provider_macro_plan_staged_pages
              WHERE session_id=?1 AND page_ordinal=?2",
                 params![session_id.to_string(), i64::from(page_ordinal)],
@@ -688,9 +771,11 @@ impl Catalog {
             .optional()?;
         row.map(|row| {
             let payload_digest = parse_sha256(&row.6)?;
-            if row.5.is_empty()
-                || row.5.len() > MAX_PROVIDER_MACRO_PLAN_CHECKPOINT_BYTES
-                || sha256_evidence(&row.5) != payload_digest
+            let payload = load_chunked_value(&self.connection, parse_sha256(&row.5)?)?;
+            if payload.session_id != session_id
+                || payload.kind != ProviderMacroPlanValueKind::Semantics
+                || payload.ordinal != page_ordinal
+                || payload.value_digest != payload_digest
             {
                 return Err(CatalogError::CorruptCatalog);
             }
@@ -704,12 +789,21 @@ impl Catalog {
                     .map_err(|_| CatalogError::CorruptCatalog)?,
                 semantics_schema_requirement_digest: parse_sha256(&row.3)?,
                 semantics_digest: parse_sha256(&row.4)?,
-                semantics_payload: row.5.into_boxed_slice(),
+                semantics_payload: payload.bytes,
                 semantics_payload_digest: payload_digest,
                 binding,
             })
         })
         .transpose()
+    }
+
+    fn provider_macro_plan_storage_chunk_bytes(&self) -> Result<usize, CatalogError> {
+        self.result_bytes
+            .max_record_bytes()
+            .checked_sub(PROVIDER_MACRO_PLAN_RECORD_OVERHEAD_BYTES)
+            .map(|value| value.min(MAX_PROVIDER_MACRO_PLAN_STORAGE_CHUNK_BYTES))
+            .filter(|value| *value > 0)
+            .ok_or(CatalogError::InvalidConfiguration)
     }
 }
 
@@ -723,6 +817,213 @@ struct StoredSession {
     data_page_count: u16,
     analytical_row_count: u64,
     semantics_bytes: u64,
+}
+
+fn retain_chunked_value(
+    transaction: &Transaction<'_>,
+    session_id: Uuid,
+    kind: ProviderMacroPlanValueKind,
+    ordinal: u16,
+    value: &[u8],
+    storage_chunk_bytes: usize,
+    retained_at: Timestamp,
+) -> Result<StoredProviderMacroPlanValue, CatalogError> {
+    if value.is_empty()
+        || value.len() > MAX_PROVIDER_MACRO_PLAN_CHECKPOINT_BYTES
+        || storage_chunk_bytes == 0
+        || storage_chunk_bytes > MAX_PROVIDER_MACRO_PLAN_STORAGE_CHUNK_BYTES
+    {
+        return Err(CatalogError::InvalidRecord);
+    }
+    let chunk_count = value.len().div_ceil(storage_chunk_bytes);
+    if chunk_count == 0 || chunk_count > MAX_PROVIDER_MACRO_PLAN_VALUE_CHUNKS {
+        return Err(CatalogError::InvalidRecord);
+    }
+    let value_digest = sha256_evidence(value);
+    let mut identity = chunked_value_identity_header(
+        session_id,
+        kind,
+        ordinal,
+        value_digest,
+        value.len(),
+        chunk_count,
+    )?;
+    for (chunk_ordinal, chunk) in value.chunks(storage_chunk_bytes).enumerate() {
+        update_chunked_value_identity(&mut identity, chunk_ordinal, chunk)?;
+    }
+    let value_id = EvidenceDigest::new(DigestAlgorithm::Sha256, identity.finalize().into());
+    transaction.execute(
+        "INSERT INTO provider_macro_plan_values
+         (value_id, session_id, value_kind, value_ordinal, value_digest,
+          byte_length, chunk_count, retained_at_ns)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            digest_bytes(value_id),
+            session_id.to_string(),
+            kind.database_name(),
+            i64::from(ordinal),
+            digest_bytes(value_digest),
+            to_i64(value.len())?,
+            to_i64(chunk_count)?,
+            retained_at.unix_nanos(),
+        ],
+    )?;
+    for (chunk_ordinal, chunk) in value.chunks(storage_chunk_bytes).enumerate() {
+        transaction.execute(
+            "INSERT INTO provider_macro_plan_value_chunks
+             (value_id, chunk_ordinal, chunk_digest, chunk_bytes)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                digest_bytes(value_id),
+                to_i64(chunk_ordinal)?,
+                digest_bytes(sha256_evidence(chunk)),
+                chunk,
+            ],
+        )?;
+    }
+    let retained = load_chunked_value(transaction, value_id)?;
+    if retained.session_id != session_id
+        || retained.kind != kind
+        || retained.ordinal != ordinal
+        || retained.value_digest != value_digest
+        || retained.bytes.as_ref() != value
+    {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    Ok(retained)
+}
+
+fn load_chunked_value(
+    connection: &Connection,
+    value_id: EvidenceDigest,
+) -> Result<StoredProviderMacroPlanValue, CatalogError> {
+    type Metadata = (String, String, i64, Vec<u8>, i64, i64);
+    let metadata: Metadata = connection
+        .query_row(
+            "SELECT session_id, value_kind, value_ordinal, value_digest,
+                    byte_length, chunk_count
+             FROM provider_macro_plan_values WHERE value_id=?1",
+            [digest_bytes(value_id)],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(CatalogError::CorruptCatalog)?;
+    let session_id = Uuid::parse_str(&metadata.0).map_err(|_| CatalogError::CorruptCatalog)?;
+    let kind = ProviderMacroPlanValueKind::parse(&metadata.1)?;
+    let ordinal = parse_u16(metadata.2)?;
+    let value_digest = parse_sha256(&metadata.3)?;
+    let byte_length = usize::try_from(metadata.4).map_err(|_| CatalogError::CorruptCatalog)?;
+    let chunk_count = usize::try_from(metadata.5).map_err(|_| CatalogError::CorruptCatalog)?;
+    if byte_length == 0
+        || byte_length > MAX_PROVIDER_MACRO_PLAN_CHECKPOINT_BYTES
+        || chunk_count == 0
+        || chunk_count > MAX_PROVIDER_MACRO_PLAN_VALUE_CHUNKS
+    {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    let mut value = Vec::new();
+    value
+        .try_reserve_exact(byte_length)
+        .map_err(|_| CatalogError::Allocation)?;
+    let mut identity = chunked_value_identity_header(
+        session_id,
+        kind,
+        ordinal,
+        value_digest,
+        byte_length,
+        chunk_count,
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT chunk_ordinal, chunk_digest, chunk_bytes
+         FROM provider_macro_plan_value_chunks
+         WHERE value_id=?1 ORDER BY chunk_ordinal LIMIT ?2",
+    )?;
+    let mut chunks = statement.query(params![
+        digest_bytes(value_id),
+        to_i64(MAX_PROVIDER_MACRO_PLAN_VALUE_CHUNKS + 1)?,
+    ])?;
+    let mut observed_chunks = 0usize;
+    while let Some(row) = chunks.next()? {
+        if observed_chunks >= chunk_count {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let chunk_ordinal =
+            usize::try_from(row.get::<_, i64>(0)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        let chunk_digest = parse_sha256(&row.get::<_, Vec<u8>>(1)?)?;
+        let chunk: Vec<u8> = row.get(2)?;
+        if chunk_ordinal != observed_chunks
+            || chunk.is_empty()
+            || chunk.len() > MAX_PROVIDER_MACRO_PLAN_STORAGE_CHUNK_BYTES
+            || sha256_evidence(&chunk) != chunk_digest
+            || value
+                .len()
+                .checked_add(chunk.len())
+                .is_none_or(|length| length > byte_length)
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        update_chunked_value_identity(&mut identity, chunk_ordinal, &chunk)?;
+        value.extend_from_slice(&chunk);
+        observed_chunks += 1;
+    }
+    if observed_chunks != chunk_count
+        || value.len() != byte_length
+        || sha256_evidence(&value) != value_digest
+        || EvidenceDigest::new(DigestAlgorithm::Sha256, identity.finalize().into()) != value_id
+    {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    Ok(StoredProviderMacroPlanValue {
+        value_id,
+        session_id,
+        kind,
+        ordinal,
+        value_digest,
+        bytes: value.into_boxed_slice(),
+    })
+}
+
+fn chunked_value_identity_header(
+    session_id: Uuid,
+    kind: ProviderMacroPlanValueKind,
+    ordinal: u16,
+    value_digest: EvidenceDigest,
+    byte_length: usize,
+    chunk_count: usize,
+) -> Result<Sha256, CatalogError> {
+    let mut identity = Sha256::new();
+    identity.update(CHUNKED_VALUE_DOMAIN);
+    identity.update(session_id.as_bytes());
+    identity.update([kind.identity_tag()]);
+    identity.update(ordinal.to_be_bytes());
+    identity.update(value_digest.bytes());
+    identity.update(
+        u64::try_from(byte_length)
+            .map_err(|_| CatalogError::InvalidRecord)?
+            .to_be_bytes(),
+    );
+    identity.update(to_u16(chunk_count)?.to_be_bytes());
+    Ok(identity)
+}
+
+fn update_chunked_value_identity(
+    identity: &mut Sha256,
+    chunk_ordinal: usize,
+    chunk: &[u8],
+) -> Result<(), CatalogError> {
+    identity.update(to_u16(chunk_ordinal)?.to_be_bytes());
+    identity.update(to_i64(chunk.len())?.to_be_bytes());
+    identity.update(sha256_evidence(chunk).bytes());
+    Ok(())
 }
 
 fn load_session(connection: &Connection, session_id: Uuid) -> Result<StoredSession, CatalogError> {
@@ -745,7 +1046,7 @@ fn load_session(connection: &Connection, session_id: Uuid) -> Result<StoredSessi
         .query_row(
             "SELECT analytical_dataset, source_id, metadata_revision, provider_dataset,
                     source_generation_digest, state, state_version, checkpoint_digest,
-                    checkpoint_bytes, response_count, data_page_count, analytical_row_count,
+                    checkpoint_value_id, response_count, data_page_count, analytical_row_count,
                     semantics_bytes
              FROM provider_macro_plan_sessions WHERE session_id=?1",
             [session_id.to_string()],
@@ -769,14 +1070,16 @@ fn load_session(connection: &Connection, session_id: Uuid) -> Result<StoredSessi
         )
         .optional()?
         .ok_or(CatalogError::ProviderCaptureConflict)?;
-    if row.8.is_empty() || row.8.len() > MAX_PROVIDER_MACRO_PLAN_CHECKPOINT_BYTES {
-        return Err(CatalogError::CorruptCatalog);
-    }
     let checkpoint_digest = parse_sha256(&row.7)?;
-    if sha256_evidence(&row.8) != checkpoint_digest {
+    let state_version = parse_u16(row.6)?;
+    let checkpoint = load_chunked_value(connection, parse_sha256(&row.8)?)?;
+    if checkpoint.session_id != session_id
+        || checkpoint.kind != ProviderMacroPlanValueKind::Checkpoint
+        || checkpoint.ordinal != state_version
+        || checkpoint.value_digest != checkpoint_digest
+    {
         return Err(CatalogError::CorruptCatalog);
     }
-    let state_version = parse_u16(row.6)?;
     Ok(StoredSession {
         key: ProviderMacroPlanSessionKey::try_new(
             session_id,
@@ -795,7 +1098,7 @@ fn load_session(connection: &Connection, session_id: Uuid) -> Result<StoredSessi
             state_version,
             checkpoint_digest,
         },
-        checkpoint: row.8.into_boxed_slice(),
+        checkpoint: checkpoint.bytes,
         response_count: parse_u16(row.9)?,
         data_page_count: parse_u16(row.10)?,
         analytical_row_count: u64::try_from(row.11).map_err(|_| CatalogError::CorruptCatalog)?,
@@ -843,7 +1146,7 @@ fn load_page_identities(
                 binding.extraction_content_digest, native.batch_digest,
                 page.canonical_record_count, page.semantics_schema,
                 page.semantics_schema_requirement_digest, page.semantics_digest,
-                page.semantics_payload, page.semantics_payload_digest
+                page.semantics_value_id, page.semantics_payload_digest
          FROM provider_macro_plan_staged_pages AS page
          JOIN provider_capture_bindings AS binding ON binding.binding_digest=page.binding_digest
          JOIN provider_raw_observations AS capture
@@ -867,15 +1170,17 @@ fn load_page_identities(
             return Err(CatalogError::CorruptCatalog);
         }
         let ordinal = parse_u16(row.get(0)?)?;
-        let payload: Vec<u8> = row.get(13)?;
+        let payload = load_chunked_value(connection, parse_sha256(&row.get::<_, Vec<u8>>(13)?)?)?;
         let payload_digest = parse_sha256(&row.get::<_, Vec<u8>>(14)?)?;
         semantics_bytes = semantics_bytes
-            .checked_add(payload.len())
+            .checked_add(payload.bytes.len())
             .ok_or(CatalogError::CorruptCatalog)?;
         if ordinal != u16::try_from(pages.len()).map_err(|_| CatalogError::CorruptCatalog)?
-            || payload.is_empty()
+            || payload.session_id != session_id
+            || payload.kind != ProviderMacroPlanValueKind::Semantics
+            || payload.ordinal != ordinal
             || semantics_bytes > MAX_PROVIDER_MACRO_PLAN_SEMANTICS_BYTES
-            || sha256_evidence(&payload) != payload_digest
+            || payload.value_digest != payload_digest
         {
             return Err(CatalogError::CorruptCatalog);
         }
@@ -1427,13 +1732,38 @@ pub(crate) fn reconstruct_provider_macro_plan_projection(
         return Err(CatalogError::CorruptCatalog);
     }
     let pages = load_page_identities(connection, session_id)?;
+    verify_generation_page_bindings(connection, row.0, run_id, &pages)?;
+    let successor = ProviderMacroPlanPublishedHead {
+        publication_digest,
+        manifest_dataset: manifest.dataset_id().clone(),
+        manifest_version: manifest.manifest_version(),
+        checkpoint_version: completed.coordinate.state_version,
+        checkpoint_digest: completed.coordinate.checkpoint_digest,
+    };
+    Ok(ProviderMacroPlanRestartProjection {
+        manifest: manifest.clone(),
+        generation_sequence,
+        anchor_manifest_id: anchor,
+        run_id,
+        completed,
+        catalog_receipt_digest: catalog_receipt,
+        predecessor,
+        successor,
+    })
+}
+
+fn verify_generation_page_bindings(
+    connection: &Connection,
+    generation_sequence: i64,
+    run_id: Uuid,
+    pages: &[StoredPageIdentity],
+) -> Result<(), CatalogError> {
     let mut statement = connection.prepare(
         "SELECT input_ordinal, binding_digest
-         FROM analytical_generation_provider_capture_bindings
-         WHERE generation_sequence=?1 AND run_id=?2 ORDER BY input_ordinal LIMIT ?3",
+         FROM ingest_run_provider_capture_bindings
+         WHERE run_id=?1 ORDER BY input_ordinal LIMIT ?2",
     )?;
     let mut inputs = statement.query(params![
-        row.0,
         run_id.to_string(),
         i64::try_from(MAX_PROVIDER_MACRO_PLAN_DATA_PAGES + 1)
             .map_err(|_| CatalogError::InvalidRecord)?,
@@ -1452,23 +1782,33 @@ pub(crate) fn reconstruct_provider_macro_plan_projection(
     if ordinal != pages.len() {
         return Err(CatalogError::CorruptCatalog);
     }
-    let successor = ProviderMacroPlanPublishedHead {
-        publication_digest,
-        manifest_dataset: manifest.dataset_id().clone(),
-        manifest_version: manifest.manifest_version(),
-        checkpoint_version: completed.coordinate.state_version,
-        checkpoint_digest: completed.coordinate.checkpoint_digest,
-    };
-    Ok(ProviderMacroPlanRestartProjection {
-        manifest: manifest.clone(),
-        generation_sequence,
-        anchor_manifest_id: anchor,
-        run_id,
-        completed,
-        catalog_receipt_digest: catalog_receipt,
-        predecessor,
-        successor,
-    })
+    let generation_input_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM analytical_generation_provider_capture_bindings
+         WHERE generation_sequence=?1 AND run_id=?2",
+        params![generation_sequence, run_id.to_string()],
+        |row| row.get(0),
+    )?;
+    if usize::try_from(generation_input_count).ok() != Some(pages.len()) {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    for page in pages {
+        let retained: bool = connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM analytical_generation_provider_capture_bindings
+                 WHERE generation_sequence=?1 AND run_id=?2 AND binding_digest=?3
+             )",
+            params![
+                generation_sequence,
+                run_id.to_string(),
+                digest_bytes(page.binding_digest),
+            ],
+            |row| row.get(0),
+        )?;
+        if !retained {
+            return Err(CatalogError::CorruptCatalog);
+        }
+    }
+    Ok(())
 }
 
 fn catalog_receipt_digest(
@@ -1570,20 +1910,35 @@ where
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::{Connection, params};
+    use std::time::Duration;
 
-    use crate::migrations::MIGRATIONS;
+    use market_squawk_domain::{
+        DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
+    };
+    use market_squawk_platform::LocalPaths;
+    use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+    use uuid::Uuid;
+
+    use super::{
+        ProviderMacroPlanSessionKey, ProviderMacroPlanValueKind, StoredPageIdentity, digest_bytes,
+        retain_chunked_value, verify_generation_page_bindings,
+    };
+    use crate::{Catalog, CatalogConfig, CatalogLimit, CatalogResultLimits, DatasetId};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
     fn macro_plan_checkpoint_requires_the_exact_predecessor() -> TestResult {
-        let connection = Connection::open_in_memory()?;
-        for migration in MIGRATIONS {
-            connection.execute_batch(migration.sql)?;
-        }
+        let directory = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(directory.path().join("market-squawk"))?;
+        let catalog = Catalog::open(CatalogConfig::try_new(
+            paths.catalog()?.clone(),
+            Duration::from_millis(750),
+            CatalogLimit::new(32)?,
+            CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+        )?)?;
         let source_revision = [3_u8; 32];
-        let source = connection.unchecked_transaction()?;
+        let source = catalog.connection.unchecked_transaction()?;
         source.execute(
             "INSERT INTO sources
              (source_id, current_revision_digest, current_registered_at_ns,
@@ -1593,60 +1948,126 @@ mod tests {
         source.execute(
             "INSERT INTO source_revisions
              (source_id, revision_digest, metadata_json, registered_at_ns)
-             VALUES (?1, ?2, '{}', 1)",
+             VALUES (?1, ?2,
+               '{\"revision_evidence\":{\"metadata_revision\":\"revision-1\"}}', 1)",
             params!["macro-source", source_revision],
         )?;
         source.commit()?;
-        let original = [1_u8; 32];
-        let successor = [2_u8; 32];
-        connection.execute(
-            "INSERT INTO provider_macro_plan_sessions
-             (session_id, analytical_dataset, source_id, metadata_revision, provider_dataset,
-              source_generation_digest, state, state_version, checkpoint_digest,
-              checkpoint_bytes, response_count, data_page_count, analytical_row_count,
-              semantics_bytes, created_at_ns, updated_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'acquiring', 0, ?7, ?8, 0, 0, 0, 0, 1, 1)",
-            params![
-                "00000000-0000-4000-8000-000000000001",
-                "macro-observations",
-                "macro-source",
-                "revision-1",
-                "provider-dataset",
-                [4_u8; 32],
-                original,
-                b"first",
-            ],
+        let session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000001")?;
+        let checkpoint = vec![0x5a; 1024 * 1024 + 17].into_boxed_slice();
+        let coordinate = catalog.begin_provider_macro_plan_session(
+            ProviderMacroPlanSessionKey::try_new(
+                session_id,
+                DatasetId::try_from("macro-observations")?,
+                SourceId::try_from("macro-source")?,
+                MetadataRevision::new(SourceIdentifier::try_from("revision-1")?),
+                SourceIdentifier::try_from("provider-dataset")?,
+                EvidenceDigest::new(DigestAlgorithm::Sha256, [4_u8; 32]),
+            )?,
+            checkpoint.clone(),
         )?;
+        let recovered = catalog.provider_macro_plan_session_recovery(session_id)?;
+        assert_eq!(recovered.coordinate(), coordinate);
+        assert_eq!(recovered.checkpoint(), checkpoint.as_ref());
 
-        let without_page = connection.execute(
+        let successor = vec![0xa5; 1024 * 1024 + 33].into_boxed_slice();
+        let storage_chunk_bytes = catalog.provider_macro_plan_storage_chunk_bytes()?;
+        let stale =
+            Transaction::new_unchecked(&catalog.connection, TransactionBehavior::Immediate)?;
+        let successor_value = retain_chunked_value(
+            &stale,
+            session_id,
+            ProviderMacroPlanValueKind::Checkpoint,
+            1,
+            &successor,
+            storage_chunk_bytes,
+            Timestamp::from_unix_nanos(2),
+        )?;
+        let updated = stale.execute(
             "UPDATE provider_macro_plan_sessions
-             SET state_version=1, checkpoint_digest=?1, checkpoint_bytes=?2,
-                 response_count=1, data_page_count=1, analytical_row_count=1,
-                 semantics_bytes=1, updated_at_ns=2
-             WHERE session_id=?3 AND state='acquiring' AND state_version=0
-               AND checkpoint_digest=?4",
-            params![
-                successor,
-                b"second",
-                "00000000-0000-4000-8000-000000000001",
-                original
-            ],
-        );
-        assert!(without_page.is_err());
-
-        let stale = connection.execute(
-            "UPDATE provider_macro_plan_sessions
-             SET checkpoint_digest=?1, checkpoint_bytes=?2
+             SET checkpoint_digest=?1, checkpoint_value_id=?2
              WHERE session_id=?3 AND state='acquiring' AND state_version=1
                AND checkpoint_digest=?4",
             params![
-                successor,
-                b"second",
-                "00000000-0000-4000-8000-000000000001",
-                original
+                digest_bytes(successor_value.value_digest),
+                digest_bytes(successor_value.value_id),
+                session_id.to_string(),
+                digest_bytes(coordinate.checkpoint_digest()),
             ],
         )?;
-        assert_eq!(stale, 0);
+        assert_eq!(updated, 0);
+        stale.rollback()?;
+        assert_eq!(
+            catalog.connection.query_row(
+                "SELECT COUNT(*) FROM provider_macro_plan_values",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
+        assert_eq!(
+            catalog
+                .provider_macro_plan_session_recovery(session_id)?
+                .checkpoint(),
+            checkpoint.as_ref()
+        );
+
+        let ordering = Connection::open_in_memory()?;
+        ordering.execute_batch(
+            "CREATE TABLE ingest_run_provider_capture_bindings (
+                 run_id TEXT NOT NULL, input_ordinal INTEGER NOT NULL,
+                 binding_digest BLOB NOT NULL
+             );
+             CREATE TABLE analytical_generation_provider_capture_bindings (
+                 generation_sequence INTEGER NOT NULL, run_id TEXT NOT NULL,
+                 input_ordinal INTEGER NOT NULL, binding_digest BLOB NOT NULL
+             );",
+        )?;
+        let run_id = Uuid::parse_str("00000000-0000-4000-8000-000000000010")?;
+        let inherited_run = Uuid::parse_str("00000000-0000-4000-8000-000000000011")?;
+        let page_zero_binding = EvidenceDigest::new(DigestAlgorithm::Sha256, [0xfe; 32]);
+        let page_one_binding = EvidenceDigest::new(DigestAlgorithm::Sha256, [0x01; 32]);
+        ordering.execute(
+            "INSERT INTO ingest_run_provider_capture_bindings VALUES (?1, 0, ?2), (?1, 1, ?3)",
+            params![
+                run_id.to_string(),
+                digest_bytes(page_zero_binding),
+                digest_bytes(page_one_binding),
+            ],
+        )?;
+        ordering.execute(
+            "INSERT INTO analytical_generation_provider_capture_bindings VALUES
+             (7, ?1, 0, ?2), (7, ?1, 1, ?3), (7, ?4, 2, ?5), (7, ?4, 3, ?6)",
+            params![
+                inherited_run.to_string(),
+                [0x02_u8; 32],
+                [0x03_u8; 32],
+                run_id.to_string(),
+                digest_bytes(page_one_binding),
+                digest_bytes(page_zero_binding),
+            ],
+        )?;
+        let page = |ordinal, binding_digest| StoredPageIdentity {
+            ordinal,
+            candidate_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0x10; 32]),
+            binding_digest,
+            capture_request_set_identity: EvidenceDigest::new(DigestAlgorithm::Sha256, [0x11; 32]),
+            capture_content_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0x12; 32]),
+            capture_observation_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0x13; 32]),
+            sealed_capture_receipt_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0x14; 32]),
+            extraction_content_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0x15; 32]),
+            native_batch_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0x16; 32]),
+            canonical_record_count: 1,
+            semantics_schema: "macro-semantics".to_owned(),
+            semantics_schema_requirement_digest: EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                [0x17; 32],
+            ),
+            semantics_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0x18; 32]),
+            semantics_payload_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [0x19; 32]),
+        };
+        let pages = [page(0, page_zero_binding), page(1, page_one_binding)];
+        verify_generation_page_bindings(&ordering, 7, run_id, &pages)?;
         Ok(())
     }
 }

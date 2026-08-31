@@ -172,6 +172,8 @@ impl Catalog {
                  + (SELECT COUNT(*) FROM provider_capture_binding_native_lineage)
                  + (SELECT COUNT(*) FROM provider_capture_binding_objects)
                  + (SELECT COUNT(*) FROM provider_capture_binding_rows)
+                 + (SELECT COUNT(*) FROM provider_macro_plan_values)
+                 + (SELECT COUNT(*) FROM provider_macro_plan_value_chunks)
                  + (SELECT COUNT(*) FROM provider_macro_plan_sessions)
                  + (SELECT COUNT(*) FROM provider_macro_plan_staged_pages)
                  + (SELECT COUNT(*) FROM provider_macro_plan_terminal_completions)
