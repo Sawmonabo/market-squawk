@@ -268,6 +268,8 @@ impl ProviderRateDispatchClaim {
 pub enum ProviderRateResponseClass {
     /// A complete response passed status, bounds, and payload validation.
     ValidatedSuccess,
+    /// A complete response with exact bytes was abandoned solely by local control after receipt.
+    KnownCompleteLocalAbort,
     /// A complete non-refusal HTTP response reported a provider-originated failure.
     HttpProviderError,
     /// A complete HTTP response refused service or imposed a rate limit.
@@ -284,7 +286,7 @@ impl ProviderRateResponseClass {
     /// Returns the non-caller-controlled provider-error charge for this response.
     pub const fn provider_error_units(self) -> u8 {
         match self {
-            Self::ValidatedSuccess => 0,
+            Self::ValidatedSuccess | Self::KnownCompleteLocalAbort => 0,
             Self::HttpProviderError
             | Self::ProviderRefusal
             | Self::ProviderBodyError

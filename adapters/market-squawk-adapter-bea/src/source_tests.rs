@@ -19,8 +19,9 @@ use market_squawk_platform::{LocalAuthorityStateStore, LocalPaths};
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, CoverageDomain,
-    DiscoveryRequest, EndpointPolicy, ExtractionRequest, FreshnessPolicy, HistoricalCapability,
-    HttpRequestBounds, NetworkAccessPolicy, ProviderRateAuthority, SourceCapabilities, SourceClass,
+    DiscoveryRequest, EndpointPolicy, ExtractionAuthorityError, ExtractionRequest, FreshnessPolicy,
+    HistoricalCapability, HttpRequestBounds, NetworkAccessPolicy, ProviderRateAuthority,
+    ProviderRateResponseClass, ProviderRateRetryAfterDisposition, SourceCapabilities, SourceClass,
     SourceCoverage, SourceMetadata, SourceMetadataInput, SourceProtocolProfile,
 };
 use serde_json::json;
@@ -501,6 +502,57 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             .map_err(|_| "poisoned scripted response queue")?
             .is_empty()
     );
+    let local_abort_target = crate::BeaQuery::dataset_list()?
+        .single_page(None)?
+        .authorize(&BeaUserId::try_new(USER_ID.to_owned())?)?
+        .expose_url()
+        .to_owned();
+    for local_error in [
+        crate::BeaError::SanitizationCancelled,
+        crate::BeaError::SanitizationDeadlineExceeded,
+        crate::BeaError::SanitizationClockUnavailable,
+    ] {
+        let failure = crate::source::BeaCompleteResponseFailure::from_sanitization(local_error);
+        assert_eq!(
+            failure.response_class(),
+            ProviderRateResponseClass::KnownCompleteLocalAbort
+        );
+        let permit = loop {
+            match authority.try_network_request(&local_abort_target) {
+                Ok(permit) => break permit,
+                Err(ExtractionAuthorityError::BudgetWaitUntil {
+                    deadline: budget_deadline,
+                }) => {
+                    let wait = authority.remaining_budget_wait(budget_deadline)?;
+                    let remaining = deadline
+                        .unix_nanos()
+                        .checked_sub(system_timestamp()?.unix_nanos())
+                        .and_then(|nanos| u64::try_from(nanos).ok())
+                        .map(Duration::from_nanos)
+                        .ok_or("local-abort settlement proof exceeded its deadline")?;
+                    if wait > remaining {
+                        return Err("local-abort settlement proof exceeded its deadline".into());
+                    }
+                    tokio::time::sleep(wait).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let receipt = crate::source::settle_complete_response(
+            permit.authorize_send(&local_abort_target)?,
+            137,
+            failure.response_class(),
+            ProviderRateRetryAfterDisposition::Absent,
+            0,
+        )?;
+        assert_eq!(
+            receipt.settlement().response_class(),
+            ProviderRateResponseClass::KnownCompleteLocalAbort
+        );
+        assert_eq!(receipt.settlement().provider_error_units(), 0);
+        assert_eq!(receipt.charged_response_bytes(), 137);
+        assert_eq!(receipt.consecutive_refusals(), 0);
+    }
     registry.shutdown()?;
     Ok(())
 }

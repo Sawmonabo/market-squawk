@@ -2598,7 +2598,8 @@ impl RateState {
                 self.apply_fallback(policy, now, 0)?;
             }
             ProviderRateResponseClass::HttpProviderError
-            | ProviderRateResponseClass::ProviderBodyError => {}
+            | ProviderRateResponseClass::ProviderBodyError
+            | ProviderRateResponseClass::KnownCompleteLocalAbort => {}
         }
         Ok(SettlementControlOutcome::Normal)
     }

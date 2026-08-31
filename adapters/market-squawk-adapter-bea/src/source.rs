@@ -24,9 +24,10 @@ use market_squawk_sources::{
     ProviderCaptureError, ProviderCaptureMaterial, ProviderCapturePageReceipt,
     ProviderCaptureSealRequest, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
     ProviderRateDeclaration, ProviderRateResponseClass, ProviderRateResponseSettlement,
-    ProviderRateRetryAfterDisposition, ProviderRateWeightedDimension, ProviderRateWeightedWindow,
-    QueryParameterRule, QuerySensitivity, SourceClass, SourceError, SourceMetadata,
-    SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity, SourceProtocolProfile,
+    ProviderRateResponseSettlementReceipt, ProviderRateRetryAfterDisposition,
+    ProviderRateWeightedDimension, ProviderRateWeightedWindow, QueryParameterRule,
+    QuerySensitivity, SourceClass, SourceError, SourceMetadata, SourceMetadataProvider,
+    SourceObject, SourceObjectCaptureIdentity, SourceProtocolProfile,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -1886,6 +1887,43 @@ struct FetchedResponse {
     in_flight: Option<InFlightExtractionRequest>,
 }
 
+pub(crate) struct BeaCompleteResponseFailure {
+    error: ExtractionSourceError,
+    response_class: ProviderRateResponseClass,
+}
+
+impl BeaCompleteResponseFailure {
+    pub(crate) fn from_sanitization(error: BeaError) -> Self {
+        let response_class = match error {
+            BeaError::SanitizationCancelled
+            | BeaError::SanitizationDeadlineExceeded
+            | BeaError::SanitizationClockUnavailable => {
+                ProviderRateResponseClass::KnownCompleteLocalAbort
+            }
+            _ => ProviderRateResponseClass::InvalidProviderResponse,
+        };
+        Self {
+            error: map_sanitization_error(error),
+            response_class,
+        }
+    }
+
+    fn invalid(error: ExtractionSourceError) -> Self {
+        Self {
+            error,
+            response_class: ProviderRateResponseClass::InvalidProviderResponse,
+        }
+    }
+
+    pub(crate) const fn response_class(&self) -> ProviderRateResponseClass {
+        self.response_class
+    }
+
+    fn into_error(self) -> ExtractionSourceError {
+        self.error
+    }
+}
+
 impl FetchedResponse {
     fn sanitize(
         self,
@@ -1930,10 +1968,12 @@ impl FetchedResponse {
                     }
                     Ok(())
                 })
-                .map_err(map_sanitization_error)?;
-            if u64::try_from(body.bytes().len()).map_err(|_| invalid_protocol())? != response_bytes
+                .map_err(BeaCompleteResponseFailure::from_sanitization)?;
+            if u64::try_from(body.bytes().len())
+                .map_err(|_| BeaCompleteResponseFailure::invalid(invalid_protocol()))?
+                != response_bytes
             {
-                return Err(invalid_protocol());
+                return Err(BeaCompleteResponseFailure::invalid(invalid_protocol()));
             }
             let request_identity = evidence_digest(request.request_digest());
             let body_digest = evidence_digest(body.retained_digest());
@@ -1954,10 +1994,12 @@ impl FetchedResponse {
                         body_digest,
                         received_at,
                     )
-                    .map_err(map_capture_error)?,
+                    .map_err(|error| {
+                        BeaCompleteResponseFailure::invalid(map_capture_error(error))
+                    })?,
                 ],
             )
-            .map_err(map_capture_error)?;
+            .map_err(|error| BeaCompleteResponseFailure::invalid(map_capture_error(error)))?;
             let received = DateTime::<Utc>::from_timestamp_nanos(received_at.unix_nanos());
             let record = RawCaptureRecord::try_new_live(
                 capture_uuid(b"event", &capture),
@@ -1968,9 +2010,13 @@ impl FetchedResponse {
                 received,
                 body.bytes().clone(),
             )
-            .map_err(|error| map_source_error(BeaSourceError::RawCapture(error)))?;
+            .map_err(|error| {
+                BeaCompleteResponseFailure::invalid(map_source_error(BeaSourceError::RawCapture(
+                    error,
+                )))
+            })?;
             let material = ProviderCaptureMaterial::try_new(capture, vec![record])
-                .map_err(map_capture_error)?;
+                .map_err(|error| BeaCompleteResponseFailure::invalid(map_capture_error(error)))?;
             Ok((body.upstream_digest(), body.retained_digest(), material))
         })();
         match sanitized {
@@ -1984,15 +2030,22 @@ impl FetchedResponse {
                 material,
                 in_flight,
             }),
-            Err(error) => {
+            Err(failure) => {
+                let response_class = failure.response_class();
+                let retry_after =
+                    if response_class == ProviderRateResponseClass::InvalidProviderResponse {
+                        ProviderRateRetryAfterDisposition::parse_http(retry_after.as_deref())
+                    } else {
+                        ProviderRateRetryAfterDisposition::Absent
+                    };
                 settle_complete_response(
                     in_flight.take().ok_or_else(invalid_protocol)?,
                     response_bytes,
-                    ProviderRateResponseClass::InvalidProviderResponse,
-                    ProviderRateRetryAfterDisposition::parse_http(retry_after.as_deref()),
+                    response_class,
+                    retry_after,
                     0,
                 )?;
-                Err(error)
+                Err(failure.into_error())
             }
         }
     }
@@ -2035,15 +2088,17 @@ impl SanitizedFetchedResponse {
             | BeaError::RowLimitExceeded
             | BeaError::StringLimitExceeded
             | BeaError::Allocation
-            | BeaError::SanitizationCancelled
-            | BeaError::SanitizationDeadlineExceeded
-            | BeaError::SanitizationClockUnavailable
             | BeaError::InvalidJson
             | BeaError::InvalidField(_)
             | BeaError::RequestEchoMismatch
             | BeaError::InvalidDecimal
             | BeaError::InvalidTimePeriod
             | BeaError::InvalidRevision => ProviderRateResponseClass::InvalidProviderResponse,
+            BeaError::SanitizationCancelled
+            | BeaError::SanitizationDeadlineExceeded
+            | BeaError::SanitizationClockUnavailable => {
+                ProviderRateResponseClass::KnownCompleteLocalAbort
+            }
         })
     }
 
@@ -2067,16 +2122,17 @@ impl SanitizedFetchedResponse {
             retry_after,
             0,
         )
+        .map(|_receipt| ())
     }
 }
 
-fn settle_complete_response(
+pub(crate) fn settle_complete_response(
     in_flight: InFlightExtractionRequest,
     response_bytes: u64,
     response_class: ProviderRateResponseClass,
     retry_after: ProviderRateRetryAfterDisposition,
     fallback_jitter_sample_basis_points: u16,
-) -> Result<(), ExtractionSourceError> {
+) -> Result<ProviderRateResponseSettlementReceipt, ExtractionSourceError> {
     let settlement = ProviderRateResponseSettlement::try_new(
         response_bytes,
         response_class,
@@ -2084,8 +2140,7 @@ fn settle_complete_response(
         fallback_jitter_sample_basis_points,
     )
     .map_err(|_| invalid_protocol())?;
-    let _receipt = in_flight.settle_response(settlement)?;
-    Ok(())
+    in_flight.settle_response(settlement).map_err(Into::into)
 }
 
 fn validate_metadata_bundle(
