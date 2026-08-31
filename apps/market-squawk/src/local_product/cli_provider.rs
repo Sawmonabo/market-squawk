@@ -5346,6 +5346,7 @@ mod tests {
     use market_squawk_sources::{OnboardingState, ProviderPublicConfiguration};
 
     use super::*;
+    use crate::local_product::provider_activation_state::DurableSourceLifecyclePhase;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -5778,7 +5779,7 @@ mod tests {
         );
         drop(product);
 
-        let recovered = crate::LocalProduct::try_new(config)?;
+        let recovered = crate::LocalProduct::try_new(config.clone())?;
         assert!(matches!(
             recovered
                 .provider_activation_state()
@@ -5807,6 +5808,79 @@ mod tests {
                 .state(),
             OnboardingState::Blocked
         );
+
+        let lifecycle = recovered
+            .provider_activation_state()
+            .source_lifecycle_record(TREASURY_FISCAL_SURFACE)?;
+        let stopped_transition = recovered
+            .provider_activation_state()
+            .begin_source_lifecycle_transition(
+                TREASURY_FISCAL_SURFACE,
+                lifecycle.revision(),
+                SourceIdentifier::try_from("treasury-stopped-restart-proof")?,
+                EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    Sha256::digest(b"treasury-stopped-restart-proof").into(),
+                ),
+                false,
+                Some(recovery_lease.session_id()),
+                Some(recovery_lease.public_configuration_digest()),
+            )?;
+        recovered
+            .provider_activation()
+            .revoke_research_runtime(&recovery_candidate)
+            .await?;
+        recovered
+            .provider_activation_state()
+            .complete_source_lifecycle_transition(
+                TREASURY_FISCAL_SURFACE,
+                stopped_transition.transition_digest(),
+                DurableSourceLifecyclePhase::Stopped,
+                Some(recovery_lease.session_id()),
+                Some(recovery_lease.public_configuration_digest()),
+                None,
+                None,
+            )?;
+        assert!(
+            recovered
+                .application()
+                .shutdown(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_complete()
+        );
+        drop(recovered);
+
+        let recovered = crate::LocalProduct::try_new(config)?;
+        assert!(matches!(
+            recovered
+                .provider_activation_state()
+                .load_recipe_for_lifecycle(TREASURY_FISCAL_SURFACE)?,
+            DurableActivationRecipeState::Desired(recipe)
+                if recipe.session_id == recovery_lease.session_id()
+        ));
+        assert!(matches!(
+            recovered
+                .provider_activation_state()
+                .load_recipe(TREASURY_FISCAL_SURFACE)?,
+            DurableActivationRecipeState::Missing
+        ));
+        assert_eq!(
+            recovered
+                .provider_activation()
+                .research_runtime_generation(recovery_candidate.profile())?,
+            None
+        );
+        assert!(
+            !recovered
+                .research_ingest()
+                .is_profile_registered(recovery_candidate.profile())?
+        );
+        require_same_activation_lease(
+            &recovered
+                .provider_onboarding()
+                .activation_lease(recovery_lease.session_id())?,
+            &recovery_lease,
+        )?;
 
         let cancellation = ProviderResearchActivationService::new(
             recovered.paths().clone(),

@@ -467,7 +467,7 @@ impl DurableProviderActivationState {
     ) -> Result<ProviderRuntimeStartupAdmissions, ProviderOnboardingError> {
         let mut entries = Vec::new();
         for surface_id in RESTORABLE_RESEARCH_SURFACES {
-            let recovered = match self.load_recipe_for_startup_recovery(surface_id) {
+            let recovered = match self.load_recipe_for_startup_admission(surface_id) {
                 Ok(DurableActivationRecipeState::Desired(recipe)) => {
                     vec![recipe.session_id]
                 }
@@ -543,9 +543,7 @@ impl DurableProviderActivationState {
         &self,
         surface_id: &str,
     ) -> Result<DurableSourceLifecycleRecord, DurableProviderActivationStateError> {
-        let key = lifecycle_surface_key(surface_id)?;
-        let store = LocalAuthorityStateStore::try_open(self.lifecycle_root(key))?;
-        let Some(encoded) = store.load()? else {
+        let Some(record) = self.stored_source_lifecycle_record(surface_id)? else {
             let recipe = surface_key(surface_id)
                 .ok()
                 .map(|recipe_key| {
@@ -586,7 +584,18 @@ impl DurableProviderActivationState {
                 credential_generation: None,
             });
         };
-        decode_source_lifecycle(surface_id, &encoded)
+        Ok(record)
+    }
+
+    fn stored_source_lifecycle_record(
+        &self,
+        surface_id: &str,
+    ) -> Result<Option<DurableSourceLifecycleRecord>, DurableProviderActivationStateError> {
+        let key = lifecycle_surface_key(surface_id)?;
+        LocalAuthorityStateStore::try_open(self.lifecycle_root(key))?
+            .load()?
+            .map(|encoded| decode_source_lifecycle(surface_id, &encoded))
+            .transpose()
     }
 
     /// Durably claims one exact lifecycle transition before mutating runtime authority.
@@ -1153,14 +1162,29 @@ impl DurableProviderActivationState {
         if !self.restored_requirements(surface_id)?.is_empty() {
             return Ok(DurableActivationRecipeState::Missing);
         }
-        let lifecycle_key = lifecycle_surface_key(surface_id)?;
-        if let Some(encoded) =
-            LocalAuthorityStateStore::try_open(self.lifecycle_root(lifecycle_key))?.load()?
-        {
-            let lifecycle = decode_source_lifecycle(surface_id, &encoded)?;
+        if let Some(lifecycle) = self.stored_source_lifecycle_record(surface_id)? {
             if lifecycle.phase() != DurableSourceLifecyclePhase::Active {
                 return Ok(DurableActivationRecipeState::Missing);
             }
+        }
+        self.load_recipe_for_lifecycle(surface_id)
+    }
+
+    /// Loads retained session authority needed for onboarding startup reconciliation.
+    ///
+    /// A stopped or indeterminate source remains non-callable, but its admitted credential session
+    /// must survive restart so an explicit start, retry, or reconciliation action can use the
+    /// retained recipe. Removed sources and backup-restored recipes do not retain that admission.
+    pub(super) fn load_recipe_for_startup_admission(
+        &self,
+        surface_id: &str,
+    ) -> Result<DurableActivationRecipeState, DurableProviderActivationStateError> {
+        if !self.restored_requirements(surface_id)?.is_empty()
+            || self
+                .stored_source_lifecycle_record(surface_id)?
+                .is_some_and(|record| record.phase() == DurableSourceLifecyclePhase::Removed)
+        {
+            return Ok(DurableActivationRecipeState::Missing);
         }
         self.load_recipe_for_lifecycle(surface_id)
     }
@@ -2575,6 +2599,11 @@ mod tests {
             DurableActivationRecipeState::Missing
         ));
         assert!(matches!(
+            state.load_recipe_for_startup_admission(surface_id)?,
+            DurableActivationRecipeState::Desired(recipe)
+                if recipe.session_id == retained_session
+        ));
+        assert!(matches!(
             state.begin_source_lifecycle_transition(
                 surface_id,
                 NonZeroU64::MIN,
@@ -2740,6 +2769,10 @@ mod tests {
         ));
         assert!(matches!(
             restored_state.load_recipe_for_startup_recovery(surface_id)?,
+            DurableActivationRecipeState::Missing
+        ));
+        assert!(matches!(
+            restored_state.load_recipe_for_startup_admission(surface_id)?,
             DurableActivationRecipeState::Missing
         ));
         assert!(matches!(
