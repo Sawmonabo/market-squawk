@@ -4,7 +4,7 @@ use std::num::NonZeroU16;
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
-use url::Url;
+use url::{Position, Url};
 
 use crate::{
     HttpMethod, RequestAdmission, SCHWAB_MARKET_DATA_BASE, SCHWAB_USER_PREFERENCE_ENDPOINT,
@@ -118,7 +118,7 @@ impl ReadOnlyRoute {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadOnlyRequest {
     route: ReadOnlyRoute,
-    url: Box<str>,
+    url: Url,
     requested_items: usize,
 }
 
@@ -132,15 +132,15 @@ impl ReadOnlyRequest {
         if requested_items == 0 || requested_items > admission.max_items() {
             return Err(SchwabAdapterError::RequestNotAdmitted);
         }
-        let url = url.to_string();
-        if url.len() > admission.max_request_bytes()
-            || ReadOnlyRoute::classify(HttpMethod::Get, &url)? != route
+        let request_target = &url[Position::BeforePath..Position::AfterQuery];
+        if request_target.as_bytes().len() > admission.max_request_bytes()
+            || ReadOnlyRoute::classify(HttpMethod::Get, url.as_str())? != route
         {
             return Err(SchwabAdapterError::RequestNotAdmitted);
         }
         Ok(Self {
             route,
-            url: url.into_boxed_str(),
+            url,
             requested_items,
         })
     }
@@ -157,6 +157,15 @@ impl ReadOnlyRequest {
 
     /// Allowlist-validated URL without credentials.
     pub fn url(&self) -> &str {
+        self.url.as_str()
+    }
+
+    /// Exact encoded origin-form target sent on the HTTP request line.
+    pub fn request_target(&self) -> &str {
+        &self.url[Position::BeforePath..Position::AfterQuery]
+    }
+
+    pub(crate) const fn wire_url(&self) -> &Url {
         &self.url
     }
 

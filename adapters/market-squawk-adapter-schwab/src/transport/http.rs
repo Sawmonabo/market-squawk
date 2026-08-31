@@ -239,7 +239,7 @@ impl SchwabHttpWire for ReqwestSchwabHttpWire {
                 ReqwestSchwabAuthorizationMaterial::try_new(request.bearer())?.into_header()?;
             let response = self
                 .client
-                .get(request.request().url())
+                .get(request.request().wire_url().clone())
                 .header(ACCEPT, "application/json")
                 .header(ACCEPT_ENCODING, "identity")
                 .header(USER_AGENT, USER_AGENT_VALUE)
@@ -1085,7 +1085,7 @@ fn capacity_observation_from_receipt(
         0,
         0,
         accounting.unexpected,
-        u64::try_from(receipt.request_url().len()).map_err(|_| SchwabTransportError::Overflow)?,
+        receipt.request_target_bytes(),
         receipt.body_bytes(),
         receipt.latency_ms(),
         receipt.status(),
@@ -1160,8 +1160,8 @@ impl SchwabRestExecutor {
         token.validate_at(unix_seconds()?, self.token_admission)?;
         let requested =
             u64::try_from(request.requested_items()).map_err(|_| SchwabTransportError::Overflow)?;
-        let request_bytes =
-            u64::try_from(request.url().len()).map_err(|_| SchwabTransportError::Overflow)?;
+        let request_bytes = u64::try_from(request.request_target().as_bytes().len())
+            .map_err(|_| SchwabTransportError::Overflow)?;
         self.telemetry
             .record_rest_attempt(requested, request_bytes)?;
         let started = Instant::now();
@@ -1198,9 +1198,8 @@ impl SchwabRestExecutor {
         self.telemetry
             .record_rest_response(status, body_bytes, latency_ms)?;
         let receipt = RawRestResponseReceipt::new(
-            request.route(),
+            request,
             token.generation(),
-            request.url().to_owned().into_boxed_str(),
             status,
             received_at_unix_millis,
             &body,

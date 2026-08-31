@@ -669,11 +669,27 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|error| panic!("OAuth issue clock: {error}"))
         .as_secs();
-    let oauth_receipt = oauth_authority
+    let completed_oauth_receipt = oauth_authority
         .complete_authorization(&callback, issued_at, SchwabOAuthInteraction::Background)
         .await
         .unwrap_or_else(|error| panic!("OAuth completion: {error}"));
-    let token = mock_token(token_admission);
+    let token = SchwabAccessTokenSource::acquire(&oauth_authority)
+        .await
+        .unwrap_or_else(|error| panic!("OAuth token acquisition: {error}"));
+    let oauth_receipt = match oauth_authority
+        .status()
+        .await
+        .unwrap_or_else(|error| panic!("OAuth status: {error}"))
+    {
+        SchwabOAuthAuthorityStatus::Active(receipt) => receipt,
+        status => panic!("OAuth authority is not active after token acquisition: {status:?}"),
+    };
+    assert!(oauth_receipt.generation() >= completed_oauth_receipt.generation());
+    assert_eq!(token.generation(), oauth_receipt.generation());
+    assert_eq!(
+        token.credential_authority(),
+        oauth_receipt.credential_authority()
+    );
     let preference_request = crate::ReadOnlyRequest::user_preference(admission())
         .unwrap_or_else(|error| panic!("preference request: {error}"));
     let preference = execute_user_preference_fixture(
@@ -711,6 +727,10 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
     .unwrap_or_else(|error| panic!("history range: {error}"))
     .build(admission())
     .unwrap_or_else(|error| panic!("history request: {error}"));
+    assert_eq!(
+        history_request.request_target(),
+        "/marketdata/v1/pricehistory?symbol=SPY&frequencyType=daily&frequency=1&startDate=1704067200000&endDate=1704153600000"
+    );
     let history_body: &'static [u8] = br#"{
       "symbol":"SPY","empty":false,
       "candles":[{"open":475.00,"high":477.00,"low":474.50,"close":476.25,"volume":1000,"datetime":1704067200000}]
@@ -2380,6 +2400,11 @@ async fn execute_market_fixture(
     assert_eq!(capacity.missing(), accounting.missing);
     assert_eq!(capacity.unexpected(), accounting.unexpected);
     assert_eq!(
+        capacity.request_bytes(),
+        u64::try_from(request.request_target().as_bytes().len())
+            .unwrap_or_else(|error| panic!("request-target bytes: {error}"))
+    );
+    assert_eq!(
         capacity.response_bytes(),
         response.capture().receipt().body_bytes()
     );
@@ -2503,10 +2528,20 @@ async fn execute_fixture(
         SchwabTransportTelemetry::default(),
     )
     .unwrap_or_else(|error| panic!("REST executor: {error}"));
-    executor
+    let outcome = executor
         .execute(request, token, CancellationToken::new())
         .await
-        .unwrap_or_else(|error| panic!("REST execution: {error}"))
+        .unwrap_or_else(|error| panic!("REST execution: {error}"));
+    assert_eq!(
+        executor
+            .telemetry()
+            .snapshot()
+            .unwrap_or_else(|error| panic!("REST telemetry: {error}"))
+            .request_target_bytes_total,
+        u64::try_from(request.request_target().as_bytes().len())
+            .unwrap_or_else(|error| panic!("request-target telemetry bytes: {error}"))
+    );
+    outcome
 }
 
 #[derive(Debug)]

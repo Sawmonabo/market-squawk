@@ -86,7 +86,7 @@ impl RequestAdmission {
         }
     }
 
-    /// Maximum encoded URL or frame bytes for this request.
+    /// Maximum encoded HTTP request-target or Streamer frame bytes for this request.
     pub const fn max_request_bytes(self) -> usize {
         self.max_request_bytes.get()
     }

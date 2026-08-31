@@ -23,7 +23,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::{ConnectionGeneration, ReadOnlyRoute, SchwabAdapterError};
+use crate::{ConnectionGeneration, ReadOnlyRequest, ReadOnlyRoute, SchwabAdapterError};
 
 pub(crate) use crate::sensitive::SensitiveBytesOwner;
 #[cfg(test)]
@@ -526,6 +526,7 @@ pub struct RawRestResponseReceipt {
     token_generation: AccessTokenGeneration,
     request_url: Box<str>,
     request_sha256: [u8; 32],
+    request_target_bytes: u64,
     status: u16,
     received_at_unix_millis: u64,
     body_bytes: u64,
@@ -537,9 +538,8 @@ pub struct RawRestResponseReceipt {
 
 impl RawRestResponseReceipt {
     pub(crate) fn new(
-        route: ReadOnlyRoute,
+        request: &ReadOnlyRequest,
         token_generation: AccessTokenGeneration,
-        request_url: Box<str>,
         status: u16,
         received_at_unix_millis: u64,
         body: &[u8],
@@ -547,13 +547,17 @@ impl RawRestResponseReceipt {
         latency_ms: u64,
         headers: Box<[ResponseHeaderEvidence]>,
     ) -> Result<Self, SchwabTransportError> {
+        let request_url = request.url().to_owned().into_boxed_str();
+        let request_target_bytes = u64::try_from(request.request_target().as_bytes().len())
+            .map_err(|_| SchwabTransportError::Overflow)?;
         let body_bytes = u64::try_from(body.len()).map_err(|_| SchwabTransportError::Overflow)?;
         let request_sha256 = request_identity(&request_url);
         Ok(Self {
-            route,
+            route: request.route(),
             token_generation,
             request_url,
             request_sha256,
+            request_target_bytes,
             status,
             received_at_unix_millis,
             body_bytes,
@@ -578,6 +582,10 @@ impl RawRestResponseReceipt {
 
     pub const fn request_sha256(&self) -> [u8; 32] {
         self.request_sha256
+    }
+
+    pub const fn request_target_bytes(&self) -> u64 {
+        self.request_target_bytes
     }
 
     pub const fn status(&self) -> u16 {
