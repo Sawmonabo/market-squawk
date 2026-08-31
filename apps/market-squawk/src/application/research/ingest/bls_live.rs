@@ -618,13 +618,28 @@ mod tests {
       "seasonal_adjustment":"seasonally-adjusted",
       "measure":"rate"
     }"#;
-    const PROVIDER_RESPONSE: &[u8] = br#"{
+    const PROVIDER_RESPONSE_V1: &[u8] = br#"{
       "status":"REQUEST_SUCCEEDED",
       "responseTime":1,
       "message":[],
       "Results":{"series":[{"seriesID":"LNS14000000","data":[{
         "year":"2026","period":"M06","periodName":"June","latest":"true",
-        "value":"4.2","footnotes":[]
+        "value":"4.2","footnotes":[{"code":"P","text":"Preliminary."}]
+      },{
+        "year":"2026","period":"M05","periodName":"May","latest":"false",
+        "value":"-","footnotes":[{"code":null,"text":"Data not available."}]
+      }]}]}
+    }"#;
+    const PROVIDER_RESPONSE_V2: &[u8] = br#"{
+      "status":"REQUEST_SUCCEEDED",
+      "responseTime":1,
+      "message":[],
+      "Results":{"series":[{"seriesID":"LNS14000000","data":[{
+        "year":"2026","period":"M06","periodName":"June","latest":"true",
+        "value":"4.1","footnotes":[]
+      },{
+        "year":"2026","period":"M05","periodName":"May","latest":"false",
+        "value":"-","footnotes":[{"code":null,"text":"Data not available."}]
       }]}]}
     }"#;
     const LIVE_REGISTERED_ACCEPTANCE: &str = "MARKET_SQUAWK_BLS_REGISTERED_LIVE_ACCEPTANCE";
@@ -672,6 +687,7 @@ mod tests {
         }
         let now = current_timestamp()?;
         let observed_at = now.checked_sub_nanos(1_000_000)?;
+        let revised_observed_at = observed_at.checked_add_nanos(1)?;
         let (authorization, expected_rejoin, profile, evidence_byte, revision) =
             match (tier, secret_reference.as_ref(), registration_key) {
                 (BlsAccessTier::PublicV1, None, None) => (
@@ -704,14 +720,24 @@ mod tests {
             .then(|| {
                 BlsScriptedTransportFactory::try_new(vec![
                     BlsScriptedResponse::try_new(
-                        Bytes::from_static(PROVIDER_RESPONSE),
+                        Bytes::from_static(PROVIDER_RESPONSE_V1),
                         observed_at,
                         observed_at,
                     )?,
                     BlsScriptedResponse::try_new(
-                        Bytes::from_static(PROVIDER_RESPONSE),
+                        Bytes::from_static(PROVIDER_RESPONSE_V1),
                         observed_at,
                         observed_at,
+                    )?,
+                    BlsScriptedResponse::try_new(
+                        Bytes::from_static(PROVIDER_RESPONSE_V2),
+                        revised_observed_at,
+                        revised_observed_at,
+                    )?,
+                    BlsScriptedResponse::try_new(
+                        Bytes::from_static(PROVIDER_RESPONSE_V2),
+                        revised_observed_at,
+                        revised_observed_at,
                     )?,
                 ])
             })
@@ -797,28 +823,51 @@ mod tests {
         )?;
         let allowlist = AnalyticalMacroSeriesAllowlist::try_from_code_owned(&["LNS14000000"])?;
         let query_limits = query_limits()?;
-        let operation_deadline = Instant::now() + Duration::from_secs(15);
-        let outcome = runtime
-            .publish_and_read(
-                BlsLiveRequest::new(
-                    now.checked_add_nanos(10_000_000_000)?,
-                    now.checked_add_nanos(10_000_000_000)?,
-                    operation_deadline,
-                    NonZeroU32::new(16).ok_or("invalid record bound")?,
-                    NonZeroU64::new(1024 * 1024).ok_or("invalid byte bound")?,
-                    allowlist.clone(),
-                    cutoff,
-                    period.clone(),
-                    query_limits,
-                    operation_deadline,
-                ),
-                &request_context(operation_deadline)?,
-            )
+        let operation_deadline = Instant::now() + Duration::from_secs(30);
+        let live_request = BlsLiveRequest::new(
+            now.checked_add_nanos(20_000_000_000)?,
+            now.checked_add_nanos(20_000_000_000)?,
+            operation_deadline,
+            NonZeroU32::new(16).ok_or("invalid record bound")?,
+            NonZeroU64::new(1024 * 1024).ok_or("invalid byte bound")?,
+            allowlist.clone(),
+            cutoff,
+            period.clone(),
+            query_limits,
+            operation_deadline,
+        );
+        let first_outcome = runtime
+            .publish_and_read(live_request.clone(), &request_context(operation_deadline)?)
             .await?;
-        assert_eq!(outcome.read().output().observations().len(), 1);
+        assert_complete_observed_handoff(first_outcome.read(), 1, None);
+        if !live_http {
+            assert_complete_observed_handoff(first_outcome.read(), 1, Some("4.2"));
+        }
+        let first_generation = (
+            first_outcome.read().restart_selector().clone(),
+            first_outcome.publication().receipt().manifest().clone(),
+            first_outcome.read().output().selection_digest(),
+        );
+        let (outcome, prior_generation) = if live_http {
+            (first_outcome, None)
+        } else {
+            let revised_outcome = runtime
+                .publish_and_read(live_request, &request_context(operation_deadline)?)
+                .await?;
+            assert_complete_observed_handoff(revised_outcome.read(), 2, Some("4.1"));
+            assert_ne!(
+                first_outcome.publication().receipt().manifest(),
+                revised_outcome.publication().receipt().manifest()
+            );
+            assert_ne!(
+                first_outcome.read().output().selection_digest(),
+                revised_outcome.read().output().selection_digest()
+            );
+            (revised_outcome, Some(first_generation))
+        };
         if let Some(fixture) = fixture {
-            assert_eq!(fixture.counters()?.attempts, 2);
-            assert_eq!(fixture.counters()?.completed, 2);
+            assert_eq!(fixture.counters()?.attempts, 4);
+            assert_eq!(fixture.counters()?.completed, 4);
             assert_eq!(fixture.counters()?.remaining, 0);
         }
         let restart_selector = outcome.read().restart_selector().clone();
@@ -834,24 +883,149 @@ mod tests {
 
         let reopened = Arc::new(open_research(&paths)?);
         let closure = BlsMacroApplicationClosure::new(reopened);
-        let reopened = closure
+        let reopened_current = closure
             .read_provider_period_latest_known(
                 BlsProviderPeriodLatestKnownRequest::try_new(
-                    restart_selector,
-                    allowlist,
+                    restart_selector.clone(),
+                    allowlist.clone(),
                     cutoff,
-                    period,
+                    period.clone(),
                 )?,
                 query_limits,
                 Instant::now() + Duration::from_secs(5),
                 CancellationToken::new(),
             )
             .await?;
-        let read = reopened.available().ok_or("restart read unavailable")?;
+        let read = reopened_current
+            .available()
+            .ok_or("restart read unavailable")?;
         assert_eq!(read.reopened().manifest(), &manifest);
         assert_eq!(read.output().selection_digest(), selection_digest);
-        assert_eq!(read.output().observations().len(), 1);
+        assert_complete_observed_handoff(read, if live_http { 1 } else { 2 }, None);
+
+        if let Some((prior_selector, prior_manifest, prior_selection_digest)) = prior_generation {
+            let reopened_prior = closure
+                .read_provider_period_latest_known(
+                    BlsProviderPeriodLatestKnownRequest::try_new(
+                        prior_selector,
+                        allowlist.clone(),
+                        cutoff,
+                        period.clone(),
+                    )?,
+                    query_limits,
+                    Instant::now() + Duration::from_secs(5),
+                    CancellationToken::new(),
+                )
+                .await?;
+            let prior = reopened_prior
+                .available()
+                .ok_or("prior restart read unavailable")?;
+            assert_eq!(prior.reopened().manifest(), &prior_manifest);
+            assert_eq!(prior.output().selection_digest(), prior_selection_digest);
+            assert_complete_observed_handoff(prior, 1, Some("4.2"));
+
+            let missing_period = ResearchPeriod::try_new(
+                SourceIdentifier::try_from("bls-monthly")?,
+                2026,
+                NonZeroU16::new(5).ok_or("invalid missing period")?,
+                SourceIdentifier::try_from("M05")?,
+            )?;
+            let missing_state = closure
+                .read_provider_period_latest_known(
+                    BlsProviderPeriodLatestKnownRequest::try_new(
+                        restart_selector,
+                        allowlist,
+                        cutoff,
+                        missing_period.clone(),
+                    )?,
+                    query_limits,
+                    Instant::now() + Duration::from_secs(5),
+                    CancellationToken::new(),
+                )
+                .await?;
+            let missing = missing_state
+                .available()
+                .ok_or("explicit missing restart read unavailable")?;
+            assert_complete_missing_handoff(missing, &missing_period, 1);
+        }
         Ok(())
+    }
+
+    fn assert_complete_observed_handoff(
+        read: &BlsProviderPeriodLatestKnownDto,
+        expected_revision: u32,
+        expected_value: Option<&str>,
+    ) {
+        let request = read.analytical_request();
+        assert_eq!(request.manifest(), read.restart_selector().manifest());
+        assert_eq!(request.manifest(), read.reopened().manifest());
+        assert_eq!(request.source_series().source_id(), read.source_id());
+        assert_eq!(
+            read.output().period_scheme(),
+            request.effective_period_cutoff().scheme()
+        );
+        let [observation] = read.output().observations() else {
+            panic!("BLS consumer handoff did not retain exactly one requested series");
+        };
+        assert_eq!(
+            observation
+                .context()
+                .time()
+                .effective()
+                .source_period_value(),
+            Some(request.effective_period_cutoff())
+        );
+        assert_eq!(
+            observation.context().time().revision().get(),
+            expected_revision
+        );
+        assert!(observation.value().missing_value().is_none());
+        assert!(
+            observation
+                .context()
+                .provenance()
+                .availability()
+                .conservative_available_at()
+                .is_some_and(|available_at| available_at <= request.knowledge_cutoff())
+        );
+        if let Some(expected_value) = expected_value {
+            assert_eq!(
+                observation
+                    .value()
+                    .observed_value()
+                    .map(|value| value.to_string())
+                    .as_deref(),
+                Some(expected_value)
+            );
+        } else {
+            assert!(observation.value().observed_value().is_some());
+        }
+    }
+
+    fn assert_complete_missing_handoff(
+        read: &BlsProviderPeriodLatestKnownDto,
+        expected_period: &ResearchPeriod,
+        expected_revision: u32,
+    ) {
+        let request = read.analytical_request();
+        assert_eq!(request.effective_period_cutoff(), expected_period);
+        let [observation] = read.output().observations() else {
+            panic!("BLS missing-value handoff did not retain exactly one requested series");
+        };
+        assert_eq!(
+            observation
+                .context()
+                .time()
+                .effective()
+                .source_period_value(),
+            Some(expected_period)
+        );
+        assert_eq!(
+            observation.context().time().revision().get(),
+            expected_revision
+        );
+        assert!(observation.value().observed_value().is_none());
+        assert!(observation.value().missing_value().is_some());
     }
 
     fn register_source(
