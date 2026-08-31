@@ -2173,6 +2173,8 @@ impl ParsedXbrlDocument {
 #[cfg(test)]
 mod tests {
     use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use bytes::Bytes;
     use cap_std::{ambient_authority, fs::Dir};
@@ -2229,8 +2231,8 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn captured_taxonomy_closes_one_mixed_source_graph_and_honors_cancellation()
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn captured_taxonomy_closes_one_mixed_source_graph_and_honors_cancellation()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
         let store = Arc::new(RawEvidenceStore::new(Dir::open_ambient_dir(
@@ -2588,6 +2590,56 @@ mod tests {
             bounded.next_request(&acquisition_cancellation),
             Err(SecXbrlError::RecordLimitExceeded)
         ));
+
+        // Returning cancellation before the blocking owner exits can expose a late raw or
+        // representation mutation. The shared production worker boundary must retain and join
+        // that owner; taxonomy persistence and final validation use the same boundary.
+        let operation_cancellation = CancellationToken::new();
+        let worker_cancellation = operation_cancellation.clone();
+        let worker_exited = Arc::new(AtomicBool::new(false));
+        let worker_exit_observation = Arc::clone(&worker_exited);
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (cancelled_sender, cancelled_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+        let mut operation = tokio::spawn(async move {
+            crate::client::run_joined_blocking(
+                Arc::new(tokio::sync::Semaphore::new(1)),
+                &worker_cancellation,
+                None,
+                move |worker_token| {
+                    started_sender
+                        .send(())
+                        .map_err(|_| crate::SecClientError::BlockingWorkerFailed)?;
+                    while !worker_token.is_cancelled() {
+                        std::thread::yield_now();
+                    }
+                    cancelled_sender
+                        .send(())
+                        .map_err(|_| crate::SecClientError::BlockingWorkerFailed)?;
+                    release_receiver
+                        .recv()
+                        .map_err(|_| crate::SecClientError::BlockingWorkerFailed)?;
+                    worker_exit_observation.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+            .await
+        });
+        started_receiver.await?;
+        operation_cancellation.cancel();
+        cancelled_receiver.await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut operation)
+                .await
+                .is_err(),
+            "the cancelled operation returned before its blocking owner exited"
+        );
+        release_sender.send(())?;
+        assert!(matches!(
+            operation.await?,
+            Err(crate::SecClientError::Cancelled)
+        ));
+        assert!(worker_exited.load(Ordering::Acquire));
         Ok(())
     }
 }

@@ -1087,26 +1087,13 @@ impl SecEdgarSource {
         T: Send + 'static,
         F: FnOnce(&CancellationToken) -> Result<T, SecClientError> + Send + 'static,
     {
-        let admission = Arc::clone(&self.blocking_admission);
-        let permit = tokio::select! {
-            permit = admission.acquire_owned() => {
-                permit.map_err(|_| SecClientError::BlockingAdmissionClosed)?
-            }
-            () = cancellation.cancelled() => return Err(SecClientError::Cancelled),
-        };
-        let worker_cancellation = cancellation.child_token();
-        let worker_token = worker_cancellation.clone();
-        let mut worker = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            work(&worker_token)
-        });
-        tokio::select! {
-            result = &mut worker => result.map_err(|_| SecClientError::BlockingWorkerFailed)?,
-            () = cancellation.cancelled() => {
-                worker_cancellation.cancel();
-                Err(SecClientError::Cancelled)
-            }
-        }
+        run_joined_blocking(
+            Arc::clone(&self.blocking_admission),
+            cancellation,
+            None,
+            work,
+        )
+        .await
     }
 
     pub(crate) async fn run_validation_blocking<T, F>(
@@ -1119,6 +1106,26 @@ impl SecEdgarSource {
         F: FnOnce(&CancellationToken) -> Result<T, SecClientError> + Send + 'static,
     {
         let result = self.run_blocking(cancellation, work).await;
+        self.finish_validation(result)
+    }
+
+    pub(crate) async fn run_validation_blocking_until<T, F>(
+        &self,
+        cancellation: &CancellationToken,
+        deadline: Timestamp,
+        work: F,
+    ) -> Result<T, SecClientError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&CancellationToken) -> Result<T, SecClientError> + Send + 'static,
+    {
+        let result = run_joined_blocking(
+            Arc::clone(&self.blocking_admission),
+            cancellation,
+            Some(deadline),
+            work,
+        )
+        .await;
         self.finish_validation(result)
     }
 
@@ -1258,6 +1265,70 @@ impl SecEdgarSource {
 
     pub(crate) const fn parser_limits(&self) -> SecParserLimits {
         self.parser_limits
+    }
+}
+
+pub(crate) async fn run_joined_blocking<T, F>(
+    admission: Arc<Semaphore>,
+    cancellation: &CancellationToken,
+    deadline: Option<Timestamp>,
+    work: F,
+) -> Result<T, SecClientError>
+where
+    T: Send + 'static,
+    F: FnOnce(&CancellationToken) -> Result<T, SecClientError> + Send + 'static,
+{
+    let permit = if let Some(deadline) = deadline {
+        tokio::select! {
+            permit = admission.acquire_owned() => {
+                permit.map_err(|_| SecClientError::BlockingAdmissionClosed)?
+            }
+            () = cancellation.cancelled() => return Err(SecClientError::Cancelled),
+            () = tokio::time::sleep(remaining_until(deadline)?) => {
+                return Err(SecClientError::DeadlineExceeded);
+            }
+        }
+    } else {
+        tokio::select! {
+            permit = admission.acquire_owned() => {
+                permit.map_err(|_| SecClientError::BlockingAdmissionClosed)?
+            }
+            () = cancellation.cancelled() => return Err(SecClientError::Cancelled),
+        }
+    };
+    let worker_cancellation = cancellation.child_token();
+    let worker_token = worker_cancellation.clone();
+    let mut worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work(&worker_token)
+    });
+    if let Some(deadline) = deadline {
+        tokio::select! {
+            result = &mut worker => {
+                result.map_err(|_| SecClientError::BlockingWorkerFailed)?
+            }
+            () = cancellation.cancelled() => {
+                worker_cancellation.cancel();
+                let _ = worker.await.map_err(|_| SecClientError::BlockingWorkerFailed)?;
+                Err(SecClientError::Cancelled)
+            }
+            () = tokio::time::sleep(remaining_until(deadline)?) => {
+                worker_cancellation.cancel();
+                let _ = worker.await.map_err(|_| SecClientError::BlockingWorkerFailed)?;
+                Err(SecClientError::DeadlineExceeded)
+            }
+        }
+    } else {
+        tokio::select! {
+            result = &mut worker => {
+                result.map_err(|_| SecClientError::BlockingWorkerFailed)?
+            }
+            () = cancellation.cancelled() => {
+                worker_cancellation.cancel();
+                let _ = worker.await.map_err(|_| SecClientError::BlockingWorkerFailed)?;
+                Err(SecClientError::Cancelled)
+            }
+        }
     }
 }
 

@@ -333,61 +333,35 @@ impl TaxonomyClientSet {
                 .map_err(|_| SecClientError::InvalidCaptureMaterial)?
         };
         let retained_source_id = source_id.clone();
-        let blocking_permit = tokio::select! {
-            permit = blocking_admission.acquire_owned() => {
-                permit.map_err(|_| SecClientError::BlockingAdmissionClosed)?
-            }
-            () = cancellation.cancelled() => {
-                if let Some(in_flight) = sec_in_flight.take() { in_flight.release(); }
-                return Err(SecClientError::Cancelled);
-            }
-            () = tokio::time::sleep(remaining_until(deadline)?) => {
-                if let Some(in_flight) = sec_in_flight.take() { in_flight.release(); }
-                return Err(SecClientError::DeadlineExceeded);
-            }
-        };
-        let worker_cancellation = cancellation.child_token();
-        let worker_token = worker_cancellation.clone();
-        let mut worker = tokio::task::spawn_blocking(move || {
-            let _blocking_permit = blocking_permit;
-            let evidence = raw_store.persist_cancellable(&bytes, &worker_token)?;
-            let size_bytes =
-                u64::try_from(bytes.len()).map_err(|_| SecClientError::ResponseTooLarge)?;
-            // The registry commit is source-qualified and completes before these bytes can be
-            // returned to the graph parser.
-            let representation = representations.record_source_success_cancellable(
-                &retained_source_id,
-                &physical_locator,
-                evidence,
-                size_bytes,
-                validators,
-                &worker_token,
-            )?;
-            Ok::<_, SecClientError>((bytes, representation))
-        });
-        let retained = tokio::select! {
-            result = &mut worker => {
-                match result {
-                    Ok(Ok(retained)) => retained,
-                    Ok(Err(error)) => {
-                        if let Some(in_flight) = sec_in_flight.take() { in_flight.release(); }
-                        return Err(error);
-                    }
-                    Err(_) => {
-                        if let Some(in_flight) = sec_in_flight.take() { in_flight.release(); }
-                        return Err(SecClientError::BlockingWorkerFailed);
-                    }
+        let retained = super::run_joined_blocking(
+            blocking_admission,
+            cancellation,
+            Some(deadline),
+            move |worker_token| {
+                let evidence = raw_store.persist_cancellable(&bytes, worker_token)?;
+                let size_bytes =
+                    u64::try_from(bytes.len()).map_err(|_| SecClientError::ResponseTooLarge)?;
+                // The registry commit is source-qualified and completes before these bytes can be
+                // returned to the graph parser.
+                let representation = representations.record_source_success_cancellable(
+                    &retained_source_id,
+                    &physical_locator,
+                    evidence,
+                    size_bytes,
+                    validators,
+                    worker_token,
+                )?;
+                Ok::<_, SecClientError>((bytes, representation))
+            },
+        )
+        .await;
+        let retained = match retained {
+            Ok(retained) => retained,
+            Err(error) => {
+                if let Some(in_flight) = sec_in_flight.take() {
+                    in_flight.release();
                 }
-            }
-            () = cancellation.cancelled() => {
-                worker_cancellation.cancel();
-                if let Some(in_flight) = sec_in_flight.take() { in_flight.release(); }
-                return Err(SecClientError::Cancelled);
-            }
-            () = tokio::time::sleep(remaining_until(deadline)?) => {
-                worker_cancellation.cancel();
-                if let Some(in_flight) = sec_in_flight.take() { in_flight.release(); }
-                return Err(SecClientError::DeadlineExceeded);
+                return Err(error);
             }
         };
         if let Err(error) = ensure_before_deadline(deadline) {
@@ -446,7 +420,7 @@ impl super::SecEdgarSource {
         let admission_revision = metadata_revision.clone();
         let parser_limits = self.parser_limits;
         let admitted_root = self
-            .run_validation_blocking(&cancellation, move |worker_token| {
+            .run_validation_blocking_until(&cancellation, deadline, move |worker_token| {
                 crate::extraction::admit_filing_xbrl_root_from_sealed_binding(
                     sealed_root,
                     admission_raw_store,
@@ -489,13 +463,11 @@ impl super::SecEdgarSource {
         let artifacts = closure.finish(&cancellation)?;
         ensure_before_deadline(deadline)?;
         self.validate_authority(authority)?;
-        let operation_cancellation = cancellation.child_token();
-        let worker_cancellation = operation_cancellation.clone();
         let raw_store = Arc::clone(&self.raw_store);
         let identities = Arc::clone(&self.identities);
         let parser_limits = self.parser_limits;
-        let preparation =
-            self.run_validation_blocking(&operation_cancellation, move |worker_token| {
+        let handoff = self
+            .run_validation_blocking_until(&cancellation, deadline, move |worker_token| {
                 crate::extraction::prepare_filing_xbrl_capture_from_admitted_root(
                     raw_store,
                     identities,
@@ -507,19 +479,8 @@ impl super::SecEdgarSource {
                     artifacts,
                     worker_token,
                 )
-            });
-        tokio::pin!(preparation);
-        let handoff = tokio::select! {
-            result = &mut preparation => result?,
-            () = cancellation.cancelled() => {
-                worker_cancellation.cancel();
-                return Err(SecClientError::Cancelled);
-            }
-            () = tokio::time::sleep(remaining_until(deadline)?) => {
-                worker_cancellation.cancel();
-                return Err(SecClientError::DeadlineExceeded);
-            }
-        };
+            })
+            .await?;
         self.validate_authority(authority)?;
         Ok(handoff)
     }
