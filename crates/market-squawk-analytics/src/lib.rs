@@ -9,6 +9,7 @@ mod cross_venue;
 mod exact;
 mod factors;
 mod fundamentals;
+mod harmonics;
 mod liquidity;
 mod macro_features;
 mod metadata;
@@ -54,6 +55,15 @@ pub use factors::{FactorObservation, FactorRegressionResult, factor_regression};
 pub use fundamentals::{
     FundamentalPeriod, earnings_surprise, free_cash_flow_yield, fundamental_growth, margin,
     valuation_multiple,
+};
+pub use harmonics::{
+    HARMONIC_PIVOT_CONFIRMATION_BARS, HARMONIC_PIVOT_COUNT, HarmonicBar, HarmonicCompletionZone,
+    HarmonicConfidenceAuthority, HarmonicDirection, HarmonicEvidenceBinding,
+    HarmonicExecutionAuthority, HarmonicFraction, HarmonicPatternError, HarmonicPatternEvidence,
+    HarmonicPatternInput, HarmonicPatternKind, HarmonicPatternRule, HarmonicPivot,
+    HarmonicPivotEvidence, HarmonicPivotKind, HarmonicRatio, HarmonicRatioBand,
+    HarmonicRatioConstraint, HarmonicRatioMeasurement, HarmonicRatioMeasurements,
+    MAX_HARMONIC_BARS, classify_harmonic_pattern,
 };
 pub use liquidity::{
     LiquidityBookView, LiquidityEstimate, LiquidityFeatureError, estimate_market_order,
