@@ -1000,7 +1000,7 @@ pub fn query_native_rows_by_joins(
     )
 }
 
-/// Materializes identifier evidence and the complete C.9-C.12 supplement set for one holding.
+/// Materializes identifier evidence and all 18 holding-linked supplement tables for one holding.
 #[allow(clippy::too_many_arguments)]
 pub fn query_nport_holding_supplements(
     store: &RawEvidenceStore,

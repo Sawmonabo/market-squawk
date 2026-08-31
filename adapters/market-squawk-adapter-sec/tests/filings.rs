@@ -470,11 +470,10 @@ mod bulk {
             deadline,
             &cancellation,
         )?;
-        assert_eq!(supplements.tables().len(), 20);
+        assert_eq!(supplements.tables().len(), 19);
         for table in [
             SecBulkTableKind::NportIdentifiers,
             SecBulkTableKind::NportDebtSecurity,
-            SecBulkTableKind::NportExplanatoryNote,
         ] {
             let related = supplements
                 .tables()
@@ -541,7 +540,6 @@ mod bulk {
         for table in [
             FundSourceTable::NportIdentifiers,
             FundSourceTable::NportDebtSecurity,
-            FundSourceTable::NportExplanatoryNote,
         ] {
             assert!(
                 holding
@@ -551,20 +549,38 @@ mod bulk {
                     .any(|row| row.table() == table)
             );
         }
-        for table in [
-            FundSourceTable::NportDebtSecurity,
-            FundSourceTable::NportExplanatoryNote,
-        ] {
-            assert_eq!(
-                holding
-                    .supplements()
-                    .iter()
-                    .find(|supplement| supplement.table() == table)
-                    .ok_or(SecBulkError::InvalidCanonicalMapping)?
-                    .disposition(),
-                FundSupplementDisposition::Reported
-            );
-        }
+        assert!(
+            !holding
+                .lineage()
+                .rows()
+                .iter()
+                .any(|row| { row.table() == FundSourceTable::NportExplanatoryNote })
+        );
+        assert_eq!(
+            holding
+                .supplements()
+                .iter()
+                .find(|supplement| supplement.table() == FundSourceTable::NportDebtSecurity)
+                .ok_or(SecBulkError::InvalidCanonicalMapping)?
+                .disposition(),
+            FundSupplementDisposition::Reported
+        );
+        let report = records
+            .iter()
+            .find_map(|record| match record {
+                FundEvidenceRecord::Report(report) => Some(report.as_ref()),
+                _ => None,
+            })
+            .ok_or(SecBulkError::InvalidCanonicalMapping)?;
+        assert_eq!(
+            report
+                .lineage()
+                .rows()
+                .iter()
+                .filter(|row| row.table() == FundSourceTable::NportExplanatoryNote)
+                .count(),
+            1
+        );
         Ok(())
     }
 
@@ -588,6 +604,8 @@ mod bulk {
         const HOLDING_HEADER: &str = "ACCESSION_NUMBER\tHOLDING_ID\tISSUER_NAME\tISSUER_LEI\tISSUER_TITLE\tISSUER_CUSIP\tBALANCE\tUNIT\tOTHER_UNIT_DESC\tCURRENCY_CODE\tCURRENCY_VALUE\tEXCHANGE_RATE\tPERCENTAGE\tPAYOFF_PROFILE\tASSET_CAT\tOTHER_ASSET\tISSUER_TYPE\tOTHER_ISSUER\tINVESTMENT_COUNTRY\tIS_RESTRICTED_SECURITY\tFAIR_VALUE_LEVEL\tDERIVATIVE_CAT";
         const IDENTIFIER_HEADER: &str = "HOLDING_ID\tIDENTIFIERS_ID\tIDENTIFIER_ISIN\tIDENTIFIER_TICKER\tOTHER_IDENTIFIER\tOTHER_IDENTIFIER_DESC";
         const RELATED_HEADER: &str = "HOLDING_ID\tDETAIL";
+        const EXPLANATORY_NOTE_HEADER: &str =
+            "ACCESSION_NUMBER\tEXPLANATORY_NOTE_ID\tITEM_NO\tEXPLANATORY_NOTE";
         let tables = NPORT_TABLES
             .iter()
             .map(|name| match *name {
@@ -614,6 +632,12 @@ mod bulk {
                     name,
                     IDENTIFIER_HEADER,
                     &["HOLDING_ID", "IDENTIFIERS_ID"],
+                ),
+                "EXPLANATORY_NOTE.tsv" => metadata_table_for(
+                    "nport_readme.htm",
+                    name,
+                    EXPLANATORY_NOTE_HEADER,
+                    &["ACCESSION_NUMBER", "EXPLANATORY_NOTE_ID"],
                 ),
                 name if NPORT_HOLDING_SUPPLEMENTS.contains(&name) => {
                     metadata_table_for("nport_readme.htm", name, RELATED_HEADER, &["HOLDING_ID"])
@@ -679,6 +703,15 @@ mod bulk {
             .as_bytes(),
             options,
         )?;
+        write_member(
+            &mut writer,
+            "EXPLANATORY_NOTE.tsv",
+            format!(
+                "{EXPLANATORY_NOTE_HEADER}\n0000000001-26-000001\t1\tB.1\tselected filing note\n0000000002-26-000002\t2\tB.1\tother filing note\n"
+            )
+            .as_bytes(),
+            options,
+        )?;
         for name in NPORT_TABLES.iter().copied().filter(|name| {
             !matches!(
                 *name,
@@ -687,9 +720,10 @@ mod bulk {
                     | "FUND_REPORTED_INFO.tsv"
                     | "FUND_REPORTED_HOLDING.tsv"
                     | "IDENTIFIERS.tsv"
+                    | "EXPLANATORY_NOTE.tsv"
             )
         }) {
-            let contents = if matches!(name, "DEBT_SECURITY.tsv" | "EXPLANATORY_NOTE.tsv") {
+            let contents = if name == "DEBT_SECURITY.tsv" {
                 format!("{RELATED_HEADER}\n101\tselected evidence\n202\tother evidence\n")
             } else if NPORT_HOLDING_SUPPLEMENTS.contains(&name) {
                 format!("{RELATED_HEADER}\n")
@@ -874,7 +908,7 @@ mod bulk {
         "REGISTRANT_HELDS_SECURITY.tsv",
     ];
 
-    const NPORT_HOLDING_SUPPLEMENTS: [&str; 19] = [
+    const NPORT_HOLDING_SUPPLEMENTS: [&str; 18] = [
         "DEBT_SECURITY.tsv",
         "DEBT_SECURITY_REF_INSTRUMENT.tsv",
         "CONVERTIBLE_SECURITY_CURRENCY.tsv",
@@ -893,7 +927,6 @@ mod bulk {
         "OTHER_DERIV.tsv",
         "OTHER_DERIV_NOTIONAL_AMOUNT.tsv",
         "SECURITIES_LENDING.tsv",
-        "EXPLANATORY_NOTE.tsv",
     ];
 
     const NPORT_TABLES: [&str; 30] = [
@@ -954,7 +987,7 @@ mod bulk {
             "FILING_DATE" | "REPORT_ENDING_PERIOD" | "REPORT_DATE" => {
                 r#"{"base":"date (DD-MON-YYYY)"}"#.to_owned()
             }
-            "TOTAL_SERIES" | "HOLDING_ID" | "IDENTIFIERS_ID" => {
+            "TOTAL_SERIES" | "HOLDING_ID" | "IDENTIFIERS_ID" | "EXPLANATORY_NOTE_ID" => {
                 r#"{"base":"NUMBER","dataPrecision":38,"dataScale":0,"maxLength":22}"#.to_owned()
             }
             "MONTHLY_AVG_NET_ASSETS"
@@ -991,6 +1024,8 @@ mod bulk {
             | "IS_COLLATERAL_REQUIRED"
             | "IS_FUND_IN_KIND_ETF" => 1,
             "REGISTRANT_NAME" | "FUND_NAME" => 150,
+            "ITEM_NO" => 50,
+            "EXPLANATORY_NOTE" => 4_000,
             "FILE_NUM" => 30,
             "LEI" => 20,
             "FUND_ID" => 42,

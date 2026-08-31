@@ -205,7 +205,8 @@ impl SecFundPendingLogicalRows {
                 match row.table() {
                     SecBulkTableKind::NportSubmission
                     | SecBulkTableKind::NportRegistrant
-                    | SecBulkTableKind::NportFundReportedInfo => Ok(accession_matches),
+                    | SecBulkTableKind::NportFundReportedInfo
+                    | SecBulkTableKind::NportExplanatoryNote => Ok(accession_matches),
                     SecBulkTableKind::NportFundReportedHolding => {
                         if !accession_matches {
                             return Ok(false);
@@ -745,12 +746,6 @@ fn map_nport<A: SecFundIdentityAuthority>(
         ingested_at,
     )?;
     let common_lineage = source_lineage(selected, handoff, &common_indices)?;
-    let report = FundReportEvidence::try_new(
-        filing.clone(),
-        FundReportAttributes::new(option_reported(submission.is_last_filing), not_applicable()),
-        common_lineage.clone(),
-    )
-    .map_err(|_| SecBulkError::InvalidCanonicalMapping)?;
     let share = FundShareClassEvidence::try_new(
         filing.clone(),
         FundShareClassAttributes::new(
@@ -780,6 +775,7 @@ fn map_nport<A: SecFundIdentityAuthority>(
     let mut holding_indices = BTreeMap::<SourceIdentifier, usize>::new();
     let mut identifiers = BTreeMap::<SourceIdentifier, Vec<usize>>::new();
     let mut supplements = BTreeMap::<SourceIdentifier, Vec<usize>>::new();
+    let mut explanatory_note_indices = Vec::new();
     for (index, row) in selected.rows.iter().enumerate() {
         match row.table() {
             SecBulkTableKind::NportFundReportedHolding => {
@@ -806,6 +802,19 @@ fn map_nport<A: SecFundIdentityAuthority>(
                     .entry(SourceIdentifier::try_from(holding_id)?)
                     .or_default()
                     .push(index);
+            }
+            SecBulkTableKind::NportExplanatoryNote => {
+                if !has_join(
+                    row,
+                    SecBulkJoinDomain::Accession,
+                    submission.accession.as_str(),
+                ) {
+                    return Err(SecBulkError::InvalidCanonicalMapping);
+                }
+                explanatory_note_indices
+                    .try_reserve(1)
+                    .map_err(|_| SecBulkError::AllocationFailed)?;
+                explanatory_note_indices.push(index);
             }
             _ => {}
         }
@@ -875,12 +884,21 @@ fn map_nport<A: SecFundIdentityAuthority>(
     if !identifiers.is_empty() || !supplements.is_empty() {
         return Err(SecBulkError::InvalidCanonicalMapping);
     }
+    let mut report_indices = common_indices.clone();
+    report_indices.extend(explanatory_note_indices);
+    sort_row_indices(selected, &mut report_indices)?;
+    let report = FundReportEvidence::try_new(
+        filing.clone(),
+        FundReportAttributes::new(option_reported(submission.is_last_filing), not_applicable()),
+        source_lineage(selected, handoff, &report_indices)?,
+    )
+    .map_err(|_| SecBulkError::InvalidCanonicalMapping)?;
     candidates
         .try_reserve(2)
         .map_err(|_| SecBulkError::AllocationFailed)?;
     candidates.push(CanonicalCandidate {
         record: FundEvidenceRecord::Report(Box::new(report)),
-        row_indices: common_indices.clone(),
+        row_indices: report_indices,
         kind: CanonicalRecordKind::Report,
     });
     candidates.push(CanonicalCandidate {
@@ -1803,7 +1821,8 @@ fn source_identifier_field(
 }
 
 fn is_canonical_holding_supplement(table: SecBulkTableKind) -> bool {
-    fund_source_table(table).is_some_and(FundSourceTable::is_holding_supplement)
+    table != SecBulkTableKind::NportExplanatoryNote
+        && fund_source_table(table).is_some_and(FundSourceTable::is_holding_supplement)
 }
 
 fn has_join(row: &SecBulkLogicalRow, domain: SecBulkJoinDomain, value: &str) -> bool {

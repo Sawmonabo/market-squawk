@@ -711,7 +711,7 @@ impl SecNportHoldingSupplementTopology {
         self.terminal_evidence
     }
 
-    /// Returns all 19 holding-linked official table families in closed order.
+    /// Returns all 18 holding-linked official table families in closed order.
     pub fn tables(&self) -> &[SecNportHoldingSupplementTable] {
         &self.tables
     }
@@ -886,7 +886,7 @@ impl SecNportHoldingSupplementCompleteness {
         self.holding_row_evidence
     }
 
-    /// Returns all 19 completeness results in code-owned order.
+    /// Returns all 18 completeness results in code-owned order.
     pub fn tables(&self) -> &[SecNportHoldingSupplementEvidence] {
         &self.tables
     }
@@ -1250,8 +1250,8 @@ fn nport_holding_supplement_topology(
     }))
 }
 
-/// The provider-neutral holding contract treats `IDENTIFIERS.tsv` as security-identity evidence,
-/// not a holding supplement. All 19 actual C.9-C.12 supplement states include explanatory notes.
+/// `IDENTIFIERS.tsv` is security-identity evidence and `EXPLANATORY_NOTE.tsv` is filing-scoped;
+/// neither is one of the 18 holding-linked C.9-C.12 supplement tables.
 const fn nport_canonical_holding_supplement_tables() -> &'static [SecBulkTableKind] {
     &[
         SecBulkTableKind::NportDebtSecurity,
@@ -1272,7 +1272,6 @@ const fn nport_canonical_holding_supplement_tables() -> &'static [SecBulkTableKi
         SecBulkTableKind::NportOtherDerivative,
         SecBulkTableKind::NportOtherDerivativeNotionalAmount,
         SecBulkTableKind::NportSecuritiesLending,
-        SecBulkTableKind::NportExplanatoryNote,
     ]
 }
 
