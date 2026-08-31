@@ -50,7 +50,6 @@ const MAX_STRING_BYTES: usize = 4_096;
 const MAX_CRUMB_BYTES: usize = 4_096;
 const MAX_CACHE_ENTRIES: usize = 32;
 const MAX_CACHE_BYTES: usize = MAX_YAHOO_DURABLE_CACHE_BODY_BYTES;
-const MAX_REDIRECTS: usize = 5;
 const MAX_ATTEMPT_RECEIPTS: usize = 32;
 const FALLBACK_CIRCUIT_COOLDOWN_MS: u64 = 5 * 60 * 1_000;
 const FALLBACK_CIRCUIT_MAX_JITTER_MS: u64 = 60 * 1_000;
@@ -467,6 +466,11 @@ pub(super) struct YahooProductActivation {
     metadata: SourceMetadata,
     rights: ResearchRightsAuthority,
     generation: ResearchProviderRuntimeGeneration,
+    authority: Arc<YahooProviderAuthority>,
+}
+
+/// Process-lifetime Yahoo session owner shared by every activation generation.
+pub(super) struct YahooProviderAuthority {
     planner: YahooRequestPlanner,
     session: YahooHttpSession,
 }
@@ -503,7 +507,7 @@ impl YahooProductActivation {
         metadata: SourceMetadata,
         rights: ResearchRightsAuthority,
         generation: ResearchProviderRuntimeGeneration,
-        control_root: &Path,
+        authority: Arc<YahooProviderAuthority>,
     ) -> Result<Arc<Self>, YahooProductError> {
         if lease.surface_id().as_str() != YAHOO_SURFACE
             || generation.profile().as_str() != YAHOO_SURFACE
@@ -511,48 +515,17 @@ impl YahooProductActivation {
         {
             return Err(YahooProductError::InvalidOperation);
         }
-        let bounds = AdapterBounds {
-            max_symbols_per_operation: MAX_SYMBOLS_PER_OPERATION,
-            max_response_bytes: MAX_RESPONSE_BYTES,
-            max_records_per_response: MAX_RECORDS_PER_RESPONSE,
-            max_option_contracts: MAX_OPTION_CONTRACTS,
-            max_option_expirations: MAX_OPTION_EXPIRATIONS,
-            max_fund_holdings: MAX_FUND_HOLDINGS,
-            max_string_bytes: MAX_STRING_BYTES,
-        };
-        let planner =
-            YahooRequestPlanner::new(bounds, YahooLocale::new("en", "US", MAX_STRING_BYTES)?)?;
-        let config = YahooHttpSessionConfig {
-            adapter_bounds: bounds,
-            connect_timeout: Duration::from_secs(10),
-            read_timeout: Duration::from_secs(20),
-            total_timeout: Duration::from_secs(30),
-            max_session_response_bytes: MAX_RESPONSE_BYTES,
-            max_crumb_bytes: MAX_CRUMB_BYTES,
-            max_cache_entries: MAX_CACHE_ENTRIES,
-            max_cache_bytes: MAX_CACHE_BYTES,
-            max_redirects: MAX_REDIRECTS,
-            max_attempt_receipts: MAX_ATTEMPT_RECEIPTS,
-            admission_policy: AdmissionPolicy::new(
-                FALLBACK_CIRCUIT_COOLDOWN_MS,
-                FALLBACK_CIRCUIT_MAX_JITTER_MS,
-                REPEATED_FAILURE_THRESHOLD,
-            )?,
-        };
-        let store = YahooDurableStateStore::try_open(control_root.join(YAHOO_AUTHORITY_DIRECTORY))?;
-        let session = YahooHttpSession::new_with_durable_state(config, store)?;
         Ok(Arc::new(Self {
             lease,
             metadata,
             rights,
             generation,
-            planner,
-            session,
+            authority,
         }))
     }
 
     fn status(&self) -> YahooEnrichmentStatus {
-        let Ok(snapshot) = self.session.admission().snapshot() else {
+        let Ok(snapshot) = self.authority.session.admission().snapshot() else {
             return YahooEnrichmentStatus::unavailable();
         };
         let availability = if matches!(snapshot.circuit, CircuitSnapshot::Open { .. }) {
@@ -587,8 +560,9 @@ impl YahooProductActivation {
             .validate_precommit()
             .map_err(|_| YahooProductError::Unavailable)?;
         let cancellation = publication.cancellation().clone();
-        let planned = operation.plan_and_publication(&self.planner)?;
+        let planned = operation.plan_and_publication(&self.authority.planner)?;
         let mut results = self
+            .authority
             .session
             .execute_plan(
                 planned.plan,
@@ -635,6 +609,41 @@ impl YahooProductActivation {
             response,
             publication: publication_summary,
         })
+    }
+}
+
+impl YahooProviderAuthority {
+    pub(super) fn try_new(control_root: &Path) -> Result<Arc<Self>, YahooProductError> {
+        let bounds = AdapterBounds {
+            max_symbols_per_operation: MAX_SYMBOLS_PER_OPERATION,
+            max_response_bytes: MAX_RESPONSE_BYTES,
+            max_records_per_response: MAX_RECORDS_PER_RESPONSE,
+            max_option_contracts: MAX_OPTION_CONTRACTS,
+            max_option_expirations: MAX_OPTION_EXPIRATIONS,
+            max_fund_holdings: MAX_FUND_HOLDINGS,
+            max_string_bytes: MAX_STRING_BYTES,
+        };
+        let planner =
+            YahooRequestPlanner::new(bounds, YahooLocale::new("en", "US", MAX_STRING_BYTES)?)?;
+        let config = YahooHttpSessionConfig {
+            adapter_bounds: bounds,
+            connect_timeout: Duration::from_secs(10),
+            read_timeout: Duration::from_secs(20),
+            total_timeout: Duration::from_secs(30),
+            max_session_response_bytes: MAX_RESPONSE_BYTES,
+            max_crumb_bytes: MAX_CRUMB_BYTES,
+            max_cache_entries: MAX_CACHE_ENTRIES,
+            max_cache_bytes: MAX_CACHE_BYTES,
+            max_attempt_receipts: MAX_ATTEMPT_RECEIPTS,
+            admission_policy: AdmissionPolicy::new(
+                FALLBACK_CIRCUIT_COOLDOWN_MS,
+                FALLBACK_CIRCUIT_MAX_JITTER_MS,
+                REPEATED_FAILURE_THRESHOLD,
+            )?,
+        };
+        let store = YahooDurableStateStore::try_open(control_root.join(YAHOO_AUTHORITY_DIRECTORY))?;
+        let session = YahooHttpSession::new_with_durable_state(config, store)?;
+        Ok(Arc::new(Self { planner, session }))
     }
 }
 

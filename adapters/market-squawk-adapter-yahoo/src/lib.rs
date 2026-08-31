@@ -16,6 +16,7 @@ mod parse;
 mod publication;
 mod request;
 
+pub(crate) use admission::YahooClockObservation;
 pub use admission::{
     AdmissionDecision, AdmissionPolicy, AdmissionRejection, AdmissionSnapshot, AttemptDisposition,
     AttemptKind, AttemptOutcome, AttemptPermit, CircuitSnapshot, YahooAdmission,

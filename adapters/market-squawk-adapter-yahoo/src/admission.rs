@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -94,15 +95,17 @@ pub enum YahooRetryAfterDirective {
     HttpDate { retry_at_unix_ms: i64 },
 }
 
-/// Complete usable server recovery evidence from one response.
+/// Complete strictly parsed server recovery evidence from one response.
 ///
 /// `Retry-After` follows HTTP semantics. `RateLimit-Reset` follows the documented delay-seconds
-/// syntax from the HTTPAPI rate-limit specification. When both are present, the later deadline is
-/// the earliest safe next attempt: a client must not resume before either server instruction.
+/// syntax from the HTTPAPI rate-limit specification. Zero and already-past values remain parsed
+/// evidence but are not usable future timing. Across all occurrences, the later usable deadline is
+/// the earliest safe next attempt: a client must not resume before any server instruction.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct YahooProviderRecoveryDirective {
-    retry_after: Option<YahooRetryAfterDirective>,
+    retry_after_delay_seconds: Option<u64>,
+    retry_after_http_date_unix_ms: Option<i64>,
     rate_limit_reset_seconds: Option<u64>,
 }
 
@@ -111,9 +114,6 @@ impl YahooProviderRecoveryDirective {
         retry_after: Option<YahooRetryAfterDirective>,
         rate_limit_reset_seconds: Option<u64>,
     ) -> Option<Self> {
-        if retry_after.is_none() && rate_limit_reset_seconds.is_none() {
-            return None;
-        }
         let retry_after_valid = match retry_after {
             Some(YahooRetryAfterDirective::DeltaSeconds { seconds }) => {
                 seconds.checked_mul(1_000).is_some()
@@ -125,37 +125,96 @@ impl YahooProviderRecoveryDirective {
         {
             return None;
         }
+        Self::from_directives(
+            retry_after.into_iter(),
+            rate_limit_reset_seconds.into_iter(),
+        )
+    }
+
+    pub(crate) fn from_directives(
+        retry_after: impl IntoIterator<Item = YahooRetryAfterDirective>,
+        rate_limit_reset_seconds: impl IntoIterator<Item = u64>,
+    ) -> Option<Self> {
+        let mut retry_after_delay_seconds = None;
+        let mut retry_after_http_date_unix_ms = None;
+        for directive in retry_after {
+            match directive {
+                YahooRetryAfterDirective::DeltaSeconds { seconds }
+                    if seconds.checked_mul(1_000).is_some() =>
+                {
+                    retry_after_delay_seconds =
+                        Some(retry_after_delay_seconds.unwrap_or(0).max(seconds));
+                }
+                YahooRetryAfterDirective::HttpDate { retry_at_unix_ms } => {
+                    retry_after_http_date_unix_ms = Some(
+                        retry_after_http_date_unix_ms
+                            .unwrap_or(i64::MIN)
+                            .max(retry_at_unix_ms),
+                    );
+                }
+                YahooRetryAfterDirective::DeltaSeconds { .. } => {}
+            }
+        }
+        let rate_limit_reset_seconds = rate_limit_reset_seconds
+            .into_iter()
+            .filter(|seconds| seconds.checked_mul(1_000).is_some())
+            .max();
+        if retry_after_delay_seconds.is_none()
+            && retry_after_http_date_unix_ms.is_none()
+            && rate_limit_reset_seconds.is_none()
+        {
+            return None;
+        }
         Some(Self {
-            retry_after,
+            retry_after_delay_seconds,
+            retry_after_http_date_unix_ms,
             rate_limit_reset_seconds,
         })
     }
 
-    pub const fn retry_after(self) -> Option<YahooRetryAfterDirective> {
-        self.retry_after
-    }
-
-    pub const fn rate_limit_reset_seconds(self) -> Option<u64> {
-        self.rate_limit_reset_seconds
-    }
-
-    fn minimum_next_attempt_at(self, completed_at_unix_ms: i64) -> Option<i64> {
-        let retry_after_at = match self.retry_after {
-            Some(YahooRetryAfterDirective::DeltaSeconds { seconds }) => seconds
-                .checked_mul(1_000)
-                .map(|delay_ms| add_millis(completed_at_unix_ms, delay_ms)),
-            Some(YahooRetryAfterDirective::HttpDate { retry_at_unix_ms })
-                if retry_at_unix_ms > completed_at_unix_ms =>
-            {
-                Some(retry_at_unix_ms)
-            }
-            Some(YahooRetryAfterDirective::HttpDate { .. }) | None => None,
-        };
-        let rate_limit_reset_at = self
+    pub(crate) fn minimum_delay_ms(self, completed_at_unix_ms: i64) -> Option<u64> {
+        let retry_after_delay_ms = self
+            .retry_after_delay_seconds
+            .filter(|seconds| *seconds > 0)
+            .and_then(|seconds| seconds.checked_mul(1_000));
+        let retry_after_http_date_delay_ms = self
+            .retry_after_http_date_unix_ms
+            .and_then(|retry_at| retry_at.checked_sub(completed_at_unix_ms))
+            .and_then(|delay| u64::try_from(delay).ok())
+            .filter(|delay| *delay > 0);
+        let rate_limit_reset_delay_ms = self
             .rate_limit_reset_seconds
+            .filter(|seconds| *seconds > 0)
             .and_then(|seconds| seconds.checked_mul(1_000))
-            .map(|delay_ms| add_millis(completed_at_unix_ms, delay_ms));
-        retry_after_at.into_iter().chain(rate_limit_reset_at).max()
+            .filter(|delay| *delay > 0);
+        retry_after_delay_ms
+            .into_iter()
+            .chain(retry_after_http_date_delay_ms)
+            .chain(rate_limit_reset_delay_ms)
+            .max()
+    }
+}
+
+/// One paired wall/monotonic observation used at admission and attempt completion boundaries.
+///
+/// Wall time is retained only as durable evidence and user-facing retry guidance. A live process
+/// enforces every open circuit against the paired monotonic coordinate.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct YahooClockObservation {
+    wall_unix_ms: i64,
+    monotonic: Instant,
+}
+
+impl YahooClockObservation {
+    pub(crate) const fn new(wall_unix_ms: i64, monotonic: Instant) -> Self {
+        Self {
+            wall_unix_ms,
+            monotonic,
+        }
+    }
+
+    pub(crate) const fn wall_unix_ms(self) -> i64 {
+        self.wall_unix_ms
     }
 }
 
@@ -173,7 +232,12 @@ pub struct AttemptOutcome {
 #[serde(deny_unknown_fields, tag = "state", rename_all = "kebab-case")]
 pub enum CircuitSnapshot {
     Closed,
-    Open { retry_at_unix_ms: i64 },
+    Open {
+        /// Durable wall-clock evidence for when this recovery interval was observed.
+        recorded_at_unix_ms: i64,
+        /// Durable wall-clock evidence for the earliest safe next attempt.
+        retry_at_unix_ms: i64,
+    },
     HalfOpen,
 }
 
@@ -247,14 +311,18 @@ struct ActiveAttempt {
     id: u64,
     request_key: String,
     requested_units: usize,
-    started_at_unix_ms: i64,
+    started_at: YahooClockObservation,
     half_open_probe: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum CircuitState {
     Closed,
-    Open { retry_at_unix_ms: i64 },
+    Open {
+        recorded_at_unix_ms: i64,
+        retry_at_unix_ms: i64,
+        retry_at_monotonic: Option<Instant>,
+    },
     HalfOpen,
 }
 
@@ -262,14 +330,21 @@ impl CircuitState {
     const fn snapshot(self) -> CircuitSnapshot {
         match self {
             Self::Closed => CircuitSnapshot::Closed,
-            Self::Open { retry_at_unix_ms } => CircuitSnapshot::Open { retry_at_unix_ms },
+            Self::Open {
+                recorded_at_unix_ms,
+                retry_at_unix_ms,
+                ..
+            } => CircuitSnapshot::Open {
+                recorded_at_unix_ms,
+                retry_at_unix_ms,
+            },
             Self::HalfOpen => CircuitSnapshot::HalfOpen,
         }
     }
 }
 
 impl YahooAdmission {
-    pub fn new(policy: AdmissionPolicy) -> Self {
+    pub(crate) fn new(policy: AdmissionPolicy) -> Self {
         let snapshot = AdmissionSnapshot {
             logical_primary_operations_total: 0,
             actual_http_attempts_total: 0,
@@ -311,16 +386,35 @@ impl YahooAdmission {
     /// request execution is process-local and cannot be resumed after a crash. The application
     /// persists only snapshots returned after an operation completes, so no request target,
     /// cookie, crumb, response body, or cache entry becomes durable admission state.
-    pub fn try_restore(
+    pub(crate) fn try_restore(
         policy: AdmissionPolicy,
-        snapshot: AdmissionSnapshot,
+        mut snapshot: AdmissionSnapshot,
+        restored_at: YahooClockObservation,
     ) -> Result<Self, AdmissionRejection> {
         validate_restored_snapshot(policy, &snapshot)?;
         let circuit = match snapshot.circuit {
             CircuitSnapshot::Closed => CircuitState::Closed,
-            CircuitSnapshot::Open { retry_at_unix_ms } => CircuitState::Open { retry_at_unix_ms },
+            CircuitSnapshot::Open {
+                recorded_at_unix_ms,
+                retry_at_unix_ms,
+            } => {
+                let recovery_ms = retry_at_unix_ms
+                    .checked_sub(recorded_at_unix_ms)
+                    .and_then(|delay| u64::try_from(delay).ok())
+                    .ok_or(AdmissionRejection::InvalidPersistedState)?;
+                // A restart severs the old monotonic timeline. Reapply the complete recorded
+                // interval on the new timeline; never shorten it based on a discontinuous wall.
+                CircuitState::Open {
+                    recorded_at_unix_ms: restored_at.wall_unix_ms,
+                    retry_at_unix_ms: add_millis(restored_at.wall_unix_ms, recovery_ms),
+                    retry_at_monotonic: restored_at
+                        .monotonic
+                        .checked_add(Duration::from_millis(recovery_ms)),
+                }
+            }
             CircuitSnapshot::HalfOpen => return Err(AdmissionRejection::InvalidPersistedState),
         };
+        snapshot.circuit = circuit.snapshot();
         let next_attempt_id = snapshot
             .logical_primary_operations_total
             .max(snapshot.actual_http_attempts_total)
@@ -337,12 +431,12 @@ impl YahooAdmission {
         })
     }
 
-    pub fn admit(
+    pub(crate) fn admit(
         &self,
         request: &YahooHttpRequest,
         request_identity: &str,
         attempt_kind: AttemptKind,
-        now_unix_ms: i64,
+        now: YahooClockObservation,
     ) -> Result<AdmissionDecision, AdmissionRejection> {
         let mut state = self
             .inner
@@ -364,16 +458,20 @@ impl YahooAdmission {
 
         let half_open_probe = match state.circuit {
             CircuitState::Closed => false,
-            CircuitState::Open { retry_at_unix_ms } if now_unix_ms < retry_at_unix_ms => {
-                return Ok(AdmissionDecision::CircuitOpen { retry_at_unix_ms });
-            }
-            CircuitState::Open { .. } => {
+            CircuitState::Open {
+                retry_at_unix_ms,
+                retry_at_monotonic,
+                ..
+            } => {
+                if retry_at_monotonic.is_none_or(|retry_at| now.monotonic < retry_at) {
+                    return Ok(AdmissionDecision::CircuitOpen { retry_at_unix_ms });
+                }
                 state.circuit = CircuitState::HalfOpen;
                 true
             }
             CircuitState::HalfOpen => {
                 return Ok(AdmissionDecision::CircuitOpen {
-                    retry_at_unix_ms: now_unix_ms,
+                    retry_at_unix_ms: now.wall_unix_ms,
                 });
             }
         };
@@ -392,7 +490,7 @@ impl YahooAdmission {
             id: attempt_id,
             request_key: request_identity.to_owned(),
             requested_units,
-            started_at_unix_ms: now_unix_ms,
+            started_at: now,
             half_open_probe,
         });
         state.snapshot.active_request_key = Some(request_identity.to_owned());
@@ -445,51 +543,41 @@ pub struct AttemptPermit {
 
 impl AttemptPermit {
     /// Records one actual upstream request completed inside this admitted logical operation.
-    pub fn record_actual_attempt(
+    pub(crate) fn record_actual_attempt(
         &mut self,
         kind: AttemptKind,
         outcome: AttemptOutcome,
-        completed_at_unix_ms: i64,
+        completed_at: YahooClockObservation,
     ) -> Result<(), AdmissionRejection> {
         let mut state = self
             .inner
             .lock()
             .map_err(|_| AdmissionRejection::StateUnavailable)?;
-        record_actual_attempt(
-            &mut state,
-            self.attempt_id,
-            kind,
-            outcome,
-            completed_at_unix_ms,
-        )
+        record_actual_attempt(&mut state, self.attempt_id, kind, outcome, completed_at)
     }
 
     /// Releases the logical-operation lane after all actual attempts have been recorded.
-    pub fn finish(
+    pub(crate) fn finish(
         mut self,
         successful: bool,
-        completed_at_unix_ms: i64,
+        completed_at: YahooClockObservation,
     ) -> Result<(), AdmissionRejection> {
         {
             let mut state = self
                 .inner
                 .lock()
                 .map_err(|_| AdmissionRejection::StateUnavailable)?;
-            finish_operation(
-                &mut state,
-                self.attempt_id,
-                successful,
-                completed_at_unix_ms,
-            )?;
+            finish_operation(&mut state, self.attempt_id, successful, completed_at)?;
         }
         self.completed = true;
         Ok(())
     }
 
-    pub fn complete(
+    #[cfg(test)]
+    pub(crate) fn complete(
         mut self,
         outcome: AttemptOutcome,
-        completed_at_unix_ms: i64,
+        completed_at: YahooClockObservation,
     ) -> Result<(), AdmissionRejection> {
         {
             let mut state = self
@@ -505,14 +593,9 @@ impl AttemptPermit {
                 self.attempt_id,
                 AttemptKind::Primary,
                 outcome,
-                completed_at_unix_ms,
+                completed_at,
             )?;
-            finish_operation(
-                &mut state,
-                self.attempt_id,
-                successful,
-                completed_at_unix_ms,
-            )?;
+            finish_operation(&mut state, self.attempt_id, successful, completed_at)?;
         }
         self.completed = true;
         Ok(())
@@ -531,7 +614,7 @@ impl Drop for AttemptPermit {
             if active.id != self.attempt_id {
                 return;
             }
-            let completed_at = active.started_at_unix_ms;
+            let completed_at = active.started_at;
             state.snapshot.cancelled_attempts_total =
                 state.snapshot.cancelled_attempts_total.saturating_add(1);
             let _ = finish_operation(&mut state, self.attempt_id, false, completed_at);
@@ -544,7 +627,7 @@ fn record_actual_attempt(
     attempt_id: u64,
     kind: AttemptKind,
     outcome: AttemptOutcome,
-    completed_at_unix_ms: i64,
+    completed_at: YahooClockObservation,
 ) -> Result<(), AdmissionRejection> {
     let active = state
         .active
@@ -616,7 +699,7 @@ fn record_actual_attempt(
             if status == 429 {
                 state.snapshot.http_429_total = checked_add(state.snapshot.http_429_total, 1)?;
             }
-            open_circuit(state, completed_at_unix_ms, recovery);
+            open_circuit(state, completed_at, recovery);
             false
         }
         AttemptDisposition::TransportFailure => {
@@ -645,7 +728,7 @@ fn record_actual_attempt(
         }
     };
     if reopen {
-        open_circuit(state, completed_at_unix_ms, None);
+        open_circuit(state, completed_at, None);
     }
     Ok(())
 }
@@ -654,7 +737,7 @@ fn finish_operation(
     state: &mut AdmissionState,
     attempt_id: u64,
     successful: bool,
-    completed_at_unix_ms: i64,
+    completed_at: YahooClockObservation,
 ) -> Result<(), AdmissionRejection> {
     let active = state
         .active
@@ -671,7 +754,9 @@ fn finish_operation(
             // caller cancellation or a local deadline). Preserve the single-probe gate, but make
             // the next explicit demand eligible immediately instead of inventing a cooldown.
             state.circuit = CircuitState::Open {
-                retry_at_unix_ms: completed_at_unix_ms,
+                recorded_at_unix_ms: completed_at.wall_unix_ms,
+                retry_at_unix_ms: completed_at.wall_unix_ms,
+                retry_at_monotonic: Some(completed_at.monotonic),
             };
         }
     }
@@ -702,24 +787,29 @@ fn increment_failure(state: &mut AdmissionState) -> Result<bool, AdmissionReject
 
 fn open_circuit(
     state: &mut AdmissionState,
-    now_unix_ms: i64,
+    completed_at: YahooClockObservation,
     recovery: Option<YahooProviderRecoveryDirective>,
 ) {
-    let provider_retry_at = recovery.and_then(|value| value.minimum_next_attempt_at(now_unix_ms));
-    let retry_at_unix_ms = provider_retry_at.unwrap_or_else(|| {
-        let cooldown = fallback_cooldown_with_jitter(state, now_unix_ms);
+    let provider_recovery_ms =
+        recovery.and_then(|value| value.minimum_delay_ms(completed_at.wall_unix_ms));
+    let recovery_ms = provider_recovery_ms.unwrap_or_else(|| {
+        let cooldown = fallback_cooldown_with_jitter(state, completed_at.wall_unix_ms);
         state.snapshot.fallback_backoff_exponent = state
             .snapshot
             .fallback_backoff_exponent
             .saturating_add(1)
             .min(MAX_FALLBACK_BACKOFF_EXPONENT);
-        add_millis(now_unix_ms, cooldown)
+        cooldown
     });
     state.circuit = CircuitState::Open {
         // A valid provider instruction is exact and is never lengthened by local policy. Only an
         // absent, malformed, or already-expired instruction advances the bounded adaptive
         // fallback. The next successful provider observation resets that fallback immediately.
-        retry_at_unix_ms,
+        recorded_at_unix_ms: completed_at.wall_unix_ms,
+        retry_at_unix_ms: add_millis(completed_at.wall_unix_ms, recovery_ms),
+        retry_at_monotonic: completed_at
+            .monotonic
+            .checked_add(Duration::from_millis(recovery_ms)),
     };
 }
 
@@ -787,6 +877,13 @@ fn validate_restored_snapshot(
         .ok_or(AdmissionRejection::InvalidPersistedState)?;
     if snapshot.active_request_key.is_some()
         || matches!(snapshot.circuit, CircuitSnapshot::HalfOpen)
+        || matches!(
+            snapshot.circuit,
+            CircuitSnapshot::Open {
+                recorded_at_unix_ms,
+                retry_at_unix_ms
+            } if retry_at_unix_ms < recorded_at_unix_ms
+        )
         || accounted_units != snapshot.requested_units_total
         || snapshot.maximum_observed_response_bytes
             > usize::try_from(snapshot.response_bytes_total).unwrap_or(usize::MAX)

@@ -21,7 +21,7 @@ use std::{
     fmt,
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
@@ -311,6 +311,7 @@ pub struct ProviderAdapterActivation {
     provider_control_root: PathBuf,
     bls: RwLock<Option<Arc<bls::BlsProductActivation>>>,
     sec_fund: RwLock<Option<Arc<SecFundProductActivation>>>,
+    yahoo_authority: Mutex<Option<Arc<yahoo::YahooProviderAuthority>>>,
     yahoo: RwLock<Option<Arc<yahoo::YahooProductActivation>>>,
     tiingo: RwLock<Option<Arc<tiingo::TiingoProductActivation>>>,
     #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
@@ -553,6 +554,7 @@ impl ProviderAdapterActivation {
             provider_control_root,
             bls: RwLock::new(None),
             sec_fund: RwLock::new(None),
+            yahoo_authority: Mutex::new(None),
             yahoo: RwLock::new(None),
             tiingo: RwLock::new(None),
             #[cfg(all(feature = "board-installed-fixture", debug_assertions))]
@@ -579,6 +581,7 @@ impl ProviderAdapterActivation {
             provider_control_root,
             bls: RwLock::new(None),
             sec_fund: RwLock::new(None),
+            yahoo_authority: Mutex::new(None),
             yahoo: RwLock::new(None),
             tiingo: RwLock::new(None),
             board_source_factory: Some(board_source_factory),
@@ -1094,7 +1097,7 @@ impl ProviderAdapterActivation {
                         committed.candidate.metadata().clone(),
                         rights,
                         committed.candidate.clone(),
-                        &self.provider_control_root,
+                        self.yahoo_provider_authority()?,
                     )?,
                 ))
             }
@@ -1853,7 +1856,7 @@ impl ProviderAdapterActivation {
             spec.metadata,
             rights.clone(),
             generation.clone(),
-            &self.provider_control_root,
+            self.yahoo_provider_authority()?,
         )?;
         self.research_mutation
             .register_provider_publication_generation(generation.clone(), rights)?;
@@ -1868,6 +1871,21 @@ impl ProviderAdapterActivation {
                 .map_err(|_| ProviderAdapterActivationError::SourceBinding)?,
             generation,
         })
+    }
+
+    fn yahoo_provider_authority(
+        &self,
+    ) -> Result<Arc<yahoo::YahooProviderAuthority>, ProviderAdapterActivationError> {
+        let mut slot = self
+            .yahoo_authority
+            .lock()
+            .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+        if let Some(authority) = slot.as_ref() {
+            return Ok(Arc::clone(authority));
+        }
+        let authority = yahoo::YahooProviderAuthority::try_new(&self.provider_control_root)?;
+        *slot = Some(Arc::clone(&authority));
+        Ok(authority)
     }
 
     async fn activate_tiingo(

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use market_squawk_domain::{MetadataRevision, SourceId, SourceIdentifier};
 use market_squawk_platform::LocalPaths;
+use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -15,11 +16,16 @@ use crate::{
     AttemptOutcome, ChartInterval, ChartWindow, CircuitSnapshot, ExplicitDemand,
     ExplicitDemandPurpose, ProviderField, YahooAdmission, YahooAssetClass, YahooAttemptTarget,
     YahooChartActionScope, YahooChartAdjustmentMode, YahooChartEventKind, YahooChartSessionScope,
-    YahooDurableStateStore, YahooExecutionDisposition, YahooExecutionLimits, YahooHttpFailureKind,
-    YahooHttpSession, YahooHttpSessionConfig, YahooLocale, YahooParsedResponse,
-    YahooProviderRecoveryDirective, YahooPublicationBinding, YahooPublicationBridgeError,
-    YahooRequestPlanner, YahooRetryAfterDirective, YahooSymbol, YahooTarget,
+    YahooClockObservation, YahooDurableStateStore, YahooExecutionDisposition, YahooExecutionLimits,
+    YahooHttpFailureKind, YahooHttpSession, YahooHttpSessionConfig, YahooLocale,
+    YahooParsedResponse, YahooProviderRecoveryDirective, YahooPublicationBinding,
+    YahooPublicationBridgeError, YahooRequestPlanner, YahooRetryAfterDirective, YahooSymbol,
+    YahooTarget,
 };
+
+fn clock(base: Instant, wall_unix_ms: i64, elapsed_ms: u64) -> YahooClockObservation {
+    YahooClockObservation::new(wall_unix_ms, base + Duration::from_millis(elapsed_ms))
+}
 
 fn bounds(maximum_symbols: usize) -> AdapterBounds {
     AdapterBounds {
@@ -71,7 +77,6 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
         max_crumb_bytes: 512,
         max_cache_entries: 8,
         max_cache_bytes: 128 * 1_024,
-        max_redirects: 3,
         max_attempt_receipts: 8,
         admission_policy: AdmissionPolicy::new(1_000, 250, 3)?,
     };
@@ -86,29 +91,29 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after: None,
-                rate_limit_reset: None,
+                retry_after: &[],
+                rate_limit_reset: &[],
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after: None,
-                rate_limit_reset: None,
+                retry_after: &[],
+                rate_limit_reset: &[],
                 body: Bytes::from_static(b"local-crumb"),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "application/json",
-                retry_after: None,
-                rate_limit_reset: None,
+                retry_after: &[],
+                rate_limit_reset: &[],
                 body: chart.clone(),
             },
             ScriptedHttpResponse {
                 status: 429,
                 content_type: "text/plain",
-                retry_after: Some("2"),
-                rate_limit_reset: Some("5"),
+                retry_after: &["0", "2", "bogus"],
+                rate_limit_reset: &["+9", "5", "4", "1000000000000000"],
                 body: Bytes::from_static(b"Too Many Requests"),
             },
         ],
@@ -381,12 +386,31 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
     assert_eq!(snapshot.missing_units_total, 1);
     assert_eq!(snapshot.http_429_total, 1);
 
-    let absolute_retry = YahooAdmission::new(AdmissionPolicy::new(9_000, 1_000, 3)?);
+    let mut repeated_headers = HeaderMap::new();
+    for value in ["2", "bogus", "0", "7"] {
+        repeated_headers.append(RETRY_AFTER, HeaderValue::from_static(value));
+    }
+    for value in ["+8", "5", "4", "1000000000000000"] {
+        repeated_headers.append("ratelimit-reset", HeaderValue::from_static(value));
+    }
+    let repeated_recovery = crate::http::provider_recovery_from_headers(&repeated_headers)
+        .ok_or("at least one repeated recovery field must be usable")?;
+    assert_eq!(repeated_recovery.minimum_delay_ms(20_000), Some(7_000));
+    let zero_or_malformed_recovery = crate::http::provider_recovery_from_values(
+        ["0", "+3", "-1", "1.5"],
+        ["0", "+4", "-2", "1.5", "1000000000000000"],
+    )
+    .ok_or("strictly valid zero values remain evidence but are not future deadlines")?;
+    assert_eq!(zero_or_malformed_recovery.minimum_delay_ms(20_000), None);
+
+    let clock_base = Instant::now();
+    let absolute_policy = AdmissionPolicy::new(9_000, 1_000, 3)?;
+    let absolute_retry = YahooAdmission::new(absolute_policy);
     let absolute_permit = match absolute_retry.admit(
         &plan.requests[0],
         "absolute-retry-after",
         AttemptKind::Primary,
-        10_000,
+        clock(clock_base, 10_000, 0),
     )? {
         AdmissionDecision::Execute(permit) => permit,
         _ => return Err("fresh absolute Retry-After admission must execute".into()),
@@ -408,21 +432,69 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
                 ),
             },
         },
-        20_000,
+        clock(clock_base, 20_000, 10),
     )?;
     assert_eq!(
         absolute_retry.snapshot()?.circuit,
         CircuitSnapshot::Open {
+            recorded_at_unix_ms: 20_000,
             retry_at_unix_ms: 50_000
         }
     );
+    let durable_absolute = absolute_retry.snapshot()?;
+    assert!(matches!(
+        absolute_retry.admit(
+            &plan.requests[0],
+            "wall-jump-must-not-short-circuit",
+            AttemptKind::Primary,
+            clock(clock_base, 500_000, 30_009),
+        )?,
+        AdmissionDecision::CircuitOpen { .. }
+    ));
+    let wall_rewind_probe = match absolute_retry.admit(
+        &plan.requests[0],
+        "wall-rewind-after-monotonic-deadline",
+        AttemptKind::Primary,
+        clock(clock_base, 1_000, 30_010),
+    )? {
+        AdmissionDecision::Execute(permit) => permit,
+        _ => return Err("monotonic deadline must admit despite a backward wall step".into()),
+    };
+    drop(wall_rewind_probe);
 
+    let restart_clock = Instant::now();
+    let restored_absolute = YahooAdmission::try_restore(
+        absolute_policy,
+        durable_absolute,
+        clock(restart_clock, 9_000_000, 0),
+    )?;
+    assert!(matches!(
+        restored_absolute.admit(
+            &plan.requests[0],
+            "restart-discontinuity",
+            AttemptKind::Primary,
+            clock(restart_clock, 99_000_000, 29_999),
+        )?,
+        AdmissionDecision::CircuitOpen { .. }
+    ));
+    let restart_probe = match restored_absolute.admit(
+        &plan.requests[0],
+        "restart-discontinuity",
+        AttemptKind::Primary,
+        clock(restart_clock, 1, 30_000),
+    )? {
+        AdmissionDecision::Execute(permit) => permit,
+        _ => return Err("restart must conservatively reapply exactly the durable interval".into()),
+    };
+    drop(restart_probe);
+
+    let expired_clock = Instant::now();
     let expired_retry = YahooAdmission::new(AdmissionPolicy::new(9_000, 1_000, 3)?);
     let expired_permit = match expired_retry.admit(
         &plan.requests[0],
         "expired-retry-after",
         AttemptKind::Primary,
-        10_000,
+        clock(expired_clock, 10_000, 0),
     )? {
         AdmissionDecision::Execute(permit) => permit,
         _ => return Err("fresh expired Retry-After admission must execute".into()),
@@ -436,18 +508,19 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
             latency_ms: 1,
             disposition: AttemptDisposition::ProviderBackoff {
                 status: 429,
-                recovery: YahooProviderRecoveryDirective::try_new(
-                    Some(YahooRetryAfterDirective::HttpDate {
-                        retry_at_unix_ms: 19_999,
-                    }),
-                    None,
-                ),
+                recovery: Some(zero_or_malformed_recovery),
             },
         },
-        20_000,
+        clock(expired_clock, 20_000, 10),
     )?;
-    let CircuitSnapshot::Open { retry_at_unix_ms } = expired_retry.snapshot()?.circuit else {
-        return Err("expired provider instruction must use the bounded fallback circuit".into());
+    let CircuitSnapshot::Open {
+        recorded_at_unix_ms: 20_000,
+        retry_at_unix_ms,
+    } = expired_retry.snapshot()?.circuit
+    else {
+        return Err(
+            "non-future provider instructions must use the bounded fallback circuit".into(),
+        );
     };
     assert!((29_000..=30_000).contains(&retry_at_unix_ms));
     assert_eq!(expired_retry.snapshot()?.fallback_backoff_exponent, 1);
@@ -455,7 +528,7 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
         &plan.requests[0],
         "expired-retry-after",
         AttemptKind::Primary,
-        retry_at_unix_ms,
+        clock(expired_clock, retry_at_unix_ms, 20_000),
     )? {
         AdmissionDecision::Execute(permit) => permit,
         _ => return Err("expired fallback deadline must admit one half-open probe".into()),
@@ -473,16 +546,18 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
                 recovery: None,
             },
         },
-        retry_at_unix_ms + 1,
+        clock(expired_clock, retry_at_unix_ms + 1, 20_001),
     )?;
-    second_fallback_permit.finish(false, retry_at_unix_ms + 1)?;
+    second_fallback_permit.finish(false, clock(expired_clock, retry_at_unix_ms + 1, 20_001))?;
     let second_fallback = expired_retry.snapshot()?;
     let CircuitSnapshot::Open {
+        recorded_at_unix_ms: second_recorded_at,
         retry_at_unix_ms: second_retry_at,
     } = second_fallback.circuit
     else {
         return Err("a repeated provider-silent backoff must keep the circuit open".into());
     };
+    assert_eq!(second_recorded_at, retry_at_unix_ms + 1);
     assert!(((retry_at_unix_ms + 18_001)..=(retry_at_unix_ms + 19_001)).contains(&second_retry_at));
     assert_eq!(second_fallback.fallback_backoff_exponent, 2);
 
@@ -496,22 +571,22 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after: None,
-                rate_limit_reset: None,
+                retry_after: &[],
+                rate_limit_reset: &[],
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after: None,
-                rate_limit_reset: None,
+                retry_after: &[],
+                rate_limit_reset: &[],
                 body: Bytes::from_static(b"bounded-crumb"),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "application/json",
-                retry_after: None,
-                rate_limit_reset: None,
+                retry_after: &[],
+                rate_limit_reset: &[],
                 body: chart.clone(),
             },
         ],
@@ -545,22 +620,22 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after: None,
-                rate_limit_reset: None,
+                retry_after: &[],
+                rate_limit_reset: &[],
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after: None,
-                rate_limit_reset: None,
+                retry_after: &[],
+                rate_limit_reset: &[],
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/html",
-                retry_after: None,
-                rate_limit_reset: None,
+                retry_after: &[],
+                rate_limit_reset: &[],
                 body: Bytes::from_static(
                     br#"<input name="csrfToken" value="csrf"><input name="sessionId" value="session">"#,
                 ),
@@ -568,29 +643,29 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after: None,
-                rate_limit_reset: None,
+                retry_after: &[],
+                rate_limit_reset: &[],
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after: None,
-                rate_limit_reset: None,
+                retry_after: &[],
+                rate_limit_reset: &[],
                 body: Bytes::new(),
             },
             ScriptedHttpResponse {
                 status: 200,
                 content_type: "text/plain",
-                retry_after: None,
-                rate_limit_reset: None,
+                retry_after: &[],
+                rate_limit_reset: &[],
                 body: Bytes::from_static(b"csrf-crumb"),
             },
             ScriptedHttpResponse {
                 status: 500,
                 content_type: "application/json",
-                retry_after: None,
-                rate_limit_reset: None,
+                retry_after: &[],
+                rate_limit_reset: &[],
                 body: Bytes::from_static(b"{}"),
             },
         ],
@@ -612,6 +687,52 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
     assert_eq!(fallback_snapshot.transport_failures_total, 1);
     assert_eq!(fallback_snapshot.consecutive_failures, 2);
 
+    let redirect_session = YahooHttpSession::new_for_test_with_durable(
+        config,
+        Url::parse("http://yahoo-redirect.test/")?,
+        vec![
+            ScriptedHttpResponse {
+                status: 200,
+                content_type: "text/plain",
+                retry_after: &[],
+                rate_limit_reset: &[],
+                body: Bytes::new(),
+            },
+            ScriptedHttpResponse {
+                status: 200,
+                content_type: "text/plain",
+                retry_after: &[],
+                rate_limit_reset: &[],
+                body: Bytes::from_static(b"redirect-crumb"),
+            },
+            ScriptedHttpResponse {
+                status: 302,
+                content_type: "text/html",
+                retry_after: &[],
+                rate_limit_reset: &[],
+                body: Bytes::from_static(b"redirect refused"),
+            },
+        ],
+        None,
+    )?;
+    let redirect_failure = redirect_session
+        .execute(plan.requests[0].clone(), limits, &cancellation)
+        .await
+        .expect_err("redirect response must fail closed without an implicit follow-up send");
+    assert_eq!(
+        redirect_failure.kind,
+        YahooHttpFailureKind::ProviderStatus { status: 302 }
+    );
+    assert_eq!(redirect_failure.attempts.len(), 3);
+    assert_eq!(redirect_session.scripted_observed_targets().await.len(), 3);
+    assert_eq!(
+        redirect_session
+            .admission()
+            .snapshot()?
+            .actual_http_attempts_total,
+        3
+    );
+
     let same_url_different_semantics = planner(4)?.chart_history(
         demand("same-url-different-semantics")?,
         vec![YahooTarget {
@@ -630,11 +751,12 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
     );
     assert_ne!(first_identity, second_identity);
     let identity_admission = YahooAdmission::new(AdmissionPolicy::new(1_000, 250, 3)?);
+    let identity_clock = Instant::now();
     let first_permit = match identity_admission.admit(
         &plan.requests[0],
         &first_identity,
         AttemptKind::Primary,
-        1_786_473_600_000,
+        clock(identity_clock, 1_786_473_600_000, 0),
     )? {
         AdmissionDecision::Execute(permit) => permit,
         _ => return Err("first semantic identity must own the provider lane".into()),
@@ -644,7 +766,7 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
             &same_url_different_semantics.requests[0],
             &second_identity,
             AttemptKind::Primary,
-            1_786_473_600_001,
+            clock(identity_clock, 1_786_473_600_001, 1),
         )?,
         AdmissionDecision::Busy { .. }
     ));
@@ -696,6 +818,22 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
     ));
     assert!(restarted.scripted_observed_targets().await.is_empty());
     drop(restarted);
+
+    let cutover_root = state_root.join("cutover-authority");
+    let cutover_owner = YahooHttpSession::new_for_test_with_durable(
+        config,
+        Url::parse("http://yahoo-cutover.test/")?,
+        Vec::new(),
+        Some(YahooDurableStateStore::try_open(&cutover_root)?),
+    )?;
+    let predecessor_generation = cutover_owner.clone();
+    let candidate_generation = cutover_owner.clone();
+    drop(cutover_owner);
+    assert!(YahooDurableStateStore::try_open(&cutover_root).is_err());
+    drop(predecessor_generation);
+    assert!(YahooDurableStateStore::try_open(&cutover_root).is_err());
+    drop(candidate_generation);
+    drop(YahooDurableStateStore::try_open(&cutover_root)?);
     std::fs::remove_dir_all(state_root)?;
     Ok(())
 }

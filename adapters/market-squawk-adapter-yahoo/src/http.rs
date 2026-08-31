@@ -42,8 +42,8 @@ use crate::{
     AdapterBounds, AdmissionDecision, AdmissionPolicy, AdmissionRejection, AttemptDisposition,
     AttemptKind, AttemptOutcome, AttemptPermit, ChartInterval, ChartWindow, ExplicitDemand,
     LookupKind, ParseContext, YAHOO_SOURCE_ID, YahooAdapterError, YahooAdmission, YahooAssetClass,
-    YahooChart, YahooDurableStateStore, YahooEnrichment, YahooFundData, YahooHttpMethod,
-    YahooHttpRequest, YahooLocale, YahooLookupHint, YahooOptionChain,
+    YahooChart, YahooClockObservation, YahooDurableStateStore, YahooEnrichment, YahooFundData,
+    YahooHttpMethod, YahooHttpRequest, YahooLocale, YahooLookupHint, YahooOptionChain,
     YahooProviderRecoveryDirective, YahooQuote, YahooReference, YahooRequestFamily,
     YahooRequestPlan, YahooRequestPlanner, YahooRetryAfterDirective, YahooReturnedDisposition,
     YahooSymbol, YahooTarget, parse_chart_response, parse_fund_response, parse_lookup_response,
@@ -71,7 +71,6 @@ pub struct YahooHttpSessionConfig {
     pub max_crumb_bytes: usize,
     pub max_cache_entries: usize,
     pub max_cache_bytes: usize,
-    pub max_redirects: usize,
     pub max_attempt_receipts: usize,
     pub admission_policy: AdmissionPolicy,
 }
@@ -89,7 +88,6 @@ impl YahooHttpSessionConfig {
             ("max_crumb_bytes", self.max_crumb_bytes),
             ("max_cache_entries", self.max_cache_entries),
             ("max_cache_bytes", self.max_cache_bytes),
-            ("max_redirects", self.max_redirects),
             ("max_attempt_receipts", self.max_attempt_receipts),
         ] {
             if value == 0 {
@@ -626,7 +624,6 @@ struct EndpointSet {
     csrf_crumb: Url,
     data_rewrite_base: Option<Url>,
     allow_plain_http: bool,
-    allowed_hosts: Arc<[String]>,
 }
 
 struct NetworkState {
@@ -662,8 +659,8 @@ struct ScriptedWireState {
 pub(crate) struct ScriptedHttpResponse {
     pub status: u16,
     pub content_type: &'static str,
-    pub retry_after: Option<&'static str>,
-    pub rate_limit_reset: Option<&'static str>,
+    pub retry_after: &'static [&'static str],
+    pub rate_limit_reset: &'static [&'static str],
     pub body: Bytes,
 }
 
@@ -838,7 +835,7 @@ impl YahooHttpSession {
                 YahooHttpFailureKind::StateUnavailable,
             ));
         }
-        let now = wall_time_ms().map_err(|_| {
+        let now = clock_observation().map_err(|_| {
             YahooHttpFailure::without_attempts(YahooHttpFailureKind::StateUnavailable)
         })?;
         let maximum_cache_age_ms =
@@ -846,6 +843,7 @@ impl YahooHttpSession {
         if !maximum_cache_age.is_zero()
             && let Some(entry) = shared.cache.get(identity)
             && now
+                .wall_unix_ms()
                 .checked_sub(entry.stored_at_unix_ms)
                 .is_some_and(|age| age >= 0 && age <= maximum_cache_age_ms)
         {
@@ -952,7 +950,8 @@ impl YahooHttpSession {
                 cancellation,
             )
             .await;
-        let completed_at = wall_time_ms().unwrap_or(i64::MAX);
+        let completed_at = clock_observation()
+            .unwrap_or_else(|_| YahooClockObservation::new(i64::MAX, Instant::now()));
         match result {
             Ok(payload) => {
                 if permit.finish(true, completed_at).is_err() {
@@ -1058,7 +1057,7 @@ impl YahooHttpSession {
         attempts: &mut Vec<YahooHttpAttemptReceipt>,
         permit: &mut AttemptPermit,
     ) -> Result<ExecutionPayload, YahooHttpFailureKind> {
-        let received_at_unix_ms = wire.completed_at_unix_ms;
+        let received_at_unix_ms = wire.completed_at.wall_unix_ms();
         let parse_context = ParseContext {
             received_at_unix_ms,
             available_at_unix_ms: wall_time_ms()
@@ -1373,6 +1372,19 @@ impl YahooHttpSession {
         if wire_indicates_rate_limit(&wire) {
             return Err(self.record_provider_backoff(wire, permit, attempts)?);
         }
+        if wire.is_redirect() {
+            let status = wire.status;
+            self.record_wire(
+                permit,
+                attempts,
+                wire,
+                0,
+                0,
+                0,
+                AttemptDisposition::TransportFailure,
+            )?;
+            return Err(YahooHttpFailureKind::ProviderStatus { status });
+        }
         // The pinned cookie bootstrap and consent submit/copy paths validate the following crumb,
         // not these intermediate statuses. A completed non-429 response is therefore progress.
         self.record_wire(permit, attempts, wire, 0, 0, 0, AttemptDisposition::Success)
@@ -1386,6 +1398,19 @@ impl YahooHttpSession {
     ) -> Result<Zeroizing<String>, YahooHttpFailureKind> {
         if wire_indicates_rate_limit(&wire) {
             return Err(self.record_provider_backoff(wire, permit, attempts)?);
+        }
+        if wire.is_redirect() {
+            let status = wire.status;
+            self.record_wire(
+                permit,
+                attempts,
+                wire,
+                0,
+                0,
+                0,
+                AttemptDisposition::TransportFailure,
+            )?;
+            return Err(YahooHttpFailureKind::ProviderStatus { status });
         }
         let crumb = std::str::from_utf8(&wire.bytes)
             .ok()
@@ -1461,6 +1486,22 @@ impl YahooHttpSession {
             return Err(DataFailure::Terminal(
                 self.record_provider_backoff(wire, permit, attempts)
                     .unwrap_or(YahooHttpFailureKind::AdmissionUnavailable),
+            ));
+        }
+        if wire.is_redirect() {
+            let status = wire.status;
+            self.record_wire(
+                permit,
+                attempts,
+                wire,
+                0,
+                request_units(request),
+                0,
+                AttemptDisposition::TransportFailure,
+            )
+            .map_err(DataFailure::Terminal)?;
+            return Err(DataFailure::Terminal(
+                YahooHttpFailureKind::ProviderStatus { status },
             ));
         }
         if !wire.is_success() || !wire.is_json() || wire.final_url_is_consent() {
@@ -1562,11 +1603,11 @@ impl YahooHttpSession {
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        let header_observed_at =
+            clock_observation().map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
         let recovery = provider_recovery_from_headers(response.headers());
         let final_url = response.url().clone();
         if response_requires_immediate_backoff(status, recovery) {
-            let completed_at_unix_ms =
-                wall_time_ms().map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
             let wire = WireResponse {
                 kind,
                 target,
@@ -1577,7 +1618,7 @@ impl YahooHttpSession {
                 recovery,
                 final_url,
                 started_at_unix_ms,
-                completed_at_unix_ms,
+                completed_at: header_observed_at,
                 latency_ms: duration_ms(started.elapsed()),
                 observation_units,
             };
@@ -1684,7 +1725,7 @@ impl YahooHttpSession {
             recovery,
             final_url,
             started_at_unix_ms,
-            completed_at_unix_ms: wall_time_ms()
+            completed_at: clock_observation()
                 .map_err(|_| YahooHttpFailureKind::StateUnavailable)?,
             latency_ms: duration_ms(started.elapsed()),
             observation_units,
@@ -1715,8 +1756,12 @@ impl YahooHttpSession {
             .responses
             .pop_front()
             .ok_or(YahooHttpFailureKind::Network)?;
-        let recovery =
-            provider_recovery_from_values(response.retry_after, response.rate_limit_reset);
+        let completed_at =
+            clock_observation().map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
+        let recovery = provider_recovery_from_values(
+            response.retry_after.iter().copied(),
+            response.rate_limit_reset.iter().copied(),
+        );
         let immediate_backoff = response_requires_immediate_backoff(response.status, recovery);
         if !immediate_backoff && response.body.len() > spec.maximum_bytes {
             return Err(YahooHttpFailureKind::ResponseTooLarge);
@@ -1738,8 +1783,7 @@ impl YahooHttpSession {
             recovery,
             final_url: spec.url,
             started_at_unix_ms,
-            completed_at_unix_ms: wall_time_ms()
-                .map_err(|_| YahooHttpFailureKind::StateUnavailable)?,
+            completed_at,
             latency_ms: duration_ms(started.elapsed()),
             observation_units: spec.observation_units,
         })
@@ -1775,7 +1819,9 @@ impl YahooHttpSession {
             | YahooHttpFailureKind::ResponseTooLarge
             | YahooHttpFailureKind::UnsupportedEncoding => AttemptDisposition::TransportFailure,
         };
-        let completed_at_unix_ms = wall_time_ms().unwrap_or(started_at_unix_ms);
+        let completed_at = clock_observation()
+            .unwrap_or_else(|_| YahooClockObservation::new(started_at_unix_ms, Instant::now()));
+        let completed_at_unix_ms = completed_at.wall_unix_ms();
         self.push_attempt(
             permit,
             attempts,
@@ -1793,6 +1839,7 @@ impl YahooHttpSession {
             0,
             observation_units,
             0,
+            completed_at,
         )
     }
 
@@ -1804,7 +1851,7 @@ impl YahooHttpSession {
     ) -> Result<YahooHttpFailureKind, YahooHttpFailureKind> {
         let recovery = wire.recovery;
         let status = wire.status;
-        let completed_at = wire.completed_at_unix_ms;
+        let completed_at = wire.completed_at.wall_unix_ms();
         let units = wire.observation_units;
         self.record_wire(
             permit,
@@ -1843,7 +1890,7 @@ impl YahooHttpSession {
             response_bytes: wire.bytes.len(),
             response_sha256_hex: wire.response_sha256_hex,
             started_at_unix_ms: wire.started_at_unix_ms,
-            completed_at_unix_ms: wire.completed_at_unix_ms,
+            completed_at_unix_ms: wire.completed_at.wall_unix_ms(),
             latency_ms: wire.latency_ms,
             disposition,
         };
@@ -1854,6 +1901,7 @@ impl YahooHttpSession {
             returned_units,
             missing_units,
             returned_records,
+            wire.completed_at,
         )
     }
 
@@ -1865,6 +1913,7 @@ impl YahooHttpSession {
         returned_units: usize,
         missing_units: usize,
         returned_records: usize,
+        completed_at: YahooClockObservation,
     ) -> Result<(), YahooHttpFailureKind> {
         if attempts.len() >= self.inner.config.max_attempt_receipts {
             return Err(YahooHttpFailureKind::AttemptReceiptLimit);
@@ -1880,7 +1929,7 @@ impl YahooHttpSession {
                     latency_ms: receipt.latency_ms,
                     disposition: receipt.disposition,
                 },
-                receipt.completed_at_unix_ms,
+                completed_at,
             )
             .map_err(|_| YahooHttpFailureKind::AdmissionUnavailable)?;
         attempts.push(receipt);
@@ -1901,7 +1950,9 @@ impl YahooHttpSession {
 impl crate::CircuitSnapshot {
     fn retry_at(&self, fallback: i64) -> i64 {
         match self {
-            Self::Open { retry_at_unix_ms } => *retry_at_unix_ms,
+            Self::Open {
+                retry_at_unix_ms, ..
+            } => *retry_at_unix_ms,
             Self::Closed | Self::HalfOpen => fallback,
         }
     }
@@ -2364,8 +2415,10 @@ fn restore_shared_state(
     if restored.cache.len() > config.max_cache_entries {
         return Err(YahooHttpFailureKind::StateUnavailable);
     }
-    let admission = YahooAdmission::try_restore(config.admission_policy, restored.admission)
-        .map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
+    let restored_at = clock_observation().map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
+    let admission =
+        YahooAdmission::try_restore(config.admission_policy, restored.admission, restored_at)
+            .map_err(|_| YahooHttpFailureKind::StateUnavailable)?;
     let mut cache = BTreeMap::new();
     let mut cache_bytes = 0_usize;
     for persisted in restored.cache {
@@ -2566,6 +2619,13 @@ fn wall_time_ms() -> Result<i64, ()> {
     i64::try_from(value.as_millis()).map_err(|_| ())
 }
 
+fn clock_observation() -> Result<YahooClockObservation, ()> {
+    // Wall first and monotonic second makes an absolute wall deadline conversion conservative by
+    // the (normally tiny) sampling interval instead of allowing it to expire early.
+    let wall_unix_ms = wall_time_ms()?;
+    Ok(YahooClockObservation::new(wall_unix_ms, Instant::now()))
+}
+
 fn duration_ms(value: Duration) -> u64 {
     u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
 }
@@ -2624,7 +2684,9 @@ fn sha256_finish(digest: Sha256) -> String {
 }
 
 fn parse_retry_after(value: &str) -> Option<YahooRetryAfterDirective> {
-    if let Ok(seconds) = value.trim().parse::<u64>() {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        let seconds = value.parse::<u64>().ok()?;
         seconds.checked_mul(1_000)?;
         return Some(YahooRetryAfterDirective::DeltaSeconds { seconds });
     }
@@ -2635,31 +2697,42 @@ fn parse_retry_after(value: &str) -> Option<YahooRetryAfterDirective> {
 }
 
 fn parse_rate_limit_reset(value: &str) -> Option<u64> {
-    let seconds = value.trim().parse::<u64>().ok()?;
+    // RFC 9651 Structured Fields integers are at most 15 decimal digits and have no leading `+`.
+    // RateLimit-Reset is a non-negative delay, so a syntactically valid negative sf-integer is
+    // unusable recovery evidence for this client.
+    let value = value.trim();
+    if value.is_empty() || value.len() > 15 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let seconds = value.parse::<u64>().ok()?;
     seconds.checked_mul(1_000)?;
     Some(seconds)
 }
 
-fn provider_recovery_from_headers(
+pub(crate) fn provider_recovery_from_headers(
     headers: &reqwest::header::HeaderMap,
 ) -> Option<YahooProviderRecoveryDirective> {
     provider_recovery_from_values(
         headers
-            .get(RETRY_AFTER)
-            .and_then(|value| value.to_str().ok()),
+            .get_all(RETRY_AFTER)
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
         headers
-            .get("ratelimit-reset")
-            .and_then(|value| value.to_str().ok()),
+            .get_all("ratelimit-reset")
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
     )
 }
 
-fn provider_recovery_from_values(
-    retry_after: Option<&str>,
-    rate_limit_reset: Option<&str>,
+pub(crate) fn provider_recovery_from_values<'a>(
+    retry_after: impl IntoIterator<Item = &'a str>,
+    rate_limit_reset: impl IntoIterator<Item = &'a str>,
 ) -> Option<YahooProviderRecoveryDirective> {
-    YahooProviderRecoveryDirective::try_new(
-        retry_after.and_then(parse_retry_after),
-        rate_limit_reset.and_then(parse_rate_limit_reset),
+    YahooProviderRecoveryDirective::from_directives(
+        retry_after.into_iter().filter_map(parse_retry_after),
+        rate_limit_reset
+            .into_iter()
+            .filter_map(parse_rate_limit_reset),
     )
 }
 
@@ -2687,10 +2760,12 @@ fn wire_indicates_rate_limit(wire: &WireResponse) -> bool {
         .any(|needle| bytes_contain_ascii_case_insensitive(&wire.bytes, needle))
 }
 
-const fn response_requires_immediate_backoff(
+fn response_requires_immediate_backoff(
     status: u16,
     recovery: Option<YahooProviderRecoveryDirective>,
 ) -> bool {
+    // A syntactically valid zero value still identifies a provider backoff response, but it is not
+    // a usable future deadline. Admission applies the bounded fallback in that case.
     status == 429 || (status == 503 && recovery.is_some())
 }
 
@@ -2841,7 +2916,7 @@ struct WireResponse {
     recovery: Option<YahooProviderRecoveryDirective>,
     final_url: Url,
     started_at_unix_ms: i64,
-    completed_at_unix_ms: i64,
+    completed_at: YahooClockObservation,
     latency_ms: u64,
     observation_units: usize,
 }
@@ -2858,6 +2933,10 @@ impl WireResponse {
                     || mime.trim().ends_with("+json")
             })
         })
+    }
+
+    fn is_redirect(&self) -> bool {
+        (300..400).contains(&self.status)
     }
 
     fn final_url_is_consent(&self) -> bool {
@@ -2898,21 +2977,12 @@ impl EndpointSet {
             csrf_crumb: parse(CSRF_CRUMB_URL)?,
             data_rewrite_base: None,
             allow_plain_http: false,
-            allowed_hosts: Arc::from([
-                "fc.yahoo.com".to_owned(),
-                "query1.finance.yahoo.com".to_owned(),
-                "query2.finance.yahoo.com".to_owned(),
-                "guce.yahoo.com".to_owned(),
-                "consent.yahoo.com".to_owned(),
-                "finance.yahoo.com".to_owned(),
-            ]),
         })
     }
 
     #[cfg(test)]
     fn local(base: Url) -> Self {
         let endpoint = |path: &str| base.join(path).expect("test path must join");
-        let host = base.host_str().expect("test host").to_owned();
         Self {
             cookie: endpoint("cookie"),
             basic_crumb: endpoint("crumb"),
@@ -2922,7 +2992,6 @@ impl EndpointSet {
             csrf_crumb: endpoint("csrf-crumb"),
             data_rewrite_base: Some(base),
             allow_plain_http: true,
-            allowed_hosts: Arc::from([host]),
         }
     }
 }
@@ -2968,8 +3037,6 @@ fn build_client(
     endpoints: &EndpointSet,
     cookie_jar: Arc<Jar>,
 ) -> Result<reqwest::Client, YahooHttpFailureKind> {
-    let allowed_hosts = Arc::clone(&endpoints.allowed_hosts);
-    let maximum_redirects = config.max_redirects;
     let mut builder = reqwest::Client::builder()
         .cookie_provider(cookie_jar)
         .connect_timeout(config.connect_timeout)
@@ -2981,20 +3048,9 @@ fn build_client(
         .no_brotli()
         .no_deflate()
         .no_zstd()
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() >= maximum_redirects {
-                return attempt.stop();
-            }
-            let allowed = attempt
-                .url()
-                .host_str()
-                .is_some_and(|host| allowed_hosts.iter().any(|allowed| allowed == host));
-            if allowed {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }));
+        // Redirect hops are physical upstream attempts. The current product contract does not
+        // require them, so fail closed instead of allowing reqwest to perform unaccounted sends.
+        .redirect(reqwest::redirect::Policy::none());
     if !endpoints.allow_plain_http {
         builder = builder.https_only(true);
     }
