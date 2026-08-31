@@ -7,9 +7,12 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use market_squawk_domain::{
-    AuthorizationBasis, ConnectionGeneration, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
-    ExactPayloadEvidence, InstrumentId, MetadataRevision, RevisionBoundPayloadEvidence, SourceId,
-    SourceIdentifier, Timestamp,
+    AuthorizationBasis, ConnectionGeneration, Currency, Denomination, DigestAlgorithm,
+    EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentDefinition,
+    InstrumentDefinitionInput, InstrumentDefinitionRevision, InstrumentId, LotSize,
+    MetadataRevision, ProviderIdentityEvidence, ProviderIdentityRecord,
+    ProviderIdentityRecordInput, ProviderInstrumentId, RevisionBoundPayloadEvidence, SourceId,
+    SourceIdentifier, TickSize, Timestamp, TradingStatus, VenueId, VenueMapping, VenueSymbol,
 };
 use market_squawk_sources::{
     ActiveLiveSourceGeneration, AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
@@ -19,6 +22,7 @@ use market_squawk_sources::{
     RawMarketFrame, RawMarketSink, RegistryError, SessionId, SinkError, SourceError,
     SourceMetadata, SourceMetadataProvider, TransportFrameKind,
 };
+use rust_decimal::Decimal;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::WebSocketStream;
@@ -193,7 +197,11 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
                 if value.as_str() == "3310070434"
         )
     }));
-    assert!(publication.is_some());
+    let publication = publication.ok_or("public book lost its publication lineage")?;
+    assert_eq!(
+        publication.native_coordinates(),
+        public_config.native_coordinates()
+    );
     assert!(terminal.is_none());
     assert_eq!(public_decode_control.health().market_messages(), 1);
 
@@ -794,12 +802,52 @@ fn test_source(
     .try_build()?;
     let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(metadata.clone(), Timestamp::from_unix_nanos(1))?;
+    let definition = public_definition(instrument)?;
+    let provider_identity_key = definition.provider_identities()[0].key();
     let config = KrakenConfig::try_new(
         metadata,
-        "BTC/USD",
-        instrument,
+        &definition,
+        &provider_identity_key,
+        Timestamp::from_unix_nanos(1),
         KrakenDepth::Ten,
         NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
     )?;
     Ok((config, registry, registered))
+}
+
+fn public_definition(instrument: InstrumentId) -> TestResult<InstrumentDefinition> {
+    let usd = Currency::try_from("USD")?;
+    let provider_identity = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+        instrument_id: instrument,
+        source_id: SourceId::try_from("kraken")?,
+        provider_instrument_id: ProviderInstrumentId::try_from("XBTUSD")?,
+        evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            [4; 32],
+        )),
+        source_timestamp: None,
+        observed_at: Timestamp::from_unix_nanos(1),
+        metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+            "kraken-instrument-identity-v1",
+        )?),
+        validity: EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+        supersedes: None,
+    });
+    Ok(InstrumentDefinition::try_new(InstrumentDefinitionInput {
+        instrument_id: instrument,
+        definition_revision: InstrumentDefinitionRevision::try_from(1)?,
+        asset_class: market_squawk_domain::AssetClass::Crypto,
+        primary_denomination: Denomination::Currency(usd),
+        quote_currency: usd,
+        tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
+        lot_size: LotSize::try_from_decimal(Decimal::new(1, 8))?,
+        contract_multiplier: Decimal::ONE,
+        venue_mappings: vec![VenueMapping::new(
+            VenueId::try_from("kraken")?,
+            VenueSymbol::try_from("BTC/USD")?,
+        )],
+        provider_identities: vec![provider_identity],
+        identifiers: Vec::new(),
+        trading_status: TradingStatus::Active,
+    })?)
 }

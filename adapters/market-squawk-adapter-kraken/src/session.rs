@@ -151,14 +151,12 @@ impl KrakenSocketHandoffConsumer {
         let decoder = match config.channel() {
             KrakenChannel::Book(depth) => KrakenMarketDecoder::try_new(
                 config.metadata().clone(),
-                config.symbol(),
-                config.instrument(),
+                config.native_coordinates().clone(),
                 depth,
             ),
             KrakenChannel::Trades => KrakenMarketDecoder::try_trades(
                 config.metadata().clone(),
-                config.symbol(),
-                config.instrument(),
+                config.native_coordinates().clone(),
             ),
         }
         .map_err(|_| SourceError::InvalidProtocolState)?;

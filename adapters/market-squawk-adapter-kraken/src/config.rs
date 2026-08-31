@@ -3,9 +3,9 @@
 use std::num::NonZeroUsize;
 
 use market_squawk_domain::{
-    DataQuality, EvidenceDigest, InstrumentId, LiveEventClass, MarketDepth, MetadataRevision,
-    ProviderChannel, ProviderIdentityKey, ProviderIdentityRecord, ProviderIdentityRegistry,
-    ProviderProduct, SequenceCapability, SourceId, VenueId, VenueSymbol,
+    DataQuality, EvidenceDigest, InstrumentDefinition, InstrumentDefinitionRevision, InstrumentId,
+    LiveEventClass, MarketDepth, MetadataRevision, ProviderChannel, ProviderIdentityKey,
+    ProviderProduct, SequenceCapability, SourceId, Timestamp, VenueId, VenueMapping, VenueSymbol,
 };
 use market_squawk_sources::{
     ChecksumValidationProfile, InstrumentCoverageMembership, MAX_RAW_FRAME_BYTES,
@@ -17,12 +17,12 @@ use url::Url;
 
 use crate::messages::PUBLIC_SUBSCRIPTION_REQUEST_ID;
 
-const KRAKEN_ENDPOINT: &str = "wss://ws.kraken.com/v2";
+pub(crate) const KRAKEN_ENDPOINT: &str = "wss://ws.kraken.com/v2";
 const MAX_SYMBOL_BYTES: usize = 64;
-const KRAKEN_PROVIDER: &str = "kraken";
-const KRAKEN_PRODUCT: &str = "kraken-spot";
-const KRAKEN_BOOK_CHANNEL: &str = "book-v2";
-const KRAKEN_TRADE_CHANNEL: &str = "trade-v2";
+pub(crate) const KRAKEN_PROVIDER: &str = "kraken";
+pub(crate) const KRAKEN_PRODUCT: &str = "kraken-spot";
+pub(crate) const KRAKEN_BOOK_CHANNEL: &str = "book-v2";
+pub(crate) const KRAKEN_TRADE_CHANNEL: &str = "trade-v2";
 
 /// Kraken-supported retained book depths.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,12 +84,14 @@ pub struct KrakenNativeMarketCoordinates {
     provider_identity_key: ProviderIdentityKey,
     provider_identity_revision: MetadataRevision,
     provider_identity_digest: EvidenceDigest,
-    venue: VenueId,
-    venue_symbol: VenueSymbol,
+    venue_mapping: VenueMapping,
+    instrument_definition_revision: InstrumentDefinitionRevision,
     provider_product: ProviderProduct,
     provider_channel: ProviderChannel,
     instrument: InstrumentId,
     channel: KrakenChannel,
+    selected_at: Timestamp,
+    valid_until: Option<Timestamp>,
 }
 
 impl KrakenNativeMarketCoordinates {
@@ -125,12 +127,22 @@ impl KrakenNativeMarketCoordinates {
 
     /// Returns the exact venue namespace.
     pub const fn venue(&self) -> &VenueId {
-        &self.venue
+        self.venue_mapping.venue_id()
     }
 
     /// Returns the venue-native WebSocket symbol independently from the provider identity key.
     pub const fn venue_symbol(&self) -> &VenueSymbol {
-        &self.venue_symbol
+        self.venue_mapping.venue_symbol()
+    }
+
+    /// Returns the exact current venue mapping selected from the canonical instrument definition.
+    pub const fn venue_mapping(&self) -> &VenueMapping {
+        &self.venue_mapping
+    }
+
+    /// Returns the canonical instrument-definition revision that owns the venue mapping.
+    pub const fn instrument_definition_revision(&self) -> InstrumentDefinitionRevision {
+        self.instrument_definition_revision
     }
 
     /// Returns the exact provider product declared by source metadata.
@@ -153,14 +165,32 @@ impl KrakenNativeMarketCoordinates {
         self.channel
     }
 
+    /// Returns the explicit instant at which registry and source validity were selected.
+    pub const fn selected_at(&self) -> Timestamp {
+        self.selected_at
+    }
+
+    /// Returns the exclusive end of the common source/identity validity window, when finite.
+    pub const fn valid_until(&self) -> Option<Timestamp> {
+        self.valid_until
+    }
+
+    /// Returns whether these coordinates remain valid at an event or session instant.
+    pub fn is_valid_at(&self, at: Timestamp) -> bool {
+        self.selected_at <= at && self.valid_until.is_none_or(|end| at < end)
+    }
+
     pub(crate) fn matches_surface(
         &self,
         metadata: &SourceMetadata,
-        symbol: &str,
-        instrument: InstrumentId,
         channel: KrakenChannel,
     ) -> bool {
-        let Ok(surface) = validate_public_surface(metadata, symbol, instrument, channel) else {
+        let Ok(surface) = validate_public_surface(
+            metadata,
+            self.venue_symbol().as_str(),
+            self.instrument,
+            channel,
+        ) else {
             return false;
         };
         self.source_id == *metadata.source_id()
@@ -170,12 +200,12 @@ impl KrakenNativeMarketCoordinates {
                     .revision_evidence()
                     .payload_evidence()
                     .content_digest()
-            && self.venue == surface.venue
-            && self.venue_symbol.as_str() == symbol
+            && self.venue() == &surface.venue
             && self.provider_product == surface.provider_product
             && self.provider_channel == surface.provider_channel
-            && self.instrument == instrument
             && self.channel == channel
+            && metadata.is_effective_at(self.selected_at)
+            && self.is_valid_at(self.selected_at)
     }
 }
 
@@ -191,9 +221,7 @@ pub(crate) struct ValidatedKrakenSurface {
 pub struct KrakenConfig {
     metadata: SourceMetadata,
     endpoint: Url,
-    symbol: String,
-    instrument: InstrumentId,
-    channel: KrakenChannel,
+    coordinates: KrakenNativeMarketCoordinates,
     max_message_bytes: NonZeroUsize,
 }
 
@@ -207,15 +235,17 @@ impl KrakenConfig {
     /// ceiling.
     pub fn try_new(
         metadata: SourceMetadata,
-        symbol: impl Into<String>,
-        instrument: InstrumentId,
+        definition: &InstrumentDefinition,
+        provider_identity_key: &ProviderIdentityKey,
+        selected_at: Timestamp,
         depth: KrakenDepth,
         max_message_bytes: NonZeroUsize,
     ) -> Result<Self, KrakenConfigError> {
         Self::try_for_channel(
             metadata,
-            symbol,
-            instrument,
+            definition,
+            provider_identity_key,
+            selected_at,
             KrakenChannel::Book(depth),
             max_message_bytes,
         )
@@ -224,14 +254,16 @@ impl KrakenConfig {
     /// Constructs a trade-channel configuration with checksum-unsupported metadata.
     pub fn try_trades(
         metadata: SourceMetadata,
-        symbol: impl Into<String>,
-        instrument: InstrumentId,
+        definition: &InstrumentDefinition,
+        provider_identity_key: &ProviderIdentityKey,
+        selected_at: Timestamp,
         max_message_bytes: NonZeroUsize,
     ) -> Result<Self, KrakenConfigError> {
         Self::try_for_channel(
             metadata,
-            symbol,
-            instrument,
+            definition,
+            provider_identity_key,
+            selected_at,
             KrakenChannel::Trades,
             max_message_bytes,
         )
@@ -239,13 +271,19 @@ impl KrakenConfig {
 
     fn try_for_channel(
         metadata: SourceMetadata,
-        symbol: impl Into<String>,
-        instrument: InstrumentId,
+        definition: &InstrumentDefinition,
+        provider_identity_key: &ProviderIdentityKey,
+        selected_at: Timestamp,
         channel: KrakenChannel,
         max_message_bytes: NonZeroUsize,
     ) -> Result<Self, KrakenConfigError> {
-        let symbol = symbol.into();
-        validate_public_surface(&metadata, &symbol, instrument, channel)?;
+        let coordinates = native_market_coordinates(
+            &metadata,
+            definition,
+            provider_identity_key,
+            selected_at,
+            channel,
+        )?;
         let NetworkAccessPolicy::Allowlisted(endpoint_policy) = metadata.network_policy() else {
             return Err(KrakenConfigError::InvalidMetadata);
         };
@@ -259,9 +297,7 @@ impl KrakenConfig {
         Ok(Self {
             metadata,
             endpoint,
-            symbol,
-            instrument,
-            channel,
+            coordinates,
             max_message_bytes,
         })
     }
@@ -273,17 +309,17 @@ impl KrakenConfig {
 
     /// Returns the provider symbol handled by this source instance.
     pub fn symbol(&self) -> &str {
-        &self.symbol
+        self.coordinates.venue_symbol().as_str()
     }
 
     /// Returns the internal instrument identity.
     pub const fn instrument(&self) -> InstrumentId {
-        self.instrument
+        self.coordinates.instrument()
     }
 
     /// Returns the independently registered provider channel.
     pub const fn channel(&self) -> KrakenChannel {
-        self.channel
+        self.coordinates.channel()
     }
 
     /// Returns the maximum exact frame size.
@@ -291,30 +327,9 @@ impl KrakenConfig {
         self.max_message_bytes.get()
     }
 
-    /// Validates one accepted provider identity against this exact Kraken market surface.
-    ///
-    /// The returned coordinates carry no current-source or publication authority. That authority
-    /// remains a serialized shared-registry responsibility.
-    ///
-    /// # Errors
-    ///
-    /// Rejects a provider-identity record absent from the supplied accepted registry, any
-    /// conflict for its natural key, a provider namespace or canonical-instrument mismatch,
-    /// zero identity evidence, non-overlapping identity/source validity, or any venue/product/
-    /// channel mismatch in this configuration.
-    pub fn try_native_coordinates(
-        &self,
-        record: &ProviderIdentityRecord,
-        accepted_identities: &ProviderIdentityRegistry,
-    ) -> Result<KrakenNativeMarketCoordinates, KrakenConfigError> {
-        native_market_coordinates(
-            &self.metadata,
-            &self.symbol,
-            self.instrument,
-            self.channel,
-            record,
-            accepted_identities,
-        )
+    /// Returns the mandatory exact provider-native coordinates for this generation.
+    pub const fn native_coordinates(&self) -> &KrakenNativeMarketCoordinates {
+        &self.coordinates
     }
 
     pub(crate) fn authorize_endpoint(&self) -> Result<(), KrakenConfigError> {
@@ -477,40 +492,50 @@ pub(crate) fn validate_public_surface(
     })
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "native identity, venue, canonical, and registered source axes remain explicit"
-)]
 fn native_market_coordinates(
     metadata: &SourceMetadata,
-    symbol: &str,
-    instrument: InstrumentId,
+    definition: &InstrumentDefinition,
+    provider_identity_key: &ProviderIdentityKey,
+    selected_at: Timestamp,
     channel: KrakenChannel,
-    record: &ProviderIdentityRecord,
-    accepted_identities: &ProviderIdentityRegistry,
 ) -> Result<KrakenNativeMarketCoordinates, KrakenConfigError> {
-    let surface = validate_public_surface(metadata, symbol, instrument, channel)?;
-    let record_is_accepted = accepted_identities
-        .accepted()
-        .iter()
-        .any(|accepted| accepted == record);
-    let key_is_conflicted = accepted_identities
-        .conflicts()
-        .iter()
-        .any(|conflict| conflict.key() == &record.key());
     let provider_namespace =
         SourceId::try_from(KRAKEN_PROVIDER).map_err(|_| KrakenConfigError::NativeIdentity)?;
-    if !record_is_accepted
-        || key_is_conflicted
-        || record.source_id() != &provider_namespace
+    if provider_identity_key.source_id() != &provider_namespace {
+        return Err(KrakenConfigError::NativeIdentity);
+    }
+    let record = definition
+        .provider_identity_at(
+            provider_identity_key.source_id(),
+            provider_identity_key.provider_instrument_id(),
+            selected_at,
+        )
+        .ok_or(KrakenConfigError::NativeIdentity)?;
+    let instrument = definition.instrument_id();
+    if record.key() != *provider_identity_key
         || record.instrument_id() != instrument
         || record.evidence().content_digest().bytes() == [0; 32]
-        || !intervals_overlap(record.validity(), metadata.coverage().effective_interval())
     {
         return Err(KrakenConfigError::NativeIdentity);
     }
-    let venue_symbol =
-        VenueSymbol::try_from(symbol).map_err(|_| KrakenConfigError::InvalidSymbol)?;
+    let venue =
+        VenueId::try_from(KRAKEN_PROVIDER).map_err(|_| KrakenConfigError::InvalidMetadata)?;
+    let venue_mapping = definition
+        .venue_mappings()
+        .iter()
+        .find(|mapping| mapping.venue_id() == &venue)
+        .cloned()
+        .ok_or(KrakenConfigError::VenueMapping)?;
+    let surface = validate_public_surface(
+        metadata,
+        venue_mapping.venue_symbol().as_str(),
+        instrument,
+        channel,
+    )?;
+    if surface.venue != *venue_mapping.venue_id() || !metadata.is_effective_at(selected_at) {
+        return Err(KrakenConfigError::NativeIdentity);
+    }
+    let valid_until = common_valid_until(metadata, record.validity(), selected_at)?;
     Ok(KrakenNativeMarketCoordinates {
         source_id: metadata.source_id().clone(),
         source_metadata_revision: metadata.revision().clone(),
@@ -521,21 +546,40 @@ fn native_market_coordinates(
         provider_identity_key: record.key(),
         provider_identity_revision: record.metadata_revision().clone(),
         provider_identity_digest: record.evidence().content_digest(),
-        venue: surface.venue,
-        venue_symbol,
+        venue_mapping,
+        instrument_definition_revision: definition.definition_revision(),
         provider_product: surface.provider_product,
         provider_channel: surface.provider_channel,
         instrument,
         channel,
+        selected_at,
+        valid_until,
     })
 }
 
-fn intervals_overlap(
-    left: market_squawk_domain::EffectiveInterval,
-    right: market_squawk_domain::EffectiveInterval,
-) -> bool {
-    left.ends_at().is_none_or(|end| right.starts_at() < end)
-        && right.ends_at().is_none_or(|end| left.starts_at() < end)
+fn common_valid_until(
+    metadata: &SourceMetadata,
+    identity: market_squawk_domain::EffectiveInterval,
+    selected_at: Timestamp,
+) -> Result<Option<Timestamp>, KrakenConfigError> {
+    let authorization = metadata.authorization().effective_interval();
+    let coverage = metadata.coverage().effective_interval();
+    let common_start = authorization
+        .starts_at()
+        .max(coverage.starts_at())
+        .max(identity.starts_at());
+    let valid_until = [
+        authorization.ends_at(),
+        coverage.ends_at(),
+        identity.ends_at(),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    if selected_at < common_start || valid_until.is_some_and(|end| selected_at >= end) {
+        return Err(KrakenConfigError::NativeIdentity);
+    }
+    Ok(valid_until)
 }
 
 /// Kraken configuration error.
@@ -550,6 +594,9 @@ pub enum KrakenConfigError {
     /// Provider-native identity evidence is absent, conflicted, or relationally inconsistent.
     #[error("Kraken provider-native identity is invalid")]
     NativeIdentity,
+    /// The current canonical definition has no exact Kraken venue-symbol mapping.
+    #[error("Kraken venue mapping is absent from the canonical instrument definition")]
+    VenueMapping,
     /// The endpoint is not the exact approved production authority.
     #[error("Kraken endpoint is not allowlisted")]
     Endpoint,
