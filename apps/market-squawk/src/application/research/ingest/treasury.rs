@@ -320,17 +320,21 @@ impl TreasuryApplicationClosure {
             .await?;
         let super::AuthorizedExtraction {
             metadata,
-            batch,
+            publication,
             company_identity,
-            capture_material,
             revisions,
             analytical_dataset,
             payload_digest,
             rights,
             admission,
-            provider_native,
         } = extracted;
-        let capture = capture_material.ok_or(TreasuryApplicationError::InvalidAcquisition)?;
+        let super::ManagedPendingProviderPublication {
+            batch,
+            capture_material: capture,
+            provider_native,
+        } = publication
+            .into_pending_provider()
+            .ok_or(TreasuryApplicationError::InvalidAcquisition)?;
         let revisions = revisions.ok_or(TreasuryApplicationError::InvalidAcquisition)?;
         validate_extraction(
             request.surface,

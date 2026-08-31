@@ -2081,16 +2081,20 @@ impl ProductionResearchIngestCoordinator {
         let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
         let operation_deadline = operation_deadline(context, self.limits.operation_duration)?;
         let operation = self.lifecycle.shutdown_token().child_token();
-        self.extract_exact(
-            profile,
-            dataset,
-            object_id,
-            context,
-            &operation,
-            operation_deadline,
-        )
-        .await
-        .map(|extracted| extracted.batch)
+        let extracted = self
+            .extract_exact(
+                profile,
+                dataset,
+                object_id,
+                context,
+                &operation,
+                operation_deadline,
+            )
+            .await?;
+        extracted
+            .publication
+            .into_local_batch()
+            .ok_or(ServiceError::InvalidResult)
     }
 
     fn prepare(&self, profile: &SourceIdentifier) -> Result<PreparedExtraction, ServiceError> {
@@ -2308,11 +2312,11 @@ impl ProductionResearchIngestCoordinator {
                 let publication = match (local_source, capture_material, provider_native) {
                     (true, None, None) => ManagedPublication::Local(batch),
                     (false, Some(capture_material), provider_native) => {
-                        ManagedPublication::PendingProvider {
+                        ManagedPublication::PendingProvider(ManagedPendingProviderPublication {
                             batch,
-                            _capture_material: capture_material,
-                            _provider_native: provider_native,
-                        }
+                            capture_material,
+                            provider_native,
+                        })
                     }
                     _ => return Err(ServiceError::InvalidResult),
                 };
@@ -2471,21 +2475,38 @@ struct PreparedExtraction {
 
 enum ManagedPublication {
     Local(ExtractionBatch),
-    PendingProvider {
-        batch: ExtractionBatch,
-        _capture_material: ProviderCaptureMaterial,
-        _provider_native: Option<ManagedProviderNativePublication>,
-    },
+    PendingProvider(ManagedPendingProviderPublication),
     Provider(SealedProviderCaptureBinding),
 }
 
 impl ManagedPublication {
     const fn batch(&self) -> &ExtractionBatch {
         match self {
-            Self::Local(batch) | Self::PendingProvider { batch, .. } => batch,
+            Self::Local(batch) => batch,
+            Self::PendingProvider(pending) => &pending.batch,
             Self::Provider(sealed_capture) => sealed_capture.batch(),
         }
     }
+
+    fn into_local_batch(self) -> Option<ExtractionBatch> {
+        match self {
+            Self::Local(batch) => Some(batch),
+            Self::PendingProvider(_) | Self::Provider(_) => None,
+        }
+    }
+
+    fn into_pending_provider(self) -> Option<ManagedPendingProviderPublication> {
+        match self {
+            Self::PendingProvider(pending) => Some(pending),
+            Self::Local(_) | Self::Provider(_) => None,
+        }
+    }
+}
+
+struct ManagedPendingProviderPublication {
+    batch: ExtractionBatch,
+    capture_material: ProviderCaptureMaterial,
+    provider_native: Option<ManagedProviderNativePublication>,
 }
 
 struct AuthorizedExtraction {
@@ -2586,7 +2607,7 @@ impl ProductionResearchIngestCoordinator {
                 analytical_dataset,
                 batch,
             ),
-            (ManagedPublication::PendingProvider { .. }, Some(_)) => {
+            (ManagedPublication::PendingProvider(_), Some(_)) => {
                 return Err(ServiceError::Unavailable);
             }
             _ => return Err(ServiceError::InvalidResult),

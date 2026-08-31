@@ -1010,24 +1010,30 @@ impl ProductionResearchIngestCoordinator {
                     wall_deadline,
                 )
                 .await?;
-            let source = extracted.metadata;
-            let batch = extracted.batch;
-            let rights = extracted.rights;
-            let extraction_payload_digest = extracted.payload_digest;
-            let page_analytical_dataset = extracted.analytical_dataset;
-            let revisions = extracted
-                .revisions
-                .ok_or(FredProductionPublicationError::InvalidRuntimeBinding)?;
-            let capture_material = extracted
-                .capture_material
+            let super::AuthorizedExtraction {
+                metadata: source,
+                publication,
+                company_identity,
+                revisions,
+                analytical_dataset: page_analytical_dataset,
+                payload_digest: extraction_payload_digest,
+                rights,
+                admission: _,
+            } = extracted;
+            let revisions =
+                revisions.ok_or(FredProductionPublicationError::InvalidRuntimeBinding)?;
+            let super::ManagedPendingProviderPublication {
+                batch,
+                capture_material,
+                provider_native,
+            } = publication
+                .into_pending_provider()
                 .ok_or(FredProductionPublicationError::InvalidRuntimeBinding)?;
             let super::ManagedProviderNativePublication {
                 native_lineage,
                 row_capture_page_ordinals,
-            } = extracted
-                .provider_native
-                .ok_or(FredProductionPublicationError::InvalidRuntimeBinding)?;
-            if extracted.company_identity.is_some()
+            } = provider_native.ok_or(FredProductionPublicationError::InvalidRuntimeBinding)?;
+            if company_identity.is_some()
                 || source != prepared.metadata
                 || page_analytical_dataset != analytical_dataset
                 || extraction_payload_digest != extraction_provider_payload_digest(&batch)
