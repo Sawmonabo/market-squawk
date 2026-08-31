@@ -305,6 +305,19 @@ mod bulk {
                 FundEvidenceRecord::ShareClass(_)
             ]
         ));
+        let ncen_report = prepared.canonical_partitions()[0]
+            .records()
+            .iter()
+            .find_map(|record| match record {
+                FundEvidenceRecord::Report(report) => Some(report.as_ref()),
+                _ => None,
+            })
+            .ok_or(SecBulkError::InvalidCanonicalMapping)?;
+        assert_eq!(ncen_report.filing().form().as_str(), "N-CEN");
+        assert_eq!(
+            ncen_report.filing().revision().status(),
+            FundRevisionStatus::Unavailable
+        );
         assert_eq!(prepared.terminal().total_canonical_rows, 2);
         assert_eq!(
             prepared
@@ -594,6 +607,7 @@ mod bulk {
                 _ => None,
             })
             .ok_or(SecBulkError::InvalidCanonicalMapping)?;
+        assert_eq!(report.filing().form().as_str(), "NPORT-P");
         assert_eq!(
             report.filing().revision().status(),
             FundRevisionStatus::Current

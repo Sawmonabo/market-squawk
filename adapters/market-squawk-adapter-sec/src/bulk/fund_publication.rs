@@ -1283,10 +1283,17 @@ fn filing_identity(
         FundAmendmentState::Amendment => FundRevisionLink::Unresolved,
     };
     let coverage = release_coverage(handoff)?;
-    // Under complete as-filed quarterly coverage, an original is the current known revision at
-    // this exact availability cutoff until a successor is observed. Amendments remain unavailable
-    // until an exact predecessor link is composed; we never infer that link from dates or names.
-    let status = if amendment == FundAmendmentState::Original && coverage.is_complete() {
+    // Only the exact ordinary filing form can be current under complete as-filed coverage at this
+    // availability cutoff. Notices, unknown forms, and amendments require separate lifecycle
+    // evidence and remain unavailable; no status is inferred from dates, names, or suffix absence.
+    let ordinary_original_form = matches!(
+        (family, form.as_str()),
+        (FundSourceFamily::Nport, "NPORT-P") | (FundSourceFamily::Ncen, "N-CEN")
+    );
+    let status = if amendment == FundAmendmentState::Original
+        && ordinary_original_form
+        && coverage.is_complete()
+    {
         FundRevisionStatus::Current
     } else {
         FundRevisionStatus::Unavailable

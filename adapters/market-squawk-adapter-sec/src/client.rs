@@ -843,6 +843,7 @@ impl SecEdgarSource {
                 () = &mut deadline_wait => {
                     worker_cancellation.cancel();
                     drop(sender);
+                    let _ = worker.await;
                     return Err(SecClientError::DeadlineExceeded);
                 }
             };
@@ -898,6 +899,7 @@ impl SecEdgarSource {
                 () = &mut deadline_wait => {
                     worker_cancellation.cancel();
                     drop(sender);
+                    let _ = worker.await;
                     return Err(SecClientError::DeadlineExceeded);
                 }
             }
@@ -916,6 +918,7 @@ impl SecEdgarSource {
             }
             () = &mut deadline_wait => {
                 worker_cancellation.cancel();
+                let _ = worker.await;
                 return Err(SecClientError::DeadlineExceeded);
             }
         };
