@@ -24,13 +24,14 @@ pub const HARMONIC_PIVOT_COUNT: usize = 5;
 pub const HARMONIC_PATTERN_FEATURE_NAME: &str = "technical.harmonic-pattern";
 
 pub(crate) const HARMONIC_IMPLEMENTATION_IDENTITY: &str = concat!(
-    "market-squawk-analytics::harmonics@v1;",
+    "market-squawk-analytics::harmonics@v2;",
     "bounds-bars7to4096@v1;taxonomy-and-ordered-precedence@v1;",
-    "ratio-bands-and-tolerances-scale1000000ppm@v1;bat-valid-b-lt618000ppm@v1;",
+    "ratio-bands-and-tolerances-scale1000000ppm@v2;",
+    "bat-valid-b-exact-lt618000over1000000@v2;",
     "selector-strict-local-radius1-outside-max-excursion-high-tie-",
     "same-kind-most-extreme-earlier-tie-latest-five@v1;",
     "confirmation-max-left-selected-right-observed-and-available@v1;",
-    "measurement-absolute-leg-reduced-rational@v1;",
+    "measurement-absolute-leg-reduced-rational-cd-over-xc-undefined-zero-xc@v2;",
     "completion-outward-floor-ceil@v1;",
     "invalidation-abcd-prz-d-other-x-prz-d@v1;",
     "expiry-decision-plus-five-timeframes@v1;",
@@ -267,7 +268,14 @@ impl HarmonicFraction {
                 .saturating_add(constraint.tolerance.parts_per_million);
             let scaled = u128::from(self.numerator) * u128::from(RATIO_SCALE);
             let denominator = u128::from(self.denominator.get());
-            scaled >= u128::from(lower) * denominator && scaled <= u128::from(upper) * denominator
+            let above_lower = scaled >= u128::from(lower) * denominator;
+            let upper_limit = u128::from(upper) * denominator;
+            above_lower
+                && if band.upper_inclusive {
+                    scaled <= upper_limit
+                } else {
+                    scaled < upper_limit
+                }
         })
     }
 }
@@ -290,11 +298,12 @@ impl HarmonicRatio {
     }
 }
 
-/// Inclusive code-owned ratio band.
+/// Code-owned ratio band with an inclusive lower and explicit upper boundary.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct HarmonicRatioBand {
     lower: HarmonicRatio,
     upper: HarmonicRatio,
+    upper_inclusive: bool,
 }
 
 impl HarmonicRatioBand {
@@ -302,6 +311,7 @@ impl HarmonicRatioBand {
         Self {
             lower: HarmonicRatio::new(parts_per_million),
             upper: HarmonicRatio::new(parts_per_million),
+            upper_inclusive: true,
         }
     }
 
@@ -309,6 +319,15 @@ impl HarmonicRatioBand {
         Self {
             lower: HarmonicRatio::new(lower),
             upper: HarmonicRatio::new(upper),
+            upper_inclusive: true,
+        }
+    }
+
+    const fn range_exclusive_upper(lower: u32, upper: u32) -> Self {
+        Self {
+            lower: HarmonicRatio::new(lower),
+            upper: HarmonicRatio::new(upper),
+            upper_inclusive: false,
         }
     }
 
@@ -322,6 +341,12 @@ impl HarmonicRatioBand {
     #[must_use]
     pub const fn upper(self) -> HarmonicRatio {
         self.upper
+    }
+
+    /// Returns whether the exact upper rational boundary is included.
+    #[must_use]
+    pub const fn upper_is_inclusive(self) -> bool {
+        self.upper_inclusive
     }
 }
 
@@ -359,7 +384,7 @@ impl HarmonicRatioConstraint {
         self.measurement
     }
 
-    /// Returns the closed accepted bands before tolerance is applied.
+    /// Returns the accepted bands before tolerance is applied.
     #[must_use]
     pub const fn accepted(self) -> &'static [HarmonicRatioBand] {
         self.accepted
@@ -411,20 +436,20 @@ pub struct HarmonicRatioMeasurements {
     cd_over_ab: HarmonicFraction,
     ad_over_xa: HarmonicFraction,
     xc_over_xa: HarmonicFraction,
-    cd_over_xc: HarmonicFraction,
+    cd_over_xc: Option<HarmonicFraction>,
 }
 
 impl HarmonicRatioMeasurements {
-    /// Returns one exact reduced measurement.
+    /// Returns one exact reduced measurement, or `None` when its denominator is zero.
     #[must_use]
-    pub const fn get(self, measurement: HarmonicRatioMeasurement) -> HarmonicFraction {
+    pub const fn get(self, measurement: HarmonicRatioMeasurement) -> Option<HarmonicFraction> {
         match measurement {
-            HarmonicRatioMeasurement::AbOverXa => self.ab_over_xa,
-            HarmonicRatioMeasurement::BcOverAb => self.bc_over_ab,
-            HarmonicRatioMeasurement::CdOverBc => self.cd_over_bc,
-            HarmonicRatioMeasurement::CdOverAb => self.cd_over_ab,
-            HarmonicRatioMeasurement::AdOverXa => self.ad_over_xa,
-            HarmonicRatioMeasurement::XcOverXa => self.xc_over_xa,
+            HarmonicRatioMeasurement::AbOverXa => Some(self.ab_over_xa),
+            HarmonicRatioMeasurement::BcOverAb => Some(self.bc_over_ab),
+            HarmonicRatioMeasurement::CdOverBc => Some(self.cd_over_bc),
+            HarmonicRatioMeasurement::CdOverAb => Some(self.cd_over_ab),
+            HarmonicRatioMeasurement::AdOverXa => Some(self.ad_over_xa),
+            HarmonicRatioMeasurement::XcOverXa => Some(self.xc_over_xa),
             HarmonicRatioMeasurement::CdOverXc => self.cd_over_xc,
         }
     }
@@ -751,7 +776,7 @@ const GARTLEY_CONSTRAINTS: &[HarmonicRatioConstraint] = &[
 const BAT_CONSTRAINTS: &[HarmonicRatioConstraint] = &[
     constraint(
         HarmonicRatioMeasurement::AbOverXa,
-        &[HarmonicRatioBand::range(0, 617_999)],
+        &[HarmonicRatioBand::range_exclusive_upper(0, 618_000)],
         HarmonicRatio::new(0),
     ),
     constraint(
@@ -1004,11 +1029,7 @@ pub fn classify_harmonic_pattern(
     let ratios = measure_ratios(pivots)?;
     let rule = RULES
         .iter()
-        .find(|rule| {
-            rule.constraints
-                .iter()
-                .all(|constraint| ratios.get(constraint.measurement).is_within(*constraint))
-        })
+        .find(|rule| rule_accepts(**rule, ratios))
         .ok_or(HarmonicPatternError::NoMatchingPattern)?;
     let completion_zone = completion_zone(*rule, direction, pivots)?;
     if !completion_zone.contains(pivots[4].price) {
@@ -1250,6 +1271,11 @@ fn measure_ratios(
     let cd = distance(pivots[3].price, pivots[4].price);
     let ad = distance(pivots[1].price, pivots[4].price);
     let xc = distance(pivots[0].price, pivots[3].price);
+    let cd_over_xc = if xc == 0 {
+        None
+    } else {
+        Some(HarmonicFraction::from_lengths(cd, xc)?)
+    };
     Ok(HarmonicRatioMeasurements {
         ab_over_xa: HarmonicFraction::from_lengths(ab, xa)?,
         bc_over_ab: HarmonicFraction::from_lengths(bc, ab)?,
@@ -1257,7 +1283,15 @@ fn measure_ratios(
         cd_over_ab: HarmonicFraction::from_lengths(cd, ab)?,
         ad_over_xa: HarmonicFraction::from_lengths(ad, xa)?,
         xc_over_xa: HarmonicFraction::from_lengths(xc, xa)?,
-        cd_over_xc: HarmonicFraction::from_lengths(cd, xc)?,
+        cd_over_xc,
+    })
+}
+
+fn rule_accepts(rule: HarmonicPatternRule, ratios: HarmonicRatioMeasurements) -> bool {
+    rule.constraints.iter().all(|constraint| {
+        ratios
+            .get(constraint.measurement)
+            .is_some_and(|ratio| ratio.is_within(*constraint))
     })
 }
 
@@ -1308,7 +1342,7 @@ fn pattern_quality(
     if kind == HarmonicPatternKind::Bat
         && ratios
             .get(HarmonicRatioMeasurement::AbOverXa)
-            .is_within(BAT_PREFERRED_B_CONSTRAINT)
+            .is_some_and(|ratio| ratio.is_within(BAT_PREFERRED_B_CONSTRAINT))
     {
         HarmonicPatternQuality::PreferredBatB
     } else {
@@ -1448,7 +1482,7 @@ struct DerivedEvidence {
 
 fn evidence_digest(input: HarmonicPatternInput<'_>, derived: &DerivedEvidence) -> EvidenceDigest {
     let mut hasher = Sha256::new();
-    hasher.update(b"market-squawk/harmonic-pattern-evidence/v1\0");
+    hasher.update(b"market-squawk/harmonic-pattern-evidence/v2\0");
     hasher.update(input.binding.instrument_id.as_uuid().as_bytes());
     hasher.update(input.binding.timeframe_nanos.get().to_be_bytes());
     hash_digest(&mut hasher, input.binding.parent_manifest);
@@ -1482,10 +1516,14 @@ fn evidence_digest(input: HarmonicPatternInput<'_>, derived: &DerivedEvidence) -
         HarmonicRatioMeasurement::XcOverXa,
         HarmonicRatioMeasurement::CdOverXc,
     ] {
-        let ratio = derived.ratios.get(measurement);
         hasher.update([measurement_code(measurement)]);
-        hasher.update(ratio.numerator.to_be_bytes());
-        hasher.update(ratio.denominator.get().to_be_bytes());
+        if let Some(ratio) = derived.ratios.get(measurement) {
+            hasher.update([1]);
+            hasher.update(ratio.numerator.to_be_bytes());
+            hasher.update(ratio.denominator.get().to_be_bytes());
+        } else {
+            hasher.update([0]);
+        }
     }
     hasher.update(derived.completion_zone.lower.get().to_be_bytes());
     hasher.update(derived.completion_zone.upper.get().to_be_bytes());
