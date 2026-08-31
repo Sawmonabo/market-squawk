@@ -467,29 +467,25 @@ impl DurableProviderActivationState {
     ) -> Result<ProviderRuntimeStartupAdmissions, ProviderOnboardingError> {
         let mut entries = Vec::new();
         for surface_id in RESTORABLE_RESEARCH_SURFACES {
-            let recovered = match self.restored_requirements(surface_id) {
-                Ok(requirements) if !requirements.is_empty() => Vec::new(),
-                Err(_) => Vec::new(),
-                Ok(_) => match self.load_recipe_for_lifecycle(surface_id) {
-                    Ok(DurableActivationRecipeState::Desired(recipe)) => {
-                        vec![recipe.session_id]
+            let recovered = match self.load_recipe_for_startup_recovery(surface_id) {
+                Ok(DurableActivationRecipeState::Desired(recipe)) => {
+                    vec![recipe.session_id]
+                }
+                Ok(
+                    DurableActivationRecipeState::Staged(recipe)
+                    | DurableActivationRecipeState::Cutover(recipe),
+                ) => {
+                    let mut sessions = std::collections::BTreeSet::from([recipe.session_id]);
+                    if let Some(predecessor) = recipe.staged_predecessor {
+                        sessions.insert(predecessor.session_id);
                     }
-                    Ok(
-                        DurableActivationRecipeState::Staged(recipe)
-                        | DurableActivationRecipeState::Cutover(recipe),
-                    ) => {
-                        let mut sessions = std::collections::BTreeSet::from([recipe.session_id]);
-                        if let Some(predecessor) = recipe.staged_predecessor {
-                            sessions.insert(predecessor.session_id);
-                        }
-                        sessions.into_iter().collect()
-                    }
-                    Ok(
-                        DurableActivationRecipeState::Missing
-                        | DurableActivationRecipeState::Quarantined(_),
-                    )
-                    | Err(_) => Vec::new(),
-                },
+                    sessions.into_iter().collect()
+                }
+                Ok(
+                    DurableActivationRecipeState::Missing
+                    | DurableActivationRecipeState::Quarantined(_),
+                )
+                | Err(_) => Vec::new(),
             };
             let surface_id = SourceIdentifier::try_from(surface_id)?;
             entries.extend(
@@ -1138,6 +1134,33 @@ impl DurableProviderActivationState {
             )
         {
             return Ok(DurableActivationRecipeState::Missing);
+        }
+        self.load_recipe_for_lifecycle(surface_id)
+    }
+
+    /// Loads retained recipe state only when startup may repair or reconstruct its runtime.
+    ///
+    /// Recipe staging predates the source-lifecycle record for a newly activated research source,
+    /// so an absent lifecycle record must still permit exact staged/cutover recovery. Once a
+    /// lifecycle record exists, only `Active` remains startup-callable: stopped, removed,
+    /// interrupted, and reconciliation-blocked sources retain evidence without regaining runtime
+    /// authority. Backup-restored recipes likewise remain inert until their explicit requirements
+    /// are completed.
+    pub(super) fn load_recipe_for_startup_recovery(
+        &self,
+        surface_id: &str,
+    ) -> Result<DurableActivationRecipeState, DurableProviderActivationStateError> {
+        if !self.restored_requirements(surface_id)?.is_empty() {
+            return Ok(DurableActivationRecipeState::Missing);
+        }
+        let lifecycle_key = lifecycle_surface_key(surface_id)?;
+        if let Some(encoded) =
+            LocalAuthorityStateStore::try_open(self.lifecycle_root(lifecycle_key))?.load()?
+        {
+            let lifecycle = decode_source_lifecycle(surface_id, &encoded)?;
+            if lifecycle.phase() != DurableSourceLifecyclePhase::Active {
+                return Ok(DurableActivationRecipeState::Missing);
+            }
         }
         self.load_recipe_for_lifecycle(surface_id)
     }
@@ -2495,6 +2518,21 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         let state = DurableProviderActivationState::new(temporary.path().to_path_buf());
         let surface_id = "treasury.fiscal-data";
+        let retained_session = Uuid::new_v4();
+        state.publish_recipe(
+            surface_id,
+            None,
+            retained_session,
+            br#"{"schema_version":2,"candidate":"retained"}"#,
+            &[],
+            generation_digest(6),
+            None,
+        )?;
+        assert!(matches!(
+            state.load_recipe_for_startup_recovery(surface_id)?,
+            DurableActivationRecipeState::Desired(recipe)
+                if recipe.session_id == retained_session
+        ));
         let operation_id = SourceIdentifier::try_from("source-stop-operation")?;
         let command_digest = generation_digest(7);
 
@@ -2527,6 +2565,15 @@ mod tests {
         )?;
         assert_eq!(completed.revision(), NonZeroU64::new(2).ok_or("revision")?);
         assert_eq!(completed.phase(), DurableSourceLifecyclePhase::Stopped);
+        assert!(matches!(
+            state.load_recipe_for_lifecycle(surface_id)?,
+            DurableActivationRecipeState::Desired(recipe)
+                if recipe.session_id == retained_session
+        ));
+        assert!(matches!(
+            state.load_recipe_for_startup_recovery(surface_id)?,
+            DurableActivationRecipeState::Missing
+        ));
         assert!(matches!(
             state.begin_source_lifecycle_transition(
                 surface_id,
@@ -2689,6 +2736,10 @@ mod tests {
         }));
         assert!(matches!(
             restored_state.load_recipe(surface_id)?,
+            DurableActivationRecipeState::Missing
+        ));
+        assert!(matches!(
+            restored_state.load_recipe_for_startup_recovery(surface_id)?,
             DurableActivationRecipeState::Missing
         ));
         assert!(matches!(

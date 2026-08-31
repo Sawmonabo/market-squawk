@@ -1982,7 +1982,7 @@ pub(super) fn restore_research_providers(
         );
     }
     for surface_id in RESTORABLE_RESEARCH_SURFACES {
-        let recipe = match state.load_recipe_for_lifecycle(surface_id) {
+        let recipe = match state.load_recipe_for_startup_recovery(surface_id) {
             Ok(DurableActivationRecipeState::Missing) => continue,
             Ok(DurableActivationRecipeState::Quarantined(quarantine)) => {
                 enforce_recovery_quarantine(
