@@ -530,10 +530,6 @@ impl SecEdgarSource {
     clippy::too_many_arguments,
     reason = "captured filing, source authority, parser bounds, and exact taxonomy bodies remain explicit"
 )]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "captured filing, source authority, and parser bounds remain explicit"
-)]
 pub(crate) fn admit_filing_xbrl_root_from_sealed_binding(
     sealed_root: SealedProviderCaptureBinding,
     raw_store: Arc<RawEvidenceStore>,

@@ -9,6 +9,7 @@ pub use contracts::{
 };
 pub(crate) use contracts::{deterministic_capture_uuid, system_timestamp};
 use contracts::{health_for_http_status, validation_health_for_error};
+pub use taxonomy::FilingTaxonomySharedRateBudgets;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -75,8 +76,9 @@ impl SecEdgarSource {
     /// Constructs a source from exact metadata and an installed TLS capability.
     ///
     /// Runtime discovery and extraction remain impossible without a matching registry-minted
-    /// [`ExtractionAuthority`]. The source deliberately retains no registration handle, endpoint
-    /// authorization, or provider-budget capability that could substitute for that authority.
+    /// [`ExtractionAuthority`]. The source retains only the four closed, application-registered
+    /// external taxonomy publisher budgets; it cannot register another budget or mint endpoint
+    /// authorization that could substitute for the extraction authority.
     #[allow(
         clippy::too_many_arguments,
         reason = "each argument is distinct metadata, identity, persistence, or parsing state"
@@ -84,6 +86,7 @@ impl SecEdgarSource {
     pub fn try_new(
         metadata: SourceMetadata,
         contact: SecContact,
+        taxonomy_rate_budgets: FilingTaxonomySharedRateBudgets,
         tls_provider: TlsProviderCapability,
         raw_store: RawEvidenceStore,
         representation_registry: SecRepresentationRegistry,
@@ -142,7 +145,8 @@ impl SecEdgarSource {
             endpoint_policy.authorize_request(required.url())?;
         }
         let _consumed_provider_identity = tls_provider.provider_id();
-        let taxonomy_clients = taxonomy::TaxonomyClientSet::try_new(&contact)?;
+        let taxonomy_clients =
+            taxonomy::TaxonomyClientSet::try_new(&contact, taxonomy_rate_budgets)?;
         let bounds = endpoint_policy.request_bounds();
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -1222,10 +1226,6 @@ impl SecEdgarSource {
 
     pub(crate) fn raw_store(&self) -> Arc<RawEvidenceStore> {
         Arc::clone(&self.raw_store)
-    }
-
-    pub(crate) fn representation_registry(&self) -> Arc<SecRepresentationRegistry> {
-        Arc::clone(&self.representation_registry)
     }
 
     pub(crate) fn retained_representation(

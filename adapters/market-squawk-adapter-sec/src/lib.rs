@@ -49,9 +49,9 @@ pub use bulk::{
     scan_bulk_archive, scan_bulk_archive_typed,
 };
 pub use client::{
-    RetrievedCompanyFacts, RetrievedSecBytes, RetrievedSubmissions, RetrievedXbrlDocument,
-    SecClientError, SecContact, SecEdgarSource, SecExtractionHealth, SecExtractionHealthState,
-    SecObjectLocator,
+    FilingTaxonomySharedRateBudgets, RetrievedCompanyFacts, RetrievedSecBytes,
+    RetrievedSubmissions, RetrievedXbrlDocument, SecClientError, SecContact, SecEdgarSource,
+    SecExtractionHealth, SecExtractionHealthState, SecObjectLocator,
 };
 pub use composite::SecCompositeBounds;
 pub use evidence_store::{RawEvidenceError, RawEvidenceStore};

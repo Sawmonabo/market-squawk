@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 use market_squawk_domain::{AvailabilityEvidence, EvidenceDigest, Timestamp};
 use market_squawk_platform::{RawCaptureRecord, RawCaptureRecordError};
 use market_squawk_sources::{
-    ProviderCaptureError, ProviderCaptureMaterial, ProviderCaptureSetReceipt,
-    ProviderCaptureTerminalDisposition,
+    BudgetPoolError, BudgetUnavailableReason, ProviderCaptureError, ProviderCaptureMaterial,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -656,6 +656,10 @@ pub enum SecClientError {
     NetworkDenied,
     #[error("SEC source lacks a registry-coordinated shared budget")]
     MissingSharedBudget,
+    #[error("SEC taxonomy publisher rate registration failed")]
+    TaxonomyRateRegistration(#[source] BudgetPoolError),
+    #[error("SEC taxonomy publisher rate authority is unavailable: {0:?}")]
+    TaxonomyRateUnavailable(BudgetUnavailableReason),
     #[error("SEC source budget exceeds the official aggregate request ceiling")]
     UnsafeBudgetPolicy,
     #[error("SEC source HTTP client profile is unsafe")]

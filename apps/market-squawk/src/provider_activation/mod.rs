@@ -32,7 +32,7 @@ use market_squawk_adapter_federal_reserve::BoardSource;
 use market_squawk_adapter_files::FileExtractionSource;
 use market_squawk_adapter_fred::{FredApiKey, FredOperation, FredRightsPolicy, FredSource};
 use market_squawk_adapter_portfolio::PortfolioManifestExtractionSource;
-use market_squawk_adapter_sec::{SecContact, SecEdgarSource};
+use market_squawk_adapter_sec::{FilingTaxonomySharedRateBudgets, SecContact, SecEdgarSource};
 use market_squawk_adapter_treasury::{TreasurySource, TreasurySourceConfig};
 use market_squawk_data::{RightsBasis, SourceOperation};
 use market_squawk_domain::{
@@ -1593,9 +1593,11 @@ impl ProviderAdapterActivation {
             }
             return Err(ProviderAdapterActivationError::SourceBinding);
         }
+        let taxonomy_rate_budgets = FilingTaxonomySharedRateBudgets::try_new(&self.provider_rate)?;
         let source = Arc::new(SecEdgarSource::try_new(
             spec.metadata,
             contact,
+            taxonomy_rate_budgets,
             market_squawk_sources::install_ring_tls_provider()?,
             spec.raw_store,
             spec.representations,
