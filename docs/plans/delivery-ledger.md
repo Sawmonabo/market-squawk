@@ -1,10 +1,62 @@
 # Market Squawk Delivery Ledger
 
-Last updated: 2026-08-30
+Last updated: 2026-08-31
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
 evidence; it does not replace the README capability truth or the canonical release plan.
+
+## Current execution handoff — 2026-08-31
+
+This section supersedes the 2026-08-30 active-state summary below. Historical release and audit
+records remain unchanged as locators.
+
+- The pushed feature branch reached code head
+  `4ca2f68ebdd52e82a75eccbfffbfe328addbb470`, tree
+  `d07ba073ecbadd68607696703df470b73af7a1cf`, on
+  `feature/v1-installed-product-experience`. The main checkout was clean and matched `origin`
+  immediately after that push. No merge to `main` or a release branch, package publication, public
+  release, or CI/CD dispatch occurred.
+- FRED/ALFRED is now integrated as a **durable data-source-complete** lane: one bounded official
+  FRED current UNRATE journey published 2,197 rows from three pages and one bounded ALFRED vintage
+  journey published 961 rows from one page; each retained sealed raw evidence, canonical immutable
+  publication, an exact typed point-in-time read, complete `LocalProduct` shutdown, construction of
+  a new product instance, exact manifest/raw/native reopen, and an identical typed read. The source
+  candidate `49023f7124480b08b431e05d97a362b3ac3f4b47` was independently approved with zero Critical,
+  Important, or Minor findings. Its fifteen commits were replayed onto current root with exact
+  range-diff equality, and the current-root application library compiled successfully with Rust
+  1.97.1 and locked dependencies.
+- FRED/ALFRED is not yet a **full product vertical**. Provider-neutral macro selection, exact
+  feature/model/forecast/financial-model/valuation/backtest consumption, calibrated recommendation
+  evidence, Desktop/CLI/MCP composition, and the installed shutdown/restart journey remain open.
+  Federal Reserve Board H.15 remains the other proven durable macro baseline; its provider-neutral
+  investment-evidence leaf is integrated, but the same complete product edge remains open.
+- Integrated product building blocks also include the sealed provider-neutral EIA analytical
+  handoff and the provider-neutral harmonic-pattern kernel. Harmonics cover the eight closed V1
+  patterns with causal pivots, exact ratios, ranges, targets, invalidation, expiry, implementation
+  identity, parent manifests, and an evidence digest. They deliberately confer neither confidence
+  nor execution authority until bound to chronological out-of-sample and complete decision
+  evidence.
+- Active provider lanes are disjoint: reference identity; Alpaca durable current/history/options;
+  Coinbase and Kraken native identity; Schwab read-only REST/Streamer authority; Treasury,
+  Census, BLS, BEA, Yahoo, and IEX HIST remediation. The decision/product lane separately owns
+  explicit chronological out-of-sample evidence, method-specific financial-model evidence, exact
+  harmonic-evidence binding, and the provider-neutral Investment Brief contract. Root alone owns
+  shared manifests, catalog migrations, application/Tauri registration, workspace manifests and
+  lockfiles, and ordered integration.
+- The current serialized barrier is canonical reference resolution. Its source-qualified reverse
+  selector must be durable and reachable through the application before Coinbase, Kraken, Alpaca,
+  Schwab, and IEX mappings can be composed without fabricated ticker or startup-time identity.
+  After that seam lands, the completed provider candidates integrate sequentially through the
+  shared catalog/application hotspots while unrelated provider remediation continues.
+- Thin verification remains the rule: one response-family mapper/authority case, one publication,
+  degradation, or restart case, and one typed product journey where required. The complete local
+  gate, native packages, installed E2E, and hosted CI remain reserved for the final unchanged
+  feature candidate.
+- Completed FRED integration and candidate worktrees were removed after handoff, their worktree
+  metadata was pruned, the patch-equivalent local branches were deleted, and the remote candidate
+  branch was deleted. Dirty older shared worktrees remain deliberately preserved and must not be
+  force-removed. Root was clean after the integration and cleanup.
 
 ## Current execution handoff — 2026-08-30
 
