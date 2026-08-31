@@ -210,7 +210,7 @@ impl MarketDataService {
             Self::ScreenerOption => "SCREENER_OPTION",
         }
     }
-    fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "LEVELONE_EQUITIES" => Self::LevelOneEquities,
             "LEVELONE_OPTIONS" => Self::LevelOneOptions,

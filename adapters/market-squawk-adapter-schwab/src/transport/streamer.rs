@@ -797,24 +797,6 @@ const fn response_code_value(code: StreamerResponseCode) -> i64 {
     }
 }
 
-fn selected_service(value: &str) -> Option<crate::MarketDataService> {
-    Some(match value {
-        "LEVELONE_EQUITIES" => crate::MarketDataService::LevelOneEquities,
-        "LEVELONE_OPTIONS" => crate::MarketDataService::LevelOneOptions,
-        "LEVELONE_FUTURES" => crate::MarketDataService::LevelOneFutures,
-        "LEVELONE_FUTURES_OPTIONS" => crate::MarketDataService::LevelOneFuturesOptions,
-        "LEVELONE_FOREX" => crate::MarketDataService::LevelOneForex,
-        "NYSE_BOOK" => crate::MarketDataService::NyseBook,
-        "NASDAQ_BOOK" => crate::MarketDataService::NasdaqBook,
-        "OPTIONS_BOOK" => crate::MarketDataService::OptionsBook,
-        "CHART_EQUITY" => crate::MarketDataService::ChartEquity,
-        "CHART_FUTURES" => crate::MarketDataService::ChartFutures,
-        "SCREENER_EQUITY" => crate::MarketDataService::ScreenerEquity,
-        "SCREENER_OPTION" => crate::MarketDataService::ScreenerOption,
-        _ => return None,
-    })
-}
-
 fn validate_streamer_microbatch(
     microbatch: &StreamerMicrobatch,
 ) -> Result<(), SchwabTransportError> {
@@ -2094,7 +2076,7 @@ impl MicrobatchBuilder {
         request_payload_sha256: Option<EvidenceDigest>,
         request_payload_bytes: Option<u64>,
     ) -> Result<(), SchwabTransportError> {
-        let Some(service) = selected_service(response.service.as_ref()) else {
+        let Some(service) = crate::MarketDataService::parse(response.service.as_ref()) else {
             if response.service.as_ref() == "ADMIN" {
                 return Ok(());
             }
