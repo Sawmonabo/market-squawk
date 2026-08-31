@@ -400,7 +400,7 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
             response_fixture(route_metadata_bytes()?, now),
             response_fixture(facet_metadata_bytes()?, now),
             response_fixture(first.clone(), now),
-            response_fixture(first.clone(), now),
+            response_fixture(first.clone(), now).cancel_after_completion(),
             response_fixture(second.clone(), now),
         ])),
         safe_urls: Mutex::new(Vec::new()),
@@ -866,6 +866,7 @@ fn response_fixture(body: Vec<u8>, received_at: Timestamp) -> EiaHttpResponseFix
         body: Bytes::from(body),
         received_at,
         latency: Duration::from_millis(5),
+        cancel_after_completion: false,
     }
 }
 

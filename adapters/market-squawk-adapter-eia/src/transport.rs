@@ -1663,10 +1663,10 @@ impl EiaSourceTransport {
                 max: u64::try_from(self.limits.max_page_bytes).unwrap_or(u64::MAX),
             });
         }
-        if cancellation.is_cancelled() {
-            return Err(ExtractionSourceError::Cancelled.into());
-        }
-        ensure_deadline(deadline)?;
+        // A completed bounded response is capture evidence. Once it is fully retained, let the
+        // root-owned sealer receive it even if cancellation races this completion. Invalid,
+        // partial, oversized, or late responses cannot reach this point.
+        ensure_received_by_deadline(response.received_at, deadline)?;
         authority
             .validate_current()
             .map_err(ExtractionSourceError::from)?;
@@ -2396,8 +2396,11 @@ fn remaining_timeout(
     Ok(remaining.min(configured_total))
 }
 
-fn ensure_deadline(deadline: Timestamp) -> Result<(), EiaSourceTransportError> {
-    if system_timestamp()? >= deadline {
+fn ensure_received_by_deadline(
+    received_at: Timestamp,
+    deadline: Timestamp,
+) -> Result<(), EiaSourceTransportError> {
+    if received_at >= deadline {
         Err(ExtractionSourceError::DeadlineExceeded.into())
     } else {
         Ok(())
@@ -2482,6 +2485,9 @@ impl EiaHttpTransport for ReqwestEiaTransport {
         in_flight: &'a market_squawk_sources::InFlightExtractionRequest,
     ) -> BoxFuture<'a, Result<EiaHttpResponse, EiaSourceTransportError>> {
         Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(ExtractionSourceError::Cancelled.into());
+            }
             let operation = async {
                 if request.authenticated_url.scheme() != "https"
                     || request.authenticated_url.host_str() != Some("api.eia.gov")
@@ -2538,12 +2544,12 @@ impl EiaHttpTransport for ReqwestEiaTransport {
             };
             tokio::select! {
                 biased;
-                () = cancellation.cancelled() => Err(ExtractionSourceError::Cancelled.into()),
                 result = tokio::time::timeout(timeout, operation) => {
                     result.map_err(|_| EiaSourceTransportError::Extraction(
                         ExtractionSourceError::DeadlineExceeded
                     ))?
                 }
+                () = cancellation.cancelled() => Err(ExtractionSourceError::Cancelled.into()),
             }
         })
     }
@@ -2607,6 +2613,14 @@ mod test_seam {
         pub(crate) body: Bytes,
         pub(crate) received_at: Timestamp,
         pub(crate) latency: Duration,
+        pub(crate) cancel_after_completion: bool,
+    }
+
+    impl EiaHttpResponseFixture {
+        pub(crate) const fn cancel_after_completion(mut self) -> Self {
+            self.cancel_after_completion = true;
+            self
+        }
     }
 
     #[derive(Debug)]
@@ -2656,6 +2670,9 @@ mod test_seam {
                         max: max_bytes,
                     })
                     .into());
+                }
+                if fixture.cancel_after_completion {
+                    cancellation.cancel();
                 }
                 Ok(EiaHttpResponse {
                     status: fixture.status,
