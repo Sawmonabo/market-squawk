@@ -658,6 +658,10 @@ async fn series_metadata_is_exact_request_bound_and_retains_ordered_revisions() 
         .as_array_mut()
         .ok_or("test series revisions")?
         .push(later_revision);
+    revisioned_value["seriess"]
+        .as_array_mut()
+        .ok_or("test series revisions")?
+        .reverse();
     let revisioned_source = source_with_options(
         now,
         FredHttpResponse {

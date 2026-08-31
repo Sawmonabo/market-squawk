@@ -444,7 +444,6 @@ fn parse_series_metadata_for_series(
     revisions
         .try_reserve_exact(wire.seriess.len())
         .map_err(|_| SourceMetadataSchemaViolation::RecordCardinality)?;
-    let mut previous_end = None;
     for row in wire.seriess {
         let values = [
             row.id.as_str(),
@@ -479,15 +478,12 @@ fn parse_series_metadata_for_series(
         if series_id.as_str() != expected_series {
             return Err(SourceMetadataSchemaViolation::RecordIdentity);
         }
-        if realtime_start > realtime_end
-            || previous_end.is_some_and(|end| !closed_intervals_are_contiguous(end, realtime_start))
-        {
+        if realtime_start > realtime_end {
             return Err(SourceMetadataSchemaViolation::PageRecordInterval);
         }
         if observation_start > observation_end {
             return Err(SourceMetadataSchemaViolation::ObservationInterval);
         }
-        previous_end = Some(realtime_end);
         revisions.push(FredSeriesMetadata {
             series_id,
             realtime_start,
@@ -506,13 +502,21 @@ fn parse_series_metadata_for_series(
             notes: row.notes,
         });
     }
+    // This endpoint has no ordering selector. Preserve the exact provider array in the raw
+    // capture, but canonicalize the semantic timeline before proving closed interval coverage.
+    revisions.sort_unstable_by_key(|revision| (revision.realtime_start, revision.realtime_end));
     let first = revisions
         .first()
         .ok_or(SourceMetadataSchemaViolation::RecordCardinality)?;
     let last = revisions
         .last()
         .ok_or(SourceMetadataSchemaViolation::RecordCardinality)?;
-    if first.realtime_start != page_start || last.realtime_end != page_end {
+    if first.realtime_start != page_start
+        || last.realtime_end != page_end
+        || revisions.windows(2).any(|pair| {
+            !closed_intervals_are_contiguous(pair[0].realtime_end, pair[1].realtime_start)
+        })
+    {
         return Err(SourceMetadataSchemaViolation::PageRecordInterval);
     }
     Ok(revisions.into_boxed_slice())
