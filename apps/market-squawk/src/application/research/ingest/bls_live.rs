@@ -26,15 +26,20 @@ use sha2::Digest as _;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use super::bls::BlsSelectedRowEvidenceJoin;
 #[cfg(all(test, feature = "bls-installed-fixture", debug_assertions))]
-use super::bls::{BlsMacroUnavailableReason, BlsProviderPeriodObservationSemanticEvidence};
+use super::bls::{
+    BlsProviderPeriodObservationSemanticEvidence, BlsSelectedRowEvidenceBatch,
+    BlsSelectedRowEvidenceJoinError, BlsSelectedRowEvidenceJoinReceipt,
+    BlsSelectedRowEvidenceLimits, BlsSelectedRowNativeEvidence,
+};
 use super::{
     BlsMacroApplicationClosure, BlsMacroApplicationError, BlsMacroCapabilityState,
-    BlsMacroPlanPublication, BlsPreparedMacroPlan, BlsProviderPeriodLatestKnownDto,
-    BlsProviderPeriodLatestKnownRequest, BlsSealFirstExtractionLimits,
-    ManagedResearchExtractionSource, ProductionResearchIngestCoordinator,
-    ProviderMacroOperationAuthority, ResearchIngestCompositionError,
-    ResearchProviderRuntimeGeneration, ResearchRevisionPlanError,
+    BlsMacroPlanPublication, BlsMacroUnavailableReason, BlsPreparedMacroPlan,
+    BlsProviderPeriodLatestKnownDto, BlsProviderPeriodLatestKnownRequest,
+    BlsSealFirstExtractionLimits, ManagedResearchExtractionSource,
+    ProductionResearchIngestCoordinator, ProviderMacroOperationAuthority,
+    ResearchIngestCompositionError, ResearchProviderRuntimeGeneration, ResearchRevisionPlanError,
 };
 
 /// One exact BLS publication and fixed provider-period read request.
@@ -104,9 +109,34 @@ impl BlsLiveComposition {
         source: BlsSource,
         generation: ResearchProviderRuntimeGeneration,
     ) -> Result<Self, BlsLivePublicationError> {
+        Self::try_new_inner(coordinator, source, generation, None)
+    }
+
+    /// Binds the root-owned selected-row evidence capability into this exact BLS runtime.
+    pub(super) fn try_new_with_selected_row_evidence(
+        coordinator: Arc<ProductionResearchIngestCoordinator>,
+        source: BlsSource,
+        generation: ResearchProviderRuntimeGeneration,
+        selected_row_evidence: Arc<dyn BlsSelectedRowEvidenceJoin>,
+    ) -> Result<Self, BlsLivePublicationError> {
+        Self::try_new_inner(coordinator, source, generation, Some(selected_row_evidence))
+    }
+
+    fn try_new_inner(
+        coordinator: Arc<ProductionResearchIngestCoordinator>,
+        source: BlsSource,
+        generation: ResearchProviderRuntimeGeneration,
+        selected_row_evidence: Option<Arc<dyn BlsSelectedRowEvidenceJoin>>,
+    ) -> Result<Self, BlsLivePublicationError> {
         let source = Arc::new(source);
         validate_source_generation(source.as_ref(), &generation)?;
-        let closure = BlsMacroApplicationClosure::new(Arc::clone(&coordinator.research));
+        let closure = match selected_row_evidence {
+            Some(selected_row_evidence) => BlsMacroApplicationClosure::with_selected_row_evidence(
+                Arc::clone(&coordinator.research),
+                selected_row_evidence,
+            ),
+            None => BlsMacroApplicationClosure::new(Arc::clone(&coordinator.research)),
+        };
         Ok(Self {
             live_source: BlsLiveSource {
                 source: Arc::clone(&source),
@@ -313,14 +343,25 @@ impl BlsLiveRuntime {
             )
             .await?;
         operation.ensure_live()?;
-        let BlsMacroCapabilityState::Available(read) = state else {
-            return Err(BlsLivePublicationError::ReadUnavailable);
+        let read = match state {
+            BlsMacroCapabilityState::Available(read) => {
+                if read.restart_selector().manifest() != publication.receipt().manifest()
+                    || read.source_id() != self.generation.metadata().source_id()
+                {
+                    return Err(BlsLivePublicationError::RestartMismatch);
+                }
+                BlsLiveReadOutcome::Available(read)
+            }
+            BlsMacroCapabilityState::Unavailable(
+                BlsMacroUnavailableReason::IncompleteSeriesAtCutoff,
+            ) => BlsLiveReadOutcome::IncompleteAtCutoff {
+                restart_selector: publication.restart_selector(),
+            },
+            BlsMacroCapabilityState::Unavailable(
+                BlsMacroUnavailableReason::ActivationRequired
+                | BlsMacroUnavailableReason::ManifestRequired,
+            ) => return Err(BlsLivePublicationError::ReadUnavailable),
         };
-        if read.restart_selector().manifest() != publication.receipt().manifest()
-            || read.source_id() != self.generation.metadata().source_id()
-        {
-            return Err(BlsLivePublicationError::RestartMismatch);
-        }
         Ok(BlsLiveOutcome {
             activation_plan_digest: self.source.activation_plan()?.plan_digest(),
             publication_digest,
@@ -342,13 +383,13 @@ impl std::fmt::Debug for BlsLiveRuntime {
     }
 }
 
-/// Exact immutable generation and provider-period rows returned by the live BLS journey.
+/// Exact immutable generation and closed provider-period result from the live BLS journey.
 #[derive(Debug)]
 pub(crate) struct BlsLiveOutcome {
     activation_plan_digest: EvidenceDigest,
     publication_digest: EvidenceDigest,
     publication: BlsMacroPlanPublication,
-    read: BlsProviderPeriodLatestKnownDto,
+    read: BlsLiveReadOutcome,
 }
 
 impl BlsLiveOutcome {
@@ -368,9 +409,62 @@ impl BlsLiveOutcome {
         &self.publication
     }
 
-    /// Returns the exact manifest-bound provider-period PIT output.
-    pub(crate) const fn read(&self) -> &BlsProviderPeriodLatestKnownDto {
-        &self.read
+    /// Returns the complete typed read only for the available state.
+    pub(crate) const fn available_read(&self) -> Option<&BlsProviderPeriodLatestKnownDto> {
+        self.read.available()
+    }
+
+    /// Returns the exact restart selector for either closed live-read state.
+    pub(crate) const fn restart_selector(
+        &self,
+    ) -> &market_squawk_data::ProviderMacroPlanRestartSelector {
+        self.read.restart_selector()
+    }
+
+    /// Returns committed restart evidence only for exact cutoff incompleteness.
+    pub(crate) const fn incomplete_restart_selector(
+        &self,
+    ) -> Option<&market_squawk_data::ProviderMacroPlanRestartSelector> {
+        self.read.incomplete_restart_selector()
+    }
+}
+
+/// Closed live read result after the new immutable generation has committed and reopened.
+#[derive(Debug)]
+enum BlsLiveReadOutcome {
+    /// The exact cutoff yielded one selected observed-or-missing row for every requested series.
+    Available(BlsProviderPeriodLatestKnownDto),
+    /// The exact cutoff had no complete selected set; the retained selector identifies the
+    /// committed and already-reopened generation that was queried.
+    IncompleteAtCutoff {
+        restart_selector: market_squawk_data::ProviderMacroPlanRestartSelector,
+    },
+}
+
+impl BlsLiveReadOutcome {
+    /// Returns the complete typed read only for the available state.
+    const fn available(&self) -> Option<&BlsProviderPeriodLatestKnownDto> {
+        match self {
+            Self::Available(read) => Some(read),
+            Self::IncompleteAtCutoff { .. } => None,
+        }
+    }
+
+    /// Returns committed restart evidence only for exact cutoff incompleteness.
+    const fn incomplete_restart_selector(
+        &self,
+    ) -> Option<&market_squawk_data::ProviderMacroPlanRestartSelector> {
+        match self {
+            Self::Available(_) => None,
+            Self::IncompleteAtCutoff { restart_selector } => Some(restart_selector),
+        }
+    }
+
+    const fn restart_selector(&self) -> &market_squawk_data::ProviderMacroPlanRestartSelector {
+        match self {
+            Self::Available(read) => read.restart_selector(),
+            Self::IncompleteAtCutoff { restart_selector } => restart_selector,
+        }
     }
 }
 
@@ -572,9 +666,11 @@ mod tests {
 
     use bytes::Bytes;
     use market_squawk_adapter_bls::{
-        BlsAccessTier, BlsAuthorization, BlsCredentialRejoin, BlsRegistrationKey,
-        BlsScriptedResponse, BlsScriptedTransportFactory, BlsSeriesMetadata, BlsSource,
-        BlsSourceConfig, bls_application_provider_budget,
+        BLS_TIMESERIES_NATIVE_LINEAGE_IMPLEMENTATION, BlsAccessTier, BlsAuthorization,
+        BlsCanonicalObservationSemantics, BlsCanonicalProviderSemantics, BlsCredentialRejoin,
+        BlsRegistrationKey, BlsScriptedResponse, BlsScriptedTransportFactory, BlsSeriesMetadata,
+        BlsSource, BlsSourceConfig, BlsTimeseriesNativeLineageRowV1,
+        bls_application_provider_budget,
     };
     use market_squawk_data::{
         AnalyticalMacroSeriesAllowlist, CatalogConfig, CatalogResultLimits, ObjectStoreConfig,
@@ -582,9 +678,9 @@ mod tests {
     };
     use market_squawk_domain::{
         AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
-        DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
-        ResearchPeriod, RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceId,
-        SourceIdentifier, Timestamp,
+        DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MacroObservation,
+        MetadataRevision, ResearchPeriod, RevisionBoundPayloadEvidence, SchemaVersion,
+        SequenceCapability, SourceId, SourceIdentifier, Timestamp,
     };
     use market_squawk_platform::{
         EncryptedFileSecretStore, LocalPaths, SecretCancellation, SecretGeneration,
@@ -610,6 +706,158 @@ mod tests {
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// Test-only proof adapter for the selected-row join contract.
+    ///
+    /// This adapter reopens the exact creating generation, which is deliberately tiny in this
+    /// fixture, and emits only rows that uniquely match the analytical selection. Production does
+    /// not install it and therefore fails closed until shared data supplies the indexed bounded
+    /// method required by [`BlsSelectedRowEvidenceJoin`].
+    struct FixtureBlsSelectedRowEvidenceJoin {
+        research: Arc<ResearchService>,
+    }
+
+    impl BlsSelectedRowEvidenceJoin for FixtureBlsSelectedRowEvidenceJoin {
+        fn reopen_selected_rows<'a>(
+            &'a self,
+            restart_selector: &'a market_squawk_data::ProviderMacroPlanRestartSelector,
+            output: &'a market_squawk_data::AnalyticalMacroProviderPeriodLatestKnownOutput,
+            limits: BlsSelectedRowEvidenceLimits,
+            deadline: Instant,
+            cancellation: CancellationToken,
+        ) -> BoxFuture<'a, Result<BlsSelectedRowEvidenceJoinReceipt, BlsSelectedRowEvidenceJoinError>>
+        {
+            Box::pin(async move {
+                ensure_fixture_evidence_join_live(deadline, &cancellation)?;
+                let store = self.research.provider_capture_store();
+                let owned = self
+                    .research
+                    .analytical()
+                    .generation_owned_provider_capture_evidence(
+                        restart_selector.manifest(),
+                        store.as_ref(),
+                    )
+                    .map_err(|_| BlsSelectedRowEvidenceJoinError::Rejected)?;
+                if owned.pinned().manifest() != restart_selector.manifest()
+                    || owned.source_id() != restart_selector.source_id()
+                {
+                    return Err(BlsSelectedRowEvidenceJoinError::Rejected);
+                }
+
+                let mut batches = Vec::new();
+                for object in owned.objects() {
+                    for input in object.inputs() {
+                        ensure_fixture_evidence_join_live(deadline, &cancellation)?;
+                        let binding = input.binding();
+                        let native_schema = binding.native_lineage();
+                        let (Some(sidecar), Some(sidecar_digest)) = (
+                            native_schema.batch_sidecar_semantic_payload(),
+                            native_schema.batch_sidecar_semantic_payload_digest(),
+                        ) else {
+                            return Err(BlsSelectedRowEvidenceJoinError::Rejected);
+                        };
+                        if binding.capture().source_id() != restart_selector.source_id()
+                            || native_schema.implementation()
+                                != BLS_TIMESERIES_NATIVE_LINEAGE_IMPLEMENTATION
+                            || native_schema.row_count() != binding.rows().len()
+                        {
+                            return Err(BlsSelectedRowEvidenceJoinError::Rejected);
+                        }
+                        let semantics =
+                            BlsCanonicalProviderSemantics::try_decode_persisted_native_sidecar(
+                                sidecar,
+                            )
+                            .map_err(|_| BlsSelectedRowEvidenceJoinError::Rejected)?;
+                        let mut selected_rows = Vec::new();
+                        for row in binding.rows() {
+                            let native = BlsTimeseriesNativeLineageRowV1::try_decode_persisted(
+                                native_schema.version(),
+                                native_schema.implementation(),
+                                row.native_semantic_payload(),
+                            )
+                            .map_err(|_| BlsSelectedRowEvidenceJoinError::Rejected)?;
+                            let companion = semantics
+                                .validate_persisted_native_row(row.canonical_row_ordinal(), &native)
+                                .map_err(|_| BlsSelectedRowEvidenceJoinError::Rejected)?;
+                            if output.observations().iter().any(|observation| {
+                                fixture_semantics_match_selected(companion, &native, observation)
+                            }) {
+                                selected_rows.push(BlsSelectedRowNativeEvidence::new(
+                                    row.canonical_row_ordinal(),
+                                    row.canonical_row_digest(),
+                                    row.native_semantic_payload().to_vec().into_boxed_slice(),
+                                    row.native_semantic_digest(),
+                                    row.received_at(),
+                                ));
+                            }
+                        }
+                        if !selected_rows.is_empty() {
+                            batches.push(BlsSelectedRowEvidenceBatch::new(
+                                binding.binding_digest(),
+                                native_schema.version(),
+                                native_schema.implementation().to_owned().into_boxed_str(),
+                                native_schema.row_count(),
+                                native_schema.batch_digest(),
+                                sidecar.to_vec().into_boxed_slice(),
+                                sidecar_digest,
+                                selected_rows,
+                            ));
+                        }
+                    }
+                }
+                ensure_fixture_evidence_join_live(deadline, &cancellation)?;
+                BlsSelectedRowEvidenceJoinReceipt::try_new(
+                    restart_selector.manifest().clone(),
+                    restart_selector.source_id().clone(),
+                    output.selection_digest(),
+                    batches,
+                    limits,
+                )
+            })
+        }
+    }
+
+    fn ensure_fixture_evidence_join_live(
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), BlsSelectedRowEvidenceJoinError> {
+        if cancellation.is_cancelled() {
+            Err(BlsSelectedRowEvidenceJoinError::Cancelled)
+        } else if Instant::now() >= deadline {
+            Err(BlsSelectedRowEvidenceJoinError::DeadlineExceeded)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn fixture_semantics_match_selected(
+        companion: &BlsCanonicalObservationSemantics,
+        native: &BlsTimeseriesNativeLineageRowV1,
+        observation: &MacroObservation,
+    ) -> bool {
+        let provenance = observation.context().provenance();
+        let value_matches = match (
+            observation.value().observed_value(),
+            observation.value().missing_value(),
+            companion.value(),
+        ) {
+            (Some(selected), None, Some(provider)) => selected == provider,
+            (None, Some(missing), None) => missing.marker().as_str() == companion.raw_value(),
+            (Some(_), Some(_), _)
+            | (None, None, _)
+            | (Some(_), None, None)
+            | (None, Some(_), Some(_)) => false,
+        };
+        companion.series_id() == observation.series()
+            && companion.effective_time() == observation.context().time().effective()
+            && companion.canonical_revision() == provenance.source_identifier()
+            && companion.locally_available_at() == provenance.received_at()
+            && companion.canonical_ingested_at() == provenance.ingested_at()
+            && provenance.availability().conservative_available_at()
+                == Some(companion.locally_available_at())
+            && native.series().unit() == observation.unit()
+            && value_matches
+    }
 
     const SERIES_METADATA: &[u8] = br#"{
       "schema_version":1,
@@ -701,6 +949,8 @@ mod tests {
         let response_received_at = observed_at.checked_sub_nanos(1)?;
         let revised_observed_at = observed_at.checked_add_nanos(1)?;
         let revised_response_received_at = revised_observed_at.checked_sub_nanos(1)?;
+        let incomplete_observed_at = revised_observed_at.checked_add_nanos(1)?;
+        let incomplete_response_received_at = incomplete_observed_at.checked_sub_nanos(1)?;
         let (authorization, expected_rejoin, profile, evidence_byte, revision) =
             match (tier, secret_reference.as_ref(), registration_key) {
                 (BlsAccessTier::PublicV1, None, None) => (
@@ -751,6 +1001,16 @@ mod tests {
                         Bytes::from_static(PROVIDER_RESPONSE_V2),
                         revised_response_received_at,
                         revised_observed_at,
+                    )?,
+                    BlsScriptedResponse::try_new(
+                        Bytes::from_static(PROVIDER_DOCTOR_RESPONSE),
+                        incomplete_response_received_at,
+                        incomplete_observed_at,
+                    )?,
+                    BlsScriptedResponse::try_new(
+                        Bytes::from_static(PROVIDER_RESPONSE_V2),
+                        incomplete_response_received_at,
+                        incomplete_observed_at,
                     )?,
                 ])
             })
@@ -822,8 +1082,15 @@ mod tests {
                 ResearchExtractionLimits::standard(),
                 std::iter::empty(),
             )?;
-        let composition =
-            BlsLiveComposition::try_new(Arc::clone(&coordinator), source, generation.clone())?;
+        let selected_row_evidence = Arc::new(FixtureBlsSelectedRowEvidenceJoin {
+            research: Arc::clone(&research),
+        });
+        let composition = BlsLiveComposition::try_new_with_selected_row_evidence(
+            Arc::clone(&coordinator),
+            source,
+            generation.clone(),
+            selected_row_evidence,
+        )?;
         let (live_source, runtime) = composition.into_parts();
         register_source(&mutation, generation, live_source, rights)?;
 
@@ -833,6 +1100,12 @@ mod tests {
             2026,
             NonZeroU16::new(6).ok_or("invalid period")?,
             SourceIdentifier::try_from("M06")?,
+        )?;
+        let no_eligible_period = ResearchPeriod::try_new(
+            SourceIdentifier::try_from("bls-monthly")?,
+            2025,
+            NonZeroU16::new(12).ok_or("invalid no-row period")?,
+            SourceIdentifier::try_from("M12")?,
         )?;
         let allowlist = AnalyticalMacroSeriesAllowlist::try_from_code_owned(&["LNS14000000"])?;
         let query_limits = query_limits()?;
@@ -852,40 +1125,85 @@ mod tests {
         let first_outcome = runtime
             .publish_and_read(live_request.clone(), &request_context(operation_deadline)?)
             .await?;
-        assert_complete_observed_handoff(first_outcome.read(), 1, None, None);
+        let first_read = first_outcome
+            .available_read()
+            .ok_or("first live read was incomplete")?;
+        assert_complete_observed_handoff(first_read, 1, None, None);
         if !live_http {
-            assert_complete_observed_handoff(first_outcome.read(), 1, Some("4.2"), Some(true));
+            assert_complete_observed_handoff(first_read, 1, Some("4.2"), Some(true));
         }
         let first_generation = (
-            first_outcome.read().restart_selector().clone(),
+            first_read.restart_selector().clone(),
             first_outcome.publication().receipt().manifest().clone(),
-            first_outcome.read().output().selection_digest(),
+            first_read.output().selection_digest(),
         );
-        let (outcome, prior_generation) = if live_http {
-            (first_outcome, None)
+        let (outcome, prior_generation, incomplete_generation) = if live_http {
+            (first_outcome, None, None)
         } else {
             let revised_outcome = runtime
-                .publish_and_read(live_request, &request_context(operation_deadline)?)
+                .publish_and_read(live_request.clone(), &request_context(operation_deadline)?)
                 .await?;
-            assert_complete_observed_handoff(revised_outcome.read(), 2, Some("4.1"), Some(false));
+            let revised_read = revised_outcome
+                .available_read()
+                .ok_or("revised live read was incomplete")?;
+            assert_complete_observed_handoff(revised_read, 2, Some("4.1"), Some(false));
             assert_ne!(
                 first_outcome.publication().receipt().manifest(),
                 revised_outcome.publication().receipt().manifest()
             );
             assert_ne!(
-                first_outcome.read().output().selection_digest(),
-                revised_outcome.read().output().selection_digest()
+                first_read.output().selection_digest(),
+                revised_read.output().selection_digest()
             );
-            (revised_outcome, Some(first_generation))
+            let mut incomplete_request = live_request;
+            incomplete_request.effective_period_cutoff = no_eligible_period.clone();
+            let incomplete_outcome = runtime
+                .publish_and_read(incomplete_request, &request_context(operation_deadline)?)
+                .await?;
+            let incomplete_selector = incomplete_outcome
+                .incomplete_restart_selector()
+                .ok_or("no-row live read did not retain exact incompleteness")?;
+            assert_eq!(
+                incomplete_selector.manifest(),
+                incomplete_outcome.publication().receipt().manifest()
+            );
+            assert_eq!(
+                incomplete_selector.manifest(),
+                incomplete_outcome.publication().reopened().manifest()
+            );
+            assert_eq!(
+                incomplete_selector.publication_digest(),
+                incomplete_outcome.publication_digest()
+            );
+            assert_ne!(
+                incomplete_selector.manifest(),
+                revised_outcome.publication().receipt().manifest()
+            );
+            let incomplete_generation = (
+                incomplete_selector.clone(),
+                incomplete_outcome
+                    .publication()
+                    .receipt()
+                    .manifest()
+                    .clone(),
+            );
+            (
+                revised_outcome,
+                Some(first_generation),
+                Some(incomplete_generation),
+            )
         };
         if let Some(fixture) = fixture {
-            assert_eq!(fixture.counters()?.attempts, 4);
-            assert_eq!(fixture.counters()?.completed, 4);
+            assert_eq!(fixture.counters()?.attempts, 6);
+            assert_eq!(fixture.counters()?.completed, 6);
             assert_eq!(fixture.counters()?.remaining, 0);
         }
-        let restart_selector = outcome.read().restart_selector().clone();
+        let outcome_read = outcome
+            .available_read()
+            .ok_or("retained live read was incomplete")?;
+        let restart_selector = outcome_read.restart_selector().clone();
         let manifest = outcome.publication().receipt().manifest().clone();
-        let selection_digest = outcome.read().output().selection_digest();
+        let selection_digest = outcome_read.output().selection_digest();
 
         drop(outcome);
         drop(runtime);
@@ -895,7 +1213,32 @@ mod tests {
         drop(research);
 
         let reopened = Arc::new(open_research(&paths)?);
-        let closure = BlsMacroApplicationClosure::new(reopened);
+        let uncomposed = BlsMacroApplicationClosure::new(Arc::clone(&reopened));
+        let uncomposed_error = uncomposed
+            .read_provider_period_latest_known(
+                BlsProviderPeriodLatestKnownRequest::try_new(
+                    restart_selector.clone(),
+                    allowlist.clone(),
+                    cutoff,
+                    period.clone(),
+                )?,
+                query_limits,
+                Instant::now() + Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("available BLS read must require the root selected-row evidence join");
+        assert!(matches!(
+            uncomposed_error,
+            BlsMacroApplicationError::SelectedRowEvidenceJoinUnavailable
+        ));
+        let reopened_selected_row_evidence = Arc::new(FixtureBlsSelectedRowEvidenceJoin {
+            research: Arc::clone(&reopened),
+        });
+        let closure = BlsMacroApplicationClosure::with_selected_row_evidence(
+            reopened,
+            reopened_selected_row_evidence,
+        );
         let reopened_current = closure
             .read_provider_period_latest_known(
                 BlsProviderPeriodLatestKnownRequest::try_new(
@@ -921,16 +1264,15 @@ mod tests {
             (!live_http).then_some(false),
         );
 
-        let no_eligible_period = ResearchPeriod::try_new(
-            SourceIdentifier::try_from("bls-monthly")?,
-            2025,
-            NonZeroU16::new(12).ok_or("invalid no-row period")?,
-            SourceIdentifier::try_from("M12")?,
-        )?;
+        let (no_eligible_selector, no_eligible_manifest) = incomplete_generation
+            .as_ref()
+            .map_or((&restart_selector, &manifest), |(selector, manifest)| {
+                (selector, manifest)
+            });
         let no_eligible = closure
             .read_provider_period_latest_known(
                 BlsProviderPeriodLatestKnownRequest::try_new(
-                    restart_selector.clone(),
+                    no_eligible_selector.clone(),
                     allowlist.clone(),
                     cutoff,
                     no_eligible_period,
@@ -945,6 +1287,7 @@ mod tests {
             no_eligible.unavailable_reason(),
             Some(BlsMacroUnavailableReason::IncompleteSeriesAtCutoff)
         );
+        assert_eq!(no_eligible_selector.manifest(), no_eligible_manifest);
 
         if let Some((prior_selector, prior_manifest, prior_selection_digest)) = prior_generation {
             let reopened_prior = closure

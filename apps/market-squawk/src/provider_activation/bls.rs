@@ -76,12 +76,22 @@ pub(crate) struct MacroProviderPeriodLatestKnownOutput {
 impl MacroProviderPeriodLatestKnownOutput {
     /// Returns the exact manifest-only selector proven reopenable before the typed read.
     pub(crate) const fn restart_selector(&self) -> &ProviderMacroPlanRestartSelector {
-        self.live.read().restart_selector()
+        self.live.restart_selector()
     }
 
-    /// Returns canonical macro rows with provider period, missingness, and exact clocks preserved.
-    pub(crate) const fn canonical(&self) -> &AnalyticalMacroProviderPeriodLatestKnownOutput {
-        self.live.read().output()
+    /// Returns canonical macro rows only when the exact cutoff produced a complete selected set.
+    pub(crate) const fn canonical(
+        &self,
+    ) -> Option<&AnalyticalMacroProviderPeriodLatestKnownOutput> {
+        match self.live.available_read() {
+            Some(read) => Some(read.output()),
+            None => None,
+        }
+    }
+
+    /// Reports exact cutoff incompleteness while retaining committed restart evidence.
+    pub(crate) const fn incomplete_at_cutoff(&self) -> bool {
+        self.live.incomplete_restart_selector().is_some()
     }
 
     /// Returns the exact whole-plan publication identity retained by the neutral operation.

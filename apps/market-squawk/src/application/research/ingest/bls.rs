@@ -12,6 +12,7 @@ use std::{
     time::Instant,
 };
 
+use futures_util::future::BoxFuture;
 use market_squawk_adapter_bls::{
     BLS_TIMESERIES_NATIVE_LINEAGE_IMPLEMENTATION, BlsCanonicalObservationSemantics,
     BlsCanonicalProviderSemantics, BlsCompletePublicationPlanHandoff, BlsSource, BlsSourceError,
@@ -20,10 +21,11 @@ use market_squawk_adapter_bls::{
 use market_squawk_data::{
     AnalyticalMacroProviderPeriodLatestKnownOutput,
     AnalyticalMacroProviderPeriodLatestKnownRequest, AnalyticalMacroSeriesAllowlist,
-    AnalyticalMacroSourceQualifiedSeries, AnalyticalReadError, DatasetId, IngestError,
-    IngestPrecommitAuthority, IngestReservation, PinnedDataset, ProviderMacroPlanChunkInput,
-    ProviderMacroPlanPublicationInput, ProviderMacroPlanPublicationReceipt,
-    ProviderMacroPlanRestartSelector, ProviderMacroPlanSemantics, QueryLimits,
+    AnalyticalMacroSourceQualifiedSeries, AnalyticalReadError, DatasetId, DatasetManifestRef,
+    IngestError, IngestPrecommitAuthority, IngestReservation, PinnedDataset,
+    ProviderMacroPlanChunkInput, ProviderMacroPlanPublicationInput,
+    ProviderMacroPlanPublicationReceipt, ProviderMacroPlanRestartSelector,
+    ProviderMacroPlanSemantics, QueryLimits,
 };
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, MacroObservation, ResearchPeriod, SourceId, Timestamp,
@@ -32,6 +34,7 @@ use market_squawk_sources::{
     DiscoveryRequest, ExtractionAuthority, ExtractionError, ExtractionRequest,
     ExtractionSourceError,
 };
+use sha2::Digest as _;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -58,10 +61,264 @@ impl BlsSealFirstExtractionLimits {
     }
 }
 
+/// Explicit bounds for the root-owned join from selected canonical rows to provider evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct BlsSelectedRowEvidenceLimits {
+    max_selected_rows: NonZeroU32,
+    max_opaque_bytes: NonZeroU64,
+}
+
+impl BlsSelectedRowEvidenceLimits {
+    fn try_for_output(
+        output: &AnalyticalMacroProviderPeriodLatestKnownOutput,
+        query_limits: QueryLimits,
+    ) -> Result<Self, BlsMacroApplicationError> {
+        let max_selected_rows = u32::try_from(output.observations().len())
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or(BlsMacroApplicationError::Capacity)?;
+        let max_opaque_bytes =
+            NonZeroU64::new(query_limits.max_bytes()).ok_or(BlsMacroApplicationError::Capacity)?;
+        Ok(Self {
+            max_selected_rows,
+            max_opaque_bytes,
+        })
+    }
+
+    /// Returns the exact maximum selected canonical row count.
+    pub(super) const fn max_selected_rows(self) -> NonZeroU32 {
+        self.max_selected_rows
+    }
+
+    /// Returns the maximum aggregate provider-native and sidecar payload bytes.
+    pub(super) const fn max_opaque_bytes(self) -> NonZeroU64 {
+        self.max_opaque_bytes
+    }
+}
+
+/// Root-composed capability for an exact, bounded selected-row provider-evidence join.
+///
+/// The shared data owner must implement this without giving the BLS leaf a catalog or raw-store
+/// handle. Its data method must consume the analytical selector's retained canonical-payload
+/// identities, constrain matches to `restart_selector.manifest()`, verify the sealed physical
+/// claims, and return only the uniquely joined rows in [`BlsSelectedRowEvidenceJoinReceipt`]. It
+/// must enforce `limits`, `deadline`, and `cancellation` during catalog and raw-evidence work. A
+/// cumulative manifest-lineage scan or a generation-wide application fallback is not admissible.
+///
+/// Root integration must add one provider-neutral data receipt that retains the already-decoded
+/// selector's ordered `payload_sha256` values (currently private inside the analytical decoder),
+/// source, manifest, and selection digest. The corresponding shared method must join those exact
+/// payload identities directly to provider-capture row mappings for that manifest and return:
+/// binding digest; native schema version/implementation/original row count/batch digest; one
+/// sidecar and its digest per matched binding; and only the selected row ordinal, canonical digest,
+/// native bytes/digest, and receipt clock. The method must verify existing sealed claims before
+/// returning and apply the count, aggregate opaque-byte, deadline, and cancellation bounds here.
+pub(super) trait BlsSelectedRowEvidenceJoin: Send + Sync {
+    /// Reopens only the provider-native rows selected by the exact analytical output.
+    fn reopen_selected_rows<'a>(
+        &'a self,
+        restart_selector: &'a ProviderMacroPlanRestartSelector,
+        output: &'a AnalyticalMacroProviderPeriodLatestKnownOutput,
+        limits: BlsSelectedRowEvidenceLimits,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<BlsSelectedRowEvidenceJoinReceipt, BlsSelectedRowEvidenceJoinError>>;
+}
+
+/// Closed failures emitted by the root-selected evidence capability.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub(super) enum BlsSelectedRowEvidenceJoinError {
+    /// The operation was cancelled before the verified receipt completed.
+    #[error("selected-row evidence join was cancelled")]
+    Cancelled,
+    /// The explicit evidence-join deadline elapsed.
+    #[error("selected-row evidence join exceeded its deadline")]
+    DeadlineExceeded,
+    /// Shared data could not produce one exact verified row per analytical selection.
+    #[error("selected-row evidence join was rejected")]
+    Rejected,
+}
+
+/// Opaque common-owned receipt for the exact selected canonical rows.
+///
+/// Batches retain only the native bytes and digests that the BLS adapter must decode. Catalog
+/// coordinates, SQL, raw-store handles, cumulative lineage, and unselected native rows stay in the
+/// shared data implementation.
+#[derive(Debug)]
+pub(super) struct BlsSelectedRowEvidenceJoinReceipt {
+    manifest: DatasetManifestRef,
+    source_id: SourceId,
+    selection_digest: EvidenceDigest,
+    batches: Box<[BlsSelectedRowEvidenceBatch]>,
+}
+
+impl BlsSelectedRowEvidenceJoinReceipt {
+    /// Builds the closed receipt after a root-owned implementation has verified physical evidence.
+    pub(super) fn try_new(
+        manifest: DatasetManifestRef,
+        source_id: SourceId,
+        selection_digest: EvidenceDigest,
+        batches: Vec<BlsSelectedRowEvidenceBatch>,
+        limits: BlsSelectedRowEvidenceLimits,
+    ) -> Result<Self, BlsSelectedRowEvidenceJoinError> {
+        if batches.is_empty()
+            || selection_digest.algorithm() != DigestAlgorithm::Sha256
+            || selection_digest.bytes() == [0; 32]
+        {
+            return Err(BlsSelectedRowEvidenceJoinError::Rejected);
+        }
+        let mut selected_rows = 0_u32;
+        let mut opaque_bytes = 0_u64;
+        for (batch_index, batch) in batches.iter().enumerate() {
+            if batch.rows.is_empty()
+                || batch.implementation.is_empty()
+                || batch.original_row_count == 0
+                || batch.binding_digest.algorithm() != DigestAlgorithm::Sha256
+                || batch.binding_digest.bytes() == [0; 32]
+                || batch.batch_digest.algorithm() != DigestAlgorithm::Sha256
+                || batch.batch_digest.bytes() == [0; 32]
+                || batch.sidecar_digest.algorithm() != DigestAlgorithm::Sha256
+                || batch.sidecar_digest.bytes() == [0; 32]
+                || digest_bytes(&batch.sidecar) != batch.sidecar_digest
+                || batches[..batch_index]
+                    .iter()
+                    .any(|prior| prior.binding_digest == batch.binding_digest)
+            {
+                return Err(BlsSelectedRowEvidenceJoinError::Rejected);
+            }
+            selected_rows = selected_rows
+                .checked_add(
+                    u32::try_from(batch.rows.len())
+                        .map_err(|_| BlsSelectedRowEvidenceJoinError::Rejected)?,
+                )
+                .ok_or(BlsSelectedRowEvidenceJoinError::Rejected)?;
+            opaque_bytes = checked_add_opaque_bytes(opaque_bytes, batch.implementation.len())?;
+            opaque_bytes = checked_add_opaque_bytes(opaque_bytes, batch.sidecar.len())?;
+            for (row_index, row) in batch.rows.iter().enumerate() {
+                if usize::try_from(row.canonical_row_ordinal)
+                    .ok()
+                    .is_none_or(|ordinal| ordinal >= batch.original_row_count)
+                    || row.native_semantic_payload.is_empty()
+                    || row.canonical_row_digest.algorithm() != DigestAlgorithm::Sha256
+                    || row.canonical_row_digest.bytes() == [0; 32]
+                    || row.native_semantic_digest.algorithm() != DigestAlgorithm::Sha256
+                    || row.native_semantic_digest.bytes() == [0; 32]
+                    || digest_bytes(&row.native_semantic_payload) != row.native_semantic_digest
+                    || batch.rows[..row_index].iter().any(|prior| {
+                        prior.canonical_row_ordinal == row.canonical_row_ordinal
+                            || prior.canonical_row_digest == row.canonical_row_digest
+                    })
+                {
+                    return Err(BlsSelectedRowEvidenceJoinError::Rejected);
+                }
+                opaque_bytes =
+                    checked_add_opaque_bytes(opaque_bytes, row.native_semantic_payload.len())?;
+            }
+        }
+        if selected_rows != limits.max_selected_rows.get()
+            || opaque_bytes == 0
+            || opaque_bytes > limits.max_opaque_bytes.get()
+        {
+            return Err(BlsSelectedRowEvidenceJoinError::Rejected);
+        }
+        Ok(Self {
+            manifest,
+            source_id,
+            selection_digest,
+            batches: batches.into_boxed_slice(),
+        })
+    }
+}
+
+/// One provider binding containing one or more selected native rows and one shared sidecar.
+#[derive(Debug)]
+pub(super) struct BlsSelectedRowEvidenceBatch {
+    binding_digest: EvidenceDigest,
+    native_schema_version: u16,
+    implementation: Box<str>,
+    original_row_count: usize,
+    batch_digest: EvidenceDigest,
+    sidecar: Box<[u8]>,
+    sidecar_digest: EvidenceDigest,
+    rows: Box<[BlsSelectedRowNativeEvidence]>,
+}
+
+impl BlsSelectedRowEvidenceBatch {
+    /// Retains verified common-owned bytes without interpreting provider semantics.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every native schema, sidecar, batch, and selected-row coordinate stays explicit"
+    )]
+    pub(super) fn new(
+        binding_digest: EvidenceDigest,
+        native_schema_version: u16,
+        implementation: Box<str>,
+        original_row_count: usize,
+        batch_digest: EvidenceDigest,
+        sidecar: Box<[u8]>,
+        sidecar_digest: EvidenceDigest,
+        rows: Vec<BlsSelectedRowNativeEvidence>,
+    ) -> Self {
+        Self {
+            binding_digest,
+            native_schema_version,
+            implementation,
+            original_row_count,
+            batch_digest,
+            sidecar,
+            sidecar_digest,
+            rows: rows.into_boxed_slice(),
+        }
+    }
+}
+
+/// Opaque common-owned evidence for one selected canonical/native row.
+#[derive(Debug)]
+pub(super) struct BlsSelectedRowNativeEvidence {
+    canonical_row_ordinal: u32,
+    canonical_row_digest: EvidenceDigest,
+    native_semantic_payload: Box<[u8]>,
+    native_semantic_digest: EvidenceDigest,
+    received_at: Timestamp,
+}
+
+impl BlsSelectedRowNativeEvidence {
+    /// Retains the exact verified row coordinate and provider-native payload.
+    pub(super) fn new(
+        canonical_row_ordinal: u32,
+        canonical_row_digest: EvidenceDigest,
+        native_semantic_payload: Box<[u8]>,
+        native_semantic_digest: EvidenceDigest,
+        received_at: Timestamp,
+    ) -> Self {
+        Self {
+            canonical_row_ordinal,
+            canonical_row_digest,
+            native_semantic_payload,
+            native_semantic_digest,
+            received_at,
+        }
+    }
+}
+
+fn checked_add_opaque_bytes(
+    retained: u64,
+    bytes: usize,
+) -> Result<u64, BlsSelectedRowEvidenceJoinError> {
+    retained
+        .checked_add(u64::try_from(bytes).map_err(|_| BlsSelectedRowEvidenceJoinError::Rejected)?)
+        .ok_or(BlsSelectedRowEvidenceJoinError::Rejected)
+}
+
+fn digest_bytes(bytes: &[u8]) -> EvidenceDigest {
+    EvidenceDigest::new(DigestAlgorithm::Sha256, sha2::Sha256::digest(bytes).into())
+}
+
 /// Application-owned physical sealer and atomic BLS publication/read coordinator.
 #[derive(Clone)]
 pub(crate) struct BlsMacroApplicationClosure {
     research: Arc<ResearchService>,
+    selected_row_evidence: Option<Arc<dyn BlsSelectedRowEvidenceJoin>>,
 }
 
 impl std::fmt::Debug for BlsMacroApplicationClosure {
@@ -76,7 +333,21 @@ impl std::fmt::Debug for BlsMacroApplicationClosure {
 impl BlsMacroApplicationClosure {
     /// Binds BLS completion to the sole application-owned sealed journal and analytical writer.
     pub(crate) fn new(research: Arc<ResearchService>) -> Self {
-        Self { research }
+        Self {
+            research,
+            selected_row_evidence: None,
+        }
+    }
+
+    /// Binds the root-owned selected-row evidence capability without giving BLS a raw store.
+    pub(super) fn with_selected_row_evidence(
+        research: Arc<ResearchService>,
+        selected_row_evidence: Arc<dyn BlsSelectedRowEvidenceJoin>,
+    ) -> Self {
+        Self {
+            research,
+            selected_row_evidence: Some(selected_row_evidence),
+        }
     }
 
     /// Acquires, physically seals, extracts, and closes every chunk in one exact BLS plan.
@@ -234,7 +505,7 @@ impl BlsMacroApplicationClosure {
                 analytical,
                 limits,
                 deadline,
-                cancellation,
+                cancellation.clone(),
             )
             .await
         {
@@ -247,15 +518,22 @@ impl BlsMacroApplicationClosure {
             Err(error) => return Err(error.into()),
         };
         if !validate_provider_period_consumer_read(&restart_selector, &retained_request, &output)? {
-            return Ok(BlsMacroCapabilityState::Unavailable(
-                BlsMacroUnavailableReason::IncompleteSeriesAtCutoff,
-            ));
+            return Err(BlsMacroApplicationError::InvalidReadResult);
         }
+        let evidence_join = self
+            .selected_row_evidence
+            .as_deref()
+            .ok_or(BlsMacroApplicationError::SelectedRowEvidenceJoinUnavailable)?;
+        let evidence_limits = BlsSelectedRowEvidenceLimits::try_for_output(&output, limits)?;
         let semantic_evidence = reopen_provider_period_semantic_evidence(
-            self.research.as_ref(),
+            evidence_join,
             &restart_selector,
             &output,
-        )?;
+            evidence_limits,
+            deadline,
+            cancellation,
+        )
+        .await?;
         Ok(BlsMacroCapabilityState::Available(
             BlsProviderPeriodLatestKnownDto {
                 restart_selector,
@@ -656,79 +934,68 @@ impl BlsProviderPeriodObservationSemanticEvidence {
     }
 }
 
-fn reopen_provider_period_semantic_evidence(
-    research: &ResearchService,
+async fn reopen_provider_period_semantic_evidence(
+    evidence_join: &dyn BlsSelectedRowEvidenceJoin,
     restart_selector: &ProviderMacroPlanRestartSelector,
     output: &AnalyticalMacroProviderPeriodLatestKnownOutput,
+    limits: BlsSelectedRowEvidenceLimits,
+    deadline: Instant,
+    cancellation: CancellationToken,
 ) -> Result<BlsProviderPeriodSemanticEvidence, BlsMacroApplicationError> {
-    let binding_digests = research
-        .analytical()
-        .provider_capture_binding_digests(restart_selector.manifest())?;
-    if binding_digests.is_empty() {
+    let receipt = evidence_join
+        .reopen_selected_rows(restart_selector, output, limits, deadline, cancellation)
+        .await
+        .map_err(BlsMacroApplicationError::from_selected_row_evidence_join)?;
+    if &receipt.manifest != restart_selector.manifest()
+        || &receipt.source_id != restart_selector.source_id()
+        || receipt.selection_digest != output.selection_digest()
+    {
         return Err(BlsMacroApplicationError::InvalidReadResult);
     }
-    let store = research.provider_capture_store();
     let mut retained = Vec::new();
-    for binding_digest in binding_digests {
-        let binding = research.analytical().provider_capture_binding_evidence(
-            restart_selector.manifest(),
-            binding_digest,
-            store.as_ref(),
-        )?;
-        let native_schema = binding.native_lineage();
-        let (Some(sidecar), Some(sidecar_digest)) = (
-            native_schema.batch_sidecar_semantic_payload(),
-            native_schema.batch_sidecar_semantic_payload_digest(),
-        ) else {
-            return Err(BlsMacroApplicationError::InvalidReadResult);
-        };
-        if binding.binding_digest() != binding_digest
-            || binding.capture().source_id() != restart_selector.source_id()
-            || native_schema.implementation() != BLS_TIMESERIES_NATIVE_LINEAGE_IMPLEMENTATION
-            || native_schema.row_count() != binding.rows().len()
-            || sidecar_digest.algorithm() != DigestAlgorithm::Sha256
-            || sidecar_digest.bytes() == [0; 32]
-            || native_schema.batch_digest().algorithm() != DigestAlgorithm::Sha256
-            || native_schema.batch_digest().bytes() == [0; 32]
-        {
+    retained
+        .try_reserve_exact(output.observations().len())
+        .map_err(|_| BlsMacroApplicationError::Capacity)?;
+    for batch in receipt.batches {
+        if batch.implementation.as_ref() != BLS_TIMESERIES_NATIVE_LINEAGE_IMPLEMENTATION {
             return Err(BlsMacroApplicationError::InvalidReadResult);
         }
         let semantics =
-            BlsCanonicalProviderSemantics::try_decode_persisted_native_sidecar(sidecar)?;
-        if semantics.observations().len() != binding.rows().len()
+            BlsCanonicalProviderSemantics::try_decode_persisted_native_sidecar(&batch.sidecar)?;
+        if semantics.observations().len() != batch.original_row_count
             || semantics.semantics_digest().algorithm() != DigestAlgorithm::Sha256
             || semantics.semantics_digest().bytes() == [0; 32]
         {
             return Err(BlsMacroApplicationError::InvalidReadResult);
         }
-        retained
-            .try_reserve(binding.rows().len())
-            .map_err(|_| BlsMacroApplicationError::Capacity)?;
-        for row in binding.rows() {
+        for row in batch.rows {
             let native = BlsTimeseriesNativeLineageRowV1::try_decode_persisted(
-                native_schema.version(),
-                native_schema.implementation(),
-                row.native_semantic_payload(),
+                batch.native_schema_version,
+                &batch.implementation,
+                &row.native_semantic_payload,
             )?;
             let companion =
-                semantics.validate_persisted_native_row(row.canonical_row_ordinal(), &native)?;
-            if companion.canonical_payload_digest() != row.canonical_row_digest()
-                || companion.locally_available_at() != row.received_at()
-                || row.canonical_row_digest().algorithm() != DigestAlgorithm::Sha256
-                || row.canonical_row_digest().bytes() == [0; 32]
-                || row.native_semantic_digest().algorithm() != DigestAlgorithm::Sha256
-                || row.native_semantic_digest().bytes() == [0; 32]
+                semantics.validate_persisted_native_row(row.canonical_row_ordinal, &native)?;
+            if companion.canonical_payload_digest() != row.canonical_row_digest
+                || companion.locally_available_at() != row.received_at
+                || retained
+                    .iter()
+                    .any(|prior: &BlsProviderPeriodObservationSemanticEvidence| {
+                        prior.canonical_row_digest == row.canonical_row_digest
+                            || (prior.binding_digest == batch.binding_digest
+                                && prior.companion.record_ordinal() == row.canonical_row_ordinal)
+                    })
             {
                 return Err(BlsMacroApplicationError::InvalidReadResult);
             }
             retained.push(BlsProviderPeriodObservationSemanticEvidence {
                 companion: companion.clone(),
                 native,
-                binding_digest,
-                canonical_row_digest: row.canonical_row_digest(),
-                native_semantic_digest: row.native_semantic_digest(),
-                native_batch_digest: native_schema.batch_digest(),
-                native_sidecar_digest: sidecar_digest,
+                binding_digest: batch.binding_digest,
+                canonical_row_digest: row.canonical_row_digest,
+                native_semantic_digest: row.native_semantic_digest,
+                native_batch_digest: batch.batch_digest,
+                native_sidecar_digest: batch.sidecar_digest,
                 provider_semantics_digest: semantics.semantics_digest(),
             });
         }
@@ -760,8 +1027,8 @@ fn reopen_provider_period_semantic_evidence(
 
 /// Validates that one shared analytical read is safe to hand to every downstream macro consumer.
 ///
-/// `Ok(false)` denotes an honest incomplete snapshot: unlike a BLS `-` row, an absent requested
-/// series has no canonical missingness evidence and cannot become a usable context silently.
+/// Incompleteness is emitted only by the analytical reader's exact `MacroSnapshotIncomplete`
+/// result. Any malformed or partial successful output is an error rather than another absence.
 fn validate_provider_period_consumer_read(
     restart_selector: &ProviderMacroPlanRestartSelector,
     request: &AnalyticalMacroProviderPeriodLatestKnownRequest,
@@ -862,6 +1129,18 @@ pub(crate) enum BlsMacroApplicationError {
     /// The exact provider-period analytical capability rejected the bounded read.
     #[error("BLS provider-period analytical read failed")]
     AnalyticalRead(#[from] AnalyticalReadError),
+    /// Shared application composition did not install the selected-row evidence capability.
+    #[error("BLS selected-row evidence join is unavailable")]
+    SelectedRowEvidenceJoinUnavailable,
+    /// Caller cancellation won while the root-owned selected-row evidence join was active.
+    #[error("BLS selected-row evidence join was cancelled")]
+    SelectedRowEvidenceJoinCancelled,
+    /// The root-owned selected-row evidence join exhausted its explicit deadline.
+    #[error("BLS selected-row evidence join exceeded its deadline")]
+    SelectedRowEvidenceJoinDeadlineExceeded,
+    /// Shared data rejected the exact selected-row evidence join.
+    #[error("BLS selected-row evidence join was rejected")]
+    SelectedRowEvidenceJoinRejected,
     /// The complete plan could not fit its declared bounded application representation.
     #[error("BLS complete plan exceeds application capacity")]
     Capacity,
@@ -877,4 +1156,16 @@ pub(crate) enum BlsMacroApplicationError {
     /// The typed read did not retain the exact source and immutable generation.
     #[error("BLS provider-period read returned invalid binding evidence")]
     InvalidReadResult,
+}
+
+impl BlsMacroApplicationError {
+    fn from_selected_row_evidence_join(error: BlsSelectedRowEvidenceJoinError) -> Self {
+        match error {
+            BlsSelectedRowEvidenceJoinError::Cancelled => Self::SelectedRowEvidenceJoinCancelled,
+            BlsSelectedRowEvidenceJoinError::DeadlineExceeded => {
+                Self::SelectedRowEvidenceJoinDeadlineExceeded
+            }
+            BlsSelectedRowEvidenceJoinError::Rejected => Self::SelectedRowEvidenceJoinRejected,
+        }
+    }
 }
