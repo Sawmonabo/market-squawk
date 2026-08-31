@@ -410,20 +410,6 @@ fn parse_series_metadata(
         limits,
     )
     .map_err(SourceProtocolViolation::MetadataSchema)?;
-    let Some(first) = series_revisions.first() else {
-        return Err(SourceProtocolViolation::MetadataSchema(
-            SourceMetadataSchemaViolation::RecordCardinality,
-        ));
-    };
-    let Some(last) = series_revisions.last() else {
-        return Err(SourceProtocolViolation::MetadataSchema(
-            SourceMetadataSchemaViolation::RecordCardinality,
-        ));
-    };
-    if first.realtime_start > dataset.realtime_start() || last.realtime_end < dataset.realtime_end()
-    {
-        return Err(SourceProtocolViolation::MetadataInterval);
-    }
     Ok(series_revisions)
 }
 
@@ -518,27 +504,11 @@ fn parse_series_metadata_for_series(
         });
     }
     // This endpoint has no ordering selector. Preserve the exact provider array in the raw
-    // capture, but canonicalize the semantic timeline before proving closed interval coverage.
+    // capture, but canonicalize the semantic timeline before proving interval validity.
     revisions.sort_unstable_by_key(|revision| (revision.realtime_start, revision.realtime_end));
-    let first = revisions
-        .first()
-        .ok_or(SourceMetadataSchemaViolation::RecordCardinality)?;
-    let last = revisions
-        .last()
-        .ok_or(SourceMetadataSchemaViolation::RecordCardinality)?;
-    // The response-level dates are the requested envelope. Provider-authored metadata validity
-    // can begin before or end after that envelope, so require complete coverage without erasing
-    // those exact source intervals.
-    if first.realtime_start > page_start {
-        return Err(metadata_interval(
-            SourceMetadataIntervalViolation::OuterStartCoverage,
-        ));
-    }
-    if last.realtime_end < page_end {
-        return Err(metadata_interval(
-            SourceMetadataIntervalViolation::OuterEndCoverage,
-        ));
-    }
+    // The response-level dates are the requested envelope, not a promise that metadata semantics
+    // existed throughout it. Retain every exact provider interval and defer completeness authority
+    // to each observation that is eligible for publication.
     for pair in revisions.windows(2) {
         if let Some(reason) = metadata_interval_discontinuity(&pair[0], &pair[1]) {
             return Err(metadata_interval(reason));
@@ -564,12 +534,7 @@ fn metadata_interval_discontinuity(
     if next.realtime_start <= previous.realtime_end {
         return Some(SourceMetadataIntervalViolation::Overlap);
     }
-    (!closed_intervals_are_contiguous(previous.realtime_end, next.realtime_start))
-        .then_some(SourceMetadataIntervalViolation::Gap)
-}
-
-fn closed_intervals_are_contiguous(previous_end: CalendarDate, next_start: CalendarDate) -> bool {
-    previous_end.days_since_unix_epoch().checked_add(1) == Some(next_start.days_since_unix_epoch())
+    None
 }
 
 fn is_valid_last_updated(value: &str) -> bool {

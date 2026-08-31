@@ -48,7 +48,7 @@ impl FredNativeLineagePlan {
         series_revisions: Box<[FredSeriesMetadata]>,
     ) -> Result<Self, FredSourceError> {
         if FredDataset::parse(&provider_dataset).ok().as_ref() != Some(&dataset)
-            || !metadata_revisions_cover_dataset(&series_revisions, &dataset)
+            || !metadata_revisions_are_unambiguous(&series_revisions, &dataset)
             || page.realtime_start() != dataset.realtime_start()
             || page.realtime_end() != dataset.realtime_end()
             || page.observations().is_empty()
@@ -352,7 +352,7 @@ pub(super) fn canonical_observation_payloads(
         .collect()
 }
 
-fn metadata_revisions_cover_dataset(
+fn metadata_revisions_are_unambiguous(
     revisions: &[FredSeriesMetadata],
     dataset: &FredDataset,
 ) -> bool {
@@ -363,21 +363,13 @@ fn metadata_revisions_cover_dataset(
     for revision in revisions {
         if revision.series_id().as_str() != dataset.series_id()
             || revision.realtime_start() > revision.realtime_end()
-            || previous_end.is_some_and(|end: CalendarDate| {
-                end.days_since_unix_epoch().checked_add(1)
-                    != Some(revision.realtime_start().days_since_unix_epoch())
-            })
+            || previous_end.is_some_and(|end: CalendarDate| revision.realtime_start() <= end)
         {
             return false;
         }
         previous_end = Some(revision.realtime_end());
     }
-    revisions
-        .first()
-        .is_some_and(|revision| revision.realtime_start() <= dataset.realtime_start())
-        && revisions
-            .last()
-            .is_some_and(|revision| revision.realtime_end() >= dataset.realtime_end())
+    true
 }
 
 fn applicable_metadata_revision(
@@ -709,7 +701,7 @@ mod tests {
 
         let split_metadata = [
             FredSeriesMetadata::parse_probe_response(
-                &metadata_response("2024-01-01", "2024-01-20", "Index")?,
+                &metadata_response("2024-01-10", "2024-01-20", "Index")?,
                 &series_id,
                 limits,
             )?,
@@ -719,6 +711,7 @@ mod tests {
                 limits,
             )?,
         ];
+        assert!(split_metadata[0].realtime_start() > narrow.realtime_start());
         let intersections = observation_metadata_intersections(&narrow, &split_metadata, 2)?;
         assert_eq!(intersections.len(), 2);
         assert_eq!(intersections[0].metadata_revision_ordinal, 0);

@@ -648,7 +648,7 @@ async fn series_metadata_is_exact_request_bound_and_retains_ordered_revisions() 
     assert_eq!(series.notes(), Some("Exact provider notes"));
 
     let mut revisioned_value: serde_json::Value = serde_json::from_slice(EXACT_SERIES_RESPONSE)?;
-    revisioned_value["seriess"][0]["realtime_start"] = serde_json::json!("2023-12-01");
+    revisioned_value["seriess"][0]["realtime_start"] = serde_json::json!("2024-01-10");
     revisioned_value["seriess"][0]["realtime_end"] = serde_json::json!("2024-01-15");
     let mut later_revision = revisioned_value["seriess"][0].clone();
     later_revision["realtime_start"] = serde_json::json!("2024-01-16");
@@ -695,7 +695,7 @@ async fn series_metadata_is_exact_request_bound_and_retains_ordered_revisions() 
         revisioned.series_revisions()[0]
             .realtime_start()
             .to_string(),
-        "2023-12-01"
+        "2024-01-10"
     );
     assert_eq!(
         revisioned.series_revisions()[0].realtime_end().to_string(),

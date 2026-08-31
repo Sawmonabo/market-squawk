@@ -494,11 +494,9 @@ impl RestoredFredNativeBatchV1 {
             || self.response_mode.file_type != "json"
             || self.response_mode.order_by != "observation_date"
             || self.response_mode.sort_order != "asc"
-            || !restored_metadata_revisions_cover_interval(
+            || !restored_metadata_revisions_are_unambiguous(
                 &self.series_revisions,
                 &expected_series,
-                expected_realtime_start,
-                expected_realtime_end,
             )
             || self.page.realtime_start != expected_realtime_start
             || self.page.realtime_end != expected_realtime_end
@@ -516,17 +514,30 @@ impl RestoredFredNativeBatchV1 {
         {
             return Err(FredProductionPublicationError::RestartVerificationMismatch);
         }
+        let mut restored_rows = Vec::new();
+        restored_rows
+            .try_reserve_exact(rows.len())
+            .map_err(|_error| FredProductionPublicationError::Capacity)?;
         for row in rows {
-            let restored: RestoredFredNativeRowV1 =
-                serde_json::from_slice(row.native_semantic_payload()).map_err(|_error| {
-                    FredProductionPublicationError::RestartVerificationMismatch
-                })?;
+            restored_rows.push(
+                serde_json::from_slice::<RestoredFredNativeRowV1>(row.native_semantic_payload())
+                    .map_err(|_error| {
+                        FredProductionPublicationError::RestartVerificationMismatch
+                    })?,
+            );
+        }
+        for (ordinal, restored) in restored_rows.iter().enumerate() {
             let metadata = self
                 .series_revisions
                 .get(usize::from(restored.metadata_revision_ordinal))
                 .ok_or(FredProductionPublicationError::RestartVerificationMismatch)?;
+            let clipped_start = restored
+                .provider_realtime_start
+                .max(self.page.realtime_start);
+            let clipped_end = restored.provider_realtime_end.min(self.page.realtime_end);
             if restored.realtime_start > restored.realtime_end
                 || restored.provider_realtime_start > restored.provider_realtime_end
+                || clipped_start > clipped_end
                 || restored.raw_value.is_empty()
                 || restored.realtime_start < self.page.realtime_start
                 || restored.realtime_end > self.page.realtime_end
@@ -534,7 +545,27 @@ impl RestoredFredNativeBatchV1 {
                 || restored.realtime_end > metadata.realtime_end
                 || restored.realtime_start < restored.provider_realtime_start
                 || restored.realtime_end > restored.provider_realtime_end
+                || restored.realtime_end != clipped_end.min(metadata.realtime_end)
                 || restored.value.is_none() != (restored.missing_marker.as_deref() == Some("."))
+            {
+                return Err(FredProductionPublicationError::RestartVerificationMismatch);
+            }
+            let previous = ordinal
+                .checked_sub(1)
+                .and_then(|index| restored_rows.get(index));
+            if previous.is_none_or(|row| !same_restored_provider_observation(row, restored)) {
+                if restored.realtime_start != clipped_start {
+                    return Err(FredProductionPublicationError::RestartVerificationMismatch);
+                }
+            } else if previous.is_none_or(|row| {
+                row.realtime_end.days_since_unix_epoch().checked_add(1)
+                    != Some(restored.realtime_start.days_since_unix_epoch())
+            }) {
+                return Err(FredProductionPublicationError::RestartVerificationMismatch);
+            }
+            let next = restored_rows.get(ordinal.saturating_add(1));
+            if next.is_none_or(|row| !same_restored_provider_observation(row, restored))
+                && restored.realtime_end != clipped_end
             {
                 return Err(FredProductionPublicationError::RestartVerificationMismatch);
             }
@@ -543,11 +574,9 @@ impl RestoredFredNativeBatchV1 {
     }
 }
 
-fn restored_metadata_revisions_cover_interval(
+fn restored_metadata_revisions_are_unambiguous(
     revisions: &[RestoredFredSeriesV1],
     expected_series: &SourceIdentifier,
-    expected_start: CalendarDate,
-    expected_end: CalendarDate,
 ) -> bool {
     if revisions.is_empty() || revisions.len() > MAX_FRED_SERIES_METADATA_REVISIONS {
         return false;
@@ -565,21 +594,13 @@ fn restored_metadata_revisions_cover_interval(
             || revision.seasonal_adjustment.is_empty()
             || revision.seasonal_adjustment_short.is_empty()
             || revision.last_updated.is_empty()
-            || previous_end.is_some_and(|end: CalendarDate| {
-                end.days_since_unix_epoch().checked_add(1)
-                    != Some(revision.realtime_start.days_since_unix_epoch())
-            })
+            || previous_end.is_some_and(|end: CalendarDate| revision.realtime_start <= end)
         {
             return false;
         }
         previous_end = Some(revision.realtime_end);
     }
-    revisions
-        .first()
-        .is_some_and(|revision| revision.realtime_start <= expected_start)
-        && revisions
-            .last()
-            .is_some_and(|revision| revision.realtime_end >= expected_end)
+    true
 }
 
 #[derive(Deserialize)]
@@ -620,12 +641,23 @@ struct RestoredFredNativeRowV1 {
     realtime_end: CalendarDate,
     provider_realtime_start: CalendarDate,
     provider_realtime_end: CalendarDate,
-    #[serde(rename = "observation_date")]
-    _observation_date: CalendarDate,
+    observation_date: CalendarDate,
     raw_value: String,
     value: Option<Value>,
     missing_marker: Option<String>,
     metadata_revision_ordinal: u16,
+}
+
+fn same_restored_provider_observation(
+    left: &RestoredFredNativeRowV1,
+    right: &RestoredFredNativeRowV1,
+) -> bool {
+    left.provider_realtime_start == right.provider_realtime_start
+        && left.provider_realtime_end == right.provider_realtime_end
+        && left.observation_date == right.observation_date
+        && left.raw_value == right.raw_value
+        && left.value == right.value
+        && left.missing_marker == right.missing_marker
 }
 
 #[derive(Deserialize)]
