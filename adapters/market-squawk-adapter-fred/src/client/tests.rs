@@ -648,10 +648,11 @@ async fn series_metadata_is_exact_request_bound_and_retains_ordered_revisions() 
     assert_eq!(series.notes(), Some("Exact provider notes"));
 
     let mut revisioned_value: serde_json::Value = serde_json::from_slice(EXACT_SERIES_RESPONSE)?;
+    revisioned_value["seriess"][0]["realtime_start"] = serde_json::json!("2023-12-01");
     revisioned_value["seriess"][0]["realtime_end"] = serde_json::json!("2024-01-15");
     let mut later_revision = revisioned_value["seriess"][0].clone();
     later_revision["realtime_start"] = serde_json::json!("2024-01-16");
-    later_revision["realtime_end"] = serde_json::json!("2024-01-31");
+    later_revision["realtime_end"] = serde_json::json!("2024-02-29");
     later_revision["title"] = serde_json::json!("Revised consumer price index title");
     later_revision["units"] = serde_json::json!("Revised index units");
     revisioned_value["seriess"]
@@ -691,6 +692,12 @@ async fn series_metadata_is_exact_request_bound_and_retains_ordered_revisions() 
         .await?;
     assert_eq!(revisioned.series_revisions().len(), 2);
     assert_eq!(
+        revisioned.series_revisions()[0]
+            .realtime_start()
+            .to_string(),
+        "2023-12-01"
+    );
+    assert_eq!(
         revisioned.series_revisions()[0].realtime_end().to_string(),
         "2024-01-15"
     );
@@ -699,6 +706,10 @@ async fn series_metadata_is_exact_request_bound_and_retains_ordered_revisions() 
             .realtime_start()
             .to_string(),
         "2024-01-16"
+    );
+    assert_eq!(
+        revisioned.series_revisions()[1].realtime_end().to_string(),
+        "2024-02-29"
     );
     assert_eq!(
         revisioned.series_revisions()[1].units(),

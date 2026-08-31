@@ -372,8 +372,12 @@ fn metadata_revisions_cover_dataset(
         }
         previous_end = Some(revision.realtime_end());
     }
-    revisions.first().map(FredSeriesMetadata::realtime_start) == Some(dataset.realtime_start())
-        && revisions.last().map(FredSeriesMetadata::realtime_end) == Some(dataset.realtime_end())
+    revisions
+        .first()
+        .is_some_and(|revision| revision.realtime_start() <= dataset.realtime_start())
+        && revisions
+            .last()
+            .is_some_and(|revision| revision.realtime_end() >= dataset.realtime_end())
 }
 
 fn applicable_metadata_revision(
@@ -402,11 +406,15 @@ fn observation_metadata_intersections<'a>(
         .try_reserve_exact(page.observations().len().min(max_rows))
         .map_err(|_| FredSourceError::Protocol)?;
     for observation in page.observations() {
-        let mut realtime_start = observation.realtime_start();
+        let mut realtime_start = observation.realtime_start().max(page.realtime_start());
+        let observation_end = observation.realtime_end().min(page.realtime_end());
+        if realtime_start > observation_end {
+            return Err(FredSourceError::Protocol);
+        }
         loop {
             let (metadata_revision_ordinal, metadata) =
                 applicable_metadata_revision(revisions, realtime_start)?;
-            let realtime_end = observation.realtime_end().min(metadata.realtime_end());
+            let realtime_end = observation_end.min(metadata.realtime_end());
             if realtime_start < metadata.realtime_start()
                 || realtime_end < realtime_start
                 || intersections.len() == max_rows
@@ -419,7 +427,7 @@ fn observation_metadata_intersections<'a>(
                 realtime_start,
                 realtime_end,
             });
-            if realtime_end == observation.realtime_end() {
+            if realtime_end == observation_end {
                 break;
             }
             realtime_start = next_calendar_date(realtime_end)?.ok_or(FredSourceError::Protocol)?;

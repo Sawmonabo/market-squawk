@@ -168,8 +168,9 @@ impl FredSeriesMetadata {
         expected_series: &SourceIdentifier,
         limits: FredParseLimits,
     ) -> Result<Self, FredSourceError> {
-        let revisions = parse_series_metadata_for_series(bytes, expected_series.as_str(), limits)
-            .map_err(|_| FredSourceError::Protocol)?;
+        let revisions =
+            parse_series_metadata_for_series(bytes, expected_series.as_str(), None, limits)
+                .map_err(|_| FredSourceError::Protocol)?;
         if revisions.len() != 1 {
             return Err(FredSourceError::Protocol);
         }
@@ -402,8 +403,13 @@ fn parse_series_metadata(
     dataset: &FredDataset,
     limits: FredParseLimits,
 ) -> Result<Box<[FredSeriesMetadata]>, SourceProtocolViolation> {
-    let series_revisions = parse_series_metadata_for_series(bytes, dataset.series_id(), limits)
-        .map_err(SourceProtocolViolation::MetadataSchema)?;
+    let series_revisions = parse_series_metadata_for_series(
+        bytes,
+        dataset.series_id(),
+        Some((dataset.realtime_start(), dataset.realtime_end())),
+        limits,
+    )
+    .map_err(SourceProtocolViolation::MetadataSchema)?;
     let Some(first) = series_revisions.first() else {
         return Err(SourceProtocolViolation::MetadataSchema(
             SourceMetadataSchemaViolation::RecordCardinality,
@@ -414,8 +420,7 @@ fn parse_series_metadata(
             SourceMetadataSchemaViolation::RecordCardinality,
         ));
     };
-    if first.realtime_start != dataset.realtime_start()
-        || last.realtime_end != dataset.realtime_end()
+    if first.realtime_start > dataset.realtime_start() || last.realtime_end < dataset.realtime_end()
     {
         return Err(SourceProtocolViolation::MetadataInterval);
     }
@@ -425,6 +430,7 @@ fn parse_series_metadata(
 fn parse_series_metadata_for_series(
     bytes: &[u8],
     expected_series: &str,
+    expected_page_interval: Option<(CalendarDate, CalendarDate)>,
     limits: FredParseLimits,
 ) -> Result<Box<[FredSeriesMetadata]>, SourceMetadataSchemaViolation> {
     admit_body(bytes, limits).map_err(|_| SourceMetadataSchemaViolation::DocumentShape)?;
@@ -437,7 +443,9 @@ fn parse_series_metadata_for_series(
         .map_err(|_| SourceMetadataSchemaViolation::PageRecordInterval)?;
     let page_end = parse_date(&wire.realtime_end)
         .map_err(|_| SourceMetadataSchemaViolation::PageRecordInterval)?;
-    if page_start > page_end {
+    if page_start > page_end
+        || expected_page_interval.is_some_and(|expected| expected != (page_start, page_end))
+    {
         return Err(SourceMetadataSchemaViolation::PageRecordInterval);
     }
     let mut revisions = Vec::new();
@@ -511,8 +519,11 @@ fn parse_series_metadata_for_series(
     let last = revisions
         .last()
         .ok_or(SourceMetadataSchemaViolation::RecordCardinality)?;
-    if first.realtime_start != page_start
-        || last.realtime_end != page_end
+    // The response-level dates are the requested envelope. Provider-authored metadata validity
+    // can begin before or end after that envelope, so require complete coverage without erasing
+    // those exact source intervals.
+    if first.realtime_start > page_start
+        || last.realtime_end < page_end
         || revisions.windows(2).any(|pair| {
             !closed_intervals_are_contiguous(pair[0].realtime_end, pair[1].realtime_start)
         })

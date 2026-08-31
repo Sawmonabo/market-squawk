@@ -528,6 +528,8 @@ impl RestoredFredNativeBatchV1 {
             if restored.realtime_start > restored.realtime_end
                 || restored.provider_realtime_start > restored.provider_realtime_end
                 || restored.raw_value.is_empty()
+                || restored.realtime_start < self.page.realtime_start
+                || restored.realtime_end > self.page.realtime_end
                 || restored.realtime_start < metadata.realtime_start
                 || restored.realtime_end > metadata.realtime_end
                 || restored.realtime_start < restored.provider_realtime_start
@@ -572,8 +574,12 @@ fn restored_metadata_revisions_cover_interval(
         }
         previous_end = Some(revision.realtime_end);
     }
-    revisions.first().map(|revision| revision.realtime_start) == Some(expected_start)
-        && revisions.last().map(|revision| revision.realtime_end) == Some(expected_end)
+    revisions
+        .first()
+        .is_some_and(|revision| revision.realtime_start <= expected_start)
+        && revisions
+            .last()
+            .is_some_and(|revision| revision.realtime_end >= expected_end)
 }
 
 #[derive(Deserialize)]
