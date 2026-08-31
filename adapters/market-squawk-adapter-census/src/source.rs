@@ -44,9 +44,10 @@ use crate::{
     CENSUS_APPLICATION_REQUESTS_PER_DAY, CENSUS_APPLICATION_REQUESTS_PER_SECOND,
     CensusAdapterError, CensusApiKey, CensusCatalogFailurePredicate, CensusClocks, CensusDataPage,
     CensusDataQuery, CensusDatasetVintage, CensusDiscoveryDocument, CensusDiscoveryKind,
-    CensusDiscoveryRequest, CensusGeography, CensusMetadataEvidence, CensusMissingReason,
-    CensusParseLimits, CensusPredicateType, CensusRequiredVariable, CensusSelection,
-    CensusTypedValue, CensusValueState, CensusVariableCatalog,
+    CensusDiscoveryRequest, CensusGeography, CensusGeographyFailurePredicate,
+    CensusMetadataEvidence, CensusMissingReason, CensusParseLimits, CensusPredicateType,
+    CensusRequiredVariable, CensusSelection, CensusTypedValue, CensusValueState,
+    CensusVariableCatalog,
 };
 
 /// Maximum exact Census query contracts retained by one source instance.
@@ -656,6 +657,12 @@ pub enum CensusDiagnosticSubreason {
     CatalogParse(CensusCatalogFailurePredicate),
     /// Parsed catalog evidence failed bounded response/request accounting.
     CatalogAccounting,
+    /// Geography metadata failed before its body reached the geography parser.
+    GeographyResponse,
+    /// The geography parser rejected one exact closed validation predicate.
+    GeographyParse(CensusGeographyFailurePredicate),
+    /// Parsed geography evidence failed bounded response/request accounting.
+    GeographyAccounting,
 }
 
 /// Bounded, payload-free failure evidence for one Census application journey.
@@ -1510,8 +1517,11 @@ impl CensusSource {
                 request.kind(),
                 CensusDiscoveryKind::Datasets | CensusDiscoveryKind::VintageDatasets { .. }
             );
+            let is_geography = matches!(request.kind(), CensusDiscoveryKind::Geographies { .. });
             if is_catalog {
                 diagnostic.note_subreason(CensusDiagnosticSubreason::CatalogResponse);
+            } else if is_geography {
+                diagnostic.note_subreason(CensusDiagnosticSubreason::GeographyResponse);
             }
             let mut response = self
                 .fetch_authorized(
@@ -1539,6 +1549,21 @@ impl CensusSource {
                         return Err(map_adapter_error(failure.into_source()));
                     }
                 }
+            } else if is_geography {
+                match CensusDiscoveryDocument::parse_geography_diagnosed(
+                    request,
+                    &response.body,
+                    self.effective_parse_limits(),
+                ) {
+                    Ok(document) => document,
+                    Err(failure) => {
+                        diagnostic.note_subreason(CensusDiagnosticSubreason::GeographyParse(
+                            failure.predicate(),
+                        ));
+                        self.telemetry.failures.fetch_add(1, Ordering::Relaxed);
+                        return Err(map_adapter_error(failure.into_source()));
+                    }
+                }
             } else {
                 match CensusDiscoveryDocument::parse(
                     request,
@@ -1554,6 +1579,8 @@ impl CensusSource {
             };
             if is_catalog {
                 diagnostic.note_subreason(CensusDiagnosticSubreason::CatalogAccounting);
+            } else if is_geography {
+                diagnostic.note_subreason(CensusDiagnosticSubreason::GeographyAccounting);
             }
             let metadata_entries = discovery_evidence(&document).returned_entries();
             let response_telemetry = response

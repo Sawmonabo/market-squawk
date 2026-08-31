@@ -68,6 +68,45 @@ pub enum CensusCatalogFailurePredicate {
     RequestKind,
 }
 
+/// Closed, payload-free predicate identifying one failed geography validation step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CensusGeographyFailurePredicate {
+    /// Exact response bytes exceeded the configured parser bound.
+    BodyBound,
+    /// Response bytes were not valid JSON.
+    JsonSyntax,
+    /// The JSON root was not an object.
+    RootObject,
+    /// The root omitted the required FIPS array.
+    FipsArray,
+    /// The FIPS array exceeded the configured entry bound.
+    EntryBound,
+    /// Bounded geography storage could not be allocated.
+    Allocation,
+    /// A FIPS-array member was not an object.
+    EntryObject,
+    /// A geography entry omitted or malformed its name.
+    Name,
+    /// A geography entry omitted or malformed its level identity.
+    GeoLevelDisplay,
+    /// Two geography entries resolved to the same identity.
+    DuplicateIdentity,
+    /// A geography entry malformed its required parent list.
+    Requires,
+    /// A geography entry malformed its wildcard parent list.
+    Wildcard,
+    /// A geography entry malformed its optional wildcard-parent list.
+    OptionalWildcard,
+    /// Wildcard metadata referred to a parent outside the entry's required set.
+    ParentGrammar,
+    /// A geography entry malformed its optional reference date.
+    ReferenceDate,
+    /// The complete geography graph referred to an unknown parent.
+    Closure,
+    /// A non-geography request was supplied to the geography-only parser.
+    RequestKind,
+}
+
 #[derive(Debug)]
 pub(crate) struct CensusCatalogParseFailure {
     source: CensusAdapterError,
@@ -88,10 +127,36 @@ impl CensusCatalogParseFailure {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct CensusGeographyParseFailure {
+    source: CensusAdapterError,
+    predicate: CensusGeographyFailurePredicate,
+}
+
+impl CensusGeographyParseFailure {
+    fn new(source: CensusAdapterError, predicate: CensusGeographyFailurePredicate) -> Self {
+        Self { source, predicate }
+    }
+
+    pub(crate) const fn predicate(&self) -> CensusGeographyFailurePredicate {
+        self.predicate
+    }
+
+    pub(crate) fn into_source(self) -> CensusAdapterError {
+        self.source
+    }
+}
+
 fn catalog_failure(
     predicate: CensusCatalogFailurePredicate,
 ) -> impl FnOnce(CensusAdapterError) -> CensusCatalogParseFailure {
     move |source| CensusCatalogParseFailure::new(source, predicate)
+}
+
+fn geography_failure(
+    predicate: CensusGeographyFailurePredicate,
+) -> impl FnOnce(CensusAdapterError) -> CensusGeographyParseFailure {
+    move |source| CensusGeographyParseFailure::new(source, predicate)
 }
 
 /// Exact payload identity and single-document accounting for discovery metadata.
@@ -168,6 +233,10 @@ impl CensusDiscoveryDocument {
             return Self::parse_catalog_diagnosed(request, bytes, limits)
                 .map_err(CensusCatalogParseFailure::into_source);
         }
+        if matches!(request.kind(), CensusDiscoveryKind::Geographies { .. }) {
+            return Self::parse_geography_diagnosed(request, bytes, limits)
+                .map_err(CensusGeographyParseFailure::into_source);
+        }
         ensure_body_bound(bytes, limits)?;
         match request.kind() {
             CensusDiscoveryKind::Datasets | CensusDiscoveryKind::VintageDatasets { .. } => {
@@ -187,10 +256,7 @@ impl CensusDiscoveryDocument {
                 limits,
             )
             .map(Self::GroupVariables),
-            CensusDiscoveryKind::Geographies { dataset } => {
-                CensusGeographyCatalog::parse_inner(bytes, dataset.clone(), limits)
-                    .map(Self::Geographies)
-            }
+            CensusDiscoveryKind::Geographies { .. } => Err(CensusAdapterError::InvalidQuery),
         }
     }
 
@@ -213,6 +279,24 @@ impl CensusDiscoveryDocument {
         };
         CensusDatasetCatalog::parse_inner_diagnosed(bytes, expected_vintage, limits)
             .map(Self::Datasets)
+    }
+
+    pub(crate) fn parse_geography_diagnosed(
+        request: &CensusDiscoveryRequest,
+        bytes: &[u8],
+        limits: CensusParseLimits,
+    ) -> Result<Self, CensusGeographyParseFailure> {
+        ensure_body_bound(bytes, limits).map_err(geography_failure(
+            CensusGeographyFailurePredicate::BodyBound,
+        ))?;
+        let CensusDiscoveryKind::Geographies { dataset } = request.kind() else {
+            return Err(CensusGeographyParseFailure::new(
+                CensusAdapterError::InvalidQuery,
+                CensusGeographyFailurePredicate::RequestKind,
+            ));
+        };
+        CensusGeographyCatalog::parse_inner_diagnosed(bytes, dataset.clone(), limits)
+            .map(Self::Geographies)
     }
 }
 
@@ -924,47 +1008,84 @@ impl CensusGeographyAdmission {
 }
 
 impl CensusGeographyCatalog {
-    fn parse_inner(
+    fn parse_inner_diagnosed(
         bytes: &[u8],
         dataset: CensusDataset,
         limits: CensusParseLimits,
-    ) -> Result<Self, CensusAdapterError> {
-        let root = parse_object(bytes)?;
-        let entries = root
-            .get("fips")
-            .and_then(Value::as_array)
-            .ok_or(CensusAdapterError::SchemaDrift)?;
-        ensure_entry_bound(entries.len(), limits)?;
+    ) -> Result<Self, CensusGeographyParseFailure> {
+        let root = parse_object(bytes).map_err(|error| {
+            let predicate = if matches!(error, CensusAdapterError::InvalidJson) {
+                CensusGeographyFailurePredicate::JsonSyntax
+            } else {
+                CensusGeographyFailurePredicate::RootObject
+            };
+            CensusGeographyParseFailure::new(error, predicate)
+        })?;
+        let entries = root.get("fips").and_then(Value::as_array).ok_or_else(|| {
+            CensusGeographyParseFailure::new(
+                CensusAdapterError::SchemaDrift,
+                CensusGeographyFailurePredicate::FipsArray,
+            )
+        })?;
+        ensure_entry_bound(entries.len(), limits).map_err(geography_failure(
+            CensusGeographyFailurePredicate::EntryBound,
+        ))?;
         let mut geographies = Vec::new();
-        geographies
-            .try_reserve_exact(entries.len())
-            .map_err(|_| CensusAdapterError::ResourceLimitExceeded)?;
+        geographies.try_reserve_exact(entries.len()).map_err(|_| {
+            CensusGeographyParseFailure::new(
+                CensusAdapterError::ResourceLimitExceeded,
+                CensusGeographyFailurePredicate::Allocation,
+            )
+        })?;
         let mut identities = BTreeSet::new();
         for entry in entries {
-            let entry = entry.as_object().ok_or(CensusAdapterError::SchemaDrift)?;
-            let name = required_text(entry, "name", limits)?;
-            let geo_level_display = identifier(&required_text(entry, "geoLevelDisplay", limits)?)?;
+            let entry = entry.as_object().ok_or_else(|| {
+                CensusGeographyParseFailure::new(
+                    CensusAdapterError::SchemaDrift,
+                    CensusGeographyFailurePredicate::EntryObject,
+                )
+            })?;
+            let name = required_text(entry, "name", limits)
+                .map_err(geography_failure(CensusGeographyFailurePredicate::Name))?;
+            let geo_level_display = required_text(entry, "geoLevelDisplay", limits)
+                .and_then(|value| identifier(&value))
+                .map_err(geography_failure(
+                    CensusGeographyFailurePredicate::GeoLevelDisplay,
+                ))?;
             if !identities.insert((name.clone(), geo_level_display.clone())) {
-                return Err(CensusAdapterError::DuplicateIdentity);
+                return Err(CensusGeographyParseFailure::new(
+                    CensusAdapterError::DuplicateIdentity,
+                    CensusGeographyFailurePredicate::DuplicateIdentity,
+                ));
             }
-            let requires = optional_string_array(entry, "requires", limits)?;
-            let wildcard = optional_string_array(entry, "wildcard", limits)?;
+            let requires = optional_string_array(entry, "requires", limits)
+                .map_err(geography_failure(CensusGeographyFailurePredicate::Requires))?;
+            let wildcard = optional_string_array(entry, "wildcard", limits)
+                .map_err(geography_failure(CensusGeographyFailurePredicate::Wildcard))?;
             let optional_with_wildcard_for =
-                optional_string_array_or_scalar(entry, "optionalWithWCFor", limits)?;
+                optional_string_array_or_scalar(entry, "optionalWithWCFor", limits).map_err(
+                    geography_failure(CensusGeographyFailurePredicate::OptionalWildcard),
+                )?;
             let required_set = requires.iter().map(String::as_str).collect::<BTreeSet<_>>();
             if wildcard
                 .iter()
                 .chain(&optional_with_wildcard_for)
                 .any(|parent| !required_set.contains(parent.as_str()))
             {
-                return Err(CensusAdapterError::SchemaDrift);
+                return Err(CensusGeographyParseFailure::new(
+                    CensusAdapterError::SchemaDrift,
+                    CensusGeographyFailurePredicate::ParentGrammar,
+                ));
             }
+            let reference_date = optional_text(entry, "referenceDate", limits)
+                .and_then(|value| value.map(|value| parse_date(&value)).transpose())
+                .map_err(geography_failure(
+                    CensusGeographyFailurePredicate::ReferenceDate,
+                ))?;
             geographies.push(CensusGeographyMetadata {
                 name,
                 geo_level_display,
-                reference_date: optional_text(entry, "referenceDate", limits)?
-                    .map(|value| parse_date(&value))
-                    .transpose()?,
+                reference_date,
                 requires,
                 wildcard,
                 optional_with_wildcard_for,
@@ -980,7 +1101,10 @@ impl CensusGeographyCatalog {
                 .iter()
                 .any(|parent| !geography_names.contains(parent.as_str()))
         }) {
-            return Err(CensusAdapterError::MetadataMismatch);
+            return Err(CensusGeographyParseFailure::new(
+                CensusAdapterError::MetadataMismatch,
+                CensusGeographyFailurePredicate::Closure,
+            ));
         }
         geographies.sort_by(|left, right| {
             (&left.geo_level_display, &left.name).cmp(&(&right.geo_level_display, &right.name))
