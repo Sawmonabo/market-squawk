@@ -8,8 +8,9 @@ use std::{
 
 use futures_util::future::BoxFuture;
 use market_squawk_adapter_census::{
-    CENSUS_PROVIDER_SEMANTICS_SCHEMA, CensusDiagnosticJourney, CensusFailureDiagnostic,
-    CensusPublicationCandidate, CensusSource, CensusSourceError, CensusSourceTelemetry,
+    CENSUS_PROVIDER_SEMANTICS_SCHEMA, CensusDiagnosticFailureClass, CensusDiagnosticJourney,
+    CensusFailureDiagnostic, CensusPublicationCandidate, CensusSource, CensusSourceError,
+    CensusSourceTelemetry,
 };
 use market_squawk_data::{
     AnalyticalMacroProviderPeriodLatestKnownOutput,
@@ -24,7 +25,7 @@ use market_squawk_services::{RequestContext, ServiceError};
 use market_squawk_sources::{
     DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionError,
     ExtractionRequest, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
-    ProviderNativeLineageImplementation, SourceMetadata, SourceMetadataProvider,
+    ProviderNativeLineageImplementation, SourceError, SourceMetadata, SourceMetadataProvider,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -211,17 +212,24 @@ impl CensusMacroApplicationClosure {
             )
             .await
             .map_err(|error| {
-                CensusMacroApplicationError::diagnosed_extraction(census, &diagnostic, error)
+                CensusMacroApplicationError::diagnosed_extraction(&diagnostic, error)
             })?;
         let (pending_doctor, doctor_seal) = doctor.into_sealing_parts();
         let raw_seal = CancellationToken::new();
+        diagnostic.enter_doctor_seal();
         let sealed_doctor = self
             .coordinator
             .research
             .seal_provider_capture(doctor_seal, &raw_seal, operation.operation_deadline())
-            .await?;
-        operation.ensure_live()?;
-        let activation = census.activation_candidate(pending_doctor, sealed_doctor)?;
+            .await
+            .map_err(|error| CensusMacroApplicationError::diagnosed_research(&diagnostic, error))?;
+        operation
+            .ensure_live()
+            .map_err(|error| CensusMacroApplicationError::diagnosed_service(&diagnostic, error))?;
+        diagnostic.enter_doctor_activation();
+        let activation = census
+            .activation_candidate(pending_doctor, sealed_doctor)
+            .map_err(|error| CensusMacroApplicationError::diagnosed_adapter(&diagnostic, error))?;
 
         let discovery =
             DiscoveryRequest::try_new(provider_dataset, None, NonZeroU16::MIN, provider_deadline)?;
@@ -235,24 +243,38 @@ impl CensusMacroApplicationClosure {
             )
             .await
             .map_err(|error| {
-                CensusMacroApplicationError::diagnosed_extraction(census, &diagnostic, error)
+                CensusMacroApplicationError::diagnosed_extraction(&diagnostic, error)
             })?;
         let (pending_discovery, graph_seal) = discovered.into_sealing_parts();
         let raw_seal = CancellationToken::new();
+        diagnostic.enter_capture_graph_seal();
         let sealed_graph = self
             .coordinator
             .research
             .seal_provider_capture(graph_seal, &raw_seal, operation.operation_deadline())
-            .await?;
-        operation.ensure_live()?;
+            .await
+            .map_err(|error| CensusMacroApplicationError::diagnosed_research(&diagnostic, error))?;
+        operation
+            .ensure_live()
+            .map_err(|error| CensusMacroApplicationError::diagnosed_service(&diagnostic, error))?;
         diagnostic.enter_sealed_rejoin();
-        let admission = pending_discovery.try_bind_sealed(sealed_graph)?;
+        let admission = pending_discovery
+            .try_bind_sealed(sealed_graph)
+            .map_err(|error| CensusMacroApplicationError::diagnosed_adapter(&diagnostic, error))?;
+        diagnostic.enter_admission_object();
+        let object = admission
+            .object()
+            .map_err(|error| CensusMacroApplicationError::diagnosed_adapter(&diagnostic, error))?;
+        diagnostic.enter_extraction_request();
         let extraction = ExtractionRequest::try_new(
-            admission.object()?.clone(),
+            object.clone(),
             limits.max_records,
             limits.max_bytes,
             provider_deadline,
-        )?;
+        )
+        .map_err(|error| {
+            CensusMacroApplicationError::diagnosed_extraction_contract(&diagnostic, error)
+        })?;
         let extracted = census
             .extract_sealed_discovery(
                 authority,
@@ -263,7 +285,7 @@ impl CensusMacroApplicationClosure {
             )
             .await
             .map_err(|error| {
-                CensusMacroApplicationError::diagnosed_extraction(census, &diagnostic, error)
+                CensusMacroApplicationError::diagnosed_extraction(&diagnostic, error)
             })?;
         let (candidate, telemetry) = extracted.into_parts();
         self.publish_candidate(candidate, telemetry, &operation)
@@ -619,6 +641,45 @@ impl CensusQuarterlyRestartReceipt {
     }
 }
 
+pub(crate) struct CensusDiagnosedError<E> {
+    source: E,
+    diagnostic: CensusFailureDiagnostic,
+}
+
+impl<E> CensusDiagnosedError<E> {
+    fn new(
+        source: E,
+        journey: &CensusDiagnosticJourney,
+        failure_class: CensusDiagnosticFailureClass,
+    ) -> Self {
+        Self {
+            source,
+            diagnostic: journey.freeze_failure(failure_class),
+        }
+    }
+}
+
+impl<E> std::fmt::Debug for CensusDiagnosedError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CensusDiagnosedError")
+            .field("diagnostic", &self.diagnostic)
+            .finish()
+    }
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for CensusDiagnosedError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for CensusDiagnosedError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum CensusMacroApplicationError {
     #[error("Census source or application authority does not match")]
@@ -631,38 +692,107 @@ pub(crate) enum CensusMacroApplicationError {
     RestartInvalid,
     #[error("Census adapter rejected application composition")]
     Adapter(#[from] CensusSourceError),
+    #[error("Census adapter rejected application composition")]
+    DiagnosedAdapter(#[source] CensusDiagnosedError<CensusSourceError>),
     #[error("Census bounded acquisition failed")]
     Extraction(#[from] ExtractionSourceError),
     #[error("Census bounded acquisition failed")]
-    DiagnosedExtraction {
-        #[source]
-        source: ExtractionSourceError,
-        diagnostic: CensusFailureDiagnostic,
-    },
+    DiagnosedExtraction(#[source] CensusDiagnosedError<ExtractionSourceError>),
     #[error("Census extraction request is invalid")]
     ExtractionContract(#[from] ExtractionError),
+    #[error("Census extraction request is invalid")]
+    DiagnosedExtractionContract(#[source] CensusDiagnosedError<ExtractionError>),
     #[error("Census atomic macro publication failed")]
     Ingest(#[from] IngestError),
     #[error("Census runtime generation is invalid")]
     Composition(#[from] ResearchIngestCompositionError),
     #[error("Census application authority is unavailable")]
     Service(#[from] ServiceError),
+    #[error("Census application authority is unavailable")]
+    DiagnosedService(#[source] CensusDiagnosedError<ServiceError>),
     #[error("Census application research composition failed")]
     Research(#[from] ResearchServiceError),
+    #[error("Census application research composition failed")]
+    DiagnosedResearch(#[source] CensusDiagnosedError<ResearchServiceError>),
     #[error("Census quarterly analytical read failed")]
     AnalyticalRead(#[from] AnalyticalReadError),
 }
 
 impl CensusMacroApplicationError {
     fn diagnosed_extraction(
-        census: &CensusSource,
         journey: &CensusDiagnosticJourney,
         source: ExtractionSourceError,
     ) -> Self {
-        Self::DiagnosedExtraction {
+        let failure_class = extraction_failure_class(&source);
+        Self::DiagnosedExtraction(CensusDiagnosedError::new(source, journey, failure_class))
+    }
+
+    fn diagnosed_adapter(journey: &CensusDiagnosticJourney, source: CensusSourceError) -> Self {
+        Self::DiagnosedAdapter(CensusDiagnosedError::new(
             source,
-            diagnostic: census.failure_diagnostic(journey),
+            journey,
+            CensusDiagnosticFailureClass::AdapterContract,
+        ))
+    }
+
+    fn diagnosed_extraction_contract(
+        journey: &CensusDiagnosticJourney,
+        source: ExtractionError,
+    ) -> Self {
+        Self::DiagnosedExtractionContract(CensusDiagnosedError::new(
+            source,
+            journey,
+            CensusDiagnosticFailureClass::ExtractionContract,
+        ))
+    }
+
+    fn diagnosed_research(journey: &CensusDiagnosticJourney, source: ResearchServiceError) -> Self {
+        Self::DiagnosedResearch(CensusDiagnosedError::new(
+            source,
+            journey,
+            CensusDiagnosticFailureClass::CaptureSeal,
+        ))
+    }
+
+    fn diagnosed_service(journey: &CensusDiagnosticJourney, source: ServiceError) -> Self {
+        Self::DiagnosedService(CensusDiagnosedError::new(
+            source,
+            journey,
+            CensusDiagnosticFailureClass::ApplicationAuthority,
+        ))
+    }
+}
+
+fn extraction_failure_class(error: &ExtractionSourceError) -> CensusDiagnosticFailureClass {
+    match error {
+        ExtractionSourceError::Source(error) => source_failure_class(*error),
+        ExtractionSourceError::Contract(_) => CensusDiagnosticFailureClass::ExtractionContract,
+        ExtractionSourceError::Authority(_) => CensusDiagnosticFailureClass::Authority,
+        ExtractionSourceError::DeadlineExceeded => CensusDiagnosticFailureClass::Deadline,
+        ExtractionSourceError::Cancelled => CensusDiagnosticFailureClass::Cancellation,
+    }
+}
+
+fn source_failure_class(error: SourceError) -> CensusDiagnosticFailureClass {
+    match error {
+        SourceError::InvalidProtocolState
+        | SourceError::GenerationResynchronizationRequired
+        | SourceError::FrameIdentityExhausted => CensusDiagnosticFailureClass::Protocol,
+        SourceError::FrameTooLarge { .. }
+        | SourceError::Network
+        | SourceError::ConnectionIdle
+        | SourceError::Sink(_)
+        | SourceError::ProviderUnavailable
+        | SourceError::CaptureNotHealthy => CensusDiagnosticFailureClass::Transport,
+        SourceError::Unauthorized => CensusDiagnosticFailureClass::Authorization,
+        SourceError::Cancelled => CensusDiagnosticFailureClass::Cancellation,
+        SourceError::BudgetWaitUntil { .. } | SourceError::BudgetUnavailable { .. } => {
+            CensusDiagnosticFailureClass::Budget
         }
+        SourceError::SessionNotCurrent
+        | SourceError::GenerationAuthorityMismatch
+        | SourceError::TrustedTimeUnavailable
+        | SourceError::TrustedTimeDiscontinuity => CensusDiagnosticFailureClass::Authority,
     }
 }
 

@@ -588,6 +588,10 @@ pub enum CensusDiagnosticPhase {
     DoctorPreflight,
     /// Credentialed doctor transport and exact response validation.
     DoctorResponse,
+    /// Physical sealing of the exact doctor response.
+    DoctorSeal,
+    /// Post-seal doctor rejoin and activation-candidate construction.
+    DoctorActivation,
     /// Dataset-catalog transport, parsing, and validation.
     MetadataCatalog,
     /// Dataset-group transport, parsing, and validation.
@@ -602,10 +606,43 @@ pub enum CensusDiagnosticPhase {
     DataResponse,
     /// Complete metadata-and-data capture graph and discovered-object construction.
     CaptureGraph,
+    /// Physical sealing of the complete metadata-and-data capture graph.
+    CaptureGraphSeal,
     /// Physical capture receipt rejoin and exact retained-acquisition validation.
     SealedRejoin,
+    /// Admission of the sole sealed discovered object.
+    AdmissionObject,
+    /// Bounded extraction-request construction from that admitted object.
+    ExtractionRequest,
     /// Provider-neutral normalization, lineage, and publication-candidate construction.
     Canonicalize,
+}
+
+/// Closed failure class retained without dynamic error material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CensusDiagnosticFailureClass {
+    /// Provider response or local source protocol invariants failed.
+    Protocol,
+    /// Provider transport or availability failed.
+    Transport,
+    /// Provider credentials were rejected.
+    Authorization,
+    /// Shared provider-budget admission or cooldown prevented progress.
+    Budget,
+    /// The bounded provider operation exceeded its deadline.
+    Deadline,
+    /// The operation was cancelled.
+    Cancellation,
+    /// Registry, generation, or trusted-time authority was unavailable.
+    Authority,
+    /// Provider-specific adapter composition or capture rejoin failed.
+    AdapterContract,
+    /// Shared bounded extraction-contract construction or validation failed.
+    ExtractionContract,
+    /// Physical provider-capture sealing failed.
+    CaptureSeal,
+    /// Application operation authority became unavailable after sealing.
+    ApplicationAuthority,
 }
 
 /// Bounded, payload-free failure evidence for one Census application journey.
@@ -614,7 +651,7 @@ pub struct CensusFailureDiagnostic {
     phase: CensusDiagnosticPhase,
     attempted_requests: u8,
     successful_requests: u8,
-    telemetry: CensusSourceTelemetry,
+    failure_class: CensusDiagnosticFailureClass,
 }
 
 impl CensusFailureDiagnostic {
@@ -633,9 +670,9 @@ impl CensusFailureDiagnostic {
         self.successful_requests
     }
 
-    /// Returns the existing closed source telemetry snapshot at failure.
-    pub const fn telemetry(self) -> CensusSourceTelemetry {
-        self.telemetry
+    /// Returns the closed failure class without retaining dynamic error material.
+    pub const fn failure_class(self) -> CensusDiagnosticFailureClass {
+        self.failure_class
     }
 }
 
@@ -665,6 +702,31 @@ impl CensusDiagnosticJourney {
         self.phase = CensusDiagnosticPhase::SealedRejoin;
     }
 
+    /// Marks physical doctor-response sealing.
+    pub fn enter_doctor_seal(&mut self) {
+        self.phase = CensusDiagnosticPhase::DoctorSeal;
+    }
+
+    /// Marks post-seal doctor activation-candidate construction.
+    pub fn enter_doctor_activation(&mut self) {
+        self.phase = CensusDiagnosticPhase::DoctorActivation;
+    }
+
+    /// Marks physical sealing of the complete provider capture graph.
+    pub fn enter_capture_graph_seal(&mut self) {
+        self.phase = CensusDiagnosticPhase::CaptureGraphSeal;
+    }
+
+    /// Marks retrieval of the sole admitted sealed object.
+    pub fn enter_admission_object(&mut self) {
+        self.phase = CensusDiagnosticPhase::AdmissionObject;
+    }
+
+    /// Marks bounded extraction-request construction.
+    pub fn enter_extraction_request(&mut self) {
+        self.phase = CensusDiagnosticPhase::ExtractionRequest;
+    }
+
     fn enter(&mut self, phase: CensusDiagnosticPhase) {
         self.phase = phase;
     }
@@ -687,12 +749,16 @@ impl CensusDiagnosticJourney {
         Ok(())
     }
 
-    fn failure(&self, telemetry: CensusSourceTelemetry) -> CensusFailureDiagnostic {
+    /// Freezes the current payload-free operation diagnostic.
+    pub fn freeze_failure(
+        &self,
+        failure_class: CensusDiagnosticFailureClass,
+    ) -> CensusFailureDiagnostic {
         CensusFailureDiagnostic {
             phase: self.phase,
             attempted_requests: self.attempted_requests,
             successful_requests: self.successful_requests,
-            telemetry,
+            failure_class,
         }
     }
 }
@@ -1377,11 +1443,6 @@ impl CensusSource {
     /// Returns a lock-free saturating snapshot of cumulative operational accounting.
     pub fn telemetry(&self) -> CensusSourceTelemetry {
         self.telemetry.snapshot()
-    }
-
-    /// Freezes one operation-local, payload-free failure diagnostic.
-    pub fn failure_diagnostic(&self, journey: &CensusDiagnosticJourney) -> CensusFailureDiagnostic {
-        journey.failure(self.telemetry())
     }
 
     /// Returns the storage-safe analytical identity for an admitted provider dataset.
