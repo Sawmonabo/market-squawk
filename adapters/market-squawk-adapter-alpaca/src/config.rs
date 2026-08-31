@@ -592,7 +592,7 @@ impl AlpacaOptionChainConfig {
                 SequenceCapability::Unsupported,
                 ChecksumCapability::Unsupported,
                 HistoricalCapability::None,
-                true,
+                false,
             ),
             SourceProtocolProfile::NotLive,
         ))?;

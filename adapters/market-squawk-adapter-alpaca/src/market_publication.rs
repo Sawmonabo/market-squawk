@@ -109,7 +109,7 @@ impl AlpacaMarketEventSurface {
 
 /// One exact canonical event, provider-native semantic projection, and raw-frame/page coordinate.
 #[derive(Clone, Debug)]
-pub struct AlpacaMarketEventRecord {
+pub(crate) struct AlpacaMarketEventRecord {
     event: MarketEvent,
     native_semantics: Value,
     capture_ordinal: u16,
@@ -118,8 +118,9 @@ pub struct AlpacaMarketEventRecord {
 }
 
 impl AlpacaMarketEventRecord {
-    /// Binds one IEX event to the exact provider identity and venue mapping that decoded it.
-    pub fn try_iex(
+    /// Binds one adapter-decoded IEX event to a mapping admitted by the exact live configuration.
+    pub(crate) fn try_iex(
+        config: &AlpacaIexLiveConfig,
         surface: AlpacaMarketEventSurface,
         mapping: &AlpacaInstrumentMapping,
         event: MarketEvent,
@@ -145,13 +146,21 @@ impl AlpacaMarketEventRecord {
         )
     }
 
-    /// Binds one indicative option event to its exact provider identity and venue mapping.
-    pub fn try_indicative_option(
+    /// Binds one adapter-decoded indicative option event to the exact configured mapping.
+    pub(crate) fn try_indicative_option(
+        config: &AlpacaOptionsLiveConfig,
         mapping: &AlpacaOptionMapping,
         event: MarketEvent,
         native_semantics: Value,
         capture_ordinal: u16,
     ) -> Result<Self, AlpacaError> {
+        if !config
+            .mappings()
+            .iter()
+            .any(|candidate| candidate.provider_coordinate() == mapping.provider_coordinate())
+        {
+            return Err(AlpacaError::Protocol);
+        }
         Self::try_new(
             AlpacaMarketEventSurface::IndicativeOptionsStream,
             mapping.provider_coordinate(),
@@ -206,7 +215,7 @@ pub struct AlpacaPreparedMarketEventPublication {
 
 impl AlpacaPreparedMarketEventPublication {
     /// Prepares an exact IEX snapshot or stream publication under the selected free-IEX profile.
-    pub fn try_iex(
+    pub(crate) fn try_iex(
         config: &AlpacaIexLiveConfig,
         surface: AlpacaMarketEventSurface,
         records: Vec<AlpacaMarketEventRecord>,
@@ -221,7 +230,7 @@ impl AlpacaPreparedMarketEventPublication {
     }
 
     /// Prepares a modified/delayed indicative-options stream publication without OPRA claims.
-    pub fn try_indicative_options(
+    pub(crate) fn try_indicative_options(
         config: &AlpacaOptionsLiveConfig,
         records: Vec<AlpacaMarketEventRecord>,
     ) -> Result<Self, AlpacaError> {

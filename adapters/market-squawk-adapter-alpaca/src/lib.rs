@@ -61,9 +61,7 @@ pub use historical_transport::{
     AlpacaHistoricalScriptedTransportCounters, AlpacaHistoricalScriptedTransportFactory,
 };
 pub use live::{AlpacaIexLiveSource, AlpacaOptionsLiveSource};
-pub use market_publication::{
-    AlpacaMarketEventRecord, AlpacaMarketEventSurface, AlpacaPreparedMarketEventPublication,
-};
+pub use market_publication::{AlpacaMarketEventSurface, AlpacaPreparedMarketEventPublication};
 pub use option_chain::{
     AlpacaOptionChainClient, AlpacaOptionChainContractAuthority,
     AlpacaOptionChainPublicationRequest, AlpacaOptionChainSealRejoin,

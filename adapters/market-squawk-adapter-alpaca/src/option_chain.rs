@@ -929,7 +929,7 @@ fn encode_option_sidecar(
     if metadata.quality_ceiling() != market_squawk_domain::DataQuality::Indicative {
         return Err(AlpacaError::Protocol);
     }
-    let pages = pages
+    let pages: Vec<AlpacaOptionPageEvidenceV1<'_>> = pages
         .iter()
         .map(|page| AlpacaOptionPageEvidenceV1 {
             ordinal: page.ordinal,
@@ -999,7 +999,7 @@ fn capture_material(
         receipts,
     )
     .map_err(|_| AlpacaError::CaptureMaterial)?;
-    let connection_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, capture.observation_digest().bytes());
+    let connection_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, &capture.observation_digest().bytes());
     let source: Arc<str> = Arc::from(metadata.source_id().as_str());
     let mut records = Vec::new();
     records
@@ -1252,7 +1252,7 @@ fn parse_decimal(value: &Number) -> Option<Decimal> {
         .to_string()
         .parse::<Decimal>()
         .ok()
-        .map(Decimal::normalize)
+        .map(|value| value.normalize())
 }
 
 fn validate_token(value: &str) -> Result<(), AlpacaError> {
