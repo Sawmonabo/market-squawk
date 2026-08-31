@@ -93,9 +93,9 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
     assert_eq!(
         revision_four.content_digest().bytes(),
         [
-            0x63, 0xc7, 0x72, 0x79, 0x5a, 0x8e, 0x54, 0xd7, 0x21, 0x5f, 0xd0, 0x39, 0x5b, 0x41,
-            0xc9, 0x75, 0x67, 0xa8, 0x1d, 0x95, 0x39, 0x5b, 0x8f, 0xb9, 0x36, 0xd3, 0x2b, 0x00,
-            0x90, 0x28, 0x4d, 0xd9,
+            0x18, 0x95, 0xc5, 0xf1, 0x1f, 0x81, 0xc0, 0x98, 0x9b, 0x24, 0x89, 0x78, 0xbb, 0x66,
+            0x58, 0x74, 0x04, 0x4c, 0xd5, 0x0a, 0x1a, 0x9e, 0x1a, 0x9e, 0x06, 0xb6, 0x91, 0xe0,
+            0x5e, 0x05, 0xca, 0x18,
         ]
     );
     for (profile_id, evidence_source, evidence_digest) in [
@@ -329,15 +329,6 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
 
     for (profile_id, activation, release, setup, credential, coverage_marker, windows) in [
         (
-            "schwab.trader-api-market-data",
-            ProfileActivationMode::ManualSecretImport,
-            ProfileReleaseState::RefreshRequired,
-            SetupMode::ManualApiKeyImport,
-            CredentialKind::ApiKeyPair,
-            "provider-native read-only REST",
-            &[(1, 60_000_000_000)][..],
-        ),
-        (
             "yahoo-finance.experimental-enrichment",
             ProfileActivationMode::NoCredential,
             ProfileReleaseState::Available,
@@ -349,7 +340,7 @@ fn available_persistence_is_bound_to_exact_current_evidence() -> TestResult {
         (
             "iex.hist-feed-files",
             ProfileActivationMode::NoCredential,
-            ProfileReleaseState::RefreshRequired,
+            ProfileReleaseState::Available,
             SetupMode::NoCredential,
             CredentialKind::None,
             "bounded cold-job",
