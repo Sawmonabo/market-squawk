@@ -602,7 +602,7 @@ impl LiveMarketSource for KrakenSource {
 /// The first validated inbound frame consumes this value and seals it to the exact registry
 /// allocation. No constructor or minting operation is exported from this module.
 #[derive(Debug)]
-struct KrakenWrittenSubscription {
+pub struct KrakenWrittenSubscription {
     source_id: SourceId,
     metadata_revision: MetadataRevision,
     connection_generation: ConnectionGeneration,
@@ -610,7 +610,13 @@ struct KrakenWrittenSubscription {
 }
 
 impl KrakenWrittenSubscription {
-    fn bind_to_frame(
+    /// Seals this one-use successful-write value to the first validated inbound frame from the
+    /// exact registry-issued connection allocation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a different source, metadata revision, or connection generation.
+    pub fn bind_to_frame(
         self,
         frame: &ValidatedRawMarketFrame<'_>,
     ) -> Result<KrakenSentSubscriptionReceipt, KrakenSubscriptionReceiptError> {
@@ -625,6 +631,68 @@ impl KrakenWrittenSubscription {
             binding: binding.clone(),
             request: self.request,
         })
+    }
+}
+
+/// Authenticated L3 sender bound to one actual WebSocket and exact active source generation.
+///
+/// Construction validates the registry authority. Sending consumes the opaque secret-bearing
+/// payload and returns a one-use successful-write value only after the exact socket accepts the
+/// message and the source generation remains current. No generic sink can mint this evidence.
+pub struct KrakenL3EstablishedSessionSender<'a, S> {
+    authority: &'a mut ActiveLiveSourceGeneration,
+    socket: &'a mut WebSocketStream<S>,
+}
+
+impl<S> std::fmt::Debug for KrakenL3EstablishedSessionSender<'_, S> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KrakenL3EstablishedSessionSender")
+            .field("connection_generation", &self.authority.generation())
+            .field("socket", &"[ESTABLISHED WEBSOCKET]")
+            .finish()
+    }
+}
+
+impl<'a, S> KrakenL3EstablishedSessionSender<'a, S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Binds the authenticated sender to one actual WebSocket and registry-issued generation.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the active source generation is no longer current.
+    pub fn try_new(
+        authority: &'a mut ActiveLiveSourceGeneration,
+        socket: &'a mut WebSocketStream<S>,
+    ) -> Result<Self, SourceError> {
+        authority.validate_current()?;
+        Ok(Self { authority, socket })
+    }
+
+    /// Sends one exact authenticated L3 subscription through this established session.
+    ///
+    /// The returned value is not yet a sent receipt: it must be consumed by
+    /// [`KrakenWrittenSubscription::bind_to_frame`] using the first captured and validated
+    /// provider response from the same source generation.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on payload invariants, cancellation, deadline, socket failure, or stale
+    /// generation authority without minting successful-write evidence.
+    pub async fn send_subscription(
+        &mut self,
+        payload: crate::KrakenL3SecretPayload,
+        cancellation: &CancellationToken,
+        deadline: Duration,
+    ) -> Result<KrakenWrittenSubscription, SourceError> {
+        let pending = payload
+            .into_pending_write(self.authority.generation())
+            .map_err(|_error| SourceError::InvalidProtocolState)?;
+        KrakenEstablishedSubscriptionSender::try_new(self.authority, self.socket)?
+            .send(pending, cancellation, deadline)
+            .await
     }
 }
 

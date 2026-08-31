@@ -48,5 +48,6 @@ pub use qualification::{
     KrakenMetadataInput, KrakenQualificationPolicy,
 };
 pub use session::{
-    KrakenHealth, KrakenSentSubscriptionReceipt, KrakenSource, KrakenSubscriptionReceiptError,
+    KrakenHealth, KrakenL3EstablishedSessionSender, KrakenSentSubscriptionReceipt, KrakenSource,
+    KrakenSubscriptionReceiptError, KrakenWrittenSubscription,
 };

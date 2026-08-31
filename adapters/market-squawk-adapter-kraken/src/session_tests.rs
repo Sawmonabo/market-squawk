@@ -32,9 +32,10 @@ use crate::{
     KRAKEN_L3_WEBSOCKET_ENDPOINT, KrakenAuthenticatedDiscontinuity, KrakenBookTransition,
     KrakenChecksumAvailability, KrakenConfig, KrakenControlOrDiscontinuityKind, KrakenDepth,
     KrakenGenerationRetirement, KrakenL3ClientTier, KrakenL3Config, KrakenL3CredentialAuthority,
-    KrakenL3Decoder, KrakenL3DecoderState, KrakenL3Depth, KrakenL3MetadataInput,
-    KrakenL3ProductMapping, KrakenMarketContinuity, KrakenMarketDecoder, KrakenMarketEventHandoff,
-    KrakenMetadataInput, KrakenPublicControl, KrakenSubscriptionRequestEvidence,
+    KrakenL3Decoder, KrakenL3DecoderState, KrakenL3Depth, KrakenL3EstablishedSessionSender,
+    KrakenL3MetadataInput, KrakenL3ProductMapping, KrakenMarketContinuity, KrakenMarketDecoder,
+    KrakenMarketEventHandoff, KrakenMetadataInput, KrakenPublicControl,
+    KrakenSubscriptionRequestEvidence,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -249,18 +250,16 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
     let mut level3_authority = level3_generation.try_start(level3_config.metadata())?;
     let (mut level3_socket, _) =
         tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
-    let level3_request = level3_config
-        .try_subscription_payload(
-            credential_authority
-                .try_mint_subscription_capability("fixture-ephemeral-token".to_owned())?,
-            0,
-            Some(7),
-        )?
-        .into_pending_write(level3_authority.generation())?;
+    let level3_payload = level3_config.try_subscription_payload(
+        credential_authority
+            .try_mint_subscription_capability("fixture-ephemeral-token".to_owned())?,
+        0,
+        Some(7),
+    )?;
     let level3_written =
-        KrakenEstablishedSubscriptionSender::try_new(&mut level3_authority, &mut level3_socket)?
-            .send(
-                level3_request,
+        KrakenL3EstablishedSessionSender::try_new(&mut level3_authority, &mut level3_socket)?
+            .send_subscription(
+                level3_payload,
                 &CancellationToken::new(),
                 Duration::from_secs(1),
             )

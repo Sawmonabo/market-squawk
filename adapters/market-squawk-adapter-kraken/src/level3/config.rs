@@ -149,7 +149,7 @@ impl KrakenL3CredentialAuthority {
     ///
     /// The coordinates are secret-free. Allocation identity, not reconstructable values alone,
     /// binds every capability minted by this authority.
-    pub fn new(
+    pub(crate) fn new(
         credential_record_id: SourceIdentifier,
         authorization_generation: NonZeroU64,
     ) -> Self {
