@@ -1,15 +1,13 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 
-use market_squawk_domain::Timestamp;
 use rust_decimal::Decimal;
 use serde_json::json;
 
 use crate::{
-    BeaCompleteness, BeaCorrectionLedgerInput, BeaCorrectionNotice, BeaDatasetIdentity, BeaError,
-    BeaMetadataGeneration, BeaMetadataRecords, BeaMissingValue, BeaObservationValue,
-    BeaParameterIdentity, BeaQuery, BeaRevisionKind, BeaUserId, parse_data_page,
-    parse_metadata_page,
+    BeaCompleteness, BeaDatasetIdentity, BeaError, BeaMetadataGeneration, BeaMetadataRecords,
+    BeaMissingValue, BeaObservationValue, BeaParameterIdentity, BeaQuery, BeaUserId,
+    parse_data_page, parse_metadata_page,
 };
 
 const USER_ID: &str = "11111111-2222-3333-4444-555555555555";
@@ -93,72 +91,6 @@ fn metadata_and_data_contract_preserves_exact_dimensions_values_notes_and_counts
     assert_eq!(data.receipt().returned_rows(), 2);
     assert_eq!(data.receipt().missing_rows(), Some(0));
     assert_eq!(data.receipt().completeness(), BeaCompleteness::Complete);
-    Ok(())
-}
-
-#[test]
-fn correction_ledger_requires_explicit_notice_and_keeps_predecessor_immutable()
--> Result<(), Box<dyn Error>> {
-    let user_id = BeaUserId::try_new(USER_ID.to_owned())?;
-    let dataset = BeaDatasetIdentity::try_new("Regional")?;
-    let generation = BeaMetadataGeneration::from_response_digests(&[[7; 32]])?;
-    let request = data_request(dataset, generation, Some(2))?;
-    let original_response = data_response("45,359", "44,000", "2026-03-25T19:25:39.113")?;
-    let corrected_response = data_response("45,400", "44,000", "2026-04-01T12:00:00.000")?;
-    let original_page = parse_data_page(
-        &original_response,
-        &request,
-        &user_id,
-        crate::BeaParseLimits::production_defaults(),
-    )?;
-    let corrected_page = parse_data_page(
-        &corrected_response,
-        &request,
-        &user_id,
-        crate::BeaParseLimits::production_defaults(),
-    )?;
-    let original_observed_at = Timestamp::from_unix_nanos(1_800_000_000_000_000_000);
-    let corrected_observed_at = Timestamp::from_unix_nanos(1_800_000_002_000_000_000);
-    let predecessor =
-        crate::BeaObservedVersion::try_from_page(&original_page, 0, original_observed_at)?;
-    let successor =
-        crate::BeaObservedVersion::try_from_page(&corrected_page, 0, corrected_observed_at)?;
-    let notice = BeaCorrectionNotice::try_new(
-        "bea-correction-2026-04-01",
-        [9; 32],
-        predecessor.series_digest(),
-        Timestamp::from_unix_nanos(1_800_000_001_000_000_000),
-        Timestamp::from_unix_nanos(1_800_000_001_100_000_000),
-    )?;
-
-    let unresolved =
-        BeaCorrectionLedgerInput::unresolved_correction(predecessor.clone(), notice.clone())?;
-    assert!(matches!(
-        unresolved,
-        BeaCorrectionLedgerInput::UnresolvedCorrection { .. }
-    ));
-    let correction = BeaCorrectionLedgerInput::revision(
-        predecessor.clone(),
-        successor.clone(),
-        BeaRevisionKind::Correction,
-        Some(notice.clone()),
-    )?;
-    assert!(matches!(
-        correction,
-        BeaCorrectionLedgerInput::Revision {
-            kind: BeaRevisionKind::Correction,
-            ..
-        }
-    ));
-    assert!(
-        BeaCorrectionLedgerInput::revision(
-            predecessor,
-            successor,
-            BeaRevisionKind::ScheduledRevision,
-            Some(notice),
-        )
-        .is_err()
-    );
     Ok(())
 }
 

@@ -101,12 +101,12 @@ impl BeaPublicationRejoinCoordinates {
         self.doctor_sealed_graph_digest
     }
 
-    /// Returns the physical request graph containing these canonical rows.
+    /// Returns the aggregate commitment joining metadata admission and observation seal.
     pub const fn acquisition_sealed_graph_digest(&self) -> EvidenceDigest {
         self.acquisition_sealed_graph_digest
     }
 
-    /// Returns the shared seal receipt for the complete acquisition graph.
+    /// Returns the shared seal receipt for the standalone observation response.
     pub const fn acquisition_capture_receipt_digest(&self) -> EvidenceDigest {
         self.acquisition_capture_receipt_digest
     }
@@ -116,7 +116,7 @@ impl BeaPublicationRejoinCoordinates {
         self.acquisition_physical_receipt_digest
     }
 
-    /// Returns the graph component containing the exact `GetData` response.
+    /// Returns the page ordinal containing the exact standalone `GetData` response.
     pub const fn data_component_ordinal(&self) -> u16 {
         self.data_component_ordinal
     }
@@ -271,21 +271,20 @@ impl BeaPublicationCandidate {
         if capture_token.persisted_receipt() != sealed_acquisition.sealed_capture() {
             return Err(BeaPublicationError::InvalidAuthority);
         }
-        let data_component = capture_token
-            .persisted_receipt()
-            .capture()
-            .request_graph_components()
-            .get(usize::from(coordinates.data_component_ordinal))
-            .ok_or(BeaPublicationError::InvalidEvidence)?;
-        if data_component.page_count().get() != 1 {
+        let data_capture = capture_token.persisted_receipt().capture();
+        if coordinates.data_component_ordinal != 0
+            || !data_capture.request_graph_components().is_empty()
+            || data_capture.pages().len() != 1
+        {
             return Err(BeaPublicationError::InvalidEvidence);
         }
+        let data_page_ordinal = data_capture.pages()[0].ordinal();
         let mut row_capture_page_ordinals = Vec::new();
         row_capture_page_ordinals
             .try_reserve_exact(canonical_batch.records().len())
             .map_err(|_| BeaPublicationError::InvalidEvidence)?;
         row_capture_page_ordinals.extend(std::iter::repeat_n(
-            data_component.first_page_ordinal(),
+            data_page_ordinal,
             canonical_batch.records().len(),
         ));
         let sealed_capture_binding = SealedProviderCaptureBinding::try_whole(
@@ -453,9 +452,6 @@ struct BeaNativeLineageRowV1<'a> {
     unit_multiplier: i16,
     note_references: &'a [String],
     notes: Vec<BeaNativeNoteV1<'a>>,
-    revision_state: &'static str,
-    correction_state: &'static str,
-    supersession_state: &'static str,
 }
 
 #[derive(Serialize)]
@@ -477,9 +473,6 @@ struct BeaNativeLineageBatchV1<'a> {
     returned_rows: u64,
     missing_rows: Option<u64>,
     completeness: &'static str,
-    revision_state: &'static str,
-    correction_state: &'static str,
-    supersession_state: &'static str,
 }
 
 #[derive(Serialize)]
@@ -599,9 +592,6 @@ fn native_lineage(
                 crate::BeaCompleteness::Partial => "partial",
                 crate::BeaCompleteness::ExpectedCountUnknown => "expected_count_unknown",
             },
-            revision_state: crate::revision::BEA_REVISION_STATE,
-            correction_state: crate::revision::BEA_CORRECTION_STATE,
-            supersession_state: crate::revision::BEA_SUPERSESSION_STATE,
         })
         .map_err(|_| BeaPublicationError::InvalidEvidence)?;
     for observation in page.observations() {
@@ -657,9 +647,6 @@ fn native_lineage(
                 unit_multiplier: observation.unit().unit_multiplier(),
                 note_references: observation.note_references(),
                 notes,
-                revision_state: crate::revision::BEA_REVISION_STATE,
-                correction_state: crate::revision::BEA_CORRECTION_STATE,
-                supersession_state: crate::revision::BEA_SUPERSESSION_STATE,
             })
             .map_err(|_| BeaPublicationError::InvalidEvidence)?;
     }

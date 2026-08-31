@@ -29,7 +29,7 @@ pub use binding::{BeaSourceBinding, BeaSourceBindingError};
 pub use canonical::{BeaCanonicalError, BeaCanonicalObservation};
 pub use doctor::{
     BEA_DOCTOR_ADMISSION_VALIDITY_NANOS, BeaDoctorAdmissionEvidence, BeaDoctorError,
-    BeaDoctorPageEvidence, BeaDoctorReceipt, BeaDoctorRun, BeaSealedDoctorRun,
+    BeaDoctorPageEvidence, BeaDoctorReceipt, BeaDoctorRun,
 };
 pub use error::{BeaError, BeaProviderError};
 pub use model::{
@@ -59,17 +59,15 @@ pub use quota::{
     BeaProviderQuotaDeclaration, BeaQuotaDeclarationError, BeaQuotaWindowDeclaration,
     BeaRequiredSharedSettlement, bea_provider_quota_declaration,
 };
-pub use revision::{
-    BeaCorrectionLedgerInput, BeaCorrectionNotice, BeaObservedVersion, BeaRevisionKind,
-};
+pub use revision::BeaObservedVersion;
 pub use sealed::{
     BeaPendingDiscoverySeal, BeaSealedAcquisitionError, BeaSealedAcquisitionReceipt,
     BeaSealedDiscoveryAdmission,
 };
 pub use source::{
     BEA_NATIVE_EXTRACTION_SCHEMA, BeaCapturedDataPage, BeaCapturedDiscovery,
-    BeaCapturedMetadataPage, BeaDataEvidencePage, BeaDatasetAcquisition, BeaDatasetContract,
-    BeaDatasetEvidence, BeaDoctorRefreshDisposition, BeaMetadataBundle, BeaMetadataEvidenceBundle,
+    BeaCapturedMetadataPage, BeaDataEvidencePage, BeaDatasetContract, BeaDatasetEvidence,
+    BeaDoctorRefreshDisposition, BeaMetadataBundle, BeaMetadataEvidenceBundle,
     BeaMetadataEvidencePage, BeaResponseTelemetry, BeaSource, BeaSourceConfig, BeaSourceError,
     BeaSourceTelemetry, MAX_BEA_CONFIGURED_DATASETS, bea_api_endpoint_rule,
     bea_provider_rate_declaration,

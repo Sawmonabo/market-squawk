@@ -221,6 +221,28 @@ const PROVIDER_COPY = Object.freeze({
       submitLabel: 'Verify renewed BLS registration'
     }
   },
+  'bea.api-data': {
+    mark: 'BEA',
+    name: 'Bureau of Economic Analysis',
+    purpose: 'Official state income and population history for economic research.',
+    examples: ['Personal income by state', 'Population by state', 'Income per person by state'],
+    goals: ['economy'],
+    effort: 'About 2 minutes',
+    access: 'Free API key',
+    account:
+      'A free BEA API user ID provides access. Market Squawk stores it in the protected local credential store and connects only the selected research dataset.',
+    handoffUrl: 'https://apps.bea.gov/API/signup/',
+    handoffInstruction:
+      'Request a free BEA API user ID, then return here without pasting it into chat.',
+    setupSteps: [
+      'Request a free user ID on the official BEA API page.',
+      'Choose the state-level economic measure you want to connect first.',
+      'Return here and submit the user ID once.',
+      'Market Squawk verifies the selection and saves it locally.'
+    ],
+    credentialLabel: 'BEA API user ID',
+    submitLabel: 'Save BEA user ID and activate'
+  },
   'treasury.daily-rates-xml': {
     mark: 'UST',
     name: 'U.S. Treasury rates',
@@ -1420,6 +1442,9 @@ function buildConfiguration(profile, advanced) {
   if (profile.id === 'bls.v1-unregistered' || profile.id === 'bls.v2-registered') {
     return blsConfiguration(advanced);
   }
+  if (profile.id === 'bea.api-data') {
+    return beaConfiguration();
+  }
   if (profile.id === 'treasury.daily-rates-xml') {
     return treasuryDailyConfiguration();
   }
@@ -1427,6 +1452,40 @@ function buildConfiguration(profile, advanced) {
     return treasuryFiscalConfiguration();
   }
   return null;
+}
+
+function beaConfiguration() {
+  const root = element('fieldset');
+  root.append(
+    element('legend', 'field-label', 'State economic history'),
+    element(
+      'p',
+      'field-hint',
+      'Choose one official state-level measure. You can change the saved selection later in Settings.'
+    )
+  );
+  const dataset = selectField('Measure', 'bea-regional-dataset', [
+    [
+      'bea:data-v1:f7050950d44163dae8a6a0131a512385450d0a904a8fb740edb73c03b04c615c',
+      'Income per person by state'
+    ],
+    [
+      'bea:data-v1:fe0977c3a6ebe67021cf5bad9ff53f16a060d183fe1faf991b67ff1cae3944b6',
+      'Personal income by state'
+    ],
+    [
+      'bea:data-v1:4161ef243b45b4406975b2c773173ccc45a258971ff08c32fd16233cfb95f152',
+      'Population by state'
+    ]
+  ]);
+  root.append(dataset.root);
+  return {
+    root,
+    read: () => {
+      requireFields([dataset]);
+      return {kind: 'bea_regional', provider_dataset: dataset.input.value};
+    }
+  };
 }
 
 function staticConfiguration(request) {

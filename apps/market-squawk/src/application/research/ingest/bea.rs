@@ -15,8 +15,8 @@ use std::{
 use futures_util::future::BoxFuture;
 use market_squawk_adapter_bea::{
     BeaDoctorAdmissionEvidence, BeaDoctorRefreshDisposition, BeaProviderQuotaDeclaration,
-    BeaPublicationCandidate, BeaPublicationError, BeaRequiredSharedSettlement,
-    BeaSealedDiscoveryAdmission, BeaSource, BeaSourceError,
+    BeaPublicationCandidate, BeaPublicationError, BeaRequiredSharedSettlement, BeaSource,
+    BeaSourceError,
 };
 use market_squawk_data::{
     AnalyticalMacroProviderPeriodLatestKnownOutput,
@@ -283,7 +283,7 @@ impl BeaMacroApplicationClosure {
         authority: &ExtractionAuthority,
         provider_dataset: &SourceIdentifier,
         doctor_deadline: Timestamp,
-        publication_deadline: Timestamp,
+        required_through: Timestamp,
         seal_deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<BeaDoctorActivationState, BeaMacroApplicationError> {
@@ -291,6 +291,16 @@ impl BeaMacroApplicationClosure {
         if !complete_shared_quota_declaration(quota) {
             return Ok(BeaDoctorActivationState::Unavailable(
                 BeaUnavailableDto::invalid_quota(quota),
+            ));
+        }
+        if let Some(admission) =
+            source.current_doctor_admission(provider_dataset, required_through)?
+        {
+            return Ok(BeaDoctorActivationState::Available(
+                BeaDoctorActivationDto {
+                    admission,
+                    refresh: BeaDoctorRefreshDisposition::ReusedCurrent,
+                },
             ));
         }
         let doctor = source
@@ -312,30 +322,15 @@ impl BeaMacroApplicationClosure {
             .research
             .seal_provider_capture(seal_request, &raw_seal, seal_deadline)
             .await?;
-        let sealed = pending.try_rejoin_for_publication(source.source_binding(), sealed)?;
-        let discovery = DiscoveryRequest::try_new(
-            provider_dataset.clone(),
-            None,
-            NonZeroU16::MIN,
-            publication_deadline,
-        )?;
-        let (admission, discovery, refresh) = source.activate_sealed_doctor_for_publication(
-            authority,
-            discovery,
-            sealed,
-            &cancellation,
-        )?;
+        let admission = Arc::new(pending.try_rejoin(source.source_binding(), sealed)?);
         if admission.quota_declaration_digest() != quota.declaration_digest()
             || admission.doctor_receipt_digest() != doctor_receipt_digest
         {
             return Err(BeaMacroApplicationError::DoctorAuthorityMismatch);
         }
+        let refresh = source.activate_doctor(Arc::clone(&admission))?;
         Ok(BeaDoctorActivationState::Available(
-            BeaDoctorActivationDto {
-                admission,
-                discovery,
-                refresh,
-            },
+            BeaDoctorActivationDto { admission, refresh },
         ))
     }
 
@@ -452,10 +447,10 @@ pub(crate) struct BeaRegionalLiveRuntime {
 impl BeaRegionalLiveRuntime {
     /// Runs one complete bounded Regional producer-to-consumer journey.
     ///
-    /// Metadata and data requests use only the registry-minted extraction authority. The sealed
-    /// doctor graph is consumed directly as the publication graph, so one bounded provider
-    /// acquisition authorizes exactly one publication. Canonicalization remains adapter-owned, so
-    /// provider publication, effective, availability, and receipt clocks pass through unchanged.
+    /// Metadata and data requests use only the registry-minted extraction authority. A current
+    /// sealed metadata admission is reused without a provider call; each publication then acquires
+    /// and seals exactly one fresh observation response. Canonicalization remains adapter-owned,
+    /// so provider publication, effective, availability, and receipt clocks pass through unchanged.
     /// Success is returned
     /// only after the exact immutable manifest reopens and its provider-period PIT read completes.
     pub(crate) async fn publish_and_read(
@@ -501,9 +496,33 @@ impl BeaRegionalLiveRuntime {
         {
             return Err(BeaLivePublicationError::SourceGenerationMismatch);
         }
-        let (admission, refresh) = doctor.into_publication_parts();
+        let (doctor_admission, refresh) = doctor.into_parts();
         operation.ensure_live()?;
         ensure_not_cancelled(&cancellation)?;
+        let discovery_request = DiscoveryRequest::try_new(
+            request.provider_dataset.clone(),
+            None,
+            NonZeroU16::MIN,
+            acquisition_deadline,
+        )?;
+        let discovered = self
+            .source
+            .discover_captured(
+                operation.extraction(),
+                discovery_request,
+                cancellation.clone(),
+            )
+            .await?;
+        let (pending_discovery, seal_request) = discovered.into_sealing_parts()?;
+        // The provider response completed before this point. Preserve its exact raw evidence even
+        // when caller cancellation races the bounded physical seal.
+        let raw_seal = CancellationToken::new();
+        let sealed = self
+            .coordinator
+            .research
+            .seal_provider_capture(seal_request, &raw_seal, seal_deadline)
+            .await?;
+        let admission = pending_discovery.try_rejoin(sealed)?;
         operation.ensure_live()?;
         ensure_not_cancelled(&cancellation)?;
         let object = match admission.batch().objects() {
@@ -522,6 +541,11 @@ impl BeaRegionalLiveRuntime {
             admission,
             cancellation.clone(),
         )?;
+        if doctor_admission.admission_digest()
+            != candidate.rejoin_coordinates().doctor_admission_digest()
+        {
+            return Err(BeaLivePublicationError::CandidateMismatch);
+        }
         validate_candidate_authority(
             self.source.as_ref(),
             &self.generation,
@@ -995,7 +1019,6 @@ pub(crate) enum BeaDoctorActivationState {
 #[derive(Debug)]
 pub(crate) struct BeaDoctorActivationDto {
     admission: Arc<BeaDoctorAdmissionEvidence>,
-    discovery: BeaSealedDiscoveryAdmission,
     refresh: BeaDoctorRefreshDisposition,
 }
 
@@ -1015,11 +1038,11 @@ impl BeaDoctorActivationDto {
         self.admission.doctor_receipt_digest()
     }
 
-    /// Consumes the linear sealed observations into their sole publication continuation.
-    pub(crate) fn into_publication_parts(
+    /// Consumes the current metadata admission and its explicit refresh disposition.
+    pub(crate) fn into_parts(
         self,
-    ) -> (BeaSealedDiscoveryAdmission, BeaDoctorRefreshDisposition) {
-        (self.discovery, self.refresh)
+    ) -> (Arc<BeaDoctorAdmissionEvidence>, BeaDoctorRefreshDisposition) {
+        (self.admission, self.refresh)
     }
 }
 

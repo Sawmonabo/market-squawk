@@ -349,6 +349,11 @@ pub enum ProviderPortalActivationRequest {
         /// Inclusive final observation year.
         end_year: u16,
     },
+    /// BEA Regional state-income research using one exact application-admitted profile.
+    BeaRegional {
+        /// Exact provider dataset identity selected from the bounded Settings catalog.
+        provider_dataset: SourceIdentifier,
+    },
     /// Treasury Fiscal Data average-interest-rate query.
     TreasuryFiscal {
         /// Inclusive first record date.

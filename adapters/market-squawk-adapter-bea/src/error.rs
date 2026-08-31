@@ -82,7 +82,7 @@ pub enum BeaError {
     /// A provider time period is outside the closed annual/quarterly/monthly contract.
     #[error("invalid BEA time period")]
     InvalidTimePeriod,
-    /// A release/revision/correction event violates append-only predecessor semantics.
-    #[error("invalid BEA correction or revision evidence")]
+    /// A locally observed row version violates its immutable evidence contract.
+    #[error("invalid BEA row-version evidence")]
     InvalidRevision,
 }

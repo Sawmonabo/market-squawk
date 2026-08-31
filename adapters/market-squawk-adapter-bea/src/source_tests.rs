@@ -238,10 +238,8 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             .as_ref()
             .is_some_and(BeaSensitiveHeader::is_zeroized)
     );
-    let mut scripted_responses = upstream_responses.clone();
-    scripted_responses.extend(upstream_responses.iter().cloned());
     let transport = Arc::new(ScriptedTransport {
-        responses: Mutex::new(VecDeque::from(scripted_responses)),
+        responses: Mutex::new(VecDeque::from(upstream_responses.clone())),
     });
     let now = system_timestamp()?;
     let metadata = source_metadata(now, &config)?;
@@ -286,63 +284,18 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             CancellationToken::new(),
         )
         .await?;
-    let acquisition = run.acquisition();
-
-    assert_eq!(acquisition.metadata().pages().len(), 3);
-    assert_eq!(acquisition.data().page().observations().len(), 1);
-    assert_eq!(
-        acquisition.data().request().query().supplied_parameters(),
-        &BTreeMap::from([(
-            crate::BeaParameterIdentity::try_new("TableName")?,
-            "SAINC1".to_owned(),
-        )])
-    );
-    assert_eq!(
-        acquisition.data().page().observations()[0]
-            .identity()
-            .table(),
-        Some("SAINC1")
-    );
-    assert!(matches!(
-        acquisition.data().page().observations()[0].value(),
-        BeaObservationValue::Missing(crate::BeaMissingValue::SuppressedRegional)
-    ));
-    for (captured, upstream) in acquisition
-        .metadata()
-        .pages()
-        .iter()
-        .zip(upstream_responses.iter())
-    {
+    assert_eq!(run.metadata().pages().len(), 3);
+    for (captured, upstream) in run.metadata().pages().iter().zip(&upstream_responses) {
         assert_secret_free_capture(captured.page().receipt(), captured.material(), upstream)?;
     }
-    let data_material = acquisition.data().material();
-    assert_secret_free_capture(
-        acquisition.data().page().receipt(),
-        data_material,
-        upstream_responses.last().ok_or("missing data response")?,
-    )?;
-    assert_eq!(data_material.receipt().pages().len(), 1);
-    assert_eq!(data_material.records().len(), 1);
+    assert_eq!(source.telemetry().requests(), 3);
+    assert_eq!(source.telemetry().successful_responses(), 3);
+    assert_eq!(source.telemetry().returned_rows(), 0);
+    assert_eq!(run.receipt().request_count(), 3);
+    assert_eq!(run.receipt().metadata_rows(), 3);
     assert_eq!(
-        u64::try_from(data_material.records()[0].payload().len())?,
-        data_material.receipt().total_body_bytes()
-    );
-    assert_eq!(source.telemetry().requests(), 4);
-    assert_eq!(source.telemetry().successful_responses(), 4);
-    assert_eq!(source.telemetry().returned_rows(), 1);
-    assert_eq!(run.receipt().request_count(), 4);
-    assert_eq!(run.receipt().returned_rows(), 1);
-    let provider_production_time = acquisition
-        .data()
-        .page()
-        .production_time()
-        .ok_or("missing provider production time")?
-        .timestamp();
-    let received_at = data_material.receipt().pages()[0].received_at();
-    assert!(provider_production_time <= received_at);
-    assert_eq!(
-        run.receipt().source_production_time(),
-        Some(provider_production_time)
+        run.receipt().metadata_completeness(),
+        BeaCompleteness::Complete
     );
     assert!(!format!("{source:?}").contains(USER_ID));
     assert!(!format!("{run:?}").contains(USER_ID));
@@ -381,6 +334,44 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
             CancellationToken::new(),
         )
         .await?;
+    assert_eq!(discovery.data().page().observations().len(), 1);
+    assert_eq!(
+        discovery.data().request().query().supplied_parameters(),
+        &BTreeMap::from([(
+            crate::BeaParameterIdentity::try_new("TableName")?,
+            "SAINC1".to_owned(),
+        )])
+    );
+    assert_eq!(
+        discovery.data().page().observations()[0].identity().table(),
+        Some("SAINC1")
+    );
+    assert!(matches!(
+        discovery.data().page().observations()[0].value(),
+        BeaObservationValue::Missing(crate::BeaMissingValue::SuppressedRegional)
+    ));
+    let data_material = discovery.data().material();
+    assert_secret_free_capture(
+        discovery.data().page().receipt(),
+        data_material,
+        upstream_responses.last().ok_or("missing data response")?,
+    )?;
+    assert_eq!(data_material.receipt().pages().len(), 1);
+    assert_eq!(data_material.records().len(), 1);
+    assert_eq!(
+        u64::try_from(data_material.records()[0].payload().len())?,
+        data_material.receipt().total_body_bytes()
+    );
+    let provider_production_time = discovery
+        .data()
+        .page()
+        .production_time()
+        .ok_or("missing provider production time")?
+        .timestamp();
+    assert!(provider_production_time <= data_material.receipt().pages()[0].received_at());
+    assert_eq!(source.telemetry().requests(), 4);
+    assert_eq!(source.telemetry().successful_responses(), 4);
+    assert_eq!(source.telemetry().returned_rows(), 1);
     let (pending_discovery, discovery_seal_request) = discovery.into_sealing_parts()?;
     let sealed_discovery = pending_discovery.try_rejoin(discovery_seal_request.seal(&store)?)?;
     let discovered_object = sealed_discovery
@@ -398,7 +389,7 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     let expected_object_id = extraction_request.object().object_id().clone();
     let discovery_capture_identity = extraction_request.object().capture_identity();
     let requests_before_extraction = source.telemetry().requests();
-    assert_eq!(requests_before_extraction, 8);
+    assert_eq!(requests_before_extraction, 4);
     let candidate = source.extract_sealed_discovery(
         authority.clone(),
         extraction_request,
@@ -471,15 +462,12 @@ async fn metadata_first_transport_retains_exact_capture_material_and_completenes
     let (coordinates, revision_plan, sealed_capture_binding) = handoff.into_parts();
     let batch = sealed_capture_binding.batch();
     let native_lineage = sealed_capture_binding.native_lineage();
-    assert_eq!(
-        sealed_capture_binding
-            .persisted_segment_receipt(0)
-            .ok_or("missing sealed BEA discovery graph")?
-            .capture()
-            .request_graph_components()
-            .len(),
-        4
-    );
+    let data_capture = sealed_capture_binding
+        .persisted_segment_receipt(0)
+        .ok_or("missing sealed BEA observation response")?
+        .capture();
+    assert!(data_capture.request_graph_components().is_empty());
+    assert_eq!(data_capture.pages().len(), 1);
     assert_eq!(
         coordinates.acquisition_capture_receipt_digest(),
         sealed_capture_binding.sealed_capture_receipt_digest()

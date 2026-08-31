@@ -71,7 +71,7 @@ use crate::provider_activation::{
     BEA_SOURCE_ID, BEA_SURFACE, BeaAdapterActivation, BoardAdapterActivation,
     CommittedProviderAdapterReplacement, ControlledLocalFileAdapterActivation,
     PreparedProviderAdapterReplacement, TiingoAdapterActivation, YahooAdapterActivation,
-    fixed_regional_source_config,
+    selected_regional_source_config,
 };
 use crate::provider_onboarding::SecCikInput;
 use crate::provider_onboarding::{
@@ -1003,6 +1003,37 @@ async fn publish_research_activation(
         .await
     {
         Ok(outcome) => outcome,
+        Err(error) if bea_activation_remains_resumable(surface_id, &error) => {
+            let desired = match state.promote_staged_recipe(surface_id, published) {
+                Ok(desired) => desired,
+                Err(_error) => {
+                    quarantine_failed_candidate(
+                        state,
+                        onboarding,
+                        surface_id,
+                        lease.session_id(),
+                        published,
+                        DurableActivationQuarantineReason::StateInvalid,
+                    )?;
+                    return Err(CliProviderActivationError::StateUnavailable);
+                }
+            };
+            if desired != candidate_state_digest {
+                quarantine_failed_candidate(
+                    state,
+                    onboarding,
+                    surface_id,
+                    lease.session_id(),
+                    desired,
+                    DurableActivationQuarantineReason::StateInvalid,
+                )?;
+                return Err(CliProviderActivationError::StateUnavailable);
+            }
+            state
+                .reconcile_evidence_objects()
+                .map_err(|_error| CliProviderActivationError::StateUnavailable)?;
+            return Err(CliProviderActivationError::Activation(error));
+        }
         Err(error) => {
             quarantine_failed_candidate(
                 state,
@@ -2437,7 +2468,8 @@ fn restore_prepared_research_provider(
 fn recovery_requires_explicit_resume(error: &ProviderAdapterActivationError) -> bool {
     matches!(
         error,
-        ProviderAdapterActivationError::ExplicitResumeRequired
+        ProviderAdapterActivationError::Cancelled
+            | ProviderAdapterActivationError::ExplicitResumeRequired
             | ProviderAdapterActivationError::Onboarding(
                 ProviderOnboardingError::SecretOperationUnavailable
                     | ProviderOnboardingError::OperationCancelled
@@ -2454,6 +2486,13 @@ fn recovery_requires_explicit_resume(error: &ProviderAdapterActivationError) -> 
                 | LocalSecretStoreError::DeadlineExceeded
         ))
     )
+}
+
+fn bea_activation_remains_resumable(
+    surface_id: &str,
+    error: &ProviderAdapterActivationError,
+) -> bool {
+    surface_id == BEA_SURFACE && recovery_requires_explicit_resume(error)
 }
 
 fn quarantine_failed_replacement_recovery(
@@ -2667,15 +2706,9 @@ fn build_research_activation(
                     .map_err(|_error| CliProviderActivationError::ProviderConfiguration)?,
             )
         }
-        ProviderRequest::BeaRegional => {
-            let config = fixed_regional_source_config()
+        ProviderRequest::BeaRegional { provider_dataset } => {
+            let config = selected_regional_source_config(&provider_dataset)
                 .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
-            let provider_dataset = config
-                .contracts()
-                .first()
-                .filter(|_| config.contracts().len() == 1)
-                .map(|contract| contract.dataset_id().clone())
-                .ok_or(CliProviderActivationError::ProviderConfiguration)?;
             let metadata = bea_metadata(lease, activation_evidence, metadata_effective, &config)?;
             ProviderAdapterActivationRequest::Bea(BeaAdapterActivation::new(
                 metadata,
@@ -2861,7 +2894,9 @@ enum ProviderRequest {
         start_year: u16,
         end_year: u16,
     },
-    BeaRegional,
+    BeaRegional {
+        provider_dataset: SourceIdentifier,
+    },
     TreasuryFiscal {
         first_record_date: CalendarDate,
         last_record_date: CalendarDate,
@@ -2904,7 +2939,7 @@ impl ProviderRequest {
         match self {
             Self::Sec { .. } => ProviderSurface::Exact(SEC_EDGAR_PROFILE_ID),
             Self::Bls { .. } => ProviderSurface::Either(BLS_PUBLIC_SURFACE, BLS_REGISTERED_SURFACE),
-            Self::BeaRegional => ProviderSurface::Exact(BEA_SURFACE),
+            Self::BeaRegional { .. } => ProviderSurface::Exact(BEA_SURFACE),
             Self::TreasuryFiscal { .. } => ProviderSurface::Exact(TREASURY_FISCAL_SURFACE),
             Self::TreasuryDailyRates => ProviderSurface::Exact(TREASURY_XML_SURFACE),
             Self::FredAlfred { .. } => ProviderSurface::Exact(FRED_SURFACE),
@@ -3084,6 +3119,17 @@ fn portal_provider_request(
                     end_year,
                 },
                 LoadedActivationEvidence { objects },
+            ))
+        }
+        ProviderPortalActivationRequest::BeaRegional { provider_dataset } => {
+            require_surface(lease, ProviderSurface::Exact(BEA_SURFACE))?;
+            selected_regional_source_config(&provider_dataset)
+                .map_err(|_| CliProviderActivationError::ProviderConfiguration)?;
+            Ok((
+                ProviderRequest::BeaRegional { provider_dataset },
+                LoadedActivationEvidence {
+                    objects: BTreeMap::new(),
+                },
             ))
         }
         ProviderPortalActivationRequest::FredAlfred { provider_dataset } => {
@@ -3458,7 +3504,7 @@ fn evidence_references(
         }
         ProviderRequest::TreasuryFiscal { .. }
         | ProviderRequest::TreasuryDailyRates
-        | ProviderRequest::BeaRegional
+        | ProviderRequest::BeaRegional { .. }
         | ProviderRequest::FederalReserveBoardH15
         | ProviderRequest::YahooEnrichment
         | ProviderRequest::TiingoStarterEodNav
@@ -3560,7 +3606,7 @@ fn decode_request(bytes: &[u8]) -> Result<ActivationRequest, CliProviderActivati
                 || matches!(
                     &request.provider,
                     ProviderRequest::FredAlfred { .. }
-                        | ProviderRequest::BeaRegional
+                        | ProviderRequest::BeaRegional { .. }
                         | ProviderRequest::YahooEnrichment
                         | ProviderRequest::TiingoStarterEodNav
                 )
@@ -3577,7 +3623,7 @@ fn decode_request(bytes: &[u8]) -> Result<ActivationRequest, CliProviderActivati
                 || matches!(
                     &request.provider,
                     ProviderRequest::FredAlfred { .. }
-                        | ProviderRequest::BeaRegional
+                        | ProviderRequest::BeaRegional { .. }
                         | ProviderRequest::FederalReserveBoardH15
                         | ProviderRequest::YahooEnrichment
                         | ProviderRequest::TiingoStarterEodNav
@@ -4542,7 +4588,17 @@ const fn lower_hex_nibble(value: u8) -> Option<u8> {
 
 fn map_portal_activation_error(error: CliProviderActivationError) -> ProviderPortalActivationError {
     match error {
-        CliProviderActivationError::Cancelled => ProviderPortalActivationError::Cancelled,
+        CliProviderActivationError::Cancelled
+        | CliProviderActivationError::Onboarding(ProviderOnboardingError::OperationCancelled)
+        | CliProviderActivationError::Activation(ProviderAdapterActivationError::Cancelled)
+        | CliProviderActivationError::Activation(ProviderAdapterActivationError::Onboarding(
+            ProviderOnboardingError::OperationCancelled,
+        ))
+        | CliProviderActivationError::Activation(ProviderAdapterActivationError::Onboarding(
+            ProviderOnboardingError::SecretStore(
+                LocalSecretStoreError::UserCancelled | LocalSecretStoreError::OperationCancelled,
+            ),
+        )) => ProviderPortalActivationError::Cancelled,
         CliProviderActivationError::StateUnavailable
         | CliProviderActivationError::InputUnavailable => {
             ProviderPortalActivationError::StateUnavailable

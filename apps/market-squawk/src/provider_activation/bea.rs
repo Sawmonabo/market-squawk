@@ -811,7 +811,7 @@ pub(crate) fn fixed_regional_source_config() -> Result<BeaSourceConfig, BeaProdu
     Ok(BeaSourceConfig::try_new(contracts, fixed_parse_limits()?)?)
 }
 
-fn selected_regional_source_config(
+pub(crate) fn selected_regional_source_config(
     provider_dataset: &SourceIdentifier,
 ) -> Result<BeaSourceConfig, BeaProductError> {
     let contract = fixed_regional_source_config()?
@@ -891,30 +891,10 @@ mod tests {
     };
 
     use chrono::{Datelike as _, Utc};
-    use market_squawk_adapter_bea::{bea_api_endpoint_rule, bea_provider_rate_declaration};
-    use market_squawk_data::{
-        CatalogConfig, CatalogResultLimits, ObjectStoreConfig, SqliteProviderRateStore,
-    };
-    use market_squawk_domain::{
-        AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
-        EffectiveInterval, ExactPayloadEvidence, MetadataRevision, RevisionBoundPayloadEvidence,
-        SchemaVersion, SequenceCapability,
-    };
-    use market_squawk_platform::{
-        AppConfig, ConfigOverrides, ConfigSources, EncryptedFileSecretStore,
-        LocalAuthorityStateStore, LocalPaths, SecretValue,
-    };
+    use market_squawk_platform::{AppConfig, ConfigOverrides, ConfigSources, SecretValue};
     use market_squawk_services::{JsonStructureLimits, RequestId, ServiceLimits};
-    use market_squawk_sources::{
-        AuthoritativeSourceRegistry, AuthorizationGrant, CoverageDomain, EndpointPolicy,
-        FreshnessPolicy, HistoricalCapability, HttpRequestBounds, NetworkAccessPolicy,
-        ProviderRateAuthority, ProviderRateDeclaration, SourceCapabilities, SourceClass,
-        SourceCoverage, SourceMetadataInput, SourceProtocolProfile,
-    };
 
     use super::*;
-    use crate::ResearchService;
-    use crate::application::ResearchExtractionLimits;
     use crate::provider_onboarding::StartOnboardingRequest;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -929,57 +909,22 @@ mod tests {
         BeaUserId::try_new(user_id.clone())?;
 
         let temporary = tempfile::tempdir()?;
-        let paths = LocalPaths::prepare(temporary.path().join("product"))?;
-        let provider_rate =
-            ProviderRateAuthority::try_new(Arc::new(SqliteProviderRateStore::try_open(
-                paths.control_root()?.root().join("provider-rate.sqlite3"),
-            )?))?;
-        let secrets = Arc::new(EncryptedFileSecretStore::try_open(
-            paths.control_root()?.root().join("provider-secrets"),
-            SecretValue::new("bea-live-proof-local-unlock".to_owned())?,
-        )?);
-        let (research, onboarding, _publisher) =
-            ResearchService::open_or_initialize_with_provider_onboarding_service(
-                &paths,
-                catalog_config(&paths)?,
-                8,
-                object_store_config()?,
-                secrets,
-                provider_rate.clone(),
-            )?;
-        let research = Arc::new(research);
-        let onboarding = Arc::new(onboarding);
-        let registry = AuthoritativeSourceRegistry::try_new_durable_with_authorization_subject_resolver_and_provider_rate(
-            LocalAuthorityStateStore::try_open(
-                paths.control_root()?.root().join("source-authority"),
-            )?,
-            Arc::new(provider_rate.clone()),
-            provider_rate.clone(),
-        )?;
-        let (coordinator, mutation, alpaca) =
-            crate::application::ProductionResearchIngestCoordinator::try_new_with_runtime_authorities(
-                registry,
-                Arc::clone(&research),
-                ResearchExtractionLimits::standard(),
-                std::iter::empty(),
-            )?;
-        let coordinator = Arc::new(coordinator);
         let app_config = AppConfig::load(ConfigSources::new(
             None,
             &BTreeMap::<OsString, OsString>::new(),
             ConfigOverrides {
-                data_dir: Some(temporary.path().join("app-data")),
+                data_dir: Some(temporary.path().join("product")),
                 ..ConfigOverrides::default()
             },
         ))?;
-        let activation = ProviderAdapterActivation::new(
-            Arc::clone(&onboarding),
-            Arc::clone(&coordinator),
-            mutation,
-            app_config,
-            provider_rate,
-            paths.control_root()?.root().to_path_buf(),
-        );
+        let product = crate::LocalProduct::try_new(app_config.clone())?;
+        let onboarding = product.provider_onboarding();
+        onboarding
+            .unlock_encrypted_file_fallback(
+                SecretValue::new("bea-live-proof-local-unlock".to_owned())?,
+                CancellationToken::new(),
+            )
+            .await?;
 
         let started = onboarding
             .start(
@@ -994,32 +939,43 @@ mod tests {
                 CancellationToken::new(),
             )
             .await?;
-        let prepared = onboarding
-            .prepare_runtime_activation_target(imported.session_id(), CancellationToken::new())
-            .await?;
-        let lease = onboarding.commit_prepared_activation(&prepared).await?;
-        let metadata = source_metadata(&lease)?;
         let provider_dataset =
             regional_state_income_contract(REGIONAL_PER_CAPITA_INCOME_LINE_CODE)?
                 .dataset_id()
                 .clone();
-        activation
-            .activate_ready_profile(
-                lease.session_id(),
-                crate::ProviderAdapterActivationRequest::Bea(BeaAdapterActivation::new(
-                    metadata,
-                    provider_dataset,
-                )),
+        product
+            .provider_portal_activation()
+            .activate(
+                imported.session_id(),
+                crate::ProviderPortalActivationRequest::BeaRegional {
+                    provider_dataset: provider_dataset.clone(),
+                },
                 CancellationToken::new(),
             )
             .await?;
+        let profile = SourceIdentifier::try_from(BEA_SURFACE)?;
+        let initial_generation = product
+            .provider_activation()
+            .research_runtime_generation(&profile)?
+            .ok_or("normal Settings activation did not retain the selected BEA runtime")?;
+        assert_eq!(
+            product
+                .provider_activation()
+                .registered_discovery_dataset(&profile)?,
+            Some(provider_dataset.clone())
+        );
+        assert_eq!(
+            product.provider_activation().bea_status().availability(),
+            BeaProductAvailability::Configured
+        );
 
         let now = current_timestamp()?;
         let provider_deadline = now.checked_add_nanos(120_000_000_000)?;
         let knowledge_cutoff = now.checked_add_nanos(120_000_000_000)?;
         let period = current_provider_annual_period()?;
         let operation_deadline = Instant::now() + Duration::from_secs(120);
-        let outcome = activation
+        let outcome = product
+            .provider_activation()
             .execute_bea_regional(
                 BeaRegionalProductRequest::try_new(
                     provider_deadline,
@@ -1045,23 +1001,88 @@ mod tests {
         assert_eq!(restart_selector.source_id().as_str(), BEA_SOURCE_ID);
 
         drop(outcome);
-        drop(activation);
+        assert!(
+            product
+                .application()
+                .shutdown(Instant::now() + Duration::from_secs(10))
+                .await
+                .is_complete()
+        );
         drop(onboarding);
-        drop(alpaca);
-        drop(coordinator);
-        drop(research);
+        drop(product);
 
-        let reopened = Arc::new(ResearchService::open_or_initialize(
-            &paths,
-            catalog_config(&paths)?,
-            8,
-            object_store_config()?,
-        )?);
-        reopened
-            .recover_provider_capture_store(&CancellationToken::new())
+        let reopened = crate::LocalProduct::try_new(app_config)?;
+        assert_eq!(
+            reopened.provider_activation().bea_status().availability(),
+            BeaProductAvailability::Desired
+        );
+        assert_eq!(
+            reopened
+                .provider_activation()
+                .research_runtime_generation(&profile)?,
+            None
+        );
+        let lifecycle = reopened.source_lifecycle_authority();
+        let restart_status = lifecycle
+            .status(
+                &profile,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(10),
+            )
             .await?;
-        let read = crate::application::BeaMacroApplicationClosure::new(reopened)
-            .read_provider_period_latest_known(
+        assert_ne!(
+            restart_status.fields().state,
+            crate::application::source::SourceLifecycleState::Active
+        );
+        assert!(restart_status.fields().runtime_generation_digest.is_none());
+
+        let reopened_onboarding = reopened.provider_onboarding();
+        reopened_onboarding
+            .unlock_encrypted_file_fallback(
+                SecretValue::new("bea-live-proof-local-unlock".to_owned())?,
+                CancellationToken::new(),
+            )
+            .await?;
+        let lease = reopened_onboarding.activation_lease(imported.session_id())?;
+        let resume = crate::application::source::SourceLifecycleCommand::try_new(
+            crate::application::source::SourceLifecycleCommandInput {
+                provider: profile.clone(),
+                action: crate::application::source::SourceLifecycleAction::Start,
+                expected_state_revision: restart_status.fields().state_revision,
+                expected_generation: None,
+                expected_runtime_generation_digest: None,
+                onboarding_session_id: Some(lease.session_id()),
+                public_configuration_digest: Some(lease.public_configuration_digest()),
+                reason: None,
+                cancellation: CancellationToken::new(),
+                deadline: Instant::now() + Duration::from_secs(30),
+            },
+        )?;
+        let resumed = lifecycle.execute(resume).await?;
+        assert_eq!(
+            resumed.fields().state,
+            crate::application::source::SourceLifecycleState::Active
+        );
+        assert_eq!(
+            resumed.fields().runtime_generation_digest,
+            Some(initial_generation.generation_digest()?)
+        );
+        assert_eq!(
+            reopened
+                .provider_activation()
+                .research_runtime_generation(&profile)?,
+            Some(initial_generation)
+        );
+        assert_eq!(
+            reopened
+                .provider_activation()
+                .registered_discovery_dataset(&profile)?,
+            Some(provider_dataset)
+        );
+
+        let read = reopened
+            .research_ingest()
+            .read_bea_provider_period_latest_known(
                 BeaProviderPeriodLatestKnownRequest::try_new(
                     restart_selector.clone(),
                     series_allowlist,
@@ -1093,77 +1114,14 @@ mod tests {
             manifest.dataset_id().as_str(),
             manifest.manifest_version(),
         );
-        Ok(())
-    }
-
-    fn source_metadata(lease: &ProviderActivationLease) -> TestResult<SourceMetadata> {
-        let config = fixed_regional_source_config()?;
-        let effective = EffectiveInterval::new(
-            lease.authority_effective_at(),
-            lease.verification_expires_at(),
-        )?;
-        let provider = SourceIdentifier::try_from("bea")?;
-        let evidence = ExactPayloadEvidence::from_content_digest(lease.capability_digest());
-        let authorization = AuthorizationGrant::new(
-            AuthorizationMode::UserAuthorized,
-            AuthorizationBasis::new(ProviderRateDeclaration::governed_provider_subject(
-                &provider,
-            )?),
-            evidence.clone(),
-            effective,
+        assert!(
+            reopened
+                .application()
+                .shutdown(Instant::now() + Duration::from_secs(10))
+                .await
+                .is_complete()
         );
-        let network = EndpointPolicy::try_from_api_rules(
-            vec![bea_api_endpoint_rule(&config)?],
-            HttpRequestBounds::default(),
-        )?;
-        Ok(SourceMetadata::try_new(SourceMetadataInput::new(
-            SchemaVersion::CURRENT,
-            SourceId::try_from(BEA_SOURCE_ID)?,
-            RevisionBoundPayloadEvidence::new(
-                MetadataRevision::new(SourceIdentifier::try_from("bea-regional-v1")?),
-                evidence.clone(),
-            ),
-            SourceClass::OfficialAgency,
-            provider,
-            authorization,
-            SourceCoverage::try_non_instrument(
-                evidence,
-                effective,
-                CoverageDomain::Macroeconomic,
-                CoverageDelay::Delayed(1),
-                DeliveryEvidence::Unknown,
-            )?,
-            DataQuality::OfficialDelayed,
-            NetworkAccessPolicy::Allowlisted(network),
-            FreshnessPolicy::try_new(60, 60, 60, 60, 1)?,
-            Some(bea_provider_rate_declaration()?.policy().clone()),
-            SourceCapabilities::new(
-                false,
-                true,
-                SequenceCapability::Unsupported,
-                ChecksumCapability::Unsupported,
-                HistoricalCapability::Historical,
-                false,
-            ),
-            SourceProtocolProfile::NotLive,
-        ))?)
-    }
-
-    fn catalog_config(paths: &LocalPaths) -> TestResult<CatalogConfig> {
-        Ok(CatalogConfig::try_new(
-            paths.catalog()?.clone(),
-            Duration::from_millis(750),
-            market_squawk_data::CatalogLimit::new(64)?,
-            CatalogResultLimits::try_new(1_024 * 1_024, 8 * 1_024 * 1_024)?,
-        )?)
-    }
-
-    fn object_store_config() -> TestResult<ObjectStoreConfig> {
-        Ok(ObjectStoreConfig::try_new(
-            16 * 1_024 * 1_024,
-            1_024,
-            Duration::from_secs(60),
-        )?)
+        Ok(())
     }
 
     fn request_context(deadline: Instant) -> TestResult<RequestContext> {

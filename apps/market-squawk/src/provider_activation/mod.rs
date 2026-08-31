@@ -70,7 +70,7 @@ pub use alpaca::{AlpacaBasicAccountActivation, AlpacaBasicActivationError};
 pub(crate) use bea::{
     BEA_SOURCE_ID, BEA_SURFACE, BeaProductAvailability, BeaProductError, BeaProductStatus,
     BeaRegionalProductOutput, BeaRegionalProductRequest, BeaRegionalRestartOutput,
-    BeaRegionalRestartRead, fixed_regional_source_config,
+    BeaRegionalRestartRead, fixed_regional_source_config, selected_regional_source_config,
 };
 pub(crate) use bls::{
     MacroProviderPeriodLatestKnownOutput, MacroProviderPeriodLatestKnownRequest,
@@ -2421,14 +2421,30 @@ fn require_surface(
 
 fn map_bea_activation_error(error: bea::BeaProductError) -> ProviderAdapterActivationError {
     match error {
-        bea::BeaProductError::Cancelled => ProviderAdapterActivationError::Cancelled,
+        bea::BeaProductError::Cancelled
+        | bea::BeaProductError::Adapter(
+            market_squawk_adapter_bea::BeaError::SanitizationCancelled,
+        )
+        | bea::BeaProductError::Source(market_squawk_adapter_bea::BeaSourceError::Cancelled) => {
+            ProviderAdapterActivationError::Cancelled
+        }
+        bea::BeaProductError::Unavailable
+        | bea::BeaProductError::AuthorityUnavailable
+        | bea::BeaProductError::Adapter(
+            market_squawk_adapter_bea::BeaError::SanitizationDeadlineExceeded
+            | market_squawk_adapter_bea::BeaError::SanitizationClockUnavailable,
+        )
+        | bea::BeaProductError::Source(
+            market_squawk_adapter_bea::BeaSourceError::Network
+            | market_squawk_adapter_bea::BeaSourceError::DeadlineExceeded
+            | market_squawk_adapter_bea::BeaSourceError::Clock
+            | market_squawk_adapter_bea::BeaSourceError::Authority,
+        ) => ProviderAdapterActivationError::ExplicitResumeRequired,
         bea::BeaProductError::Onboarding(error) => {
             ProviderAdapterActivationError::Onboarding(error)
         }
         bea::BeaProductError::SetupRequired
-        | bea::BeaProductError::Unavailable
         | bea::BeaProductError::InvalidOperation
-        | bea::BeaProductError::AuthorityUnavailable
         | bea::BeaProductError::InvalidReadResult
         | bea::BeaProductError::Adapter(_)
         | bea::BeaProductError::Source(_)

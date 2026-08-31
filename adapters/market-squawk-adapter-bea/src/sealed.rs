@@ -1,4 +1,6 @@
-//! Typed rejoin of BEA native evidence with one shared immutable raw request-graph receipt.
+//! Typed rejoin of admitted BEA metadata and one immutable raw observation receipt.
+
+use std::sync::Arc;
 
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier,
@@ -11,7 +13,10 @@ use market_squawk_sources::{
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::{BeaDatasetEvidence, BeaDatasetIdentity, BeaMetadataGeneration};
+use crate::{
+    BeaDataEvidencePage, BeaDatasetEvidence, BeaDatasetIdentity, BeaDoctorAdmissionEvidence,
+    BeaMetadataEvidenceBundle, BeaMetadataGeneration,
+};
 
 /// A typed BEA acquisition could not be matched to the shared journal's physical receipt.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -21,12 +26,11 @@ pub enum BeaSealedAcquisitionError {
     InvalidEvidence,
 }
 
-/// Complete native BEA evidence rejoined with one exact shared `MSJ1` request-graph seal.
+/// Native BEA evidence rejoined from a sealed metadata admission and one fresh `MSJ1` data seal.
 ///
-/// Construction consumes typed evidence and an actual shared seal receipt. Every independent
-/// metadata/data request remains visible as an ordered graph component, while the physical store
-/// commits the complete bounded doctor or acquisition journey as one segment. No constructor
-/// accepts a caller-supplied seal digest.
+/// Construction consumes the typed observation evidence and the actual data-response seal while
+/// binding both to the already-admitted metadata generation. No constructor accepts a
+/// caller-supplied seal digest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BeaSealedAcquisitionReceipt {
     source_id: SourceId,
@@ -41,24 +45,30 @@ pub struct BeaSealedAcquisitionReceipt {
 
 impl BeaSealedAcquisitionReceipt {
     /// Derives persisted sidecar evidence only while retaining the exact live whole-capture token.
-    pub(crate) fn try_from_token(
-        evidence: BeaDatasetEvidence,
+    pub(crate) fn try_from_data_token(
+        admission: &BeaDoctorAdmissionEvidence,
+        data: BeaDataEvidencePage,
         capture_token: &ProviderWholeCaptureToken,
     ) -> Result<Self, BeaSealedAcquisitionError> {
         let sealed_capture = capture_token.persisted_receipt().clone();
-        let expected_graph_identity = validate_sealed_capture_sidecar(&evidence, &sealed_capture)?;
-        let expected_count = evidence.expected_capture_count();
-        let first = evidence
-            .expected_capture(0)
-            .ok_or(BeaSealedAcquisitionError::InvalidEvidence)?;
-        let source_id = first.source_id().clone();
-        let metadata_revision = first.metadata_revision().clone();
-        let dataset_id = evidence.metadata().dataset_id().clone();
-        let provider_dataset = evidence.data().page().dataset().clone();
-        let data_component_ordinal = u16::try_from(expected_count.saturating_sub(1))
-            .map_err(|_| BeaSealedAcquisitionError::InvalidEvidence)?;
+        validate_sealed_data_sidecar(&data, &sealed_capture)?;
+        let source_id = data.capture().source_id().clone();
+        let metadata_revision = data.capture().metadata_revision().clone();
+        let dataset_id = admission.dataset_id().clone();
+        let provider_dataset = data.page().dataset().clone();
+        let metadata = admission.metadata_evidence().clone();
+        if admission.source_id() != &source_id
+            || admission.metadata_revision() != &metadata_revision
+            || metadata.dataset_id() != &dataset_id
+            || metadata.generation() != data.page().metadata_generation()
+            || admission.metadata_generation().bytes() != metadata.generation().digest()
+        {
+            return Err(BeaSealedAcquisitionError::InvalidEvidence);
+        }
+        let evidence = BeaDatasetEvidence::from_admitted_parts(metadata, data);
+        let data_component_ordinal = 0;
         let mut hasher = Sha256::new();
-        hasher.update(b"market-squawk/bea-sealed-acquisition/v3");
+        hasher.update(b"market-squawk/bea-sealed-observation/v1");
         hash_text(&mut hasher, source_id.as_str())?;
         hash_text(
             &mut hasher,
@@ -67,13 +77,18 @@ impl BeaSealedAcquisitionReceipt {
         hash_text(&mut hasher, dataset_id.as_str())?;
         hash_text(&mut hasher, provider_dataset.as_str())?;
         hasher.update(evidence.metadata().generation().digest());
-        for page in evidence.metadata().pages() {
-            hasher.update(page.page().receipt().upstream_response_digest());
-            hasher.update(page.page().receipt().response_digest());
-        }
+        hasher.update(admission.admission_digest().bytes());
+        hasher.update(admission.doctor_sealed_graph_digest().bytes());
+        hasher.update(admission.sealed_capture().receipt_digest().bytes());
+        hasher.update(
+            admission
+                .sealed_capture()
+                .segment()
+                .physical_receipt_digest()
+                .bytes(),
+        );
         hasher.update(evidence.data().page().receipt().upstream_response_digest());
         hasher.update(evidence.data().page().receipt().response_digest());
-        hasher.update(expected_graph_identity.bytes());
         hasher.update(sealed_capture.receipt_digest().bytes());
         hasher.update(sealed_capture.segment().physical_receipt_digest().bytes());
         let sealed_graph_digest =
@@ -90,12 +105,12 @@ impl BeaSealedAcquisitionReceipt {
         })
     }
 
-    /// Returns the exact source shared by every graph component.
+    /// Returns the exact source shared by the metadata admission and observation response.
     pub const fn source_id(&self) -> &SourceId {
         &self.source_id
     }
 
-    /// Returns the exact source registration revision shared by every graph component.
+    /// Returns the exact source registration revision shared by both sealed evidence sets.
     pub const fn metadata_revision(&self) -> &MetadataRevision {
         &self.metadata_revision
     }
@@ -120,7 +135,7 @@ impl BeaSealedAcquisitionReceipt {
         &self.sealed_capture
     }
 
-    /// Returns the graph component ordinal containing the `GetData` response.
+    /// Returns the page ordinal containing the standalone `GetData` response.
     pub const fn data_component_ordinal(&self) -> u16 {
         self.data_component_ordinal
     }
@@ -169,9 +184,8 @@ impl BeaSealedAcquisitionReceipt {
 /// Opaque captured discovery waiting for the shared sealer's physical receipt.
 pub struct BeaPendingDiscoverySeal {
     discovery_batch: DiscoveryBatch,
-    evidence: BeaDatasetEvidence,
-    doctor_admission_digest: EvidenceDigest,
-    doctor_sealed_graph_digest: EvidenceDigest,
+    data: BeaDataEvidencePage,
+    admission: Arc<BeaDoctorAdmissionEvidence>,
     expectation: ProviderCaptureSealExpectation,
 }
 
@@ -186,16 +200,14 @@ impl std::fmt::Debug for BeaPendingDiscoverySeal {
 impl BeaPendingDiscoverySeal {
     pub(crate) fn from_source(
         discovery_batch: DiscoveryBatch,
-        evidence: BeaDatasetEvidence,
-        doctor_admission_digest: EvidenceDigest,
-        doctor_sealed_graph_digest: EvidenceDigest,
+        data: BeaDataEvidencePage,
+        admission: Arc<BeaDoctorAdmissionEvidence>,
         expectation: ProviderCaptureSealExpectation,
     ) -> Self {
         Self {
             discovery_batch,
-            evidence,
-            doctor_admission_digest,
-            doctor_sealed_graph_digest,
+            data,
+            admission,
             expectation,
         }
     }
@@ -215,14 +227,17 @@ impl BeaPendingDiscoverySeal {
                 return Err(BeaSealedAcquisitionError::InvalidEvidence);
             }
         };
-        let sealed_acquisition =
-            BeaSealedAcquisitionReceipt::try_from_token(self.evidence, &capture_token)?;
+        let sealed_acquisition = BeaSealedAcquisitionReceipt::try_from_data_token(
+            self.admission.as_ref(),
+            self.data,
+            &capture_token,
+        )?;
         Ok(BeaSealedDiscoveryAdmission {
             discovery_batch: self.discovery_batch,
             sealed_acquisition,
             capture_token,
-            doctor_admission_digest: self.doctor_admission_digest,
-            doctor_sealed_graph_digest: self.doctor_sealed_graph_digest,
+            doctor_admission_digest: self.admission.admission_digest(),
+            doctor_sealed_graph_digest: self.admission.doctor_sealed_graph_digest(),
         })
     }
 }
@@ -242,22 +257,6 @@ pub struct BeaSealedDiscoveryAdmission {
 }
 
 impl BeaSealedDiscoveryAdmission {
-    pub(crate) fn from_sealed_doctor(
-        discovery_batch: DiscoveryBatch,
-        sealed_acquisition: BeaSealedAcquisitionReceipt,
-        capture_token: ProviderWholeCaptureToken,
-        doctor_admission_digest: EvidenceDigest,
-        doctor_sealed_graph_digest: EvidenceDigest,
-    ) -> Self {
-        Self {
-            discovery_batch,
-            sealed_acquisition,
-            capture_token,
-            doctor_admission_digest,
-            doctor_sealed_graph_digest,
-        }
-    }
-
     /// Returns the exact discovery batch only after its influencing graph has been sealed.
     pub const fn batch(&self) -> &DiscoveryBatch {
         &self.discovery_batch
@@ -326,8 +325,25 @@ impl BeaSealedExtractionOutput {
     }
 }
 
-fn validate_sealed_capture_sidecar(
-    evidence: &BeaDatasetEvidence,
+fn validate_sealed_data_sidecar(
+    evidence: &BeaDataEvidencePage,
+    sealed_capture: &SealedProviderCaptureSetReceipt,
+) -> Result<(), BeaSealedAcquisitionError> {
+    let expected = evidence.capture();
+    if expected.terminal() == ProviderCaptureTerminalDisposition::CompleteRequestGraph
+        || !expected.request_graph_components().is_empty()
+        || expected.pages().len() != 1
+        || sealed_capture.capture() != expected
+        || !valid_digest(sealed_capture.receipt_digest())
+        || !valid_digest(sealed_capture.segment().physical_receipt_digest())
+    {
+        return Err(BeaSealedAcquisitionError::InvalidEvidence);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_sealed_metadata_sidecar(
+    evidence: &BeaMetadataEvidenceBundle,
     sealed_capture: &SealedProviderCaptureSetReceipt,
 ) -> Result<EvidenceDigest, BeaSealedAcquisitionError> {
     let expected_count = evidence.expected_capture_count();
@@ -345,6 +361,31 @@ fn validate_sealed_capture_sidecar(
                 .ok_or(BeaSealedAcquisitionError::InvalidEvidence)?,
         );
     }
+    let graph_identity = validate_sealed_capture_sequence(
+        evidence.dataset_id(),
+        evidence.generation(),
+        &expected,
+        sealed_capture,
+    )?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"market-squawk/bea-sealed-metadata-admission/v1");
+    hash_text(&mut hasher, evidence.dataset_id().as_str())?;
+    hasher.update(evidence.generation().digest());
+    hasher.update(graph_identity.bytes());
+    hasher.update(sealed_capture.receipt_digest().bytes());
+    hasher.update(sealed_capture.segment().physical_receipt_digest().bytes());
+    Ok(EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        hasher.finalize().into(),
+    ))
+}
+
+fn validate_sealed_capture_sequence(
+    dataset_id: &SourceIdentifier,
+    metadata_generation: BeaMetadataGeneration,
+    expected: &[&ProviderCaptureSetReceipt],
+    sealed_capture: &SealedProviderCaptureSetReceipt,
+) -> Result<EvidenceDigest, BeaSealedAcquisitionError> {
     let first = expected
         .first()
         .copied()
@@ -357,15 +398,12 @@ fn validate_sealed_capture_sidecar(
     }) {
         return Err(BeaSealedAcquisitionError::InvalidEvidence);
     }
-    let expected_graph_identity = bea_capture_graph_identity(
-        evidence.metadata().dataset_id(),
-        evidence.metadata().generation(),
-        &expected,
-    )?;
+    let expected_graph_identity =
+        bea_capture_graph_identity(dataset_id, metadata_generation, expected)?;
     let graph = sealed_capture.capture();
     if graph.source_id() != first.source_id()
         || graph.metadata_revision() != first.metadata_revision()
-        || graph.dataset() != evidence.metadata().dataset_id()
+        || graph.dataset() != dataset_id
         || graph.request_set_identity() != expected_graph_identity
         || graph.terminal() != ProviderCaptureTerminalDisposition::CompleteRequestGraph
         || graph.request_graph_components().len() != expected_count
