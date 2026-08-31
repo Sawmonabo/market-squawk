@@ -25,8 +25,8 @@ use market_squawk_services::{
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, DiscoveryBatch, DiscoveryRequest, ExtractionAuthority,
-    ExtractionBatch, ExtractionRequest, ExtractionRevisionPlan, ExtractionSource,
-    ExtractionSourceError, MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_RECORDS,
+    ExtractionAuthorityError, ExtractionBatch, ExtractionRequest, ExtractionRevisionPlan,
+    ExtractionSource, ExtractionSourceError, MAX_DISCOVERY_OBJECTS, MAX_EXTRACTION_RECORDS,
     MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, ProviderCaptureError, ProviderCaptureMaterial,
     ProviderCaptureSealRequest, ProviderNativeLineageBatch, ProviderNativeLineageImplementation,
     RegisteredSource, RegistryError, SealedProviderCaptureBinding, SealedProviderCaptureMaterial,
@@ -2251,18 +2251,68 @@ impl ProductionResearchIngestCoordinator {
         operation_deadline: Instant,
         deadline: Timestamp,
     ) -> Result<AuthorizedExtraction, ServiceError> {
-        prepared.rights.validate_at(system_timestamp()?)?;
+        self.extract_prepared_object_diagnostic(
+            prepared,
+            object,
+            discovery_capture,
+            context,
+            operation,
+            operation_deadline,
+            deadline,
+        )
+        .await
+        .map_err(ProviderOperationDiagnostic::service_error)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "exact extraction inputs and one diagnostic phase remain explicit"
+    )]
+    async fn extract_prepared_object_diagnostic(
+        &self,
+        prepared: PreparedExtraction,
+        object: SourceObject,
+        discovery_capture: Option<ProviderCaptureMaterial>,
+        context: &RequestContext,
+        operation: &CancellationToken,
+        operation_deadline: Instant,
+        deadline: Timestamp,
+    ) -> Result<AuthorizedExtraction, ProviderOperationDiagnostic> {
+        let phase = ProviderOperationPhase::Extraction;
+        let service_diagnostic = |error| ProviderOperationDiagnostic::from_service(phase, error);
+        let invalid_result = || {
+            ProviderOperationDiagnostic::new(phase, ProviderOperationFailureClass::InvalidResult)
+        };
+        let unauthorized =
+            || ProviderOperationDiagnostic::new(phase, ProviderOperationFailureClass::Unauthorized);
+        prepared
+            .rights
+            .validate_at(system_timestamp().map_err(service_diagnostic)?)
+            .map_err(|_error| unauthorized())?;
         let subject = prepared
             .source
             .rights_subject(object.dataset())
-            .map_err(|_error| ServiceError::InvalidRequest)?;
-        prepared.rights.validate_subject(subject.as_ref())?;
+            .map_err(|_error| {
+                ProviderOperationDiagnostic::new(
+                    phase,
+                    ProviderOperationFailureClass::InvalidRequest,
+                )
+            })?;
+        prepared
+            .rights
+            .validate_subject(subject.as_ref())
+            .map_err(|_error| unauthorized())?;
         let extraction_request =
             ExtractionRequest::try_new(object, self.limits.records, self.limits.bytes, deadline)
-                .map_err(|_error| ServiceError::InvalidRequest)?;
+                .map_err(|_error| {
+                    ProviderOperationDiagnostic::new(
+                        phase,
+                        ProviderOperationFailureClass::InvalidRequest,
+                    )
+                })?;
         let capture =
             ManagedProviderCaptureAuthority::new(Arc::clone(&self.research), operation_deadline);
-        let managed = await_extraction(
+        let managed = await_extraction_diagnostic(
             prepared.source.extract_managed_with_native(
                 capture,
                 prepared.authority,
@@ -2273,6 +2323,7 @@ impl ProductionResearchIngestCoordinator {
             operation,
             &prepared.admission,
             operation_deadline,
+            phase,
         )
         .await?;
         let local_source = matches!(
@@ -2290,11 +2341,11 @@ impl ProductionResearchIngestCoordinator {
                 provider_native,
             } => {
                 let (batch, capture_material) = match (discovery_capture, extraction_capture) {
-                    (Some(_), Some(_)) => return Err(ServiceError::InvalidResult),
+                    (Some(_), Some(_)) => return Err(invalid_result()),
                     (Some(capture_material), None) => {
                         let batch = batch
                             .try_bind_provider_capture(capture_material.receipt())
-                            .map_err(|_error| ServiceError::InvalidResult)?;
+                            .map_err(|_error| invalid_result())?;
                         (batch, Some(capture_material))
                     }
                     (None, capture_material) => (batch, capture_material),
@@ -2304,12 +2355,12 @@ impl ProductionResearchIngestCoordinator {
                         .as_ref()
                         .is_none_or(|capture| capture_material_matches_batch(capture, &batch))
                 {
-                    return Err(ServiceError::InvalidResult);
+                    return Err(invalid_result());
                 }
                 let revisions = prepared
                     .source
                     .revision_plan(&batch)
-                    .map_err(|_error| ServiceError::InvalidResult)?;
+                    .map_err(|_error| invalid_result())?;
                 let publication = match (local_source, capture_material, provider_native) {
                     (true, None, None) => ManagedPublication::Local(batch),
                     (false, Some(capture_material), provider_native) => {
@@ -2319,7 +2370,7 @@ impl ProductionResearchIngestCoordinator {
                             provider_native,
                         })
                     }
-                    _ => return Err(ServiceError::InvalidResult),
+                    _ => return Err(invalid_result()),
                 };
                 (publication, company_identity, revisions)
             }
@@ -2329,7 +2380,7 @@ impl ProductionResearchIngestCoordinator {
             } => {
                 if local_source || discovery_capture.is_some() || sealed_capture.validate().is_err()
                 {
-                    return Err(ServiceError::InvalidResult);
+                    return Err(invalid_result());
                 }
                 (
                     ManagedPublication::Provider(sealed_capture),
@@ -2342,15 +2393,20 @@ impl ProductionResearchIngestCoordinator {
         let analytical_dataset = prepared
             .source
             .analytical_dataset(batch)
-            .map_err(|_error| ServiceError::InvalidResult)?;
+            .map_err(|_error| invalid_result())?;
         let payload_digest = extraction_provider_payload_digest(batch);
-        let retrieved_at = system_timestamp()?;
-        let rights = prepared.rights.decision(payload_digest, retrieved_at)?;
-        ensure_operation_live(operation_deadline, operation)?;
-        prepared
-            .admission
-            .ensure_live()
-            .map_err(|_error| ServiceError::Unavailable)?;
+        let retrieved_at = system_timestamp().map_err(service_diagnostic)?;
+        let rights = prepared
+            .rights
+            .decision(payload_digest, retrieved_at)
+            .map_err(|_error| unauthorized())?;
+        ensure_operation_live(operation_deadline, operation).map_err(service_diagnostic)?;
+        prepared.admission.ensure_live().map_err(|_error| {
+            ProviderOperationDiagnostic::new(
+                phase,
+                ProviderOperationFailureClass::ProviderAuthority,
+            )
+        })?;
         Ok(AuthorizedExtraction {
             metadata: prepared.metadata,
             publication,
@@ -2708,6 +2764,115 @@ impl ResearchIngestCoordinator for ProductionResearchIngestCoordinator {
     }
 }
 
+/// Internal operation phase retained only by provider diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderOperationPhase {
+    Runtime,
+    Discovery,
+    Extraction,
+    RawSeal,
+}
+
+/// Closed, payload-free cause retained after provider and storage errors cross the app boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderOperationFailureClass {
+    Cancelled,
+    DeadlineExceeded,
+    Unauthorized,
+    InvalidRequest,
+    NotFound,
+    InvalidResult,
+    Capacity,
+    RuntimeUnavailable,
+    ProviderNetwork,
+    ProviderNetworkPolicy,
+    ProviderUnavailable,
+    ProviderRateLimited,
+    ProviderBudgetUnavailable,
+    ProviderResponseLimit,
+    ProviderProtocol,
+    ProviderGenerationChanged,
+    ProviderAuthority,
+    TrustedTime,
+    CaptureUnavailable,
+    StorageUnavailable,
+    PublicationAuthority,
+    Internal,
+}
+
+/// Secret-free internal detail for logs and diagnostics, never an application response DTO.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct ProviderOperationDiagnostic {
+    phase: ProviderOperationPhase,
+    failure: ProviderOperationFailureClass,
+}
+
+impl ProviderOperationDiagnostic {
+    const fn new(phase: ProviderOperationPhase, failure: ProviderOperationFailureClass) -> Self {
+        Self { phase, failure }
+    }
+
+    const fn from_service(phase: ProviderOperationPhase, error: ServiceError) -> Self {
+        let failure = match error {
+            ServiceError::InvalidRequest => ProviderOperationFailureClass::InvalidRequest,
+            ServiceError::NotFound => ProviderOperationFailureClass::NotFound,
+            ServiceError::Unauthorized => ProviderOperationFailureClass::Unauthorized,
+            ServiceError::ResourceExhausted => ProviderOperationFailureClass::Capacity,
+            ServiceError::Cancelled => ProviderOperationFailureClass::Cancelled,
+            ServiceError::DeadlineExceeded => ProviderOperationFailureClass::DeadlineExceeded,
+            ServiceError::Unavailable => ProviderOperationFailureClass::RuntimeUnavailable,
+            ServiceError::InvalidResult => ProviderOperationFailureClass::InvalidResult,
+            ServiceError::Internal => ProviderOperationFailureClass::Internal,
+        };
+        Self::new(phase, failure)
+    }
+
+    const fn service_error(self) -> ServiceError {
+        match self.failure {
+            ProviderOperationFailureClass::Cancelled => ServiceError::Cancelled,
+            ProviderOperationFailureClass::DeadlineExceeded => ServiceError::DeadlineExceeded,
+            ProviderOperationFailureClass::Unauthorized => ServiceError::Unauthorized,
+            ProviderOperationFailureClass::InvalidRequest => ServiceError::InvalidRequest,
+            ProviderOperationFailureClass::NotFound => ServiceError::NotFound,
+            ProviderOperationFailureClass::InvalidResult => ServiceError::InvalidResult,
+            ProviderOperationFailureClass::Capacity => ServiceError::ResourceExhausted,
+            ProviderOperationFailureClass::Internal => ServiceError::Internal,
+            ProviderOperationFailureClass::RuntimeUnavailable
+            | ProviderOperationFailureClass::ProviderNetwork
+            | ProviderOperationFailureClass::ProviderNetworkPolicy
+            | ProviderOperationFailureClass::ProviderUnavailable
+            | ProviderOperationFailureClass::ProviderRateLimited
+            | ProviderOperationFailureClass::ProviderBudgetUnavailable
+            | ProviderOperationFailureClass::ProviderResponseLimit
+            | ProviderOperationFailureClass::ProviderProtocol
+            | ProviderOperationFailureClass::ProviderGenerationChanged
+            | ProviderOperationFailureClass::ProviderAuthority
+            | ProviderOperationFailureClass::TrustedTime
+            | ProviderOperationFailureClass::CaptureUnavailable
+            | ProviderOperationFailureClass::StorageUnavailable
+            | ProviderOperationFailureClass::PublicationAuthority => ServiceError::Unavailable,
+        }
+    }
+}
+
+impl fmt::Display for ProviderOperationDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("provider operation failed")
+    }
+}
+
+impl fmt::Debug for ProviderOperationDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderOperationDiagnostic")
+            .field("phase", &self.phase)
+            .field("failure", &self.failure)
+            .finish()
+    }
+}
+
+impl std::error::Error for ProviderOperationDiagnostic {}
+
 async fn await_extraction<T>(
     future: impl Future<Output = Result<T, ExtractionSourceError>>,
     context: &RequestContext,
@@ -2715,26 +2880,63 @@ async fn await_extraction<T>(
     admission: &ResearchProviderAdmission,
     operation_deadline: Instant,
 ) -> Result<T, ServiceError> {
+    await_extraction_diagnostic(
+        future,
+        context,
+        operation,
+        admission,
+        operation_deadline,
+        ProviderOperationPhase::Extraction,
+    )
+    .await
+    .map_err(ProviderOperationDiagnostic::service_error)
+}
+
+async fn await_extraction_diagnostic<T>(
+    future: impl Future<Output = Result<T, ExtractionSourceError>>,
+    context: &RequestContext,
+    operation: &CancellationToken,
+    admission: &ResearchProviderAdmission,
+    operation_deadline: Instant,
+    phase: ProviderOperationPhase,
+) -> Result<T, ProviderOperationDiagnostic> {
     if Instant::now() >= operation_deadline {
         operation.cancel();
-        return Err(ServiceError::DeadlineExceeded);
+        return Err(ProviderOperationDiagnostic::new(
+            phase,
+            ProviderOperationFailureClass::DeadlineExceeded,
+        ));
     }
     tokio::select! {
         biased;
         () = context.cancellation().cancelled() => {
             operation.cancel();
-            Err(ServiceError::Cancelled)
+            Err(ProviderOperationDiagnostic::new(
+                phase,
+                ProviderOperationFailureClass::Cancelled,
+            ))
         }
-        () = operation.cancelled() => Err(ServiceError::Unavailable),
+        () = operation.cancelled() => Err(ProviderOperationDiagnostic::new(
+            phase,
+            ProviderOperationFailureClass::RuntimeUnavailable,
+        )),
         () = admission.cancellation().cancelled() => {
             operation.cancel();
-            Err(ServiceError::Unavailable)
+            Err(ProviderOperationDiagnostic::new(
+                phase,
+                ProviderOperationFailureClass::ProviderAuthority,
+            ))
         }
         () = tokio::time::sleep_until(operation_deadline.into()) => {
             operation.cancel();
-            Err(ServiceError::DeadlineExceeded)
+            Err(ProviderOperationDiagnostic::new(
+                phase,
+                ProviderOperationFailureClass::DeadlineExceeded,
+            ))
         }
-        result = future => result.map_err(map_extraction_error),
+        result = future => result.map_err(|error| {
+            ProviderOperationDiagnostic::new(phase, classify_extraction_error(error))
+        }),
     }
 }
 
@@ -2745,26 +2947,63 @@ async fn await_publication<T>(
     admission: &ResearchProviderAdmission,
     operation_deadline: Instant,
 ) -> Result<T, ServiceError> {
+    await_publication_diagnostic(
+        future,
+        context,
+        operation,
+        admission,
+        operation_deadline,
+        ProviderOperationPhase::RawSeal,
+    )
+    .await
+    .map_err(ProviderOperationDiagnostic::service_error)
+}
+
+async fn await_publication_diagnostic<T>(
+    future: impl Future<Output = Result<T, ResearchServiceError>>,
+    context: &RequestContext,
+    operation: &CancellationToken,
+    admission: &ResearchProviderAdmission,
+    operation_deadline: Instant,
+    phase: ProviderOperationPhase,
+) -> Result<T, ProviderOperationDiagnostic> {
     if Instant::now() >= operation_deadline {
         operation.cancel();
-        return Err(ServiceError::DeadlineExceeded);
+        return Err(ProviderOperationDiagnostic::new(
+            phase,
+            ProviderOperationFailureClass::DeadlineExceeded,
+        ));
     }
     tokio::select! {
         biased;
         () = context.cancellation().cancelled() => {
             operation.cancel();
-            Err(ServiceError::Cancelled)
+            Err(ProviderOperationDiagnostic::new(
+                phase,
+                ProviderOperationFailureClass::Cancelled,
+            ))
         }
-        () = operation.cancelled() => Err(ServiceError::Unavailable),
+        () = operation.cancelled() => Err(ProviderOperationDiagnostic::new(
+            phase,
+            ProviderOperationFailureClass::RuntimeUnavailable,
+        )),
         () = admission.cancellation().cancelled() => {
             operation.cancel();
-            Err(ServiceError::Unavailable)
+            Err(ProviderOperationDiagnostic::new(
+                phase,
+                ProviderOperationFailureClass::ProviderAuthority,
+            ))
         }
         () = tokio::time::sleep_until(operation_deadline.into()) => {
             operation.cancel();
-            Err(ServiceError::DeadlineExceeded)
+            Err(ProviderOperationDiagnostic::new(
+                phase,
+                ProviderOperationFailureClass::DeadlineExceeded,
+            ))
         }
-        result = future => result.map_err(map_research_error),
+        result = future => result.map_err(|error| {
+            ProviderOperationDiagnostic::new(phase, classify_research_error(error))
+        }),
     }
 }
 
@@ -2842,15 +3081,72 @@ fn system_timestamp() -> Result<Timestamp, ServiceError> {
     Ok(Timestamp::from_unix_nanos(nanos))
 }
 
-fn map_extraction_error(error: ExtractionSourceError) -> ServiceError {
+fn classify_extraction_error(error: ExtractionSourceError) -> ProviderOperationFailureClass {
     match error {
-        ExtractionSourceError::DeadlineExceeded => ServiceError::DeadlineExceeded,
+        ExtractionSourceError::DeadlineExceeded => ProviderOperationFailureClass::DeadlineExceeded,
         ExtractionSourceError::Cancelled
-        | ExtractionSourceError::Source(SourceError::Cancelled) => ServiceError::Cancelled,
-        ExtractionSourceError::Source(SourceError::Unauthorized) => ServiceError::Unauthorized,
-        ExtractionSourceError::Contract(_) => ServiceError::InvalidRequest,
-        ExtractionSourceError::Source(_) | ExtractionSourceError::Authority(_) => {
-            ServiceError::Unavailable
+        | ExtractionSourceError::Source(SourceError::Cancelled) => {
+            ProviderOperationFailureClass::Cancelled
+        }
+        ExtractionSourceError::Source(error) => classify_source_error(error),
+        ExtractionSourceError::Contract(_) => ProviderOperationFailureClass::InvalidRequest,
+        ExtractionSourceError::Authority(error) => classify_extraction_authority_error(error),
+    }
+}
+
+fn classify_source_error(error: SourceError) -> ProviderOperationFailureClass {
+    match error {
+        SourceError::Unauthorized => ProviderOperationFailureClass::Unauthorized,
+        SourceError::Cancelled => ProviderOperationFailureClass::Cancelled,
+        SourceError::Network | SourceError::ConnectionIdle => {
+            ProviderOperationFailureClass::ProviderNetwork
+        }
+        SourceError::ProviderUnavailable => ProviderOperationFailureClass::ProviderUnavailable,
+        SourceError::BudgetWaitUntil { .. } => ProviderOperationFailureClass::ProviderRateLimited,
+        SourceError::BudgetUnavailable { .. } => {
+            ProviderOperationFailureClass::ProviderBudgetUnavailable
+        }
+        SourceError::GenerationResynchronizationRequired => {
+            ProviderOperationFailureClass::ProviderGenerationChanged
+        }
+        SourceError::SessionNotCurrent | SourceError::GenerationAuthorityMismatch => {
+            ProviderOperationFailureClass::ProviderAuthority
+        }
+        SourceError::TrustedTimeUnavailable | SourceError::TrustedTimeDiscontinuity => {
+            ProviderOperationFailureClass::TrustedTime
+        }
+        SourceError::Sink(_) | SourceError::CaptureNotHealthy => {
+            ProviderOperationFailureClass::CaptureUnavailable
+        }
+        SourceError::FrameTooLarge { .. } => ProviderOperationFailureClass::ProviderResponseLimit,
+        SourceError::InvalidProtocolState | SourceError::FrameIdentityExhausted => {
+            ProviderOperationFailureClass::ProviderProtocol
+        }
+    }
+}
+
+fn classify_extraction_authority_error(
+    error: ExtractionAuthorityError,
+) -> ProviderOperationFailureClass {
+    match error {
+        ExtractionAuthorityError::NotCurrent | ExtractionAuthorityError::NotEffective => {
+            ProviderOperationFailureClass::ProviderAuthority
+        }
+        ExtractionAuthorityError::TrustedTimeUnavailable
+        | ExtractionAuthorityError::TrustedTimeDiscontinuous => {
+            ProviderOperationFailureClass::TrustedTime
+        }
+        ExtractionAuthorityError::NetworkDenied
+        | ExtractionAuthorityError::NetworkPolicy(_)
+        | ExtractionAuthorityError::RequestTargetMismatch => {
+            ProviderOperationFailureClass::ProviderNetworkPolicy
+        }
+        ExtractionAuthorityError::BudgetWaitUntil { .. } => {
+            ProviderOperationFailureClass::ProviderRateLimited
+        }
+        ExtractionAuthorityError::BudgetNotConfigured
+        | ExtractionAuthorityError::BudgetUnavailable { .. } => {
+            ProviderOperationFailureClass::ProviderBudgetUnavailable
         }
     }
 }
@@ -2859,27 +3155,36 @@ fn map_registry_error(_error: RegistryError) -> ServiceError {
     ServiceError::Unavailable
 }
 
-fn map_ingest_error(error: IngestError) -> ServiceError {
+fn classify_ingest_error(error: IngestError) -> ProviderOperationFailureClass {
     match error {
-        IngestError::Cancelled => ServiceError::Cancelled,
-        IngestError::DeadlineExceeded => ServiceError::DeadlineExceeded,
+        IngestError::Cancelled => ProviderOperationFailureClass::Cancelled,
+        IngestError::DeadlineExceeded => ProviderOperationFailureClass::DeadlineExceeded,
         IngestError::RevisionEvidenceMismatch
         | IngestError::RevisionEvidenceRequired
         | IngestError::InvalidDataset
         | IngestError::InvalidProviderMacroPlan
         | IngestError::ProviderLogicalFundRequired
-        | IngestError::ContentIdentity(_) => ServiceError::InvalidResult,
-        IngestError::PublicationAuthorityRevoked
-        | IngestError::Plan(_)
-        | IngestError::Parquet(_)
-        | IngestError::Arrow(_)
+        | IngestError::ContentIdentity(_) => ProviderOperationFailureClass::InvalidResult,
+        IngestError::PublicationAuthorityRevoked | IngestError::AuthorityTransitionRejected => {
+            ProviderOperationFailureClass::PublicationAuthority
+        }
+        IngestError::Parquet(_)
         | IngestError::Manifest(_)
         | IngestError::Catalog(_)
         | IngestError::SecFundJob(_)
-        | IngestError::ListingReference(_)
+        | IngestError::ListingReference(_) => ProviderOperationFailureClass::StorageUnavailable,
+        IngestError::ProviderCaptureRequired
+        | IngestError::ProviderCapture(_)
+        | IngestError::SealedProviderCapture(_)
+        | IngestError::ProviderMarketEventSelection(_)
+        | IngestError::ProviderCaptureRecoveryWorkerUnavailable => {
+            ProviderOperationFailureClass::CaptureUnavailable
+        }
+        IngestError::AuthorityLockPoisoned => ProviderOperationFailureClass::RuntimeUnavailable,
+        IngestError::Plan(_)
+        | IngestError::Arrow(_)
         | IngestError::Serialization(_)
         | IngestError::RevisionAuthority(_)
-        | IngestError::AuthorityTransitionRejected
         | IngestError::CatalogCompositionMismatch
         | IngestError::UnknownSource
         | IngestError::UnknownReservation
@@ -2887,30 +3192,36 @@ fn map_ingest_error(error: IngestError) -> ServiceError {
         | IngestError::PersistRightsRequired
         | IngestError::TerminalRun
         | IngestError::IncompleteSuccessfulRun
-        | IngestError::ReplayConflict
-        | IngestError::ProviderCaptureRequired
-        | IngestError::ProviderCapture(_)
-        | IngestError::SealedProviderCapture(_)
-        | IngestError::ProviderMarketEventSelection(_)
-        | IngestError::ProviderCaptureRecoveryWorkerUnavailable
-        | IngestError::AuthorityLockPoisoned => ServiceError::Unavailable,
+        | IngestError::ReplayConflict => ProviderOperationFailureClass::PublicationAuthority,
     }
 }
 
 fn map_research_error(error: ResearchServiceError) -> ServiceError {
+    ProviderOperationDiagnostic::new(
+        ProviderOperationPhase::RawSeal,
+        classify_research_error(error),
+    )
+    .service_error()
+}
+
+fn classify_research_error(error: ResearchServiceError) -> ProviderOperationFailureClass {
     match error {
-        ResearchServiceError::Ingest(error) => map_ingest_error(error),
+        ResearchServiceError::Ingest(error) => classify_ingest_error(error),
         ResearchServiceError::Rights(_) | ResearchServiceError::IngestAuthorityMismatch => {
-            ServiceError::Unauthorized
+            ProviderOperationFailureClass::Unauthorized
         }
-        ResearchServiceError::IdentityOverflow => ServiceError::Internal,
+        ResearchServiceError::IdentityOverflow => ProviderOperationFailureClass::Internal,
         ResearchServiceError::Path(_)
         | ResearchServiceError::Catalog(_)
         | ResearchServiceError::Manifest(_)
         | ResearchServiceError::ProviderCaptureStore(_)
-        | ResearchServiceError::ProviderCaptureSealWorkerUnavailable
-        | ResearchServiceError::ProviderOnboarding(_)
-        | ResearchServiceError::Dataset(_) => ServiceError::Unavailable,
+        | ResearchServiceError::Dataset(_) => ProviderOperationFailureClass::StorageUnavailable,
+        ResearchServiceError::ProviderCaptureSealWorkerUnavailable => {
+            ProviderOperationFailureClass::CaptureUnavailable
+        }
+        ResearchServiceError::ProviderOnboarding(_) => {
+            ProviderOperationFailureClass::RuntimeUnavailable
+        }
     }
 }
 

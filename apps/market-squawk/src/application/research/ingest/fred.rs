@@ -38,7 +38,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     DomainLifecycle, PreparedExtraction, ProductionResearchIngestCoordinator,
-    ResearchIngestCompositionError, ResearchRevisionPlanError, await_extraction, await_publication,
+    ProviderOperationDiagnostic, ProviderOperationPhase, ResearchIngestCompositionError,
+    ResearchRevisionPlanError, await_extraction_diagnostic, await_publication_diagnostic,
     ensure_operation_live, operation_deadline, system_timestamp, wall_deadline,
 };
 use crate::provider_activation::{FredPointInTimeReadCapability, FredPointInTimeReadError};
@@ -1016,13 +1017,19 @@ impl ProductionResearchIngestCoordinator {
         provider_dataset: &SourceIdentifier,
         context: &RequestContext,
     ) -> Result<FredSealedDatasetPublication, FredProductionPublicationError> {
-        let _call = DomainLifecycle::enter(&self.lifecycle, context)?;
-        let operation_deadline = operation_deadline(context, self.limits.operation_duration)?;
+        let runtime_diagnostic = |error: ServiceError| {
+            ProviderOperationDiagnostic::from_service(ProviderOperationPhase::Runtime, error)
+        };
+        let _call = DomainLifecycle::enter(&self.lifecycle, context).map_err(runtime_diagnostic)?;
+        let operation_deadline = operation_deadline(context, self.limits.operation_duration)
+            .map_err(runtime_diagnostic)?;
         let operation = self.lifecycle.shutdown_token().child_token();
-        let prepared = self.prepare(profile)?;
+        let prepared = self.prepare(profile).map_err(runtime_diagnostic)?;
         validate_fred_runtime(profile, provider_dataset, &prepared)?;
 
-        prepared.rights.validate_at(system_timestamp()?)?;
+        prepared
+            .rights
+            .validate_at(system_timestamp().map_err(runtime_diagnostic)?)?;
         let expected_subject = FredSource::series_identifier(provider_dataset)?;
         let subject = prepared
             .source
@@ -1037,14 +1044,15 @@ impl ProductionResearchIngestCoordinator {
             Arc::new(prepared.admission.acquire_publication_lease().await?);
         publication_lease.validate_precommit()?;
 
-        let wall_deadline = wall_deadline(operation_deadline, &operation)?;
+        let wall_deadline =
+            wall_deadline(operation_deadline, &operation).map_err(runtime_diagnostic)?;
         let discovery_request = market_squawk_sources::DiscoveryRequest::try_new(
             provider_dataset.clone(),
             None,
             self.limits.discovery_objects,
             wall_deadline,
         )?;
-        let discovery = await_extraction(
+        let discovery = await_extraction_diagnostic(
             prepared.source.discover_managed(
                 prepared.authority.clone(),
                 discovery_request,
@@ -1054,6 +1062,7 @@ impl ProductionResearchIngestCoordinator {
             &operation,
             &prepared.admission,
             operation_deadline,
+            ProviderOperationPhase::Discovery,
         )
         .await?;
         if discovery.capture_material.is_some() {
@@ -1071,13 +1080,15 @@ impl ProductionResearchIngestCoordinator {
             .map_err(|_error| FredProductionPublicationError::Capacity)?;
 
         for (object, identity) in chain.objects.into_iter().zip(chain.identities) {
-            ensure_operation_live(operation_deadline, &operation)?;
+            ensure_operation_live(operation_deadline, &operation).map_err(|error| {
+                ProviderOperationDiagnostic::from_service(ProviderOperationPhase::Extraction, error)
+            })?;
             prepared
                 .admission
                 .ensure_live()
                 .map_err(|_error| FredProductionPublicationError::RuntimeRevoked)?;
             let extracted = self
-                .extract_prepared_object(
+                .extract_prepared_object_diagnostic(
                     PreparedExtraction {
                         source: Arc::clone(&prepared.source),
                         metadata: prepared.metadata.clone(),
@@ -1139,13 +1150,14 @@ impl ProductionResearchIngestCoordinator {
             }
 
             let (expectation, seal_request) = capture_material.into_whole_seal_parts();
-            let sealed = await_publication(
+            let sealed = await_publication_diagnostic(
                 self.research
                     .seal_provider_capture(seal_request, &operation, operation_deadline),
                 context,
                 &operation,
                 &prepared.admission,
                 operation_deadline,
+                ProviderOperationPhase::RawSeal,
             )
             .await?;
             let sealed_capture = expectation.try_rejoin(sealed)?.try_into_whole()?;
@@ -1168,7 +1180,9 @@ impl ProductionResearchIngestCoordinator {
             });
         }
 
-        ensure_operation_live(operation_deadline, &operation)?;
+        ensure_operation_live(operation_deadline, &operation).map_err(|error| {
+            ProviderOperationDiagnostic::from_service(ProviderOperationPhase::Extraction, error)
+        })?;
         prepared
             .admission
             .ensure_live()
@@ -1612,6 +1626,9 @@ pub(crate) enum FredProductionPublicationError {
     /// A shared application operation rejected the current request or lifecycle state.
     #[error("FRED/ALFRED application operation failed")]
     Service(#[from] ServiceError),
+    /// Internal payload-free detail identifies the failed runtime/provider/storage phase.
+    #[error("FRED/ALFRED provider operation failed")]
+    ProviderOperation(#[from] ProviderOperationDiagnostic),
     /// Provider-generation publication authority could not be retained through commit.
     #[error("FRED/ALFRED publication authority failed")]
     Composition(#[from] ResearchIngestCompositionError),
