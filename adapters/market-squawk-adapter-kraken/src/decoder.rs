@@ -1,7 +1,7 @@
 //! Exact-lexeme, message-atomic Kraken decoder and book state.
 
 use std::num::NonZeroU16;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use chrono::DateTime;
 use market_squawk_domain::{
@@ -482,7 +482,7 @@ impl KrakenMarketDecodeHandoff {
         (self.live, self.publication)
     }
 
-    fn try_from_socket_handoff(
+    pub(crate) fn try_from_socket_handoff(
         handoff: KrakenMarketEventHandoff,
     ) -> Result<Self, DecodeInternalError> {
         match handoff {
@@ -573,85 +573,6 @@ impl KrakenMarketDecodeHandoff {
                 Err(DecodeInternalError::InvariantViolation)
             }
         }
-    }
-}
-
-/// Single-allocation source-to-sink handoff publisher used only by the socket-owned decoder.
-#[derive(Debug)]
-pub(crate) struct KrakenSocketHandoffPublisher {
-    state: Arc<Mutex<Option<KrakenMarketEventHandoff>>>,
-}
-
-impl KrakenSocketHandoffPublisher {
-    pub(crate) fn try_publish(
-        &self,
-        handoff: KrakenMarketEventHandoff,
-    ) -> Result<(), DecodeInternalError> {
-        let mut pending = self
-            .state
-            .lock()
-            .map_err(|_| DecodeInternalError::InvariantViolation)?;
-        if pending.is_some() {
-            return Err(DecodeInternalError::InvariantViolation);
-        }
-        *pending = Some(handoff);
-        Ok(())
-    }
-}
-
-/// Sole one-use consumer for socket-owned Kraken decode results.
-#[derive(Debug)]
-pub struct KrakenSocketHandoffConsumer {
-    metadata: SourceMetadata,
-    state: Arc<Mutex<Option<KrakenMarketEventHandoff>>>,
-}
-
-impl KrakenSocketHandoffConsumer {
-    pub(crate) fn channel(metadata: SourceMetadata) -> (KrakenSocketHandoffPublisher, Self) {
-        let state = Arc::new(Mutex::new(None));
-        (
-            KrakenSocketHandoffPublisher {
-                state: Arc::clone(&state),
-            },
-            Self { metadata, state },
-        )
-    }
-
-    /// Consumes only the socket-owned result for this exact validated frame allocation.
-    pub fn consume(
-        &mut self,
-        frame: &ValidatedRawMarketFrame<'_>,
-    ) -> Result<KrakenMarketDecodeHandoff, DecodeInternalError> {
-        let handoff = self
-            .state
-            .lock()
-            .map_err(|_| DecodeInternalError::InvariantViolation)?
-            .take()
-            .ok_or(DecodeInternalError::InvariantViolation)?;
-        let SourceProtocolProfile::Live(profile) = self.metadata.protocol_profile() else {
-            return Err(DecodeInternalError::InvariantViolation);
-        };
-        let expected = DecoderEvidence::from_validated_frame(frame, profile.decoder_rule().clone());
-        if frame.frame().source_id() != self.metadata.source_id()
-            || frame.frame().metadata_revision() != self.metadata.revision()
-            || handoff.evidence() != &expected
-            || handoff.native_payload() != frame.frame().payload()
-            || handoff.transport() != frame.frame().transport()
-        {
-            return Err(DecodeInternalError::InvariantViolation);
-        }
-        handoff
-            .evidence()
-            .currentness_lease()
-            .validate_current()
-            .map_err(|_| DecodeInternalError::InvariantViolation)?;
-        KrakenMarketDecodeHandoff::try_from_socket_handoff(handoff)
-    }
-}
-
-impl SourceMetadataProvider for KrakenSocketHandoffConsumer {
-    fn metadata(&self) -> &SourceMetadata {
-        &self.metadata
     }
 }
 

@@ -14,9 +14,10 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     ActiveLiveSourceGeneration, AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
     AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy,
-    BudgetReservationDecision, BudgetScope, DecodeOutcome, FreshnessPolicy, LiveMarketSource,
-    LiveSourceGeneration, ProviderBudgetPolicy, RawMarketFrame, RawMarketSink, RegistryError,
-    SessionId, SinkError, SourceError, SourceMetadata, SourceMetadataProvider, TransportFrameKind,
+    BudgetReservationDecision, BudgetScope, CurrentSourceSession, DecodeOutcome, FreshnessPolicy,
+    LiveMarketSource, LiveSourceGeneration, ProviderBudgetPolicy, ProviderChecksumEvidence,
+    RawMarketFrame, RawMarketSink, RegistryError, SessionId, SinkError, SourceError,
+    SourceMetadata, SourceMetadataProvider, TransportFrameKind,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -25,48 +26,59 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    KrakenDecoderState, KrakenEstablishedSubscriptionSender, KrakenSource,
-    KrakenWrittenSubscription,
+    KrakenDecoderState, KrakenSocketDecodeControl, KrakenSocketHandoffConsumer, KrakenSource,
+    send_subscription,
 };
-use crate::decoder::{KrakenSocketHandoffConsumer, KrakenSocketHandoffPublisher};
 use crate::{
     KRAKEN_L3_WEBSOCKET_ENDPOINT, KrakenAuthenticatedDiscontinuity, KrakenBookTransition,
     KrakenChecksumAvailability, KrakenConfig, KrakenControlOrDiscontinuityKind, KrakenDepth,
-    KrakenGenerationRetirement, KrakenL3ClientTier, KrakenL3Config, KrakenL3CredentialAuthority,
-    KrakenL3Decoder, KrakenL3DecoderState, KrakenL3Depth, KrakenL3EstablishedSessionSender,
-    KrakenL3MetadataInput, KrakenL3ProductMapping, KrakenL3SubscriptionDispatch,
-    KrakenMarketContinuity, KrakenMarketDecodeHandoff, KrakenMarketDecoder,
-    KrakenMarketEventHandoff, KrakenMetadataInput, KrakenPublicControl,
+    KrakenL3ClientTier, KrakenL3Config, KrakenL3CredentialAuthority, KrakenL3Decoder,
+    KrakenL3DecoderState, KrakenL3Depth, KrakenL3EstablishedSessionSender, KrakenL3MetadataInput,
+    KrakenL3ProductMapping, KrakenL3SubscriptionDispatch, KrakenMarketContinuity,
+    KrakenMarketDecodeHandoff, KrakenMarketEventHandoff, KrakenMetadataInput,
     KrakenSubscriptionRequestEvidence,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Debug)]
-struct RecordingSink {
+struct RecordingSink<'a> {
     frames: Vec<RawMarketFrame>,
     limit: usize,
     terminal_after_capture: bool,
+    session: Option<&'a CurrentSourceSession>,
+    decoder: Option<KrakenSocketHandoffConsumer>,
 }
 
-impl Default for RecordingSink {
+impl Default for RecordingSink<'_> {
     fn default() -> Self {
         Self {
             frames: Vec::with_capacity(2),
             limit: 2,
             terminal_after_capture: false,
+            session: None,
+            decoder: None,
         }
     }
 }
 
-impl RawMarketSink for RecordingSink {
+impl RawMarketSink for RecordingSink<'_> {
     fn try_publish(&mut self, frame: RawMarketFrame) -> Result<(), SinkError> {
         if self.frames.len() == self.limit {
             return Err(SinkError::Saturated);
         }
-        self.frames.push(frame);
+        self.frames.push(frame.clone());
         if self.terminal_after_capture {
             return Err(SinkError::CaptureIncomplete);
+        }
+        if let Some(decoder) = &mut self.decoder {
+            let session = self.session.ok_or(SinkError::CaptureIncomplete)?;
+            let validated = session
+                .validate_live_frame(&frame)
+                .map_err(|_| SinkError::CaptureIncomplete)?;
+            decoder
+                .consume(&validated)
+                .map_err(|_| SinkError::CaptureIncomplete)?;
         }
         Ok(())
     }
@@ -104,9 +116,6 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
         public_socket
             .send(Message::Text(PUBLIC_RESET.into()))
             .await?;
-        public_socket
-            .send(Message::Text(std::str::from_utf8(public_snapshot)?.into()))
-            .await?;
 
         let mut level3_socket = accept_subscription(&listener).await?;
         level3_socket.send(Message::Text(LEVEL3_ACK.into())).await?;
@@ -132,82 +141,80 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
     )?;
     let public_generation = live_generation(&mut public_registry, &public_session)?;
     let mut public_authority = public_generation.try_start(public_config.metadata())?;
+    let public_budget = public_authority
+        .budget()?
+        .cloned()
+        .ok_or("public session has no coordinated budget")?;
+    let (public_decode_control, mut public_handoff_consumer) =
+        KrakenSocketHandoffConsumer::channel(&public_config, public_budget.clone())?;
     let (mut public_socket, _) =
         tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
-    let public_request = public_config
-        .try_subscription_request(public_authority.generation())?
-        .into_pending_write();
-    let public_written =
-        KrakenEstablishedSubscriptionSender::try_new(&mut public_authority, &mut public_socket)?
-            .send(
-                public_request,
-                &CancellationToken::new(),
-                Duration::from_secs(1),
-            )
-            .await?;
-    let mut public_decoder = KrakenMarketDecoder::try_new(
-        public_config.metadata().clone(),
-        "BTC/USD",
-        instrument,
-        KrakenDepth::Ten,
-    )?;
-    let (public_handoff_publisher, mut public_handoff_consumer) =
-        KrakenSocketHandoffConsumer::channel(public_config.metadata().clone());
-    let public_ack = receive_text(&mut public_socket).await?;
-    let acknowledgement = decode_public_frame(
+    let public_request = public_config.try_subscription_request(public_authority.generation())?;
+    let (public_permit, public_written) = send_subscription(
+        &mut public_socket,
         &mut public_authority,
-        &mut public_decoder,
-        public_ack,
-        Some(public_written),
-    )?;
-    assert!(matches!(
-        disposition_kind(&acknowledgement)?,
-        KrakenControlOrDiscontinuityKind::PublicControl(KrakenPublicControl::Subscribed {
-            request_id: 1,
-            ..
-        })
-    ));
-    let (public_continuity, public_snapshot_handoff) = decode_public_frame_through_socket_handoff(
+        &public_budget,
+        public_request,
+        &CancellationToken::new(),
+        Duration::from_secs(1),
+    )
+    .await?;
+    public_decode_control.install_subscription(public_permit, public_written)?;
+    let (acknowledgement, terminal) = decode_public_frame_through_socket_handoff(
         &mut public_authority,
-        &mut public_decoder,
         receive_text(&mut public_socket).await?,
-        &public_handoff_publisher,
         &mut public_handoff_consumer,
+        &public_decode_control,
     )?;
+    let (acknowledgement, acknowledgement_publication) = acknowledgement.into_parts();
     assert!(matches!(
-        public_continuity,
-        KrakenMarketContinuity::PriceLevelBook {
-            transition: KrakenBookTransition::Snapshot,
-            checksum: KrakenChecksumAvailability::Validated(3_310_070_434),
-            ..
-        }
+        acknowledgement,
+        DecodeOutcome::Control(control)
+            if control.kind() == market_squawk_sources::ControlFrameKind::SubscriptionAcknowledgement
     ));
+    assert!(acknowledgement_publication.is_some());
+    assert!(terminal.is_none());
+    assert!(public_decode_control.health().book_subscribed());
+
+    let (public_snapshot_handoff, terminal) = decode_public_frame_through_socket_handoff(
+        &mut public_authority,
+        receive_text(&mut public_socket).await?,
+        &mut public_handoff_consumer,
+        &public_decode_control,
+    )?;
     let (public_snapshot, publication) = public_snapshot_handoff.into_parts();
-    assert!(matches!(public_snapshot, DecodeOutcome::Data(_)));
-    assert!(publication.is_some());
-    let reset = decode_public_frame(
-        &mut public_authority,
-        &mut public_decoder,
-        receive_text(&mut public_socket).await?,
-        None,
-    )?;
-    assert!(matches!(
-        disposition_kind(&reset)?,
-        KrakenControlOrDiscontinuityKind::PublicControl(
-            KrakenPublicControl::ProviderReset { system }
-        ) if system.as_str() == "maintenance"
-    ));
-    let replay = decode_public_frame(
-        &mut public_authority,
-        &mut public_decoder,
-        receive_text(&mut public_socket).await?,
-        None,
-    )?;
-    assert_eq!(
-        disposition_kind(&replay)?,
-        &KrakenControlOrDiscontinuityKind::PublicGenerationRetired(
-            KrakenGenerationRetirement::AlreadyRetired,
+    let DecodeOutcome::Data(public_snapshot) = public_snapshot else {
+        return Err("public book escaped the capture-owned decoder".into());
+    };
+    assert!(public_snapshot.observations().iter().all(|observation| {
+        matches!(
+            observation.checksum(),
+            ProviderChecksumEvidence::Provided { value, .. }
+                if value.as_str() == "3310070434"
         )
+    }));
+    assert!(publication.is_some());
+    assert!(terminal.is_none());
+    assert_eq!(public_decode_control.health().market_messages(), 1);
+
+    let (reset, terminal) = decode_public_frame_through_socket_handoff(
+        &mut public_authority,
+        receive_text(&mut public_socket).await?,
+        &mut public_handoff_consumer,
+        &public_decode_control,
+    )?;
+    let (reset, reset_publication) = reset.into_parts();
+    assert!(matches!(
+        reset,
+        DecodeOutcome::Resynchronize(recovery)
+            if recovery.reason()
+                == market_squawk_sources::ResynchronizationReason::ProviderRequestedReset
+    ));
+    assert!(reset_publication.is_some());
+    assert_eq!(terminal, Some(SourceError::InvalidProtocolState));
+    assert_eq!(
+        public_decode_control.health().state(),
+        KrakenDecoderState::Retired
     );
 
     let credential_record = SourceIdentifier::try_from("kraken-read-only-market-data-account")?;
@@ -401,40 +408,19 @@ where
     Ok(Bytes::copy_from_slice(text.as_bytes()))
 }
 
-fn decode_public_frame(
-    authority: &mut ActiveLiveSourceGeneration,
-    decoder: &mut KrakenMarketDecoder,
-    payload: Bytes,
-    written: Option<KrakenWrittenSubscription>,
-) -> TestResult<KrakenMarketEventHandoff> {
-    let frame = authority
-        .frames_mut()?
-        .try_frame(TransportFrameKind::Text, payload)?;
-    let validated = authority.validate_live_frame(&frame)?;
-    if let Some(written) = written {
-        decoder.register_sent_subscription(written.bind_to_frame(&validated)?)?;
-    }
-    Ok(decoder.decode_captured(&validated)?)
-}
-
 fn decode_public_frame_through_socket_handoff(
     authority: &mut ActiveLiveSourceGeneration,
-    decoder: &mut KrakenMarketDecoder,
     payload: Bytes,
-    publisher: &KrakenSocketHandoffPublisher,
     consumer: &mut KrakenSocketHandoffConsumer,
-) -> TestResult<(KrakenMarketContinuity, KrakenMarketDecodeHandoff)> {
+    control: &KrakenSocketDecodeControl,
+) -> TestResult<(KrakenMarketDecodeHandoff, Option<SourceError>)> {
     let frame = authority
         .frames_mut()?
         .try_frame(TransportFrameKind::Text, payload)?;
+    let frame_id = frame.frame_id();
     let validated = authority.validate_live_frame(&frame)?;
-    let handoff = decoder.decode_captured(&validated)?;
-    let KrakenMarketEventHandoff::Public(public) = &handoff else {
-        return Err("public book escaped the socket-owned market handoff".into());
-    };
-    let continuity = public.continuity();
-    publisher.try_publish(handoff)?;
-    Ok((continuity, consumer.consume(&validated)?))
+    let handoff = consumer.consume(&validated)?;
+    Ok((handoff, control.finish_frame(frame_id)?))
 }
 
 fn decode_level3_frame(
@@ -506,9 +492,9 @@ fn level3_metadata(
             SourceIdentifier::try_from("kraken")?,
             credential_record,
         ),
-        NonZeroU32::new(200).ok_or("zero request budget")?,
+        NonZeroU32::new(1).ok_or("zero request budget")?,
         NonZeroU64::new(1_000_000_000).ok_or("zero budget window")?,
-        NonZeroU16::new(2).ok_or("zero concurrency")?,
+        NonZeroU16::new(1).ok_or("zero concurrency")?,
         BackoffPolicy::try_new(
             NonZeroU64::new(100_000_000).ok_or("zero initial backoff")?,
             NonZeroU64::new(30_000_000_000).ok_or("zero maximum backoff")?,
@@ -559,8 +545,10 @@ async fn sink_admission_precedes_decode_and_terminal_controls_are_counted() -> T
         TestResult::Ok(())
     });
 
+    let endpoint = format!("ws://{address}");
     let (first_config, mut first_registry, first_registered) =
         test_source("kraken-public-book-v2", "kraken-policy-v1")?;
+    let first_config = first_config.with_local_endpoint_for_test(&endpoint)?;
     let first_session = first_registry.begin_session(
         &first_registered,
         SessionId::new(SourceIdentifier::try_from("kraken-sink-rejected")?),
@@ -568,15 +556,17 @@ async fn sink_admission_precedes_decode_and_terminal_controls_are_counted() -> T
         Timestamp::from_unix_nanos(1),
     )?;
     let first_generation = live_generation(&mut first_registry, &first_session)?;
-    let (mut first_socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
-    let mut first_source = KrakenSource::try_new(first_config, first_generation)?;
+    let (mut first_source, first_decoder) =
+        KrakenSource::try_new_with_publication_handoff(first_config, first_generation)?;
     let mut first_sink = RecordingSink {
         terminal_after_capture: true,
+        session: Some(&first_session),
+        decoder: Some(first_decoder),
         ..RecordingSink::default()
     };
 
     let first_result = first_source
-        .run_established(&mut first_socket, &mut first_sink, CancellationToken::new())
+        .run(&mut first_sink, CancellationToken::new())
         .await;
 
     assert_eq!(
@@ -590,6 +580,7 @@ async fn sink_admission_precedes_decode_and_terminal_controls_are_counted() -> T
 
     let (config, mut registry, registered) =
         test_source("kraken-public-book-v2", "kraken-policy-v1")?;
+    let config = config.with_local_endpoint_for_test(&endpoint)?;
     let session = registry.begin_session(
         &registered,
         SessionId::new(SourceIdentifier::try_from("kraken-refusal-admitted")?),
@@ -597,17 +588,18 @@ async fn sink_admission_precedes_decode_and_terminal_controls_are_counted() -> T
         Timestamp::from_unix_nanos(1),
     )?;
     let generation = live_generation(&mut registry, &session)?;
-    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}")).await?;
     let budget = session
         .budget()
         .cloned()
         .ok_or("source session has no coordinated budget")?;
-    let mut source = KrakenSource::try_new(config, generation)?;
-    let mut sink = RecordingSink::default();
+    let (mut source, decoder) = KrakenSource::try_new_with_publication_handoff(config, generation)?;
+    let mut sink = RecordingSink {
+        session: Some(&session),
+        decoder: Some(decoder),
+        ..RecordingSink::default()
+    };
 
-    let result = source
-        .run_established(&mut socket, &mut sink, CancellationToken::new())
-        .await;
+    let result = source.run(&mut sink, CancellationToken::new()).await;
 
     let refusal_deadline = match result {
         Err(SourceError::BudgetWaitUntil { deadline }) => deadline,
@@ -630,7 +622,7 @@ async fn accept_book_source(listener: &TcpListener) -> TestResult<WebSocketStrea
     let (stream, _) = listener.accept().await?;
     let mut socket = tokio_tungstenite::accept_async(stream).await?;
     let Some(Ok(Message::Text(subscription))) =
-        tokio::time::timeout(Duration::from_secs(1), socket.next()).await?
+        tokio::time::timeout(Duration::from_secs(2), socket.next()).await?
     else {
         return Err("source did not send a text subscription".into());
     };
@@ -662,7 +654,7 @@ fn source_authority_rejects_rollover_factory_grafting_and_cross_registry_session
         Timestamp::from_unix_nanos(2),
     )?;
     assert!(matches!(
-        KrakenSource::try_new(config.clone(), stale_generation),
+        KrakenSource::try_new_with_publication_handoff(config.clone(), stale_generation),
         Err(SourceError::SessionNotCurrent)
     ));
 
@@ -718,7 +710,8 @@ async fn source_uses_the_session_budget_and_cannot_run_twice() -> TestResult {
         .cloned()
         .ok_or("source session has no coordinated budget")?;
     let generation = live_generation(&mut registry, &session)?;
-    let mut source = KrakenSource::try_new(config, generation)?;
+    let (mut source, _decoder) =
+        KrakenSource::try_new_with_publication_handoff(config, generation)?;
     assert!(source.budget.shares_allocation_with(&expected_budget));
 
     let cancellation = CancellationToken::new();
@@ -753,18 +746,6 @@ fn test_source(
     AuthoritativeSourceRegistry,
     market_squawk_sources::RegisteredSource,
 )> {
-    test_source_with_concurrency(source_id, metadata_revision, 3)
-}
-
-fn test_source_with_concurrency(
-    source_id: &str,
-    metadata_revision: &str,
-    max_concurrent: u16,
-) -> TestResult<(
-    KrakenConfig,
-    AuthoritativeSourceRegistry,
-    market_squawk_sources::RegisteredSource,
-)> {
     let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
     let exact = |byte| {
         ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
@@ -781,9 +762,9 @@ fn test_source_with_concurrency(
     );
     let budget = ProviderBudgetPolicy::try_new(
         BudgetScope::new(provider),
-        NonZeroU32::new(20).ok_or("zero request budget")?,
+        NonZeroU32::new(1).ok_or("zero request budget")?,
         NonZeroU64::new(1_000_000_000).ok_or("zero budget window")?,
-        NonZeroU16::new(max_concurrent).ok_or("zero concurrency")?,
+        NonZeroU16::new(1).ok_or("zero concurrency")?,
         BackoffPolicy::try_new(
             NonZeroU64::new(10_000_000).ok_or("zero initial backoff")?,
             NonZeroU64::new(1_000_000_000).ok_or("zero maximum backoff")?,
