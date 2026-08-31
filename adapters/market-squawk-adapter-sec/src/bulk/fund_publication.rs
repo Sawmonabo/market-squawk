@@ -26,7 +26,10 @@ use market_squawk_domain::{
     FundSupplementDisposition, Isin, MAX_FUND_SOURCE_ROWS, SchemaVersion, SourceId,
     SourceIdentifier, Timestamp,
 };
-use market_squawk_platform::{ResearchObjectControl, SealedResearchJournalStore};
+use market_squawk_platform::{
+    ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
+    SealedResearchJournalStore,
+};
 use market_squawk_sources::{
     LogicalItemRange, LogicalPartitionFamily, LogicalPartitionSetAdmission,
     PendingLogicalPartitionSet, ProviderLogicalTerminalInput, SEC_EDGAR_SOURCE_ID,
@@ -114,6 +117,114 @@ impl SecFundPublicationScope {
     }
 }
 
+/// Closed authoritative identifier family admitted to held-security composition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecFundSecurityIdentifierKind {
+    /// Exact source CUSIP from the filing's holding row.
+    Cusip,
+    /// Exact source ISIN from one filing-scoped identifier row.
+    Isin,
+}
+
+/// One exact CUSIP/ISIN candidate bound to its SEC source row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecFundSecurityIdentifierInput {
+    kind: SecFundSecurityIdentifierKind,
+    value: SourceIdentifier,
+    row_evidence: EvidenceDigest,
+}
+
+impl SecFundSecurityIdentifierInput {
+    /// Returns the closed authoritative namespace. Names and tickers have no variant.
+    pub const fn kind(&self) -> SecFundSecurityIdentifierKind {
+        self.kind
+    }
+
+    /// Returns the exact source lexical identifier.
+    pub const fn value(&self) -> &SourceIdentifier {
+        &self.value
+    }
+
+    /// Returns the exact provider row containing this identifier.
+    pub const fn row_evidence(&self) -> EvidenceDigest {
+        self.row_evidence
+    }
+}
+
+/// Provider-minted SEC series/share-class identity input for root reference composition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecFundShareClassIdentityInput {
+    accession: SourceIdentifier,
+    series_id: SourceIdentifier,
+    row_evidence: EvidenceDigest,
+    manifest_evidence: EvidenceDigest,
+    terminal_evidence: EvidenceDigest,
+}
+
+impl SecFundShareClassIdentityInput {
+    /// Returns the exact filing accession that supplied this series coordinate.
+    pub const fn accession(&self) -> &SourceIdentifier {
+        &self.accession
+    }
+
+    /// Returns exact SEC `SERIES_ID`; name and ticker inference are intentionally unavailable.
+    pub const fn series_id(&self) -> &SourceIdentifier {
+        &self.series_id
+    }
+
+    /// Returns the exact SEC fund row evidence.
+    pub const fn row_evidence(&self) -> EvidenceDigest {
+        self.row_evidence
+    }
+
+    /// Returns the immutable source-layout identity.
+    pub const fn manifest_evidence(&self) -> EvidenceDigest {
+        self.manifest_evidence
+    }
+
+    /// Returns the complete validated archive terminal identity.
+    pub const fn terminal_evidence(&self) -> EvidenceDigest {
+        self.terminal_evidence
+    }
+}
+
+/// Provider-minted filing-scoped held-security identity input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecFundHoldingIdentityInput {
+    accession: SourceIdentifier,
+    holding_id: SourceIdentifier,
+    identifiers: Box<[SecFundSecurityIdentifierInput]>,
+    manifest_evidence: EvidenceDigest,
+    terminal_evidence: EvidenceDigest,
+}
+
+impl SecFundHoldingIdentityInput {
+    /// Returns the exact filing owner of this provider-local holding coordinate.
+    pub const fn accession(&self) -> &SourceIdentifier {
+        &self.accession
+    }
+
+    /// Returns exact provider `HOLDING_ID`, interpreted only with [`Self::accession`].
+    pub const fn holding_id(&self) -> &SourceIdentifier {
+        &self.holding_id
+    }
+
+    /// Returns only exact CUSIP/ISIN source inputs, each with its provider-row evidence.
+    pub fn identifiers(&self) -> &[SecFundSecurityIdentifierInput] {
+        &self.identifiers
+    }
+
+    /// Returns the immutable source-layout identity.
+    pub const fn manifest_evidence(&self) -> EvidenceDigest {
+        self.manifest_evidence
+    }
+
+    /// Returns the complete validated archive terminal identity.
+    pub const fn terminal_evidence(&self) -> EvidenceDigest {
+        self.terminal_evidence
+    }
+}
+
 /// Separately governed identity authority used during SEC canonical mapping.
 ///
 /// Implementations may return explicit unresolved/ambiguous held-security states. Fund identity
@@ -122,15 +233,14 @@ pub trait SecFundIdentityAuthority {
     /// Resolves exact SEC `SERIES_ID` to an already governed canonical share-class identity.
     fn resolve_share_class(
         &mut self,
-        series_id: &SourceIdentifier,
+        input: &SecFundShareClassIdentityInput,
         cutoff: Timestamp,
     ) -> Result<FundShareClassIdentity, SecBulkError>;
 
     /// Resolves only authoritative CUSIP/ISIN evidence; names and tickers are associations only.
     fn resolve_holding_security(
         &mut self,
-        holding: &SecNportHoldingRow,
-        identifiers: &[SecNportIdentifierRow],
+        input: &SecFundHoldingIdentityInput,
         cutoff: Timestamp,
     ) -> Result<FundHoldingSecurityIdentity, SecBulkError>;
 }
@@ -168,6 +278,7 @@ pub struct SecFundPendingLogicalRows {
     scope: SecFundPublicationScope,
     rows: Vec<SecBulkLogicalRow>,
     nport_holding_ids: BTreeSet<String>,
+    nport_holding_scope_evidence: Option<EvidenceDigest>,
     accounted_native_bytes: u64,
     aborted: bool,
 }
@@ -179,6 +290,7 @@ impl SecFundPendingLogicalRows {
             scope,
             rows: Vec::new(),
             nport_holding_ids: BTreeSet::new(),
+            nport_holding_scope_evidence: None,
             accounted_native_bytes: 0,
             aborted: false,
         }
@@ -211,6 +323,17 @@ impl SecFundPendingLogicalRows {
                         if !accession_matches {
                             return Ok(false);
                         }
+                        let scope_evidence = row
+                            .lineage()
+                            .nport_holding_scope_evidence()
+                            .ok_or(SecBulkError::RelationalIntegrity)?;
+                        match self.nport_holding_scope_evidence {
+                            Some(expected) if expected != scope_evidence => {
+                                return Err(SecBulkError::RelationalIntegrity);
+                            }
+                            Some(_) => {}
+                            None => self.nport_holding_scope_evidence = Some(scope_evidence),
+                        }
                         let holding_id = join_value(row, SecBulkJoinDomain::Holding)
                             .ok_or(SecBulkError::InvalidCanonicalMapping)?;
                         if !self.nport_holding_ids.insert(holding_id.to_owned()) {
@@ -218,16 +341,12 @@ impl SecFundPendingLogicalRows {
                         }
                         Ok(true)
                     }
-                    // The closed manifest order places holdings before identifiers/supplements,
-                    // and archive validation proves HOLDING_ID uniqueness and referential
-                    // integrity across the complete quarter before this selection pass begins.
-                    SecBulkTableKind::NportIdentifiers => {
-                        Ok(join_value(row, SecBulkJoinDomain::Holding)
-                            .is_some_and(|holding_id| self.nport_holding_ids.contains(holding_id)))
-                    }
+                    // These SEC tables omit ACCESSION_NUMBER. Admit them only under the exact
+                    // archive-scoped owner proof minted by complete validation; HOLDING_ID alone
+                    // is never treated as quarter-global identity.
+                    SecBulkTableKind::NportIdentifiers => Ok(self.accepts_nport_holding_child(row)),
                     table if is_canonical_holding_supplement(table) => {
-                        Ok(join_value(row, SecBulkJoinDomain::Holding)
-                            .is_some_and(|holding_id| self.nport_holding_ids.contains(holding_id)))
+                        Ok(self.accepts_nport_holding_child(row))
                     }
                     _ => Ok(false),
                 }
@@ -253,6 +372,13 @@ impl SecFundPendingLogicalRows {
                 })
             }
         }
+    }
+
+    fn accepts_nport_holding_child(&self, row: &SecBulkLogicalRow) -> bool {
+        self.nport_holding_scope_evidence
+            .is_some_and(|expected| row.lineage().nport_holding_scope_evidence() == Some(expected))
+            && join_value(row, SecBulkJoinDomain::Holding)
+                .is_some_and(|holding_id| self.nport_holding_ids.contains(holding_id))
     }
 }
 
@@ -286,6 +412,7 @@ impl SecBulkPendingLogicalRowSink for SecFundPendingLogicalRows {
     fn abort(&mut self) {
         self.rows.clear();
         self.nport_holding_ids.clear();
+        self.nport_holding_scope_evidence = None;
         self.accounted_native_bytes = 0;
         self.aborted = true;
     }
@@ -491,8 +618,8 @@ fn prepare_selected_fund<A: SecFundIdentityAuthority>(
         return Err(SecBulkError::PublicationNotReady);
     }
     let candidates = match selected.scope.family() {
-        SecBulkFamily::Nport => map_nport(&selected, &handoff, authority, ingested_at)?,
-        SecBulkFamily::Ncen => map_ncen(&selected, &handoff, authority, ingested_at)?,
+        SecBulkFamily::Nport => map_nport(&selected, &handoff, authority, ingested_at, control)?,
+        SecBulkFamily::Ncen => map_ncen(&selected, &handoff, authority, ingested_at, control)?,
     };
     if candidates.is_empty() {
         return Err(SecBulkError::PublicationNotReady);
@@ -599,6 +726,7 @@ fn stage_candidates(
     let native_generation = handoff.report().ordered_typed_rows_evidence();
     for (ordinal, candidate) in candidates.into_iter().enumerate() {
         let ordinal = u64::try_from(ordinal).map_err(|_| SecBulkError::QueryLimitExceeded)?;
+        checkpoint_fund_preparation(control, ordinal)?;
         let native_bytes = native_envelope_bytes(
             selected,
             handoff,
@@ -714,12 +842,27 @@ fn validate_prepared_alignment(
     Ok(())
 }
 
+fn checkpoint_fund_preparation(
+    control: &dyn ResearchObjectControl,
+    offset_bytes: u64,
+) -> Result<(), SecBulkError> {
+    control
+        .checkpoint(ResearchObjectControlPoint::BeforeVerificationChunk { offset_bytes })
+        .map_err(|error| match error {
+            ResearchObjectControlError::Cancelled => SecBulkError::Cancelled,
+            ResearchObjectControlError::DeadlineExceeded => SecBulkError::DeadlineExceeded,
+            ResearchObjectControlError::Unavailable => SecBulkError::PublicationNotReady,
+        })
+}
+
 fn map_nport<A: SecFundIdentityAuthority>(
     selected: &SecFundPendingLogicalRows,
     handoff: &SecBulkLogicalPublicationHandoff,
     authority: &mut A,
     ingested_at: Timestamp,
+    control: &dyn ResearchObjectControl,
 ) -> Result<Vec<CanonicalCandidate>, SecBulkError> {
+    checkpoint_fund_preparation(control, 0)?;
     let submission_index = unique_projected_index(selected, SecBulkTableKind::NportSubmission)?;
     let registrant_index = unique_projected_index(selected, SecBulkTableKind::NportRegistrant)?;
     let fund_index = unique_projected_index(selected, SecBulkTableKind::NportFundReportedInfo)?;
@@ -732,7 +875,14 @@ fn map_nport<A: SecFundIdentityAuthority>(
     {
         return Err(SecBulkError::InvalidCanonicalMapping);
     }
-    let fund_identity = authority.resolve_share_class(&fund.series_id, ingested_at)?;
+    let fund_identity_input = share_class_identity_input(
+        selected,
+        handoff,
+        fund_index,
+        &fund.accession,
+        &fund.series_id,
+    )?;
+    let fund_identity = authority.resolve_share_class(&fund_identity_input, ingested_at)?;
     if fund_identity.provider_series_id() != &fund.series_id {
         return Err(SecBulkError::InvalidCanonicalMapping);
     }
@@ -777,6 +927,12 @@ fn map_nport<A: SecFundIdentityAuthority>(
     let mut supplements = BTreeMap::<SourceIdentifier, Vec<usize>>::new();
     let mut explanatory_note_indices = Vec::new();
     for (index, row) in selected.rows.iter().enumerate() {
+        if index % 1_024 == 0 {
+            checkpoint_fund_preparation(
+                control,
+                u64::try_from(index).map_err(|_| SecBulkError::QueryLimitExceeded)?,
+            )?;
+        }
         match row.table() {
             SecBulkTableKind::NportFundReportedHolding => {
                 let holding = nport_holding(row)?;
@@ -827,15 +983,20 @@ fn map_nport<A: SecFundIdentityAuthority>(
         return Err(SecBulkError::InvalidCanonicalMapping);
     }
     for (holding_id, holding_index) in holding_indices {
+        checkpoint_fund_preparation(
+            control,
+            u64::try_from(holding_index).map_err(|_| SecBulkError::QueryLimitExceeded)?,
+        )?;
         let holding = nport_holding(&selected.rows[holding_index])?;
         let identifier_indices = identifiers.remove(&holding_id).unwrap_or_default();
         let identifier_rows = identifier_indices
             .iter()
             .map(|index| nport_identifier(&selected.rows[*index]).cloned())
             .collect::<Result<Vec<_>, _>>()?;
+        let held_security_input = holding_identity_input(handoff, holding, &identifier_rows)?;
         let held_security =
-            authority.resolve_holding_security(holding, &identifier_rows, ingested_at)?;
-        validate_holding_identity(&held_security, holding, &identifier_rows)?;
+            authority.resolve_holding_security(&held_security_input, ingested_at)?;
+        validate_holding_identity(&held_security, &held_security_input)?;
         let mut row_indices = common_indices.clone();
         row_indices.push(holding_index);
         row_indices.extend(identifier_indices);
@@ -914,7 +1075,9 @@ fn map_ncen<A: SecFundIdentityAuthority>(
     handoff: &SecBulkLogicalPublicationHandoff,
     authority: &mut A,
     ingested_at: Timestamp,
+    control: &dyn ResearchObjectControl,
 ) -> Result<Vec<CanonicalCandidate>, SecBulkError> {
+    checkpoint_fund_preparation(control, 0)?;
     let submission_index = unique_projected_index(selected, SecBulkTableKind::NcenSubmission)?;
     let registrant_index = unique_projected_index(selected, SecBulkTableKind::NcenRegistrant)?;
     let fund_index = unique_projected_index(selected, SecBulkTableKind::NcenFundReportedInfo)?;
@@ -932,7 +1095,9 @@ fn map_ncen<A: SecFundIdentityAuthority>(
     {
         return Err(SecBulkError::InvalidCanonicalMapping);
     }
-    let fund_identity = authority.resolve_share_class(series_id, ingested_at)?;
+    let fund_identity_input =
+        share_class_identity_input(selected, handoff, fund_index, &fund.accession, series_id)?;
+    let fund_identity = authority.resolve_share_class(&fund_identity_input, ingested_at)?;
     if fund_identity.provider_series_id() != series_id {
         return Err(SecBulkError::InvalidCanonicalMapping);
     }
@@ -1117,9 +1282,18 @@ fn filing_identity(
         FundAmendmentState::Original => FundRevisionLink::NotApplicable,
         FundAmendmentState::Amendment => FundRevisionLink::Unresolved,
     };
+    let coverage = release_coverage(handoff)?;
+    // Under complete as-filed quarterly coverage, an original is the current known revision at
+    // this exact availability cutoff until a successor is observed. Amendments remain unavailable
+    // until an exact predecessor link is composed; we never infer that link from dates or names.
+    let status = if amendment == FundAmendmentState::Original && coverage.is_complete() {
+        FundRevisionStatus::Current
+    } else {
+        FundRevisionStatus::Unavailable
+    };
     let revision = FundRevisionEvidence::try_new(
         amendment,
-        FundRevisionStatus::Unavailable,
+        status,
         predecessor,
         FundRevisionLink::NotObserved,
         Vec::new(),
@@ -1137,7 +1311,7 @@ fn filing_identity(
         identity,
         chronology,
         revision,
-        release_coverage(handoff)?,
+        coverage,
     )
     .map_err(|_| SecBulkError::InvalidCanonicalMapping)
 }
@@ -1389,24 +1563,91 @@ fn holding_attributes(holding: &SecNportHoldingRow) -> FundPortfolioHoldingAttri
     )
 }
 
-fn validate_holding_identity(
-    identity: &FundHoldingSecurityIdentity,
+fn share_class_identity_input(
+    selected: &SecFundPendingLogicalRows,
+    handoff: &SecBulkLogicalPublicationHandoff,
+    fund_index: usize,
+    accession: &SourceIdentifier,
+    series_id: &SourceIdentifier,
+) -> Result<SecFundShareClassIdentityInput, SecBulkError> {
+    let row = selected
+        .rows
+        .get(fund_index)
+        .ok_or(SecBulkError::InvalidCanonicalMapping)?;
+    if row.table()
+        != match selected.scope.family() {
+            SecBulkFamily::Nport => SecBulkTableKind::NportFundReportedInfo,
+            SecBulkFamily::Ncen => SecBulkTableKind::NcenFundReportedInfo,
+        }
+        || !has_join(row, SecBulkJoinDomain::Accession, accession.as_str())
+        || handoff.manifest().evidence() != row.lineage().manifest_evidence()
+        || handoff.terminal_evidence() != row.lineage().terminal_evidence()
+    {
+        return Err(SecBulkError::InvalidCanonicalMapping);
+    }
+    Ok(SecFundShareClassIdentityInput {
+        accession: accession.clone(),
+        series_id: series_id.clone(),
+        row_evidence: row.row_evidence(),
+        manifest_evidence: handoff.manifest().evidence(),
+        terminal_evidence: handoff.terminal_evidence(),
+    })
+}
+
+fn holding_identity_input(
+    handoff: &SecBulkLogicalPublicationHandoff,
     holding: &SecNportHoldingRow,
     identifiers: &[SecNportIdentifierRow],
+) -> Result<SecFundHoldingIdentityInput, SecBulkError> {
+    let mut authoritative = Vec::new();
+    authoritative
+        .try_reserve_exact(usize::from(holding.cusip.is_some()) + identifiers.len())
+        .map_err(|_| SecBulkError::AllocationFailed)?;
+    if let Some(cusip) = &holding.cusip {
+        authoritative.push(SecFundSecurityIdentifierInput {
+            kind: SecFundSecurityIdentifierKind::Cusip,
+            value: cusip.clone(),
+            row_evidence: holding.row_evidence,
+        });
+    }
+    for identifier in identifiers {
+        if let Some(isin) = &identifier.isin {
+            authoritative.push(SecFundSecurityIdentifierInput {
+                kind: SecFundSecurityIdentifierKind::Isin,
+                value: isin.clone(),
+                row_evidence: identifier.row_evidence,
+            });
+        }
+    }
+    Ok(SecFundHoldingIdentityInput {
+        accession: holding.accession.clone(),
+        holding_id: holding.holding_id.clone(),
+        identifiers: authoritative.into_boxed_slice(),
+        manifest_evidence: handoff.manifest().evidence(),
+        terminal_evidence: handoff.terminal_evidence(),
+    })
+}
+
+fn validate_holding_identity(
+    identity: &FundHoldingSecurityIdentity,
+    input: &SecFundHoldingIdentityInput,
 ) -> Result<(), SecBulkError> {
     let Some(identifier) = identity.authoritative_identifier() else {
         return Ok(());
     };
     let found = match identifier {
-        market_squawk_domain::FundSecurityIdentifier::Cusip(cusip) => holding
-            .cusip
-            .as_ref()
-            .is_some_and(|value| value.as_str() == cusip.as_str()),
-        market_squawk_domain::FundSecurityIdentifier::Isin(isin) => identifiers.iter().any(|row| {
-            row.isin
-                .as_ref()
-                .is_some_and(|value| value.as_str() == isin.as_str())
-        }),
+        market_squawk_domain::FundSecurityIdentifier::Cusip(cusip) => {
+            input.identifiers.iter().any(|candidate| {
+                candidate.kind == SecFundSecurityIdentifierKind::Cusip
+                    && candidate.value.as_str() == cusip.as_str()
+            })
+        }
+        market_squawk_domain::FundSecurityIdentifier::Isin(isin) => {
+            input.identifiers.iter().any(|candidate| {
+                candidate.kind == SecFundSecurityIdentifierKind::Isin
+                    && candidate.value.as_str() == isin.as_str()
+            })
+        }
     };
     if found {
         Ok(())

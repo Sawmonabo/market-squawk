@@ -475,7 +475,7 @@ pub(crate) fn reconcile_submissions_with_allocation_authority(
     retained.admit_bytes(recent.inner.cik.retained_bytes())?;
     admit_company_metadata(&retained, &recent.inner.company_metadata)?;
     admit_vec_allocation(&retained, &recent.inner.companions)?;
-    for companion in &recent.inner.companions {
+    for companion in recent.inner.companions.as_slice() {
         retained.admit_bytes(companion.name.retained_bytes())?;
     }
     let cik = recent.inner.cik.clone();
@@ -883,7 +883,7 @@ pub(crate) fn admit_document_allocations(
         retained.admit_bytes(filing_dynamic_bytes(filing)?)?;
     }
     admit_vec_allocation(retained, &document.inner.companions)?;
-    for companion in &document.inner.companions {
+    for companion in document.inner.companions.as_slice() {
         retained.admit_bytes(companion.name.retained_bytes())?;
     }
     Ok(())

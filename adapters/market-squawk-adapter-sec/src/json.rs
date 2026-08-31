@@ -21,7 +21,10 @@ pub use submissions::{
     SecTickerExchangePair, SubmissionsArchive, SubmissionsDocument, reconcile_submissions,
     reconcile_submissions_with_cancellation,
 };
-pub(crate) use submissions::{admit_document_allocations, validate_companion_coverage};
+pub(crate) use submissions::{
+    admit_document_allocations, reconcile_submissions_with_allocation_authority,
+    validate_companion_coverage,
+};
 
 /// Allocator-independent ceiling for one balanced-tree node's links, bookkeeping, and alignment.
 /// String and value payloads are charged separately from this per-entry allocation ceiling.
@@ -266,33 +269,6 @@ impl SecParserLimits {
     pub(crate) const fn string_bytes(self) -> usize {
         self.max_string_bytes
     }
-
-    pub(crate) const fn total_string_bytes(self) -> usize {
-        self.max_total_string_bytes
-    }
-}
-
-pub(crate) fn parse_bounded_json_with_cancellation(
-    bytes: &[u8],
-    limits: SecParserLimits,
-    cancellation: &CancellationToken,
-) -> Result<Value, SecParserError> {
-    parse_bounded_json_with_retained_budget(bytes, limits, cancellation).map(|(value, _)| value)
-}
-
-pub(crate) fn parse_bounded_json_with_retained_budget(
-    bytes: &[u8],
-    limits: SecParserLimits,
-    cancellation: &CancellationToken,
-) -> Result<(Value, RetainedJsonBudget), SecParserError> {
-    let retained = RetainedJsonBudget::new(limits);
-    let value = parse_bounded_json_with_allocation_authority(
-        bytes,
-        limits,
-        cancellation,
-        retained.clone(),
-    )?;
-    Ok((value, retained))
 }
 
 pub(crate) fn parse_bounded_json_with_allocation_authority(
@@ -368,18 +344,6 @@ impl RawJsonParseAuthority {
         } else {
             Ok(())
         }
-    }
-
-    pub(crate) fn check_cancelled(&self) -> Result<(), SecParserError> {
-        check_parser_cancelled(&self.cancellation)
-    }
-
-    pub(crate) const fn limits(&self) -> SecParserLimits {
-        self.limits
-    }
-
-    pub(crate) fn retained(&self) -> &RetainedJsonBudget {
-        &self.retained
     }
 }
 

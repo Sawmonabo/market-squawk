@@ -556,11 +556,21 @@ impl SecEdgarSource {
             }
             () = cancellation.cancelled() => {
                 worker_cancellation.cancel();
-                Err(crate::SecBulkError::Cancelled)
+                match worker.await {
+                    Ok(_) => Err(crate::SecBulkError::Cancelled),
+                    Err(_) => Err(crate::SecBulkError::Client(
+                        SecClientError::BlockingWorkerFailed,
+                    )),
+                }
             }
             () = tokio::time::sleep(remaining) => {
                 worker_cancellation.cancel();
-                Err(crate::SecBulkError::DeadlineExceeded)
+                match worker.await {
+                    Ok(_) => Err(crate::SecBulkError::DeadlineExceeded),
+                    Err(_) => Err(crate::SecBulkError::Client(
+                        SecClientError::BlockingWorkerFailed,
+                    )),
+                }
             }
         }
     }

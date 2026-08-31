@@ -21,7 +21,6 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     RawEvidenceStore, RetrievedSecBytes, RetrievedSubmissions, SecClientError, SecEdgarSource,
     SecObjectLocator, SecParserError, SecParserLimits, SubmissionsArchive, SubmissionsDocument,
-    reconcile_submissions, reconcile_submissions_with_cancellation,
 };
 
 const MAX_COMPANION_OBJECTS: u16 = MAX_PROVIDER_CAPTURE_PAGES as u16 - 1;
@@ -1002,7 +1001,7 @@ mod tests {
         let limits = SecParserLimits::production_defaults();
         let recent = SubmissionsDocument::parse(recent_bytes, limits)?;
         let archive = SubmissionsDocument::parse_archive(archive_bytes, limits)?;
-        let reconciled = reconcile_submissions(&recent, &[archive], limits)?;
+        let reconciled = crate::json::reconcile_submissions(&recent, &[archive], limits)?;
         let current_locator = SecObjectLocator::submissions(reconciled.cik().as_str())?
             .url()
             .to_owned();

@@ -1014,10 +1014,13 @@ pub fn query_nport_holding_supplements(
     if generation.family() != SecBulkFamily::Nport {
         return Err(SecBulkError::InvalidCanonicalMapping);
     }
-    let holding_filters = [
-        SecBulkNativeJoinFilter::try_new(SecBulkJoinDomain::Accession, accession.as_str())?,
-        SecBulkNativeJoinFilter::try_new(SecBulkJoinDomain::Holding, holding_id.as_str())?,
-    ];
+    // Supplement members expose HOLDING_ID without ACCESSION_NUMBER. Resolve that key through
+    // the durable core-holding index first and require one exact accession-qualified owner before
+    // materializing any unscoped child row.
+    let holding_filters = [SecBulkNativeJoinFilter::try_new(
+        SecBulkJoinDomain::Holding,
+        holding_id.as_str(),
+    )?];
     let holding_page = query_native_rows_by_joins(
         store,
         generation,
@@ -1039,6 +1042,11 @@ pub fn query_nport_holding_supplements(
         .first()
         .cloned()
         .ok_or(SecBulkError::NativeRowUnavailable)?;
+    if !holding.joins().iter().any(|join| {
+        join.domain() == SecBulkJoinDomain::Accession && join.value() == accession.as_str()
+    }) {
+        return Err(SecBulkError::NativeRowUnavailable);
+    }
     let mut groups = Vec::new();
     groups
         .try_reserve_exact(nport_holding_supplement_tables().len())

@@ -16,8 +16,10 @@ pub use archive::{
     recover_bulk_archive, scan_bulk_archive, scan_bulk_archive_typed,
 };
 pub use fund_publication::{
-    SecFundIdentityAuthority, SecFundPartitionAdmissions, SecFundPendingLogicalRows,
-    SecFundPublicationScope, SecPreparedFundCanonicalPartition, SecPreparedFundLogicalPublication,
+    SecFundHoldingIdentityInput, SecFundIdentityAuthority, SecFundPartitionAdmissions,
+    SecFundPendingLogicalRows, SecFundPublicationScope, SecFundSecurityIdentifierInput,
+    SecFundSecurityIdentifierKind, SecFundShareClassIdentityInput,
+    SecPreparedFundCanonicalPartition, SecPreparedFundLogicalPublication,
 };
 pub use model::{
     SEC_BULK_CATALOG_SNAPSHOT_DATE, SEC_NCEN_SCHEMA_EFFECTIVE_DATE, SEC_NCEN_SCHEMA_VERSION,

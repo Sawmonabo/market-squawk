@@ -224,6 +224,7 @@ pub struct SecBulkLogicalRowLineage {
     table: SecBulkTableKind,
     row_number: u64,
     row_evidence: EvidenceDigest,
+    nport_holding_scope_evidence: Option<EvidenceDigest>,
 }
 
 /// One lossless SEC row that cannot be detached from its exact terminal source coordinates.
@@ -473,6 +474,9 @@ impl SecPendingBulkLogicalPublication {
             archive_semantic_identity,
             readme_semantic_identity,
         );
+        let nport_holding_scope_evidence = (self.manifest.capture().selection().family()
+            == SecBulkFamily::Nport)
+            .then(|| nport_holding_scope_evidence(terminal_evidence));
         let mut emitted = 0_u64;
         let mut order = OrderedTypedRows::new();
         let manifest_evidence = self.manifest.evidence();
@@ -497,6 +501,7 @@ impl SecPendingBulkLogicalPublication {
                     table: row.table(),
                     row_number: row.row_number(),
                     row_evidence: row.row_evidence(),
+                    nport_holding_scope_evidence,
                 };
                 sink.stage(SecBulkLogicalRow { row, lineage })
             },
@@ -545,6 +550,16 @@ impl SecBulkLogicalRowLineage {
     /// Returns the exact inspected layout identity.
     pub const fn manifest_evidence(&self) -> EvidenceDigest {
         self.manifest_evidence
+    }
+
+    /// Returns the exact-archive proof that unscoped N-PORT supplement keys have one owner.
+    ///
+    /// SEC supplement members expose `HOLDING_ID` without `ACCESSION_NUMBER`. This receipt is
+    /// minted only after the complete archive's holding-owner validation has succeeded, so a
+    /// filing selector never treats provider-local holding identifiers as quarter-global by
+    /// assumption.
+    pub const fn nport_holding_scope_evidence(&self) -> Option<EvidenceDigest> {
+        self.nport_holding_scope_evidence
     }
 
     /// Returns the archive object coordinate in the ordered common raw graph.
@@ -1209,6 +1224,13 @@ fn bulk_terminal_evidence(
     digest.update(report.source_rows().to_be_bytes());
     digest.update(report.emitted_typed_rows().to_be_bytes());
     digest.update(report.ordered_typed_rows_evidence().bytes());
+    EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into())
+}
+
+fn nport_holding_scope_evidence(terminal_evidence: EvidenceDigest) -> EvidenceDigest {
+    let mut digest = Sha256::new();
+    digest.update(b"market-squawk/sec-nport-accession-holding-scope/v1");
+    digest.update(terminal_evidence.bytes());
     EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into())
 }
 
@@ -3498,6 +3520,10 @@ impl<'a> ArchiveIntegrityValidator<'a> {
         match self.family {
             SecBulkFamily::Nport if table == "FUND_REPORTED_HOLDING.tsv" => {
                 let holding = column_value(columns, record, "HOLDING_ID")?;
+                // Core identity is ACCESSION_NUMBER + HOLDING_ID, but SEC's supplement members
+                // omit ACCESSION_NUMBER. The secondary producer set therefore rejects a reused
+                // HOLDING_ID for this exact archive: without one owner, supplement attribution is
+                // irreducibly ambiguous and must fail closed rather than cross filing boundaries.
                 self.secondary.producers.push(b"holding-id", &[holding])?;
             }
             SecBulkFamily::Nport => {

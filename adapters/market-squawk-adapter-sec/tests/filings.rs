@@ -5,19 +5,21 @@ mod bulk {
     use cap_std::{ambient_authority, fs::Dir};
     use market_squawk_adapter_sec::{
         RawEvidenceStore, SecBulkCapture, SecBulkCoverage, SecBulkError, SecBulkFamily,
-        SecBulkMediaKind, SecBulkNativePublicationSession, SecBulkParseLimits,
-        SecBulkProjectionDisposition, SecBulkProviderProjection, SecBulkQueryLimits,
-        SecBulkRelatedRowsState, SecBulkSelection, SecBulkTableKind, SecBulkTransportEvidence,
-        SecBulkTypedValue, SecFundIdentityAuthority, SecFundPartitionAdmissions,
-        SecFundPendingLogicalRows, SecFundPublicationScope, SecHttpValidators,
-        SecPendingBulkLogicalPublication, SecQuarter, SecRepresentationLimits,
+        SecBulkLayoutManifest, SecBulkMediaKind, SecBulkNativePublicationSession,
+        SecBulkParseLimits, SecBulkProjectionDisposition, SecBulkProviderProjection,
+        SecBulkQueryLimits, SecBulkRelatedRowsState, SecBulkSelection, SecBulkTableKind,
+        SecBulkTransportEvidence, SecBulkTypedValue, SecFundHoldingIdentityInput,
+        SecFundIdentityAuthority, SecFundPartitionAdmissions, SecFundPendingLogicalRows,
+        SecFundPublicationScope, SecFundSecurityIdentifierKind, SecFundShareClassIdentityInput,
+        SecHttpValidators, SecPendingBulkLogicalPublication, SecQuarter, SecRepresentationLimits,
         SecRepresentationRegistry, inspect_bulk_archive, query_nport_holding_supplements,
         recover_bulk_archive, scan_bulk_archive, scan_bulk_archive_typed,
     };
     use market_squawk_domain::{
         EvidenceDigest, ExactPayloadEvidence, FundEvidenceRecord, FundHoldingSecurityIdentity,
-        FundMissingState, FundShareClassIdentity, FundSourceTable, FundSupplementDisposition,
-        InstrumentId, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
+        FundMissingState, FundRevisionStatus, FundShareClassIdentity, FundSourceTable,
+        FundSupplementDisposition, InstrumentId, MetadataRevision, SourceId, SourceIdentifier,
+        Timestamp,
     };
     use market_squawk_platform::{
         LocalPaths, ResearchObjectAdmission, ResearchObjectControl, ResearchObjectControlError,
@@ -47,9 +49,25 @@ mod bulk {
     impl SecFundIdentityAuthority for FixtureIdentityAuthority {
         fn resolve_share_class(
             &mut self,
-            series_id: &SourceIdentifier,
+            input: &SecFundShareClassIdentityInput,
             _cutoff: Timestamp,
         ) -> Result<FundShareClassIdentity, SecBulkError> {
+            let series_id = input.series_id();
+            if input.accession().as_str().is_empty()
+                || input.row_evidence().bytes().iter().all(|byte| *byte == 0)
+                || input
+                    .manifest_evidence()
+                    .bytes()
+                    .iter()
+                    .all(|byte| *byte == 0)
+                || input
+                    .terminal_evidence()
+                    .bytes()
+                    .iter()
+                    .all(|byte| *byte == 0)
+            {
+                return Err(SecBulkError::UnresolvedIdentity);
+            }
             FundShareClassIdentity::try_new(
                 "4c7f46e9-58f0-49de-90ef-beb9d49a2884"
                     .parse::<InstrumentId>()
@@ -67,10 +85,32 @@ mod bulk {
 
         fn resolve_holding_security(
             &mut self,
-            _holding: &market_squawk_adapter_sec::SecNportHoldingRow,
-            _identifiers: &[market_squawk_adapter_sec::SecNportIdentifierRow],
+            input: &SecFundHoldingIdentityInput,
             _cutoff: Timestamp,
         ) -> Result<FundHoldingSecurityIdentity, SecBulkError> {
+            if input.accession().as_str() != "0000000001-26-000001"
+                || input.holding_id().as_str() != "101"
+                || !input.identifiers().iter().any(|identifier| {
+                    identifier.kind() == SecFundSecurityIdentifierKind::Cusip
+                        && identifier.value().as_str() == "037833100"
+                        && identifier
+                            .row_evidence()
+                            .bytes()
+                            .iter()
+                            .any(|byte| *byte != 0)
+                })
+                || !input.identifiers().iter().any(|identifier| {
+                    identifier.kind() == SecFundSecurityIdentifierKind::Isin
+                        && identifier.value().as_str() == "US0378331005"
+                        && identifier
+                            .row_evidence()
+                            .bytes()
+                            .iter()
+                            .any(|byte| *byte != 0)
+                })
+            {
+                return Err(SecBulkError::UnresolvedIdentity);
+            }
             FundHoldingSecurityIdentity::unresolved(FundMissingState::UnresolvedIdentity)
                 .map_err(|_| SecBulkError::UnresolvedIdentity)
         }
@@ -379,68 +419,50 @@ mod bulk {
 
     fn prove_nport_holding_topology(root: &std::path::Path) -> Result<(), Box<dyn Error>> {
         let raw_path = root.join("nport-raw");
-        let registry_path = root.join("nport-representations");
         std::fs::create_dir(&raw_path)?;
-        std::fs::create_dir(&registry_path)?;
         let store = RawEvidenceStore::new(Dir::open_ambient_dir(&raw_path, ambient_authority())?);
+        let registry_path = root.join("nport-representations");
+        let collision_registry_path = root.join("nport-collision-representations");
+        std::fs::create_dir(&registry_path)?;
+        std::fs::create_dir(&collision_registry_path)?;
         let registry = SecRepresentationRegistry::open(
             Dir::open_ambient_dir(&registry_path, ambient_authority())?,
             SecRepresentationLimits::production_defaults(),
         )?;
-        let selection =
-            SecBulkSelection::current(SecBulkFamily::Nport, SecQuarter::try_new(2026, 2)?)?;
-        let archive_bytes = minimal_nport_archive()?;
-        let archive_evidence = store.persist(&archive_bytes)?;
+        let collision_registry = SecRepresentationRegistry::open(
+            Dir::open_ambient_dir(&collision_registry_path, ambient_authority())?,
+            SecRepresentationLimits::production_defaults(),
+        )?;
+        let archive_bytes = minimal_nport_archive(false)?;
         let readme_bytes = b"official N-PORT readme evidence";
-        let readme_evidence = store.persist(readme_bytes)?;
-        let archive_representation = registry.record_success(
-            selection.archive_locator().as_str(),
-            archive_evidence,
-            u64::try_from(archive_bytes.len())?,
-            SecHttpValidators::default(),
-        )?;
-        let readme_representation = registry.record_success(
-            selection.readme_locator().as_str(),
-            readme_evidence,
-            u64::try_from(readme_bytes.len())?,
-            SecHttpValidators::default(),
-        )?;
-        let archive_received_at = archive_representation.first_observed_at();
-        let readme_received_at = readme_representation.first_observed_at();
-        let observed_at = archive_received_at.max(readme_received_at);
-        let archive_capture = SecBulkCapture::try_from_registry_representation(
-            selection.clone(),
-            archive_representation,
-            SecBulkTransportEvidence::try_new(
-                200,
-                SecBulkMediaKind::Zip,
-                Some("application/zip"),
-                SecHttpValidators::default(),
-                archive_received_at,
-            )?,
-        )?;
-        let readme_capture = SecBulkCapture::try_from_registry_representation(
-            selection,
-            readme_representation,
-            SecBulkTransportEvidence::try_new(
-                200,
-                SecBulkMediaKind::Pdf,
-                Some("application/pdf"),
-                SecHttpValidators::default(),
-                readme_received_at,
-            )?,
-        )?;
         let cancellation = CancellationToken::new();
         let limits = SecBulkParseLimits::production_defaults();
         let deadline = Timestamp::from_unix_nanos(i64::MAX);
-        let manifest = inspect_bulk_archive(
-            &store,
-            archive_capture,
-            readme_capture,
-            limits,
-            deadline,
-            &cancellation,
-        )?;
+        let (manifest, archive_evidence, _readme_evidence, archive_received_at, readme_received_at) =
+            inspect_nport_fixture(
+                &store,
+                &registry,
+                &archive_bytes,
+                readme_bytes,
+                limits,
+                deadline,
+                &cancellation,
+            )?;
+        let observed_at = archive_received_at.max(readme_received_at);
+
+        let collision_archive = minimal_nport_archive(true)?;
+        assert!(matches!(
+            inspect_nport_fixture(
+                &store,
+                &collision_registry,
+                &collision_archive,
+                readme_bytes,
+                limits,
+                deadline,
+                &cancellation,
+            ),
+            Err(SecBulkError::RelationalIntegrity)
+        ));
 
         let mut native = SecBulkNativePublicationSession::new(
             &store,
@@ -573,6 +595,10 @@ mod bulk {
             })
             .ok_or(SecBulkError::InvalidCanonicalMapping)?;
         assert_eq!(
+            report.filing().revision().status(),
+            FundRevisionStatus::Current
+        );
+        assert_eq!(
             report
                 .lineage()
                 .rows()
@@ -582,6 +608,85 @@ mod bulk {
             1
         );
         Ok(())
+    }
+
+    fn inspect_nport_fixture(
+        store: &RawEvidenceStore,
+        registry: &SecRepresentationRegistry,
+        archive: &[u8],
+        readme: &[u8],
+        limits: SecBulkParseLimits,
+        deadline: Timestamp,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        (
+            SecBulkLayoutManifest,
+            EvidenceDigest,
+            EvidenceDigest,
+            Timestamp,
+            Timestamp,
+        ),
+        SecBulkError,
+    > {
+        let selection =
+            SecBulkSelection::current(SecBulkFamily::Nport, SecQuarter::try_new(2026, 2)?)?;
+        let archive_evidence = store.persist(archive)?;
+        let readme_evidence = store.persist(readme)?;
+        let archive_representation = registry
+            .record_success(
+                selection.archive_locator().as_str(),
+                archive_evidence,
+                u64::try_from(archive.len()).map_err(|_| SecBulkError::QueryLimitExceeded)?,
+                SecHttpValidators::default(),
+            )
+            .map_err(|_| SecBulkError::InvalidCapture)?;
+        let readme_representation = registry
+            .record_success(
+                selection.readme_locator().as_str(),
+                readme_evidence,
+                u64::try_from(readme.len()).map_err(|_| SecBulkError::QueryLimitExceeded)?,
+                SecHttpValidators::default(),
+            )
+            .map_err(|_| SecBulkError::InvalidCapture)?;
+        let archive_received_at = archive_representation.first_observed_at();
+        let readme_received_at = readme_representation.first_observed_at();
+        let archive_capture = SecBulkCapture::try_from_registry_representation(
+            selection.clone(),
+            archive_representation,
+            SecBulkTransportEvidence::try_new(
+                200,
+                SecBulkMediaKind::Zip,
+                Some("application/zip"),
+                SecHttpValidators::default(),
+                archive_received_at,
+            )?,
+        )?;
+        let readme_capture = SecBulkCapture::try_from_registry_representation(
+            selection,
+            readme_representation,
+            SecBulkTransportEvidence::try_new(
+                200,
+                SecBulkMediaKind::Pdf,
+                Some("application/pdf"),
+                SecHttpValidators::default(),
+                readme_received_at,
+            )?,
+        )?;
+        let manifest = inspect_bulk_archive(
+            store,
+            archive_capture,
+            readme_capture,
+            limits,
+            deadline,
+            cancellation,
+        )?;
+        Ok((
+            manifest,
+            archive_evidence,
+            readme_evidence,
+            archive_received_at,
+            readme_received_at,
+        ))
     }
 
     fn with_declared_eocd_entries(
@@ -597,7 +702,7 @@ mod bulk {
         Ok(archive)
     }
 
-    fn minimal_nport_archive() -> Result<Vec<u8>, Box<dyn Error>> {
+    fn minimal_nport_archive(holding_id_collision: bool) -> Result<Vec<u8>, Box<dyn Error>> {
         const SUBMISSION_HEADER: &str = "ACCESSION_NUMBER\tFILING_DATE\tSUB_TYPE\tREPORT_ENDING_PERIOD\tREPORT_DATE\tIS_LAST_FILING";
         const REGISTRANT_HEADER: &str = "ACCESSION_NUMBER\tCIK\tREGISTRANT_NAME\tLEI";
         const FUND_HEADER: &str = "ACCESSION_NUMBER\tSERIES_NAME\tSERIES_ID\tSERIES_LEI\tTOTAL_ASSETS\tTOTAL_LIABILITIES\tNET_ASSETS";
@@ -624,9 +729,12 @@ mod bulk {
                 "FUND_REPORTED_INFO.tsv" => {
                     metadata_table_for("nport_readme.htm", name, FUND_HEADER, &["ACCESSION_NUMBER"])
                 }
-                "FUND_REPORTED_HOLDING.tsv" => {
-                    metadata_table_for("nport_readme.htm", name, HOLDING_HEADER, &["HOLDING_ID"])
-                }
+                "FUND_REPORTED_HOLDING.tsv" => metadata_table_for(
+                    "nport_readme.htm",
+                    name,
+                    HOLDING_HEADER,
+                    &["ACCESSION_NUMBER", "HOLDING_ID"],
+                ),
                 "IDENTIFIERS.tsv" => metadata_table_for(
                     "nport_readme.htm",
                     name,
@@ -689,7 +797,8 @@ mod bulk {
             &mut writer,
             "FUND_REPORTED_HOLDING.tsv",
             format!(
-                "{HOLDING_HEADER}\n0000000001-26-000001\t101\tApple Inc.\t54930000000000000101\tCommon Stock\t037833100\t10\tshares\t\tUSD\t1000\t1\t5\tLONG\tEC\t\tCORP\t\tUS\tN\t1\t\n0000000002-26-000002\t202\tOther Issuer\t54930000000000000202\tCommon Stock\t594918104\t20\tshares\t\tUSD\t2000\t1\t10\tLONG\tEC\t\tCORP\t\tUS\tN\t1\t\n"
+                "{HOLDING_HEADER}\n0000000001-26-000001\t101\tApple Inc.\t54930000000000000101\tCommon Stock\t037833100\t10\tshares\t\tUSD\t1000\t1\t5\tLONG\tEC\t\tCORP\t\tUS\tN\t1\t\n0000000002-26-000002\t{}\tOther Issuer\t54930000000000000202\tCommon Stock\t594918104\t20\tshares\t\tUSD\t2000\t1\t10\tLONG\tEC\t\tCORP\t\tUS\tN\t1\t\n",
+                if holding_id_collision { "101" } else { "202" }
             )
             .as_bytes(),
             options,
@@ -698,7 +807,12 @@ mod bulk {
             &mut writer,
             "IDENTIFIERS.tsv",
             format!(
-                "{IDENTIFIER_HEADER}\n101\t1\tUS0378331005\tAAPL\t\t\n202\t2\tUS5949181045\tMSFT\t\t\n"
+                "{IDENTIFIER_HEADER}\n101\t1\tUS0378331005\tAAPL\t\t\n{}",
+                if holding_id_collision {
+                    ""
+                } else {
+                    "202\t2\tUS5949181045\tMSFT\t\t\n"
+                }
             )
             .as_bytes(),
             options,
@@ -724,7 +838,14 @@ mod bulk {
             )
         }) {
             let contents = if name == "DEBT_SECURITY.tsv" {
-                format!("{RELATED_HEADER}\n101\tselected evidence\n202\tother evidence\n")
+                format!(
+                    "{RELATED_HEADER}\n101\tselected evidence\n{}",
+                    if holding_id_collision {
+                        ""
+                    } else {
+                        "202\tother evidence\n"
+                    }
+                )
             } else if NPORT_HOLDING_SUPPLEMENTS.contains(&name) {
                 format!("{RELATED_HEADER}\n")
             } else {
