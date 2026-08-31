@@ -2772,8 +2772,10 @@ mod tests {
         let query = query(&metadata()?)?;
         Ok(CensusGeographyAdmission::Standard {
             for_level: "state".to_owned(),
-            geo_level_display: SourceIdentifier::try_from("040")
-                .map_err(|_| crate::CensusAdapterError::InvalidComponent)?,
+            geo_level_display: Some(
+                SourceIdentifier::try_from("040")
+                    .map_err(|_| crate::CensusAdapterError::InvalidComponent)?,
+            ),
             requires: Box::new([]),
             wildcard_parents: Box::new([]),
             optional_with_wildcard_for: Box::new([]),

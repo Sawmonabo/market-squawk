@@ -87,7 +87,7 @@ pub enum CensusGeographyFailurePredicate {
     EntryObject,
     /// A geography entry omitted or malformed its name.
     Name,
-    /// A geography entry omitted or malformed its level identity.
+    /// A geography entry malformed its optional summary-level display metadata.
     GeoLevelDisplay,
     /// Two geography entries resolved to the same identity.
     DuplicateIdentity,
@@ -847,7 +847,7 @@ impl CensusGroupCatalog {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CensusGeographyMetadata {
     name: String,
-    geo_level_display: SourceIdentifier,
+    geo_level_display: Option<SourceIdentifier>,
     reference_date: Option<CalendarDate>,
     requires: Vec<String>,
     wildcard: Vec<String>,
@@ -860,9 +860,9 @@ impl CensusGeographyMetadata {
         &self.name
     }
 
-    /// Returns the provider summary-level display identity.
-    pub const fn geo_level_display(&self) -> &SourceIdentifier {
-        &self.geo_level_display
+    /// Returns the optional provider summary-level display metadata.
+    pub fn geo_level_display(&self) -> Option<&SourceIdentifier> {
+        self.geo_level_display.as_ref()
     }
 
     /// Returns the dataset geography reference date when supplied.
@@ -905,7 +905,7 @@ pub enum CensusGeographyAdmission {
     /// One standard `for`/`in` grammar compiled from the provider's exact metadata entry.
     Standard {
         for_level: String,
-        geo_level_display: SourceIdentifier,
+        geo_level_display: Option<SourceIdentifier>,
         requires: Box<[String]>,
         wildcard_parents: Box<[String]>,
         optional_with_wildcard_for: Box<[String]>,
@@ -1047,12 +1047,17 @@ impl CensusGeographyCatalog {
             })?;
             let name = required_text(entry, "name", limits)
                 .map_err(geography_failure(CensusGeographyFailurePredicate::Name))?;
-            let geo_level_display = required_text(entry, "geoLevelDisplay", limits)
-                .and_then(|value| identifier(&value))
+            let geo_level_display = optional_text(entry, "geoLevelDisplay", limits)
+                .and_then(|value| {
+                    value
+                        .filter(|value| !value.is_empty())
+                        .map(|value| identifier(&value))
+                        .transpose()
+                })
                 .map_err(geography_failure(
                     CensusGeographyFailurePredicate::GeoLevelDisplay,
                 ))?;
-            if !identities.insert((name.clone(), geo_level_display.clone())) {
+            if !identities.insert(name.clone()) {
                 return Err(CensusGeographyParseFailure::new(
                     CensusAdapterError::DuplicateIdentity,
                     CensusGeographyFailurePredicate::DuplicateIdentity,
@@ -1107,7 +1112,7 @@ impl CensusGeographyCatalog {
             ));
         }
         geographies.sort_by(|left, right| {
-            (&left.geo_level_display, &left.name).cmp(&(&right.geo_level_display, &right.name))
+            (&left.name, &left.geo_level_display).cmp(&(&right.name, &right.geo_level_display))
         });
         Ok(Self {
             dataset,
