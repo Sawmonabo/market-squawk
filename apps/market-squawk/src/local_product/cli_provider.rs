@@ -5000,7 +5000,10 @@ fn treasury_metadata(
         HistoricalCapability::Historical,
         effective,
         network,
-        simple_budget("us-treasury", 1, SECOND_NANOS, 1, None)?,
+        lease
+            .provider_budget_policy()
+            .cloned()
+            .ok_or(CliProviderActivationError::InvalidMetadata)?,
     )
 }
 

@@ -191,8 +191,8 @@ The result always contains the 17 selected mappings in this fixed order:
 | `fred_alfred` | `fred-alfred.api-v1-v2` rev 5 | FRED API key |
 | `tiingo` | `tiingo.starter-eod-nav` rev 3 | Tiingo token |
 | `sec` | `sec.edgar-public` rev 4 | No secret; organization and contact email become public onboarding configuration |
-| `treasury_fiscal_data` | `treasury.fiscal-data` rev 4 | No secret |
-| `treasury_daily_rates` | `treasury.daily-rates-xml` rev 4 | No secret |
+| `treasury_fiscal_data` | `treasury.fiscal-data` rev 5 | No secret |
+| `treasury_daily_rates` | `treasury.daily-rates-xml` rev 5 | No secret |
 | `federal_reserve_board_direct` | `federal-reserve-board.data-download-program` rev 4 | No secret; exact H.15 doctor intent only |
 
 Each provider row has exactly one secret-free `disposition`:

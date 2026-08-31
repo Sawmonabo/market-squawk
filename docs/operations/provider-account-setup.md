@@ -70,8 +70,8 @@ The 17 receipt-provider mappings are:
 | `fred_alfred` | `fred-alfred.api-v1-v2` rev 5 | API key |
 | `tiingo` | `tiingo.starter-eod-nav` rev 3 | API token |
 | `sec` | `sec.edgar-public` rev 4 | Public organization/contact values; no secret |
-| `treasury_fiscal_data` | `treasury.fiscal-data` rev 4 | No secret |
-| `treasury_daily_rates` | `treasury.daily-rates-xml` rev 4 | No secret |
+| `treasury_fiscal_data` | `treasury.fiscal-data` rev 5 | No secret |
+| `treasury_daily_rates` | `treasury.daily-rates-xml` rev 5 | No secret |
 | `federal_reserve_board_direct` | `federal-reserve-board.data-download-program` rev 4 | No secret; exact H.15 doctor intent |
 
 Every row returns exactly one disposition: `disabled`, `credential_stored_unverified`,

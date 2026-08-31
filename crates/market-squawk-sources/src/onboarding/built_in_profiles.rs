@@ -1035,7 +1035,7 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
             ProviderCapabilityRevision::new(3)?,
             prior_credential_kind,
             RatePolicyDescriptor::try_new_enforced(
-                SourceIdentifier::try_from(current_rate_policy(&spec))?,
+                SourceIdentifier::try_from(spec.rate_policy)?,
                 PROVIDER_RELEASE_REPORT_DIGEST,
                 true,
                 ProviderCapabilityRevision::new(2)?,
@@ -1045,14 +1045,34 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
                 spec.probe.transport() != ProbeTransport::Local,
             )?,
         )?;
-        let current = build_capability(
+        let revision_four = build_capability(
             &spec,
             ProviderCapabilityRevision::new(4)?,
             prior_credential_kind,
             revision_three.rate_policy().clone(),
         )?;
+        let current = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(5)?,
+            prior_credential_kind,
+            RatePolicyDescriptor::try_new_enforced(
+                SourceIdentifier::try_from(current_rate_policy(&spec))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                true,
+                ProviderCapabilityRevision::new(3)?,
+                SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                treasury_budget()?,
+                true,
+            )?,
+        )?;
         (
-            vec![legacy_capability, revision_two, revision_three],
+            vec![
+                legacy_capability,
+                revision_two,
+                revision_three,
+                revision_four,
+            ],
             current,
         )
     } else if spec.id == TREASURY_FISCAL_PROFILE {
@@ -1061,7 +1081,7 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
             ProviderCapabilityRevision::new(3)?,
             prior_credential_kind,
             RatePolicyDescriptor::try_new_enforced(
-                SourceIdentifier::try_from(current_rate_policy(&spec))?,
+                SourceIdentifier::try_from(spec.rate_policy)?,
                 PROVIDER_RELEASE_REPORT_DIGEST,
                 true,
                 ProviderCapabilityRevision::new(2)?,
@@ -1071,14 +1091,34 @@ fn build(spec: BuiltInSpec) -> Result<ProviderOnboardingProfile, ProviderProfile
                 true,
             )?,
         )?;
-        let current = build_capability(
+        let revision_four = build_capability(
             &spec,
             ProviderCapabilityRevision::new(4)?,
             prior_credential_kind,
             revision_three.rate_policy().clone(),
         )?;
+        let current = build_capability(
+            &spec,
+            ProviderCapabilityRevision::new(5)?,
+            prior_credential_kind,
+            RatePolicyDescriptor::try_new_enforced(
+                SourceIdentifier::try_from(current_rate_policy(&spec))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                true,
+                ProviderCapabilityRevision::new(3)?,
+                SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
+                PROVIDER_RELEASE_REPORT_DIGEST,
+                treasury_budget()?,
+                true,
+            )?,
+        )?;
         (
-            vec![legacy_capability, revision_two, revision_three],
+            vec![
+                legacy_capability,
+                revision_two,
+                revision_three,
+                revision_four,
+            ],
             current,
         )
     } else if spec.id == FRED_PROFILE {
@@ -1518,6 +1558,10 @@ fn is_selected_architecture_profile(profile_id: &str) -> bool {
 fn current_rate_policy(spec: &BuiltInSpec) -> &'static str {
     if spec.id == "fred-alfred.api-v1-v2" {
         "fred-alfred.api-v1-v2.rate-policy.v2"
+    } else if spec.id == TREASURY_DAILY_RATES_PROFILE {
+        "treasury.daily-rates-xml.rate-policy.v2"
+    } else if spec.id == TREASURY_FISCAL_PROFILE {
+        "treasury.fiscal-data.rate-policy.v2"
     } else if spec.id == ALPACA_BASIC_PROFILE {
         "alpaca.basic-market-data.account-rate-policy.v2"
     } else if spec.id == SCHWAB_MARKET_DATA_PROFILE {
@@ -1717,6 +1761,20 @@ fn fred_budget(
         &windows,
         NonZeroU16::new(1).ok_or(ProviderProfileError::InvalidProfile)?,
         backoff,
+    )?)
+}
+
+fn treasury_budget() -> Result<ProviderBudgetPolicy, ProviderProfileError> {
+    let windows = [ProviderBudgetWindow::try_new(
+        NonZeroU32::new(1).ok_or(ProviderProfileError::InvalidProfile)?,
+        nonzero_u64(SECOND_NANOS)?,
+        BudgetWindowSemantics::Sliding,
+    )?];
+    Ok(ProviderBudgetPolicy::try_new_conjunctive(
+        BudgetScope::new(SourceIdentifier::try_from("us-treasury")?),
+        &windows,
+        NonZeroU16::new(1).ok_or(ProviderProfileError::InvalidProfile)?,
+        BackoffPolicy::try_new(nonzero_u64(SECOND_NANOS)?, nonzero_u64(MINUTE_NANOS)?, 0)?,
     )?)
 }
 

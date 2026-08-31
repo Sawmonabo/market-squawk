@@ -1308,6 +1308,73 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
     let treasury_fiscal = profiles
         .get("treasury.fiscal-data")
         .ok_or("missing Treasury Fiscal Data profile")?;
+    for (profile, current_policy_id, prior_policy_id) in [
+        (
+            treasury_xml,
+            "treasury.daily-rates-xml.rate-policy.v2",
+            "treasury.daily-rates-xml.rate-policy.v1",
+        ),
+        (
+            treasury_fiscal,
+            "treasury.fiscal-data.rate-policy.v2",
+            "treasury.fiscal-data.rate-policy.v1",
+        ),
+    ] {
+        assert_eq!(
+            profile.capability().rate_policy().policy_id().as_str(),
+            current_policy_id
+        );
+        let current_budget = profile
+            .capability()
+            .rate_policy()
+            .enforcement_policy()
+            .ok_or("Treasury profile omitted rate enforcement")?;
+        assert_eq!(
+            current_budget.scope().as_source_identifier().as_str(),
+            "us-treasury"
+        );
+        assert!(current_budget.scope().authorization_account().is_none());
+        assert_eq!(current_budget.window_count(), 1);
+        assert_eq!(
+            current_budget.window(0).map(|window| (
+                window.requests_per_window(),
+                window.window_nanos(),
+                window.semantics(),
+            )),
+            Some((1, 1_000_000_000, crate::BudgetWindowSemantics::Sliding,))
+        );
+        assert_eq!(current_budget.max_concurrent(), 1);
+        assert_eq!(profile.capability().revision().get(), 5);
+        assert_eq!(
+            profile
+                .capability_history()
+                .map(|capability| capability.revision().get())
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5]
+        );
+        let prior_capability = profile
+            .capability_history()
+            .find(|capability| capability.revision().get() == 4)
+            .ok_or("Treasury profile omitted revision 4")?;
+        assert_eq!(
+            prior_capability.rate_policy().policy_id().as_str(),
+            prior_policy_id
+        );
+        let prior_budget = prior_capability
+            .rate_policy()
+            .enforcement_policy()
+            .ok_or("Treasury revision 4 omitted rate enforcement")?;
+        assert_eq!(prior_budget.window_count(), 1);
+        assert_eq!(
+            prior_budget.window(0).map(|window| (
+                window.requests_per_window(),
+                window.window_nanos(),
+                window.semantics(),
+            )),
+            Some((100, 60_000_000_000, crate::BudgetWindowSemantics::Tumbling,))
+        );
+        assert_eq!(prior_budget.max_concurrent(), 2);
+    }
     for profile in [sec, bls_public] {
         assert_eq!(profile.capability().revision().get(), 4);
         assert_eq!(
@@ -1327,14 +1394,6 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
             .map(|capability| capability.revision().get())
             .collect::<Vec<_>>(),
         [1, 2, 3, 4, 5]
-    );
-    assert_eq!(treasury_fiscal.capability().revision().get(), 4);
-    assert_eq!(
-        treasury_fiscal
-            .capability_history()
-            .map(|capability| capability.revision().get())
-            .collect::<Vec<_>>(),
-        [1, 2, 3, 4]
     );
     assert_eq!(
         treasury_fiscal.probe().endpoint(),
