@@ -912,6 +912,9 @@ impl TreasurySource {
         cancellation: &CancellationToken,
     ) -> Result<TreasuryAllHistoryBackfill, TreasurySourceError> {
         ensure_restore_open(deadline, cancellation)?;
+        if encoded_checkpoint.is_empty() || encoded_checkpoint.len() > MAX_CHECKPOINT_JSON_BYTES {
+            return Err(TreasurySourceError::InvalidBackfillCheckpoint);
+        }
         let admission = Arc::clone(&self.all_history_restore_admission);
         let permit = tokio::select! {
             permit = admission.acquire_owned() => {

@@ -424,12 +424,12 @@ async fn reopen_treasury_startup_surface(
     domains: &ResearchApplicationServices,
     surface: TreasurySurface,
     configuration: TreasuryStartupConfiguration,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Option<PendingTreasuryStartupPublication> {
     let Some(deadline) = Instant::now().checked_add(TREASURY_ANALYTICAL_STARTUP_TIMEOUT) else {
         tracing::error!("Treasury startup reopening deadline could not be represented");
         return None;
     };
-    let cancellation = tokio_util::sync::CancellationToken::new();
     let TreasuryStartupConfiguration {
         provider_datasets,
         generation,
@@ -478,6 +478,7 @@ async fn publish_treasury_startup_surface(
     domains: Arc<ResearchApplicationServices>,
     surface: TreasurySurface,
     pending: PendingTreasuryStartupPublication,
+    cancellation: tokio_util::sync::CancellationToken,
 ) {
     let Some(deadline) = Instant::now().checked_add(TREASURY_ANALYTICAL_STARTUP_TIMEOUT) else {
         tracing::error!("Treasury startup publication deadline could not be represented");
@@ -490,7 +491,7 @@ async fn publish_treasury_startup_surface(
         pending.provider_datasets,
         pending.generation,
         deadline,
-        tokio_util::sync::CancellationToken::new(),
+        cancellation,
     )
     .await
     {
@@ -548,6 +549,7 @@ async fn publish_fred_startup(
     coordinator: Arc<ProductionResearchIngestCoordinator>,
     domains: Arc<ResearchApplicationServices>,
     provider_dataset: SourceIdentifier,
+    cancellation: tokio_util::sync::CancellationToken,
 ) {
     let Some(deadline) = Instant::now().checked_add(FRED_ANALYTICAL_STARTUP_TIMEOUT) else {
         tracing::error!("FRED startup publication deadline could not be represented");
@@ -557,7 +559,7 @@ async fn publish_fred_startup(
         coordinator,
         provider_dataset,
         deadline,
-        tokio_util::sync::CancellationToken::new(),
+        cancellation,
     )
     .await
     {
@@ -1077,9 +1079,17 @@ impl LocalProduct {
                     if let Some(provider_dataset) = pending_fred_dataset {
                         let coordinator = Arc::clone(&research_ingest);
                         let domains = Arc::clone(&research_domains);
-                        runtime.spawn(async move {
-                            publish_fred_startup(coordinator, domains, provider_dataset).await;
-                        });
+                        research_domains
+                            .spawn_startup_task(&runtime, move |cancellation| async move {
+                                publish_fred_startup(
+                                    coordinator,
+                                    domains,
+                                    provider_dataset,
+                                    cancellation,
+                                )
+                                .await;
+                            })
+                            .map_err(|_| CliProviderActivationError::StateUnavailable)?;
                     }
                     if let (Some(closure), Some(configuration)) =
                         (treasury_closure.as_ref(), treasury_fiscal_datasets)
@@ -1087,25 +1097,29 @@ impl LocalProduct {
                         let coordinator = Arc::clone(&research_ingest);
                         let closure = Arc::clone(closure);
                         let domains = Arc::clone(&research_domains);
-                        runtime.spawn(async move {
-                            if let Some(pending) = reopen_treasury_startup_surface(
-                                Arc::clone(&closure),
-                                domains.as_ref(),
-                                TreasurySurface::FiscalData,
-                                configuration,
-                            )
-                            .await
-                            {
-                                publish_treasury_startup_surface(
-                                    coordinator,
-                                    closure,
-                                    domains,
+                        research_domains
+                            .spawn_startup_task(&runtime, move |cancellation| async move {
+                                if let Some(pending) = reopen_treasury_startup_surface(
+                                    Arc::clone(&closure),
+                                    domains.as_ref(),
                                     TreasurySurface::FiscalData,
-                                    pending,
+                                    configuration,
+                                    cancellation.clone(),
                                 )
-                                .await;
-                            }
-                        });
+                                .await
+                                {
+                                    publish_treasury_startup_surface(
+                                        coordinator,
+                                        closure,
+                                        domains,
+                                        TreasurySurface::FiscalData,
+                                        pending,
+                                        cancellation,
+                                    )
+                                    .await;
+                                }
+                            })
+                            .map_err(|_| CliProviderActivationError::StateUnavailable)?;
                     }
                     if let (Some(closure), Some(configuration)) =
                         (treasury_closure.as_ref(), treasury_daily_datasets)
@@ -1113,25 +1127,29 @@ impl LocalProduct {
                         let coordinator = Arc::clone(&research_ingest);
                         let closure = Arc::clone(closure);
                         let domains = Arc::clone(&research_domains);
-                        runtime.spawn(async move {
-                            if let Some(pending) = reopen_treasury_startup_surface(
-                                Arc::clone(&closure),
-                                domains.as_ref(),
-                                TreasurySurface::DailyRatesXml,
-                                configuration,
-                            )
-                            .await
-                            {
-                                publish_treasury_startup_surface(
-                                    coordinator,
-                                    closure,
-                                    domains,
+                        research_domains
+                            .spawn_startup_task(&runtime, move |cancellation| async move {
+                                if let Some(pending) = reopen_treasury_startup_surface(
+                                    Arc::clone(&closure),
+                                    domains.as_ref(),
                                     TreasurySurface::DailyRatesXml,
-                                    pending,
+                                    configuration,
+                                    cancellation.clone(),
                                 )
-                                .await;
-                            }
-                        });
+                                .await
+                                {
+                                    publish_treasury_startup_surface(
+                                        coordinator,
+                                        closure,
+                                        domains,
+                                        TreasurySurface::DailyRatesXml,
+                                        pending,
+                                        cancellation,
+                                    )
+                                    .await;
+                                }
+                            })
+                            .map_err(|_| CliProviderActivationError::StateUnavailable)?;
                     }
                 }
                 Err(error) => {

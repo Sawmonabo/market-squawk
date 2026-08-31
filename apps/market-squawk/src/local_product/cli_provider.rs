@@ -5029,6 +5029,17 @@ mod tests {
                     && recipe.staged_predecessor.is_some()
         ));
         drop(committed);
+        let (startup_started_tx, startup_started_rx) = oneshot::channel();
+        let (startup_stopped_tx, startup_stopped_rx) = oneshot::channel();
+        product.research_services.spawn_startup_task(
+            &tokio::runtime::Handle::current(),
+            move |cancellation| async move {
+                let _sent = startup_started_tx.send(());
+                cancellation.cancelled().await;
+                let _sent = startup_stopped_tx.send(());
+            },
+        )?;
+        tokio::time::timeout(Duration::from_secs(1), startup_started_rx).await??;
         assert!(
             product
                 .application()
@@ -5036,6 +5047,7 @@ mod tests {
                 .await
                 .is_complete()
         );
+        tokio::time::timeout(Duration::from_secs(1), startup_stopped_rx).await??;
         drop(product);
 
         let recovered = crate::LocalProduct::try_new(config.clone())?;

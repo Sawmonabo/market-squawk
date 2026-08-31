@@ -2,6 +2,7 @@
 
 use std::{
     fmt,
+    future::Future,
     io::{self, Write},
     num::NonZeroU16,
     str::FromStr,
@@ -37,6 +38,8 @@ use market_squawk_services::{
     TypedToolRequest, TypedToolResult,
 };
 use serde_json::{Value, json};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use super::{ApplicationDomainService, domain_support::DomainLifecycle, effective_service_limits};
 use crate::ResearchService;
@@ -281,6 +284,80 @@ pub struct ResearchApplicationServices {
     controller: Arc<ResearchController>,
 }
 
+struct ApplicationTaskState {
+    accepting: bool,
+    handles: Vec<JoinHandle<()>>,
+}
+
+struct ApplicationTaskOwner {
+    cancellation: CancellationToken,
+    state: parking_lot::Mutex<ApplicationTaskState>,
+}
+
+impl ApplicationTaskOwner {
+    fn new() -> Self {
+        Self {
+            cancellation: CancellationToken::new(),
+            state: parking_lot::Mutex::new(ApplicationTaskState {
+                accepting: true,
+                handles: Vec::new(),
+            }),
+        }
+    }
+
+    fn spawn<F, Fut>(&self, runtime: &tokio::runtime::Handle, task: F) -> Result<(), ServiceError>
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut state = self.state.lock();
+        if !state.accepting {
+            return Err(ServiceError::Unavailable);
+        }
+        state
+            .handles
+            .try_reserve(1)
+            .map_err(|_error| ServiceError::ResourceExhausted)?;
+        let cancellation = self.cancellation.child_token();
+        state.handles.push(runtime.spawn(task(cancellation)));
+        Ok(())
+    }
+
+    fn begin_shutdown(&self) {
+        let mut state = self.state.lock();
+        state.accepting = false;
+        self.cancellation.cancel();
+    }
+
+    async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
+        self.begin_shutdown();
+        let mut handles = {
+            let mut state = self.state.lock();
+            std::mem::take(&mut state.handles)
+        };
+        let mut task_failed = false;
+        while let Some(mut handle) = handles.pop() {
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut handle)
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_error)) => task_failed = true,
+                Err(_elapsed) => {
+                    handles.push(handle);
+                    let mut state = self.state.lock();
+                    state.handles.append(&mut handles);
+                    return Err(ServiceError::DeadlineExceeded);
+                }
+            }
+        }
+        if task_failed {
+            Err(ServiceError::Unavailable)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl ResearchApplicationServices {
     /// Binds one application-owned analytical service and one concrete extraction coordinator.
     #[must_use]
@@ -387,8 +464,21 @@ impl ResearchApplicationServices {
                 treasury_fiscal_latest_known,
                 treasury_daily_latest_known,
                 lifecycle: DomainLifecycle::new(),
+                startup_tasks: ApplicationTaskOwner::new(),
             }),
         }
+    }
+
+    pub(crate) fn spawn_startup_task<F, Fut>(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        task: F,
+    ) -> Result<(), ServiceError>
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.controller.startup_tasks.spawn(runtime, task)
     }
 
     /// Returns the Research-domain implementation.
@@ -741,6 +831,7 @@ struct ResearchController {
     market_history: MarketHistoryReadCapability,
     treasury_fiscal_latest_known: TreasuryLatestKnownOperation,
     treasury_daily_latest_known: TreasuryLatestKnownOperation,
+    startup_tasks: ApplicationTaskOwner,
     lifecycle: Arc<DomainLifecycle>,
 }
 
@@ -953,13 +1044,15 @@ impl ResearchController {
 
     fn begin_shutdown(&self) {
         self.lifecycle.begin_shutdown();
+        self.startup_tasks.begin_shutdown();
         self.ingest.begin_shutdown();
     }
 
     async fn finish_shutdown(&self, deadline: Instant) -> Result<(), ServiceError> {
         let drained = self.lifecycle.finish_shutdown(deadline).await;
+        let startup_tasks = self.startup_tasks.finish_shutdown(deadline).await;
         let ingest = self.ingest.finish_shutdown(deadline).await;
-        drained.and(ingest)
+        drained.and(startup_tasks).and(ingest)
     }
 }
 
