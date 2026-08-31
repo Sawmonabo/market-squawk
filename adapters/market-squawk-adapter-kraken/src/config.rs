@@ -4,8 +4,9 @@ use std::num::NonZeroUsize;
 
 use market_squawk_domain::{
     DataQuality, EffectiveInterval, EvidenceDigest, InstrumentDefinition, InstrumentId,
-    LiveEventClass, MarketDepth, MetadataRevision, ProviderChannel, ProviderIdentityKey,
-    ProviderProduct, SequenceCapability, SourceId, Timestamp, VenueId, VenueMapping, VenueSymbol,
+    LiveEventClass, MarketDataInstrumentDefinition, MarketDepth, MetadataRevision, ProviderChannel,
+    ProviderIdentityKey, ProviderProduct, SequenceCapability, SourceId, Timestamp, VenueId,
+    VenueMapping, VenueSymbol,
 };
 use market_squawk_sources::{
     ChecksumValidationProfile, InstrumentCoverageMembership, MAX_RAW_FRAME_BYTES,
@@ -398,6 +399,67 @@ impl KrakenConfig {
         )
     }
 
+    /// Constructs a book configuration from a catalog-selected non-execution definition.
+    pub fn try_new_selected(
+        metadata: SourceMetadata,
+        definition: &MarketDataInstrumentDefinition,
+        provider_identity_key: &ProviderIdentityKey,
+        reference_selection: &KrakenReferenceSelectionEvidence,
+        selected_at: Timestamp,
+        depth: KrakenDepth,
+        max_message_bytes: NonZeroUsize,
+    ) -> Result<Self, KrakenConfigError> {
+        Self::try_for_selected_channel(
+            metadata,
+            definition,
+            provider_identity_key,
+            reference_selection,
+            selected_at,
+            KrakenChannel::Book(depth),
+            max_message_bytes,
+        )
+    }
+
+    /// Constructs a trade configuration from a catalog-selected non-execution definition.
+    pub fn try_trades_selected(
+        metadata: SourceMetadata,
+        definition: &MarketDataInstrumentDefinition,
+        provider_identity_key: &ProviderIdentityKey,
+        reference_selection: &KrakenReferenceSelectionEvidence,
+        selected_at: Timestamp,
+        max_message_bytes: NonZeroUsize,
+    ) -> Result<Self, KrakenConfigError> {
+        Self::try_for_selected_channel(
+            metadata,
+            definition,
+            provider_identity_key,
+            reference_selection,
+            selected_at,
+            KrakenChannel::Trades,
+            max_message_bytes,
+        )
+    }
+
+    fn try_for_selected_channel(
+        metadata: SourceMetadata,
+        definition: &MarketDataInstrumentDefinition,
+        provider_identity_key: &ProviderIdentityKey,
+        reference_selection: &KrakenReferenceSelectionEvidence,
+        selected_at: Timestamp,
+        channel: KrakenChannel,
+        max_message_bytes: NonZeroUsize,
+    ) -> Result<Self, KrakenConfigError> {
+        let coordinates = native_selected_market_coordinates(
+            &metadata,
+            definition,
+            provider_identity_key,
+            reference_selection,
+            selected_at,
+            channel,
+        )?;
+        Self::from_coordinates(metadata, coordinates, max_message_bytes)
+    }
+
     fn try_for_channel(
         metadata: SourceMetadata,
         definition: &InstrumentDefinition,
@@ -415,6 +477,14 @@ impl KrakenConfig {
             selected_at,
             channel,
         )?;
+        Self::from_coordinates(metadata, coordinates, max_message_bytes)
+    }
+
+    fn from_coordinates(
+        metadata: SourceMetadata,
+        coordinates: KrakenNativeMarketCoordinates,
+        max_message_bytes: NonZeroUsize,
+    ) -> Result<Self, KrakenConfigError> {
         let NetworkAccessPolicy::Allowlisted(endpoint_policy) = metadata.network_policy() else {
             return Err(KrakenConfigError::InvalidMetadata);
         };
@@ -495,6 +565,38 @@ impl KrakenConfig {
         self.endpoint = endpoint;
         Ok(self)
     }
+}
+
+fn native_selected_market_coordinates(
+    metadata: &SourceMetadata,
+    definition: &MarketDataInstrumentDefinition,
+    provider_identity_key: &ProviderIdentityKey,
+    reference_selection: &KrakenReferenceSelectionEvidence,
+    selected_at: Timestamp,
+    channel: KrakenChannel,
+) -> Result<KrakenNativeMarketCoordinates, KrakenConfigError> {
+    if definition.reference_revision() != reference_selection.reference_revision()
+        || definition.reference_payload_evidence().content_digest()
+            != reference_selection.reference_payload_digest()
+        || definition.effective_interval() != reference_selection.definition_validity()
+    {
+        return Err(KrakenConfigError::NativeIdentity);
+    }
+    native_market_coordinates_parts(
+        metadata,
+        definition.instrument_id(),
+        definition.effective_interval(),
+        definition.venue_mappings(),
+        definition.provider_identity_at(
+            provider_identity_key.source_id(),
+            provider_identity_key.provider_instrument_id(),
+            selected_at,
+        ),
+        provider_identity_key,
+        reference_selection,
+        selected_at,
+        channel,
+    )
 }
 
 #[cfg(all(feature = "loopback-fixture", debug_assertions))]
@@ -631,19 +733,41 @@ fn native_market_coordinates(
     selected_at: Timestamp,
     channel: KrakenChannel,
 ) -> Result<KrakenNativeMarketCoordinates, KrakenConfigError> {
+    native_market_coordinates_parts(
+        metadata,
+        definition.instrument_id(),
+        reference_selection.definition_validity(),
+        definition.venue_mappings(),
+        definition.provider_identity_at(
+            provider_identity_key.source_id(),
+            provider_identity_key.provider_instrument_id(),
+            selected_at,
+        ),
+        provider_identity_key,
+        reference_selection,
+        selected_at,
+        channel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn native_market_coordinates_parts(
+    metadata: &SourceMetadata,
+    instrument: InstrumentId,
+    definition_validity: EffectiveInterval,
+    venue_mappings: &[VenueMapping],
+    record: Option<&market_squawk_domain::ProviderIdentityRecord>,
+    provider_identity_key: &ProviderIdentityKey,
+    reference_selection: &KrakenReferenceSelectionEvidence,
+    selected_at: Timestamp,
+    channel: KrakenChannel,
+) -> Result<KrakenNativeMarketCoordinates, KrakenConfigError> {
     let provider_namespace =
         SourceId::try_from(KRAKEN_PROVIDER).map_err(|_| KrakenConfigError::NativeIdentity)?;
     if provider_identity_key.source_id() != &provider_namespace {
         return Err(KrakenConfigError::NativeIdentity);
     }
-    let record = definition
-        .provider_identity_at(
-            provider_identity_key.source_id(),
-            provider_identity_key.provider_instrument_id(),
-            selected_at,
-        )
-        .ok_or(KrakenConfigError::NativeIdentity)?;
-    let instrument = definition.instrument_id();
+    let record = record.ok_or(KrakenConfigError::NativeIdentity)?;
     if record.key() != *provider_identity_key
         || record.instrument_id() != instrument
         || record.evidence().content_digest().bytes() == [0; 32]
@@ -652,8 +776,7 @@ fn native_market_coordinates(
     }
     let venue =
         VenueId::try_from(KRAKEN_PROVIDER).map_err(|_| KrakenConfigError::InvalidMetadata)?;
-    let venue_mapping = definition
-        .venue_mappings()
+    let venue_mapping = venue_mappings
         .iter()
         .find(|mapping| mapping.venue_id() == &venue)
         .cloned()
@@ -672,7 +795,7 @@ fn native_market_coordinates(
     }
     let (valid_from, valid_until) = common_validity_interval(
         metadata,
-        reference_selection.definition_validity(),
+        definition_validity,
         record.validity(),
         selected_at,
     )?;

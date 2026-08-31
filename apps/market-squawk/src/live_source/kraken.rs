@@ -9,18 +9,24 @@ use std::{
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use market_squawk_adapter_kraken::{
     KrakenChannel, KrakenConfig, KrakenConfigError, KrakenDepth, KrakenMetadataError,
-    KrakenSocketHandoffConsumer, KrakenSource,
+    KrakenMetadataInput, KrakenReferenceSelectionEvidence, KrakenSocketHandoffConsumer,
+    KrakenSource,
 };
-#[cfg(test)]
-use market_squawk_adapter_kraken::{KrakenMetadataInput, KrakenReferenceSelectionEvidence};
-#[cfg(test)]
+use market_squawk_data::{
+    MarketDataInstrumentCatalogError, MarketDataInstrumentRecord,
+    MarketDataProviderIdentitySelection,
+};
 use market_squawk_domain::{
     DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentDefinition,
-    InstrumentDefinitionInput, MetadataRevision, ProviderIdentityEvidence, ProviderIdentityKey,
-    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderInstrumentId,
-    RevisionBoundPayloadEvidence, VenueId,
+    MarketDataInstrumentDefinition, MetadataRevision, ProviderIdentityKey, ProviderIdentityRecord,
+    RevisionBoundPayloadEvidence, VenueId, VenueMapping,
 };
 use market_squawk_domain::{IdentityError, SourceId, SourceIdentifier, Timestamp};
+#[cfg(test)]
+use market_squawk_domain::{
+    InstrumentDefinitionInput, ProviderIdentityEvidence, ProviderIdentityRecordInput,
+    ProviderInstrumentId,
+};
 use market_squawk_live::{
     LiveSnapshotReader, RouteSnapshot, ShardKey, SnapshotCompleteness, StreamPhaseSnapshot,
     StreamSnapshot,
@@ -31,9 +37,7 @@ use market_squawk_sources::{
     LiveSourceGeneration, ProviderBudgetPolicy, SourceError, SourceMetadata,
     SourceMetadataProvider,
 };
-#[cfg(test)]
 use serde::Serialize;
-#[cfg(test)]
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -44,11 +48,8 @@ use super::supervisor::{ProductionSourceSupervisor, ProductionSupervisorError};
 
 const BOOK_SOURCE_ID: &str = "kraken-public-book-v2";
 const TRADE_SOURCE_ID: &str = "kraken-public-trades-v2";
-#[cfg(test)]
 const BOOK_IMPLEMENTATION_PROFILE_VERSION: &str = "kraken-book-v2-profile-2026-08-14";
-#[cfg(test)]
 const TRADE_IMPLEMENTATION_PROFILE_VERSION: &str = "kraken-trade-v2-profile-2026-08-14";
-#[cfg(test)]
 const PROFILE_EVIDENCE_DOMAIN: &[u8] = b"market-squawk/kraken-production-profile/v1\0";
 const REQUESTS_PER_WINDOW: u32 = 8;
 const REQUEST_WINDOW_NANOS: u64 = 1_000_000_000;
@@ -79,7 +80,42 @@ pub(super) struct ProductionKrakenProfileSet {
     trades: ProductionKrakenProfile,
 }
 
+#[derive(Clone, Copy)]
+enum KrakenProfileDefinition<'a> {
+    Legacy(&'a InstrumentDefinition),
+    Selected(&'a MarketDataInstrumentDefinition),
+}
+
+impl KrakenProfileDefinition<'_> {
+    const fn instrument_id(self) -> market_squawk_domain::InstrumentId {
+        match self {
+            Self::Legacy(definition) => definition.instrument_id(),
+            Self::Selected(definition) => definition.instrument_id(),
+        }
+    }
+}
+
 impl ProductionKrakenProfileSet {
+    pub(super) fn try_from_selection(
+        config: &KrakenSourceConfig,
+        record: &MarketDataInstrumentRecord,
+        selection: &MarketDataProviderIdentitySelection,
+    ) -> Result<Self, ProductionKrakenProfileError> {
+        let selected = SelectedKrakenReference::try_new(config, record, selection)?;
+        Ok(Self {
+            book: ProductionKrakenProfile::try_for_selected_channel(
+                config,
+                &selected,
+                KrakenChannel::Book(KrakenDepth::Ten),
+            )?,
+            trades: ProductionKrakenProfile::try_for_selected_channel(
+                config,
+                &selected,
+                KrakenChannel::Trades,
+            )?,
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn try_from_at(
         config: &KrakenSourceConfig,
@@ -153,6 +189,23 @@ impl ProductionKrakenProfile {
         )
     }
 
+    fn try_for_selected_channel(
+        config: &KrakenSourceConfig,
+        selected: &SelectedKrakenReference<'_>,
+        channel: KrakenChannel,
+    ) -> Result<Self, ProductionKrakenProfileError> {
+        Self::try_for_channel_parts(
+            config,
+            KrakenProfileDefinition::Selected(selected.definition),
+            selected.provider_identity,
+            selected.venue_mapping,
+            &selected.provider_identity_key,
+            &selected.reference_evidence,
+            selected.selected_at,
+            channel,
+        )
+    }
+
     #[cfg(test)]
     fn try_for_channel_with_reference(
         config: &KrakenSourceConfig,
@@ -182,9 +235,39 @@ impl ProductionKrakenProfile {
             .iter()
             .find(|mapping| mapping.venue_id() == &venue)
             .ok_or(ProductionKrakenProfileError::NativeIdentity)?;
+        Self::try_for_channel_parts(
+            config,
+            KrakenProfileDefinition::Legacy(definition),
+            provider_identity,
+            venue_mapping,
+            provider_identity_key,
+            reference_selection,
+            at,
+            channel,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_for_channel_parts(
+        config: &KrakenSourceConfig,
+        definition: KrakenProfileDefinition<'_>,
+        provider_identity: &ProviderIdentityRecord,
+        venue_mapping: &VenueMapping,
+        provider_identity_key: &ProviderIdentityKey,
+        reference_selection: &KrakenReferenceSelectionEvidence,
+        at: Timestamp,
+        channel: KrakenChannel,
+    ) -> Result<Self, ProductionKrakenProfileError> {
+        let attestation = config.authorization();
+        if attestation.provider().as_str() != "kraken" {
+            return Err(ProductionKrakenProfileError::AuthorizationMismatch);
+        }
+        if !attestation.is_effective_at(at) {
+            return Err(ProductionKrakenProfileError::AuthorizationNotEffective);
+        }
         let evidence_input = KrakenProfileEvidence::try_for_channel(
             config,
-            definition,
+            definition.instrument_id(),
             provider_identity,
             venue_mapping,
             reference_selection,
@@ -253,24 +336,49 @@ impl ProductionKrakenProfile {
             ),
         };
         let metadata = metadata_input.try_build()?;
-        let adapter_config = match channel {
-            KrakenChannel::Book(depth) => KrakenConfig::try_new(
-                metadata,
-                definition,
-                provider_identity_key,
-                reference_selection,
-                at,
-                depth,
-                config.max_frame_bytes(),
-            )?,
-            KrakenChannel::Trades => KrakenConfig::try_trades(
-                metadata,
-                definition,
-                provider_identity_key,
-                reference_selection,
-                at,
-                config.max_frame_bytes(),
-            )?,
+        let adapter_config = match (channel, definition) {
+            (KrakenChannel::Book(depth), KrakenProfileDefinition::Legacy(definition)) => {
+                KrakenConfig::try_new(
+                    metadata,
+                    definition,
+                    provider_identity_key,
+                    reference_selection,
+                    at,
+                    depth,
+                    config.max_frame_bytes(),
+                )?
+            }
+            (KrakenChannel::Trades, KrakenProfileDefinition::Legacy(definition)) => {
+                KrakenConfig::try_trades(
+                    metadata,
+                    definition,
+                    provider_identity_key,
+                    reference_selection,
+                    at,
+                    config.max_frame_bytes(),
+                )?
+            }
+            (KrakenChannel::Book(depth), KrakenProfileDefinition::Selected(definition)) => {
+                KrakenConfig::try_new_selected(
+                    metadata,
+                    definition,
+                    provider_identity_key,
+                    reference_selection,
+                    at,
+                    depth,
+                    config.max_frame_bytes(),
+                )?
+            }
+            (KrakenChannel::Trades, KrakenProfileDefinition::Selected(definition)) => {
+                KrakenConfig::try_trades_selected(
+                    metadata,
+                    definition,
+                    provider_identity_key,
+                    reference_selection,
+                    at,
+                    config.max_frame_bytes(),
+                )?
+            }
         };
         Ok(Self { adapter_config })
     }
@@ -321,7 +429,92 @@ impl TryFrom<&KrakenSourceConfig> for ProductionKrakenProfile {
     }
 }
 
-#[cfg(test)]
+struct SelectedKrakenReference<'a> {
+    definition: &'a MarketDataInstrumentDefinition,
+    provider_identity: &'a ProviderIdentityRecord,
+    venue_mapping: &'a VenueMapping,
+    provider_identity_key: ProviderIdentityKey,
+    reference_evidence: KrakenReferenceSelectionEvidence,
+    selected_at: Timestamp,
+}
+
+impl<'a> SelectedKrakenReference<'a> {
+    fn try_new(
+        config: &KrakenSourceConfig,
+        record: &'a MarketDataInstrumentRecord,
+        selection: &MarketDataProviderIdentitySelection,
+    ) -> Result<Self, ProductionKrakenProfileError> {
+        let query = selection.query();
+        let exact = selection.exact_receipt()?;
+        let provider = SourceId::try_from("kraken")?;
+        let venue = VenueId::try_from("kraken")?;
+        let definition = record.definition();
+
+        if query.source_id() != &provider
+            || query.provider_instrument_id().as_str() != config.symbol()
+            || exact.instrument_id() != definition.instrument_id()
+            || exact.instrument_id() != config.definition().instrument_id()
+            || record.revision_digest() != exact.definition_revision_digest()
+            || record.revision_sequence() != exact.definition_revision_sequence()
+            || record.published_at() != exact.definition_published_at()
+            || definition.reference_revision() != exact.definition_reference_revision()
+            || definition.reference_payload_evidence().content_digest()
+                != exact.definition_reference_payload_digest()
+            || !interval_contains(definition.effective_interval(), query.effective_at())
+            || !exact.matching_venues().contains(&venue)
+        {
+            return Err(ProductionKrakenProfileError::NativeIdentity);
+        }
+
+        let provider_identity = definition
+            .provider_identity_at(
+                query.source_id(),
+                query.provider_instrument_id(),
+                query.effective_at(),
+            )
+            .ok_or(ProductionKrakenProfileError::NativeIdentity)?;
+        if provider_identity.metadata_revision() != exact.provider_identity_revision()
+            || provider_identity.evidence().content_digest()
+                != exact.provider_identity_payload_digest()
+            || provider_identity.validity() != exact.provider_identity_validity()
+        {
+            return Err(ProductionKrakenProfileError::NativeIdentity);
+        }
+
+        let venue_mapping = definition
+            .venue_mappings()
+            .iter()
+            .find(|mapping| mapping.venue_id() == &venue)
+            .filter(|mapping| mapping.venue_symbol().as_str() == config.symbol())
+            .ok_or(ProductionKrakenProfileError::NativeIdentity)?;
+        let provider_identity_key = ProviderIdentityKey::new(
+            query.source_id().clone(),
+            query.provider_instrument_id().clone(),
+        );
+        let reference_evidence = KrakenReferenceSelectionEvidence::try_new(
+            exact.definition_reference_revision().clone(),
+            exact.definition_reference_payload_digest(),
+            exact.definition_revision_digest(),
+            exact.definition_revision_sequence(),
+            exact.definition_published_at(),
+            definition.effective_interval(),
+            selection.selection_digest(),
+        )?;
+        Ok(Self {
+            definition,
+            provider_identity,
+            venue_mapping,
+            provider_identity_key,
+            reference_evidence,
+            selected_at: query.effective_at(),
+        })
+    }
+}
+
+fn interval_contains(interval: EffectiveInterval, at: Timestamp) -> bool {
+    at >= interval.starts_at() && interval.ends_at().is_none_or(|end| at < end)
+}
+
 #[derive(Serialize)]
 struct KrakenProfileEvidence<'a> {
     implementation_profile_version: &'static str,
@@ -353,11 +546,10 @@ struct KrakenProfileEvidence<'a> {
     authorization: &'a KrakenAuthorizationAttestation,
 }
 
-#[cfg(test)]
 impl<'a> KrakenProfileEvidence<'a> {
     fn try_for_channel(
         config: &'a KrakenSourceConfig,
-        definition: &'a InstrumentDefinition,
+        instrument_id: market_squawk_domain::InstrumentId,
         provider_identity: &'a ProviderIdentityRecord,
         venue_mapping: &'a market_squawk_domain::VenueMapping,
         reference_selection: &'a KrakenReferenceSelectionEvidence,
@@ -377,7 +569,7 @@ impl<'a> KrakenProfileEvidence<'a> {
             channel: channel_name,
             endpoint: config.endpoint(),
             symbol: config.symbol(),
-            instrument_id: definition.instrument_id(),
+            instrument_id,
             provider_identity_source: provider_identity.source_id().as_str(),
             provider_instrument_id: provider_identity.provider_instrument_id().as_str(),
             provider_identity_revision: provider_identity
@@ -517,7 +709,6 @@ fn test_reference_selection_evidence(
     )?)
 }
 
-#[cfg(test)]
 fn content_addressed_revision(
     digest: [u8; 32],
 ) -> Result<SourceIdentifier, ProductionKrakenProfileError> {
@@ -975,6 +1166,8 @@ fn nonzero_u64(value: u64) -> Result<NonZeroU64, ProductionKrakenProfileError> {
 pub enum ProductionKrakenProfileError {
     #[error("a digest-verified durable Kraken reference selection is required")]
     ReferenceSelectionRequired,
+    #[error("Kraken catalog identity selection is invalid")]
+    Catalog(#[from] MarketDataInstrumentCatalogError),
     #[error("Kraken production profile allocation failed")]
     Allocation,
     #[error("Kraken production profile identity is invalid")]
