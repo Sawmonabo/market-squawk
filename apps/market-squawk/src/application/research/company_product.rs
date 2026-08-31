@@ -4,7 +4,10 @@
 //! statement meaning, exact-input ratios, filing meaning, knowledge clocks, coverage, and honest
 //! limitations. Selection and persistence evidence remain private.
 
-use std::io::{self, Write};
+use std::{
+    fmt,
+    io::{self, Write},
+};
 
 use market_squawk_domain::{
     CalendarDate, Currency, FundamentalAmendmentStatus, FundamentalCadence,
@@ -29,7 +32,7 @@ const MAX_PRODUCT_FILING_FORM_BYTES: usize = 64;
 const MAX_COMPANY_PRODUCT_SERIALIZED_BYTES: usize = 128 * 1024 * 1024;
 
 /// One closed company-research result with no provider or storage vocabulary.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CompanyProductResult {
     #[serde(skip)]
@@ -43,6 +46,24 @@ pub(crate) struct CompanyProductResult {
     clocks: CompanyProductClocks,
     coverage: CompanyProductCoverage,
     limitations: Box<[CompanyProductLimitation]>,
+}
+
+impl fmt::Debug for CompanyProductResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompanyProductResult")
+            .field("instrument_id", &self.instrument_id)
+            .field("identity", &self.identity)
+            .field("availability", &self.availability)
+            .field("facts", &self.facts)
+            .field("statements", &self.statements)
+            .field("ratios", &self.ratios)
+            .field("filings", &self.filings)
+            .field("clocks", &self.clocks)
+            .field("coverage", &self.coverage)
+            .field("limitations", &self.limitations)
+            .finish()
+    }
 }
 
 impl CompanyProductResult {
@@ -154,7 +175,7 @@ impl CompanyFactsProduct {
 
 /// One exact reported financial fact. Missing and conflict states remain section-level because
 /// the canonical read does not invent absent taxonomy coordinates.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CompanyFactProduct {
     #[serde(skip)]
@@ -173,10 +194,36 @@ pub(crate) struct CompanyFactProduct {
     known_at: Timestamp,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 struct CompanyFactPrivateLineage {
     filing_identity: Box<str>,
     publication_identity: [u8; 32],
+}
+
+impl fmt::Debug for CompanyFactPrivateLineage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[PRIVATE FACT LINEAGE]")
+    }
+}
+
+impl fmt::Debug for CompanyFactProduct {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompanyFactProduct")
+            .field("scope", &self.scope)
+            .field("revision", &self.revision)
+            .field("metric", &self.metric)
+            .field("display_name", &self.display_name)
+            .field("value", &self.value)
+            .field("unit", &self.unit)
+            .field("period", &self.period)
+            .field("fiscal_context", &self.fiscal_context)
+            .field("reporting_context", &self.reporting_context)
+            .field("filed_on", &self.filed_on)
+            .field("effective", &self.effective)
+            .field("known_at", &self.known_at)
+            .finish()
+    }
 }
 
 impl CompanyFactProduct {
@@ -976,14 +1023,11 @@ fn project_snapshot(
         .into_iter()
         .filter(|state| *state == CompanyProductSectionState::Reported)
         .count();
-    let availability = match available_product_sections {
-        0 => {
-            limitations.push(CompanyProductLimitation::NoSupportedCompanyInformationToShow);
-            CompanyProductAvailability::Unavailable
-        }
-        COMPANY_PRODUCT_SECTIONS => CompanyProductAvailability::Available,
-        _ => CompanyProductAvailability::Partial,
-    };
+    let availability =
+        company_product_availability(available_product_sections, complete_source_sections);
+    if availability == CompanyProductAvailability::Unavailable {
+        limitations.push(CompanyProductLimitation::NoSupportedCompanyInformationToShow);
+    }
     let reported_facts = facts.len();
     let statement_lines = statements
         .groups
@@ -1027,6 +1071,19 @@ fn project_snapshot(
         },
         limitations: limitations.into_boxed_slice(),
     })
+}
+
+const fn company_product_availability(
+    available_product_sections: usize,
+    complete_selected_input_coverage: bool,
+) -> CompanyProductAvailability {
+    match available_product_sections {
+        0 => CompanyProductAvailability::Unavailable,
+        COMPANY_PRODUCT_SECTIONS if complete_selected_input_coverage => {
+            CompanyProductAvailability::Available
+        }
+        _ => CompanyProductAvailability::Partial,
+    }
 }
 
 fn project_statements(
@@ -1891,6 +1948,14 @@ mod tests {
                     && item.lineage.publication_identity == first.publication_identity
             }));
         }
+        let debug = format!("{:?}", facts[0]);
+        assert!(!debug.contains("filing-a"));
+        assert!(!debug.contains("publication_identity"));
+        assert_eq!(format!("{:?}", facts[0].lineage), "[PRIVATE FACT LINEAGE]");
+        assert_eq!(
+            company_product_availability(COMPANY_PRODUCT_SECTIONS, false),
+            CompanyProductAvailability::Partial
+        );
 
         let ratios = project_ratios(&facts, CompanyProductSectionState::Reported, &mut budget)?;
         assert_eq!(ratios.state(), CompanyProductSectionState::Reported);

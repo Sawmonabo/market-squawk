@@ -460,7 +460,7 @@ impl ResearchProductReadCapability {
             FundProductReadSet::new(&portfolio, &annual),
             None,
             product_identity(&identity)?,
-            &holding_identities,
+            holding_identities,
         )
         .map_err(ResearchProductReadError::FundProjection)?;
         Ok(FundProductRead {
@@ -495,7 +495,7 @@ impl ResearchProductReadCapability {
             FundProductReadSet::new(&portfolio, &annual),
             None,
             product_identity(&identity)?,
-            &holding_identities,
+            holding_identities,
         )
         .map_err(ResearchProductReadError::FundProjection)?;
         if product != expected.product {
@@ -725,13 +725,29 @@ struct CompanyResearchEvidence {
 }
 
 /// Honest company-research availability.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) enum CompanyResearchOutcome {
     Available(CompanyResearchSnapshot),
     Partial(CompanyResearchSnapshot),
     Missing,
     Ambiguous,
     Unavailable(CompanyResearchUnavailableReason),
+}
+
+impl fmt::Debug for CompanyResearchOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Available(snapshot) => {
+                formatter.debug_tuple("Available").field(snapshot).finish()
+            }
+            Self::Partial(snapshot) => formatter.debug_tuple("Partial").field(snapshot).finish(),
+            Self::Missing => formatter.write_str("Missing"),
+            Self::Ambiguous => formatter.write_str("Ambiguous"),
+            Self::Unavailable(reason) => {
+                formatter.debug_tuple("Unavailable").field(reason).finish()
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -829,7 +845,7 @@ pub(crate) enum CompanyResearchRestatementState {
 }
 
 /// One exact point-in-time fact stripped of provider and raw-object coordinates.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct CompanyResearchFact {
     lineage: CompanyResearchFactLineage,
     scope: CompanyFactScope,
@@ -849,6 +865,31 @@ pub(crate) struct CompanyResearchFact {
     filed_on: Option<CalendarDate>,
     effective: ResearchTemporalCoordinate,
     known_at: Timestamp,
+}
+
+impl fmt::Debug for CompanyResearchFact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompanyResearchFact")
+            .field("scope", &self.scope)
+            .field("revision", &self.revision)
+            .field("metric", &self.metric)
+            .field("value", &self.value)
+            .field("unit", &self.unit)
+            .field("period", &self.period)
+            .field("fiscal_year", &self.fiscal_year)
+            .field("fiscal_period", &self.fiscal_period)
+            .field("cadence", &self.cadence)
+            .field("dimension_state", &self.dimension_state)
+            .field("consolidation", &self.consolidation)
+            .field("amendment_status", &self.amendment_status)
+            .field("restatement_state", &self.restatement_state)
+            .field("occurrence", &self.occurrence)
+            .field("filed_on", &self.filed_on)
+            .field("effective", &self.effective)
+            .field("known_at", &self.known_at)
+            .finish()
+    }
 }
 
 impl CompanyResearchFact {
@@ -909,10 +950,16 @@ impl CompanyResearchFact {
 }
 
 /// Exact filing and immutable publication identity used only for safe calculation grouping.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct CompanyResearchFactLineage {
     filing_identity: Box<str>,
     publication_identity: EvidenceDigest,
+}
+
+impl fmt::Debug for CompanyResearchFactLineage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[PRIVATE FACT LINEAGE]")
+    }
 }
 
 impl CompanyResearchFactLineage {

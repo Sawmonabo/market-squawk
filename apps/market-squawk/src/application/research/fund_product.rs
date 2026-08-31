@@ -5,6 +5,8 @@
 //! identity, never substitutes market price for NAV, and never exposes filing coordinates,
 //! provider fields, manifests, digests, or runtime state.
 
+use std::io::{self, Write};
+
 use market_squawk_data::{
     AnalyticalFundNavOutput, AnalyticalFundNavReadRequest, PointInTimeRevisionMode,
 };
@@ -29,6 +31,7 @@ use super::sec_fund_product::{
 use crate::application::domain_support::{ProductTextCopyError, try_boxed_product_text};
 
 const MAX_FUND_PRODUCT_PROJECTED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FUND_PRODUCT_SERIALIZED_BYTES: usize = MAX_FUND_PRODUCT_PROJECTED_BYTES;
 const MAX_FUND_PRODUCT_DECIMAL_BYTES: usize = 128;
 
 /// Exact typed NAV output whose complete point-in-time request is retained by the output itself.
@@ -99,19 +102,26 @@ impl FundProductResult {
         &mut self,
         instrument_id: InstrumentId,
         identity: ResearchProductIdentity,
-        holdings: &[Option<ResearchProductIdentity>],
+        holdings: Vec<Option<ResearchProductIdentity>>,
+        budget: &mut FundProductByteBudget,
     ) -> Result<(), FundProductProjectionError> {
         if self.fund_share_class_instrument_id != instrument_id
             || self.identity.is_some()
-            || (!self.holdings.items.is_empty() && self.holdings.items.len() != holdings.len())
+            || self.holdings.items.len() != holdings.len()
         {
             return Err(FundProductProjectionError::InvalidEvidence);
         }
-        for (holding, identity) in self.holdings.items.iter_mut().zip(holdings) {
+        for (holding, identity) in self.holdings.items.iter().zip(&holdings) {
             if holding.instrument_id.is_none() && identity.is_some() {
                 return Err(FundProductProjectionError::InvalidEvidence);
             }
-            holding.identity = identity.clone();
+        }
+        budget.charge_serialized(&identity)?;
+        for identity in holdings.iter().flatten() {
+            budget.charge_serialized(identity)?;
+        }
+        for (holding, identity) in self.holdings.items.iter_mut().zip(holdings) {
+            holding.identity = identity;
         }
         self.identity = Some(identity);
         Ok(())
@@ -741,6 +751,66 @@ impl FundProductByteBudget {
             .ok_or(FundProductProjectionError::ResourceExhausted)?;
         Ok(())
     }
+
+    fn charge_serialized<T: Serialize>(
+        &mut self,
+        value: &T,
+    ) -> Result<(), FundProductProjectionError> {
+        let bytes = fund_serialized_bytes_with_limit(value, self.remaining)?;
+        self.charge(bytes)
+    }
+}
+
+struct FundBoundedCountingWriter {
+    remaining: usize,
+    written: usize,
+    exhausted: bool,
+}
+
+impl Write for FundBoundedCountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.len() > self.remaining {
+            self.exhausted = true;
+            return Err(io::Error::other(
+                "fund product serialization bound exceeded",
+            ));
+        }
+        self.remaining -= buffer.len();
+        self.written = self
+            .written
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::other("fund product serialization length overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn fund_serialized_bytes_with_limit<T: Serialize>(
+    value: &T,
+    limit: usize,
+) -> Result<usize, FundProductProjectionError> {
+    let mut writer = FundBoundedCountingWriter {
+        remaining: limit,
+        written: 0,
+        exhausted: false,
+    };
+    if serde_json::to_writer(&mut writer, value).is_err() {
+        return Err(if writer.exhausted {
+            FundProductProjectionError::ResourceExhausted
+        } else {
+            FundProductProjectionError::InvalidEvidence
+        });
+    }
+    Ok(writer.written)
+}
+
+fn ensure_fund_product_serialized_bound(
+    product: &FundProductResult,
+) -> Result<(), FundProductProjectionError> {
+    fund_serialized_bytes_with_limit(product, MAX_FUND_PRODUCT_SERIALIZED_BYTES).map(|_| ())
 }
 
 /// Projects a verified canonical fund read and an optional exact latest-known NAV read.
@@ -748,7 +818,7 @@ pub(crate) fn project_fund_product(
     reads: FundProductReadSet<'_>,
     nav: Option<FundNavProductRead<'_>>,
     identity: ResearchProductIdentity,
-    holding_identities: &[Option<ResearchProductIdentity>],
+    holding_identities: Vec<Option<ResearchProductIdentity>>,
 ) -> Result<FundProductResult, FundProductProjectionError> {
     let request = reads.portfolio.request();
     let annual_request = reads.annual.request();
@@ -828,7 +898,8 @@ pub(crate) fn project_fund_product(
             ))
         }
     }?;
-    result.bind_display_identities(instrument_id, identity, holding_identities)?;
+    result.bind_display_identities(instrument_id, identity, holding_identities, &mut budget)?;
+    ensure_fund_product_serialized_bound(&result)?;
     Ok(result)
 }
 
@@ -2437,6 +2508,20 @@ mod tests {
         assert_eq!(withheld.alignment(), FundOverlapAlignmentState::Misaligned);
         assert_eq!(withheld.state(), FundAnalysisState::Unavailable);
         assert_eq!(withheld.overlap_share(), None);
+
+        let mut bounded = left.clone();
+        let holding_identity = ResearchProductIdentity::try_new("Example holding", "HOLD")?;
+        let holding_identities = vec![Some(holding_identity); bounded.holdings.items.len()];
+        let mut budget = FundProductByteBudget::new()?;
+        let remaining_before_identities = budget.remaining;
+        bounded.bind_display_identities(
+            bounded.fund_share_class_instrument_id,
+            ResearchProductIdentity::try_new("Example fund", "FUND")?,
+            holding_identities,
+            &mut budget,
+        )?;
+        assert!(budget.remaining < remaining_before_identities);
+        ensure_fund_product_serialized_bound(&bounded)?;
         Ok(())
     }
 
