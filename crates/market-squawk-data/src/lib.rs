@@ -16,11 +16,15 @@ mod catalog;
 mod catalog_capabilities;
 mod corporate_actions;
 mod dataset_builder;
+mod fund_holdings;
 mod ingest;
 mod manifest;
+mod market_event;
 mod migrations;
+mod option_market;
 mod parquet_store;
 mod pit;
+mod provider_event_selection;
 mod provider_rate;
 mod publication_coordinator;
 mod python_dataset;
@@ -28,6 +32,7 @@ mod query;
 mod research_use;
 mod rights;
 mod schema;
+mod sec_research;
 mod universe;
 
 pub use analytical_backup::{
@@ -37,9 +42,18 @@ pub use analytical_backup::{
 };
 pub use analytical_read::{
     AnalyticalFeatureDataset, AnalyticalFeatureDatasetPage, AnalyticalFeatureDatasetSelection,
-    AnalyticalGeneration, AnalyticalGenerationPage, AnalyticalObservationOutput,
-    AnalyticalObservationReadRequest, AnalyticalObservationTemplate, AnalyticalReadCapability,
-    AnalyticalReadError, AnalyticalReadLimit, ObservationKnowledgeRange,
+    AnalyticalFundNavOutput, AnalyticalFundNavReadLimit, AnalyticalFundNavReadRequest,
+    AnalyticalGeneration, AnalyticalGenerationPage, AnalyticalMacroLatestKnownOutput,
+    AnalyticalMacroLatestKnownRequest, AnalyticalMacroProviderPeriodLatestKnownOutput,
+    AnalyticalMacroProviderPeriodLatestKnownRequest, AnalyticalMacroSeriesAllowlist,
+    AnalyticalMacroSourceQualifiedSeries, AnalyticalMarketBarOutput, AnalyticalMarketBarReadLimit,
+    AnalyticalMarketBarReadRequest, AnalyticalObservationOutput, AnalyticalObservationReadRequest,
+    AnalyticalObservationTemplate, AnalyticalReadCapability, AnalyticalReadError,
+    AnalyticalReadLimit, CompleteMarketBarHistoryOutput, CompleteMarketBarHistoryReadReceipt,
+    ForecastDatasetEvidence, ForecastDatasetEvidenceFence, ForecastDatasetReadLimits,
+    ForecastFeatureRow, ForecastFeatureValue, FundNavDateRange, MarketBarEffectiveRange,
+    ObservationKnowledgeRange, OutcomeMarketBarRequest, OutcomeMarketBarSelectedReceipt,
+    OutcomeMarketBarSelection, OutcomeMarketBarSeries, OutcomeMarketBarUnavailableReason,
 };
 pub use arrow_convert::{
     ArrowConversionError, DatasetArrowBatch, DatasetSchemaError, DatasetSchemaRef,
@@ -50,21 +64,111 @@ pub use authority_transition::{
     ArtifactInventoryDigest, AuthorityEventDigest, AuthorityEvidenceDigest, AuthorityGeneration,
     CatalogEndpointIdentity, StableArtifactRootIdentity,
 };
+pub use catalog::PersistedProviderLogicalGenerationBinding;
 pub use catalog::{
     ArtifactRecord, AuditEvent, BackupReceipt, Catalog, CatalogAuthority, CatalogConfig,
     CatalogDiagnosticSnapshot, CatalogError, CatalogHealth, CatalogLimit, CatalogResultLimits,
+    CompanyIdentityExactRecord, CompanyIdentityMatchKind, CompanyIdentityMatchReason,
+    CompanyIdentitySearchMatch, CompanyIdentitySearchPage, CompanySecurityIdentityCatalogError,
+    CompanySecurityIdentityDisposition, CompanySecurityIdentityExclusion,
+    CompanySecurityIdentityExclusionReason, CompanySecurityIdentityQuery,
+    CompanySecurityIdentityReadCapability, CompanySecurityIdentityRecord,
+    CompanySecurityIdentitySelection, CompanySecurityIdentitySelectionReceipt,
+    CompanySecurityLinkPublicationCapability, CompanySecurityLinkPublicationDisposition,
+    CompanySecurityLinkPublicationReceipt, CompanySecuritySelectionReceiptEntry,
     ContractCompletion, DatasetManifestRecord, FairValueCatalogAuditEvent, FairValueCatalogCommit,
     FairValueCatalogLink, FairValueCatalogOperation, FairValueCatalogPosition,
     FairValueCatalogRecord, FairValueCatalogSnapshot, FairValueCatalogSnapshotLimits,
     FairValueCommitDisposition, FairValueLinkRelation, FairValueOperationKind, FairValueRecordKind,
-    IngestReservation, IngestRunRecord, IngestRunState, OnboardingAppendOutcome,
-    OnboardingReservation, OnboardingReservationRequest, PinnedInstrumentDefinitions,
-    ProviderOnboardingDiagnostic, PublishedIngest, QueryArtifactReservation,
-    QueryArtifactReservationInput, QueryArtifactResult, ReferenceBundle, ResumedIngest,
-    ResumedProviderOnboarding, SourceCursor, StoredObservedRevision,
+    IngestReservation, IngestRunRecord, IngestRunState, InstrumentSearchMatch,
+    InstrumentSearchPage, ListingReferenceDirectoryPresence, ListingReferenceError,
+    ListingReferenceExchangeCode, ListingReferenceFileEvidence, ListingReferenceFileKind,
+    ListingReferenceFinancialStatus, ListingReferenceGenerationInput,
+    ListingReferenceGenerationReceipt, ListingReferenceGenerationSelection,
+    ListingReferenceMarketCategory, ListingReferenceMatchKind, ListingReferenceMembershipCursor,
+    ListingReferenceMembershipPage, ListingReferenceMembershipPageState,
+    ListingReferenceMembershipSelectionReceipt, ListingReferencePublicationCapability,
+    ListingReferencePublicationDisposition, ListingReferencePublicationReceipt,
+    ListingReferenceReadCapability, ListingReferenceRecord, ListingReferenceRecordInput,
+    ListingReferenceRightsState, ListingReferenceSearchMatch, ListingReferenceSearchPage,
+    ListingReferenceSourceFileInput, MAX_COMPANY_SECURITY_SELECTION_ROWS,
+    MAX_LISTING_REFERENCE_MEMBERSHIP_PAGE_ROWS, MAX_LISTING_REFERENCE_RECORDS,
+    MAX_LISTING_REFERENCE_SEARCH_ROWS, MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS,
+    MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS, MAX_MARKET_DATA_INSTRUMENT_SYNC_ROWS,
+    MAX_SEC_FUND_POINT_IN_TIME_CANDIDATES, MAX_SEC_FUND_POINT_IN_TIME_RETAINED_BYTES,
+    MarketDataInstrumentCatalogError, MarketDataInstrumentMatchKind,
+    MarketDataInstrumentPopulationDisposition, MarketDataInstrumentPopulationExclusion,
+    MarketDataInstrumentPopulationExclusionReason, MarketDataInstrumentPopulationQuery,
+    MarketDataInstrumentPopulationSelection, MarketDataInstrumentReadCapability,
+    MarketDataInstrumentRecord, MarketDataInstrumentSearchMatch, MarketDataInstrumentSearchPage,
+    MarketDataInstrumentSynchronization, MarketDataInstrumentSynchronizationCapability,
+    MarketDataInstrumentSynchronizationReceipt, MarketDataProviderIdentityExactReceipt,
+    MarketDataProviderIdentityQuery, MarketDataProviderIdentityResolution,
+    MarketDataProviderIdentityResolutionOutcome, MarketDataProviderIdentitySelection,
+    OnboardingAppendOutcome, OnboardingReservation, OnboardingReservationRequest,
+    PinnedInstrumentDefinitions, ProviderOnboardingDiagnostic, PublishedIngest,
+    QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult, ReferenceBundle,
+    ResumedIngest, ResumedProviderOnboarding, SecFundJobCatalogCapability, SecFundJobCatalogError,
+    SecFundJobCommit, SecFundJobCoordinate, SecFundJobDurablePublication, SecFundJobFamily,
+    SecFundJobPointInTimeSelection, SecFundJobRecovery, SecFundPointInTimeReadOutcome,
+    SecFundPointInTimeReadRequest, SecFundamentalIdentityAvailability, SecFundamentalIdentityQuery,
+    SecFundamentalIdentitySelection, SourceCursor, StoredObservedRevision,
+};
+pub use catalog::{
+    MAX_OFFICIAL_OPTIONS_REFERENCE_ALIAS_ASSERTIONS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_ALIAS_RESOLUTIONS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_CANONICAL_CANDIDATES, MAX_OFFICIAL_OPTIONS_REFERENCE_CONFLICTS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_EXACT_ROWS, MAX_OFFICIAL_OPTIONS_REFERENCE_OBJECTS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_RECORDS, MAX_OFFICIAL_OPTIONS_REFERENCE_SEARCH_ROWS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_STAGE_BATCH_BYTES,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_STAGE_BATCH_ROWS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_STAGE_TOTAL_BYTES, MAX_OFFICIAL_OPTIONS_REFERENCE_STAGES,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_STRICT_ROWS, OfficialOptionsReferenceAliasAssertionSetBuilder,
+    OfficialOptionsReferenceAliasAssertionSetEvidence, OfficialOptionsReferenceAliasKey,
+    OfficialOptionsReferenceAliasResolutionInput, OfficialOptionsReferenceAliasResolutionState,
+    OfficialOptionsReferenceAmbiguity, OfficialOptionsReferenceCanonicalCandidate,
+    OfficialOptionsReferenceCanonicalMatchKind, OfficialOptionsReferenceCanonicalResolution,
+    OfficialOptionsReferenceCatalogReadCapability, OfficialOptionsReferenceCatalogResolution,
+    OfficialOptionsReferenceCboeSeries, OfficialOptionsReferenceConflict,
+    OfficialOptionsReferenceConflictInput, OfficialOptionsReferenceConflictKind,
+    OfficialOptionsReferenceConflictSetDigestBuilder, OfficialOptionsReferenceConflictSetEvidence,
+    OfficialOptionsReferenceError, OfficialOptionsReferenceExactIdentity,
+    OfficialOptionsReferenceGenerationHeader, OfficialOptionsReferenceGenerationReceipt,
+    OfficialOptionsReferenceGenerationSelection, OfficialOptionsReferenceIdentityQuery,
+    OfficialOptionsReferenceIdentityResolution, OfficialOptionsReferenceObjectBindingFields,
+    OfficialOptionsReferenceObjectEvidence, OfficialOptionsReferenceObjectInput,
+    OfficialOptionsReferenceObjectInputFields, OfficialOptionsReferenceOccExchangeListingEvidence,
+    OfficialOptionsReferenceOccPositionLimit, OfficialOptionsReferenceOccProduct,
+    OfficialOptionsReferenceOccProductType, OfficialOptionsReferenceProvider,
+    OfficialOptionsReferencePublicationCapability, OfficialOptionsReferencePublicationDisposition,
+    OfficialOptionsReferencePublicationReceipt, OfficialOptionsReferenceReadCapability,
+    OfficialOptionsReferenceRecord, OfficialOptionsReferenceRecordInput,
+    OfficialOptionsReferenceRecordSetDigestBuilder, OfficialOptionsReferenceRecordSetEvidence,
+    OfficialOptionsReferenceRecordValue, OfficialOptionsReferenceRequestBinding,
+    OfficialOptionsReferenceResolutionSetDigestBuilder,
+    OfficialOptionsReferenceResolutionSetEvidence, OfficialOptionsReferenceSealedStage,
+    OfficialOptionsReferenceSearchPage, OfficialOptionsReferenceSourceAuthority,
+    OfficialOptionsReferenceSourceEvidence, OfficialOptionsReferenceStageCapability,
+    OfficialOptionsReferenceStageProgress, OfficialOptionsReferenceStageRestartDisposition,
+    OfficialOptionsReferenceSurface, official_options_reference_object_binding_digest,
+};
+pub use catalog::{
+    PersistedProviderCaptureBindingEvidence, PersistedProviderCaptureBindingRow,
+    PersistedProviderCapturePhysicalClaim, PersistedProviderNativeLineageSchema,
+};
+pub use catalog::{
+    PersistedProviderEventBindingEvidence, PersistedProviderEventBindingRow,
+    PersistedProviderEventNativeLineage, PersistedProviderPublicationEvidence,
+    PersistedProviderResponseMarketEventBindingEvidence,
+    PersistedProviderResponseMarketEventBindingRow,
+};
+pub use catalog::{
+    PersistedProviderOptionMarketBindingEvidence, PersistedProviderOptionMarketBindingRow,
+    PersistedProviderOptionMarketNativeLineage,
 };
 pub use catalog_capabilities::{
-    FairValueCatalogCapability, InstrumentDefinitionReadCapability, OnboardingCatalogCapability,
+    CompanyIdentityReadCapability, FairValueCatalogCapability, InstrumentCatalogCapability,
+    InstrumentDefinitionReadCapability, OnboardingCatalogCapability,
 };
 pub use corporate_actions::{
     AdjustmentConflict, AdjustmentRatio, AdjustmentStep, CorporateActionAdjustment,
@@ -75,27 +179,59 @@ pub use corporate_actions::{
 pub use dataset_builder::{
     ChronologicalSplitPolicy, ComponentAdjustmentEvidence, ComponentKind, ComponentScope,
     ComponentSelector, ComponentValue, CorporateActionSensitivity, DatasetBuildError,
-    DatasetBuildInputs, DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildRequest,
-    DatasetBuilder, DatasetBuilderService, DatasetExample, DatasetOutputAuthorization,
-    DatasetSplit, DatasetSplitCounts, FeatureLabelComponentInput, FeatureLabelComponentSpec,
-    FeatureLabelDataset, FeatureLabelPythonExport, MAX_FEATURE_LABEL_EXPORT_BYTES,
-    MissingValuePolicy, PythonDatasetAdmission,
+    DatasetBuildInputs, DatasetBuildLimits, DatasetBuildPolicy, DatasetBuildPrecommitAuthority,
+    DatasetBuildRequest, DatasetBuilder, DatasetBuilderService, DatasetExample,
+    DatasetOutputAuthorization, DatasetResearchUsePreflightReceipt, DatasetSplit,
+    DatasetSplitCounts, FEATURE_DATASET_PRODUCTION_RECEIPT_SCHEMA, FEATURE_LABEL_PROBABILITY_UNIT,
+    FEATURE_LABEL_RETURN_UNIT, FeatureDatasetMacroComponentDescriptor,
+    FeatureDatasetProductContract, FeatureDatasetProductionComposition,
+    FeatureDatasetProductionError, FeatureDatasetProductionProofV1,
+    FeatureDatasetProductionPublication, FeatureDatasetProductionPublicationDisposition,
+    FeatureDatasetProductionPublisher, FeatureDatasetProductionReceiptV1,
+    FeatureLabelComponentInput, FeatureLabelComponentSpec, FeatureLabelDataset,
+    FeatureLabelMeasurement, FeatureLabelMeasurementBinding, FeatureLabelPythonExport,
+    MAX_FEATURE_DATASET_PRODUCTION_RECEIPT_BYTES, MAX_FEATURE_LABEL_EXPORT_BYTES,
+    MissingValuePolicy,
+};
+pub use fund_holdings::{
+    FundHoldingsArrowBatch, FundLatestUnavailableReason, FundPointInTimeOutcome,
+    FundPointInTimeRequest, FundPointInTimeRevisionMode, FundPointInTimeSelection,
+    MAX_FUND_HOLDINGS_BATCH_RECORDS, MAX_FUND_HOLDINGS_RETAINED_BYTES,
 };
 pub use ingest::{
-    AnalyticalDataService, CommittedDataset, CompactionRequest, IngestError,
-    IngestPrecommitAuthority, PinnedArtifactQueryRequest, QueryArtifactPublication,
-    ResearchIngestService, extraction_batch_digest, extraction_provider_payload_digest,
+    AnalyticalDataService, CommittedDataset, CompactionRequest, CompletedProviderMacroPlanReceipt,
+    GenerationOwnedProviderCaptureEvidence, GenerationOwnedProviderCaptureInputEvidence,
+    GenerationOwnedProviderCaptureObjectEvidence, IngestError, IngestPrecommitAuthority,
+    ListingReferenceAdmissionCapability, PendingProviderMacroPlanPublication,
+    PinnedArtifactQueryRequest, ProviderMacroPlanChunkInput, ProviderMacroPlanManifestSelector,
+    ProviderMacroPlanPublicationInput, ProviderMacroPlanPublicationReceipt,
+    ProviderMacroPlanRestartSelector, ProviderMacroPlanSemantics, ProviderMacroPlanSessionInput,
+    ProviderMacroPlanSessionReceipt, ProviderMacroPlanStagedPage, ProviderMacroPlanTerminal,
+    ProviderMarketEventPublicationKind, ProviderMarketEventPublicationSelector,
+    ProviderOptionMarketPublicationSelector, ProviderPublicationInput, QueryArtifactPublication,
+    ResearchIngestService, StagedProviderMacroPlanPublicationReceipt,
+    StagedProviderMacroPlanRestartEvidence, extraction_batch_digest,
+    extraction_provider_payload_digest, provider_market_event_publication_digest,
+    provider_option_market_publication_digest,
 };
 pub use manifest::{
-    AnalyticalManifestCatalog, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,
+    AnalyticalManifestCatalog, CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,
+    CompleteMarketBarHistorySelection, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,
     DerivedGenerationParents, GenerationKind, GenerationParent, GenerationParentRelation,
-    MAX_DERIVED_GENERATION_PARENTS, MAX_RETAINED_PYTHON_DATASET_ADMISSIONS,
-    MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES, ManifestCatalogError, ManifestObject,
-    ManifestPlan, ManifestPlanError, PinnedDataset, PinnedManifestObject, Sha256Digest,
+    LatestCanonicalMarketBarHistoryWindowRequest, LatestCanonicalMarketBarHistoryWindowSelection,
+    MAX_DERIVED_GENERATION_PARENTS, MAX_RETAINED_FEATURE_DATASET_PRODUCTION_ADMISSIONS,
+    MAX_RETAINED_FEATURE_DATASET_PRODUCTION_PAYLOAD_BYTES, ManifestCatalogError, ManifestObject,
+    ManifestPlan, ManifestPlanError, MarketBarHistoryPublicationReceipt,
+    MarketHistorySelectionPolicy, PinnedDataset, PinnedManifestObject, Sha256Digest,
 };
 #[cfg(feature = "release-evidence")]
 pub use manifest::{
     ReleaseEvidenceStorageError, ReleaseEvidenceStorageResult, run_release_evidence_storage,
+};
+pub use market_event::ProviderMarketEventArrowBatch;
+pub use option_market::{
+    OptionMarketPointInTimeRequest, OptionMarketPointInTimeSelection,
+    ProviderOptionMarketArrowBatch,
 };
 pub use parquet_store::{
     ObjectStoreConfig, OrphanRecoveryReport, ParquetObjectStore, ParquetStoreError, PublishedObject,
@@ -109,6 +245,17 @@ pub use pit::{
     PointInTimeLimits, PointInTimePolicy, PointInTimeRecord, PointInTimeRequest,
     PointInTimeRevisionCounts, PointInTimeRevisionMode, PointInTimeRevisionState,
     PointInTimeSelection, PointInTimeService,
+};
+pub use provider_event_selection::{
+    MAX_PROVIDER_MARKET_EVENT_POINT_IN_TIME_CANDIDATES, ProviderMarketEventComponentKind,
+    ProviderMarketEventEffectiveTimeBasis, ProviderMarketEventExactPublication,
+    ProviderMarketEventExclusionCounts, ProviderMarketEventPointInTimeRequest,
+    ProviderMarketEventPointInTimeSelection, ProviderMarketEventSelectedCandidate,
+    ProviderMarketEventSelectionCompleteness, ProviderMarketEventSelectionCoordinate,
+    ProviderMarketEventSelectionError, ProviderMarketEventSourceSelection,
+};
+pub(crate) use provider_event_selection::{
+    ProviderMarketEventCatalogCandidate, ProviderMarketEventCatalogPlan,
 };
 pub use provider_rate::SqliteProviderRateStore;
 pub use python_dataset::{
@@ -134,8 +281,17 @@ pub use research_use::{
     ResearchUseRevocationReceipt, ResearchUseSet, ResearchUseSourceInput,
 };
 pub use rights::{
-    IngestIdentity, RegisteredRightsGrant, ReviewedTermsBasis, RightsBasis, RightsDecisionInput,
-    RightsError, SourceOperation, UserOwnedLocalBasis,
+    ImportedUserInputBasis, ImportedUserInputEvidence, IngestIdentity, RegisteredRightsGrant,
+    ReviewedTermsBasis, RightsBasis, RightsDecisionInput, RightsError, SourceOperation,
+    UserOwnedLocalBasis,
+};
+pub use sec_research::{
+    MAX_SEC_RESEARCH_OBJECT_BYTES, SecResearchConflict, SecResearchDisposition,
+    SecResearchExcludedRow, SecResearchFamily, SecResearchIdentityOutcome,
+    SecResearchIdentityReadRequest, SecResearchIdentitySelection, SecResearchKnowledgeExclusions,
+    SecResearchOrigin, SecResearchPointInTimeIdentities, SecResearchReadCapability,
+    SecResearchReadError, SecResearchReadRequest, SecResearchRowIdentity, SecResearchSelectedRow,
+    SecResearchSelection, SecResearchSelectionReceipt,
 };
 pub use universe::{
     ContractRollEvidence, DerivativeBoundary, DerivativeCivilDate, DerivativeLifecycle,

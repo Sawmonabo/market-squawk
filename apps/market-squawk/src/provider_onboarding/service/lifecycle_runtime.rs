@@ -21,8 +21,37 @@ use super::{
     ProviderRuntimeStartupAdmissions, SECRET_OPERATION_DURATION, SESSION_DURATION,
     await_blocking_secret_operation, event_digest, session_view, system_timestamp, wall_deadline,
 };
+use crate::provider_onboarding::SCHWAB_MARKET_DATA_SURFACE_ID;
 
 impl ProviderOnboardingService {
+    #[cfg(test)]
+    pub(crate) fn retained_credential_coordinate(
+        &self,
+        session_id: Uuid,
+    ) -> Result<
+        (
+            market_squawk_platform::SecretGeneration,
+            market_squawk_platform::SecretRef,
+            CredentialGenerationState,
+        ),
+        ProviderOnboardingError,
+    > {
+        let resumed = self.catalog.resume_provider_onboarding(session_id)?;
+        let lifecycle = resumed.lifecycle();
+        let generation = lifecycle
+            .candidate_generation()
+            .or_else(|| lifecycle.active_generation())
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        let reference = lifecycle
+            .generation_reference(generation)
+            .cloned()
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        let state = lifecycle
+            .generation_state(generation)
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        Ok((generation, reference, state))
+    }
+
     /// Replays one exact durable session, closes safe refresh recovery, and returns status.
     pub fn resume(
         &self,
@@ -117,6 +146,7 @@ impl ProviderOnboardingService {
         }
         if capability_is_current
             && resumed.lifecycle().active_generation().is_none()
+            && !schwab_oauth_bootstrap_retained(resumed.lifecycle())
             && !matches!(
                 resumed.lifecycle().state(),
                 OnboardingState::Blocked
@@ -161,8 +191,14 @@ impl ProviderOnboardingService {
             && let Some(generation) = resumed.lifecycle().active_generation()
             && let Some(expires_at) = resumed
                 .lifecycle()
-                .generation_verification(generation)
-                .and_then(AuthorityVerification::expires_at)
+                .generation_alpaca_paper_iex_doctor_receipt(generation)
+                .map(|receipt| receipt.exclusive_expires_at())
+                .or_else(|| {
+                    resumed
+                        .lifecycle()
+                        .generation_verification(generation)
+                        .and_then(AuthorityVerification::expires_at)
+                })
             && expires_at <= observed_at
         {
             self.append(
@@ -346,7 +382,13 @@ impl ProviderOnboardingService {
                     });
                 let authority_recognized =
                     profile.is_some() && exact_capability.is_some() && public_configuration_valid;
-                if (!current_runtime_admitted && secret_authority_retained) || !authority_recognized
+                let schwab_bootstrap_recognized = authority_recognized
+                    && exact_capability == profile.map(|profile| profile.capability())
+                    && schwab_oauth_bootstrap_retained(lifecycle);
+                if (!current_runtime_admitted
+                    && secret_authority_retained
+                    && !schwab_bootstrap_recognized)
+                    || !authority_recognized
                 {
                     self.quarantine_startup_authority(&resumed)?;
                 }
@@ -762,6 +804,37 @@ const fn startup_remote_cleanup_unresolved(outcome: Option<RemoteRevocationOutco
         outcome,
         Some(RemoteRevocationOutcome::Failed | RemoteRevocationOutcome::Indeterminate)
     )
+}
+
+fn schwab_oauth_bootstrap_retained(lifecycle: &market_squawk_sources::OnboardingLifecycle) -> bool {
+    if lifecycle.surface_id().as_str() != SCHWAB_MARKET_DATA_SURFACE_ID {
+        return false;
+    }
+    let Some(generation) = lifecycle
+        .candidate_generation()
+        .or_else(|| lifecycle.active_generation())
+    else {
+        return false;
+    };
+    lifecycle.generation_reference(generation).is_some()
+        && matches!(
+            lifecycle.generation_state(generation),
+            Some(
+                CredentialGenerationState::StoredUnverified
+                    | CredentialGenerationState::VerifiedLeastPrivilege
+                    | CredentialGenerationState::ActiveScoped
+            )
+        )
+        && matches!(
+            lifecycle.state(),
+            OnboardingState::StoredUnverified
+                | OnboardingState::VerifiedLeastPrivilege
+                | OnboardingState::RightsAdmissionPending
+                | OnboardingState::RuntimeVerificationPending
+                | OnboardingState::ActiveScoped
+                | OnboardingState::RenewalRequired
+                | OnboardingState::RefreshRequired
+        )
 }
 
 #[cfg(test)]

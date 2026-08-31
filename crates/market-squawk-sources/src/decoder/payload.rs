@@ -11,6 +11,8 @@ pub enum ProviderObservationPayload {
         quantity: ProviderQuantity,
         /// Exact typed aggressor/maker evidence.
         aggressor: ProviderAggressorEvidence,
+        /// Provider-authored taker order type when the selected feed supplies it.
+        taker_order_type: Option<TradeTakerOrderType>,
     },
     /// Quote with at least one side; each side is price/quantity atomic.
     Quote {
@@ -159,6 +161,7 @@ impl ProviderObservationPayload {
                 price,
                 quantity,
                 aggressor,
+                taker_order_type: _,
             } => checked_sum([
                 trade_id.retained_bytes(),
                 price.0.retained_bytes(),

@@ -15,8 +15,10 @@ cap-fs-ext.workspace = true
 cap-std.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
+httpdate.workspace = true
 libc.workspace = true
 market-squawk-domain.workspace = true
+market-squawk-platform.workspace = true
 market-squawk-sources.workspace = true
 quick-xml.workspace = true
 reqwest.workspace = true
@@ -29,6 +31,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 url.workspace = true
 uuid.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

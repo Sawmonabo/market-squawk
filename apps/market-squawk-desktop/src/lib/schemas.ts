@@ -1,24 +1,121 @@
 import { z } from "zod"
 
+import { losslessIntegerSchema } from "@/lib/lossless-integer"
+
 export const readinessSchema = z.object({
   state: z.enum(["ready", "available", "not_configured", "unverified"]),
   label: z.string(),
   detail: z.string(),
 })
 
-export const operationSummarySchema = z.object({
-  name: z.string(),
-  description: z.string(),
-  domain: z.string(),
-  authorization: z.enum([
-    "read_only",
-    "local_confirmation",
-    "risk_mediated",
-  ]),
-  readOnly: z.boolean(),
-  destructive: z.boolean(),
-  inputSchema: z.record(z.string(), z.unknown()),
-})
+const productCapabilities = [
+  "backtest_activity",
+  "backtest_preparation",
+  "backtest_prepared_start",
+  "backtest_preview",
+  "backtest_result",
+  "bot_prepare_start",
+  "bot_start",
+  "bot_start_preparation",
+  "bot_status",
+  "bot_stop",
+  "decision_analysis",
+  "decision_analysis_list",
+  "decision_recommendation_history",
+  "decision_screen_list",
+  "decision_target_review",
+  "execution_cancel",
+  "execution_fills",
+  "execution_manual_prepare",
+  "execution_manual_submit",
+  "execution_manual_targets",
+  "execution_orders",
+  "feature_dataset_preparation",
+  "feature_dataset_prepared_start",
+  "feature_dataset_preview",
+  "forecast_detail",
+  "forecast_list",
+  "forecast_outcomes",
+  "forecast_preparation",
+  "forecast_prepare",
+  "forecast_prepared_start",
+  "fundamental_facts",
+  "investment_lookup",
+  "macro_context",
+  "macro_revisions",
+  "market_history",
+  "market_instrument",
+  "market_overview",
+  "market_universe",
+  "model_activity",
+  "model_evidence",
+  "portfolio_account_list",
+  "portfolio_attribution",
+  "portfolio_candidate_impact",
+  "portfolio_exposure",
+  "portfolio_holdings",
+  "portfolio_import_approve",
+  "portfolio_import_commit",
+  "portfolio_import_discard",
+  "portfolio_import_preview",
+  "portfolio_performance",
+  "portfolio_rebalance",
+  "portfolio_recommendation_setup",
+  "portfolio_revision_list",
+  "portfolio_risk",
+  "portfolio_scenario",
+  "portfolio_scenario_batch",
+  "portfolio_transactions",
+  "research_dataset_list",
+  "research_export",
+  "research_file_commit",
+  "research_file_discard",
+  "research_file_preview",
+  "research_manifest",
+  "risk_kill_switch",
+] as const
+
+const systemOnlyCapabilities = [
+  "backtest_advanced_start",
+  "backtest_artifact_read",
+  "execution_reconcile",
+  "fair_value_approvals",
+  "fair_value_audit",
+  "fair_value_classification",
+  "fair_value_classify",
+  "fair_value_evidence",
+  "fair_value_explain",
+  "fair_value_governance_commit",
+  "fair_value_governance_preview",
+  "fair_value_market_access",
+  "fair_value_measurement",
+  "fair_value_measurement_list",
+  "fair_value_workspace",
+  "governance_authenticate",
+  "governance_principals",
+  "installation_status",
+  "job_list",
+  "job_watch",
+  "model_training_start",
+  "operations_backup_list",
+  "operations_log_export",
+  "operations_log_query",
+  "operations_rollback_preview",
+  "operations_rollback_start",
+  "operations_runtime_status",
+  "operations_settings",
+  "operations_update_check",
+  "operations_update_preview",
+  "operations_update_start",
+  "operations_update_status",
+  "operations_workspace_list",
+] as const
+
+export const productCapabilitySchema = z.enum(productCapabilities)
+const desktopCapabilitySchema = z.enum([
+  ...productCapabilities,
+  ...systemOnlyCapabilities,
+])
 
 export const providerProfileSchema = z
   .object({
@@ -59,60 +156,40 @@ export const encryptedFileFallbackSchema = z.enum([
   "ready",
 ])
 
-export const setupStepSchema = z.object({
-  id: z.enum([
-    "system",
-    "storage",
-    "sources",
-    "research",
-    "portfolio",
-    "paper",
-    "mcp",
-    "review",
-  ]),
-  label: z.string(),
-  state: z.enum(["complete", "action_required", "blocked", "available"]),
-  complete: z.boolean(),
-  detail: z.string(),
-  blockingReason: z.string().nullable(),
-  recovery: z.string().nullable(),
-  action: z
-    .enum([
-      "configure_sources",
-      "configure_research",
-      "configure_portfolio",
-      "configure_paper",
-      "review_mcp",
-      "review_status",
-    ])
-    .nullable(),
-})
-
-export const mcpClientInstructionSchema = z.object({
-  program: z.string().min(1),
-  arguments: z.array(z.string()),
-  environment: z.record(z.string(), z.string()),
-  requiresDesktopExit: z.literal(true),
-})
-
-export const desktopBootstrapSchema = z.object({
+export const desktopSystemBootstrapSchema = z.object({
   contractVersion: z.literal("market-squawk-desktop-v1"),
   applicationVersion: z.string(),
   buildProfile: z.string(),
   platform: z.string(),
   dataRoot: z.string(),
+  productSessionToken: z.string().uuid(),
   storage: readinessSchema,
   installation: readinessSchema,
   modelRuntime: readinessSchema,
   mcp: readinessSchema,
-  mcpClient: mcpClientInstructionSchema.nullable(),
   telemetryEnabled: z.boolean(),
-  encryptedFileFallback: encryptedFileFallbackSchema,
-  providerProfiles: z.array(providerProfileSchema),
-  providerSessions: z.array(providerSessionSchema),
-  setupSteps: z.array(setupStepSchema).length(8),
-  operations: z.array(operationSummarySchema),
-})
+  capabilities: z.array(desktopCapabilitySchema),
+}).strict()
+
+export const desktopBootstrapSchema = z
+  .object({
+    productSessionToken:
+      desktopSystemBootstrapSchema.shape.productSessionToken,
+    capabilities: z.array(productCapabilitySchema),
+  })
+  .strict()
+
+export function projectDesktopBootstrap(
+  system: DesktopSystemBootstrap,
+): DesktopBootstrap {
+  return desktopBootstrapSchema.parse({
+    productSessionToken: system.productSessionToken,
+    capabilities: system.capabilities.filter(
+      (capability): capability is ProductCapability =>
+        productCapabilitySchema.safeParse(capability).success,
+    ),
+  })
+}
 
 export const installationStatusSchema = z.object({
   installed: z.boolean(),
@@ -146,25 +223,252 @@ export const installationControlResultSchema = z.object({
   restartRequired: z.boolean(),
 })
 
-export const applicationResultSchema = z.object({
-  data: z.unknown(),
-  metadata: z.object({
-    completeness: z.string(),
-    returnedItems: z.number().int().nonnegative(),
-    availableItems: z.number().int().nonnegative(),
-    sourceCoverage: z.unknown(),
-    dataQuality: z.unknown(),
-  }),
+export const applicationResultSchema = z
+  .object({
+    data: z.unknown(),
+    metadata: z
+      .object({
+        completeness: z.string(),
+        returnedItems: z.number().int().nonnegative(),
+        availableItems: z.number().int().nonnegative(),
+      })
+      .strict(),
+  })
+  .strict()
+
+export const nativeEvidenceApplicationResultSchema = z
+  .object({
+    data: z.unknown(),
+    metadata: z
+      .object({
+        completeness: z.string(),
+        returnedItems: z.number().int().nonnegative(),
+        availableItems: z.number().int().nonnegative(),
+        sourceCoverage: z.unknown(),
+        dataQuality: z.unknown(),
+      })
+      .strict(),
+  })
+  .strict()
+
+export const governanceProvisioningStatusSchema = z.object({
+  state: z.enum(["unprovisioned", "active"]),
+  configured: z.boolean(),
+  principals: z.array(
+    z.object({
+      principalId: z.string().min(1),
+      displayName: z.string().min(1),
+      roles: z.array(z.string().min(1)),
+    }),
+  ),
+  missingRoles: z.array(z.string().min(1)),
 })
 
 export const providerBootstrapSchema = z.object({
   profiles: z.array(providerProfileSchema),
   sessions: z.array(providerSessionSchema),
   encryptedFileFallback: encryptedFileFallbackSchema,
+  capabilities: z.object({
+    credentialImport: z.boolean(),
+    health: z.boolean(),
+    manifestEvidence: z.boolean(),
+    researchIngestion: z.boolean(),
+    status: z.boolean(),
+    coverage: z.boolean(),
+  }).strict(),
+}).strict()
+
+export const inputTicketSchema = z.object({
+  id: z.string().uuid(),
+  installationId: z.string().uuid(),
+  workspaceId: z.string().uuid(),
+  generation: z.number().int().positive(),
+  clientId: z.string().uuid(),
+  mediaType: z.string(),
+  byteLength: z.number().int().positive(),
+  digest: z.object({
+    algorithm: z.literal("sha256"),
+    bytes: z.array(z.number().int().min(0).max(255)).length(32),
+  }),
+  expiresAt: losslessIntegerSchema,
 })
 
+const mcpServiceClientStatusSchema = z.object({
+  client: z.enum(["claude_code", "codex"]),
+  clientId: z.string().uuid(),
+  credentialGeneration: z.number().int().positive(),
+  credentialIdentity: z.string().min(1).max(128),
+  maximumActiveRequests: z.number().int().positive(),
+  activeRequests: z.number().int().nonnegative(),
+  admittedRequests: z.number().int().nonnegative(),
+  rateLimitedRequests: z.number().int().nonnegative(),
+  observedRelayInitializations: z.number().int().nonnegative(),
+  lastActivityUnixSeconds: z.number().int().nonnegative().nullable(),
+  credentialRotationRecoveryPending: z.boolean(),
+  priorCredentialCleanupPending: z.boolean(),
+  accessRevoked: z.boolean(),
+})
+
+const mcpRuntimeStatusSchema = z.object({
+  sessionModel: z.literal("stateless_request_scoped"),
+  activeClients: z.number().int().nonnegative(),
+  activeRequests: z.number().int().nonnegative(),
+  admittedRequests: z.number().int().nonnegative().nullable(),
+  rateLimitedRequests: z.number().int().nonnegative().nullable(),
+  rejectedCredentials: z.number().int().nonnegative(),
+  uptimeSeconds: z.number().int().nonnegative(),
+  process: z.object({
+    residentMemoryBytes: z.number().int().nonnegative().nullable(),
+    virtualMemoryBytes: z.number().int().nonnegative().nullable(),
+  }),
+  limits: z.object({
+    maximumFrameBytes: z.number().int().positive(),
+    maximumBodyBytes: z.number().int().positive(),
+    maximumActiveRequests: z.number().int().positive(),
+    maximumInlineBytes: z.number().int().positive(),
+    maximumInlineItems: z.number().int().positive(),
+    maximumResultBytes: z.number().int().positive(),
+    maximumResultItems: z.number().int().positive(),
+    requestTimeoutMilliseconds: z.number().int().positive(),
+  }),
+  clients: z.array(mcpServiceClientStatusSchema).length(2),
+})
+
+export const mcpClientsStatusSchema = z.object({
+  serviceReady: z.boolean(),
+  sharedEndpointReady: z.boolean(),
+  workspaceId: z.string().uuid(),
+  serviceGeneration: z.number().int().positive(),
+  protocolVersion: z.string().min(1).max(64),
+  transport: z.literal("stdio_relay"),
+  runtime: mcpRuntimeStatusSchema,
+  clients: z.array(
+    z.object({
+      client: z.enum(["claude_code", "codex"]),
+      label: z.string().min(1).max(64),
+      state: z.enum([
+        "absent",
+        "unsupported",
+        "ready",
+        "owned",
+        "repair_required",
+        "access_revoked",
+        "conflict",
+      ]),
+      clientVersion: z.string().min(1).max(128).nullable(),
+      receipt: z
+        .object({
+          commandSha256: z.string().regex(/^[0-9a-f]{64}$/),
+          observedAtUnixSeconds: z.number().int().nonnegative(),
+        })
+        .nullable(),
+      verification: z
+        .object({
+          protocolVersion: z.string().min(1).max(64),
+          clientInfoName: z.string().min(1).max(128),
+          serverName: z.string().min(1).max(128),
+          toolCount: z.number().int().nonnegative(),
+          resourceCount: z.number().int().nonnegative(),
+          toolDomains: z.array(z.string().min(1).max(64)).min(1).max(32),
+          resourceNames: z.array(z.string().min(1).max(64)).min(1).max(32),
+          safeReadTool: z.string().min(1).max(128),
+          verifiedAtUnixSeconds: z.number().int().nonnegative(),
+        })
+        .nullable(),
+      blocker: z.string().min(1).max(256).nullable(),
+      service: mcpServiceClientStatusSchema,
+    }),
+  ).length(2),
+})
+
+const desktopEventSequenceSchema = z
+  .string()
+  .refine(
+    (value) =>
+      value.length <= 20 &&
+      /^(?:0|[1-9]\d*)$/.test(value) &&
+      BigInt(value) <= 18_446_744_073_709_551_615n,
+    { message: "Expected a canonical unsigned 64-bit decimal" },
+  )
+
+export const desktopInvalidationDomainSchema = z.enum([
+  "job",
+  "decision",
+  "operations",
+  "source",
+  "market",
+  "research",
+  "fundamental",
+  "macro",
+  "portfolio",
+  "analysis",
+  "model",
+  "fair_value",
+  "bot",
+  "execution",
+])
+
+export const desktopEventSchema = z
+  .object({
+    productSessionToken: desktopSystemBootstrapSchema.shape.productSessionToken,
+    sequence: desktopEventSequenceSchema,
+    body: z.discriminatedUnion("type", [
+      z
+        .object({
+          type: z.literal("invalidate"),
+          domains: z.array(desktopInvalidationDomainSchema).min(1).max(2),
+        })
+        .strict(),
+      z.object({ type: z.literal("resync_required") }).strict(),
+      z.object({ type: z.literal("stream_disconnected") }).strict(),
+    ]),
+  })
+  .strict()
+
+export const desktopEventSubscriptionReceiptSchema = z
+  .object({
+    subscriptionId: z.string().uuid(),
+    productSessionToken: desktopSystemBootstrapSchema.shape.productSessionToken,
+    sequence: desktopEventSequenceSchema,
+    resumed: z.boolean(),
+  })
+  .strict()
+
+export const desktopServiceBootstrapSchema = z.object({
+  status: z.literal("bootstrap_required"),
+  requirement: z.enum([
+    "encrypted_fallback_locked",
+    "foreground_keyring_credential",
+  ]),
+})
+
+export const desktopSystemStartupSchema = z.union([
+  desktopSystemBootstrapSchema,
+  desktopServiceBootstrapSchema,
+])
+
 export type ApplicationResult = z.infer<typeof applicationResultSchema>
+export type NativeEvidenceApplicationResult = z.infer<
+  typeof nativeEvidenceApplicationResultSchema
+>
 export type DesktopBootstrap = z.infer<typeof desktopBootstrapSchema>
+export type ProductCapability = z.infer<typeof productCapabilitySchema>
+export type DesktopSystemBootstrap = z.infer<
+  typeof desktopSystemBootstrapSchema
+>
+export type DesktopServiceBootstrap = z.infer<
+  typeof desktopServiceBootstrapSchema
+>
+export type DesktopSystemStartup = z.infer<
+  typeof desktopSystemStartupSchema
+>
+export type DesktopEvent = z.infer<typeof desktopEventSchema>
+export type DesktopInvalidationDomain = z.infer<
+  typeof desktopInvalidationDomainSchema
+>
+export type DesktopEventSubscriptionReceipt = z.infer<
+  typeof desktopEventSubscriptionReceiptSchema
+>
 export type EncryptedFileFallback = z.infer<
   typeof encryptedFileFallbackSchema
 >
@@ -172,8 +476,12 @@ export type InstallationControlResult = z.infer<
   typeof installationControlResultSchema
 >
 export type InstallationStatus = z.infer<typeof installationStatusSchema>
+export type InputTicket = z.infer<typeof inputTicketSchema>
+export type GovernanceProvisioningStatus = z.infer<
+  typeof governanceProvisioningStatusSchema
+>
+export type McpClientsStatus = z.infer<typeof mcpClientsStatusSchema>
 export type ProviderActivation = z.infer<typeof providerActivationSchema>
 export type ProviderBootstrap = z.infer<typeof providerBootstrapSchema>
 export type ProviderProfile = z.infer<typeof providerProfileSchema>
 export type ProviderSession = z.infer<typeof providerSessionSchema>
-export type SetupStep = z.infer<typeof setupStepSchema>

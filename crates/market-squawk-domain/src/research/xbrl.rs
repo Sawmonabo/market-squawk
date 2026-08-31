@@ -1290,6 +1290,11 @@ impl XbrlFactEvidence {
         &self.accession
     }
 
+    /// Returns the exact XBRL context identity referenced by the occurrence.
+    pub const fn context_id(&self) -> &SourceIdentifier {
+        &self.context_id
+    }
+
     /// Returns source period semantics.
     pub const fn period(&self) -> XbrlPeriod {
         self.period
@@ -1303,6 +1308,11 @@ impl XbrlFactEvidence {
     /// Returns the source lexical and resolved unit expression.
     pub const fn unit(&self) -> &XbrlUnitExpression {
         &self.unit
+    }
+
+    /// Returns the complete bounded dimensions supplied by the XBRL context.
+    pub fn dimensions(&self) -> &[XbrlDimensionEvidence] {
+        &self.dimensions.0
     }
 
     /// Returns bounded segment/scenario structure.

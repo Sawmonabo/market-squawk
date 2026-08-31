@@ -19,10 +19,11 @@ release-evidence = ["onnx-tract"]
 [dependencies]
 cap-std.workspace = true
 csv.workspace = true
-ed25519-dalek = { version = "=3.0.0", features = ["signature"] }
+ed25519-dalek.workspace = true
 market-squawk-analytics.workspace = true
 market-squawk-data.workspace = true
 market-squawk-domain.workspace = true
+same-file.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -42,7 +42,12 @@ fuzz_target!(|data: &[u8]| {
         }
         _ => {
             if let Some(context) = xbrl_context() {
-                let _document = XbrlDocumentParser::parse(payload, sec_limits, context);
+                let _document = XbrlDocumentParser::parse_with_cancellation(
+                    payload,
+                    sec_limits,
+                    context,
+                    &Default::default(),
+                );
             }
             None
         }

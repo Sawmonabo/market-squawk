@@ -12,6 +12,8 @@ const MAXIMUM_ARTIFACT_ID_BYTES: usize = 160;
 const MAXIMUM_MEDIA_TYPE_BYTES: usize = 128;
 /// Closed media type for verified immutable Parquet query results.
 pub const PARQUET_ARTIFACT_MEDIA_TYPE: &str = "application/vnd.apache.parquet";
+/// Closed media type for verified newline-delimited JSON diagnostic exports.
+pub const NDJSON_ARTIFACT_MEDIA_TYPE: &str = "application/x-ndjson";
 
 /// Complete content-addressed publication handed to a capability-confined repository.
 ///
@@ -43,6 +45,46 @@ impl ArtifactPublication {
             sha256_hex: Arc::from(format!("{:x}", Sha256::digest(&content))),
             content: content.into(),
             media_type: Arc::from("application/json"),
+        })
+    }
+
+    /// Creates an immutable newline-delimited JSON publication and derives its content identity.
+    ///
+    /// Every nonempty line must be exactly one JSON object. A final newline is accepted, while
+    /// blank records and non-object values are rejected so readers can stream records safely.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::InvalidPublication`] when `content` is empty or malformed.
+    pub fn try_ndjson(content: Vec<u8>) -> Result<Self, ArtifactError> {
+        if content.is_empty() {
+            return Err(ArtifactError::InvalidPublication);
+        }
+        let mut records = 0_usize;
+        let mut lines = content.split(|byte| *byte == b'\n').peekable();
+        while let Some(line) = lines.next() {
+            if line.is_empty() {
+                if lines.peek().is_none() {
+                    continue;
+                }
+                return Err(ArtifactError::InvalidPublication);
+            }
+            let value = serde_json::from_slice::<serde_json::Value>(line)
+                .map_err(|_| ArtifactError::InvalidPublication)?;
+            if !value.is_object() {
+                return Err(ArtifactError::InvalidPublication);
+            }
+            records = records
+                .checked_add(1)
+                .ok_or(ArtifactError::InvalidPublication)?;
+        }
+        if records == 0 {
+            return Err(ArtifactError::InvalidPublication);
+        }
+        Ok(Self {
+            sha256_hex: Arc::from(format!("{:x}", Sha256::digest(&content))),
+            content: content.into(),
+            media_type: Arc::from(NDJSON_ARTIFACT_MEDIA_TYPE),
         })
     }
 
@@ -188,15 +230,7 @@ impl ArtifactReference {
         let id = id.into();
         let sha256 = sha256.into();
         let media_type = media_type.into();
-        let valid_id = !id.is_empty()
-            && id.len() <= MAXIMUM_ARTIFACT_ID_BYTES
-            && id
-                .bytes()
-                .next()
-                .is_some_and(|byte| byte.is_ascii_alphanumeric())
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+        let valid_id = valid_artifact_id(&id);
         let valid_digest = sha256.len() == 64
             && sha256
                 .bytes()
@@ -247,6 +281,44 @@ impl ArtifactReference {
     #[must_use]
     pub fn media_type(&self) -> &str {
         &self.media_type
+    }
+}
+
+/// Path-free, caller-bounded request to resolve one published artifact identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactResolveRequest {
+    id: Arc<str>,
+    maximum_bytes: NonZeroUsize,
+}
+
+impl ArtifactResolveRequest {
+    /// Binds an opaque artifact identifier to the maximum complete object the caller can retain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::InvalidReference`] when `id` violates the path-free artifact
+    /// identity grammar.
+    pub fn try_new(
+        id: impl Into<Arc<str>>,
+        maximum_bytes: NonZeroUsize,
+    ) -> Result<Self, ArtifactError> {
+        let id = id.into();
+        if !valid_artifact_id(&id) {
+            return Err(ArtifactError::InvalidReference);
+        }
+        Ok(Self { id, maximum_bytes })
+    }
+
+    /// Returns the exact opaque artifact identifier supplied by the caller.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the caller-selected complete-object byte ceiling.
+    #[must_use]
+    pub const fn maximum_bytes(&self) -> NonZeroUsize {
+        self.maximum_bytes
     }
 }
 
@@ -426,6 +498,48 @@ pub trait ArtifactRepository: Send + Sync + 'static {
         request: ArtifactReadRequest,
         context: ArtifactReadContext,
     ) -> Result<ArtifactRead, ArtifactError>;
+}
+
+/// Capability-confined resolver for complete registered artifact references.
+///
+/// Callers provide only an opaque identifier and never construct or receive a filesystem path.
+/// Implementations must resolve within their retained repository capability, verify the complete
+/// object's content identity and size, and observe the caller's cancellation, deadline, and byte
+/// ceiling before returning.
+#[async_trait]
+pub trait ArtifactReferenceResolver: Send + Sync + 'static {
+    /// Resolves one opaque identity into its exact verified repository reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::NotFound`] when no registered object matches `request`,
+    /// [`ArtifactError::ReadLimitExceeded`] when the object exceeds the caller's bound, or another
+    /// typed artifact failure when resolution cannot be verified.
+    async fn resolve(
+        &self,
+        request: ArtifactResolveRequest,
+        context: ArtifactReadContext,
+    ) -> Result<ArtifactReference, ArtifactError>;
+}
+
+/// One repository identity that both resolves and reads its own artifact references.
+///
+/// This combined authority prevents callers from resolving a reference through one repository and
+/// accidentally presenting it to a different repository implementation.
+pub trait ArtifactAuthority: ArtifactRepository + ArtifactReferenceResolver {}
+
+impl<T> ArtifactAuthority for T where T: ArtifactRepository + ArtifactReferenceResolver {}
+
+fn valid_artifact_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAXIMUM_ARTIFACT_ID_BYTES
+        && id
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 /// Artifact contract or repository failure.

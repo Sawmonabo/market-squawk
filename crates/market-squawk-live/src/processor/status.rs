@@ -119,7 +119,7 @@ impl StatusBook {
         default_status: TradingStatus,
     ) -> Result<StagedStatus, LiveApplyError> {
         let key = StatusKey::from_current(current);
-        let generation = current.frame_evidence().binding().connection_generation();
+        let generation = current.evidence().binding().connection_generation();
         let existing = self.entries.get(&key);
         if let Some(shared) = existing
             && shared.generation != generation

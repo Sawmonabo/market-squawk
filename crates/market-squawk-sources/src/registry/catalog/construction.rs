@@ -1,5 +1,14 @@
 use super::*;
 
+/// Code-owned location of the restart-durable research source authority within a workspace.
+pub const RESEARCH_SOURCE_AUTHORITY_DIRECTORY: &str = "sources/research-runtime";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UncleanPredecessorPolicy {
+    Reject,
+    RecoverStructurallyValidExclusiveInstalledReplacement,
+}
+
 impl AuthoritativeSourceRegistry {
     /// Opens the restart-durable authority registry and marks its new run generation in-use before
     /// any provider-budget authority can be minted.
@@ -108,6 +117,129 @@ impl AuthoritativeSourceRegistry {
             resolver,
             Arc::new(SystemRawRegistryClock::try_new()?),
             Some(provider_rate),
+            UncleanPredecessorPolicy::Reject,
+        )
+    }
+
+    /// Opens source authority for an exclusively admitted installed-service replacement.
+    ///
+    /// Structurally valid source registrations, provenance, policies, window consumption, cooldowns,
+    /// and generation history are retained. Orphaned in-flight request counts are reconciled to zero
+    /// under a checked availability-generation advance because no request owner can survive the
+    /// crashed process. The run generation advances and the canonical envelope remains in-use for
+    /// the replacement. Invalid state, wall rollback, or any generation exhaustion remains
+    /// fail-closed.
+    ///
+    /// The selected-workspace guard owns the installation-global instance lock and exact prepared
+    /// workspace together. This constructor derives the fixed source store from that capability;
+    /// it does not accept a separately substitutable store. Default durable constructors do not
+    /// accept the guard and continue to reject every unclean predecessor.
+    ///
+    /// A raw authority-state store cannot be paired with an unrelated installation guard:
+    ///
+    /// ```compile_fail
+    /// use std::sync::Arc;
+    /// use market_squawk_platform::{
+    ///     InstalledServiceSelectedWorkspaceGuard, LocalAuthorityStateStore,
+    /// };
+    /// use market_squawk_sources::{
+    ///     AuthoritativeSourceRegistry, AuthorizationSubjectResolver, ProviderRateAuthority,
+    /// };
+    ///
+    /// fn rejected(
+    ///     store: LocalAuthorityStateStore,
+    ///     selected: &InstalledServiceSelectedWorkspaceGuard,
+    ///     resolver: Arc<dyn AuthorizationSubjectResolver>,
+    ///     provider_rate: ProviderRateAuthority,
+    /// ) {
+    ///     let _registry = AuthoritativeSourceRegistry::
+    ///         try_new_durable_for_exclusive_installed_service_replacement(
+    ///             store,
+    ///             resolver,
+    ///             provider_rate,
+    ///             selected,
+    ///         );
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on invalid persistence, restore, subject resolution, aggregate registration,
+    /// trusted-time rollback, or generation exhaustion.
+    pub fn try_new_durable_for_exclusive_installed_service_replacement(
+        selected_workspace: &market_squawk_platform::InstalledServiceSelectedWorkspaceGuard,
+        resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
+        provider_rate: crate::ProviderRateAuthority,
+    ) -> Result<Self, RegistryError> {
+        let control = selected_workspace
+            .workspace_paths()
+            .control_root()
+            .map_err(|_error| RegistryError::AuthorityPersistence)?;
+        let store = market_squawk_platform::LocalAuthorityStateStore::try_open(
+            control.root().join(RESEARCH_SOURCE_AUTHORITY_DIRECTORY),
+        )
+        .map_err(|_error| RegistryError::AuthorityPersistence)?;
+        let store: Arc<dyn crate::policy::AuthorityStateStore> = Arc::new(store);
+        Self::try_new_durable_with_store_resolver_clock_and_provider_rate(
+            store,
+            resolver,
+            Arc::new(SystemRawRegistryClock::try_new()?),
+            Some(provider_rate),
+            UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement,
+        )
+    }
+
+    /// Reconciles one live-source authority store while the installed service exclusively owns
+    /// the exact selected workspace.
+    ///
+    /// This is a startup-only recovery boundary. It derives the live authority store from the
+    /// installation-bound workspace guard, advances a structurally valid orphaned run, and then
+    /// publishes a clean terminal marker before any live runtime is constructed. Ordinary live
+    /// constructors continue to reject unclean predecessors, so an in-process retry cannot use
+    /// this operation to overlap a producer that may still be alive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::AuthorityPersistence`] when `source_key` is not one safe path
+    /// component or the exact store cannot be opened. All durable state, clock, capacity, and
+    /// shutdown failures retain their existing typed errors.
+    pub fn reconcile_live_authority_for_exclusive_installed_service_replacement(
+        selected_workspace: &market_squawk_platform::InstalledServiceSelectedWorkspaceGuard,
+        source_key: &str,
+    ) -> Result<(), RegistryError> {
+        if !is_safe_live_authority_key(source_key) {
+            return Err(RegistryError::AuthorityPersistence);
+        }
+        let store = market_squawk_platform::LocalAuthorityStateStore::try_open(
+            selected_workspace
+                .workspace_paths()
+                .root()
+                .join("authority")
+                .join(source_key),
+        )
+        .map_err(|_error| RegistryError::AuthorityPersistence)?;
+        let store: Arc<dyn crate::policy::AuthorityStateStore> = Arc::new(store);
+        let registry = Self::try_new_durable_with_store_resolver_clock_and_provider_rate(
+            store,
+            Arc::new(UnconfiguredAuthorizationSubjectResolver),
+            Arc::new(SystemRawRegistryClock::try_new()?),
+            None,
+            UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement,
+        )?;
+        registry.shutdown()
+    }
+
+    #[cfg(test)]
+    pub(super) fn try_new_durable_with_store_for_exclusive_installed_replacement_for_test(
+        store: Arc<dyn crate::policy::AuthorityStateStore>,
+        resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
+    ) -> Result<Self, RegistryError> {
+        Self::try_new_durable_with_store_resolver_clock_and_provider_rate(
+            store,
+            resolver,
+            Arc::new(SystemRawRegistryClock::try_new()?),
+            None,
+            UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement,
         )
     }
 
@@ -126,7 +258,11 @@ impl AuthoritativeSourceRegistry {
         raw_clock: Arc<dyn RawRegistryClockSource>,
     ) -> Result<Self, RegistryError> {
         Self::try_new_durable_with_store_resolver_clock_and_provider_rate(
-            store, resolver, raw_clock, None,
+            store,
+            resolver,
+            raw_clock,
+            None,
+            UncleanPredecessorPolicy::Reject,
         )
     }
 
@@ -135,11 +271,21 @@ impl AuthoritativeSourceRegistry {
         resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
         raw_clock: Arc<dyn RawRegistryClockSource>,
         provider_rate: Option<crate::ProviderRateAuthority>,
+        unclean_predecessor_policy: UncleanPredecessorPolicy,
     ) -> Result<Self, RegistryError> {
         let clock = Arc::new(SealedRegistryClock::new(raw_clock));
         let now = clock.observe()?.wall();
-        let unpublished = AuthorityDurabilitySession::open_unpublished(store, now)
-            .map_err(map_authority_persistence_error)?;
+        let unpublished = match unclean_predecessor_policy {
+            UncleanPredecessorPolicy::Reject => {
+                AuthorityDurabilitySession::open_unpublished(store, now)
+            }
+            UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement => {
+                AuthorityDurabilitySession::open_unpublished_for_exclusive_installed_replacement(
+                    store, now,
+                )
+            }
+        }
+        .map_err(map_authority_persistence_error)?;
         let durability = Arc::clone(unpublished.session());
         if durability.recovered_unclean() {
             durability.invalidate();
@@ -414,6 +560,70 @@ impl AuthoritativeSourceRegistry {
         authority_state_from_history(&self.history, self.budgets.policies())
     }
 
+    /// Captures a non-consuming clean-restart image under the registry owner's mutation fence.
+    ///
+    /// The caller must retain its composition-level registry fence while invoking this method.
+    /// Later mutations cannot affect the returned immutable bytes.
+    ///
+    /// # Errors
+    ///
+    /// Rejects in-memory registries, active source sessions, active provider requests, mismatched
+    /// durable checkpoints, unavailable trusted time, and invalid persisted authority state.
+    pub fn retain_clean_restart_backup_bytes(&self) -> Result<Box<[u8]>, RegistryError> {
+        self.retain_clean_restart_backup()
+            .map(|backup| Box::from(backup.as_bytes()))
+    }
+
+    /// Validates and canonicalizes an opaque registry clean-restart image without opening runtime
+    /// authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, noncanonical, in-use, future-dated, or non-clean budget state.
+    pub fn validate_clean_restart_backup_bytes(bytes: &[u8]) -> Result<Box<[u8]>, RegistryError> {
+        RegistryCleanRestartBackup::try_from_bytes(bytes).map(|backup| Box::from(backup.as_bytes()))
+    }
+
+    /// Restores an opaque clean-restart image only into an absent production registry store.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an occupied target or any payload that fails clean-restart validation.
+    pub fn restore_clean_restart_backup_fresh(
+        store: market_squawk_platform::LocalAuthorityStateStore,
+        bytes: &[u8],
+    ) -> Result<(), RegistryError> {
+        RegistryCleanRestartBackup::try_from_bytes(bytes)?.restore_fresh(store)
+    }
+
+    fn retain_clean_restart_backup(&self) -> Result<RegistryCleanRestartBackup, RegistryError> {
+        if self.entries.values().any(|entry| entry.active.is_some()) {
+            return Err(RegistryError::ActiveAuthorityAtShutdown);
+        }
+        let AuthorityComposition::Durable(durability) = &self.composition else {
+            return Err(RegistryError::AuthorityPersistence);
+        };
+        if durability.recovered_unclean() {
+            return Err(RegistryError::UncleanAuthorityPredecessor);
+        }
+        if self
+            .budgets
+            .has_active_requests()
+            .map_err(|_error| RegistryError::AuthorityPersistence)?
+        {
+            return Err(RegistryError::ActiveAuthorityAtShutdown);
+        }
+        let proof = self
+            .budgets
+            .validate_clean_shutdown(durability)
+            .map_err(|_error| RegistryError::ActiveAuthorityAtShutdown)?;
+        let observed = self.clock.observe()?;
+        let bytes = durability
+            .export_clean_restart_backup(proof, self.export_authority_state()?, observed.wall())
+            .map_err(map_authority_persistence_error)?;
+        RegistryCleanRestartBackup::try_from_bytes(&bytes)
+    }
+
     /// Durably marks this run clean after every source session and provider request reconciles.
     ///
     /// Consuming the registry prevents authority minting after the clean marker. Retained durable
@@ -446,4 +656,13 @@ impl AuthoritativeSourceRegistry {
         }
         Ok(())
     }
+}
+
+fn is_safe_live_authority_key(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }

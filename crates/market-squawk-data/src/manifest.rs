@@ -10,19 +10,30 @@ use thiserror::Error;
 use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
 
 mod catalog;
+mod market_history;
 
 #[cfg(feature = "release-evidence")]
 pub use self::catalog::benchmark_support::{
     ReleaseEvidenceStorageError, ReleaseEvidenceStorageResult, run_release_evidence_storage,
 };
 pub use self::catalog::{
-    AnalyticalManifestCatalog, GenerationKind, MAX_RETAINED_PYTHON_DATASET_ADMISSIONS,
-    MAX_RETAINED_PYTHON_DATASET_DESCRIPTOR_BYTES, ManifestCatalogError, PinnedDataset,
+    AnalyticalManifestCatalog, GenerationKind, MAX_RETAINED_FEATURE_DATASET_PRODUCTION_ADMISSIONS,
+    MAX_RETAINED_FEATURE_DATASET_PRODUCTION_PAYLOAD_BYTES, ManifestCatalogError, PinnedDataset,
     PinnedManifestObject,
 };
 pub(crate) use self::catalog::{
     CatalogFeatureDataset, CatalogFeatureDatasetPage, CatalogFeatureDatasetSelection,
-    CatalogGenerationPage,
+    CatalogGenerationPage, propagate_generation_provider_capture_bindings,
+    propagate_generation_provider_publication_bindings,
+};
+pub use self::market_history::{
+    CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,
+    CompleteMarketBarHistorySelection, LatestCanonicalMarketBarHistoryWindowRequest,
+    LatestCanonicalMarketBarHistoryWindowSelection, MarketBarHistoryPublicationReceipt,
+    MarketHistorySelectionPolicy,
+};
+pub(crate) use self::market_history::{
+    MarketBarHistoryPublicationCandidate, propagate_generation_market_bar_history_inputs,
 };
 
 /// Fixed maximum number of exact input generations retained by one derived generation.
@@ -140,7 +151,7 @@ impl fmt::Debug for DatasetBuildSpecDigest {
 /// Typed semantic relationship from one generation to an exact prior generation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum GenerationParentRelation {
-    /// An ingest appends one object to its immediately preceding generation.
+    /// An ingest appends one ordered, nonempty object group to its immediate predecessor.
     AppendPredecessor,
     /// A compaction replaces its immediately preceding generation without changing semantics.
     CompactionPredecessor,
@@ -361,14 +372,14 @@ pub struct ManifestPlan {
 }
 
 impl ManifestPlan {
-    /// Appends one immutable object while enforcing the configured small-file ceiling.
+    /// Appends one ordered nonempty immutable object group while enforcing the file ceiling.
     pub fn append(
         dataset_id: DatasetId,
         previous: Option<&Self>,
-        object: ManifestObject,
+        new_objects: Vec<ManifestObject>,
         max_objects: usize,
     ) -> Result<Self, ManifestPlanError> {
-        if max_objects == 0 {
+        if max_objects == 0 || new_objects.is_empty() || new_objects.len() > 1024 {
             return Err(ManifestPlanError::SmallFileCeiling { max_objects });
         }
         let previous_objects = match previous {
@@ -376,13 +387,13 @@ impl ManifestPlan {
             Some(_) => return Err(ManifestPlanError::DatasetMismatch),
             None => &[],
         };
-        if previous_objects.len() >= max_objects {
-            return Err(ManifestPlanError::SmallFileCeiling { max_objects });
-        }
         let object_count = previous_objects
             .len()
-            .checked_add(1)
+            .checked_add(new_objects.len())
             .ok_or(ManifestPlanError::CountOverflow)?;
+        if object_count > max_objects || object_count > 1024 {
+            return Err(ManifestPlanError::SmallFileCeiling { max_objects });
+        }
         let mut objects = Vec::new();
         objects
             .try_reserve_exact(object_count)
@@ -391,7 +402,7 @@ impl ManifestPlan {
             return Err(ManifestPlanError::AllocationContract);
         }
         objects.extend_from_slice(previous_objects);
-        objects.push(object);
+        objects.extend(new_objects);
         Self::from_objects(dataset_id, objects)
     }
 

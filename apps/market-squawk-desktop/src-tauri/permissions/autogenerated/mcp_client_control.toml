@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mcp-client-control"
+description = "Enables the mcp_client_control command without any pre-configured scope."
+commands.allow = ["mcp_client_control"]
+
+[[permission]]
+identifier = "deny-mcp-client-control"
+description = "Denies the mcp_client_control command without any pre-configured scope."
+commands.deny = ["mcp_client_control"]

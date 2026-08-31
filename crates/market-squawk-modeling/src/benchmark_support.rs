@@ -21,10 +21,12 @@ use thiserror::Error;
 use super::{BundleArtifact, ModelBundle};
 use crate::native::NativeArtifact;
 use crate::{
-    BundleExpectations, BundleId, DecisionThresholds, FeatureNormalizer, InferenceBackend,
-    InferenceError, ModelFeatureBinding, ModelFeatureValue, ModelFormat, ModelInput,
-    ModelInputError, ModelMetadata, ModelOutput, ModelOutputSemantics, NativeBackendError,
-    NativeLinearBackend, OnnxBackendError, OnnxFallbackPolicy, OnnxModelPolicy, OnnxWorkerProgram,
+    BundleExpectations, BundleId, DecisionThresholds, FeatureNormalizer, ForecastCentralStatistic,
+    ForecastEstimatorProfile, ForecastMeasurement, ForecastOutputBinding, ForecastTargetMeaning,
+    ForecastTrainingObjective, ForecastTransform, InferenceBackend, InferenceError,
+    ModelFeatureBinding, ModelFeatureValue, ModelFormat, ModelInput, ModelInputError,
+    ModelMetadata, ModelOutput, ModelOutputSemantics, NativeBackendError, NativeLinearBackend,
+    OnnxBackendError, OnnxFallbackPolicy, OnnxModelPolicy, OnnxWorkerProgram,
     OnnxWorkerProgramError, TractOnnxBackend, TrainingDatasetIdentity, TrainingPeriod,
     ValidationMetric, ValidationMetricName,
 };
@@ -161,11 +163,12 @@ impl ReleaseEvidenceInferenceFixture {
             bindings,
             None,
         )?);
-        let policy = OnnxModelPolicy::try_new(
+        let policy = OnnxModelPolicy::try_new_with_output_semantics(
             Sha256Digest::new(onnx_digest),
             onnx_fixture.opset,
             &onnx_fixture.input_shape,
             &onnx_fixture.output_shape,
+            ModelOutputSemantics::Regression,
             Duration::from_millis(250),
             OnnxFallbackPolicy::NoAction,
         )
@@ -271,7 +274,27 @@ fn build_bundle(
     features: Vec<ModelFeatureBinding>,
     native: Option<NativeArtifact>,
 ) -> Result<ModelBundle, ReleaseEvidenceInferenceError> {
-    let expectations = BundleExpectations::try_new(
+    let label = FeatureLabelComponentSpec::try_new(
+        ComponentKind::Label,
+        ComponentScope::Instrument,
+        CorporateActionSensitivity::RequiresAdjustment,
+        "forward-return",
+        NonZeroU32::MIN,
+    )
+    .map_err(|_| ReleaseEvidenceInferenceError::InvalidFixture)?;
+    let output_binding = ForecastOutputBinding::try_from_admitted_model(
+        ModelOutputSemantics::Regression,
+        ForecastMeasurement::Return,
+        ForecastCentralStatistic::Unavailable,
+        ForecastTargetMeaning::Unsupported,
+        ForecastTransform::Identity,
+        ForecastTransform::Identity,
+        ForecastTrainingObjective::SquaredError,
+        ForecastEstimatorProfile::SealedDirectLeastSquaresV1,
+        label.clone(),
+    )
+    .map_err(|_| ReleaseEvidenceInferenceError::InvalidFixture)?;
+    let expectations = BundleExpectations::try_new_with_output_binding(
         ModelId::from_str(seed.model_id)
             .map_err(|_| ReleaseEvidenceInferenceError::InvalidFixture)?,
         BundleId::try_new(seed.bundle_id)
@@ -282,19 +305,13 @@ fn build_bundle(
             .map_err(|_| ReleaseEvidenceInferenceError::InvalidFixture)?,
         TrainingPeriod::try_new(Timestamp::from_unix_nanos(1), Timestamp::from_unix_nanos(2))
             .map_err(|_| ReleaseEvidenceInferenceError::InvalidFixture)?,
-        FeatureLabelComponentSpec::try_new(
-            ComponentKind::Label,
-            ComponentScope::Instrument,
-            CorporateActionSensitivity::RequiresAdjustment,
-            "forward-return",
-            NonZeroU32::MIN,
-        )
-        .map_err(|_| ReleaseEvidenceInferenceError::InvalidFixture)?,
+        label,
         "release-evidence-v1",
         Sha256Digest::new([31; 32]),
         Sha256Digest::new(seed.metadata_digest),
         Sha256Digest::new(seed.artifact_digest),
         Sha256Digest::new(seed.training_run_digest),
+        output_binding,
     )
     .map_err(|_| ReleaseEvidenceInferenceError::InvalidFixture)?;
     let metadata = ModelMetadata::new(
@@ -303,8 +320,6 @@ fn build_bundle(
         Sha256Digest::new(seed.artifact_digest),
         format,
         FORMAT_VERSION,
-        ModelOutputSemantics::Regression,
-        false,
         features,
         vec![ValidationMetric::new(
             ValidationMetricName::MeanSquaredError,
@@ -325,6 +340,13 @@ fn build_bundle(
     let metadata_bytes: Box<[u8]> = seed.metadata_digest.into();
     let artifact_bytes: Box<[u8]> = artifact_bytes.into();
     let training_run_bytes: Box<[u8]> = seed.training_run_digest.into();
+    let metadata_path: Box<str> = "bundle.json".into();
+    let artifact_path: Box<str> = match format {
+        ModelFormat::Onnx => "model.onnx",
+        ModelFormat::NativeLinear | ModelFormat::NativeLogistic => "artifact.json",
+    }
+    .into();
+    let training_run_path: Box<str> = "training-run.json".into();
     let retained_bytes = size_of::<ModelBundle>()
         .checked_add(
             metadata
@@ -338,13 +360,21 @@ fn build_bundle(
         .and_then(|bytes| bytes.checked_add(metadata_bytes.len()))
         .and_then(|bytes| bytes.checked_add(artifact_bytes.len()))
         .and_then(|bytes| bytes.checked_add(training_run_bytes.len()))
+        .and_then(|bytes| bytes.checked_add(metadata_path.len()))
+        .and_then(|bytes| bytes.checked_add(artifact_path.len()))
+        .and_then(|bytes| bytes.checked_add(training_run_path.len()))
         .ok_or(ReleaseEvidenceInferenceError::InvalidFixture)?;
     Ok(ModelBundle {
         metadata,
         artifact,
+        metadata_path,
+        artifact_path,
+        training_run_path,
         metadata_bytes,
         artifact_bytes,
         training_run_bytes,
+        forecast_residuals_bytes: None,
+        forecast_policy_bytes: None,
         retained_bytes,
     })
 }

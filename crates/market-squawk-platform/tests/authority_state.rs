@@ -129,6 +129,39 @@ fn unproven_orphan_temp_is_rejected_as_ambiguous_state() -> TestResult {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn valid_pre_replace_temporary_is_discarded_without_advancing_committed_state() -> TestResult {
+    let canonical = tempfile::tempdir()?;
+    {
+        let store = LocalAuthorityStateStore::try_open(canonical.path())?;
+        store.store(b"committed")?;
+    }
+
+    let successor = tempfile::tempdir()?;
+    fs::copy(
+        canonical.path().join(SLOT_A_FILE),
+        successor.path().join(SLOT_A_FILE),
+    )?;
+    fs::copy(
+        canonical.path().join(SLOT_B_FILE),
+        successor.path().join(SLOT_B_FILE),
+    )?;
+    {
+        let store = LocalAuthorityStateStore::try_open(successor.path())?;
+        store.store(b"not-committed")?;
+    }
+    fs::copy(
+        successor.path().join(SLOT_A_FILE),
+        canonical.path().join(TEMP_A_FILE),
+    )?;
+
+    let reopened = LocalAuthorityStateStore::try_open(canonical.path())?;
+    assert_eq!(reopened.load()?, Some(b"committed".to_vec()));
+    assert!(!canonical.path().join(TEMP_A_FILE).exists());
+    Ok(())
+}
+
 #[test]
 fn one_content_invalid_peer_is_repaired_but_two_valid_unrelated_peers_fail_closed() -> TestResult {
     let cases: &[CorruptionCase] = &[

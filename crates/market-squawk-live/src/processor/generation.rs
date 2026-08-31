@@ -18,6 +18,7 @@ struct SourceGenerationKey {
     metadata_revision: market_squawk_domain::MetadataRevision,
     session_id: market_squawk_sources::SessionId,
     generation: ConnectionGeneration,
+    health_epoch: u64,
 }
 
 impl SourceGenerationKey {
@@ -27,6 +28,7 @@ impl SourceGenerationKey {
             metadata_revision: binding.metadata_revision().clone(),
             session_id: binding.session_id().clone(),
             generation: binding.connection_generation(),
+            health_epoch: source.health_epoch(),
         }
     }
 }
@@ -36,6 +38,7 @@ struct GenerationEntry {
     key: SourceGenerationKey,
     source: CurrentSourceAuthorityLease,
     owner: GenerationLeaseOwner,
+    previous_owner: Option<GenerationLeaseOwner>,
 }
 
 /// Exact O(1) producer binding minted only from an opaque current-source lease.
@@ -46,9 +49,27 @@ pub(crate) struct GenerationAdmission {
     registry: RegistryLifecycleLease,
 }
 
+/// Revocation-only capability for one exact route generation.
+///
+/// This carries no source observation or publish authority. It exists so the generation owner can
+/// withdraw currentness and ask the shard actor to publish that transition before replacement data
+/// is available.
+#[derive(Clone, Debug)]
+pub(crate) struct GenerationRevocation {
+    generation: GenerationLease,
+    registry: RegistryLifecycleLease,
+}
+
 impl GenerationAdmission {
     pub(crate) fn invalidate_on_admission_failure(&self) {
         self.generation.invalidate();
+    }
+
+    pub(crate) fn revocation(&self) -> GenerationRevocation {
+        GenerationRevocation {
+            generation: self.generation.clone(),
+            registry: self.registry.clone(),
+        }
     }
 
     pub(crate) const fn source(&self) -> &CurrentSourceAuthorityLease {
@@ -75,6 +96,12 @@ impl GenerationAdmission {
                 value.checked_add(2 * market_squawk_domain::SourceIdentifier::MAX_LENGTH)
             })
             .ok_or(LiveApplyError::SnapshotRetainedSizeOverflow)
+    }
+}
+
+impl GenerationRevocation {
+    pub(crate) fn invalidate(&self) {
+        self.generation.invalidate();
     }
 }
 
@@ -112,7 +139,12 @@ impl GenerationAuthorityRegistry {
         })
     }
 
-    /// Binds the current-source lease, reusing one generation allocation across health epochs.
+    /// Binds the exact current-source lease and isolates authority across health epochs.
+    ///
+    /// A healthy refresh gives the successor an independent allocation while retaining exactly
+    /// one preceding allocation for bounded FIFO drain. The source lease supplies the original
+    /// deadline and immediate degradation revocation. A later refresh or connection rollover
+    /// retires that overlap, so delayed work cannot accumulate or resurrect authority.
     pub(crate) fn bind_current(
         &mut self,
         source: &CurrentSourceAuthorityLease,
@@ -137,6 +169,12 @@ impl GenerationAuthorityRegistry {
                 {
                     return Err(LiveApplyError::GenerationAdmissionTransplant);
                 }
+                if existing.owner.lease().validate().is_err() {
+                    // Explicit or admission-failure revocation is terminal for this exact key.
+                    // A later healthy epoch or connection generation may bind a fresh owner, but
+                    // retrying the revoked key must never return an already-dead admission.
+                    return Err(LiveApplyError::GenerationNotAdvanced);
+                }
                 existing.source = source.clone();
                 return Ok(GenerationAdmission {
                     source: source.clone(),
@@ -144,7 +182,12 @@ impl GenerationAuthorityRegistry {
                     registry: self.lifecycle.lease(),
                 });
             }
-            if existing.key.generation >= key.generation {
+            let same_connection = existing.key.metadata_revision == key.metadata_revision
+                && existing.key.session_id == key.session_id
+                && existing.key.generation == key.generation;
+            if (same_connection && existing.key.health_epoch >= key.health_epoch)
+                || (!same_connection && existing.key.generation >= key.generation)
+            {
                 return Err(LiveApplyError::GenerationNotAdvanced);
             }
             let owner = GenerationLeaseOwner::new(key.generation.get());
@@ -153,12 +196,17 @@ impl GenerationAuthorityRegistry {
                 generation: owner.lease(),
                 registry: self.lifecycle.lease(),
             };
-            existing.owner.invalidate();
-            *existing = GenerationEntry {
-                key,
-                source: source.clone(),
-                owner,
-            };
+            // Only the immediately preceding healthy epoch may overlap. Dropping an older owner
+            // revokes any work that exceeded the bounded refresh window.
+            drop(existing.previous_owner.take());
+            let former_owner = std::mem::replace(&mut existing.owner, owner);
+            if same_connection {
+                existing.previous_owner = Some(former_owner);
+            } else {
+                drop(former_owner);
+            }
+            existing.key = key;
+            existing.source = source.clone();
             return Ok(admission);
         }
         if self.generations.len() >= self.maximum {
@@ -176,6 +224,7 @@ impl GenerationAuthorityRegistry {
                 key,
                 source: source.clone(),
                 owner,
+                previous_owner: None,
             },
         );
         Ok(admission)
@@ -185,10 +234,19 @@ impl GenerationAuthorityRegistry {
         GenerationRegistryExitHandle(self.lifecycle.lease())
     }
 
+    pub(crate) fn owns_revocation(&self, revocation: &GenerationRevocation) -> bool {
+        self.lifecycle
+            .lease()
+            .shares_allocation_with(&revocation.registry)
+    }
+
     pub(crate) fn invalidate_all(&mut self) {
         self.lifecycle.invalidate();
         for entry in self.generations.values_mut() {
             entry.owner.invalidate();
+            if let Some(previous) = entry.previous_owner.as_mut() {
+                previous.invalidate();
+            }
         }
     }
 }

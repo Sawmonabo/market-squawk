@@ -154,12 +154,16 @@ Normal developer `dev` and `test` builds remain incremental with line-table debu
 non-workspace dependencies carry no debug information. The opt-in `debugging` profile provides full
 workspace debug information with incremental compilation disabled. Agent, CI, benchmark, and
 approval commands export `CARGO_INCREMENTAL=0` so their evidence does not depend on incremental
-state. VS Code rust-analyzer on-save flycheck is disabled for this workspace because its default
-workspace/all-target invocation duplicates explicit gates; analyzer-owned Cargo invocations also
-disable incremental state. Run focused diagnostics or the repository verification entry point on
-demand. The verification entry point enforces a 20 GiB hard ceiling on its local `target/` before
-and after the gate. Reclaim only ignored reproducible Cargo output after checking active processes
-and preserving every dirty or unique worktree state.
+state. Ordinary non-authoritative build scripts must not watch Git metadata merely to embed the
+current commit: Cargo's shipping-input graph owns compilation invalidation, while exact commit and
+tree identity belongs in external verification and package evidence. An explicitly requested,
+clean authoritative benchmark may bind and watch the exact Git head because that head is part of
+the measurement evidence. VS Code rust-analyzer on-save flycheck is disabled for this workspace
+because its default workspace/all-target invocation duplicates explicit gates; analyzer-owned Cargo
+invocations also disable incremental state. Run focused diagnostics or the repository verification
+entry point on demand. The verification entry point enforces a 20 GiB hard ceiling on its local
+`target/` before and after the gate. Reclaim only ignored reproducible Cargo output after checking
+active processes and preserving every dirty or unique worktree state.
 
 ### Worktree lifecycle
 
@@ -1450,3 +1454,213 @@ completed Tauri's maintained `app,dmg` bundler, verified and mounted the DMG, pa
 product and 63-tool MCP smoke, collected the closed artifacts, and uploaded them. That candidate is
 not a release candidate because its separate Windows package job failed at the staging command
 corrected after the run.
+
+## 2026-08-01 installed-product candidate authority
+
+The approved
+[`2026-08-01-market-squawk-v1-installed-product-experience.md`](superpowers/plans/2026-08-01-market-squawk-v1-installed-product-experience.md)
+supersedes the earlier `release/*`-only platform-dispatch and public-release sequence for its
+defined scope. Task 25 may explicitly dispatch platform verification for the exact pushed and
+frozen `feature/v1-installed-product-experience` candidate. The dispatch must remain fail-closed,
+must identify that exact feature ref and commit, and must produce controlled workflow artifacts
+without creating a GitHub Release. Ordinary feature pushes still do not build native packages.
+
+Task 26 freezes and verifies that unchanged feature candidate, runs the existing final Quarter 4
+grouped review, and hands controlled artifact references to the owner through the draft PR and
+project. It does not authorize public release creation, stable curl hosting, release-branch or
+`main` integration, signing/notarization claims, or a release declaration. Those actions require a
+separate user-authorized workflow after owner testing.
+
+Historical version, component, package, and checkpoint facts above remain valid only for their
+dated audit anchors. Current candidate version, component identities, head/tree, package receipts,
+review state, blockers, issue state, and cleanup disposition live only in
+[`docs/plans/delivery-ledger.md`](plans/delivery-ledger.md); this memory is not a second mutable
+ledger.
+
+## 2026-08-09 unified Markets V1 contract
+
+The V1 installed-product goal includes one unified, non-technical Markets feed, search surface,
+and instrument workspace as a release-blocking product capability. Users select investments and
+questions, not upstream providers. A Market Squawk-owned resolver chooses the richest admitted
+observation that meets the requested asset, timing, depth, quality, operation, health, budget, and
+rights requirements while preserving an exact source-selection and downgrade receipt.
+
+The simple product view sits above independently governed provider surfaces. One per-user service
+owns bounded provider connections, subscriptions, budgets, caches, cursors, and recovery
+generations for Desktop, CLI, MCP, models, and jobs. Provider-native snapshot, sequencing,
+checksum, reconnect, and quarantine state remains isolated. A fallback never inherits another
+source's quality, coverage, venue, depth, or execution eligibility.
+
+The full admitted multi-asset universe is searchable locally; live subscriptions prioritize
+holdings, positions and paper orders, watchlists, active screens, the currently viewed instrument,
+and a bounded benchmark set. The desktop combines market pulse, personalized opportunities,
+quotes/trades/books/bars, features, forecasts, buy/add/trim/sell targets, backtests,
+fundamentals/filings, portfolio impact, and risk. Plain availability labels lead; exact provider,
+venue, timing, depth, quality, and coverage remain expandable under Data confidence.
+
+The installation retains no mandatory paid data requirement and provides the best available depth
+from admitted sources. Order-level depth is shown only where the exact provider supplies it;
+universal free order-level US equity/options/futures/FX/crypto coverage is not a V1 claim, and a
+calculated index never receives an invented order book. Separately licensed sources can improve
+coverage through the same contracts but cannot bypass rights, quality, source integrity, or central
+risk authority.
+
+The binding evidence, provider posture, reuse constraints, implementation DAG, and thin critical
+acceptance path are maintained in
+[`docs/research/2026-08-08-unified-markets-provider-ecosystem.md`](research/2026-08-08-unified-markets-provider-ecosystem.md),
+the installed-product design and plan, and issue `#45`. Public README content remains product-
+focused; mutable head, progress, blocker, verification, and issue state remains only in the delivery
+ledger.
+
+## 2026-08-11 selected market-data and data-first resumption contract
+
+The V1 goal remains paused until the owner explicitly resumes it. On resume, data handling is the
+first implementation barrier because the Console workflows cannot be accepted over credentials or
+adapters alone. The binding target authorities are the
+[provider architecture](architecture/market-data-provider-architecture.md),
+[selected-provider contracts](reference/providers/README.md),
+[canonical schema and evidence contract](reference/market-data-canonical-schemas.md),
+[provider setup runbook](operations/provider-account-setup.md), credential-only
+[`market-squawk-provider-credentials/v1`](reference/market-squawk-provider-credentials.env.example)
+template, paused goal attachment, and current delivery-ledger entry.
+
+The selected sources are complementary: Alpaca Paper Only/Basic supplies the no-live-brokerage IEX
+current-data and stock-history core; public Coinbase Advanced Trade and public Kraken Spot remain
+no-key crypto specialists for venue-qualified books and trades; optional owner-enabled Coinbase
+Exchange Direct remains a distinct authenticated crypto market-data complement; owner-authorized
+Schwab supplies an optional read-only multi-asset REST and Streamer complement; Yahoo/yfinance is
+explicit-demand experimental enrichment; IEX HIST is a selected feed/date T+1 cold lane; Nasdaq
+Trader, OCC, and Cboe supply reference identity; SEC supplies company/fund evidence; FRED/ALFRED
+and the selected direct government sources supply macro, rates, fiscal, labor, national-account,
+demographic/trade, and energy evidence; and Tiingo is the optional supported mutual-fund NAV/EOD
+lane. The Coinbase and Kraken sources add crypto coverage only; they do not supply the stock, ETF,
+index, bond, mutual-fund, or REIT breadth assigned to the rest of the stack. Tradier remains outside
+the selected stack and does not participate in new credential import, activation, scheduling,
+fallback, product composition, or release gates. Tiingo NAV uses the closed
+`ResearchObservation::FundNav(FundNavObservation)` research variant with exact fund/share-class,
+NAV date/value-or-missing state, availability, revision, and PIT evidence; EOD remains a separate
+bar family. Only those selected sources participate in new
+credential import, activation, scheduling, fallback, product composition, and release gates.
+
+No frontend calls a provider. Every source must complete
+`configured -> entitled -> producing -> durably published -> queryable -> workflow-composed ->
+restart/release-proven` through the existing protected secret store, provider-rate authority,
+bounded raw capture, closed canonical families, Arrow validation, immutable Parquet generations,
+SQLite manifests/control state, point-in-time selectors, and bounded typed application operations.
+Schwab uses only the code-owned market-data route allowlist plus minimum read-only User Preference
+bootstrap; it grants no account, position, transaction, or order use. The credential file remains a
+32-field one-time import/probe-intent format and must not become another provider, adapter, crate,
+service, configuration system, or endpoint/rate-policy surface.
+
+Provider capacity is accepted from requests and actual observations separately. Requested symbols,
+chain calls, pages, and decoded frames are not successful rows. Retained evidence must report valid
+returned components, missing/invalid dispositions, complete option contracts and non-null Greeks,
+accepted stream events, complete local bars, SEC/fund/macro manifest rows, and bytes written. FRED
+contracts remain version-specific: v1 uses offset pages up to 100,000 rows with no reviewed numeric
+v1 request-rate ceiling; v2 release observations use cursor pages up to 500,000 rows and a documented
+2-request/second throttle. One conservative 1-request/second shared application queue is the current
+policy, without conflating either version's pagination or provider facts.
+
+The implementation sequence is data-to-workflow vertical: thin credential import and doctors;
+reference identity plus Alpaca IEX into Markets; optional owner-enabled Schwab through the same
+publication/selection path; complete Alpaca/Schwab history into charts and exact analytical
+generations; SEC/macro/fund/options lanes; Yahoo and IEX HIST specialized lanes; then generated
+recommendations, portfolio/risk, and virtual paper over those same typed reads. An enabled flag,
+successful HTTP response, or published dataset cannot enable a workflow until its typed read,
+frontend composition, degradation behavior, and focused restart journey pass.
+
+## 2026-08-31 source-completion vocabulary and first completed product vertical
+
+Source status must never again collapse durable data delivery and complete product delivery into
+one ambiguous word. Every progress report, delivery decision, and review uses these two explicit
+levels:
+
+1. **Durable data-source complete** means the source is configured and entitled where required,
+   produces real official data, seals bounded raw evidence, publishes closed canonical rows into an
+   immutable Parquet generation and manifest, supports the required point-in-time or exact selector,
+   and returns the same typed data after process restart.
+2. **Full product vertical complete** means the durable source above also flows through the
+   provider-neutral rich store or selector, its intended feature/model/forecast/valuation/backtest
+   and recommendation or research consumers, provider-neutral Desktop/CLI/MCP operations, and an
+   installed shutdown/restart journey. Provider names, retry state, quotas, endpoints, adapter
+   terminology, and technical readiness language remain confined to setup, settings, logs, and
+   diagnostics.
+
+A report must state both levels separately. It must not say that no source is complete when a
+source has crossed the durable data-source boundary, and it must not call an adapter, HTTP probe,
+credential check, published dataset, or restartable dataset a complete product vertical.
+
+At the accepted 2026-08-31 audit base `9f5a45d673b6ef44278398c8db79505df2ab07fa`,
+Federal Reserve Board H.15 is the first durable data-source-complete baseline: official live pull,
+sealed raw capture, immutable canonical/Parquet publication, typed application read, and read after
+restart are established. H.15 is not yet a full product vertical. Its remaining provider-neutral
+macro/rates selection, regime/valuation/backtest evidence, Desktop/CLI/MCP composition, and
+installed restart journey are mandatory last-mile work.
+
+H.15 owns the first full-product-completion lane until that last mile is accepted. Disjoint provider
+foundation and remediation lanes may continue in parallel, but they may not repeatedly displace the
+H.15 last-mile lane or turn another provider into the sole global agenda. If a shared application,
+manifest, or Desktop hotspot conflicts with that lane, serialize the hotspot and finish the H.15
+product edge first unless a substantiated correctness or authority defect makes progress unsafe.
+Always keep at least one source on a last-mile product-completion path; do not allow every active
+lane to end at an adapter, catalog, contract, or review checkpoint.
+
+The selected providers' personal-use permission and credential-use decisions are settled for this
+goal. Do not reopen licensing, permission, or resale analysis absent new provider-specific evidence,
+a material scope change beyond personal use, or an explicit owner request. Implementation still
+retains exact provenance, source quality, capacity, point-in-time, and rights evidence; those
+technical facts do not authorize repeated policy churn.
+
+## 2026-08-31 forecasting, financial-modeling, signal, and harmonic-evidence contract
+
+The complete V1 investment workflow must do more than collect and chart data. It must turn exact
+provider-neutral, point-in-time generations into versioned features, multi-horizon forecasts,
+method-specific financial-model and valuation scenarios, cost-adjusted out-of-sample backtests,
+portfolio/liquidity/risk context, and an immutable `Buy`, `Add`, `Hold`, `Trim`, `Sell`, or
+`Abstain` decision. The plain-language result includes the decision horizon, entry range, expected
+price/return ranges where admitted, target/trim/sell range, sizing or portfolio impact where
+supported, reasons, risks, assumptions, expiry, invalidators, evidence coverage, calibration, and
+uncertainty. A model score, valuation output, or chart pattern alone is never confidence or an
+execution instruction.
+
+Harmonic price-pattern analysis is a required provider-neutral derived-feature family. Its initial
+closed taxonomy includes `AB=CD`, Gartley, Bat, Butterfly, Crab, Deep Crab, Cypher, and Shark
+patterns. Detection is backend-owned and deterministic over the exact selected adjusted-bar
+generation. Each result retains instrument and timeframe, causal pivot identities, direction,
+ratio measurements and tolerances, pattern-completion zone, observation and confirmation cutoffs,
+expiry, invalidation level, implementation identity, parent manifests, and an evidence digest.
+Ordinary product pages describe this as price-pattern evidence; exact ratios and algorithm evidence
+belong in an expandable provider-neutral analysis view, never in provider plumbing or frontend
+calculations.
+
+Harmonic evidence must be point-in-time safe. A detector may use only bars and pivot confirmations
+available at the decision cutoff; it may not backdate a pattern using a later-confirmed pivot.
+Adjustment, split, dividend, session, calendar, missing-bar, liquidity, and stale-data semantics
+remain explicit. Pattern rules and tolerances are selected on training/validation periods and
+measured on a separate chronological out-of-sample period with realistic fees, spread, slippage,
+latency, turnover, capacity, and delisting/survivorship treatment. If sample size, calibration,
+coverage, marketability, or conflicting fundamental/forecast/valuation/risk evidence is
+insufficient, the product returns low confidence, unavailable, or `Abstain` rather than forcing a
+trade.
+
+Forecasts must produce horizon-aligned central paths or conditional means plus calibrated ranges
+and retained rolling-origin evidence. Financial modeling must bind exact PIT fundamentals, macro
+and rate assumptions, model/method identity, currency, scenario inputs, sensitivity, and valuation
+range. The decision engine combines those independent evidence families with current market,
+options/liquidity where available, portfolio impact, and central risk; no provider and no single
+analytical family may feed a recommendation directly.
+
+In current V1, “signal execution” means an actionable entry/exit plan and execution through the
+isolated virtual-paper ledger only. A recommendation does not implicitly become an order. A user-
+approved or explicitly configured paper strategy must still pass supported-instrument, current-
+market, sizing, liquidity, and central-risk authority before a simulated order can be created,
+filled, reconciled, checkpointed, and recovered. Real brokerage orders, account trading, money
+movement, and recommendation-to-live-order authority remain outside this read-only product.
+
+The provider-neutral Desktop, CLI, and MCP must expose the same typed opportunity, investment-
+analysis, forecast/model, backtest, recommendation, and virtual-paper capabilities. Full product
+completion requires one thin critical journey from an exact immutable PIT input set through
+harmonic and non-harmonic features, forecast, financial model/valuation, realistic backtest,
+calibrated decision, virtual-paper action or honest abstention, clean shutdown, and identical
+restart reads. Do not create a broad pattern fixture matrix or a second analytical stack; extend
+the existing feature, forecast, decision, backtest, and paper authorities in place.

@@ -22,17 +22,26 @@ use crate::contracts::{
 use crate::manifest::{
     AdmittedRelease, MAXIMUM_ARCHIVE_BYTES, MAXIMUM_MANIFEST_BYTES, ManifestError, ReleaseManifest,
 };
-use crate::platform::ProgramName;
+use crate::platform::{NativeTrustMode, ProgramName};
+use crate::service_registration::{
+    RegistrationSpec, ServiceRegistrationError, activate_and_verify as activate_registration,
+    remove_owned as remove_owned_registration,
+    remove_owned_or_prove_absent as remove_owned_registration_or_prove_absent,
+    verify as verify_registration,
+};
 use crate::store::{
     InstallStore, InstallationState, StoreError, StoredVersion, remove_tree, validate_store_parent,
 };
+use crate::update_metadata::UpdateMetadataError;
 
 const CACHED_MANIFEST_FILE: &str = "manifest.json";
 const CACHED_BUNDLE_FILE: &str = "bundle.zip";
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
-const STABLE_PROGRAMS: [ProgramName; 5] = [
+const STABLE_PROGRAMS: [ProgramName; 7] = [
     ProgramName::Desktop,
+    ProgramName::Service,
+    ProgramName::McpRelay,
     ProgramName::Cli,
     ProgramName::CaptureHelper,
     ProgramName::OnnxWorker,
@@ -64,24 +73,30 @@ pub fn install(request: InstallRequest) -> Result<InstallReceipt, InstallError> 
 /// Returns [`InstallError::NotInstalled`] without an active selector and
 /// [`InstallError::UpdateNotNewer`] unless the admitted semantic version is strictly newer.
 pub fn update(request: UpdateRequest) -> Result<InstallReceipt, InstallError> {
-    let store = InstallStore::open_existing(&request.root)?.ok_or(InstallError::NotInstalled)?;
+    let UpdateRequest {
+        root,
+        release,
+        bundle,
+        channel_manifest_url,
+        trusted_update,
+    } = request;
+    let store = InstallStore::open_existing(&root)?.ok_or(InstallError::NotInstalled)?;
     recover_pending_activation(&store)?;
     let mut state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
     let current =
         Version::parse(&state.active.version).map_err(|_| InstallError::CorruptInstallation)?;
     let candidate =
-        Version::parse(request.release.version()).map_err(|_| InstallError::CorruptInstallation)?;
+        Version::parse(release.version()).map_err(|_| InstallError::CorruptInstallation)?;
     if candidate <= current {
         return Err(InstallError::UpdateNotNewer);
     }
     let retain_current_as_previous =
         verify_installed_tree(&store.version_path(&state.active), &state.active.components).is_ok();
-    let active = prepare_candidate(&store, &request.release, &request.bundle)?;
-    state.activate(
-        active,
-        request.channel_manifest_url,
-        retain_current_as_previous,
-    )?;
+    let active = prepare_candidate(&store, &release, &bundle)?;
+    if let Some(trusted_update) = trusted_update {
+        trusted_update.persist()?;
+    }
+    state.activate(active, channel_manifest_url, retain_current_as_previous)?;
     commit_activation(&store, &state)?;
     receipt(&state, false)
 }
@@ -120,7 +135,9 @@ pub fn repair(request: RepairRequest) -> Result<InstallReceipt, InstallError> {
             read_cached_release(&store, &state.active)?;
             false
         };
-        if verify_stable_programs(&store, &state).is_ok() {
+        if verify_stable_programs(&store, &state).is_ok()
+            && verify_service_registration(&store, &state.active).is_ok()
+        {
             return complete_repair(
                 &store,
                 &mut state,
@@ -156,6 +173,7 @@ fn complete_repair(
     if state.bind_channel_manifest_url(channel_manifest_url)? {
         commit_activation(store, state)?;
     } else if publish_programs {
+        activate_service_registration(store, &state.active)?;
         publish_stable_programs(store, state)?;
     }
     store.verify_private_permissions()?;
@@ -235,7 +253,8 @@ pub fn status(root: &Path) -> Result<InstallStatus, InstallError> {
     };
     let healthy =
         verify_installed_tree(&store.version_path(&state.active), &state.active.components).is_ok()
-            && verify_stable_programs(&store, &state).is_ok();
+            && verify_stable_programs(&store, &state).is_ok()
+            && verify_service_registration(&store, &state.active).is_ok();
     Ok(installed_status(&state, healthy))
 }
 
@@ -334,6 +353,28 @@ pub fn active_release_root(root: &Path) -> Result<PathBuf, InstallError> {
     Ok(active)
 }
 
+/// Returns the native publisher-trust mode from the exact retained active release.
+///
+/// The active tree, stable entrypoints, selector, and sealed cached manifest are revalidated while
+/// the installer lock is held. A caller must separately establish that its running executable
+/// belongs to this installation before treating the result as process authority.
+///
+/// # Errors
+///
+/// Fails when the installation is absent, targets another platform, or any retained release
+/// evidence is inconsistent.
+pub fn active_native_trust_mode(root: &Path) -> Result<NativeTrustMode, InstallError> {
+    let store = InstallStore::open_existing(root)?.ok_or(InstallError::NotInstalled)?;
+    recover_pending_activation(&store)?;
+    let state = store.load_state()?.ok_or(InstallError::NotInstalled)?;
+    if state.active.target != crate::platform::SupportedTarget::current()? {
+        return Err(InstallError::CorruptInstallation);
+    }
+    verify_installed_tree(&store.version_path(&state.active), &state.active.components)?;
+    verify_stable_programs(&store, &state)?;
+    Ok(read_cached_manifest(&store, &state.active)?.native_trust_mode())
+}
+
 /// Resolves the active release root for a verified installed program path.
 ///
 /// The path may identify either a stable Unix entrypoint or the executable inside the active
@@ -347,6 +388,29 @@ pub fn active_release_root_for_installed_program(
     executable: &Path,
     program: ProgramName,
 ) -> Result<Option<PathBuf>, InstallError> {
+    Ok(installed_program_location(executable, program)?.map(|(_, active)| active))
+}
+
+/// Resolves the installation root for a verified installed program path.
+///
+/// The path may identify either a stable Unix entrypoint or the executable inside the active
+/// immutable release. Paths that do not belong to an installation return `None`; a path that
+/// claims an installation but disagrees with its retained selector fails closed.
+///
+/// # Errors
+///
+/// Fails when a discovered installation, active release, or program entrypoint is inconsistent.
+pub fn installation_root_for_installed_program(
+    executable: &Path,
+    program: ProgramName,
+) -> Result<Option<PathBuf>, InstallError> {
+    Ok(installed_program_location(executable, program)?.map(|(root, _)| root))
+}
+
+fn installed_program_location(
+    executable: &Path,
+    program: ProgramName,
+) -> Result<Option<(PathBuf, PathBuf)>, InstallError> {
     let target = crate::platform::SupportedTarget::current()?;
     let relative = program.relative_path(target);
     let expected_name = relative
@@ -371,7 +435,7 @@ pub fn active_release_root_for_installed_program(
         if !same_canonical_path(executable, &expected)? {
             return Err(InstallError::CorruptInstallation);
         }
-        return Ok(Some(active));
+        return Ok(Some((root.to_path_buf(), active)));
     }
 
     let release = bin.parent().ok_or(InstallError::CorruptInstallation)?;
@@ -388,7 +452,7 @@ pub fn active_release_root_for_installed_program(
     if !same_canonical_path(release, &active)? || !same_canonical_path(executable, &expected)? {
         return Err(InstallError::CorruptInstallation);
     }
-    Ok(Some(active))
+    Ok(Some((root.to_path_buf(), active)))
 }
 
 fn installation_selector_exists(root: &Path) -> Result<bool, InstallError> {
@@ -543,12 +607,168 @@ fn recover_pending_activation(store: &InstallStore) -> Result<(), InstallError> 
     let Some(state) = store.load_pending_activation()? else {
         return Ok(());
     };
+    let previous = store.load_state()?;
     verify_installed_tree(&store.version_path(&state.active), &state.active.components)?;
-    store.write_state(&state)?;
-    publish_stable_programs(store, &state)?;
+    let precommit = (|| {
+        activate_service_registration(store, &state.active)?;
+        publish_stable_programs(store, &state)?;
+        Ok::<(), InstallError>(())
+    })();
+    if let Err(error) = precommit {
+        return Err(recover_activation_failure(
+            store,
+            previous.as_ref(),
+            state.active.target,
+            error,
+        ));
+    }
+    if let Err(error) = store.write_state(&state) {
+        let committed = store.load_state()?.is_some_and(|observed| {
+            observed.active.manifest_sha256 == state.active.manifest_sha256
+        });
+        if !committed {
+            return Err(recover_activation_failure(
+                store,
+                previous.as_ref(),
+                state.active.target,
+                error.into(),
+            ));
+        }
+    }
     store.prune(&state)?;
     store.clear_pending_activation()?;
     store.verify_private_permissions()?;
+    Ok(())
+}
+
+fn activate_service_registration(
+    store: &InstallStore,
+    version: &StoredVersion,
+) -> Result<(), InstallError> {
+    let version_root = store.version_path(version);
+    let specification = RegistrationSpec::new(
+        store.installation_data_root()?,
+        store.program_root(),
+        &version_root,
+        version.target,
+        &version.version,
+        &version.manifest_sha256,
+    )?;
+    activate_registration(&specification)?;
+    Ok(())
+}
+
+fn verify_service_registration(
+    store: &InstallStore,
+    version: &StoredVersion,
+) -> Result<(), InstallError> {
+    let version_root = store.version_path(version);
+    let specification = RegistrationSpec::new(
+        store.installation_data_root()?,
+        store.program_root(),
+        &version_root,
+        version.target,
+        &version.version,
+        &version.manifest_sha256,
+    )?;
+    verify_registration(&specification)?;
+    Ok(())
+}
+
+fn restore_known_good_activation(
+    store: &InstallStore,
+    previous: Option<&InstallationState>,
+    failed_target: crate::platform::SupportedTarget,
+) -> Result<(), KnownGoodRestorationFailure> {
+    match store.load_pending_activation() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(KnownGoodRestorationFailure::barrier(
+                RecoveryBarrier::Missing,
+            ));
+        }
+        Err(error) => {
+            return Err(KnownGoodRestorationFailure::barrier(
+                RecoveryBarrier::InspectionFailed(Box::new(error.into())),
+            ));
+        }
+    }
+
+    let native = (|| {
+        remove_owned_registration_or_prove_absent(store.program_root(), failed_target)?;
+        if let Some(previous) = previous {
+            activate_service_registration(store, &previous.active)?;
+        }
+        Ok::<(), InstallError>(())
+    })()
+    .err()
+    .map(Box::new);
+    let entrypoints = match previous {
+        Some(previous) => publish_stable_programs(store, previous),
+        None => clear_stable_programs(store, failed_target),
+    }
+    .err()
+    .map(Box::new);
+
+    if native.is_none() && entrypoints.is_none() {
+        store
+            .clear_pending_activation()
+            .map_err(|error| KnownGoodRestorationFailure {
+                native: None,
+                entrypoints: None,
+                barrier: RecoveryBarrier::ClearFailed(Box::new(error.into())),
+            })
+    } else {
+        Err(KnownGoodRestorationFailure {
+            native,
+            entrypoints,
+            barrier: RecoveryBarrier::Preserved,
+        })
+    }
+}
+
+fn recover_activation_failure(
+    store: &InstallStore,
+    previous: Option<&InstallationState>,
+    failed_target: crate::platform::SupportedTarget,
+    primary: InstallError,
+) -> InstallError {
+    match restore_known_good_activation(store, previous, failed_target) {
+        Ok(()) => primary,
+        Err(recovery) => InstallActivationRecoveryFailure {
+            primary: Box::new(primary),
+            recovery,
+        }
+        .into(),
+    }
+}
+
+#[cfg(unix)]
+fn clear_stable_programs(
+    store: &InstallStore,
+    target: crate::platform::SupportedTarget,
+) -> Result<(), InstallError> {
+    for program in STABLE_PROGRAMS {
+        let path = store.entrypoint_path(program, target)?;
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(InstallError::Io {
+                    operation: "remove failed stable program entrypoint",
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn clear_stable_programs(
+    _store: &InstallStore,
+    _target: crate::platform::SupportedTarget,
+) -> Result<(), InstallError> {
     Ok(())
 }
 
@@ -642,6 +862,7 @@ fn program_receipt(
 pub fn uninstall(request: UninstallRequest) -> Result<UninstallReceipt, InstallError> {
     let prepared_deletions = preflight_deletions(&request.deletions, &request.root)?;
     let store = InstallStore::open_existing(&request.root)?;
+    remove_owned_registration(&request.root, crate::platform::SupportedTarget::current()?)?;
     let removed_program = if let Some(store) = store.as_ref() {
         let detached = store.quarantine_for_uninstall()?;
         remove_tree(&detached)?;
@@ -1036,15 +1257,30 @@ fn read_cached_release(
     store: &InstallStore,
     version: &StoredVersion,
 ) -> Result<AdmittedRelease, InstallError> {
+    let release = read_cached_manifest(store, version)?;
     let directory = store.release_path(&version.manifest_sha256);
-    let bytes = read_bounded_file(
-        &directory.join(CACHED_MANIFEST_FILE),
-        MAXIMUM_MANIFEST_BYTES,
-    )?;
-    if sha256_file(
-        &directory.join(CACHED_MANIFEST_FILE),
-        MAXIMUM_MANIFEST_BYTES as u64,
-    )? != version.manifest_sha256.as_ref()
+    verify_cached_release(&directory, &release)?;
+    Ok(release)
+}
+
+fn read_cached_manifest(
+    store: &InstallStore,
+    version: &StoredVersion,
+) -> Result<AdmittedRelease, InstallError> {
+    let directory = store.release_path(&version.manifest_sha256);
+    let metadata = fs::symlink_metadata(&directory).map_err(|source| InstallError::Io {
+        operation: "inspect retained release directory",
+        source,
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(InstallError::CorruptInstallation);
+    }
+    verify_cache_directory_sealed(&directory)?;
+    let manifest_path = directory.join(CACHED_MANIFEST_FILE);
+    verify_cache_file_sealed(&manifest_path)?;
+    let bytes = read_bounded_file(&manifest_path, MAXIMUM_MANIFEST_BYTES)?;
+    if sha256_file(&manifest_path, MAXIMUM_MANIFEST_BYTES as u64)?
+        != version.manifest_sha256.as_ref()
     {
         return Err(InstallError::CorruptInstallation);
     }
@@ -1056,7 +1292,6 @@ fn read_cached_release(
     {
         return Err(InstallError::CorruptInstallation);
     }
-    verify_cached_release(&directory, &release)?;
     Ok(release)
 }
 
@@ -1336,9 +1571,81 @@ fn is_path_redirect(metadata: &fs::Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
+#[derive(Debug)]
+enum RecoveryBarrier {
+    Preserved,
+    Missing,
+    InspectionFailed(Box<InstallError>),
+    ClearFailed(Box<InstallError>),
+}
+
+impl std::fmt::Display for RecoveryBarrier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Preserved => formatter.write_str("preserved for a deterministic retry"),
+            Self::Missing => formatter.write_str("was unexpectedly absent"),
+            Self::InspectionFailed(error) => write!(formatter, "inspection failed: {error}"),
+            Self::ClearFailed(error) => write!(formatter, "could not be cleared: {error}"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct KnownGoodRestorationFailure {
+    native: Option<Box<InstallError>>,
+    entrypoints: Option<Box<InstallError>>,
+    barrier: RecoveryBarrier,
+}
+
+impl KnownGoodRestorationFailure {
+    fn barrier(barrier: RecoveryBarrier) -> Self {
+        Self {
+            native: None,
+            entrypoints: None,
+            barrier,
+        }
+    }
+}
+
+impl std::fmt::Display for KnownGoodRestorationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (&self.native, &self.entrypoints) {
+            (None, None) => write!(formatter, "pending activation barrier {}", self.barrier),
+            (Some(native), None) => write!(
+                formatter,
+                "native service recovery failed ({native}); pending activation barrier {}",
+                self.barrier
+            ),
+            (None, Some(entrypoints)) => write!(
+                formatter,
+                "stable entrypoint recovery failed ({entrypoints}); pending activation barrier {}",
+                self.barrier
+            ),
+            (Some(native), Some(entrypoints)) => write!(
+                formatter,
+                "native service recovery failed ({native}) and stable entrypoint recovery failed \
+                 ({entrypoints}); pending activation barrier {}",
+                self.barrier
+            ),
+        }
+    }
+}
+
+/// Primary installation activation failure plus any incomplete known-good restoration.
+#[derive(Debug, Error)]
+#[error("installation activation failed: {primary}; recovery failed: {recovery}")]
+pub struct InstallActivationRecoveryFailure {
+    #[source]
+    primary: Box<InstallError>,
+    recovery: KnownGoodRestorationFailure,
+}
+
 /// Complete installation lifecycle failure.
 #[derive(Debug, Error)]
 pub enum InstallError {
+    /// Activation failed and the known-good state could not be restored completely.
+    #[error(transparent)]
+    ActivationRecoveryFailed(#[from] InstallActivationRecoveryFailure),
     /// A release manifest failed closed admission.
     #[error(transparent)]
     Manifest(#[from] ManifestError),
@@ -1384,6 +1691,18 @@ pub enum InstallError {
     /// Current release platform detection failed.
     #[error(transparent)]
     Platform(#[from] crate::platform::PlatformError),
+    /// Per-user service registration, ownership validation, or readiness failed.
+    #[error(transparent)]
+    ServiceRegistration(#[from] ServiceRegistrationError),
+    /// Threshold-signed update metadata or monotonic trust persistence failed.
+    #[error(transparent)]
+    UpdateMetadata(#[from] UpdateMetadataError),
+    /// A network-channel update did not carry verified trusted metadata.
+    #[error("network-channel updates require threshold-signed trusted metadata")]
+    TrustedUpdateRequired,
+    /// Trusted targets do not bind the supplied release manifest and archive exactly.
+    #[error("trusted update targets do not match the supplied release")]
+    TrustedUpdateIdentity,
 }
 
 #[cfg(test)]

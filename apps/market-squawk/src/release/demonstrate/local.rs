@@ -344,6 +344,7 @@ async fn fair_value_vertical(product: &LocalProduct, scratch: &Path) -> Result<b
                 "amount": "250.005",
                 "currency": "USD",
                 "scale": 3,
+                "amountBasis": "per_instrument_unit",
                 "measurementAt": "1970-01-01T00:00:00.000000100Z",
                 "preparedAt": "1970-01-01T00:00:00.000000104Z",
                 "preparedBy": "release-demo",

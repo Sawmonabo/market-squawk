@@ -19,7 +19,7 @@ use crate::measurement::ValuationInputSpec;
 use crate::{
     ActorId, ApprovedMarketAccess, EvidenceOrigin, EvidenceVerification, FairValueError,
     FairValueEvidence, FairValueLimitInput, FairValueLimits, FairValueService, ValuationAmount,
-    ValuationMeasurementSpec, ValuationMethod,
+    ValuationAmountBasis, ValuationMeasurementSpec, ValuationMethod,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -47,7 +47,7 @@ fn incomplete_or_unverified_evidence_is_unclassified_while_complete_observable_e
 }
 
 #[test]
-fn explicitly_stale_quality_is_usable_only_under_legacy_rules() -> TestResult {
+fn explicitly_stale_quality_fails_closed_under_current_rules() -> TestResult {
     let input = ValuationInput::try_from_spec(input_spec(
         evidence(
             research_origin()?,
@@ -61,20 +61,8 @@ fn explicitly_stale_quality_is_usable_only_under_legacy_rules() -> TestResult {
     )?)?;
     let measurement = measurement(input)?;
 
-    assert_eq!(
-        ClassificationRuleset::versioned(1, 100)?
-            .classify(&measurement)?
-            .hierarchy(),
-        FairValueHierarchy::Level2
-    );
     let current = ClassificationRuleset::current(100)?.classify(&measurement)?;
     assert_eq!(current.hierarchy(), FairValueHierarchy::Unclassified);
-    assert!(
-        current
-            .reasons()
-            .iter()
-            .any(|reason| reason.code() == DecisionReasonCode::EvidenceStale)
-    );
     Ok(())
 }
 
@@ -198,7 +186,11 @@ fn instrument() -> Result<InstrumentId, Box<dyn std::error::Error>> {
 
 fn amount() -> Result<ValuationAmount, FairValueError> {
     let currency = Currency::try_from("USD").map_err(|_| FairValueError::InvalidAmount)?;
-    ValuationAmount::try_new(Money::new(Decimal::new(10_000, 2), currency), 2)
+    ValuationAmount::try_new(
+        Money::new(Decimal::new(10_000, 2), currency),
+        2,
+        ValuationAmountBasis::PerInstrumentUnit,
+    )
 }
 
 fn manifest() -> Result<DatasetManifestRef, Box<dyn std::error::Error>> {

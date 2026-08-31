@@ -18,16 +18,38 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 pub mod analysis;
+pub mod backup;
+pub(crate) mod company_security_resolution;
 mod contracts;
+pub mod decision;
 mod domain_support;
 pub mod fair_value;
+pub mod governance;
+pub mod job;
+pub mod lifecycle;
 mod live_fair_value;
+pub mod logs;
+mod market_calendar;
+mod market_runtime;
+pub(crate) mod market_selection;
 pub mod model;
+pub mod operations;
 mod paper;
+pub(crate) mod recommendation;
 mod research;
+pub mod settings;
+pub mod setup;
 pub mod source;
+pub mod workspace;
 
 pub use contracts::{APPLICATION_CONTRACT_VERSION, application_capabilities};
+pub(crate) use contracts::{
+    PRODUCT_LOOKUP_ACTION_OPEN_INVESTMENT, PRODUCT_LOOKUP_ACTION_OPEN_SAVED_SCREEN,
+    PRODUCT_LOOKUP_CATEGORIES, PRODUCT_LOOKUP_CATEGORY_INVESTMENT,
+    PRODUCT_LOOKUP_CATEGORY_SAVED_SCREEN, PRODUCT_LOOKUP_QUERY_MAXIMUM_CHARACTERS,
+    internal_forecast_generation_descriptor, product_lookup_query_is_canonical,
+};
+pub(crate) use domain_support::{opaque_product_text_token, opaque_product_token};
 pub use fair_value::{
     AnalyticsFairValueInputPublisher, FairValueDomainService, FairValueInputAuthorityError,
     FairValueInputAuthorityLimitInput, FairValueInputAuthorityLimits,
@@ -39,22 +61,64 @@ pub use fair_value::{
     ResearchFairValueInputPublisher,
 };
 pub use live_fair_value::{LiveFairValueObservationBuffer, LiveFairValueObservationBufferError};
+pub(crate) use market_runtime::{
+    AccountMarketSurface, MarketProviderGroupLifecycleEvidence, MarketRuntimeGroupGeneration,
+    MarketRuntimeRegistry, MarketSourceRuntimeGeneration,
+    PreparedMarketProviderConfigurationRequest, PreparedMarketProviderConfigurationResolver,
+    PreparedSchwabMarketRuntimeResolver, SCHWAB_CURRENT_LIVE_AUTHORITY_KEY,
+    SchwabRestQuoteCurrentRuntimeInput, SchwabRestQuoteRuntimeBounds, SchwabRestQuoteRuntimeError,
+    SchwabRestQuoteSourceEvidence,
+};
 pub use paper::PaperApplicationServices;
+pub(crate) use paper::{
+    MarketReferenceMatchKind, MarketReferenceRecord, MarketReferenceSearchAuthority,
+    MarketReferenceSearchPage, PaperRuntimeActivityAuthority, PortfolioCandidateResolutionFactory,
+};
+pub(crate) use research::{
+    AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
+    AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
+    AnalyticalForecastEvidenceReader, CoinbaseMarketApplicationOutcome,
+    CompanyResearchReadCapability, CryptoCommittedRowIngress, CryptoMarketPublicationAuthority,
+    CryptoMarketPublicationError, CryptoPendingFrameIngress, CryptoPublicationRendezvousLimits,
+    DatasetPreparationAuthority, DatasetPreparationError, DatasetPreparationOptions,
+    DatasetPreparationPreview, DatasetPreparationPreviewRequest, DatasetPreparationReceipt,
+    DatasetPreparationSelection, FeatureDatasetProductionFinalizer, FredLatestKnownOperation,
+    FredPublishedGenerationHandoff, InstrumentContext, InstrumentContextOutcome,
+    InstrumentContextReadCapability, InstrumentContextReadError, InstrumentContextRequest,
+    InstrumentIdentityReadCapability, InstrumentIdentityResolutionOutcome,
+    InstrumentIdentityResolutionRead, InstrumentIdentityResolutionRequest,
+    InstrumentOfficialLifecycleEvidence, InstrumentSearchCandidate, InstrumentSearchListing,
+    InstrumentSearchMatchReason, InstrumentSearchRead, InstrumentSearchRequest,
+    KrakenMarketApplicationOutcome, MacroContextReadCapability, MacroFeatureVector,
+    MarketEventDurableRead, MarketEventDurableReadWriter, MarketEventReadError,
+    MarketEventRestartSelector, MarketHistoryReadCapability, OptionsContextReadCapability,
+    PreparedFeatureDatasetBuild, ResearchProviderPublicationOperation,
+    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
+    SEC_FUNDAMENTALS_RESEARCH_STATUS_OPERATION, SchwabMarketPublicationError,
+    SchwabRestQuoteGenerationAuthority, SchwabRestQuotePostSealFailure,
+    SchwabRestQuotePublicationPackage, SchwabRestQuoteSourceHealthOutcome,
+    SecFundPublicationReceipt, SecFundamentalsResearchError, SecFundamentalsResearchOperation,
+    SecFundamentalsResearchRequest, SecFundamentalsResearchStatus, SecLiveFundApplicationError,
+    SecLiveFundRequest, SecLiveFundSource, SecResearchFamilyBinding, TreasuryApplicationClosure,
+    TreasuryLatestKnownOperation, TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
+    read_macro_feature_vector,
+};
+pub(crate) use research::{
+    BlsLiveComposition, BlsLiveOutcome, BlsLivePublicationError, BlsLiveRequest, BlsLiveRuntime,
+};
 pub use research::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,
     ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,
-    ResearchIngestCompositionError, ResearchIngestCoordinator, ResearchProviderRuntimeGeneration,
-    ResearchRevisionPlanError, ResearchRightsAuthority, ResearchSourceDiscovery,
-    ResearchSourceDiscoveryCoordinator, ResearchSourceDiscoveryObject,
+    ResearchIngestCommitAuthority, ResearchIngestCompositionError, ResearchIngestCoordinator,
+    ResearchProviderRuntimeGeneration, ResearchRevisionPlanError, ResearchRightsAuthority,
+    ResearchSourceDiscovery, ResearchSourceDiscoveryCoordinator, ResearchSourceDiscoveryObject,
     ResearchSourceDiscoveryRights, ResearchSourceObjectListing,
-};
-pub(crate) use research::{
-    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
 };
 pub use source::{
     EphemeralSourceInspectionAuthority, EphemeralSourceInspectionRequest,
     EphemeralSourceInspectionResult, SourceApplicationError, SourceDomainService,
-    SourceRuntimeRequest, SourceRuntimeSnapshot, SourceRuntimeSnapshotBatch,
+    SourceLifecycleAuthority, SourceLifecycleCommand, SourceLifecycleError, SourceLifecycleReceipt,
+    SourceLifecycleStatus, SourceRuntimeRequest, SourceRuntimeSnapshot, SourceRuntimeSnapshotBatch,
     SourceRuntimeSnapshotError, SourceRuntimeView, SourceRuntimeViewError,
 };
 
@@ -178,8 +242,8 @@ impl ApplicationDomainServices {
     }
 
     fn service(&self, domain: ServiceDomain) -> Option<&Arc<dyn ApplicationDomainService>> {
-        self.services
-            .get(domain_index(domain))
+        domain_index(domain)
+            .and_then(|index| self.services.get(index))
             .filter(|service| service.domain() == domain)
     }
 }
@@ -334,7 +398,9 @@ impl Application {
                 tokio::time::timeout_at(deadline, service.finish_shutdown(deadline.into_std()))
                     .await
                     .unwrap_or(Err(ServiceError::DeadlineExceeded));
-            report.failures[domain_index(service.domain())] = outcome.err();
+            if let Some(index) = domain_index(service.domain()) {
+                report.failures[index] = outcome.err();
+            }
         }
         *retained = Some(report);
         report
@@ -479,7 +545,10 @@ impl ApplicationShutdownReport {
     /// Returns the terminal failure for one domain, if any.
     #[must_use]
     pub const fn failure(self, domain: ServiceDomain) -> Option<ServiceError> {
-        self.failures[domain_index(domain)]
+        match domain_index(domain) {
+            Some(index) => self.failures[index],
+            None => None,
+        }
     }
 }
 
@@ -524,19 +593,20 @@ fn effective_service_limits(
     .map_err(|_error| ServiceError::InvalidRequest)
 }
 
-const fn domain_index(domain: ServiceDomain) -> usize {
+const fn domain_index(domain: ServiceDomain) -> Option<usize> {
     match domain {
-        ServiceDomain::Source => 0,
-        ServiceDomain::Market => 1,
-        ServiceDomain::Research => 2,
-        ServiceDomain::Fundamental => 3,
-        ServiceDomain::Macro => 4,
-        ServiceDomain::Portfolio => 5,
-        ServiceDomain::Analysis => 6,
-        ServiceDomain::Model => 7,
-        ServiceDomain::FairValue => 8,
-        ServiceDomain::Bot => 9,
-        ServiceDomain::Execution => 10,
+        ServiceDomain::Job | ServiceDomain::Decision | ServiceDomain::Operations => None,
+        ServiceDomain::Source => Some(0),
+        ServiceDomain::Market => Some(1),
+        ServiceDomain::Research => Some(2),
+        ServiceDomain::Fundamental => Some(3),
+        ServiceDomain::Macro => Some(4),
+        ServiceDomain::Portfolio => Some(5),
+        ServiceDomain::Analysis => Some(6),
+        ServiceDomain::Model => Some(7),
+        ServiceDomain::FairValue => Some(8),
+        ServiceDomain::Bot => Some(9),
+        ServiceDomain::Execution => Some(10),
     }
 }
 

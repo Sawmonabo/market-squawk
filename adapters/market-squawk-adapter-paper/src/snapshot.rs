@@ -5,9 +5,12 @@ use std::io::{self, Write};
 use std::num::NonZeroU64;
 
 use market_squawk_domain::{
-    AccountId, ClientOrderId, Money, OrderId, PriceTicks, QuantityLots, Timestamp,
+    AccountId, BasisPoints, ClientOrderId, InstrumentExecutionTerms, Money, OrderId, OrderSide,
+    PriceTicks, QuantityLots, Timestamp,
 };
-use market_squawk_execution::{ReconciliationBatchBinding, ReconciliationBatchId};
+use market_squawk_execution::{
+    OrderTargetReference, ReconciliationBatchBinding, ReconciliationBatchId,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,21 +19,98 @@ use thiserror::Error;
 use crate::ledger::{LedgerRecoveryWire, checked_notional};
 use crate::order::{PaperOrder, PaperOrderRecoveryWire};
 use crate::{
-    LiquidityRole, PaperAccountRiskSnapshot, PaperCashBalance, PaperLedger, PaperOrderState,
-    PaperPosition,
+    LiquidityRole, PaperAccountRiskSnapshot, PaperCashBalance, PaperExecutionConfig, PaperLedger,
+    PaperOrderState, PaperPosition,
 };
+
+const PREVIOUS_CHECKPOINT_SCHEMA_VERSION: u32 = 10;
+
+/// Immutable simulation terms that governed the complete paper state image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PaperSimulationSnapshot {
+    configuration_version: u64,
+    minimum_latency_nanos: u64,
+    maximum_latency_nanos: u64,
+    cancel_latency_nanos: u64,
+    maximum_mark_age_nanos: u64,
+    maximum_participation_basis_points: u32,
+    impact_basis_points_per_level: u32,
+    maker_fee_basis_points: u32,
+    taker_fee_basis_points: u32,
+    minimum_fee: Money,
+    maximum_fee: Option<Money>,
+}
+
+impl PaperSimulationSnapshot {
+    fn from_config(config: &PaperExecutionConfig) -> Self {
+        let input = config.input();
+        let fees = input.fee_schedule;
+        Self {
+            configuration_version: input.configuration_version.get(),
+            minimum_latency_nanos: input.minimum_latency_nanos,
+            maximum_latency_nanos: input.maximum_latency_nanos,
+            cancel_latency_nanos: input.cancel_latency_nanos,
+            maximum_mark_age_nanos: input.maximum_mark_age_nanos,
+            maximum_participation_basis_points: input.maximum_participation_basis_points,
+            impact_basis_points_per_level: input.impact_basis_points_per_level,
+            maker_fee_basis_points: fees.maker_basis_points(),
+            taker_fee_basis_points: fees.taker_basis_points(),
+            minimum_fee: fees.minimum_fee(),
+            maximum_fee: fees.maximum_fee(),
+        }
+    }
+
+    pub const fn configuration_version(self) -> u64 {
+        self.configuration_version
+    }
+    pub const fn minimum_latency_nanos(self) -> u64 {
+        self.minimum_latency_nanos
+    }
+    pub const fn maximum_latency_nanos(self) -> u64 {
+        self.maximum_latency_nanos
+    }
+    pub const fn cancel_latency_nanos(self) -> u64 {
+        self.cancel_latency_nanos
+    }
+    pub const fn maximum_mark_age_nanos(self) -> u64 {
+        self.maximum_mark_age_nanos
+    }
+    pub const fn maximum_participation_basis_points(self) -> u32 {
+        self.maximum_participation_basis_points
+    }
+    pub const fn impact_basis_points_per_level(self) -> u32 {
+        self.impact_basis_points_per_level
+    }
+    pub const fn maker_fee_basis_points(self) -> u32 {
+        self.maker_fee_basis_points
+    }
+    pub const fn taker_fee_basis_points(self) -> u32 {
+        self.taker_fee_basis_points
+    }
+    pub const fn minimum_fee(self) -> Money {
+        self.minimum_fee
+    }
+    pub const fn maximum_fee(self) -> Option<Money> {
+        self.maximum_fee
+    }
+}
 
 /// Immutable public order state image.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaperOrderSnapshot {
     order_id: OrderId,
+    execution_terms: InstrumentExecutionTerms,
     account_id: AccountId,
+    target_reference: Option<OrderTargetReference>,
     state: PaperOrderState,
     requested: QuantityLots,
     cumulative_filled: QuantityLots,
     average_fill_price: Option<PriceTicks>,
     maximum_fill_price: Option<PriceTicks>,
     maximum_execution_price: PriceTicks,
+    side: OrderSide,
+    reference_price: PriceTicks,
+    maximum_slippage: BasisPoints,
     cumulative_fees: Money,
     accepted_at: Timestamp,
     eligible_at: Timestamp,
@@ -42,13 +122,18 @@ impl PaperOrderSnapshot {
     pub(crate) fn from_order(order: &PaperOrder) -> Self {
         Self {
             order_id: order.order_id,
+            execution_terms: order.terms,
             account_id: order.account_id,
+            target_reference: order.target_reference.clone(),
             state: order.lifecycle.state(),
             requested: order.quantity,
             cumulative_filled: order.lifecycle.cumulative_filled(),
             average_fill_price: order.average_fill_price(),
             maximum_fill_price: order.maximum_fill_price,
             maximum_execution_price: order.execution_price_bound.maximum_price(),
+            side: order.side,
+            reference_price: order.reference_price,
+            maximum_slippage: order.maximum_slippage,
             cumulative_fees: order.cumulative_fee,
             accepted_at: order.accepted_at,
             eligible_at: order.eligible_at,
@@ -60,8 +145,16 @@ impl PaperOrderSnapshot {
     pub const fn order_id(&self) -> OrderId {
         self.order_id
     }
+    /// Returns the immutable instrument identity and conversion terms accepted with the order.
+    pub const fn execution_terms(&self) -> InstrumentExecutionTerms {
+        self.execution_terms
+    }
     pub const fn account_id(&self) -> AccountId {
         self.account_id
+    }
+    /// Returns exact target/decision provenance when this order was target-derived.
+    pub const fn target_reference(&self) -> Option<&OrderTargetReference> {
+        self.target_reference.as_ref()
     }
     pub const fn state(&self) -> PaperOrderState {
         self.state
@@ -80,6 +173,18 @@ impl PaperOrderSnapshot {
     }
     pub const fn maximum_execution_price(&self) -> PriceTicks {
         self.maximum_execution_price
+    }
+    /// Returns the order side used when evaluating realized paper slippage.
+    pub const fn side(&self) -> OrderSide {
+        self.side
+    }
+    /// Returns the risk-approved reference price that preceded paper matching.
+    pub const fn reference_price(&self) -> PriceTicks {
+        self.reference_price
+    }
+    /// Returns the intent-selected maximum adverse slippage bound in basis points.
+    pub const fn maximum_slippage(&self) -> BasisPoints {
+        self.maximum_slippage
     }
     pub const fn cumulative_fees(&self) -> Money {
         self.cumulative_fees
@@ -173,6 +278,7 @@ impl PaperFillSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaperExecutionSnapshot {
     configuration_digest: [u8; 32],
+    simulation: PaperSimulationSnapshot,
     sequence: u64,
     complete: bool,
     reconciliation_required: bool,
@@ -192,6 +298,7 @@ impl PaperExecutionSnapshot {
     )]
     pub(crate) fn from_state(
         configuration_digest: [u8; 32],
+        configuration: &PaperExecutionConfig,
         sequence: u64,
         reconciliation_required: bool,
         orders: &BTreeMap<OrderId, PaperOrder>,
@@ -216,6 +323,7 @@ impl PaperExecutionSnapshot {
         all_fills.sort_unstable_by_key(|fill| fill.sequence);
         Self {
             configuration_digest,
+            simulation: PaperSimulationSnapshot::from_config(configuration),
             sequence,
             complete: true,
             reconciliation_required,
@@ -231,6 +339,10 @@ impl PaperExecutionSnapshot {
 
     pub const fn configuration_digest(&self) -> [u8; 32] {
         self.configuration_digest
+    }
+    /// Returns the immutable configured simulation terms that produced this state image.
+    pub const fn simulation(&self) -> PaperSimulationSnapshot {
+        self.simulation
     }
     pub const fn sequence(&self) -> u64 {
         self.sequence
@@ -313,6 +425,11 @@ struct CheckpointWire {
     acknowledged_reconciliation_batches: Vec<AcknowledgedReconciliationBatchWire>,
     ledger: LedgerRecoveryWire,
     idempotency: Vec<IdempotencyRecoveryWire>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct CheckpointHeaderWire {
+    schema_version: u32,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -433,6 +550,11 @@ impl PaperExecutionCheckpoint {
         repository_id: [u8; 32],
         generation: NonZeroU64,
     ) {
+        // A version-10 artifact is first reserialized and verified in its original schema by the
+        // repository. Only that exact manifest-authority boundary may normalize it to version 11.
+        if self.schema_version == PREVIOUS_CHECKPOINT_SCHEMA_VERSION {
+            self.schema_version = crate::PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION;
+        }
         self.durable_sequence = self.sequence;
         self.accepted_repository_id = repository_id;
         self.accepted_repository_generation = generation.get();
@@ -521,6 +643,18 @@ impl PaperExecutionCheckpoint {
         if bytes.is_empty() || bytes.len() > maximum_bytes || maximum_bytes == 0 {
             return Err(PaperCheckpointError::TooLarge);
         }
+        let header: CheckpointHeaderWire =
+            serde_json::from_slice(bytes).map_err(PaperCheckpointError::Encoding)?;
+        if !matches!(
+            header.schema_version,
+            PREVIOUS_CHECKPOINT_SCHEMA_VERSION
+                | crate::PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION
+        ) {
+            return Err(PaperCheckpointError::IncompatibleSchema {
+                expected: crate::PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION,
+                actual: header.schema_version,
+            });
+        }
         let wire: CheckpointWire =
             serde_json::from_slice(bytes).map_err(PaperCheckpointError::Encoding)?;
         let limits = config.input();
@@ -534,9 +668,14 @@ impl PaperExecutionCheckpoint {
             .get()
             .checked_add(limits.maximum_archived_orders.get())
             .ok_or(PaperCheckpointError::InvalidHeader)?;
-        if wire.schema_version != crate::PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION
-            || wire.configuration_digest != config.digest()
+        if wire.configuration_digest != config.digest()
             || !wire.complete
+            || (wire.schema_version == PREVIOUS_CHECKPOINT_SCHEMA_VERSION
+                && wire
+                    .orders
+                    .iter()
+                    .chain(&wire.archived_orders)
+                    .any(PaperOrderRecoveryWire::has_target_reference))
             || wire.orders.len() > limits.maximum_orders.get()
             || wire.fills.len() > limits.maximum_fills.get()
             || wire.archived_orders.len() > limits.maximum_archived_orders.get()
@@ -923,6 +1062,8 @@ const fn is_terminal(state: PaperOrderState) -> bool {
 pub enum PaperCheckpointError {
     #[error("paper checkpoint exceeds its byte bound")]
     TooLarge,
+    #[error("paper checkpoint schema {actual} is incompatible with required schema {expected}")]
+    IncompatibleSchema { expected: u32, actual: u32 },
     #[error("paper checkpoint header, schema, completeness, or configuration is invalid")]
     InvalidHeader,
     #[error("paper checkpoint order state is invalid")]

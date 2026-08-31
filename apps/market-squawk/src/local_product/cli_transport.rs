@@ -1,32 +1,52 @@
 //! Bounded CLI transport over the same application operations exposed through MCP.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use market_squawk_data::{AnalyticalReadError, QueryError};
 use market_squawk_platform::UserAuthorizedInputRoot;
+use market_squawk_runtime::{
+    ApplicationClient, ApplicationClientError, InputAdmission, LoopbackApplicationClient,
+};
 use market_squawk_services::{
-    ArtifactError, JsonStructureLimits, RequestContext, RequestId, ServiceLimits,
-    ToolResultMetadata, TypedToolResult,
+    ArtifactError, JsonStructureLimits, RequestContext, RequestId, RequestOrigin,
+    ResultEnvelopeProjection, ServiceLimits, ToolResultMetadata, TypedToolResult,
 };
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use super::{LocalProduct, cli_backtest, cli_dataset, cli_model, cli_portfolio, cli_provider};
-use crate::cli::{
-    BacktestCommand, BotCommand, Command, DatasetCommand, ExecutionCommand, FairValueCommand,
-    FeatureCommand, IngestCommand, ModelCommand, PortfolioCommand, QueryCommand, SourceCommand,
+use super::{LocalProduct, cli_dataset, cli_model, cli_portfolio, cli_provider};
+use crate::application::{
+    logs::{LogDomain, LogSeverity},
+    settings::{SettingValue, UpdateChannel},
+    setup::{SetupGoal, SetupPlanSelection, SetupStarterPlan},
 };
+use crate::cli::{
+    BacktestCommand, BackupOperationsCommand, BackupRetentionCommand, BotCommand, Command,
+    DatasetCommand, ExecutionCommand, FairValueCommand, FeatureCommand, ForecastCommand,
+    IngestCommand, JobCommand, LogDomainArgument, LogOperationsCommand, LogQueryArguments,
+    LogSeverityArgument, MarketCommand, ModelCommand, OperationsCommand,
+    OperationsPreviewConfirmationArguments, PortfolioCommand, PortfolioImportCommand,
+    ProgramRollbackCommand, QueryCommand, RestoreCommand, SettingsChangeArguments,
+    SettingsChangeCommand, SettingsOperationsCommand, SettingsRollbackCommand, SetupApplyArguments,
+    SetupCommand, SetupGoalArgument, SetupPreviewArguments, SetupStarterPlanArgument,
+    SourceCommand, UpdateChannelArgument, UpdateOperationsCommand, WorkspaceOperationsCommand,
+    WorkspaceSwitchCommand,
+};
+use crate::provider_activation::FRED_ALFRED_READ_OPERATION;
 
 mod files;
 mod query;
 
 const CLI_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const CLI_INSTALLED_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CLI_JSON_MAXIMUM_BYTES: u64 = 8 * 1024 * 1024;
 const CLI_DEFAULT_MAXIMUM_ITEMS: usize = 10_000;
 const CLI_DEFAULT_MAXIMUM_BYTES: usize = 16 * 1024 * 1024;
 const CLI_HARD_MAXIMUM_BYTES: usize = 64 * 1024 * 1024;
+static LOCAL_PAPER_CLI_ORIGIN: OnceLock<RequestOrigin> = OnceLock::new();
 
 /// Structured result returned by one product CLI command.
 #[derive(Debug)]
@@ -68,18 +88,15 @@ pub enum CliProductError {
     /// Opaque analytical result publication or retrieval failed.
     #[error("CLI analytical artifact failed: {0}")]
     Artifact(#[from] ArtifactError),
-    /// A point-in-time dataset build failed admission or publication.
+    /// A phase-one point-in-time derived-generation request failed.
     #[error("{0}")]
-    Dataset(#[from] cli_dataset::CliDatasetError),
+    PhaseOneDerivedGeneration(#[from] cli_dataset::CliDatasetError),
     /// A controlled portfolio manifest import failed.
     #[error("{0}")]
     Portfolio(#[from] cli_portfolio::CliPortfolioImportError),
     /// A production model bundle failed closed admission.
     #[error("{0}")]
     ModelAdmission(#[from] cli_model::CliModelAdmissionError),
-    /// A governed backtest input failed closed registration.
-    #[error("{0}")]
-    BacktestRegistration(#[from] cli_backtest::CliBacktestRegistrationError),
     /// A verified provider activation request failed closed.
     #[error("{0}")]
     ProviderActivation(#[from] cli_provider::CliProviderActivationError),
@@ -89,6 +106,29 @@ pub enum CliProductError {
     /// The shared application rejected or failed the operation.
     #[error("application operation failed: {0}")]
     Application(#[from] market_squawk_services::ServiceError),
+    /// The installed service client rejected or could not complete the operation.
+    #[error(transparent)]
+    Client(#[from] ApplicationClientError),
+    /// The installed-service request contract could not be constructed.
+    #[error("CLI installed-service request is invalid")]
+    RuntimeRequest,
+    /// A mutation command omitted its explicit operator confirmation.
+    #[error("CLI mutation requires --confirm")]
+    ConfirmationRequired,
+    /// A typed settings preview omitted every closed setting value.
+    #[error("CLI settings change requires at least one typed setting option")]
+    SettingsChangeRequired,
+    /// A guided setup goal/starter selection is incompatible.
+    #[error("CLI setup selection is invalid: {0}")]
+    SetupPlan(#[from] crate::application::setup::SetupPlanError),
+    /// This operation still requires a service-owned staged-input consumer.
+    #[error(
+        "CLI operation `{operation}` requires a service-owned staged-input or specialized workflow"
+    )]
+    StagedInputRequired { operation: &'static str },
+    /// The operation is owned only by the shared installed service.
+    #[error("CLI operation `{operation}` requires the installed application service")]
+    InstalledServiceRequired { operation: &'static str },
     /// The paper command could not observe its requested stop signal.
     #[error("failed to wait for the paper-operation stop condition")]
     Signal,
@@ -99,35 +139,158 @@ pub async fn execute_cli_command(
     product: &LocalProduct,
     command: Command,
 ) -> Result<CliProductResult, CliProductError> {
+    execute(CliAuthority::Local(product), command).await
+}
+
+/// Executes one product command through the authenticated installed-service client.
+pub async fn execute_installed_cli_command(
+    client: &LoopbackApplicationClient,
+    command: Command,
+) -> Result<CliProductResult, CliProductError> {
+    execute(CliAuthority::Installed(client), command).await
+}
+
+#[derive(Clone, Copy)]
+enum CliAuthority<'a> {
+    Local(&'a LocalProduct),
+    Installed(&'a LoopbackApplicationClient),
+}
+
+impl<'a> CliAuthority<'a> {
+    fn local_for(self, operation: &'static str) -> Result<&'a LocalProduct, CliProductError> {
+        match self {
+            Self::Local(product) => Ok(product),
+            Self::Installed(_) => Err(CliProductError::StagedInputRequired { operation }),
+        }
+    }
+}
+
+async fn execute(
+    authority: CliAuthority<'_>,
+    command: Command,
+) -> Result<CliProductResult, CliProductError> {
     match command {
-        Command::Source { command } => source(product, command).await,
-        Command::Ingest { command } => ingest(product, command).await,
-        Command::Dataset { command } => dataset(product, command).await,
-        Command::Query { command } => query(product, command).await,
-        Command::Feature { command } => feature(product, command).await,
-        Command::Model { command } => model(product, command).await,
-        Command::Portfolio { command } => portfolio(product, command).await,
-        Command::Backtest { command } => backtest(product, command).await,
-        Command::Bot { command } => bot(product, command).await,
-        Command::Execution { command } => execution(product, command).await,
-        Command::FairValue { command } => fair_value(product, command).await,
+        Command::Source { command } => source(authority, command).await,
+        Command::Market { command } => market(authority, command).await,
+        Command::EconomicContext {
+            knowledge_cutoff,
+            effective_date_cutoff,
+        } => economic_context(authority, knowledge_cutoff, effective_date_cutoff).await,
+        Command::Ingest { command } => ingest(authority, command).await,
+        Command::Dataset { command } => dataset(authority, command).await,
+        Command::Query { command } => query(authority, command).await,
+        Command::Feature { command } => feature(authority, command).await,
+        Command::Model { command } => model(authority, command).await,
+        Command::Forecast { command } => forecast(authority, command).await,
+        Command::Portfolio { command } => portfolio(authority, command).await,
+        Command::Backtest { command } => backtest(authority, command).await,
+        Command::Bot { command } => bot(authority, command).await,
+        Command::Execution { command } => execution(authority, command).await,
+        Command::FairValue { command } => fair_value(authority, command).await,
+        Command::Job { command } => job(authority, command).await,
+        Command::Operations { command } => operations(authority, command).await,
+        Command::Setup { command } => setup(authority, command).await,
         Command::Init
         | Command::Config { .. }
         | Command::Capture(_)
         | Command::Release { .. }
+        | Command::Service { .. }
         | Command::Mcp { .. }
         | Command::Doctor
         | Command::Mock(_)
-        | Command::PaperBot(_)
         | Command::Replay(_) => Err(CliProductError::WrongCommand),
     }
 }
 
+async fn economic_context(
+    authority: CliAuthority<'_>,
+    knowledge_cutoff: Option<String>,
+    effective_date_cutoff: Option<String>,
+) -> Result<CliProductResult, CliProductError> {
+    let mut arguments = match (knowledge_cutoff, effective_date_cutoff) {
+        (None, None) => Map::new(),
+        (Some(knowledge_cutoff), Some(effective_date_cutoff)) => json_object(json!({
+            "knowledgeCutoff": knowledge_cutoff,
+            "effectiveDateCutoff": effective_date_cutoff,
+        }))?,
+        (Some(_), None) | (None, Some(_)) => return Err(CliProductError::RequestShape),
+    };
+    invoke(
+        authority,
+        "Macro.GetContext",
+        &mut arguments,
+        Some(12),
+        "economic context read",
+    )
+    .await
+}
+
+async fn market(
+    authority: CliAuthority<'_>,
+    command: MarketCommand,
+) -> Result<CliProductResult, CliProductError> {
+    match command {
+        MarketCommand::Overview { page_token } => {
+            let mut arguments = Map::new();
+            if let Some(token) = page_token {
+                arguments.insert("pageToken".to_owned(), json!(token));
+            }
+            invoke(
+                authority,
+                "Market.GetOverview",
+                &mut arguments,
+                None,
+                "market overview read",
+            )
+            .await
+        }
+        MarketCommand::Search { query, page_token } => {
+            let mut arguments = json_object(json!({"query": query}))?;
+            if let Some(token) = page_token {
+                arguments.insert("pageToken".to_owned(), json!(token));
+            }
+            invoke(
+                authority,
+                "Market.SearchUniverse",
+                &mut arguments,
+                None,
+                "market search",
+            )
+            .await
+        }
+        MarketCommand::Select { selection_token } => {
+            let mut arguments = json_object(json!({"selectionToken": selection_token}))?;
+            invoke(
+                authority,
+                "Market.GetInstrument",
+                &mut arguments,
+                None,
+                "market investment read",
+            )
+            .await
+        }
+        MarketCommand::History { history_token } => {
+            let mut arguments = json_object(json!({"historyToken": history_token}))?;
+            invoke(
+                authority,
+                "Market.GetHistory",
+                &mut arguments,
+                None,
+                "market history read",
+            )
+            .await
+        }
+    }
+}
+
 async fn source(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: SourceCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
+        SourceCommand::ImportCredentials { bundle, confirm } => {
+            return import_provider_credentials(authority, &bundle, confirm).await;
+        }
         SourceCommand::Register { provider, confirm } => (
             "Source.Register",
             json_object(json!({"provider": provider, "confirm": confirm}))?,
@@ -179,7 +342,7 @@ async fn source(
                 "sourceCoverage": [provider],
             }))?;
             return invoke(
-                product,
+                authority,
                 "Source.Inspect",
                 &mut arguments,
                 Some(maximum_items),
@@ -189,7 +352,7 @@ async fn source(
         }
         SourceCommand::Activate { request, confirm } => {
             let value = cli_provider::activate_research_provider(
-                product,
+                authority.local_for("Source.Activate")?,
                 &request,
                 confirm,
                 CancellationToken::new(),
@@ -198,11 +361,72 @@ async fn source(
             return direct_result(value, "source adapter activated");
         }
     };
-    invoke(product, operation, &mut arguments, None, summary).await
+    invoke(authority, operation, &mut arguments, None, summary).await
+}
+
+async fn import_provider_credentials(
+    authority: CliAuthority<'_>,
+    path: &Path,
+    confirm: bool,
+) -> Result<CliProductResult, CliProductError> {
+    if !confirm {
+        return Err(CliProductError::ConfirmationRequired);
+    }
+    let ticket = stage_bounded_input(
+        authority,
+        path,
+        64 * 1024,
+        "market-squawk.provider-credentials.v1",
+        "Source.ImportCredentialBundle",
+    )
+    .await?;
+    let arguments = json!({
+        "inputTicketId": ticket,
+        "confirm": true,
+        "resultLimits": {
+            "maximumItems": 17,
+            "maximumBytes": 1_048_576,
+        },
+    });
+    invoke_without_result_limits(
+        authority,
+        "Source.ImportCredentialBundle",
+        arguments,
+        "provider credential bundle imported",
+    )
+    .await
+}
+
+async fn stage_bounded_input(
+    authority: CliAuthority<'_>,
+    path: &Path,
+    maximum_bytes: u64,
+    media_type: &'static str,
+    operation: &'static str,
+) -> Result<market_squawk_runtime::InputTicketId, CliProductError> {
+    let CliAuthority::Installed(client) = authority else {
+        return Err(CliProductError::InstalledServiceRequired { operation });
+    };
+    let input = read_bounded_input_with_limit(path, maximum_bytes)?;
+    let byte_length =
+        u64::try_from(input.as_bytes().len()).map_err(|_error| CliProductError::RequestFile)?;
+    let admission = InputAdmission::try_new(
+        market_squawk_domain::SourceIdentifier::try_from(media_type)
+            .map_err(|_error| CliProductError::RuntimeRequest)?,
+        byte_length,
+        input.digest(),
+    )
+    .map_err(|_error| CliProductError::RuntimeRequest)?;
+    let exact_bytes = input.into_bytes();
+    let mut bytes = exact_bytes.as_ref();
+    let ticket = client
+        .stage_input(admission, &mut bytes, CancellationToken::new())
+        .await?;
+    Ok(ticket.id())
 }
 
 async fn ingest(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: IngestCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
@@ -219,7 +443,7 @@ async fn ingest(
                 "sourceCoverage": [provider],
             }))?;
             let discovery = invoke(
-                product,
+                authority,
                 "Source.Discover",
                 &mut discovery_arguments,
                 None,
@@ -237,7 +461,7 @@ async fn ingest(
                 "sourceCoverage": [provider],
             }))?;
             invoke(
-                product,
+                authority,
                 "Research.IngestSource",
                 &mut arguments,
                 None,
@@ -250,7 +474,16 @@ async fn ingest(
             object,
             dataset,
             confirm,
-        } => files::ingest_local_file(product, &manifest, object, dataset, confirm).await,
+        } => {
+            files::ingest_local_file(
+                authority.local_for("Research.IngestFile")?,
+                &manifest,
+                object,
+                dataset,
+                confirm,
+            )
+            .await
+        }
     }
 }
 
@@ -307,7 +540,7 @@ fn exact_discovery_receipt(
 }
 
 async fn dataset(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: DatasetCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
@@ -317,7 +550,7 @@ async fn dataset(
                 arguments.insert("afterDataset".to_owned(), Value::String(after_dataset));
             }
             invoke(
-                product,
+                authority,
                 "Research.ListDatasets",
                 &mut arguments,
                 None,
@@ -328,7 +561,7 @@ async fn dataset(
         DatasetCommand::Manifest { dataset } => {
             let mut arguments = json_object(json!({"dataset": dataset}))?;
             invoke(
-                product,
+                authority,
                 "Research.GetManifest",
                 &mut arguments,
                 None,
@@ -336,16 +569,36 @@ async fn dataset(
             )
             .await
         }
-        DatasetCommand::Build { request, confirm } => {
-            let value =
-                cli_dataset::build_point_in_time_dataset(product, &request, confirm).await?;
-            direct_result(value, "point-in-time dataset published")
-        }
+        DatasetCommand::Build { request, confirm } => match authority {
+            CliAuthority::Local(product) => {
+                let value =
+                    cli_dataset::build_phase_one_derived_generation(product, &request, confirm)
+                        .await?;
+                direct_result(value, "phase-one derived generation published")
+            }
+            CliAuthority::Installed(_) => {
+                require_confirmation(confirm)?;
+                let mut arguments = Map::new();
+                arguments.insert(
+                    "registration".to_owned(),
+                    Value::Object(read_json_object(&request)?),
+                );
+                arguments.insert("confirm".to_owned(), Value::Bool(true));
+                invoke(
+                    authority,
+                    "Research.StartDatasetBuild",
+                    &mut arguments,
+                    Some(1),
+                    "phase-one derived-generation job started",
+                )
+                .await
+            }
+        },
     }
 }
 
 async fn query(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: QueryCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
@@ -366,7 +619,7 @@ async fn query(
                 "maximumBytes": maximum_bytes,
             }))?;
             invoke(
-                product,
+                authority,
                 "Analysis.ReadArtifact",
                 &mut arguments,
                 Some(1),
@@ -380,7 +633,7 @@ async fn query(
         } => {
             let mut arguments = json_object(json!({"dataset": dataset}))?;
             invoke(
-                product,
+                authority,
                 "Research.GetHistory",
                 &mut arguments,
                 Some(maximum_rows),
@@ -388,16 +641,65 @@ async fn query(
             )
             .await
         }
+        QueryCommand::FredAlfredStatus => {
+            invoke(
+                authority,
+                FRED_ALFRED_READ_OPERATION,
+                &mut Map::new(),
+                Some(1),
+                "FRED/ALFRED point-in-time availability read",
+            )
+            .await
+        }
+        QueryCommand::FredAlfredLatestKnown {
+            manifest_version,
+            schema_name,
+            schema_version,
+            schema_fingerprint,
+            content_hash,
+            knowledge_cutoff,
+            effective_date_cutoff,
+        } => {
+            let mut arguments = json_object(json!({
+                "generation": {
+                    "manifestVersion": manifest_version.to_string(),
+                    "schema": {
+                        "name": schema_name,
+                        "version": schema_version,
+                        "fingerprint": lowercase_sha256(&schema_fingerprint)?,
+                    },
+                    "contentHash": lowercase_sha256(&content_hash)?,
+                },
+                "knowledgeCutoff": knowledge_cutoff,
+                "effectiveDateCutoff": effective_date_cutoff,
+            }))?;
+            invoke(
+                authority,
+                FRED_ALFRED_READ_OPERATION,
+                &mut arguments,
+                Some(1),
+                "FRED/ALFRED latest-known point-in-time observation read",
+            )
+            .await
+        }
         QueryCommand::Sql {
             dataset,
             statement,
             maximum_rows,
-        } => query::query_sql(product, &dataset, statement, maximum_rows).await,
+        } => {
+            query::query_sql(
+                authority.local_for("Research.QuerySql")?,
+                &dataset,
+                statement,
+                maximum_rows,
+            )
+            .await
+        }
     }
 }
 
 async fn feature(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: FeatureCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
@@ -407,7 +709,7 @@ async fn feature(
                 arguments.insert("afterDataset".to_owned(), Value::String(after_dataset));
             }
             invoke(
-                product,
+                authority,
                 "Analysis.GetFeatureDatasets",
                 &mut arguments,
                 None,
@@ -415,22 +717,58 @@ async fn feature(
             )
             .await
         }
-        FeatureCommand::Build { request, confirm } => {
-            let value =
-                cli_dataset::build_point_in_time_dataset(product, &request, confirm).await?;
-            direct_result(value, "point-in-time feature dataset published")
-        }
+        FeatureCommand::Build { request, confirm } => match authority {
+            CliAuthority::Local(product) => {
+                let value =
+                    cli_dataset::build_phase_one_derived_generation(product, &request, confirm)
+                        .await?;
+                direct_result(value, "phase-one feature-derived generation published")
+            }
+            CliAuthority::Installed(_) => {
+                require_confirmation(confirm)?;
+                let mut arguments = Map::new();
+                arguments.insert(
+                    "registration".to_owned(),
+                    Value::Object(read_json_object(&request)?),
+                );
+                arguments.insert("confirm".to_owned(), Value::Bool(true));
+                invoke(
+                    authority,
+                    "Analysis.StartFeatureDatasetBuild",
+                    &mut arguments,
+                    Some(1),
+                    "phase-one feature-derived-generation job started",
+                )
+                .await
+            }
+        },
     }
 }
 
 async fn model(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: ModelCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
-        ModelCommand::List => ("Model.ListBundles", Map::new(), "model bundles listed"),
+        ModelCommand::List => ("Model.ListBundles", Map::new(), "model evidence listed"),
+        ModelCommand::Activity => {
+            if matches!(authority, CliAuthority::Local(_)) {
+                return Err(CliProductError::InstalledServiceRequired {
+                    operation: "Model.ListProductActivity",
+                });
+            }
+            (
+                "Model.ListProductActivity",
+                Map::new(),
+                "model activity listed",
+            )
+        }
         ModelCommand::Admit { request, confirm } => {
-            let value = cli_model::admit_model_bundle(product, &request, confirm)?;
+            let value = cli_model::admit_model_bundle(
+                authority.local_for("Model.Admit")?,
+                &request,
+                confirm,
+            )?;
             return direct_result(value, "model bundle admitted");
         }
         ModelCommand::Metadata { model } => (
@@ -449,25 +787,99 @@ async fn model(
             "model prediction completed",
         ),
     };
-    invoke(product, operation, &mut arguments, None, summary).await
+    invoke(authority, operation, &mut arguments, None, summary).await
+}
+
+async fn forecast(
+    authority: CliAuthority<'_>,
+    command: ForecastCommand,
+) -> Result<CliProductResult, CliProductError> {
+    let (operation, mut arguments, summary) = match command {
+        ForecastCommand::Options => (
+            "Model.GetForecastPreparation",
+            Map::new(),
+            "forecast choices read",
+        ),
+        ForecastCommand::Preview {
+            model_token,
+            history_token,
+            investment_token,
+            horizon_token,
+        } => (
+            "Model.PrepareForecast",
+            json_object(json!({
+                "selection": {
+                    "modelToken": model_token,
+                    "historyToken": history_token,
+                    "investmentToken": investment_token,
+                    "horizonToken": horizon_token,
+                }
+            }))?,
+            "forecast preview prepared",
+        ),
+        ForecastCommand::Start {
+            confirmation_token,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            (
+                "Model.StartPreparedForecast",
+                json_object(json!({
+                    "confirmationToken": confirmation_token,
+                    "confirm": true,
+                }))?,
+                "forecast started",
+            )
+        }
+        ForecastCommand::List => ("Model.ListForecasts", Map::new(), "forecasts listed"),
+        ForecastCommand::Show { forecast_token } => (
+            "Model.GetForecast",
+            json_object(json!({"forecastToken": forecast_token}))?,
+            "forecast read",
+        ),
+        ForecastCommand::Outcomes { forecast_token } => (
+            "Model.GetForecastOutcomes",
+            json_object(json!({"forecastToken": forecast_token}))?,
+            "forecast outcomes read",
+        ),
+    };
+    require_installed(authority, operation)?;
+    invoke(authority, operation, &mut arguments, None, summary).await
 }
 
 async fn portfolio(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: PortfolioCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
+        PortfolioCommand::Accounts {
+            after_account_token,
+        } => {
+            let mut arguments = Map::new();
+            if let Some(token) = after_account_token {
+                arguments.insert("afterAccountToken".to_owned(), json!(token));
+            }
+            ("Portfolio.ListAccounts", arguments, "portfolios listed")
+        }
         PortfolioCommand::Import {
             path,
             account,
             confirm,
         } => {
-            let value =
-                cli_portfolio::import_portfolio_manifest(product, &path, account, confirm).await?;
+            let value = cli_portfolio::import_portfolio_manifest(
+                authority.local_for("Portfolio.Import")?,
+                &path,
+                account,
+                confirm,
+            )
+            .await?;
             return Ok(CliProductResult {
                 summary: "portfolio manifest imported",
                 value,
             });
+        }
+        PortfolioCommand::ImportFlow { command } => {
+            return portfolio_import(authority, command).await;
         }
         PortfolioCommand::Holdings { account } => (
             "Portfolio.GetHoldings",
@@ -495,37 +907,156 @@ async fn portfolio(
             "portfolio risk calculated",
         ),
     };
-    invoke(product, operation, &mut arguments, None, summary).await
+    invoke(authority, operation, &mut arguments, None, summary).await
+}
+
+async fn portfolio_import(
+    authority: CliAuthority<'_>,
+    command: PortfolioImportCommand,
+) -> Result<CliProductResult, CliProductError> {
+    let (operation, mut arguments, summary) = match command {
+        PortfolioImportCommand::Preview {
+            path,
+            account,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            let ticket = stage_bounded_input(
+                authority,
+                &path,
+                8 * 1024 * 1024,
+                "market-squawk.portfolio-extraction-batch.v1",
+                "Portfolio.PreviewStagedImport",
+            )
+            .await?;
+            (
+                "Portfolio.PreviewStagedImport",
+                json_object(json!({
+                    "accountId": account,
+                    "inputTicketId": ticket,
+                    "confirm": true,
+                }))?,
+                "portfolio import reviewed",
+            )
+        }
+        PortfolioImportCommand::Approve {
+            review_token,
+            interpretations,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            (
+                "Portfolio.ApproveStagedImport",
+                json_object(json!({
+                    "reviewToken": review_token,
+                    "interpretations": read_json_array(&interpretations)?,
+                    "confirm": true,
+                }))?,
+                "portfolio import approved",
+            )
+        }
+        PortfolioImportCommand::Commit {
+            approval_token,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            (
+                "Portfolio.CommitStagedImport",
+                json_object(json!({
+                    "approvalToken": approval_token,
+                    "confirm": true,
+                }))?,
+                "portfolio import saved",
+            )
+        }
+        PortfolioImportCommand::Discard {
+            review_token,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            (
+                "Portfolio.DiscardStagedImport",
+                json_object(json!({
+                    "reviewToken": review_token,
+                    "confirm": true,
+                }))?,
+                "portfolio import discarded",
+            )
+        }
+    };
+    require_installed(authority, operation)?;
+    invoke(authority, operation, &mut arguments, None, summary).await
 }
 
 async fn backtest(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: BacktestCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
-        BacktestCommand::Run { request, confirm } => {
-            let value = cli_backtest::register_backtest_input(&request, confirm).await?;
-            let arguments = json_object(value)?;
-            ("Analysis.RunBacktest", arguments, "backtest completed")
+        BacktestCommand::Options => (
+            "Analysis.GetBacktestPreparation",
+            Map::new(),
+            "investment-test choices read",
+        ),
+        BacktestCommand::Preview {
+            history_token,
+            period_token,
+            method_token,
+            cost_token,
+            portfolio_token,
+            comparison_token,
+        } => (
+            "Analysis.PreviewBacktest",
+            json_object(json!({
+                "selection": {
+                    "historyToken": history_token,
+                    "periodToken": period_token,
+                    "methodToken": method_token,
+                    "costToken": cost_token,
+                    "portfolioToken": portfolio_token,
+                    "comparisonToken": comparison_token,
+                }
+            }))?,
+            "investment-test preview prepared",
+        ),
+        BacktestCommand::Start {
+            confirmation_token,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            (
+                "Analysis.StartPreparedBacktest",
+                json_object(json!({
+                    "confirmationToken": confirmation_token,
+                    "confirm": true,
+                }))?,
+                "investment test started",
+            )
         }
-        BacktestCommand::Show { run } => (
-            "Analysis.GetBacktests",
-            json_object(json!({"runId": run}))?,
-            "backtest result read",
+        BacktestCommand::List => (
+            "Analysis.ListProductBacktests",
+            Map::new(),
+            "investment tests listed",
+        ),
+        BacktestCommand::Show { backtest_token } => (
+            "Analysis.GetProductBacktest",
+            json_object(json!({"backtestToken": backtest_token}))?,
+            "investment-test result read",
         ),
     };
-    invoke(product, operation, &mut arguments, None, summary).await
+    require_installed(authority, operation)?;
+    invoke(authority, operation, &mut arguments, None, summary).await
 }
 
 async fn bot(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: BotCommand,
 ) -> Result<CliProductResult, CliProductError> {
     match command {
         BotCommand::Status => {
             let mut arguments = Map::new();
             invoke(
-                product,
+                authority,
                 "Bot.GetStatus",
                 &mut arguments,
                 None,
@@ -533,32 +1064,54 @@ async fn bot(
             )
             .await
         }
-        BotCommand::Start { paper, confirm } => {
+        BotCommand::Preparation => {
+            let mut arguments = Map::new();
+            invoke(
+                authority,
+                "Bot.GetStartPreparation",
+                &mut arguments,
+                None,
+                "paper-session choices read",
+            )
+            .await
+        }
+        BotCommand::Prepare {
+            cash_choice,
+            cost_choice,
+            mode_choice,
+        } => {
+            let mut arguments = json_object(json!({
+                "cashChoice": cash_choice,
+                "costChoice": cost_choice,
+                "modeChoice": mode_choice,
+            }))?;
+            invoke(
+                authority,
+                "Bot.PrepareStart",
+                &mut arguments,
+                None,
+                "paper session prepared",
+            )
+            .await
+        }
+        BotCommand::Start {
+            confirmation_token,
+            seconds,
+            confirm,
+        } => {
             let mut start_arguments = json_object(json!({
-                "provider": match paper.provider {
-                    crate::cli::ProductionSourceArgument::Coinbase => "coinbase",
-                    crate::cli::ProductionSourceArgument::CoinbaseDirect => "coinbase-direct",
-                    crate::cli::ProductionSourceArgument::Kraken => "kraken",
-                },
-                "initialCash": paper.initial_cash.to_string(),
-                "feeBasisPoints": paper.fee_basis_points,
+                "confirmationToken": confirmation_token,
                 "confirm": confirm,
             }))?;
-            if let Some(provider_session_id) = paper.provider_session_id {
-                start_arguments.insert(
-                    "providerSessionId".to_owned(),
-                    Value::String(provider_session_id.to_string()),
-                );
-            }
             let started = invoke(
-                product,
+                authority,
                 "Bot.Start",
                 &mut start_arguments,
                 None,
                 "paper operation started",
             )
             .await?;
-            match paper.seconds {
+            match seconds {
                 Some(seconds) => tokio::time::sleep(Duration::from_secs(seconds)).await,
                 None => tokio::signal::ctrl_c()
                     .await
@@ -569,7 +1122,7 @@ async fn bot(
                 "confirm": true,
             }))?;
             let stopped = invoke(
-                product,
+                authority,
                 "Bot.Stop",
                 &mut stop_arguments,
                 None,
@@ -584,7 +1137,7 @@ async fn bot(
         BotCommand::Stop { reason, confirm } => {
             let mut arguments = json_object(json!({"reason": reason, "confirm": confirm}))?;
             invoke(
-                product,
+                authority,
                 "Bot.Stop",
                 &mut arguments,
                 None,
@@ -596,15 +1149,36 @@ async fn bot(
 }
 
 async fn execution(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: ExecutionCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
         ExecutionCommand::Orders => ("Execution.GetOrders", Map::new(), "paper orders listed"),
         ExecutionCommand::Fills => ("Execution.GetFills", Map::new(), "paper fills listed"),
-        ExecutionCommand::Cancel { order, confirm } => (
+        ExecutionCommand::Targets => (
+            "Execution.GetManualPaperTargets",
+            Map::new(),
+            "paper target choices listed",
+        ),
+        ExecutionCommand::PrepareManual { request } => (
+            "Execution.PrepareManualPaperDraft",
+            read_json_object(&request)?,
+            "manual paper order prepared",
+        ),
+        ExecutionCommand::SubmitManual {
+            confirmation_token,
+            confirm,
+        } => (
+            "Execution.SubmitManualPaperDraft",
+            json_object(json!({"confirmationToken": confirmation_token, "confirm": confirm}))?,
+            "manual paper order submitted",
+        ),
+        ExecutionCommand::Cancel {
+            action_token,
+            confirm,
+        } => (
             "Execution.Cancel",
-            json_object(json!({"orderId": order, "confirm": confirm}))?,
+            json_object(json!({"actionToken": action_token, "confirm": confirm}))?,
             "paper order cancellation processed",
         ),
         ExecutionCommand::Reconcile { confirm } => (
@@ -613,18 +1187,18 @@ async fn execution(
             "paper execution reconciled",
         ),
     };
-    invoke(product, operation, &mut arguments, None, summary).await
+    invoke(authority, operation, &mut arguments, None, summary).await
 }
 
 async fn fair_value(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     command: FairValueCommand,
 ) -> Result<CliProductResult, CliProductError> {
     let (operation, mut arguments, summary) = match command {
         FairValueCommand::List => (
-            "FairValue.ListMeasurements",
-            Map::new(),
-            "fair-value measurements listed",
+            "FairValue.GetWorkspace",
+            json_object(json!({"at": chrono::Utc::now().to_rfc3339()}))?,
+            "fair-value workspace read",
         ),
         FairValueCommand::Measure { request, confirm } => {
             let mut arguments = read_json_object(&request)?;
@@ -678,11 +1252,735 @@ async fn fair_value(
             "fair-value measurement approved",
         ),
     };
-    invoke(product, operation, &mut arguments, None, summary).await
+    invoke(authority, operation, &mut arguments, None, summary).await
+}
+
+async fn job(
+    authority: CliAuthority<'_>,
+    command: JobCommand,
+) -> Result<CliProductResult, CliProductError> {
+    if matches!(authority, CliAuthority::Local(_)) {
+        return Err(CliProductError::InstalledServiceRequired { operation: "Job" });
+    }
+    let (operation, arguments, summary) = match command {
+        JobCommand::List {
+            after_job_id,
+            limit,
+        } => {
+            let mut arguments = json_object(json!({"limit": limit}))?;
+            if let Some(after_job_id) = after_job_id {
+                arguments.insert(
+                    "afterJobId".to_owned(),
+                    Value::String(after_job_id.to_string()),
+                );
+            }
+            ("Job.List", Value::Object(arguments), "durable jobs listed")
+        }
+        JobCommand::Get { job_id, generation } => (
+            "Job.Get",
+            json!({"jobId": job_id.to_string(), "generation": generation}),
+            "durable job read",
+        ),
+        JobCommand::Watch {
+            job_id,
+            generation,
+            after_sequence,
+            limit,
+        } => (
+            "Job.Watch",
+            json!({
+                "jobId": job_id.to_string(),
+                "generation": generation,
+                "afterSequence": after_sequence,
+                "limit": limit,
+            }),
+            "durable job events read",
+        ),
+        JobCommand::Cancel {
+            job_id,
+            generation,
+            expected_sequence,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            (
+                "Job.Cancel",
+                json!({
+                    "jobId": job_id.to_string(),
+                    "generation": generation,
+                    "expectedSequence": expected_sequence,
+                    "confirm": true,
+                }),
+                "durable job cancellation requested",
+            )
+        }
+        JobCommand::Confirm {
+            job_id,
+            generation,
+            expected_sequence,
+            confirmation_identity,
+            evidence_sha256,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            (
+                "Job.Confirm",
+                json!({
+                    "jobId": job_id.to_string(),
+                    "generation": generation,
+                    "expectedSequence": expected_sequence,
+                    "identity": confirmation_identity,
+                    "digest": lowercase_sha256(&evidence_sha256)?,
+                    "confirm": true,
+                }),
+                "durable job confirmation recorded",
+            )
+        }
+        JobCommand::Retry {
+            job_id,
+            generation,
+            expected_sequence,
+            confirm,
+        } => {
+            require_confirmation(confirm)?;
+            (
+                "Job.Retry",
+                json!({
+                    "jobId": job_id.to_string(),
+                    "generation": generation,
+                    "expectedSequence": expected_sequence,
+                    "confirm": true,
+                }),
+                "durable job retry requested",
+            )
+        }
+    };
+    invoke_without_result_limits(authority, operation, arguments, summary).await
+}
+
+async fn operations(
+    authority: CliAuthority<'_>,
+    command: OperationsCommand,
+) -> Result<CliProductResult, CliProductError> {
+    require_installed(authority, "Operations")?;
+    match command {
+        OperationsCommand::Backup { command } => backup_operations(authority, command).await,
+        OperationsCommand::Workspace { command } => workspace_operations(authority, command).await,
+        OperationsCommand::Update { command } => update_operations(authority, command).await,
+        OperationsCommand::Logs { command } => log_operations(authority, command).await,
+        OperationsCommand::Settings { command } => settings_operations(authority, command).await,
+    }
+}
+
+async fn backup_operations(
+    authority: CliAuthority<'_>,
+    command: BackupOperationsCommand,
+) -> Result<CliProductResult, CliProductError> {
+    match command {
+        BackupOperationsCommand::List {
+            after_backup_id,
+            limit,
+        } => {
+            let mut arguments = json_object(json!({"limit": limit}))?;
+            if let Some(after_backup_id) = after_backup_id {
+                arguments.insert(
+                    "afterBackupId".to_owned(),
+                    Value::String(lowercase_sha256(&after_backup_id)?.to_owned()),
+                );
+            }
+            invoke(
+                authority,
+                "Operations.ListBackups",
+                &mut arguments,
+                Some(usize::from(limit)),
+                "product backups listed",
+            )
+            .await
+        }
+        BackupOperationsCommand::Get { backup_id } => {
+            let mut arguments = backup_identity_arguments(backup_id)?;
+            invoke(
+                authority,
+                "Operations.GetBackup",
+                &mut arguments,
+                Some(1),
+                "product backup manifest read",
+            )
+            .await
+        }
+        BackupOperationsCommand::Create { confirm } => {
+            require_confirmation(confirm)?;
+            let mut arguments = json_object(json!({"confirm": true}))?;
+            invoke(
+                authority,
+                "Operations.StartBackup",
+                &mut arguments,
+                Some(1),
+                "product backup job started",
+            )
+            .await
+        }
+        BackupOperationsCommand::Verify { backup_id, confirm } => {
+            require_confirmation(confirm)?;
+            let mut arguments = backup_identity_arguments(backup_id)?;
+            arguments.insert("confirm".to_owned(), Value::Bool(true));
+            invoke(
+                authority,
+                "Operations.StartBackupVerification",
+                &mut arguments,
+                Some(1),
+                "product backup verification job started",
+            )
+            .await
+        }
+        BackupOperationsCommand::Retention { command } => match command {
+            BackupRetentionCommand::Preview { keep_latest } => {
+                let mut arguments = json_object(json!({"keepLatest": keep_latest}))?;
+                invoke(
+                    authority,
+                    "Operations.PreviewBackupRetention",
+                    &mut arguments,
+                    None,
+                    "backup retention previewed",
+                )
+                .await
+            }
+            BackupRetentionCommand::Apply(preview) => {
+                let mut arguments = operations_preview_arguments(preview)?;
+                invoke(
+                    authority,
+                    "Operations.StartBackupRetention",
+                    &mut arguments,
+                    Some(1),
+                    "backup retention job started",
+                )
+                .await
+            }
+        },
+        BackupOperationsCommand::Restore { command } => match command {
+            RestoreCommand::Preview { backup_id } => {
+                let mut arguments = backup_identity_arguments(backup_id)?;
+                invoke(
+                    authority,
+                    "Operations.PreviewRestore",
+                    &mut arguments,
+                    None,
+                    "product restore previewed",
+                )
+                .await
+            }
+            RestoreCommand::Start(preview) => {
+                let mut arguments = operations_preview_arguments(preview)?;
+                invoke(
+                    authority,
+                    "Operations.StartRestore",
+                    &mut arguments,
+                    Some(1),
+                    "product restore job started",
+                )
+                .await
+            }
+        },
+    }
+}
+
+async fn workspace_operations(
+    authority: CliAuthority<'_>,
+    command: WorkspaceOperationsCommand,
+) -> Result<CliProductResult, CliProductError> {
+    match command {
+        WorkspaceOperationsCommand::List {
+            after_workspace_id,
+            limit,
+        } => {
+            let mut arguments = json_object(json!({"limit": limit}))?;
+            if let Some(after_workspace_id) = after_workspace_id {
+                arguments.insert(
+                    "afterWorkspaceId".to_owned(),
+                    Value::String(after_workspace_id.to_string()),
+                );
+            }
+            invoke(
+                authority,
+                "Operations.ListWorkspaces",
+                &mut arguments,
+                Some(usize::from(limit)),
+                "local workspaces listed",
+            )
+            .await
+        }
+        WorkspaceOperationsCommand::Switch { command } => match command {
+            WorkspaceSwitchCommand::Preview { workspace_id } => {
+                let mut arguments = json_object(json!({"workspaceId": workspace_id.to_string()}))?;
+                invoke(
+                    authority,
+                    "Operations.PreviewWorkspaceSwitch",
+                    &mut arguments,
+                    None,
+                    "workspace switch previewed",
+                )
+                .await
+            }
+            WorkspaceSwitchCommand::Start(preview) => {
+                let mut arguments = operations_preview_arguments(preview)?;
+                invoke(
+                    authority,
+                    "Operations.StartWorkspaceSwitch",
+                    &mut arguments,
+                    Some(1),
+                    "workspace switch job started",
+                )
+                .await
+            }
+        },
+    }
+}
+
+async fn update_operations(
+    authority: CliAuthority<'_>,
+    command: UpdateOperationsCommand,
+) -> Result<CliProductResult, CliProductError> {
+    match command {
+        UpdateOperationsCommand::Status => {
+            let mut arguments = Map::new();
+            invoke(
+                authority,
+                "Operations.GetUpdateStatus",
+                &mut arguments,
+                Some(1),
+                "trusted update status read",
+            )
+            .await
+        }
+        UpdateOperationsCommand::Check { confirm } => {
+            require_confirmation(confirm)?;
+            let mut arguments = json_object(json!({"confirm": true}))?;
+            invoke(
+                authority,
+                "Operations.CheckForUpdates",
+                &mut arguments,
+                None,
+                "trusted update candidate checked and staged",
+            )
+            .await
+        }
+        UpdateOperationsCommand::Preview => {
+            let mut arguments = Map::new();
+            invoke(
+                authority,
+                "Operations.PreviewUpdate",
+                &mut arguments,
+                None,
+                "trusted update activation previewed",
+            )
+            .await
+        }
+        UpdateOperationsCommand::Start(preview) => {
+            let mut arguments = operations_preview_arguments(preview)?;
+            invoke(
+                authority,
+                "Operations.StartUpdate",
+                &mut arguments,
+                Some(1),
+                "trusted update job started",
+            )
+            .await
+        }
+        UpdateOperationsCommand::ProgramRollback { command } => match command {
+            ProgramRollbackCommand::Preview => {
+                let mut arguments = Map::new();
+                invoke(
+                    authority,
+                    "Operations.PreviewProgramRollback",
+                    &mut arguments,
+                    None,
+                    "program rollback previewed",
+                )
+                .await
+            }
+            ProgramRollbackCommand::Start(preview) => {
+                let mut arguments = operations_preview_arguments(preview)?;
+                invoke(
+                    authority,
+                    "Operations.StartProgramRollback",
+                    &mut arguments,
+                    Some(1),
+                    "program rollback job started",
+                )
+                .await
+            }
+        },
+    }
+}
+
+async fn log_operations(
+    authority: CliAuthority<'_>,
+    command: LogOperationsCommand,
+) -> Result<CliProductResult, CliProductError> {
+    match command {
+        LogOperationsCommand::Query(query) => {
+            let maximum_items = usize::from(query.limit);
+            let mut arguments = log_query_arguments(query)?;
+            invoke(
+                authority,
+                "Operations.QueryLogs",
+                &mut arguments,
+                Some(maximum_items),
+                "structured logs queried",
+            )
+            .await
+        }
+        LogOperationsCommand::Export { query, confirm } => {
+            require_confirmation(confirm)?;
+            let mut arguments = log_query_arguments(query)?;
+            arguments.insert("confirm".to_owned(), Value::Bool(true));
+            invoke(
+                authority,
+                "Operations.ExportLogs",
+                &mut arguments,
+                Some(1),
+                "redacted log export published",
+            )
+            .await
+        }
+    }
+}
+
+async fn settings_operations(
+    authority: CliAuthority<'_>,
+    command: SettingsOperationsCommand,
+) -> Result<CliProductResult, CliProductError> {
+    match command {
+        SettingsOperationsCommand::Get => {
+            let mut arguments = Map::new();
+            invoke(
+                authority,
+                "Operations.GetSettings",
+                &mut arguments,
+                None,
+                "typed product settings read",
+            )
+            .await
+        }
+        SettingsOperationsCommand::Change { command } => match command {
+            SettingsChangeCommand::Preview(change) => {
+                let expected_revision = change.expected_revision;
+                let changes = setting_values(change)?;
+                let mut arguments = json_object(json!({
+                    "expectedRevision": expected_revision,
+                    "changes": changes,
+                }))?;
+                invoke(
+                    authority,
+                    "Operations.PreviewSettingsChange",
+                    &mut arguments,
+                    None,
+                    "typed settings change previewed",
+                )
+                .await
+            }
+            SettingsChangeCommand::Apply(preview) => {
+                let mut arguments = operations_preview_arguments(preview)?;
+                invoke(
+                    authority,
+                    "Operations.ApplySettingsChange",
+                    &mut arguments,
+                    Some(1),
+                    "typed settings change applied",
+                )
+                .await
+            }
+        },
+        SettingsOperationsCommand::Rollback { command } => match command {
+            SettingsRollbackCommand::Preview {
+                expected_revision,
+                target_revision,
+            } => {
+                let mut arguments = json_object(json!({
+                    "expectedRevision": expected_revision,
+                    "targetRevision": target_revision,
+                }))?;
+                invoke(
+                    authority,
+                    "Operations.PreviewSettingsRollback",
+                    &mut arguments,
+                    None,
+                    "typed settings rollback previewed",
+                )
+                .await
+            }
+            SettingsRollbackCommand::Apply(preview) => {
+                let mut arguments = operations_preview_arguments(preview)?;
+                invoke(
+                    authority,
+                    "Operations.RollbackSettings",
+                    &mut arguments,
+                    Some(1),
+                    "typed settings rollback applied",
+                )
+                .await
+            }
+        },
+    }
+}
+
+async fn setup(
+    authority: CliAuthority<'_>,
+    command: SetupCommand,
+) -> Result<CliProductResult, CliProductError> {
+    require_installed(authority, "Setup")?;
+    match command {
+        SetupCommand::Status => {
+            let mut arguments = Map::new();
+            invoke(
+                authority,
+                "Setup.GetStatus",
+                &mut arguments,
+                None,
+                "guided setup status read",
+            )
+            .await
+        }
+        SetupCommand::Preview(arguments) => setup_preview(authority, arguments).await,
+        SetupCommand::Apply(arguments) => setup_apply(authority, arguments).await,
+    }
+}
+
+async fn setup_preview(
+    authority: CliAuthority<'_>,
+    arguments: SetupPreviewArguments,
+) -> Result<CliProductResult, CliProductError> {
+    let goals = arguments
+        .goals
+        .into_iter()
+        .map(setup_goal)
+        .collect::<Vec<_>>();
+    let selection = SetupPlanSelection::try_new(goals, setup_starter_plan(arguments.starter_plan))?;
+    let mut operation_arguments = json_object(json!({
+        "expectedRevision": arguments.expected_revision,
+        "selection": selection,
+    }))?;
+    invoke(
+        authority,
+        "Setup.PreviewPlan",
+        &mut operation_arguments,
+        None,
+        "guided setup plan previewed; no setup step completed",
+    )
+    .await
+}
+
+async fn setup_apply(
+    authority: CliAuthority<'_>,
+    arguments: SetupApplyArguments,
+) -> Result<CliProductResult, CliProductError> {
+    require_confirmation(arguments.confirm)?;
+    if arguments.preview_id.is_nil() {
+        return Err(CliProductError::RequestShape);
+    }
+    let preview_sha256 = lowercase_sha256(&arguments.preview_sha256)?;
+    let mut operation_arguments = json_object(json!({
+        "previewId": arguments.preview_id.to_string(),
+        "previewSha256": preview_sha256,
+        "confirm": true,
+    }))?;
+    invoke(
+        authority,
+        "Setup.ApplyPlan",
+        &mut operation_arguments,
+        Some(1),
+        "guided setup plan accepted; capability steps remain evidence-driven",
+    )
+    .await
+}
+
+fn require_installed(
+    authority: CliAuthority<'_>,
+    operation: &'static str,
+) -> Result<(), CliProductError> {
+    if matches!(authority, CliAuthority::Installed(_)) {
+        Ok(())
+    } else {
+        Err(CliProductError::InstalledServiceRequired { operation })
+    }
+}
+
+fn backup_identity_arguments(backup_id: String) -> Result<Map<String, Value>, CliProductError> {
+    json_object(json!({"backupId": lowercase_sha256(&backup_id)?}))
+}
+
+fn operations_preview_arguments(
+    arguments: OperationsPreviewConfirmationArguments,
+) -> Result<Map<String, Value>, CliProductError> {
+    require_confirmation(arguments.confirm)?;
+    if arguments.preview_id.is_nil() {
+        return Err(CliProductError::RequestShape);
+    }
+    json_object(json!({
+        "previewId": arguments.preview_id.to_string(),
+        "previewDigest": lowercase_sha256(&arguments.preview_digest)?,
+        "confirm": true,
+    }))
+}
+
+fn log_query_arguments(
+    arguments: LogQueryArguments,
+) -> Result<Map<String, Value>, CliProductError> {
+    let mut result = json_object(json!({"limit": arguments.limit}))?;
+    insert_optional_string(&mut result, "from", arguments.from);
+    insert_optional_string(&mut result, "through", arguments.through);
+    if let Some(severity) = arguments.minimum_severity {
+        result.insert(
+            "minimumSeverity".to_owned(),
+            serde_json::to_value(log_severity(severity))
+                .map_err(|_| CliProductError::RequestShape)?,
+        );
+    }
+    if let Some(domain) = arguments.domain {
+        result.insert(
+            "domain".to_owned(),
+            serde_json::to_value(log_domain(domain)).map_err(|_| CliProductError::RequestShape)?,
+        );
+    }
+    insert_optional_string(&mut result, "sourceId", arguments.source_id);
+    insert_optional_string(&mut result, "jobId", arguments.job_id);
+    insert_optional_string(&mut result, "correlationId", arguments.correlation_id);
+    insert_optional_string(&mut result, "search", arguments.search);
+    if let Some(after_sequence) = arguments.after_sequence {
+        result.insert("afterSequence".to_owned(), json!(after_sequence));
+    }
+    Ok(result)
+}
+
+fn insert_optional_string(
+    arguments: &mut Map<String, Value>,
+    name: &'static str,
+    value: Option<String>,
+) {
+    if let Some(value) = value {
+        arguments.insert(name.to_owned(), Value::String(value));
+    }
+}
+
+fn log_severity(value: LogSeverityArgument) -> LogSeverity {
+    match value {
+        LogSeverityArgument::Trace => LogSeverity::Trace,
+        LogSeverityArgument::Debug => LogSeverity::Debug,
+        LogSeverityArgument::Info => LogSeverity::Info,
+        LogSeverityArgument::Warn => LogSeverity::Warn,
+        LogSeverityArgument::Error => LogSeverity::Error,
+    }
+}
+
+fn log_domain(value: LogDomainArgument) -> LogDomain {
+    match value {
+        LogDomainArgument::Application => LogDomain::Application,
+        LogDomainArgument::Source => LogDomain::Source,
+        LogDomainArgument::Market => LogDomain::Market,
+        LogDomainArgument::Research => LogDomain::Research,
+        LogDomainArgument::Portfolio => LogDomain::Portfolio,
+        LogDomainArgument::Model => LogDomain::Model,
+        LogDomainArgument::Backtest => LogDomain::Backtest,
+        LogDomainArgument::Execution => LogDomain::Execution,
+        LogDomainArgument::Risk => LogDomain::Risk,
+        LogDomainArgument::FairValue => LogDomain::FairValue,
+        LogDomainArgument::Mcp => LogDomain::Mcp,
+        LogDomainArgument::Lifecycle => LogDomain::Lifecycle,
+    }
+}
+
+fn setting_values(
+    arguments: SettingsChangeArguments,
+) -> Result<Vec<SettingValue>, CliProductError> {
+    let mut values = Vec::new();
+    if let Some(value) = arguments.log_retention_days {
+        values.push(SettingValue::LogRetentionDays(value));
+    }
+    if let Some(value) = arguments.log_minimum_severity {
+        values.push(SettingValue::LogMinimumSeverity(log_severity(value)));
+    }
+    if let Some(value) = arguments.update_channel {
+        values.push(SettingValue::UpdateChannel(update_channel(value)));
+    }
+    if let Some(value) = arguments.automatic_update_checks {
+        values.push(SettingValue::AutomaticUpdateChecks(value));
+    }
+    if let Some(value) = arguments.storage_soft_limit_bytes {
+        values.push(SettingValue::StorageSoftLimitBytes(value));
+    }
+    if let Some(value) = arguments.default_query_row_limit {
+        values.push(SettingValue::DefaultQueryRowLimit(value));
+    }
+    if let Some(value) = arguments.maximum_concurrent_jobs {
+        values.push(SettingValue::MaximumConcurrentJobs(value));
+    }
+    if let Some(value) = arguments.market_freshness_millis {
+        values.push(SettingValue::MarketFreshnessMillis(value));
+    }
+    if let Some(value) = arguments.backup_retention_count {
+        values.push(SettingValue::BackupRetentionCount(value));
+    }
+    if values.is_empty() {
+        Err(CliProductError::SettingsChangeRequired)
+    } else {
+        Ok(values)
+    }
+}
+
+fn update_channel(value: UpdateChannelArgument) -> UpdateChannel {
+    match value {
+        UpdateChannelArgument::Stable => UpdateChannel::Stable,
+        UpdateChannelArgument::Preview => UpdateChannel::Preview,
+    }
+}
+
+fn setup_goal(value: SetupGoalArgument) -> SetupGoal {
+    match value {
+        SetupGoalArgument::EverythingRecommended => SetupGoal::EverythingRecommended,
+        SetupGoalArgument::ExplorePublicMarkets => SetupGoal::ExplorePublicMarkets,
+        SetupGoalArgument::ResearchInvestments => SetupGoal::ResearchInvestments,
+        SetupGoalArgument::ManagePortfolio => SetupGoal::ManagePortfolio,
+        SetupGoalArgument::BuildAndEvaluateModels => SetupGoal::BuildAndEvaluateModels,
+        SetupGoalArgument::PracticePaperExecution => SetupGoal::PracticePaperExecution,
+        SetupGoalArgument::UseClaudeCode => SetupGoal::UseClaudeCode,
+        SetupGoalArgument::UseCodex => SetupGoal::UseCodex,
+    }
+}
+
+fn setup_starter_plan(value: SetupStarterPlanArgument) -> SetupStarterPlan {
+    match value {
+        SetupStarterPlanArgument::EverythingRecommended => SetupStarterPlan::EverythingRecommended,
+        SetupStarterPlanArgument::PublicMarkets => SetupStarterPlan::PublicMarkets,
+        SetupStarterPlanArgument::Research => SetupStarterPlan::Research,
+        SetupStarterPlanArgument::Portfolio => SetupStarterPlan::Portfolio,
+        SetupStarterPlanArgument::Models => SetupStarterPlan::Models,
+        SetupStarterPlanArgument::PaperPractice => SetupStarterPlan::PaperPractice,
+        SetupStarterPlanArgument::AiClients => SetupStarterPlan::AiClients,
+    }
+}
+
+fn require_confirmation(confirm: bool) -> Result<(), CliProductError> {
+    if confirm {
+        Ok(())
+    } else {
+        Err(CliProductError::ConfirmationRequired)
+    }
+}
+
+fn lowercase_sha256(value: &str) -> Result<&str, CliProductError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        Ok(value)
+    } else {
+        Err(CliProductError::RequestShape)
+    }
 }
 
 async fn invoke(
-    product: &LocalProduct,
+    authority: CliAuthority<'_>,
     operation: &str,
     arguments: &mut Map<String, Value>,
     maximum_items: Option<usize>,
@@ -696,18 +1994,91 @@ async fn invoke(
             "maximumBytes": CLI_DEFAULT_MAXIMUM_BYTES,
         }),
     );
-    let application = product.application();
-    let result = application
-        .invoke(operation, std::mem::take(arguments), request_context()?)
-        .await?;
-    Ok(CliProductResult {
+    invoke_without_result_limits(
+        authority,
+        operation,
+        Value::Object(std::mem::take(arguments)),
         summary,
-        value: result_envelope(&result),
-    })
+    )
+    .await
+}
+
+async fn invoke_without_result_limits(
+    authority: CliAuthority<'_>,
+    operation: &str,
+    arguments: Value,
+    summary: &'static str,
+) -> Result<CliProductResult, CliProductError> {
+    let value = match authority {
+        CliAuthority::Local(product) => {
+            let Value::Object(arguments) = arguments else {
+                return Err(CliProductError::RequestShape);
+            };
+            let result = product
+                .application()
+                .invoke(
+                    operation,
+                    arguments,
+                    request_context(
+                        local_paper_operation(operation)
+                            .then(local_cli_origin)
+                            .transpose()?,
+                    )?,
+                )
+                .await?;
+            let projection = if product
+                .application()
+                .product_capabilities()
+                .map_err(|_error| CliProductError::Limits)?
+                .find(operation)
+                .is_some()
+            {
+                ResultEnvelopeProjection::ProductV1
+            } else {
+                ResultEnvelopeProjection::NativeEvidenceV1
+            };
+            result.into_envelope(projection)
+        }
+        CliAuthority::Installed(client) => {
+            let context = request_context(None)?;
+            let response = client
+                .invoke_operation(
+                    context.request_id().clone(),
+                    operation,
+                    arguments,
+                    CLI_INSTALLED_REQUEST_TIMEOUT,
+                    CancellationToken::new(),
+                )
+                .await?;
+            unwrap_application_result(response.result())?
+        }
+    };
+    Ok(CliProductResult { summary, value })
+}
+
+fn unwrap_application_result(result: &Value) -> Result<Value, CliProductError> {
+    let object = result.as_object().ok_or(CliProductError::RuntimeRequest)?;
+    match object.get("ok").and_then(Value::as_bool) {
+        Some(true) => object
+            .get("value")
+            .cloned()
+            .ok_or(CliProductError::RuntimeRequest),
+        Some(false) => match object.get("error").and_then(Value::as_str) {
+            Some("rejected") => Err(CliProductError::Client(ApplicationClientError::Rejected)),
+            Some("interrupted") => {
+                Err(CliProductError::Client(ApplicationClientError::Interrupted))
+            }
+            Some("unavailable") => {
+                Err(CliProductError::Client(ApplicationClientError::Unavailable))
+            }
+            _ => Err(CliProductError::RuntimeRequest),
+        },
+        None => Err(CliProductError::RuntimeRequest),
+    }
 }
 
 fn direct_result(value: Value, summary: &'static str) -> Result<CliProductResult, CliProductError> {
-    let context = request_context()?;
+    let context = request_context(None)?;
     let result = TypedToolResult::try_new(
         value,
         1,
@@ -717,11 +2088,11 @@ fn direct_result(value: Value, summary: &'static str) -> Result<CliProductResult
     .map_err(|_| CliProductError::Limits)?;
     Ok(CliProductResult {
         summary,
-        value: result_envelope(&result),
+        value: result.into_envelope(ResultEnvelopeProjection::NativeEvidenceV1),
     })
 }
 
-fn request_context() -> Result<RequestContext, CliProductError> {
+fn request_context(origin: Option<RequestOrigin>) -> Result<RequestContext, CliProductError> {
     let structure = JsonStructureLimits::try_new(32, 1024 * 1024, 100_000, 10_000)
         .map_err(|_| CliProductError::Limits)?;
     let limits = ServiceLimits::try_new(
@@ -737,12 +2108,36 @@ fn request_context() -> Result<RequestContext, CliProductError> {
     let deadline = Instant::now()
         .checked_add(CLI_REQUEST_TIMEOUT)
         .ok_or(CliProductError::Limits)?;
-    Ok(RequestContext::new(
-        request_id,
-        CancellationToken::new(),
-        deadline,
-        limits,
-    ))
+    let context = RequestContext::new(request_id, CancellationToken::new(), deadline, limits);
+    Ok(match origin {
+        Some(origin) => context.with_origin(origin),
+        None => context,
+    })
+}
+
+fn local_paper_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "Bot.GetStartPreparation"
+            | "Bot.PrepareStart"
+            | "Bot.Start"
+            | "Execution.GetManualPaperTargets"
+            | "Execution.PrepareManualPaperDraft"
+            | "Execution.SubmitManualPaperDraft"
+    )
+}
+
+fn local_cli_origin() -> Result<RequestOrigin, CliProductError> {
+    if let Some(origin) = LOCAL_PAPER_CLI_ORIGIN.get().copied() {
+        return Ok(origin);
+    }
+    let candidate = RequestOrigin::try_new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
+        .map_err(|_error| CliProductError::Limits)?;
+    let _ = LOCAL_PAPER_CLI_ORIGIN.set(candidate);
+    LOCAL_PAPER_CLI_ORIGIN
+        .get()
+        .copied()
+        .ok_or(CliProductError::Limits)
 }
 
 fn source_filter(provider: Option<String>) -> Map<String, Value> {
@@ -751,22 +2146,6 @@ fn source_filter(provider: Option<String>) -> Map<String, Value> {
         arguments.insert("sourceCoverage".to_owned(), json!([provider]));
     }
     arguments
-}
-
-fn result_envelope(result: &TypedToolResult) -> Value {
-    let metadata = result.metadata();
-    json!({
-        "data": result.structured_content(),
-        "metadata": {
-            "completeness": metadata.completeness(),
-            "returnedItems": result.item_count(),
-            "availableItems": metadata.available_items().unwrap_or(result.item_count()),
-            "sourceCoverage": metadata.source_coverage(),
-            "dataQuality": metadata.data_quality(),
-            "sourceEvidence": metadata.source_evidence(),
-        },
-        "encodedBytes": result.encoded_bytes(),
-    })
 }
 
 fn read_json_object(path: &Path) -> Result<Map<String, Value>, CliProductError> {
@@ -778,15 +2157,31 @@ fn read_json_object(path: &Path) -> Result<Map<String, Value>, CliProductError> 
         .ok_or(CliProductError::RequestShape)
 }
 
+fn read_json_array(path: &Path) -> Result<Vec<Value>, CliProductError> {
+    let input = read_bounded_input(path)?;
+    serde_json::from_slice::<Value>(input.as_bytes())
+        .map_err(|_| CliProductError::RequestShape)?
+        .as_array()
+        .cloned()
+        .ok_or(CliProductError::RequestShape)
+}
+
 fn read_bounded_input(
     path: &Path,
+) -> Result<market_squawk_platform::BoundedInput, CliProductError> {
+    read_bounded_input_with_limit(path, CLI_JSON_MAXIMUM_BYTES)
+}
+
+fn read_bounded_input_with_limit(
+    path: &Path,
+    maximum_bytes: u64,
 ) -> Result<market_squawk_platform::BoundedInput, CliProductError> {
     let absolute = admitted_absolute_path(path)?;
     let parent = absolute.parent().ok_or(CliProductError::RequestFile)?;
     let name = absolute.file_name().ok_or(CliProductError::RequestFile)?;
     UserAuthorizedInputRoot::open(parent)
         .and_then(|root| root.resolve(PathBuf::from(name)))
-        .and_then(|input| input.open_bounded(CLI_JSON_MAXIMUM_BYTES))
+        .and_then(|input| input.open_bounded(maximum_bytes))
         .and_then(|input| input.read_bounded())
         .map_err(|_| CliProductError::RequestFile)
 }

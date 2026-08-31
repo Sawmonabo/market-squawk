@@ -11,19 +11,27 @@ use std::{
 };
 
 use async_trait::async_trait;
+use axum::{
+    body::{Body, to_bytes},
+    http::{Method, Request, StatusCode, header},
+};
 use market_squawk_mcp::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
     ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
-    AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditPhase, AuditSink,
-    LocalProcessIdentityClass, McpLimitSpec, McpLimits, McpServer, MutationAuditBundle,
+    AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditOperation,
+    AuditPhase, AuditSink, AuthenticatedMcpClient, HttpMcpConfig, LocalProcessIdentityClass,
+    McpHandlerFactory, McpHttpAuthError, McpHttpAuthenticator, McpHttpService, McpLimitSpec,
+    McpLimits, McpRelayError, McpRelayExchange, McpRelayResponse, McpRelayTransport,
+    McpRelayTransportError, McpServer, McpStdioRelay, MutationAuditBundle,
     MutationAuditReservation, ServerError, ServerExit,
 };
+use market_squawk_runtime::{ClientId, CredentialGeneration, NamedClient, WorkspaceId};
 use market_squawk_services::{
-    ProgressError, RequestContext, ScopeRequirement, ServiceCapabilities, ServiceCapabilityError,
-    ServiceDomain, ServiceError, SourceEvidencePolicy, TOOL_INSTRUMENT_IDS_FIELD,
-    TOOL_RESULT_LIMITS_FIELD, TOOL_SOURCE_COVERAGE_FIELD, TOOL_TIME_RANGE_FIELD,
-    ToolArtifactPolicy, ToolAuthorization, ToolContract, ToolDescriptor, ToolEffects,
-    ToolInputError, ToolResultMetadata, ToolResultPolicy, ToolScope, ToolServices,
+    ProgressError, RequestContext, RequestOrigin, ScopeRequirement, ServiceCapabilities,
+    ServiceCapabilityError, ServiceDomain, ServiceError, SourceEvidencePolicy,
+    TOOL_INSTRUMENT_IDS_FIELD, TOOL_RESULT_LIMITS_FIELD, TOOL_SOURCE_COVERAGE_FIELD,
+    TOOL_TIME_RANGE_FIELD, ToolArtifactPolicy, ToolAuthorization, ToolContract, ToolDescriptor,
+    ToolEffects, ToolInputError, ToolResultMetadata, ToolResultPolicy, ToolScope, ToolServices,
     TypedToolRequest, TypedToolResult,
 };
 use rmcp::model::{
@@ -299,13 +307,13 @@ async fn lifecycle_negotiates_protocol_and_advertises_no_unregistered_domains()
 
     let initialized = harness.initialize(json!(17)).await?;
     assert_eq!(initialized["id"], 17);
-    assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(initialized["result"]["protocolVersion"], "2026-07-28");
     assert!(initialized["result"]["capabilities"].get("tools").is_none());
 
     harness
         .send(json!({"jsonrpc":"2.0","id":"early","method":"tools/list"}))
         .await?;
-    assert_eq!(harness.receive().await?["error"]["code"], -32002);
+    assert_eq!(harness.receive().await?["error"]["code"], -32602);
 
     harness.initialized().await?;
     harness
@@ -313,7 +321,7 @@ async fn lifecycle_negotiates_protocol_and_advertises_no_unregistered_domains()
         .await?;
     let empty_id = harness.receive().await?;
     assert_eq!(empty_id["id"], "");
-    assert_eq!(empty_id["result"], json!({}));
+    assert_eq!(empty_id["result"], Value::Null);
 
     harness
         .send(json!({
@@ -340,7 +348,7 @@ async fn lifecycle_negotiates_protocol_and_advertises_no_unregistered_domains()
         .await?;
     let ping = harness.receive().await?;
     assert_eq!(ping["id"], "ping-1");
-    assert_eq!(ping["result"], json!({}));
+    assert_eq!(ping["result"], Value::Null);
 
     harness
         .send(json!({"jsonrpc":"2.0","id":18,"method":"tools/list"}))
@@ -816,10 +824,19 @@ impl ToolServices for WaitingService {
 
     async fn call(
         &self,
-        _request: TypedToolRequest,
+        request: TypedToolRequest,
         context: RequestContext,
     ) -> Result<TypedToolResult, ServiceError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if request.name() != "Market.Wait" {
+            return TypedToolResult::try_new(
+                json!({"ok":true}),
+                1,
+                ToolResultMetadata::complete_not_applicable(),
+                context.limits(),
+            )
+            .map_err(Into::into);
+        }
         self.started.notify_one();
         context.cancellation().cancelled().await;
         Err(ServiceError::Cancelled)
@@ -1032,7 +1049,7 @@ async fn duplicate_active_ids_are_rejected_and_cancellation_reaches_the_service(
     harness
         .send(json!({"jsonrpc":"2.0","id":"after-release","method":"ping"}))
         .await?;
-    assert_eq!(harness.receive().await?["result"], json!({}));
+    assert_eq!(harness.receive().await?["result"], Value::Null);
     for cycle in 0..3 {
         let started = service.started.notified();
         let id = format!("cancel-cycle-{cycle}");
@@ -1212,5 +1229,998 @@ async fn terminal_results_close_delayed_progress_for_normal_and_cancelled_calls(
     }
 
     assert_eq!(harness.close().await?, ServerExit::EndOfInput);
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct HttpProductServices {
+    started: Notify,
+    calls: AtomicUsize,
+    resource_calls: Mutex<Vec<(String, serde_json::Map<String, Value>, RequestOrigin)>>,
+}
+
+const PRODUCT_RESOURCE_OPERATIONS: [&str; 10] = [
+    "Market.GetOverview",
+    "Macro.GetContext",
+    "Model.ListForecasts",
+    "Model.GetForecast",
+    "Model.GetForecastOutcomes",
+    "Analysis.ListProductBacktests",
+    "Analysis.GetProductBacktest",
+    "Decision.ListInvestmentAnalyses",
+    "Decision.GetInvestmentAnalysis",
+    "Decision.GetRecommendationTrackRecord",
+];
+
+fn http_product_schema(operation: &str) -> Value {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    if resource_requires_result_limits(operation) {
+        properties.insert(
+            "resultLimits".to_owned(),
+            json!({
+                "type":"object",
+                "properties":{
+                    "maximumItems":{"type":"integer","minimum":1,"maximum":100_000},
+                    "maximumBytes":{"type":"integer","minimum":1,"maximum":268_435_456}
+                },
+                "required":["maximumItems","maximumBytes"],
+                "additionalProperties":false
+            }),
+        );
+        required.push(Value::String("resultLimits".to_owned()));
+    }
+    let property = match operation {
+        "Model.GetForecast" | "Model.GetForecastOutcomes" => Some(("forecastToken", "string")),
+        "Analysis.GetProductBacktest" => Some(("backtestToken", "string")),
+        "Decision.GetInvestmentAnalysis" | "Decision.GetRecommendationTrackRecord" => {
+            Some(("actionToken", "string"))
+        }
+        "Decision.ListInvestmentAnalyses" => Some(("limit", "integer")),
+        _ => None,
+    };
+    if let Some((name, kind)) = property {
+        properties.insert(name.to_owned(), json!({"type":kind}));
+        required.push(Value::String(name.to_owned()));
+    }
+    let mut schema = serde_json::Map::from_iter([
+        ("type".to_owned(), Value::String("object".to_owned())),
+        ("properties".to_owned(), Value::Object(properties)),
+        ("additionalProperties".to_owned(), Value::Bool(false)),
+    ]);
+    if !required.is_empty() {
+        schema.insert("required".to_owned(), Value::Array(required));
+    }
+    Value::Object(schema)
+}
+
+fn admit_http_product(
+    operation: &str,
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<(), ToolInputError> {
+    let mut business_arguments = arguments.clone();
+    let result_limits = business_arguments.remove("resultLimits");
+    if resource_requires_result_limits(operation) {
+        let Some(limits) = result_limits.as_ref().and_then(Value::as_object) else {
+            return Err(ToolInputError::Invalid);
+        };
+        if limits.len() != 2
+            || limits.get("maximumItems").and_then(Value::as_u64) != Some(1_000)
+            || limits.get("maximumBytes").and_then(Value::as_u64) != Some(65_536)
+        {
+            return Err(ToolInputError::Invalid);
+        }
+    } else if result_limits.is_some() {
+        return Err(ToolInputError::Invalid);
+    }
+    let valid = match operation {
+        "Model.GetForecast" | "Model.GetForecastOutcomes" => {
+            canonical_uuid_argument(&business_arguments, "forecastToken")
+        }
+        "Analysis.GetProductBacktest" => {
+            canonical_uuid_argument(&business_arguments, "backtestToken")
+        }
+        "Decision.GetInvestmentAnalysis" | "Decision.GetRecommendationTrackRecord" => {
+            canonical_uuid_argument(&business_arguments, "actionToken")
+        }
+        "Decision.ListInvestmentAnalyses" => {
+            business_arguments.len() == 1
+                && business_arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|limit| (1..=1_000).contains(&limit))
+        }
+        _ => business_arguments.is_empty(),
+    };
+    valid.then_some(()).ok_or(ToolInputError::Invalid)
+}
+
+fn resource_requires_result_limits(operation: &str) -> bool {
+    PRODUCT_RESOURCE_OPERATIONS.contains(&operation) && operation != "Market.GetOverview"
+}
+
+fn http_product_scope(operation: &str) -> ToolScope {
+    if resource_requires_result_limits(operation) {
+        ToolScope::new(
+            ScopeRequirement::NotApplicable,
+            ScopeRequirement::NotApplicable,
+            ScopeRequirement::Required,
+            ScopeRequirement::NotApplicable,
+        )
+    } else {
+        NO_SCOPE
+    }
+}
+
+fn canonical_uuid_argument(arguments: &serde_json::Map<String, Value>, name: &str) -> bool {
+    arguments.len() == 1
+        && arguments
+            .get(name)
+            .and_then(Value::as_str)
+            .and_then(|value| {
+                uuid::Uuid::parse_str(value)
+                    .ok()
+                    .map(|token| (value, token))
+            })
+            .is_some_and(|(value, token)| !token.is_nil() && token.to_string() == value)
+}
+
+#[async_trait]
+impl ToolServices for HttpProductServices {
+    fn capabilities(&self) -> ServiceCapabilities {
+        let descriptors = PRODUCT_RESOURCE_OPERATIONS
+            .into_iter()
+            .chain(["Bot.Test", "Market.Wait"])
+            .filter_map(|operation| {
+                ToolDescriptor::try_new(
+                    operation,
+                    "1",
+                    "Read one bounded provider-neutral product result.",
+                    http_product_schema(operation),
+                    read_only_contract(ServiceDomain::Analysis, http_product_scope(operation)),
+                    ToolEffects::read_only_closed_world(),
+                    move |arguments: &serde_json::Map<String, Value>| {
+                        admit_http_product(operation, arguments)
+                    },
+                )
+                .and_then(|descriptor| {
+                    descriptor.try_into_product_v1(
+                        move |arguments: &serde_json::Map<String, Value>| {
+                            admit_http_product(operation, arguments)
+                        },
+                    )
+                })
+                .ok()
+            })
+            .collect();
+        ServiceCapabilities::try_new(descriptors).unwrap_or_else(|_| ServiceCapabilities::empty())
+    }
+
+    async fn call(
+        &self,
+        request: TypedToolRequest,
+        context: RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if request.name() == "Market.Wait" {
+            self.started.notify_one();
+            context.cancellation().cancelled().await;
+            return Err(ServiceError::Cancelled);
+        }
+        let (item_count, metadata) = match request.name() {
+            "Market.GetOverview" => (2, ToolResultMetadata::complete_not_applicable()),
+            "Model.ListForecasts" => (
+                2,
+                ToolResultMetadata::try_truncated_not_applicable(3).map_err(ServiceError::from)?,
+            ),
+            _ => (1, ToolResultMetadata::complete_not_applicable()),
+        };
+        if PRODUCT_RESOURCE_OPERATIONS.contains(&request.name()) {
+            let origin = context.origin().ok_or(ServiceError::Unauthorized)?;
+            self.resource_calls
+                .lock()
+                .map_err(|_| ServiceError::Internal)?
+                .push((
+                    request.name().to_owned(),
+                    request.arguments().clone(),
+                    origin,
+                ));
+        }
+        let value = if request.name() == "Bot.Test" {
+            json!({"ok":true})
+        } else {
+            json!({"summary":"available","items":["first","second"]})
+        };
+        TypedToolResult::try_new(value, item_count, metadata, context.limits()).map_err(Into::into)
+    }
+}
+
+#[derive(Debug)]
+struct FixedHttpAuthenticator {
+    alpha: AuthenticatedMcpClient,
+    beta: AuthenticatedMcpClient,
+    calls: AtomicUsize,
+}
+
+impl FixedHttpAuthenticator {
+    fn try_new() -> Result<Self, Box<dyn Error>> {
+        let alpha_id: ClientId = serde_json::from_str("\"00000000-0000-0000-0000-000000000011\"")?;
+        let beta_id: ClientId = serde_json::from_str("\"00000000-0000-0000-0000-000000000012\"")?;
+        let generation = CredentialGeneration::try_new(1)?;
+        Ok(Self {
+            alpha: AuthenticatedMcpClient::try_new(
+                NamedClient::ClaudeCode,
+                alpha_id,
+                generation,
+                1,
+            )?,
+            beta: AuthenticatedMcpClient::try_new(NamedClient::Codex, beta_id, generation, 1)?,
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl McpHttpAuthenticator for FixedHttpAuthenticator {
+    fn authenticate(&self, bearer_token: &str) -> Result<AuthenticatedMcpClient, McpHttpAuthError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match bearer_token {
+            "alpha" => Ok(self.alpha.clone()),
+            "beta" => Ok(self.beta.clone()),
+            _ => Err(McpHttpAuthError::Rejected),
+        }
+    }
+}
+
+fn stateless_request(method: Method, token: Option<&str>, body: Value) -> Request<Body> {
+    let rpc_method = body.get("method").and_then(Value::as_str);
+    let rpc_name = rpc_method.and_then(|method| match method {
+        "tools/call" => body.pointer("/params/name").and_then(Value::as_str),
+        "resources/read" => body.pointer("/params/uri").and_then(Value::as_str),
+        _ => None,
+    });
+    let mut builder = Request::builder()
+        .method(method)
+        .uri("/mcp")
+        .header(header::HOST, "127.0.0.1:43123")
+        .header(header::ORIGIN, "http://localhost:43123")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2026-07-28");
+    if let Some(method) = rpc_method {
+        builder = builder.header("Mcp-Method", method);
+    }
+    if let Some(name) = rpc_name {
+        builder = builder.header("Mcp-Name", name);
+    }
+    if let Some(token) = token {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    builder
+        .body(Body::from(body.to_string()))
+        .unwrap_or_else(|_| Request::new(Body::empty()))
+}
+
+fn stateless_message(id: &str, method: &str, params: Value) -> Value {
+    let mut params = params.as_object().cloned().unwrap_or_default();
+    params.insert(
+        "_meta".to_owned(),
+        json!({
+            "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+            "io.modelcontextprotocol/clientInfo":{"name":"tests","version":"1"},
+            "io.modelcontextprotocol/clientCapabilities":{}
+        }),
+    );
+    json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+}
+
+async fn response_json(response: axum::response::Response) -> Result<Value, Box<dyn Error>> {
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+async fn stateless_rpc(
+    http: &McpHttpService,
+    token: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, Box<dyn Error>> {
+    let response = http
+        .handle(stateless_request(
+            Method::POST,
+            Some(token),
+            stateless_message(method, method, params),
+        ))
+        .await;
+    let status = response.status();
+    let value = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "unexpected MCP response: {value}");
+    Ok(value)
+}
+
+#[tokio::test]
+async fn stateless_http_is_authenticated_bounded_and_has_only_stable_v1_capabilities()
+-> Result<(), Box<dyn Error>> {
+    let services = Arc::new(HttpProductServices::default());
+    let limits = McpLimits::try_from(McpLimitSpec {
+        maximum_frame_bytes: 256 * 1024,
+        maximum_body_bytes: 8 * 1024,
+        maximum_writer_queue_bytes: 256 * 1024 + 1,
+        ..McpLimitSpec::default()
+    })?;
+    let audit = Arc::new(CollectingAudit::default());
+    let workspace_id: WorkspaceId =
+        serde_json::from_str("\"00000000-0000-0000-0000-000000000001\"")?;
+    let factory =
+        McpHandlerFactory::try_new(services.clone(), limits, audit.clone(), workspace_id)?;
+    let authenticator = Arc::new(FixedHttpAuthenticator::try_new()?);
+    let http = McpHttpService::new(
+        factory,
+        authenticator.clone(),
+        HttpMcpConfig::try_new(
+            ["127.0.0.1:43123"],
+            ["http://localhost:43123"],
+            CancellationToken::new(),
+        )?,
+    );
+
+    for token in ["alpha", "beta"] {
+        let discover = stateless_rpc(&http, token, "server/discover", json!({})).await?;
+        assert_eq!(
+            discover["result"]["supportedVersions"],
+            json!(["2026-07-28"]),
+            "unexpected discovery response: {discover}"
+        );
+        assert!(discover["result"]["capabilities"].get("tools").is_some());
+        assert!(
+            discover["result"]["capabilities"]
+                .get("resources")
+                .is_some()
+        );
+        assert!(discover["result"]["capabilities"].get("tasks").is_none());
+        let tools = stateless_rpc(&http, token, "tools/list", json!({})).await?;
+        assert!(
+            tools["result"]["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "Bot.Test"))
+        );
+        let resources = stateless_rpc(&http, token, "resources/list", json!({})).await?;
+        let resource_uris = resources["result"]["resources"]
+            .as_array()
+            .ok_or("resources/list did not return an array")?
+            .iter()
+            .map(|resource| resource["uri"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resource_uris,
+            [
+                Some("market-squawk://market-overview"),
+                Some("market-squawk://economic-context"),
+                Some("market-squawk://forecasts"),
+                Some("market-squawk://backtests"),
+                Some("market-squawk://investment-analyses"),
+            ]
+        );
+        let templates = stateless_rpc(&http, token, "resources/templates/list", json!({})).await?;
+        let template_uris = templates["result"]["resourceTemplates"]
+            .as_array()
+            .ok_or("resources/templates/list did not return an array")?
+            .iter()
+            .map(|template| template["uriTemplate"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            template_uris,
+            [
+                Some("market-squawk://forecasts/{forecast_token}"),
+                Some("market-squawk://forecasts/{forecast_token}/outcomes"),
+                Some("market-squawk://backtests/{backtest_token}"),
+                Some("market-squawk://investment-analyses/{action_token}"),
+                Some("market-squawk://investment-analyses/{action_token}/track-record"),
+            ]
+        );
+        let catalog = format!("{resources}{templates}");
+        for forbidden in [
+            "market-squawk://sources/",
+            "market-squawk://models/",
+            "market-squawk://jobs/",
+            "market-squawk://artifacts/",
+            "market-squawk://workspace",
+            "market-squawk://service",
+        ] {
+            assert!(!catalog.contains(forbidden));
+        }
+        let overview = stateless_rpc(
+            &http,
+            token,
+            "resources/read",
+            json!({"uri":"market-squawk://market-overview"}),
+        )
+        .await?;
+        let overview_document: Value = serde_json::from_str(
+            overview["result"]["contents"][0]["text"]
+                .as_str()
+                .ok_or("resource response did not return its provider-neutral JSON document")?,
+        )?;
+        assert_eq!(overview_document["metadata"]["returnedItems"], 2);
+        assert!(
+            overview_document["metadata"]
+                .get("sourceCoverage")
+                .is_none()
+        );
+        let forecasts = stateless_rpc(
+            &http,
+            token,
+            "resources/read",
+            json!({"uri":"market-squawk://forecasts"}),
+        )
+        .await?;
+        let forecasts_document: Value = serde_json::from_str(
+            forecasts["result"]["contents"][0]["text"]
+                .as_str()
+                .ok_or("forecast resource did not return its provider-neutral JSON document")?,
+        )?;
+        assert_eq!(forecasts_document["metadata"]["completeness"], "truncated");
+        assert_eq!(forecasts_document["metadata"]["returnedItems"], 2);
+        assert_eq!(forecasts_document["metadata"]["availableItems"], 3);
+        let read = stateless_rpc(
+            &http,
+            token,
+            "tools/call",
+            json!({"name":"Bot.Test","arguments":{}}),
+        )
+        .await?;
+        assert_eq!(read["result"]["structuredContent"]["data"]["ok"], true);
+    }
+
+    let held = http
+        .handle(stateless_request(
+            Method::POST,
+            Some("alpha"),
+            stateless_message(
+                "read",
+                "tools/call",
+                json!({"name":"Bot.Test","arguments":{}}),
+            ),
+        ))
+        .await;
+    assert_eq!(held.status(), StatusCode::OK);
+    assert_eq!(
+        http.handle(stateless_request(
+            Method::POST,
+            Some("alpha"),
+            stateless_message("saturated", "server/discover", json!({})),
+        ))
+        .await
+        .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        http.handle(stateless_request(
+            Method::POST,
+            Some("beta"),
+            stateless_message("isolated", "server/discover", json!({})),
+        ))
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let read = response_json(held).await?;
+    assert_eq!(read["result"]["structuredContent"]["data"]["ok"], true);
+
+    let interrupted_http = http.clone();
+    let interrupted = tokio::spawn(async move {
+        interrupted_http
+            .handle(stateless_request(
+                Method::POST,
+                Some("alpha"),
+                stateless_message(
+                    "interrupted",
+                    "tools/call",
+                    json!({"name":"Market.Wait","arguments":{}}),
+                ),
+            ))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), services.started.notified())
+        .await
+        .map_err(|_error| "interrupted MCP service call did not start")?;
+    interrupted.abort();
+    let _ = interrupted.await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        audit.wait_for_result_count(market_squawk_mcp::AuditResultClass::Cancelled, 1),
+    )
+    .await
+    .map_err(|_error| "dropping the MCP request did not cancel its service call")??;
+    let unaffected = stateless_rpc(&http, "beta", "server/discover", json!({})).await?;
+    assert_eq!(
+        unaffected["result"]["supportedVersions"],
+        json!(["2026-07-28"])
+    );
+
+    for (request, expected) in [
+        (
+            stateless_request(
+                Method::POST,
+                None,
+                stateless_message("missing", "server/discover", json!({})),
+            ),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            stateless_request(
+                Method::POST,
+                Some("wrong"),
+                stateless_message("wrong", "server/discover", json!({})),
+            ),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            stateless_request(Method::GET, Some("alpha"), json!({})),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (
+            stateless_request(Method::DELETE, Some("alpha"), json!({})),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+    ] {
+        assert_eq!(http.handle(request).await.status(), expected);
+    }
+
+    let missing_metadata = stateless_request(
+        Method::POST,
+        Some("alpha"),
+        json!({"jsonrpc":"2.0","id":"metadata","method":"server/discover","params":{}}),
+    );
+    assert_ne!(http.handle(missing_metadata).await.status(), StatusCode::OK);
+
+    let authenticated_before_transport_rejections = authenticator.call_count();
+    let mut wrong_host = stateless_request(
+        Method::POST,
+        Some("alpha"),
+        stateless_message("host", "server/discover", json!({})),
+    );
+    wrong_host.headers_mut().insert(
+        header::HOST,
+        header::HeaderValue::from_static("example.com"),
+    );
+    assert_eq!(
+        http.handle(wrong_host).await.status(),
+        StatusCode::MISDIRECTED_REQUEST
+    );
+
+    let mut wrong_origin = stateless_request(
+        Method::POST,
+        Some("alpha"),
+        stateless_message("origin", "server/discover", json!({})),
+    );
+    wrong_origin.headers_mut().insert(
+        header::ORIGIN,
+        header::HeaderValue::from_static("https://example.com"),
+    );
+    assert_eq!(
+        http.handle(wrong_origin).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        authenticator.call_count(),
+        authenticated_before_transport_rejections,
+        "Host and Origin must be rejected before credential verification"
+    );
+
+    let mut disagreement = stateless_request(
+        Method::POST,
+        Some("alpha"),
+        stateless_message("version", "tools/list", json!({})),
+    );
+    disagreement.headers_mut().insert(
+        "MCP-Protocol-Version",
+        header::HeaderValue::from_static("2025-11-25"),
+    );
+    assert_ne!(http.handle(disagreement).await.status(), StatusCode::OK);
+
+    let mut unsupported_body = stateless_message("unsupported", "tools/list", json!({}));
+    unsupported_body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+        json!("2025-11-25");
+    let mut unsupported = stateless_request(Method::POST, Some("alpha"), unsupported_body);
+    unsupported.headers_mut().insert(
+        "MCP-Protocol-Version",
+        header::HeaderValue::from_static("2025-11-25"),
+    );
+    assert_ne!(http.handle(unsupported).await.status(), StatusCode::OK);
+
+    let mut legacy = stateless_request(
+        Method::POST,
+        Some("alpha"),
+        stateless_message("legacy", "server/discover", json!({})),
+    );
+    legacy.headers_mut().insert(
+        "Mcp-Session-Id",
+        header::HeaderValue::from_static("legacy-session"),
+    );
+    legacy.headers_mut().insert(
+        "Last-Event-ID",
+        header::HeaderValue::from_static("legacy-event"),
+    );
+    assert_eq!(http.handle(legacy).await.status(), StatusCode::BAD_REQUEST);
+
+    let oversized = stateless_request(
+        Method::POST,
+        Some("alpha"),
+        json!({"padding":"x".repeat(9 * 1024)}),
+    );
+    assert_eq!(
+        http.handle(oversized).await.status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+
+    let forecast_token = "00000000-0000-0000-0000-000000000001";
+    let forecast = response_json(
+        http.handle(stateless_request(
+            Method::POST,
+            Some("beta"),
+            stateless_message(
+                "forecast",
+                "resources/read",
+                json!({"uri":format!("market-squawk://forecasts/{forecast_token}")}),
+            ),
+        ))
+        .await,
+    )
+    .await?;
+    assert_eq!(
+        forecast["result"]["contents"][0]["uri"],
+        format!("market-squawk://forecasts/{forecast_token}")
+    );
+    assert_eq!(
+        forecast["result"]["contents"][0]["mimeType"],
+        "application/json"
+    );
+    for invalid_uri in [
+        "market-squawk://forecasts/00000000-0000-0000-0000-000000000001?latest=true",
+        "market-squawk://jobs/00000000-0000-0000-0000-000000000001",
+        "market-squawk://forecasts/%30%30%30%30%30%30%30%30-0000-0000-0000-000000000001",
+    ] {
+        let rejected = response_json(
+            http.handle(stateless_request(
+                Method::POST,
+                Some("beta"),
+                stateless_message(
+                    "invalid-resource",
+                    "resources/read",
+                    json!({"uri":invalid_uri}),
+                ),
+            ))
+            .await,
+        )
+        .await?;
+        assert_eq!(rejected["error"]["code"], -32602);
+    }
+    let resource_calls = services
+        .resource_calls
+        .lock()
+        .map_err(|_| "resource call log was poisoned")?;
+    assert!(resource_calls.iter().any(|(operation, arguments, origin)| {
+        let result_limits = arguments.get("resultLimits").and_then(Value::as_object);
+        operation == "Model.GetForecast"
+            && arguments.get("forecastToken") == Some(&json!(forecast_token))
+            && result_limits.and_then(|limits| limits.get("maximumItems")) == Some(&json!(1_000))
+            && result_limits.and_then(|limits| limits.get("maximumBytes")) == Some(&json!(65_536))
+            && origin.workspace_id() == workspace_id.as_uuid()
+            && origin.client_id() == authenticator.beta.client_id().as_uuid()
+    }));
+    drop(resource_calls);
+    assert!(audit.events()?.iter().any(|event| {
+        matches!(
+            event.operation(),
+            AuditOperation::ReadResource {
+                name,
+                operation,
+                version,
+            } if name.as_ref() == "forecast"
+                && operation.as_ref() == "Model.GetForecast"
+                && version.as_ref() == "1"
+        )
+    }));
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct RecordingRelayTransport {
+    exchanges: Mutex<Vec<Value>>,
+    waiting_started: Notify,
+    waiting_cancelled: Notify,
+}
+
+struct RelayCancellationGuard<'a>(&'a Notify);
+
+impl Drop for RelayCancellationGuard<'_> {
+    fn drop(&mut self) {
+        self.0.notify_waiters();
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InvalidRelayBoundary {
+    Status,
+    Oversized,
+}
+
+#[derive(Debug)]
+struct InvalidRelayTransport(InvalidRelayBoundary);
+
+#[async_trait]
+impl McpRelayTransport for InvalidRelayTransport {
+    async fn exchange(
+        &self,
+        request: McpRelayExchange,
+        _cancellation: CancellationToken,
+    ) -> Result<McpRelayResponse, McpRelayTransportError> {
+        let value: Value = serde_json::from_slice(request.body())
+            .map_err(|_error| McpRelayTransportError::InvalidRequest)?;
+        let id = value.get("id").cloned().unwrap_or(Value::Null);
+        if request.method() == "initialize" {
+            let body = serde_json::to_vec(&json!({
+                "jsonrpc":"2.0",
+                "id":id,
+                "result":{
+                    "protocolVersion":"2026-07-28",
+                    "capabilities":{},
+                    "serverInfo":{"name":"market-squawk","version":"1.0.0"}
+                }
+            }))
+            .map_err(|_error| McpRelayTransportError::InvalidResponse)?;
+            return McpRelayResponse::try_new(200, Some("application/json"), body)
+                .map_err(|_error| McpRelayTransportError::InvalidResponse);
+        }
+        match self.0 {
+            InvalidRelayBoundary::Status => McpRelayResponse::try_new(401, None, Vec::new()),
+            InvalidRelayBoundary::Oversized => McpRelayResponse::try_new(
+                200,
+                Some("application/json"),
+                vec![b' '; request.maximum_response_bytes() + 1],
+            ),
+        }
+        .map_err(|_error| McpRelayTransportError::InvalidResponse)
+    }
+}
+
+#[async_trait]
+impl McpRelayTransport for RecordingRelayTransport {
+    async fn exchange(
+        &self,
+        request: McpRelayExchange,
+        _cancellation: CancellationToken,
+    ) -> Result<McpRelayResponse, McpRelayTransportError> {
+        assert!(request.maximum_response_bytes() > 0);
+        let body: Value = serde_json::from_slice(request.body())
+            .map_err(|_error| McpRelayTransportError::InvalidRequest)?;
+        self.exchanges
+            .lock()
+            .map_err(|_error| McpRelayTransportError::Unavailable)?
+            .push(body.clone());
+        let id = body.get("id").cloned().unwrap_or(Value::Null);
+        if request.method() == "tools/call" && request.name() == Some("Invalid.Params") {
+            let encoded = serde_json::to_vec(&json!({
+                "jsonrpc":"2.0",
+                "id":id,
+                "error":{"code":-32602,"message":"Invalid params"}
+            }))
+            .map_err(|_error| McpRelayTransportError::InvalidResponse)?;
+            return McpRelayResponse::try_new(400, Some("application/json"), encoded)
+                .map_err(|_error| McpRelayTransportError::InvalidResponse);
+        }
+        let result = match request.method() {
+            "initialize" => json!({
+                "protocolVersion":"2026-07-28",
+                "capabilities":{"tools":{},"resources":{}},
+                "serverInfo":{"name":"market-squawk","version":"1.0.0"}
+            }),
+            "tools/list" => json!({"tools":[{"name":"Market.Lookup"}]}),
+            "tools/call" => {
+                assert_eq!(request.name(), Some("Market.Wait"));
+                let _cancelled = RelayCancellationGuard(&self.waiting_cancelled);
+                self.waiting_started.notify_waiters();
+                std::future::pending::<()>().await;
+                return Err(McpRelayTransportError::Interrupted);
+            }
+            "resources/read" => {
+                assert_eq!(request.name(), Some("market-squawk://service"));
+                json!({"contents":[{
+                    "uri":"market-squawk://service",
+                    "mimeType":"application/json",
+                    "text":"{\"service\":\"shared\"}"
+                }]})
+            }
+            _ => return Err(McpRelayTransportError::InvalidRequest),
+        };
+        let encoded = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":result}))
+            .map_err(|_error| McpRelayTransportError::InvalidResponse)?;
+        McpRelayResponse::try_new(200, Some("application/json"), encoded)
+            .map_err(|_error| McpRelayTransportError::InvalidResponse)
+    }
+}
+
+#[tokio::test]
+async fn stdio_relay_proxies_tools_and_resources_to_the_shared_service()
+-> Result<(), Box<dyn Error>> {
+    let transport = Arc::new(RecordingRelayTransport::default());
+    let relay = McpStdioRelay::try_new(
+        NamedClient::Codex,
+        transport.clone(),
+        McpLimits::try_from(McpLimitSpec::default())?,
+    )?;
+    let (client, service) = tokio::io::duplex(64 * 1024);
+    let (service_reader, service_writer) = tokio::io::split(service);
+    let task = tokio::spawn(relay.serve_unverified_io(
+        service_reader,
+        service_writer,
+        CancellationToken::new(),
+    ));
+    let (client_reader, mut client_writer) = tokio::io::split(client);
+    let mut client_reader = BufReader::new(client_reader);
+
+    async fn round_trip(
+        writer: &mut WriteHalf<DuplexStream>,
+        reader: &mut BufReader<ReadHalf<DuplexStream>>,
+        message: Value,
+    ) -> Result<Value, Box<dyn Error>> {
+        writer.write_all(&serde_json::to_vec(&message)?).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        Ok(serde_json::from_str(&line)?)
+    }
+
+    let initialized = round_trip(
+        &mut client_writer,
+        &mut client_reader,
+        json!({
+            "jsonrpc":"2.0",
+            "id":"initialize",
+            "method":"initialize",
+            "params":{
+                "protocolVersion":"2025-11-25",
+                "capabilities":{},
+                "clientInfo":{"name":"codex","version":"1"}
+            }
+        }),
+    )
+    .await?;
+    assert_eq!(initialized["result"]["protocolVersion"], "2026-07-28");
+    client_writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await?;
+
+    let tools = round_trip(
+        &mut client_writer,
+        &mut client_reader,
+        json!({"jsonrpc":"2.0","id":"tools","method":"tools/list","params":{}}),
+    )
+    .await?;
+    assert_eq!(tools["result"]["tools"][0]["name"], "Market.Lookup");
+    let resource = round_trip(
+        &mut client_writer,
+        &mut client_reader,
+        json!({
+            "jsonrpc":"2.0",
+            "id":"resource",
+            "method":"resources/read",
+            "params":{"uri":"market-squawk://service"}
+        }),
+    )
+    .await?;
+    assert_eq!(
+        resource["result"]["contents"][0]["uri"],
+        "market-squawk://service"
+    );
+    let invalid = round_trip(
+        &mut client_writer,
+        &mut client_reader,
+        json!({
+            "jsonrpc":"2.0",
+            "id":"invalid",
+            "method":"tools/call",
+            "params":{"name":"Invalid.Params","arguments":{}}
+        }),
+    )
+    .await?;
+    assert_eq!(invalid["error"]["code"], -32602);
+
+    let waiting_started = transport.waiting_started.notified();
+    tokio::pin!(waiting_started);
+    waiting_started.as_mut().enable();
+    client_writer
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":\"waiting\",\"method\":\"tools/call\",\"params\":{\"name\":\"Market.Wait\",\"arguments\":{}}}\n",
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(1), waiting_started).await?;
+    let waiting_cancelled = transport.waiting_cancelled.notified();
+    tokio::pin!(waiting_cancelled);
+    waiting_cancelled.as_mut().enable();
+    client_writer
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"waiting\"}}\n",
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(1), waiting_cancelled).await?;
+
+    client_writer.shutdown().await?;
+    assert_eq!(task.await??, ServerExit::EndOfInput);
+    let exchanges = transport
+        .exchanges
+        .lock()
+        .map_err(|_error| "relay exchange log was poisoned")?;
+    assert_eq!(exchanges.len(), 5);
+    let mut request_namespace = None;
+    for exchange in exchanges.iter() {
+        let forwarded_id = exchange["id"]
+            .as_str()
+            .ok_or("relay did not namespace a request identifier")?;
+        let (namespace, digest) = forwarded_id
+            .rsplit_once(':')
+            .ok_or("relay request namespace was malformed")?;
+        assert!(namespace.starts_with("msq-relay:"));
+        assert_eq!(digest.len(), 64);
+        if let Some(expected) = request_namespace.as_deref() {
+            assert_eq!(namespace, expected);
+        } else {
+            request_namespace = Some(namespace.to_owned());
+        }
+    }
+    for exchange in &exchanges[1..] {
+        assert_eq!(
+            exchange.pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion"),
+            Some(&json!("2026-07-28"))
+        );
+        assert_eq!(
+            exchange.pointer("/params/_meta/io.modelcontextprotocol~1clientInfo/name"),
+            Some(&json!("codex"))
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_relay_rejects_invalid_http_status_and_excessive_response()
+-> Result<(), Box<dyn Error>> {
+    for boundary in [
+        InvalidRelayBoundary::Status,
+        InvalidRelayBoundary::Oversized,
+    ] {
+        let relay = McpStdioRelay::try_new(
+            NamedClient::ClaudeCode,
+            Arc::new(InvalidRelayTransport(boundary)),
+            McpLimits::try_from(McpLimitSpec::default())?,
+        )?;
+        let (mut client, service) = tokio::io::duplex(64 * 1024);
+        let (service_reader, service_writer) = tokio::io::split(service);
+        let task = tokio::spawn(relay.serve_unverified_io(
+            service_reader,
+            service_writer,
+            CancellationToken::new(),
+        ));
+        client
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{},\"clientInfo\":{\"name\":\"claude-code\",\"version\":\"1\"}}}\n",
+            )
+            .await?;
+        let mut initialized = String::new();
+        BufReader::new(&mut client)
+            .read_line(&mut initialized)
+            .await?;
+        client
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":\"tools\",\"method\":\"tools/list\",\"params\":{}}\n",
+            )
+            .await?;
+        let outcome = tokio::time::timeout(Duration::from_secs(1), task).await??;
+        assert!(matches!(outcome, Err(McpRelayError::InvalidResponse)));
+    }
     Ok(())
 }

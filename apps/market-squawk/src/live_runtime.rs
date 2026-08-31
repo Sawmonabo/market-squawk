@@ -10,10 +10,10 @@
 //! app-local event/book/quality path are deleted rather than promoted.
 
 use market_squawk_live::{
-    BoundShardIngress, LiveIngressBindError, LiveRouteConfig, LiveRuntime, LiveRuntimeConfig,
-    LiveRuntimeHealthEvent, LiveRuntimeIngress, LiveRuntimeReplaceError, LiveRuntimeShutdown,
-    LiveRuntimeStartError, LiveSnapshotReader, RouteActionHook, RouteQualifiedMarketExport,
-    ShardId, ShardKey,
+    BoundShardIngress, LiveActionControlError, LiveActionHookReapReceipt, LiveIngressBindError,
+    LiveRouteConfig, LiveRuntime, LiveRuntimeConfig, LiveRuntimeHealthEvent, LiveRuntimeIngress,
+    LiveRuntimeReplaceError, LiveRuntimeShutdown, LiveRuntimeStartError, LiveSnapshotReader,
+    PreparedLiveActionHookGroup, RouteActionHook, RouteQualifiedMarketExport, ShardId, ShardKey,
 };
 use market_squawk_sources::CurrentSourceAuthorityLease;
 use thiserror::Error;
@@ -79,6 +79,25 @@ impl LiveRuntimeComposition {
         })
     }
 
+    /// Starts every shard with a bounded qualified-market export and no execution authority.
+    ///
+    /// This is the source-only runtime used by market display, research, and valuation consumers.
+    /// It deliberately installs no strategy or execution action hook.
+    pub async fn start_with_qualified_market_exports(
+        config: LiveRuntimeConfig,
+        routes: Vec<LiveRouteConfig>,
+        qualified_market_exports: Vec<RouteQualifiedMarketExport>,
+    ) -> Result<Self, LiveRuntimeCompositionError> {
+        Ok(Self {
+            runtime: LiveRuntime::start_with_qualified_market_exports(
+                config,
+                routes,
+                qualified_market_exports,
+            )
+            .await?,
+        })
+    }
+
     /// Returns bounded authority-free immutable snapshot access.
     pub fn snapshots(&self) -> LiveSnapshotReader {
         self.runtime.snapshots()
@@ -127,6 +146,29 @@ impl LiveRuntimeComposition {
         self.runtime.try_next_snapshot_notification()
     }
 
+    /// Transfers one complete route-hook group into the running actors while it remains disabled.
+    pub async fn prepare_action_hooks(
+        &mut self,
+        hooks: Vec<RouteActionHook>,
+        cancellation: CancellationToken,
+    ) -> Result<PreparedLiveActionHookGroup, LiveRuntimeCompositionError> {
+        self.runtime
+            .prepare_action_hooks(hooks, cancellation)
+            .await
+            .map_err(LiveRuntimeCompositionError::ActionControl)
+    }
+
+    /// Removes the exact disabled dynamic hook group from every owning actor.
+    pub async fn reap_action_hooks(
+        &mut self,
+        cancellation: CancellationToken,
+    ) -> Result<LiveActionHookReapReceipt, LiveRuntimeCompositionError> {
+        self.runtime
+            .reap_action_hooks(cancellation)
+            .await
+            .map_err(LiveRuntimeCompositionError::ActionControl)
+    }
+
     /// Fully shuts down the former incarnation before starting a clean replacement.
     pub async fn replace(
         self,
@@ -158,6 +200,8 @@ pub enum LiveRuntimeCompositionError {
     Bind(LiveIngressBindError),
     #[error(transparent)]
     Replace(#[from] LiveRuntimeReplaceError),
+    #[error(transparent)]
+    ActionControl(LiveActionControlError),
     #[error("production live runtime shutdown was incomplete")]
     IncompleteShutdown(LiveRuntimeShutdown),
 }

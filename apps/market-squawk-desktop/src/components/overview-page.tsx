@@ -1,12 +1,11 @@
-import { ShieldCheck } from "lucide-react"
+import { Sparkles } from "lucide-react"
+import { Link } from "react-router-dom"
 
 import { useProduct } from "@/app/product-context"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
-import { SquawkSignal } from "@/components/squawk-signal"
-import { SetupOverview } from "@/components/setup/setup-overview"
-import { VerificationPanel } from "@/components/setup/verification-panel"
+import { OverviewDashboard } from "@/features/overview/overview-dashboard"
 
 export function OverviewPage() {
   const product = useProduct()
@@ -17,8 +16,10 @@ export function OverviewPage() {
     return (
       <div className="mx-auto max-w-3xl p-8">
         <Alert variant="destructive">
-          <AlertTitle>Local application unavailable</AlertTitle>
-          <AlertDescription>{product.error}</AlertDescription>
+          <AlertTitle>Investment workspace unavailable</AlertTitle>
+          <AlertDescription>
+            Your investment workspace cannot be shown right now. Try again.
+          </AlertDescription>
         </Alert>
         <Button className="mt-4" onClick={product.refresh}>
           Try again
@@ -27,101 +28,61 @@ export function OverviewPage() {
     )
   }
   const bootstrap = product.bootstrap
-  const paper = bootstrap.setupSteps.find((step) => step.id === "paper")
-  const firstIncomplete = bootstrap.setupSteps.findIndex(
-    (step) => !step.complete,
-  )
-  const currentStep = firstIncomplete < 0 ? bootstrap.setupSteps.length : firstIncomplete + 1
-
   return (
     <div className="mx-auto w-full max-w-[1120px] space-y-4 p-5 lg:p-7">
       <section className="grid items-start gap-6 lg:grid-cols-[1fr_340px]">
         <div className="pt-1">
           <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-            Setup · Step {currentStep} of {bootstrap.setupSteps.length}
+            Home
           </p>
           <h1 className="mt-3 text-3xl font-bold tracking-[-0.04em] sm:text-4xl">
-            <span className="text-white">Welcome to Market</span>{" "}
-            <span className="text-primary">Squawk</span>
+            What needs your attention now?
           </h1>
           <p className="mt-3 max-w-3xl text-sm leading-6 text-muted-foreground">
-            Build a private market workspace for live data, investment research,
-            portfolios, modeling, and safe paper execution. The recommended setup
-            configures every first-release capability and explains each decision
-            in plain language.
+            Start with clear investment guidance, then check current prices,
+            uncertainty, and portfolio impact before deciding what to do.
           </p>
+          <div className="mt-5 flex flex-wrap items-center gap-3">
+            <Button asChild>
+              <Link to="/opportunities">
+                <Sparkles aria-hidden="true" />
+                Review investment guidance
+              </Link>
+            </Button>
+            <Button asChild variant="outline">
+              <Link to="/markets">Explore investments</Link>
+            </Button>
+          </div>
         </div>
-        <SquawkSignal status={bootstrap.storage.label} />
+        <section className="flex min-h-32 flex-col justify-between rounded-xl border border-border bg-card/45 p-4">
+          <p className="font-mono text-[9px] uppercase tracking-widest text-muted-foreground">
+            Decision checklist
+          </p>
+          <div>
+            <p className="text-lg font-semibold">Evidence before action</p>
+            <p className="mt-2 text-xs leading-5 text-muted-foreground">
+              Check the horizon, ranges, reasons, risks, assumptions, expiry,
+              invalidators, evidence coverage, and uncertainty together.
+            </p>
+          </div>
+        </section>
       </section>
 
-      <section
-        aria-label="Application facts"
-        className="grid overflow-hidden rounded-xl border border-border bg-card/55 sm:grid-cols-2 lg:grid-cols-4"
-      >
-        <Fact
-          label="Application"
-          value={bootstrap.storage.label}
-          ready={bootstrap.storage.state === "ready"}
-        />
-        <Fact
-          label="Release"
-          value={`v${bootstrap.applicationVersion} · ${bootstrap.installation.label}`}
-        />
-        <Fact label="Model runtime" value={bootstrap.modelRuntime.label} />
-        <Fact
-          label="Execution safety"
-          value={paper?.complete ? "Central risk required" : "Unavailable"}
-          ready={paper?.complete}
-        />
+      <OverviewDashboard
+        transport={product.transport}
+        scope={bootstrap.productSessionToken}
+      />
+
+      <section className="rounded-xl border border-border bg-card/35 p-5">
+        <h2 className="text-sm font-semibold">Setup and connections</h2>
+        <p className="mt-2 max-w-3xl text-xs leading-5 text-muted-foreground">
+          Manage setup and connectivity in Settings. Home shows only the resulting
+          investment guidance and availability.
+        </p>
+        <Button asChild className="mt-4" variant="outline">
+          <Link to="/connections/sources">Manage connections</Link>
+        </Button>
       </section>
-
-      <div className="grid gap-4 lg:grid-cols-[1fr_340px]">
-        <SetupOverview
-          bootstrap={bootstrap}
-          transport={product.transport}
-          onRefresh={product.refresh}
-        />
-        <VerificationPanel bootstrap={bootstrap} />
-      </div>
-
-      <aside className="flex items-start gap-3 rounded-lg border border-border bg-card/20 px-4 py-3 text-[11px] leading-relaxed text-muted-foreground">
-        <ShieldCheck
-          className="mt-0.5 size-4 shrink-0 text-foreground/70"
-          aria-hidden="true"
-        />
-        <span>
-          Safe to close. Accepted provider work is checkpointed by the Rust
-          authorities and resumes without exposing credentials or fabricating
-          readiness.
-        </span>
-      </aside>
-    </div>
-  )
-}
-
-function Fact({
-  label,
-  value,
-  ready = false,
-}: {
-  label: string
-  value: string
-  ready?: boolean
-}) {
-  return (
-    <div className="min-h-16 border-b border-border px-4 py-3 last:border-b-0 sm:odd:border-r lg:border-b-0 lg:border-r lg:last:border-r-0">
-      <p className="font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
-        {label}
-      </p>
-      <p className="mt-2 flex items-center gap-2 text-xs font-medium">
-        {ready ? (
-          <span
-            className="size-1.5 rounded-full bg-[var(--success)]"
-            aria-hidden="true"
-          />
-        ) : null}
-        {value}
-      </p>
     </div>
   )
 }

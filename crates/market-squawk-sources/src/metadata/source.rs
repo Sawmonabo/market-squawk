@@ -252,6 +252,7 @@ impl SourceMetadata {
                 | SourceClass::Broker
                 | SourceClass::OfficialAgency
                 | SourceClass::RegulatoryFiling
+                | SourceClass::StandardsPublisher
                 | SourceClass::OnChain
         );
         if requires_network

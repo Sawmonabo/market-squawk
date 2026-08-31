@@ -479,6 +479,7 @@ impl SourceHarness {
                         Some(id("BUY")?),
                         rule("coinbase-aggressor")?,
                     ),
+                    taker_order_type: None,
                 },
             )?);
         }

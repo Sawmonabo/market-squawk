@@ -6,7 +6,8 @@ use futures_util::future::BoxFuture;
 use futures_util::{Stream, StreamExt};
 use market_squawk_domain::Timestamp;
 use market_squawk_sources::{
-    ExtractionAuthority, ExtractionSourceError, NetworkAccessPolicy, SourceError, SourceMetadata,
+    ExtractionAuthority, ExtractionSourceError, InFlightExtractionRequest, NetworkAccessPolicy,
+    SourceError, SourceMetadata,
 };
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER, USER_AGENT,
@@ -18,6 +19,7 @@ use crate::TreasurySourceError;
 pub(crate) const JSON_MEDIA_TYPE: &str = "application/json";
 pub(crate) const XML_MEDIA_TYPE: &str = "application/atom+xml, application/xml, text/xml";
 const USER_AGENT_VALUE: &str = "market-squawk/0.1 treasury-adapter";
+const MAX_RESPONSE_HEADER_BYTES: usize = 4 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct TreasuryHttpClient {
@@ -32,8 +34,12 @@ impl TreasuryHttpClient {
             return Err(TreasurySourceError::InvalidMetadata);
         };
         let bounds = policy.request_bounds();
-        let max_response_bytes = usize::try_from(bounds.max_response_bytes())
-            .map_err(|_| TreasurySourceError::InvalidMetadata)?;
+        let max_response_bytes = usize::try_from(
+            bounds
+                .max_response_bytes()
+                .min(market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGE_BYTES),
+        )
+        .map_err(|_| TreasurySourceError::InvalidMetadata)?;
         let total_timeout = Duration::from_nanos(bounds.total_timeout_nanos());
         let transport = Arc::new(ReqwestTreasuryTransport::try_new(bounds)?);
         Ok(Self {
@@ -54,8 +60,12 @@ impl TreasuryHttpClient {
         let bounds = policy.request_bounds();
         Ok(Self {
             transport,
-            max_response_bytes: usize::try_from(bounds.max_response_bytes())
-                .map_err(|_| TreasurySourceError::InvalidMetadata)?,
+            max_response_bytes: usize::try_from(
+                bounds
+                    .max_response_bytes()
+                    .min(market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGE_BYTES),
+            )
+            .map_err(|_| TreasurySourceError::InvalidMetadata)?,
             total_timeout: Duration::from_nanos(bounds.total_timeout_nanos()),
         })
     }
@@ -131,6 +141,7 @@ impl TreasuryHttpClient {
         Ok(RetrievedResponse {
             bytes: response.body,
             received_at: response.received_at,
+            in_flight,
         })
     }
 }
@@ -210,24 +221,33 @@ impl TreasuryTransport for ReqwestTreasuryTransport {
                     .send()
                     .await
                     .map_err(|_| TreasurySourceError::Source(SourceError::Network))?;
-                if response.content_length().is_some_and(|length| {
-                    usize::try_from(length).map_or(true, |length| length > max_bytes)
-                }) {
-                    return Err(TreasurySourceError::BodyTooLarge);
-                }
                 let status = response.status().as_u16();
                 let retry_after = response
                     .headers()
                     .get(RETRY_AFTER)
+                    .filter(|value| value.as_bytes().len() <= MAX_RESPONSE_HEADER_BYTES)
                     .map(|value| value.as_bytes().to_vec());
+                if response_body_admission(status, response.content_length(), max_bytes)?.is_none()
+                {
+                    return Ok(TreasuryHttpResponse {
+                        status,
+                        retry_after,
+                        content_encoding: None,
+                        content_type: None,
+                        body: Bytes::new(),
+                        received_at: system_timestamp()?,
+                    });
+                }
                 let content_encoding = response
                     .headers()
                     .get(CONTENT_ENCODING)
-                    .map(|value| value.as_bytes().to_vec());
+                    .map(|value| bounded_success_header(value.as_bytes()))
+                    .transpose()?;
                 let content_type = response
                     .headers()
                     .get(CONTENT_TYPE)
-                    .map(|value| value.as_bytes().to_vec());
+                    .map(|value| bounded_success_header(value.as_bytes()))
+                    .transpose()?;
                 let body = collect_bounded_stream(response.bytes_stream(), max_bytes).await?;
                 Ok(TreasuryHttpResponse {
                     status,
@@ -249,12 +269,37 @@ impl TreasuryTransport for ReqwestTreasuryTransport {
     }
 }
 
+fn response_body_admission(
+    status: u16,
+    content_length: Option<u64>,
+    max_bytes: usize,
+) -> Result<Option<usize>, TreasurySourceError> {
+    if status != 200 {
+        return Ok(None);
+    }
+    if content_length
+        .is_some_and(|length| usize::try_from(length).map_or(true, |length| length > max_bytes))
+    {
+        return Err(TreasurySourceError::BodyTooLarge);
+    }
+    Ok(Some(max_bytes))
+}
+
+fn bounded_success_header(value: &[u8]) -> Result<Vec<u8>, TreasurySourceError> {
+    if value.len() > MAX_RESPONSE_HEADER_BYTES {
+        return Err(TreasurySourceError::InvalidProtocol);
+    }
+    Ok(value.to_vec())
+}
+
 fn map_adapter_error(error: TreasurySourceError) -> ExtractionSourceError {
     match error {
         TreasurySourceError::Cancelled => ExtractionSourceError::Cancelled,
         TreasurySourceError::DeadlineExceeded => ExtractionSourceError::DeadlineExceeded,
         TreasurySourceError::Source(error) => ExtractionSourceError::Source(error),
         TreasurySourceError::InvalidMetadata
+        | TreasurySourceError::InvalidBackfillCheckpoint
+        | TreasurySourceError::BackfillIncomplete
         | TreasurySourceError::QueryBindingMismatch
         | TreasurySourceError::InvalidProtocol
         | TreasurySourceError::Protocol(_)
@@ -270,6 +315,14 @@ fn map_adapter_error(error: TreasurySourceError) -> ExtractionSourceError {
 pub(crate) struct RetrievedResponse {
     pub(crate) bytes: Bytes,
     pub(crate) received_at: Timestamp,
+    in_flight: InFlightExtractionRequest,
+}
+
+impl RetrievedResponse {
+    pub(crate) fn record_success(self) -> Result<(Bytes, Timestamp), ExtractionSourceError> {
+        self.in_flight.record_success()?;
+        Ok((self.bytes, self.received_at))
+    }
 }
 
 async fn collect_bounded_stream<S, E>(
@@ -335,10 +388,14 @@ mod tests {
     use bytes::Bytes;
     use futures_util::stream;
 
-    use super::{TreasurySourceError, collect_bounded_stream};
+    use super::{TreasurySourceError, collect_bounded_stream, response_body_admission};
 
     #[tokio::test]
-    async fn streamed_body_limit_is_enforced_across_chunks() {
+    async fn streamed_body_limit_and_refusal_body_admission_are_bounded() {
+        assert!(matches!(
+            response_body_admission(429, Some(u64::MAX), 7),
+            Ok(None)
+        ));
         let chunks = stream::iter([
             Ok::<_, std::io::Error>(Bytes::from_static(b"abcd")),
             Ok(Bytes::from_static(b"efgh")),

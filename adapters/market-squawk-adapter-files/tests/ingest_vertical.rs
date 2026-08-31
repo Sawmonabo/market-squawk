@@ -9,14 +9,15 @@ use std::fs;
 use std::io::{Cursor, Write as _};
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{Array as _, ArrayRef, Decimal128Array, StringArray, UInt8Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use market_squawk_adapter_files::{
     ExtractionClock, ExtractionClockError, ExtractionClockReading, ExtractionLimits,
-    ExtractionLimitsInput, FileAdapterError, FileExtractionSource,
+    ExtractionLimitsInput, FileAdapterError, FileExtractionSource, FilePreviewCell,
+    FilePreviewColumnKind, FilePreviewFormat, FilePreviewLimits, preview_bytes,
 };
 use market_squawk_data::{
     AnalyticalDataService, AnalyticalManifestCatalog, CatalogAuthority, CatalogConfig,
@@ -65,6 +66,174 @@ struct AuthorizedLocalSource {
     source: FileExtractionSource,
     authority: ExtractionAuthority,
     _registry: AuthoritativeSourceRegistry,
+}
+
+#[tokio::test]
+async fn preview_and_row_time_mapping_share_the_exact_parser_and_fail_closed() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    let csv = b"id,value,effective_ns,published_ns,available_ns,revision_id,revision_number,superseded_ns\nrow-1,1.25,100,150,175,row-revision-2,2,200\n";
+    fs::write(directory.path().join("timed.csv"), csv)?;
+    let cancellation = CancellationToken::new();
+    let preview = preview_bytes(
+        FilePreviewFormat::Csv { delimiter: b',' },
+        csv,
+        ExtractionLimits::try_new(ExtractionLimitsInput::standard())?,
+        FilePreviewLimits::standard(),
+        preview_deadline()?,
+        &cancellation,
+    )?;
+    assert_eq!(preview.row_count(), 1);
+    let value_column = preview
+        .columns()
+        .iter()
+        .find(|column| column.name() == "value")
+        .ok_or("preview omitted the value column")?;
+    assert_eq!(value_column.kind(), FilePreviewColumnKind::ExactDecimal);
+    assert!(!value_column.nullable());
+    let effective_index = preview
+        .columns()
+        .iter()
+        .position(|column| column.name() == "effective_ns")
+        .ok_or("preview omitted the effective-time column")?;
+    assert!(matches!(
+        preview.sample_rows()[0].cells().get(effective_index),
+        Some(FilePreviewCell::Text {
+            value,
+            truncated: false,
+        }) if value == "100"
+    ));
+
+    let manifest = row_time_manifest()?;
+    let source = authorized_local_source(
+        directory.path(),
+        state.path().join("row-time"),
+        "row-time-manifest.json",
+        &manifest,
+    )?;
+    let discovery = DiscoveryRequest::try_new(
+        SourceIdentifier::try_from("timed-prices")?,
+        None,
+        NonZeroU16::MIN,
+        Timestamp::from_unix_nanos(10_000_000_000),
+    )?;
+    let object = source
+        .source
+        .discover_files(&source.authority, &discovery, &CancellationToken::new())
+        .await?
+        .objects()
+        .first()
+        .cloned()
+        .ok_or("row-time object was not discovered")?;
+    let batch = extract_one(&source, object).await?;
+    let record = batch.records().first().ok_or("row-time record is absent")?;
+    assert_eq!(
+        record.effective_time().exact_timestamp(),
+        Some(Timestamp::from_unix_nanos(100))
+    );
+    assert_eq!(
+        record
+            .published_time()
+            .and_then(ResearchTemporalCoordinate::exact_timestamp),
+        Some(Timestamp::from_unix_nanos(150))
+    );
+    assert_eq!(record.available_at(), Some(Timestamp::from_unix_nanos(175)));
+    assert_eq!(record.revision().as_str(), "row-revision-2");
+    assert_eq!(
+        record
+            .superseded_time()
+            .and_then(ResearchTemporalCoordinate::exact_timestamp),
+        Some(Timestamp::from_unix_nanos(200))
+    );
+    let observation: ResearchObservation = serde_json::from_slice(record.payload())?;
+    let ResearchObservation::AlternativeData(observation) = observation else {
+        return Err("row-time extraction produced the wrong observation kind".into());
+    };
+    let context = observation.context();
+    assert_eq!(
+        context.time().effective().exact_timestamp(),
+        Some(Timestamp::from_unix_nanos(100))
+    );
+    assert_eq!(context.time().revision().get(), 2);
+    assert_eq!(
+        context
+            .provenance()
+            .availability()
+            .conservative_available_at(),
+        Some(Timestamp::from_unix_nanos(175))
+    );
+
+    fs::write(
+        directory.path().join("timed.csv"),
+        b"id,value,effective_ns,published_ns,available_ns,revision_id,revision_number,superseded_ns\nrow-1,1.25,+100,150,175,row-revision-2,2,200\n",
+    )?;
+    let changed = source
+        .source
+        .discover_files(&source.authority, &discovery, &CancellationToken::new())
+        .await?
+        .objects()
+        .first()
+        .cloned()
+        .ok_or("changed row-time object was not discovered")?;
+    let error = extract_one(&source, changed)
+        .await
+        .err()
+        .ok_or("noncanonical row timestamp unexpectedly extracted")?;
+    assert_eq!(
+        error.downcast_ref::<FileAdapterError>(),
+        Some(&FileAdapterError::InvalidRecord)
+    );
+    Ok(())
+}
+
+fn preview_deadline() -> TestResult<Timestamp> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    let nanos = i128::from(now.as_secs())
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(i128::from(now.subsec_nanos())))
+        .and_then(|value| value.checked_add(5_000_000_000))
+        .ok_or("preview deadline overflow")?;
+    Ok(Timestamp::from_unix_nanos(i64::try_from(nanos)?))
+}
+
+fn row_time_manifest() -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema_version": 5,
+        "objects": [{
+            "dataset": "timed-prices",
+            "object_id": "timed-price-object",
+            "path": "timed.csv",
+            "format": {"kind": "csv", "delimiter": 44},
+            "effective_at": 1,
+            "published_at": 2,
+            "revision": "object-revision-1",
+            "revision_number": 1,
+            "superseded_at": 250,
+            "record_time": {
+                "effective": ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(10)),
+                "published": ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(20)),
+                "superseded": ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(250)),
+            },
+            "row_time": {
+                "effective_field": "effective_ns",
+                "published_field": "published_ns",
+                "available_field": "available_ns",
+                "revision_field": "revision_id",
+                "revision_number_field": "revision_number",
+                "superseded_field": "superseded_ns",
+            },
+            "instrument_binding": {"kind": "unscoped"},
+            "row_policy": {
+                "identity_field": "id",
+                "fields": [{
+                    "source": "value",
+                    "field": "price",
+                    "decimal_scale": 2,
+                    "unit": "USD",
+                }],
+            },
+        }],
+    }))
 }
 
 #[tokio::test]

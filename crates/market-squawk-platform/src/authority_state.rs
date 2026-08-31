@@ -11,6 +11,8 @@ use std::sync::Mutex;
 
 use thiserror::Error;
 
+use crate::paths::{ControlRoot, LocalPaths};
+
 pub use self::envelope::{AuthorityCommitContext, AuthorityStateSnapshot};
 use self::envelope::{Envelope, next_context, validate_payload_size};
 use self::filesystem::{LifetimeLock, Slot, StateFiles};
@@ -26,6 +28,91 @@ pub struct LocalAuthorityStateStore {
     files: StateFiles,
     _lock: LifetimeLock,
     gate: Mutex<StoreGate>,
+}
+
+/// Exclusive lifetime guard for one selected installation's service process.
+///
+/// Unlike a general [`LocalAuthorityStateStore`], this capability can only be acquired at the
+/// code-owned `installed-service/instance` authority beneath a prepared control root. Holding it
+/// proves that no other service process owns that installation authority for the guard's lifetime.
+pub struct InstalledServiceInstanceGuard {
+    _store: LocalAuthorityStateStore,
+}
+
+/// One installation-global service instance bound linearly to one selected workspace.
+///
+/// The private fields and consuming bind prevent a caller from retaining the unbound installation
+/// lock, substituting a second workspace, or supplying an unrelated source-authority store after
+/// the workspace has been selected.
+pub struct InstalledServiceSelectedWorkspaceGuard {
+    _instance: InstalledServiceInstanceGuard,
+    workspace_paths: LocalPaths,
+}
+
+impl fmt::Debug for InstalledServiceInstanceGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstalledServiceInstanceGuard")
+            .field("authority", &"[INSTALLATION SERVICE INSTANCE]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl InstalledServiceInstanceGuard {
+    /// Acquires the exact installed-service instance authority under `installation_control`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocalAuthorityStateStoreError`] when the authority root is unsafe, unavailable,
+    /// corrupt, or already owned by another service process.
+    pub fn try_acquire(
+        installation_control: &ControlRoot,
+    ) -> Result<Self, LocalAuthorityStateStoreError> {
+        const SERVICE_DIRECTORY: &str = "installed-service";
+        const INSTANCE_DIRECTORY: &str = "instance";
+
+        let store = LocalAuthorityStateStore::try_open(
+            installation_control
+                .root()
+                .join(SERVICE_DIRECTORY)
+                .join(INSTANCE_DIRECTORY),
+        )?;
+        Ok(Self { _store: store })
+    }
+
+    /// Consumes the installation instance and binds it to one already selected workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::PathError`] when the selected workspace no longer exposes its exact
+    /// prepared control-directory capability.
+    pub fn bind_selected_workspace(
+        self,
+        workspace_paths: LocalPaths,
+    ) -> Result<InstalledServiceSelectedWorkspaceGuard, crate::PathError> {
+        workspace_paths.control_root()?.try_clone_directory()?;
+        Ok(InstalledServiceSelectedWorkspaceGuard {
+            _instance: self,
+            workspace_paths,
+        })
+    }
+}
+
+impl fmt::Debug for InstalledServiceSelectedWorkspaceGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstalledServiceSelectedWorkspaceGuard")
+            .field("authority", &"[INSTALLATION-BOUND SELECTED WORKSPACE]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl InstalledServiceSelectedWorkspaceGuard {
+    /// Returns the exact prepared workspace capability bound to the installation instance.
+    #[must_use]
+    pub const fn workspace_paths(&self) -> &LocalPaths {
+        &self.workspace_paths
+    }
 }
 
 struct StoreGate {

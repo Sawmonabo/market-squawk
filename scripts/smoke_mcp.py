@@ -1,23 +1,127 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
+import base64
+import contextlib
 import json
+import os
 import pathlib
 import queue
+import re
+import secrets
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from typing import TextIO
 
 
 REQUEST_TIMEOUT_SECONDS = 15.0
 SHUTDOWN_TIMEOUT_SECONDS = 25.0
+SERVICE_STATUS_TIMEOUT_SECONDS = 35.0
+SERVICE_BOOTSTRAP_TIMEOUT_SECONDS = 45.0
+SERVICE_START_TIMEOUT_SECONDS = 60.0
+APPIMAGE_EXTRACTION_TIMEOUT_SECONDS = 90.0
+MCP_PROTOCOL_VERSION = "2026-07-28"
+MAXIMUM_DIAGNOSTIC_BYTES = 8 * 1024
+MAXIMUM_INSTALLATION_ROOT_BYTES = 4 * 1024
+
+
+def isolated_child_environment(root: pathlib.Path) -> dict[str, str]:
+    home = root / "home"
+    temporary = root / "tmp"
+    xdg_config = root / "xdg" / "config"
+    xdg_data = root / "xdg" / "data"
+    xdg_state = root / "xdg" / "state"
+    xdg_cache = root / "xdg" / "cache"
+    for directory in (home, temporary, xdg_config, xdg_data, xdg_state, xdg_cache):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    environment = {
+        "HOME": str(home),
+        "TMPDIR": str(temporary),
+        "TMP": str(temporary),
+        "TEMP": str(temporary),
+        "XDG_CONFIG_HOME": str(xdg_config),
+        "XDG_DATA_HOME": str(xdg_data),
+        "XDG_STATE_HOME": str(xdg_state),
+        "XDG_CACHE_HOME": str(xdg_cache),
+    }
+    path = os.environ.get("PATH")
+    if path:
+        environment["PATH"] = path
+    if os.name == "nt":
+        app_data = root / "appdata"
+        local_app_data = root / "localappdata"
+        app_data.mkdir(parents=True, exist_ok=True)
+        local_app_data.mkdir(parents=True, exist_ok=True)
+        home_drive, home_path = os.path.splitdrive(str(home))
+        environment.update(
+            {
+                "APPDATA": str(app_data),
+                "LOCALAPPDATA": str(local_app_data),
+                "USERPROFILE": str(home),
+                "HOMEDRIVE": home_drive,
+                "HOMEPATH": home_path,
+            }
+        )
+        for name in ("SystemRoot", "ComSpec", "PATHEXT"):
+            value = os.environ.get(name)
+            if value:
+                environment[name] = value
+    return environment
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Exercise one named Market Squawk MCP relay over stdio."
+    )
+    parser.add_argument("binary", nargs="?", default="target/debug/market-squawk")
+    parser.add_argument("--client", choices=("claude-code", "codex"), default="codex")
+    parser.add_argument("--data-dir", type=pathlib.Path)
+    parser.add_argument("--installation-data-root", type=pathlib.Path)
+    parser.add_argument(
+        "--running-service",
+        action="store_true",
+        help="Use the already-ready installed service instead of starting a sibling service.",
+    )
+    parser.add_argument(
+        "--installed-relay",
+        action="store_true",
+        help="Treat binary as the installed market-squawk-mcp-relay executable.",
+    )
+    parser.add_argument("--desktop-appimage", action="store_true")
+    arguments = parser.parse_args()
+    if arguments.desktop_appimage and (
+        arguments.running_service or arguments.installed_relay
+    ):
+        parser.error("--desktop-appimage cannot use --running-service or --installed-relay")
+    if arguments.running_service and arguments.data_dir is None:
+        parser.error("--running-service requires --data-dir")
+    if arguments.installed_relay and not arguments.running_service:
+        parser.error("--installed-relay requires --running-service")
+    if arguments.installation_data_root is not None and not arguments.running_service:
+        parser.error("--installation-data-root requires --running-service")
+    return arguments
 
 
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
+
+
+def encode_installation_data_root(root: pathlib.Path) -> str:
+    canonical = root.resolve(strict=True)
+    value = str(canonical).encode("utf-8")
+    require(
+        0 < len(value) <= MAXIMUM_INSTALLATION_ROOT_BYTES,
+        "installed service root is invalid",
+    )
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
 def readline_with_timeout(stream: TextIO, timeout_seconds: float) -> str:
@@ -65,6 +169,26 @@ def stop_process(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
 
 
+def stop_service(process: subprocess.Popen[str]) -> None:
+    if process.poll() is None:
+        if os.name == "nt":
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            process.terminate()
+        try:
+            process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            process.kill()
+            process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+            raise TimeoutError(
+                "installed service did not complete bounded credential retirement"
+            ) from error
+    require(
+        process.returncode == 0,
+        f"installed service exited with status {process.returncode}",
+    )
+
+
 def finish_process(process: subprocess.Popen[str]) -> None:
     require(process.stdin is not None, "MCP process stdin is unavailable")
     process.stdin.close()
@@ -77,39 +201,379 @@ def finish_process(process: subprocess.Popen[str]) -> None:
     require(return_code == 0, f"MCP process exited with status {return_code}")
 
 
-def main() -> int:
-    arguments = sys.argv[1:]
-    desktop_appimage = bool(arguments and arguments[0] == "--desktop-appimage")
-    if desktop_appimage:
-        arguments = arguments[1:]
-    if len(arguments) > 1:
-        print(
-            "usage: smoke_mcp.py [--desktop-appimage] [/path/to/executable]",
-            file=sys.stderr,
-        )
-        return 2
+def bounded_redacted_diagnostics(
+    stream: TextIO, sensitive_values: tuple[str, ...] = ()
+) -> str:
+    stream.seek(0)
+    encoded = stream.read(MAXIMUM_DIAGNOSTIC_BYTES + 1).encode(
+        "utf-8", errors="replace"
+    )
+    truncated = len(encoded) > MAXIMUM_DIAGNOSTIC_BYTES
+    text = encoded[:MAXIMUM_DIAGNOSTIC_BYTES].decode("utf-8", errors="replace")
+    for sensitive in sensitive_values:
+        if sensitive:
+            text = text.replace(sensitive, "[REDACTED]")
+    text = re.sub(
+        r"(?i)(secret|credential|token|password|unlock)(\s*[:=]\s*)[^\s,;]+",
+        r"\1\2[REDACTED]",
+        text,
+    )
+    text = "".join(character for character in text if character in "\n\r\t" or character.isprintable())
+    text = text.strip()
+    if truncated:
+        text = f"{text}\n[diagnostics truncated]" if text else "[diagnostics truncated]"
+    return text
 
-    binary = pathlib.Path(
-        arguments[0] if arguments else "target/debug/market-squawk"
-    ).resolve()
-    require(binary.is_file(), f"Market Squawk binary does not exist: {binary}")
-    with (
-        tempfile.TemporaryDirectory() as data_dir,
-        tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_log,
-    ):
-        command = [str(binary), "--data-dir", data_dir, "mcp", "serve"]
-        if desktop_appimage:
-            command = [str(binary), "--stdio-mcp", "--data-dir", data_dir]
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=stderr_log,
+
+def controlled_extracted_program(
+    extraction_root: pathlib.Path, name: str
+) -> pathlib.Path:
+    candidate = extraction_root / "usr" / "bin" / name
+    metadata = candidate.lstat()
+    require(not candidate.is_symlink(), f"AppImage program is a symbolic link: {name}")
+    require(metadata.st_size > 0, f"AppImage program is empty: {name}")
+    require(candidate.is_file(), f"AppImage program is not a regular file: {name}")
+    resolved_root = extraction_root.resolve(strict=True)
+    resolved = candidate.resolve(strict=True)
+    require(
+        resolved.is_relative_to(resolved_root),
+        f"AppImage program escapes the extracted package: {name}",
+    )
+    require(os.access(resolved, os.X_OK), f"AppImage program is not executable: {name}")
+    return resolved
+
+
+def extract_appimage_programs(
+    appimage: pathlib.Path,
+    extraction_directory: pathlib.Path,
+    environment: dict[str, str],
+) -> tuple[pathlib.Path, pathlib.Path]:
+    extraction_environment = environment.copy()
+    extraction_environment.pop("APPIMAGE_EXTRACT_AND_RUN", None)
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr:
+        result = subprocess.run(
+            [str(appimage), "--appimage-extract"],
+            cwd=extraction_directory,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr,
             text=True,
-            bufsize=1,
+            check=False,
+            env=extraction_environment,
+            timeout=APPIMAGE_EXTRACTION_TIMEOUT_SECONDS,
         )
+        if result.returncode != 0:
+            diagnostics = bounded_redacted_diagnostics(stderr)
+            detail = f": {diagnostics}" if diagnostics else ""
+            raise RuntimeError(
+                f"AppImage extraction exited with status {result.returncode}{detail}"
+            )
+    extracted = extraction_directory / "squashfs-root"
+    extracted_metadata = extracted.lstat()
+    require(not extracted.is_symlink(), "AppImage extraction root is a symbolic link")
+    require(extracted_metadata.st_size > 0, "AppImage extraction root is empty")
+    require(extracted.is_dir(), "AppImage extraction root is not a directory")
+    return (
+        controlled_extracted_program(extracted, "market-squawk"),
+        controlled_extracted_program(extracted, "market-squawk-service"),
+    )
+
+
+def bootstrap_service(
+    binary: pathlib.Path,
+    data_dir: str,
+    installation_data_root: str,
+    requirement: str,
+    environment: dict[str, str],
+) -> None:
+    unlock = secrets.token_urlsafe(32) if requirement == "encrypted_fallback_locked" else ""
+    command = [
+        str(binary),
+        "--output",
+        "json",
+        "--data-dir",
+        data_dir,
+        "--installation-data-root",
+        installation_data_root,
+        "service",
+        "bootstrap",
+    ]
+    if unlock:
+        command.append("--stdin")
+    elif requirement == "foreground_keyring_retry":
+        command.append("--retry-after-foreground-keyring")
+    else:
+        raise RuntimeError("installed service returned an unsupported bootstrap requirement")
+    with (
+        tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout,
+        tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr,
+    ):
+        result = subprocess.run(
+            command,
+            input=f"{unlock}\n" if unlock else None,
+            stdout=stdout,
+            stderr=stderr,
+            text=True,
+            check=False,
+            env=environment,
+            timeout=SERVICE_BOOTSTRAP_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0:
+            diagnostics = bounded_redacted_diagnostics(stderr, (unlock,))
+            detail = f": {diagnostics}" if diagnostics else ""
+            raise RuntimeError(
+                f"installed CLI bootstrap exited with status {result.returncode}{detail}"
+            )
+
+
+def wait_for_service(
+    binary: pathlib.Path,
+    data_dir: str,
+    installation_data_root: str,
+    service: subprocess.Popen[str],
+    environment: dict[str, str],
+) -> None:
+    deadline = time.monotonic() + SERVICE_START_TIMEOUT_SECONDS
+    bootstrap_attempted = False
+    while time.monotonic() < deadline:
+        if service.poll() is not None:
+            raise RuntimeError(
+                f"installed service exited before readiness with status {service.returncode}"
+            )
+        with (
+            tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as probe_stdout,
+            tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as probe_stderr,
+        ):
+            probe = subprocess.run(
+                [
+                    str(binary),
+                    "--output",
+                    "json",
+                    "--data-dir",
+                    data_dir,
+                    "--installation-data-root",
+                    installation_data_root,
+                    "service",
+                    "status",
+                ],
+                stdout=probe_stdout,
+                stderr=probe_stderr,
+                check=False,
+                env=environment,
+                timeout=SERVICE_STATUS_TIMEOUT_SECONDS,
+                text=True,
+            )
+            if probe.returncode == 0:
+                probe_stdout.seek(0)
+                try:
+                    status = json.load(probe_stdout)
+                except json.JSONDecodeError:
+                    status = None
+                if isinstance(status, dict) and status.get("status") == "ready":
+                    return
+                bootstrap = status.get("bootstrap") if isinstance(status, dict) else None
+                if (
+                    not bootstrap_attempted
+                    and isinstance(bootstrap, dict)
+                    and status.get("status") == "bootstrap_required"
+                    and bootstrap.get("state") == "required"
+                    and isinstance(bootstrap.get("requirement"), str)
+                ):
+                    bootstrap_attempted = True
+                    bootstrap_service(
+                        binary,
+                        data_dir,
+                        installation_data_root,
+                        bootstrap["requirement"],
+                        environment,
+                    )
+        time.sleep(0.1)
+    raise TimeoutError(
+        f"installed service did not reach readiness in {SERVICE_START_TIMEOUT_SECONDS:.3f}s"
+    )
+
+
+def wait_for_service_root(
+    installation_data_root: str,
+    service: subprocess.Popen[str],
+) -> None:
+    """Wait until the service has admitted and created its fresh verification root."""
+    root = pathlib.Path(installation_data_root)
+    deadline = time.monotonic() + SERVICE_START_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if service.poll() is not None:
+            raise RuntimeError(
+                f"installed service exited before startup with status {service.returncode}"
+            )
+        try:
+            metadata = root.lstat()
+        except FileNotFoundError:
+            time.sleep(0.05)
+            continue
+        except OSError as error:
+            raise RuntimeError("failed to inspect the service verification root") from error
+        require(
+            stat.S_ISDIR(metadata.st_mode),
+            "installed service verification root is not a real directory",
+        )
+        return
+    raise TimeoutError(
+        "installed service did not create its verification root within "
+        f"{SERVICE_START_TIMEOUT_SECONDS:.3f}s"
+    )
+
+
+def main() -> int:
+    arguments = parse_arguments()
+    binary = pathlib.Path(arguments.binary).resolve()
+    require(binary.is_file(), f"Market Squawk binary does not exist: {binary}")
+    temporary_user_context = (
+        contextlib.nullcontext(None)
+        if arguments.running_service
+        else tempfile.TemporaryDirectory(prefix="market-squawk-smoke-user-")
+    )
+    temporary_installation_context = (
+        contextlib.nullcontext(None)
+        if arguments.running_service
+        else tempfile.TemporaryDirectory(prefix="market-squawk-smoke-installation-")
+    )
+    temporary_appimage_context = (
+        tempfile.TemporaryDirectory(prefix="market-squawk-smoke-appimage-")
+        if arguments.desktop_appimage
+        else contextlib.nullcontext(None)
+    )
+    with (
+        tempfile.TemporaryDirectory() as temporary_data_dir,
+        temporary_user_context as temporary_user_root,
+        temporary_installation_context as temporary_installation_parent,
+        temporary_appimage_context as temporary_appimage_root,
+        tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_log,
+        tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as service_stderr,
+    ):
+        data_dir = str(arguments.data_dir or temporary_data_dir)
+        environment = (
+            None
+            if temporary_user_root is None
+            else isolated_child_environment(pathlib.Path(temporary_user_root))
+        )
+        installation_data_root = (
+            str(arguments.installation_data_root.resolve(strict=True))
+            if arguments.installation_data_root is not None
+            else (
+                None
+                if temporary_installation_parent is None
+                else str(
+                    pathlib.Path(temporary_installation_parent).resolve(strict=True)
+                    / "installation"
+                )
+            )
+        )
+        installation_arguments = (
+            []
+            if installation_data_root is None
+            else ["--installation-data-root", installation_data_root]
+        )
+        service: subprocess.Popen[str] | None = None
+        process: subprocess.Popen[str] | None = None
+        service_cli = binary
+        service_binary = binary.with_name(f"market-squawk-service{binary.suffix}")
+        if arguments.desktop_appimage:
+            require(environment is not None, "isolated AppImage environment is unavailable")
+            require(
+                temporary_appimage_root is not None,
+                "isolated AppImage extraction root is unavailable",
+            )
+            service_cli, service_binary = extract_appimage_programs(
+                binary,
+                pathlib.Path(temporary_appimage_root),
+                environment,
+            )
+            environment["APPIMAGE_EXTRACT_AND_RUN"] = "1"
+        command = [
+            str(binary),
+            "--data-dir",
+            data_dir,
+            *installation_arguments,
+            "mcp",
+            "serve",
+            "--client",
+            arguments.client,
+        ]
+        if arguments.desktop_appimage:
+            command = [
+                str(binary),
+                "--stdio-mcp",
+                "--mcp-client",
+                arguments.client,
+                "--data-dir",
+                data_dir,
+                *installation_arguments,
+            ]
+        elif arguments.installed_relay:
+            relay_client = "claude" if arguments.client == "claude-code" else "codex"
+            command = [
+                str(binary),
+                "--client",
+                relay_client,
+                "--data-dir",
+                data_dir,
+            ]
+            if installation_data_root is not None:
+                command.extend(
+                    [
+                        "--installation-data-root-encoded",
+                        encode_installation_data_root(
+                            pathlib.Path(installation_data_root)
+                        ),
+                    ]
+                )
         failure: BaseException | None = None
         try:
+            if not arguments.running_service:
+                require(
+                    installation_data_root is not None,
+                    "isolated installation root is unavailable",
+                )
+                require(
+                    service_binary.is_file(),
+                    f"Market Squawk service binary does not exist: {service_binary}",
+                )
+                service = subprocess.Popen(
+                    [
+                        str(service_binary),
+                        "--data-dir",
+                        data_dir,
+                        "--installation-data-root",
+                        installation_data_root,
+                        "--ephemeral-verification-credentials",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=service_stderr,
+                    text=True,
+                    env=environment,
+                    creationflags=(
+                        subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+                    ),
+                )
+                require(environment is not None, "isolated service environment is unavailable")
+                wait_for_service_root(installation_data_root, service)
+                wait_for_service(
+                    service_cli,
+                    data_dir,
+                    installation_data_root,
+                    service,
+                    environment,
+                )
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=stderr_log,
+                text=True,
+                bufsize=1,
+                env=environment,
+            )
             initialized = request(
                 process,
                 {
@@ -117,7 +581,7 @@ def main() -> int:
                     "id": 1,
                     "method": "initialize",
                     "params": {
-                        "protocolVersion": "2025-11-25",
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
                         "capabilities": {},
                         "clientInfo": {"name": "smoke-test", "version": "1"},
                     },
@@ -127,6 +591,11 @@ def main() -> int:
                 initialized.get("result", {}).get("serverInfo", {}).get("name")
                 == "market-squawk",
                 "MCP initialize response has the wrong server identity",
+            )
+            require(
+                initialized.get("result", {}).get("protocolVersion")
+                == MCP_PROTOCOL_VERSION,
+                "MCP initialize response has the wrong protocol version",
             )
             require(process.stdin is not None, "MCP process stdin is unavailable")
             process.stdin.write(
@@ -157,9 +626,11 @@ def main() -> int:
                 "Portfolio",
                 "Analysis",
                 "Model",
+                "Decision",
                 "FairValue",
                 "Bot",
                 "Execution",
+                "Job",
             }
             observed_domains = {
                 name.split(".", maxsplit=1)[0] for name in names if "." in name
@@ -265,18 +736,28 @@ def main() -> int:
         except BaseException as error:
             failure = error
         finally:
-            if failure is None:
+            if process is not None and failure is None:
                 try:
                     finish_process(process)
                 except BaseException as error:
                     failure = error
-            else:
+            elif process is not None:
                 stop_process(process)
+            if service is not None:
+                try:
+                    stop_service(service)
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+                    else:
+                        failure.add_note(f"service cleanup also failed: {error}")
         if failure is not None:
-            stderr_log.seek(0)
-            diagnostics = stderr_log.read().strip()
+            diagnostics = bounded_redacted_diagnostics(stderr_log)
             if diagnostics:
                 print(f"MCP stderr:\n{diagnostics}", file=sys.stderr)
+            service_diagnostics = bounded_redacted_diagnostics(service_stderr)
+            if service_diagnostics:
+                print(f"Service stderr:\n{service_diagnostics}", file=sys.stderr)
             raise failure
     return 0
 

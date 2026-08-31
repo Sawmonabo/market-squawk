@@ -56,6 +56,19 @@ def generate_rustdoc(target_directory: Path) -> None:
     subprocess.run(
         [
             "cargo",
+            "clean",
+            "--doc",
+            "--target-dir",
+            str(target_directory),
+            "--locked",
+        ],
+        cwd=REPOSITORY,
+        env=environment,
+        check=True,
+    )
+    subprocess.run(
+        [
+            "cargo",
             "doc",
             "--workspace",
             "--all-features",

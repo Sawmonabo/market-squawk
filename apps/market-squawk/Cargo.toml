@@ -11,6 +11,12 @@ autotests = false
 
 [features]
 default = []
+board-installed-fixture = [
+    "market-squawk-adapter-federal-reserve/scripted-transport-fixture",
+]
+bls-installed-fixture = [
+    "market-squawk-adapter-bls/scripted-transport-fixture",
+]
 release-evidence = [
     "dep:memory-stats",
     "dep:tempfile",
@@ -44,60 +50,91 @@ path = "src/main.rs"
 name = "market-squawk-capture-helper"
 path = "src/bin/market-squawk-capture-helper.rs"
 
+[[bin]]
+name = "market-squawk-service"
+path = "src/bin/market-squawk-service.rs"
+
+[[bin]]
+name = "market-squawk-mcp-relay"
+path = "src/bin/market-squawk-mcp-relay.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 arrow = { workspace = true }
 atomicwrites = { workspace = true }
 async-trait = { workspace = true }
+axum = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 cap-fs-ext = { workspace = true }
 cap-std = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 clap = { workspace = true }
 crc32fast = { workspace = true }
 fs2 = { workspace = true }
 futures-util = { workspace = true }
 getrandom = { workspace = true }
+hmac = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+interprocess = { workspace = true }
 libc = { workspace = true }
 memory-stats = { workspace = true, optional = true }
 parking_lot = { workspace = true }
 market-squawk-domain = { workspace = true }
+market-squawk-adapter-bea = { workspace = true }
 market-squawk-adapter-bls = { workspace = true }
+market-squawk-adapter-alpaca = { workspace = true }
+market-squawk-adapter-census = { workspace = true }
 market-squawk-adapter-coinbase = { workspace = true }
+market-squawk-adapter-eia = { workspace = true }
+market-squawk-adapter-federal-reserve = { workspace = true }
 market-squawk-adapter-files = { workspace = true }
 market-squawk-adapter-fred = { workspace = true }
+market-squawk-adapter-iex-hist = { workspace = true }
 market-squawk-adapter-kraken = { workspace = true }
+market-squawk-adapter-nasdaq-symbols = { workspace = true }
+market-squawk-adapter-options-reference = { workspace = true }
 market-squawk-adapter-paper = { workspace = true }
 market-squawk-adapter-portfolio = { workspace = true }
 market-squawk-adapter-sec = { workspace = true }
+market-squawk-adapter-schwab = { workspace = true }
+market-squawk-adapter-tiingo = { workspace = true }
 market-squawk-adapter-treasury = { workspace = true }
+market-squawk-adapter-yahoo = { workspace = true }
 market-squawk-analytics = { workspace = true }
 market-squawk-backtesting = { path = "../../crates/market-squawk-backtesting", version = "=1.0.0" }
 market-squawk-data = { workspace = true }
+market-squawk-decisions = { workspace = true }
 market-squawk-execution = { workspace = true }
 market-squawk-live = { workspace = true }
+market-squawk-jobs = { workspace = true }
 market-squawk-mcp = { workspace = true }
 market-squawk-modeling = { workspace = true, features = ["onnx-tract"] }
 market-squawk-installer = { workspace = true }
 market-squawk-platform = { workspace = true }
 market-squawk-portfolio = { workspace = true }
+market-squawk-runtime = { workspace = true }
 market-squawk-services = { workspace = true }
 market-squawk-sources = { workspace = true }
 market-squawk-valuation = { workspace = true }
 rust_decimal = { workspace = true }
 reqwest = { workspace = true }
+rcgen = { workspace = true }
+rpassword = { workspace = true }
+rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
+sysinfo = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -105,11 +142,19 @@ tempfile = { workspace = true, optional = true }
 uuid = { workspace = true }
 url = { workspace = true }
 webbrowser = { workspace = true }
+zeroize = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "=0.6.4", default-features = false }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSWorkspace"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSString", "NSURL"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+recvmsg = { workspace = true }
+widestring = { workspace = true }
 win-security-identifier = { workspace = true }
 windows-permissions = { workspace = true }
 

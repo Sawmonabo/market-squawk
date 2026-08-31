@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use market_squawk_modeling::{
+use crate::{
     InferenceBackend, InferenceError, MAX_MODEL_FEATURES, ModelDecision, ModelFeatureValue,
     ModelInput, ModelInputError, NativeLinearBackend,
 };
 
-use crate::bundle::{TestResult, valid_fixture};
+use super::bundle::{TestResult, valid_fixture};
 
 #[test]
 fn native_linear_and_logistic_inference_are_deterministic_and_identity_bound() -> TestResult {
@@ -126,9 +126,6 @@ fn native_artifact_rejects_nonfinite_weights_and_multiple_outputs() -> TestResul
         .load()
         .err()
         .ok_or_else(|| std::io::Error::other("multiple artifact outputs were accepted"))?;
-    assert_eq!(
-        observed,
-        market_squawk_modeling::BundleError::UnsupportedOutputShape
-    );
+    assert_eq!(observed, crate::BundleError::UnsupportedOutputShape);
     Ok(())
 }

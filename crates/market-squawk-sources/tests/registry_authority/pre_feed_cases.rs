@@ -103,11 +103,20 @@ fn pre_feed_current_leases_are_deadline_capture_health_and_registry_bound() -> T
         &mut first_reporter,
         refreshed_at.unix_nanos(),
     )?;
-    assert!(lease.validate_at(refreshed_at).is_err());
+    assert!(lease.validate_at(refreshed_at).is_ok());
     let refreshed = first
         .validate_current_authority(&first_session)?
         .try_current_lease()?;
     assert!(refreshed.health_epoch() > lease.health_epoch());
+    let second_refresh_at = next_timestamp_after(refreshed_at)?;
+    record_qualified_health(
+        &mut first,
+        &first_session,
+        &mut first_reporter,
+        second_refresh_at.unix_nanos(),
+    )?;
+    assert!(lease.validate_at(second_refresh_at).is_err());
+    assert!(refreshed.validate_at(second_refresh_at).is_ok());
 
     let (
         mut second,

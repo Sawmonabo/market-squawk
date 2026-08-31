@@ -45,6 +45,162 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
+    #[derive(Debug, Default)]
+    struct OnePerMinuteRateStore {
+        last_admitted_at: Mutex<Option<Timestamp>>,
+    }
+
+    #[cfg(debug_assertions)]
+    #[derive(Debug)]
+    struct ImmediatePreparedRateBatch {
+        registrations: Box<[ProviderRateRegistration]>,
+    }
+
+    #[cfg(debug_assertions)]
+    impl PreparedProviderRateRegistrationBatch for ImmediatePreparedRateBatch {
+        fn registrations(&self) -> &[ProviderRateRegistration] {
+            &self.registrations
+        }
+
+        fn commit(self: Box<Self>) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    impl ProviderRateStore for OnePerMinuteRateStore {
+        fn start_run(&self, _now: Timestamp) -> Result<ProviderRateRunId, ProviderRateStoreError> {
+            Ok(ProviderRateRunId::from_bytes([1; 16]))
+        }
+
+        fn prepare_registration_batch(
+            &self,
+            _run_id: ProviderRateRunId,
+            declarations: &[ProviderRateDeclaration],
+            _now: Timestamp,
+        ) -> Result<Box<dyn PreparedProviderRateRegistrationBatch>, ProviderRateStoreError>
+        {
+            let registrations = declarations
+                .iter()
+                .map(|declaration| {
+                    ProviderRateRegistration::new(
+                        ProviderRateGroupId::from_bytes([2; 16]),
+                        declaration.policy_digest(),
+                        declaration.declaration_digest(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            Ok(Box::new(ImmediatePreparedRateBatch { registrations }))
+        }
+
+        fn try_reserve(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
+            Ok(ProviderRateReservationDecision::Ready(
+                ProviderRateReservationId::from_bytes([3; 16]),
+            ))
+        }
+
+        fn commit_dispatch(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _reservation_id: ProviderRateReservationId,
+            now: Timestamp,
+        ) -> Result<ProviderRateDispatchDecision, ProviderRateStoreError> {
+            const MINUTE_NANOS: i64 = 60_000_000_000;
+            let mut last_admitted_at = self
+                .last_admitted_at
+                .lock()
+                .map_err(|_| ProviderRateStoreError::Corrupt)?;
+            if let Some(last) = *last_admitted_at {
+                let deadline = last
+                    .unix_nanos()
+                    .checked_add(MINUTE_NANOS)
+                    .map(Timestamp::from_unix_nanos)
+                    .ok_or(ProviderRateStoreError::Clock)?;
+                if now < deadline {
+                    return Ok(ProviderRateDispatchDecision::WaitUntil(deadline));
+                }
+            }
+            *last_admitted_at = Some(now);
+            Ok(ProviderRateDispatchDecision::Ready(
+                ProviderRatePermitId::from_bytes([3; 16]),
+            ))
+        }
+
+        fn cancel_reservation(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _reservation_id: ProviderRateReservationId,
+        ) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
+
+        fn release(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _permit_id: ProviderRatePermitId,
+        ) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
+
+        fn apply_retry_after(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+            _retry_after: RetryAfter,
+        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
+            Err(ProviderRateStoreError::Unavailable)
+        }
+
+        fn apply_refusal(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+            _jitter_sample_basis_points: u16,
+        ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
+            Err(ProviderRateStoreError::Unavailable)
+        }
+
+        fn record_success(
+            &self,
+            _run_id: ProviderRateRunId,
+            _registration: ProviderRateRegistration,
+            _now: Timestamp,
+        ) -> Result<(), ProviderRateStoreError> {
+            Ok(())
+        }
+
+        fn bind_authorization_subject(
+            &self,
+            _run_id: ProviderRateRunId,
+            _mode: crate::AuthorizationMode,
+            _evidence: market_squawk_domain::EvidenceDigest,
+            _subject: &SourceIdentifier,
+            _now: Timestamp,
+        ) -> Result<(), ProviderRateStoreError> {
+            Err(ProviderRateStoreError::Unavailable)
+        }
+
+        fn resolve_authorization_subject(
+            &self,
+            _mode: crate::AuthorizationMode,
+            _evidence: market_squawk_domain::EvidenceDigest,
+        ) -> Result<Option<SourceIdentifier>, ProviderRateStoreError> {
+            Ok(None)
+        }
+    }
+
     #[derive(Debug)]
     struct SwitchableClock {
         observation: Mutex<ClockObservation>,
@@ -171,7 +327,10 @@ mod tests {
             legacy_json,
             r#"{"scope":{"provider":"provider","authorization_account":null},"requests_per_window":2,"window_nanos":100,"max_concurrent":1,"backoff":{"initial_nanos":10,"maximum_nanos":100,"jitter_basis_points":1000}}"#
         );
-        assert_eq!(serde_json::from_str::<ProviderBudgetPolicy>(&legacy_json)?, legacy);
+        assert_eq!(
+            serde_json::from_str::<ProviderBudgetPolicy>(&legacy_json)?,
+            legacy
+        );
 
         let windows = [
             ProviderBudgetWindow::try_new(
@@ -196,11 +355,14 @@ mod tests {
         assert_eq!(conjunctive.window(1), Some(windows[1]));
         assert!(serde_json::to_string(&conjunctive)?.contains("additional_windows"));
 
-        let duplicate_duration = [windows[0], ProviderBudgetWindow::try_new(
-            NonZeroU32::new(2).ok_or("window limit must be nonzero")?,
-            NonZeroU64::new(500).ok_or("window duration must be nonzero")?,
-            BudgetWindowSemantics::Tumbling,
-        )?];
+        let duplicate_duration = [
+            windows[0],
+            ProviderBudgetWindow::try_new(
+                NonZeroU32::new(2).ok_or("window limit must be nonzero")?,
+                NonZeroU64::new(500).ok_or("window duration must be nonzero")?,
+                BudgetWindowSemantics::Tumbling,
+            )?,
+        ];
         assert_eq!(
             ProviderBudgetPolicy::try_new_conjunctive(
                 legacy.scope().clone(),
@@ -236,8 +398,7 @@ mod tests {
         assert_eq!(
             ProviderBudgetWindow::try_new(
                 NonZeroU32::new(1).ok_or("window limit must be nonzero")?,
-                NonZeroU64::new((i64::MAX as u64) + 1)
-                    .ok_or("window duration must be nonzero")?,
+                NonZeroU64::new((i64::MAX as u64) + 1).ok_or("window duration must be nonzero")?,
                 BudgetWindowSemantics::Tumbling,
             ),
             Err(NetworkPolicyError::InvalidBudgetPolicy)
@@ -305,13 +466,11 @@ mod tests {
                     .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?,
             ),
             NonZeroU32::new(2).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
-            NonZeroU64::new(30_000_000_000)
-                .ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
+            NonZeroU64::new(30_000_000_000).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
             NonZeroU16::new(1).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
             BackoffPolicy::try_new(
                 NonZeroU64::new(10).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
-                NonZeroU64::new(10_000_000_000)
-                    .ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
+                NonZeroU64::new(10_000_000_000).ok_or(NetworkPolicyError::InvalidBudgetPolicy)?,
                 1_000,
             )?,
         )
@@ -403,6 +562,55 @@ mod tests {
         );
         assert!(clock.set(0, 100));
         assert!(matches!(budget.try_acquire(), BudgetDecision::Ready(_)));
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_clock_advances_provider_and_local_windows_together()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const MINUTE_NANOS: u64 = 60_000_000_000;
+        let provider = SourceIdentifier::try_from("manual-clock-provider")?;
+        let subject = SourceIdentifier::try_from("manual-clock-subject")?;
+        let policy = ProviderBudgetPolicy::try_new(
+            BudgetScope::with_authorization_account(provider, subject.clone()),
+            NonZeroU32::MIN,
+            NonZeroU64::new(MINUTE_NANOS).ok_or("minute window must be nonzero")?,
+            NonZeroU16::MIN,
+            BackoffPolicy::try_new(
+                NonZeroU64::MIN,
+                NonZeroU64::new(MINUTE_NANOS).ok_or("maximum backoff must be nonzero")?,
+                0,
+            )?,
+        )?;
+        let declaration = ProviderRateDeclaration::try_for_authorization_subject(policy, &subject)?;
+        let authority = ProviderRateAuthority::try_new_with_debug_manual_clock(
+            Arc::new(OnePerMinuteRateStore::default()),
+            Timestamp::from_unix_nanos(1_000_000_000),
+        )?;
+        let doctor = authority.register_budget(declaration.clone())?;
+        let production = authority.register_budget(declaration)?;
+
+        let BudgetDecision::Ready(doctor_permit) = doctor.try_acquire() else {
+            return Err("doctor request was not admitted".into());
+        };
+        doctor_permit.release();
+        let deadline = match production.try_acquire() {
+            BudgetDecision::WaitUntil(deadline) => deadline,
+            _ => return Err("production request bypassed the shared minute window".into()),
+        };
+        assert_eq!(deadline.as_nanos(), MINUTE_NANOS);
+        assert_eq!(
+            production.remaining_wait(deadline),
+            Ok(Duration::from_secs(60))
+        );
+
+        authority.advance_debug_manual_clock(Duration::from_secs(60))?;
+        assert_eq!(production.remaining_wait(deadline), Ok(Duration::ZERO));
+        let BudgetDecision::Ready(production_permit) = production.try_acquire() else {
+            return Err("production request was not admitted at the exact minute boundary".into());
+        };
+        production_permit.release();
         Ok(())
     }
 
@@ -529,10 +737,7 @@ mod tests {
         assert_eq!(deadline.as_nanos(), 1_010);
 
         assert!(clock.set(109, 1_009));
-        assert_eq!(
-            budget.remaining_wait(deadline),
-            Ok(Duration::from_nanos(1))
-        );
+        assert_eq!(budget.remaining_wait(deadline), Ok(Duration::from_nanos(1)));
         assert!(matches!(
             budget.try_acquire(),
             BudgetDecision::WaitUntil(observed) if observed == deadline
@@ -567,9 +772,7 @@ mod tests {
         );
         assert!(matches!(
             regression_budget.try_acquire(),
-            BudgetDecision::Unavailable(
-                BudgetUnavailableReason::AvailabilityGenerationExhausted
-            )
+            BudgetDecision::Unavailable(BudgetUnavailableReason::AvailabilityGenerationExhausted)
         ));
 
         let unavailable_clock = Arc::new(SwitchableClock::new(100, 1_000));
@@ -589,9 +792,7 @@ mod tests {
         );
         assert!(matches!(
             unavailable_budget.try_acquire(),
-            BudgetDecision::Unavailable(
-                BudgetUnavailableReason::AvailabilityGenerationExhausted
-            )
+            BudgetDecision::Unavailable(BudgetUnavailableReason::AvailabilityGenerationExhausted)
         ));
         Ok(())
     }
@@ -945,9 +1146,7 @@ mod tests {
                 ])?,
             },
             BudgetWindowCheckpointState::Sliding {
-                release_deadlines_wall: BoundedVec::singleton(
-                    Timestamp::from_unix_nanos(1_150),
-                ),
+                release_deadlines_wall: BoundedVec::singleton(Timestamp::from_unix_nanos(1_150)),
             },
         ])?;
         assert_eq!(

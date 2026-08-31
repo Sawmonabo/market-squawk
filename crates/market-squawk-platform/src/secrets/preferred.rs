@@ -204,7 +204,7 @@ impl ConfiguredEncryptedFileFallback {
 /// is routed solely by its backend field; the router never probes another backend with that
 /// reference and never copies secret bytes between backends.
 pub struct PreferredSecretStore {
-    primary: OsKeyringSecretStore,
+    primary: Option<OsKeyringSecretStore>,
     fallback: Option<ConfiguredEncryptedFileFallback>,
 }
 
@@ -219,7 +219,7 @@ impl PreferredSecretStore {
         fallback: Option<EncryptedFileSecretFallback>,
     ) -> Result<Self, LocalSecretStoreError> {
         Ok(Self {
-            primary: OsKeyringSecretStore::try_new(service)?,
+            primary: Some(OsKeyringSecretStore::try_new(service)?),
             fallback: fallback.map(ConfiguredEncryptedFileFallback::ready),
         })
     }
@@ -239,7 +239,23 @@ impl PreferredSecretStore {
         root: impl AsRef<Path>,
     ) -> Result<Self, LocalSecretStoreError> {
         Ok(Self {
-            primary: OsKeyringSecretStore::try_new(service)?,
+            primary: Some(OsKeyringSecretStore::try_new(service)?),
+            fallback: Some(ConfiguredEncryptedFileFallback::locked(
+                root.as_ref().to_path_buf(),
+            )),
+        })
+    }
+
+    /// Constructs an encrypted-file-only authority in the locked state.
+    ///
+    /// No operating-system keyring is opened or probed. New generations therefore cannot be
+    /// assigned an OS-keyring reference, and an OS-keyring reference from another selection is
+    /// rejected rather than copied or migrated.
+    pub fn try_new_with_locked_encrypted_file(
+        root: impl AsRef<Path>,
+    ) -> Result<Self, LocalSecretStoreError> {
+        Ok(Self {
+            primary: None,
             fallback: Some(ConfiguredEncryptedFileFallback::locked(
                 root.as_ref().to_path_buf(),
             )),
@@ -257,6 +273,12 @@ impl PreferredSecretStore {
         operation: impl FnOnce(&EncryptedFileSecretStore) -> Result<T, LocalSecretStoreError>,
     ) -> Result<T, LocalSecretStoreError> {
         self.fallback()?.with_ready(operation)
+    }
+
+    fn primary(&self) -> Result<&OsKeyringSecretStore, LocalSecretStoreError> {
+        self.primary
+            .as_ref()
+            .ok_or(LocalSecretStoreError::InvalidReference)
     }
 
     fn encrypted_reference<T>(
@@ -280,7 +302,7 @@ impl fmt::Debug for PreferredSecretStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PreferredSecretStore")
-            .field("primary", &"[OS KEYRING]")
+            .field("os_keyring_enabled", &self.primary.is_some())
             .field("fallback_configured", &self.fallback.is_some())
             .field(
                 "fallback_ready",
@@ -364,7 +386,10 @@ impl SecretStore for PreferredSecretStore {
         &self,
         control: &SecretOperationControl,
     ) -> Result<SecretStoreCapabilities, LocalSecretStoreError> {
-        match self.primary.probe(control) {
+        let Some(primary) = self.primary.as_ref() else {
+            return self.use_fallback(|fallback| fallback.probe(control));
+        };
+        match primary.probe(control) {
             Ok(capabilities) if capabilities.supports_exact_lifecycle() => Ok(capabilities),
             Ok(_) => self.use_fallback(|fallback| fallback.probe(control)),
             Err(error) if keyring_is_unavailable(&error) => match self.fallback.as_ref() {
@@ -381,7 +406,10 @@ impl SecretStore for PreferredSecretStore {
         generation: SecretGeneration,
         control: &SecretOperationControl,
     ) -> Result<SecretMutationPlan, LocalSecretStoreError> {
-        match self.primary.plan_create(key, generation, control) {
+        let Some(primary) = self.primary.as_ref() else {
+            return self.use_fallback(|fallback| fallback.plan_create(key, generation, control));
+        };
+        match primary.plan_create(key, generation, control) {
             Ok(plan) => Ok(plan),
             Err(error) if keyring_is_unavailable(&error) => match self.fallback.as_ref() {
                 Some(fallback) => {
@@ -404,7 +432,7 @@ impl SecretStore for PreferredSecretStore {
             SecretBackend::AppleKeychain
             | SecretBackend::WindowsCredentialManager
             | SecretBackend::SecretService => {
-                self.primary
+                self.primary()?
                     .plan_replace(key, current, candidate_generation, control)
             }
             SecretBackend::EncryptedFile => self.encrypted_reference(current, |store| {
@@ -423,9 +451,13 @@ impl SecretStore for PreferredSecretStore {
         match plan.target().backend() {
             SecretBackend::AppleKeychain
             | SecretBackend::WindowsCredentialManager
-            | SecretBackend::SecretService => {
-                self.primary.execute_planned(key, plan, value, control)
-            }
+            | SecretBackend::SecretService => self
+                .primary
+                .as_ref()
+                .ok_or_else(|| {
+                    SecretMutationFailure::no_effect(LocalSecretStoreError::InvalidReference)
+                })?
+                .execute_planned(key, plan, value, control),
             SecretBackend::EncryptedFile => self
                 .fallback
                 .as_ref()
@@ -445,7 +477,7 @@ impl SecretStore for PreferredSecretStore {
         match plan.target().backend() {
             SecretBackend::AppleKeychain
             | SecretBackend::WindowsCredentialManager
-            | SecretBackend::SecretService => self.primary.inspect_planned(key, plan, control),
+            | SecretBackend::SecretService => self.primary()?.inspect_planned(key, plan, control),
             SecretBackend::EncryptedFile => self.encrypted_reference(plan.target(), |store| {
                 store.inspect_planned(key, plan, control)
             }),
@@ -462,9 +494,9 @@ impl SecretStore for PreferredSecretStore {
         match plan.target().backend() {
             SecretBackend::AppleKeychain
             | SecretBackend::WindowsCredentialManager
-            | SecretBackend::SecretService => {
-                self.primary.matches_planned(key, plan, expected, control)
-            }
+            | SecretBackend::SecretService => self
+                .primary()?
+                .matches_planned(key, plan, expected, control),
             SecretBackend::EncryptedFile => self.encrypted_reference(plan.target(), |store| {
                 store.matches_planned(key, plan, expected, control)
             }),
@@ -480,7 +512,13 @@ impl SecretStore for PreferredSecretStore {
         match plan.target().backend() {
             SecretBackend::AppleKeychain
             | SecretBackend::WindowsCredentialManager
-            | SecretBackend::SecretService => self.primary.delete_planned(key, plan, control),
+            | SecretBackend::SecretService => self
+                .primary
+                .as_ref()
+                .ok_or_else(|| {
+                    SecretMutationFailure::no_effect(LocalSecretStoreError::InvalidReference)
+                })?
+                .delete_planned(key, plan, control),
             SecretBackend::EncryptedFile => self
                 .fallback
                 .as_ref()
@@ -498,9 +536,12 @@ impl SecretStore for PreferredSecretStore {
         value: SecretValue,
         control: &SecretOperationControl,
     ) -> Result<SecretRef, LocalSecretStoreError> {
-        match self.primary.probe(control) {
+        let Some(primary) = self.primary.as_ref() else {
+            return self.use_fallback(|fallback| fallback.create(key, generation, value, control));
+        };
+        match primary.probe(control) {
             Ok(capabilities) if capabilities.supports_exact_lifecycle() => {
-                self.primary.create(key, generation, value, control)
+                primary.create(key, generation, value, control)
             }
             Ok(_) => self.use_fallback(|fallback| fallback.create(key, generation, value, control)),
             Err(error) if keyring_is_unavailable(&error) => match self.fallback.as_ref() {
@@ -521,7 +562,7 @@ impl SecretStore for PreferredSecretStore {
         match reference.backend() {
             SecretBackend::AppleKeychain
             | SecretBackend::WindowsCredentialManager
-            | SecretBackend::SecretService => self.primary.read(reference, control),
+            | SecretBackend::SecretService => self.primary()?.read(reference, control),
             SecretBackend::EncryptedFile => {
                 self.encrypted_reference(reference, |store| store.read(reference, control))
             }
@@ -540,7 +581,7 @@ impl SecretStore for PreferredSecretStore {
             SecretBackend::AppleKeychain
             | SecretBackend::WindowsCredentialManager
             | SecretBackend::SecretService => {
-                self.primary
+                self.primary()?
                     .replace(key, current, candidate_generation, value, control)
             }
             SecretBackend::EncryptedFile => self.encrypted_reference(current, |store| {
@@ -557,7 +598,7 @@ impl SecretStore for PreferredSecretStore {
         match reference.backend() {
             SecretBackend::AppleKeychain
             | SecretBackend::WindowsCredentialManager
-            | SecretBackend::SecretService => self.primary.delete(reference, control),
+            | SecretBackend::SecretService => self.primary()?.delete(reference, control),
             SecretBackend::EncryptedFile => {
                 self.encrypted_reference(reference, |store| store.delete(reference, control))
             }
@@ -565,11 +606,11 @@ impl SecretStore for PreferredSecretStore {
     }
 
     fn store(&self, key: &SecretKey, value: SecretValue) -> Result<(), LocalSecretStoreError> {
-        self.primary.store(key, value)
+        self.primary()?.store(key, value)
     }
 
     fn load(&self, key: &SecretKey) -> Result<SecretValue, LocalSecretStoreError> {
-        self.primary.load(key)
+        self.primary()?.load(key)
     }
 }
 

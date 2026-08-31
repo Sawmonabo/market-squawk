@@ -8,14 +8,15 @@ source, research, portfolio, model, paper-execution, MCP, storage, and developme
 | Document type | Operations runbook |
 | Audience | Local operators, incident responders, integrators, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-25 |
-| Reviewed commit | `041175590bd2e4a357ea28d75c675c252d3b3746` |
+| Last substantive review | 2026-08-03 |
+| Review basis | Current installed shared-service, durable-job, setup, and operations contracts; not release approval evidence |
 
 ## Contents
 
 - [Scope](#scope)
 - [First response](#first-response)
 - [Configuration and startup](#configuration-and-startup)
+- [Retrieve bounded redacted diagnostics](#retrieve-bounded-redacted-diagnostics)
 - [Sources and live integrity](#sources-and-live-integrity)
 - [Research, datasets, and queries](#research-datasets-and-queries)
 - [Models and Python](#models-and-python)
@@ -30,9 +31,11 @@ source, research, portfolio, model, paper-execution, MCP, storage, and developme
 ## Scope
 
 Use this page to identify the owning subsystem, preserve evidence, and select the corresponding
-recovery operation. It does not authorize manual changes to SQLite, immutable artifacts, authority
-state, audits, or paper checkpoints. Those files are inputs to application-owned recovery and must
-remain unchanged during diagnosis.
+recovery operation. The installed product has one active per-user service/workspace authority; the
+Desktop, CLI, and registered Claude Code/Codex clients reconnect to it rather than repair a local
+copy. This page does not authorize manual changes to SQLite, immutable artifacts, authority state,
+audits, jobs, backups, or paper checkpoints. Those are inputs to application-owned recovery and
+must remain unchanged during diagnosis.
 
 CLI success writes a result to stdout and exits `0`. Clap usage failures exit `2`. Configuration,
 admission, service, I/O, lifecycle, and shutdown failures exit `1` with a diagnostic chain on
@@ -73,6 +76,9 @@ market-squawk --config /absolute/path/market-squawk.toml \
 
 market-squawk --config /absolute/path/market-squawk.toml \
   --output json doctor
+
+market-squawk --output json setup status
+market-squawk --output json operations settings get
 ```
 
 For local diagnostic detail, add a temporary tracing filter and keep stdout separate from stderr:
@@ -100,9 +106,48 @@ still be sensitive.
 | Product construction reports a catalog writer lock | Another process owns the same prepared root | Identify and gracefully stop that owner; do not remove `.catalog.writer.lock` to defeat an active OS lock |
 | Prepared root identity changed | The configured root was renamed, replaced, linked, or its identity changed after opening | Stop all users, restore the exact directory identity/ownership, or recover a complete backup into a fresh root |
 | Durable model admissions require the signed training release | Restored model authority exists but `training_release_root` is absent or mismatched | Install and configure the exact verified training release before reopening those admissions |
+| Desktop/CLI/MCP says its service or workspace generation is stale | A restart, update, restore, or workspace switch fenced the prior client view | Reconnect the client, perform its normal bounded bootstrap/health read, and discard old mutation previews, job handles, and request IDs |
+| Setup status shows a blocker or incomplete step | A selected plan records intent but the required evidence was not produced | Read the step's blocker/recovery/action; complete the owning provider, model, portfolio, paper, MCP, or backup workflow rather than marking it complete manually |
+| Typed settings change/rollback rejects | Expected revision, retained target, setting range, or one-use preview no longer matches | Reread `operations settings get`, correct the closed setting values, then create and apply a fresh preview |
 
 Configuration is immutable for a process lifetime. After correction, start a new command; there is
 no hot reload.
+
+## Retrieve bounded redacted diagnostics
+
+Use the service-owned structured-log operation when `doctor`, a job, or a client identifies an
+operational failure. It is a bounded redacted query/export surface, not a raw log tail or a path
+browser.
+
+```bash
+market-squawk --output json operations logs query \
+  --domain lifecycle \
+  --minimum-severity warn \
+  --limit 250
+```
+
+Optionally narrow the query with inclusive `--from`/`--through` RFC 3339 bounds, an exact
+`--source-id`, `--job-id`, or `--correlation-id`, a bounded `--search`, and `--after-sequence`.
+The limit is `1..=1000`. Record the selected filters, returned sequence range, service/workspace
+generation, and associated job/backup/operation identity; those are the success evidence for a
+bounded diagnostic read.
+
+To retain support evidence, review the same selection first, then explicitly publish its redacted
+controlled artifact:
+
+```bash
+market-squawk --output json operations logs export \
+  --domain lifecycle \
+  --minimum-severity warn \
+  --limit 250 \
+  --confirm
+```
+
+Success is a returned controlled-artifact identity, not a local output filename. If the query is
+rejected, oversized, unavailable, or the export fails, preserve the command, filters, error class,
+and any prior bounded result; narrow the selection or restore the named service/storage authority.
+Never bypass redaction by opening service log files, copying an audit file, or attaching raw logs to
+a public issue without data-handling review.
 
 ## Sources and live integrity
 
@@ -182,26 +227,30 @@ Python is a research/training boundary and is not called from the live event-to-
 | Performance says `insufficient_history` | Fewer than two comparable admitted revisions exist | Import genuine later point-in-time revisions; do not synthesize history |
 | `bot start` is unavailable | Provider config, runtime composition, checkpoint, audit, or lifecycle admission failed | Validate config/source state, check single-writer ownership and disk, then retry only after the first cause is resolved |
 | Paper run has zero orders/fills | Current strategy emits no intents and provider data is not execution eligible | Expected current behavior; this does not prove a broken matching engine |
-| Separate CLI `bot status` shows stopped | CLI processes do not attach to another process's controller | Use the same persistent stdio MCP session for status/execution calls, or inspect foreground run result and durable audits |
+| Client sees stale or unavailable paper status after a service transition | The client still carries the previous workspace/service generation, or the runtime is recovering | Reconnect, reread `Bot.GetStatus`, and follow its lifecycle/reconciliation state; never start a parallel controller |
 | Reconciliation required | Orders/fills/balances/positions are not current as one state | Keep action stopped and invoke same-owner execution reconciliation before terminal shutdown |
 | Paper checkpoint reports an unclean prior run | A complete terminal checkpoint was not durably established | Preserve audits/checkpoint, recover exact state, reconcile, and publish a clean terminal checkpoint |
 
 See the [portfolio and paper-execution runbook](portfolio-and-paper-execution.md) before operating
 these mutations.
 
-## MCP
+## MCP and shared-service reconnection
 
-MCP uses stdio. Stdout is reserved for protocol frames; local tracing belongs on stderr.
+The installed service owns the active workspace and authenticated loopback MCP endpoint; registered
+Claude Code and Codex clients use their named relay/credential path and must not be repaired by
+editing client configuration files directly. The compatibility CLI relay uses stdio, where stdout
+is reserved for protocol frames and tracing belongs on stderr.
 
 | Symptom | Interpretation | Action |
 | --- | --- | --- |
-| Client receives no tools | Initialization handshake or `tools/list` did not complete | Send a supported initialize request, initialized notification, then `tools/list` in order |
+| Client receives no tools or cannot reach the service | Service/rendezvous/credential/client registration is unavailable or stale | Use the MCP page or owned setup repair to inspect the exact registration and service health; reconnect after the service reports its current generation |
 | JSON parse/frame failure | A non-protocol writer contaminated stdout or the frame exceeded bounds | Remove wrapper output from stdout, preserve stderr separately, and restart a fresh session |
 | Unknown tool | Name differs from the exact 63-tool registry | Read `tools/list` or the MCP reference; do not derive names from CLI labels |
 | Tool argument rejected | Closed JSON schema, identifier, range, confirmation, or result limit failed | Correct the typed arguments; unknown fields are not accepted as extensions |
 | Mutation is unavailable after valid schema | Durable audit admission, local confirmation, domain authority, or risk failed | Repair the owning authority; transport validity does not grant mutation authority |
 | Large result is returned by reference | Inline item/byte ceiling selected artifact publication | Retain the complete reference and read bounded chunks with `Analysis.ReadArtifact` or `query artifact`; never derive or open a filesystem path |
 | Session shutdown is incomplete | One domain/helper failed its bounded drain | Preserve stderr and audit evidence, reconcile the named domain, and start a fresh session only after ownership is resolved |
+| Restore, workspace switch, or update just completed | Existing clients/handles are fenced to the old generation | Reconnect Desktop/CLI/Claude Code/Codex, repeat discovery/health and safe reads, and never replay an old mutation, preview, or token-bearing command |
 
 Do not send ordinary CLI output through an MCP client's protocol stdout stream.
 
@@ -223,8 +272,8 @@ du -sh /absolute/path/to/.market-squawk
 | Stale-looking lock file | Determine whether an OS lock is active; the persistent file itself is not proof and should not be manually removed during diagnosis |
 | Interrupted immutable object | Let exact publication/orphan recovery decide whether it is current, staged, or removable |
 
-Use [Backup and recovery](backup-and-recovery.md) for the complete cold-backup and fresh-restore
-procedure.
+Use [Backup and recovery](backup-and-recovery.md) for the service-owned backup, verification,
+preview-bound fresh-workspace restore, workspace-switch, update, and program-rollback procedure.
 
 ## Maintainer build diagnostics
 

@@ -2,6 +2,8 @@
 
 mod capture;
 mod classification;
+mod company_identity;
+mod company_security;
 mod denomination;
 mod digest;
 mod evidence;
@@ -9,7 +11,9 @@ mod financial;
 mod identifiers;
 mod identity;
 mod instrument;
+mod macro_feature;
 mod market;
+mod option_market;
 mod order;
 mod provenance;
 mod research;
@@ -42,6 +46,16 @@ pub use classification::{
     SourceAuthorization, SourceCoverageRecord, SourcePolicyAssessment, StreamIntegrityState,
     TimestampIntegrity,
 };
+pub use company_identity::{
+    CompanyIdentityError, CompanyIdentityObservation, CompanyIdentityObservationInput,
+    CompanyIdentitySurface, FormerCompanyName, MAX_COMPANY_FORMER_NAMES,
+    MAX_COMPANY_SECURITY_ASSOCIATIONS, ProviderReportedSecurityAssociation,
+};
+pub use company_security::{
+    CommonEquitySuitability, CompanySecurityIdentityError, CompanySecurityIdentityLink,
+    CompanySecurityIdentityLinkInput, CompanySecurityKind, CompanySecurityLinkTransition,
+    CompanySecurityRelationshipKind, CompanySecurityResolutionBasis,
+};
 pub use denomination::Denomination;
 pub use digest::DigestAlgorithm;
 pub use digest::DigestAlgorithm as PayloadHashAlgorithm;
@@ -69,17 +83,30 @@ pub use instrument::{
     ExternalIdentifierRecord, ExternalIdentifierRecordInput, IdentifierEntitlement,
     IdentifierRightsPolicyReference, IdentifierSyntaxVerification, InstrumentDefinition,
     InstrumentDefinitionInput, InstrumentError, LifecycleTransition, LifecycleTransitionKind,
-    ProviderIdentityCollection, ProviderIdentityConflict, ProviderIdentityConflictReason,
-    ProviderIdentityEvidence, ProviderIdentityIngestOutcome, ProviderIdentityKey,
-    ProviderIdentityLocator, ProviderIdentityRecord, ProviderIdentityRecordInput,
-    ProviderIdentityRegistry, ProviderIdentitySupersession, SymbolIdentityRecord, TradingStatus,
-    VenueMapping,
+    MAX_MARKET_DATA_DISPLAY_NAME_BYTES, MAX_MARKET_DATA_EXTERNAL_IDENTIFIERS,
+    MAX_MARKET_DATA_PROVIDER_IDENTITIES, MAX_MARKET_DATA_VENUE_MAPPINGS, MarketDataDisplayName,
+    MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionError,
+    MarketDataInstrumentDefinitionInput, ProviderIdentityCollection, ProviderIdentityConflict,
+    ProviderIdentityConflictReason, ProviderIdentityEvidence, ProviderIdentityIngestOutcome,
+    ProviderIdentityKey, ProviderIdentityLocator, ProviderIdentityRecord,
+    ProviderIdentityRecordInput, ProviderIdentityRegistry, ProviderIdentitySupersession,
+    SymbolIdentityRecord, TradingStatus, VenueMapping,
+};
+pub use macro_feature::{
+    FeatureDatasetMacroComponentDescriptor, feature_dataset_macro_components_v1,
 };
 pub use market::{
     AggressorSide, AuctionEvent, AuctionPhase, BookChange, BookDeltaEvent, BookLevel,
     BookSnapshotEvent, CorporateActionEvent, CorporateActionKind, HaltTransition,
     InstrumentStatusEvent, MarketEvent, MarketEventError, MarketSide, MergerConsideration,
-    QuoteEvent, TradeEvent, TradingHaltEvent,
+    QuoteEvent, TradeEvent, TradeTakerOrderType, TradingHaltEvent,
+};
+pub use option_market::{
+    MAX_OPTION_TRADE_CONDITIONS, OptionComponent, OptionComponentState, OptionContractTerms,
+    OptionContractTermsInput, OptionExerciseStyle, OptionExpirationClass,
+    OptionExpirationObservation, OptionExpirationObservationInput, OptionMarketError,
+    OptionSettlementKind, OptionSnapshotObservation, OptionSnapshotObservationInput,
+    OptionUnderlyingObservation,
 };
 pub use order::{
     InstrumentDefinitionRevision, InstrumentExecutionTerms, OrderContractError, OrderReasonCode,
@@ -92,10 +119,29 @@ pub use provenance::{
     ResearchTemporalPrecision, ResearchTime, RevisionNumber,
 };
 pub use research::{
-    AlternativeDataObservation, CorporateActionObservation, FilingObservation,
-    FundamentalObservation, MAX_XBRL_DIMENSIONS, MAX_XBRL_GRAPH_EVENTS, MAX_XBRL_RELATIONSHIP_REFS,
+    AlternativeDataObservation, BarTimeSemantics, BarTimestampBasis, CorporateActionObservation,
+    FUND_HOLDING_SUPPLEMENT_TABLE_COUNT, FUND_HOLDINGS_SCHEMA_NAME, FUND_HOLDINGS_SCHEMA_VERSION,
+    FilingObservation, FundAmendmentState, FundConflictState, FundCurrencyAmount, FundEtfMechanics,
+    FundEvidenceRecord, FundExchangeAssociation, FundFilingChronology, FundFilingIdentity,
+    FundHoldingAssociations, FundHoldingQuantity, FundHoldingSecurityIdentity,
+    FundHoldingSupplementEvidence, FundHoldingUnit, FundHoldingsError, FundLineageRowRange,
+    FundMissingState, FundNavCompleteness, FundNavCorrectionState, FundNavDisposition,
+    FundNavEntitlementEvidence, FundNavFinality, FundNavLineage, FundNavMissingState,
+    FundNavNativeSchema, FundNavObservation, FundNavObservationInput, FundNavRevisionEvidence,
+    FundNavValuationBasis, FundNavValue, FundPortfolioHoldingAttributes,
+    FundPortfolioHoldingEvidence, FundReleaseCoverage, FundReportAttributes, FundReportEvidence,
+    FundReportedDecimal, FundReportedValue, FundRevisionEvidence, FundRevisionLink,
+    FundRevisionStatus, FundSecurityIdentifier, FundShareClassAttributes, FundShareClassEvidence,
+    FundShareClassIdentity, FundSourceFamily, FundSourceLineage, FundSourceRowEvidence,
+    FundSourceTable, FundSourceText, FundSupplementDisposition, FundamentalAmendmentStatus,
+    FundamentalCadence, FundamentalConsolidation, FundamentalContextError,
+    FundamentalDimensionContext, FundamentalFactContext, FundamentalFactContextInput,
+    FundamentalObservation, FundamentalPeriod, FundamentalRestatementStatus,
+    FundamentalRevisionOrder, MAX_FUND_COMPETING_ACCESSIONS, MAX_FUND_EXCHANGE_ASSOCIATIONS,
+    MAX_FUND_SOURCE_ROWS, MAX_XBRL_DIMENSIONS, MAX_XBRL_GRAPH_EVENTS, MAX_XBRL_RELATIONSHIP_REFS,
     MAX_XBRL_RELATIONSHIPS, MAX_XBRL_UNIT_MEASURES, MacroMissingValue, MacroObservation,
-    MacroValue, NormalizedPortfolioLotMethod, NormalizedPortfolioTransactionClass,
+    MacroValue, MarketBarAdjustment, MarketBarObservation, MarketBarSessionEvidence,
+    MarketBarSessionKind, NormalizedPortfolioLotMethod, NormalizedPortfolioTransactionClass,
     NormalizedPortfolioTransactionError, NormalizedPortfolioTransactionEvidence,
     NormalizedPortfolioTransactionEvidenceInput, PositionObservation, PositionSide, ResearchError,
     ResearchObservation, TransactionObservation, UniverseMembershipObservation,

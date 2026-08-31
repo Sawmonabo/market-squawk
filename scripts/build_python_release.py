@@ -14,7 +14,7 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import platform
 import re
 import shutil
@@ -22,6 +22,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import tomllib
 import urllib.error
 import urllib.parse
@@ -33,7 +34,8 @@ MAX_LOCK_BYTES = 2 * 1024 * 1024
 MAX_ARTIFACTS = 64
 MAX_SOURCES = 2_048
 MAX_RUNTIME_DISTRIBUTIONS = 32
-MAX_DISTRIBUTION_FILES = 8_192
+MAX_DISTRIBUTION_FILES = 16_384
+MAX_DISTRIBUTION_EXTERNAL_PATHS = 256
 MAX_DISTRIBUTION_ROOTS = 64
 MAX_DISTRIBUTION_FILE_BYTES = 256 * 1024 * 1024
 MAX_APPLICATION_EXECUTABLE_BYTES = 768 * 1024 * 1024
@@ -46,15 +48,31 @@ RUST_TOOLCHAIN = "1.97.1"
 MACOS_DEPLOYMENT_TARGET = "12.0"
 SOURCE_DATE_EPOCH = "946684800"
 RELEASE_MANIFEST_DOMAIN = b"market-squawk-release-manifest-v1\0"
-ENVIRONMENT_RECEIPT_DOMAIN = b"market-squawk-training-environment-v1\0"
+ENVIRONMENT_RECEIPT_DOMAIN = b"market-squawk-training-environment-v2\0"
 SUPPORTED_PYTHONS = ((3, 14),)
 REQUIRED_PYTHON = (3, 14, 6)
 CANONICAL_RELEASE = "release-cp314"
+PACKAGING_VERSION = "26.2"
+PACKAGING_BOOTSTRAP = {
+    "filename": "packaging-26.2-py3-none-any.whl",
+    "project": "packaging",
+    "sha256": "5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e",
+    "size_bytes": 100_195,
+    "url": (
+        "https://files.pythonhosted.org/packages/df/b2/"
+        "87e62e8c3e2f4b32e5fe99e0b86d576da1312593b39f47d8ceef365e95ed/"
+        "packaging-26.2-py3-none-any.whl"
+    ),
+    "version": PACKAGING_VERSION,
+}
 ROOT_MARKER = ".market-squawk-python-artifacts-v1"
 CHILD_MARKER = ".market-squawk-owned-v1"
 ROOT_PURPOSE = "market-squawk-python-release-artifacts"
 COMPONENT_ROOT_MARKER = ".market-squawk-release-components-v1"
 COMPONENT_ROOT_PURPOSE = "market-squawk-locked-release-components"
+DEVELOPMENT_ROOT_MARKER = ".market-squawk-development-runtime-v1"
+DEVELOPMENT_ROOT_PURPOSE = "market-squawk-development-model-runtime"
+DEVELOPMENT_RUNTIME_RELATIVE = Path(".market-squawk/development-model-runtime")
 ALLOWED_LICENSES = {
     "Apache-2.0",
     "MIT",
@@ -62,16 +80,32 @@ ALLOWED_LICENSES = {
     "BSD-3-Clause",
     "MIT OR Apache-2.0",
     "Apache-2.0 OR BSD-2-Clause",
+    "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
+    "PSF-2.0",
 }
-REQUIRED_PROJECTS = {
-    "maturin",
-    "pyarrow",
-    "pytest",
-    "packaging",
-    "pluggy",
-    "iniconfig",
-    "pygments",
+PYTHON_LICENSE_POLICY = {
+    "colorama": "BSD-3-Clause",
+    "iniconfig": "MIT",
+    "joblib": "BSD-3-Clause",
+    "mapie": "BSD-3-Clause",
+    "maturin": "MIT OR Apache-2.0",
+    "ml-dtypes": "Apache-2.0",
+    "narwhals": "MIT",
+    "numpy": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
+    "onnx": "Apache-2.0",
+    "packaging": "Apache-2.0 OR BSD-2-Clause",
+    "pluggy": "MIT",
+    "protobuf": "BSD-3-Clause",
+    "pyarrow": "Apache-2.0",
+    "pygments": "BSD-2-Clause",
+    "pytest": "MIT",
+    "scikit-learn": "BSD-3-Clause",
+    "scipy": "BSD-3-Clause",
+    "skl2onnx": "Apache-2.0",
+    "threadpoolctl": "BSD-3-Clause",
+    "typing-extensions": "PSF-2.0",
 }
+REQUIRED_PROJECTS = set(PYTHON_LICENSE_POLICY)
 FOCUSED_TESTS = (
     "python/tests/test_data.py",
     "python/tests/test_finance_parity.py",
@@ -82,6 +116,132 @@ FOCUSED_TESTS = (
 
 class ReleaseBuildError(RuntimeError):
     """A release authority, source, wheel, runtime, or build contract failed."""
+
+
+def bootstrap_locked_packaging(
+    lock_path: Path,
+    wheelhouse: Path,
+    source_cache: Path | None,
+    *,
+    allow_network: bool,
+) -> None:
+    """Load the exact hash-locked build-time packaging wheel without host mutation."""
+
+    try:
+        if lock_path.is_symlink():
+            raise ReleaseBuildError("Python release lock must not be a symbolic link")
+        raw = lock_path.read_bytes()
+        if not raw or len(raw) > MAX_LOCK_BYTES:
+            raise ReleaseBuildError("Python release lock exceeds its byte bound")
+        value = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseBuildError("Python release lock is unreadable") from error
+    artifacts = value.get("artifacts") if isinstance(value, dict) else None
+    if not isinstance(artifacts, list) or len(artifacts) > MAX_ARTIFACTS:
+        raise ReleaseBuildError("Python release lock has no bounded artifact inventory")
+    matches = [
+        artifact
+        for artifact in artifacts
+        if isinstance(artifact, dict)
+        and artifact.get("project") == PACKAGING_BOOTSTRAP["project"]
+    ]
+    if len(matches) != 1 or any(
+        matches[0].get(field) != expected
+        for field, expected in PACKAGING_BOOTSTRAP.items()
+    ):
+        raise ReleaseBuildError("Python release lock lacks the admitted packaging bootstrap")
+
+    _admit_owned_child(wheelhouse, wheelhouse.parent, "wheelhouse")
+    destination = wheelhouse / str(PACKAGING_BOOTSTRAP["filename"])
+    expected = (
+        int(PACKAGING_BOOTSTRAP["size_bytes"]),
+        str(PACKAGING_BOOTSTRAP["sha256"]),
+    )
+    if destination.exists() or destination.is_symlink():
+        if destination.is_symlink() or not destination.is_file():
+            raise ReleaseBuildError("packaging bootstrap cache path is unsafe")
+        if _file_digest(destination) != expected:
+            raise ReleaseBuildError("cached packaging bootstrap identity differs")
+    else:
+        temporary = destination.with_suffix(destination.suffix + ".part")
+        temporary.unlink(missing_ok=True)
+        cached = (
+            source_cache / destination.name if source_cache is not None else None
+        )
+        if cached is not None and cached.is_file() and not cached.is_symlink():
+            shutil.copyfile(cached, temporary)
+        elif allow_network:
+            request = urllib.request.Request(
+                str(PACKAGING_BOOTSTRAP["url"]),
+                headers={
+                    "Accept": "application/octet-stream",
+                    "User-Agent": "market-squawk-release-builder",
+                },
+            )
+            observed = 0
+            digest = hashlib.sha256()
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response, temporary.open(
+                    "xb"
+                ) as output:
+                    final = urllib.parse.urlparse(response.geturl())
+                    if (
+                        final.scheme != "https"
+                        or final.hostname != "files.pythonhosted.org"
+                    ):
+                        raise ReleaseBuildError(
+                            "packaging bootstrap redirected outside PyPI files"
+                        )
+                    declared = response.headers.get("Content-Length")
+                    try:
+                        declared_size = int(declared) if declared is not None else None
+                    except ValueError as error:
+                        raise ReleaseBuildError(
+                            "packaging bootstrap response length is invalid"
+                        ) from error
+                    if declared_size is not None and declared_size != expected[0]:
+                        raise ReleaseBuildError("packaging bootstrap response length differs")
+                    while chunk := response.read(1024 * 1024):
+                        observed += len(chunk)
+                        if observed > expected[0]:
+                            raise ReleaseBuildError(
+                                "packaging bootstrap exceeded its locked size"
+                            )
+                        digest.update(chunk)
+                        output.write(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+            except (OSError, urllib.error.URLError, ReleaseBuildError):
+                temporary.unlink(missing_ok=True)
+                raise
+            if observed != expected[0] or digest.hexdigest() != expected[1]:
+                temporary.unlink(missing_ok=True)
+                raise ReleaseBuildError("downloaded packaging bootstrap identity differs")
+        else:
+            raise ReleaseBuildError(
+                "locked packaging bootstrap is absent from the offline cache"
+            )
+        if _file_digest(temporary) != expected:
+            temporary.unlink(missing_ok=True)
+            raise ReleaseBuildError("packaging bootstrap identity differs")
+        os.replace(temporary, destination)
+
+    for module_name in tuple(sys.modules):
+        if module_name == "packaging" or module_name.startswith("packaging."):
+            del sys.modules[module_name]
+    admitted_wheel = destination.resolve(strict=True)
+    sys.path.insert(0, str(admitted_wheel))
+    try:
+        import packaging
+    except ImportError as error:
+        raise ReleaseBuildError("locked packaging bootstrap could not load") from error
+    loader_archive = getattr(getattr(packaging, "__loader__", None), "archive", None)
+    try:
+        loaded_wheel = Path(loader_archive).resolve(strict=True)
+    except (OSError, TypeError):
+        loaded_wheel = None
+    if packaging.__version__ != PACKAGING_VERSION or loaded_wheel != admitted_wheel:
+        raise ReleaseBuildError("locked packaging bootstrap identity differs")
 
 
 @dataclass(frozen=True)
@@ -195,6 +355,13 @@ def _interpreter_platform_matches(
 
 
 @dataclass(frozen=True)
+class LicenseFile:
+    path: str
+    sha256: str
+    size_bytes: int
+
+
+@dataclass(frozen=True)
 class Artifact:
     project: str
     version: str
@@ -203,7 +370,10 @@ class Artifact:
     sha256: str
     size_bytes: int
     url: str
-    license_file_sha256: str | None = None
+    requires_python: str = ""
+    metadata_sha256: str = ""
+    tags: tuple[str, ...] = ()
+    license_files: tuple[LicenseFile, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -277,6 +447,9 @@ class InstalledDistribution:
     name: str
     version: str
     roots: tuple[str, ...]
+    external_paths: tuple[str, ...]
+    owned_paths: tuple[Path, ...]
+    owned_file_identities: tuple[tuple[int, int], ...]
     record: Path
     record_sha256: str
     record_size: int
@@ -396,7 +569,12 @@ class ReleaseSigner:
         return completed.stdout
 
 
-def load_lock(path: Path, target: str | None = None) -> ReleaseLock:
+def load_lock(
+    path: Path,
+    target: str | None = None,
+    *,
+    platform_lock_directory: Path | None = None,
+) -> ReleaseLock:
     try:
         if path.is_symlink():
             raise ReleaseBuildError("Python release lock must not be a symbolic link")
@@ -411,10 +589,12 @@ def load_lock(path: Path, target: str | None = None) -> ReleaseLock:
         "python",
         "artifacts",
         "sources",
+        "inventory_generation",
     }:
         raise ReleaseBuildError("Python release lock shape is invalid")
-    if value["schema_version"] != 2:
+    if value["schema_version"] != 3:
         raise ReleaseBuildError("Python release lock version is unsupported")
+    _sha256(value["inventory_generation"])
     python = value["python"]
     if not isinstance(python, dict) or set(python) != {"minimum", "maximum_exclusive"}:
         raise ReleaseBuildError("Python interpreter matrix is invalid")
@@ -440,24 +620,74 @@ def load_lock(path: Path, target: str | None = None) -> ReleaseLock:
             "sha256",
             "size_bytes",
             "url",
+            "requires_python",
+            "metadata_sha256",
+            "tags",
+            "license_files",
+            "upload_time",
+            "yanked",
         }
         if (
             not isinstance(item, dict)
-            or not required <= set(item)
-            or not set(item) <= required | {"license_file_sha256"}
+            or set(item) != required
         ):
             raise ReleaseBuildError("Python wheel identity is incomplete")
+        if any(
+            not isinstance(item[field], str)
+            for field in (
+                "project",
+                "version",
+                "license",
+                "filename",
+                "sha256",
+                "url",
+                "requires_python",
+                "metadata_sha256",
+                "upload_time",
+            )
+        ):
+            raise ReleaseBuildError("Python wheel identity has an invalid type")
         if item["filename"] in names or item["license"] not in ALLOWED_LICENSES:
             raise ReleaseBuildError("Python wheel identity or license is invalid")
         _sha256(item["sha256"])
-        license_file_sha256 = item.get("license_file_sha256")
-        if license_file_sha256 is not None:
-            _sha256(license_file_sha256)
+        _sha256(item["metadata_sha256"])
+        license_files = item["license_files"]
+        if not isinstance(license_files, list) or not license_files:
+            raise ReleaseBuildError("Python wheel license identity is invalid")
+        parsed_license_files = []
+        for license_file in license_files:
+            if not isinstance(license_file, dict) or set(license_file) != {
+                "path",
+                "sha256",
+                "size_bytes",
+            }:
+                raise ReleaseBuildError("Python wheel license identity is invalid")
+            if (
+                not isinstance(license_file["path"], str)
+                or not license_file["path"]
+                or license_file["path"].startswith(("/", "\\"))
+                or "\\" in license_file["path"]
+                or not isinstance(license_file["size_bytes"], int)
+                or license_file["size_bytes"] <= 0
+            ):
+                raise ReleaseBuildError("Python wheel license identity is invalid")
+            _sha256(license_file["sha256"])
+            license_path = PurePosixPath(license_file["path"])
+            if license_path.is_absolute() or any(
+                part in {"", ".", ".."} for part in license_path.parts
+            ):
+                raise ReleaseBuildError("Python wheel license identity is invalid")
+            parsed_license_files.append(LicenseFile(**license_file))
         if (
             item["sha256"] == "0" * 64
-            or license_file_sha256 == "0" * 64
+            or item["metadata_sha256"] == "0" * 64
             or not isinstance(item["size_bytes"], int)
             or item["size_bytes"] <= 0
+            or item["yanked"] is not False
+            or not isinstance(item["requires_python"], str)
+            or not item["requires_python"]
+            or not isinstance(item["upload_time"], str)
+            or not item["upload_time"]
         ):
             raise ReleaseBuildError("Python wheel hash or size is invalid")
         parsed = urllib.parse.urlparse(item["url"])
@@ -467,12 +697,54 @@ def load_lock(path: Path, target: str | None = None) -> ReleaseLock:
             or Path(parsed.path).name != item["filename"]
         ):
             raise ReleaseBuildError("Python wheel URL is not an exact official artifact")
-        _wheel_tags(item["filename"])
-        artifacts.append(Artifact(**item))
+        parsed_project, parsed_release, parsed_build, parsed_tags = _parse_wheel(
+            item["filename"]
+        )
+        project = _normalize_project_name(item["project"])
+        if (
+            str(parsed_project) != project
+            or str(parsed_release) != item["version"]
+            or parsed_build
+            or project not in PYTHON_LICENSE_POLICY
+            or item["license"] != PYTHON_LICENSE_POLICY[project]
+        ):
+            raise ReleaseBuildError("Python wheel metadata differs from its filename")
+        try:
+            from packaging.specifiers import InvalidSpecifier, SpecifierSet
+        except ImportError as error:
+            raise ReleaseBuildError(
+                "packaging 26.2 is required for wheel admission"
+            ) from error
+        try:
+            requires_python = SpecifierSet(item["requires_python"])
+        except InvalidSpecifier as error:
+            raise ReleaseBuildError(
+                "Python wheel interpreter requirement is invalid"
+            ) from error
+        if not requires_python.contains("3.14.6", prereleases=False):
+            raise ReleaseBuildError("Python wheel excludes the admitted interpreter")
+        tags = item["tags"]
+        if (
+            not isinstance(tags, list)
+            or tags != sorted(tags)
+            or len(tags) != len(set(tags))
+            or set(tags) != {str(tag) for tag in parsed_tags}
+        ):
+            raise ReleaseBuildError("Python wheel tag identity is invalid")
+        artifact_value = dict(item)
+        artifact_value["tags"] = tuple(tags)
+        artifact_value["license_files"] = tuple(parsed_license_files)
+        artifact_value.pop("upload_time")
+        artifact_value.pop("yanked")
+        artifacts.append(Artifact(**artifact_value))
         names.add(item["filename"])
     profile = platform_profile(target or host_profile().target)
-    profile_path = path.parent / "wheelhouse" / f"{profile.target}.json"
-    profile_artifacts = _load_platform_wheel_lock(profile_path, profile)
+    profile_path = (
+        platform_lock_directory or path.parent / "wheelhouse"
+    ) / f"{profile.target}.json"
+    profile_artifacts = _load_platform_wheel_lock(
+        profile_path, profile, value["inventory_generation"]
+    )
     selected = {
         artifact.filename: artifact
         for artifact in artifacts
@@ -480,6 +752,17 @@ def load_lock(path: Path, target: str | None = None) -> ReleaseLock:
     }
     if set(selected) != profile_artifacts:
         raise ReleaseBuildError("platform wheel set is absent from the common release lock")
+    if any(
+        not _compatible(artifact.filename, minimum, profile)
+        for artifact in selected.values()
+    ):
+        raise ReleaseBuildError("platform wheel set contains an incompatible artifact")
+    selected_projects = {artifact.project for artifact in selected.values()}
+    required_projects = REQUIRED_PROJECTS
+    if profile.system != "Windows":
+        required_projects = REQUIRED_PROJECTS - {"colorama"}
+    if selected_projects != required_projects:
+        raise ReleaseBuildError("platform wheel project closure is incomplete or unexpected")
     sources_value = value["sources"]
     if not isinstance(sources_value, list) or len(sources_value) > MAX_SOURCES:
         raise ReleaseBuildError("Python source lock is invalid")
@@ -510,7 +793,7 @@ def load_lock(path: Path, target: str | None = None) -> ReleaseLock:
 
 
 def _load_platform_wheel_lock(
-    path: Path, profile: PlatformProfile
+    path: Path, profile: PlatformProfile, inventory_generation: str
 ) -> set[str]:
     try:
         if path.is_symlink():
@@ -527,12 +810,14 @@ def _load_platform_wheel_lock(
         "minimum_system",
         "wheel_platform_tag",
         "artifacts",
+        "inventory_generation",
     }:
         raise ReleaseBuildError("platform wheel lock shape is invalid")
     artifacts = value["artifacts"]
     if (
-        value["schema_version"] != 1
+        value["schema_version"] != 2
         or value["target"] != profile.target
+        or value["inventory_generation"] != inventory_generation
         or value["minimum_system"] != profile.minimum_system
         or value["wheel_platform_tag"] != profile.wheel_platform_tag
         or not isinstance(artifacts, list)
@@ -573,7 +858,7 @@ def admit_release_components(
     ):
         raise ReleaseBuildError("locked uv executable identity differs")
     version = _run_output([str(executable), "--version"], root)
-    if not version.startswith("uv 0.12.0 "):
+    if not version.startswith("uv 0.12.1 "):
         raise ReleaseBuildError("locked uv executable reports the wrong version")
     selected_zig = target.get("zig")
     if profile.system == "Linux":
@@ -627,9 +912,9 @@ def load_release_components(
         value["schema_version"] != 1
         or not isinstance(uv, dict)
         or set(uv) != {"version", "license", "release_url"}
-        or uv["version"] != "0.12.0"
+        or uv["version"] != "0.12.1"
         or uv["license"] != "Apache-2.0 OR MIT"
-        or uv["release_url"] != "https://github.com/astral-sh/uv/releases/tag/0.12.0"
+        or uv["release_url"] != "https://github.com/astral-sh/uv/releases/tag/0.12.1"
         or not isinstance(zig, dict)
         or set(zig) != {"version", "license", "release_url"}
         or zig["version"] != "0.16.0"
@@ -760,11 +1045,17 @@ def acquire_release_components(
     repository_root: Path,
     *,
     allow_network: bool,
+    development_runtime_root: Path | None = None,
 ) -> AcquiredReleaseComponents:
     """Acquire and safely expand the exact uv, CPython, and Linux Zig archives."""
 
     _raw, target = load_release_components(path, profile)
-    root = _admit_component_root(component_root, repository_root, profile)
+    root = _admit_component_root(
+        component_root,
+        repository_root,
+        profile,
+        development_runtime_root=development_runtime_root,
+    )
     downloads = root / "downloads"
     expanded = root / "expanded"
     for directory in (downloads, expanded):
@@ -844,6 +1135,8 @@ def _admit_component_root(
     path: Path,
     repository_root: Path,
     profile: PlatformProfile,
+    *,
+    development_runtime_root: Path | None = None,
 ) -> Path:
     repository_root = repository_root.resolve(strict=True)
     home = Path.home().resolve(strict=True)
@@ -856,9 +1149,14 @@ def _admit_component_root(
         canonical = candidate.resolve(strict=True)
     else:
         canonical = candidate.parent.resolve(strict=True) / candidate.name
-    if (
-        canonical in {Path("/"), home, repository_root}
-        or canonical.is_relative_to(repository_root)
+    allowed_development_root = (
+        development_runtime_root.resolve(strict=True) / "components"
+        if development_runtime_root is not None
+        else None
+    )
+    if canonical in {Path("/"), home, repository_root} or (
+        canonical.is_relative_to(repository_root)
+        and canonical != allowed_development_root
     ):
         raise ReleaseBuildError("release component root resolves to a protected location")
     purpose = f"{COMPONENT_ROOT_PURPOSE}:{profile.target}"
@@ -911,7 +1209,9 @@ def _acquire_locked_download(
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=60) as response, temporary.open("xb") as output:
+        with urllib.request.urlopen(request, timeout=60) as response, temporary.open(
+            "xb"
+        ) as output:
             final = urllib.parse.urlparse(response.geturl())
             if (
                 final.scheme != "https"
@@ -1060,6 +1360,72 @@ def _admit_extracted_tree(root: Path) -> None:
             raise ReleaseBuildError("release component extraction exceeds its fixed bounds")
 
 
+def admit_development_runtime_root(
+    path: Path,
+    repository_root: Path,
+    *,
+    create: bool,
+) -> Path:
+    """Admit the one ignored, builder-owned development model-runtime root."""
+
+    repository_root = repository_root.resolve(strict=True)
+    expected = repository_root / DEVELOPMENT_RUNTIME_RELATIVE
+    candidate = Path(os.path.abspath(path.expanduser()))
+    if candidate != expected or candidate.is_symlink():
+        raise ReleaseBuildError("development runtime root is not the repository-owned path")
+
+    parent = expected.parent
+    if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+        raise ReleaseBuildError("development runtime parent is unsafe")
+    if not parent.exists():
+        if not create:
+            raise ReleaseBuildError("development runtime is not prepared")
+        parent.mkdir(mode=0o700)
+
+    marker = expected / DEVELOPMENT_ROOT_MARKER
+    marker_content = _marker_content(expected, DEVELOPMENT_ROOT_PURPOSE)
+    if expected.exists():
+        if not expected.is_dir() or expected.is_symlink():
+            raise ReleaseBuildError("development runtime root is unsafe")
+        entries = tuple(expected.iterdir())
+        if marker not in entries:
+            if entries or not create:
+                raise ReleaseBuildError("development runtime root is not builder-owned")
+            marker.write_text(marker_content, encoding="utf-8")
+        elif (
+            marker.is_symlink()
+            or not marker.is_file()
+            or marker.read_text(encoding="utf-8") != marker_content
+        ):
+            raise ReleaseBuildError("development runtime ownership marker is invalid")
+    elif create:
+        expected.mkdir(mode=0o700)
+        marker.write_text(marker_content, encoding="utf-8")
+    else:
+        raise ReleaseBuildError("development runtime is not prepared")
+    if os.name != "nt":
+        expected.chmod(0o700)
+        marker.chmod(0o600)
+    return expected.resolve(strict=True)
+
+
+def reset_development_runtime_root(path: Path, repository_root: Path) -> None:
+    """Remove only the admitted ignored development model-runtime cache."""
+
+    repository_root = repository_root.resolve(strict=True)
+    expected = repository_root / DEVELOPMENT_RUNTIME_RELATIVE
+    candidate = Path(os.path.abspath(path.expanduser()))
+    if candidate != expected:
+        raise ReleaseBuildError("development runtime root is not the repository-owned path")
+    if not candidate.exists() and not candidate.is_symlink():
+        return
+    admitted = admit_development_runtime_root(candidate, repository_root, create=False)
+    release = admitted / "python" / CANONICAL_RELEASE
+    if release.exists() and not release.is_symlink():
+        _unseal_owned_release_authority(release)
+    _remove_owned_tree(admitted)
+
+
 def admit_artifact_root(path: Path, repository_root: Path) -> ArtifactLayout:
     """Claim or re-open one explicit root; only its marked direct children are mutable."""
 
@@ -1119,9 +1485,9 @@ def admit_wheelhouse(
     )
     projects = {artifact.project.lower() for artifact in selected}
     required_projects = (
-        REQUIRED_PROJECTS | {"colorama"}
+        REQUIRED_PROJECTS
         if profile.system == "Windows"
-        else REQUIRED_PROJECTS
+        else REQUIRED_PROJECTS - {"colorama"}
     )
     if not required_projects <= projects:
         raise ReleaseBuildError("wheelhouse has no complete compatible dependency set")
@@ -1132,7 +1498,7 @@ def admit_wheelhouse(
             raise ReleaseBuildError("offline wheelhouse is missing a locked artifact")
         if _file_digest(path) != (artifact.size_bytes, artifact.sha256):
             raise ReleaseBuildError("offline wheelhouse artifact hash or size mismatch")
-        _admit_license(path, artifact.license, artifact.license_file_sha256)
+        _admit_license(path, artifact.license, artifact.license_files)
         admitted.append(path)
     return tuple(admitted)
 
@@ -1142,41 +1508,19 @@ def locked_runtime_requirements(
 ) -> tuple[RuntimeRequirement, ...]:
     """Resolve every exact Python project dependency against each supported wheel set."""
 
-    project = _toml(root / "python/pyproject.toml").get("project")
-    dependencies = project.get("dependencies") if isinstance(project, dict) else None
-    if (
-        not isinstance(dependencies, list)
-        or not dependencies
-        or len(dependencies) > MAX_RUNTIME_DISTRIBUTIONS
-    ):
-        raise ReleaseBuildError("Python runtime dependency policy is invalid")
+    del root
     requirements = []
     names = set()
-    for dependency in dependencies:
-        if not isinstance(dependency, str):
-            raise ReleaseBuildError("Python runtime dependency is not exact")
-        match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9._+-]*)", dependency)
-        if match is None:
-            raise ReleaseBuildError("Python runtime dependency is not exact")
-        name = _normalize_project_name(match.group(1))
-        version = match.group(2)
+    for artifact in lock.artifacts:
+        name = _normalize_project_name(artifact.project)
+        if name == "maturin":
+            continue
         if name in names:
             raise ReleaseBuildError("Python runtime dependency is duplicated")
-        for python_version in SUPPORTED_PYTHONS:
-            profile = platform_profile(lock.target)
-            candidates = [
-                artifact
-                for artifact in lock.artifacts
-                if _normalize_project_name(artifact.project) == name
-                and artifact.version == version
-                and _compatible(artifact.filename, python_version, profile)
-            ]
-            if len(candidates) != 1:
-                raise ReleaseBuildError(
-                    "Python runtime dependency has no unique locked wheel"
-                )
-        requirements.append(RuntimeRequirement(name, version))
+        requirements.append(RuntimeRequirement(name, artifact.version))
         names.add(name)
+    if not requirements or len(requirements) > MAX_RUNTIME_DISTRIBUTIONS:
+        raise ReleaseBuildError("Python runtime dependency policy is invalid")
     return tuple(sorted(requirements, key=lambda value: value.name))
 
 
@@ -1185,8 +1529,13 @@ def prepare_wheelhouse(
     wheelhouse: Path,
     source_cache: Path | None,
 ) -> None:
-    if os.environ.get("MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK") != "1" and source_cache is None:
-        raise ReleaseBuildError("wheel preparation requires an explicit cache or network authorization")
+    if (
+        os.environ.get("MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK") != "1"
+        and source_cache is None
+    ):
+        raise ReleaseBuildError(
+            "wheel preparation requires an explicit cache or network authorization"
+        )
     _admit_owned_child(wheelhouse, wheelhouse.parent, "wheelhouse")
     selected = {
         artifact.filename: artifact
@@ -1226,7 +1575,7 @@ def prepare_wheelhouse(
         if _file_digest(temporary) != (artifact.size_bytes, artifact.sha256):
             temporary.unlink(missing_ok=True)
             raise ReleaseBuildError("prepared wheel hash or size mismatch")
-        _admit_license(temporary, artifact.license, artifact.license_file_sha256)
+        _admit_license(temporary, artifact.license, artifact.license_files)
         os.replace(temporary, destination)
 
 
@@ -1261,11 +1610,7 @@ def expected_source_paths(root: Path) -> tuple[str, ...]:
 
     root = root.resolve(strict=True)
     paths = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml"}
-    for relative in (
-        "python/market_squawk",
-        "python/tests",
-        "python/examples",
-    ):
+    for relative in ("python/market_squawk",):
         paths.update(_regular_files(root, root / relative))
     paths.update(
         {
@@ -1277,7 +1622,6 @@ def expected_source_paths(root: Path) -> tuple[str, ...]:
             "python/wheelhouse/x86_64-pc-windows-msvc.json",
             "python/wheelhouse/x86_64-unknown-linux-gnu.json",
             "scripts/build_python_release.py",
-            "scripts/tests/test_build_python_release.py",
         }
     )
     workspace = _toml(root / "Cargo.toml")
@@ -1359,6 +1703,673 @@ def expected_source_paths(root: Path) -> tuple[str, ...]:
                 pending.append(package_root / dependency_path / "Cargo.toml")
     paths.update(_literal_rust_include_paths(root, paths))
     return tuple(sorted(paths))
+
+
+def refresh_source_closure(lock_path: Path, root: Path) -> None:
+    """Atomically replace only the complete, stable source identity closure."""
+
+    root = root.resolve(strict=True)
+    lock_path = lock_path.expanduser().absolute()
+    if lock_path.is_symlink() or not lock_path.is_file():
+        raise ReleaseBuildError("Python release lock must be one regular file")
+    lock_before = lock_path.stat(follow_symlinks=False)
+    try:
+        raw = lock_path.read_bytes()
+        value = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseBuildError("Python release lock is unreadable") from error
+    if (
+        not raw
+        or len(raw) > MAX_LOCK_BYTES
+        or not isinstance(value, dict)
+        or set(value)
+        != {"schema_version", "python", "artifacts", "sources", "inventory_generation"}
+        or value.get("schema_version") != 3
+    ):
+        raise ReleaseBuildError("Python release lock shape is invalid")
+
+    entries = []
+    identities: list[tuple[Path, tuple[int, int, int, int, int]]] = []
+    for relative in expected_source_paths(root):
+        candidate = root.joinpath(*PurePosixPath(relative).parts)
+        if candidate.is_symlink() or not candidate.is_file():
+            raise ReleaseBuildError("Python release source is unavailable")
+        before = candidate.stat(follow_symlinks=False)
+        size, digest, _header, _file_identity = _inspect_installed_distribution_file(
+            candidate
+        )
+        identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        identities.append((candidate, identity))
+        entries.append({"path": relative, "sha256": digest, "size_bytes": size})
+
+    for candidate, expected in identities:
+        observed = candidate.stat(follow_symlinks=False)
+        if candidate.is_symlink() or (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_mode,
+            observed.st_size,
+            observed.st_mtime_ns,
+        ) != expected:
+            raise ReleaseBuildError("Python release source changed during refresh")
+    current = lock_path.stat(follow_symlinks=False)
+    if (
+        current.st_dev,
+        current.st_ino,
+        current.st_mode,
+        current.st_size,
+        current.st_mtime_ns,
+    ) != (
+        lock_before.st_dev,
+        lock_before.st_ino,
+        lock_before.st_mode,
+        lock_before.st_size,
+        lock_before.st_mtime_ns,
+    ):
+        raise ReleaseBuildError("Python release lock changed during refresh")
+
+    value["sources"] = entries
+    _atomic_write_json(lock_path, value)
+
+
+def refresh_development_source_closure(
+    template_path: Path,
+    development_root: Path,
+    repository_root: Path,
+) -> Path:
+    """Create a development lock with current sources without changing the shipping lock."""
+
+    repository_root = repository_root.resolve(strict=True)
+    expected_template = repository_root / "python/wheelhouse-lock.json"
+    template_candidate = template_path.expanduser().absolute()
+    if template_candidate != expected_template or template_candidate.is_symlink():
+        raise ReleaseBuildError("development source template is not the shipping lock")
+    template_path = template_candidate.resolve(strict=True)
+    before = template_path.stat(follow_symlinks=False)
+    raw = template_path.read_bytes()
+    if not raw or len(raw) > MAX_LOCK_BYTES:
+        raise ReleaseBuildError("Python release lock exceeds its byte bound")
+
+    destination = development_root / "source-lock.json"
+    if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+        raise ReleaseBuildError("development source lock path is unsafe")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".source-lock.", suffix=".refresh", dir=development_root
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            if os.name != "nt":
+                os.fchmod(output.fileno(), 0o600)
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        refresh_source_closure(temporary, repository_root)
+        after = template_path.stat(follow_symlinks=False)
+        if template_path.is_symlink() or (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+        ) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+            before.st_mtime_ns,
+        ):
+            raise ReleaseBuildError("shipping source lock changed during development refresh")
+        os.replace(temporary, destination)
+        if os.name != "nt":
+            destination.chmod(0o600)
+            directory = os.open(
+                development_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
+def admit_development_source_template(lock_path: Path, repository_root: Path) -> None:
+    """Require the development lock to differ from shipping only in source identities."""
+
+    development = _load_refresh_lock(lock_path)
+    shipping = _load_refresh_lock(repository_root / "python/wheelhouse-lock.json")
+    development = dict(development)
+    shipping = dict(shipping)
+    development.pop("sources", None)
+    shipping.pop("sources", None)
+    if development != shipping:
+        raise ReleaseBuildError("development lock differs from the shipping dependency authority")
+
+
+def _atomic_write_json(path: Path, value: object) -> None:
+    encoded = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if not encoded or len(encoded) > MAX_LOCK_BYTES:
+        raise ReleaseBuildError("refreshed release manifest exceeds its byte bound")
+    destination = path.stat(follow_symlinks=False)
+    if path.is_symlink() or not stat.S_ISREG(destination.st_mode):
+        raise ReleaseBuildError("release manifest destination is unsafe")
+    destination_mode = stat.S_IMODE(destination.st_mode)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".refresh", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            if os.name != "nt":
+                os.fchmod(output.fileno(), destination_mode)
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+        if path.is_symlink():
+            raise ReleaseBuildError("release manifest destination became unsafe")
+        os.replace(temporary, path)
+        if os.name != "nt":
+            directory = os.open(
+                path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def refresh_lock_manifests(
+    requirements_path: Path,
+    lock_path: Path,
+    targets: tuple[str, ...],
+    root: Path,
+) -> None:
+    """Resolve exact wheel metadata into one fail-closed four-target lock generation."""
+
+    if len(targets) != len(PLATFORM_PROFILES) or set(targets) != set(PLATFORM_PROFILES):
+        raise ReleaseBuildError("lock refresh requires the exact supported target matrix")
+    targets = tuple(PLATFORM_PROFILES)
+    requirements = _locked_requirement_set(requirements_path)
+    build_system = _toml(root / "python/pyproject.toml").get("build-system")
+    build_requirements = (
+        build_system.get("requires") if isinstance(build_system, dict) else None
+    )
+    if build_requirements != ["maturin==1.14.1"]:
+        raise ReleaseBuildError("Python build-system requirement is not exact")
+    requirements["maturin"] = ("1.14.1", None, frozenset())
+    if set(requirements) != REQUIRED_PROJECTS:
+        raise ReleaseBuildError("resolved Python project set is incomplete or unexpected")
+
+    metadata = {
+        name: _pypi_release_metadata(name, version)
+        for name, (version, _marker, _hashes) in sorted(requirements.items())
+    }
+    selected_by_target: dict[str, tuple[dict[str, object], ...]] = {}
+    selected_union: dict[str, dict[str, object]] = {}
+    metadata_by_filename: dict[str, object] = {}
+    with tempfile.TemporaryDirectory(prefix="market-squawk-wheel-refresh-") as temporary:
+        cache = Path(temporary)
+        for target in targets:
+            profile = platform_profile(target)
+            environment = _target_marker_environment(profile)
+            selected = []
+            for name, (version, marker, hashes) in sorted(requirements.items()):
+                if marker is not None and not marker.evaluate(environment=environment):
+                    continue
+                artifact = _select_target_wheel(
+                    name,
+                    version,
+                    metadata[name],
+                    hashes,
+                    profile,
+                )
+                filename = str(artifact["filename"])
+                if filename not in selected_union:
+                    inspected, wheel_metadata = _inspect_selected_wheel(
+                        artifact,
+                        PYTHON_LICENSE_POLICY[name],
+                        cache,
+                    )
+                    selected_union[filename] = inspected
+                    metadata_by_filename[filename] = wheel_metadata
+                selected.append(selected_union[filename])
+            selected_by_target[target] = tuple(
+                sorted(selected, key=lambda value: str(value["filename"]))
+            )
+
+    for target, selected in selected_by_target.items():
+        _validate_resolved_dependency_closure(
+            selected,
+            metadata_by_filename,
+            _target_marker_environment(platform_profile(target)),
+        )
+    old = _load_refresh_lock(lock_path)
+    master = {
+        "artifacts": [selected_union[name] for name in sorted(selected_union)],
+        "inventory_generation": "",
+        "python": {"maximum_exclusive": "3.15", "minimum": "3.14"},
+        "schema_version": 3,
+        "sources": old["sources"],
+    }
+    generation_input = {
+        "artifacts": master["artifacts"],
+        "targets": {
+            target: [value["filename"] for value in selected_by_target[target]]
+            for target in targets
+        },
+    }
+    generation = _mapping_sha256(generation_input)
+    master["inventory_generation"] = generation
+    inventories = {}
+    for target in targets:
+        profile = platform_profile(target)
+        inventories[lock_path.parent / "wheelhouse" / f"{target}.json"] = {
+            "artifacts": [value["filename"] for value in selected_by_target[target]],
+            "inventory_generation": generation,
+            "minimum_system": profile.minimum_system,
+            "schema_version": 2,
+            "target": target,
+            "wheel_platform_tag": profile.wheel_platform_tag,
+        }
+    for path, value in inventories.items():
+        _atomic_write_json(path, value)
+    _atomic_write_json(lock_path, master)
+    for target in targets:
+        load_lock(lock_path, target)
+
+
+def _load_refresh_lock(path: Path) -> dict[str, object]:
+    try:
+        if path.is_symlink():
+            raise ReleaseBuildError("Python release lock must not be a symbolic link")
+        raw = path.read_bytes()
+        value = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseBuildError("Python release lock is unreadable") from error
+    if (
+        not raw
+        or len(raw) > MAX_LOCK_BYTES
+        or not isinstance(value, dict)
+        or value.get("schema_version") not in {2, 3}
+        or not isinstance(value.get("sources"), list)
+    ):
+        raise ReleaseBuildError("Python release lock shape is invalid")
+    return value
+
+
+def _locked_requirement_set(
+    path: Path,
+) -> dict[str, tuple[str, object | None, frozenset[str]]]:
+    try:
+        import packaging
+        from packaging.requirements import InvalidRequirement, Requirement
+    except ImportError as error:
+        raise ReleaseBuildError("packaging 26.2 is required for lock refresh") from error
+    if packaging.__version__ != PACKAGING_VERSION:
+        raise ReleaseBuildError("lock refresh requires exact packaging 26.2")
+    try:
+        if path.is_symlink():
+            raise ReleaseBuildError("requirements lock must not be a symbolic link")
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ReleaseBuildError("requirements lock is unreadable") from error
+    if not raw or len(raw.encode("utf-8")) > MAX_LOCK_BYTES:
+        raise ReleaseBuildError("requirements lock exceeds its byte bound")
+    blocks: list[list[str]] = []
+    current: list[str] | None = None
+    for line in raw.splitlines():
+        if line and not line[0].isspace() and not line.startswith("#"):
+            current = [line]
+            blocks.append(current)
+        elif current is not None and ("--hash=" in line or line.lstrip().startswith("#")):
+            current.append(line)
+    result = {}
+    for block in blocks:
+        requirement_text = block[0].removesuffix("\\").strip()
+        try:
+            requirement = Requirement(requirement_text)
+        except InvalidRequirement as error:
+            raise ReleaseBuildError("requirements lock contains an invalid requirement") from error
+        name = _normalize_project_name(requirement.name)
+        specifiers = tuple(requirement.specifier)
+        if requirement.url is not None or requirement.extras or len(specifiers) != 1:
+            raise ReleaseBuildError("requirements lock is not exact")
+        specifier = specifiers[0]
+        if specifier.operator != "==" or "*" in specifier.version:
+            raise ReleaseBuildError("requirements lock is not exact")
+        hashes = frozenset(
+            match.group(1)
+            for line in block
+            if (match := re.search(r"--hash=sha256:([0-9a-f]{64})", line))
+        )
+        if not hashes or name in result:
+            raise ReleaseBuildError("requirements lock hash set is incomplete")
+        result[name] = (specifier.version, requirement.marker, hashes)
+    return result
+
+
+def _pypi_release_metadata(name: str, version: str) -> dict[str, object]:
+    url = f"https://pypi.org/pypi/{urllib.parse.quote(name)}/{urllib.parse.quote(version)}/json"
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "market-squawk-release-builder"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            if response.geturl() != url:
+                raise ReleaseBuildError("PyPI metadata redirected unexpectedly")
+            payload = response.read(MAX_LOCK_BYTES + 1)
+    except (OSError, urllib.error.URLError) as error:
+        raise ReleaseBuildError("PyPI release metadata is unavailable") from error
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseBuildError("PyPI release metadata is invalid") from error
+    if (
+        len(payload) > MAX_LOCK_BYTES
+        or not isinstance(value, dict)
+        or not isinstance(value.get("info"), dict)
+        or value["info"].get("version") != version
+        or not isinstance(value.get("urls"), list)
+    ):
+        raise ReleaseBuildError("PyPI release metadata identity is invalid")
+    return value
+
+
+def _select_target_wheel(
+    name: str,
+    version: str,
+    release: dict[str, object],
+    requirement_hashes: frozenset[str],
+    profile: PlatformProfile,
+) -> dict[str, object]:
+    try:
+        from packaging.specifiers import InvalidSpecifier, SpecifierSet
+        from packaging.version import Version
+    except ImportError as error:
+        raise ReleaseBuildError("packaging 26.2 is required for lock refresh") from error
+    supported = _ordered_supported_wheel_tags((3, 14), profile)
+    ranking = {tag: index for index, tag in enumerate(supported)}
+    candidates = []
+    for value in release["urls"]:
+        if not isinstance(value, dict) or value.get("packagetype") != "bdist_wheel":
+            continue
+        filename = value.get("filename")
+        if not isinstance(filename, str):
+            continue
+        parsed_name, parsed_version, build, tags = _parse_wheel(filename)
+        if (
+            _normalize_project_name(str(parsed_name)) != name
+            or parsed_version != Version(version)
+            or parsed_version.is_prerelease
+            or build
+            or value.get("yanked") is not False
+        ):
+            continue
+        matching = tags.intersection(ranking)
+        if not matching:
+            continue
+        requires_python = value.get("requires_python") or release["info"].get("requires_python")
+        try:
+            supported_python = SpecifierSet(str(requires_python)).contains(
+                "3.14.6", prereleases=False
+            )
+        except InvalidSpecifier as error:
+            raise ReleaseBuildError("wheel Requires-Python is invalid") from error
+        digest = value.get("digests", {}).get("sha256")
+        core_metadata = value.get("core-metadata")
+        if (
+            not supported_python
+            or not isinstance(digest, str)
+            or (requirement_hashes and digest not in requirement_hashes)
+            or not isinstance(core_metadata, dict)
+            or not isinstance(core_metadata.get("sha256"), str)
+        ):
+            continue
+        candidates.append(
+            ((min(ranking[tag] for tag in matching), len(tags)), value, tags)
+        )
+    if not candidates:
+        raise ReleaseBuildError(f"{name} has no admitted wheel for {profile.target}")
+    candidates.sort(key=lambda item: item[0])
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        raise ReleaseBuildError(f"{name} has ambiguous wheels for {profile.target}")
+    selected = dict(candidates[0][1])
+    selected["parsed_tags"] = tuple(sorted(str(tag) for tag in candidates[0][2]))
+    return selected
+
+
+def _target_marker_environment(profile: PlatformProfile) -> dict[str, str]:
+    if profile.system == "Darwin":
+        machine = "arm64" if profile.target.startswith("aarch64") else "x86_64"
+        os_name, sys_platform = "posix", "darwin"
+    elif profile.system == "Windows":
+        machine, os_name, sys_platform = "AMD64", "nt", "win32"
+    else:
+        machine, os_name, sys_platform = "x86_64", "posix", "linux"
+    return {
+        "implementation_name": "cpython",
+        "implementation_version": "3.14.6",
+        "os_name": os_name,
+        "platform_machine": machine,
+        "platform_python_implementation": "CPython",
+        "platform_release": "",
+        "platform_system": profile.system,
+        "platform_version": "",
+        "python_full_version": "3.14.6",
+        "python_version": "3.14",
+        "sys_platform": sys_platform,
+        "extra": "",
+    }
+
+
+def _inspect_selected_wheel(
+    artifact: dict[str, object],
+    license_policy: str,
+    cache: Path,
+) -> tuple[dict[str, object], object]:
+    filename = str(artifact["filename"])
+    destination = cache / filename
+    _download_locked_wheel(artifact, destination)
+    try:
+        with zipfile.ZipFile(destination) as archive:
+            names = archive.namelist()
+            metadata_names = [name for name in names if name.endswith(".dist-info/METADATA")]
+            record_names = [name for name in names if name.endswith(".dist-info/RECORD")]
+            if len(metadata_names) != 1 or len(record_names) != 1:
+                raise ReleaseBuildError("wheel metadata or RECORD is not unique")
+            metadata_payload = archive.read(metadata_names[0])
+            expected_metadata = artifact["core-metadata"]["sha256"]
+            if hashlib.sha256(metadata_payload).hexdigest() != expected_metadata:
+                raise ReleaseBuildError("wheel metadata digest differs from PyPI")
+            metadata = BytesParser().parsebytes(metadata_payload)
+            observed_expression = metadata.get("License-Expression")
+            if observed_expression is not None and observed_expression.strip() != license_policy:
+                raise ReleaseBuildError("wheel SPDX expression differs from policy")
+            license_files = _inspect_wheel_license_files(
+                archive,
+                metadata_names[0],
+                metadata,
+            )
+            _validate_wheel_record(archive, record_names[0])
+    except (OSError, zipfile.BadZipFile, KeyError) as error:
+        raise ReleaseBuildError("selected wheel is unreadable") from error
+    url = str(artifact["url"])
+    parsed = urllib.parse.urlparse(url)
+    digest = str(artifact["digests"]["sha256"])
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "files.pythonhosted.org"
+        or Path(parsed.path).name != filename
+        or artifact.get("yanked") is not False
+    ):
+        raise ReleaseBuildError("selected wheel origin is invalid")
+    project, version, _build, _tags = _parse_wheel(filename)
+    value = {
+        "filename": filename,
+        "license": license_policy,
+        "license_files": license_files,
+        "metadata_sha256": str(artifact["core-metadata"]["sha256"]),
+        "project": _normalize_project_name(str(project)),
+        "requires_python": str(artifact.get("requires_python") or ""),
+        "sha256": digest,
+        "size_bytes": int(artifact["size"]),
+        "tags": list(artifact["parsed_tags"]),
+        "upload_time": str(artifact.get("upload_time_iso_8601") or ""),
+        "url": url,
+        "version": str(version),
+        "yanked": False,
+    }
+    return value, metadata
+
+
+def _download_locked_wheel(artifact: dict[str, object], destination: Path) -> None:
+    expected_size = artifact.get("size")
+    expected_digest = artifact.get("digests", {}).get("sha256")
+    if (
+        not isinstance(expected_size, int)
+        or expected_size <= 0
+        or expected_size > MAX_DISTRIBUTION_FILE_BYTES
+        or not isinstance(expected_digest, str)
+    ):
+        raise ReleaseBuildError("selected wheel identity is invalid")
+    request = urllib.request.Request(
+        str(artifact["url"]),
+        headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": "market-squawk-release-builder",
+        },
+    )
+    digest = hashlib.sha256()
+    observed = 0
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response, destination.open(
+            "xb"
+        ) as output:
+            final = urllib.parse.urlparse(response.geturl())
+            if final.scheme != "https" or final.hostname != "files.pythonhosted.org":
+                raise ReleaseBuildError("selected wheel redirected outside PyPI files")
+            while chunk := response.read(1024 * 1024):
+                observed += len(chunk)
+                if observed > expected_size:
+                    raise ReleaseBuildError("selected wheel exceeded its locked size")
+                digest.update(chunk)
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+    except (OSError, urllib.error.URLError):
+        destination.unlink(missing_ok=True)
+        raise
+    if observed != expected_size or digest.hexdigest() != expected_digest:
+        destination.unlink(missing_ok=True)
+        raise ReleaseBuildError("selected wheel identity differs")
+
+
+def _inspect_wheel_license_files(
+    archive: zipfile.ZipFile,
+    metadata_name: str,
+    metadata: object,
+) -> list[dict[str, object]]:
+    dist_info = PurePosixPath(metadata_name).parent
+    declared = metadata.get_all("License-File", [])
+    candidates = []
+    if declared:
+        for value in declared:
+            relative = PurePosixPath(value)
+            if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+                raise ReleaseBuildError("wheel license path is invalid")
+            candidates.append((dist_info / "licenses" / relative).as_posix())
+    else:
+        for name in archive.namelist():
+            path = PurePosixPath(name)
+            if (
+                not name.endswith("/")
+                and dist_info in path.parents
+                and path.name.upper().startswith(("LICENSE", "COPYING", "NOTICE"))
+            ):
+                candidates.append(name)
+    candidates = sorted(set(candidates))
+    if not candidates:
+        raise ReleaseBuildError("wheel contains no declared license material")
+    result = []
+    for name in candidates:
+        try:
+            payload = archive.read(name)
+        except KeyError as error:
+            raise ReleaseBuildError("declared wheel license file is absent") from error
+        if not payload or len(payload) > MAX_RECORD_BYTES:
+            raise ReleaseBuildError("wheel license material exceeds its byte bound")
+        result.append(
+            {
+                "path": name,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size_bytes": len(payload),
+            }
+        )
+    return result
+
+
+def _validate_wheel_record(archive: zipfile.ZipFile, record_name: str) -> None:
+    try:
+        rows = list(csv.reader(io.TextIOWrapper(archive.open(record_name), encoding="utf-8")))
+    except (UnicodeError, csv.Error) as error:
+        raise ReleaseBuildError("wheel RECORD is unreadable") from error
+    if any(len(row) != 3 or not row[0] for row in rows):
+        raise ReleaseBuildError("wheel RECORD contains a malformed entry")
+    records = {row[0]: row[1:] for row in rows}
+    if len(records) != len(rows):
+        raise ReleaseBuildError("wheel RECORD contains a duplicate entry")
+    files = {name for name in archive.namelist() if name and not name.endswith("/")}
+    if set(records) != files:
+        raise ReleaseBuildError("wheel RECORD does not cover the exact archive")
+    for name in sorted(files - {record_name}):
+        digest_value, size_value = records[name]
+        if not digest_value.startswith("sha256=") or not size_value.isdigit():
+            raise ReleaseBuildError("wheel RECORD entry lacks SHA-256 or size")
+        payload = archive.read(name)
+        encoded = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
+        if digest_value != f"sha256={encoded}" or int(size_value) != len(payload):
+            raise ReleaseBuildError("wheel RECORD entry identity differs")
+
+
+def _validate_resolved_dependency_closure(
+    artifacts: tuple[dict[str, object], ...],
+    metadata_by_filename: dict[str, object],
+    environment: dict[str, str],
+) -> None:
+    try:
+        from packaging.requirements import InvalidRequirement, Requirement
+        from packaging.version import Version
+    except ImportError as error:
+        raise ReleaseBuildError("packaging 26.2 is required for lock refresh") from error
+    installed = {
+        str(value["project"]): Version(str(value["version"])) for value in artifacts
+    }
+    for value in artifacts:
+        metadata = metadata_by_filename[str(value["filename"])]
+        for raw_requirement in metadata.get_all("Requires-Dist", []):
+            try:
+                requirement = Requirement(raw_requirement)
+            except InvalidRequirement as error:
+                raise ReleaseBuildError("wheel dependency metadata is invalid") from error
+            if requirement.marker is not None and not requirement.marker.evaluate(
+                environment=environment
+            ):
+                continue
+            dependency = _normalize_project_name(requirement.name)
+            observed = installed.get(dependency)
+            if observed is None or observed not in requirement.specifier:
+                raise ReleaseBuildError("selected wheel dependency closure is incomplete")
 
 
 def _literal_rust_include_paths(root: Path, source_paths: set[str]) -> set[str]:
@@ -1943,6 +2954,8 @@ def build_release(
     release_components_sha256: str,
     uv_executable: Path,
     native_code_signing: NativeCodeSigning | None,
+    *,
+    development_runtime: bool = False,
 ) -> None:
     with ExitStack() as cleanup:
         _build_release(
@@ -1955,6 +2968,7 @@ def build_release(
             release_components_sha256,
             uv_executable,
             native_code_signing,
+            development_runtime,
             cleanup,
         )
 
@@ -1969,6 +2983,7 @@ def _build_release(
     release_components_sha256: str,
     uv_executable: Path,
     native_code_signing: NativeCodeSigning | None,
+    development_runtime: bool,
     cleanup: ExitStack,
 ) -> None:
     admit_sources(lock, root)
@@ -2095,7 +3110,10 @@ def _build_release(
         raise ReleaseBuildError("maturin did not create exactly one project wheel")
     project_wheel = project_wheels[0]
     harden_project_wheel(project_wheel)
-    python_tag, abi_tag, platform_tag = _wheel_tags(project_wheel.name)
+    project_tag = _single_wheel_tag(project_wheel.name)
+    python_tag = project_tag.interpreter
+    abi_tag = project_tag.abi
+    platform_tag = project_tag.platform
     if (
         python_tag != "cp310"
         or abi_tag != "abi3"
@@ -2366,6 +3384,14 @@ def _build_release(
         json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
+    if development_runtime:
+        _write_development_runtime_receipt(
+            root,
+            layout.root.parent,
+            layout,
+            lock_path,
+            profile,
+        )
     _remove_owned_child(layout.build_venv, layout.root, "build-venv")
     _remove_owned_child(layout.build_home, layout.root, "build-home")
 
@@ -2432,8 +3458,166 @@ def _build_native_release_executables(
     return executables
 
 
+def _development_runtime_receipt(
+    root: Path,
+    development_root: Path,
+    layout: ArtifactLayout,
+    lock_path: Path,
+    profile: PlatformProfile,
+) -> dict[str, object]:
+    suffix = profile.executable_suffix
+    native_bin = _cargo_release_dir(root, profile)
+    release_bin = layout.root / CANONICAL_RELEASE / "bin"
+    program_paths = {
+        "application": native_bin / f"market-squawk{suffix}",
+        "onnx_worker": native_bin / f"market-squawk-onnx-worker{suffix}",
+    }
+    programs = {}
+    for name, path in program_paths.items():
+        maximum_bytes = (
+            MAX_ONNX_WORKER_EXECUTABLE_BYTES
+            if name == "onnx_worker"
+            else MAX_APPLICATION_EXECUTABLE_BYTES
+        )
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.stat().st_size == 0
+            or path.stat().st_size > maximum_bytes
+        ):
+            raise ReleaseBuildError("development runtime program is unavailable")
+        size_bytes, sha256 = _file_digest(path)
+        programs[name] = {
+            "path": path.relative_to(root).as_posix(),
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+        }
+    installed_application = release_bin / f"market-squawk{suffix}"
+    installed_worker = release_bin / f"market-squawk-onnx-worker{suffix}"
+    if (
+        installed_application.is_symlink()
+        or not installed_application.is_file()
+        or installed_application.stat().st_size == 0
+        or installed_application.stat().st_size > MAX_APPLICATION_EXECUTABLE_BYTES
+        or installed_worker.is_symlink()
+        or not installed_worker.is_file()
+        or installed_worker.stat().st_size == 0
+        or installed_worker.stat().st_size > MAX_ONNX_WORKER_EXECUTABLE_BYTES
+    ):
+        raise ReleaseBuildError("development runtime installed program is unavailable")
+    if (
+        _file_digest(installed_application)
+        != _file_digest(program_paths["application"])
+        or _file_digest(installed_worker) != _file_digest(program_paths["onnx_worker"])
+    ):
+        raise ReleaseBuildError("development runtime sibling identity differs")
+    return {
+        "foundation_sha256": _file_digest(layout.root / "training-foundation.json")[1],
+        "programs": programs,
+        "release_manifest_sha256": _file_digest(
+            layout.root / "market-squawk-release.json"
+        )[1],
+        "release_root": (layout.root / CANONICAL_RELEASE)
+        .relative_to(development_root)
+        .as_posix(),
+        "schema_version": 2,
+        "source_lock_sha256": _file_digest(lock_path)[1],
+        "target": profile.target,
+    }
+
+
+def _write_development_runtime_receipt(
+    root: Path,
+    development_root: Path,
+    layout: ArtifactLayout,
+    lock_path: Path,
+    profile: PlatformProfile,
+) -> None:
+    destination = development_root / "runtime.json"
+    if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+        raise ReleaseBuildError("development runtime receipt path is unsafe")
+    if not destination.exists():
+        descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(descriptor)
+    _atomic_write_json(
+        destination,
+        _development_runtime_receipt(
+            root,
+            development_root,
+            layout,
+            lock_path,
+            profile,
+        ),
+    )
+
+
 def _cargo_release_dir(root: Path, profile: PlatformProfile) -> Path:
     return root / "target" / profile.target / "release"
+
+
+def admit_development_runtime(
+    root: Path,
+    development_root: Path,
+    lock: ReleaseLock,
+) -> None:
+    """Verify the cached release and its training-authority programs."""
+
+    artifact_root = development_root / "python"
+    canonical_release = artifact_root / CANONICAL_RELEASE
+    if (
+        not artifact_root.is_dir()
+        or artifact_root.is_symlink()
+        or not (artifact_root / ROOT_MARKER).is_file()
+        or not canonical_release.is_dir()
+        or canonical_release.is_symlink()
+        or not (canonical_release / CHILD_MARKER).is_file()
+    ):
+        raise ReleaseBuildError("development model runtime is not materialized")
+    layout = admit_artifact_root(artifact_root, root)
+    _admit_owned_child(canonical_release, layout.root, CANONICAL_RELEASE)
+
+    profile = platform_profile(lock.target)
+    suffix = profile.executable_suffix
+    installed_bin = canonical_release / "bin"
+    native_bin = _cargo_release_dir(root, profile)
+    installed_application = installed_bin / f"market-squawk{suffix}"
+    installed_worker = installed_bin / f"market-squawk-onnx-worker{suffix}"
+    native_application = native_bin / f"market-squawk{suffix}"
+    native_worker = native_bin / f"market-squawk-onnx-worker{suffix}"
+    receipt_path = development_root / "runtime.json"
+    required = (
+        receipt_path,
+        artifact_root / "training-foundation.json",
+        artifact_root / "market-squawk-release.json",
+        artifact_root / "market-squawk-release-evidence.json",
+        canonical_release / "share/market-squawk/training-environment.json",
+        canonical_release / "share/market-squawk/market-squawk-release.json",
+        installed_application,
+        installed_worker,
+        installed_bin / f"market-squawk-model-validator{suffix}",
+        installed_bin / f"market-squawk-train{suffix}",
+        native_application,
+        native_worker,
+    )
+    if any(path.is_symlink() or not path.is_file() for path in required):
+        raise ReleaseBuildError("development model runtime is incomplete")
+    receipt_size = receipt_path.stat().st_size
+    if receipt_size == 0 or receipt_size > 64 * 1024:
+        raise ReleaseBuildError("development runtime receipt exceeds its byte bound")
+    try:
+        raw_receipt = receipt_path.read_bytes()
+        receipt = json.loads(raw_receipt)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseBuildError("development runtime receipt is unreadable") from error
+    expected_receipt = _development_runtime_receipt(
+        root,
+        development_root,
+        layout,
+        development_root / "source-lock.json",
+        profile,
+    )
+    if len(raw_receipt) != receipt_size or receipt != expected_receipt:
+        raise ReleaseBuildError("development runtime receipt identity differs")
 
 
 def _copy_native_release_executables(
@@ -2678,11 +3862,14 @@ def rewrite_signed_record_entries(
         return
     profile = host_profile()
     site_packages = _site_packages_path(release_root, runtime, profile).resolve(strict=True)
-    pending = {
-        path.resolve(strict=True)
-        for path in signed_paths
-        if path.resolve(strict=True).is_relative_to(site_packages)
+    signed = {path.resolve(strict=True) for path in signed_paths}
+    required_owners = {
+        path
+        for path in signed
+        if path.is_relative_to(site_packages)
     }
+    observed_owners: set[Path] = set()
+    rewrites: list[tuple[Path, list[list[str]]]] = []
     for record in sorted(site_packages.glob("*.dist-info/RECORD")):
         if record.is_symlink() or not record.is_file() or record.stat().st_size > MAX_RECORD_BYTES:
             raise ReleaseBuildError("installed distribution RECORD is invalid")
@@ -2693,13 +3880,15 @@ def rewrite_signed_record_entries(
                 for row in csv.reader(stream):
                     if len(row) != 3:
                         raise ReleaseBuildError("installed distribution RECORD is malformed")
-                    candidate = (
-                        site_packages.joinpath(*PurePosixPath(row[0]).parts)
-                        .resolve(strict=True)
+                    candidate, _is_internal = _installed_record_path(
+                        row[0], site_packages, release_root, profile
                     )
-                    if not candidate.is_relative_to(release_root):
-                        raise ReleaseBuildError("installed distribution RECORD escapes its release")
-                    if candidate in pending:
+                    candidate = candidate.resolve(strict=True)
+                    if candidate in signed:
+                        if candidate in observed_owners:
+                            raise ReleaseBuildError(
+                                "signed installed distribution ownership overlaps"
+                            )
                         size, digest = _file_digest(candidate)
                         encoded = (
                             base64.urlsafe_b64encode(bytes.fromhex(digest))
@@ -2707,13 +3896,16 @@ def rewrite_signed_record_entries(
                             .decode("ascii")
                         )
                         row = [row[0], f"sha256={encoded}", str(size)]
-                        pending.remove(candidate)
+                        observed_owners.add(candidate)
                         changed = True
                     rows.append(row)
         except (OSError, UnicodeError, csv.Error) as error:
             raise ReleaseBuildError("installed distribution RECORD is unreadable") from error
-        if not changed:
-            continue
+        if changed:
+            rewrites.append((record, rows))
+    if not required_owners <= observed_owners:
+        raise ReleaseBuildError("signed installed distribution file is absent from RECORD")
+    for record, rows in rewrites:
         temporary = record.with_name(f".{record.name}.signed")
         if temporary.exists() or temporary.is_symlink():
             raise ReleaseBuildError("signed RECORD replacement path already exists")
@@ -2727,8 +3919,6 @@ def rewrite_signed_record_entries(
             os.replace(temporary, record)
         finally:
             temporary.unlink(missing_ok=True)
-    if pending:
-        raise ReleaseBuildError("signed installed distribution file is absent from RECORD")
 
 
 def _is_native_code(path: Path, system: str) -> bool:
@@ -3048,7 +4238,9 @@ def _interpreter_evidence(
     try:
         evidence = json.loads(output)
         raw_version = evidence["version"]
-        if not isinstance(raw_version, list) or any(not isinstance(value, int) for value in raw_version):
+        if not isinstance(raw_version, list) or any(
+            not isinstance(value, int) for value in raw_version
+        ):
             raise TypeError
         version = tuple(raw_version)
     except (KeyError, TypeError, json.JSONDecodeError) as error:
@@ -3597,6 +4789,9 @@ def inspect_installed_distribution(
     entries: dict[str, tuple[str, int]] = {}
     hashed_entries: set[str] = set()
     checked_hash_bytecode: list[tuple[str, str]] = []
+    external_entries: set[str] = set()
+    owned_paths: set[Path] = set()
+    owned_file_identities: set[tuple[int, int]] = set()
     saw_record = False
     saw_training_driver = False
     total_size = 0
@@ -3632,15 +4827,33 @@ def inspect_installed_distribution(
                         raise ReleaseBuildError(
                             "installed training driver path is invalid"
                         )
+                    external_entries.add(name)
                     saw_training_driver = True
                 else:
-                    relative = _safe_record_path(name)
-                    path = site_packages / relative
+                    path, is_internal = _installed_record_path(
+                        name, site_packages, release_root, profile
+                    )
+                    if not is_internal:
+                        external_entries.add(name)
+                if len(external_entries) > MAX_DISTRIBUTION_EXTERNAL_PATHS:
+                    raise ReleaseBuildError(
+                        "installed distribution external path count is unbounded"
+                    )
                 if path.is_symlink() or not path.is_file():
                     raise ReleaseBuildError("installed distribution file is unavailable")
-                observed_size, observed_sha256, header = (
+                observed_size, observed_sha256, header, file_identity = (
                     _inspect_installed_distribution_file(path)
                 )
+                resolved_path = path.resolve(strict=True)
+                if (
+                    resolved_path in owned_paths
+                    or file_identity in owned_file_identities
+                ):
+                    raise ReleaseBuildError(
+                        "installed distribution physical ownership overlaps"
+                    )
+                owned_paths.add(resolved_path)
+                owned_file_identities.add(file_identity)
                 if not encoded_digest and not encoded_size:
                     source_name = _checked_hash_bytecode_source(name, runtime)
                     if (
@@ -3703,7 +4916,9 @@ def inspect_installed_distribution(
     ):
         raise ReleaseBuildError("installed distribution RECORD is incomplete")
     internal_entries = {
-        name for name in entries if name != training_driver_record
+        name
+        for name in entries
+        if name != training_driver_record and name not in external_entries
     }
     roots = tuple(
         sorted(
@@ -3732,11 +4947,21 @@ def inspect_installed_distribution(
         native_name = native_entries[0]
         native = site_packages / _safe_record_path(native_name)
         native_sha256, native_size = entries[native_name]
-    record_size, record_sha256 = _file_digest(record)
+    record_size, record_sha256, _header, record_identity = (
+        _inspect_installed_distribution_file(record)
+    )
+    resolved_record = record.resolve(strict=True)
+    if resolved_record in owned_paths or record_identity in owned_file_identities:
+        raise ReleaseBuildError("installed distribution physical ownership overlaps")
+    owned_paths.add(resolved_record)
+    owned_file_identities.add(record_identity)
     return InstalledDistribution(
         name=requirement.name,
         version=requirement.version,
         roots=roots,
+        external_paths=tuple(sorted(external_entries)),
+        owned_paths=tuple(sorted(owned_paths)),
+        owned_file_identities=tuple(sorted(owned_file_identities)),
         record=record.relative_to(release_root),
         record_sha256=record_sha256,
         record_size=record_size,
@@ -3790,11 +5015,26 @@ def _require_disjoint_distribution_roots(
     distributions: tuple[InstalledDistribution, ...],
 ) -> None:
     roots = set()
+    external_paths = set()
+    owned_paths = set()
+    owned_file_identities = set()
     for distribution in distributions:
         for root in distribution.roots:
             if root in roots:
                 raise ReleaseBuildError("installed distribution roots overlap")
             roots.add(root)
+        for path in distribution.external_paths:
+            if path in external_paths:
+                raise ReleaseBuildError("installed distribution ownership overlaps")
+            external_paths.add(path)
+        for path in distribution.owned_paths:
+            if path in owned_paths:
+                raise ReleaseBuildError("installed distribution ownership overlaps")
+            owned_paths.add(path)
+        for identity in distribution.owned_file_identities:
+            if identity in owned_file_identities:
+                raise ReleaseBuildError("installed distribution ownership overlaps")
+            owned_file_identities.add(identity)
 
 
 def install_training_environment(
@@ -3882,7 +5122,7 @@ def install_training_environment(
     ).encode("ascii")
     receipt = {
         "payload": payload,
-        "schema_version": 1,
+        "schema_version": 2,
         "signature": signer.sign(ENVIRONMENT_RECEIPT_DOMAIN, payload_bytes),
     }
     encoded = json.dumps(
@@ -3903,6 +5143,7 @@ def install_training_environment(
 
 def _distribution_payload(distribution: InstalledDistribution) -> dict[str, object]:
     return {
+        "external_paths": list(distribution.external_paths),
         "file_count": distribution.file_count,
         "file_set_sha256": distribution.file_set_sha256,
         "name": distribution.name,
@@ -3936,7 +5177,9 @@ def _checked_hash_bytecode_source(
     return (path.parent.parent / f"{stem}.py").as_posix()
 
 
-def _inspect_installed_distribution_file(path: Path) -> tuple[int, str, bytes]:
+def _inspect_installed_distribution_file(
+    path: Path,
+) -> tuple[int, str, bytes, tuple[int, int]]:
     flags = (
         os.O_RDONLY
         | getattr(os, "O_BINARY", 0)
@@ -3997,20 +5240,74 @@ def _inspect_installed_distribution_file(path: Path) -> tuple[int, str, bytes]:
         raise ReleaseBuildError(
             "installed distribution file changed during inspection"
         )
-    return observed, digest.hexdigest(), bytes(header)
+    return observed, digest.hexdigest(), bytes(header), (before.st_dev, before.st_ino)
 
 
 def _safe_record_path(value: str) -> Path:
-    path = Path(value)
+    parts = _record_path_parts(value, allow_leading_parents=False)
+    return Path(*parts)
+
+
+def _installed_record_path(
+    value: str,
+    site_packages: Path,
+    release_root: Path,
+    profile: PlatformProfile,
+) -> tuple[Path, bool]:
+    """Resolve an installed RECORD path within its owned installation scheme."""
+
+    try:
+        return site_packages / _safe_record_path(value), True
+    except ReleaseBuildError:
+        parts = _record_path_parts(value, allow_leading_parents=True)
+    if parts[0] != "..":
+        raise ReleaseBuildError("installed project RECORD path is invalid")
+    first_owned = next(
+        (index for index, part in enumerate(parts) if part != ".."), None
+    )
+    if first_owned is None or any(part == ".." for part in parts[first_owned:]):
+        raise ReleaseBuildError("installed project RECORD path is invalid")
+
+    try:
+        canonical_release = release_root.resolve(strict=True)
+        canonical_site_packages = site_packages.resolve(strict=True)
+        scripts = release_root / _training_driver_path(profile).parent
+        if scripts.is_symlink() or not scripts.is_dir():
+            raise ReleaseBuildError("installed project RECORD path is invalid")
+        canonical_scripts = scripts.resolve(strict=True)
+        path = canonical_site_packages.joinpath(*parts).resolve(strict=False)
+    except OSError as error:
+        raise ReleaseBuildError("installed project RECORD path is invalid") from error
+    observed = os.path.relpath(path, canonical_site_packages).replace(os.sep, "/")
+    if (
+        not canonical_site_packages.is_relative_to(canonical_release)
+        or canonical_scripts.parent != canonical_release
+        or path.parent != canonical_scripts
+        or observed != value
+    ):
+        raise ReleaseBuildError("installed project RECORD path is invalid")
+    return path, False
+
+
+def _record_path_parts(
+    value: str, *, allow_leading_parents: bool
+) -> tuple[str, ...]:
+    posix = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    raw_parts = value.split("/")
     if (
         not value
         or len(value.encode("utf-8")) > 1024
+        or "\0" in value
         or "\\" in value
-        or path.is_absolute()
-        or any(part in {"", ".", ".."} for part in path.parts)
+        or posix.is_absolute()
+        or windows.is_absolute()
+        or bool(windows.drive)
+        or any(part in {"", "."} for part in raw_parts)
+        or (not allow_leading_parents and ".." in raw_parts)
     ):
         raise ReleaseBuildError("installed project RECORD path is invalid")
-    return path
+    return tuple(raw_parts)
 
 
 def _record_set_sha256(entries: dict[str, tuple[str, int]]) -> str:
@@ -4036,29 +5333,14 @@ def _compatible(
     version: tuple[int, int],
     profile: PlatformProfile,
 ) -> bool:
-    python_tag, _abi, platform_tag = _wheel_tags(filename)
-    current = f"cp{version[0]}{version[1]}"
-    python_tags = python_tag.split(".")
-    python_ok = "py3" in python_tags or current in python_tags
-    platform_ok = platform_tag == "any"
-    if profile.target == "aarch64-apple-darwin":
-        platform_ok = platform_ok or "arm64" in platform_tag or "universal2" in platform_tag
-    elif profile.target == "x86_64-apple-darwin":
-        platform_ok = platform_ok or "x86_64" in platform_tag or "universal2" in platform_tag
-    elif profile.target == "x86_64-pc-windows-msvc":
-        platform_ok = platform_ok or platform_tag == "win_amd64"
-    elif profile.target == "x86_64-unknown-linux-gnu":
-        platform_ok = platform_ok or (
-            "x86_64" in platform_tag
-            and ("manylinux" in platform_tag or "linux" in platform_tag)
-        )
-    return python_ok and platform_ok
+    _name, _wheel_version, _build, wheel_tags = _parse_wheel(filename)
+    return bool(wheel_tags.intersection(_supported_wheel_tags(version, profile)))
 
 
 def _admit_license(
     path: Path,
     expected: str,
-    expected_file_sha256: str | None = None,
+    expected_files: tuple[LicenseFile, ...],
 ) -> None:
     try:
         with zipfile.ZipFile(path) as archive:
@@ -4066,34 +5348,25 @@ def _admit_license(
             if len(names) != 1:
                 raise ReleaseBuildError("wheel has no unique core metadata")
             metadata = BytesParser().parsebytes(archive.read(names[0]))
-            observed = metadata.get("License-Expression") or metadata.get("License")
+            observed = metadata.get("License-Expression")
             if observed is not None and observed.strip() != expected:
                 raise ReleaseBuildError("wheel license differs from the locked expression")
-            if expected_file_sha256 is None:
-                if observed is None:
-                    raise ReleaseBuildError("wheel license differs from the locked expression")
-                return
-            license_files = metadata.get_all("License-File", [])
-            if len(license_files) != 1:
-                raise ReleaseBuildError("wheel has no unique locked license file")
-            license_file = PurePosixPath(license_files[0])
-            if (
-                license_file.is_absolute()
-                or len(license_file.parts) != 1
-                or any(part in {"", ".", ".."} for part in license_file.parts)
-            ):
-                raise ReleaseBuildError("wheel license file path is invalid")
-            license_path = (
-                PurePosixPath(names[0]).parent / "licenses" / license_file
-            ).as_posix()
-            license_payload = archive.read(license_path)
+            observed_files = _inspect_wheel_license_files(
+                archive,
+                names[0],
+                metadata,
+            )
     except (OSError, zipfile.BadZipFile, KeyError) as error:
         raise ReleaseBuildError("wheel metadata is unreadable") from error
-    if hashlib.sha256(license_payload).hexdigest() != expected_file_sha256:
+    expected_value = [
+        {"path": value.path, "sha256": value.sha256, "size_bytes": value.size_bytes}
+        for value in expected_files
+    ]
+    if observed_files != expected_value:
         raise ReleaseBuildError("wheel license file differs from its locked identity")
 
 
-def _wheel_tags(filename: str) -> tuple[str, str, str]:
+def _parse_wheel(filename: str) -> tuple[object, object, object, frozenset[object]]:
     if (
         not isinstance(filename, str)
         or not filename.endswith(".whl")
@@ -4101,10 +5374,72 @@ def _wheel_tags(filename: str) -> tuple[str, str, str]:
         or "\\" in filename
     ):
         raise ReleaseBuildError("wheel filename is invalid")
-    parts = filename[:-4].rsplit("-", 3)
-    if len(parts) != 4 or any(not part for part in parts):
-        raise ReleaseBuildError("wheel compatibility tags are invalid")
-    return parts[1], parts[2], parts[3]
+    try:
+        import packaging
+        from packaging.utils import InvalidWheelFilename, parse_wheel_filename
+    except ImportError as error:
+        raise ReleaseBuildError(
+            "packaging 26.2 is required for wheel admission"
+        ) from error
+    if packaging.__version__ != PACKAGING_VERSION:
+        raise ReleaseBuildError("wheel admission requires exact packaging 26.2")
+    try:
+        return parse_wheel_filename(filename, validate_order=False)
+    except InvalidWheelFilename as error:
+        raise ReleaseBuildError("wheel compatibility tags are invalid") from error
+
+
+def _single_wheel_tag(filename: str) -> object:
+    _name, _wheel_version, _build, tags = _parse_wheel(filename)
+    if len(tags) != 1:
+        raise ReleaseBuildError("project wheel must have one exact compatibility tag")
+    return next(iter(tags))
+
+
+def _supported_wheel_tags(
+    version: tuple[int, int], profile: PlatformProfile
+) -> frozenset[object]:
+    return frozenset(_ordered_supported_wheel_tags(version, profile))
+
+
+def _ordered_supported_wheel_tags(
+    version: tuple[int, int], profile: PlatformProfile
+) -> tuple[object, ...]:
+    try:
+        import packaging
+        from packaging.tags import compatible_tags, cpython_tags, mac_platforms
+    except ImportError as error:
+        raise ReleaseBuildError(
+            "packaging 26.2 is required for wheel admission"
+        ) from error
+    if packaging.__version__ != PACKAGING_VERSION or version != (3, 14):
+        raise ReleaseBuildError("wheel admission requires exact packaging 26.2 and CPython 3.14")
+    if profile.target == "aarch64-apple-darwin":
+        platforms = tuple(mac_platforms((12, 0), "arm64"))
+    elif profile.target == "x86_64-apple-darwin":
+        platforms = tuple(mac_platforms((12, 0), "x86_64"))
+    elif profile.target == "x86_64-pc-windows-msvc":
+        platforms = ("win_amd64",)
+    elif profile.target == "x86_64-unknown-linux-gnu":
+        platforms = tuple(
+            f"manylinux_2_{minor}_x86_64" for minor in range(28, 4, -1)
+        ) + ("manylinux2014_x86_64", "manylinux2010_x86_64", "manylinux1_x86_64")
+    else:
+        raise ReleaseBuildError("release target is unsupported")
+    tags = tuple(
+        cpython_tags(
+            python_version=version,
+            abis=("cp314",),
+            platforms=platforms,
+        )
+    ) + tuple(
+        compatible_tags(
+            python_version=version,
+            interpreter="cp314",
+            platforms=platforms,
+        )
+    )
+    return tuple(dict.fromkeys(tags))
 
 
 def _version(value: object) -> tuple[int, int]:
@@ -4187,15 +5522,105 @@ def _run_output(
     return completed.stdout.strip()
 
 
+def _packaging_is_exact() -> bool:
+    try:
+        import packaging
+    except ImportError:
+        return False
+    return packaging.__version__ == PACKAGING_VERSION
+
+
+def _run_refresh_with_locked_packaging(requirements: Path) -> int:
+    uv = shutil.which("uv")
+    if uv is None:
+        raise ReleaseBuildError("lock refresh requires exact uv 0.12.1")
+    if not _run_output([uv, "--version"], Path.cwd()).startswith("uv 0.12.1 "):
+        raise ReleaseBuildError("lock refresh requires exact uv 0.12.1")
+    raw = requirements.read_text(encoding="utf-8")
+    lines = raw.splitlines()
+    selected = []
+    active = False
+    for line in lines:
+        if line.startswith(f"packaging=={PACKAGING_VERSION} "):
+            active = True
+            selected.append(line)
+            continue
+        if active and ("--hash=sha256:" in line or line.lstrip().startswith("#")):
+            selected.append(line)
+            continue
+        if active and line and not line[0].isspace():
+            break
+    if (
+        not selected
+        or sum("--hash=sha256:" in line for line in selected) < 2
+    ):
+        raise ReleaseBuildError("requirements lock lacks exact packaging 26.2 hashes")
+    with tempfile.TemporaryDirectory(prefix="market-squawk-packaging-tool-") as temporary:
+        tool_root = Path(temporary)
+        tool_requirements = tool_root / "requirements.txt"
+        tool_requirements.write_text("\n".join(selected) + "\n", encoding="utf-8")
+        environment = {
+            "HOME": str(tool_root),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "PYTHONNOUSERSITE": "1",
+            "UV_NO_CONFIG": "1",
+            "UV_NO_PROGRESS": "1",
+        }
+        venv = tool_root / "venv"
+        _run([uv, "venv", "--python", sys.executable, str(venv)], Path.cwd(), environment)
+        interpreter = _venv_python(venv)
+        _run(
+            [
+                uv,
+                "pip",
+                "sync",
+                "--python",
+                interpreter,
+                "--require-hashes",
+                "--strict",
+                "--only-binary",
+                ":all:",
+                str(tool_requirements),
+            ],
+            Path.cwd(),
+            environment,
+        )
+        completed = subprocess.run(
+            [interpreter, "-I", str(Path(__file__).resolve()), *sys.argv[1:], "--packaging-ready"],
+            cwd=Path.cwd(),
+            env=environment,
+            check=False,
+        )
+        return completed.returncode
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--lock", required=True, type=Path)
+    parser.add_argument("--lock", type=Path)
     parser.add_argument(
         "--target",
-        required=True,
         choices=tuple(PLATFORM_PROFILES),
     )
-    parser.add_argument("--artifact-root", required=True, type=Path)
+    parser.add_argument("--artifact-root", type=Path)
+    parser.add_argument("--requirements", type=Path)
+    parser.add_argument("--targets")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--refresh-lock-manifests", action="store_true")
+    actions.add_argument("--refresh-source-closure", action="store_true")
+    actions.add_argument("--verify-source-closure", action="store_true")
+    actions.add_argument("--verify-development-runtime", action="store_true")
+    actions.add_argument("--reset-development-runtime", action="store_true")
+    parser.add_argument(
+        "--development-runtime-root",
+        type=Path,
+        help=(
+            "Use the single ignored repository development model-runtime cache; "
+            "release builds never select this mode."
+        ),
+    )
+    parser.add_argument("--packaging-ready", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--python", action="append", type=Path)
     parser.add_argument("--uv", type=Path)
     parser.add_argument("--zig", type=Path)
@@ -4215,16 +5640,173 @@ def main() -> int:
     options = parser.parse_args()
     try:
         root = Path(__file__).resolve().parents[1]
-        lock_path = options.lock.expanduser().resolve(strict=True)
+        build_arguments = (
+            options.target,
+            options.artifact_root,
+            options.requirements,
+            options.targets,
+            options.python,
+            options.uv,
+            options.zig,
+            options.component_root,
+            options.source_cache,
+            options.offline,
+            options.prepare_cache_only,
+            options.sign_native,
+        )
+        if options.reset_development_runtime:
+            if (
+                options.development_runtime_root is None
+                or options.lock is not None
+                or any(value is not None and value is not False for value in build_arguments)
+            ):
+                raise ReleaseBuildError("development runtime reset arguments are invalid")
+            reset_development_runtime_root(options.development_runtime_root, root)
+            return 0
+        if options.refresh_lock_manifests:
+            if (
+                options.development_runtime_root is not None
+                or options.requirements is None
+                or options.lock is None
+                or options.targets is None
+            ):
+                raise ReleaseBuildError("lock refresh arguments are incomplete")
+            requirements_path = options.requirements.expanduser().resolve(strict=True)
+            if not _packaging_is_exact():
+                if options.packaging_ready:
+                    raise ReleaseBuildError("sealed packaging 26.2 bootstrap failed")
+                return _run_refresh_with_locked_packaging(requirements_path)
+            targets = tuple(options.targets.split(","))
+            refresh_lock_manifests(
+                requirements_path,
+                options.lock.expanduser().resolve(strict=True),
+                targets,
+                root,
+            )
+            return 0
+        if options.refresh_source_closure:
+            if (
+                options.lock is None
+                or any(value is not None and value is not False for value in build_arguments)
+            ):
+                raise ReleaseBuildError("source refresh arguments are incomplete")
+            if options.development_runtime_root is None:
+                refresh_source_closure(options.lock, root)
+            else:
+                development_root = admit_development_runtime_root(
+                    options.development_runtime_root,
+                    root,
+                    create=True,
+                )
+                refresh_development_source_closure(
+                    options.lock,
+                    development_root,
+                    root,
+                )
+            return 0
+        if options.verify_source_closure:
+            if (
+                any(value is not None and value is not False for value in build_arguments)
+                or not _packaging_is_exact()
+            ):
+                raise ReleaseBuildError("source verification arguments are incomplete")
+            if options.development_runtime_root is None:
+                if options.lock is None:
+                    raise ReleaseBuildError("source verification arguments are incomplete")
+                lock_path = options.lock.expanduser().resolve(strict=True)
+                platform_lock_directory = None
+            else:
+                if options.lock is not None:
+                    raise ReleaseBuildError("source verification arguments are incomplete")
+                development_root = admit_development_runtime_root(
+                    options.development_runtime_root,
+                    root,
+                    create=False,
+                )
+                lock_path = (development_root / "source-lock.json").resolve(strict=True)
+                platform_lock_directory = root / "python/wheelhouse"
+                admit_development_source_template(lock_path, root)
+            lock = load_lock(
+                lock_path,
+                platform_lock_directory=platform_lock_directory,
+            )
+            admit_sources(lock, root)
+            return 0
+        if options.verify_development_runtime:
+            if (
+                options.development_runtime_root is None
+                or options.lock is not None
+                or any(value is not None and value is not False for value in build_arguments)
+                or not _packaging_is_exact()
+            ):
+                raise ReleaseBuildError("development runtime verification arguments are invalid")
+            development_root = admit_development_runtime_root(
+                options.development_runtime_root,
+                root,
+                create=False,
+            )
+            lock_path = (development_root / "source-lock.json").resolve(strict=True)
+            admit_development_source_template(lock_path, root)
+            lock = load_lock(
+                lock_path,
+                platform_lock_directory=root / "python/wheelhouse",
+            )
+            admit_development_runtime(root, development_root, lock)
+            return 0
+        development_root = None
+        if options.development_runtime_root is not None:
+            if any(
+                value is not None
+                for value in (
+                    options.lock,
+                    options.artifact_root,
+                    options.component_root,
+                    options.source_cache,
+                    options.python,
+                    options.uv,
+                    options.zig,
+                    options.requirements,
+                    options.targets,
+                )
+            ) or options.sign_native:
+                raise ReleaseBuildError("development runtime build arguments are invalid")
+            development_root = admit_development_runtime_root(
+                options.development_runtime_root,
+                root,
+                create=False,
+            )
+            lock_path = (development_root / "source-lock.json").resolve(strict=True)
+            admit_development_source_template(lock_path, root)
+            artifact_root = development_root / "python"
+            component_root = development_root / "components"
+            selected_target = options.target or host_profile().target
+        else:
+            if options.lock is None or options.target is None or options.artifact_root is None:
+                raise ReleaseBuildError("release build arguments are incomplete")
+            lock_path = options.lock.expanduser().resolve(strict=True)
+            artifact_root = options.artifact_root
+            component_root = options.component_root
+            selected_target = options.target
         source_cache = (
             options.source_cache.expanduser().resolve(strict=True)
             if options.source_cache is not None
             else None
         )
-        profile = platform_profile(options.target)
+        profile = platform_profile(selected_target)
         if host_profile() != profile:
             raise ReleaseBuildError("release target does not match the native build host")
-        if options.component_root is not None:
+        layout = admit_artifact_root(artifact_root, root)
+        allow_network = (
+            options.prepare_cache_only
+            and os.environ.get("MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK") == "1"
+        )
+        bootstrap_locked_packaging(
+            lock_path,
+            layout.wheelhouse,
+            source_cache,
+            allow_network=allow_network,
+        )
+        if component_root is not None:
             if (
                 options.python is not None
                 or options.uv is not None
@@ -4236,10 +5818,10 @@ def main() -> int:
             acquired = acquire_release_components(
                 root / "distribution/release-components.json",
                 profile,
-                options.component_root,
+                component_root,
                 root,
-                allow_network=options.prepare_cache_only
-                and os.environ.get("MARKET_SQUAWK_PYTHON_WHEEL_PREPARE_NETWORK") == "1",
+                allow_network=allow_network,
+                development_runtime_root=development_root,
             )
             python_paths = (acquired.python,)
             uv_path = acquired.uv
@@ -4252,7 +5834,13 @@ def main() -> int:
             python_paths = tuple(options.python)
             uv_path = options.uv
             zig_path = options.zig
-        lock = load_lock(lock_path, profile.target)
+        lock = load_lock(
+            lock_path,
+            profile.target,
+            platform_lock_directory=(
+                root / "python/wheelhouse" if development_root is not None else None
+            ),
+        )
         components_sha256 = admit_release_components(
             root / "distribution/release-components.json",
             profile,
@@ -4268,7 +5856,6 @@ def main() -> int:
         toolchain = admit_toolchain(root, profile, zig_path)
         runtimes = admit_runtimes(python_paths, lock)
         admit_sources(lock, root)
-        layout = admit_artifact_root(options.artifact_root, root)
         if options.prepare_cache_only:
             if options.offline:
                 raise ReleaseBuildError("cache preparation and offline build modes are exclusive")
@@ -4289,6 +5876,7 @@ def main() -> int:
                 components_sha256,
                 uv_executable,
                 native_code_signing,
+                development_runtime=development_root is not None,
             )
     except (OSError, ReleaseBuildError) as error:
         print(f"python release rejected: {error}", file=sys.stderr)

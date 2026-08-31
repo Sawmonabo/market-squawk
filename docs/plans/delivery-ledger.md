@@ -1,10 +1,270 @@
 # Market Squawk Delivery Ledger
 
-Last updated: 2026-08-01
+Last updated: 2026-08-31
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
 evidence; it does not replace the README capability truth or the canonical release plan.
+
+## Current execution handoff — 2026-08-31
+
+This section supersedes the 2026-08-30 active-state summary below. Historical release and audit
+records remain unchanged as locators.
+
+- The pushed feature branch reached code head
+  `4ca2f68ebdd52e82a75eccbfffbfe328addbb470`, tree
+  `d07ba073ecbadd68607696703df470b73af7a1cf`, on
+  `feature/v1-installed-product-experience`. The main checkout was clean and matched `origin`
+  immediately after that push. No merge to `main` or a release branch, package publication, public
+  release, or CI/CD dispatch occurred.
+- FRED/ALFRED is now integrated as a **durable data-source-complete** lane: one bounded official
+  FRED current UNRATE journey published 2,197 rows from three pages and one bounded ALFRED vintage
+  journey published 961 rows from one page; each retained sealed raw evidence, canonical immutable
+  publication, an exact typed point-in-time read, complete `LocalProduct` shutdown, construction of
+  a new product instance, exact manifest/raw/native reopen, and an identical typed read. The source
+  candidate `49023f7124480b08b431e05d97a362b3ac3f4b47` was independently approved with zero Critical,
+  Important, or Minor findings. Its fifteen commits were replayed onto current root with exact
+  range-diff equality, and the current-root application library compiled successfully with Rust
+  1.97.1 and locked dependencies.
+- FRED/ALFRED is not yet a **full product vertical**. Provider-neutral macro selection, exact
+  feature/model/forecast/financial-model/valuation/backtest consumption, calibrated recommendation
+  evidence, Desktop/CLI/MCP composition, and the installed shutdown/restart journey remain open.
+  Federal Reserve Board H.15 remains the other proven durable macro baseline; its provider-neutral
+  investment-evidence leaf is integrated, but the same complete product edge remains open.
+- Integrated product building blocks also include the sealed provider-neutral EIA analytical
+  handoff and the provider-neutral harmonic-pattern kernel. Harmonics cover the eight closed V1
+  patterns with causal pivots, exact ratios, ranges, targets, invalidation, expiry, implementation
+  identity, parent manifests, and an evidence digest. They deliberately confer neither confidence
+  nor execution authority until bound to chronological out-of-sample and complete decision
+  evidence.
+- Active provider lanes are disjoint: reference identity; Alpaca durable current/history/options;
+  Coinbase and Kraken native identity; Schwab read-only REST/Streamer authority; Treasury,
+  Census, BLS, BEA, Yahoo, and IEX HIST remediation. The decision/product lane separately owns
+  explicit chronological out-of-sample evidence, method-specific financial-model evidence, exact
+  harmonic-evidence binding, and the provider-neutral Investment Brief contract. Root alone owns
+  shared manifests, catalog migrations, application/Tauri registration, workspace manifests and
+  lockfiles, and ordered integration.
+- The current serialized barrier is canonical reference resolution. Its source-qualified reverse
+  selector must be durable and reachable through the application before Coinbase, Kraken, Alpaca,
+  Schwab, and IEX mappings can be composed without fabricated ticker or startup-time identity.
+  After that seam lands, the completed provider candidates integrate sequentially through the
+  shared catalog/application hotspots while unrelated provider remediation continues.
+- Thin verification remains the rule: one response-family mapper/authority case, one publication,
+  degradation, or restart case, and one typed product journey where required. The complete local
+  gate, native packages, installed E2E, and hosted CI remain reserved for the final unchanged
+  feature candidate.
+- Completed FRED integration and candidate worktrees were removed after handoff, their worktree
+  metadata was pruned, the patch-equivalent local branches were deleted, and the remote candidate
+  branch was deleted. Dirty older shared worktrees remain deliberately preserved and must not be
+  force-removed. Root was clean after the integration and cleanup.
+
+## Current execution handoff — 2026-08-30
+
+This section supersedes older active-state statements below. Historical release and audit records
+remain unchanged as locators.
+
+- Frozen and pushed feature checkpoint:
+  `fe8c130cd48301874705f6b665b826c904b5d6a2` on
+  `feature/v1-installed-product-experience`. No release-branch or mainline merge, public release,
+  package publication, or CI/CD dispatch occurred.
+- Accepted focused evidence at that unchanged checkpoint:
+  application library compilation, diff integrity, and the existing critical publication journey
+  covering sealed provider capture, canonical and derived publication, product admission, exact
+  historical forecast evidence, process reopen, backup, and fresh restore. The Desktop TypeScript
+  tree was unchanged from the earlier accepted `a66970fc` typecheck. These are focused integration
+  proofs, not the final release gate.
+- Integrated provider/data outcomes include the existing durable Federal Reserve Board H.15
+  vertical plus durable provider leaves for FRED/ALFRED, Treasury fiscal and daily rates, BEA, BLS,
+  Census, EIA, Alpaca history, Nasdaq reference, OCC/Cboe reference, SEC filings/fundamentals/funds,
+  Yahoo, Tiingo, IEX HIST, Coinbase/Kraken public data, and the Coinbase Direct production join.
+  H.15 remains the only source currently counted as a complete installed live-to-restart product
+  vertical; the other entries are not represented as fully composed merely because their durable
+  leaves exist.
+- The shared ordinary-result envelope and the rewritten Markets, Macro, Forecast, and Backtest
+  slices are provider-neutral. Provider names, source/runtime state, retry details, manifests,
+  digests, and configuration evidence are being confined to Connections, Settings, Logs, and
+  Diagnostics. Older Advanced Research and Decisions browser contracts still expose some
+  data-management coordinates and remain active release-blocking remediation; the complete
+  ordinary Desktop boundary is not yet accepted. Forecasts and backtests now use opaque product
+  tokens and expose financial meaning, point-in-time/out-of-sample evidence, costs, uncertainty,
+  limitations, expiry, invalidators, and honest unavailable/no-action states.
+- The single V1 product dataset recipe now combines immutable price-return evidence with the closed
+  twelve-component macro context and the fixed-horizon forward-return label. The production
+  publication path retains capture, provider-publication, and complete-history lineage transitively
+  across derived generations, and the same admitted generations reopen for forecast and backtest
+  consumers. Schwab quote activation now requires exact sealed provider-authored timing evidence;
+  unknown timing is retained internally and fails closed.
+- Active Wave C uses disjoint ownership for: the single V1 macro-enriched feature recipe; neutral
+  reference/fundamental/fund reads; neutral options and history reads; Schwab current quote runtime;
+  Schwab history/options adapter mapping; credential/live-evidence verification; and one serialized
+  ordinary CLI/MCP visibility policy. Shared contracts, application composition, Tauri registration,
+  and Desktop transport remain serialized integration hotspots.
+- Remaining terminal path:
+  neutral consumer composition -> features/forecasts/valuation/backtests -> recommendations and
+  portfolio/risk/paper -> fully wired Desktop/CLI/MCP -> installed live restart journey -> one final
+  unchanged release gate.
+- The main worktree was clean immediately after pushing `fe8c130c`. Seven older auxiliary worktrees
+  remain preserved because each contains unique uncommitted state: `alpaca-history-shutdown` (17
+  paths), `common-seal-root-integration` (255), `crypto-canonical-data` (24),
+  `fred-shared-integration` (41), `postqualified-live-export` (5), `sec-product-handoff` (28), and
+  `source-current-integration` (57). They must not be force-removed; each will be reconciled or
+  preserved before cleanup.
+
+## Active installed-product V1 execution
+
+- Active branch: `feature/v1-installed-product-experience`, based on
+  `release/market-squawk-v0.1.0`. No public release, package publication, merge to `main`, or final
+  release-branch integration is authorized in this execution scope.
+- The latest pushed product-code checkpoint is
+  `f1dafac589cbcf4feb66d478bfdf2fece6ee642c`, tree
+  `ead687bc2e00d1f5a484842f9713b544a36e340f`. It preserves the bounded Federal Reserve Board H.15
+  dashboard vertical, Desktop service-generation reconnect barrier, and reviewed feature-product
+  authority checkpoint, then adds the protected main-window provider-credential import described
+  below.
+- The main checkout owns the feature branch. `.worktrees` is empty and no temporary lane branch
+  exists. The research/data authority and Desktop credential-import slices are integrated and
+  pushed; product code was clean and upstream-aligned at `f1dafac5`. This delivery-ledger update is
+  the sole recording overlay. The Python source-closure lock is intentionally not refreshed because
+  that release authority is updated only after the remaining product source changes are final.
+- The approved Markets expansion is now a V1 release blocker in issue
+  [#45](https://github.com/Sawmonabo/market-squawk/issues/45), the maintained installed-product
+  design/plan, and the
+  [provider-ecosystem decision](../research/2026-08-08-unified-markets-provider-ecosystem.md). V1
+  requires one unified non-technical feed/search/instrument experience over bounded concurrent
+  providers, a searchable multi-asset universe, best-available-depth disclosure, deterministic
+  source selection/downgrade evidence, and end-to-end use by forecasts, targets, backtests,
+  portfolio analytics, risk, and paper workflows.
+- The audited market-data closure is now a V1 release blocker alongside that Markets work. The
+  maintained [provider architecture](../architecture/market-data-provider-architecture.md) assigns
+  Alpaca Paper Only/Basic to the governed free IEX live/WARM and stock-history core; Nasdaq Trader,
+  OCC, and Cboe to content-addressed reference discovery; SEC to company/fund evidence; FRED/ALFRED plus
+  direct government providers to macro; optional Tiingo to bounded daily mutual-fund NAV/EOD; and
+  a default-enabled pinned Yahoo contract to adaptive explicit-demand enrichment only. Low-capacity
+  free tiers are not admitted unless their complete assigned workload fits. Schwab's Individual
+  Trader API is now an optional owner-enabled complementary market-data source, not a base
+  dependency. Current
+  first-party documentation proves the 30-minute access/seven-day refresh lifecycle and one
+  Streamer connection/user; a bounded authenticated read-only probe proved the configured app's
+  multi-asset REST shapes, 500/500 single-request quote return, option/history/reference surfaces,
+  and five accepted Streamer services. Schwab still publishes no numeric market-data REST rate,
+  REST batch maximum, or Streamer symbol maximum, and normal-session sustainable throughput is not
+  release-proven. Its implementation therefore requires a strict market-data/User Preference
+  allowlist, protected token rotation, one multiplexed socket, adaptive capacity, exact
+  delay/feed/depth provenance, unlink/revocation handling, and no account/order routes. The exact
+  [credential input](../reference/market-squawk-provider-credentials.env.example) and
+  [account setup](../operations/provider-account-setup.md) are documented. The pushed candidate
+  implements the strict 32-field `market-squawk-provider-credentials/v1` parser and the one-time
+  installed command
+  `market-squawk source import-credentials <absolute-file> --confirm`. It stages bounded bytes to
+  the existing onboarding/secret-store service and returns exactly 17 secret-free provider
+  dispositions: `disabled`, `credential_stored_unverified`, `probe_required`, or
+  `profile_unavailable`, and the Desktop now invokes that same protected operation through a
+  main-window-only native picker and one-shot staged ticket. Import never probes, activates,
+  schedules, publishes, or trades. The former fixed Yahoo 25-symbol
+  value had no provider evidence and is removed: one shared runtime lane must measure actual
+  attempts and returns, coalesce/cache demand, and stop on its provider-wide 429 circuit. IEX HIST
+  enablement authorizes only explicitly selected, byte-admitted feed/date cold jobs and never an
+  automatic full-catalog download. Current in-flight core/transport adapters now exist for Yahoo,
+  IEX HIST, OCC/Cboe reference, owner-enabled Schwab, optional Tiingo, BEA, Federal Reserve Board,
+  Census, and EIA; installed activation bindings, doctors, transport completion where applicable,
+  publication, PIT reads, and product composition remain incomplete. FRED v2 release bulk; SEC
+  N-PORT/N-CEN; complete Alpaca historical and current-batch composition; adaptive scheduling;
+  quota/quality telemetry; and the corresponding canonical product consumers also remain
+  incomplete.
+  Yahoo cannot become WARM or sole decision authority without a retained normal-session benchmark,
+  and the 8,000-symbol Alpaca target is conditional on an effective batch of at least 50 plus
+  authenticated rate/entitlement proof. The credential file is one-time operator input, not a
+  startup/runtime configuration layer and not an availability claim. The per-source contracts are
+  indexed under
+  [selected providers](../reference/providers/README.md), and the shared closed data families,
+  clocks, exact values, immutable generations, PIT selection, analytical bindings, and typed reads
+  are governed by the [canonical schema contract](../reference/market-data-canonical-schemas.md).
+  Tiingo NAV specifically requires the closed
+  `ResearchObservation::FundNav(FundNavObservation)` variant, exact fund/share-class and NAV-date
+  identity, value-or-missing state, availability/revision/PIT evidence, immutable publication, and
+  a bounded typed fund read; provider EOD bars cannot substitute for NAV.
+  FRED remains version-specific: v1 observations use up to 100,000 rows/page with offsets and no
+  reviewed numeric v1 request-rate ceiling; v2 release observations use up to 500,000 rows/page
+  with cursors and a documented 2-request/second throttle. Market Squawk retains one conservative
+  shared 1-request/second v1/v2 queue. Capacity acceptance must report actual valid returned
+  observations, contracts/Greeks, stream events, generated bars, manifest rows, and bytes separately
+  from requests and requested slots; full-session actuals remain unmeasured until retained probes
+  establish them.
+- Data-first resumption contract, 2026-08-11: the maintained provider architecture now defines the
+  full closure path `configured -> entitled -> producing -> published -> queryable -> composed ->
+  release-proven`. An enabled provider field is only import/probe intent. New sources must publish
+  exact raw evidence and canonical observations through the existing capture, SQLite authority,
+  Arrow/Parquet generation, manifest, PIT selector, and typed application-read boundaries before
+  any Desktop/CLI/MCP workflow becomes available. The required first verticals are: provider
+  import/doctors; reference identity plus Alpaca IEX into Markets search/current; owner-enabled
+  Schwab read-only market data; Alpaca/Schwab history into charts and reusable model/backtest
+  generations; SEC and macro into fundamentals/research; entitlement-gated options and optional
+  Tiingo funds; specialized Yahoo/IEX HIST lanes; then
+  recommendations, portfolio/risk, and virtual paper over those same typed reads. The exact
+  32-field credential/probe-intent example
+  schema and the owner-local credential file have matching field names; the local file remains
+  mode `0600`, and its values are not recorded here. Import produces only Configured,
+  Probe-required, Disabled, or Profile-unavailable evidence. Available still requires the complete
+  chain above. Implementation has resumed; the next serialized vertical is an Alpaca Paper/IEX
+  read-only doctor and durable activation boundary, not an inference from imported credentials.
+- The first dirty-tree integration review found concrete paper/live lifecycle, provider-switch,
+  research-file client-isolation/crash-recovery, desktop bootstrap, startup-window, stored-source
+  attribution, preview-retention, and development-runtime defects. The code checkpoint closes
+  those bounded defects with serialized live ownership, owner-scoped durable import recovery, one
+  explicit bootstrap action, delayed window reveal, source-bound stored evidence, bounded preview
+  retention, and a reusable two-program model runtime. The market-runtime checkpoint then removes
+  the one-live-provider restriction and prevents paper execution from opening a duplicate market
+  connection. This is remediation and implementation evidence, not a new review checkpoint or
+  release approval.
+- Issue [#25](https://github.com/Sawmonabo/market-squawk/issues/25), issue
+  [#45](https://github.com/Sawmonabo/market-squawk/issues/45), draft PR
+  [#43](https://github.com/Sawmonabo/market-squawk/pull/43), and the Project items remain open and
+  `In Progress`. The pushed Markets slice passed a locked application-library check with zero
+  warnings, a locked Tauri Desktop check, Desktop TypeScript compilation, the one critical unified
+  Markets journey, the account-group resynchronization authority case, repository formatting, and
+  diff integrity. The release-evidence slice passed 21 host-boundary cases, the exact
+  source-closure-drift case, and Python syntax validation. These are focused checkpoint results,
+  not the future unchanged-head release gate. Generated Cargo output is 17,482,952 KiB, below the
+  20 GiB ceiling; no extra worktree exists.
+  Automatic broad run
+  `31322655877` was cancelled before completion. Workflow checkpoint
+  `9baac4f4f24af67befb5ffca406ce2348084f45e` now reserves compiler/test matrices for explicit
+  frozen-candidate dispatches and pushes to integration branches; intermediate pull-request pushes
+  retain only lightweight classification, generated-input, credential, and documentation policy
+  checks.
+- Remaining barriers before the requested owner-test handoff are outcome-based:
+
+  1. Carry the implemented credential import through exact provider doctors and activation without
+     adding a credential crate or configuration system, then close the Alpaca Paper batch and
+     entitlement doctor, owner-enabled Schwab read-only OAuth/REST/Streamer binding, Yahoo
+     experimental binding, Nasdaq/OCC/Cboe reference ingestion, optional IEX HIST and Tiingo
+     lanes, BEA, Board, Census, EIA, FRED v2, SEC fund, Alpaca historical,
+     quota/checkpoint, raw-evidence publication, canonical schema/generation, PIT selector,
+     scheduler, telemetry, and fixed typed application surfaces without adding trading authority
+     or a parallel data application. Only the selected provider set participates in credentials,
+     scheduling, fallback, and product composition.
+  2. Run the isolated no-account and credential-authorized live Market paths against exact current
+     provider responses. Prove startup, search, subscriptions, source selection, order-level
+     resynchronization, rate budgeting, fallback disclosure, restart, stale-credential rejection,
+     and shared Desktop/CLI/MCP reads before advertising that coverage as accepted.
+  3. Complete the unified non-technical investment workspace above those published typed reads:
+     Markets search/current/history, bars, options when entitled, funds/NAV, fundamentals/filings,
+     macro evidence, features, forecasts, buy/add/trim/sell targets, backtests, portfolio impact,
+     risk, virtual paper, and personalized opportunities. A provider is not complete
+     merely because its adapter runs; each intended workflow must consume its exact data or remain
+     explicitly unavailable. Derived-index children remain absent unless their configured identity
+     and source evidence exist.
+  4. Complete the resumable guided setup execution and every remaining shared-service/MCP,
+     onboarding, research, Python/model, portfolio, decision, source, and restart workflow.
+  5. Run one focused installed integration/e2e pass, including every desktop route and every flow
+     not blocked by an unavailable user account or key, plus fresh shared Claude Code and Codex MCP
+     clients and restart/stale-credential recovery.
+  6. Refresh the Python source closure only after the product source is final, freeze one unchanged
+     feature head, run the complete local release gate once, obtain all four
+     platform installed-product proofs, close every grouped Quarter 4 finding, update PR #43 and
+     the ledger with exact-head evidence, and prepare the owner-test package.
+- Completion stops at the feature-branch packaged V1 handoff. Publishing assets, creating a public
+  release, or merging to the release branch or `main` remains explicitly outside this execution.
 
 ## Current v1.0.0 release state
 
@@ -311,9 +571,11 @@ Subsequent source-derived review established the current first-use handoff state
 
 - `source discover` now returns bounded exact provider objects without minting authority; confirmed
   ingestion independently discovers the selected object and consumes its process-local receipt.
-- `feature build` and `dataset build` now populate the durable public feature-dataset registry and
-  return `pythonExportSha256`; `market-squawk-train` consumes that exact export through a closed
-  configuration and emits authority-bound ONNX admission requests.
+- `feature build` and `dataset build` now publish only immutable phase-one analytical generations
+  and a deterministic phase-one descriptor. They do not populate the receipt-backed product
+  registry and do not authorize Python/model training. Product reads and `market-squawk-train`
+  require a separate code-owned Training-contract production receipt; no generic CLI, job, or
+  caller-materialized value path can mint one.
 - The Python release builder builds and signs the application, validator, and ONNX worker and
   installs the supported production training driver. Its code-owned producer emits deterministic
   static-shape linear and logistic graphs, with terminal `Sigmoid` required for
@@ -1198,3 +1460,428 @@ Issue `#38`, PR `#39`, and the Project item remain In Progress. The next barrier
 hosted run of the corrected exact head, followed by implementation of the accepted no-cost
 release-trust policy, publication of real assets, installed public-endpoint verification, grouped
 Quarter 4 acceptance, merge, and branch/worktree/cache closeout.
+
+## 2026-08-12 Federal Reserve Board H.15 dashboard checkpoint
+
+Product checkpoint `66c989b23daa63b7c06542d207b67c64d02845a3`, with lifecycle correction parent
+`faa784c94fd11708a1d2f3cb02af389dacf66a5f`, advances the installed-product candidate from an
+evidence-bound dashboard contract to a bounded installed producer-to-consumer vertical. The active
+product dataset is the exact `Output.aspx` rolling response with lowercase `lastobs=100`: 100 dates
+by the eleven admitted Treasury constant-maturity series, or exactly 1,100 observations. The doctor
+remains a separate ten-date readiness contract. The exact full-history `Download.aspx` identity is
+preserved but fails closed with `PartitionedExtractionRequired` because its 179,311-observation
+2024 response cannot fit the indivisible 100,000-record/64 MiB publication boundary; future full
+history requires partitioned, checkpointed, resumable ingestion rather than raised bounds.
+
+The rolling contract digest is
+`339413969849b22570e106bc02f2a86916f18345b8bb907b86147e69fe0a037f`. Its provider dataset is
+`federal-reserve-board:h15:h15-treasury-constant-maturities:339413969849b22570e106bc02f2a86916f18345b8bb907b86147e69fe0a037f`;
+its analytical dataset is
+`federal-reserve-board.h15.h15-treasury-constant-maturities.339413969849b22570e106bc02f2a86916f18345b8bb907b86147e69fe0a037f`.
+
+The Desktop does not select a provider dataset, series set, cutoff, maturity order, revision, or
+financial arithmetic. The application derives those from the frozen Board contract and returns
+exact decimal strings or explicit provider missing states. The wire keeps the bounded pinned-query
+result digest separate from the final typed-selection digest and keeps durable publication
+readiness separate from current provider-runtime readiness.
+
+The existing installed control-plane journey now proves, without a new test target:
+
+- revision-4 no-key onboarding and the exact eleven-series/ten-date doctor;
+- one durable shared-rate refusal followed by admission after the governed 60-second advance;
+- one rolling production discovery, rich capture, `MSJ1` seal, catalog publication, immutable
+  Parquet manifest, and a 1,100-row bounded history artifact;
+- the closed `Macro.GetDashboard` output in canonical maturity order, including an exact latest
+  20-year `ND` state while preserving an older observed value;
+- clean installed shutdown and same-root reopen with stable manifest, object, artifact, and
+  dashboard evidence; and
+- zero provider HTTP calls after restart.
+
+The exact focused command passed 1/1 with 31 filtered cases. The existing server-resolved portfolio
+candidate proof also passed after the lifecycle cut. Desktop TypeScript compilation and the existing
+grouped Research journey passed with the exact rolling provider/analytical identities. Rust
+formatting and diff/whitespace checks are clean. No CI or broad workspace suite ran at this
+checkpoint; generated Cargo output is approximately 16.5 GiB after the final focused journey,
+below the 20 GiB ceiling.
+
+One separately authorized direct probe of the exact rolling URL returned HTTP 200 `text/csv`, 8,627
+bytes, SHA-256 `5c7bd008c221e1b33b6a865cf7d1bbb4620661f57908a4e7dd00822bf8104579`, and exactly 100 dates/1,100
+cells. That validates the current official response shape but is not an installed-service smoke.
+The real-network installed barrier subsequently closed at exact source head
+`ba95a954883d4feb3dd328b40019682998c0b8e7`. The rebuilt CLI and service binaries were exercised
+against fresh, separate installation and workspace roots. The run completed the real no-key doctor,
+proved an immediate rolling discovery refusal under the durable one-request-per-minute authority,
+waited for the natural window, retrieved the exact 8,627-byte official response, and published its
+1,100 observations. The manifest content hash was
+`9904df0db93ef299d853b13d517d7ec2cb7109908770973df3097f1f4704b915`; the single raw object was
+26,994 bytes with content-addressed SHA-256
+`c51523f076698c74bbdef30841474541a81a6e0a80c4b25bdc721ef54e596abc`; and the single Parquet
+object was 295,309 bytes with SHA-256
+`516406c1ca4c85bdcad8e0d7075a04ebcd29efccdb0d4bb0df65c0e3adc9413e`.
+
+An authenticated MCP `Macro.GetDashboard` read returned all eleven ordered maturities for
+2026-08-10 with exact decimals, record provenance, immutable publication evidence, pinned result
+digest `8a7716bf6f4c8d8e1138e57f7b020613b5d3a7f2216dd6138de541562331602a`, and a separate final typed
+selection digest. The service then stopped cleanly and reopened the same workspace at generation 3.
+A local-only dashboard read returned the same manifest, object graph, pinned result digest, source
+payload identities, dates, revisions, and values; only the query and selection identities that bind
+the fresh evaluated-at cutoff changed. No post-restart source operation ran, and the raw/Parquet
+object counts and hashes remained unchanged. All temporary product processes were stopped after the
+proof. No CI or broad suite ran; the exact binary build left `target/` at approximately 19.9 GiB,
+below but close to the 20 GiB ceiling.
+
+Native Tauri/WebView package acceptance remains later release evidence. The broader product still
+lacks its guided Find/Analyze producer, current Investment Brief and track-record Desktop wiring,
+governed recommendation-to-user-target handoff, several selected-provider publication/PIT/Desktop
+verticals, and the final unchanged-head Quarter 4/release gates.
+
+## 2026-08-12 selected-candidate analysis and Investment Brief checkpoint
+
+Pushed checkpoint `ca3901b520bb91e74a60f1d8f73d5feab722dbfc` closes the next generic
+analysis-evidence barrier without introducing a backend-owned guided/default workflow. The backend
+continues to expose independently composable capabilities and immutable results; the Desktop Tauri
+controller remains the owner of the opinionated Market Squawk Default V1 profile and eventual
+multi-step Find/Analyze orchestration.
+
+The decision authority now retains a complete selected-candidate binding rather than only an
+instrument or proposal coordinate. Its identity includes the exact immutable SavedScreen policy,
+screen revision and universe, as-of semantics, ordered predicates and null policies, ranking,
+result bound, admitted quality constraints and complete feature-semantic closure, as well as the
+exact ScreenRun, candidate rank/score/contributions, coverage, liquidity, portfolio revision,
+flags, and evidence identity. A selected-candidate analysis can be published only as one prepared
+bundle containing the proposal decision, publication, selected-candidate evidence, and immutable
+typed explanation. The application journal persists that bundle as one strict version-4 record;
+standalone proposal persistence rejects selected-candidate analyses so the binding cannot be
+silently omitted.
+
+The prepared append path stages every fallible validation before mutation, writes the durable
+record before committing the staged in-memory repository state, and poisons the authority on an
+impossible post-journal divergence. Recovery requires the exact SavedScreen and ScreenExecution to
+appear before the bundle, reconstructs and revalidates the selected-candidate evidence, and rejects
+out-of-order, partial, or mismatched public results. There is no legacy v3 compatibility reader or
+migration: this unreleased greenfield wire was updated in place to singular v4.
+
+The same checkpoint also adds generic research-only prerequisites for a future producer:
+
+- an exact-horizon conditional-mean price forecast projection with complete 50/80/95 calibration,
+  model, artifact, vintage, availability, expiry, and newest-valid selection evidence;
+- a strict recommendation-outcome signal-plan materializer over a complete paired subject and
+  benchmark PIT population, three non-overlapping two-year folds, conservative execution costs,
+  one-lot simulation quantities, complete caller-authorized Entry/NoAction/Unavailable evidence,
+  and fixed work bounds;
+- complete imported-portfolio/current-market analytical prerequisites with exact selected-source
+  marks and depth, exact-decimal historical 95% VaR/expected-shortfall authority, checked risk and
+  side-aware liquidity capacity, and repeated portfolio/market rechecks;
+- a generic evidence-derived market-reference identity approval that joins exact Nasdaq listing,
+  OpenFIGI mapping, canonical definition, coverage, rights, currentness, and expiry without
+  hard-coding a benchmark, ticker-derived UUID, currency, or consumer asset-class policy; and
+- pure automatic DCF, comparable, residual-income, and forecast-distribution calculation receipts
+  over genuine PIT valuation inputs and rights evidence. These calculations deliberately do not
+  claim to be governed `ValuationMeasurement`s yet; a separate evidence-origin/measurement adapter
+  remains required before classification, approval, or latest-valid selection.
+
+The Desktop Investment Brief now strictly admits the current complete
+`Decision.GetInvestmentAnalysis` response, including execution ineligibility, publication,
+projection, sizing, and realized-outcome sidecars, and cross-binds them to the generated proposal.
+It also invokes `Decision.GetRecommendationTrackRecord` with the exact publication profile,
+policy horizon, and one server-coordinate cutoff, then renders the complete fixed six-cohort
+envelope. Integer time coordinates cross the WebView boundary as canonical decimal text and are
+parsed in Tauri. React performs no financial calculation, account inference, dataset selection, or
+evidence authorship.
+
+Focused checkpoint evidence was:
+
+| Evidence | Result |
+| --- | --- |
+| Rust formatting and whitespace | `cargo +1.97.1 fmt --all -- --check` and `git diff --check` passed |
+| Serialized application compile | `CARGO_INCREMENTAL=0 cargo +1.97.1 check --locked -p market-squawk --lib` passed; only the existing warning backlog remained |
+| Atomic decision/restart proof | Existing `control_plane` decision-persistence case passed 1/1, with 31 filtered cases |
+| Desktop compile | `pnpm --dir apps/market-squawk-desktop typecheck` passed in the frozen Desktop lane |
+| Desktop critical journey | Existing grouped product-navigation case passed 1/1, with 6 skipped cases |
+| Storage hygiene | Reproducible `market-squawk` Cargo artifacts were reclaimed after the proof; `target/` returned to approximately 9.2 GiB, below the 20 GiB ceiling |
+
+The focused decision case forces a SQLite rejection of the prepared bundle and proves that no
+proposal, publication, or bundle row becomes visible. It then publishes the exact bundle, proves
+idempotency and conflict handling, reopens the same decision store, and verifies the complete
+SavedScreen/candidate/proposal/publication/explanation/projection identities. This is lane evidence,
+not clean exact-head release approval or a substitute for the unchanged-head gate.
+
+The branch was clean and upstream-aligned at `ca3901b5`, and the checkpoint was recorded on draft
+PR `#43`. No CI, broad workspace suite, release matrix, merge, or publication ran.
+
+The active next barrier is a generic application-owned PIT feature-dataset producer. It must derive
+features and labels from exact admitted research parents rather than accept caller-computed values,
+preflight and reauthorize rights, select a complete source-authored universe, pin all market
+definitions as of the knowledge cutoff, prove one evidence-backed completed market session, and
+publish a required immutable production receipt alongside the existing dataset generation. Only
+after those authorities freeze can the Desktop controller truthfully start/resume Find and Analyze.
+Provider-specific investment workflows, recommendation-to-governed-target adoption, explicit paper
+draft confirmation, native package acceptance, grouped Quarter 4 review, and exact-head release
+gates remain open.
+
+## 2026-08-12 feature-product authority remediation checkpoint
+
+Pushed checkpoint `215f27582d596707ae6e04a536b5c6e3aac00fc0`, tree
+`d134d38071f1ee314f9a7b233b5f07723598e74f`, integrates the reviewed research/data candidate. It
+separates caller-materialized phase-one analytical generations from product admission, removes the
+raw-generation bypass from `Analysis.GetFeatureDatasets`, and adds a non-cloneable, session-bound
+publisher for the closed price-return/fixed-horizon-forward-return Analysis and Training contracts.
+The final catalog transaction revalidates exact source roots, use, output rights, generation
+objects, contract, producer proof, descriptor, and receipt, then publishes the descriptor and
+canonical receipt atomically. Exact historical manifest reads remain selectable after a successor
+version, while relocated catalogs cannot re-fence a receipt bound to another catalog endpoint.
+
+Generic `dataset build` and `feature build` operations now report an immutable
+`phase_one_derived_generation`. Their operation result truthfully states that the phase-one
+operation did not itself admit a product. Live generic Research dataset reads make the narrower
+claim that product admission is not established on that surface; receipt-backed product status is
+owned by `Analysis.GetFeatureDatasets`. FRED/BLS provider release evidence retains raw publication,
+query, restart, and Train-rights facts but no longer counterfeits Python training from a generic
+phase-one descriptor. The provider closer therefore remains explicitly blocked until a real
+code-owned Training-contract producer receipt exists.
+
+Focused checkpoint evidence is intentionally thin:
+
+- the existing data recovery test proves phase-one invisibility, atomic publication/replay,
+  Analysis/Training isolation, exact v1 selection after v2, same-root restart, bounded backup
+  verification, and fail-closed rejection of a distinct-root restore whose retained catalog
+  endpoint does not match the live endpoint;
+- the existing control-plane backtest case proves a phase-one generation remains queryable but is
+  absent from the product registry, while the schema-v3 pinned backtest admission remains valid;
+- focused application/modeling/Python compilation, the exact backtest case, and the exact provider
+  release blocker passed; and
+- no CI, broad workspace suite, release build, package matrix, or source-lock refresh ran.
+
+The grouped staged-candidate review initially rejected seven Important findings. Remediation closed
+the live product-state wording, catalog endpoint binding, operator documentation, contract/use
+pairing, raw-versus-prepared provenance, exact-qualification bypass, and realized-target currentness
+findings. Forecast product selection is deliberately unavailable for current vintages: the only
+closed producer emits forward returns, while the prior exact-price path lacked a separately admitted
+Analysis dataset, a governed return-to-price/current-mark calculation, and a sealed prepared-vintage
+provenance chain. Raw and currently prepared forecasts remain research artifacts and cannot become
+recommendation-facing price evidence. The final grouped staged-index review accepted the exact
+64-path candidate at Critical 0, Important 0, Minor 0. Its binary patch SHA-256 was
+`053a26646511fe664880602bf118fe5d085a2e76ac0e182badd1ed7039804d8a`, and the committed diff has
+the same digest. The focused final app check, exact forecast selection test, exact output-contract
+test, exact publication/recovery test, and unchanged earlier lane gates all passed; no broad suite,
+CI, release build, package matrix, or source-lock refresh ran.
+
+After that checkpoint, the active product barrier is still the installed private producer. It must
+reconstruct retained completed-session evidence from the exact immutable manifest/capture graph,
+move the sole production publisher into the code-owned recipe, publish genuine separate Analysis
+and Training products, and retain their pairing/derivation receipts. Governed terminal-price
+forecasting, valuation, recommendation/targets, portfolio/risk, Alpaca Paper/IEX doctor and runtime
+activation, and the novice Find → Analyze → forecast/backtest → signal → paper journey remain open
+until those producer authorities exist. `.worktrees` remains empty. The subsequent protected
+Desktop credential-import checkpoint is recorded below.
+
+## 2026-08-12 protected Desktop credential-import checkpoint
+
+Pushed checkpoint `f1dafac589cbcf4feb66d478bfdf2fece6ee642c`, tree
+`ead687bc2e00d1f5a484842f9713b544a36e340f`, closes the installed WebView-to-service credential
+origin boundary without creating provider availability. The main window can select one confirmed
+`.env` file through the native picker; native code opens only a non-empty regular file with
+no-follow semantics, enforces the 64 KiB ceiling, hashes the opened descriptor, stages it under one
+generation/workspace/client-bound opaque ticket, and immediately consumes that ticket through the
+existing private `Source.ImportCredentialBundle` operation. Path, bytes, digest, ticket, service
+envelope, and unexpected fields never cross into the WebView.
+
+Native and TypeScript layers independently require the exact closed schema, all 17 providers in
+code-owned order, the four admitted dispositions, and consistent enabled state. The UI renders only
+redacted setup dispositions and explicitly says that import does not verify, activate, start,
+schedule, publish, or trade. A cancelled picker truthfully leaves setup unchanged. Any non-cancelled
+failure warns that earlier provider entries may already have been stored, invalidates the source
+authority domain, and refreshes status, coverage, health, and retained-manifest evidence before the
+user retries.
+
+Focused checkpoint evidence was intentionally limited to the authority boundary:
+
+- Rust formatting, capability JSON parsing, cached diff integrity, and the locked offline Desktop
+  native check passed;
+- Desktop TypeScript compilation passed;
+- the existing grouped product-navigation journey passed 1/1 with six skipped cases and proves
+  cancel, redacted success, strict rejection of an unexpected secret-like field, truthful warning
+  that earlier entries may have been stored, and a source-status refetch after the failed result;
+  and
+- no broad suite, CI, release build, package matrix, provider network request, or source-lock
+  refresh ran.
+
+The final 13-file candidate was independently accepted at Critical 0, Important 0, Minor 0. Its
+reviewed and committed binary patch SHA-256 is
+`2c646a1a79b430d87aa6cf3acf6dcf74bd32df23a28f7656e91bbbaa15a3d90a`. Product code was clean and
+upstream-aligned at that checkpoint, and the checkout still has one worktree; this ledger update is
+the only subsequent overlay. Import is only Configured or Probe-required evidence. The next barrier
+is a read-only Alpaca doctor that durably binds the exact paper-realm credential generation and
+non-trading account identity to IEX market-data endpoint/feed, batch/cardinality,
+historical-bars/calendar entitlement, and rate-capacity evidence. It must never call or authorize
+account, position, order, or trading routes; only after that evidence is current may the existing
+source-start authority create an IEX market-data runtime.
+
+## 2026-08-13 Alpaca Paper/IEX doctor and source-runtime checkpoint
+
+Pushed checkpoint `9c1be5fded3b87b055cdaa50297bb80617046b4c`, tree
+`506581da9603877ef88515475fcb5ef62541f6f2`, closes the first selected-market-data authority
+barrier without claiming a live external-provider result. The installed product now owns a closed
+five-probe Alpaca Paper/IEX doctor covering the fixed quote, exact 50-symbol snapshot batch, IEX
+WebSocket authentication/subscription acknowledgement, terminal raw-history pagination, and exact
+Paper IEX/UTC calendar reconciliation. Its provider-observed result is nonconvertible from the
+installed scripted fixture. The durable receipt binds the exact credential generation, non-trading
+market-data principal, profile/configuration/rights/rate identities, complete observation digest,
+fifteen-minute exclusive validity, and same-generation renewal predecessor.
+
+`Source.Verify`, `Source.Start`, restart restoration, expiry, renewal, resynchronization, and
+shutdown now retain exact receipt/configuration/generation authority. Alpaca, Tradier, and Kraken
+account runtimes begin with display reads closed; final publication and read admission occur while
+the registry, onboarding mutation guard, and entry authority remain coherently held. Weak-only
+currentness monitors revoke reads before cancellation, generation-CAS health drains remove and join
+only the stale generation, every shutdown has a finite code-owned deadline, and historical Alpaca
+capabilities require the exact runtime receipt plus credential generation. A same-generation
+renewal accepts an already-drained prior runtime as idempotently stopped, while every present entry
+still receives complete request validation. Failed or expired post-start transitions clean the
+exact runtime under a fresh product-owned deadline before durable reconciliation.
+
+Catalog migration 0016 remains immutable. Forward migration 0022 adds exact per-session onboarding
+stream heads and performs a bounded Rust backfill inside the migration transaction, including
+zero-event retained sessions. Replay validates canonical reservation, audit, event, deadline,
+lifecycle, and cumulative-chain evidence and applies trusted current-time deadline semantics before
+returning an exact replay. Desktop Sources strictly renders the server-owned doctor evidence and
+closed Verify/Start/Resynchronize/renewal controls; setup copy states that doctor success neither
+starts a source nor grants trading authority.
+
+Focused checkpoint evidence remained deliberately thin:
+
+- the locked offline application compile passed on the frozen source candidate;
+- the existing exact source receipt/renewal test passed;
+- the three existing application tests for cancellable monitor join, exact historical
+  receipt/generation mismatch, and stale-generation drain CAS each passed;
+- the existing catalog replay/migration test passed, including the retained zero-event stream;
+- Desktop TypeScript compilation and the existing grouped product-navigation journey passed; and
+- no broad workspace suite, CI/CD, release build, native package matrix, provider network request,
+  or source-lock refresh ran.
+
+The closing grouped remediation review accepted the frozen working source at Critical 0,
+Important 0, Minor 0; its 28-file reviewed aggregate SHA-256 was
+`d37cb8a4858ba8139e2c5d827a73035038f2ea91c0751ed86d25c678a988cb89`.
+That is focused checkpoint evidence, not clean exact-head release approval. The branch and upstream
+matched at the pushed commit, the sole worktree was clean, no completed worktree or lane branch
+remained to remove, and generated `target/` state was approximately 13 GiB under the 20 GiB ceiling.
+
+The active barrier is the first honest installed Markets producer-to-Desktop vertical: a
+credential-free, network-denied AAPL/IEX fixture must traverse the real Alpaca decoder, bounded
+live-source supervisor, display directory, `Market.GetUnifiedFeed`, and existing Markets UI while
+remaining visibly `InstalledFixture` and `DirectUnverified`. The fixture cannot infer a canonical
+instrument from `AAPL`, fabricate Nasdaq/OpenFIGI/FIGI evidence, reuse a production doctor receipt,
+or obtain account, historical-provider, order, or trading authority. The next integration event is
+an exact retained AAPL reference definition plus the sealed fixture runtime and one existing Rust
+installed-service journey and grouped Desktop journey proving the real read path. Live Alpaca
+entitlement remains a later separately authorized provider smoke; historical/PIT product
+publication, models, forecasting, valuation, recommendation, backtesting, portfolio/risk, and the
+complete novice decision journey remain release blockers after this current-market slice.
+
+## 2026-08-14 real Alpaca and strict Markets working-candidate checkpoint
+
+This entry supersedes only the stale *next-barrier* statement at the end of the 2026-08-13 entry;
+it does not rewrite that historical checkpoint. Work began from frozen pushed base
+`ca0601a5969b0e23bdc99c870b2cb4b8dc879ab9`. The evidence below was produced from the current
+working-tree candidate layered on that base and is therefore focused dirty-candidate evidence, not
+clean exact-head approval.
+
+**Integrated implementation commit: `f2d6f3b7` (`feat: wire real Alpaca market dashboard`).** The
+checkpoint history that follows records that code commit and the later protected-currentness
+assertion remediation; any approval claim must use the final clean, unchanged head rather than
+infer authority from the earlier working tree.
+
+The current candidate replaces the proposed scripted-fixture barrier with the protected production
+Alpaca Paper/IEX path. The application performs the bounded real REST boot snapshot before its real
+WebSocket session, requires the exact IEX subscription acknowledgement, retains raw capture and
+freshness/currentness authority, projects the active account group through the Source lifecycle,
+and preserves a canonical unavailable Market row when after-hours data is not current. The
+protected journey imported the configured credential bundle, ran all five real doctor probes,
+started the source, queried the same Market authority through native and MCP clients, shut down,
+reopened the same root, and queried native and MCP again. The after-hours execution observed the
+truthful unavailable branch; it did not substitute a fixture, stub, fake provider, or scripted
+market response.
+
+The Desktop and Rust wires now use closed schemas for the unified feed, secondary trade/quote/book/
+comparison detail, and Source status/coverage/health. Source lifecycle status is the sole
+operational authority, while coverage and health can enrich only exact matching status rows. Live
+quotes and books remain visible, but current hot rows are explicitly
+`runtime_display_only`, `executionEligible: false`, and unavailable for investment analysis until
+durable point-in-time evidence exists. Exact instrument-definition evidence, reference identity,
+effective interval, revision, and definition digest stay bound through selection. A live hot source
+cannot mint durable investment, feature, portfolio-mark, recommendation, backtest, forecast, or
+execution authority.
+
+Tradier is unselected and removed from shipped application discovery, credential import,
+onboarding, activation, configuration, runtime, display, lifecycle, restore, and Desktop controls.
+The public Coinbase Advanced Trade and public Kraken Spot sources remain selected no-key crypto-only
+specialists; optional authenticated Coinbase Direct remains a separate crypto complement. None of
+those crypto sources is represented as stock, ETF, index, bond, mutual-fund, or REIT breadth, and
+this focused Alpaca journey is not fresh release proof for them.
+
+Focused working-candidate gates completed:
+
+- `CARGO_INCREMENTAL=0 cargo +1.97.1 check --locked -p market-squawk --lib` passed; only the
+  existing warning backlog remained.
+- `cargo +1.97.1 fmt --all -- --check` and `git diff --check` passed.
+- The existing exact Alpaca doctor-receipt/current-generation renewal case passed 1/1.
+- The existing protected production journey passed 1/1 with 31 filtered cases: protected import,
+  five real probes, `Source.Start`, native Market read, MCP Market read, shutdown/restart, and both
+  reads again. A later MCP read may truthfully transition to the strict zero-row result only when
+  its metadata is complete, exact-scoped to the requested Alpaca surface, and reports zero current
+  observations; the journey does not freeze a stale row across non-atomic reads.
+- Desktop TypeScript compilation passed, and the narrow existing grouped selector passed 2 cases
+  with 5 skipped.
+
+No broad workspace suite, CI/CD workflow, release build, package matrix, source-lock refresh,
+Quarter 4 review, or clean exact-head release gate ran. These focused results prove only the current
+Alpaca/display slice. Final checkpoint authority remains pending the root-filled commit, unchanged-
+head verification, and the applicable grouped review.
+
+The next barrier is not a fixture. It is application-owned durable Alpaca daily-history and market-
+calendar publication through the existing capture/catalog/storage authorities, followed by a
+manifest-pinned `Market.GetHistory` read and the Desktop chart composition over that exact immutable
+generation. The following dependency is a separately sealed forward live-event archive. Only real
+publication-time evidence accumulated by those durable paths may unlock genuine point-in-time
+features, backtests, forecasts, recommendations and track records; first-observed-now history can
+support current charts and research but cannot be presented as retrospective PIT evidence.
+
+### 2026-08-14 exact-definition and canonical-market remediation
+
+Exact code checkpoint `5133f338279dffa17fe3e72b447cac503239fa60`, tree
+`c423a5c65c7ff2599e70c9aeb79f523e892f47c9`, closes the grouped I1–I4 remediation on the real
+Alpaca/Markets vertical. `Market.GetUnifiedFeed` now selects an immutable market-data definition
+that was both knowable and effective at the operation's exact reference time, rejects expired or
+future-published definitions, and binds the nonzero whole-definition SHA-256 through every
+candidate, the selection request and digest, the row, the receipt, MCP, and the strict Desktop
+parser. Desktop independently requires the same end-exclusive effective interval and exact
+row-to-receipt digest equality.
+
+The operation is deliberately a hot current-display operation: it may show a fresh selected-source
+trade or bid/ask midpoint, but its closed Rust and Desktop contracts always report
+`runtime_display_only`, `executionEligible: false`, and no durable analytical observation. The UI
+states only that this live-feed response is not PIT evidence; it does not claim that a separate
+archive is absent. A canonical instrument row may transition between live and unavailable across
+non-atomic reads, but it may no longer disappear from MCP after the native read has established the
+configured topology. Stable identity, including the exact definition digest, survives that
+transition and restart.
+
+Focused clean, unchanged, exact-head evidence on `5133f338` passed:
+
+- Rust formatting and diff integrity;
+- the bounded output-schema validator's single nonzero-SHA-256 proof;
+- the existing market-selection determinism/downgrade/execution case, including definition-revision
+  mismatch and digest-change proof;
+- Desktop TypeScript compilation and the existing unified-market journey (1 passed, 6 skipped);
+  and
+- the protected real Alpaca installed-service journey (1 passed, 31 filtered): credential import,
+  five real probes, start, native and MCP reads, clean shutdown, same-root restart, and both reads
+  again.
+
+The frozen 15-file remediation was independently reviewed at Critical 0, Important 0, Minor 0;
+its pre-commit aggregate patch SHA-256 was
+`a3a1ea38a2e31bb34e5ba49782730ead2c7a9839e923a85c4a53c3d738597b84`. No broad suite, CI/CD,
+release build, package matrix, or release-branch merge ran. This is an exact product checkpoint,
+not complete V1 or release approval. The active barrier remains complete Alpaca daily-history and
+calendar publication, manifest-pinned `Market.GetHistory`, Desktop charts, and then the separately
+sealed forward live-event archive needed before genuine PIT analytics can become available.

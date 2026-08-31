@@ -3,9 +3,12 @@
 > **Status: Historical audit. No current execution authority.** The detailed classifications below
 > are frozen to the rejected `651a01e120dfe27a598b9475296733d238d870b7` anchor. They remain useful
 > audit evidence but are not an exact-head inventory, delivery plan, approval record, or stopping
-> condition. Current capability state lives in the [README](../../README.md) and
-> [release baseline](../verification/usable-release-baseline.md), and the active plan is the
-> [usable complete-release implementation plan](../superpowers/plans/2026-07-17-market-squawk-usable-complete-release.md).
+> condition. Current mutable state and remaining predicates live only in the
+> [delivery ledger](delivery-ledger.md). The installed-product capability contract is the
+> [approved V1 design](../superpowers/specs/2026-08-01-market-squawk-v1-installed-product-experience-design.md),
+> and current execution authority is the
+> [August 1 V1 plan](../superpowers/plans/2026-08-01-market-squawk-v1-installed-product-experience.md).
+> The July 18 release baseline and July 17 plan are preserved historical inputs.
 
 <!-- q2-checkpoint-state
 candidate-id: q2-integrated-remediation-2026-07-16

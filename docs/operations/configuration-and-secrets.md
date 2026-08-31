@@ -9,8 +9,8 @@ by the reviewed `LocalProduct`.
 | Document type | Operations runbook |
 | Audience | Local operators, security reviewers, and maintainers |
 | Status | Current |
-| Last substantive review | 2026-07-26 |
-| Reviewed commit | `4edc8adf4425ffed44235b614d9607aef30fd585` |
+| Last substantive review | 2026-08-11 |
+| Review basis | Current installed-service configuration, one-time credential import, setup, and typed-settings contracts; not release approval evidence |
 
 ## Contents
 
@@ -22,7 +22,9 @@ by the reviewed `LocalProduct`.
 - [Create and validate a configuration](#create-and-validate-a-configuration)
 - [Inspect effective values and precedence](#inspect-effective-values-and-precedence)
 - [Secret operations boundary](#secret-operations-boundary)
+- [Import the one-time provider credential bundle](#import-the-one-time-provider-credential-bundle)
 - [Apply a correction or planned change](#apply-a-correction-or-planned-change)
+- [Use guided setup and typed settings](#use-guided-setup-and-typed-settings)
 - [Expected success evidence](#expected-success-evidence)
 - [Rollback and recovery](#rollback-and-recovery)
 - [Known failure modes](#known-failure-modes)
@@ -34,8 +36,8 @@ by the reviewed `LocalProduct`.
 
 Market Squawk builds one immutable `AppConfig` at process startup. This page covers its four
 configuration layers, every accepted setting, closed-file validation, redacted inspection,
-OS-keyring-first secret composition, explicit encrypted-fallback unlock, and the
-stop-correct-validate-restart procedure.
+OS-keyring-first secret composition, the distinct one-time provider credential import, explicit
+encrypted-fallback unlock, and the stop-correct-validate-restart procedure.
 
 Configuration can select local paths, resource ceilings, timing, optional provider profiles, and
 opaque secret locators. It cannot:
@@ -51,6 +53,13 @@ Use [Source operations](source-operations.md) for evidence-bound provider onboar
 release blockers and provider-qualification status remain in the
 [delivery ledger](../plans/delivery-ledger.md).
 
+The installed product also has **typed operational settings** and a durable **guided setup plan**.
+They are service-owned workspace state, distinct from startup TOML/environment configuration. The
+Desktop's Settings and Setup routes and the installed-only `operations settings` and `setup`
+commands use the same bounded application authority. Do not edit the corresponding control files
+or infer setup completion from a displayed capability; only a typed settings receipt or setup
+status evidence proves the action.
+
 ## Preconditions
 
 - Complete [Installation and local bootstrap](installation-and-bootstrap.md), or otherwise have the
@@ -59,10 +68,11 @@ release blockers and provider-qualification status remain in the
 - Select an operator-owned absolute path for the TOML file. The application accepts relative paths,
   but an absolute path avoids working-directory ambiguity in services and scheduled jobs.
 - Inventory all inherited `MARKET_SQUAWK_*` environment variables in the launch environment.
-- For any future code-admitted credential workflow, use an available interactive OS credential
-  service or plan an explicit foreground unlock of the encrypted fallback through the loopback
-  portal. At the reviewed commit, every credentialed built-in provider is release-gated, so no
-  credentialed provider setup procedure is currently operable.
+- For selected provider credentials, prepare the exact owner-only
+  [`market-squawk-provider-credentials/v1`](../reference/market-squawk-provider-credentials.env.example)
+  file and ensure the installed application service is reachable. Use an available interactive OS
+  credential service or plan an explicit foreground unlock of the encrypted fallback through the
+  loopback portal.
 
 Examples use:
 
@@ -74,7 +84,9 @@ CONFIG=/absolute/operator-owned/market-squawk/config.toml
 ## Safety and authority
 
 1. Never place a provider key, password, token, unlock phrase, cookie, or other credential value in
-   TOML, an environment variable, a CLI argument, shell history, or an activation request file.
+   startup TOML, the process environment, a CLI argument, shell history, or an activation request.
+   The exact owner-only one-time provider credential bundle is the admitted file exception; never
+   source it as a shell file.
 2. The `source_secret` setting is an opaque locator only. Its accepted syntax does not connect that
    locator to either onboarding backend in the current application composition.
 3. Always pass `--config <PATH>` explicitly. Market Squawk does not search the current directory,
@@ -271,19 +283,13 @@ a credential is stored and which generation is active. The platform secret value
 `1..=65536` bytes; the portal's provider-key field, when a profile is release-enabled, is further
 limited to 8192 characters.
 
-At this reviewed source head, the credentialed profiles have different release states:
-
-- `bls.v2-registered` is `refresh_required`;
-- `fred-alfred.api-v1-v2` revision 5 is `rights_limited`: bounded ephemeral retrieval is available,
-  while persistence and training require exact written St. Louis Fed service permission plus
-  independent exact-series public-domain or owner-permission evidence.
-
-The portal keeps BLS v2 disabled while its evidence refresh is incomplete. FRED accepts a
-provider-issued zero-fee API key only through its typed foreground setup. Durable activation also
-requires an exact Bank response matched byte-for-byte against a fresh reacquisition from its
-official HTTPS URL, a hash-bound local review of its grantee/service/series/operation scope, and
-exact series-rights evidence. Storing a key, presenting email headers, or submitting the permissions
-contact form cannot create persistence, training, or redistribution authority.
+The installed credential-bundle path can delegate the selected Schwab, Alpaca Paper, BLS, BEA,
+Census, EIA, FRED/ALFRED, and Tiingo values into those same protected authorities. It can also
+create durable probe-required onboarding sessions for the selected no-secret sources. A successful
+write means only that one credential generation is stored or one probe-intent session exists. It
+does not verify the provider, activate an adapter, publish data, enable a workflow, or grant
+trading authority. Provider-specific release state and downstream readiness remain visible through
+the source operations rather than inferred from secret-store state.
 
 ### Encrypted fallback lifecycle
 
@@ -311,6 +317,44 @@ There is also no public generic `secret set`, `secret get`, `secret list`, or `s
 command. Do not manipulate catalog secret references or OS-keyring entries independently of their
 onboarding lifecycle.
 
+## Import the one-time provider credential bundle
+
+The credential bundle is not an `AppConfig` layer and is never searched automatically. It is a
+one-time, owner-managed input to the existing provider-onboarding service. Copy the maintained
+[example](../reference/market-squawk-provider-credentials.env.example) outside the repository,
+retain the exact 32-field order, replace enabled placeholders, leave disabled-provider credential
+fields empty, and keep the file owner-only. On POSIX systems:
+
+```bash
+CREDENTIALS=/absolute/operator-owned/market-squawk-provider-credentials.env
+chmod 600 "$CREDENTIALS"
+"$MSQ" --config "$CONFIG" --output json \
+  source import-credentials "$CREDENTIALS" --confirm
+```
+
+The command requires the installed application service and explicit `--confirm`. It admits at most
+64 KiB from an identity-checked regular file, stages the bytes once, and parses only schema
+`market-squawk-provider-credentials/v1`. The parser does not source the file, expand variables,
+interpolate commands, contact a provider, or accept unknown fields. Callback URLs, endpoint paths,
+authentication routes, feed labels, official/provider limits, application budgets, batching,
+pagination, and cadences remain code-owned; the credential file cannot override them.
+
+The secret-free result has exactly 17 provider rows. Its only dispositions are:
+
+| Disposition | Configuration meaning |
+| --- | --- |
+| `disabled` | Provider was not requested |
+| `credential_stored_unverified` | Protected credential write completed; provider verification remains open |
+| `probe_required` | No-secret onboarding intent is durable; the provider probe remains open |
+| `profile_unavailable` | Exact selected profile mapping/revision/release contract could not be satisfied |
+
+An imported credential is **Configured**, not **Available**. Availability additionally requires a
+successful current doctor/entitlement probe, actual provider production, durable canonical
+publication, a point-in-time typed application read, product composition, and focused restart
+proof. Import never starts collection and never calls account, order, preview, replace, cancel, or
+other trading routes. The input copy is not deleted automatically; after retaining the secret-free
+receipt, preserve or remove it according to the owner's protected-file policy.
+
 ## Apply a correction or planned change
 
 1. Identify every process using this configuration and data root.
@@ -336,6 +380,107 @@ onboarding lifecycle.
 8. Run query-only `doctor` or the domain-specific status command and retain stdout plus stderr.
 
 No signal or file rewrite changes the configuration of a process that is already running.
+
+## Use guided setup and typed settings
+
+### Inspect or accept an evidence-driven setup plan
+
+Use guided setup after the installed service is reachable. It records the selected goals and starter
+plan but deliberately does **not** mark a source, model, portfolio, paper account, MCP client,
+backup, or first useful result complete. Those steps remain evidence-driven in `setup status` and
+the Desktop checklist.
+
+```bash
+MSQ="/path/to/installed/market-squawk"
+"$MSQ" --output json setup status
+"$MSQ" --output json setup preview \
+  --expected-revision 0 \
+  --goal everything-recommended \
+  --starter-plan everything-recommended
+```
+
+Review the returned workspace, current revision, selected goals/starter plan, each step's current
+evidence, blocking reason, recovery guidance, expected contact/change, time/disk impact, and the
+one-use `previewId`/`previewSha256`. Replace `0` with the exact returned revision whenever a plan
+already exists. Accept only that preview:
+
+```bash
+"$MSQ" --output json setup apply \
+  --preview-id <PREVIEW_UUID> \
+  --preview-sha256 <LOWERCASE_SHA256> \
+  --confirm
+"$MSQ" --output json setup status
+```
+
+Success is an accepted-plan receipt followed by status that identifies the same plan/revision; it
+does not claim that individual steps are done. If a preview is stale, replayed, scoped to another
+workspace, or rejected, refresh `setup status`, resolve the reported condition, and create a new
+preview. Closing the desktop, disconnecting a CLI, or skipping a step preserves honest incomplete
+state. Use the owning source, portfolio, model, MCP, or backup procedure to create the evidence
+that advances a step.
+
+### Change typed product settings
+
+Typed settings are the supported way to change log retention/minimum severity, update channel and
+automatic checks, storage soft limit, default query row limit, maximum concurrent jobs, market
+freshness, and backup retention. They are revisioned workspace policy, not a raw TOML editor and
+not a secret mechanism. Read the current snapshot first:
+
+```bash
+"$MSQ" --output json operations settings get
+```
+
+Record its `revision`, values, origins, and restart impact. Preview a complete desired change at
+that exact revision; every supplied field is checked and omitted fields remain unchanged. For
+example:
+
+```bash
+"$MSQ" --output json operations settings change preview \
+  --expected-revision <CURRENT_REVISION> \
+  --log-retention-days 30 \
+  --log-minimum-severity info \
+  --storage-soft-limit-bytes 21474836480 \
+  --maximum-concurrent-jobs 2 \
+  --backup-retention-count 3
+```
+
+The admitted ranges are: log retention `1..=365` days; storage soft limit
+`1,073,741,824..=17,592,186,044,416` bytes; query rows `100..=1,000,000`; concurrent jobs
+`1..=64`; market freshness `250..=600,000` milliseconds; and retained backups `1..=64`.
+`update-channel` is `stable` or `preview`; log severity is one of `trace`, `debug`, `info`, `warn`,
+or `error`. Read the preview rather than assuming its restart requirement.
+
+Apply only its exact one-use reference:
+
+```bash
+"$MSQ" --output json operations settings change apply \
+  --preview-id <PREVIEW_UUID> \
+  --preview-digest <LOWERCASE_SHA256> \
+  --confirm
+"$MSQ" --output json operations settings get
+```
+
+Success is a new monotonic settings receipt/revision and a reread that reports the intended
+values. Where the receipt says restart/reconnect is required, let the service finish its bounded
+transition, reconnect Desktop/CLI/MCP clients, and repeat their safe bootstrap/health check. Do not
+make a second change using the old revision.
+
+To undo a settings revision, restore it as a new revision—never rewrite the history:
+
+```bash
+"$MSQ" --output json operations settings rollback preview \
+  --expected-revision <CURRENT_REVISION> \
+  --target-revision <RETAINED_REVISION>
+"$MSQ" --output json operations settings rollback apply \
+  --preview-id <PREVIEW_UUID> \
+  --preview-digest <LOWERCASE_SHA256> \
+  --confirm
+```
+
+The preview verifies the target and applies the same authority/restart checks. A stale revision,
+unknown retained revision, malformed setting, duplicate/immutable setting, or expired preview is
+a fail-closed result: preserve the returned evidence, reread settings, and correct through a new
+preview. It is never safe to repair typed settings by editing an internal database or control file.
 
 ## Expected success evidence
 
@@ -398,10 +543,13 @@ commands for those separate checks.
 - **Runtime fails after an otherwise valid change:** quiesce it, restore the prior configuration
   layers, validate, and restart. If the new version opened durable state, use the coherent
   pre-change backup unless backward compatibility is explicitly verified.
+- **The operating system requests foreground credential approval:** complete the native Apple
+  Keychain or Secret Service prompt. Market Squawk retries the unchanged durable plan and reconnects
+  the dashboard; this condition does not select or unlock the encrypted fallback.
 - **Keyring operation is unavailable or indeterminate:** preserve the onboarding session status
-  and error. For a code-admitted foreground workflow, explicitly unlock the configured fallback in
-  the same portal process and retry only the lifecycle-owned operation; otherwise follow the
-  session's fail-closed reconciliation state.
+  and error. A proved unavailable, session-unavailable, or unsupported primary may use the already
+  configured and explicitly unlocked fallback for a new eligible plan. Existing keyring-bound
+  references remain bound to that keyring and follow their lifecycle-owned recovery state.
 - **Encrypted fallback is locked after restart:** reopen the loopback portal and submit the same
   unlock through its write-only fallback control. Do not place the unlock in startup configuration
   or automation.
@@ -424,7 +572,10 @@ commands for those separate checks.
 | Changed file has no effect | Environment or CLI layer wins, or the existing process has not restarted | Inspect launch inputs, stop the old process, validate, and start anew |
 | A reported origin is unexpected | A higher-precedence environment or CLI layer supplied the effective value | Inspect the inherited environment and exact launch arguments; correct the highest-precedence source |
 | `sourceSecretConfigured.value` is `true` but secret use fails | The value is only a locator and does not grant onboarding or fallback-unlock authority | Use the admitted portal lifecycle; do not put the credential or unlock in configuration |
-| OS credential prompt or service is unavailable | Primary keyring backend/session unavailable | Unlock the code-owned fallback through the foreground portal before an admitted credential mutation, or fail closed |
+| `source import-credentials` rejects the input | The installed service is unavailable, `--confirm` is absent, path/file confinement failed, the file exceeds 64 KiB, or the strict ordered V1 contract failed | Use the installed CLI and an owner-only regular file at an absolute path; compare all 32 fields with the maintained example and correct only the input |
+| Credential receipt says `credential_stored_unverified` or `probe_required` | Import succeeded but provider verification or no-secret probing is still required | Continue through the provider-specific doctor/activation flow; do not report the source or workflow as Available |
+| Native OS credential approval prompt appears | The primary keyring requires one foreground user decision | Complete the operating-system prompt; the Desktop keeps navigation available and reconnects automatically |
+| OS credential service is unavailable | The primary backend or session cannot provide the required exact lifecycle | Use the explicitly unlocked fallback only for a new eligible plan; preserve existing backend-bound references and fail closed when they cannot be recovered |
 | Portal reports `invalid_unlock` | Submitted unlock does not authenticate the retained vault authority | Preserve the vault, correct the operator-owned unlock, and retry through the same bounded portal |
 | Portal reports `fallback_unavailable` | Fallback is locked, unavailable, or cannot complete the requested transition | Preserve portal stderr and vault state; do not delete, recreate, or bypass the authority |
 | `config validate` succeeds but `doctor` reports unavailable storage | Configuration validity does not prove that `init` created a safe, current layout and catalog | Preserve the doctor result; run the explicit bootstrap/upgrade procedure or repair the stable diagnostic class |
@@ -435,21 +586,27 @@ commands for those separate checks.
 | Location or stream | Contents and handling |
 | --- | --- |
 | Explicit TOML path | Operator-owned non-secret startup policy; not copied into the data root by `AppConfig` |
+| Owner-managed provider credential bundle | One-time input outside the repository; POSIX mode `0600`; never sourced, searched as configuration, echoed in a receipt, or deleted automatically |
 | Process environment and launch arguments | Higher-precedence ephemeral configuration; inventory outside Market Squawk |
 | OS credential service | Credential bytes and opaque generations for admitted onboarding; not stored under the data root |
 | `<data-root>/control/secrets/provider-credentials/` | Authenticated encrypted fallback vault; unlock material is never persisted there |
 | `<data-root>/catalog.sqlite3` | Durable onboarding references and product catalog; may have SQLite sidecars while active |
 | `<data-root>/control/` | Durable non-secret authority and recovery state |
 | stdout | Redacted command results |
-| stderr | Configuration/startup tracing; `--json-logs` selects structured tracing; no log file exists by default |
+| stderr | Configuration/startup tracing; `--json-logs` selects structured tracing |
+| Service-owned structured-log store | Bounded redacted operational records, queried/exported only through `operations logs`; neither a raw tail nor an editable log path is exposed |
 
 Market Squawk does not persist an effective configuration cache or a plaintext resolved-secret
-file.
+file. Query logs with `operations logs query --limit <1..=1000>` and use
+`operations logs export ... --confirm` only for the exact bounded redacted selection; controlled
+exports are artifacts, not arbitrary output paths.
 
 ## Related documentation and code
 
 - [Installation and local bootstrap](installation-and-bootstrap.md)
 - [Source operations](source-operations.md)
+- [Provider accounts and credential preparation](provider-account-setup.md)
+- [Selected provider credential example](../reference/market-squawk-provider-credentials.env.example)
 - [CLI reference](../reference/cli.md)
 - [Configuration reference](../reference/configuration.md)
 - [Data quality and live qualification](../reference/data-quality.md)
@@ -461,6 +618,9 @@ file.
 - [Redacted provenance representation](../../crates/market-squawk-platform/src/config/report.rs)
 - [Application configuration command output](../../apps/market-squawk/src/main.rs)
 - [Production `LocalProduct` composition](../../apps/market-squawk/src/local_product/mod.rs)
+- [Installed credential import service](../../apps/market-squawk/src/service/provider_credential_import.rs)
+- [Strict credential-bundle parser](../../apps/market-squawk/src/provider_onboarding/credential_bundle.rs)
+- [Selected credential delegation](../../apps/market-squawk/src/provider_onboarding/credential_bundle_delegation.rs)
 - [Secret-store interfaces](../../crates/market-squawk-platform/src/secrets.rs)
 - [Encrypted-file implementation](../../crates/market-squawk-platform/src/secrets/encrypted.rs)
 - [OS-first fallback router and explicit unlock lifecycle](../../crates/market-squawk-platform/src/secrets/preferred.rs)

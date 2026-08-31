@@ -7,6 +7,7 @@ use url::Url;
 
 use crate::lifecycle::InstallError;
 use crate::manifest::{AdmittedRelease, ReleaseManifest};
+use crate::update_metadata::PendingTrustedUpdate;
 
 /// A fully admitted local or downloaded initial release.
 #[derive(Debug)]
@@ -52,6 +53,7 @@ pub struct UpdateRequest {
     pub(crate) release: AdmittedRelease,
     pub(crate) bundle: PathBuf,
     pub(crate) channel_manifest_url: Option<Box<str>>,
+    pub(crate) trusted_update: Option<PendingTrustedUpdate>,
 }
 
 impl UpdateRequest {
@@ -66,6 +68,50 @@ impl UpdateRequest {
             release: ReleaseManifest::admit_current(manifest)?,
             bundle: bundle.to_path_buf(),
             channel_manifest_url: None,
+            trusted_update: None,
+        })
+    }
+
+    /// Binds exact local release files to an already verified threshold-signed metadata chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::TrustedUpdateIdentity`] unless both files match their exact signed
+    /// targets and the release manifest's own archive identity.
+    pub fn from_trusted_local(
+        root: PathBuf,
+        manifest: &[u8],
+        bundle: &Path,
+        pending: PendingTrustedUpdate,
+        manifest_target_path: &str,
+        archive_target_path: &str,
+    ) -> Result<Self, InstallError> {
+        if manifest_target_path == archive_target_path {
+            return Err(InstallError::TrustedUpdateIdentity);
+        }
+        let release = ReleaseManifest::admit_current(manifest)?;
+        let manifest_target = pending
+            .target(manifest_target_path)
+            .ok_or(InstallError::TrustedUpdateIdentity)?;
+        let archive_target = pending
+            .target(archive_target_path)
+            .ok_or(InstallError::TrustedUpdateIdentity)?;
+        let manifest_length =
+            u64::try_from(manifest.len()).map_err(|_| InstallError::TrustedUpdateIdentity)?;
+        if manifest_target.length() != manifest_length
+            || lower_hex(manifest_target.sha256()) != release.manifest_sha256()
+            || archive_target.length() != release.target_release().archive.size
+            || lower_hex(archive_target.sha256())
+                != release.target_release().archive.sha256.as_ref()
+        {
+            return Err(InstallError::TrustedUpdateIdentity);
+        }
+        Ok(Self {
+            root,
+            release,
+            bundle: bundle.to_path_buf(),
+            channel_manifest_url: None,
+            trusted_update: Some(pending),
         })
     }
 
@@ -73,12 +119,26 @@ impl UpdateRequest {
     ///
     /// # Errors
     ///
-    /// Returns [`InstallError::ManifestUrl`] when the URL is not an uncredentialed HTTPS URL.
+    /// Returns [`InstallError::ManifestUrl`] when the URL is not an uncredentialed HTTPS URL, or
+    /// [`InstallError::TrustedUpdateRequired`] when the request has no signed update admission.
     pub fn with_channel_manifest_url(mut self, url: &str) -> Result<Self, InstallError> {
         validate_manifest_url(url)?;
+        if self.trusted_update.is_none() {
+            return Err(InstallError::TrustedUpdateRequired);
+        }
         self.channel_manifest_url = Some(url.into());
         Ok(self)
     }
+}
+
+fn lower_hex(bytes: [u8; 32]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 /// Request to verify and reconstruct the active immutable version when necessary.

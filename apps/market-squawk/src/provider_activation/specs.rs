@@ -10,20 +10,25 @@ use market_squawk_adapter_bls::{
 use market_squawk_adapter_coinbase::{
     CoinbaseConfigError, CoinbaseDirectLimits, CoinbaseProductMapping,
 };
+use market_squawk_adapter_federal_reserve::BoardDatasetProfile;
 use market_squawk_adapter_files::ExtractionLimits;
-use market_squawk_adapter_fred::FredRightsPolicy;
+use market_squawk_adapter_fred::FredSource;
 use market_squawk_adapter_portfolio::PortfolioImportLimits;
 use market_squawk_adapter_sec::{RawEvidenceStore, SecParserLimits, SecRepresentationRegistry};
 use market_squawk_adapter_treasury::TreasurySourceConfig;
+use market_squawk_adapter_yahoo::YAHOO_SOURCE_ID;
+use market_squawk_data::ImportedUserInputEvidence;
 use market_squawk_domain::{ProviderIdentityRegistry, ProviderProduct, SourceIdentifier};
 use market_squawk_live::LiveRouteConfig;
 use market_squawk_platform::{
-    BoundedInput, LocalAuthorityStateStore, SecretReference, UserAuthorizedInputRoot,
-    UserOwnedInputEvidence,
+    BoundedInput, ControlledImportInputRoot, LocalAuthorityStateStore, SecretReference,
+    UserAuthorizedInputRoot, UserOwnedInputEvidence,
 };
 use market_squawk_sources::{FreshnessPolicy, SourceMetadata};
 
 use crate::application::ResearchIngestCompositionError;
+
+const TIINGO_SOURCE_ID: &str = "tiingo-starter";
 
 /// Coinbase Direct account subscription ceiling for the exact `full` product/channel pair.
 pub const COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS: usize = 10;
@@ -218,6 +223,40 @@ impl fmt::Debug for SecAdapterActivation {
     }
 }
 
+/// Exact no-key source metadata for the explicit-demand Yahoo enrichment lane.
+#[derive(Debug)]
+pub struct YahooAdapterActivation {
+    pub(super) metadata: SourceMetadata,
+}
+
+impl YahooAdapterActivation {
+    /// Retains only the reviewed Yahoo source contract; session, cache, circuit, and paths remain
+    /// application-owned.
+    pub fn try_new(metadata: SourceMetadata) -> Result<Self, ProviderAdapterActivationError> {
+        if metadata.source_id().as_str() != YAHOO_SOURCE_ID {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        Ok(Self { metadata })
+    }
+}
+
+/// Exact secret-backed source metadata for the bounded Tiingo Starter NAV/EOD lane.
+#[derive(Debug)]
+pub struct TiingoAdapterActivation {
+    pub(super) metadata: SourceMetadata,
+}
+
+impl TiingoAdapterActivation {
+    /// Retains only reviewed source metadata. The token is resolved from the active onboarding
+    /// lease and never enters an activation request or application result.
+    pub fn try_new(metadata: SourceMetadata) -> Result<Self, ProviderAdapterActivationError> {
+        if metadata.source_id().as_str() != TIINGO_SOURCE_ID {
+            return Err(ProviderAdapterActivationError::SourceBinding);
+        }
+        Ok(Self { metadata })
+    }
+}
+
 /// BLS adapter construction inputs excluding credential material.
 #[derive(Debug)]
 pub struct BlsAdapterActivation {
@@ -255,7 +294,7 @@ impl BlsAdapterActivation {
     ) -> Result<Self, market_squawk_adapter_bls::BlsSourceError> {
         let configuration = match tier {
             BlsAccessTier::PublicV1 => BlsAdapterConfiguration::Public(BlsSourceConfig::try_new(
-                BlsAuthorization::PublicV1,
+                BlsAuthorization::public_v1(),
                 series,
                 start_year,
                 end_year,
@@ -296,18 +335,53 @@ impl TreasuryAdapterActivation {
     }
 }
 
-/// FRED construction inputs accepted only after an exact scope-specific active lease exists.
+/// FRED construction inputs accepted only after an exact active source lease exists.
 #[derive(Debug)]
 pub struct FredAdapterActivation {
     pub(super) metadata: SourceMetadata,
-    pub(super) policy: FredRightsPolicy,
+    provider_dataset: SourceIdentifier,
 }
 
 impl FredAdapterActivation {
-    /// Retains the exact per-series policy, metadata, and independent persistence evidence.
+    /// Binds source metadata to one exact provider series and vintage interval.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any identity outside the adapter's closed series-observations grammar.
+    pub fn try_new(
+        metadata: SourceMetadata,
+        provider_dataset: SourceIdentifier,
+    ) -> Result<Self, ProviderAdapterActivationError> {
+        FredSource::series_identifier(&provider_dataset)?;
+        Ok(Self {
+            metadata,
+            provider_dataset,
+        })
+    }
+
+    /// Returns the sole exact provider dataset bound to this activation.
+    pub(crate) const fn provider_dataset_identifier(&self) -> &SourceIdentifier {
+        &self.provider_dataset
+    }
+}
+
+/// Federal Reserve Board construction inputs for one exact code-owned H.15 package.
+#[derive(Debug)]
+pub struct BoardAdapterActivation {
+    pub(super) metadata: SourceMetadata,
+    pub(super) profile: BoardDatasetProfile,
+}
+
+impl BoardAdapterActivation {
+    /// Retains exact no-key metadata and the selected provider request/schema profile.
     #[must_use]
-    pub fn new(metadata: SourceMetadata, policy: FredRightsPolicy) -> Self {
-        Self { metadata, policy }
+    pub fn new(metadata: SourceMetadata, profile: BoardDatasetProfile) -> Self {
+        Self { metadata, profile }
+    }
+
+    /// Returns the exact provider discovery identity carried by the selected Board profile.
+    pub(crate) const fn provider_dataset_identifier(&self) -> &SourceIdentifier {
+        self.profile.dataset()
     }
 }
 
@@ -350,6 +424,51 @@ impl fmt::Debug for LocalFileAdapterActivation {
             .field("source_id", self.metadata.source_id())
             .field("metadata_revision", self.metadata.revision())
             .field("root", &"[USER-AUTHORIZED]")
+            .field("manifest", &self.manifest)
+            .field("representation_state_root", &"[CONTROLLED]")
+            .finish()
+    }
+}
+
+/// Controlled, path-free import bundle for the installed guided local-file workflow.
+pub struct ControlledLocalFileAdapterActivation {
+    pub(super) metadata: SourceMetadata,
+    pub(super) root: ControlledImportInputRoot,
+    pub(super) representation_state_root: PathBuf,
+    pub(super) manifest: BoundedInput,
+    pub(super) limits: ExtractionLimits,
+    pub(super) evidence: ImportedUserInputEvidence,
+}
+
+impl ControlledLocalFileAdapterActivation {
+    /// Retains a controlled import root, exact manifest, parser limits, and import evidence.
+    #[must_use]
+    pub fn new(
+        metadata: SourceMetadata,
+        root: ControlledImportInputRoot,
+        representation_state_root: impl AsRef<Path>,
+        manifest: BoundedInput,
+        limits: ExtractionLimits,
+        evidence: ImportedUserInputEvidence,
+    ) -> Self {
+        Self {
+            metadata,
+            root,
+            representation_state_root: representation_state_root.as_ref().to_path_buf(),
+            manifest,
+            limits,
+            evidence,
+        }
+    }
+}
+
+impl fmt::Debug for ControlledLocalFileAdapterActivation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControlledLocalFileAdapterActivation")
+            .field("source_id", self.metadata.source_id())
+            .field("metadata_revision", self.metadata.revision())
+            .field("root", &"[CONTROLLED IMPORT]")
             .field("manifest", &self.manifest)
             .field("representation_state_root", &"[CONTROLLED]")
             .finish()
@@ -430,10 +549,18 @@ pub enum ProviderAdapterActivationRequest {
     Bls(BlsAdapterActivation),
     /// Treasury Fiscal Data or daily-rate XML extraction.
     Treasury(TreasuryAdapterActivation),
-    /// FRED/ALFRED extraction under exact scope-specific rights.
+    /// FRED/ALFRED extraction under the shared source authority.
     Fred(FredAdapterActivation),
+    /// Federal Reserve Board H.15 extraction from one exact no-key DDP package.
+    Board(BoardAdapterActivation),
+    /// No-key, explicit-demand-only Yahoo experimental enrichment.
+    Yahoo(YahooAdapterActivation),
+    /// Secret-backed bounded Tiingo Starter NAV/EOD retrieval.
+    Tiingo(TiingoAdapterActivation),
     /// User-owned local file extraction.
     LocalFiles(LocalFileAdapterActivation),
+    /// Workspace-controlled exact bytes admitted by the guided local-file workflow.
+    ControlledLocalFiles(ControlledLocalFileAdapterActivation),
     /// User-owned portfolio holdings and transactions extraction.
     Portfolio(PortfolioAdapterActivation),
 }
@@ -443,12 +570,16 @@ impl ProviderAdapterActivationRequest {
     pub(crate) fn provider_dataset_identifier(&self) -> Option<&SourceIdentifier> {
         match self {
             Self::Bls(specification) => specification.provider_dataset_identifier(),
+            Self::Board(specification) => Some(specification.provider_dataset_identifier()),
+            Self::Fred(specification) => Some(specification.provider_dataset_identifier()),
             Self::Live(_)
             | Self::CoinbaseDirect(_)
             | Self::Sec(_)
             | Self::Treasury(_)
-            | Self::Fred(_)
+            | Self::Yahoo(_)
+            | Self::Tiingo(_)
             | Self::LocalFiles(_)
+            | Self::ControlledLocalFiles(_)
             | Self::Portfolio(_) => None,
         }
     }
@@ -487,9 +618,18 @@ pub enum ProviderAdapterActivationError {
     /// Treasury construction rejected metadata or provider profile.
     #[error(transparent)]
     Treasury(#[from] market_squawk_adapter_treasury::TreasurySourceError),
-    /// FRED construction rejected exact key, rights, or metadata authority.
+    /// FRED construction rejected the exact key, dataset, or metadata authority.
     #[error(transparent)]
     Fred(#[from] market_squawk_adapter_fred::FredSourceError),
+    /// Federal Reserve Board construction rejected exact metadata or the H.15 profile.
+    #[error(transparent)]
+    Board(#[from] market_squawk_adapter_federal_reserve::BoardSourceError),
+    /// Yahoo source/session/application composition rejected the exact operation authority.
+    #[error(transparent)]
+    Yahoo(#[from] super::yahoo::YahooProductError),
+    /// Tiingo source/quota/application composition rejected the exact operation authority.
+    #[error(transparent)]
+    Tiingo(#[from] super::tiingo::TiingoProductError),
     /// Local-file construction rejected root, manifest, metadata, or storage authority.
     #[error(transparent)]
     Files(#[from] market_squawk_adapter_files::FileAdapterError),

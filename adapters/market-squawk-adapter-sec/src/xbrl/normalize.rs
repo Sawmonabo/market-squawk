@@ -32,6 +32,12 @@ impl NormalizedDraft {
         let context = contexts
             .get(&fact.context_id)
             .ok_or(SecXbrlError::UnknownContext)?;
+        if let Some(expected_cik) = &document.expected_cik
+            && (context.entity_scheme.as_deref() != Some("http://www.sec.gov/CIK")
+                || context.entity_value.as_deref() != Some(expected_cik.as_str()))
+        {
+            return Err(SecXbrlError::EntityMismatch);
+        }
         let occurrence_id = SourceIdentifier::try_from(fact.occurrence_id.clone())?;
         let source_concept = fact.concept.source_qname().clone();
         let context_id = SourceIdentifier::try_from(fact.context_id)?;

@@ -17,13 +17,14 @@ mod current_source;
 
 use self::current_source::{INSTRUMENT_ONE, INSTRUMENT_TWO, SourceHarness, TestResult, now, route};
 use super::{
-    BoundShardIngress, COMMAND_SHARED_ALLOCATION_CHARGE, LiveIngressBindError, LiveIngressError,
-    LiveRuntimeHealthEvent, LiveRuntimeHealthKind, LiveRuntimeIngress, RegistrationCommand,
+    ActorControlCommand, BoundShardIngress, COMMAND_SHARED_ALLOCATION_CHARGE, LiveIngressBindError,
+    LiveIngressError, LiveRuntimeHealthEvent, LiveRuntimeHealthKind, LiveRuntimeIngress,
     RegistrationFailure, RegistrationGrant, RouteIngressChannels, ShardCommand,
     checked_command_retained_bytes,
 };
 use crate::authority::{RuntimeLeaseOwner, ShardLeaseOwner};
 use crate::processor::{GenerationAdmission, GenerationAuthorityRegistry};
+use crate::snapshot::SnapshotPlaneRevocation;
 use crate::{ShardId, ShardKey};
 
 #[derive(Debug)]
@@ -33,6 +34,7 @@ struct AdmissionHarness {
     receiver: mpsc::Receiver<ShardCommand>,
     health: mpsc::Receiver<LiveRuntimeHealthEvent>,
     byte_budget: Arc<Semaphore>,
+    _controls: mpsc::Receiver<ActorControlCommand>,
     _registry: GenerationAuthorityRegistry,
     _runtime_owner: RuntimeLeaseOwner,
     _shard_owner: ShardLeaseOwner,
@@ -41,7 +43,7 @@ struct AdmissionHarness {
 #[derive(Debug)]
 struct ReservationHarness {
     ingress: LiveRuntimeIngress,
-    registrations: mpsc::Receiver<RegistrationCommand>,
+    controls: mpsc::Receiver<ActorControlCommand>,
     _mailbox: mpsc::Receiver<ShardCommand>,
     _health: mpsc::Receiver<LiveRuntimeHealthEvent>,
     _runtime_owner: RuntimeLeaseOwner,
@@ -54,7 +56,7 @@ fn reservation_harness(route: ShardKey) -> TestResult<ReservationHarness> {
     let runtime = runtime_owner.lease();
     let shard_liveness = shard_owner.lease();
     let (mailbox, mailbox_receiver) = mpsc::channel(1);
-    let (registration, registrations) = mpsc::channel(1);
+    let (control, controls) = mpsc::channel(1);
     let (health, health_receiver) = mpsc::channel(1);
     let channels = RouteIngressChannels {
         shard: ShardId::new(0, 1)?,
@@ -62,7 +64,7 @@ fn reservation_harness(route: ShardKey) -> TestResult<ReservationHarness> {
         shard_liveness,
         mailbox,
         byte_budget: Arc::new(Semaphore::new(65_536)),
-        registration: registration.clone(),
+        control: control.clone(),
         registration_deadline: Duration::from_secs(1),
         maximum_message_bytes: 65_536,
         health,
@@ -74,7 +76,7 @@ fn reservation_harness(route: ShardKey) -> TestResult<ReservationHarness> {
             routes: Arc::new(routes),
             runtime,
         },
-        registrations,
+        controls,
         _mailbox: mailbox_receiver,
         _health: health_receiver,
         _runtime_owner: runtime_owner,
@@ -109,15 +111,17 @@ async fn consuming_activation_binds_once_and_cancelled_activation_releases_reser
     let dormant = harness.ingress.reserve_route(route.clone())?;
     let activation = dormant.activate(source.current_lease()?, CancellationToken::new());
     let registration = async {
-        let command = harness
-            .registrations
-            .recv()
-            .await
-            .ok_or("registration closed")?;
+        let command = harness.controls.recv().await.ok_or("registration closed")?;
+        let ActorControlCommand::Register(command) = command else {
+            return Err("unexpected non-registration control".into());
+        };
         let (registry, admission) = admission(&command.source)?;
         command
             .response
-            .send(Ok(RegistrationGrant::new(admission)))
+            .send(Ok(RegistrationGrant::new(
+                admission,
+                SnapshotPlaneRevocation::isolated_for_test(),
+            )))
             .map_err(|_| "activation receiver dropped")?;
         TestResult::Ok(registry)
     };
@@ -146,14 +150,19 @@ fn dropped_buffered_registration_response_invalidates_minted_admission() -> Test
     let source = SourceHarness::try_new("dropped-registration", 1, INSTRUMENT_ONE)?;
     let (_registry, admission) = admission(&source.current_lease()?)?;
     let probe = admission.clone();
+    let snapshot_plane = SnapshotPlaneRevocation::isolated_for_test();
     let (response, receiver) = oneshot::channel::<Result<RegistrationGrant, RegistrationFailure>>();
 
     response
-        .send(Ok(RegistrationGrant::new(admission)))
+        .send(Ok(RegistrationGrant::new(
+            admission,
+            snapshot_plane.clone(),
+        )))
         .map_err(|_| "registration receiver dropped before send")?;
     drop(receiver);
 
     assert!(probe.validate_at(now()?).is_err());
+    assert!(snapshot_plane.is_revoked_for_test());
     Ok(())
 }
 
@@ -176,6 +185,7 @@ fn harness(
     let runtime_owner = RuntimeLeaseOwner::new(1);
     let shard_owner = ShardLeaseOwner::new(1);
     let (mailbox, receiver) = mpsc::channel(mailbox_capacity);
+    let (control, controls) = mpsc::channel(1);
     let (health_sender, health) = mpsc::channel(8);
     let byte_budget = Arc::new(Semaphore::new(usize::try_from(byte_capacity)?));
     let ingress = BoundShardIngress {
@@ -185,6 +195,8 @@ fn harness(
         shard_liveness: shard_owner.lease(),
         mailbox,
         byte_budget: Arc::clone(&byte_budget),
+        control,
+        control_deadline: Duration::from_secs(1),
         maximum_message_bytes,
         admission: admission.clone(),
         health: health_sender,
@@ -195,6 +207,7 @@ fn harness(
         receiver,
         health,
         byte_budget,
+        _controls: controls,
         _registry: registry,
         _runtime_owner: runtime_owner,
         _shard_owner: shard_owner,
@@ -525,7 +538,7 @@ fn runtime_shard_and_source_validation_fail_closed_in_order() -> TestResult {
 }
 
 #[test]
-fn health_rebind_reuses_generation_while_rollover_replaces_it() -> TestResult {
+fn health_rebind_and_rollover_replace_generation_without_cross_invalidation() -> TestResult {
     let mut source = SourceHarness::try_new("source-a", 1, INSTRUMENT_ONE)?;
     let old_lease = source.current_lease()?;
     let mut registry = GenerationAuthorityRegistry::try_new(2)?;
@@ -534,10 +547,10 @@ fn health_rebind_reuses_generation_while_rollover_replaces_it() -> TestResult {
     source.refresh_health()?;
     let refreshed_lease = source.current_lease()?;
     let refreshed = registry.bind_current(&refreshed_lease, now()?)?;
-    assert!(old.validate_at(now()?).is_err());
+    old.validate_at(now()?)?;
     refreshed.validate_at(now()?)?;
     old.invalidate_on_admission_failure();
-    assert!(refreshed.validate_at(now()?).is_err());
+    refreshed.validate_at(now()?)?;
 
     let source = source.rollover(2)?;
     let successor_lease = source.current_lease()?;

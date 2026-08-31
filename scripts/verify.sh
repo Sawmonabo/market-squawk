@@ -87,7 +87,13 @@ run_policy() {
   python3 scripts/check_workspace_boundaries.py
   python3 scripts/check_generated_artifacts.py
   cargo deny check
-  # The exact exceptions, upstream constraints, and refresh gates are documented in deny.toml.
+  resolved_tree="$(cargo tree --workspace --all-features --target all --locked)"
+  if rg -q 'rkyv v0\.[0-7]\.' <<<"$resolved_tree"; then
+    printf 'RUSTSEC-2026-0235 exception is invalid: vulnerable rkyv is active\n' >&2
+    return 1
+  fi
+  # Maintenance exceptions are documented in deny.toml. The lockfile-only rkyv exception and its
+  # fail-closed reachability gate are documented in the usable-release dependency research.
   cargo audit --deny warnings \
     --ignore RUSTSEC-2024-0370 \
     --ignore RUSTSEC-2024-0411 \
@@ -103,7 +109,8 @@ run_policy() {
     --ignore RUSTSEC-2025-0080 \
     --ignore RUSTSEC-2025-0081 \
     --ignore RUSTSEC-2025-0098 \
-    --ignore RUSTSEC-2025-0100
+    --ignore RUSTSEC-2025-0100 \
+    --ignore RUSTSEC-2026-0235
   gitleaks dir --redact --no-banner .
   gitleaks git --redact --no-banner
 }

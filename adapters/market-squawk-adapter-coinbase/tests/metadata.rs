@@ -3,7 +3,9 @@ mod common;
 use std::collections::BTreeSet;
 
 use common::{TestResult, config, config_with_channels};
-use market_squawk_adapter_coinbase::{COINBASE_EXCHANGE_ENDPOINT, CoinbaseChannel};
+use market_squawk_adapter_coinbase::{
+    COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT, CoinbaseChannel,
+};
 use market_squawk_domain::{ChecksumCapability, CoverageDelay, DataQuality, SequenceCapability};
 use market_squawk_sources::AuthorizationMode;
 
@@ -12,7 +14,10 @@ fn metadata_is_single_venue_realtime_partial_and_never_execution_quality() -> Te
     let config = config()?;
     let metadata = config.metadata();
 
-    assert_eq!(config.endpoint(), COINBASE_EXCHANGE_ENDPOINT);
+    assert_eq!(
+        config.endpoint(),
+        COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT
+    );
     assert_eq!(
         metadata.authorization().mode(),
         AuthorizationMode::PublicInterface
@@ -32,7 +37,7 @@ fn metadata_is_single_venue_realtime_partial_and_never_execution_quality() -> Te
     assert!(
         metadata
             .network_policy()
-            .authorize(COINBASE_EXCHANGE_ENDPOINT)
+            .authorize(COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT)
             .is_ok()
     );
     assert!(
@@ -44,7 +49,7 @@ fn metadata_is_single_venue_realtime_partial_and_never_execution_quality() -> Te
     assert!(
         metadata
             .network_policy()
-            .authorize("wss://advanced-trade-ws.coinbase.com")
+            .authorize("wss://ws-feed.exchange.coinbase.com")
             .is_err()
     );
 
@@ -53,8 +58,8 @@ fn metadata_is_single_venue_realtime_partial_and_never_execution_quality() -> Te
         channels,
         BTreeSet::from([
             CoinbaseChannel::Level2,
-            CoinbaseChannel::Matches,
-            CoinbaseChannel::Heartbeat,
+            CoinbaseChannel::MarketTrades,
+            CoinbaseChannel::Heartbeats,
         ])
     );
     Ok(())
@@ -63,14 +68,14 @@ fn metadata_is_single_venue_realtime_partial_and_never_execution_quality() -> Te
 #[test]
 fn configuration_rejects_duplicate_or_incomplete_subscriptions() -> TestResult {
     assert!(
-        config_with_channels(vec![CoinbaseChannel::Level2, CoinbaseChannel::Heartbeat,]).is_err()
+        config_with_channels(vec![CoinbaseChannel::Level2, CoinbaseChannel::Heartbeats,]).is_err()
     );
     assert!(
         config_with_channels(vec![
             CoinbaseChannel::Level2,
-            CoinbaseChannel::Matches,
-            CoinbaseChannel::Heartbeat,
-            CoinbaseChannel::Heartbeat,
+            CoinbaseChannel::MarketTrades,
+            CoinbaseChannel::Heartbeats,
+            CoinbaseChannel::Heartbeats,
         ],)
         .is_err()
     );

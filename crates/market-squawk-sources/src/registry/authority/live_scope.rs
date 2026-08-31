@@ -156,7 +156,7 @@ impl ValidatedLiveScope {
     fn into_current_observation(
         self,
         observation: crate::ProviderNormalizedObservation,
-        frame_evidence: CurrentFrameEvidence,
+        evidence: CurrentObservationEvidence,
     ) -> Result<CurrentProviderObservation, RegistryError> {
         let crate::SourceProtocolProfile::Live(protocol) = self.protocol else {
             return Err(RegistryError::DecoderProfileMismatch);
@@ -189,7 +189,7 @@ impl ValidatedLiveScope {
         };
         Ok(CurrentProviderObservation {
             key,
-            frame_evidence,
+            evidence,
             observation,
             policy: CurrentLivePolicy {
                 stream_key,

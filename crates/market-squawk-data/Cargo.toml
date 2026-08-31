@@ -22,6 +22,7 @@ chrono = { workspace = true }
 datafusion = { workspace = true }
 futures-util = { workspace = true }
 libc = { workspace = true }
+market-squawk-adapter-alpaca = { workspace = true }
 market-squawk-domain = { workspace = true }
 market-squawk-platform = { workspace = true }
 market-squawk-sources = { workspace = true }

@@ -72,6 +72,22 @@ fn durable_workflow_recovers_exact_state_and_blocks_level_one_override() -> Test
             assert_eq!(pair[1].previous_event_id(), Some(pair[0].id()));
             assert!(pair[1].occurred_at() >= pair[0].occurred_at());
         }
+        let expected_ids = audit.iter().map(|event| event.id()).collect::<Vec<_>>();
+        let mut cursor = None;
+        let mut paged_ids = Vec::new();
+        loop {
+            let page = service.audit_page(cursor, 2)?;
+            assert_eq!(page.total_count(), expected_ids.len());
+            if let (Some(previous), Some(first)) = (cursor, page.events().first()) {
+                assert_eq!(first.previous_event_id(), Some(previous.event_id()));
+            }
+            paged_ids.extend(page.events().iter().map(|event| event.id()));
+            let Some(next) = page.next_cursor() else {
+                break;
+            };
+            cursor = Some(next);
+        }
+        assert_eq!(paged_ids, expected_ids);
         (
             proposal.decision().id(),
             approval.id(),

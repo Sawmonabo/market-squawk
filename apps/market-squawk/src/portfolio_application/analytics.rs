@@ -3,12 +3,13 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
-use market_squawk_adapter_portfolio::TransactionKind;
+use market_squawk_adapter_portfolio::{
+    BasisResolution, ReconciliationField, ReconciliationTolerance, TransactionKind,
+};
 use market_squawk_analytics::{
-    Annualization, ExactDecimalScale, ExactRate, MissingValuePolicy, MonetaryBasis, MonetaryValue,
-    PortfolioAllocation, Quantile, ReturnSeries, ScenarioShock, ShockComposition, StatisticalInput,
-    StatisticalScale, StatisticalUnit, VarianceConvention, discrete_expected_shortfall,
-    historical_var, portfolio_exposure, scenario_impact, volatility,
+    ExactDecimalScale, ExactRate, MonetaryBasis, MonetaryValue, PortfolioAllocation, Quantile,
+    ScenarioShock, ShockComposition, StatisticalInput, StatisticalScale, StatisticalUnit,
+    discrete_expected_shortfall, historical_var, portfolio_exposure, scenario_impact,
 };
 use market_squawk_domain::{Currency, Money, SourceIdentifier};
 use market_squawk_portfolio::{
@@ -24,7 +25,10 @@ use serde_json::{Map, Number, Value, json};
 use super::PortfolioApplicationServiceError;
 use super::import::hex;
 use super::model::{PortfolioReadImage, PublishedRevision};
-use super::read::{ReadScope, report_result};
+use super::read::{ReadScope, product_report_result, report_result};
+
+/// Three 5% tail observations are the minimum retained evidence for the historical tail measures.
+const MINIMUM_HISTORICAL_RISK_RETURNS: usize = 60;
 
 pub(super) fn performance(
     image: &PortfolioReadImage,
@@ -34,6 +38,10 @@ pub(super) fn performance(
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
     let history = admitted_history(image, revision, scope)?;
     let mut output = base_report(revision, "modified_dietz_v1");
+    output.insert(
+        "accountingEvidence".to_owned(),
+        accounting_evidence(revision)?,
+    );
     output.insert(
         "currentValue".to_owned(),
         money_value(total_value(revision, scope)?),
@@ -142,88 +150,129 @@ pub(super) fn risk(
     context: &RequestContext,
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
     let history = admitted_history(image, revision, scope)?;
+    let admitted_comparisons = history.len().saturating_sub(1);
     let periods = performance_periods(&history, scope)?;
+    let rejected_comparisons = admitted_comparisons.saturating_sub(periods.len());
     let returns = historical_returns(&periods)?;
-    let mut output = base_report(revision, "task12_historical_risk_v1");
-    output.insert("confidence".to_owned(), number(0.95)?);
-    output.insert("scenario".to_owned(), standard_stress(revision, scope)?);
-    if returns.is_empty() {
-        output.insert(
-            "historyStatus".to_owned(),
-            Value::String("insufficient_history".to_owned()),
-        );
-        return report_result(Value::Object(output), revision, scope, context);
-    }
-    let losses = returns
-        .iter()
-        .map(|value| {
-            StatisticalInput::try_new(
-                (-value).max(0.0),
-                StatisticalUnit::Return,
-                StatisticalScale::Unit,
-            )
-            .map_err(|_| PortfolioApplicationServiceError::Analytics)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let confidence =
-        Quantile::try_new(0.95).map_err(|_| PortfolioApplicationServiceError::Analytics)?;
-    let value_at_risk = historical_var(&losses, confidence)
-        .map_err(|_| PortfolioApplicationServiceError::Analytics)?;
-    let expected_shortfall = discrete_expected_shortfall(&losses, confidence)
-        .map_err(|_| PortfolioApplicationServiceError::Analytics)?;
-    output.insert("valueAtRisk".to_owned(), number(value_at_risk.value())?);
-    output.insert(
-        "expectedShortfall".to_owned(),
-        number(expected_shortfall.value())?,
-    );
-    output.insert(
-        "observations".to_owned(),
-        Value::from(value_at_risk.observations()),
-    );
-    if returns.len() >= 2 {
-        let series = ReturnSeries::try_new(
-            returns
-                .iter()
-                .map(|value| {
-                    StatisticalInput::try_new(
-                        *value,
-                        StatisticalUnit::Return,
-                        StatisticalScale::Unit,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| PortfolioApplicationServiceError::Analytics)?,
-            Annualization::PeriodsPerYear(
-                NonZeroU32::new(252).ok_or(PortfolioApplicationServiceError::Analytics)?,
+    let available_at = revision
+        .available_at
+        .ok_or(PortfolioApplicationServiceError::CorruptPublication)?;
+    let sufficient_tail_history = returns.len() >= MINIMUM_HISTORICAL_RISK_RETURNS;
+    let (value_at_risk, expected_shortfall) = if !sufficient_tail_history {
+        (None, None)
+    } else {
+        let losses = returns
+            .iter()
+            .map(|value| {
+                StatisticalInput::try_new(
+                    (-value).max(0.0),
+                    StatisticalUnit::Return,
+                    StatisticalScale::Unit,
+                )
+                .map_err(|_| PortfolioApplicationServiceError::Analytics)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let confidence =
+            Quantile::try_new(0.95).map_err(|_| PortfolioApplicationServiceError::Analytics)?;
+        (
+            Some(
+                historical_var(&losses, confidence)
+                    .map_err(|_| PortfolioApplicationServiceError::Analytics)?
+                    .value(),
+            ),
+            Some(
+                discrete_expected_shortfall(&losses, confidence)
+                    .map_err(|_| PortfolioApplicationServiceError::Analytics)?
+                    .value(),
             ),
         )
-        .map_err(|_| PortfolioApplicationServiceError::Analytics)?;
-        match volatility(
-            &series,
-            VarianceConvention::Sample,
-            MissingValuePolicy::Reject,
-        ) {
-            Ok(value) => {
-                output.insert("annualizedVolatility".to_owned(), number(value.value())?);
-            }
-            Err(_) => {
-                output.insert(
-                    "volatilityStatus".to_owned(),
-                    Value::String("zero_variance".to_owned()),
-                );
-            }
-        }
+    };
+    // Portfolio revisions arrive on no admitted fixed cadence. Annualizing each update as one
+    // trading day would invent a period frequency, so the ordinary product reports unavailable.
+    let annualized_volatility = None;
+    let measure = |label: &'static str,
+                   value: Option<f64>,
+                   status: &'static str,
+                   explanation: &'static str|
+     -> Result<Value, PortfolioApplicationServiceError> {
+        Ok(json!({
+            "label": label,
+            "value": value.map(super::product::percentage).transpose()?,
+            "status": if value.is_some() { "available" } else { status },
+            "explanation": explanation,
+        }))
+    };
+    let coverage_state = if returns.is_empty() {
+        "unavailable"
+    } else if !revision.discrepancies.is_empty() || rejected_comparisons > 0 {
+        "partial"
     } else {
-        output.insert(
-            "volatilityStatus".to_owned(),
-            Value::String("insufficient_history".to_owned()),
-        );
-    }
-    output.insert(
-        "trackingErrorStatus".to_owned(),
-        Value::String("benchmark_not_supplied".to_owned()),
-    );
-    report_result(Value::Object(output), revision, scope, context)
+        "complete"
+    };
+    let coverage_explanation = match coverage_state {
+        "complete" => format!(
+            "All {admitted_comparisons} admitted portfolio comparisons in this period were used."
+        ),
+        "partial" => format!(
+            "Used {} of {admitted_comparisons} admitted portfolio comparisons; {rejected_comparisons} could not be compared and {} current data issues need review.",
+            periods.len(),
+            revision.discrepancies.len(),
+        ),
+        _ => "At least two comparable portfolio observations are required.".to_owned(),
+    };
+    let period_start = periods
+        .first()
+        .map_or(revision.effective_at, |period| period.starts_at());
+    let stress = standard_stress(revision, scope)?;
+    let stress_impact = stress.get("impact").cloned().unwrap_or(Value::Null);
+    let stress_available = !stress_impact.is_null();
+    let output = json!({
+        "accountName": super::product::account_display_name(image, revision.account.account_id())?,
+        "asOf": super::product::timestamp(revision.effective_at),
+        "availableAt": super::product::timestamp(available_at),
+        "horizon": "One portfolio update",
+        "coverage": {
+            "state": coverage_state,
+            "observations": returns.len(),
+            "period": format!("{} through {}", super::product::timestamp(period_start), super::product::timestamp(revision.effective_at)),
+            "explanation": coverage_explanation,
+        },
+        "measures": [
+            measure("Value at risk", value_at_risk, "insufficient_history", "A positive percentage is the estimated one-update loss threshold at 95% confidence; at least 60 comparable returns are required.")?,
+            measure("Expected shortfall", expected_shortfall, "insufficient_history", "A positive percentage is the average loss beyond the 95% threshold; at least 60 comparable returns are required.")?,
+            measure("Annualized volatility", annualized_volatility, if returns.is_empty() { "insufficient_history" } else { "unavailable" }, "Annualized volatility is unavailable because portfolio updates do not have an admitted fixed schedule.")?,
+        ],
+        "stress": {
+            "label": "Broad market decline of 10%",
+            "impact": stress_impact,
+            "status": if stress_available { "available" } else if revision.holdings.is_empty() { "incomplete" } else { "unavailable" },
+            "explanation": if stress_available { "Negative money is an estimated portfolio loss under the stated shock." } else { "The current holdings do not support this stress estimate." },
+            "assumptions": ["Every included holding falls 10% at the same time.", "Cash is unchanged and no trades, taxes, or fees are applied."],
+        },
+        "recommendation": {
+            "action": "abstain",
+            "horizon": "Until recommendation evidence is available",
+            "summary": "No portfolio action is recommended from risk statistics alone.",
+            "ranges": [],
+            "reasons": ["Risk measures describe possible loss and variability; they do not establish whether an investment should be bought or sold."],
+            "risks": ["Acting on risk measures without valuation, forecast, and recommendation evidence could produce an unsuitable trade."],
+            "assumptions": ["This guidance uses only the retained portfolio history and the stated stress assumptions."],
+            "invalidators": ["A new evidence-backed portfolio recommendation replaces this abstention."],
+            "validity": {
+                "state": "unavailable",
+                "explanation": "No evidence-backed portfolio recommendation or review time is available.",
+            },
+            "uncertainty": {
+                "level": "unavailable",
+                "explanation": "The forecast, valuation, and recommendation evidence needed for portfolio guidance is unavailable.",
+                "outOfSampleEvidence": "unavailable",
+                "calibration": "unavailable",
+                "tradingCosts": "unavailable",
+                "pointInTimeInputs": if revision.discrepancies.is_empty() { "supported" } else { "partial" },
+            },
+        },
+    });
+    product_report_result(output, revision, scope, context)
 }
 
 fn admitted_history<'a>(
@@ -484,6 +533,120 @@ fn base_report(revision: &PublishedRevision, policy: &str) -> Map<String, Value>
         }),
     );
     output
+}
+
+/// Returns only source-backed accounting aggregates available to the installed portfolio reader.
+///
+/// Raw holdings are snapshot evidence, while normalized trade and income records still require
+/// the explicit lifecycle/subtype interpretation authority before they can become a realized-gain
+/// ledger. This result retains exact source totals and explains that boundary instead of using the
+/// previous synthetic cash-only replay as accounting evidence.
+fn accounting_evidence(
+    revision: &PublishedRevision,
+) -> Result<Value, PortfolioApplicationServiceError> {
+    let currency = revision.account.currency();
+    let reported_market_value = revision.holdings.iter().try_fold(
+        Money::new(Decimal::ZERO, currency),
+        |total, holding| {
+            total
+                .checked_add(holding.market_value())
+                .map_err(|_| PortfolioApplicationServiceError::Analytics)
+        },
+    )?;
+    let resolved_unrealized = revision.holdings.iter().try_fold(
+        Some(Money::new(Decimal::ZERO, currency)),
+        |total, holding| match (total, holding.basis()) {
+            (Some(total), BasisResolution::Resolved { observation }) => holding
+                .market_value()
+                .checked_sub(observation.amount())
+                .and_then(|gain| total.checked_add(gain))
+                .map(Some)
+                .map_err(|_| PortfolioApplicationServiceError::Analytics),
+            _ => Ok(None),
+        },
+    )?;
+    let source_income = source_transaction_total(revision, TransactionKind::Income)?;
+    let source_fees = source_transaction_total(revision, TransactionKind::Fee)?;
+    let reconciliation = revision
+        .discrepancies
+        .iter()
+        .map(|discrepancy| {
+            let ReconciliationTolerance::Absolute { amount } = discrepancy.tolerance_policy();
+            json!({
+                "field": reconciliation_field(discrepancy.field()),
+                "supplied": money_value(discrepancy.supplied()),
+                "calculated": money_value(discrepancy.calculated()),
+                "currency": discrepancy.currency().as_str(),
+                "tolerance": {
+                    "kind": "absolute",
+                    "amount": money_value(amount)
+                },
+                "sourceReference": discrepancy.source_reference().as_str()
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "cash": {
+            "amount": money_value(revision.account.cash_balance()),
+            "observedAtUnixNanos": revision.account.as_of().unix_nanos().to_string(),
+            "sourceReference": revision.account.source_reference().as_str(),
+            "status": "source_reported_snapshot"
+        },
+        "reportedMarketValue": money_value(reported_market_value),
+        "unrealizedGain": resolved_unrealized.map_or_else(
+            || json!({
+                "status": "not_calculable_incomplete_source_basis",
+                "reason": "one_or_more_holdings_has_missing_or_ambiguous_basis"
+            }),
+            |amount| json!({
+                "status": "calculated_from_source_reported_mark_and_resolved_basis",
+                "amount": money_value(amount)
+            })
+        ),
+        "realizedGain": {
+            "status": "requires_committed_trade_lifecycle_interpretation",
+            "reason": "signed_trade_quantity_does_not_distinguish_sell_from_short_or_buy_from_cover"
+        },
+        "income": {
+            "status": "source_classified_pending_explicit_subtype",
+            "amount": money_value(source_income),
+            "reason": "generic_income_does_not_distinguish_dividend_interest_or_withholding"
+        },
+        "fees": {
+            "status": "source_classified",
+            "amount": money_value(source_fees)
+        },
+        "reconciliation": {
+            "status": if revision.discrepancies.is_empty() { "no_retained_discrepancies" } else { "discrepancies_require_review" },
+            "discrepancies": reconciliation
+        }
+    }))
+}
+
+fn source_transaction_total(
+    revision: &PublishedRevision,
+    kind: TransactionKind,
+) -> Result<Money, PortfolioApplicationServiceError> {
+    revision
+        .transactions
+        .iter()
+        .filter(|transaction| transaction.kind() == kind)
+        .try_fold(
+            Money::new(Decimal::ZERO, revision.account.currency()),
+            |total, transaction| {
+                total
+                    .checked_add(transaction.amount())
+                    .map_err(|_| PortfolioApplicationServiceError::Analytics)
+            },
+        )
+}
+
+const fn reconciliation_field(field: ReconciliationField) -> &'static str {
+    match field {
+        ReconciliationField::Cash => "cash",
+        ReconciliationField::MarketValue => "market_value",
+        ReconciliationField::CostBasis => "cost_basis",
+    }
 }
 
 fn money_value(value: Money) -> Value {

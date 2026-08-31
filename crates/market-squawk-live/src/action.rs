@@ -1,8 +1,10 @@
 //! Actor-scoped live-action contracts with no caller-mintable authority surface.
 
 use std::marker::PhantomData;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use market_squawk_analytics::{LiveFeatureView, RequiredLiveFeature};
 use market_squawk_domain::{
@@ -11,12 +13,17 @@ use market_squawk_domain::{
 };
 use thiserror::Error;
 
-use crate::authority::{AppliedObservationAuthority, SystemTrustedClock};
+use crate::authority::{AppliedObservationAuthority, RuntimeLease, SystemTrustedClock};
 use crate::processor::InstrumentLiveProcessor;
 use crate::{AuthorityError, ConsumedLiveAuthority, LiveExecutionCapability, ShardKey};
 
 /// Hard maximum capabilities one route hook may request for one committed observation.
 pub const MAX_ACTION_AUTHORITY_ISSUES_PER_OBSERVATION: usize = 64;
+
+const PREPARED_ACTION_HOOK_GENERATION: u64 = 0;
+const RETIRED_ACTION_HOOK_GENERATION: u64 = u64::MAX;
+/// Shared allocation and allocator slack conservatively charged to every route in a dynamic group.
+const ACTION_HOOK_ACTIVATION_ALLOCATION_BYTES: usize = 256;
 
 /// Validated closed authority-issue bound for one route hook invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +63,7 @@ pub struct RouteActionHook {
     required_features: Box<[RequiredLiveFeature]>,
     issue_limit: ActionAuthorityIssueLimit,
     declared_retained_bytes: usize,
+    activation: RouteActionActivation,
 }
 
 impl RouteActionHook {
@@ -92,6 +100,7 @@ impl RouteActionHook {
             required_features: required_features.into_boxed_slice(),
             issue_limit,
             declared_retained_bytes,
+            activation: RouteActionActivation::Startup,
         })
     }
 
@@ -142,6 +151,31 @@ impl RouteActionHook {
     pub(crate) fn hook_mut(&mut self) -> &mut dyn LiveActionHook {
         self.hook.as_mut()
     }
+
+    pub(crate) fn into_prepared_dynamic(mut self, activation: ActionHookActivationLease) -> Self {
+        self.activation = RouteActionActivation::Dynamic(activation);
+        self
+    }
+
+    pub(crate) fn action_enabled(&self) -> bool {
+        match &self.activation {
+            RouteActionActivation::Startup => true,
+            RouteActionActivation::Dynamic(activation) => activation.is_active(),
+        }
+    }
+
+    pub(crate) fn belongs_to_dynamic_group(&self, activation: &ActionHookActivationLease) -> bool {
+        matches!(
+            &self.activation,
+            RouteActionActivation::Dynamic(current) if current.same_group(activation)
+        )
+    }
+}
+
+#[derive(Debug)]
+enum RouteActionActivation {
+    Startup,
+    Dynamic(ActionHookActivationLease),
 }
 
 /// Route hook construction or startup accounting failure.
@@ -183,7 +217,393 @@ fn route_action_retained_bytes(
             )
         })
         .and_then(|value| value.checked_add(hook_retained_bytes))
+        .and_then(|value| value.checked_add(ACTION_HOOK_ACTIVATION_ALLOCATION_BYTES))
         .ok_or(RouteActionHookError::RetainedSizeOverflow)
+}
+
+/// Exact process-local generation assigned to one complete dynamically installed hook group.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LiveActionHookGeneration(NonZeroU64);
+
+impl LiveActionHookGeneration {
+    pub(crate) const fn new(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the nonzero process-local generation value.
+    pub const fn get(self) -> NonZeroU64 {
+        self.0
+    }
+}
+
+#[derive(Debug)]
+struct ActionHookActivationState {
+    runtime_incarnation: NonZeroU64,
+    generation: LiveActionHookGeneration,
+    active_generation: AtomicU64,
+    runtime: RuntimeLease,
+}
+
+/// Internal validation-only view shared by every actor-owned route in one prepared group.
+#[derive(Debug)]
+pub(crate) struct ActionHookActivationLease {
+    state: Arc<ActionHookActivationState>,
+}
+
+impl Clone for ActionHookActivationLease {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl ActionHookActivationLease {
+    pub(crate) fn prepare(
+        runtime_incarnation: NonZeroU64,
+        generation: LiveActionHookGeneration,
+        runtime: RuntimeLease,
+    ) -> (Self, PreparedLiveActionHookGroup) {
+        let activation = Self {
+            state: Arc::new(ActionHookActivationState {
+                runtime_incarnation,
+                generation,
+                active_generation: AtomicU64::new(PREPARED_ACTION_HOOK_GENERATION),
+                runtime,
+            }),
+        };
+        let prepared = PreparedLiveActionHookGroup {
+            activation: activation.clone(),
+        };
+        (activation, prepared)
+    }
+
+    pub(crate) fn validate_prepared(
+        &self,
+        runtime_incarnation: NonZeroU64,
+        generation: LiveActionHookGeneration,
+    ) -> Result<(), LiveActionHookActivationError> {
+        self.validate_identity(runtime_incarnation, generation)?;
+        match self.state.active_generation.load(Ordering::Acquire) {
+            PREPARED_ACTION_HOOK_GENERATION => Ok(()),
+            RETIRED_ACTION_HOOK_GENERATION => Err(LiveActionHookActivationError::Retired),
+            _ => Err(LiveActionHookActivationError::AlreadyActive),
+        }
+    }
+
+    pub(crate) fn validate_disabled(
+        &self,
+        runtime_incarnation: NonZeroU64,
+        generation: LiveActionHookGeneration,
+    ) -> Result<(), LiveActionHookActivationError> {
+        self.validate_identity(runtime_incarnation, generation)?;
+        match self.state.active_generation.load(Ordering::Acquire) {
+            PREPARED_ACTION_HOOK_GENERATION => Ok(()),
+            RETIRED_ACTION_HOOK_GENERATION => Err(LiveActionHookActivationError::Retired),
+            _ => Err(LiveActionHookActivationError::StillActive),
+        }
+    }
+
+    pub(crate) fn disable(&self) {
+        let current = self.state.active_generation.load(Ordering::Acquire);
+        if current == self.state.generation.get().get() {
+            let _ = self.state.active_generation.compare_exchange(
+                current,
+                PREPARED_ACTION_HOOK_GENERATION,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+
+    pub(crate) fn retire(&self) -> Result<(), LiveActionHookActivationError> {
+        self.state
+            .active_generation
+            .compare_exchange(
+                PREPARED_ACTION_HOOK_GENERATION,
+                RETIRED_ACTION_HOOK_GENERATION,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|observed| match observed {
+                RETIRED_ACTION_HOOK_GENERATION => LiveActionHookActivationError::Retired,
+                _ => LiveActionHookActivationError::StillActive,
+            })
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.state.active_generation.load(Ordering::Acquire) == self.state.generation.get().get()
+            && self.state.runtime.validate().is_ok()
+    }
+
+    pub(crate) fn same_group(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+            && self.state.runtime_incarnation == other.state.runtime_incarnation
+            && self.state.generation == other.state.generation
+    }
+
+    fn activate(&self) -> Result<(), LiveActionHookActivationError> {
+        self.state
+            .runtime
+            .validate()
+            .map_err(|_| LiveActionHookActivationError::RuntimeClosed)?;
+        self.state
+            .active_generation
+            .compare_exchange(
+                PREPARED_ACTION_HOOK_GENERATION,
+                self.state.generation.get().get(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|observed| match observed {
+                RETIRED_ACTION_HOOK_GENERATION => LiveActionHookActivationError::Retired,
+                _ => LiveActionHookActivationError::AlreadyActive,
+            })
+    }
+
+    fn validate_identity(
+        &self,
+        runtime_incarnation: NonZeroU64,
+        generation: LiveActionHookGeneration,
+    ) -> Result<(), LiveActionHookActivationError> {
+        if self.state.runtime_incarnation != runtime_incarnation {
+            return Err(LiveActionHookActivationError::RuntimeMismatch);
+        }
+        if self.state.generation != generation {
+            return Err(LiveActionHookActivationError::GenerationMismatch);
+        }
+        self.state
+            .runtime
+            .validate()
+            .map_err(|_| LiveActionHookActivationError::RuntimeClosed)
+    }
+}
+
+/// Non-cloneable owner token returned only after every route acknowledged disabled installation.
+#[derive(Debug)]
+pub struct PreparedLiveActionHookGroup {
+    activation: ActionHookActivationLease,
+}
+
+impl PreparedLiveActionHookGroup {
+    /// Atomically enables the exact generation for every installed route in this group.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the runtime is closed or the generation was activated or reaped already.
+    pub fn activate(self) -> Result<ActiveLiveActionHookGroup, LiveActionHookActivationError> {
+        if let Err(error) = self.activation.activate() {
+            self.activation.disable();
+            return Err(error);
+        }
+        Ok(ActiveLiveActionHookGroup {
+            activation: self.activation,
+        })
+    }
+
+    /// Returns the exact runtime incarnation bound to this non-transferable gate.
+    pub fn runtime_incarnation(&self) -> NonZeroU64 {
+        self.activation.state.runtime_incarnation
+    }
+
+    /// Returns the exact prepared group generation.
+    pub fn generation(&self) -> LiveActionHookGeneration {
+        self.activation.state.generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activation_for_test(&self) -> ActionHookActivationLease {
+        self.activation.clone()
+    }
+}
+
+/// Non-cloneable active owner token whose drop path always disables the complete hook group.
+#[derive(Debug)]
+pub struct ActiveLiveActionHookGroup {
+    activation: ActionHookActivationLease,
+}
+
+impl ActiveLiveActionHookGroup {
+    /// Synchronously disables the shared generation before hook removal or runtime shutdown.
+    pub fn disable(self) -> DisabledLiveActionHookGroup {
+        self.activation.disable();
+        DisabledLiveActionHookGroup {
+            activation: self.activation.clone(),
+        }
+    }
+
+    /// Returns the exact runtime incarnation bound to this active gate.
+    pub fn runtime_incarnation(&self) -> NonZeroU64 {
+        self.activation.state.runtime_incarnation
+    }
+
+    /// Returns the exact active group generation.
+    pub fn generation(&self) -> LiveActionHookGeneration {
+        self.activation.state.generation
+    }
+}
+
+impl Drop for ActiveLiveActionHookGroup {
+    fn drop(&mut self) {
+        self.activation.disable();
+    }
+}
+
+/// Non-cloneable diagnostic receipt proving the caller synchronously disabled its exact group.
+#[derive(Debug)]
+pub struct DisabledLiveActionHookGroup {
+    activation: ActionHookActivationLease,
+}
+
+impl DisabledLiveActionHookGroup {
+    /// Returns the exact runtime incarnation formerly bound to this disabled gate.
+    pub fn runtime_incarnation(&self) -> NonZeroU64 {
+        self.activation.state.runtime_incarnation
+    }
+
+    /// Returns the exact disabled group generation.
+    pub fn generation(&self) -> LiveActionHookGeneration {
+        self.activation.state.generation
+    }
+}
+
+/// Dynamic hook-group activation failure. No variant grants or restores execution authority.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum LiveActionHookActivationError {
+    /// The exact runtime incarnation has closed.
+    #[error("live runtime incarnation is closed")]
+    RuntimeClosed,
+    /// The gate belongs to a different runtime incarnation.
+    #[error("live action hook gate belongs to a different runtime incarnation")]
+    RuntimeMismatch,
+    /// The gate belongs to a different hook generation.
+    #[error("live action hook gate belongs to a different generation")]
+    GenerationMismatch,
+    /// This exact generation was already activated.
+    #[error("live action hook generation is already active")]
+    AlreadyActive,
+    /// Removal requires synchronous group disablement first.
+    #[error("live action hook generation is still active")]
+    StillActive,
+    /// The exact generation was removed and cannot be reactivated.
+    #[error("live action hook generation is retired")]
+    Retired,
+}
+
+/// Exact acknowledgement receipt for one actor-owned dynamic hook-group cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveActionHookReapReceipt {
+    runtime_incarnation: NonZeroU64,
+    generation: LiveActionHookGeneration,
+    removed_hooks: usize,
+}
+
+impl LiveActionHookReapReceipt {
+    pub(crate) const fn new(
+        runtime_incarnation: NonZeroU64,
+        generation: LiveActionHookGeneration,
+        removed_hooks: usize,
+    ) -> Self {
+        Self {
+            runtime_incarnation,
+            generation,
+            removed_hooks,
+        }
+    }
+
+    /// Returns the runtime incarnation that owned every removed hook.
+    pub const fn runtime_incarnation(self) -> NonZeroU64 {
+        self.runtime_incarnation
+    }
+
+    /// Returns the exact retired hook generation.
+    pub const fn generation(self) -> LiveActionHookGeneration {
+        self.generation
+    }
+
+    /// Returns the number of route-owned hooks synchronously dropped before acknowledgement.
+    pub const fn removed_hooks(self) -> usize {
+        self.removed_hooks
+    }
+}
+
+/// Closed actor-rejection reasons for dynamic hook-group control.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveActionControlRejection {
+    RuntimeMismatch,
+    InvalidActivation,
+    EmptyGroup,
+    DuplicateRoute,
+    UnknownRoute,
+    HookAlreadyInstalled,
+    PartialGroup,
+    InvalidHook,
+}
+
+/// Bounded dynamic hook-group preparation and cleanup failure.
+#[derive(Debug, Error)]
+pub enum LiveActionControlError {
+    #[error("startup action hooks already own every configured route")]
+    StartupHooksInstalled,
+    #[error("one dynamic action hook group is already prepared")]
+    GroupAlreadyPrepared,
+    #[error("dynamic action hook group must contain at least one route")]
+    EmptyGroup,
+    #[error("dynamic action hook group contains duplicate route {route:?}")]
+    DuplicateRoute { route: ShardKey },
+    #[error("dynamic action hook group contains unknown route {route:?}")]
+    UnknownRoute { route: ShardKey },
+    #[error("dynamic route action hook {route:?} failed admission")]
+    InvalidHook {
+        route: ShardKey,
+        #[source]
+        error: RouteActionHookError,
+    },
+    #[error("runtime incarnation is closed")]
+    RuntimeClosed,
+    #[error("route shard {shard} is closed")]
+    ShardClosed { shard: crate::ShardId },
+    #[error("dynamic action hook control was cancelled")]
+    Cancelled,
+    #[error("dynamic action hook control exceeded its bounded deadline")]
+    DeadlineExceeded,
+    #[error("dynamic action hook control deadline cannot be represented")]
+    DeadlineRange,
+    #[error("dynamic action hook control channel is closed")]
+    ControlClosed,
+    #[error("dynamic action hook control bounded allocation failed")]
+    Allocation,
+    #[error("dynamic action hook retained-byte accounting overflowed")]
+    RetainedSizeOverflow,
+    #[error("dynamic action hook generation identity exhausted")]
+    GenerationExhausted,
+    #[error("dynamic action hook control violated deterministic shard ownership")]
+    ShardInvariant,
+    #[error("actor {shard} rejected dynamic action hook control: {reason:?}")]
+    ActorRejected {
+        shard: crate::ShardId,
+        reason: LiveActionControlRejection,
+    },
+    #[error("actor {shard} acknowledged {observed} hooks but exact control required {expected}")]
+    AcknowledgementMismatch {
+        shard: crate::ShardId,
+        expected: usize,
+        observed: usize,
+    },
+    #[error("dynamic action hook preparation failed and bounded rollback remains incomplete")]
+    RollbackIncomplete {
+        generation: LiveActionHookGeneration,
+    },
+    #[error("dynamic action hook group state was lost before complete installation")]
+    GroupStateLost,
+    #[error("no dynamic action hook group is prepared")]
+    NoPreparedGroup,
+    #[error(transparent)]
+    Activation(#[from] LiveActionHookActivationError),
+    #[error(transparent)]
+    Routing(#[from] crate::ShardRoutingError),
 }
 
 /// Authority-free reference to the exact committed market state exposed to one action hook call.

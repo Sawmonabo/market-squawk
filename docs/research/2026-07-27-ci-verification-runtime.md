@@ -9,9 +9,9 @@ approximately one-hour Linux verification feedback loop.
 | Audience | Maintainers, CI owners, release reviewers |
 | Status | Audited decision input; cross-platform correctness follow-up accepted; fast-feedback runtime target not met |
 | Research date | 2026-07-27 |
-| Last substantive review | 2026-07-31 |
+| Last substantive review | 2026-08-03 |
 | Repository audit anchor | `75de7d43a74b0a1b7a5e9cd2f19e311a7ae2ed45` |
-| Latest diagnosed candidate | `49ff79d10877516fc403796fe31771ac0e3ad014` |
+| Latest diagnosed candidate | `a5c1595cc22282f4eb587cbe37d19215e10b2438` |
 | Evidence audit | [PASS_WITH_NOTES](../audits/2026-07-27-ci-verification-runtime-evidence-audit.md) |
 
 ## Table of Contents
@@ -23,6 +23,7 @@ approximately one-hour Linux verification feedback loop.
 - [Root causes](#root-causes)
 - [Current candidate correctness follow-up](#current-candidate-correctness-follow-up)
 - [Correction design](#correction-design)
+- [Sealed Python and RustSec bootstrap correction](#sealed-python-and-rustsec-bootstrap-correction)
 - [Acceptance evidence](#acceptance-evidence)
 - [Risks and rejected shortcuts](#risks-and-rejected-shortcuts)
 - [Sources](#sources)
@@ -406,6 +407,37 @@ This is a reproduced repository defect, not a general performance hypothesis.
 A correct implementation must emit only absolute, existing Git metadata paths and must handle a
 normal checkout, linked worktrees, symbolic refs, detached `HEAD`, and packed refs. Simply joining
 the repository root with `.git/HEAD` would not cover all of those Git layouts.
+
+#### 2026-08-08 follow-up: authoritative Git identity must not invalidate ordinary builds
+
+The absolute-path correction removed the perpetual missing-file rebuild, but retaining a valid Git
+metadata watch in every non-authoritative all-feature build still made any commit rebuild
+`market-squawk-platform` and its large downstream graph. This was especially costly when only a
+verification script or documentation changed: the shipping Rust inputs were unchanged, but the
+release binaries relinked for approximately 12 minutes on the maintained Apple Silicon development
+system.
+
+Cargo recommends narrowing build-script change detection to the inputs that actually require the
+script to rerun, and its fingerprints use the emitted `rerun-if-changed` paths
+([Cargo build scripts](https://doc.rust-lang.org/cargo/reference/build-scripts.html), reviewed
+2026-08-08). Reproducible Builds likewise distinguishes deterministic source/version identity from
+incidental build-time state
+([version information](https://reproducible-builds.org/docs/version-information/), reviewed
+2026-08-08).
+
+The maintained boundary is therefore:
+
+- a clean, explicitly authoritative capture benchmark reads the full Git object ID, verifies the
+  clean tree, and watches the checkout's resolved `HEAD`, symbolic reference, and packed references;
+- an ordinary non-authoritative build emits the existing 40-zero unverified identity convention and
+  does not read or watch Git metadata;
+- Cargo's normal source, manifest, lockfile, feature, and build-script fingerprints continue to
+  invalidate binaries when shipping inputs change; and
+- release/package evidence binds the exact commit, tree, complete source closure, and component
+  manifest outside the Rust compilation graph.
+
+This preserves exact benchmark and release provenance while preventing unrelated repository commits
+from masquerading as shipping-code changes.
 
 ### 3. Loom repeats the invalidated build
 
@@ -850,6 +882,30 @@ wrapped child terminates the owned job. The dependency is Windows-only, keeps th
 `unsafe_code = "forbid"` boundary, and replaces the post-spawn assignment rather than adding a
 second containment layer.
 
+### Windows Job Object completion after termination
+
+Hosted Windows candidate `a5c1595c` later isolated a different failure in the contained training
+process: the worker's five-second deadline elapsed, but its test remained blocked until the
+60-minute CI job was cancelled. The locked `process-wrap 9.1.0` implementation explains the
+otherwise unbounded path. `JobObjectChild::try_wait` performs a zero-duration read from the Job
+Object completion port before polling the leader, while `JobObjectChild::wait` later waits for
+another completion-port message without a deadline. Microsoft explicitly documents that ordinary
+Job Object completion-port notifications are best effort, so the later wait is not an authoritative
+termination proof
+([completion-port association](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_associate_completion_port),
+[`process-wrap` 9.1.0 source](https://github.com/watchexec/process-wrap/blob/v9.1.0/src/std/job_object.rs)).
+
+The corrected post-termination path keeps suspended-before-assignment containment and requires
+`TerminateJobObject` to succeed, preserving whole-tree termination. It then reaps the already
+exited leader through the inner child instead of entering a second unbounded completion-port wait.
+Microsoft defines `TerminateJobObject` as terminating every current member and specifies that job
+members cannot postpone or handle that termination
+([`TerminateJobObject`](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-terminatejobobject)).
+The same rule governs normal completion, failure after spawn, and the fixed-capacity deferred
+reaper, preventing the hang from moving into shutdown cleanup. No deadline increase, retry, skipped
+test, dependency change, or leader-only termination fallback is involved. Hosted Windows green
+evidence remains required for the corrected exact candidate.
+
 ### Tokio runtime topology and paper-recovery sequence handoff
 
 The Kraken production verticals formerly used plain `#[tokio::test]`. Tokio 1.53.1 documents that
@@ -961,6 +1017,88 @@ The first corrected cold run is projected at 28–32 minutes because the measure
 26m08s and the independent leaves can run concurrently. This is a planning estimate, not a
 performance claim. Cache benefit remains unquantified until measured.
 
+### 8. Classify the event delta and isolate package evidence
+
+An ordinary pull-request synchronization must classify the commits introduced by that specific
+head update, not the complete accumulated difference from the pull request's base. GitHub's
+`pull_request` event runs by default for `opened`, `synchronize`, and `reopened`; the official
+generated `synchronize` payload includes the prior and current head identities as `before` and
+`after`. Market Squawk therefore uses `before..head` for a normal synchronization, the pull-request
+base for an opened or reopened request, and the push event's `before..head` range on `main`. A
+missing, zero, or unavailable comparison remains fail-broad. Explicit frozen-candidate dispatches
+continue to select the complete matrix regardless of the event delta.
+
+This distinction makes a later documentation-only synchronization inexpensive without allowing an
+unknown event shape, initial pull request, or final candidate to inherit a narrow classification.
+The classifier still checks out and freezes the exact selected head before it computes the range.
+
+Installed-package test receipts are evidence, not release assets. The complete-release builder
+admits an exact closed platform asset set, so native update/rollback receipts are uploaded as
+separate target- and commit-bound artifacts. Adding an unrecognized receipt to the platform asset
+directory would correctly make aggregation fail.
+
+Documentation link validation uses the maintained Lychee action only when the classifier observes
+a documentation change. A blocking offline pass validates relative and local links across every
+Markdown document. A separate network pass validates external links in maintained public
+architecture, operations, reference, testing, and repository-entry documentation; dated research,
+audit, report, plan, and design evidence retains its source URLs without turning later provider
+link movement into a release failure. SEC, BLS, FRED/St. Louis Fed, and FASB endpoints are retained
+as citations but excluded from automated probes because those authoritative sites reject or fail
+headless CI clients. Lychee's official rate-limit guidance recommends excluding a whole site when
+its automated checks are blocked.
+
+The action and its Lychee binary version are pinned; concurrency is bounded to four; retries are
+disabled to avoid amplifying provider rate limits; and transient `429` and `5xx` responses are
+excluded from the one-day response cache. Cache restores are usable on pull requests, while cache
+publication is limited to trusted `main` pushes. This keeps ordinary code-only changes out of the
+link lane and avoids turning external-site instability into broad build churn. Both passes retain
+Lychee's default fail behavior, so a broken local link anywhere or a broken reachable external link
+in maintained documentation fails the job.
+
+## Sealed Python and RustSec bootstrap correction
+
+The explicitly dispatched four-platform candidate
+[`a5c1595cc22282f4eb587cbe37d19215e10b2438`](https://github.com/Sawmonabo/market-squawk/actions/runs/30800376101)
+exposed two independent bootstrap failures before product packaging:
+
+1. GitHub's Python 3.14.6 toolcache did not contain `packaging 26.2`. The Linux, Windows, Apple
+   Silicon, and Intel package jobs therefore failed at the same wheel-admission boundary. This was
+   not four platform defects.
+2. The policy job received an HTTP 503 while `cargo-deny` cloned the RustSec advisory database.
+   Generated-artifact, credential, and workspace-boundary checks had already passed; no dependency
+   finding was reported.
+
+The Python builder now admits its build-time parser from the same exact `packaging 26.2` wheel that
+is already present in the repository's release lock. The wheel's filename, PyPI file URL, size, and
+SHA-256 identity must match a code-owned bootstrap identity before any wheel code is imported. The
+authorized preparation phase either copies that verified wheel from the caller's source cache or
+downloads it from `files.pythonhosted.org` into the builder-owned wheelhouse. The offline phase
+loads the same admitted wheel directly as a ZIP import and proves that the importer's archive is
+the admitted file. It does not install into or otherwise mutate the host Python environment. PyPI
+publishes `packaging 26.2` as a universal wheel, and Python documents ZIP files on `sys.path` plus
+the importer's `archive` identity as standard import behavior
+([PyPI release](https://pypi.org/project/packaging/26.2/),
+[`zipimport`](https://docs.python.org/3.14/library/zipimport.html)).
+
+The RustSec correction separates retrieval from evaluation. `cargo deny fetch db` receives a
+bounded three-attempt transport retry. A failed initial clone can leave an incomplete generated
+database directory; an isolated reproduction confirmed that a subsequent `cargo-deny` invocation
+tries to reset and fetch that non-repository rather than replacing it. Before another attempt, the
+workflow removes only generated `advisory-db-*` directories that do not have a valid Git `HEAD`.
+Before disabling network access, `cargo fetch --locked` admits the exact Cargo graph needed by
+`cargo-deny 0.20.2`; an empty-Cargo-home verification proved that omitting this step makes offline
+Cargo metadata fail before policy evaluation. After one complete database is present, its exact
+commit is recorded and both security tools run against local immutable state: `cargo deny --offline
+check` and `cargo audit --db ... --no-fetch`. Vulnerability, license, source, and ban results are
+never retried or suppressed. Market Squawk's `P7D` `maximum-db-staleness` remains effective in
+offline mode, as documented by cargo-deny
+([common options](https://embarkstudios.github.io/cargo-deny/cli/common.html),
+[advisory configuration](https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html),
+[RustSec cargo-audit](https://github.com/rustsec/rustsec/blob/main/cargo-audit/README.md)).
+
+These corrections are not accepted by local source tests alone. Acceptance requires a fresh exact-
+head policy job and all four complete unpublished package jobs to pass without host-package setup.
+
 ## Acceptance evidence
 
 The correction is acceptable only when all of the following are true:
@@ -1010,6 +1148,8 @@ The correction therefore does not require a paid runner under the current public
 The platform-contract sources added during the correctness follow-up were reviewed on 2026-07-28.
 The workflow-runtime benchmark sources were reviewed on 2026-07-29.
 The Windows staging and macOS sanitizer-linker sources were reviewed on 2026-07-30.
+The sealed Python, RustSec bootstrap, and Windows Job Object termination sources were reviewed on
+2026-08-03.
 
 ### Cargo, Rust, and toolchain documentation
 
@@ -1052,7 +1192,9 @@ The Windows staging and macOS sanitizer-linker sources were reviewed on 2026-07-
 - [Microsoft `HeapReAlloc`](https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heaprealloc)
 - [Microsoft Job Object basic limits](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information)
 - [Microsoft Job Object extended limits](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_extended_limit_information)
+- [Microsoft Job Object completion-port association](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_associate_completion_port)
 - [Microsoft Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
+- [Microsoft `TerminateJobObject`](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-terminatejobobject)
 - [Microsoft `MoveFileExW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)
 - [Microsoft `CreateFileW` sharing](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
 - [Microsoft `GetFileInformationByHandle`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle)
@@ -1068,17 +1210,23 @@ The Windows staging and macOS sanitizer-linker sources were reviewed on 2026-07-
 - [`win32job 2.0.3` source](https://github.com/ohadravid/win32job-rs/tree/v2.0.3)
 - [`win32job` extended-limit issue](https://github.com/ohadravid/win32job-rs/issues/6)
 - [`process-wrap 9.1.0` Job Object implementation](https://docs.rs/process-wrap/9.1.0/src/process_wrap/std/job_object.rs.html)
+- [`process-wrap 9.1.0` tagged Job Object source](https://github.com/watchexec/process-wrap/blob/v9.1.0/src/std/job_object.rs)
 
 ### Official GitHub documentation and maintained tools
 
 - [GitHub Actions metrics](https://docs.github.com/en/actions/concepts/metrics)
 - [GitHub Actions dependency caching](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)
 - [GitHub Actions workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax)
+- [GitHub Actions `pull_request` event](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request)
+- [Official generated `pull_request.synchronize` payload](https://raw.githubusercontent.com/octokit/webhooks/main/payload-examples/api.github.com/pull_request/synchronize.payload.json)
 - [GitHub Actions job variations](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations)
 - [GitHub-hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
 - [GitHub Actions billing and usage](https://docs.github.com/en/actions/concepts/billing-and-usage)
 - [Swatinem/rust-cache](https://github.com/Swatinem/rust-cache)
 - [actions/cache](https://github.com/actions/cache)
+- [Lychee action v2.9.0](https://github.com/lycheeverse/lychee-action/tree/e7477775783ea5526144ba13e8db5eec57747ce8)
+- [Lychee GitHub Actions guidance](https://lychee.cli.rs/continuous-integration/github/)
+- [Lychee rate-limit guidance](https://lychee.cli.rs/troubleshooting/rate-limits/)
 - [Mozilla sccache](https://github.com/mozilla/sccache)
 - [cargo-nextest](https://github.com/nextest-rs/nextest)
 - [Pinned Tauri CLI bundle command](https://github.com/tauri-apps/tauri/blob/8909f221d1515955fc843808032bdc5d62209c96/crates/tauri-cli/src/bundle.rs)

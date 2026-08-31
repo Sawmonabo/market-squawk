@@ -38,6 +38,6 @@ pub use session::{
 pub(crate) use snapshot::PaperCheckpointPersistenceEvidence;
 pub use snapshot::{
     PaperCheckpointError, PaperExecutionCheckpoint, PaperExecutionSnapshot, PaperFillSnapshot,
-    PaperOrderSnapshot,
+    PaperOrderSnapshot, PaperSimulationSnapshot,
 };
 pub use state::{PaperOrderLifecycle, PaperOrderState, PaperStateError};

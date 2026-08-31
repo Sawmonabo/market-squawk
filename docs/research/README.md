@@ -57,6 +57,17 @@ decisions can be audited without relying on conversation history.
 
 ## Build and verification decisions
 
+- [Unified Markets provider ecosystem](2026-08-08-unified-markets-provider-ecosystem.md) — audited
+  review of 16 maintained investment/data repositories and 53 additional research, official, and
+  reputable sources; defines the approved one-feed experience, provider federation, best-available-
+  depth boundary, source-selection evidence, provider posture, and V1 acceptance contract.
+- [Installed service credential bootstrap and Python integrity](2026-08-03-installed-service-credential-bootstrap-and-python-integrity.md)
+  — evidence-verified per-user credential authority, owner-authenticated native bootstrap,
+  platform-specific local IPC composition, installed `RECORD` path semantics, and immutable
+  Python-generation release evidence.
+- [Installed Operations authority boundaries](2026-08-02-installed-operations-authority-boundaries.md)
+  — exact-head source audit of the Operations composition gap and the required coherent backup,
+  signed-update, settings/logging, and cross-generation recovery boundaries.
 - [Normal installation and first-run experience](2026-08-01-normal-installation-and-first-run.md)
   — decision-grade review of 35 maintained repositories, 28 official documentation sources,
   22 research papers, and 23 reputable guidance sources; defines the complete native install,

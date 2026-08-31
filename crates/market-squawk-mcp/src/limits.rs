@@ -78,15 +78,17 @@ pub struct McpLimitSpec {
 impl Default for McpLimitSpec {
     fn default() -> Self {
         Self {
-            maximum_frame_bytes: 1024 * 1024,
+            // Complete code-owned tools/list schemas need a larger discovery frame than ordinary
+            // request bodies. Request admission remains independently capped at one MiB below.
+            maximum_frame_bytes: 16 * 1024 * 1024,
             maximum_body_bytes: 1024 * 1024,
-            maximum_depth: 32,
+            maximum_depth: 64,
             maximum_string_bytes: 64 * 1024,
             maximum_array_items: 10_000,
             maximum_map_entries: 2_000,
             maximum_active_requests: 8,
             writer_queue_capacity: 64,
-            maximum_writer_queue_bytes: 8 * 1024 * 1024,
+            maximum_writer_queue_bytes: 32 * 1024 * 1024,
             maximum_inline_bytes: 64 * 1024,
             maximum_inline_items: 1_000,
             maximum_result_bytes: 64 * 1024 * 1024,

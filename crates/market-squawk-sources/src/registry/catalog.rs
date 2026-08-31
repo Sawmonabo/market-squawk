@@ -490,6 +490,7 @@ impl AuthoritativeSourceRegistry {
             terminal: AtomicBool::new(false),
             live_qualified: AtomicBool::new(false),
             health_epoch: AtomicU64::new(0),
+            minimum_valid_health_epoch: AtomicU64::new(0),
             valid_from_nanos: AtomicI64::new(i64::MAX),
             valid_until_nanos: AtomicI64::new(i64::MIN),
             last_health_observed_nanos: AtomicI64::new(i64::MIN),
@@ -767,6 +768,46 @@ impl AuthoritativeSourceRegistry {
         }
         entry.health_authority = None;
         persistence
+    }
+
+    /// Releases one exact process-owned registration without revoking its durable source history.
+    ///
+    /// This is a composition rollback/teardown primitive, not provider unlink or rights
+    /// revocation. It invalidates the exact current handle and any process-local session, removes
+    /// only that registry instance's active entry, and deliberately preserves the non-revoked
+    /// latest revision evidence so [`Self::register_or_resume_exact`] can rejoin it under the same
+    /// clean-restart rules.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a stale, transplanted, superseded, or durably revoked registration. No successor
+    /// registration can be removed because current handle pointer identity is required.
+    #[doc(hidden)]
+    pub fn release_process_registration_exact(
+        &mut self,
+        registered: &RegisteredSource,
+    ) -> Result<(), RegistryError> {
+        let entry = self.validate_registered_structure(registered)?;
+        let history = self
+            .history
+            .get(&registered.source_id)
+            .ok_or(RegistryError::InvalidAuthorityState)?;
+        if history.revoked
+            || history.latest_revision_evidence.as_ref() != Some(entry.metadata.revision_evidence())
+        {
+            return Err(RegistryError::InvalidAuthorityState);
+        }
+        let mut released = self
+            .entries
+            .remove(&registered.source_id)
+            .ok_or(RegistryError::UnknownSource)?;
+        released.registration_lease.invalidate();
+        if let Some(active) = released.active.take() {
+            active.lease.invalidate();
+            active.capture.mark_incomplete();
+        }
+        released.health_authority = None;
+        Ok(())
     }
 
     /// Revalidates a registration handle against registry-owned current state.

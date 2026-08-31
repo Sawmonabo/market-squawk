@@ -115,6 +115,12 @@ enum DurableRunState {
     InUse,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UncleanPredecessorPolicy {
+    Reject,
+    RecoverStructurallyValidExclusiveInstalledReplacement,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderBudgetPolicyV1 {
@@ -389,6 +395,31 @@ impl BudgetCheckpointState {
         self.availability_generation = self.availability_generation.saturating_add(1);
     }
 
+    fn recover_exclusive_installed_replacement(&mut self) -> Result<(), AuthorityPersistenceError> {
+        let terminalized_predecessor = self.terminal && self.poisoned && self.disabled;
+        if self.terminal != self.poisoned || (self.terminal && !self.disabled) {
+            return Err(AuthorityPersistenceError::InvalidState);
+        }
+        if self.in_flight == 0 && !terminalized_predecessor {
+            return Ok(());
+        }
+        self.in_flight = 0;
+        if terminalized_predecessor {
+            // A normal constructor terminalizes an unclean predecessor before rejecting it. The
+            // installation-global workspace guard proves that an exclusive replacement cannot
+            // overlap that predecessor, so the replacement may retire this exact fail-closed
+            // marker while preserving windows, request counts, deadlines, and authority history.
+            self.terminal = false;
+            self.poisoned = false;
+            self.disabled = false;
+        }
+        self.availability_generation = self
+            .availability_generation
+            .checked_add(1)
+            .ok_or(AuthorityPersistenceError::GenerationExhausted)?;
+        Ok(())
+    }
+
     pub(crate) const fn in_flight(&self) -> u16 {
         self.in_flight
     }
@@ -422,6 +453,16 @@ impl BudgetCheckpointState {
 pub(crate) struct DurableBudgetGroup {
     declarations: BoundedVec<PersistedProviderBudgetPolicy, MAX_PROCESS_BUDGET_SCOPES>,
     checkpoint: BudgetCheckpointState,
+}
+
+pub(in crate::policy) enum DurableBudgetRegistrationTarget {
+    Existing { slot: usize },
+    New { checkpoint: BudgetCheckpointState },
+}
+
+pub(in crate::policy) struct DurableBudgetRegistrationGroup {
+    pub(in crate::policy) target: DurableBudgetRegistrationTarget,
+    pub(in crate::policy) declarations: Vec<PersistedProviderBudgetPolicy>,
 }
 
 impl DurableBudgetGroup {
@@ -490,7 +531,7 @@ impl DurableBudgetGroup {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct DurableAuthorityEnvelope {
+pub(crate) struct DurableAuthorityEnvelope {
     format_version: u16,
     run_generation: u64,
     run_state: DurableRunState,
@@ -498,6 +539,39 @@ struct DurableAuthorityEnvelope {
     wall_high_water: Timestamp,
     registry: crate::RegistryAuthorityState,
     budgets: BoundedVec<DurableBudgetGroup, MAX_PROCESS_BUDGET_SCOPES>,
+}
+
+pub(crate) fn deserialize_clean_restart_backup(
+    payload: &[u8],
+    now: Timestamp,
+) -> Result<DurableAuthorityEnvelope, AuthorityPersistenceError> {
+    let envelope = deserialize_canonical_envelope(payload)?;
+    envelope.validate(now)?;
+    if envelope.run_state != DurableRunState::Clean
+        || envelope
+            .budgets
+            .as_slice()
+            .iter()
+            .any(|group| group.checkpoint.in_flight() != 0)
+    {
+        return Err(AuthorityPersistenceError::InvalidState);
+    }
+    Ok(envelope)
+}
+
+pub(crate) fn serialize_clean_restart_backup(
+    envelope: &DurableAuthorityEnvelope,
+) -> Result<Vec<u8>, AuthorityPersistenceError> {
+    if envelope.run_state != DurableRunState::Clean
+        || envelope
+            .budgets
+            .as_slice()
+            .iter()
+            .any(|group| group.checkpoint.in_flight() != 0)
+    {
+        return Err(AuthorityPersistenceError::InvalidState);
+    }
+    serialize_canonical_envelope(envelope)
 }
 
 impl DurableAuthorityEnvelope {
@@ -623,10 +697,18 @@ impl AuthorityDurabilitySession {
         store: Arc<dyn AuthorityStateStore>,
         now: Timestamp,
     ) -> Result<UnpublishedAuthoritySession, AuthorityPersistenceError> {
-        Self::open_session(store, now).map(|session| UnpublishedAuthoritySession {
-            session,
-            finalized: false,
-        })
+        Self::open_unpublished_with_policy(store, now, UncleanPredecessorPolicy::Reject)
+    }
+
+    pub(crate) fn open_unpublished_for_exclusive_installed_replacement(
+        store: Arc<dyn AuthorityStateStore>,
+        now: Timestamp,
+    ) -> Result<UnpublishedAuthoritySession, AuthorityPersistenceError> {
+        Self::open_unpublished_with_policy(
+            store,
+            now,
+            UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement,
+        )
     }
 
     #[cfg(test)]
@@ -634,12 +716,24 @@ impl AuthorityDurabilitySession {
         store: Arc<dyn AuthorityStateStore>,
         now: Timestamp,
     ) -> Result<Arc<Self>, AuthorityPersistenceError> {
-        Self::open_session(store, now)
+        Self::open_session(store, now, UncleanPredecessorPolicy::Reject)
+    }
+
+    fn open_unpublished_with_policy(
+        store: Arc<dyn AuthorityStateStore>,
+        now: Timestamp,
+        policy: UncleanPredecessorPolicy,
+    ) -> Result<UnpublishedAuthoritySession, AuthorityPersistenceError> {
+        Self::open_session(store, now, policy).map(|session| UnpublishedAuthoritySession {
+            session,
+            finalized: false,
+        })
     }
 
     fn open_session(
         store: Arc<dyn AuthorityStateStore>,
         now: Timestamp,
+        policy: UncleanPredecessorPolicy,
     ) -> Result<Arc<Self>, AuthorityPersistenceError> {
         let mut envelope = match store.load().map_err(|_| AuthorityPersistenceError::Store)? {
             Some(bytes) => {
@@ -649,11 +743,22 @@ impl AuthorityDurabilitySession {
             }
             None => DurableAuthorityEnvelope::empty(now),
         };
-        let recovered_unclean = envelope.run_state == DurableRunState::InUse;
+        let predecessor_was_unclean = envelope.run_state == DurableRunState::InUse;
+        let recover_exclusive_installed_replacement = predecessor_was_unclean
+            && policy
+                == UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement;
+        let recovered_unclean = predecessor_was_unclean && !recover_exclusive_installed_replacement;
         if recovered_unclean {
             let mut groups = envelope.budgets.as_slice().to_vec();
             for group in &mut groups {
                 group.checkpoint.terminalize_unclean();
+            }
+            envelope.budgets = BoundedVec::try_new(groups)
+                .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
+        } else if recover_exclusive_installed_replacement {
+            let mut groups = envelope.budgets.as_slice().to_vec();
+            for group in &mut groups {
+                group.checkpoint.recover_exclusive_installed_replacement()?;
             }
             envelope.budgets = BoundedVec::try_new(groups)
                 .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
@@ -773,6 +878,65 @@ impl AuthorityDurabilitySession {
         })
     }
 
+    pub(in crate::policy) fn register_budget_batch(
+        self: &Arc<Self>,
+        registry: crate::RegistryAuthorityState,
+        groups: &[DurableBudgetRegistrationGroup],
+        wall: Timestamp,
+    ) -> Result<Box<[usize]>, AuthorityPersistenceError> {
+        if groups.is_empty() || groups.len() > MAX_PROCESS_BUDGET_SCOPES {
+            return Err(AuthorityPersistenceError::InvalidState);
+        }
+        let mut assigned = Vec::new();
+        assigned
+            .try_reserve_exact(groups.len())
+            .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
+        self.transact(wall, |envelope, wall_adjustment| {
+            let mut budgets = envelope.budgets.as_slice().to_vec();
+            for group in groups {
+                let (first, remaining) = group
+                    .declarations
+                    .split_first()
+                    .ok_or(AuthorityPersistenceError::InvalidState)?;
+                let slot = match &group.target {
+                    DurableBudgetRegistrationTarget::Existing { slot } => {
+                        if assigned.contains(slot) {
+                            return Err(AuthorityPersistenceError::InvalidState);
+                        }
+                        let retained = budgets
+                            .get_mut(*slot)
+                            .ok_or(AuthorityPersistenceError::InvalidState)?;
+                        retained.add_declaration(first.clone())?;
+                        for declaration in remaining {
+                            retained.add_declaration(declaration.clone())?;
+                        }
+                        *slot
+                    }
+                    DurableBudgetRegistrationTarget::New { checkpoint } => {
+                        if budgets.len() == MAX_PROCESS_BUDGET_SCOPES {
+                            return Err(AuthorityPersistenceError::StateTooLarge);
+                        }
+                        let slot = budgets.len();
+                        let mut anchored = checkpoint.clone();
+                        anchored.shift_wall_anchor(wall_adjustment)?;
+                        let mut retained = DurableBudgetGroup::try_new(first.clone(), anchored)?;
+                        for declaration in remaining {
+                            retained.add_declaration(declaration.clone())?;
+                        }
+                        budgets.push(retained);
+                        slot
+                    }
+                };
+                assigned.push(slot);
+            }
+            envelope.budgets = BoundedVec::try_new(budgets)
+                .map_err(|_| AuthorityPersistenceError::StateTooLarge)?;
+            envelope.registry = registry;
+            Ok(())
+        })?;
+        Ok(assigned.into_boxed_slice())
+    }
+
     #[cfg(test)]
     pub(crate) fn update_budget(
         self: &Arc<Self>,
@@ -824,6 +988,33 @@ impl AuthorityDurabilitySession {
             envelope.registry = registry;
             Ok(())
         })
+    }
+
+    pub(crate) fn export_clean_restart_backup(
+        self: &Arc<Self>,
+        proof: CleanShutdownProof,
+        registry: crate::RegistryAuthorityState,
+        wall: Timestamp,
+    ) -> Result<Vec<u8>, AuthorityPersistenceError> {
+        if !proof.belongs_to(self) || !self.is_available() {
+            proof.invalidate_bound_session();
+            self.invalidate();
+            return Err(AuthorityPersistenceError::SessionUnavailable);
+        }
+        let mut envelope = self
+            .envelope
+            .lock()
+            .map_err(|_| self.fail(AuthorityPersistenceError::SessionUnavailable))?
+            .clone();
+        if wall < envelope.wall_high_water {
+            return Err(AuthorityPersistenceError::WallRollback);
+        }
+        envelope.run_state = DurableRunState::Clean;
+        envelope.saved_at_wall = wall;
+        envelope.wall_high_water = wall;
+        envelope.registry = registry;
+        envelope.validate(wall)?;
+        serialize_clean_restart_backup(&envelope)
     }
 
     pub(crate) fn close_clean(

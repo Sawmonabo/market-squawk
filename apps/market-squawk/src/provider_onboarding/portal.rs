@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use super::contracts::{
     OnboardingSessionView, ProviderPortalActivationRequest, ProviderPortalActivationView,
-    ProviderProfileView,
+    ProviderProfileView, SchwabOAuthLifecycleAction, SchwabOAuthLifecycleView,
 };
 use super::service::{ProviderOnboardingError, ProviderOnboardingService, StartOnboardingRequest};
 
@@ -65,6 +65,19 @@ pub trait ProviderPortalActivationAuthority: Send + Sync {
         session_id: Uuid,
         cancellation: CancellationToken,
     ) -> Result<OnboardingSessionView, ProviderPortalActivationError>;
+
+    /// Applies one exact application-owned Schwab OAuth lifecycle operation.
+    ///
+    /// The default remains unavailable until the application runtime supplies the sole callback
+    /// session and protected token authority owner.
+    async fn schwab_oauth(
+        &self,
+        _session_id: Uuid,
+        _action: SchwabOAuthLifecycleAction,
+        _cancellation: CancellationToken,
+    ) -> Result<SchwabOAuthLifecycleView, ProviderPortalActivationError> {
+        Err(ProviderPortalActivationError::Unavailable)
+    }
 
     /// Closes admission to application-owned activation work before portal transport teardown.
     fn begin_shutdown(&self) {}
@@ -551,6 +564,24 @@ async fn dispatch(
             let body = collect_body(request.into_body(), MAX_JSON_BODY_BYTES).await?;
             require_empty_json_body(&body)?;
             let status = activation.cancel(session_id, cancellation).await?;
+            return Ok(json_response(StatusCode::OK, &status));
+        }
+        let schwab_oauth_action = match action {
+            Some("schwab-oauth-begin") => Some(SchwabOAuthLifecycleAction::Begin),
+            Some("schwab-oauth-continue") => Some(SchwabOAuthLifecycleAction::Continue),
+            Some("schwab-oauth-cancel") => Some(SchwabOAuthLifecycleAction::Cancel),
+            Some("schwab-oauth-unlink") => Some(SchwabOAuthLifecycleAction::Unlink),
+            _ => None,
+        };
+        if method == Method::POST
+            && let Some(schwab_oauth_action) = schwab_oauth_action
+        {
+            validate_mutation(&request, &security, "application/json")?;
+            let body = collect_body(request.into_body(), MAX_JSON_BODY_BYTES).await?;
+            require_empty_json_body(&body)?;
+            let status = activation
+                .schwab_oauth(session_id, schwab_oauth_action, cancellation)
+                .await?;
             return Ok(json_response(StatusCode::OK, &status));
         }
     }

@@ -1,7 +1,8 @@
 //! Independent verification of the installed Python training release authority.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, Metadata};
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 
@@ -22,12 +23,13 @@ const MAX_ONNX_WORKER_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_VALIDATOR_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TRAINING_LAUNCHER_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_DISTRIBUTION_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_DISTRIBUTION_FILES: usize = 8_192;
+const MAX_DISTRIBUTION_FILES: usize = 16_384;
+const MAX_DISTRIBUTION_EXTERNAL_PATHS: usize = 256;
 const MAX_DISTRIBUTION_ROOTS: usize = 64;
 const MAX_RUNTIME_DISTRIBUTIONS: usize = 32;
 const RECORD_SET_DOMAIN: &[u8] = b"market-squawk-record-set-v1\0";
 const RELEASE_MANIFEST_DOMAIN: &[u8] = b"market-squawk-release-manifest-v1\0";
-const ENVIRONMENT_RECEIPT_DOMAIN: &[u8] = b"market-squawk-training-environment-v1\0";
+const ENVIRONMENT_RECEIPT_DOMAIN: &[u8] = b"market-squawk-training-environment-v2\0";
 
 /// Installed training-release verification failed closed.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -63,6 +65,35 @@ pub struct VerifiedTrainingEnvironment {
     python_tag: Box<str>,
     python_version: Box<str>,
     training_code_revision: Box<str>,
+    training_worker: VerifiedTrainingWorkerProgram,
+}
+
+/// Exact installed launcher identity for process-supervised candidate production.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedTrainingWorkerProgram {
+    path: PathBuf,
+    sha256: [u8; 32],
+    size_bytes: u64,
+}
+
+impl VerifiedTrainingWorkerProgram {
+    /// Returns the canonical installed launcher path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the signed launcher digest rechecked by training-environment verification.
+    #[must_use]
+    pub const fn sha256(&self) -> [u8; 32] {
+        self.sha256
+    }
+
+    /// Returns the signed launcher byte length.
+    #[must_use]
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
 }
 
 impl VerifiedTrainingEnvironment {
@@ -112,6 +143,12 @@ impl VerifiedTrainingEnvironment {
     #[must_use]
     pub fn training_code_revision(&self) -> &str {
         &self.training_code_revision
+    }
+
+    /// Returns the exact launcher evidence for the process-tree supervisor.
+    #[must_use]
+    pub const fn training_worker(&self) -> &VerifiedTrainingWorkerProgram {
+        &self.training_worker
     }
 }
 
@@ -216,6 +253,7 @@ struct RelativeFileWire {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DistributionWire {
+    external_paths: Vec<String>,
     file_count: usize,
     file_set_sha256: String,
     name: String,
@@ -242,6 +280,8 @@ struct VerifiedFiles {
     onnx_worker_sha256: [u8; 32],
     onnx_worker_size_bytes: u64,
     validator_sha256: [u8; 32],
+    training_driver_sha256: [u8; 32],
+    training_driver_size_bytes: u64,
     root: PathBuf,
 }
 
@@ -342,6 +382,11 @@ impl VerifiedFiles {
             python_tag: self.environment.interpreter.python_tag.into(),
             python_version: self.environment.interpreter.version.into(),
             training_code_revision: self.environment.training_code_revision.into(),
+            training_worker: VerifiedTrainingWorkerProgram {
+                path: self.root.join(training_driver_relative_path()),
+                sha256: self.training_driver_sha256,
+                size_bytes: self.training_driver_size_bytes,
+            },
         })
     }
 }
@@ -378,7 +423,7 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         &manifest_file.bytes,
         TrainingEnvironmentError::ReleaseManifest,
     )?;
-    if signed_environment.schema_version != 1
+    if signed_environment.schema_version != 2
         || signed_manifest.schema_version != 3
         || !verify_signature(
             &foundation.release_public_key,
@@ -511,6 +556,8 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         onnx_worker_sha256: onnx_worker.sha256,
         onnx_worker_size_bytes: onnx_worker.size_bytes,
         validator_sha256: validator.sha256,
+        training_driver_sha256: training_driver.sha256,
+        training_driver_size_bytes: training_driver.size_bytes,
         root: canonical_root,
     })
 }
@@ -617,6 +664,8 @@ fn embedded_foundation() -> Result<FoundationWire, TrainingEnvironmentError> {
 
 struct VerifiedDistribution {
     entries: BTreeMap<String, ([u8; 32], u64)>,
+    external_paths: BTreeSet<String>,
+    owned_paths: Vec<PathBuf>,
     roots: BTreeSet<String>,
     site_packages: PathBuf,
 }
@@ -638,6 +687,8 @@ fn verify_distributions(
         return Err(TrainingEnvironmentError::InstalledDistribution);
     }
     let mut owned_roots = project.roots.clone();
+    let mut owned_external_paths = project.external_paths.clone();
+    let mut owned_paths = project.owned_paths.clone();
     for (wire, requirement) in environment
         .runtime_distributions
         .iter()
@@ -652,10 +703,16 @@ fn verify_distributions(
                 .roots
                 .iter()
                 .any(|value| !owned_roots.insert(value.clone()))
+            || verified
+                .external_paths
+                .iter()
+                .any(|value| !owned_external_paths.insert(value.clone()))
         {
             return Err(TrainingEnvironmentError::InstalledDistribution);
         }
+        owned_paths.extend(verified.owned_paths);
     }
+    verify_unique_owned_files(&owned_paths)?;
 
     let native_relative = relative_path(&environment.native_extension.relative_path)?;
     let native_path = root.join(native_relative);
@@ -705,6 +762,12 @@ fn verify_distribution(
         .ok_or(TrainingEnvironmentError::InstalledDistribution)?
         .replace('\\', "/");
     let roots = distribution.roots.iter().cloned().collect::<BTreeSet<_>>();
+    let external_paths = distribution
+        .external_paths
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut owned_paths = vec![canonical(&record_path)?];
 
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
@@ -738,18 +801,19 @@ fn verify_distribution(
             saw_record = true;
             continue;
         }
+        let is_external = external_paths.contains(name);
         let is_training_driver = require_training_driver && name == training_driver_record_path;
-        let file = if is_training_driver {
-            if saw_training_driver || digest.is_empty() || size.is_empty() {
+        let owned_path;
+        let file = if is_external {
+            if digest.is_empty() || size.is_empty() || (is_training_driver && saw_training_driver) {
                 return Err(TrainingEnvironmentError::InstalledDistribution);
             }
-            saw_training_driver = true;
-            read_controlled(
-                root,
-                Path::new(training_driver_relative_path()),
-                MAX_DISTRIBUTION_FILE_BYTES,
-                false,
-            )?
+            if is_training_driver {
+                saw_training_driver = true;
+            }
+            let relative = external_distribution_relative_path(name)?;
+            owned_path = root.join(&relative);
+            read_controlled(root, &relative, MAX_DISTRIBUTION_FILE_BYTES, false)?
         } else {
             let relative = relative_path(name)?;
             let first = relative
@@ -763,8 +827,10 @@ fn verify_distribution(
             if !roots.contains(first) {
                 return Err(TrainingEnvironmentError::InstalledDistribution);
             }
+            owned_path = site_packages.join(relative);
             read_controlled(site_packages, relative, MAX_DISTRIBUTION_FILE_BYTES, false)?
         };
+        owned_paths.push(canonical(&owned_path)?);
         let size = if digest.is_empty() && size.is_empty() {
             file.size_bytes
         } else {
@@ -792,8 +858,15 @@ fn verify_distribution(
             return Err(TrainingEnvironmentError::InstalledDistribution);
         }
     }
+    let observed_external_paths = entries
+        .keys()
+        .filter(|name| external_paths.contains(name.as_str()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
     if !saw_record
         || require_training_driver != saw_training_driver
+        || require_training_driver != external_paths.contains(training_driver_record_path)
+        || observed_external_paths != external_paths
         || entries.len() != distribution.file_count
         || record_set_digest(&entries) != parse_hex(&distribution.file_set_sha256)?
     {
@@ -801,7 +874,7 @@ fn verify_distribution(
     }
     let mut expected_paths = entries
         .keys()
-        .filter(|name| name.as_str() != training_driver_record_path)
+        .filter(|name| !external_paths.contains(name.as_str()))
         .cloned()
         .collect::<BTreeSet<_>>();
     expected_paths.insert(record_entry);
@@ -810,6 +883,8 @@ fn verify_distribution(
     }
     Ok(VerifiedDistribution {
         entries,
+        external_paths,
+        owned_paths,
         roots,
         site_packages: site_packages.to_path_buf(),
     })
@@ -841,6 +916,51 @@ const fn training_driver_record_path() -> &'static str {
     } else {
         "../../../bin/market-squawk-train"
     }
+}
+
+fn external_distribution_relative_path(value: &str) -> Result<PathBuf, TrainingEnvironmentError> {
+    let (prefix, directory) = if cfg!(windows) {
+        ("../../Scripts/", "Scripts")
+    } else {
+        ("../../../bin/", "bin")
+    };
+    let filename = value
+        .strip_prefix(prefix)
+        .ok_or(TrainingEnvironmentError::InstalledDistribution)?;
+    let path = Path::new(filename);
+    if filename.is_empty()
+        || filename.len() > 255
+        || filename.contains(['/', '\\'])
+        || path.components().count() != 1
+        || !matches!(path.components().next(), Some(Component::Normal(_)))
+    {
+        return Err(TrainingEnvironmentError::InstalledDistribution);
+    }
+    Ok(Path::new(directory).join(path))
+}
+
+fn verify_unique_owned_files(paths: &[PathBuf]) -> Result<(), TrainingEnvironmentError> {
+    let mut canonical_paths = BTreeSet::new();
+    let mut identities: HashMap<u64, Vec<&Path>> = HashMap::new();
+    for path in paths {
+        if !canonical_paths.insert(path.clone()) {
+            return Err(TrainingEnvironmentError::InstalledDistribution);
+        }
+        let handle = same_file::Handle::from_path(path)
+            .map_err(|_| TrainingEnvironmentError::InstalledDistribution)?;
+        let mut hasher = DefaultHasher::new();
+        handle.hash(&mut hasher);
+        let candidates = identities.entry(hasher.finish()).or_default();
+        for candidate in candidates.iter().copied() {
+            if same_file::is_same_file(candidate, path)
+                .map_err(|_| TrainingEnvironmentError::InstalledDistribution)?
+            {
+                return Err(TrainingEnvironmentError::InstalledDistribution);
+            }
+        }
+        candidates.push(path);
+    }
+    Ok(())
 }
 
 fn scan_distribution_paths(
@@ -1162,6 +1282,15 @@ fn valid_runtime_requirements(values: &[RuntimeRequirementWire]) -> bool {
 fn valid_distribution(value: &DistributionWire) -> bool {
     value.file_count > 0
         && value.file_count <= MAX_DISTRIBUTION_FILES
+        && value.external_paths.len() <= MAX_DISTRIBUTION_EXTERNAL_PATHS
+        && value
+            .external_paths
+            .iter()
+            .all(|path| external_distribution_relative_path(path).is_ok())
+        && value
+            .external_paths
+            .windows(2)
+            .all(|pair| pair[0].as_str() < pair[1].as_str())
         && valid_hex(&value.file_set_sha256)
         && valid_distribution_name(&value.name)
         && valid_hex(&value.record_sha256)
@@ -1305,7 +1434,25 @@ fn base64_url(bytes: &[u8; 32]) -> String {
 mod tests {
     use std::fs;
 
-    use super::{TrainingEnvironmentError, hash, verify_runtime_program_identity};
+    use super::{
+        TrainingEnvironmentError, hash, verify_runtime_program_identity, verify_unique_owned_files,
+    };
+
+    #[test]
+    fn distribution_ownership_rejects_distinct_hard_link_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        fs::write(&first, b"one physical distribution file")?;
+        fs::hard_link(&first, &second)?;
+
+        assert_eq!(
+            verify_unique_owned_files(&[first, second]),
+            Err(TrainingEnvironmentError::InstalledDistribution)
+        );
+        Ok(())
+    }
 
     #[test]
     fn runtime_program_identity_accepts_a_copy_and_rejects_a_substitution()

@@ -1,13 +1,22 @@
 //! Validated SEC locators, retained representations, health, and typed failures.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use market_squawk_domain::{AvailabilityEvidence, EvidenceDigest, Timestamp};
+use market_squawk_platform::{RawCaptureRecord, RawCaptureRecordError};
+use market_squawk_sources::{
+    BudgetPoolError, BudgetUnavailableReason, ProviderCaptureError, ProviderCaptureMaterial,
+    ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use uuid::Uuid;
 
 use crate::{
     CompanyFactsDocument, ParsedXbrlDocument, RawEvidenceError, RawEvidenceStore, SecParserError,
@@ -78,6 +87,50 @@ impl SecObjectLocator {
         Self::from_url(format!("{DATA_BASE}/api/xbrl/companyfacts/CIK{cik}.json"))
     }
 
+    /// Locates one exact SEC quarterly N-PORT or N-CEN derived-data archive.
+    pub fn quarterly_bulk_archive(
+        family: crate::SecBulkFamily,
+        quarter: crate::SecQuarter,
+    ) -> Result<Self, SecClientError> {
+        let snapshot = crate::SecBulkCatalogSnapshot::official_2026_08_14()
+            .map_err(|_| SecClientError::InvalidLocator)?;
+        if !quarter.is_catalogued(family, snapshot) {
+            return Err(SecClientError::InvalidLocator);
+        }
+        let dataset = match family {
+            crate::SecBulkFamily::Nport => "form-n-port-data-sets",
+            crate::SecBulkFamily::Ncen => "form-n-cen-data-sets",
+        };
+        Self::from_url(format!(
+            "https://www.sec.gov/files/dera/data/{dataset}/{}q{}_{}.zip",
+            quarter.year(),
+            quarter.quarter(),
+            family.tag(),
+        ))
+    }
+
+    /// Locates the current official readme for one quarterly derived-data family.
+    pub fn quarterly_bulk_readme(family: crate::SecBulkFamily) -> Result<Self, SecClientError> {
+        Self::from_url(format!(
+            "https://www.sec.gov/files/{}_readme.pdf",
+            family.tag(),
+        ))
+    }
+
+    /// Locates the official nightly complete-submissions bootstrap archive.
+    pub fn bulk_submissions() -> Result<Self, SecClientError> {
+        Self::from_url(
+            "https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip".to_owned(),
+        )
+    }
+
+    /// Locates the official nightly Company Facts bootstrap archive.
+    pub fn bulk_company_facts() -> Result<Self, SecClientError> {
+        Self::from_url(
+            "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip".to_owned(),
+        )
+    }
+
     /// Locates a provider-declared submissions companion object.
     pub fn companion(name: &str) -> Result<Self, SecClientError> {
         validate_filename(name, ".json")?;
@@ -128,6 +181,7 @@ pub struct RetrievedSecBytes {
     pub(super) availability: AvailabilityEvidence,
     pub(super) locator: Option<String>,
     pub(super) retrieval_revision: Option<u64>,
+    pub(super) capture_receipt: Option<ProviderCaptureSetReceipt>,
 }
 
 impl RetrievedSecBytes {
@@ -161,6 +215,40 @@ impl RetrievedSecBytes {
         self.retrieval_revision
     }
 
+    /// Returns the source-neutral receipt for an exact online response body.
+    ///
+    /// Offline imports and local composite manifests deliberately have no provider capture.
+    pub const fn capture_receipt(&self) -> Option<&ProviderCaptureSetReceipt> {
+        self.capture_receipt.as_ref()
+    }
+
+    /// Rebuilds the exact body-only material required by the shared raw publication boundary.
+    ///
+    /// Request headers, including the identifying SEC `User-Agent`, are structurally absent.
+    pub fn capture_material(&self) -> Result<Option<ProviderCaptureMaterial>, SecClientError> {
+        let Some(receipt) = self.capture_receipt.as_ref() else {
+            return Ok(None);
+        };
+        let page = receipt
+            .pages()
+            .first()
+            .filter(|page| {
+                receipt.pages().len() == 1
+                    && receipt.terminal() == ProviderCaptureTerminalDisposition::StandaloneResponse
+                    && receipt.request_set_identity() == page.request_identity()
+                    && page.body_digest() == self.evidence
+                    && self.locator.as_deref() == Some(receipt.dataset().as_str())
+                    && self.retrieval_revision.is_some()
+            })
+            .ok_or(SecClientError::InvalidCaptureMaterial)?;
+        if page.body_bytes()
+            != u64::try_from(self.bytes.len()).map_err(|_| SecClientError::ResponseTooLarge)?
+        {
+            return Err(SecClientError::InvalidCaptureMaterial);
+        }
+        provider_capture_material(receipt.clone(), self.bytes.clone()).map(Some)
+    }
+
     pub(crate) fn restored_online(
         bytes: Vec<u8>,
         evidence: EvidenceDigest,
@@ -175,6 +263,26 @@ impl RetrievedSecBytes {
             availability: AvailabilityEvidence::local_first_observed(received_at),
             locator: Some(locator),
             retrieval_revision: Some(retrieval_revision),
+            capture_receipt: None,
+        }
+    }
+
+    pub(crate) fn captured_online(
+        bytes: Vec<u8>,
+        evidence: EvidenceDigest,
+        first_observed_at: Timestamp,
+        locator: String,
+        retrieval_revision: u64,
+        capture_receipt: ProviderCaptureSetReceipt,
+    ) -> Self {
+        Self {
+            bytes: Bytes::from(bytes),
+            evidence,
+            received_at: first_observed_at,
+            availability: AvailabilityEvidence::local_first_observed(first_observed_at),
+            locator: Some(locator),
+            retrieval_revision: Some(retrieval_revision),
+            capture_receipt: Some(capture_receipt),
         }
     }
 
@@ -190,6 +298,7 @@ impl RetrievedSecBytes {
             availability: AvailabilityEvidence::Unknown,
             locator: None,
             retrieval_revision: None,
+            capture_receipt: None,
         }
     }
 
@@ -205,6 +314,7 @@ impl RetrievedSecBytes {
             availability: AvailabilityEvidence::local_first_observed(available_at),
             locator: None,
             retrieval_revision: None,
+            capture_receipt: None,
         }
     }
 }
@@ -250,6 +360,14 @@ impl RetrievedSubmissions {
     pub fn components(&self) -> &[RetrievedSecBytes] {
         &self.components
     }
+
+    /// Returns the exact current submissions representation that authored company metadata.
+    ///
+    /// Complete submissions snapshots retain this as the first component beside their composite
+    /// manifest. A direct current-only retrieval uses [`Self::raw`] as that same representation.
+    pub fn current_component(&self) -> &RetrievedSecBytes {
+        self.components.first().unwrap_or(&self.raw)
+    }
 }
 
 /// Parsed Company Facts paired with retained exact source bytes.
@@ -266,10 +384,17 @@ impl RetrievedCompanyFacts {
         raw_store: &RawEvidenceStore,
         parser_limits: SecParserLimits,
     ) -> Result<Self, SecClientError> {
+        let retained = crate::json::RetainedJsonBudget::new(parser_limits);
+        retained.admit_bytes(bytes.len())?;
         let evidence = raw_store.persist(bytes)?;
         let received_at = system_timestamp()?;
         Ok(Self {
-            document: CompanyFactsDocument::parse(bytes, parser_limits)?,
+            document: CompanyFactsDocument::parse_with_allocation_authority(
+                bytes,
+                parser_limits,
+                &CancellationToken::new(),
+                retained,
+            )?,
             raw: RetrievedSecBytes::offline_import(bytes, evidence, received_at),
         })
     }
@@ -282,8 +407,14 @@ impl RetrievedCompanyFacts {
         parser_limits: SecParserLimits,
         cancellation: &CancellationToken,
     ) -> Result<Self, SecClientError> {
-        let document =
-            CompanyFactsDocument::parse_with_cancellation(&bytes, parser_limits, cancellation)?;
+        let retained = crate::json::RetainedJsonBudget::new(parser_limits);
+        retained.admit_bytes(bytes.capacity())?;
+        let document = CompanyFactsDocument::parse_with_allocation_authority(
+            &bytes,
+            parser_limits,
+            cancellation,
+            retained,
+        )?;
         Ok(Self {
             document,
             raw: RetrievedSecBytes {
@@ -293,6 +424,7 @@ impl RetrievedCompanyFacts {
                 availability,
                 locator: None,
                 retrieval_revision: None,
+                capture_receipt: None,
             },
         })
     }
@@ -305,6 +437,11 @@ impl RetrievedCompanyFacts {
     /// Returns exact immutable source evidence.
     pub const fn raw(&self) -> &RetrievedSecBytes {
         &self.raw
+    }
+
+    /// Returns the exact online Company Facts response material, or `None` for an offline import.
+    pub fn capture_material(&self) -> Result<Option<ProviderCaptureMaterial>, SecClientError> {
+        self.raw.capture_material()
     }
 }
 
@@ -325,6 +462,57 @@ impl RetrievedXbrlDocument {
     pub const fn raw(&self) -> &RetrievedSecBytes {
         &self.raw
     }
+
+    /// Returns the exact online filing/XBRL response material.
+    pub fn capture_material(&self) -> Result<ProviderCaptureMaterial, SecClientError> {
+        self.raw
+            .capture_material()?
+            .ok_or(SecClientError::InvalidCaptureMaterial)
+    }
+}
+
+pub(crate) fn provider_capture_material(
+    receipt: ProviderCaptureSetReceipt,
+    bytes: Bytes,
+) -> Result<ProviderCaptureMaterial, SecClientError> {
+    if receipt.pages().len() != 1 {
+        return Err(SecClientError::InvalidCaptureMaterial);
+    }
+    let page = receipt
+        .pages()
+        .first()
+        .ok_or(SecClientError::InvalidCaptureMaterial)?;
+    let received_at = DateTime::<Utc>::from_timestamp_nanos(page.received_at().unix_nanos());
+    let record = RawCaptureRecord::try_new_live(
+        deterministic_capture_uuid(b"event", &receipt, 0),
+        Arc::from(receipt.source_id().as_str()),
+        deterministic_capture_uuid(b"connection", &receipt, 0),
+        Some(0),
+        None,
+        received_at,
+        bytes,
+    )?;
+    ProviderCaptureMaterial::try_new(receipt, vec![record]).map_err(Into::into)
+}
+
+pub(crate) fn deterministic_capture_uuid(
+    tag: &[u8],
+    receipt: &ProviderCaptureSetReceipt,
+    ordinal: u16,
+) -> Uuid {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/sec-provider-capture-id/v1");
+    hash.update((tag.len() as u64).to_be_bytes());
+    hash.update(tag);
+    hash.update(receipt.request_set_identity().bytes());
+    hash.update(receipt.observation_digest().bytes());
+    hash.update(ordinal.to_be_bytes());
+    let mut bytes: [u8; 16] = hash.finalize()[..16]
+        .try_into()
+        .expect("SHA-256 prefix has a fixed length");
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 /// Current extraction-specific provider health.
@@ -385,7 +573,9 @@ pub(super) const fn validation_health_for_error(
 ) -> Option<SecExtractionHealthState> {
     match error {
         SecClientError::Cancelled | SecClientError::Parser(SecParserError::Cancelled) => None,
-        SecClientError::Parser(SecParserError::AllocationFailed)
+        SecClientError::Parser(
+            SecParserError::AllocationFailed | SecParserError::AllocationAuthorityPoisoned,
+        )
         | SecClientError::AllocationFailed
         | SecClientError::BlockingAdmissionClosed
         | SecClientError::BlockingWorkerFailed
@@ -394,12 +584,17 @@ pub(super) const fn validation_health_for_error(
         | SecClientError::RevisionAuthority(_)
         | SecClientError::Normalization(_) => Some(SecExtractionHealthState::LocalFailure),
         SecClientError::Parser(_)
+        | SecClientError::CompanyIdentity(_)
+        | SecClientError::ResponseCikMismatch
         | SecClientError::InvalidCompanionSet
         | SecClientError::InvalidCompositeRepresentation
+        | SecClientError::InvalidCaptureMaterial
+        | SecClientError::ProviderCapture(_)
         | SecClientError::CompanionObjectLimitExceeded
         | SecClientError::CompositeByteLimitExceeded => {
             Some(SecExtractionHealthState::InvalidResponse)
         }
+        SecClientError::RawCapture(_) => Some(SecExtractionHealthState::LocalFailure),
         _ => Some(SecExtractionHealthState::LocalFailure),
     }
 }
@@ -415,7 +610,7 @@ pub(crate) fn system_timestamp() -> Result<Timestamp, SecClientError> {
     Ok(Timestamp::from_unix_nanos(nanos))
 }
 
-fn normalized_cik(value: &str) -> Result<String, SecClientError> {
+pub(super) fn normalized_cik(value: &str) -> Result<String, SecClientError> {
     if value.is_empty() || value.len() > 10 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(SecClientError::InvalidLocator);
     }
@@ -477,6 +672,10 @@ pub enum SecClientError {
     NetworkDenied,
     #[error("SEC source lacks a registry-coordinated shared budget")]
     MissingSharedBudget,
+    #[error("SEC taxonomy publisher rate registration failed")]
+    TaxonomyRateRegistration(#[source] BudgetPoolError),
+    #[error("SEC taxonomy publisher rate authority is unavailable: {0:?}")]
+    TaxonomyRateUnavailable(BudgetUnavailableReason),
     #[error("SEC source budget exceeds the official aggregate request ceiling")]
     UnsafeBudgetPolicy,
     #[error("SEC source HTTP client profile is unsafe")]
@@ -503,12 +702,16 @@ pub enum SecClientError {
     InvalidCompanionSet,
     #[error("SEC composite representation evidence is incomplete")]
     InvalidCompositeRepresentation,
+    #[error("SEC provider capture material is incomplete or inconsistent")]
+    InvalidCaptureMaterial,
     #[error("SEC composite-manifest serialization failed")]
     CompositeSerialization,
     #[error("SEC conditional-response validator header is invalid")]
     InvalidValidatorHeader,
     #[error("SEC returned HTTP status {0}")]
     HttpStatus(u16),
+    #[error("SEC response CIK does not match the exact requested CIK")]
+    ResponseCikMismatch,
     #[error("SEC raw evidence did not match its computed identity")]
     RawEvidenceMismatch,
     #[error("system clock is outside the domain timestamp range")]
@@ -538,7 +741,13 @@ pub enum SecClientError {
     #[error(transparent)]
     Identity(#[from] market_squawk_domain::IdentityError),
     #[error(transparent)]
+    CompanyIdentity(#[from] market_squawk_domain::CompanyIdentityError),
+    #[error(transparent)]
     RevisionAuthority(#[from] market_squawk_sources::ObservedRevisionError),
+    #[error(transparent)]
+    ProviderCapture(#[from] ProviderCaptureError),
+    #[error(transparent)]
+    RawCapture(#[from] RawCaptureRecordError),
 }
 
 impl From<RawEvidenceError> for SecClientError {

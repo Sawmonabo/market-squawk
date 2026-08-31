@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-analysis-control"
+description = "Enables the analysis_control command without any pre-configured scope."
+commands.allow = ["analysis_control"]
+
+[[permission]]
+identifier = "deny-analysis-control"
+description = "Denies the analysis_control command without any pre-configured scope."
+commands.deny = ["analysis_control"]

@@ -5,19 +5,124 @@ mod output;
 use std::collections::HashSet;
 
 use chrono::DateTime;
-use market_squawk_execution::MAX_PAPER_FEE_BASIS_POINTS;
 use market_squawk_services::{
-    PARQUET_ARTIFACT_MEDIA_TYPE, ScopeRequirement, ServiceCapabilities, ServiceCapabilityError,
-    ServiceDomain, SourceEvidencePolicy, ToolArtifactPolicy, ToolAuthorization, ToolContract,
-    ToolDescriptor, ToolEffects, ToolInputError, ToolResultPolicy, ToolScope,
+    NDJSON_ARTIFACT_MEDIA_TYPE, PARQUET_ARTIFACT_MEDIA_TYPE, ScopeRequirement, ServiceCapabilities,
+    ServiceCapabilityError, ServiceDomain, SourceEvidencePolicy, ToolArtifactPolicy,
+    ToolAuthorization, ToolContract, ToolDescriptor, ToolEffects, ToolInputError, ToolResultPolicy,
+    ToolScope,
 };
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use self::output::output_data_schema;
+use super::research::{
+    MACRO_GET_CONTEXT, MAX_MARKET_HISTORY_BARS, TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION,
+    TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION,
+};
+use crate::provider_activation::FRED_ALFRED_READ_OPERATION;
 
 /// Exact contract version shared by CLI and MCP for the first local release.
 pub const APPLICATION_CONTRACT_VERSION: &str = "1";
+
+/// Presentation visibility for one existing application operation.
+///
+/// Operations are management-only unless this policy explicitly admits their provider-neutral
+/// product contract. That default keeps new registrations out of ordinary MCP discovery until
+/// their product DTO and language have been reviewed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OperationVisibility {
+    Product,
+    Management,
+}
+
+pub(crate) fn operation_visibility(name: &str) -> OperationVisibility {
+    if matches!(
+        name,
+        "Market.GetOverview"
+            | "Market.GetInstrument"
+            | "Market.GetHistory"
+            | "Market.SearchUniverse"
+            | MACRO_GET_CONTEXT
+            | "Portfolio.PreviewStagedImport"
+            | "Portfolio.ApproveStagedImport"
+            | "Portfolio.CommitStagedImport"
+            | "Portfolio.DiscardStagedImport"
+            | "Portfolio.ListAccounts"
+            | "Portfolio.ListRevisions"
+            | "Portfolio.GetHoldings"
+            | "Portfolio.GetTransactions"
+            | "Portfolio.GetPerformance"
+            | "Portfolio.GetExposure"
+            | "Portfolio.GetRisk"
+            | "Portfolio.GetAttribution"
+            | "Portfolio.EvaluateScenario"
+            | "Portfolio.EvaluateScenarioBatch"
+            | "Portfolio.ProposeRebalance"
+            | "Portfolio.EvaluateCandidateImpact"
+            | "Analysis.Lookup"
+            | "Analysis.ListProductBacktests"
+            | "Analysis.GetProductBacktest"
+            | "Analysis.GetBacktestPreparation"
+            | "Analysis.PreviewBacktest"
+            | "Analysis.StartPreparedBacktest"
+            | "Model.ListBundles"
+            | "Model.GetForecastPreparation"
+            | "Model.PrepareForecast"
+            | "Model.StartPreparedForecast"
+            | "Model.ListForecasts"
+            | "Model.GetForecast"
+            | "Model.GetForecastOutcomes"
+            | "Model.ListProductActivity"
+            | "Decision.GetScreen"
+            | "Decision.GetInvestmentAnalysis"
+            | "Decision.ListInvestmentAnalyses"
+            | "Decision.GetRecommendationTrackRecord"
+            | "Bot.GetStatus"
+            | "Bot.GetStartPreparation"
+            | "Bot.PrepareStart"
+            | "Bot.Start"
+            | "Bot.Stop"
+            | "Execution.GetOrders"
+            | "Execution.GetFills"
+            | "Execution.GetManualPaperTargets"
+            | "Execution.PrepareManualPaperDraft"
+            | "Execution.SubmitManualPaperDraft"
+            | "Execution.Cancel"
+            | "Risk.TriggerKillSwitch"
+    ) {
+        OperationVisibility::Product
+    } else {
+        OperationVisibility::Management
+    }
+}
+
+pub(crate) const PRODUCT_LOOKUP_CATEGORIES: &[&str] = &[
+    "company",
+    "investment",
+    "investment_target",
+    "model",
+    "portfolio",
+    "research",
+    "saved_screen",
+];
+pub(crate) const PRODUCT_LOOKUP_CATEGORY_INVESTMENT: &str = PRODUCT_LOOKUP_CATEGORIES[1];
+pub(crate) const PRODUCT_LOOKUP_CATEGORY_SAVED_SCREEN: &str = PRODUCT_LOOKUP_CATEGORIES[6];
+pub(crate) const PRODUCT_LOOKUP_ACTION_OPEN_INVESTMENT: &str = "open_investment";
+pub(crate) const PRODUCT_LOOKUP_ACTION_OPEN_SAVED_SCREEN: &str = "open_saved_screen";
+const PRODUCT_LOOKUP_QUERY_PATTERN: &str = r"^[^\s\u0000-\u001F\u007F-\u009F](?:[^\u0000-\u001F\u007F-\u009F]*[^\s\u0000-\u001F\u007F-\u009F])?$";
+/// Sixty-four Unicode scalars remain within the canonical catalog's 256-byte UTF-8 admission
+/// bound even when every scalar uses four bytes.
+pub(crate) const PRODUCT_LOOKUP_QUERY_MAXIMUM_CHARACTERS: usize = 64;
+
+pub(crate) fn product_lookup_query_is_canonical(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            == value.trim_matches(|character: char| {
+                character.is_whitespace() || character == '\u{FEFF}'
+            })
+        && !value.chars().any(char::is_control)
+        && value.chars().count() <= PRODUCT_LOOKUP_QUERY_MAXIMUM_CHARACTERS
+}
 
 const MAXIMUM_INSTRUMENTS: usize = 256;
 const MAXIMUM_SOURCES: usize = 32;
@@ -32,6 +137,7 @@ const MAXIMUM_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_ARTIFACT_CHUNK_BYTES: u64 = 32 * 1024;
 const MAXIMUM_SOURCE_INSPECTION_PAGE_INDEX: u64 = 63;
 const MAXIMUM_SOURCE_INSPECTION_RECORDS: u64 = 1_024;
+const MAXIMUM_FORECAST_VALIDITY_NANOS: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
 
 const LOCAL_SCOPE: ToolScope = ToolScope::new(
     ScopeRequirement::NotApplicable,
@@ -57,11 +163,35 @@ const DATA_SCOPE: ToolScope = ToolScope::new(
     ScopeRequirement::Required,
     ScopeRequirement::Optional,
 );
+const JOB_SCOPE: ToolScope = ToolScope::new(
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::NotApplicable,
+);
 const PORTFOLIO_SCOPE: ToolScope = ToolScope::new(
     ScopeRequirement::Optional,
     ScopeRequirement::Optional,
     ScopeRequirement::Required,
     ScopeRequirement::Optional,
+);
+const PRODUCT_PORTFOLIO_ACCOUNT_SCOPE: ToolScope = ToolScope::new(
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::Required,
+    ScopeRequirement::NotApplicable,
+);
+const PRODUCT_PORTFOLIO_RISK_SCOPE: ToolScope = ToolScope::new(
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::Optional,
+    ScopeRequirement::Required,
+    ScopeRequirement::NotApplicable,
+);
+const PORTFOLIO_CANDIDATE_SCOPE: ToolScope = ToolScope::new(
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::NotApplicable,
+    ScopeRequirement::Required,
+    ScopeRequirement::NotApplicable,
 );
 
 const NO_ARGUMENTS: &[ArgumentSpec] = &[];
@@ -77,8 +207,62 @@ const FEATURE_DATASET_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::optional("dataset", ArgumentKind::Identifier),
     ArgumentSpec::optional("afterDataset", ArgumentKind::Identifier),
 ];
+const FEATURE_DATASET_PREVIEW_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("catalogGeneration", ArgumentKind::Sha256),
+    ArgumentSpec::required("dataset", ArgumentKind::Identifier),
+    ArgumentSpec::required("intendedUse", ArgumentKind::Identifier),
+];
+const FEATURE_DATASET_PREPARED_START_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("receipt", ArgumentKind::Object)];
+const ANALYSIS_LOOKUP_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("query", ArgumentKind::ProductLookupQuery),
+    ArgumentSpec::optional(
+        "categories",
+        ArgumentKind::EnumerationArray(PRODUCT_LOOKUP_CATEGORIES),
+    ),
+];
+const MARKET_OVERVIEW_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::optional(
+    "pageToken",
+    ArgumentKind::MarketPageToken,
+)];
+const MARKET_UNIVERSE_SEARCH_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("query", ArgumentKind::ProductLookupQuery),
+    ArgumentSpec::optional("pageToken", ArgumentKind::MarketPageToken),
+];
+const MARKET_INSTRUMENT_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "selectionToken",
+    ArgumentKind::MarketSelectionToken,
+)];
+const MARKET_HISTORY_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "historyToken",
+    ArgumentKind::MarketHistoryToken,
+)];
 const PROVIDER_ARGUMENT: &[ArgumentSpec] =
     &[ArgumentSpec::required("provider", ArgumentKind::Identifier)];
+const MACRO_DASHBOARD_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required(
+        "provider",
+        ArgumentKind::Enumeration(&["federal-reserve-board.data-download-program"]),
+    ),
+    ArgumentSpec::required("release", ArgumentKind::Enumeration(&["h15"])),
+];
+const MACRO_CONTEXT_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("knowledgeCutoff", ArgumentKind::BoundedTimestamp),
+    ArgumentSpec::optional("effectiveDateCutoff", ArgumentKind::CalendarDate),
+];
+const FRED_ALFRED_LATEST_KNOWN_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("generation", ArgumentKind::FredGeneration),
+    ArgumentSpec::optional("knowledgeCutoff", ArgumentKind::BoundedTimestamp),
+    ArgumentSpec::optional("effectiveDateCutoff", ArgumentKind::CalendarDate),
+];
+const TREASURY_LATEST_KNOWN_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("generation", ArgumentKind::FredGeneration),
+    ArgumentSpec::optional("knowledgeCutoff", ArgumentKind::BoundedTimestamp),
+    ArgumentSpec::optional("effectiveDateCutoff", ArgumentKind::CalendarDate),
+    ArgumentSpec::optional("seriesIds", ArgumentKind::TreasurySeriesIds),
+];
+const PROVIDER_CREDENTIAL_BUNDLE_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("inputTicketId", ArgumentKind::Uuid)];
 const SOURCE_DISCOVERY_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("provider", ArgumentKind::Identifier),
     ArgumentSpec::required("dataset", ArgumentKind::Identifier),
@@ -102,6 +286,15 @@ const SOURCE_INSPECTION_ARGUMENTS: &[ArgumentSpec] = &[
         },
     ),
 ];
+const SOURCE_LIFECYCLE_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("provider", ArgumentKind::Identifier),
+    ArgumentSpec::required("expectedStateRevision", ArgumentKind::PositiveUnsignedText),
+    ArgumentSpec::optional("expectedGeneration", ArgumentKind::PositiveUnsignedText),
+    ArgumentSpec::optional("expectedRuntimeGenerationSha256", ArgumentKind::Sha256),
+    ArgumentSpec::optional("onboardingSessionId", ArgumentKind::Uuid),
+    ArgumentSpec::optional("publicConfigurationSha256", ArgumentKind::Sha256),
+    ArgumentSpec::optional("reason", ArgumentKind::Identifier),
+];
 const ACCOUNT_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required(
     "accountId",
     ArgumentKind::Identifier,
@@ -110,16 +303,353 @@ const PORTFOLIO_IMPORT_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("accountId", ArgumentKind::Identifier),
     ArgumentSpec::required("artifactId", ArgumentKind::Identifier),
 ];
+const PORTFOLIO_IMPORT_PREVIEW_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    ArgumentSpec::required("inputTicketId", ArgumentKind::Uuid),
+];
+const PORTFOLIO_IMPORT_APPROVAL_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("reviewToken", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "interpretations",
+        ArgumentKind::PortfolioImportInterpretations,
+    ),
+];
+const PORTFOLIO_IMPORT_COMMIT_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("approvalToken", ArgumentKind::Uuid)];
+const PORTFOLIO_IMPORT_DISCARD_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("reviewToken", ArgumentKind::Uuid)];
+const RESEARCH_FILE_PREVIEW_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("inputTicketId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "format",
+        ArgumentKind::Enumeration(&["csv", "json", "ndjson", "parquet"]),
+    ),
+];
+const RESEARCH_FILE_COMMIT_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("previewId", ArgumentKind::Sha256),
+    ArgumentSpec::required("mapping", ArgumentKind::ResearchFileMapping),
+];
+const RESEARCH_FILE_DISCARD_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("previewId", ArgumentKind::Sha256)];
+const LIST_ACCOUNTS_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::optional(
+    "afterAccountToken",
+    ArgumentKind::OpaqueProductToken,
+)];
+const PORTFOLIO_RISK_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "accountToken",
+    ArgumentKind::OpaqueProductToken,
+)];
+const RECOMMENDATION_SETUP_PREVIEW_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required(
+        "expectedRevision",
+        ArgumentKind::Unsigned {
+            minimum: 0,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required("accountId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "allocationProfile",
+        ArgumentKind::RecommendationAllocationProfile,
+    ),
+];
+const RECOMMENDATION_SETUP_COMMIT_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("previewId", ArgumentKind::Uuid),
+    ArgumentSpec::required("previewDigest", ArgumentKind::Sha256),
+];
+const LIST_REVISIONS_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    ArgumentSpec::optional("afterSnapshotToken", ArgumentKind::Uuid),
+];
+const PORTFOLIO_ATTRIBUTION_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    ArgumentSpec::required("baselineSnapshotToken", ArgumentKind::Uuid),
+];
+const PORTFOLIO_SCENARIO_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    ArgumentSpec::required("scenario", ArgumentKind::Object),
+];
+const PORTFOLIO_SCENARIO_BATCH_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    ArgumentSpec::required("scenarios", ArgumentKind::Array),
+];
+const PORTFOLIO_REBALANCE_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("accountId", ArgumentKind::Identifier),
+    ArgumentSpec::required("proposal", ArgumentKind::Object),
+];
+const PORTFOLIO_CANDIDATE_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("instrumentId", ArgumentKind::Identifier),
+    ArgumentSpec::required("proposedQuantity", ArgumentKind::Decimal),
+    ArgumentSpec::required("scenarioShock", ArgumentKind::Decimal),
+];
 const MODEL_ARGUMENT: &[ArgumentSpec] =
     &[ArgumentSpec::required("modelId", ArgumentKind::Identifier)];
 const MODEL_EVALUATION_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("modelId", ArgumentKind::Identifier),
     ArgumentSpec::required("input", ArgumentKind::Object),
 ];
+const MODEL_TRAINING_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("configTicketId", ArgumentKind::Uuid),
+    ArgumentSpec::required("authorityTicketId", ArgumentKind::Uuid),
+];
+const MODEL_FORECAST_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("modelId", ArgumentKind::Identifier),
+    ArgumentSpec::required("request", ArgumentKind::ForecastRequest),
+];
+const MODEL_FORECAST_PREPARATION_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("selection", ArgumentKind::Object)];
+const MODEL_FORECAST_PREPARED_START_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "confirmationToken",
+    ArgumentKind::Uuid,
+)];
+const MODEL_FORECAST_TOKEN_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("forecastToken", ArgumentKind::Uuid)];
+const MODEL_LATEST_VALID_FORECAST_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("instrumentId", ArgumentKind::Uuid),
+    ArgumentSpec::required("asOf", ArgumentKind::Timestamp),
+];
+const DECISION_SAVE_SCREEN_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional(
+        "expectedRevision",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u32::MAX as u64,
+        },
+    ),
+    ArgumentSpec::required("screen", ArgumentKind::Object),
+];
+const DECISION_RUN_SCREEN_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("screenId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "screenRevision",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u32::MAX as u64,
+        },
+    ),
+    ArgumentSpec::required("datasetManifest", ArgumentKind::Object),
+    ArgumentSpec::required("asOf", ArgumentKind::Timestamp),
+];
+const DECISION_LIST_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "limit",
+    ArgumentKind::Unsigned {
+        minimum: 1,
+        maximum: 4_096,
+    },
+)];
+const DECISION_SCREEN_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("screenId", ArgumentKind::Identifier)];
+const DECISION_RUN_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("runId", ArgumentKind::Identifier)];
+const DECISION_RUN_LIST_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("afterRunId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 1_000,
+        },
+    ),
+];
+const DECISION_DOSSIER_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "dossierId",
+    ArgumentKind::Identifier,
+)];
+const DECISION_DOSSIER_LIST_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("candidateId", ArgumentKind::Identifier),
+    ArgumentSpec::optional("afterDossierId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 1_000,
+        },
+    ),
+];
+const DECISION_DOSSIER_PREPARATION_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "candidateId",
+    ArgumentKind::Identifier,
+)];
+const DECISION_DOSSIER_PREVIEW_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("draft", ArgumentKind::Object)];
+const DECISION_DOSSIER_COMMIT_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("receiptId", ArgumentKind::Uuid)];
+const DECISION_TARGET_PREPARATION_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "dossierId",
+    ArgumentKind::Identifier,
+)];
+const DECISION_TARGET_PREVIEW_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("draft", ArgumentKind::Object)];
+const DECISION_TARGET_COMMIT_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("receiptId", ArgumentKind::Uuid)];
+const DECISION_TARGET_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("targetId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "revision",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u32::MAX as u64,
+        },
+    ),
+];
+const DECISION_TARGET_LIST_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("targetId", ArgumentKind::Identifier)];
+const DECISION_TARGET_INDEX_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("afterTargetId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 1_000,
+        },
+    ),
+];
+const DECISION_TARGET_REVIEW_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("review", ArgumentKind::Object)];
+const DECISION_INVESTMENT_ANALYSIS_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "actionToken",
+    ArgumentKind::ActionToken,
+)];
+const DECISION_INVESTMENT_ANALYSIS_LIST_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("afterActionToken", ArgumentKind::ActionToken),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 1_000,
+        },
+    ),
+];
+const DECISION_RECOMMENDATION_TRACK_RECORD_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "actionToken",
+    ArgumentKind::ActionToken,
+)];
+const OPERATIONS_BACKUP_LIST_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("afterBackupId", ArgumentKind::Sha256),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 64,
+        },
+    ),
+];
+const OPERATIONS_BACKUP_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("backupId", ArgumentKind::Sha256)];
+const OPERATIONS_RETENTION_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "keepLatest",
+    ArgumentKind::Unsigned {
+        minimum: 1,
+        maximum: 128,
+    },
+)];
+const OPERATIONS_WORKSPACE_LIST_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("afterWorkspaceId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 64,
+        },
+    ),
+];
+const OPERATIONS_WORKSPACE_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("workspaceId", ArgumentKind::Uuid)];
+const OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("previewId", ArgumentKind::Uuid),
+    ArgumentSpec::required("previewDigest", ArgumentKind::Sha256),
+];
+const OPERATIONS_LOG_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("from", ArgumentKind::Timestamp),
+    ArgumentSpec::optional("through", ArgumentKind::Timestamp),
+    ArgumentSpec::optional(
+        "minimumSeverity",
+        ArgumentKind::Enumeration(&["trace", "debug", "info", "warn", "error"]),
+    ),
+    ArgumentSpec::optional(
+        "domain",
+        ArgumentKind::Enumeration(&[
+            "application",
+            "source",
+            "market",
+            "research",
+            "portfolio",
+            "model",
+            "backtest",
+            "execution",
+            "risk",
+            "fair_value",
+            "mcp",
+            "lifecycle",
+        ]),
+    ),
+    ArgumentSpec::optional("sourceId", ArgumentKind::Identifier),
+    ArgumentSpec::optional("jobId", ArgumentKind::Identifier),
+    ArgumentSpec::optional("correlationId", ArgumentKind::Identifier),
+    ArgumentSpec::optional("search", ArgumentKind::Text),
+    ArgumentSpec::optional(
+        "afterSequence",
+        ArgumentKind::Unsigned {
+            minimum: 0,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 10_000,
+        },
+    ),
+];
+const OPERATIONS_SETTINGS_CHANGE_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required(
+        "expectedRevision",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required("changes", ArgumentKind::SettingsChanges),
+];
+const OPERATIONS_SETTINGS_ROLLBACK_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required(
+        "expectedRevision",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required(
+        "targetRevision",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+];
+const SETUP_PLAN_PREVIEW_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required(
+        "expectedRevision",
+        ArgumentKind::Unsigned {
+            minimum: 0,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required("selection", ArgumentKind::Object),
+];
+const SETUP_PLAN_CONFIRMATION_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("previewId", ArgumentKind::Uuid),
+    ArgumentSpec::required("previewSha256", ArgumentKind::Sha256),
+];
 const MEASUREMENT_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required(
     "measurementId",
     ArgumentKind::Identifier,
 )];
+const FAIR_VALUE_WORKSPACE_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("measurementToken", ArgumentKind::Uuid),
+    ArgumentSpec::required("at", ArgumentKind::Timestamp),
+];
 const FAIR_VALUE_STATUS_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("measurementId", ArgumentKind::Identifier),
     ArgumentSpec::required("at", ArgumentKind::Timestamp),
@@ -134,6 +664,34 @@ const FAIR_VALUE_APPROVAL_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("approvedBy", ArgumentKind::Identifier),
     ArgumentSpec::required("approvedAt", ArgumentKind::Timestamp),
     ArgumentSpec::required("expiresAt", ArgumentKind::Timestamp),
+];
+const FAIR_VALUE_OVERRIDE_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("measurementId", ArgumentKind::Identifier),
+    ArgumentSpec::required("decisionId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "requestedHierarchy",
+        ArgumentKind::Enumeration(&["level_2", "level_3"]),
+    ),
+    ArgumentSpec::required("justification", ArgumentKind::Text),
+    ArgumentSpec::required("preparedBy", ArgumentKind::Identifier),
+    ArgumentSpec::required("preparedAt", ArgumentKind::Timestamp),
+    ArgumentSpec::required("expiresAt", ArgumentKind::Timestamp),
+];
+const FAIR_VALUE_REVOCATION_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("approvalId", ArgumentKind::Identifier),
+    ArgumentSpec::required("revokedBy", ArgumentKind::Identifier),
+    ArgumentSpec::required("revokedAt", ArgumentKind::Timestamp),
+    ArgumentSpec::required("reason", ArgumentKind::Text),
+];
+const FAIR_VALUE_AUDIT_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("after", ArgumentKind::Object),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 10_000,
+        },
+    ),
 ];
 const MARKET_ACCESS_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required(
     "assessmentId",
@@ -157,7 +715,16 @@ const FAIR_VALUE_MARKET_ACCESS_ARGUMENTS: &[ArgumentSpec] = &[
 ];
 const BACKTEST_RUN_ARGUMENTS: &[ArgumentSpec] =
     &[ArgumentSpec::required("registration", ArgumentKind::Object)];
-const RUN_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required("runId", ArgumentKind::Identifier)];
+const BACKTEST_PREPARATION_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("selection", ArgumentKind::Object)];
+const BACKTEST_PREPARED_START_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "confirmationToken",
+    ArgumentKind::Uuid,
+)];
+const BACKTEST_PRODUCT_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("backtestToken", ArgumentKind::Uuid)];
+const DATASET_BUILD_ARGUMENTS: &[ArgumentSpec] =
+    &[ArgumentSpec::required("registration", ArgumentKind::Object)];
 const ARTIFACT_READ_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("artifactId", ArgumentKind::Identifier),
     ArgumentSpec::required("sha256", ArgumentKind::Sha256),
@@ -170,7 +737,11 @@ const ARTIFACT_READ_ARGUMENTS: &[ArgumentSpec] = &[
     ),
     ArgumentSpec::required(
         "mediaType",
-        ArgumentKind::Enumeration(&["application/json", PARQUET_ARTIFACT_MEDIA_TYPE]),
+        ArgumentKind::Enumeration(&[
+            "application/json",
+            PARQUET_ARTIFACT_MEDIA_TYPE,
+            NDJSON_ARTIFACT_MEDIA_TYPE,
+        ]),
     ),
     ArgumentSpec::required(
         "offset",
@@ -187,32 +758,202 @@ const ARTIFACT_READ_ARGUMENTS: &[ArgumentSpec] = &[
         },
     ),
 ];
-const BOT_START_ARGUMENTS: &[ArgumentSpec] = &[
+const BOT_PREPARE_START_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("cashChoice", ArgumentKind::OpaqueProductToken),
+    ArgumentSpec::required("costChoice", ArgumentKind::OpaqueProductToken),
+    ArgumentSpec::required("modeChoice", ArgumentKind::OpaqueProductToken),
+];
+const PAPER_CONFIRMATION_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "confirmationToken",
+    ArgumentKind::OpaqueProductToken,
+)];
+const BOT_STOP_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required("reason", ArgumentKind::Text)];
+const MANUAL_PAPER_PREPARATION_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("targetToken", ArgumentKind::OpaqueProductToken),
+    ArgumentSpec::required("side", ArgumentKind::Enumeration(&["buy", "sell"])),
     ArgumentSpec::required(
-        "provider",
-        ArgumentKind::Enumeration(&["coinbase", "coinbase-direct", "kraken"]),
+        "orderType",
+        ArgumentKind::Enumeration(&["market", "limit", "stop", "stop_limit"]),
     ),
-    ArgumentSpec::optional("providerSessionId", ArgumentKind::Identifier),
-    ArgumentSpec::required("initialCash", ArgumentKind::Decimal),
+    ArgumentSpec::required("quantityLots", ArgumentKind::PositiveLotQuantity),
+    ArgumentSpec::optional(
+        "limitTargetLevel",
+        ArgumentKind::Enumeration(MANUAL_PAPER_TARGET_LEVELS),
+    ),
+    ArgumentSpec::optional(
+        "stopTargetLevel",
+        ArgumentKind::Enumeration(MANUAL_PAPER_TARGET_LEVELS),
+    ),
     ArgumentSpec::required(
-        "feeBasisPoints",
-        ArgumentKind::Unsigned {
-            minimum: 0,
-            maximum: MAX_PAPER_FEE_BASIS_POINTS,
-        },
+        "timeInForce",
+        ArgumentKind::Enumeration(&[
+            "day",
+            "good_til_cancelled",
+            "immediate_or_cancel",
+            "fill_or_kill",
+        ]),
     ),
 ];
-const BOT_STOP_ARGUMENTS: &[ArgumentSpec] = &[ArgumentSpec::required("reason", ArgumentKind::Text)];
-const ORDER_ARGUMENT: &[ArgumentSpec] =
-    &[ArgumentSpec::required("orderId", ArgumentKind::Identifier)];
+const MANUAL_PAPER_TARGET_LEVELS: &[&str] = &[
+    "downside",
+    "add",
+    "entry_lower",
+    "entry_upper",
+    "base",
+    "trim_lower",
+    "trim_upper",
+    "exit_lower",
+    "exit_upper",
+    "upside",
+];
+const ORDER_ARGUMENT: &[ArgumentSpec] = &[ArgumentSpec::required(
+    "actionToken",
+    ArgumentKind::OpaqueProductToken,
+)];
 const INGEST_SOURCE_ARGUMENTS: &[ArgumentSpec] = &[
     ArgumentSpec::required("provider", ArgumentKind::Identifier),
     ArgumentSpec::required("object", ArgumentKind::Identifier),
     ArgumentSpec::required("dataset", ArgumentKind::Identifier),
     ArgumentSpec::required("discoveryReceipt", ArgumentKind::Identifier),
 ];
+const JOB_LIST_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::optional("afterJobId", ArgumentKind::Identifier),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 1_024,
+        },
+    ),
+];
+const JOB_GET_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("jobId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "generation",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+];
+const JOB_WATCH_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("jobId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "generation",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required(
+        "afterSequence",
+        ArgumentKind::Unsigned {
+            minimum: 0,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required(
+        "limit",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: 4_096,
+        },
+    ),
+];
+const JOB_MUTATION_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("jobId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "generation",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required(
+        "expectedSequence",
+        ArgumentKind::Unsigned {
+            minimum: 0,
+            maximum: u64::MAX,
+        },
+    ),
+];
+const JOB_CONFIRM_ARGUMENTS: &[ArgumentSpec] = &[
+    ArgumentSpec::required("jobId", ArgumentKind::Uuid),
+    ArgumentSpec::required(
+        "generation",
+        ArgumentKind::Unsigned {
+            minimum: 1,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required(
+        "expectedSequence",
+        ArgumentKind::Unsigned {
+            minimum: 0,
+            maximum: u64::MAX,
+        },
+    ),
+    ArgumentSpec::required("identity", ArgumentKind::Identifier),
+    ArgumentSpec::required("digest", ArgumentKind::Sha256),
+];
 
 const OPERATION_SPECS: &[OperationSpec] = &[
+    read(
+        "Job.List",
+        "List bounded latest job generations in stable identity order.",
+        ServiceDomain::Job,
+        JOB_SCOPE,
+        JOB_LIST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Job.Get",
+        "Return one durable sanitized job generation.",
+        ServiceDomain::Job,
+        JOB_SCOPE,
+        JOB_GET_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Job.Watch",
+        "Return a bounded ordered page of durable job events.",
+        ServiceDomain::Job,
+        JOB_SCOPE,
+        JOB_WATCH_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Job.Cancel",
+        "Request cooperative cancellation of one exact job generation.",
+        ServiceDomain::Job,
+        JOB_SCOPE,
+        JOB_MUTATION_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Job.Confirm",
+        "Confirm one exact generation-bound job request.",
+        ServiceDomain::Job,
+        JOB_SCOPE,
+        JOB_CONFIRM_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Job.Retry",
+        "Start the next bounded generation after a retryable terminal failure.",
+        ServiceDomain::Job,
+        JOB_SCOPE,
+        JOB_MUTATION_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Source.ImportCredentialBundle",
+        "Claim one native-staged provider credential bundle, transfer enabled secrets into the protected store, and return only secret-free provider dispositions.",
+        ServiceDomain::Source,
+        LOCAL_SCOPE,
+        PROVIDER_CREDENTIAL_BUNDLE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
     mutation(
         "Source.Register",
         "Register one code-supported provider capability in the local catalog.",
@@ -274,6 +1015,62 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         SOURCE_DISCOVERY_SCOPE,
         SOURCE_DISCOVERY_ARGUMENTS,
     ),
+    mutation(
+        "Source.Start",
+        "Start one admitted source configuration under exact state revision fencing.",
+        ServiceDomain::Source,
+        SOURCE_SCOPE,
+        SOURCE_LIFECYCLE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Source.Stop",
+        "Stop source activity while preserving registration and retained data.",
+        ServiceDomain::Source,
+        SOURCE_SCOPE,
+        SOURCE_LIFECYCLE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Source.Retry",
+        "Retry one blocked source lifecycle phase under the existing provider budget.",
+        ServiceDomain::Source,
+        SOURCE_SCOPE,
+        SOURCE_LIFECYCLE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Source.Resynchronize",
+        "Invalidate one source generation and establish a verified successor.",
+        ServiceDomain::Source,
+        SOURCE_SCOPE,
+        SOURCE_LIFECYCLE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Source.Verify",
+        "Revalidate source readiness without starting runtime activity.",
+        ServiceDomain::Source,
+        SOURCE_SCOPE,
+        SOURCE_LIFECYCLE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Source.Reconfigure",
+        "Activate an already prepared public source configuration generation.",
+        ServiceDomain::Source,
+        SOURCE_SCOPE,
+        SOURCE_LIFECYCLE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Source.Remove",
+        "Revoke source runtime authority under the selected local cleanup contract.",
+        ServiceDomain::Source,
+        SOURCE_SCOPE,
+        SOURCE_LIFECYCLE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
     read(
         "Market.GetSnapshot",
         "Return current bounded market state with explicit coverage and quality evidence.",
@@ -296,6 +1093,42 @@ const OPERATION_SPECS: &[OperationSpec] = &[
     read_data(
         "Market.GetComparisons",
         "Compare bounded observations across requested sources.",
+    ),
+    read_data(
+        "Market.GetUnifiedFeed",
+        "Return one source-preserving market view per exact instrument.",
+    ),
+    read(
+        "Market.GetOverview",
+        "Show a concise overview of current investment prices and market conditions.",
+        ServiceDomain::Market,
+        JOB_SCOPE,
+        MARKET_OVERVIEW_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Market.GetInstrument",
+        "Show the current price and market details for one investment.",
+        ServiceDomain::Market,
+        JOB_SCOPE,
+        MARKET_INSTRUMENT_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Market.GetHistory",
+        "Show the available daily price history for one investment.",
+        ServiceDomain::Market,
+        JOB_SCOPE,
+        MARKET_HISTORY_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Market.SearchUniverse",
+        "Find investments by name.",
+        ServiceDomain::Market,
+        JOB_SCOPE,
+        MARKET_UNIVERSE_SEARCH_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
     ),
     read(
         "Research.ListDatasets",
@@ -330,11 +1163,59 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         SourceEvidencePolicy::Required,
     ),
     source_ingest(
-        "Research.IngestSource",
-        "Extract and ingest one configured provider object under retained rights authority.",
+        "Research.StartIngestSource",
+        "Start durable extraction and ingestion of one receipt-admitted provider object.",
         ServiceDomain::Research,
         SOURCE_SCOPE,
         INGEST_SOURCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    source_ingest(
+        "Research.IngestSource",
+        "Compatibility wait for durable extraction and ingestion under the caller deadline.",
+        ServiceDomain::Research,
+        SOURCE_SCOPE,
+        INGEST_SOURCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Research.PreviewStagedFile",
+        "Claim one staged user-owned research file and return a bounded path-free preview.",
+        ServiceDomain::Research,
+        LOCAL_SCOPE,
+        RESEARCH_FILE_PREVIEW_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    source_evidence_mutation(
+        "Research.CommitStagedFile",
+        "Bind one guided mapping to exact staged bytes and start durable research ingestion.",
+        ServiceDomain::Research,
+        LOCAL_SCOPE,
+        RESEARCH_FILE_COMMIT_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Research.DiscardStagedFile",
+        "Discard one uncommitted user-owned research-file preview.",
+        ServiceDomain::Research,
+        LOCAL_SCOPE,
+        RESEARCH_FILE_DISCARD_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Research.StartDatasetBuild",
+        "Start one durable phase-one point-in-time derived generation from an admitted request; the result conveys no product admission.",
+        ServiceDomain::Research,
+        LOCAL_SCOPE,
+        DATASET_BUILD_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Research.StartExport",
+        "Start one durable manifest-pinned research export to controlled local artifacts.",
+        ServiceDomain::Research,
+        DATA_SCOPE,
+        DATASET_ARGUMENT,
         ToolAuthorization::LocalConfirmation,
     ),
     read_observations(
@@ -356,6 +1237,51 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         "Fundamental.GetRatios",
         "Return bounded point-in-time fundamental ratios.",
         ServiceDomain::Fundamental,
+    ),
+    OperationSpec {
+        name: "Macro.GetDashboard",
+        description: "Return the exact latest-known Federal Reserve Board H.15 Treasury constant-maturity dashboard.",
+        domain: ServiceDomain::Macro,
+        scope: LOCAL_SCOPE,
+        arguments: MACRO_DASHBOARD_ARGUMENTS,
+        authorization: ToolAuthorization::ReadOnly,
+        source_evidence: SourceEvidencePolicy::Required,
+        artifact: ToolArtifactPolicy::InlineOnly,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+    },
+    read(
+        MACRO_GET_CONTEXT,
+        "Show the economic and interest-rate backdrop as it was known at the selected time.",
+        ServiceDomain::Macro,
+        LOCAL_SCOPE,
+        MACRO_CONTEXT_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        FRED_ALFRED_READ_OPERATION,
+        "Return FRED/ALFRED availability or one exact manifest-pinned latest-known observation.",
+        ServiceDomain::Macro,
+        LOCAL_SCOPE,
+        FRED_ALFRED_LATEST_KNOWN_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION,
+        "Return Treasury Fiscal Data availability or one exact manifest-pinned latest-known snapshot.",
+        ServiceDomain::Macro,
+        LOCAL_SCOPE,
+        TREASURY_LATEST_KNOWN_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION,
+        "Return Treasury daily-rates availability or one exact manifest-pinned latest-known snapshot.",
+        ServiceDomain::Macro,
+        LOCAL_SCOPE,
+        TREASURY_LATEST_KNOWN_ARGUMENTS,
+        SourceEvidencePolicy::Required,
     ),
     read_observations(
         "Macro.ListSeries",
@@ -385,6 +1311,78 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         PORTFOLIO_IMPORT_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
     ),
+    mutation(
+        "Portfolio.PreviewStagedImport",
+        "Review how a selected portfolio file will be interpreted before import.",
+        ServiceDomain::Portfolio,
+        LOCAL_SCOPE,
+        PORTFOLIO_IMPORT_PREVIEW_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    idempotent_mutation(
+        "Portfolio.ApproveStagedImport",
+        "Approve the selected interpretations for a reviewed portfolio file.",
+        ServiceDomain::Portfolio,
+        LOCAL_SCOPE,
+        PORTFOLIO_IMPORT_APPROVAL_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Portfolio.CommitStagedImport",
+        "Add the approved positions and transactions to the portfolio.",
+        ServiceDomain::Portfolio,
+        LOCAL_SCOPE,
+        PORTFOLIO_IMPORT_COMMIT_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Portfolio.DiscardStagedImport",
+        "Discard a portfolio import preview that has not been applied.",
+        ServiceDomain::Portfolio,
+        LOCAL_SCOPE,
+        PORTFOLIO_IMPORT_DISCARD_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Portfolio.GetRecommendationSetup",
+        "Return the explicit selected recommendation account and numeric allocation setup.",
+        ServiceDomain::Portfolio,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Portfolio.PreviewRecommendationSetup",
+        "Preview one explicit account selection and same-account numeric allocation profile.",
+        ServiceDomain::Portfolio,
+        LOCAL_SCOPE,
+        RECOMMENDATION_SETUP_PREVIEW_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Portfolio.CommitRecommendationSetup",
+        "Commit one exact recommendation-setup preview after local confirmation.",
+        ServiceDomain::Portfolio,
+        LOCAL_SCOPE,
+        RECOMMENDATION_SETUP_COMMIT_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Portfolio.ListAccounts",
+        "List named portfolio accounts with opaque product tokens and current summary coverage.",
+        ServiceDomain::Portfolio,
+        PRODUCT_PORTFOLIO_ACCOUNT_SCOPE,
+        LIST_ACCOUNTS_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        "Portfolio.ListRevisions",
+        "List bounded append-only revisions for one portfolio account.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        LIST_REVISIONS_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
     read_portfolio(
         "Portfolio.GetHoldings",
         "Return bounded current holdings under an exact revision.",
@@ -401,13 +1399,73 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         "Portfolio.GetExposure",
         "Return point-in-time instrument, sector, factor, and currency exposure.",
     ),
-    read_portfolio(
+    read(
         "Portfolio.GetRisk",
-        "Return point-in-time portfolio risk and scenarios.",
+        "Return named portfolio risk measures, coverage, stress evidence, and evidence-backed guidance.",
+        ServiceDomain::Portfolio,
+        PRODUCT_PORTFOLIO_RISK_SCOPE,
+        PORTFOLIO_RISK_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        "Portfolio.GetAttribution",
+        "Return source-mark change attribution between two immutable revisions.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        PORTFOLIO_ATTRIBUTION_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        "Portfolio.EvaluateScenario",
+        "Evaluate one bounded exact scenario over pinned holdings.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        PORTFOLIO_SCENARIO_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        "Portfolio.EvaluateScenarioBatch",
+        "Evaluate a bounded batch of exact scenarios over pinned holdings.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        PORTFOLIO_SCENARIO_BATCH_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        "Portfolio.ProposeRebalance",
+        "Produce a non-executable rebalance proposal over one pinned revision.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_SCOPE,
+        PORTFOLIO_REBALANCE_ARGUMENTS,
+        SourceEvidencePolicy::Required,
+    ),
+    read(
+        "Portfolio.EvaluateCandidateImpact",
+        "Show how adding one candidate could change the selected portfolio's exposure and scenario risk; analysis only.",
+        ServiceDomain::Portfolio,
+        PORTFOLIO_CANDIDATE_SCOPE,
+        PORTFOLIO_CANDIDATE_ARGUMENTS,
+        SourceEvidencePolicy::Required,
     ),
     read_analysis(
         "Analysis.GetReturns",
         "Return bounded price and total returns.",
+    ),
+    read(
+        "Analysis.Lookup",
+        "Search bounded installed-product indexes and report unavailable categories explicitly.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        ANALYSIS_LOOKUP_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Analysis.GetDecisionOverview",
+        "Return a bounded current overview of local decision-support authorities.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
     ),
     read_analysis("Analysis.GetFactors", "Return bounded factor estimates."),
     read_analysis(
@@ -418,6 +1476,14 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         "Analysis.GetScenarios",
         "Return bounded scenario and stress-analysis outputs.",
     ),
+    mutation(
+        "Analysis.StartScenarioBatch",
+        "Start one durable deterministic scenario and stress-analysis batch.",
+        ServiceDomain::Analysis,
+        DATA_SCOPE,
+        DATASET_ARGUMENT,
+        ToolAuthorization::LocalConfirmation,
+    ),
     read(
         "Analysis.GetFeatureDatasets",
         "Return registered feature contracts and immutable feature datasets.",
@@ -427,16 +1493,80 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         SourceEvidencePolicy::Required,
     ),
     read(
-        "Analysis.GetBacktests",
-        "Return governed backtest experiment metadata and results.",
+        "Analysis.GetFeatureDatasetPreparationOptions",
+        "Return bounded point-in-time feature-dataset build choices derived by the data owner.",
         ServiceDomain::Analysis,
         LOCAL_SCOPE,
-        RUN_ARGUMENT,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Analysis.PreviewFeatureDatasetBuild",
+        "Validate one guided dataset choice and retain its exact build behind a one-use receipt.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        FEATURE_DATASET_PREVIEW_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
     ),
     mutation(
-        "Analysis.RunBacktest",
-        "Run one governed point-in-time backtest experiment.",
+        "Analysis.StartPreparedFeatureDatasetBuild",
+        "Consume one exact dataset-build receipt and start its durable job.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        FEATURE_DATASET_PREPARED_START_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Analysis.StartFeatureDatasetBuild",
+        "Start one durable phase-one point-in-time feature and label derived generation; the result conveys no product admission.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        DATASET_BUILD_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Analysis.ListProductBacktests",
+        "List saved investment tests.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Analysis.GetProductBacktest",
+        "Show one investment test with its costs, out-of-sample results, drawdown, and uncertainty.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        BACKTEST_PRODUCT_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Analysis.GetBacktestPreparation",
+        "Show the available data, horizon, strategy, and cost choices for an investment test.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Analysis.PreviewBacktest",
+        "Prepare one governed investment test and return its one-use confirmation.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        BACKTEST_PREPARATION_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Analysis.StartPreparedBacktest",
+        "Confirm the prepared investment test and begin the analysis.",
+        ServiceDomain::Analysis,
+        LOCAL_SCOPE,
+        BACKTEST_PREPARED_START_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Analysis.StartBacktest",
+        "Start one durable governed point-in-time backtest experiment.",
         ServiceDomain::Analysis,
         LOCAL_SCOPE,
         BACKTEST_RUN_ARGUMENTS,
@@ -457,7 +1587,15 @@ const OPERATION_SPECS: &[OperationSpec] = &[
     ),
     read(
         "Model.ListBundles",
-        "List admitted immutable model bundle generations.",
+        "List product model evidence with explicit point-in-time, held-out, and limitation states.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Model.ListProductActivity",
+        "List bounded product model and forecast research activity.",
         ServiceDomain::Model,
         LOCAL_SCOPE,
         NO_ARGUMENTS,
@@ -477,6 +1615,486 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         ServiceDomain::Model,
         LOCAL_SCOPE,
         MODEL_EVALUATION_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Model.StartTraining",
+        "Start one durable governed training run from exact native-streamed inputs.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        MODEL_TRAINING_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Model.GetForecastPreparation",
+        "Show the investments, time horizons, and forecast methods currently available.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Model.PrepareForecast",
+        "Prepare one point-in-time investment forecast and return its one-use confirmation.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        MODEL_FORECAST_PREPARATION_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Model.StartPreparedForecast",
+        "Confirm the prepared investment forecast and begin the analysis.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        MODEL_FORECAST_PREPARED_START_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Model.GetForecast",
+        "Show one saved investment forecast.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        MODEL_FORECAST_TOKEN_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Model.SelectLatestValidForecast",
+        "Select and fully revalidate the newest nonexpired forecast for one exact instrument and point in time.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        MODEL_LATEST_VALID_FORECAST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Model.ListForecasts",
+        "List saved investment forecasts.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Model.GetForecastOutcomes",
+        "Show how one saved forecast performed after its horizon elapsed.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        MODEL_FORECAST_TOKEN_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    idempotent_mutation(
+        "Decision.SaveScreen",
+        "Save one validated point-in-time investment screen revision.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_SAVE_SCREEN_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    idempotent_mutation(
+        "Decision.RunScreen",
+        "Run one immutable point-in-time screen and retain ranked candidates.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_RUN_SCREEN_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Decision.ListScreens",
+        "List bounded saved investment screens.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_LIST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.GetScreen",
+        "Open one current saved investment screen by its stable product identity.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_SCREEN_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.ListScreenRuns",
+        "List bounded immutable saved-screen runs using an exact continuation cursor.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_RUN_LIST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.GetCandidates",
+        "Return ranked candidates for one exact screen run.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_RUN_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.GetDossier",
+        "Return one point-in-time investment dossier.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_DOSSIER_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.ListCandidateDossiers",
+        "List bounded retained dossiers for one exact candidate using an exact continuation cursor.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_DOSSIER_LIST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.GetDossierPreparation",
+        "Return the exact retained evidence available for one candidate dossier.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_DOSSIER_PREPARATION_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.PrepareDossier",
+        "Prepare a candidate investment brief for confirmation.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_DOSSIER_PREVIEW_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    idempotent_mutation(
+        "Decision.CreateDossier",
+        "Confirm and save the prepared candidate investment brief.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_DOSSIER_COMMIT_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Decision.GetTargetPreparation",
+        "Show the evidence available for reviewing one investment target.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_PREPARATION_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.PrepareTargetSet",
+        "Validate one human target judgment and return a bounded one-use preview.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_PREVIEW_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    idempotent_mutation(
+        "Decision.CreateTargetSet",
+        "Confirm and save the prepared investment target.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_COMMIT_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Decision.GetTargetSet",
+        "Return one exact governed investment target revision.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.ListTargetSets",
+        "List bounded revisions for one governed investment target.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_LIST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.ListTargetIndex",
+        "List bounded current heads of governed investment-target series using an exact cursor.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_INDEX_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    idempotent_mutation(
+        "Decision.ReviewTargetSet",
+        "Record one immutable review of a governed investment target revision.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_REVIEW_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    idempotent_mutation(
+        "Decision.ReevaluateTargetSet",
+        "Confirm and save an updated assessment of the investment target.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_COMMIT_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Decision.GetTargetSetStatus",
+        "Return the current governed status of one exact target revision.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_TARGET_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.GetInvestmentAnalysis",
+        "Return one exact retained generated, no-action, or unavailable investment analysis.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_INVESTMENT_ANALYSIS_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.ListInvestmentAnalyses",
+        "List saved investment analyses in creation order.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_INVESTMENT_ANALYSIS_LIST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Decision.GetRecommendationTrackRecord",
+        "Return the comparable realized history available for one retained investment analysis.",
+        ServiceDomain::Decision,
+        LOCAL_SCOPE,
+        DECISION_RECOMMENDATION_TRACK_RECORD_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Operations.ListBackups",
+        "List bounded verified product backups and retention state.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_BACKUP_LIST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Operations.GetBackup",
+        "Return one exact verified product-backup manifest.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_BACKUP_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.StartBackup",
+        "Start one durable complete product-backup job.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "Operations.StartBackupVerification",
+        "Start durable verification of one exact retained backup.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_BACKUP_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.PreviewBackupRetention",
+        "Preview exact backups selected by the bounded retention policy.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_RETENTION_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.StartBackupRetention",
+        "Start one exact preview-bound durable backup-retention job.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.PreviewRestore",
+        "Preview restoring one exact backup into a new fenced workspace.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_BACKUP_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.StartRestore",
+        "Start one exact preview-bound durable restore and workspace-switch job.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.ListWorkspaces",
+        "List bounded local workspaces and the active generation.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_WORKSPACE_LIST_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Operations.PreviewWorkspaceSwitch",
+        "Preview a fenced local workspace switch and its blockers.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_WORKSPACE_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.StartWorkspaceSwitch",
+        "Start one exact preview-bound durable workspace switch.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.GetRuntimeStatus",
+        "Return one complete path-free snapshot of installed service and workspace activity.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Operations.GetUpdateStatus",
+        "Return current trusted update, known-good, and recovery state.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.CheckForUpdates",
+        "Check trusted metadata and stage only an admitted update candidate.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.PreviewUpdate",
+        "Preview activation of the currently staged trusted update.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.StartUpdate",
+        "Start exact preview-bound update activation and health verification.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.PreviewProgramRollback",
+        "Preview rollback to the verified known-good program generation.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.StartProgramRollback",
+        "Start exact preview-bound rollback of program files without restoring data.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.QueryLogs",
+        "Query bounded redacted local structured logs.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_LOG_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.ExportLogs",
+        "Publish a bounded redacted log export to controlled artifacts.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_LOG_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.GetSettings",
+        "Return typed effective settings with origin and restart impact.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Operations.PreviewSettingsChange",
+        "Preview a typed settings change at one exact revision.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_SETTINGS_CHANGE_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.ApplySettingsChange",
+        "Apply one exact preview-bound typed settings change.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Operations.PreviewSettingsRollback",
+        "Preview restoring retained typed settings as a new monotonic revision.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_SETTINGS_ROLLBACK_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Operations.RollbackSettings",
+        "Apply one exact preview-bound typed settings rollback.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        OPERATIONS_PREVIEW_REFERENCE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "Setup.GetStatus",
+        "Return the closed setup catalog and exact durable accepted plan.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Setup.PreviewPlan",
+        "Preview one complete workspace-bound guided setup plan without changing authority.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        SETUP_PLAN_PREVIEW_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Setup.ApplyPlan",
+        "Accept one exact one-use setup-plan preview after explicit local confirmation.",
+        ServiceDomain::Operations,
+        LOCAL_SCOPE,
+        SETUP_PLAN_CONFIRMATION_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "FairValue.GetWorkspace",
+        "Return the product fair-value workspace with opaque workflow tokens.",
+        ServiceDomain::FairValue,
+        LOCAL_SCOPE,
+        FAIR_VALUE_WORKSPACE_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
     ),
     read(
@@ -543,6 +2161,30 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         FAIR_VALUE_APPROVAL_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
     ),
+    mutation(
+        "FairValue.ProposeOverride",
+        "Propose an expiring Level 2 or Level 3 override with retained justification.",
+        ServiceDomain::FairValue,
+        LOCAL_SCOPE,
+        FAIR_VALUE_OVERRIDE_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    mutation(
+        "FairValue.RevokeApproval",
+        "Revoke one exact valuation approval with actor, time, and reason evidence.",
+        ServiceDomain::FairValue,
+        LOCAL_SCOPE,
+        FAIR_VALUE_REVOCATION_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ),
+    read(
+        "FairValue.ListAuditEvents",
+        "List a bounded hash-verified page of fair-value audit events.",
+        ServiceDomain::FairValue,
+        LOCAL_SCOPE,
+        FAIR_VALUE_AUDIT_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
     idempotent_mutation(
         "FairValue.ApproveMarketAccess",
         "Create or supersede one dual-approved account, venue, and instrument access assessment.",
@@ -567,17 +2209,33 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         NO_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
     ),
-    mutation(
-        "Bot.Start",
-        "Start an explicitly configured local paper operation.",
+    read(
+        "Bot.GetStartPreparation",
+        "Show explicit virtual-cash, estimated-cost, and practice-mode choices for a paper session.",
         ServiceDomain::Bot,
         LOCAL_SCOPE,
-        BOT_START_ARGUMENTS,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Bot.PrepareStart",
+        "Prepare one exact paper-session preview and return its short-lived one-use confirmation.",
+        ServiceDomain::Bot,
+        LOCAL_SCOPE,
+        BOT_PREPARE_START_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Bot.Start",
+        "Confirm one prepared paper session without placing a virtual or brokerage order.",
+        ServiceDomain::Bot,
+        LOCAL_SCOPE,
+        PAPER_CONFIRMATION_ARGUMENTS,
         ToolAuthorization::LocalConfirmation,
     ),
     mutation(
         "Bot.Stop",
-        "Stop the current local paper operation and durably reconcile it.",
+        "Stop the current paper-investing session and update its final status.",
         ServiceDomain::Bot,
         LOCAL_SCOPE,
         BOT_STOP_ARGUMENTS,
@@ -599,9 +2257,33 @@ const OPERATION_SPECS: &[OperationSpec] = &[
         NO_ARGUMENTS,
         SourceEvidencePolicy::NotApplicable,
     ),
+    read(
+        "Execution.GetManualPaperTargets",
+        "Show active investment targets that can be used for paper investing.",
+        ServiceDomain::Execution,
+        LOCAL_SCOPE,
+        NO_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    read(
+        "Execution.PrepareManualPaperDraft",
+        "Prepare an exact virtual-order preview from explicit plan choices and return its short-lived one-use confirmation.",
+        ServiceDomain::Execution,
+        LOCAL_SCOPE,
+        MANUAL_PAPER_PREPARATION_ARGUMENTS,
+        SourceEvidencePolicy::NotApplicable,
+    ),
+    mutation(
+        "Execution.SubmitManualPaperDraft",
+        "Confirm one prepared virtual-order draft; active safeguards still decide whether it can proceed.",
+        ServiceDomain::Execution,
+        LOCAL_SCOPE,
+        PAPER_CONFIRMATION_ARGUMENTS,
+        ToolAuthorization::RiskMediated,
+    ),
     mutation(
         "Execution.Cancel",
-        "Cancel one tracked paper order through dispatcher-owned authority.",
+        "Cancel one open paper order.",
         ServiceDomain::Execution,
         LOCAL_SCOPE,
         ORDER_ARGUMENT,
@@ -638,34 +2320,78 @@ pub fn application_capabilities() -> Result<ServiceCapabilities, ServiceCapabili
             maximum: OPERATION_SPECS.len(),
         })?;
     for spec in OPERATION_SPECS {
-        let schema = schema_for(*spec);
-        let output_schema =
-            output_data_schema(spec.name).ok_or(ServiceCapabilityError::InvalidOutputSchema)?;
-        let effects = ToolEffects::try_new(
-            matches!(spec.authorization, ToolAuthorization::ReadOnly),
-            spec.destructive,
-            spec.idempotent,
-            spec.open_world,
-        )?;
-        let contract = ToolContract::new(
-            spec.domain,
-            spec.authorization,
-            spec.scope,
-            ToolResultPolicy::new(spec.source_evidence, spec.artifact),
-        );
-        let operation = *spec;
-        descriptors.push(ToolDescriptor::try_new_with_output(
-            spec.name,
-            APPLICATION_CONTRACT_VERSION,
-            spec.description,
-            schema,
-            output_schema,
-            contract,
-            effects,
-            move |arguments: &Map<String, Value>| admit(operation, arguments),
-        )?);
+        descriptors.push(descriptor_for(*spec)?);
     }
     ServiceCapabilities::try_new(descriptors)
+}
+
+impl super::Application {
+    /// Returns the provider-neutral product projection used by ordinary MCP discovery.
+    pub(crate) fn product_capabilities(
+        &self,
+    ) -> Result<ServiceCapabilities, ServiceCapabilityError> {
+        let mut descriptors = Vec::new();
+        descriptors
+            .try_reserve_exact(self.capabilities.tools().len())
+            .map_err(|_| ServiceCapabilityError::TooManyTools {
+                maximum: self.capabilities.tools().len(),
+            })?;
+        for descriptor in self.capabilities.tools().iter().filter(|descriptor| {
+            operation_visibility(descriptor.name()) == OperationVisibility::Product
+        }) {
+            let spec = OPERATION_SPECS
+                .iter()
+                .copied()
+                .find(|spec| spec.name == descriptor.name())
+                .ok_or(ServiceCapabilityError::InvalidContract)?;
+            descriptors.push(descriptor.clone().try_into_product_v1(
+                move |arguments: &Map<String, Value>| admit_product(spec, arguments),
+            )?);
+        }
+        ServiceCapabilities::try_new(descriptors)
+    }
+}
+
+/// Builds the terminal forecast descriptor held only by the one-use preparation authority and job
+/// runner. It is deliberately absent from public application capabilities.
+pub(crate) fn internal_forecast_generation_descriptor()
+-> Result<ToolDescriptor, ServiceCapabilityError> {
+    descriptor_for(mutation(
+        "Model.GenerateForecast",
+        "Generate and durably publish one prepared point-in-time forecast vintage.",
+        ServiceDomain::Model,
+        LOCAL_SCOPE,
+        MODEL_FORECAST_ARGUMENTS,
+        ToolAuthorization::LocalConfirmation,
+    ))
+}
+
+fn descriptor_for(spec: OperationSpec) -> Result<ToolDescriptor, ServiceCapabilityError> {
+    let schema = schema_for(spec);
+    let output_schema =
+        output_data_schema(spec.name).ok_or(ServiceCapabilityError::InvalidOutputSchema)?;
+    let effects = ToolEffects::try_new(
+        matches!(spec.authorization, ToolAuthorization::ReadOnly),
+        spec.destructive,
+        spec.idempotent,
+        spec.open_world,
+    )?;
+    let contract = ToolContract::new(
+        spec.domain,
+        spec.authorization,
+        spec.scope,
+        ToolResultPolicy::new(spec.source_evidence, spec.artifact),
+    );
+    Ok(ToolDescriptor::try_new_with_output(
+        spec.name,
+        APPLICATION_CONTRACT_VERSION,
+        spec.description,
+        schema,
+        output_schema,
+        contract,
+        effects,
+        move |arguments: &Map<String, Value>| admit(spec, arguments),
+    )?)
 }
 
 #[derive(Clone, Copy)]
@@ -722,6 +2448,29 @@ const fn mutation(
         arguments,
         authorization,
         source_evidence: SourceEvidencePolicy::NotApplicable,
+        artifact: ToolArtifactPolicy::InlineOnly,
+        destructive: true,
+        idempotent: false,
+        open_world: false,
+    }
+}
+
+const fn source_evidence_mutation(
+    name: &'static str,
+    description: &'static str,
+    domain: ServiceDomain,
+    scope: ToolScope,
+    arguments: &'static [ArgumentSpec],
+    authorization: ToolAuthorization,
+) -> OperationSpec {
+    OperationSpec {
+        name,
+        description,
+        domain,
+        scope,
+        arguments,
+        authorization,
+        source_evidence: SourceEvidencePolicy::Required,
         artifact: ToolArtifactPolicy::InlineOnly,
         destructive: true,
         idempotent: false,
@@ -916,13 +2665,33 @@ impl ArgumentSpec {
 enum ArgumentKind {
     Identifier,
     Uuid,
+    ActionToken,
+    OpaqueProductToken,
     Sha256,
     Text,
+    ProductLookupQuery,
+    MarketSelectionToken,
+    MarketHistoryToken,
+    MarketPageToken,
     Decimal,
+    PositiveLotQuantity,
+    PositiveUnsignedText,
     Object,
+    Array,
+    EnumerationArray(&'static [&'static str]),
     Timestamp,
+    CalendarDate,
+    BoundedTimestamp,
+    FredGeneration,
+    TreasurySeriesIds,
     FairValueMeasurement,
+    ForecastRequest,
+    PortfolioImportInterpretations,
+    RecommendationAllocationProfile,
+    ResearchFileMapping,
+    SettingsChanges,
     Enumeration(&'static [&'static str]),
+    Signed { minimum: i64, maximum: i64 },
     Unsigned { minimum: u64, maximum: u64 },
 }
 
@@ -930,6 +2699,17 @@ fn schema_for(spec: OperationSpec) -> Value {
     let mut properties = Map::new();
     let mut required = Vec::new();
     insert_scope_schema(&mut properties, &mut required, spec.scope);
+    if spec.name == "Market.GetHistory"
+        && let Some(maximum_items) = properties
+            .get_mut("resultLimits")
+            .and_then(Value::as_object_mut)
+            .and_then(|schema| schema.get_mut("properties"))
+            .and_then(Value::as_object_mut)
+            .and_then(|properties| properties.get_mut("maximumItems"))
+            .and_then(Value::as_object_mut)
+    {
+        maximum_items.insert("maximum".to_owned(), Value::from(MAX_MARKET_HISTORY_BARS));
+    }
     for argument in spec.arguments {
         properties.insert(argument.name.to_owned(), argument_schema(argument.kind));
         if argument.required {
@@ -948,6 +2728,59 @@ fn schema_for(spec: OperationSpec) -> Value {
     schema.insert("properties".to_owned(), Value::Object(properties));
     if !required.is_empty() {
         schema.insert("required".to_owned(), Value::Array(required));
+    }
+    if latest_known_grouped_operation(spec.name) {
+        let absent_fields = if spec.name == FRED_ALFRED_READ_OPERATION {
+            json!([
+                {"required": ["generation"]},
+                {"required": ["knowledgeCutoff"]},
+                {"required": ["effectiveDateCutoff"]},
+            ])
+        } else {
+            json!([
+                {"required": ["generation"]},
+                {"required": ["knowledgeCutoff"]},
+                {"required": ["effectiveDateCutoff"]},
+                {"required": ["seriesIds"]},
+            ])
+        };
+        let required_read = if spec.name == FRED_ALFRED_READ_OPERATION {
+            json!(["generation", "knowledgeCutoff", "effectiveDateCutoff"])
+        } else {
+            json!([
+                "generation",
+                "knowledgeCutoff",
+                "effectiveDateCutoff",
+                "seriesIds"
+            ])
+        };
+        schema.insert(
+            "oneOf".to_owned(),
+            json!([
+                {
+                    "not": {
+                        "anyOf": absent_fields
+                    }
+                },
+                {"required": required_read},
+            ]),
+        );
+    }
+    if spec.name == MACRO_GET_CONTEXT {
+        schema.insert(
+            "oneOf".to_owned(),
+            json!([
+                {
+                    "not": {
+                        "anyOf": [
+                            {"required": ["knowledgeCutoff"]},
+                            {"required": ["effectiveDateCutoff"]},
+                        ]
+                    }
+                },
+                {"required": ["knowledgeCutoff", "effectiveDateCutoff"]},
+            ]),
+        );
     }
     schema.insert("additionalProperties".to_owned(), Value::Bool(false));
     Value::Object(schema)
@@ -1051,6 +2884,17 @@ fn argument_schema(kind: ArgumentKind) -> Value {
             "type": "string",
             "format": "uuid"
         }),
+        ArgumentKind::ActionToken => json!({
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        }),
+        ArgumentKind::OpaqueProductToken => json!({
+            "type": "string",
+            "minLength": 16,
+            "maxLength": 512,
+            "pattern": "^[a-z][a-z0-9_]{15,511}$"
+        }),
         ArgumentKind::Sha256 => json!({
             "type": "string",
             "minLength": 64,
@@ -1062,15 +2906,66 @@ fn argument_schema(kind: ArgumentKind) -> Value {
             "minLength": 1,
             "maxLength": MAXIMUM_TEXT_BYTES
         }),
+        ArgumentKind::ProductLookupQuery => json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": PRODUCT_LOOKUP_QUERY_MAXIMUM_CHARACTERS,
+            "pattern": PRODUCT_LOOKUP_QUERY_PATTERN
+        }),
+        ArgumentKind::MarketSelectionToken => market_token_schema("market"),
+        ArgumentKind::MarketHistoryToken => market_token_schema("history"),
+        ArgumentKind::MarketPageToken => market_token_schema("page"),
         ArgumentKind::Decimal => json!({
             "type": "string",
             "minLength": 1,
             "maxLength": 128
         }),
+        ArgumentKind::PositiveLotQuantity => json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 19,
+            "pattern": "^[1-9][0-9]{0,18}$"
+        }),
+        ArgumentKind::PositiveUnsignedText => json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 20,
+            "pattern": "^[1-9][0-9]{0,19}$"
+        }),
         ArgumentKind::Object => json!({"type": "object", "minProperties": 1}),
+        ArgumentKind::Array => json!({"type": "array", "minItems": 1}),
+        ArgumentKind::EnumerationArray(values) => json!({
+            "type": "array",
+            "minItems": 1,
+            "maxItems": values.len(),
+            "uniqueItems": true,
+            "items": {"type": "string", "enum": values}
+        }),
         ArgumentKind::Timestamp => json!({"type": "string", "format": "date-time"}),
+        ArgumentKind::CalendarDate => calendar_date_argument_schema(),
+        ArgumentKind::BoundedTimestamp => json!({
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1,
+            "maxLength": 64,
+        }),
+        ArgumentKind::FredGeneration => fred_generation_argument_schema(),
+        ArgumentKind::TreasurySeriesIds => json!({
+            "type":"array","minItems":1,"maxItems":32,"uniqueItems":true,
+            "items":{"type":"string","minLength":1,"maxLength":256}
+        }),
         ArgumentKind::FairValueMeasurement => fair_value_measurement_schema(),
+        ArgumentKind::ForecastRequest => forecast_request_schema(),
+        ArgumentKind::PortfolioImportInterpretations => portfolio_import_interpretations_schema(),
+        ArgumentKind::RecommendationAllocationProfile => recommendation_allocation_profile_schema(),
+        ArgumentKind::ResearchFileMapping => research_file_mapping_schema(),
+        ArgumentKind::SettingsChanges => settings_changes_schema(),
         ArgumentKind::Enumeration(values) => json!({"type": "string", "enum": values}),
+        ArgumentKind::Signed { minimum, maximum } => json!({
+            "type": "integer",
+            "minimum": minimum,
+            "maximum": maximum
+        }),
         ArgumentKind::Unsigned { minimum, maximum } => json!({
             "type": "integer",
             "minimum": minimum,
@@ -1079,12 +2974,59 @@ fn argument_schema(kind: ArgumentKind) -> Value {
     }
 }
 
+fn market_token_schema(prefix: &str) -> Value {
+    json!({
+        "type": "string",
+        "minLength": prefix.len() + 33,
+        "maxLength": prefix.len() + 87,
+        "pattern": format!("^{prefix}_[A-Za-z0-9_-]{{32,86}}$")
+    })
+}
+
+fn admit_market_token(value: &Value, prefix: &str) -> Result<(), ToolInputError> {
+    let value = value.as_str().ok_or(ToolInputError::Invalid)?;
+    let payload = value
+        .strip_prefix(prefix)
+        .and_then(|value| value.strip_prefix('_'))
+        .ok_or(ToolInputError::Invalid)?;
+    if (32..=86).contains(&payload.len())
+        && payload
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        Ok(())
+    } else {
+        Err(ToolInputError::Invalid)
+    }
+}
+
 fn admit(spec: OperationSpec, arguments: &Map<String, Value>) -> Result<(), ToolInputError> {
+    admit_with_source_coverage(spec, arguments, true)
+}
+
+fn admit_product(
+    spec: OperationSpec,
+    arguments: &Map<String, Value>,
+) -> Result<(), ToolInputError> {
+    admit_with_source_coverage(spec, arguments, false)
+}
+
+fn admit_with_source_coverage(
+    spec: OperationSpec,
+    arguments: &Map<String, Value>,
+    source_coverage_visible: bool,
+) -> Result<(), ToolInputError> {
     let mut allowed = HashSet::new();
     allowed
         .try_reserve(5_usize.saturating_add(spec.arguments.len()))
         .map_err(|_| ToolInputError::Invalid)?;
-    admit_scope(arguments, spec.scope, &mut allowed)?;
+    if latest_known_grouped_operation(spec.name) {
+        admit_latest_known_argument_group(arguments, spec.name != FRED_ALFRED_READ_OPERATION)?;
+    }
+    if spec.name == MACRO_GET_CONTEXT {
+        admit_macro_context_cutoffs(arguments)?;
+    }
+    admit_scope(arguments, spec.scope, source_coverage_visible, &mut allowed)?;
     for argument in spec.arguments {
         allowed.insert(argument.name);
         match arguments.get(argument.name) {
@@ -1108,6 +3050,7 @@ fn admit(spec: OperationSpec, arguments: &Map<String, Value>) -> Result<(), Tool
 fn admit_scope(
     arguments: &Map<String, Value>,
     scope: ToolScope,
+    source_coverage_visible: bool,
     allowed: &mut HashSet<&'static str>,
 ) -> Result<(), ToolInputError> {
     admit_scoped(
@@ -1135,7 +3078,11 @@ fn admit_scope(
         arguments,
         allowed,
         "sourceCoverage",
-        scope.source_coverage(),
+        if source_coverage_visible {
+            scope.source_coverage()
+        } else {
+            ScopeRequirement::NotApplicable
+        },
         admit_sources,
     )
 }
@@ -1256,6 +3203,27 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
             .and_then(|value| Uuid::parse_str(value).ok())
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
+        ArgumentKind::ActionToken => value
+            .as_str()
+            .and_then(|value| {
+                Uuid::parse_str(value)
+                    .ok()
+                    .filter(|token| !token.is_nil() && token.to_string() == value)
+            })
+            .map(|_| ())
+            .ok_or(ToolInputError::Invalid),
+        ArgumentKind::OpaqueProductToken => value
+            .as_str()
+            .filter(|value| {
+                (16..=512).contains(&value.len())
+                    && value.bytes().enumerate().all(|(index, byte)| {
+                        byte.is_ascii_lowercase()
+                            || (index > 0 && (byte.is_ascii_digit() || byte == b'_'))
+                    })
+                    && Uuid::parse_str(value).is_err()
+            })
+            .map(|_| ())
+            .ok_or(ToolInputError::Invalid),
         ArgumentKind::Sha256 => value
             .as_str()
             .filter(|value| {
@@ -1272,10 +3240,42 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
             .filter(|value| !value.is_empty() && value.len() <= MAXIMUM_TEXT_BYTES)
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
+        ArgumentKind::ProductLookupQuery => value
+            .as_str()
+            .filter(|value| product_lookup_query_is_canonical(value))
+            .map(|_| ())
+            .ok_or(ToolInputError::Invalid),
+        ArgumentKind::MarketSelectionToken => admit_market_token(value, "market"),
+        ArgumentKind::MarketHistoryToken => admit_market_token(value, "history"),
+        ArgumentKind::MarketPageToken => admit_market_token(value, "page"),
         ArgumentKind::Decimal => value
             .as_str()
             .filter(|value| value.len() <= 128)
             .and_then(|value| value.parse::<rust_decimal::Decimal>().ok())
+            .map(|_| ())
+            .ok_or(ToolInputError::Invalid),
+        ArgumentKind::PositiveLotQuantity => value
+            .as_str()
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 19
+                    && value.bytes().all(|byte| byte.is_ascii_digit())
+                    && !value.starts_with('0')
+            })
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .map(|_| ())
+            .ok_or(ToolInputError::Invalid),
+        ArgumentKind::PositiveUnsignedText => value
+            .as_str()
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 20
+                    && value.bytes().all(|byte| byte.is_ascii_digit())
+                    && !value.starts_with('0')
+            })
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
         ArgumentKind::Object => value
@@ -1283,11 +3283,49 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
             .filter(|value| !value.is_empty())
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
+        ArgumentKind::Array => value
+            .as_array()
+            .filter(|values| !values.is_empty())
+            .map(|_| ())
+            .ok_or(ToolInputError::Invalid),
+        ArgumentKind::EnumerationArray(allowed) => value
+            .as_array()
+            .filter(|values| {
+                !values.is_empty()
+                    && values.len() <= allowed.len()
+                    && values
+                        .iter()
+                        .all(|value| value.as_str().is_some_and(|value| allowed.contains(&value)))
+                    && values
+                        .iter()
+                        .enumerate()
+                        .all(|(index, value)| !values[..index].contains(value))
+            })
+            .map(|_| ())
+            .ok_or(ToolInputError::Invalid),
         ArgumentKind::Timestamp => admit_timestamp(value),
+        ArgumentKind::CalendarDate => admit_calendar_date(value),
+        ArgumentKind::BoundedTimestamp => admit_bounded_timestamp(value),
+        ArgumentKind::FredGeneration => admit_fred_generation(value),
+        ArgumentKind::TreasurySeriesIds => admit_treasury_series_ids(value),
         ArgumentKind::FairValueMeasurement => admit_fair_value_measurement(value),
+        ArgumentKind::ForecastRequest => admit_forecast_request(value),
+        ArgumentKind::PortfolioImportInterpretations => {
+            admit_portfolio_import_interpretations(value)
+        }
+        ArgumentKind::RecommendationAllocationProfile => {
+            admit_recommendation_allocation_profile(value)
+        }
+        ArgumentKind::ResearchFileMapping => admit_research_file_mapping(value),
+        ArgumentKind::SettingsChanges => admit_settings_changes(value),
         ArgumentKind::Enumeration(values) => value
             .as_str()
             .filter(|value| values.contains(value))
+            .map(|_| ())
+            .ok_or(ToolInputError::Invalid),
+        ArgumentKind::Signed { minimum, maximum } => value
+            .as_i64()
+            .filter(|value| (*value >= minimum) && (*value <= maximum))
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
         ArgumentKind::Unsigned { minimum, maximum } => value
@@ -1296,6 +3334,1368 @@ fn admit_argument(value: &Value, kind: ArgumentKind) -> Result<(), ToolInputErro
             .map(|_| ())
             .ok_or(ToolInputError::Invalid),
     }
+}
+
+fn fred_generation_argument_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "manifestVersion": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 20,
+                "pattern": "^[1-9][0-9]{0,19}$",
+            },
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256,
+                    },
+                    "version": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": u16::MAX,
+                    },
+                    "fingerprint": nonzero_sha256_argument_schema(),
+                },
+                "required": ["name", "version", "fingerprint"],
+                "additionalProperties": false,
+            },
+            "contentHash": nonzero_sha256_argument_schema(),
+        },
+        "required": ["manifestVersion", "schema", "contentHash"],
+        "additionalProperties": false,
+    })
+}
+
+fn nonzero_sha256_argument_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 64,
+        "maxLength": 64,
+        "pattern": "^[0-9a-f]{64}$",
+        "not": {
+            "const": "0000000000000000000000000000000000000000000000000000000000000000",
+        },
+    })
+}
+
+fn calendar_date_argument_schema() -> Value {
+    json!({
+        "type": "string",
+        "format": "date",
+        "minLength": 10,
+        "maxLength": 10,
+        "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+    })
+}
+
+fn latest_known_grouped_operation(name: &str) -> bool {
+    matches!(
+        name,
+        FRED_ALFRED_READ_OPERATION
+            | TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION
+            | TREASURY_DAILY_RATES_LATEST_KNOWN_OPERATION
+    )
+}
+
+fn admit_latest_known_argument_group(
+    arguments: &Map<String, Value>,
+    requires_series: bool,
+) -> Result<(), ToolInputError> {
+    let supplied = ["generation", "knowledgeCutoff", "effectiveDateCutoff"]
+        .into_iter()
+        .filter(|name| arguments.contains_key(*name))
+        .count();
+    let series = arguments.contains_key("seriesIds");
+    if (supplied == 0 && !series) || (supplied == 3 && series == requires_series) {
+        Ok(())
+    } else {
+        Err(ToolInputError::Invalid)
+    }
+}
+
+fn admit_macro_context_cutoffs(arguments: &Map<String, Value>) -> Result<(), ToolInputError> {
+    let supplied = ["knowledgeCutoff", "effectiveDateCutoff"]
+        .into_iter()
+        .filter(|name| arguments.contains_key(*name))
+        .count();
+    if matches!(supplied, 0 | 2) {
+        Ok(())
+    } else {
+        Err(ToolInputError::Invalid)
+    }
+}
+
+fn admit_treasury_series_ids(value: &Value) -> Result<(), ToolInputError> {
+    let values = value.as_array().ok_or(ToolInputError::Invalid)?;
+    if values.is_empty() || values.len() > 32 {
+        return Err(ToolInputError::Invalid);
+    }
+    let mut seen = HashSet::new();
+    for value in values {
+        let identifier = value
+            .as_str()
+            .filter(|value| !value.is_empty() && value.len() <= 256)
+            .ok_or(ToolInputError::Invalid)?;
+        if !seen.insert(identifier) {
+            return Err(ToolInputError::Invalid);
+        }
+    }
+    Ok(())
+}
+
+fn admit_fred_generation(value: &Value) -> Result<(), ToolInputError> {
+    let generation = value.as_object().ok_or(ToolInputError::Invalid)?;
+    if generation.len() != 3
+        || generation
+            .keys()
+            .any(|key| !matches!(key.as_str(), "manifestVersion" | "schema" | "contentHash"))
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    admit_argument(
+        generation
+            .get("manifestVersion")
+            .ok_or(ToolInputError::Invalid)?,
+        ArgumentKind::PositiveUnsignedText,
+    )?;
+    admit_nonzero_sha256(
+        generation
+            .get("contentHash")
+            .ok_or(ToolInputError::Invalid)?,
+    )?;
+
+    let schema = generation
+        .get("schema")
+        .and_then(Value::as_object)
+        .ok_or(ToolInputError::Invalid)?;
+    if schema.len() != 3
+        || schema
+            .keys()
+            .any(|key| !matches!(key.as_str(), "name" | "version" | "fingerprint"))
+        || schema
+            .get("name")
+            .and_then(Value::as_str)
+            .is_none_or(|name| name.is_empty() || name.len() > 256)
+        || schema
+            .get("version")
+            .and_then(Value::as_u64)
+            .is_none_or(|version| version == 0 || version > u64::from(u16::MAX))
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    admit_nonzero_sha256(schema.get("fingerprint").ok_or(ToolInputError::Invalid)?)
+}
+
+fn admit_nonzero_sha256(value: &Value) -> Result<(), ToolInputError> {
+    let value = value.as_str().ok_or(ToolInputError::Invalid)?;
+    if value == "0000000000000000000000000000000000000000000000000000000000000000"
+        || value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    Ok(())
+}
+
+fn admit_calendar_date(value: &Value) -> Result<(), ToolInputError> {
+    value
+        .as_str()
+        .filter(|value| value.len() == 10)
+        .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+        .map(|_| ())
+        .ok_or(ToolInputError::Invalid)
+}
+
+fn admit_bounded_timestamp(value: &Value) -> Result<(), ToolInputError> {
+    value
+        .as_str()
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .filter(|value| value.timestamp_nanos_opt().is_some())
+        .map(|_| ())
+        .ok_or(ToolInputError::Invalid)
+}
+
+fn recommendation_allocation_profile_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "preferredPositionWeightLowerBps": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10_000,
+            },
+            "preferredPositionWeightUpperBps": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10_000,
+            },
+            "minimumCashReserve": {
+                "type": "object",
+                "properties": {
+                    "amount": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                    },
+                    "currency": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 3,
+                        "pattern": "^[A-Z]{3}$",
+                    },
+                },
+                "required": ["amount", "currency"],
+                "additionalProperties": false,
+            },
+            "maximumDownsideLossBpsOfMarkedEquity": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10_000,
+            },
+            "availableInvestmentHorizonDays": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3_650,
+            },
+        },
+        "required": [
+            "preferredPositionWeightLowerBps",
+            "preferredPositionWeightUpperBps",
+            "minimumCashReserve",
+            "maximumDownsideLossBpsOfMarkedEquity",
+            "availableInvestmentHorizonDays",
+        ],
+        "additionalProperties": false,
+    })
+}
+
+fn admit_recommendation_allocation_profile(value: &Value) -> Result<(), ToolInputError> {
+    const ALLOWED: [&str; 5] = [
+        "preferredPositionWeightLowerBps",
+        "preferredPositionWeightUpperBps",
+        "minimumCashReserve",
+        "maximumDownsideLossBpsOfMarkedEquity",
+        "availableInvestmentHorizonDays",
+    ];
+    let profile = value.as_object().ok_or(ToolInputError::Invalid)?;
+    if profile.len() != ALLOWED.len()
+        || profile.keys().any(|name| !ALLOWED.contains(&name.as_str()))
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    let lower = bounded_u64(profile, "preferredPositionWeightLowerBps", 1, 10_000)?;
+    let upper = bounded_u64(profile, "preferredPositionWeightUpperBps", 1, 10_000)?;
+    if lower > upper {
+        return Err(ToolInputError::Invalid);
+    }
+    bounded_u64(profile, "maximumDownsideLossBpsOfMarkedEquity", 1, 10_000)?;
+    bounded_u64(profile, "availableInvestmentHorizonDays", 1, 3_650)?;
+    let reserve = profile
+        .get("minimumCashReserve")
+        .and_then(Value::as_object)
+        .ok_or(ToolInputError::Invalid)?;
+    if reserve.len() != 2
+        || reserve
+            .keys()
+            .any(|name| name != "amount" && name != "currency")
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    let amount = reserve
+        .get("amount")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .and_then(|value| value.parse::<rust_decimal::Decimal>().ok())
+        .filter(|value| !value.is_sign_negative())
+        .ok_or(ToolInputError::Invalid)?;
+    let _ = amount;
+    reserve
+        .get("currency")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_uppercase()))
+        .map(|_| ())
+        .ok_or(ToolInputError::Invalid)
+}
+
+fn bounded_u64(
+    object: &Map<String, Value>,
+    name: &str,
+    minimum: u64,
+    maximum: u64,
+) -> Result<u64, ToolInputError> {
+    object
+        .get(name)
+        .and_then(Value::as_u64)
+        .filter(|value| *value >= minimum && *value <= maximum)
+        .ok_or(ToolInputError::Invalid)
+}
+
+fn portfolio_import_interpretations_schema() -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 100_000,
+        "items": {
+            "type": "object",
+            "properties": {
+                "recordToken": {
+                    "type": "string",
+                    "format": "uuid",
+                },
+                "interpretation": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                },
+                "rationale": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAXIMUM_TEXT_BYTES,
+                },
+                "selectedLotIndexes": {
+                    "type": "array",
+                    "maxItems": 100_000,
+                    "uniqueItems": true,
+                    "items": {"type": "integer", "minimum": 0, "maximum": 99_999},
+                },
+            },
+            "required": ["recordToken", "interpretation", "rationale"],
+            "additionalProperties": false,
+        },
+    })
+}
+
+fn research_file_mapping_schema() -> Value {
+    let source_field = || {
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAXIMUM_IDENTIFIER_BYTES,
+        })
+    };
+    let identifier = || {
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAXIMUM_IDENTIFIER_BYTES,
+            "pattern": "^[A-Za-z0-9_.:/-]+$",
+        })
+    };
+    json!({
+        "type": "object",
+        "properties": {
+            "dataset": identifier(),
+            "identityField": source_field(),
+            "fields": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 64,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "source": source_field(),
+                        "field": identifier(),
+                        "decimalScale": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 28,
+                        },
+                        "unit": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 64,
+                        },
+                    },
+                    "required": ["source", "field", "decimalScale"],
+                    "additionalProperties": false,
+                },
+            },
+            "effectiveAt": {"type": "string", "format": "date-time"},
+            "publishedAt": {"type": "string", "format": "date-time"},
+            "effectiveField": source_field(),
+            "publishedField": source_field(),
+            "availableField": source_field(),
+            "revisionField": source_field(),
+            "revisionNumberField": source_field(),
+            "supersededField": source_field(),
+            "instrumentId": {"type": "string", "format": "uuid"},
+            "universe": identifier(),
+        },
+        "required": ["dataset", "identityField", "fields", "effectiveAt"],
+        "additionalProperties": false,
+    })
+}
+
+fn admit_research_file_mapping(value: &Value) -> Result<(), ToolInputError> {
+    const OPTIONAL_SOURCE_FIELDS: [&str; 6] = [
+        "effectiveField",
+        "publishedField",
+        "availableField",
+        "revisionField",
+        "revisionNumberField",
+        "supersededField",
+    ];
+    const ALLOWED: [&str; 13] = [
+        "dataset",
+        "identityField",
+        "fields",
+        "effectiveAt",
+        "publishedAt",
+        "effectiveField",
+        "publishedField",
+        "availableField",
+        "revisionField",
+        "revisionNumberField",
+        "supersededField",
+        "instrumentId",
+        "universe",
+    ];
+    let mapping = value.as_object().ok_or(ToolInputError::Invalid)?;
+    if mapping.len() < 4
+        || mapping.len() > ALLOWED.len()
+        || mapping.keys().any(|key| !ALLOWED.contains(&key.as_str()))
+        || !mapping
+            .get("dataset")
+            .and_then(Value::as_str)
+            .is_some_and(valid_identifier)
+        || !mapping
+            .get("identityField")
+            .and_then(Value::as_str)
+            .is_some_and(valid_source_field)
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    admit_timestamp(mapping.get("effectiveAt").ok_or(ToolInputError::Invalid)?)?;
+    if let Some(published) = mapping.get("publishedAt") {
+        admit_timestamp(published)?;
+    }
+    for name in OPTIONAL_SOURCE_FIELDS {
+        if let Some(value) = mapping.get(name)
+            && !value.as_str().is_some_and(valid_source_field)
+        {
+            return Err(ToolInputError::Invalid);
+        }
+    }
+    if mapping
+        .get("universe")
+        .is_some_and(|value| !value.as_str().is_some_and(valid_identifier))
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    let instrument = mapping.get("instrumentId");
+    if instrument
+        .and_then(Value::as_str)
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| ToolInputError::Invalid)?
+        .is_none()
+        && mapping.contains_key("universe")
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    let fields = mapping
+        .get("fields")
+        .and_then(Value::as_array)
+        .filter(|fields| !fields.is_empty() && fields.len() <= 64)
+        .ok_or(ToolInputError::Invalid)?;
+    let mut source_fields = HashSet::new();
+    let mut output_fields = HashSet::new();
+    for field in fields {
+        let field = field.as_object().ok_or(ToolInputError::Invalid)?;
+        if field.len() < 3
+            || field.len() > 4
+            || field
+                .keys()
+                .any(|key| !matches!(key.as_str(), "source" | "field" | "decimalScale" | "unit"))
+        {
+            return Err(ToolInputError::Invalid);
+        }
+        let source = field
+            .get("source")
+            .and_then(Value::as_str)
+            .filter(|value| valid_source_field(value))
+            .ok_or(ToolInputError::Invalid)?;
+        let output = field
+            .get("field")
+            .and_then(Value::as_str)
+            .filter(|value| valid_identifier(value))
+            .ok_or(ToolInputError::Invalid)?;
+        field
+            .get("decimalScale")
+            .and_then(Value::as_u64)
+            .filter(|value| *value <= 28)
+            .ok_or(ToolInputError::Invalid)?;
+        if !source_fields.insert(source)
+            || !output_fields.insert(output)
+            || field.get("unit").is_some_and(|unit| {
+                !unit
+                    .as_str()
+                    .is_some_and(|value| !value.trim().is_empty() && value.len() <= 64)
+            })
+        {
+            return Err(ToolInputError::Invalid);
+        }
+    }
+    Ok(())
+}
+
+fn admit_portfolio_import_interpretations(value: &Value) -> Result<(), ToolInputError> {
+    let selections = value
+        .as_array()
+        .filter(|selections| !selections.is_empty() && selections.len() <= 100_000)
+        .ok_or(ToolInputError::Invalid)?;
+    for selection in selections {
+        let selection = selection.as_object().ok_or(ToolInputError::Invalid)?;
+        if selection.len() < 3
+            || selection.len() > 4
+            || selection.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "recordToken" | "interpretation" | "rationale" | "selectedLotIndexes"
+                )
+            })
+        {
+            return Err(ToolInputError::Invalid);
+        }
+        let text_is_valid = |name: &str, maximum: usize| {
+            selection
+                .get(name)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty() && value.len() <= maximum)
+        };
+        if selection
+            .get("recordToken")
+            .and_then(Value::as_str)
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .is_none()
+            || !text_is_valid("interpretation", 128)
+            || !text_is_valid("rationale", MAXIMUM_TEXT_BYTES)
+        {
+            return Err(ToolInputError::Invalid);
+        }
+        if let Some(indexes) = selection.get("selectedLotIndexes") {
+            let indexes = indexes
+                .as_array()
+                .filter(|indexes| indexes.len() <= 100_000)
+                .ok_or(ToolInputError::Invalid)?;
+            let mut unique = HashSet::new();
+            unique
+                .try_reserve(indexes.len())
+                .map_err(|_| ToolInputError::Invalid)?;
+            if indexes.iter().any(|index| {
+                index
+                    .as_u64()
+                    .filter(|index| *index <= 99_999)
+                    .is_none_or(|index| !unique.insert(index))
+            }) {
+                return Err(ToolInputError::Invalid);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn settings_changes_schema() -> Value {
+    let variant = |kind: &'static str, value: Value| {
+        json!({
+            "type": "object",
+            "properties": {
+                "kind": {"const": kind},
+                "value": value,
+            },
+            "required": ["kind", "value"],
+            "additionalProperties": false,
+        })
+    };
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 16,
+        "items": {
+            "oneOf": [
+                variant("log_retention_days", json!({"type": "integer", "minimum": 1, "maximum": 365})),
+                variant("log_minimum_severity", json!({"type": "string", "enum": ["trace", "debug", "info", "warn", "error"]})),
+                variant("update_channel", json!({"type": "string", "enum": ["stable", "preview"]})),
+                variant("automatic_update_checks", json!({"type": "boolean"})),
+                variant("storage_soft_limit_bytes", json!({"type": "integer", "minimum": 1_073_741_824_u64, "maximum": 17_592_186_044_416_u64})),
+                variant("default_query_row_limit", json!({"type": "integer", "minimum": 100, "maximum": 1_000_000})),
+                variant("maximum_concurrent_jobs", json!({"type": "integer", "minimum": 1, "maximum": 64})),
+                variant("market_freshness_millis", json!({"type": "integer", "minimum": 250, "maximum": 600_000})),
+                variant("backup_retention_count", json!({"type": "integer", "minimum": 1, "maximum": 64})),
+            ]
+        }
+    })
+}
+
+fn admit_settings_changes(value: &Value) -> Result<(), ToolInputError> {
+    let changes = value.as_array().ok_or(ToolInputError::Invalid)?;
+    if changes.is_empty() || changes.len() > 16 {
+        return Err(ToolInputError::Invalid);
+    }
+    let mut kinds = HashSet::new();
+    for change in changes {
+        let change = change.as_object().ok_or(ToolInputError::Invalid)?;
+        if change.len() != 2 || !change.contains_key("value") {
+            return Err(ToolInputError::Invalid);
+        }
+        let kind = change
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|kind| kinds.insert(*kind))
+            .ok_or(ToolInputError::Invalid)?;
+        let setting = change.get("value").ok_or(ToolInputError::Invalid)?;
+        let valid = match kind {
+            "log_retention_days" => unsigned_in(setting, 1, 365),
+            "log_minimum_severity" => {
+                string_in(setting, &["trace", "debug", "info", "warn", "error"])
+            }
+            "update_channel" => string_in(setting, &["stable", "preview"]),
+            "automatic_update_checks" => setting.is_boolean(),
+            "storage_soft_limit_bytes" => unsigned_in(setting, 1_073_741_824, 17_592_186_044_416),
+            "default_query_row_limit" => unsigned_in(setting, 100, 1_000_000),
+            "maximum_concurrent_jobs" => unsigned_in(setting, 1, 64),
+            "market_freshness_millis" => unsigned_in(setting, 250, 600_000),
+            "backup_retention_count" => unsigned_in(setting, 1, 64),
+            _ => false,
+        };
+        if !valid {
+            return Err(ToolInputError::Invalid);
+        }
+    }
+    Ok(())
+}
+
+fn unsigned_in(value: &Value, minimum: u64, maximum: u64) -> bool {
+    value
+        .as_u64()
+        .is_some_and(|value| (minimum..=maximum).contains(&value))
+}
+
+fn string_in(value: &Value, allowed: &[&str]) -> bool {
+    value.as_str().is_some_and(|value| allowed.contains(&value))
+}
+
+fn forecast_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "instrumentId": {"type": "string", "format": "uuid"},
+            "productIdentity": {
+                "type": "object",
+                "properties": {
+                    "displayName": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 240
+                    },
+                    "canonicalSymbol": {
+                        "type": ["string", "null"],
+                        "minLength": 1,
+                        "maxLength": 64
+                    },
+                    "description": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 400
+                    },
+                    "quoteCurrency": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 3,
+                        "pattern": "^[A-Z]{3}$"
+                    },
+                    "knowledgeAtUnixNanos": {"type": "integer"},
+                    "effectiveAtUnixNanos": {"type": "integer"}
+                },
+                "required": [
+                    "displayName",
+                    "canonicalSymbol",
+                    "description",
+                    "quoteCurrency",
+                    "knowledgeAtUnixNanos",
+                    "effectiveAtUnixNanos"
+                ],
+                "additionalProperties": false
+            },
+            "modelEvidence": {
+                "type": "object",
+                "properties": {
+                    "modelToken": {"type": "string", "format": "uuid"},
+                    "overall": {
+                        "type": "string",
+                        "enum": ["sufficient", "limited", "unavailable"]
+                    },
+                    "pitInputs": {
+                        "type": "string",
+                        "enum": ["sufficient", "limited", "unavailable"]
+                    },
+                    "outOfSample": {
+                        "type": "string",
+                        "enum": ["sufficient", "limited", "unavailable"]
+                    },
+                    "horizonAlignment": {
+                        "type": "string",
+                        "enum": ["sufficient", "limited", "unavailable"]
+                    },
+                    "calibration": {
+                        "type": "string",
+                        "enum": ["calibrated", "limited", "unavailable"]
+                    },
+                    "interpretation": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000
+                    }
+                },
+                "required": [
+                    "modelToken",
+                    "overall",
+                    "pitInputs",
+                    "outOfSample",
+                    "horizonAlignment",
+                    "calibration",
+                    "interpretation"
+                ],
+                "additionalProperties": false
+            },
+            "bundleId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAXIMUM_IDENTIFIER_BYTES
+            },
+            "bundleVersion": {"type": "integer", "minimum": 1},
+            "observedThroughUnixNanos": {"type": "integer"},
+            "availableAtUnixNanos": {"type": "integer"},
+            "horizonPoints": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": market_squawk_modeling::MAX_FORECAST_POINTS
+            },
+            "horizonStepNanos": {"type": "integer", "minimum": 1},
+            "decimalScale": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": market_squawk_modeling::MAX_FORECAST_DECIMAL_SCALE
+            },
+            "validityNanos": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAXIMUM_FORECAST_VALIDITY_NANOS
+            },
+            "observedHistory": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "observedAtUnixNanos": {"type": "integer"},
+                        "availableAtUnixNanos": {"type": "integer"},
+                        "mantissa": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 40,
+                            "pattern": "^-?[0-9]+$"
+                        },
+                        "sourcePitHash": {
+                            "type": "string",
+                            "minLength": 64,
+                            "maxLength": 64,
+                            "pattern": "^[0-9a-f]{64}$"
+                        },
+                        "quality": {
+                            "type": "string",
+                            "enum": [
+                                "direct_verified",
+                                "direct_unverified",
+                                "official_delayed",
+                                "aggregated",
+                                "indicative",
+                                "estimated",
+                                "stale",
+                                "quarantined"
+                            ]
+                        }
+                    },
+                    "required": [
+                        "observedAtUnixNanos",
+                        "availableAtUnixNanos",
+                        "mantissa",
+                        "sourcePitHash",
+                        "quality"
+                    ],
+                    "additionalProperties": false
+                }
+            },
+            "analysisEvidence": {
+                "type": "object",
+                "properties": {
+                    "manifest": {
+                        "type": "object",
+                        "properties": {
+                            "dataset": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 256,
+                                "pattern": "^[A-Za-z0-9._-]+$"
+                            },
+                            "manifestVersion": {"type": "integer", "minimum": 1},
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 256,
+                                        "pattern": "^[a-z0-9._]+$"
+                                    },
+                                    "version": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": u16::MAX
+                                    },
+                                    "fingerprint": nonzero_sha256_argument_schema()
+                                },
+                                "required": ["name", "version", "fingerprint"],
+                                "additionalProperties": false
+                            },
+                            "contentHash": nonzero_sha256_argument_schema()
+                        },
+                        "required": ["dataset", "manifestVersion", "schema", "contentHash"],
+                        "additionalProperties": false
+                    },
+                    "productionIdentitySha256": nonzero_sha256_argument_schema(),
+                    "productionReceiptSha256": nonzero_sha256_argument_schema(),
+                    "pairingSha256": nonzero_sha256_argument_schema()
+                },
+                "required": [
+                    "manifest",
+                    "productionIdentitySha256",
+                    "productionReceiptSha256",
+                    "pairingSha256"
+                ],
+                "additionalProperties": false
+            },
+            "servingEvidence": {
+                "type": "object",
+                "properties": {
+                    "manifest": {
+                        "type": "object",
+                        "properties": {
+                            "dataset": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 256,
+                                "pattern": "^[A-Za-z0-9._-]+$"
+                            },
+                            "manifestVersion": {"type": "integer", "minimum": 1},
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 256,
+                                        "pattern": "^[a-z0-9._]+$"
+                                    },
+                                    "version": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": u16::MAX
+                                    },
+                                    "fingerprint": nonzero_sha256_argument_schema()
+                                },
+                                "required": ["name", "version", "fingerprint"],
+                                "additionalProperties": false
+                            },
+                            "contentHash": nonzero_sha256_argument_schema()
+                        },
+                        "required": ["dataset", "manifestVersion", "schema", "contentHash"],
+                        "additionalProperties": false
+                    },
+                    "sourceId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAXIMUM_IDENTIFIER_BYTES
+                    },
+                    "objectGraphSha256": nonzero_sha256_argument_schema(),
+                    "selectionSha256": nonzero_sha256_argument_schema(),
+                    "resultSha256": nonzero_sha256_argument_schema(),
+                    "knowledgeCutoffUnixNanos": {"type": "integer"},
+                    "priorObservedAtUnixNanos": {"type": "integer"},
+                    "observedThroughUnixNanos": {"type": "integer"},
+                    "featureSha256": nonzero_sha256_argument_schema()
+                },
+                "required": [
+                    "manifest",
+                    "sourceId",
+                    "objectGraphSha256",
+                    "selectionSha256",
+                    "resultSha256",
+                    "knowledgeCutoffUnixNanos",
+                    "priorObservedAtUnixNanos",
+                    "observedThroughUnixNanos",
+                    "featureSha256"
+                ],
+                "additionalProperties": false
+            },
+            "inputs": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": market_squawk_modeling::MAX_FORECAST_POINTS,
+                "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": market_squawk_modeling::MAX_MODEL_FEATURES,
+                    "items": {"type": "number"}
+                }
+            }
+        },
+        "required": [
+            "instrumentId",
+            "productIdentity",
+            "modelEvidence",
+            "bundleId",
+            "bundleVersion",
+            "observedThroughUnixNanos",
+            "availableAtUnixNanos",
+            "horizonPoints",
+            "horizonStepNanos",
+            "decimalScale",
+            "validityNanos",
+            "observedHistory",
+            "analysisEvidence",
+            "servingEvidence",
+            "inputs"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn admit_forecast_request(value: &Value) -> Result<(), ToolInputError> {
+    const FIELDS: [&str; 15] = [
+        "instrumentId",
+        "productIdentity",
+        "modelEvidence",
+        "bundleId",
+        "bundleVersion",
+        "observedThroughUnixNanos",
+        "availableAtUnixNanos",
+        "horizonPoints",
+        "horizonStepNanos",
+        "decimalScale",
+        "validityNanos",
+        "observedHistory",
+        "analysisEvidence",
+        "servingEvidence",
+        "inputs",
+    ];
+    const OBSERVED_FIELDS: [&str; 5] = [
+        "observedAtUnixNanos",
+        "availableAtUnixNanos",
+        "mantissa",
+        "sourcePitHash",
+        "quality",
+    ];
+    const OBSERVED_QUALITIES: [&str; 8] = [
+        "direct_verified",
+        "direct_unverified",
+        "official_delayed",
+        "aggregated",
+        "indicative",
+        "estimated",
+        "stale",
+        "quarantined",
+    ];
+
+    let request = value.as_object().ok_or(ToolInputError::Invalid)?;
+    if request.len() != FIELDS.len()
+        || request.keys().any(|name| !FIELDS.contains(&name.as_str()))
+        || request
+            .get("instrumentId")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .is_none()
+        || request
+            .get("bundleId")
+            .and_then(Value::as_str)
+            .is_none_or(|value| !valid_identifier(value))
+        || request
+            .get("bundleVersion")
+            .and_then(Value::as_u64)
+            .is_none_or(|value| value == 0)
+        || request
+            .get("observedThroughUnixNanos")
+            .and_then(Value::as_i64)
+            .is_none()
+        || request
+            .get("availableAtUnixNanos")
+            .and_then(Value::as_i64)
+            .is_none()
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    admit_forecast_product_identity(
+        request
+            .get("productIdentity")
+            .ok_or(ToolInputError::Invalid)?,
+    )?;
+    admit_forecast_model_evidence(
+        request
+            .get("modelEvidence")
+            .ok_or(ToolInputError::Invalid)?,
+    )?;
+    let horizon_points = request
+        .get("horizonPoints")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| (1..=market_squawk_modeling::MAX_FORECAST_POINTS).contains(value))
+        .ok_or(ToolInputError::Invalid)?;
+    if request
+        .get("horizonStepNanos")
+        .and_then(Value::as_u64)
+        .is_none_or(|value| value == 0)
+        || request
+            .get("decimalScale")
+            .and_then(Value::as_u64)
+            .is_none_or(|value| {
+                value > u64::from(market_squawk_modeling::MAX_FORECAST_DECIMAL_SCALE)
+            })
+        || request
+            .get("validityNanos")
+            .and_then(Value::as_u64)
+            .is_none_or(|value| value == 0 || value > MAXIMUM_FORECAST_VALIDITY_NANOS)
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    let observed = request
+        .get("observedHistory")
+        .and_then(Value::as_array)
+        .filter(|values| {
+            !values.is_empty()
+                && values.len() <= market_squawk_modeling::MAX_FORECAST_OBSERVED_POINTS
+        })
+        .ok_or(ToolInputError::Invalid)?;
+    for point in observed {
+        let point = point.as_object().ok_or(ToolInputError::Invalid)?;
+        let hash = point.get("sourcePitHash").and_then(Value::as_str);
+        if point.len() != OBSERVED_FIELDS.len()
+            || point
+                .keys()
+                .any(|name| !OBSERVED_FIELDS.contains(&name.as_str()))
+            || point
+                .get("observedAtUnixNanos")
+                .and_then(Value::as_i64)
+                .is_none()
+            || point
+                .get("availableAtUnixNanos")
+                .and_then(Value::as_i64)
+                .is_none()
+            || point
+                .get("mantissa")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<i128>().ok())
+                .is_none()
+            || hash.is_none_or(|value| {
+                value == "0000000000000000000000000000000000000000000000000000000000000000"
+                    || value.len() != 64
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            })
+            || point
+                .get("quality")
+                .and_then(Value::as_str)
+                .is_none_or(|value| !OBSERVED_QUALITIES.contains(&value))
+        {
+            return Err(ToolInputError::Invalid);
+        }
+    }
+    admit_forecast_analysis_evidence(
+        request
+            .get("analysisEvidence")
+            .ok_or(ToolInputError::Invalid)?,
+    )?;
+    admit_forecast_serving_evidence(
+        request
+            .get("servingEvidence")
+            .ok_or(ToolInputError::Invalid)?,
+    )?;
+    let inputs = request
+        .get("inputs")
+        .and_then(Value::as_array)
+        .filter(|rows| rows.len() == horizon_points)
+        .ok_or(ToolInputError::Invalid)?;
+    if inputs.iter().any(|row| {
+        row.as_array().is_none_or(|values| {
+            values.is_empty()
+                || values.len() > market_squawk_modeling::MAX_MODEL_FEATURES
+                || values.iter().any(|value| value.as_f64().is_none())
+        })
+    }) {
+        return Err(ToolInputError::Invalid);
+    }
+    Ok(())
+}
+
+fn admit_forecast_product_identity(value: &Value) -> Result<(), ToolInputError> {
+    const FIELDS: [&str; 6] = [
+        "displayName",
+        "canonicalSymbol",
+        "description",
+        "quoteCurrency",
+        "knowledgeAtUnixNanos",
+        "effectiveAtUnixNanos",
+    ];
+    let identity = value.as_object().ok_or(ToolInputError::Invalid)?;
+    let display_name = identity.get("displayName").and_then(Value::as_str);
+    let canonical_symbol = identity.get("canonicalSymbol");
+    let description = identity.get("description").and_then(Value::as_str);
+    let quote_currency = identity.get("quoteCurrency").and_then(Value::as_str);
+    let knowledge_at = identity.get("knowledgeAtUnixNanos").and_then(Value::as_i64);
+    let effective_at = identity.get("effectiveAtUnixNanos").and_then(Value::as_i64);
+    if identity.len() != FIELDS.len()
+        || identity.keys().any(|name| !FIELDS.contains(&name.as_str()))
+        || display_name.is_none_or(|value| !valid_product_text(value, 240))
+        || canonical_symbol.is_none_or(|value| {
+            !value.is_null()
+                && value
+                    .as_str()
+                    .is_none_or(|value| !valid_product_text(value, 64))
+        })
+        || description.is_none_or(|value| !valid_product_text(value, 400))
+        || quote_currency.is_none_or(|value| {
+            value.len() != 3 || !value.bytes().all(|byte| byte.is_ascii_uppercase())
+        })
+        || knowledge_at.is_none()
+        || effective_at.is_none()
+        || effective_at > knowledge_at
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    Ok(())
+}
+
+fn admit_forecast_model_evidence(value: &Value) -> Result<(), ToolInputError> {
+    const FIELDS: [&str; 7] = [
+        "modelToken",
+        "overall",
+        "pitInputs",
+        "outOfSample",
+        "horizonAlignment",
+        "calibration",
+        "interpretation",
+    ];
+    const EVIDENCE_STATES: [&str; 3] = ["sufficient", "limited", "unavailable"];
+    const CALIBRATION_STATES: [&str; 3] = ["calibrated", "limited", "unavailable"];
+    let evidence = value.as_object().ok_or(ToolInputError::Invalid)?;
+    if evidence.len() != FIELDS.len()
+        || evidence.keys().any(|name| !FIELDS.contains(&name.as_str()))
+        || evidence
+            .get("modelToken")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .is_none()
+        || ["overall", "pitInputs", "outOfSample", "horizonAlignment"]
+            .iter()
+            .any(|field| {
+                evidence
+                    .get(*field)
+                    .is_none_or(|value| !string_in(value, &EVIDENCE_STATES))
+            })
+        || evidence
+            .get("calibration")
+            .is_none_or(|value| !string_in(value, &CALIBRATION_STATES))
+        || evidence
+            .get("interpretation")
+            .and_then(Value::as_str)
+            .is_none_or(|value| !valid_product_text(value, 1_000))
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    Ok(())
+}
+
+fn valid_product_text(value: &str, maximum_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum_bytes
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+fn admit_forecast_serving_evidence(value: &Value) -> Result<(), ToolInputError> {
+    const FIELDS: [&str; 9] = [
+        "manifest",
+        "sourceId",
+        "objectGraphSha256",
+        "selectionSha256",
+        "resultSha256",
+        "knowledgeCutoffUnixNanos",
+        "priorObservedAtUnixNanos",
+        "observedThroughUnixNanos",
+        "featureSha256",
+    ];
+    let evidence = value.as_object().ok_or(ToolInputError::Invalid)?;
+    if evidence.len() != FIELDS.len()
+        || evidence.keys().any(|name| !FIELDS.contains(&name.as_str()))
+        || evidence
+            .get("sourceId")
+            .and_then(Value::as_str)
+            .is_none_or(|value| !valid_identifier(value))
+        || [
+            "objectGraphSha256",
+            "selectionSha256",
+            "resultSha256",
+            "featureSha256",
+        ]
+        .iter()
+        .any(|name| {
+            evidence
+                .get(*name)
+                .and_then(Value::as_str)
+                .is_none_or(|value| {
+                    value == "0000000000000000000000000000000000000000000000000000000000000000"
+                        || value.len() != 64
+                        || !value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                })
+        })
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    let knowledge = evidence
+        .get("knowledgeCutoffUnixNanos")
+        .and_then(Value::as_i64)
+        .ok_or(ToolInputError::Invalid)?;
+    let prior = evidence
+        .get("priorObservedAtUnixNanos")
+        .and_then(Value::as_i64)
+        .ok_or(ToolInputError::Invalid)?;
+    let observed = evidence
+        .get("observedThroughUnixNanos")
+        .and_then(Value::as_i64)
+        .ok_or(ToolInputError::Invalid)?;
+    if prior >= observed || observed > knowledge {
+        return Err(ToolInputError::Invalid);
+    }
+    admit_forecast_manifest(
+        evidence
+            .get("manifest")
+            .and_then(Value::as_object)
+            .ok_or(ToolInputError::Invalid)?,
+    )
+}
+
+fn admit_forecast_analysis_evidence(value: &Value) -> Result<(), ToolInputError> {
+    const EVIDENCE_FIELDS: [&str; 4] = [
+        "manifest",
+        "productionIdentitySha256",
+        "productionReceiptSha256",
+        "pairingSha256",
+    ];
+    let evidence = value.as_object().ok_or(ToolInputError::Invalid)?;
+    let manifest = evidence
+        .get("manifest")
+        .and_then(Value::as_object)
+        .ok_or(ToolInputError::Invalid)?;
+    let valid_digest = |name: &str, object: &Map<String, Value>| {
+        object
+            .get(name)
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                value != "0000000000000000000000000000000000000000000000000000000000000000"
+                    && value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            })
+    };
+    if evidence.len() != EVIDENCE_FIELDS.len()
+        || evidence
+            .keys()
+            .any(|name| !EVIDENCE_FIELDS.contains(&name.as_str()))
+        || !valid_digest("productionIdentitySha256", evidence)
+        || !valid_digest("productionReceiptSha256", evidence)
+        || !valid_digest("pairingSha256", evidence)
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    admit_forecast_manifest(manifest)
+}
+
+fn admit_forecast_manifest(manifest: &Map<String, Value>) -> Result<(), ToolInputError> {
+    const MANIFEST_FIELDS: [&str; 4] = ["dataset", "manifestVersion", "schema", "contentHash"];
+    const SCHEMA_FIELDS: [&str; 3] = ["name", "version", "fingerprint"];
+    let schema = manifest
+        .get("schema")
+        .and_then(Value::as_object)
+        .ok_or(ToolInputError::Invalid)?;
+    let valid_digest = |name: &str, object: &Map<String, Value>| {
+        object
+            .get(name)
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                value != "0000000000000000000000000000000000000000000000000000000000000000"
+                    && value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            })
+    };
+    if manifest.len() != MANIFEST_FIELDS.len()
+        || manifest
+            .keys()
+            .any(|name| !MANIFEST_FIELDS.contains(&name.as_str()))
+        || schema.len() != SCHEMA_FIELDS.len()
+        || schema
+            .keys()
+            .any(|name| !SCHEMA_FIELDS.contains(&name.as_str()))
+        || manifest
+            .get("dataset")
+            .and_then(Value::as_str)
+            .is_none_or(|value| {
+                value.is_empty()
+                    || value.len() > 256
+                    || value.bytes().any(|byte| {
+                        !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+                    })
+            })
+        || manifest
+            .get("manifestVersion")
+            .and_then(Value::as_u64)
+            .is_none_or(|value| value == 0)
+        || schema
+            .get("name")
+            .and_then(Value::as_str)
+            .is_none_or(|value| {
+                value.is_empty()
+                    || value.len() > 256
+                    || value.bytes().any(|byte| {
+                        !(byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'.' | b'_'))
+                    })
+            })
+        || schema
+            .get("version")
+            .and_then(Value::as_u64)
+            .is_none_or(|value| value == 0 || value > u64::from(u16::MAX))
+        || !valid_digest("fingerprint", schema)
+        || !valid_digest("contentHash", manifest)
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    Ok(())
 }
 
 fn fair_value_measurement_schema() -> Value {
@@ -1312,6 +4712,14 @@ fn fair_value_measurement_schema() -> Value {
                 "pattern": "^[A-Za-z]{3}$"
             },
             "scale": {"type": "integer", "minimum": 0, "maximum": 28},
+            "amountBasis": {
+                "type": "string",
+                "enum": [
+                    "per_instrument_unit",
+                    "reporting_entity_total",
+                    "position_total"
+                ]
+            },
             "measurementAt": {"type": "string", "format": "date-time"},
             "preparedAt": {"type": "string", "format": "date-time"},
             "preparedBy": {
@@ -1427,6 +4835,7 @@ fn fair_value_measurement_schema() -> Value {
             "amount",
             "currency",
             "scale",
+            "amountBasis",
             "measurementAt",
             "preparedAt",
             "preparedBy",
@@ -1450,12 +4859,13 @@ fn admit_timestamp(value: &Value) -> Result<(), ToolInputError> {
 }
 
 fn admit_fair_value_measurement(value: &Value) -> Result<(), ToolInputError> {
-    const REQUIRED: [&str; 9] = [
+    const REQUIRED: [&str; 10] = [
         "accountId",
         "instrumentId",
         "amount",
         "currency",
         "scale",
+        "amountBasis",
         "measurementAt",
         "preparedAt",
         "preparedBy",
@@ -1473,6 +4883,7 @@ fn admit_fair_value_measurement(value: &Value) -> Result<(), ToolInputError> {
                     | "amount"
                     | "currency"
                     | "scale"
+                    | "amountBasis"
                     | "measurementAt"
                     | "preparedAt"
                     | "preparedBy"
@@ -1510,6 +4921,18 @@ fn admit_fair_value_measurement(value: &Value) -> Result<(), ToolInputError> {
         .get("scale")
         .and_then(Value::as_u64)
         .is_none_or(|scale| scale > 28)
+    {
+        return Err(ToolInputError::Invalid);
+    }
+    if measurement
+        .get("amountBasis")
+        .and_then(Value::as_str)
+        .is_none_or(|basis| {
+            !matches!(
+                basis,
+                "per_instrument_unit" | "reporting_entity_total" | "position_total"
+            )
+        })
     {
         return Err(ToolInputError::Invalid);
     }
@@ -1673,4 +5096,10 @@ fn valid_identifier(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
         })
+}
+
+fn valid_source_field(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAXIMUM_IDENTIFIER_BYTES
+        && !value.chars().any(char::is_control)
 }

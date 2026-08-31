@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use market_squawk_data::{
-    PythonDatasetRow, PythonDatasetSelection, PythonDatasetValue, PythonDatasetVerificationLimits,
-    Sha256Digest, verify_python_dataset,
+    FeatureDatasetProductContract, PythonDatasetRow, PythonDatasetSelection, PythonDatasetValue,
+    PythonDatasetVerificationLimits, Sha256Digest, verify_python_dataset,
 };
 use market_squawk_domain::Timestamp;
 use pyo3::prelude::*;
@@ -107,6 +107,7 @@ fn open_dataset_admission(
         verify_python_dataset(
             &operator_root,
             export_sha256,
+            FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1,
             Timestamp::from_unix_nanos(as_of_unix_nanos),
             limits,
             deadline,
@@ -135,7 +136,7 @@ fn python_dataset_row(value: &Bound<'_, PyAny>) -> PyResult<PythonDatasetRow> {
         return Err(invalid_input());
     }
     let mapping = value.cast::<PyMapping>().map_err(|_| invalid_input())?;
-    if mapping.len().map_err(|_| invalid_input())? != 14 {
+    if mapping.len().map_err(|_| invalid_input())? != 17 {
         return Err(invalid_input());
     }
     let example_id = exact_string(
@@ -157,6 +158,21 @@ fn python_dataset_row(value: &Bound<'_, PyAny>) -> PyResult<PythonDatasetRow> {
         return Err(invalid_input());
     }
     let cutoff_at = exact_i64(&cutoff.getattr("unix_nanos").map_err(|_| invalid_input())?)?;
+    let observed_effective_at = optional_utc_nanos(
+        &mapping
+            .get_item("observed_effective_at")
+            .map_err(|_| invalid_input())?,
+    )?;
+    let label_effective_at = optional_utc_nanos(
+        &mapping
+            .get_item("label_effective_at")
+            .map_err(|_| invalid_input())?,
+    )?;
+    let target_coordinate_kind = exact_u8(
+        &mapping
+            .get_item("target_coordinate_kind")
+            .map_err(|_| invalid_input())?,
+    )?;
     let split =
         match exact_string(&mapping.get_item("split").map_err(|_| invalid_input())?)?.as_str() {
             "train" => 1,
@@ -249,6 +265,9 @@ fn python_dataset_row(value: &Bound<'_, PyAny>) -> PyResult<PythonDatasetRow> {
         &example_id,
         instrument.into_bytes(),
         Timestamp::from_unix_nanos(cutoff_at),
+        observed_effective_at.map(Timestamp::from_unix_nanos),
+        label_effective_at.map(Timestamp::from_unix_nanos),
+        target_coordinate_kind,
         split,
         component_kind,
         &component_name,
@@ -259,6 +278,16 @@ fn python_dataset_row(value: &Bound<'_, PyAny>) -> PyResult<PythonDatasetRow> {
         lineage,
     )
     .map_err(|_| invalid_input())
+}
+
+fn optional_utc_nanos(value: &Bound<'_, PyAny>) -> PyResult<Option<i64>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    if !exact_python_type(value, "market_squawk._data_validation", "UtcNanoseconds")? {
+        return Err(invalid_input());
+    }
+    exact_i64(&value.getattr("unix_nanos").map_err(|_| invalid_input())?).map(Some)
 }
 
 fn exact_python_type(value: &Bound<'_, PyAny>, module: &str, name: &str) -> PyResult<bool> {

@@ -5,7 +5,7 @@ use market_squawk_analytics::{
     FeatureTimeSemantics, FeatureUnit, FeatureWarmUp, MissingValuePolicy, ShockComposition,
     VarianceConvention, WeightPolicy,
 };
-use market_squawk_data::{AnalyticalFeatureDataset, DatasetManifestRef, FeatureLabelDataset};
+use market_squawk_data::{AnalyticalFeatureDataset, DatasetManifestRef};
 use serde_json::{Value, json};
 
 use crate::application::domain_support::encode_hex;
@@ -46,22 +46,6 @@ pub(super) fn feature_metadata_value(metadata: &FeatureMetadata) -> Value {
         "implementationRevision": metadata.implementation_revision(),
         "implementationDigest": encode_hex(metadata.implementation_digest().as_bytes()),
         "semanticDigest": encode_hex(metadata.semantic_digest().as_bytes())
-    })
-}
-
-pub(super) fn feature_dataset_value(dataset: &FeatureLabelDataset) -> Value {
-    let split = dataset.split_counts();
-    json!({
-        "kind": "feature_dataset",
-        "manifest": manifest_value(dataset.manifest()),
-        "buildSpecDigest": encode_hex(dataset.build_spec_digest().digest().bytes()),
-        "policyDigest": encode_hex(dataset.policy_digest().bytes()),
-        "universeDigest": encode_hex(dataset.universe_digest().bytes()),
-        "splitCounts": {
-            "train": split.train_examples(),
-            "validation": split.validation_examples(),
-            "test": split.test_examples()
-        }
     })
 }
 

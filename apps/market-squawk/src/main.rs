@@ -3,38 +3,48 @@
 // enabled because this allowance is restricted to debug-assertion builds.
 #![cfg_attr(all(target_os = "macos", debug_assertions), allow(linker_messages))]
 
-use std::{ffi::OsString, sync::Arc, time::Duration};
+use std::{
+    ffi::OsString,
+    io::{IsTerminal as _, Read as _},
+    path::Path,
+    process::{Command as ProcessCommand, Stdio},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use market_squawk::{
     AppConfig, AppPaths, DiagnosticEngine, DiagnosticEngineSnapshot, LocalProduct,
-    ProductionSourceProvider,
     cli::{
-        Cli, Command, ConfigCommand, McpCommand, OutputFormat, ProductionSourceArgument,
-        ReleaseCommand, ReleaseEvidenceCommand, SourceCommand,
+        Cli, Command, ConfigCommand, McpCommand, OutputFormat, ReleaseCommand,
+        ReleaseEvidenceCommand, ServiceCommand, SourceCommand,
     },
     doctor,
-    local_product::execute_cli_command,
-    mcp::LocalMcpComposition,
-    paper_bot::local_paper_bot,
+    local_product::{execute_installed_cli_command, verified_installed_service_program},
     release::execute_release_command,
     replay::replay_coinbase_journal,
+    service::{InstalledServiceConnector, launch_foreground_keyring_broker},
     source::{MarketSource, coinbase::CoinbaseSource, mock::MockSource},
     source_supervisor::{
         SourceShutdownError, SourceShutdownOutcome, SourceSupervisor, SupervisedSourceTask,
     },
+    termination::TerminationSignals,
 };
 use market_squawk_domain::{
     CaptureAuthorityIdentity, ConnectionGeneration, MetadataRevision, SourceId, SourceIdentifier,
 };
-use market_squawk_installer::{ProgramName, active_release_root_for_installed_program};
+use market_squawk_installer::{
+    ProgramName, active_release_root_for_installed_program, default_installation_data_root,
+};
+use market_squawk_mcp::{McpLimitSpec, McpLimits, McpStdioRelay};
 use market_squawk_platform::{
     CaptureChannelLimits, CaptureProcessInfrastructureLimits, CaptureShutdownStatus,
     CaptureWorkerReapError, CaptureWorkerTermination, CaptureWriterPolicy, ConfigOverrides,
-    ConfigSources, DiagnosticCaptureBundle, PendingCaptureWriter,
+    ConfigSources, DiagnosticCaptureBundle, PendingCaptureWriter, SecretValue,
     initialize_capture_process_infrastructure, raw_capture_channel, spawn_capture_writer,
 };
+use market_squawk_runtime::NamedClient;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -42,6 +52,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 const APPLICATION_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
+const MAXIMUM_BOOTSTRAP_UNLOCK_BYTES: u64 = 4 * 1024;
 
 fn main() -> Result<()> {
     let application = std::thread::Builder::new()
@@ -66,6 +77,7 @@ async fn run() -> Result<()> {
     initialize_logging(&cli.log, cli.json_logs)?;
     let output = cli.output;
     let config_file = cli.config.clone();
+    let installation_data_root = cli.installation_data_root.clone();
     let training_release_root = match cli.training_release_root {
         Some(root) => Some(root),
         None => {
@@ -128,18 +140,37 @@ async fn run() -> Result<()> {
             run_config_command(command, &config, output)?;
         }
         command @ (Command::Source { .. }
+        | Command::Market { .. }
+        | Command::EconomicContext { .. }
         | Command::Ingest { .. }
         | Command::Dataset { .. }
         | Command::Query { .. }
         | Command::Feature { .. }
         | Command::Model { .. }
+        | Command::Forecast { .. }
         | Command::Portfolio { .. }
         | Command::Backtest { .. }
         | Command::Bot { .. }
         | Command::Execution { .. }
-        | Command::FairValue { .. }) => {
+        | Command::FairValue { .. }
+        | Command::Job { .. }
+        | Command::Operations { .. }
+        | Command::Setup { .. }) => {
             let config = load_config(config_file.as_deref(), cli_overrides)?;
-            run_product_command(config, command, output).await?;
+            run_product_command(config, command, output, installation_data_root.as_deref()).await?;
+        }
+        Command::Service { command } => {
+            let config = load_config(config_file.as_deref(), cli_overrides)?;
+            run_service_command(
+                command,
+                &config,
+                config_file.as_deref(),
+                &cli.log,
+                cli.json_logs,
+                output,
+                installation_data_root.as_deref(),
+            )
+            .await?;
         }
         Command::Doctor => {
             let config = load_config(config_file.as_deref(), cli_overrides)?;
@@ -180,65 +211,20 @@ async fn run() -> Result<()> {
             let snapshot = finish_run_source(disposition).await?;
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
-        Command::PaperBot(arguments) => {
-            let provider = match arguments.provider {
-                ProductionSourceArgument::Coinbase => ProductionSourceProvider::Coinbase,
-                ProductionSourceArgument::Kraken => ProductionSourceProvider::Kraken,
-                ProductionSourceArgument::CoinbaseDirect => {
-                    return Err(anyhow!(
-                        "Coinbase Direct requires `market-squawk bot start` so the exact \
-                         provider-onboarding session and application authority are retained"
-                    ));
-                }
-            };
-            let seconds = arguments.seconds;
-            let initial_cash = arguments.initial_cash;
-            let fee_basis_points = arguments.fee_basis_points;
-            let config = load_config(config_file.as_deref(), cli_overrides)?;
-            let composition = local_paper_bot(config, provider, initial_cash, fee_basis_points)?;
-            let cancellation = CancellationToken::new();
-            let runtime = composition.start(cancellation.clone()).await?;
-            let primary = match seconds {
-                Some(seconds) => {
-                    tokio::time::sleep(Duration::from_secs(seconds)).await;
-                    None
-                }
-                None => tokio::signal::ctrl_c()
-                    .await
-                    .err()
-                    .map(|error| anyhow!(error).context("failed to listen for Ctrl-C")),
-            };
-            let shutdown = cancel_and_shutdown_paper_bot(
-                &cancellation,
-                primary,
-                runtime.shutdown(),
-                |shutdown| shutdown.is_complete(),
-            )
-            .await?;
-            let paper = shutdown
-                .paper()
-                .as_ref()
-                .map_err(|error| anyhow!(error.to_string()))?;
-            println!(
-                "paper bot stopped cleanly: sequence={}, orders={}, fills={}",
-                paper.sequence(),
-                paper.orders().len(),
-                paper.fills().len()
-            );
-        }
         Command::Mcp { command } => {
-            if !matches!(command, None | Some(McpCommand::Serve)) {
-                anyhow::bail!("unsupported MCP operation");
-            }
+            let McpCommand::Serve { client } = command;
             let termination = TerminationSignals::install()?;
             let config = load_config(config_file.as_deref(), cli_overrides)?;
-            let product = LocalProduct::try_new(config)?;
-            let composition = LocalMcpComposition::try_new(
-                product.paths(),
-                product.application(),
-                product.artifacts(),
+            let client = NamedClient::from(client);
+            let transport =
+                installed_service_connector(&config, installation_data_root.as_deref())?
+                    .connect_mcp_relay(client)?;
+            let relay = McpStdioRelay::try_new(
+                client,
+                transport,
+                McpLimits::try_from(McpLimitSpec::default())?,
             )?;
-            run_mcp_until_termination(composition, termination).await?;
+            run_mcp_until_termination(relay, termination).await?;
         }
         Command::Release { command } => {
             let benchmark_worker = matches!(
@@ -312,11 +298,11 @@ fn finish_with_cleanup<T>(primary: Result<T>, cleanup_failure: Option<anyhow::Er
 }
 
 async fn run_mcp_until_termination(
-    composition: LocalMcpComposition,
+    relay: McpStdioRelay,
     mut termination: TerminationSignals,
 ) -> Result<()> {
     let cancellation = CancellationToken::new();
-    let mut serving = Box::pin(composition.serve_stdio(cancellation.clone()));
+    let mut serving = Box::pin(relay.serve_stdio(cancellation.clone()));
     tokio::select! {
         result = &mut serving => {
             result?;
@@ -327,92 +313,9 @@ async fn run_mcp_until_termination(
             let completion = serving.await.map(|_exit| ()).map_err(anyhow::Error::from);
             match signal {
                 Ok(()) => completion,
-                Err(error) => finish_with_cleanup(Err(error), completion.err()),
+                Err(error) => finish_with_cleanup(Err(error.into()), completion.err()),
             }
         }
-    }
-}
-
-#[cfg(unix)]
-struct TerminationSignals {
-    interrupt: tokio::signal::unix::Signal,
-    terminate: tokio::signal::unix::Signal,
-}
-
-#[cfg(unix)]
-impl TerminationSignals {
-    fn install() -> Result<Self> {
-        Ok(Self {
-            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                .context("failed to install the SIGINT listener")?,
-            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .context("failed to install the SIGTERM listener")?,
-        })
-    }
-
-    async fn wait(&mut self) -> Result<()> {
-        tokio::select! {
-            observed = self.interrupt.recv() => {
-                observed.ok_or_else(|| anyhow!("SIGINT listener closed before observing a signal"))
-            }
-            observed = self.terminate.recv() => {
-                observed.ok_or_else(|| anyhow!("SIGTERM listener closed before observing a signal"))
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-struct TerminationSignals {
-    ctrl_c: tokio::signal::windows::CtrlC,
-    ctrl_break: tokio::signal::windows::CtrlBreak,
-    ctrl_close: tokio::signal::windows::CtrlClose,
-    ctrl_logoff: tokio::signal::windows::CtrlLogoff,
-    ctrl_shutdown: tokio::signal::windows::CtrlShutdown,
-}
-
-#[cfg(windows)]
-impl TerminationSignals {
-    fn install() -> Result<Self> {
-        Ok(Self {
-            ctrl_c: tokio::signal::windows::ctrl_c()
-                .context("failed to install the Windows Ctrl-C listener")?,
-            ctrl_break: tokio::signal::windows::ctrl_break()
-                .context("failed to install the Windows Ctrl-Break listener")?,
-            ctrl_close: tokio::signal::windows::ctrl_close()
-                .context("failed to install the Windows Ctrl-Close listener")?,
-            ctrl_logoff: tokio::signal::windows::ctrl_logoff()
-                .context("failed to install the Windows Ctrl-Logoff listener")?,
-            ctrl_shutdown: tokio::signal::windows::ctrl_shutdown()
-                .context("failed to install the Windows Ctrl-Shutdown listener")?,
-        })
-    }
-
-    async fn wait(&mut self) -> Result<()> {
-        tokio::select! {
-            observed = self.ctrl_c.recv() => observed,
-            observed = self.ctrl_break.recv() => observed,
-            observed = self.ctrl_close.recv() => observed,
-            observed = self.ctrl_logoff.recv() => observed,
-            observed = self.ctrl_shutdown.recv() => observed,
-        }
-        .ok_or_else(|| anyhow!("Windows termination listener closed before observing a signal"))
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-struct TerminationSignals;
-
-#[cfg(not(any(unix, windows)))]
-impl TerminationSignals {
-    const fn install() -> Result<Self> {
-        Ok(Self)
-    }
-
-    async fn wait(&mut self) -> Result<()> {
-        tokio::signal::ctrl_c()
-            .await
-            .context("failed to listen for the platform termination signal")
     }
 }
 
@@ -423,7 +326,6 @@ fn load_config(
     let mut environment = ConfigSources::process_environment();
     environment.remove(&OsString::from("MARKET_SQUAWK_LOG"));
     environment.remove(&OsString::from("MARKET_SQUAWK_EXTERNAL_NETWORK"));
-    environment.remove(&OsString::from("MARKET_SQUAWK_PROVIDER_TERMS_ACCEPTED"));
     Ok(AppConfig::load(ConfigSources::new(
         config_file,
         &environment,
@@ -453,6 +355,7 @@ async fn run_product_command(
     config: AppConfig,
     command: Command,
     output: OutputFormat,
+    installation_data_root: Option<&Path>,
 ) -> Result<()> {
     let opens_onboarding_portal = matches!(
         &command,
@@ -460,9 +363,9 @@ async fn run_product_command(
             command: SourceCommand::Setup { .. }
         }
     );
-    let product = LocalProduct::try_new(config)?;
-    let application = product.application();
-    let result = execute_cli_command(&product, command).await;
+    let connector = installed_service_connector(&config, installation_data_root)?;
+    let client = connector.connect(NamedClient::Cli, None)?;
+    let result = execute_installed_cli_command(&client, command).await;
     let portal_outcome = match &result {
         Ok(result) if opens_onboarding_portal => {
             match emit_result(output, result.summary(), result.value()) {
@@ -472,27 +375,219 @@ async fn run_product_command(
         }
         Ok(_) | Err(_) => Ok(()),
     };
-    let deadline = std::time::Instant::now()
-        .checked_add(application.shutdown_timeout())
-        .ok_or_else(|| anyhow!("application shutdown deadline overflow"));
-    application.begin_shutdown();
-    let cleanup_failure = match deadline {
-        Ok(deadline) => {
-            let shutdown = application.shutdown(deadline).await;
-            (!shutdown.is_complete())
-                .then(|| anyhow!("local application shutdown was incomplete: {shutdown:?}"))
-        }
-        Err(error) => Some(error),
-    };
     let result = match result {
         Ok(result) => portal_outcome.map(|()| result),
         Err(error) => Err(anyhow::Error::from(error)),
     };
-    let result = finish_with_cleanup(result, cleanup_failure)?;
+    let result = result?;
     if opens_onboarding_portal {
         Ok(())
     } else {
         emit_result(output, result.summary(), result.value())
+    }
+}
+
+async fn run_service_command(
+    command: ServiceCommand,
+    config: &AppConfig,
+    config_file: Option<&std::path::Path>,
+    log: &str,
+    json_logs: bool,
+    output: OutputFormat,
+    installation_data_root: Option<&Path>,
+) -> Result<()> {
+    let (summary, value) = match command {
+        ServiceCommand::Status => service_status(config, installation_data_root).await?,
+        ServiceCommand::Start => {
+            start_installed_service(
+                config,
+                config_file,
+                log,
+                json_logs,
+                Duration::from_secs(15),
+                installation_data_root,
+            )
+            .await?
+        }
+        ServiceCommand::Bootstrap {
+            stdin,
+            complete_foreground_keyring,
+        } => {
+            let connector = installed_service_connector(config, installation_data_root)?;
+            let captured_status = connector.bootstrap_status().await?;
+            let value = if complete_foreground_keyring {
+                let installation_root = installation_data_root
+                    .map(Path::to_path_buf)
+                    .map_or_else(default_installation_data_root, Ok)?;
+                launch_foreground_keyring_broker(installation_root, captured_status).await?;
+                serde_json::json!({"status": "accepted"})
+            } else {
+                serde_json::to_value(
+                    connector
+                        .bootstrap_unlock(captured_status, read_bootstrap_unlock(stdin)?)
+                        .await?,
+                )?
+            };
+            ("secure startup was accepted", value)
+        }
+    };
+    emit_result(output, summary, &value)
+}
+
+fn installed_service_connector(
+    config: &AppConfig,
+    installation_data_root: Option<&Path>,
+) -> Result<InstalledServiceConnector> {
+    installation_data_root
+        .map_or_else(
+            || InstalledServiceConnector::try_new(config),
+            |root| InstalledServiceConnector::try_new_at_installation_root(config, root),
+        )
+        .map_err(Into::into)
+}
+
+async fn service_status(
+    config: &AppConfig,
+    installation_data_root: Option<&Path>,
+) -> Result<(&'static str, serde_json::Value)> {
+    if let Ok(snapshot) = installed_service_snapshot(config, installation_data_root).await {
+        return Ok(("installed service is ready", snapshot));
+    }
+    let connector = installed_service_connector(config, installation_data_root)?;
+    let status = connector.bootstrap_status().await?;
+    Ok((
+        "installed service requires credential bootstrap",
+        serde_json::json!({"status": "bootstrap_required", "bootstrap": status}),
+    ))
+}
+
+fn read_bootstrap_unlock(explicit_stdin: bool) -> Result<SecretValue> {
+    if explicit_stdin {
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .take(MAXIMUM_BOOTSTRAP_UNLOCK_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .context("failed to read the bounded bootstrap unlock from standard input")?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAXIMUM_BOOTSTRAP_UNLOCK_BYTES {
+            anyhow::bail!("bootstrap unlock exceeds its input bound");
+        }
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+        }
+        return SecretValue::from_utf8_bytes(bytes)
+            .context("bootstrap unlock is empty, invalid UTF-8, or outside its secret bound");
+    }
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("bootstrap unlock requires a terminal or explicit --stdin");
+    }
+    let unlock = rpassword::prompt_password("Encrypted fallback unlock: ")
+        .context("failed to read the no-echo bootstrap unlock")?;
+    SecretValue::new(unlock).context("bootstrap unlock is empty or outside its secret bound")
+}
+
+async fn installed_service_snapshot(
+    config: &AppConfig,
+    installation_data_root: Option<&Path>,
+) -> Result<serde_json::Value> {
+    let connector = installed_service_connector(config, installation_data_root)?;
+    let client = connector.connect(NamedClient::Cli, None)?;
+    client.probe_ready(CancellationToken::new()).await?;
+    let bootstrap = client.bootstrap(CancellationToken::new()).await?;
+    Ok(serde_json::json!({
+        "status": "ready",
+        "bootstrap": bootstrap,
+    }))
+}
+
+async fn start_installed_service(
+    config: &AppConfig,
+    config_file: Option<&std::path::Path>,
+    log: &str,
+    json_logs: bool,
+    readiness_timeout: Duration,
+    installation_data_root: Option<&Path>,
+) -> Result<(&'static str, serde_json::Value)> {
+    if let Ok(snapshot) = installed_service_snapshot(config, installation_data_root).await {
+        return Ok(("installed service was already ready", snapshot));
+    }
+
+    let program = verified_installed_service_program()?;
+    let mut command = ProcessCommand::new(program);
+    command
+        .arg("--data-dir")
+        .arg(config.data_dir())
+        .arg("--log")
+        .arg(log)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(config_file) = config_file {
+        command.arg("--config").arg(config_file);
+    }
+    if let Some(training_release_root) = config.training_release_root() {
+        command
+            .arg("--training-release-root")
+            .arg(training_release_root);
+    }
+    if let Some(root) = installation_data_root {
+        command.arg("--installation-data-root").arg(root);
+    }
+    if json_logs {
+        command.arg("--json-logs");
+    }
+    let mut child = command
+        .spawn()
+        .context("failed to start the verified installed Market Squawk service")?;
+    let deadline = tokio::time::Instant::now()
+        .checked_add(readiness_timeout)
+        .ok_or_else(|| anyhow!("installed-service readiness deadline overflow"))?;
+    loop {
+        if let Ok(snapshot) = installed_service_snapshot(config, installation_data_root).await {
+            return Ok(("installed service started", snapshot));
+        }
+        let connector = installed_service_connector(config, installation_data_root)?;
+        if let Ok(status) = connector.bootstrap_status().await {
+            return Ok((
+                "installed service started and requires credential bootstrap",
+                serde_json::json!({"status": "bootstrap_required", "bootstrap": status}),
+            ));
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to inspect the installed-service child")?
+        {
+            anyhow::bail!("installed service exited before readiness with status {status}");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            child
+                .kill()
+                .context("installed service missed readiness and could not be terminated")?;
+            reap_service_child(&mut child, Duration::from_secs(2)).await?;
+            anyhow::bail!("installed service did not reach authenticated readiness in time");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn reap_service_child(child: &mut std::process::Child, timeout: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| anyhow!("installed-service reap deadline overflow"))?;
+    loop {
+        if child
+            .try_wait()
+            .context("failed to inspect the terminating installed service")?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("terminated installed service could not be reaped within its deadline");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 

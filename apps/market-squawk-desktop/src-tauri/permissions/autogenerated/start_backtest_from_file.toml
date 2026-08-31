@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-backtest-from-file"
+description = "Enables the start_backtest_from_file command without any pre-configured scope."
+commands.allow = ["start_backtest_from_file"]
+
+[[permission]]
+identifier = "deny-start-backtest-from-file"
+description = "Denies the start_backtest_from_file command without any pre-configured scope."
+commands.deny = ["start_backtest_from_file"]

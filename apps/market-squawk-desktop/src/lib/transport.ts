@@ -1,17 +1,240 @@
 import type {
+  AnalyticalControllerRequest,
+  AnalyticalControllerResponse,
+} from "@/features/advanced/analytical-profile-contracts"
+import type {
   ApplicationResult,
   DesktopBootstrap,
+  DesktopEvent,
+  DesktopEventSubscriptionReceipt,
+  DesktopSystemStartup,
   EncryptedFileFallback,
   InstallationControlResult,
+  InputTicket,
+  McpClientsStatus,
+  NativeEvidenceApplicationResult,
   ProviderActivation,
   ProviderBootstrap,
   ProviderSession,
 } from "@/lib/schemas"
 
-export interface ApplicationRequest {
-  operation: string
-  arguments?: Record<string, unknown>
+export type DesktopEventSubscriptionRequest = {
+  productSessionToken: DesktopBootstrap["productSessionToken"]
+  afterSequence: DesktopEvent["sequence"]
 }
+
+export type DesktopEventSubscription = {
+  receipt: DesktopEventSubscriptionReceipt
+  unsubscribe: () => Promise<void>
+}
+
+export const productLookupCategories = [
+  "company",
+  "investment",
+  "investment_target",
+  "model",
+  "portfolio",
+  "research",
+  "saved_screen",
+] as const
+
+export type ProductLookupCategory = (typeof productLookupCategories)[number]
+
+export const productLookupCategory = {
+  company: productLookupCategories[0],
+  investment: productLookupCategories[1],
+  investmentTarget: productLookupCategories[2],
+  model: productLookupCategories[3],
+  portfolio: productLookupCategories[4],
+  research: productLookupCategories[5],
+  savedScreen: productLookupCategories[6],
+} as const
+
+export const productLookupActions = {
+  openInvestment: "open_investment",
+  openSavedScreen: "open_saved_screen",
+} as const
+
+export const PRODUCT_LOOKUP_QUERY_MAXIMUM_CHARACTERS = 64
+
+export type ProductQuery =
+  | {
+      query: "macroContext"
+      knowledgeCutoff?: string
+      effectiveDateCutoff?: string
+    }
+  | {
+      query: "lookup"
+      text: string
+      categories?: ProductLookupCategory[]
+    }
+  | { query: "marketOverview"; pageToken?: string }
+  | { query: "analysisSettings" }
+  | { query: "marketUniverse"; text: string; pageToken?: string }
+  | {
+      query: "marketInstrument"
+      selectionToken: string
+    }
+  | {
+      query: "marketHistory"
+      historyToken: string
+    }
+  | { query: "researchCollections"; afterCollection?: string }
+  | {
+      query:
+        | "researchCollection"
+        | "researchCollectionHistory"
+        | "researchCollectionAlternativeData"
+      collection: string
+    }
+  | { query: "portfolioAccounts"; afterAccountToken?: string }
+  | {
+      query:
+        | "portfolioHoldings"
+        | "portfolioTransactions"
+        | "portfolioPerformance"
+        | "portfolioExposure"
+      accountId: string
+    }
+  | { query: "portfolioRisk"; accountToken: string }
+  | {
+      query: "portfolioRevisions"
+      accountId: string
+      afterSnapshotToken?: string
+    }
+  | {
+      query: "portfolioAttribution"
+      accountId: string
+      baselineSnapshotToken: string
+    }
+  | {
+      query: "portfolioCandidateImpact"
+      instrumentId: string
+      proposedQuantity: string
+      scenarioShock: string
+    }
+  | {
+      query:
+        | "forecasts"
+        | "paperStatus"
+        | "paperOrders"
+        | "paperFills"
+    }
+  | { query: "forecast" | "forecastOutcomes"; forecastToken: string }
+  | { query: "decisionScreens"; limit: number }
+  | { query: "decisionScreen"; screenId: string }
+  | { query: "decisionInvestmentAnalysis"; actionToken: string }
+  | {
+      query: "decisionInvestmentAnalyses"
+      afterActionToken?: string
+      limit: number
+    }
+  | {
+      query: "decisionRecommendationTrackRecord"
+      actionToken: string
+    }
+
+export type SystemQuery =
+  | {
+      query: "sourceStatus" | "sourceCoverage" | "sourceHealth"
+      sourceIds?: string[]
+    }
+  | { query: "researchDatasets"; afterDataset?: string }
+  | {
+      query: "researchManifest" | "researchHistory" | "researchAlternativeData"
+      dataset: string
+    }
+  | {
+      query: "researchSourceObjects"
+      provider: string
+      dataset: string
+    }
+  | {
+      query: "portfolioScenario"
+      accountId: string
+      scenario: Record<string, unknown>
+    }
+  | {
+      query: "portfolioScenarioBatch"
+      accountId: string
+      scenarios: unknown[]
+    }
+  | {
+      query: "portfolioRebalance"
+      accountId: string
+      proposal: Record<string, unknown>
+    }
+  | { query: "fairValueWorkspace"; measurementToken?: string; at: string }
+  | {
+      query: "latestValidForecast"
+      instrumentId: string
+      asOf: string
+    }
+  | { query: "analysisFeatureDatasets"; dataset?: string; afterDataset?: string }
+  | {
+      query: "decisionScreenRuns"
+      afterRunId?: string
+      limit: number
+    }
+  | { query: "decisionCandidates"; runId: string }
+  | {
+      query: "decisionCandidateDossiers"
+      candidateId: string
+      afterDossierId?: string
+      limit: number
+    }
+  | { query: "decisionDossier"; dossierId: string }
+  | { query: "decisionDossierPreparation"; candidateId: string }
+  | { query: "decisionTargetPreparation"; dossierId: string }
+  | {
+      query: "decisionTarget" | "decisionTargetStatus"
+      targetId: string
+      revision: number
+    }
+  | { query: "decisionTargets"; targetId: string }
+  | { query: "decisionTargetIndex"; afterTargetId?: string; limit: number }
+  | {
+      query: "analysisArtifact"
+      artifactId: string
+      sha256: string
+      byteCount: number
+      mediaType:
+        | "application/json"
+        | "application/vnd.apache.parquet"
+        | "application/x-ndjson"
+      offset: number
+      maximumBytes: number
+    }
+  | { query: "jobs"; afterJobId?: string; limit: number }
+  | { query: "operationRuntimeStatus" }
+  | { query: "operationBackups"; afterBackupId?: string; limit: number }
+  | { query: "operationBackup"; backupId: string }
+  | { query: "operationBackupRetentionPreview"; keepLatest: number }
+  | { query: "operationRestorePreview"; backupId: string }
+  | {
+      query: "operationWorkspaces"
+      afterWorkspaceId?: string
+      limit: number
+    }
+  | { query: "operationWorkspaceSwitchPreview"; workspaceId: string }
+  | {
+      query:
+        | "operationUpdateStatus"
+        | "operationUpdatePreview"
+        | "operationProgramRollbackPreview"
+        | "operationSettings"
+    }
+  | ({ query: "operationLogs" } & OperationLogFilter)
+  | {
+      query: "operationSettingsChangePreview"
+      expectedRevision: string
+      changes: OperationSettingValue[]
+    }
+  | {
+      query: "operationSettingsRollbackPreview"
+      expectedRevision: string
+      targetRevision: string
+    }
 
 export type InstallationControlRequest =
   | { action: "status" }
@@ -19,6 +242,10 @@ export type InstallationControlRequest =
   | { action: "repair" }
   | { action: "rollback" }
   | { action: "uninstall" }
+
+export type DesktopServiceBootstrapRequest =
+  | { action: "unlock_encrypted_fallback"; unlock: string }
+  | { action: "complete_foreground_keyring" }
 
 export type ProviderOnboardingRequest =
   | { action: "bootstrap" }
@@ -51,15 +278,434 @@ export type ProviderOnboardingResult<
       ? ProviderActivation
       : ProviderSession
 
+export type ModelProductRequest =
+  | { action: "list" }
+  | { action: "activity" }
+
+export type BacktestProductRequest =
+  | { action: "list" }
+  | { action: "get"; backtestToken: string }
+
 export interface ProductTransport {
-  bootstrap(): Promise<DesktopBootstrap>
+  query(request: ProductQuery): Promise<ApplicationResult>
+  modelProducts(request: ModelProductRequest): Promise<ApplicationResult>
+  backtestProducts(request: BacktestProductRequest): Promise<ApplicationResult>
+  datasetPreparation(
+    request: DatasetPreparationRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+  backtestPreparation(
+    request: BacktestPreparationRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+  forecastPreparation(
+    request: ForecastPreparationRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+  researchExport(
+    collectionToken: string,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+  paperControl(
+    request: PaperControlRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+  manualPaper(
+    request: ManualPaperRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+}
+
+export type DatasetPreparationRequest =
+  | { action: "options" }
+  | {
+      action: "preview"
+      choice: string
+      intendedUse: "local_analysis" | "train"
+    }
+  | { action: "start"; confirmationToken: string }
+
+export type BacktestPreparationRequest =
+  | { action: "options" }
+  | {
+      action: "preview"
+      selection: {
+        historyToken: string
+        periodToken: string
+        methodToken: string
+        costToken: string
+        portfolioToken: string
+        comparisonToken: string
+      }
+    }
+  | { action: "start"; confirmationToken: string }
+
+export type ForecastPreparationRequest =
+  | { action: "options" }
+  | {
+      action: "preview"
+      selection: {
+        modelToken: string
+        historyToken: string
+        investmentToken: string
+        horizonToken: string
+      }
+    }
+  | { action: "start"; confirmationToken: string }
+
+export interface SystemTransport {
+  bootstrap(): Promise<DesktopSystemStartup>
+  bootstrapService(request: DesktopServiceBootstrapRequest): Promise<void>
   installation(
     request: InstallationControlRequest,
+    confirmed?: boolean,
   ): Promise<InstallationControlResult>
-  invoke(request: ApplicationRequest): Promise<ApplicationResult>
+  systemQuery(request: SystemQuery): Promise<NativeEvidenceApplicationResult>
+  analyticalController(
+    request: AnalyticalControllerRequest,
+    confirmed?: boolean,
+  ): Promise<AnalyticalControllerResponse>
+  researchControl(
+    request: ResearchControlRequest,
+    confirmed?: boolean,
+  ): Promise<NativeEvidenceApplicationResult>
+  startBacktestFromFile(confirmed?: boolean): Promise<ApplicationResult | null>
+  modelControl(
+    request: ModelControlRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+  decisionControl(
+    request: DecisionControlRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+  governanceQuery(
+    request: GovernanceQueryRequest,
+  ): Promise<NativeEvidenceApplicationResult>
+  governanceControl(
+    request: GovernanceControlRequest,
+    confirmed?: boolean,
+  ): Promise<NativeEvidenceApplicationResult>
+  fairValueControl(
+    request: FairValueControlRequest,
+    confirmed?: boolean,
+  ): Promise<ApplicationResult>
+  jobControl(
+    request: JobControlRequest,
+    confirmed?: boolean,
+  ): Promise<NativeEvidenceApplicationResult>
+  sourceControl(
+    action: SourceLifecycleAction,
+    request: SourceLifecycleRequest,
+    confirmed?: boolean,
+  ): Promise<NativeEvidenceApplicationResult>
+  importProviderCredentialBundle(): Promise<unknown | null>
+  operationsControl(
+    request: OperationsControlRequest,
+    confirmed?: boolean,
+  ): Promise<NativeEvidenceApplicationResult>
+  stageTrainingInput(kind: TrainingInputKind): Promise<InputTicket | null>
+  mcpClients(): Promise<McpClientsStatus>
+  mcpClientControl(
+    request: McpClientControlRequest,
+    confirmed?: boolean,
+  ): Promise<McpClientsStatus>
+  subscribe(
+    request: DesktopEventSubscriptionRequest,
+    onEvent: (event: DesktopEvent) => void,
+    onProtocolError: (error: Error) => void,
+  ): Promise<DesktopEventSubscription>
   onboard<Request extends ProviderOnboardingRequest>(
     request: Request,
   ): Promise<ProviderOnboardingResult<Request>>
   openOfficialProviderPage(providerId: string): Promise<void>
   openProtectedProviderSetup(providerId: string): Promise<void>
+}
+
+export interface DesktopTransport {
+  product: ProductTransport
+  system: SystemTransport
+}
+
+export type OperationLogSeverity = "trace" | "debug" | "info" | "warn" | "error"
+
+export type OperationLogDomain =
+  | "application"
+  | "source"
+  | "market"
+  | "research"
+  | "portfolio"
+  | "model"
+  | "backtest"
+  | "execution"
+  | "risk"
+  | "fair_value"
+  | "mcp"
+  | "lifecycle"
+
+export interface OperationLogFilter {
+  fromUnixNanos?: string
+  throughUnixNanos?: string
+  minimumSeverity?: OperationLogSeverity
+  domain?: OperationLogDomain
+  sourceId?: string
+  jobId?: string
+  correlationId?: string
+  search?: string
+  afterSequence?: string
+  limit: number
+}
+
+export type OperationSettingValue =
+  | { kind: "log_retention_days"; value: number }
+  | { kind: "log_minimum_severity"; value: OperationLogSeverity }
+  | { kind: "update_channel"; value: "stable" | "preview" }
+  | { kind: "automatic_update_checks"; value: boolean }
+  | { kind: "storage_soft_limit_bytes"; value: string }
+  | { kind: "default_query_row_limit"; value: number }
+  | { kind: "maximum_concurrent_jobs"; value: number }
+  | { kind: "market_freshness_millis"; value: number }
+  | { kind: "backup_retention_count"; value: number }
+
+type PreviewReference = {
+  previewId: string
+  previewDigest: string
+}
+
+export type OperationsControlRequest =
+  | { action: "checkForUpdates" }
+  | ({ action: "exportLogs" } & OperationLogFilter)
+  | { action: "startBackup" }
+  | { action: "startBackupVerification"; backupId: string }
+  | ({ action: "startBackupRetention" } & PreviewReference)
+  | ({ action: "startRestore" } & PreviewReference)
+  | ({ action: "startWorkspaceSwitch" } & PreviewReference)
+  | ({ action: "startUpdate" } & PreviewReference)
+  | ({ action: "startProgramRollback" } & PreviewReference)
+  | ({ action: "applySettingsChange" } & PreviewReference)
+  | ({ action: "rollbackSettings" } & PreviewReference)
+
+export type TrainingInputKind = "configuration" | "model_authority"
+
+export type McpClientControlRequest = {
+  action:
+    | "connect"
+    | "reconnect"
+    | "verify"
+    | "repair"
+    | "rotateCredential"
+    | "revokeCredential"
+    | "disconnect"
+  client: "claude_code" | "codex"
+}
+
+export type ResearchControlRequest =
+  | { action: "discoverSourceObjects"; provider: string; dataset: string }
+  | {
+      action: "startIngestSource"
+      provider: string
+      object: string
+      dataset: string
+      discoveryReceipt: string
+    }
+
+export type ModelControlRequest = {
+  action: "startTraining"
+  configTicketId: string
+  authorityTicketId: string
+}
+
+export type GovernanceQueryRequest =
+  | { query: "provisioningStatus" }
+  | {
+      query: "principals"
+      after?: string
+      limit?: number
+    }
+
+export type GovernanceControlRequest =
+  | {
+      action: "provisionPrincipalSet"
+      primaryDisplayName: string
+      primaryCredential: string
+      reviewerDisplayName: string
+      reviewerCredential: string
+    }
+  | {
+      action: "authenticateAction"
+      previewId: string
+      principalId: string
+      credential: string
+    }
+
+export type DecisionControlRequest =
+  | {
+      action: "saveScreen"
+      expectedRevision?: number
+      screen: Record<string, unknown>
+    }
+  | {
+      action: "runScreen"
+      screenId: string
+      screenRevision: number
+      datasetManifest: Record<string, unknown>
+      asOf: string
+    }
+  | { action: "prepareDossier"; draft: Record<string, unknown> }
+  | { action: "createDossier"; receiptId: string }
+  | { action: "prepareTargetSet"; draft: Record<string, unknown> }
+  | { action: "createTargetSet" | "reevaluateTargetSet"; receiptId: string }
+  | {
+      action: "previewGovernanceAction"
+      proposal:
+        | {
+            kind: "review"
+            targetId: string
+            targetRevision: number
+            disposition: "activate" | "reject" | "needs_changes"
+            note: string
+          }
+        | {
+            kind: "invalidation"
+            targetId: string
+            targetRevision: number
+            invalidationKind:
+              | "corporate_action"
+              | "model"
+              | "data"
+              | "reference_mark"
+              | "assumption"
+            note: string
+          }
+    }
+  | {
+      action: "commitGovernanceAction"
+      previewId: string
+      authorizationHandles: string[]
+    }
+
+export type FairValueGovernanceProposal =
+  | {
+      kind: "approve"
+      measurementToken: string
+      classificationToken: string
+      expiresAt: string
+    }
+  | {
+      kind: "override"
+      measurementToken: string
+      classificationToken: string
+      requestedHierarchy: "level_2" | "level_3"
+      justification: string
+      expiresAt: string
+    }
+  | {
+      kind: "revoke"
+      approvalToken: string
+      reason: string
+    }
+  | {
+      kind: "market_access"
+      marketInputToken: string
+      conclusion: "accessible" | "inaccessible"
+      effectiveFrom: string
+      effectiveUntil: string
+      rationale: string
+    }
+
+export type FairValueControlRequest =
+  | { action: "measure"; measurement: Record<string, unknown> }
+  | {
+      action: "previewGovernanceAction"
+      proposal: FairValueGovernanceProposal
+    }
+  | {
+      action: "commitGovernanceAction"
+      previewId: string
+      authorizationHandles: string[]
+    }
+
+export type PaperControlRequest =
+  | { action: "startPreparation" }
+  | {
+      action: "prepareStart"
+      cashChoice: string
+      costChoice: string
+      modeChoice: string
+    }
+  | { action: "start"; confirmationToken: string }
+  | { action: "stop" | "triggerKillSwitch"; reason: string }
+  | { action: "cancel"; actionToken: string }
+
+export type ManualPaperTargetLevel =
+  | "downside"
+  | "add"
+  | "entry_lower"
+  | "entry_upper"
+  | "base"
+  | "trim_lower"
+  | "trim_upper"
+  | "exit_lower"
+  | "exit_upper"
+  | "upside"
+
+export type ManualPaperRequest =
+  | { action: "targets" }
+  | {
+      action: "prepareManual"
+      targetToken: string
+      side: "buy" | "sell"
+      orderType: "market" | "limit" | "stop" | "stop_limit"
+      quantityLots: string
+      limitTargetLevel?: ManualPaperTargetLevel
+      stopTargetLevel?: ManualPaperTargetLevel
+      timeInForce:
+        | "day"
+        | "good_til_cancelled"
+        | "immediate_or_cancel"
+        | "fill_or_kill"
+    }
+  | { action: "submitManual"; confirmationToken: string }
+
+export type JobControlRequest =
+  | { action: "list"; afterJobId?: string; limit: number }
+  | { action: "get"; jobId: string; generation: string }
+  | {
+      action: "watch"
+      jobId: string
+      generation: string
+      afterSequence: string
+      limit: number
+    }
+  | {
+      action: "cancel" | "retry"
+      jobId: string
+      generation: string
+      expectedSequence: string
+    }
+  | {
+      action: "confirm"
+      jobId: string
+      generation: string
+      expectedSequence: string
+      identity: string
+      digest: string
+    }
+
+export type SourceLifecycleAction =
+  | "start"
+  | "stop"
+  | "retry"
+  | "resynchronize"
+  | "verify"
+  | "reconfigure"
+  | "remove"
+
+export interface SourceLifecycleRequest {
+  provider: string
+  expectedStateRevision: string
+  expectedGeneration?: string
+  expectedRuntimeGenerationSha256?: string
+  onboardingSessionId?: string
+  publicConfigurationSha256?: string
+  reason?: string
 }

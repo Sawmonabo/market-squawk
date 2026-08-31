@@ -237,6 +237,11 @@ impl TreasuryPageRequest {
         self.request_digest
     }
 
+    /// Returns the exact canonical provider page-token fragment sent by this request.
+    pub fn page_token(&self) -> String {
+        canonical_page_token(self.page_number, self.page_size)
+    }
+
     /// Returns the response-source identity bound into the profile.
     pub const fn source_identity(&self) -> &'static str {
         self.profile.source_identity()
@@ -253,6 +258,13 @@ impl TreasuryPageRequest {
     pub(crate) fn contains_record_date(&self, date: CalendarDate) -> bool {
         date >= self.first_record_date && date <= self.last_record_date
     }
+}
+
+pub(crate) fn canonical_page_token(page_number: usize, page_size: NonZeroU16) -> String {
+    format!(
+        "&page%5Bnumber%5D={page_number}&page%5Bsize%5D={}",
+        page_size.get()
+    )
 }
 
 fn query_digest(

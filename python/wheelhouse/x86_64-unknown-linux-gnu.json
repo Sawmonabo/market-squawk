@@ -1,15 +1,28 @@
 {
   "artifacts": [
     "iniconfig-2.3.0-py3-none-any.whl",
+    "joblib-1.5.3-py3-none-any.whl",
+    "mapie-1.4.1-py3-none-any.whl",
     "maturin-1.14.1-py3-none-manylinux_2_12_x86_64.manylinux2010_x86_64.musllinux_1_1_x86_64.whl",
+    "ml_dtypes-0.5.4-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    "narwhals-2.24.0-py3-none-any.whl",
+    "numpy-2.5.1-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    "onnx-1.22.0-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
     "packaging-26.2-py3-none-any.whl",
     "pluggy-1.6.0-py3-none-any.whl",
+    "protobuf-7.35.1-cp310-abi3-manylinux2014_x86_64.whl",
     "pyarrow-25.0.0-cp314-cp314-manylinux_2_28_x86_64.whl",
     "pygments-2.20.0-py3-none-any.whl",
-    "pytest-9.1.1-py3-none-any.whl"
+    "pytest-9.1.1-py3-none-any.whl",
+    "scikit_learn-1.9.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    "scipy-1.18.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    "skl2onnx-1.20.0-py3-none-any.whl",
+    "threadpoolctl-3.6.0-py3-none-any.whl",
+    "typing_extensions-4.16.0-py3-none-any.whl"
   ],
+  "inventory_generation": "4dc8aee225412f0fee0d2bff3f77f56b4b65268d234ef8c25518da7891c01b8b",
   "minimum_system": "Ubuntu 24.04-compatible",
-  "schema_version": 1,
+  "schema_version": 2,
   "target": "x86_64-unknown-linux-gnu",
   "wheel_platform_tag": "manylinux_2_28_x86_64"
 }
