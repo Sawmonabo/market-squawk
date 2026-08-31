@@ -12,8 +12,10 @@ use market_squawk_adapter_kraken::{
     KrakenMetadataInput, KrakenSocketHandoffConsumer, KrakenSource,
 };
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, IdentityError, MetadataRevision,
-    RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp,
+    DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, IdentityError, InstrumentDefinition,
+    InstrumentDefinitionInput, MetadataRevision, ProviderIdentityEvidence, ProviderIdentityKey,
+    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderInstrumentId,
+    RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_live::{
     LiveSnapshotReader, RouteSnapshot, ShardKey, SnapshotCompleteness, StreamPhaseSnapshot,
@@ -39,6 +41,8 @@ const TRADE_SOURCE_ID: &str = "kraken-public-trades-v2";
 const BOOK_IMPLEMENTATION_PROFILE_VERSION: &str = "kraken-book-v2-profile-2026-08-14";
 const TRADE_IMPLEMENTATION_PROFILE_VERSION: &str = "kraken-trade-v2-profile-2026-08-14";
 const PROFILE_EVIDENCE_DOMAIN: &[u8] = b"market-squawk/kraken-production-profile/v1\0";
+const NATIVE_IDENTITY_EVIDENCE_DOMAIN: &[u8] = b"market-squawk/kraken-native-identity/v1\0";
+const NATIVE_IDENTITY_PROFILE_VERSION: &str = "kraken-native-identity-profile-2026-08-31";
 const REQUESTS_PER_WINDOW: u32 = 8;
 const REQUEST_WINDOW_NANOS: u64 = 1_000_000_000;
 // Book and trade are separate exact WebSocket supervisors and may connect/subscribe concurrently.
@@ -128,7 +132,8 @@ impl ProductionKrakenProfile {
         if !attestation.is_effective_at(at) {
             return Err(ProductionKrakenProfileError::AuthorizationNotEffective);
         }
-        let evidence_input = KrakenProfileEvidence::try_for_channel(config, channel)?;
+        let (definition, provider_identity_key) = definition_with_native_identity(config, at)?;
+        let evidence_input = KrakenProfileEvidence::try_for_channel(config, &definition, channel)?;
         let encoded = serde_json::to_vec(&evidence_input)
             .map_err(|_error| ProductionKrakenProfileError::EvidenceSerialization)?;
         let mut hasher = Sha256::new();
@@ -176,7 +181,7 @@ impl ProductionKrakenProfile {
                 authorization,
                 profile_evidence,
                 effective,
-                config.definition().instrument_id(),
+                definition.instrument_id(),
                 freshness,
                 budget,
             ),
@@ -186,7 +191,7 @@ impl ProductionKrakenProfile {
                 authorization,
                 profile_evidence,
                 effective,
-                config.definition().instrument_id(),
+                definition.instrument_id(),
                 freshness,
                 budget,
             ),
@@ -195,15 +200,17 @@ impl ProductionKrakenProfile {
         let adapter_config = match channel {
             KrakenChannel::Book(depth) => KrakenConfig::try_new(
                 metadata,
-                config.symbol(),
-                config.definition().instrument_id(),
+                &definition,
+                &provider_identity_key,
+                at,
                 depth,
                 config.max_frame_bytes(),
             )?,
             KrakenChannel::Trades => KrakenConfig::try_trades(
                 metadata,
-                config.symbol(),
-                config.definition().instrument_id(),
+                &definition,
+                &provider_identity_key,
+                at,
                 config.max_frame_bytes(),
             )?,
         };
@@ -273,17 +280,10 @@ struct KrakenProfileEvidence<'a> {
     authorization: &'a KrakenAuthorizationAttestation,
 }
 
-impl<'a> TryFrom<&'a KrakenSourceConfig> for KrakenProfileEvidence<'a> {
-    type Error = ProductionKrakenProfileError;
-
-    fn try_from(config: &'a KrakenSourceConfig) -> Result<Self, Self::Error> {
-        Self::try_for_channel(config, KrakenChannel::Book(KrakenDepth::Ten))
-    }
-}
-
 impl<'a> KrakenProfileEvidence<'a> {
     fn try_for_channel(
         config: &'a KrakenSourceConfig,
+        definition: &'a InstrumentDefinition,
         channel: KrakenChannel,
     ) -> Result<Self, ProductionKrakenProfileError> {
         let controls = config.control_limits();
@@ -300,7 +300,7 @@ impl<'a> KrakenProfileEvidence<'a> {
             channel: channel_name,
             endpoint: config.endpoint(),
             symbol: config.symbol(),
-            definition: config.definition(),
+            definition,
             depth,
             snapshot: true,
             freshness_nanos: duration_nanos(config.freshness())?,
@@ -313,12 +313,130 @@ impl<'a> KrakenProfileEvidence<'a> {
     }
 }
 
+#[derive(Serialize)]
+struct KrakenNativeIdentityEvidence<'a> {
+    implementation_profile_version: &'static str,
+    provider: &'static str,
+    venue: &'a VenueId,
+    provider_instrument_id: &'a ProviderInstrumentId,
+    venue_symbol: &'a market_squawk_domain::VenueSymbol,
+    instrument_id: market_squawk_domain::InstrumentId,
+    instrument_definition_revision: market_squawk_domain::InstrumentDefinitionRevision,
+    authorization: &'a KrakenAuthorizationAttestation,
+}
+
+fn definition_with_native_identity(
+    config: &KrakenSourceConfig,
+    observed_at: Timestamp,
+) -> Result<(InstrumentDefinition, ProviderIdentityKey), ProductionKrakenProfileError> {
+    let provider = SourceId::try_from("kraken")?;
+    let provider_instrument = ProviderInstrumentId::try_from(config.symbol())?;
+    let key = ProviderIdentityKey::new(provider.clone(), provider_instrument.clone());
+    let definition = config.definition();
+    let venue = VenueId::try_from("kraken")?;
+    let venue_mapping = definition
+        .venue_mappings()
+        .iter()
+        .find(|mapping| mapping.venue_id() == &venue)
+        .filter(|mapping| mapping.venue_symbol().as_str() == config.symbol())
+        .ok_or(ProductionKrakenProfileError::NativeIdentity)?;
+
+    if definition
+        .provider_identity_conflicts()
+        .iter()
+        .any(|conflict| conflict.key() == &key)
+    {
+        return Err(ProductionKrakenProfileError::NativeIdentity);
+    }
+    if definition
+        .provider_identity_at(&provider, &provider_instrument, observed_at)
+        .is_some()
+    {
+        return Ok((definition.clone(), key));
+    }
+    if definition
+        .provider_identities()
+        .iter()
+        .any(|record| record.key() == key)
+    {
+        // A configured assertion exists but is not effective now. Silently inventing a successor
+        // would discard the provider-authored revision edge required by the identity registry.
+        return Err(ProductionKrakenProfileError::NativeIdentity);
+    }
+
+    let identity_evidence = KrakenNativeIdentityEvidence {
+        implementation_profile_version: NATIVE_IDENTITY_PROFILE_VERSION,
+        provider: "kraken",
+        venue: venue_mapping.venue_id(),
+        provider_instrument_id: &provider_instrument,
+        venue_symbol: venue_mapping.venue_symbol(),
+        instrument_id: definition.instrument_id(),
+        instrument_definition_revision: definition.definition_revision(),
+        authorization: config.authorization(),
+    };
+    let encoded = serde_json::to_vec(&identity_evidence)
+        .map_err(|_error| ProductionKrakenProfileError::EvidenceSerialization)?;
+    let mut hasher = Sha256::new();
+    hasher.update(NATIVE_IDENTITY_EVIDENCE_DOMAIN);
+    hasher.update(encoded);
+    let digest: [u8; 32] = hasher.finalize().into();
+    let revision = MetadataRevision::new(content_addressed_identity_revision(digest)?);
+    let record = ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+        instrument_id: definition.instrument_id(),
+        source_id: provider,
+        provider_instrument_id: provider_instrument,
+        evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            digest,
+        )),
+        source_timestamp: None,
+        observed_at,
+        metadata_revision: revision,
+        validity: config.authorization().effective_interval(),
+        supersedes: None,
+    });
+    let mut provider_identities = Vec::new();
+    provider_identities
+        .try_reserve_exact(definition.provider_identities().len().saturating_add(1))
+        .map_err(|_error| ProductionKrakenProfileError::Allocation)?;
+    provider_identities.extend(definition.provider_identities().iter().cloned());
+    provider_identities.push(record);
+    let definition = InstrumentDefinition::try_new(InstrumentDefinitionInput {
+        instrument_id: definition.instrument_id(),
+        definition_revision: definition.definition_revision(),
+        asset_class: definition.asset_class(),
+        primary_denomination: definition.primary_denomination(),
+        quote_currency: definition.quote_currency(),
+        tick_size: definition.tick_size(),
+        lot_size: definition.lot_size(),
+        contract_multiplier: definition.contract_multiplier(),
+        venue_mappings: definition.venue_mappings().to_vec(),
+        provider_identities,
+        identifiers: definition.identifiers().to_vec(),
+        trading_status: definition.trading_status(),
+    })?;
+    Ok((definition, key))
+}
+
 fn content_addressed_revision(
     digest: [u8; 32],
 ) -> Result<SourceIdentifier, ProductionKrakenProfileError> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut revision = String::with_capacity(74);
     revision.push_str("kraken-v2-");
+    for byte in digest {
+        revision.push(char::from(HEX[usize::from(byte >> 4)]));
+        revision.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(SourceIdentifier::try_from(revision)?)
+}
+
+fn content_addressed_identity_revision(
+    digest: [u8; 32],
+) -> Result<SourceIdentifier, ProductionKrakenProfileError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut revision = String::with_capacity(87);
+    revision.push_str("kraken-native-v1-");
     for byte in digest {
         revision.push(char::from(HEX[usize::from(byte >> 4)]));
         revision.push(char::from(HEX[usize::from(byte & 0x0f)]));
@@ -768,8 +886,14 @@ fn nonzero_u64(value: u64) -> Result<NonZeroU64, ProductionKrakenProfileError> {
 /// Kraken production-profile validation failure.
 #[derive(Debug, Error)]
 pub enum ProductionKrakenProfileError {
+    #[error("Kraken production profile allocation failed")]
+    Allocation,
     #[error("Kraken production profile identity is invalid")]
     Identity(#[from] IdentityError),
+    #[error("Kraken production native identity assertion is invalid")]
+    NativeIdentity,
+    #[error("Kraken production instrument definition is invalid")]
+    Instrument(#[from] market_squawk_domain::InstrumentError),
     #[error("Kraken source metadata is invalid")]
     Metadata(#[from] KrakenMetadataError),
     #[error("Kraken adapter configuration is invalid")]

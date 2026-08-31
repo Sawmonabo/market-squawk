@@ -27,8 +27,8 @@ use crate::handoff::{
     KrakenInstrumentBinding, KrakenMarketContinuity, KrakenMarketEventHandoff, KrakenProviderText,
     KrakenPublicControl, KrakenSubscriptionAcknowledgementEvidence,
     KrakenSubscriptionRequestEvidence, captured_acknowledgement, from_public_outcome,
-    instrument_binding, public_connection, public_continuity, public_control_handoff,
-    public_retirement_handoff,
+    instrument_binding_from_coordinates, public_connection, public_continuity,
+    public_control_handoff, public_retirement_handoff,
 };
 use crate::messages::{
     BookData, BookEnvelope, EnvelopeKind, Heartbeat, MAX_SUBSCRIPTION_ERROR_BYTES,
@@ -103,11 +103,8 @@ impl KrakenMarketDecoder {
         let coordinates = Arc::new(coordinates);
         let connection = public_connection(&metadata, Arc::clone(&coordinates), None)
             .map_err(|_| DecodeError::InvalidProviderEvidence)?;
-        let instrument_binding = instrument_binding(
-            coordinates.venue_symbol().as_str(),
-            coordinates.instrument(),
-        )
-        .map_err(|_| DecodeError::InvalidProviderEvidence)?;
+        let instrument_binding = instrument_binding_from_coordinates(&coordinates)
+            .map_err(|_| DecodeError::InvalidProviderEvidence)?;
         Ok(Self {
             metadata,
             decoder: KrakenDecoder::try_for_channel(Arc::clone(&coordinates), channel)?,
@@ -171,6 +168,9 @@ impl KrakenMarketDecoder {
         };
         if *request_id != PUBLIC_SUBSCRIPTION_REQUEST_ID
             || instrument_binding.native_symbol() != self.instrument_binding.native_symbol()
+            || instrument_binding.provider_identity_key()
+                != self.instrument_binding.provider_identity_key()
+            || instrument_binding.venue_mapping() != self.instrument_binding.venue_mapping()
             || instrument_binding.externally_resolved_instrument()
                 != self.instrument_binding.externally_resolved_instrument()
             || *channel != self.decoder.channel

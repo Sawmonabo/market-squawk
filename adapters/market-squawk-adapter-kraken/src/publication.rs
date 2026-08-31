@@ -853,8 +853,13 @@ fn validate_capture(
                     != expected_feed
                 || *channel != config.channel()
                 || instrument.native_symbol().as_str() != config.symbol()
+                || instrument.provider_identity_key()
+                    != config.native_coordinates().provider_identity_key()
+                || instrument.venue_mapping() != config.native_coordinates().venue_mapping()
                 || instrument.externally_resolved_instrument() != config.instrument()
                 || instrument_binding.native_symbol() != instrument.native_symbol()
+                || instrument_binding.provider_identity_key() != instrument.provider_identity_key()
+                || instrument_binding.venue_mapping() != instrument.venue_mapping()
                 || instrument_binding.externally_resolved_instrument()
                     != instrument.externally_resolved_instrument()
                 || payload.as_bytes() != expected_payload.as_bytes()
@@ -909,26 +914,26 @@ fn continuity_matches_config(
     continuity: Option<KrakenMarketContinuity>,
     channel: KrakenChannel,
 ) -> bool {
-    match (continuity, channel) {
-        (None, _) => true,
-        (
-            Some(KrakenMarketContinuity::PriceLevelBook {
-                checksum: KrakenChecksumAvailability::Validated(_),
-                sequence: KrakenSequenceAvailability::ProviderUnsupported,
-                ..
-            }),
-            KrakenChannel::Book(_),
-        ) => true,
-        (
-            Some(KrakenMarketContinuity::Trades {
-                checksum: KrakenChecksumAvailability::Unsupported,
-                sequence: KrakenSequenceAvailability::ProviderUnsupported,
-                ..
-            }),
-            KrakenChannel::Trades,
-        ) => true,
-        _ => false,
-    }
+    matches!(
+        (continuity, channel),
+        (None, _)
+            | (
+                Some(KrakenMarketContinuity::PriceLevelBook {
+                    checksum: KrakenChecksumAvailability::Validated(_),
+                    sequence: KrakenSequenceAvailability::ProviderUnsupported,
+                    ..
+                }),
+                KrakenChannel::Book(_),
+            )
+            | (
+                Some(KrakenMarketContinuity::Trades {
+                    checksum: KrakenChecksumAvailability::Unsupported,
+                    sequence: KrakenSequenceAvailability::ProviderUnsupported,
+                    ..
+                }),
+                KrakenChannel::Trades,
+            )
+    )
 }
 
 fn validate_disposition(

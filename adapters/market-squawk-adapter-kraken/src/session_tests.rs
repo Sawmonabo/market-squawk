@@ -324,6 +324,28 @@ async fn captured_public_and_level3_handoffs_preserve_identity_continuity_and_at
         request_evidence.authorization_generation(),
         credential_authority.authorization_generation()
     );
+    let level3_identity = level3_snapshot_handoff.instrument_binding();
+    assert_eq!(level3_identity.native_symbol().as_str(), "BTC/USD");
+    assert_eq!(
+        level3_identity.provider_identity_key().source_id().as_str(),
+        "kraken"
+    );
+    assert_eq!(
+        level3_identity
+            .provider_identity_key()
+            .provider_instrument_id()
+            .as_str(),
+        "BTC/USD"
+    );
+    assert_eq!(
+        level3_identity.venue_mapping().venue_id().as_str(),
+        "kraken"
+    );
+    assert_eq!(
+        level3_identity.venue_mapping().venue_symbol().as_str(),
+        "BTC/USD"
+    );
+    assert_eq!(level3_identity.externally_resolved_instrument(), instrument);
     assert!(matches!(
         level3_snapshot_handoff.continuity(),
         KrakenMarketContinuity::AuthenticatedLevel3 {
@@ -441,19 +463,17 @@ fn decode_level3_frame(
         .frames_mut()?
         .try_frame(TransportFrameKind::Text, payload)?;
     let validated = authority.validate_live_frame(&frame)?;
-    if let Some(dispatch) = dispatch.as_deref_mut() {
-        if let Some(sent) = dispatch.bind_to_frame(&validated)? {
-            decoder.register_sent_subscription(sent)?;
-        }
+    if let Some(dispatch) = dispatch.as_deref_mut()
+        && let Some(sent) = dispatch.bind_to_frame(&validated)?
+    {
+        decoder.register_sent_subscription(sent)?;
     }
     let handoff = decoder.decode_captured(&validated)?;
-    if let Some(dispatch) = dispatch {
-        if let KrakenMarketEventHandoff::ControlOrDiscontinuity(control) = &handoff {
-            if let KrakenControlOrDiscontinuityKind::AuthenticatedControl(control) = control.kind()
-            {
-                dispatch.apply_control(control)?;
-            }
-        }
+    if let Some(dispatch) = dispatch
+        && let KrakenMarketEventHandoff::ControlOrDiscontinuity(control) = &handoff
+        && let KrakenControlOrDiscontinuityKind::AuthenticatedControl(control) = control.kind()
+    {
+        dispatch.apply_control(control)?;
     }
     Ok(handoff)
 }

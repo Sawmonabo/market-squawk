@@ -87,6 +87,44 @@ async fn public_kraken_reaches_live_state_but_both_execution_safety_layers_rejec
     let source_config = config.kraken().ok_or("Kraken source profile missing")?;
     let profiles =
         super::super::kraken::ProductionKrakenProfileSet::try_from_config(source_config)?;
+    let book_coordinates = profiles
+        .book()
+        .publication_config()
+        .native_coordinates()
+        .clone();
+    let trade_coordinates = profiles
+        .trades()
+        .publication_config()
+        .native_coordinates()
+        .clone();
+    assert_eq!(
+        book_coordinates.provider_identity_key(),
+        trade_coordinates.provider_identity_key()
+    );
+    assert_eq!(
+        book_coordinates.provider_identity_revision(),
+        trade_coordinates.provider_identity_revision()
+    );
+    assert_eq!(
+        book_coordinates.provider_identity_digest(),
+        trade_coordinates.provider_identity_digest()
+    );
+    assert_eq!(
+        book_coordinates
+            .provider_identity_key()
+            .source_id()
+            .as_str(),
+        "kraken"
+    );
+    assert_eq!(
+        book_coordinates
+            .provider_identity_key()
+            .provider_instrument_id()
+            .as_str(),
+        "BTC/USD"
+    );
+    assert_eq!(book_coordinates.venue().as_str(), "kraken");
+    assert_eq!(book_coordinates.venue_symbol().as_str(), "BTC/USD");
     let book_metadata = profiles.book().metadata().clone();
     let trade_metadata = profiles.trades().metadata().clone();
     assert_eq!(

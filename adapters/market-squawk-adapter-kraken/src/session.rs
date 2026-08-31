@@ -996,11 +996,9 @@ impl KrakenL3SubscriptionDispatch {
             .take()
             .ok_or(SourceError::InvalidProtocolState)?;
         permit.release();
-        let result = self
-            .budget
+        self.budget
             .record_success()
-            .map_err(|reason| SourceError::BudgetUnavailable { reason });
-        result
+            .map_err(|reason| SourceError::BudgetUnavailable { reason })
     }
 
     /// Returns whether every exact symbol acknowledgement settled this dispatch.

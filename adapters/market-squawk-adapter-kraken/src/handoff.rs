@@ -11,7 +11,8 @@ use crate::level3::{
 };
 use market_squawk_domain::{
     CapturePayload, EvidenceDigest, InstrumentId, LiveEventClass, MarketDepth, ProviderChannel,
-    ProviderProduct, SourceIdentifier, Timestamp, VenueId,
+    ProviderIdentityKey, ProviderInstrumentId, ProviderProduct, SourceId, SourceIdentifier,
+    Timestamp, VenueId, VenueMapping, VenueSymbol,
 };
 use market_squawk_sources::{
     ControlFrameKind, DecodeInternalError, DecodeOutcome, DecodedProviderBatch, DecoderEvidence,
@@ -119,12 +120,16 @@ impl KrakenConnectionBinding {
 #[derive(Debug)]
 pub struct KrakenInstrumentBinding {
     native_symbol: SourceIdentifier,
+    provider_identity_key: ProviderIdentityKey,
+    venue_mapping: VenueMapping,
     externally_resolved_instrument: InstrumentId,
 }
 
 impl PartialEq for KrakenInstrumentBinding {
     fn eq(&self, other: &Self) -> bool {
         self.native_symbol == other.native_symbol
+            && self.provider_identity_key == other.provider_identity_key
+            && self.venue_mapping == other.venue_mapping
             && self.externally_resolved_instrument == other.externally_resolved_instrument
     }
 }
@@ -135,6 +140,20 @@ impl KrakenInstrumentBinding {
     /// Returns the exact Kraken product symbol.
     pub const fn native_symbol(&self) -> &SourceIdentifier {
         &self.native_symbol
+    }
+
+    /// Returns the source-qualified provider identity carried through this exact feed handoff.
+    ///
+    /// Public Spot additionally carries accepted identity revision/digest evidence in
+    /// [`KrakenNativeMarketCoordinates`]. Authenticated Level 3 currently binds the exact
+    /// provider symbol at transport admission without promoting it to reference-catalog authority.
+    pub const fn provider_identity_key(&self) -> &ProviderIdentityKey {
+        &self.provider_identity_key
+    }
+
+    /// Returns the exact Kraken venue and WebSocket symbol admitted for this handoff.
+    pub const fn venue_mapping(&self) -> &VenueMapping {
+        &self.venue_mapping
     }
 
     /// Returns the instrument identity supplied by external reference authority.
@@ -973,10 +992,32 @@ pub(crate) fn instrument_binding(
     symbol: &str,
     instrument: InstrumentId,
 ) -> Result<Arc<KrakenInstrumentBinding>, DecodeInternalError> {
+    let provider =
+        SourceId::try_from(KRAKEN_PROVIDER).map_err(|_| DecodeInternalError::InvariantViolation)?;
+    let provider_instrument_id = ProviderInstrumentId::try_from(symbol)
+        .map_err(|_| DecodeInternalError::InvariantViolation)?;
+    let venue =
+        VenueId::try_from(KRAKEN_PROVIDER).map_err(|_| DecodeInternalError::InvariantViolation)?;
+    let venue_symbol =
+        VenueSymbol::try_from(symbol).map_err(|_| DecodeInternalError::InvariantViolation)?;
     Ok(Arc::new(KrakenInstrumentBinding {
         native_symbol: SourceIdentifier::try_from(symbol)
             .map_err(|_| DecodeInternalError::InvariantViolation)?,
+        provider_identity_key: ProviderIdentityKey::new(provider, provider_instrument_id),
+        venue_mapping: VenueMapping::new(venue, venue_symbol),
         externally_resolved_instrument: instrument,
+    }))
+}
+
+pub(crate) fn instrument_binding_from_coordinates(
+    coordinates: &KrakenNativeMarketCoordinates,
+) -> Result<Arc<KrakenInstrumentBinding>, DecodeInternalError> {
+    Ok(Arc::new(KrakenInstrumentBinding {
+        native_symbol: SourceIdentifier::try_from(coordinates.venue_symbol().as_str())
+            .map_err(|_| DecodeInternalError::InvariantViolation)?,
+        provider_identity_key: coordinates.provider_identity_key().clone(),
+        venue_mapping: coordinates.venue_mapping().clone(),
+        externally_resolved_instrument: coordinates.instrument(),
     }))
 }
 
@@ -1019,6 +1060,7 @@ pub(crate) fn public_continuity(
     if observations.is_empty()
         || observations.iter().any(|observation| {
             observation.venue() != connection.venue()
+                || observation.venue() != binding.venue_mapping().venue_id()
                 || observation.instrument() != binding.externally_resolved_instrument()
                 || !matches!(
                     observation.sequence(),
