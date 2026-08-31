@@ -2656,7 +2656,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_authority_recipe_is_quarantined_during_product_startup() -> TestResult {
+    async fn startup_quarantines_missing_authority_without_deleting_stopped_credentials()
+    -> TestResult {
         let temporary = tempfile::tempdir()?;
         let environment = BTreeMap::<OsString, OsString>::new();
         let config = AppConfig::load(ConfigSources::new(
@@ -2669,6 +2670,62 @@ mod tests {
         ))?;
         let initial = crate::LocalProduct::try_new(config.clone())?;
         let state = initial.provider_activation_state().clone();
+        let onboarding = initial.provider_onboarding();
+        onboarding
+            .unlock_encrypted_file_fallback(
+                market_squawk_platform::SecretValue::new(
+                    "stopped credential restart proof".to_owned(),
+                )?,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await?;
+        let credential_surface = "tiingo.starter-eod-nav";
+        let started = onboarding.start_deferred(crate::StartOnboardingRequest::try_new(
+            credential_surface,
+            None,
+            None,
+        )?)?;
+        let credential_session = started.session_id();
+        let stored = onboarding
+            .submit_secret(
+                credential_session,
+                market_squawk_platform::SecretValue::new("fixture-tiingo-token".to_owned())?,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await?;
+        assert!(stored.credential_stored());
+        let credential_before = onboarding.retained_credential_coordinate(credential_session)?;
+        assert_eq!(
+            credential_before.2,
+            market_squawk_sources::CredentialGenerationState::StoredUnverified
+        );
+        state.publish_recipe(
+            credential_surface,
+            None,
+            credential_session,
+            br#"{"schema_version":6,"source":"tiingo"}"#,
+            &[],
+            generation_digest(31),
+            None,
+        )?;
+        let stopped = state.begin_source_lifecycle_transition(
+            credential_surface,
+            NonZeroU64::MIN,
+            SourceIdentifier::try_from("stop-retained-credential")?,
+            generation_digest(32),
+            false,
+            Some(credential_session),
+            None,
+        )?;
+        state.complete_source_lifecycle_transition(
+            credential_surface,
+            stopped.transition_digest(),
+            DurableSourceLifecyclePhase::Stopped,
+            Some(credential_session),
+            None,
+            None,
+            None,
+        )?;
         assert!(
             initial
                 .application
@@ -2676,6 +2733,7 @@ mod tests {
                 .await
                 .is_complete()
         );
+        drop(onboarding);
         drop(initial);
         state.publish_recipe(
             "treasury.fiscal-data",
@@ -2687,13 +2745,41 @@ mod tests {
             None,
         )?;
 
-        drop(crate::LocalProduct::try_new(config)?);
+        let recovered = crate::LocalProduct::try_new(config)?;
         assert!(matches!(
-            state.load_recipe("treasury.fiscal-data")?,
+            state.load_recipe_for_startup_recovery(credential_surface)?,
+            DurableActivationRecipeState::Missing
+        ));
+        assert!(matches!(
+            state.load_recipe_for_startup_admission(credential_surface)?,
+            DurableActivationRecipeState::Desired(recipe)
+                if recipe.session_id == credential_session
+        ));
+        let credential_after = recovered
+            .provider_onboarding()
+            .retained_credential_coordinate(credential_session)?;
+        assert_eq!(credential_after, credential_before);
+        let resumed = recovered.provider_onboarding().resume(credential_session)?;
+        assert!(resumed.credential_stored());
+        assert_eq!(
+            resumed.state(),
+            market_squawk_sources::OnboardingState::StoredUnverified
+        );
+        assert!(matches!(
+            recovered
+                .provider_activation_state()
+                .load_recipe_for_lifecycle("treasury.fiscal-data")?,
             DurableActivationRecipeState::Quarantined(quarantine)
                 if quarantine.reason
                     == DurableActivationQuarantineReason::AuthorityInvalidated
         ));
+        assert!(
+            recovered
+                .application
+                .shutdown(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_complete()
+        );
         Ok(())
     }
 

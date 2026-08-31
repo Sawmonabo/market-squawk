@@ -24,6 +24,34 @@ use super::{
 use crate::provider_onboarding::SCHWAB_MARKET_DATA_SURFACE_ID;
 
 impl ProviderOnboardingService {
+    #[cfg(test)]
+    pub(crate) fn retained_credential_coordinate(
+        &self,
+        session_id: Uuid,
+    ) -> Result<
+        (
+            market_squawk_platform::SecretGeneration,
+            market_squawk_platform::SecretRef,
+            CredentialGenerationState,
+        ),
+        ProviderOnboardingError,
+    > {
+        let resumed = self.catalog.resume_provider_onboarding(session_id)?;
+        let lifecycle = resumed.lifecycle();
+        let generation = lifecycle
+            .candidate_generation()
+            .or_else(|| lifecycle.active_generation())
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        let reference = lifecycle
+            .generation_reference(generation)
+            .cloned()
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        let state = lifecycle
+            .generation_state(generation)
+            .ok_or(ProviderOnboardingError::InvalidSessionState)?;
+        Ok((generation, reference, state))
+    }
+
     /// Replays one exact durable session, closes safe refresh recovery, and returns status.
     pub fn resume(
         &self,
