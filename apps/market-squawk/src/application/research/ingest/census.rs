@@ -231,8 +231,12 @@ impl CensusMacroApplicationClosure {
             .activation_candidate(pending_doctor, sealed_doctor)
             .map_err(|error| CensusMacroApplicationError::diagnosed_adapter(&diagnostic, error))?;
 
+        diagnostic.enter_discovery_request();
         let discovery =
-            DiscoveryRequest::try_new(provider_dataset, None, NonZeroU16::MIN, provider_deadline)?;
+            DiscoveryRequest::try_new(provider_dataset, None, NonZeroU16::MIN, provider_deadline)
+                .map_err(|error| {
+                CensusMacroApplicationError::diagnosed_extraction_contract(&diagnostic, error)
+            })?;
         let discovered = census
             .discover_with_activation(
                 authority.clone(),
@@ -728,11 +732,8 @@ impl CensusMacroApplicationError {
     }
 
     fn diagnosed_adapter(journey: &CensusDiagnosticJourney, source: CensusSourceError) -> Self {
-        Self::DiagnosedAdapter(CensusDiagnosedError::new(
-            source,
-            journey,
-            CensusDiagnosticFailureClass::AdapterContract,
-        ))
+        let failure_class = census_source_failure_class(&source);
+        Self::DiagnosedAdapter(CensusDiagnosedError::new(source, journey, failure_class))
     }
 
     fn diagnosed_extraction_contract(
@@ -755,11 +756,43 @@ impl CensusMacroApplicationError {
     }
 
     fn diagnosed_service(journey: &CensusDiagnosticJourney, source: ServiceError) -> Self {
-        Self::DiagnosedService(CensusDiagnosedError::new(
-            source,
-            journey,
-            CensusDiagnosticFailureClass::ApplicationAuthority,
-        ))
+        let failure_class = service_failure_class(source);
+        Self::DiagnosedService(CensusDiagnosedError::new(source, journey, failure_class))
+    }
+}
+
+fn census_source_failure_class(error: &CensusSourceError) -> CensusDiagnosticFailureClass {
+    match error {
+        CensusSourceError::Protocol => CensusDiagnosticFailureClass::Protocol,
+        CensusSourceError::Network | CensusSourceError::BodyTooLarge => {
+            CensusDiagnosticFailureClass::Transport
+        }
+        CensusSourceError::DeadlineExceeded => CensusDiagnosticFailureClass::Deadline,
+        CensusSourceError::Cancelled => CensusDiagnosticFailureClass::Cancellation,
+        CensusSourceError::Clock | CensusSourceError::Authority => {
+            CensusDiagnosticFailureClass::Authority
+        }
+        CensusSourceError::InvalidMetadata
+        | CensusSourceError::InvalidConfiguration
+        | CensusSourceError::TelemetryOverflow
+        | CensusSourceError::Adapter(_)
+        | CensusSourceError::Capture(_)
+        | CensusSourceError::Revision(_)
+        | CensusSourceError::RateDeclaration(_) => CensusDiagnosticFailureClass::AdapterContract,
+    }
+}
+
+const fn service_failure_class(error: ServiceError) -> CensusDiagnosticFailureClass {
+    match error {
+        ServiceError::DeadlineExceeded => CensusDiagnosticFailureClass::Deadline,
+        ServiceError::Cancelled => CensusDiagnosticFailureClass::Cancellation,
+        ServiceError::InvalidRequest
+        | ServiceError::NotFound
+        | ServiceError::Unauthorized
+        | ServiceError::ResourceExhausted
+        | ServiceError::Unavailable
+        | ServiceError::InvalidResult
+        | ServiceError::Internal => CensusDiagnosticFailureClass::ApplicationAuthority,
     }
 }
 

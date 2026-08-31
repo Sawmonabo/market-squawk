@@ -592,6 +592,8 @@ pub enum CensusDiagnosticPhase {
     DoctorSeal,
     /// Post-seal doctor rejoin and activation-candidate construction.
     DoctorActivation,
+    /// Bounded discovery-request construction after doctor activation.
+    DiscoveryRequest,
     /// Dataset-catalog transport, parsing, and validation.
     MetadataCatalog,
     /// Dataset-group transport, parsing, and validation.
@@ -710,6 +712,11 @@ impl CensusDiagnosticJourney {
     /// Marks post-seal doctor activation-candidate construction.
     pub fn enter_doctor_activation(&mut self) {
         self.phase = CensusDiagnosticPhase::DoctorActivation;
+    }
+
+    /// Marks bounded discovery-request construction.
+    pub fn enter_discovery_request(&mut self) {
+        self.phase = CensusDiagnosticPhase::DiscoveryRequest;
     }
 
     /// Marks physical sealing of the complete provider capture graph.
