@@ -1559,38 +1559,126 @@ async fn oauth_authority_durably_reauthorizes_unusable_token_state() {
     ));
 }
 
-#[test]
-fn bearer_network_handoffs_keep_one_zeroizing_owner_through_completion() {
-    for transport_fails in [false, true] {
-        let rest_audit = crate::transport::SensitiveDropAudit::default();
-        let mut rest =
-            crate::transport::ReqwestSchwabAuthorizationMaterial::try_new("rest-bearer-secret")
-                .unwrap_or_else(|error| panic!("REST bearer material: {error}"));
-        rest.arm_drop_audit(rest_audit.clone());
-        let rest_owner = rest.as_bytes().as_ptr();
-        let header = rest
-            .into_header()
-            .unwrap_or_else(|error| panic!("REST bearer header: {error}"));
-        assert_eq!(header.as_bytes().as_ptr(), rest_owner);
-        let network_header = header.clone();
-        drop(header);
-        assert_eq!(rest_audit.cleared_drops(), 0);
-        let rest_result = if transport_fails {
-            Err(SchwabTransportError::Network)
-        } else {
-            Ok(())
-        };
-        drop(network_header);
-        assert_eq!(rest_audit.cleared_drops(), 1);
-        assert_eq!(rest_audit.uncleared_drops(), 0);
-        assert_eq!(rest_result.is_err(), transport_fails);
+#[derive(Clone, Copy, Debug)]
+enum SensitiveSendCompletion {
+    Success,
+    NetworkError,
+    Pending,
+}
 
-        let preference = br#"{
-          "streamerInfo":[{"streamerSocketUrl":"wss://streamer.example.test/ws","schwabClientCustomerId":"customer","schwabClientCorrelId":"correlation","schwabClientChannel":"channel","schwabClientFunctionId":"function"}],
-          "offers":[{"mktDataPermission":"NP","level2Permissions":true}]
-        }"#;
-        let bootstrap = parse_user_preference(preference, bounds())
-            .unwrap_or_else(|error| panic!("Streamer bootstrap: {error}"));
+struct SensitiveHandoffConnection {
+    completion: SensitiveSendCompletion,
+    owner_address: usize,
+    audit: crate::transport::SensitiveDropAudit,
+}
+
+impl fmt::Debug for SensitiveHandoffConnection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SensitiveHandoffConnection(..)")
+    }
+}
+
+impl crate::transport::SealedSchwabStreamerConnection for SensitiveHandoffConnection {}
+
+impl SchwabStreamerConnection for SensitiveHandoffConnection {
+    fn send_text<'a>(
+        &'a mut self,
+        payload: Bytes,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SchwabTransportError>> + Send + 'a>> {
+        let completion = self.completion;
+        let owner_address = self.owner_address;
+        let audit = self.audit.clone();
+        Box::pin(async move {
+            assert_eq!(payload.as_ptr() as usize, owner_address);
+            assert_eq!(audit.cleared_drops(), 0);
+            let result = match completion {
+                SensitiveSendCompletion::Success => Ok(()),
+                SensitiveSendCompletion::NetworkError => Err(SchwabTransportError::Network),
+                SensitiveSendCompletion::Pending => pending().await,
+            };
+            assert_eq!(audit.cleared_drops(), 0);
+            drop(payload);
+            result
+        })
+    }
+
+    fn send_pong<'a>(
+        &'a mut self,
+        _payload: Bytes,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SchwabTransportError>> + Send + 'a>> {
+        Box::pin(async { Err(SchwabTransportError::Protocol) })
+    }
+
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<InboundStreamerFrame>, SchwabTransportError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(pending())
+    }
+
+    fn close<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SchwabTransportError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn bearer_network_handoffs_keep_one_zeroizing_owner_through_completion() {
+    let rest_audit = crate::transport::SensitiveDropAudit::default();
+    let mut rest =
+        crate::transport::ReqwestSchwabAuthorizationMaterial::try_new("rest-bearer-secret")
+            .unwrap_or_else(|error| panic!("REST bearer material: {error}"));
+    rest.arm_drop_audit(rest_audit.clone());
+    let rest_owner = rest.as_bytes().as_ptr();
+    let header = rest
+        .into_header()
+        .unwrap_or_else(|error| panic!("REST bearer header: {error}"));
+    assert_eq!(header.as_bytes().as_ptr(), rest_owner);
+    let network_header = header.clone();
+    drop(header);
+    assert_eq!(rest_audit.cleared_drops(), 0);
+    drop(network_header);
+    assert_eq!(rest_audit.cleared_drops(), 1);
+    assert_eq!(rest_audit.uncleared_drops(), 0);
+
+    let preference = br#"{
+      "streamerInfo":[{"streamerSocketUrl":"wss://streamer.example.test/ws","schwabClientCustomerId":"customer","schwabClientCorrelId":"correlation","schwabClientChannel":"channel","schwabClientFunctionId":"function"}],
+      "offers":[{"mktDataPermission":"NP","level2Permissions":true}]
+    }"#;
+    let bootstrap = parse_user_preference(preference, bounds())
+        .unwrap_or_else(|error| panic!("Streamer bootstrap: {error}"));
+    for (completion, timeout, cancel, expected) in [
+        (
+            SensitiveSendCompletion::Success,
+            Duration::from_secs(1),
+            false,
+            Ok(()),
+        ),
+        (
+            SensitiveSendCompletion::NetworkError,
+            Duration::from_secs(1),
+            false,
+            Err(SchwabTransportError::Network),
+        ),
+        (
+            SensitiveSendCompletion::Pending,
+            Duration::from_millis(1),
+            false,
+            Err(SchwabTransportError::Deadline),
+        ),
+        (
+            SensitiveSendCompletion::Pending,
+            Duration::from_secs(1),
+            true,
+            Err(SchwabTransportError::Cancelled),
+        ),
+    ] {
         let stream_admission = StreamerAdmission::new(admission(), nonzero(4), nonzero(16));
         let generation = ConnectionGeneration::new(
             NonZeroU64::new(1).unwrap_or_else(|| panic!("generation must be nonzero")),
@@ -1607,25 +1695,25 @@ fn bearer_network_handoffs_keep_one_zeroizing_owner_through_completion() {
             .unwrap_or_else(|error| panic!("Streamer login request: {error}"));
         let streamer_audit = crate::transport::SensitiveDropAudit::default();
         login.arm_drop_audit(streamer_audit.clone());
-        let streamer_owner = login.expose_body().as_ptr();
-        let payload = login.into_shared_body();
-        assert_eq!(payload.as_ptr(), streamer_owner);
-        let message = crate::transport::streamer_text_message(payload)
-            .unwrap_or_else(|error| panic!("Streamer UTF-8 handoff: {error}"));
-        let tokio_tungstenite::tungstenite::Message::Text(network_text) = message else {
-            panic!("Streamer login must remain a text message");
+        let mut connection = SensitiveHandoffConnection {
+            completion,
+            owner_address: login.expose_body().as_ptr() as usize,
+            audit: streamer_audit.clone(),
         };
-        assert_eq!(network_text.as_bytes().as_ptr(), streamer_owner);
-        assert_eq!(streamer_audit.cleared_drops(), 0);
-        let stream_result = if transport_fails {
-            Err(SchwabTransportError::Network)
-        } else {
-            Ok(())
-        };
-        drop(network_text);
+        let cancellation = CancellationToken::new();
+        if cancel {
+            cancellation.cancel();
+        }
+        let result = crate::transport::send_streamer_request_for_test(
+            &mut connection,
+            login,
+            timeout,
+            &cancellation,
+        )
+        .await;
+        assert_eq!(result, expected);
         assert_eq!(streamer_audit.cleared_drops(), 1);
         assert_eq!(streamer_audit.uncleared_drops(), 0);
-        assert_eq!(stream_result.is_err(), transport_fails);
     }
 }
 
@@ -2222,6 +2310,8 @@ impl SchwabStreamerConnector for MockStreamerConnector {
     }
 }
 
+impl crate::transport::SealedSchwabStreamerConnector for MockStreamerConnector {}
+
 struct MockStreamerConnection {
     state: Arc<Mutex<MockStreamerState>>,
     inbound: VecDeque<MockStreamerInbound>,
@@ -2232,6 +2322,8 @@ impl fmt::Debug for MockStreamerConnection {
         formatter.write_str("MockStreamerConnection(..)")
     }
 }
+
+impl crate::transport::SealedSchwabStreamerConnection for MockStreamerConnection {}
 
 impl SchwabStreamerConnection for MockStreamerConnection {
     fn send_text<'a>(

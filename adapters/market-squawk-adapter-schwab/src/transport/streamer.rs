@@ -887,8 +887,15 @@ impl fmt::Debug for InboundStreamerFrame {
     }
 }
 
-/// One connected Streamer wire. Implementations must not retain outbound login bytes.
-pub trait SchwabStreamerConnection: fmt::Debug + Send {
+/// Seals the secret-bearing wire implementation boundary to this adapter crate.
+pub(crate) trait SealedSchwabStreamerConnection {}
+
+/// One connected Streamer wire. Only adapter-owned implementations can receive login bytes.
+#[allow(
+    private_bounds,
+    reason = "the private supertrait prevents external secret-bearing wire implementations"
+)]
+pub trait SchwabStreamerConnection: SealedSchwabStreamerConnection + fmt::Debug + Send {
     fn send_text<'a>(
         &'a mut self,
         payload: Bytes,
@@ -914,8 +921,17 @@ pub trait SchwabStreamerConnection: fmt::Debug + Send {
     ) -> Pin<Box<dyn Future<Output = Result<(), SchwabTransportError>> + Send + 'a>>;
 }
 
-/// Injectable Streamer connector used by the production WSS client and local mock proof.
-pub trait SchwabStreamerConnector: fmt::Debug + Send + Sync {
+/// Seals connection construction to the production wire and adapter-local tests.
+pub(crate) trait SealedSchwabStreamerConnector {}
+
+/// Adapter-owned Streamer connector used by the production WSS client and local mock proof.
+#[allow(
+    private_bounds,
+    reason = "the private supertrait prevents external interception of login handoffs"
+)]
+pub trait SchwabStreamerConnector:
+    SealedSchwabStreamerConnector + fmt::Debug + Send + Sync
+{
     fn connect<'a>(
         &'a self,
         endpoint: &'a str,
@@ -932,6 +948,8 @@ pub trait SchwabStreamerConnector: fmt::Debug + Send + Sync {
 /// Production rustls WebSocket connector.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProductionSchwabStreamerConnector;
+
+impl SealedSchwabStreamerConnector for ProductionSchwabStreamerConnector {}
 
 impl SchwabStreamerConnector for ProductionSchwabStreamerConnector {
     fn connect<'a>(
@@ -968,6 +986,8 @@ impl SchwabStreamerConnector for ProductionSchwabStreamerConnector {
 struct TungsteniteSchwabConnection {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
 }
+
+impl SealedSchwabStreamerConnection for TungsteniteSchwabConnection {}
 
 impl fmt::Debug for TungsteniteSchwabConnection {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2092,6 +2112,24 @@ async fn send_request(
     await_operation(connection.send_text(bytes), timeout, cancellation).await?;
     telemetry.record_stream_request(length)?;
     Ok(sent)
+}
+
+#[cfg(test)]
+pub(crate) async fn send_streamer_request_for_test(
+    connection: &mut dyn SchwabStreamerConnection,
+    request: TransientStreamerRequest,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<(), SchwabTransportError> {
+    send_request(
+        connection,
+        request,
+        &SchwabTransportTelemetry::default(),
+        timeout,
+        cancellation,
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn acquire_token(

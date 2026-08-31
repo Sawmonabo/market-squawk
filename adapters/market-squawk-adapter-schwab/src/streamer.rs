@@ -623,7 +623,7 @@ impl TransientStreamerRequest {
             request_id,
         })
     }
-    pub fn expose_body(&self) -> &[u8] {
+    pub(crate) fn expose_body(&self) -> &[u8] {
         self.body.as_bytes()
     }
     pub const fn service(&self) -> Option<MarketDataService> {

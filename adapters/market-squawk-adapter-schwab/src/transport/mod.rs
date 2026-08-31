@@ -36,8 +36,6 @@ pub use http::{
     SchwabSealedRawRestCapture, SchwabSealedRestResponse, SchwabUserPreferenceEvidence,
 };
 pub(crate) use streamer::SchwabSealedStreamerCaptureParts;
-#[cfg(test)]
-pub(crate) use streamer::streamer_text_message;
 pub use streamer::{
     InboundStreamerFrame, ProductionSchwabStreamerConnector, RawStreamerFrame,
     RawStreamerFrameKind, SchwabPendingStreamerCapture, SchwabSealedStreamerCapture,
@@ -47,6 +45,10 @@ pub use streamer::{
     SchwabStreamerExecutor, SchwabStreamerFrameSealEvidence, SchwabStreamerServiceResponseEvidence,
     StreamerCaptureSink, StreamerCaptureSinkError, StreamerMicrobatch, StreamerMicrobatchReceipt,
     StreamerRunExit,
+};
+#[cfg(test)]
+pub(crate) use streamer::{
+    SealedSchwabStreamerConnection, SealedSchwabStreamerConnector, send_streamer_request_for_test,
 };
 
 /// Source-neutral capture coordinates supplied by the registered provider/runtime owner.
