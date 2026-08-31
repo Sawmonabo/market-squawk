@@ -1,5 +1,6 @@
 //! Authority-bound EIA HTTP transport and terminal offset-page acquisition.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{io, mem::size_of};
@@ -2475,6 +2476,26 @@ impl ReqwestEiaTransport {
     }
 }
 
+/// Resolves cancellation against a future that may yield only a complete bounded capture body.
+pub(crate) async fn await_capture_completion<T, F>(
+    timeout: Duration,
+    cancellation: CancellationToken,
+    completion: F,
+) -> Result<T, EiaSourceTransportError>
+where
+    F: Future<Output = Result<T, EiaSourceTransportError>>,
+{
+    tokio::select! {
+        biased;
+        result = tokio::time::timeout(timeout, completion) => {
+            result.map_err(|_| EiaSourceTransportError::Extraction(
+                ExtractionSourceError::DeadlineExceeded
+            ))?
+        }
+        () = cancellation.cancelled() => Err(ExtractionSourceError::Cancelled.into()),
+    }
+}
+
 impl EiaHttpTransport for ReqwestEiaTransport {
     fn execute<'a>(
         &'a self,
@@ -2542,15 +2563,7 @@ impl EiaHttpTransport for ReqwestEiaTransport {
                     latency: started.elapsed(),
                 })
             };
-            tokio::select! {
-                biased;
-                result = tokio::time::timeout(timeout, operation) => {
-                    result.map_err(|_| EiaSourceTransportError::Extraction(
-                        ExtractionSourceError::DeadlineExceeded
-                    ))?
-                }
-                () = cancellation.cancelled() => Err(ExtractionSourceError::Cancelled.into()),
-            }
+            await_capture_completion(timeout, cancellation, operation).await
         })
     }
 }
@@ -2613,14 +2626,6 @@ mod test_seam {
         pub(crate) body: Bytes,
         pub(crate) received_at: Timestamp,
         pub(crate) latency: Duration,
-        pub(crate) cancel_after_completion: bool,
-    }
-
-    impl EiaHttpResponseFixture {
-        pub(crate) const fn cancel_after_completion(mut self) -> Self {
-            self.cancel_after_completion = true;
-            self
-        }
     }
 
     #[derive(Debug)]
@@ -2670,9 +2675,6 @@ mod test_seam {
                         max: max_bytes,
                     })
                     .into());
-                }
-                if fixture.cancel_after_completion {
-                    cancellation.cancel();
                 }
                 Ok(EiaHttpResponse {
                     status: fixture.status,

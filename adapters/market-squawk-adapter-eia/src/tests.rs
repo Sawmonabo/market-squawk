@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::transport::{EiaHttpResponseFixture, EiaMockTransport};
+use crate::transport::{EiaHttpResponseFixture, EiaMockTransport, await_capture_completion};
 use crate::{
     EiaAcquisition, EiaApiKey, EiaApplicationBudget, EiaCapacityGuidance, EiaDataFieldContract,
     EiaDataFieldContractInput, EiaDataPage, EiaDataPageTransition, EiaDataQuery, EiaDataQueryInput,
@@ -395,12 +395,24 @@ async fn authority_bound_transport_redacts_and_terminally_closes_paged_capture()
         vec![price_row("2024-03", "12.50", "2024-04-01T15:00:00Z")],
         2,
     )?;
+    let completed_body = Bytes::from(first.clone());
+    let completion_cancellation = CancellationToken::new();
+    completion_cancellation.cancel();
+    assert_eq!(
+        await_capture_completion(
+            Duration::from_secs(1),
+            completion_cancellation,
+            std::future::ready(Ok(completed_body.clone())),
+        )
+        .await?,
+        completed_body
+    );
     let transport = Arc::new(EiaMockTransport {
         responses: Mutex::new(VecDeque::from([
             response_fixture(route_metadata_bytes()?, now),
             response_fixture(facet_metadata_bytes()?, now),
             response_fixture(first.clone(), now),
-            response_fixture(first.clone(), now).cancel_after_completion(),
+            response_fixture(first.clone(), now),
             response_fixture(second.clone(), now),
         ])),
         safe_urls: Mutex::new(Vec::new()),
@@ -866,7 +878,6 @@ fn response_fixture(body: Vec<u8>, received_at: Timestamp) -> EiaHttpResponseFix
         body: Bytes::from(body),
         received_at,
         latency: Duration::from_millis(5),
-        cancel_after_completion: false,
     }
 }
 
