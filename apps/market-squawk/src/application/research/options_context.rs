@@ -460,7 +460,6 @@ impl OptionsContextReadCapability {
             Ok(OfficialOptionsReferenceCatalogResolution::Selected(resolution)) => resolution,
             Err(
                 OfficialOptionsReferenceError::SourceUnavailable
-                | OfficialOptionsReferenceError::RightsUnavailable
                 | OfficialOptionsReferenceError::AuthorityUnavailable,
             ) => {
                 return Ok((

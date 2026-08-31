@@ -130,8 +130,9 @@ pub(crate) use iex_hist::{
 };
 pub(crate) use official_options_reference::{
     OfficialOptionsReferenceApplicationBinding, OfficialOptionsReferenceApplicationError,
-    OfficialOptionsReferenceCatalogCommitInput, OfficialOptionsReferenceClosureCommitment,
-    OfficialOptionsReferenceObjectCommitment, OfficialOptionsReferenceStrictObjectCommitment,
+    OfficialOptionsReferenceApplicationStage, OfficialOptionsReferenceCatalogCommitInput,
+    OfficialOptionsReferenceClosureCommitment, OfficialOptionsReferenceObjectCommitment,
+    OfficialOptionsReferenceStrictObjectCommitment,
 };
 pub use provider_runtime::ResearchProviderRuntimeGeneration;
 pub(crate) use provider_runtime::{

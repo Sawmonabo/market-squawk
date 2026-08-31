@@ -12,6 +12,7 @@ mod market_data_instruments;
 mod migration_preflight;
 mod observed_revisions;
 mod official_options_reference;
+mod official_options_reference_stage;
 mod onboarding;
 mod provider_capture;
 mod provider_event;
@@ -102,19 +103,27 @@ pub use self::official_options_reference::{
     OfficialOptionsReferenceError, OfficialOptionsReferenceExactIdentity,
     OfficialOptionsReferenceGenerationHeader, OfficialOptionsReferenceGenerationReceipt,
     OfficialOptionsReferenceGenerationSelection, OfficialOptionsReferenceIdentityQuery,
-    OfficialOptionsReferenceIdentityResolution, OfficialOptionsReferenceObjectEvidence,
-    OfficialOptionsReferenceObjectInput, OfficialOptionsReferenceObjectInputFields,
-    OfficialOptionsReferenceOccExchangeListingEvidence, OfficialOptionsReferenceOccPositionLimit,
-    OfficialOptionsReferenceOccProduct, OfficialOptionsReferenceOccProductType,
-    OfficialOptionsReferenceProvider, OfficialOptionsReferencePublicationCapability,
-    OfficialOptionsReferencePublicationDisposition, OfficialOptionsReferencePublicationReceipt,
-    OfficialOptionsReferenceReadCapability, OfficialOptionsReferenceRecord,
-    OfficialOptionsReferenceRecordInput, OfficialOptionsReferenceRecordSetDigestBuilder,
-    OfficialOptionsReferenceRecordSetEvidence, OfficialOptionsReferenceRecordValue,
+    OfficialOptionsReferenceIdentityResolution, OfficialOptionsReferenceObjectBindingFields,
+    OfficialOptionsReferenceObjectEvidence, OfficialOptionsReferenceObjectInput,
+    OfficialOptionsReferenceObjectInputFields, OfficialOptionsReferenceOccExchangeListingEvidence,
+    OfficialOptionsReferenceOccPositionLimit, OfficialOptionsReferenceOccProduct,
+    OfficialOptionsReferenceOccProductType, OfficialOptionsReferenceProvider,
+    OfficialOptionsReferencePublicationCapability, OfficialOptionsReferencePublicationDisposition,
+    OfficialOptionsReferencePublicationReceipt, OfficialOptionsReferenceReadCapability,
+    OfficialOptionsReferenceRecord, OfficialOptionsReferenceRecordInput,
+    OfficialOptionsReferenceRecordSetDigestBuilder, OfficialOptionsReferenceRecordSetEvidence,
+    OfficialOptionsReferenceRecordValue, OfficialOptionsReferenceRequestBinding,
     OfficialOptionsReferenceResolutionSetDigestBuilder,
     OfficialOptionsReferenceResolutionSetEvidence, OfficialOptionsReferenceSearchPage,
     OfficialOptionsReferenceSourceAuthority, OfficialOptionsReferenceSourceEvidence,
-    OfficialOptionsReferenceSurface,
+    OfficialOptionsReferenceSurface, official_options_reference_object_binding_digest,
+};
+pub use self::official_options_reference_stage::{
+    MAX_OFFICIAL_OPTIONS_REFERENCE_STAGE_BATCH_BYTES,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_STAGE_BATCH_ROWS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_STAGE_TOTAL_BYTES, MAX_OFFICIAL_OPTIONS_REFERENCE_STAGES,
+    OfficialOptionsReferenceSealedStage, OfficialOptionsReferenceStageCapability,
+    OfficialOptionsReferenceStageProgress, OfficialOptionsReferenceStageRestartDisposition,
 };
 pub use self::onboarding::{
     OnboardingAppendOutcome, OnboardingReservation, OnboardingReservationRequest,
