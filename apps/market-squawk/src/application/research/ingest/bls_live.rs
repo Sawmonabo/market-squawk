@@ -571,8 +571,8 @@ mod tests {
     use bytes::Bytes;
     use market_squawk_adapter_bls::{
         BlsAccessTier, BlsAuthorization, BlsCredentialRejoin, BlsRegistrationKey,
-        BlsScriptedResponse, BlsScriptedTransportFactory, BlsSeriesMetadata, BlsSourceConfig,
-        bls_application_provider_budget,
+        BlsScriptedResponse, BlsScriptedTransportFactory, BlsSeriesMetadata, BlsSource,
+        BlsSourceConfig, bls_application_provider_budget,
     };
     use market_squawk_data::{
         AnalyticalMacroSeriesAllowlist, CatalogConfig, CatalogResultLimits, ObjectStoreConfig,
@@ -627,22 +627,35 @@ mod tests {
         "value":"4.2","footnotes":[]
       }]}]}
     }"#;
+    const LIVE_REGISTERED_ACCEPTANCE: &str = "MARKET_SQUAWK_BLS_REGISTERED_LIVE_ACCEPTANCE";
 
     #[tokio::test]
     async fn public_and_protected_sources_seal_publish_and_reopen_exact_macro_plans() -> TestResult
     {
         let temporary = tempfile::tempdir()?;
-        let secret_reference = protected_registration_key(temporary.path())?;
+        let live_registered = live_registered_acceptance_enabled()?;
+        let registration_key = if live_registered {
+            std::env::var("BLS_REGISTRATION_KEY")
+                .map_err(|_error| "live BLS registration key is unavailable")?
+        } else {
+            "fixture-registration-key".to_owned()
+        };
+        let secret_reference =
+            protected_registration_key(temporary.path(), &registration_key, live_registered)?;
         prove_live_journey(
             &temporary.path().join("public-v1"),
             BlsAccessTier::PublicV1,
             None,
+            None,
+            false,
         )
         .await?;
         prove_live_journey(
             &temporary.path().join("registered-v2"),
             BlsAccessTier::RegisteredV2,
             Some(secret_reference),
+            Some(registration_key),
+            live_registered,
         )
         .await
     }
@@ -651,46 +664,62 @@ mod tests {
         root: &std::path::Path,
         tier: BlsAccessTier,
         secret_reference: Option<SecretRef>,
+        registration_key: Option<String>,
+        live_http: bool,
     ) -> TestResult {
+        if live_http && tier != BlsAccessTier::RegisteredV2 {
+            return Err("live BLS acceptance is registered-v2 only".into());
+        }
         let now = current_timestamp()?;
         let observed_at = now.checked_sub_nanos(1_000_000)?;
         let (authorization, expected_rejoin, profile, evidence_byte, revision) =
-            match (tier, secret_reference.as_ref()) {
-                (BlsAccessTier::PublicV1, None) => (
+            match (tier, secret_reference.as_ref(), registration_key) {
+                (BlsAccessTier::PublicV1, None, None) => (
                     BlsAuthorization::public_v1(),
                     BlsCredentialRejoin::PublicNoCredential,
                     "bls.v1-unregistered",
                     1,
                     "bls-public-v1-fixture",
                 ),
-                (BlsAccessTier::RegisteredV2, Some(reference)) => (
+                (BlsAccessTier::RegisteredV2, Some(reference), Some(registration_key)) => (
                     BlsAuthorization::registered_v2(
-                        BlsRegistrationKey::try_new("fixture-registration-key".to_owned())?,
+                        BlsRegistrationKey::try_new(registration_key)?,
                         reference,
                     )?,
                     BlsCredentialRejoin::for_registered_v2(reference)?,
                     "bls.v2-registered",
                     2,
-                    "bls-registered-v2-fixture",
+                    if live_http {
+                        "bls-registered-v2-live-acceptance"
+                    } else {
+                        "bls-registered-v2-fixture"
+                    },
                 ),
                 _ => return Err("credential does not match BLS access tier".into()),
             };
         let config = BlsSourceConfig::try_new(authorization, vec![series_metadata()?], 2026, 2026)?;
         let metadata = source_metadata(tier, now, digest(evidence_byte), revision)?;
 
-        let fixture = BlsScriptedTransportFactory::try_new(vec![
-            BlsScriptedResponse::try_new(
-                Bytes::from_static(PROVIDER_RESPONSE),
-                observed_at,
-                observed_at,
-            )?,
-            BlsScriptedResponse::try_new(
-                Bytes::from_static(PROVIDER_RESPONSE),
-                observed_at,
-                observed_at,
-            )?,
-        ])?;
-        let source = fixture.production_source(metadata.clone(), config)?;
+        let fixture = (!live_http)
+            .then(|| {
+                BlsScriptedTransportFactory::try_new(vec![
+                    BlsScriptedResponse::try_new(
+                        Bytes::from_static(PROVIDER_RESPONSE),
+                        observed_at,
+                        observed_at,
+                    )?,
+                    BlsScriptedResponse::try_new(
+                        Bytes::from_static(PROVIDER_RESPONSE),
+                        observed_at,
+                        observed_at,
+                    )?,
+                ])
+            })
+            .transpose()?;
+        let source = match fixture.as_ref() {
+            Some(fixture) => fixture.production_source(metadata.clone(), config)?,
+            None => BlsSource::try_new(metadata.clone(), config)?,
+        };
         assert_eq!(
             source.activation_plan()?.credential_rejoin(),
             expected_rejoin
@@ -787,9 +816,11 @@ mod tests {
             )
             .await?;
         assert_eq!(outcome.read().output().observations().len(), 1);
-        assert_eq!(fixture.counters()?.attempts, 2);
-        assert_eq!(fixture.counters()?.completed, 2);
-        assert_eq!(fixture.counters()?.remaining, 0);
+        if let Some(fixture) = fixture {
+            assert_eq!(fixture.counters()?.attempts, 2);
+            assert_eq!(fixture.counters()?.completed, 2);
+            assert_eq!(fixture.counters()?.remaining, 0);
+        }
         let restart_selector = outcome.read().restart_selector().clone();
         let manifest = outcome.publication().receipt().manifest().clone();
         let selection_digest = outcome.read().output().selection_digest();
@@ -846,7 +877,11 @@ mod tests {
         )?)
     }
 
-    fn protected_registration_key(root: &std::path::Path) -> TestResult<SecretRef> {
+    fn protected_registration_key(
+        root: &std::path::Path,
+        registration_key: &str,
+        live: bool,
+    ) -> TestResult<SecretRef> {
         let store = EncryptedFileSecretStore::try_open(
             root.join("secrets"),
             SecretValue::new("bls-live-fixture-unlock".to_owned())?,
@@ -859,11 +894,28 @@ mod tests {
             SecretCancellation::new(),
         )?;
         Ok(store.create(
-            &SecretKey::try_new("market-squawk.bls", "registered-v2-fixture")?,
+            &SecretKey::try_new(
+                "market-squawk.bls",
+                if live {
+                    "registered-v2-live-acceptance"
+                } else {
+                    "registered-v2-fixture"
+                },
+            )?,
             SecretGeneration::new(1)?,
-            SecretValue::new("fixture-registration-key".to_owned())?,
+            SecretValue::new(registration_key.to_owned())?,
             &control,
         )?)
+    }
+
+    fn live_registered_acceptance_enabled() -> TestResult<bool> {
+        match std::env::var(LIVE_REGISTERED_ACCEPTANCE) {
+            Err(std::env::VarError::NotPresent) => Ok(false),
+            Ok(value) if value == "1" => Ok(true),
+            Ok(_) | Err(std::env::VarError::NotUnicode(_)) => {
+                Err("live BLS acceptance gate must be unset or exactly 1".into())
+            }
+        }
     }
 
     fn series_metadata() -> TestResult<BlsSeriesMetadata> {
