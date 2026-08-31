@@ -232,7 +232,7 @@ fn map_fred_error(error: FredSourceError) -> ServiceError {
         FredSourceError::DeadlineExceeded => ServiceError::DeadlineExceeded,
         FredSourceError::InvalidApiKey => ServiceError::Unauthorized,
         FredSourceError::InvalidDataset => ServiceError::InvalidRequest,
-        FredSourceError::BodyTooLarge => ServiceError::ResourceExhausted,
+        FredSourceError::BodyTooLarge { .. } => ServiceError::ResourceExhausted,
         FredSourceError::Network
         | FredSourceError::Protocol
         | FredSourceError::InvalidConfiguration
