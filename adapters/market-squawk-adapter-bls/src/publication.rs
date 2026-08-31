@@ -10,10 +10,11 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryRequestId, ExtractionBatch, ExtractionContentIdentity,
     ExtractionRevisionPlan, MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES,
-    PROVIDER_NATIVE_LINEAGE_SCHEMA_VERSION, ProviderCaptureTerminalDisposition,
-    ProviderNativeLineageBatch, ProviderNativeLineageBatchBuilder,
-    ProviderNativeLineageImplementation, ProviderNativeLineageSchema, SealedProviderCaptureBinding,
-    SourceMetadata, SourceObjectCaptureIdentity,
+    MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES, PROVIDER_NATIVE_LINEAGE_SCHEMA_VERSION,
+    ProviderCaptureTerminalDisposition, ProviderNativeLineageBatch,
+    ProviderNativeLineageBatchBuilder, ProviderNativeLineageImplementation,
+    ProviderNativeLineageSchema, SealedProviderCaptureBinding, SourceMetadata,
+    SourceObjectCaptureIdentity,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -33,7 +34,7 @@ const BLS_PROVIDER_SEMANTICS_SCHEMA: &str = "market-squawk-bls-provider-semantic
 pub const BLS_TIMESERIES_NATIVE_LINEAGE_IMPLEMENTATION: &str = "bls_timeseries_v1";
 
 /// Explicit root schema-extension rejoin required to preserve BLS-native semantics.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlsRootSchemaExtensionRequirement {
     base_schema: SourceIdentifier,
@@ -121,7 +122,7 @@ impl BlsCanonicalFootnote {
 }
 
 /// Full configured semantics for one BLS series in a publication chunk.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlsCanonicalSeriesManifest {
     series_id: SourceIdentifier,
@@ -150,6 +151,11 @@ impl BlsCanonicalSeriesManifest {
         &self.frequency
     }
 
+    /// Returns the exact verified unit.
+    pub const fn unit(&self) -> &SourceIdentifier {
+        &self.unit
+    }
+
     /// Returns the exact verified seasonal-adjustment semantic.
     pub const fn seasonal_adjustment(&self) -> &SourceIdentifier {
         &self.seasonal_adjustment
@@ -162,7 +168,7 @@ impl BlsCanonicalSeriesManifest {
 }
 
 /// BLS-native semantics and exact clocks aligned one-for-one with a canonical extraction row.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlsCanonicalObservationSemantics {
     record_ordinal: u32,
@@ -186,9 +192,39 @@ pub struct BlsCanonicalObservationSemantics {
 }
 
 impl BlsCanonicalObservationSemantics {
+    /// Returns the exact zero-based canonical extraction-row coordinate.
+    pub const fn record_ordinal(&self) -> u32 {
+        self.record_ordinal
+    }
+
+    /// Returns the exact configured series identifier.
+    pub const fn series_id(&self) -> &SourceIdentifier {
+        &self.series_id
+    }
+
+    /// Returns the provider-authored year.
+    pub const fn year(&self) -> u16 {
+        self.year
+    }
+
+    /// Returns the provider-authored period code.
+    pub const fn period(&self) -> &SourceIdentifier {
+        &self.period
+    }
+
     /// Returns the exact provider period label without reducing it to a month number.
     pub fn period_label(&self) -> &str {
         &self.period_label
+    }
+
+    /// Returns the exact lexical provider value, including the missing `-` marker.
+    pub fn raw_value(&self) -> &str {
+        &self.raw_value
+    }
+
+    /// Returns the checked provider decimal, or `None` for an explicit missing marker.
+    pub const fn value(&self) -> Option<Decimal> {
+        self.value
     }
 
     /// Returns whether BLS marked this row latest.
@@ -210,10 +246,40 @@ impl BlsCanonicalObservationSemantics {
     pub fn missing_explanations(&self) -> &[Box<str>] {
         &self.missing_explanations
     }
+
+    /// Returns the provider-period coordinate retained without inventing a calendar date.
+    pub const fn effective_time(&self) -> &ResearchTemporalCoordinate {
+        &self.effective_time
+    }
+
+    /// Returns when response headers first became available to the transport.
+    pub const fn response_received_at(&self) -> Timestamp {
+        self.response_received_at
+    }
+
+    /// Returns when the complete bounded response became locally usable.
+    pub const fn locally_available_at(&self) -> Timestamp {
+        self.locally_available_at
+    }
+
+    /// Returns when canonical normalization completed.
+    pub const fn canonical_ingested_at(&self) -> Timestamp {
+        self.canonical_ingested_at
+    }
+
+    /// Returns the adapter-authored local-content revision identity.
+    pub const fn canonical_revision(&self) -> &SourceIdentifier {
+        &self.canonical_revision
+    }
+
+    /// Returns the exact extraction-row payload digest retained beside native evidence.
+    pub const fn canonical_payload_digest(&self) -> EvidenceDigest {
+        self.canonical_payload_digest
+    }
 }
 
 /// Typed companion payload retaining BLS information the shared MacroObservation cannot express.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlsCanonicalProviderSemantics {
     schema_requirement: BlsRootSchemaExtensionRequirement,
@@ -285,8 +351,8 @@ impl BlsCanonicalProviderSemantics {
                 } else {
                     Box::default()
                 };
-                if response_received_at > locally_available_at
-                    || locally_available_at > canonical_ingested_at
+                if response_received_at >= locally_available_at
+                    || locally_available_at >= canonical_ingested_at
                     || record.schema().as_str() != CURRENT_RESEARCH_RECORD_SCHEMA
                     || record.available_at() != Some(locally_available_at)
                     || record.effective_time() != canonical.context().time().effective()
@@ -362,7 +428,66 @@ impl BlsCanonicalProviderSemantics {
         self.semantics_digest
     }
 
+    /// Decodes and independently validates one persisted BLS native-lineage sidecar.
+    pub fn try_decode_persisted_native_sidecar(
+        semantic_payload: &[u8],
+    ) -> Result<Self, BlsSourceError> {
+        if semantic_payload.is_empty()
+            || semantic_payload.len() > MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES
+        {
+            return Err(BlsSourceError::InvalidPublication);
+        }
+        let semantics: Self = serde_json::from_slice(semantic_payload)
+            .map_err(|_| BlsSourceError::InvalidPublication)?;
+        semantics.validate_persisted_structure()?;
+        Ok(semantics)
+    }
+
+    /// Rejoins one persisted companion observation to its exact value-only native row.
+    pub fn validate_persisted_native_row(
+        &self,
+        record_ordinal: u32,
+        native: &BlsTimeseriesNativeLineageRowV1,
+    ) -> Result<&BlsCanonicalObservationSemantics, BlsSourceError> {
+        let observation = self
+            .observations
+            .get(usize::try_from(record_ordinal).map_err(|_| BlsSourceError::InvalidPublication)?)
+            .filter(|observation| observation.record_ordinal == record_ordinal)
+            .ok_or(BlsSourceError::InvalidPublication)?;
+        let mut matching_series = self
+            .series
+            .iter()
+            .filter(|series| series.series_id == observation.series_id);
+        let series = matching_series
+            .next()
+            .ok_or(BlsSourceError::InvalidPublication)?;
+        let native_series = native.series();
+        let native_observation = native.observation();
+        if matching_series.next().is_some()
+            || native_series.series_id() != &series.series_id
+            || native_series.title() != series.title.as_ref()
+            || native_series.unit() != &series.unit
+            || native_series.frequency() != &series.frequency
+            || native_series.seasonal_adjustment() != &series.seasonal_adjustment
+            || native_series.measure() != &series.measure
+            || native_observation.series_id() != &observation.series_id
+            || native_observation.year() != observation.year
+            || native_observation.period() != &observation.period
+            || native_observation.period_label() != observation.period_label.as_ref()
+            || native_observation.raw_value() != observation.raw_value.as_ref()
+            || native_observation.value() != observation.value
+            || native_observation.is_preliminary() != observation.preliminary
+            || native_observation.footnotes() != observation.footnotes.as_ref()
+            || native_observation.missing_explanations()
+                != observation.missing_explanations.as_ref()
+        {
+            return Err(BlsSourceError::InvalidPublication);
+        }
+        Ok(observation)
+    }
+
     pub(crate) fn validate(&self, batch: &ExtractionBatch) -> Result<(), BlsSourceError> {
+        self.validate_persisted_structure()?;
         self.schema_requirement.validate()?;
         if self.series.is_empty()
             || self.observations.len() != batch.records().len()
@@ -392,6 +517,82 @@ impl BlsCanonicalProviderSemantics {
         Ok(())
     }
 
+    fn validate_persisted_structure(&self) -> Result<(), BlsSourceError> {
+        self.schema_requirement.validate()?;
+        if self.series.is_empty()
+            || self.observations.is_empty()
+            || self.semantics_digest != self.compute_digest()?
+            || self.series.iter().enumerate().any(|(index, series)| {
+                series.title.is_empty()
+                    || self.series[..index]
+                        .iter()
+                        .any(|prior| prior.series_id == series.series_id)
+            })
+        {
+            return Err(BlsSourceError::InvalidPublication);
+        }
+        for (index, observation) in self.observations.iter().enumerate() {
+            let mut matching_series = self
+                .series
+                .iter()
+                .filter(|series| series.series_id == observation.series_id);
+            let series = matching_series
+                .next()
+                .ok_or(BlsSourceError::InvalidPublication)?;
+            let (scheme, ordinal, frequency) =
+                crate::observations::period_parts(observation.period.as_str())
+                    .ok_or(BlsSourceError::InvalidPublication)?;
+            let effective = observation
+                .effective_time
+                .source_period_value()
+                .ok_or(BlsSourceError::InvalidPublication)?;
+            let expected_value = if observation.raw_value.as_ref() == "-" {
+                None
+            } else {
+                Some(
+                    Decimal::from_str_exact(&observation.raw_value)
+                        .map_err(|_| BlsSourceError::InvalidPublication)?,
+                )
+            };
+            let expected_preliminary = observation
+                .footnotes
+                .iter()
+                .any(|footnote| footnote.code() == Some("P"));
+            let expected_missing_explanations = if expected_value.is_none() {
+                observation
+                    .footnotes
+                    .iter()
+                    .filter_map(BlsCanonicalFootnote::text)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if usize::try_from(observation.record_ordinal).ok() != Some(index)
+                || matching_series.next().is_some()
+                || series.frequency.as_str() != frequency
+                || effective.scheme().as_str() != scheme
+                || effective.year() != observation.year
+                || effective.ordinal().get() != ordinal
+                || effective.code() != &observation.period
+                || observation.value != expected_value
+                || observation.preliminary != expected_preliminary
+                || observation
+                    .missing_explanations
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .ne(expected_missing_explanations)
+                || observation.first_observed_at != observation.locally_available_at
+                || observation.response_received_at >= observation.locally_available_at
+                || observation.locally_available_at >= observation.canonical_ingested_at
+                || observation.canonical_payload_digest.algorithm() != DigestAlgorithm::Sha256
+                || observation.canonical_payload_digest.bytes() == [0; 32]
+            {
+                return Err(BlsSourceError::InvalidPublication);
+            }
+        }
+        Ok(())
+    }
+
     fn compute_digest(&self) -> Result<EvidenceDigest, BlsSourceError> {
         digest_serialized(
             b"market-squawk/bls-canonical-provider-semantics/v1",
@@ -409,6 +610,9 @@ impl BlsCanonicalProviderSemantics {
             batch,
         )
         .map_err(|_| BlsSourceError::InvalidPublication)?;
+        native_lineage
+            .try_set_batch_sidecar(self)
+            .map_err(|_| BlsSourceError::InvalidPublication)?;
         for observation in &self.observations {
             let mut matching_series = self
                 .series
@@ -1024,9 +1228,9 @@ impl BlsPublicationCandidate {
             || object.evidence().content_digest() != page.body_digest()
             || object.expected_bytes() != Some(page.body_bytes())
             || batch.request().deadline() >= activation.expires_at()
-            || response_received_at > locally_available_at
+            || response_received_at >= locally_available_at
             || first_observed_at != locally_available_at
-            || locally_available_at > canonical_ingested_at
+            || locally_available_at >= canonical_ingested_at
             || provider_semantics.observations.iter().any(|observation| {
                 observation.response_received_at != response_received_at
                     || observation.locally_available_at != locally_available_at
@@ -1174,10 +1378,10 @@ impl BlsPublicationCandidate {
             || self.discovery_request_id != object.discovery_request_id()
             || self.object_id != *object.object_id()
             || self.first_observed_at != object.effective_interval().starts_at()
-            || self.response_received_at > self.locally_available_at
+            || self.response_received_at >= self.locally_available_at
             || self.locally_available_at != page.received_at()
             || self.first_observed_at != self.locally_available_at
-            || self.locally_available_at > self.canonical_ingested_at
+            || self.locally_available_at >= self.canonical_ingested_at
             || batch.request().deadline() >= activation.expires_at()
             || self.canonical_schema.as_str() != CURRENT_RESEARCH_RECORD_SCHEMA
             || self.canonical_schema_version != SchemaVersion::CURRENT
@@ -1281,10 +1485,10 @@ impl BlsPublicationCandidate {
             || self.provider_dataset != *object.dataset()
             || self.object_id != *object.object_id()
             || self.first_observed_at != object.effective_interval().starts_at()
-            || self.response_received_at > self.locally_available_at
+            || self.response_received_at >= self.locally_available_at
             || self.locally_available_at != page.received_at()
             || self.first_observed_at != self.locally_available_at
-            || self.locally_available_at > self.canonical_ingested_at
+            || self.locally_available_at >= self.canonical_ingested_at
             || self.discovery_request_set_identity != capture.request_set_identity()
             || self.discovery_capture_content_digest != capture.content_digest()
             || self.discovery_capture_observation_digest != capture.observation_digest()

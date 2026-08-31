@@ -12,7 +12,11 @@ use std::{
     time::Instant,
 };
 
-use market_squawk_adapter_bls::{BlsCompletePublicationPlanHandoff, BlsSource, BlsSourceError};
+use market_squawk_adapter_bls::{
+    BLS_TIMESERIES_NATIVE_LINEAGE_IMPLEMENTATION, BlsCanonicalObservationSemantics,
+    BlsCanonicalProviderSemantics, BlsCompletePublicationPlanHandoff, BlsSource, BlsSourceError,
+    BlsTimeseriesNativeLineageRowV1,
+};
 use market_squawk_data::{
     AnalyticalMacroProviderPeriodLatestKnownOutput,
     AnalyticalMacroProviderPeriodLatestKnownRequest, AnalyticalMacroSeriesAllowlist,
@@ -21,7 +25,9 @@ use market_squawk_data::{
     ProviderMacroPlanPublicationInput, ProviderMacroPlanPublicationReceipt,
     ProviderMacroPlanRestartSelector, ProviderMacroPlanSemantics, QueryLimits,
 };
-use market_squawk_domain::{EvidenceDigest, ResearchPeriod, SourceId, Timestamp};
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, MacroObservation, ResearchPeriod, SourceId, Timestamp,
+};
 use market_squawk_sources::{
     DiscoveryRequest, ExtractionAuthority, ExtractionError, ExtractionRequest,
     ExtractionSourceError,
@@ -221,7 +227,7 @@ impl BlsMacroApplicationClosure {
             return Err(BlsMacroApplicationError::RestartVerificationMismatch);
         }
         let retained_request = analytical.clone();
-        let output = self
+        let output = match self
             .research
             .analytical_reader()
             .read_macro_provider_period_latest_known_snapshot(
@@ -230,18 +236,33 @@ impl BlsMacroApplicationClosure {
                 deadline,
                 cancellation,
             )
-            .await?;
+            .await
+        {
+            Ok(output) => output,
+            Err(AnalyticalReadError::MacroSnapshotIncomplete) => {
+                return Ok(BlsMacroCapabilityState::Unavailable(
+                    BlsMacroUnavailableReason::IncompleteSeriesAtCutoff,
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
         if !validate_provider_period_consumer_read(&restart_selector, &retained_request, &output)? {
             return Ok(BlsMacroCapabilityState::Unavailable(
                 BlsMacroUnavailableReason::IncompleteSeriesAtCutoff,
             ));
         }
+        let semantic_evidence = reopen_provider_period_semantic_evidence(
+            self.research.as_ref(),
+            &restart_selector,
+            &output,
+        )?;
         Ok(BlsMacroCapabilityState::Available(
             BlsProviderPeriodLatestKnownDto {
                 restart_selector,
                 reopened,
                 analytical_request: retained_request,
                 output,
+                semantic_evidence,
             },
         ))
     }
@@ -503,6 +524,7 @@ pub(crate) struct BlsProviderPeriodLatestKnownDto {
     reopened: PinnedDataset,
     analytical_request: AnalyticalMacroProviderPeriodLatestKnownRequest,
     output: AnalyticalMacroProviderPeriodLatestKnownOutput,
+    semantic_evidence: BlsProviderPeriodSemanticEvidence,
 }
 
 impl BlsProviderPeriodLatestKnownDto {
@@ -533,10 +555,207 @@ impl BlsProviderPeriodLatestKnownDto {
         &self.output
     }
 
+    /// Returns exact reopened native/companion evidence aligned to the selected canonical rows.
+    pub(crate) fn semantic_observations(&self) -> &[BlsProviderPeriodObservationSemanticEvidence] {
+        &self.semantic_evidence.observations
+    }
+
     /// Returns the sole source-rights owner for the fixed series selection.
     pub(crate) const fn source_id(&self) -> &SourceId {
         self.output.source_id()
     }
+}
+
+/// Provider-local durable evidence for the selected canonical rows.
+///
+/// This value remains below provider-neutral product composition. It proves the native/companion
+/// join without adding provider fields to Desktop, CLI, MCP, feature, or forecast DTOs.
+#[derive(Debug)]
+pub(crate) struct BlsProviderPeriodSemanticEvidence {
+    observations: Box<[BlsProviderPeriodObservationSemanticEvidence]>,
+}
+
+/// One selected canonical observation rejoined to exact persisted BLS semantics and digests.
+#[derive(Clone, Debug)]
+pub(crate) struct BlsProviderPeriodObservationSemanticEvidence {
+    companion: BlsCanonicalObservationSemantics,
+    native: BlsTimeseriesNativeLineageRowV1,
+    binding_digest: EvidenceDigest,
+    canonical_row_digest: EvidenceDigest,
+    native_semantic_digest: EvidenceDigest,
+    native_batch_digest: EvidenceDigest,
+    native_sidecar_digest: EvidenceDigest,
+    provider_semantics_digest: EvidenceDigest,
+}
+
+impl BlsProviderPeriodObservationSemanticEvidence {
+    /// Returns the full persisted companion observation, including distinct local clocks.
+    pub(crate) const fn companion(&self) -> &BlsCanonicalObservationSemantics {
+        &self.companion
+    }
+
+    /// Returns the exact decoded value-only native row aligned by canonical row ordinal.
+    pub(crate) const fn native(&self) -> &BlsTimeseriesNativeLineageRowV1 {
+        &self.native
+    }
+
+    /// Returns the common-owned exact provider binding identity.
+    pub(crate) const fn binding_digest(&self) -> EvidenceDigest {
+        self.binding_digest
+    }
+
+    /// Returns the exact extraction-row digest bound into persisted native lineage.
+    pub(crate) const fn canonical_row_digest(&self) -> EvidenceDigest {
+        self.canonical_row_digest
+    }
+
+    /// Returns SHA-256 of this row's exact persisted native semantic bytes.
+    pub(crate) const fn native_semantic_digest(&self) -> EvidenceDigest {
+        self.native_semantic_digest
+    }
+
+    /// Returns the complete persisted native batch identity.
+    pub(crate) const fn native_batch_digest(&self) -> EvidenceDigest {
+        self.native_batch_digest
+    }
+
+    /// Returns SHA-256 of the complete persisted BLS companion sidecar.
+    pub(crate) const fn native_sidecar_digest(&self) -> EvidenceDigest {
+        self.native_sidecar_digest
+    }
+
+    /// Returns the adapter-authored semantic identity decoded from that sidecar.
+    pub(crate) const fn provider_semantics_digest(&self) -> EvidenceDigest {
+        self.provider_semantics_digest
+    }
+
+    fn matches_selected(&self, observation: &MacroObservation) -> bool {
+        let companion = &self.companion;
+        let provenance = observation.context().provenance();
+        let value_matches = match (
+            observation.value().observed_value(),
+            observation.value().missing_value(),
+            companion.value(),
+        ) {
+            (Some(selected), None, Some(provider)) => selected == provider,
+            (None, Some(missing), None) => missing.marker().as_str() == companion.raw_value(),
+            (Some(_), Some(_), _)
+            | (None, None, _)
+            | (Some(_), None, None)
+            | (None, Some(_), Some(_)) => false,
+        };
+        companion.series_id() == observation.series()
+            && companion.effective_time() == observation.context().time().effective()
+            && companion.canonical_revision() == provenance.source_identifier()
+            && companion.locally_available_at() == provenance.received_at()
+            && companion.canonical_ingested_at() == provenance.ingested_at()
+            && provenance.availability().conservative_available_at()
+                == Some(companion.locally_available_at())
+            && self.native.series().unit() == observation.unit()
+            && value_matches
+    }
+}
+
+fn reopen_provider_period_semantic_evidence(
+    research: &ResearchService,
+    restart_selector: &ProviderMacroPlanRestartSelector,
+    output: &AnalyticalMacroProviderPeriodLatestKnownOutput,
+) -> Result<BlsProviderPeriodSemanticEvidence, BlsMacroApplicationError> {
+    let binding_digests = research
+        .analytical()
+        .provider_capture_binding_digests(restart_selector.manifest())?;
+    if binding_digests.is_empty() {
+        return Err(BlsMacroApplicationError::InvalidReadResult);
+    }
+    let store = research.provider_capture_store();
+    let mut retained = Vec::new();
+    for binding_digest in binding_digests {
+        let binding = research.analytical().provider_capture_binding_evidence(
+            restart_selector.manifest(),
+            binding_digest,
+            store.as_ref(),
+        )?;
+        let native_schema = binding.native_lineage();
+        let (Some(sidecar), Some(sidecar_digest)) = (
+            native_schema.batch_sidecar_semantic_payload(),
+            native_schema.batch_sidecar_semantic_payload_digest(),
+        ) else {
+            return Err(BlsMacroApplicationError::InvalidReadResult);
+        };
+        if binding.binding_digest() != binding_digest
+            || binding.capture().source_id() != restart_selector.source_id()
+            || native_schema.implementation() != BLS_TIMESERIES_NATIVE_LINEAGE_IMPLEMENTATION
+            || native_schema.row_count() != binding.rows().len()
+            || sidecar_digest.algorithm() != DigestAlgorithm::Sha256
+            || sidecar_digest.bytes() == [0; 32]
+            || native_schema.batch_digest().algorithm() != DigestAlgorithm::Sha256
+            || native_schema.batch_digest().bytes() == [0; 32]
+        {
+            return Err(BlsMacroApplicationError::InvalidReadResult);
+        }
+        let semantics =
+            BlsCanonicalProviderSemantics::try_decode_persisted_native_sidecar(sidecar)?;
+        if semantics.observations().len() != binding.rows().len()
+            || semantics.semantics_digest().algorithm() != DigestAlgorithm::Sha256
+            || semantics.semantics_digest().bytes() == [0; 32]
+        {
+            return Err(BlsMacroApplicationError::InvalidReadResult);
+        }
+        retained
+            .try_reserve(binding.rows().len())
+            .map_err(|_| BlsMacroApplicationError::Capacity)?;
+        for row in binding.rows() {
+            let native = BlsTimeseriesNativeLineageRowV1::try_decode_persisted(
+                native_schema.version(),
+                native_schema.implementation(),
+                row.native_semantic_payload(),
+            )?;
+            let companion =
+                semantics.validate_persisted_native_row(row.canonical_row_ordinal(), &native)?;
+            if companion.canonical_payload_digest() != row.canonical_row_digest()
+                || companion.locally_available_at() != row.received_at()
+                || row.canonical_row_digest().algorithm() != DigestAlgorithm::Sha256
+                || row.canonical_row_digest().bytes() == [0; 32]
+                || row.native_semantic_digest().algorithm() != DigestAlgorithm::Sha256
+                || row.native_semantic_digest().bytes() == [0; 32]
+            {
+                return Err(BlsMacroApplicationError::InvalidReadResult);
+            }
+            retained.push(BlsProviderPeriodObservationSemanticEvidence {
+                companion: companion.clone(),
+                native,
+                binding_digest,
+                canonical_row_digest: row.canonical_row_digest(),
+                native_semantic_digest: row.native_semantic_digest(),
+                native_batch_digest: native_schema.batch_digest(),
+                native_sidecar_digest: sidecar_digest,
+                provider_semantics_digest: semantics.semantics_digest(),
+            });
+        }
+    }
+
+    let mut selected = Vec::new();
+    selected
+        .try_reserve_exact(output.observations().len())
+        .map_err(|_| BlsMacroApplicationError::Capacity)?;
+    for observation in output.observations() {
+        let mut matches = retained
+            .iter()
+            .filter(|evidence| evidence.matches_selected(observation));
+        let evidence = matches
+            .next()
+            .ok_or(BlsMacroApplicationError::InvalidReadResult)?;
+        if matches.next().is_some() {
+            return Err(BlsMacroApplicationError::InvalidReadResult);
+        }
+        selected.push(evidence.clone());
+    }
+    if selected.len() != output.observations().len() {
+        return Err(BlsMacroApplicationError::InvalidReadResult);
+    }
+    Ok(BlsProviderPeriodSemanticEvidence {
+        observations: selected.into_boxed_slice(),
+    })
 }
 
 /// Validates that one shared analytical read is safe to hand to every downstream macro consumer.

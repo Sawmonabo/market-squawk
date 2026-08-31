@@ -26,6 +26,8 @@ use sha2::Digest as _;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(all(test, feature = "bls-installed-fixture", debug_assertions))]
+use super::bls::{BlsMacroUnavailableReason, BlsProviderPeriodObservationSemanticEvidence};
 use super::{
     BlsMacroApplicationClosure, BlsMacroApplicationError, BlsMacroCapabilityState,
     BlsMacroPlanPublication, BlsPreparedMacroPlan, BlsProviderPeriodLatestKnownDto,
@@ -618,6 +620,15 @@ mod tests {
       "seasonal_adjustment":"seasonally-adjusted",
       "measure":"rate"
     }"#;
+    const PROVIDER_DOCTOR_RESPONSE: &[u8] = br#"{
+      "status":"REQUEST_SUCCEEDED",
+      "responseTime":1,
+      "message":[],
+      "Results":{"series":[{"seriesID":"LNS14000000","data":[{
+        "year":"2026","period":"M06","periodName":"June","latest":"true",
+        "value":"4.2","footnotes":[]
+      }]}]}
+    }"#;
     const PROVIDER_RESPONSE_V1: &[u8] = br#"{
       "status":"REQUEST_SUCCEEDED",
       "responseTime":1,
@@ -687,7 +698,9 @@ mod tests {
         }
         let now = current_timestamp()?;
         let observed_at = now.checked_sub_nanos(1_000_000)?;
+        let response_received_at = observed_at.checked_sub_nanos(1)?;
         let revised_observed_at = observed_at.checked_add_nanos(1)?;
+        let revised_response_received_at = revised_observed_at.checked_sub_nanos(1)?;
         let (authorization, expected_rejoin, profile, evidence_byte, revision) =
             match (tier, secret_reference.as_ref(), registration_key) {
                 (BlsAccessTier::PublicV1, None, None) => (
@@ -720,23 +733,23 @@ mod tests {
             .then(|| {
                 BlsScriptedTransportFactory::try_new(vec![
                     BlsScriptedResponse::try_new(
-                        Bytes::from_static(PROVIDER_RESPONSE_V1),
-                        observed_at,
+                        Bytes::from_static(PROVIDER_DOCTOR_RESPONSE),
+                        response_received_at,
                         observed_at,
                     )?,
                     BlsScriptedResponse::try_new(
                         Bytes::from_static(PROVIDER_RESPONSE_V1),
+                        response_received_at,
                         observed_at,
-                        observed_at,
+                    )?,
+                    BlsScriptedResponse::try_new(
+                        Bytes::from_static(PROVIDER_DOCTOR_RESPONSE),
+                        revised_response_received_at,
+                        revised_observed_at,
                     )?,
                     BlsScriptedResponse::try_new(
                         Bytes::from_static(PROVIDER_RESPONSE_V2),
-                        revised_observed_at,
-                        revised_observed_at,
-                    )?,
-                    BlsScriptedResponse::try_new(
-                        Bytes::from_static(PROVIDER_RESPONSE_V2),
-                        revised_observed_at,
+                        revised_response_received_at,
                         revised_observed_at,
                     )?,
                 ])
@@ -839,9 +852,9 @@ mod tests {
         let first_outcome = runtime
             .publish_and_read(live_request.clone(), &request_context(operation_deadline)?)
             .await?;
-        assert_complete_observed_handoff(first_outcome.read(), 1, None);
+        assert_complete_observed_handoff(first_outcome.read(), 1, None, None);
         if !live_http {
-            assert_complete_observed_handoff(first_outcome.read(), 1, Some("4.2"));
+            assert_complete_observed_handoff(first_outcome.read(), 1, Some("4.2"), Some(true));
         }
         let first_generation = (
             first_outcome.read().restart_selector().clone(),
@@ -854,7 +867,7 @@ mod tests {
             let revised_outcome = runtime
                 .publish_and_read(live_request, &request_context(operation_deadline)?)
                 .await?;
-            assert_complete_observed_handoff(revised_outcome.read(), 2, Some("4.1"));
+            assert_complete_observed_handoff(revised_outcome.read(), 2, Some("4.1"), Some(false));
             assert_ne!(
                 first_outcome.publication().receipt().manifest(),
                 revised_outcome.publication().receipt().manifest()
@@ -901,7 +914,37 @@ mod tests {
             .ok_or("restart read unavailable")?;
         assert_eq!(read.reopened().manifest(), &manifest);
         assert_eq!(read.output().selection_digest(), selection_digest);
-        assert_complete_observed_handoff(read, if live_http { 1 } else { 2 }, None);
+        assert_complete_observed_handoff(
+            read,
+            if live_http { 1 } else { 2 },
+            None,
+            (!live_http).then_some(false),
+        );
+
+        let no_eligible_period = ResearchPeriod::try_new(
+            SourceIdentifier::try_from("bls-monthly")?,
+            2025,
+            NonZeroU16::new(12).ok_or("invalid no-row period")?,
+            SourceIdentifier::try_from("M12")?,
+        )?;
+        let no_eligible = closure
+            .read_provider_period_latest_known(
+                BlsProviderPeriodLatestKnownRequest::try_new(
+                    restart_selector.clone(),
+                    allowlist.clone(),
+                    cutoff,
+                    no_eligible_period,
+                )?,
+                query_limits,
+                Instant::now() + Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await?;
+        assert!(no_eligible.available().is_none());
+        assert_eq!(
+            no_eligible.unavailable_reason(),
+            Some(BlsMacroUnavailableReason::IncompleteSeriesAtCutoff)
+        );
 
         if let Some((prior_selector, prior_manifest, prior_selection_digest)) = prior_generation {
             let reopened_prior = closure
@@ -922,7 +965,7 @@ mod tests {
                 .ok_or("prior restart read unavailable")?;
             assert_eq!(prior.reopened().manifest(), &prior_manifest);
             assert_eq!(prior.output().selection_digest(), prior_selection_digest);
-            assert_complete_observed_handoff(prior, 1, Some("4.2"));
+            assert_complete_observed_handoff(prior, 1, Some("4.2"), Some(true));
 
             let missing_period = ResearchPeriod::try_new(
                 SourceIdentifier::try_from("bls-monthly")?,
@@ -955,6 +998,7 @@ mod tests {
         read: &BlsProviderPeriodLatestKnownDto,
         expected_revision: u32,
         expected_value: Option<&str>,
+        expected_preliminary: Option<bool>,
     ) {
         let request = read.analytical_request();
         assert_eq!(request.manifest(), read.restart_selector().manifest());
@@ -1000,6 +1044,37 @@ mod tests {
         } else {
             assert!(observation.value().observed_value().is_some());
         }
+        let [semantic] = read.semantic_observations() else {
+            panic!("BLS consumer handoff did not retain exactly one native semantic row");
+        };
+        assert_common_semantic_evidence(semantic);
+        let companion = semantic.companion();
+        let native = semantic.native().observation();
+        assert_eq!(companion.series_id(), observation.series());
+        assert_eq!(
+            companion.effective_time(),
+            observation.context().time().effective()
+        );
+        assert_eq!(companion.value(), observation.value().observed_value());
+        assert_eq!(companion.raw_value(), native.raw_value());
+        if let Some(expected_value) = expected_value {
+            assert_eq!(companion.raw_value(), expected_value);
+        }
+        assert_eq!(companion.is_latest(), true);
+        if let Some(expected_preliminary) = expected_preliminary {
+            assert_eq!(companion.is_preliminary(), expected_preliminary);
+            assert_eq!(native.is_preliminary(), expected_preliminary);
+            if expected_preliminary {
+                let [footnote] = companion.footnotes() else {
+                    panic!("preliminary BLS row did not retain its exact footnote");
+                };
+                assert_eq!(footnote.code(), Some("P"));
+                assert_eq!(footnote.text(), Some("Preliminary."));
+            } else {
+                assert!(companion.footnotes().is_empty());
+            }
+        }
+        assert!(companion.missing_explanations().is_empty());
     }
 
     fn assert_complete_missing_handoff(
@@ -1026,6 +1101,51 @@ mod tests {
         );
         assert!(observation.value().observed_value().is_none());
         assert!(observation.value().missing_value().is_some());
+        let [semantic] = read.semantic_observations() else {
+            panic!("BLS missing-value handoff did not retain exactly one native semantic row");
+        };
+        assert_common_semantic_evidence(semantic);
+        let companion = semantic.companion();
+        let native = semantic.native().observation();
+        assert_eq!(companion.raw_value(), "-");
+        assert_eq!(native.raw_value(), "-");
+        assert_eq!(companion.value(), None);
+        assert!(!companion.is_latest());
+        assert!(!companion.is_preliminary());
+        let [footnote] = companion.footnotes() else {
+            panic!("missing BLS row did not retain its exact explanatory footnote");
+        };
+        assert_eq!(footnote.code(), None);
+        assert_eq!(footnote.text(), Some("Data not available."));
+        assert_eq!(
+            companion
+                .missing_explanations()
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
+            vec!["Data not available."]
+        );
+    }
+
+    fn assert_common_semantic_evidence(semantic: &BlsProviderPeriodObservationSemanticEvidence) {
+        let companion = semantic.companion();
+        assert!(companion.response_received_at() < companion.locally_available_at());
+        assert!(companion.locally_available_at() < companion.canonical_ingested_at());
+        assert_eq!(
+            companion.canonical_payload_digest(),
+            semantic.canonical_row_digest()
+        );
+        for digest in [
+            semantic.binding_digest(),
+            semantic.canonical_row_digest(),
+            semantic.native_semantic_digest(),
+            semantic.native_batch_digest(),
+            semantic.native_sidecar_digest(),
+            semantic.provider_semantics_digest(),
+        ] {
+            assert_eq!(digest.algorithm(), DigestAlgorithm::Sha256);
+            assert_ne!(digest.bytes(), [0; 32]);
+        }
     }
 
     fn register_source(
@@ -1175,7 +1295,7 @@ mod tests {
         Ok(QueryLimits::try_new(
             32,
             1024 * 1024,
-            8 * 1024 * 1024,
+            64 * 1024 * 1024,
             8,
             1024,
             1024,
