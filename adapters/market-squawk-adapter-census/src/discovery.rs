@@ -114,6 +114,8 @@ pub enum CensusGeographyWildcardFailurePredicate {
     Null,
     /// The present wildcard field was a bounded string scalar rather than an array.
     Scalar,
+    /// The present wildcard scalar exceeded bounds or contained a control character.
+    ScalarBound,
     /// The wildcard array exceeded the configured column bound.
     ArrayBound,
     /// Bounded wildcard-array storage could not be allocated.
@@ -1451,7 +1453,7 @@ fn optional_wildcard_array_diagnosed(
             if value.len() > limits.max_string_bytes() || value.chars().any(char::is_control) {
                 return Err((
                     CensusAdapterError::ResourceLimitExceeded,
-                    CensusGeographyWildcardFailurePredicate::MemberBound,
+                    CensusGeographyWildcardFailurePredicate::ScalarBound,
                 ));
             }
             return Err((
