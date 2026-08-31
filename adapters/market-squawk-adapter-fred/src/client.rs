@@ -26,10 +26,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::series::parse_date;
-use crate::{
-    FredObservationPage, FredOperation, FredParseLimits, FredRightsDisposition, FredRightsPolicy,
-};
+use crate::series::{parse_date, valid_exact_series_id};
+use crate::{FredObservationPage, FredParseLimits};
 
 mod http;
 mod lineage;
@@ -170,7 +168,7 @@ impl FredDataset {
         let series_id = fields.next().ok_or(FredSourceError::InvalidDataset)?;
         let realtime_start = fields.next().ok_or(FredSourceError::InvalidDataset)?;
         let realtime_end = fields.next().ok_or(FredSourceError::InvalidDataset)?;
-        if fields.next().is_some() || crate::rights::validate_exact_series_id(series_id).is_err() {
+        if fields.next().is_some() || !valid_exact_series_id(series_id) {
             return Err(FredSourceError::InvalidDataset);
         }
         let realtime_start =
@@ -380,13 +378,13 @@ fn invalid_protocol_state() -> ExtractionSourceError {
 
 /// Registry-bound FRED and ALFRED extraction source.
 ///
-/// Every network operation requires a fresh registry-minted [`ExtractionAuthority`]. Durable
-/// extraction preserves provider civil dates and fails closed unless the exact series has an
-/// effective grant for [`FredOperation::Persist`].
+/// Every network operation requires a fresh registry-minted [`ExtractionAuthority`]. The shared
+/// source authority owns the owner-local personal-research scope; this adapter additionally
+/// confines extraction to the exact configured series and real-time interval.
 pub struct FredSource {
     metadata: SourceMetadata,
     api_key: FredApiKey,
-    rights: FredRightsPolicy,
+    provider_dataset: SourceIdentifier,
     transport: Arc<dyn FredTransport>,
     response_limit: usize,
     request_timeout: Duration,
@@ -399,6 +397,7 @@ impl std::fmt::Debug for FredSource {
             .debug_struct("FredSource")
             .field("source_id", self.metadata.source_id())
             .field("metadata_revision", self.metadata.revision())
+            .field("provider_dataset", &self.provider_dataset)
             .field("api_key", &"[REDACTED]")
             .field("response_limit", &self.response_limit)
             .finish_non_exhaustive()
@@ -410,14 +409,20 @@ impl FredSource {
     pub fn try_new(
         metadata: SourceMetadata,
         api_key: FredApiKey,
-        rights: FredRightsPolicy,
+        provider_dataset: SourceIdentifier,
     ) -> Result<Self, FredSourceError> {
         let bounds = match metadata.network_policy() {
             NetworkAccessPolicy::Allowlisted(policy) => policy.request_bounds(),
             NetworkAccessPolicy::Denied => return Err(FredSourceError::InvalidConfiguration),
         };
         let transport = Arc::new(ReqwestFredTransport::try_new(bounds)?);
-        Self::try_new_with_transport(metadata, api_key, rights, transport, DISCOVERY_PAGE_RECORDS)
+        Self::try_new_with_transport(
+            metadata,
+            api_key,
+            provider_dataset,
+            transport,
+            DISCOVERY_PAGE_RECORDS,
+        )
     }
 
     /// Builds a production HTTP source whose page size is bounded for non-durable inspection.
@@ -429,7 +434,7 @@ impl FredSource {
     pub fn try_new_for_ephemeral_inspection(
         metadata: SourceMetadata,
         api_key: FredApiKey,
-        rights: FredRightsPolicy,
+        provider_dataset: SourceIdentifier,
         page_records: NonZeroU16,
     ) -> Result<Self, FredSourceError> {
         if page_records.get() > MAX_FRED_EPHEMERAL_PAGE_RECORDS {
@@ -443,10 +448,15 @@ impl FredSource {
         Self::try_new_with_transport(
             metadata,
             api_key,
-            rights,
+            provider_dataset,
             transport,
             usize::from(page_records.get()),
         )
+    }
+
+    /// Returns the exact provider dataset carried by this source.
+    pub const fn provider_dataset_identifier(&self) -> &SourceIdentifier {
+        &self.provider_dataset
     }
 
     /// Derives the storage-safe analytical identity for one exact provider dataset.
@@ -474,13 +484,13 @@ impl FredSource {
         .map_err(|_| FredSourceError::InvalidDataset)
     }
 
-    /// Derives the exact series identity used by scoped runtime-rights admission.
+    /// Derives the exact provider series identity carried by one dataset.
     ///
     /// # Errors
     ///
     /// Returns [`FredSourceError::InvalidDataset`] unless the provider dataset is one exact
     /// bounded FRED/ALFRED observations request.
-    pub fn rights_subject_identifier(
+    pub fn series_identifier(
         provider_dataset: &SourceIdentifier,
     ) -> Result<SourceIdentifier, FredSourceError> {
         let dataset = FredDataset::parse(provider_dataset)?;
@@ -562,10 +572,11 @@ impl FredSource {
     fn try_new_with_transport(
         metadata: SourceMetadata,
         api_key: FredApiKey,
-        rights: FredRightsPolicy,
+        provider_dataset: SourceIdentifier,
         transport: Arc<dyn FredTransport>,
         discovery_page_records: usize,
     ) -> Result<Self, FredSourceError> {
+        FredDataset::parse(&provider_dataset)?;
         if metadata.source_class() != SourceClass::OfficialAgency
             || metadata.provider().as_str() != "fred"
             || metadata.authorization().mode() != AuthorizationMode::UserAuthorized
@@ -593,7 +604,7 @@ impl FredSource {
         Ok(Self {
             metadata,
             api_key,
-            rights,
+            provider_dataset,
             transport,
             response_limit,
             request_timeout: Duration::from_nanos(bounds.total_timeout_nanos()),
@@ -618,6 +629,7 @@ impl FredSource {
         }
         let dataset = FredDataset::parse(request.object().dataset())
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+        self.validate_provider_dataset(request.object().dataset())?;
         let object = parse_object_id(request.object().object_id())
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
         let series_metadata = self
@@ -626,7 +638,6 @@ impl FredSource {
                 request.object().dataset(),
                 request.deadline(),
                 cancellation.clone(),
-                FredOperation::RetrieveEphemeral,
             )
             .await?;
         if series_metadata.evidence().content_digest().bytes() != object.metadata_digest() {
@@ -642,7 +653,6 @@ impl FredSource {
                     offset: object.offset(),
                     limit: object.limit(),
                     deadline: request.deadline(),
-                    operation: FredOperation::RetrieveEphemeral,
                 },
                 cancellation,
             )
@@ -724,13 +734,13 @@ impl FredSource {
         }
         let dataset = FredDataset::parse(request.dataset())
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+        self.validate_provider_dataset(request.dataset())?;
         let series_metadata = self
             .acquire_series_metadata(
                 &authority,
                 request.dataset(),
                 request.deadline(),
                 cancellation.clone(),
-                FredOperation::RetrieveEphemeral,
             )
             .await?;
         let metadata_digest = series_metadata.evidence().content_digest().bytes();
@@ -749,7 +759,6 @@ impl FredSource {
                         offset,
                         limit: self.discovery_page_records,
                         deadline: request.deadline(),
-                        operation: FredOperation::RetrieveEphemeral,
                     },
                     cancellation.clone(),
                 )
@@ -849,6 +858,7 @@ impl FredSource {
         }
         let dataset = FredDataset::parse(request.object().dataset())
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
+        self.validate_provider_dataset(request.object().dataset())?;
         let object = parse_object_id(request.object().object_id())
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
         let series_metadata = self
@@ -857,7 +867,6 @@ impl FredSource {
                 request.object().dataset(),
                 request.deadline(),
                 cancellation.clone(),
-                FredOperation::Persist,
             )
             .await?;
         if series_metadata.evidence().content_digest().bytes() != object.metadata_digest() {
@@ -873,7 +882,6 @@ impl FredSource {
                     offset: object.offset(),
                     limit: object.limit(),
                     deadline: request.deadline(),
-                    operation: FredOperation::Persist,
                 },
                 cancellation,
             )
@@ -961,7 +969,6 @@ impl FredSource {
             offset,
             limit,
             deadline,
-            operation,
         } = request;
         self.validate_authority(authority)?;
         if cancellation.is_cancelled() {
@@ -970,19 +977,6 @@ impl FredSource {
         let now = system_timestamp().map_err(map_adapter_error)?;
         if deadline <= now {
             return Err(ExtractionSourceError::DeadlineExceeded);
-        }
-        let rights = self
-            .rights
-            .assess(
-                &SourceIdentifier::try_from(dataset.series_id()).map_err(|_| {
-                    ExtractionSourceError::Source(SourceError::InvalidProtocolState)
-                })?,
-                &[operation],
-                now,
-            )
-            .map_err(|_| ExtractionSourceError::Source(SourceError::Unauthorized))?;
-        if rights.disposition() != FredRightsDisposition::Permitted {
-            return Err(ExtractionSourceError::Source(SourceError::Unauthorized));
         }
         let mut public_url = url::Url::parse(OBSERVATIONS_ENDPOINT)
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
@@ -1101,6 +1095,18 @@ impl FredSource {
         }
         Ok(())
     }
+
+    fn validate_provider_dataset(
+        &self,
+        provider_dataset: &SourceIdentifier,
+    ) -> Result<(), ExtractionSourceError> {
+        if &self.provider_dataset != provider_dataset {
+            return Err(ExtractionSourceError::Source(
+                SourceError::InvalidProtocolState,
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl SourceMetadataProvider for FredSource {
@@ -1143,7 +1149,6 @@ struct FredPageRequest<'a> {
     offset: usize,
     limit: usize,
     deadline: Timestamp,
-    operation: FredOperation,
 }
 
 async fn acquire_request_permit(

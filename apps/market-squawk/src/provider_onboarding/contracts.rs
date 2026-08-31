@@ -1,7 +1,6 @@
 //! Secret-free status contracts shared by local portal and CLI transports.
 
 use market_squawk_adapter_bls::BlsSeriesMetadataInput;
-use market_squawk_adapter_fred::FredOperation;
 use market_squawk_data::ResumedProviderOnboarding;
 use market_squawk_domain::{
     CalendarDate, DataQuality, EvidenceDigest, SourceIdentifier, Timestamp,
@@ -366,12 +365,10 @@ pub enum ProviderPortalActivationRequest {
         /// Inclusive final observation year.
         end_year: u16,
     },
-    /// FRED/ALFRED using typed, exact-series rights evidence.
+    /// FRED/ALFRED using one exact configured series and vintage interval.
     FredAlfred {
-        /// Exact written St. Louis Fed service permission for every durable operation.
-        service_permission: Box<FredPortalServicePermissionInput>,
-        /// Exact rights grants; the guided starter uses reviewed `UNRATE` evidence.
-        grants: Vec<FredPortalGrantInput>,
+        /// Exact provider discovery dataset retained through restart and immutable reads.
+        provider_dataset: SourceIdentifier,
     },
     /// Federal Reserve Board H.15 current-definition Treasury constant-maturity rates.
     FederalReserveBoardH15,
@@ -379,86 +376,6 @@ pub enum ProviderPortalActivationRequest {
     YahooEnrichment,
     /// Secret-store-backed Tiingo Starter NAV/EOD access using the durable application quota.
     TiingoStarterEodNav,
-}
-
-/// Exact written St. Louis Fed permission for Market Squawk's durable FRED API operations.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct FredPortalServicePermissionInput {
-    pub(crate) evidence: FredPortalServiceEvidenceInput,
-    pub(crate) review: FredPortalServiceReviewInput,
-}
-
-/// Exact raw Bank-response evidence imported through the local portal.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct FredPortalServiceEvidenceInput {
-    pub(crate) channel: FredPortalServicePermissionChannelInput,
-    pub(crate) sha256: String,
-    pub(crate) byte_length: u64,
-    pub(crate) content_base64: String,
-}
-
-/// Closed authentic delivery channel for one exact Bank response.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
-pub(crate) enum FredPortalServicePermissionChannelInput {
-    OfficialHttps {
-        evidence_url: String,
-        authority_url: String,
-    },
-}
-
-/// Explicit local review decision bound to the exact raw Bank response.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct FredPortalServiceReviewInput {
-    pub(crate) reviewer: SourceIdentifier,
-    pub(crate) reviewed_at_unix_nanos: String,
-    pub(crate) issuer: SourceIdentifier,
-    pub(crate) application: SourceIdentifier,
-    pub(crate) service: SourceIdentifier,
-    pub(crate) series: Vec<SourceIdentifier>,
-    pub(crate) operations: Vec<FredOperation>,
-    pub(crate) conditions: Vec<String>,
-    pub(crate) effective_at_unix_nanos: String,
-    pub(crate) expires_at_unix_nanos: Option<String>,
-    pub(crate) revalidate_by_unix_nanos: String,
-}
-
-/// One exact FRED series grant accepted from the bounded local portal.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct FredPortalGrantInput {
-    pub(crate) series: SourceIdentifier,
-    pub(crate) owner: SourceIdentifier,
-    pub(crate) evidence: FredPortalEvidenceInput,
-    pub(crate) effective_at_unix_nanos: String,
-    pub(crate) expires_at_unix_nanos: String,
-}
-
-/// Typed exact evidence accepted for one portal-created FRED series grant.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
-pub(crate) enum FredPortalEvidenceInput {
-    /// The exact code-reviewed BLS public-domain decision for FRED series `UNRATE`.
-    ReviewedUnrate,
-    /// Caller-supplied exact public-domain evidence.
-    PublicDomain {
-        evidence_reference_url: String,
-        authority_url: String,
-        sha256: String,
-        byte_length: u64,
-        content_base64: String,
-    },
-    /// Caller-supplied exact series-owner permission.
-    OwnerPermission {
-        evidence_reference_url: String,
-        authority_url: String,
-        sha256: String,
-        byte_length: u64,
-        content_base64: String,
-    },
 }
 
 /// Secret-free evidence returned after durable adapter registration succeeds.

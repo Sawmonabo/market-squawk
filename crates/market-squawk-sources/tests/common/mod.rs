@@ -11,15 +11,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use market_squawk_domain::{
     AssetClass, AuthorizationBasis, ChecksumCapability, CoverageDelay, DataQuality,
     DeliveryEvidence, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
-    IntegrityRule, LiveEventClass, MetadataRevision, ProviderChannel, ProviderProduct,
+    InstrumentId, IntegrityRule, LiveEventClass, MarketDataInstrumentDefinition,
+    MarketDataInstrumentDefinitionInput, MetadataRevision, ProviderChannel,
+    ProviderIdentityEvidence, ProviderIdentityKey, ProviderIdentityRecord,
+    ProviderIdentityRecordInput, ProviderInstrumentId, ProviderProduct,
     RevisionBoundPayloadEvidence, RuleVersion, SchemaVersion, SequenceCapability,
-    SnapshotApplicability, SourceId, SourceIdentifier, Timestamp, VenueId,
+    SnapshotApplicability, SourceId, SourceIdentifier, Timestamp, VenueId, VenueMapping,
+    VenueSymbol,
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, CoverageTopology,
     EndpointPolicy, FreshnessPolicy, HistoricalCapability, InstrumentCoverage,
     LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile, NetworkAccessPolicy,
-    ProviderBudgetPolicy, ProviderNumericPolicy, SemanticInterpretationProfile,
+    ProviderBudgetPolicy, ProviderNativeInstrumentAttestation,
+    ProviderNativeInstrumentAttestationInput, ProviderNumericPolicy, SemanticInterpretationProfile,
     SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
     SourceMetadataInput, SourceProtocolProfile,
 };
@@ -51,6 +56,60 @@ pub(crate) fn exact_evidence(byte: u8) -> ExactPayloadEvidence {
         DigestAlgorithm::Sha256,
         [byte; 32],
     ))
+}
+
+pub(crate) fn instrument_attestation(
+    source: &str,
+    instrument: InstrumentId,
+    selected_at: Timestamp,
+) -> TestResult<ProviderNativeInstrumentAttestation> {
+    let source_id = SourceId::try_from(source)?;
+    let provider_instrument_id = ProviderInstrumentId::try_from("native-instrument-1")?;
+    let venue_mapping = VenueMapping::new(
+        VenueId::try_from("coinbase")?,
+        VenueSymbol::try_from("BTC-USD")?,
+    );
+    let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+    let definition =
+        MarketDataInstrumentDefinition::try_new(MarketDataInstrumentDefinitionInput {
+            instrument_id: instrument,
+            reference_evidence: RevisionBoundPayloadEvidence::new(
+                MetadataRevision::new(source_identifier("test-reference-v1")?),
+                exact_evidence(41),
+            ),
+            effective_interval: effective,
+            asset_class: AssetClass::Crypto,
+            display_name: None,
+            quote_currency: market_squawk_domain::Currency::try_from("USD")?,
+            quote_currency_evidence: exact_evidence(42),
+            venue_mappings: vec![venue_mapping.clone()],
+            provider_identities: vec![ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+                instrument_id: instrument,
+                source_id: source_id.clone(),
+                provider_instrument_id: provider_instrument_id.clone(),
+                evidence: ProviderIdentityEvidence::from_content_digest(
+                    exact_evidence(43).content_digest(),
+                ),
+                source_timestamp: None,
+                observed_at: Timestamp::from_unix_nanos(0),
+                metadata_revision: MetadataRevision::new(source_identifier(
+                    "test-provider-identity-v1",
+                )?),
+                validity: effective,
+                supersedes: None,
+            })],
+            identifiers: Vec::new(),
+        })?;
+    Ok(ProviderNativeInstrumentAttestation::try_select(
+        ProviderNativeInstrumentAttestationInput {
+            definition: &definition,
+            definition_revision_digest: exact_evidence(44).content_digest(),
+            definition_published_at: Timestamp::from_unix_nanos(0),
+            provider_key: ProviderIdentityKey::new(source_id, provider_instrument_id),
+            venue_mapping,
+            selected_at,
+        },
+    )?)
 }
 
 pub(crate) fn direct_metadata(

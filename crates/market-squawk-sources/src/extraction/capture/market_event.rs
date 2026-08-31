@@ -4,6 +4,8 @@ use std::io::{self, Write};
 
 use market_squawk_domain::{LiveProvenance, MarketEvent};
 
+use crate::ProviderNativeInstrumentAttestation;
+
 use super::super::native_lineage::{
     MAX_PROVIDER_NATIVE_LINEAGE_BATCH_BYTES, MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES,
     MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES, ProviderNativeLineageBatchSidecarEvidenceRef,
@@ -22,6 +24,8 @@ const PROVIDER_MARKET_EVENT_CONTENT_DOMAIN: &[u8] =
     b"market-squawk/provider-market-event/content/v1";
 const PROVIDER_MARKET_EVENT_NATIVE_DOMAIN: &[u8] =
     b"market-squawk/provider-market-event/native-lineage/v1";
+const PROVIDER_MARKET_EVENT_NATIVE_ROW_MAGIC: &[u8; 5] = b"MSNI1";
+const PROVIDER_MARKET_EVENT_NATIVE_ROW_HEADER_BYTES: usize = 9;
 
 /// Deterministic identity of one exact ordered canonical live-market event batch.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -249,6 +253,57 @@ fn provider_market_event_schema_fingerprint() -> EvidenceDigest {
 
 /// Exact provider-native semantics aligned one-for-one to a canonical market-event batch.
 #[derive(Debug)]
+pub struct ProviderMarketEventNativeLineageRow {
+    instrument_attestation: ProviderNativeInstrumentAttestation,
+    provider_native_semantic_payload: Bytes,
+    encoded_payload: Bytes,
+}
+
+impl ProviderMarketEventNativeLineageRow {
+    /// Binds exact provider-native row semantics to one canonical identity attestation.
+    pub fn try_new(
+        instrument_attestation: ProviderNativeInstrumentAttestation,
+        provider_native_semantic_payload: Bytes,
+    ) -> Result<Self, ProviderCaptureError> {
+        if provider_native_semantic_payload.is_empty() {
+            return Err(ProviderCaptureError::SealedBindingMismatch);
+        }
+        let encoded_payload = encode_provider_market_event_native_row(
+            &instrument_attestation,
+            &provider_native_semantic_payload,
+        )?;
+        Ok(Self {
+            instrument_attestation,
+            provider_native_semantic_payload,
+            encoded_payload,
+        })
+    }
+
+    /// Returns the exact durable canonical/provider identity evidence.
+    pub const fn instrument_attestation(&self) -> &ProviderNativeInstrumentAttestation {
+        &self.instrument_attestation
+    }
+
+    /// Returns exact adapter-native semantics without the shared identity envelope.
+    pub const fn provider_native_semantic_payload(&self) -> &Bytes {
+        &self.provider_native_semantic_payload
+    }
+
+    fn try_from_encoded(encoded_payload: Bytes) -> Result<Self, ProviderCaptureError> {
+        let (instrument_attestation, provider_native_semantic_payload) =
+            decode_provider_market_event_native_row(&encoded_payload)?;
+        Ok(Self {
+            instrument_attestation,
+            provider_native_semantic_payload: Bytes::copy_from_slice(
+                provider_native_semantic_payload,
+            ),
+            encoded_payload,
+        })
+    }
+}
+
+/// Exact provider-native semantics aligned one-for-one to a canonical market-event batch.
+#[derive(Debug)]
 pub struct ProviderMarketEventNativeLineageBatch {
     implementation: ProviderNativeLineageImplementation,
     content_identity: ProviderMarketEventContentIdentity,
@@ -260,11 +315,11 @@ pub struct ProviderMarketEventNativeLineageBatch {
 }
 
 impl ProviderMarketEventNativeLineageBatch {
-    /// Binds bounded exact adapter-native row semantics and one optional batch sidecar.
+    /// Binds bounded exact identity-attested adapter-native rows and one optional batch sidecar.
     pub fn try_new(
         implementation: ProviderNativeLineageImplementation,
         batch: &ProviderMarketEventBatch,
-        rows: Vec<Bytes>,
+        rows: Vec<ProviderMarketEventNativeLineageRow>,
         batch_sidecar: Option<Bytes>,
     ) -> Result<Self, ProviderCaptureError> {
         if rows.len() != batch.events().len() || rows.len() > MAX_PROVIDER_MARKET_EVENT_BATCH_EVENTS
@@ -276,16 +331,19 @@ impl ProviderMarketEventNativeLineageBatch {
         row_digests
             .try_reserve_exact(rows.len())
             .map_err(|_| ProviderCaptureError::AllocationFailed)?;
-        for row in &rows {
-            if row.is_empty() || row.len() > MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES {
+        for (ordinal, row) in rows.iter().enumerate() {
+            validate_native_row_attestation(batch, ordinal, &row.instrument_attestation)?;
+            if row.encoded_payload.is_empty()
+                || row.encoded_payload.len() > MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES
+            {
                 return Err(ProviderCaptureError::SealedBindingMismatch);
             }
             retained = retained
-                .checked_add(row.len())
+                .checked_add(row.encoded_payload.len())
                 .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
             row_digests.push(EvidenceDigest::new(
                 DigestAlgorithm::Sha256,
-                Sha256::digest(row).into(),
+                Sha256::digest(&row.encoded_payload).into(),
             ));
         }
         let batch_sidecar_digest = match batch_sidecar.as_ref() {
@@ -321,7 +379,7 @@ impl ProviderMarketEventNativeLineageBatch {
                         canonical_event_digest: batch
                             .canonical_event_digest(ordinal)
                             .ok_or(ProviderCaptureError::SealedBindingMismatch)?,
-                        native_semantic_bytes: row.len(),
+                        native_semantic_bytes: row.encoded_payload.len(),
                         native_semantic_digest: *row_digest,
                     })
                 }),
@@ -338,7 +396,11 @@ impl ProviderMarketEventNativeLineageBatch {
         Ok(Self {
             implementation,
             content_identity,
-            rows: rows.into_boxed_slice(),
+            rows: rows
+                .into_iter()
+                .map(|row| row.encoded_payload)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             row_digests: row_digests.into_boxed_slice(),
             batch_sidecar,
             batch_sidecar_digest,
@@ -385,7 +447,11 @@ impl ProviderMarketEventNativeLineageBatch {
         let rebuilt = Self::try_new(
             self.implementation,
             batch,
-            self.rows.to_vec(),
+            self.rows
+                .iter()
+                .cloned()
+                .map(ProviderMarketEventNativeLineageRow::try_from_encoded)
+                .collect::<Result<Vec<_>, _>>()?,
             self.batch_sidecar.clone(),
         )?;
         if rebuilt.content_identity != self.content_identity
@@ -409,6 +475,8 @@ pub struct ProviderMarketEventNativeLineageRowEvidenceRef<'a> {
     canonical_event_digest: EvidenceDigest,
     native_semantic_payload: &'a [u8],
     native_semantic_digest: EvidenceDigest,
+    instrument_attestation: ProviderNativeInstrumentAttestation,
+    provider_native_semantic_payload: &'a [u8],
 }
 
 impl<'a> ProviderMarketEventNativeLineageRowEvidenceRef<'a> {
@@ -437,12 +505,26 @@ impl<'a> ProviderMarketEventNativeLineageRowEvidenceRef<'a> {
         {
             return Err(ProviderCaptureError::SealedBindingMismatch);
         }
+        let (instrument_attestation, provider_native_semantic_payload) =
+            decode_provider_market_event_native_row(native_semantic_payload)?;
         Ok(Self {
             canonical_row_ordinal,
             canonical_event_digest,
             native_semantic_payload,
             native_semantic_digest,
+            instrument_attestation,
+            provider_native_semantic_payload,
         })
+    }
+
+    /// Returns the exact durable canonical/provider identity evidence recovered at restart.
+    pub const fn instrument_attestation(&self) -> &ProviderNativeInstrumentAttestation {
+        &self.instrument_attestation
+    }
+
+    /// Returns exact adapter-native semantics without the shared identity envelope.
+    pub const fn provider_native_semantic_payload(&self) -> &'a [u8] {
+        self.provider_native_semantic_payload
     }
 
     fn digest_projection(&self) -> ProviderMarketEventNativeLineageDigestRow {
@@ -507,6 +589,9 @@ pub fn verify_provider_market_event_native_lineage_batch_evidence(
         }
         require_sha256_identity(row.canonical_event_digest)?;
         require_sha256_identity(row.native_semantic_digest)?;
+        row.instrument_attestation
+            .validate_at(row.instrument_attestation.selected_at())
+            .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?;
     }
     let sidecar = match batch_sidecar {
         Some(sidecar) => {
@@ -538,6 +623,80 @@ pub fn verify_provider_market_event_native_lineage_batch_evidence(
         return Err(ProviderCaptureError::SealedBindingMismatch);
     }
     Ok(())
+}
+
+fn validate_native_row_attestation(
+    batch: &ProviderMarketEventBatch,
+    ordinal: usize,
+    attestation: &ProviderNativeInstrumentAttestation,
+) -> Result<(), ProviderCaptureError> {
+    let event = batch
+        .events()
+        .get(ordinal)
+        .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+    let provenance = market_event_provenance(event);
+    if attestation.provider_key().source_id() != batch.source_id()
+        || provenance.instrument_id() != Some(attestation.instrument_id())
+        || provenance.venue_id() != Some(attestation.venue_mapping().venue_id())
+    {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+    attestation
+        .validate_at(provenance.received_at())
+        .map_err(|_| ProviderCaptureError::SealedBindingMismatch)
+}
+
+fn encode_provider_market_event_native_row(
+    attestation: &ProviderNativeInstrumentAttestation,
+    provider_native_semantic_payload: &[u8],
+) -> Result<Bytes, ProviderCaptureError> {
+    let attestation = serde_json::to_vec(attestation)
+        .map_err(|_| ProviderCaptureError::MaterialBindingMismatch)?;
+    let attestation_len = u32::try_from(attestation.len())
+        .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?;
+    let total = PROVIDER_MARKET_EVENT_NATIVE_ROW_HEADER_BYTES
+        .checked_add(attestation.len())
+        .and_then(|size| size.checked_add(provider_native_semantic_payload.len()))
+        .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+    if total > MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(total)
+        .map_err(|_| ProviderCaptureError::AllocationFailed)?;
+    encoded.extend_from_slice(PROVIDER_MARKET_EVENT_NATIVE_ROW_MAGIC);
+    encoded.extend_from_slice(&attestation_len.to_be_bytes());
+    encoded.extend_from_slice(&attestation);
+    encoded.extend_from_slice(provider_native_semantic_payload);
+    Ok(Bytes::from(encoded))
+}
+
+fn decode_provider_market_event_native_row(
+    encoded: &[u8],
+) -> Result<(ProviderNativeInstrumentAttestation, &[u8]), ProviderCaptureError> {
+    if encoded.len() <= PROVIDER_MARKET_EVENT_NATIVE_ROW_HEADER_BYTES
+        || encoded.len() > MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES
+        || encoded.get(..PROVIDER_MARKET_EVENT_NATIVE_ROW_MAGIC.len())
+            != Some(PROVIDER_MARKET_EVENT_NATIVE_ROW_MAGIC.as_slice())
+    {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+    let length_bytes: [u8; 4] = encoded[5..9]
+        .try_into()
+        .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?;
+    let attestation_end = PROVIDER_MARKET_EVENT_NATIVE_ROW_HEADER_BYTES
+        .checked_add(
+            usize::try_from(u32::from_be_bytes(length_bytes))
+                .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?,
+        )
+        .ok_or(ProviderCaptureError::SealedBindingMismatch)?;
+    if attestation_end >= encoded.len() {
+        return Err(ProviderCaptureError::SealedBindingMismatch);
+    }
+    let attestation = serde_json::from_slice(&encoded[9..attestation_end])
+        .map_err(|_| ProviderCaptureError::SealedBindingMismatch)?;
+    Ok((attestation, &encoded[attestation_end..]))
 }
 
 #[derive(Clone, Copy)]

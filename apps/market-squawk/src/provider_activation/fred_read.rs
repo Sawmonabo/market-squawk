@@ -73,7 +73,7 @@ impl FredPointInTimeReadCapability {
             .map_err(|_| FredPointInTimeReadError::InvalidBinding)?;
         let analytical_dataset = DatasetId::try_from(analytical_identifier.as_str())
             .map_err(|_| FredPointInTimeReadError::InvalidBinding)?;
-        let series_id = FredSource::rights_subject_identifier(&provider_dataset)
+        let series_id = FredSource::series_identifier(&provider_dataset)
             .map_err(|_| FredPointInTimeReadError::InvalidBinding)?;
         let (realtime_start, realtime_end) =
             FredSource::dataset_realtime_interval(&provider_dataset)

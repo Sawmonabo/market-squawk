@@ -908,7 +908,7 @@ impl ManagedResearchExtractionSource for market_squawk_adapter_fred::FredSource 
         &self,
         dataset: &SourceIdentifier,
     ) -> Result<Option<SourceIdentifier>, ResearchRevisionPlanError> {
-        market_squawk_adapter_fred::FredSource::rights_subject_identifier(dataset)
+        market_squawk_adapter_fred::FredSource::series_identifier(dataset)
             .map(Some)
             .map_err(|_error| ResearchRevisionPlanError)
     }

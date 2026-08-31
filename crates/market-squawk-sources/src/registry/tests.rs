@@ -9,9 +9,13 @@ mod tests {
 
     use bytes::Bytes;
     use market_squawk_domain::{
-        AggressorSide, ConnectionGeneration, DataQuality, InstrumentId, IntegrityRule,
-        LiveEventClass, MarketDepth, MetadataRevision, RuleVersion, SequenceNumber,
-        SequenceValidationRule, SourceId, SourceIdentifier, Timestamp, VenueId,
+        AggressorSide, AssetClass, ConnectionGeneration, Currency, DataQuality, DigestAlgorithm,
+        EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentId, IntegrityRule,
+        LiveEventClass, MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionInput,
+        MarketDepth, MetadataRevision, ProviderIdentityEvidence, ProviderIdentityKey,
+        ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderInstrumentId,
+        RevisionBoundPayloadEvidence, RuleVersion, SequenceNumber, SequenceValidationRule,
+        SourceId, SourceIdentifier, Timestamp, VenueId, VenueMapping, VenueSymbol,
     };
 
     use super::{
@@ -35,11 +39,66 @@ mod tests {
         BudgetDecision, BudgetUnavailableReason, ChecksumValidationProfile, CurrentHealthReporter,
         CurrentSourceSession, FrameSessionBinding, LiveProtocolProfile, ProviderAggressorEvidence,
         ProviderBookChange, ProviderBookLevel, ProviderBookSide, ProviderChecksumEvidence,
-        ProviderDecimalLexeme, ProviderNormalizedObservation, ProviderNumericPolicy,
+        ProviderDecimalLexeme, ProviderNativeInstrumentAttestation,
+        ProviderNativeInstrumentAttestationInput, ProviderNormalizedObservation, ProviderNumericPolicy,
         ProviderObservationPayload, ProviderPrice, ProviderQuantity, ProviderSequenceEvidence,
         ProviderSnapshotEvidence, ProviderTimestampEvidence, SemanticInterpretationProfile,
         SequenceValidationProfile, SessionId, SourceError, TransportFrameKind,
     };
+
+    fn instrument_attestation(
+        instrument_id: InstrumentId,
+    ) -> Result<ProviderNativeInstrumentAttestation, Box<dyn std::error::Error>> {
+        let source_id = SourceId::try_from("source-a")?;
+        let provider_instrument_id = ProviderInstrumentId::try_from("native-instrument-1")?;
+        let venue_mapping = VenueMapping::new(
+            VenueId::try_from("coinbase")?,
+            VenueSymbol::try_from("BTC-USD")?,
+        );
+        let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+        let digest = |byte| EvidenceDigest::new(DigestAlgorithm::Sha256, [byte; 32]);
+        let definition = MarketDataInstrumentDefinition::try_new(
+            MarketDataInstrumentDefinitionInput {
+                instrument_id,
+                reference_evidence: RevisionBoundPayloadEvidence::new(
+                    MetadataRevision::new(SourceIdentifier::try_from("test-reference-v1")?),
+                    ExactPayloadEvidence::from_content_digest(digest(51)),
+                ),
+                effective_interval: effective,
+                asset_class: AssetClass::Crypto,
+                display_name: None,
+                quote_currency: Currency::try_from("USD")?,
+                quote_currency_evidence: ExactPayloadEvidence::from_content_digest(digest(52)),
+                venue_mappings: vec![venue_mapping.clone()],
+                provider_identities: vec![ProviderIdentityRecord::new(
+                    ProviderIdentityRecordInput {
+                        instrument_id,
+                        source_id: source_id.clone(),
+                        provider_instrument_id: provider_instrument_id.clone(),
+                        evidence: ProviderIdentityEvidence::from_content_digest(digest(53)),
+                        source_timestamp: None,
+                        observed_at: Timestamp::from_unix_nanos(0),
+                        metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+                            "test-provider-identity-v1",
+                        )?),
+                        validity: effective,
+                        supersedes: None,
+                    },
+                )],
+                identifiers: Vec::new(),
+            },
+        )?;
+        Ok(ProviderNativeInstrumentAttestation::try_select(
+            ProviderNativeInstrumentAttestationInput {
+                definition: &definition,
+                definition_revision_digest: digest(54),
+                definition_published_at: Timestamp::from_unix_nanos(0),
+                provider_key: ProviderIdentityKey::new(source_id, provider_instrument_id),
+                venue_mapping,
+                selected_at: Timestamp::from_unix_nanos(1),
+            },
+        )?)
+    }
 
     #[derive(Clone, Copy, Debug)]
     struct ManualClockState {
@@ -484,8 +543,9 @@ mod tests {
         let observation = |payload| {
             ProviderNormalizedObservation::try_new(
                 SourceIdentifier::try_from("message-1")?,
-                VenueId::try_from("coinbase")?,
-                InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
+                instrument_attestation(InstrumentId::from_str(
+                    "4c74ab95-53b9-42ad-9b66-0ed403b88fed",
+                )?)?,
                 ProviderTimestampEvidence::Provided {
                     value: Timestamp::from_unix_nanos(1),
                     rule: timestamp.clone(),
@@ -565,8 +625,7 @@ mod tests {
         let observation = |id, snapshot, payload| {
             ProviderNormalizedObservation::try_new(
                 SourceIdentifier::try_from(id)?,
-                VenueId::try_from("coinbase")?,
-                instrument,
+                instrument_attestation(instrument)?,
                 ProviderTimestampEvidence::AuthoritativelyAbsent(timestamp.clone()),
                 ProviderSequenceEvidence::Unsupported {
                     rule: no_sequence.clone(),

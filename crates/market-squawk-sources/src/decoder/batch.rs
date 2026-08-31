@@ -2,8 +2,7 @@
 #[derive(Clone, Debug)]
 pub struct ProviderNormalizedObservation {
     source_identifier: SourceIdentifier,
-    venue: VenueId,
-    instrument: InstrumentId,
+    instrument_attestation: ProviderNativeInstrumentAttestation,
     timestamp: ProviderTimestampEvidence,
     sequence: ProviderSequenceEvidence,
     snapshot: ProviderSnapshotEvidence,
@@ -23,8 +22,7 @@ impl ProviderNormalizedObservation {
     )]
     pub fn try_new(
         source_identifier: SourceIdentifier,
-        venue: VenueId,
-        instrument: InstrumentId,
+        instrument_attestation: ProviderNativeInstrumentAttestation,
         timestamp: ProviderTimestampEvidence,
         sequence: ProviderSequenceEvidence,
         snapshot: ProviderSnapshotEvidence,
@@ -46,8 +44,7 @@ impl ProviderNormalizedObservation {
         }
         Ok(Self {
             source_identifier,
-            venue,
-            instrument,
+            instrument_attestation,
             timestamp,
             sequence,
             snapshot,
@@ -63,12 +60,17 @@ impl ProviderNormalizedObservation {
 
     /// Returns the provider venue.
     pub const fn venue(&self) -> &VenueId {
-        &self.venue
+        self.instrument_attestation.venue_mapping().venue_id()
     }
 
     /// Returns the resolved internal instrument.
     pub const fn instrument(&self) -> InstrumentId {
-        self.instrument
+        self.instrument_attestation.instrument_id()
+    }
+
+    /// Returns the exact provider-native identity selected from durable canonical evidence.
+    pub const fn instrument_attestation(&self) -> &ProviderNativeInstrumentAttestation {
+        &self.instrument_attestation
     }
 
     /// Returns the provider event class.
@@ -138,7 +140,7 @@ impl ProviderNormalizedObservation {
         };
         checked_sum([
             self.source_identifier.retained_bytes(),
-            self.venue.retained_bytes(),
+            self.instrument_attestation.dynamic_retained_bytes(),
             timestamp_rule,
             sequence_dynamic_retained_bytes(&self.sequence),
             snapshot_bytes,

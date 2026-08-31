@@ -461,7 +461,7 @@ impl RestoredFredNativeBatchV1 {
             .next()
             .filter(|namespace| matches!(*namespace, "fred" | "alfred"))
             .ok_or(FredProductionPublicationError::RestartVerificationMismatch)?;
-        let expected_series = FredSource::rights_subject_identifier(provider_dataset)?;
+        let expected_series = FredSource::series_identifier(provider_dataset)?;
         let (expected_realtime_start, expected_realtime_end) =
             FredSource::dataset_realtime_interval(provider_dataset)?;
         let consumed = self
@@ -1023,7 +1023,7 @@ impl ProductionResearchIngestCoordinator {
         validate_fred_runtime(profile, provider_dataset, &prepared)?;
 
         prepared.rights.validate_at(system_timestamp()?)?;
-        let expected_subject = FredSource::rights_subject_identifier(provider_dataset)?;
+        let expected_subject = FredSource::series_identifier(provider_dataset)?;
         let subject = prepared
             .source
             .rights_subject(provider_dataset)

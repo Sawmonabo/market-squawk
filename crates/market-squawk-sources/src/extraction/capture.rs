@@ -8,11 +8,12 @@ pub use market_event::{
     ProviderCompositeResponseEventRowCoordinate, ProviderEventMicrobatchBindingDigest,
     ProviderEventMicrobatchRowFrame, ProviderEventMicrobatchRowFrameEvidence,
     ProviderMarketEventBatch, ProviderMarketEventContentIdentity,
-    ProviderMarketEventNativeLineageBatch, ProviderMarketEventNativeLineageRowEvidenceRef,
-    ProviderPublicationBindingDigest, ProviderPublicationBindingKind,
-    ProviderResponseMarketEventBindingDigest, ProviderResponseMarketEventRowFrameEvidence,
-    SealedProviderCompositeResponseEventBinding, SealedProviderEventMicrobatchBinding,
-    SealedProviderPublicationBinding, SealedProviderResponseMarketEventBinding,
+    ProviderMarketEventNativeLineageBatch, ProviderMarketEventNativeLineageRow,
+    ProviderMarketEventNativeLineageRowEvidenceRef, ProviderPublicationBindingDigest,
+    ProviderPublicationBindingKind, ProviderResponseMarketEventBindingDigest,
+    ProviderResponseMarketEventRowFrameEvidence, SealedProviderCompositeResponseEventBinding,
+    SealedProviderEventMicrobatchBinding, SealedProviderPublicationBinding,
+    SealedProviderResponseMarketEventBinding,
     verify_provider_market_event_native_lineage_batch_evidence,
 };
 

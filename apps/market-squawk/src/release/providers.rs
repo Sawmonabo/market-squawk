@@ -1093,8 +1093,8 @@ async fn exercise_fred_research(
     dataset: &SourceIdentifier,
 ) -> Result<Vec<ResearchPublicationEvidence>> {
     let dataset_text = dataset.as_str();
-    let series = FredSource::rights_subject_identifier(dataset)
-        .context("FRED/ALFRED dataset has no exact rights subject")?;
+    let series = FredSource::series_identifier(dataset)
+        .context("FRED/ALFRED dataset has no exact series identity")?;
     let (realtime_start, realtime_end) = FredSource::dataset_realtime_interval(dataset)
         .context("FRED/ALFRED dataset has no exact real-time interval")?;
     let discovery = invoke(

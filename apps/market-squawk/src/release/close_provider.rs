@@ -1118,7 +1118,7 @@ fn validate_fred_publications(runtime: &Value) -> Result<()> {
         .and_then(Value::as_str)
         .and_then(|value| SourceIdentifier::try_from(value).ok())
         .ok_or_else(|| anyhow::anyhow!("FRED/ALFRED provider dataset is invalid"))?;
-    let series = FredSource::rights_subject_identifier(&provider_dataset)
+    let series = FredSource::series_identifier(&provider_dataset)
         .map_err(|_| anyhow::anyhow!("FRED/ALFRED provider dataset has no exact series"))?;
     let (realtime_start, realtime_end) =
         FredSource::dataset_realtime_interval(&provider_dataset)

@@ -11,8 +11,8 @@ use market_squawk_sources::{
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::FredParseLimits;
 use crate::series::{admit_body, parse_date, validate_strings};
-use crate::{FredOperation, FredParseLimits, FredRightsDisposition};
 
 use super::http::system_timestamp;
 use super::lineage::{evidence_for_payload, map_adapter_error};
@@ -154,7 +154,7 @@ impl FredSeriesMetadata {
     /// Parses one bounded credential-probe response for an exact code-owned series selector.
     ///
     /// This uses the same strict one-series schema and civil-date consistency checks as normal
-    /// extraction without manufacturing a durable dataset or rights decision.
+    /// extraction without manufacturing a durable dataset.
     ///
     /// # Errors
     ///
@@ -257,9 +257,9 @@ impl FredSource {
         dataset: &SourceIdentifier,
         deadline: Timestamp,
         cancellation: CancellationToken,
-        operation: FredOperation,
     ) -> Result<FredSeriesMetadataDocument, ExtractionSourceError> {
         self.validate_authority(authority)?;
+        self.validate_provider_dataset(dataset)?;
         if cancellation.is_cancelled() {
             return Err(ExtractionSourceError::Cancelled);
         }
@@ -269,20 +269,6 @@ impl FredSource {
         if deadline <= now {
             return Err(ExtractionSourceError::DeadlineExceeded);
         }
-        let rights = self
-            .rights
-            .assess(
-                &SourceIdentifier::try_from(dataset_identity.series_id()).map_err(|_| {
-                    ExtractionSourceError::Source(SourceError::InvalidProtocolState)
-                })?,
-                &[operation],
-                now,
-            )
-            .map_err(|_| ExtractionSourceError::Source(SourceError::Unauthorized))?;
-        if rights.disposition() != FredRightsDisposition::Permitted {
-            return Err(ExtractionSourceError::Source(SourceError::Unauthorized));
-        }
-
         let mut public_url = url::Url::parse(SERIES_ENDPOINT)
             .map_err(|_| ExtractionSourceError::Source(SourceError::InvalidProtocolState))?;
         public_url

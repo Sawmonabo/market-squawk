@@ -3,10 +3,7 @@
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use market_squawk_adapter_fred::{
-    FredOperation, FredRightsArtifact, FredRightsDisposition, FredRightsPolicy, FredSource,
-    FredSourceError, FredTermsDocumentBytes,
-};
+use market_squawk_adapter_fred::{FredSource, FredSourceError};
 use market_squawk_domain::{
     DigestAlgorithm, EffectiveInterval, EvidenceDigest, SourceIdentifier, Timestamp,
 };
@@ -22,12 +19,12 @@ use crate::application::{
     EphemeralSourceInspectionAuthority, EphemeralSourceInspectionRequest,
     EphemeralSourceInspectionResult,
 };
-use crate::{FredAdapterActivation, ProviderAdapterActivationError, ProviderOnboardingError};
+use crate::{ProviderAdapterActivationError, ProviderOnboardingError};
 
 use super::{
-    CliProviderActivationError, FRED_RIGHTS_MANIFEST_BYTES, FRED_SURFACE,
-    ProviderResearchActivationService, ProviderSurface, fred_budget, fred_network_policy, metadata,
-    require_surface, reviewed_unrate_dashboard_dataset, update_digest,
+    CliProviderActivationError, FRED_SURFACE, ProviderResearchActivationService, ProviderSurface,
+    default_unrate_dashboard_dataset, fred_budget, fred_network_policy, metadata, require_surface,
+    update_digest,
 };
 
 const INSPECTION_EVIDENCE_DOMAIN: &[u8] = b"market-squawk:fred-ephemeral-inspection-authority:v1\0";
@@ -49,44 +46,20 @@ impl EphemeralSourceInspectionAuthority for ProviderResearchActivationService {
         }
         let cancellation = request.cancellation().clone();
         let session_id = request.onboarding_session_id();
-        let (lease, terms) = tokio::try_join!(
-            self.onboarding
-                .prepare_runtime_activation_target(session_id, cancellation.child_token()),
-            self.onboarding
-                .acquire_current_fred_terms(cancellation.child_token()),
-        )
-        .map_err(map_onboarding_error)?;
+        let lease = self
+            .onboarding
+            .prepare_runtime_activation_target(session_id, cancellation.child_token())
+            .await
+            .map_err(map_onboarding_error)?;
         require_surface(&lease, ProviderSurface::Exact(FRED_SURFACE))
             .map_err(|_error| ServiceError::Unauthorized)?;
 
-        let documents = terms
-            .iter()
-            .map(|document| FredTermsDocumentBytes::try_new(document.role(), document.as_bytes()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_error| ServiceError::Unauthorized)?;
-        let artifact =
-            FredRightsArtifact::parse_current_reviewed(FRED_RIGHTS_MANIFEST_BYTES, &documents)
-                .map_err(|_error| ServiceError::Unauthorized)?;
-        let terms_digest = artifact.terms_evidence().bundle_digest();
-        let policy = FredRightsPolicy::try_new(artifact, None, Vec::new())
-            .map_err(|_error| ServiceError::Unauthorized)?;
         let dataset = request.dataset_identifier().clone();
-        let dashboard_dataset = reviewed_unrate_dashboard_dataset().map_err(map_cli_error)?;
-        if dataset != dashboard_dataset.provider_dataset {
+        let dashboard_dataset = default_unrate_dashboard_dataset().map_err(map_cli_error)?;
+        if dataset != dashboard_dataset {
             return Err(ServiceError::InvalidRequest);
         }
-        let series = FredSource::rights_subject_identifier(&dataset)
-            .map_err(|_error| ServiceError::InvalidRequest)?;
-        let decision = policy
-            .assess(
-                &series,
-                &[FredOperation::RetrieveEphemeral],
-                lease.issued_at(),
-            )
-            .map_err(|_error| ServiceError::Unauthorized)?;
-        if decision.disposition() != FredRightsDisposition::Permitted {
-            return Err(ServiceError::Unauthorized);
-        }
+        FredSource::series_identifier(&dataset).map_err(|_error| ServiceError::InvalidRequest)?;
 
         let evidence = inspection_evidence(
             &lease,
@@ -94,7 +67,6 @@ impl EphemeralSourceInspectionAuthority for ProviderResearchActivationService {
             &dataset,
             request.page_index(),
             request.max_records().get(),
-            terms_digest.bytes(),
         );
         let effective = EffectiveInterval::new(
             lease.authority_effective_at(),
@@ -115,18 +87,12 @@ impl EphemeralSourceInspectionAuthority for ProviderResearchActivationService {
             fred_budget(&lease).map_err(map_cli_error)?,
         )
         .map_err(map_cli_error)?;
-        let policy_effective_at = lease.issued_at();
         let page = self
             .activation
             .inspect_fred_ephemeral(
                 lease,
-                FredAdapterActivation::try_new_for_ephemeral_inspection(
-                    source_metadata,
-                    policy,
-                    dataset.clone(),
-                    policy_effective_at,
-                )
-                .map_err(map_activation_error)?,
+                source_metadata,
+                dataset.clone(),
                 request.page_index(),
                 request.max_records(),
                 request.max_bytes(),
@@ -169,7 +135,6 @@ fn inspection_evidence(
     dataset: &SourceIdentifier,
     page_index: u16,
     max_records: u16,
-    terms_digest: [u8; 32],
 ) -> EvidenceDigest {
     let mut hasher = Sha256::new();
     hasher.update(INSPECTION_EVIDENCE_DOMAIN);
@@ -187,7 +152,6 @@ fn inspection_evidence(
     hash_identifier(&mut hasher, dataset);
     hasher.update(page_index.to_be_bytes());
     hasher.update(max_records.to_be_bytes());
-    hasher.update(terms_digest);
     EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
 }
 
