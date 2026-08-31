@@ -128,8 +128,12 @@ pub enum CensusGeographyWildcardFailurePredicate {
     EmptyMember,
     /// A wildcard-array parent occurred more than once.
     DuplicateMember,
-    /// The present wildcard field had another unsupported JSON type.
-    Type,
+    /// The present wildcard field was a boolean.
+    Boolean,
+    /// The present wildcard field was a number.
+    Number,
+    /// The present wildcard field was an object.
+    Object,
 }
 
 #[derive(Debug)]
@@ -1462,10 +1466,22 @@ fn optional_wildcard_array_diagnosed(
             ));
         }
         Value::Array(values) => values,
-        Value::Bool(_) | Value::Number(_) | Value::Object(_) => {
+        Value::Bool(_) => {
             return Err((
                 CensusAdapterError::SchemaDrift,
-                CensusGeographyWildcardFailurePredicate::Type,
+                CensusGeographyWildcardFailurePredicate::Boolean,
+            ));
+        }
+        Value::Number(_) => {
+            return Err((
+                CensusAdapterError::SchemaDrift,
+                CensusGeographyWildcardFailurePredicate::Number,
+            ));
+        }
+        Value::Object(_) => {
+            return Err((
+                CensusAdapterError::SchemaDrift,
+                CensusGeographyWildcardFailurePredicate::Object,
             ));
         }
     };
