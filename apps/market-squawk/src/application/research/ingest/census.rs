@@ -371,6 +371,9 @@ fn census_macro_plan_input(
     analytical_dataset: DatasetId,
     source_generation_digest: EvidenceDigest,
 ) -> Result<ProviderMacroPlanPublicationInput, CensusMacroApplicationError> {
+    let source_id = candidate.source_id().clone();
+    let metadata_revision = candidate.metadata_revision().clone();
+    let provider_dataset = candidate.provider_dataset().clone();
     let completion_digest = candidate.candidate_digest();
     let expected_rows = u64::try_from(candidate.canonical_record_count())
         .map_err(|_error| CensusMacroApplicationError::CandidateInvalid)?;
@@ -401,12 +404,22 @@ fn census_macro_plan_input(
         sealed_capture,
         revisions,
     )?;
-    Ok(ProviderMacroPlanPublicationInput::try_new(
+    let input = ProviderMacroPlanPublicationInput::try_new(
         analytical_dataset,
         completion_digest,
         expected_rows,
         vec![chunk],
-    )?)
+    )?;
+    if input.source_id() != &source_id
+        || input.metadata_revision().as_source_identifier() != &metadata_revision
+        || input.provider_dataset() != &provider_dataset
+        || input.source_generation_digest() != source_generation_digest
+        || input.total_chunks() != 1
+        || input.total_rows() != expected_rows
+    {
+        return Err(CensusMacroApplicationError::CandidateInvalid);
+    }
+    Ok(input)
 }
 
 #[derive(Debug)]
@@ -461,10 +474,6 @@ impl CensusRestartSelector {
 
     pub(crate) const fn manifest(&self) -> &market_squawk_data::DatasetManifestRef {
         self.selector.manifest()
-    }
-
-    pub(crate) const fn binding_digest(&self) -> market_squawk_domain::EvidenceDigest {
-        self.selector.publication_digest()
     }
 
     fn validate_quarterly_request(
