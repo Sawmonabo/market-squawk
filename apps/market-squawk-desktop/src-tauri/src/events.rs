@@ -112,7 +112,6 @@ pub(crate) async fn subscribe_service_events(
     let cancellation = generation.cancellation();
     let task = tauri::async_runtime::spawn(forward_service_events(
         generation.application(),
-        runtime,
         product_session_token,
         generation.service_operation_index(),
         limit,
@@ -195,7 +194,6 @@ async fn stop_active_subscription(registry: &mut SubscriptionRegistry, expected_
 
 async fn forward_service_events(
     application: Arc<LoopbackApplicationClient>,
-    runtime: RuntimeIdentity,
     product_session_token: ProductSessionToken,
     operations: BTreeMap<String, String>,
     limit: EventPageLimit,
