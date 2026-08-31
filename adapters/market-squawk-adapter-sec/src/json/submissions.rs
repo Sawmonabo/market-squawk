@@ -1,8 +1,8 @@
 //! SEC submissions and historical companion reconciliation.
 
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
 use super::*;
 
@@ -137,8 +137,13 @@ impl SecSubmissionCompanyMetadata {
 }
 
 /// One SEC filing reconstructed from the submissions columnar representation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecFiling {
+    inner: Arc<SecFilingInner>,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct SecFilingInner {
     accession: SourceIdentifier,
     form: SourceIdentifier,
     filed_on: CalendarDate,
@@ -152,54 +157,68 @@ pub struct SecFiling {
 
 impl SecFiling {
     /// Returns the stable EDGAR accession number.
-    pub const fn accession(&self) -> &SourceIdentifier {
-        &self.accession
+    pub fn accession(&self) -> &SourceIdentifier {
+        &self.inner.accession
     }
     /// Returns the source form code, including amendment suffixes.
-    pub const fn form(&self) -> &SourceIdentifier {
-        &self.form
+    pub fn form(&self) -> &SourceIdentifier {
+        &self.inner.form
     }
     /// Returns whether the form code denotes an amendment.
     pub fn is_amendment(&self) -> bool {
-        self.form.as_str().ends_with("/A")
+        self.inner.form.as_str().ends_with("/A")
     }
     /// Returns exact SEC acceptance time when the provider supplied it.
-    pub const fn accepted_at(&self) -> Option<Timestamp> {
-        self.accepted_at
+    pub fn accepted_at(&self) -> Option<Timestamp> {
+        self.inner.accepted_at
     }
     /// Returns the filing date without inventing time-of-day availability.
-    pub const fn filed_on(&self) -> CalendarDate {
-        self.filed_on
+    pub fn filed_on(&self) -> CalendarDate {
+        self.inner.filed_on
     }
     /// Returns the source-reported report period.
-    pub const fn report_date(&self) -> Option<CalendarDate> {
-        self.report_date
+    pub fn report_date(&self) -> Option<CalendarDate> {
+        self.inner.report_date
     }
     /// Returns the provider-declared primary filing document when present.
-    pub const fn primary_document(&self) -> Option<&SourceIdentifier> {
-        self.primary_document.as_ref()
+    pub fn primary_document(&self) -> Option<&SourceIdentifier> {
+        self.inner.primary_document.as_ref()
     }
     /// Returns the provider-declared filing size in bytes when present.
-    pub const fn size_bytes(&self) -> Option<u64> {
-        self.size_bytes
+    pub fn size_bytes(&self) -> Option<u64> {
+        self.inner.size_bytes
     }
     /// Returns whether SEC marks the filing as containing XBRL.
-    pub const fn is_xbrl(&self) -> bool {
-        self.is_xbrl
+    pub fn is_xbrl(&self) -> bool {
+        self.inner.is_xbrl
     }
     /// Returns whether SEC marks the filing as containing Inline XBRL.
-    pub const fn is_inline_xbrl(&self) -> bool {
-        self.is_inline_xbrl
+    pub fn is_inline_xbrl(&self) -> bool {
+        self.inner.is_inline_xbrl
+    }
+}
+
+impl Serialize for SecFiling {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.inner.serialize(serializer)
     }
 }
 
 /// Reconciled SEC submissions document with recent and historical accessions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubmissionsDocument {
+    inner: Arc<SubmissionsDocumentInner>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SubmissionsDocumentInner {
     cik: SourceIdentifier,
-    company_metadata: SecSubmissionCompanyMetadata,
+    company_metadata: Arc<SecSubmissionCompanyMetadata>,
     filings: Vec<SecFiling>,
-    companions: Vec<SecSubmissionsCompanion>,
+    companions: Arc<Vec<SecSubmissionsCompanion>>,
 }
 
 impl SubmissionsDocument {
@@ -249,12 +268,20 @@ impl SubmissionsDocument {
         }
         let companions =
             parse_companions(filings_object.get("files"), limits, cancellation, &retained)?;
-        Ok(Self {
+        retained.admit_bytes(
+            std::mem::size_of::<SecSubmissionCompanyMetadata>()
+                .checked_add(std::mem::size_of::<Vec<SecSubmissionsCompanion>>())
+                .and_then(|bytes| {
+                    bytes.checked_add(std::mem::size_of::<SubmissionsDocumentInner>())
+                })
+                .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
+        )?;
+        Ok(Self::from_inner(SubmissionsDocumentInner {
             cik,
-            company_metadata,
+            company_metadata: Arc::new(company_metadata),
             filings,
-            companions,
-        })
+            companions: Arc::new(companions),
+        }))
     }
 
     /// Parses a bounded historical companion filing-columns document.
@@ -301,26 +328,33 @@ impl SubmissionsDocument {
         })
     }
     /// Returns the exact zero-padded ten-digit CIK.
-    pub const fn cik(&self) -> &SourceIdentifier {
-        &self.cik
+    pub fn cik(&self) -> &SourceIdentifier {
+        &self.inner.cik
     }
     /// Returns bounded source company metadata without promoting it to canonical identity.
-    pub const fn company_metadata(&self) -> &SecSubmissionCompanyMetadata {
-        &self.company_metadata
+    pub fn company_metadata(&self) -> &SecSubmissionCompanyMetadata {
+        &self.inner.company_metadata
     }
     /// Returns accessions ordered deterministically by filing date and accession.
     pub fn filings(&self) -> &[SecFiling] {
-        &self.filings
+        &self.inner.filings
     }
     /// Looks up a filing by accession.
     pub fn filing(&self, accession: &str) -> Option<&SecFiling> {
-        self.filings
+        self.inner
+            .filings
             .iter()
-            .find(|filing| filing.accession.as_str() == accession)
+            .find(|filing| filing.accession().as_str() == accession)
     }
     /// Returns provider-declared historical objects with their promised count/date coverage.
     pub fn companions(&self) -> &[SecSubmissionsCompanion] {
-        &self.companions
+        &self.inner.companions
+    }
+
+    fn from_inner(inner: SubmissionsDocumentInner) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
     }
 }
 
@@ -374,61 +408,86 @@ pub(crate) fn reconcile_submissions_with_allocation_authority(
     cancellation: &CancellationToken,
     retained: RetainedJsonBudget,
 ) -> Result<SubmissionsDocument, SecParserError> {
-    if recent.companions.len() != archives.len() {
+    if recent.inner.companions.len() != archives.len() {
         return Err(SecParserError::InvalidCompanionCoverage);
     }
-    for (declaration, archive) in recent.companions.iter().zip(archives) {
-        validate_companion_coverage(declaration, archive, &recent.cik)?;
+    for (declaration, archive) in recent.inner.companions.iter().zip(archives) {
+        validate_companion_coverage(declaration, archive, &recent.inner.cik)?;
     }
-    let mut filings = BTreeMap::new();
+    let total_filings = recent
+        .inner
+        .filings
+        .len()
+        .checked_add(
+            archives
+                .iter()
+                .try_fold(0usize, |total, archive| {
+                    total.checked_add(archive.filings.len())
+                })
+                .ok_or(SecParserError::RecordLimitExceeded)?,
+        )
+        .ok_or(SecParserError::RecordLimitExceeded)?;
+    if total_filings > limits.max_records {
+        return Err(SecParserError::RecordLimitExceeded);
+    }
+    let mut ordered = Vec::new();
+    try_reserve_exact_bounded(&mut ordered, total_filings, &retained)?;
     for filing in recent
+        .inner
         .filings
         .iter()
         .chain(archives.iter().flat_map(|archive| archive.filings.iter()))
     {
         check_parser_cancelled(cancellation)?;
-        let accession = owned_string_bounded(filing.accession.as_str(), &retained)?;
-        retained.admit_btree_entry::<String, SecFiling>(
-            accession
-                .capacity()
-                .checked_add(filing_dynamic_bytes(filing)?)
-                .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
-        )?;
-        match filings.entry(accession) {
-            Entry::Vacant(entry) => {
-                entry.insert(filing.clone());
+        ordered.push(filing);
+    }
+    ordered.sort_unstable_by(|left, right| left.accession().cmp(right.accession()));
+    let mut unique_count = 0usize;
+    let mut previous: Option<&SecFiling> = None;
+    for filing in &ordered {
+        match previous {
+            Some(existing) if existing.accession() == filing.accession() && existing != *filing => {
+                return Err(SecParserError::ConflictingAccession);
             }
-            Entry::Occupied(entry) if entry.get() == filing => {}
-            Entry::Occupied(_) => return Err(SecParserError::ConflictingAccession),
-        }
-        if filings.len() > limits.max_records {
-            return Err(SecParserError::RecordLimitExceeded);
+            Some(existing) if existing.accession() == filing.accession() => {}
+            _ => {
+                unique_count = unique_count
+                    .checked_add(1)
+                    .ok_or(SecParserError::RecordLimitExceeded)?;
+                previous = Some(filing);
+            }
         }
     }
-    let mut reconciled_filings = Vec::new();
-    try_reserve_exact_bounded(&mut reconciled_filings, filings.len(), &retained)?;
-    reconciled_filings.extend(filings.into_values());
-    let mut filings = reconciled_filings;
+    let mut filings = Vec::new();
+    try_reserve_exact_bounded(&mut filings, unique_count, &retained)?;
+    previous = None;
+    for filing in ordered {
+        if previous.is_none_or(|existing| existing.accession() != filing.accession()) {
+            filings.push(filing.clone());
+            previous = Some(filing);
+        }
+    }
     filings.sort_by(|left, right| {
-        left.filed_on
-            .cmp(&right.filed_on)
-            .then_with(|| left.accession.cmp(&right.accession))
+        left.filed_on()
+            .cmp(&right.filed_on())
+            .then_with(|| left.accession().cmp(right.accession()))
     });
-    retained.admit_bytes(recent.cik.retained_bytes())?;
-    admit_company_metadata(&retained, &recent.company_metadata)?;
-    admit_vec_allocation(&retained, &recent.companions)?;
-    for companion in &recent.companions {
+    retained.admit_bytes(recent.inner.cik.retained_bytes())?;
+    admit_company_metadata(&retained, &recent.inner.company_metadata)?;
+    admit_vec_allocation(&retained, &recent.inner.companions)?;
+    for companion in &recent.inner.companions {
         retained.admit_bytes(companion.name.retained_bytes())?;
     }
-    let cik = recent.cik.clone();
-    let company_metadata = recent.company_metadata.clone();
-    let companions = recent.companions.clone();
-    Ok(SubmissionsDocument {
+    let cik = recent.inner.cik.clone();
+    let company_metadata = Arc::clone(&recent.inner.company_metadata);
+    let companions = Arc::clone(&recent.inner.companions);
+    retained.admit_bytes(std::mem::size_of::<SubmissionsDocumentInner>())?;
+    Ok(SubmissionsDocument::from_inner(SubmissionsDocumentInner {
         cik,
         company_metadata,
         filings,
         companions,
-    })
+    }))
 }
 
 fn parse_company_metadata(
@@ -476,7 +535,6 @@ fn parse_former_names(
     }
     let mut former_names = Vec::new();
     try_reserve_exact_bounded(&mut former_names, entries.len(), retained)?;
-    let mut seen = BTreeMap::new();
     for value in entries {
         check_parser_cancelled(cancellation)?;
         let object = as_object(value, "former name")?;
@@ -487,19 +545,6 @@ fn parse_former_names(
         if effective_from > effective_to {
             return Err(SecParserError::InvalidPeriod);
         }
-        let interval = (effective_from, effective_to);
-        retained.admit_btree_entry::<String, (Timestamp, Timestamp)>(name.capacity())?;
-        match seen.entry(name.clone()) {
-            Entry::Vacant(entry) => {
-                entry.insert(interval);
-            }
-            Entry::Occupied(entry) if *entry.get() == interval => {
-                return Err(SecParserError::DuplicateMetadataAssociation);
-            }
-            Entry::Occupied(_) => {
-                return Err(SecParserError::ConflictingMetadataAssociation);
-            }
-        }
         retained.admit_bytes(name.capacity())?;
         former_names.push(SecFormerName {
             name,
@@ -507,6 +552,7 @@ fn parse_former_names(
             effective_to,
         });
     }
+    validate_former_name_associations(&former_names, retained)?;
     Ok(former_names)
 }
 
@@ -526,29 +572,11 @@ fn parse_ticker_exchange_pairs(
     }
     let mut pairs = Vec::new();
     try_reserve_exact_bounded(&mut pairs, tickers.len(), retained)?;
-    let mut seen = BTreeMap::new();
     for index in 0..tickers.len() {
         check_parser_cancelled(cancellation)?;
         let ticker = validated_metadata_text(array_string(tickers, index)?, MAX_TICKER_BYTES)?;
         let exchange =
             validated_metadata_text(array_string(exchanges, index)?, MAX_EXCHANGE_BYTES)?;
-        retained.admit_btree_entry::<String, String>(
-            ticker
-                .capacity()
-                .checked_add(exchange.capacity())
-                .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
-        )?;
-        match seen.entry(ticker.clone()) {
-            Entry::Vacant(entry) => {
-                entry.insert(exchange.clone());
-            }
-            Entry::Occupied(entry) if entry.get() == &exchange => {
-                return Err(SecParserError::DuplicateMetadataAssociation);
-            }
-            Entry::Occupied(_) => {
-                return Err(SecParserError::ConflictingMetadataAssociation);
-            }
-        }
         retained.admit_bytes(
             ticker
                 .capacity()
@@ -557,6 +585,7 @@ fn parse_ticker_exchange_pairs(
         )?;
         pairs.push(SecTickerExchangePair { ticker, exchange });
     }
+    validate_ticker_associations(&pairs, retained)?;
     Ok(pairs)
 }
 
@@ -598,39 +627,39 @@ fn parse_filing_columns(
     }
     let mut filings = Vec::new();
     try_reserve_exact_bounded(&mut filings, accessions.len(), retained)?;
-    let mut page_accessions = BTreeMap::new();
     for index in 0..accessions.len() {
         check_parser_cancelled(cancellation)?;
         let accession = SourceIdentifier::try_from(array_string(accessions, index)?)?;
         validate_accession(accession.as_str())?;
+        retained.admit_bytes(std::mem::size_of::<SecFilingInner>())?;
         let filing = SecFiling {
-            accession,
-            form: SourceIdentifier::try_from(column_string(object, "form", index)?)?,
-            filed_on: parse_date(column_string(object, "filingDate", index)?)?,
-            report_date: nonempty_column_string(object, "reportDate", index)?
-                .map(parse_date)
-                .transpose()?,
-            accepted_at: nonempty_column_string(object, "acceptanceDateTime", index)?
-                .map(parse_acceptance_timestamp)
-                .transpose()?,
-            primary_document: optional_nonempty_column_string(object, "primaryDocument", index)?
+            inner: Arc::new(SecFilingInner {
+                accession,
+                form: SourceIdentifier::try_from(column_string(object, "form", index)?)?,
+                filed_on: parse_date(column_string(object, "filingDate", index)?)?,
+                report_date: nonempty_column_string(object, "reportDate", index)?
+                    .map(parse_date)
+                    .transpose()?,
+                accepted_at: nonempty_column_string(object, "acceptanceDateTime", index)?
+                    .map(parse_acceptance_timestamp)
+                    .transpose()?,
+                primary_document: optional_nonempty_column_string(
+                    object,
+                    "primaryDocument",
+                    index,
+                )?
                 .map(SourceIdentifier::try_from)
                 .transpose()?,
-            size_bytes: optional_column_u64(object, "size", index)?,
-            is_xbrl: optional_column_boolish(object, "isXBRL", index)?.unwrap_or(false),
-            is_inline_xbrl: optional_column_boolish(object, "isInlineXBRL", index)?
-                .unwrap_or(false),
+                size_bytes: optional_column_u64(object, "size", index)?,
+                is_xbrl: optional_column_boolish(object, "isXBRL", index)?.unwrap_or(false),
+                is_inline_xbrl: optional_column_boolish(object, "isInlineXBRL", index)?
+                    .unwrap_or(false),
+            }),
         };
         retained.admit_bytes(filing_dynamic_bytes(&filing)?)?;
-        retained.admit_btree_entry::<SourceIdentifier, ()>(filing.accession.retained_bytes())?;
-        if page_accessions
-            .insert(filing.accession.clone(), ())
-            .is_some()
-        {
-            return Err(SecParserError::ConflictingAccession);
-        }
         filings.push(filing);
     }
+    validate_unique_filing_accessions(&filings, retained)?;
     Ok(filings)
 }
 
@@ -649,7 +678,6 @@ fn parse_companions(
     }
     let mut companions = Vec::new();
     try_reserve_exact_bounded(&mut companions, entries.len(), retained)?;
-    let mut names = BTreeMap::new();
     for entry in entries {
         check_parser_cancelled(cancellation)?;
         let object = as_object(entry, "companion file")?;
@@ -658,10 +686,6 @@ fn parse_companions(
             return Err(SecParserError::InvalidCompanionName);
         }
         let name = SourceIdentifier::try_from(name)?;
-        retained.admit_btree_entry::<SourceIdentifier, ()>(name.retained_bytes())?;
-        if names.insert(name.clone(), ()).is_some() {
-            return Err(SecParserError::InvalidCompanionCoverage);
-        }
         let filing_count = required(object, "filingCount")?
             .as_u64()
             .filter(|count| *count > 0)
@@ -682,7 +706,97 @@ fn parse_companions(
             filing_to,
         });
     }
+    validate_unique_companion_names(&companions, retained)?;
     Ok(companions)
+}
+
+fn sorted_indices_by<T, F>(
+    values: &[T],
+    retained: &RetainedJsonBudget,
+    mut compare: F,
+) -> Result<Vec<usize>, SecParserError>
+where
+    F: FnMut(&T, &T) -> std::cmp::Ordering,
+{
+    let mut indices = Vec::new();
+    try_reserve_exact_bounded(&mut indices, values.len(), retained)?;
+    indices.extend(0..values.len());
+    indices.sort_unstable_by(|left, right| compare(&values[*left], &values[*right]));
+    Ok(indices)
+}
+
+fn validate_former_name_associations(
+    values: &[SecFormerName],
+    retained: &RetainedJsonBudget,
+) -> Result<(), SecParserError> {
+    let indices = sorted_indices_by(values, retained, |left, right| left.name.cmp(&right.name))?;
+    for pair in indices.windows(2) {
+        let left = &values[pair[0]];
+        let right = &values[pair[1]];
+        if left.name == right.name {
+            return if left.effective_from == right.effective_from
+                && left.effective_to == right.effective_to
+            {
+                Err(SecParserError::DuplicateMetadataAssociation)
+            } else {
+                Err(SecParserError::ConflictingMetadataAssociation)
+            };
+        }
+    }
+    Ok(())
+}
+
+fn validate_ticker_associations(
+    values: &[SecTickerExchangePair],
+    retained: &RetainedJsonBudget,
+) -> Result<(), SecParserError> {
+    let indices = sorted_indices_by(values, retained, |left, right| {
+        left.ticker.cmp(&right.ticker)
+    })?;
+    for pair in indices.windows(2) {
+        let left = &values[pair[0]];
+        let right = &values[pair[1]];
+        if left.ticker == right.ticker {
+            return if left.exchange == right.exchange {
+                Err(SecParserError::DuplicateMetadataAssociation)
+            } else {
+                Err(SecParserError::ConflictingMetadataAssociation)
+            };
+        }
+    }
+    Ok(())
+}
+
+fn validate_unique_filing_accessions(
+    values: &[SecFiling],
+    retained: &RetainedJsonBudget,
+) -> Result<(), SecParserError> {
+    let indices = sorted_indices_by(values, retained, |left, right| {
+        left.accession().cmp(right.accession())
+    })?;
+    if indices
+        .windows(2)
+        .any(|pair| values[pair[0]].accession() == values[pair[1]].accession())
+    {
+        Err(SecParserError::ConflictingAccession)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_unique_companion_names(
+    values: &[SecSubmissionsCompanion],
+    retained: &RetainedJsonBudget,
+) -> Result<(), SecParserError> {
+    let indices = sorted_indices_by(values, retained, |left, right| left.name.cmp(&right.name))?;
+    if indices
+        .windows(2)
+        .any(|pair| values[pair[0]].name == values[pair[1]].name)
+    {
+        Err(SecParserError::InvalidCompanionCoverage)
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn validate_companion_coverage(
@@ -695,7 +809,8 @@ pub(crate) fn validate_companion_coverage(
     }
     for filing in &archive.filings {
         validate_accession_owner(filing.accession(), cik)?;
-        if filing.filed_on < declaration.filing_from || filing.filed_on > declaration.filing_to {
+        if filing.filed_on() < declaration.filing_from || filing.filed_on() > declaration.filing_to
+        {
             return Err(SecParserError::InvalidCompanionCoverage);
         }
     }
@@ -760,14 +875,15 @@ pub(crate) fn admit_document_allocations(
     retained: &RetainedJsonBudget,
     document: &SubmissionsDocument,
 ) -> Result<(), SecParserError> {
-    retained.admit_bytes(document.cik.retained_bytes())?;
-    admit_company_metadata(retained, &document.company_metadata)?;
-    admit_vec_allocation(retained, &document.filings)?;
-    for filing in &document.filings {
+    retained.admit_bytes(document.inner.cik.retained_bytes())?;
+    admit_company_metadata(retained, &document.inner.company_metadata)?;
+    admit_vec_allocation(retained, &document.inner.filings)?;
+    for filing in &document.inner.filings {
+        retained.admit_bytes(std::mem::size_of::<SecFilingInner>())?;
         retained.admit_bytes(filing_dynamic_bytes(filing)?)?;
     }
-    admit_vec_allocation(retained, &document.companions)?;
-    for companion in &document.companions {
+    admit_vec_allocation(retained, &document.inner.companions)?;
+    for companion in &document.inner.companions {
         retained.admit_bytes(companion.name.retained_bytes())?;
     }
     Ok(())
@@ -775,9 +891,9 @@ pub(crate) fn admit_document_allocations(
 
 fn filing_dynamic_bytes(filing: &SecFiling) -> Result<usize, SecParserError> {
     [
-        Some(&filing.accession),
-        Some(&filing.form),
-        filing.primary_document.as_ref(),
+        Some(filing.accession()),
+        Some(filing.form()),
+        filing.primary_document(),
     ]
     .into_iter()
     .flatten()

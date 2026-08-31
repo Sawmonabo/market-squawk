@@ -79,7 +79,7 @@ impl RetainedJsonBudget {
         Ok(remaining)
     }
 
-    fn release_bytes(&self, bytes: usize) -> Result<(), SecParserError> {
+    pub(crate) fn release_bytes(&self, bytes: usize) -> Result<(), SecParserError> {
         let mut state = self
             .state
             .lock()
@@ -266,6 +266,10 @@ impl SecParserLimits {
     pub(crate) const fn string_bytes(self) -> usize {
         self.max_string_bytes
     }
+
+    pub(crate) const fn total_string_bytes(self) -> usize {
+        self.max_total_string_bytes
+    }
 }
 
 pub(crate) fn parse_bounded_json_with_cancellation(
@@ -302,7 +306,7 @@ pub(crate) fn parse_bounded_json_with_allocation_authority(
         return Err(SecParserError::ByteLimitExceeded);
     }
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let mut budget = JsonBudget::new(limits, cancellation.clone(), retained);
+    let mut budget = RawJsonParseAuthority::new(limits, cancellation.clone(), retained);
     let value = BoundedValueSeed {
         budget: &mut budget,
         depth: 1,
@@ -312,7 +316,7 @@ pub(crate) fn parse_bounded_json_with_allocation_authority(
     Ok(value)
 }
 
-struct JsonBudget {
+pub(crate) struct RawJsonParseAuthority {
     limits: SecParserLimits,
     total_string_bytes: usize,
     nodes: usize,
@@ -321,8 +325,8 @@ struct JsonBudget {
     retained: RetainedJsonBudget,
 }
 
-impl JsonBudget {
-    fn new(
+impl RawJsonParseAuthority {
+    pub(crate) fn new(
         limits: SecParserLimits,
         cancellation: CancellationToken,
         retained: RetainedJsonBudget,
@@ -337,7 +341,7 @@ impl JsonBudget {
         }
     }
 
-    fn charge_node(&mut self) -> Result<(), SecParserError> {
+    pub(crate) fn charge_node(&mut self) -> Result<(), SecParserError> {
         check_parser_cancelled(&self.cancellation)?;
         self.nodes = self
             .nodes
@@ -350,7 +354,7 @@ impl JsonBudget {
         }
     }
 
-    fn charge_string(&mut self, text: &str) -> Result<(), SecParserError> {
+    pub(crate) fn charge_string(&mut self, text: &str) -> Result<(), SecParserError> {
         check_parser_cancelled(&self.cancellation)?;
         if text.len() > self.limits.max_string_bytes {
             return Err(SecParserError::StringLimitExceeded);
@@ -365,10 +369,22 @@ impl JsonBudget {
             Ok(())
         }
     }
+
+    pub(crate) fn check_cancelled(&self) -> Result<(), SecParserError> {
+        check_parser_cancelled(&self.cancellation)
+    }
+
+    pub(crate) const fn limits(&self) -> SecParserLimits {
+        self.limits
+    }
+
+    pub(crate) fn retained(&self) -> &RetainedJsonBudget {
+        &self.retained
+    }
 }
 
 struct BoundedValueSeed<'a> {
-    budget: &'a mut JsonBudget,
+    budget: &'a mut RawJsonParseAuthority,
     depth: usize,
 }
 
@@ -391,7 +407,7 @@ impl<'de> DeserializeSeed<'de> for BoundedValueSeed<'_> {
 }
 
 struct BoundedStringSeed<'a> {
-    budget: &'a mut JsonBudget,
+    budget: &'a mut RawJsonParseAuthority,
 }
 
 impl<'de> DeserializeSeed<'de> for BoundedStringSeed<'_> {
@@ -408,7 +424,7 @@ impl<'de> DeserializeSeed<'de> for BoundedStringSeed<'_> {
 }
 
 struct BoundedStringVisitor<'a> {
-    budget: &'a mut JsonBudget,
+    budget: &'a mut RawJsonParseAuthority,
 }
 
 impl Visitor<'_> for BoundedStringVisitor<'_> {
@@ -440,7 +456,7 @@ impl Visitor<'_> for BoundedStringVisitor<'_> {
 }
 
 struct BoundedValueVisitor<'a> {
-    budget: &'a mut JsonBudget,
+    budget: &'a mut RawJsonParseAuthority,
     depth: usize,
 }
 
