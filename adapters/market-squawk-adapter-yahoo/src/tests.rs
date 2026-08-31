@@ -131,6 +131,7 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
         maximum_cache_age: Duration::ZERO,
     };
     let cancellation = CancellationToken::new();
+    session.fail_next_scripted_availability_clock().await;
     let first = session
         .execute(plan.requests[0].clone(), limits, &cancellation)
         .await?;
@@ -148,6 +149,10 @@ async fn explicit_demand_network_response_crosses_one_pending_publication_handof
     assert_eq!(
         first_chart.provenance.available_at_unix_ms,
         first.raw_receipt().available_at_unix_ms
+    );
+    assert_eq!(
+        first.raw_receipt().available_at_unix_ms,
+        first.raw_receipt().received_at_unix_ms
     );
     assert_eq!(first.raw_receipt().attempts.len(), 3);
     assert_eq!(

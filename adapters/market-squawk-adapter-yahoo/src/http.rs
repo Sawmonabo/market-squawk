@@ -654,6 +654,7 @@ struct ScriptedWireState {
     responses: VecDeque<ScriptedHttpResponse>,
     observed_targets: Vec<String>,
     fail_next_post_send_clock: bool,
+    fail_next_availability_clock: bool,
 }
 
 #[cfg(test)]
@@ -1059,10 +1060,10 @@ impl YahooHttpSession {
         permit: &mut AttemptPermit,
     ) -> Result<ExecutionPayload, YahooHttpFailureKind> {
         let received_at_unix_ms = wire.completed_at.wall_unix_ms();
+        let available_at_unix_ms = wire.available_at_unix_ms();
         let parse_context = ParseContext {
             received_at_unix_ms,
-            available_at_unix_ms: wall_time_ms()
-                .map_err(|_| YahooHttpFailureKind::StateUnavailable)?,
+            available_at_unix_ms,
         };
         let parsed = match parse_selected_response(
             request,
@@ -1619,6 +1620,8 @@ impl YahooHttpSession {
                 completed_at: header_observed_at,
                 latency_ms: duration_ms(started.elapsed()),
                 observation_units,
+                #[cfg(test)]
+                fail_availability_clock: false,
             };
             return Err(self.record_provider_backoff(wire, permit, attempts)?);
         }
@@ -1721,6 +1724,8 @@ impl YahooHttpSession {
             completed_at: post_send_clock_observation(started_at, clock_observation()),
             latency_ms: duration_ms(started.elapsed()),
             observation_units,
+            #[cfg(test)]
+            fail_availability_clock: false,
         })
     }
 
@@ -1759,6 +1764,8 @@ impl YahooHttpSession {
             clock_observation()
         };
         let completed_at = post_send_clock_observation(started_at, observed_at);
+        let fail_availability_clock = matches!(&spec.target, YahooAttemptTarget::Data(_))
+            && std::mem::take(&mut state.fail_next_availability_clock);
         let immediate_backoff = response_requires_immediate_backoff(response.status, recovery);
         if !immediate_backoff && response.body.len() > spec.maximum_bytes {
             return Err(YahooHttpFailureKind::ResponseTooLarge);
@@ -1783,6 +1790,7 @@ impl YahooHttpSession {
             completed_at,
             latency_ms: duration_ms(started.elapsed()),
             observation_units: spec.observation_units,
+            fail_availability_clock,
         })
     }
 
@@ -2937,9 +2945,28 @@ struct WireResponse {
     completed_at: YahooClockObservation,
     latency_ms: u64,
     observation_units: usize,
+    #[cfg(test)]
+    fail_availability_clock: bool,
 }
 
 impl WireResponse {
+    fn available_at_unix_ms(&self) -> i64 {
+        #[cfg(test)]
+        let observed_at = if self.fail_availability_clock {
+            Err(())
+        } else {
+            wall_time_ms()
+        };
+        #[cfg(not(test))]
+        let observed_at = wall_time_ms();
+
+        // Completion already owns an infallible wall/monotonic coordinate. A later wall failure or
+        // backward step cannot erase the completed response or make it available before receipt.
+        observed_at
+            .unwrap_or_else(|_| self.completed_at.wall_unix_ms())
+            .max(self.completed_at.wall_unix_ms())
+    }
+
     fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
     }
@@ -3110,6 +3137,7 @@ impl YahooHttpSession {
                         responses: responses.into(),
                         observed_targets: Vec::new(),
                         fail_next_post_send_clock: false,
+                        fail_next_availability_clock: false,
                     })),
                     _cookie_jar: cookie_jar,
                     crumb: None,
@@ -3133,5 +3161,13 @@ impl YahooHttpSession {
             return;
         };
         state.lock().await.fail_next_post_send_clock = true;
+    }
+
+    pub(crate) async fn fail_next_scripted_availability_clock(&self) {
+        let network = self.inner.network.lock().await;
+        let WireClient::Scripted(state) = &network.client else {
+            return;
+        };
+        state.lock().await.fail_next_availability_clock = true;
     }
 }
