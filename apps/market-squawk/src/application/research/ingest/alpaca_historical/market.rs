@@ -7,7 +7,8 @@
 use std::{fmt, sync::Arc, time::Instant};
 
 use market_squawk_adapter_alpaca::{
-    AlpacaError, AlpacaOptionChainPublicationRequest, AlpacaOptionChainSealRejoin,
+    AlpacaError, AlpacaIexDecoder, AlpacaMarketDecodeHandoff, AlpacaOptionChainPublicationRequest,
+    AlpacaOptionChainSealRejoin, AlpacaOptionsDecoder,
 };
 use market_squawk_data::{
     DatasetId, DatasetManifestRef, IngestError, IngestIdentity, IngestPrecommitAuthority,
@@ -17,15 +18,16 @@ use market_squawk_data::{
     provider_market_event_publication_digest, provider_option_market_publication_digest,
 };
 use market_squawk_domain::{
-    DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentId, SourceId, SourceIdentifier,
-    Timestamp,
+    DataQuality, DigestAlgorithm, EvidenceDigest, InstrumentDefinition, InstrumentId, SourceId,
+    SourceIdentifier, Timestamp,
 };
 use market_squawk_services::ServiceError;
 use market_squawk_sources::{
     OptionMarketBatchDisposition, OptionMarketBatchKind, OptionMarketCursorState,
     OptionMarketRequestFilter, ProviderCaptureError, ProviderCaptureSealRequest,
     ProviderNativeLineageImplementation, SealedProviderOptionMarketBinding,
-    SealedProviderPublicationBinding, SourceClass, SourceMetadata, SourceProtocolProfile,
+    SealedProviderPublicationBinding, SourceClass, SourceMetadata, SourceMetadataProvider,
+    SourceProtocolProfile, ValidatedRawMarketFrame,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -99,6 +101,48 @@ impl AlpacaMarketPublicationClosure {
             source_registered_at,
             surface,
         })
+    }
+
+    /// Runs the closed adapter decoder/preparer used by the production IEX publication lane.
+    ///
+    /// The application supplies only exact reference definitions and the publication clock. The
+    /// adapter consumes the validated provider response/stream frame and remains the sole creator
+    /// of the canonical/native prepared material.
+    pub(crate) fn decode_iex_for_publication(
+        &self,
+        decoder: &mut AlpacaIexDecoder,
+        frame: &ValidatedRawMarketFrame<'_>,
+        definitions: &[InstrumentDefinition],
+        ingested_at: Timestamp,
+    ) -> Result<AlpacaMarketDecodeHandoff, AlpacaMarketPublicationError> {
+        if self.surface != AlpacaPublicationSurface::IexLive
+            || decoder.metadata() != &self.source
+            || ingested_at < frame.frame().received_at()
+        {
+            return Err(AlpacaMarketPublicationError::FamilyMismatch);
+        }
+        decoder
+            .decode_for_publication(frame, definitions, ingested_at)
+            .map_err(Into::into)
+    }
+
+    /// Runs the closed adapter decoder/preparer used by the production indicative-option stream.
+    pub(crate) fn decode_indicative_options_for_publication(
+        &self,
+        decoder: &mut AlpacaOptionsDecoder,
+        frame: &ValidatedRawMarketFrame<'_>,
+        definitions: &[InstrumentDefinition],
+        ingested_at: Timestamp,
+    ) -> Result<AlpacaMarketDecodeHandoff, AlpacaMarketPublicationError> {
+        if self.surface != AlpacaPublicationSurface::IndicativeOptionsLive
+            || decoder.metadata() != &self.source
+            || ingested_at < frame.frame().received_at()
+        {
+            return Err(AlpacaMarketPublicationError::FamilyMismatch);
+        }
+        decoder
+            .decode_for_publication(frame, definitions, ingested_at)
+            .map_err(Into::into)
     }
 
     /// Atomically publishes one adapter-sealed IEX response or IEX/indicative stream microbatch.
@@ -811,6 +855,8 @@ pub(crate) enum AlpacaMarketPublicationError {
     PointInTimeInvalid,
     #[error(transparent)]
     Capture(#[from] ProviderCaptureError),
+    #[error(transparent)]
+    Decode(#[from] market_squawk_sources::DecodeInternalError),
     #[error(transparent)]
     Adapter(#[from] AlpacaError),
     #[error(transparent)]

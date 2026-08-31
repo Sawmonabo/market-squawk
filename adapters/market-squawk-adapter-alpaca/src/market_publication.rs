@@ -1,34 +1,38 @@
 //! Provider-local preparation for durable Alpaca current-market publications.
 //!
-//! Distinct closed native-lineage implementations keep free IEX evidence separate from modified,
-//! delayed indicative-option evidence. Canonical events, exact provider-native row semantics,
-//! batch semantics, and raw-frame/page ordinals stay joined until the adapter consumes them into
-//! the shared sealed publication contract.
+//! The only public producer consumes a validated frame through the stateful Alpaca decoder. Exact
+//! configured mappings, provider-normalized typed fields, reference-master price/quantity terms,
+//! canonical events, and native-lineage bytes therefore stay joined without accepting a
+//! caller-created [`MarketEvent`] or open JSON value.
+
+use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use market_squawk_domain::{
-    DataQuality, EvidenceDigest, LiveEventClass, LiveProvenance, MarketEvent, SourceIdentifier,
-    Timestamp,
+    AggressorSide, AssetClass, BookLevel, CanonicalStateDigest, CanonicalizationRule,
+    CoverageStatus, DataQuality, DecodedLiveProvenanceInput, DigestAlgorithm, EvidenceDigest,
+    HaltTransition, InstrumentDefinition, LiveEventClass, LiveEvidenceBinding, LiveProvenance,
+    MarketEvent, PayloadHash, PayloadReference, PriceTicks, QuantityLots, QuoteEvent, RuleVersion,
+    SourceIdentifier, Timestamp, TradeEvent, TradeTakerOrderType, TradingHaltEvent,
 };
 use market_squawk_sources::{
-    ProviderEventMicrobatchToken, ProviderMarketEventBatch, ProviderMarketEventNativeLineageBatch,
-    ProviderNativeLineageImplementation, ProviderWholeCaptureToken,
-    SealedProviderEventMicrobatchBinding, SealedProviderResponseMarketEventBinding, SourceMetadata,
+    DecoderEvidence, ProviderBookLevel, ProviderEventMicrobatchToken, ProviderMarketEventBatch,
+    ProviderMarketEventNativeLineageBatch, ProviderNativeLineageImplementation,
+    ProviderNormalizedObservation, ProviderObservationPayload, ProviderTimestampEvidence,
+    ProviderWholeCaptureToken, SealedProviderEventMicrobatchBinding,
+    SealedProviderResponseMarketEventBinding, SourceMetadata,
 };
 use serde::Serialize;
-use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
+use crate::AlpacaError;
 use crate::config::{
     ALPACA_PROVIDER, AlpacaProviderInstrumentCoordinate, IEX_VENUE, INDICATIVE_OPTIONS_VENUE,
-};
-use crate::{
-    AlpacaError, AlpacaIexLiveConfig, AlpacaInstrumentMapping, AlpacaOptionMapping,
-    AlpacaOptionsLiveConfig,
 };
 
 const IEX_DATASET_PREFIX: &str = "alpaca:iex-market-events:v1:";
 const INDICATIVE_OPTIONS_DATASET_PREFIX: &str = "alpaca:indicative-option-market-events:v1:";
+const CANONICALIZATION_RULE: &str = "alpaca-decoded-market-event-v1";
 
 /// Exact Alpaca current-data surface represented by one immutable publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -93,7 +97,16 @@ impl AlpacaMarketEventSurface {
         }
     }
 
-    fn admits(self, class: LiveEventClass) -> bool {
+    fn expected_asset_class(self, actual: AssetClass) -> bool {
+        match self {
+            Self::IexBootSnapshot | Self::IexStream => {
+                matches!(actual, AssetClass::Equity | AssetClass::Fund)
+            }
+            Self::IndicativeOptionsStream => actual == AssetClass::Option,
+        }
+    }
+
+    const fn admits(self, class: LiveEventClass) -> bool {
         match self {
             Self::IexBootSnapshot => matches!(class, LiveEventClass::Trade | LiveEventClass::Quote),
             Self::IexStream => matches!(
@@ -107,106 +120,11 @@ impl AlpacaMarketEventSurface {
     }
 }
 
-/// One exact canonical event, provider-native semantic projection, and raw-frame/page coordinate.
-#[derive(Clone, Debug)]
-pub(crate) struct AlpacaMarketEventRecord {
-    event: MarketEvent,
-    native_semantics: Value,
-    capture_ordinal: u16,
-    coordinate: AlpacaProviderInstrumentCoordinate,
-    surface: AlpacaMarketEventSurface,
-}
-
-impl AlpacaMarketEventRecord {
-    /// Binds one adapter-decoded IEX event to a mapping admitted by the exact live configuration.
-    pub(crate) fn try_iex(
-        config: &AlpacaIexLiveConfig,
-        surface: AlpacaMarketEventSurface,
-        mapping: &AlpacaInstrumentMapping,
-        event: MarketEvent,
-        native_semantics: Value,
-        capture_ordinal: u16,
-    ) -> Result<Self, AlpacaError> {
-        if !matches!(
-            surface,
-            AlpacaMarketEventSurface::IexBootSnapshot | AlpacaMarketEventSurface::IexStream
-        ) || !config
-            .mappings()
-            .iter()
-            .any(|candidate| candidate.provider_coordinate() == mapping.provider_coordinate())
-        {
-            return Err(AlpacaError::Protocol);
-        }
-        Self::try_new(
-            surface,
-            mapping.provider_coordinate(),
-            event,
-            native_semantics,
-            capture_ordinal,
-        )
-    }
-
-    /// Binds one adapter-decoded indicative option event to the exact configured mapping.
-    pub(crate) fn try_indicative_option(
-        config: &AlpacaOptionsLiveConfig,
-        mapping: &AlpacaOptionMapping,
-        event: MarketEvent,
-        native_semantics: Value,
-        capture_ordinal: u16,
-    ) -> Result<Self, AlpacaError> {
-        if !config
-            .mappings()
-            .iter()
-            .any(|candidate| candidate.provider_coordinate() == mapping.provider_coordinate())
-        {
-            return Err(AlpacaError::Protocol);
-        }
-        Self::try_new(
-            AlpacaMarketEventSurface::IndicativeOptionsStream,
-            mapping.provider_coordinate(),
-            event,
-            native_semantics,
-            capture_ordinal,
-        )
-    }
-
-    fn try_new(
-        surface: AlpacaMarketEventSurface,
-        coordinate: &AlpacaProviderInstrumentCoordinate,
-        event: MarketEvent,
-        native_semantics: Value,
-        capture_ordinal: u16,
-    ) -> Result<Self, AlpacaError> {
-        let provenance = event_provenance(&event);
-        let class = event_class(&event);
-        let effective_at = provenance
-            .source_timestamp()
-            .unwrap_or(provenance.received_at());
-        if !native_semantics.is_object()
-            || !surface.admits(class)
-            || coordinate.venue().as_str() != surface.venue()
-            || provenance.instrument_id() != Some(coordinate.instrument())
-            || provenance.venue_id() != Some(coordinate.venue())
-            || provenance.quality() != surface.quality()
-            || !provenance
-                .source_identifier()
-                .as_str()
-                .starts_with(surface.source_identifier_prefix())
-            || !coordinate.is_effective_at(effective_at)
-        {
-            return Err(AlpacaError::Protocol);
-        }
-        Ok(Self {
-            event,
-            native_semantics,
-            capture_ordinal,
-            coordinate: coordinate.clone(),
-            surface,
-        })
-    }
-}
-
-/// Complete provider-local current-event material for one closed shared implementation tag.
+/// Complete decoder-owned current-event material for one closed shared implementation tag.
+///
+/// There is deliberately no public constructor. [`crate::AlpacaIexDecoder`] and
+/// [`crate::AlpacaOptionsDecoder`] are the only producers, after parsing a validated raw frame and
+/// matching every typed observation to the exact configured mapping and instrument definition.
 #[derive(Debug)]
 pub struct AlpacaPreparedMarketEventPublication {
     surface: AlpacaMarketEventSurface,
@@ -214,83 +132,59 @@ pub struct AlpacaPreparedMarketEventPublication {
 }
 
 impl AlpacaPreparedMarketEventPublication {
-    /// Prepares an exact IEX snapshot or stream publication under the selected free-IEX profile.
-    pub(crate) fn try_iex(
-        config: &AlpacaIexLiveConfig,
-        surface: AlpacaMarketEventSurface,
-        records: Vec<AlpacaMarketEventRecord>,
-    ) -> Result<Self, AlpacaError> {
-        if !matches!(
-            surface,
-            AlpacaMarketEventSurface::IexBootSnapshot | AlpacaMarketEventSurface::IexStream
-        ) {
-            return Err(AlpacaError::Protocol);
-        }
-        Self::try_new(config.metadata(), surface, records)
-    }
-
-    /// Prepares a modified/delayed indicative-options stream publication without OPRA claims.
-    pub(crate) fn try_indicative_options(
-        config: &AlpacaOptionsLiveConfig,
-        records: Vec<AlpacaMarketEventRecord>,
-    ) -> Result<Self, AlpacaError> {
-        if records.iter().any(|record| {
-            !config
-                .mappings()
-                .iter()
-                .any(|mapping| mapping.provider_coordinate() == &record.coordinate)
-        }) {
-            return Err(AlpacaError::Protocol);
-        }
-        Self::try_new(
-            config.metadata(),
-            AlpacaMarketEventSurface::IndicativeOptionsStream,
-            records,
-        )
-    }
-
-    fn try_new(
+    pub(crate) fn try_from_decoded(
         metadata: &SourceMetadata,
         surface: AlpacaMarketEventSurface,
-        records: Vec<AlpacaMarketEventRecord>,
+        configured: &BTreeMap<String, std::sync::Arc<AlpacaProviderInstrumentCoordinate>>,
+        decoded: &market_squawk_sources::DecodedProviderBatch,
+        definitions: &[InstrumentDefinition],
+        ingested_at: Timestamp,
     ) -> Result<Self, AlpacaError> {
+        let evidence = decoded.evidence();
+        let live = metadata.coverage().live().ok_or(AlpacaError::Protocol)?;
         if metadata.provider().as_str() != ALPACA_PROVIDER
             || metadata.quality_ceiling() != surface.quality()
-            || records.is_empty()
-            || records.iter().any(|record| record.surface != surface)
+            || evidence.binding().source_id() != metadata.source_id()
+            || evidence.binding().metadata_revision() != metadata.revision()
+            || evidence.received_at() > ingested_at
+            || decoded.observations().is_empty()
         {
             return Err(AlpacaError::Protocol);
         }
-        let live = metadata.coverage().live().ok_or(AlpacaError::Protocol)?;
         let dataset = publication_dataset(metadata, surface)?;
         let mut events = Vec::new();
         let mut native_rows = Vec::new();
         let mut capture_ordinals = Vec::new();
         events
-            .try_reserve_exact(records.len())
+            .try_reserve_exact(decoded.observations().len())
             .map_err(|_| AlpacaError::Allocation)?;
         native_rows
-            .try_reserve_exact(records.len())
+            .try_reserve_exact(decoded.observations().len())
             .map_err(|_| AlpacaError::Allocation)?;
         capture_ordinals
-            .try_reserve_exact(records.len())
+            .try_reserve_exact(decoded.observations().len())
             .map_err(|_| AlpacaError::Allocation)?;
-        for (ordinal, record) in records.into_iter().enumerate() {
-            let provenance = event_provenance(&record.event);
-            let class = event_class(&record.event);
-            if provenance.source_id() != metadata.source_id()
-                || provenance.binding().metadata_revision() != metadata.revision()
-                || provenance.binding().provider_product() != live.provider_product()
-                || provenance.binding().provider_channel() != live.provider_channel()
-                || provenance.binding().event_class() != class
-                || live.rule_for(class, None).is_none()
-                || !metadata.is_effective_at(provenance.received_at())
-            {
-                return Err(AlpacaError::Protocol);
-            }
-            native_rows.push(encode_native_row(ordinal, &record)?);
-            capture_ordinals.push(record.capture_ordinal);
-            events.push(record.event);
+
+        for (ordinal, observation) in decoded.observations().iter().enumerate() {
+            let coordinate = exact_coordinate(configured, observation)?;
+            let definition = exact_definition(definitions, coordinate, observation, surface)?;
+            let event = canonical_event(
+                metadata,
+                live,
+                surface,
+                evidence,
+                observation,
+                definition,
+                ingested_at,
+            )?;
+            native_rows.push(encode_native_row(
+                ordinal,
+                surface,
+                coordinate,
+                observation,
+            )?);
+            capture_ordinals.push(0);
+            events.push(event);
         }
         let batch = ProviderMarketEventBatch::try_new(
             metadata.source_id().clone(),
@@ -329,7 +223,7 @@ impl AlpacaPreparedMarketEventPublication {
         })
     }
 
-    /// Returns the exact provider-local surface.
+    /// Returns the exact provider-local surface selected by the decoder state.
     pub const fn surface(&self) -> AlpacaMarketEventSurface {
         self.surface
     }
@@ -364,7 +258,7 @@ impl AlpacaPreparedMarketEventPublication {
         .map_err(|_| AlpacaError::CaptureMaterial)
     }
 
-    /// Consumes a sealed IEX or indicative-options frame batch into the common stream binding.
+    /// Consumes a sealed IEX or indicative-options frame into the common stream binding.
     pub fn try_into_event_microbatch_binding(
         self,
         authority: ProviderEventMicrobatchToken,
@@ -412,7 +306,7 @@ struct AlpacaMarketEventNativeV1<'a> {
     canonical_row_ordinal: u32,
     provider_event_id: &'a str,
     event_class: LiveEventClass,
-    source_timestamp: Option<Timestamp>,
+    source_timestamp: Timestamp,
     provider_identity_source: &'a str,
     provider_instrument_id: &'a str,
     provider_identity_revision: &'a str,
@@ -423,7 +317,7 @@ struct AlpacaMarketEventNativeV1<'a> {
     venue_symbol: &'a str,
     canonical_instrument_id: market_squawk_domain::InstrumentId,
     coordinate_digest: EvidenceDigest,
-    provider_semantics: &'a Value,
+    provider_semantics: AlpacaProviderSemanticsV1<'a>,
 }
 
 #[derive(Serialize)]
@@ -442,19 +336,310 @@ struct AlpacaMarketBatchNativeV1<'a> {
     event_count: usize,
 }
 
+#[derive(Serialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+enum AlpacaProviderSemanticsV1<'a> {
+    Trade {
+        trade_id: &'a str,
+        price: &'a str,
+        quantity: &'a str,
+        aggressor_side: AggressorSide,
+        provider_aggressor_code: Option<&'a str>,
+        aggressor_rule: &'a str,
+        taker_order_type: Option<TradeTakerOrderType>,
+    },
+    Quote {
+        bid: Option<AlpacaProviderBookLevelV1<'a>>,
+        ask: Option<AlpacaProviderBookLevelV1<'a>>,
+    },
+    TradingHalt {
+        status: &'a str,
+        status_rule: &'a str,
+        transition: HaltTransition,
+        reason: &'a str,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct AlpacaProviderBookLevelV1<'a> {
+    price: &'a str,
+    quantity: &'a str,
+}
+
+fn exact_coordinate<'a>(
+    configured: &'a BTreeMap<String, std::sync::Arc<AlpacaProviderInstrumentCoordinate>>,
+    observation: &ProviderNormalizedObservation,
+) -> Result<&'a AlpacaProviderInstrumentCoordinate, AlpacaError> {
+    let mut matches = configured
+        .values()
+        .filter(|coordinate| {
+            coordinate.instrument() == observation.instrument()
+                && coordinate.venue() == observation.venue()
+        })
+        .map(std::sync::Arc::as_ref);
+    let coordinate = matches.next().ok_or(AlpacaError::Protocol)?;
+    if matches.next().is_some() {
+        return Err(AlpacaError::Protocol);
+    }
+    Ok(coordinate)
+}
+
+fn exact_definition<'a>(
+    definitions: &'a [InstrumentDefinition],
+    coordinate: &AlpacaProviderInstrumentCoordinate,
+    observation: &ProviderNormalizedObservation,
+    surface: AlpacaMarketEventSurface,
+) -> Result<&'a InstrumentDefinition, AlpacaError> {
+    let mut matches = definitions
+        .iter()
+        .filter(|definition| definition.instrument_id() == coordinate.instrument());
+    let definition = matches.next().ok_or(AlpacaError::Protocol)?;
+    let provider_identity = definition.provider_identities().iter().find(|identity| {
+        identity.key() == *coordinate.identity_key()
+            && identity.metadata_revision() == coordinate.provider_identity_revision()
+            && identity.evidence().content_digest() == coordinate.provider_identity_digest()
+            && identity.validity() == coordinate.provider_identity_validity()
+    });
+    if matches.next().is_some()
+        || !surface.expected_asset_class(definition.asset_class())
+        || observation.instrument() != definition.instrument_id()
+        || !definition.venue_mappings().iter().any(|mapping| {
+            mapping.venue_id() == coordinate.venue()
+                && mapping.venue_symbol() == coordinate.venue_symbol()
+        })
+        || provider_identity.is_none()
+    {
+        return Err(AlpacaError::Protocol);
+    }
+    Ok(definition)
+}
+
+fn canonical_event(
+    metadata: &SourceMetadata,
+    live: &market_squawk_sources::LiveCoverageDeclaration,
+    surface: AlpacaMarketEventSurface,
+    evidence: &DecoderEvidence,
+    observation: &ProviderNormalizedObservation,
+    definition: &InstrumentDefinition,
+    ingested_at: Timestamp,
+) -> Result<MarketEvent, AlpacaError> {
+    let source_timestamp = observation_timestamp(observation)?;
+    if !surface.admits(observation.event_class())
+        || observation.venue().as_str() != surface.venue()
+        || !observation
+            .source_identifier()
+            .as_str()
+            .starts_with(surface.source_identifier_prefix())
+        || !metadata.is_effective_at(evidence.received_at())
+        || !metadata
+            .authorization()
+            .is_effective_at(evidence.received_at())
+    {
+        return Err(AlpacaError::Protocol);
+    }
+    let payload = AlpacaCanonicalPayload::try_from_observation(observation, definition)?;
+    let canonical_state_digest = payload.canonical_digest()?;
+    let binding = LiveEvidenceBinding::new(
+        metadata.source_id().clone(),
+        evidence
+            .binding()
+            .session_id()
+            .as_source_identifier()
+            .clone(),
+        metadata.revision().clone(),
+        metadata.authorization().basis().clone(),
+        observation.venue().clone(),
+        observation.instrument(),
+        evidence.binding().connection_generation(),
+        live.provider_product().clone(),
+        live.provider_channel().clone(),
+        observation.event_class(),
+        observation.source_identifier().clone(),
+        evidence.payload_digest(),
+        canonical_state_digest,
+        None,
+    )
+    .map_err(|_| AlpacaError::Protocol)?;
+    let provenance = LiveProvenance::decoded(DecodedLiveProvenanceInput::new(
+        binding,
+        Some(source_timestamp),
+        evidence.received_at(),
+        evidence.received_at(),
+        ingested_at,
+        surface.quality(),
+        CoverageStatus::Insufficient,
+        PayloadReference::ContentHash(PayloadHash::new(
+            evidence.payload_digest().algorithm(),
+            evidence.payload_digest().bytes(),
+        )),
+    ))
+    .map_err(|_| AlpacaError::Protocol)?;
+    payload.into_event(provenance)
+}
+
+enum AlpacaCanonicalPayload {
+    Trade {
+        price: PriceTicks,
+        quantity: QuantityLots,
+        aggressor: AggressorSide,
+        taker_order_type: Option<TradeTakerOrderType>,
+    },
+    Quote {
+        bid: Option<BookLevel>,
+        ask: Option<BookLevel>,
+    },
+    TradingHalt {
+        transition: HaltTransition,
+        reason: SourceIdentifier,
+    },
+}
+
+impl AlpacaCanonicalPayload {
+    fn try_from_observation(
+        observation: &ProviderNormalizedObservation,
+        definition: &InstrumentDefinition,
+    ) -> Result<Self, AlpacaError> {
+        match observation.payload() {
+            ProviderObservationPayload::Trade {
+                price,
+                quantity,
+                aggressor,
+                taker_order_type,
+                ..
+            } => Ok(Self::Trade {
+                price: PriceTicks::try_from_decimal(
+                    price.value().decimal(),
+                    definition.tick_size(),
+                )
+                .map_err(|_| AlpacaError::Protocol)?,
+                quantity: QuantityLots::try_from_decimal(
+                    quantity.value().decimal(),
+                    definition.lot_size(),
+                )
+                .map_err(|_| AlpacaError::Protocol)?,
+                aggressor: aggressor.side(),
+                taker_order_type: *taker_order_type,
+            }),
+            ProviderObservationPayload::Quote { bid, ask } => Ok(Self::Quote {
+                bid: bid
+                    .as_ref()
+                    .map(|level| canonical_level(level, definition))
+                    .transpose()?,
+                ask: ask
+                    .as_ref()
+                    .map(|level| canonical_level(level, definition))
+                    .transpose()?,
+            }),
+            ProviderObservationPayload::TradingHalt {
+                transition, reason, ..
+            } => Ok(Self::TradingHalt {
+                transition: *transition,
+                reason: reason.clone(),
+            }),
+            ProviderObservationPayload::BookSnapshot(_)
+            | ProviderObservationPayload::BookDelta(_)
+            | ProviderObservationPayload::Auction { .. }
+            | ProviderObservationPayload::InstrumentStatus { .. }
+            | ProviderObservationPayload::CorporateAction { .. } => Err(AlpacaError::Protocol),
+        }
+    }
+
+    fn canonical_digest(&self) -> Result<CanonicalStateDigest, AlpacaError> {
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/alpaca-decoded-market-event/v1\0");
+        match self {
+            Self::Trade {
+                price,
+                quantity,
+                aggressor,
+                taker_order_type,
+            } => {
+                digest.update([1]);
+                digest.update(price.get().to_be_bytes());
+                digest.update(quantity.get().to_be_bytes());
+                digest.update([match aggressor {
+                    AggressorSide::Buy => 1,
+                    AggressorSide::Sell => 2,
+                    AggressorSide::Unknown => 3,
+                }]);
+                digest.update([match taker_order_type {
+                    None => 0,
+                    Some(TradeTakerOrderType::Limit) => 1,
+                    Some(TradeTakerOrderType::Market) => 2,
+                }]);
+            }
+            Self::Quote { bid, ask } => {
+                digest.update([2]);
+                hash_level(&mut digest, *bid);
+                hash_level(&mut digest, *ask);
+            }
+            Self::TradingHalt { transition, reason } => {
+                digest.update([3]);
+                digest.update([match transition {
+                    HaltTransition::Halted => 1,
+                    HaltTransition::Resumed => 2,
+                }]);
+                hash_text(&mut digest, reason.as_str())?;
+            }
+        }
+        Ok(CanonicalStateDigest::new(
+            EvidenceDigest::new(DigestAlgorithm::Sha256, digest.finalize().into()),
+            CanonicalizationRule::new(
+                SourceIdentifier::try_from(CANONICALIZATION_RULE)?,
+                RuleVersion::new(1).map_err(|_| AlpacaError::Protocol)?,
+            ),
+        ))
+    }
+
+    fn into_event(self, provenance: LiveProvenance) -> Result<MarketEvent, AlpacaError> {
+        match self {
+            Self::Trade {
+                price,
+                quantity,
+                aggressor,
+                taker_order_type,
+            } => TradeEvent::new(provenance, price, quantity, aggressor, taker_order_type)
+                .map(MarketEvent::Trade)
+                .map_err(|_| AlpacaError::Protocol),
+            Self::Quote { bid, ask } => QuoteEvent::new(provenance, bid, ask)
+                .map(MarketEvent::Quote)
+                .map_err(|_| AlpacaError::Protocol),
+            Self::TradingHalt { transition, reason } => {
+                TradingHaltEvent::new(provenance, transition, reason)
+                    .map(MarketEvent::TradingHalt)
+                    .map_err(|_| AlpacaError::Protocol)
+            }
+        }
+    }
+}
+
+fn canonical_level(
+    level: &ProviderBookLevel,
+    definition: &InstrumentDefinition,
+) -> Result<BookLevel, AlpacaError> {
+    let price =
+        PriceTicks::try_from_decimal(level.price().value().decimal(), definition.tick_size())
+            .map_err(|_| AlpacaError::Protocol)?;
+    let quantity =
+        QuantityLots::try_from_decimal(level.quantity().value().decimal(), definition.lot_size())
+            .map_err(|_| AlpacaError::Protocol)?;
+    BookLevel::new(price, quantity).map_err(|_| AlpacaError::Protocol)
+}
+
 fn encode_native_row(
     ordinal: usize,
-    record: &AlpacaMarketEventRecord,
+    surface: AlpacaMarketEventSurface,
+    coordinate: &AlpacaProviderInstrumentCoordinate,
+    observation: &ProviderNormalizedObservation,
 ) -> Result<Bytes, AlpacaError> {
-    let provenance = event_provenance(&record.event);
-    let coordinate = &record.coordinate;
     serde_json::to_vec(&AlpacaMarketEventNativeV1 {
         version: 1,
-        surface: record.surface.name(),
+        surface: surface.name(),
         canonical_row_ordinal: u32::try_from(ordinal).map_err(|_| AlpacaError::Protocol)?,
-        provider_event_id: provenance.source_identifier().as_str(),
-        event_class: event_class(&record.event),
-        source_timestamp: provenance.source_timestamp(),
+        provider_event_id: observation.source_identifier().as_str(),
+        event_class: observation.event_class(),
+        source_timestamp: observation_timestamp(observation)?,
         provider_identity_source: coordinate.identity_key().source_id().as_str(),
         provider_instrument_id: coordinate.identity_key().provider_instrument_id().as_str(),
         provider_identity_revision: coordinate
@@ -468,10 +653,67 @@ fn encode_native_row(
         venue_symbol: coordinate.venue_symbol().as_str(),
         canonical_instrument_id: coordinate.instrument(),
         coordinate_digest: coordinate.binding_digest(),
-        provider_semantics: &record.native_semantics,
+        provider_semantics: native_semantics(observation)?,
     })
     .map(Bytes::from)
     .map_err(|_| AlpacaError::Serialization)
+}
+
+fn native_semantics(
+    observation: &ProviderNormalizedObservation,
+) -> Result<AlpacaProviderSemanticsV1<'_>, AlpacaError> {
+    match observation.payload() {
+        ProviderObservationPayload::Trade {
+            trade_id,
+            price,
+            quantity,
+            aggressor,
+            taker_order_type,
+        } => Ok(AlpacaProviderSemanticsV1::Trade {
+            trade_id: trade_id.as_str(),
+            price: price.value().as_str(),
+            quantity: quantity.value().as_str(),
+            aggressor_side: aggressor.side(),
+            provider_aggressor_code: aggressor.provider_code().map(SourceIdentifier::as_str),
+            aggressor_rule: aggressor.rule().provider_rule().as_str(),
+            taker_order_type: *taker_order_type,
+        }),
+        ProviderObservationPayload::Quote { bid, ask } => Ok(AlpacaProviderSemanticsV1::Quote {
+            bid: bid.as_ref().map(native_level),
+            ask: ask.as_ref().map(native_level),
+        }),
+        ProviderObservationPayload::TradingHalt {
+            status,
+            transition,
+            reason,
+        } => Ok(AlpacaProviderSemanticsV1::TradingHalt {
+            status: status.status().as_str(),
+            status_rule: status.rule().provider_rule().as_str(),
+            transition: *transition,
+            reason: reason.as_str(),
+        }),
+        ProviderObservationPayload::BookSnapshot(_)
+        | ProviderObservationPayload::BookDelta(_)
+        | ProviderObservationPayload::Auction { .. }
+        | ProviderObservationPayload::InstrumentStatus { .. }
+        | ProviderObservationPayload::CorporateAction { .. } => Err(AlpacaError::Protocol),
+    }
+}
+
+fn native_level(level: &ProviderBookLevel) -> AlpacaProviderBookLevelV1<'_> {
+    AlpacaProviderBookLevelV1 {
+        price: level.price().value().as_str(),
+        quantity: level.quantity().value().as_str(),
+    }
+}
+
+fn observation_timestamp(
+    observation: &ProviderNormalizedObservation,
+) -> Result<Timestamp, AlpacaError> {
+    match observation.timestamp() {
+        ProviderTimestampEvidence::Provided { value, .. } => Ok(*value),
+        ProviderTimestampEvidence::AuthoritativelyAbsent(_) => Err(AlpacaError::Protocol),
+    }
 }
 
 fn publication_dataset(
@@ -495,6 +737,17 @@ fn publication_dataset(
     .map_err(Into::into)
 }
 
+fn hash_level(digest: &mut Sha256, level: Option<BookLevel>) {
+    match level {
+        Some(level) => {
+            digest.update([1]);
+            digest.update(level.price().get().to_be_bytes());
+            digest.update(level.quantity().get().to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
+}
+
 fn hash_text(digest: &mut Sha256, value: &str) -> Result<(), AlpacaError> {
     digest.update(
         u32::try_from(value.len())
@@ -513,30 +766,4 @@ fn lower_hex(bytes: [u8; 32]) -> String {
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
-}
-
-fn event_provenance(event: &MarketEvent) -> &LiveProvenance {
-    match event {
-        MarketEvent::Trade(event) => event.provenance(),
-        MarketEvent::Quote(event) => event.provenance(),
-        MarketEvent::BookSnapshot(event) => event.provenance(),
-        MarketEvent::BookDelta(event) => event.provenance(),
-        MarketEvent::Auction(event) => event.provenance(),
-        MarketEvent::TradingHalt(event) => event.provenance(),
-        MarketEvent::InstrumentStatus(event) => event.provenance(),
-        MarketEvent::CorporateAction(event) => event.provenance(),
-    }
-}
-
-const fn event_class(event: &MarketEvent) -> LiveEventClass {
-    match event {
-        MarketEvent::Trade(_) => LiveEventClass::Trade,
-        MarketEvent::Quote(_) => LiveEventClass::Quote,
-        MarketEvent::BookSnapshot(_) => LiveEventClass::BookSnapshot,
-        MarketEvent::BookDelta(_) => LiveEventClass::BookDelta,
-        MarketEvent::Auction(_) => LiveEventClass::Auction,
-        MarketEvent::TradingHalt(_) => LiveEventClass::TradingHalt,
-        MarketEvent::InstrumentStatus(_) => LiveEventClass::InstrumentStatus,
-        MarketEvent::CorporateAction(_) => LiveEventClass::CorporateAction,
-    }
 }

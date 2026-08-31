@@ -31,7 +31,7 @@ pub use config::{
     AlpacaTransportLimits,
 };
 pub use credentials::AlpacaCredentials;
-pub use decoder::{AlpacaIexDecoder, AlpacaOptionsDecoder};
+pub use decoder::{AlpacaIexDecoder, AlpacaMarketDecodeHandoff, AlpacaOptionsDecoder};
 pub use doctor::{
     ALPACA_PAPER_IEX_DOCTOR_BATCH_SYMBOL_COUNT, AlpacaDoctorBatchObservation,
     AlpacaDoctorCalendarObservation, AlpacaDoctorHistoricalObservation, AlpacaDoctorHttpEvidence,

@@ -1,20 +1,26 @@
 use std::error::Error;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use market_squawk_domain::{
     AssetClass, AuthorizationBasis, BarTimeSemantics, BarTimestampBasis, CoverageDelay, Currency,
-    DataQuality, DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence,
-    InstrumentId, MarketBarSessionEvidence, MarketBarSessionKind, MetadataRevision,
-    ProviderIdentityEvidence, ProviderIdentityRecord, ProviderIdentityRecordInput,
-    ProviderInstrumentId, RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, Timestamp,
-    VenueId, VenueMapping, VenueSymbol,
+    DataQuality, Denomination, DigestAlgorithm, EffectiveInterval, EvidenceDigest,
+    ExactPayloadEvidence, InstrumentDefinition, InstrumentDefinitionInput,
+    InstrumentDefinitionRevision, InstrumentId, LotSize, MarketBarSessionEvidence,
+    MarketBarSessionKind, MetadataRevision, ProviderIdentityEvidence, ProviderIdentityRecord,
+    ProviderIdentityRecordInput, ProviderInstrumentId, RevisionBoundPayloadEvidence, SourceId,
+    SourceIdentifier, TickSize, Timestamp, TradingStatus, VenueId, VenueMapping, VenueSymbol,
 };
 use market_squawk_sources::{
-    AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, FreshnessPolicy,
-    HistoricalCapability, HttpRequestBounds, ProviderBudgetPolicy,
+    AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
+    AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy, BudgetScope,
+    DecodeOutcome, FreshnessPolicy, HistoricalCapability, HttpRequestBounds, ProviderBudgetPolicy,
+    SessionId, TransportFrameKind,
 };
+use rust_decimal::Decimal;
 
 use crate::config::ALPACA_PROVIDER;
 use crate::{
@@ -23,8 +29,9 @@ use crate::{
     AlpacaHistoricalBarTimeAuthority, AlpacaHistoricalBarTimeRequest, AlpacaHistoricalEquityConfig,
     AlpacaHistoricalEquityDatasetPlan, AlpacaHistoricalEquityPreflightPlan,
     AlpacaHistoricalLookback, AlpacaHistoricalSeriesSemantics, AlpacaIexDecoder,
-    AlpacaIexLiveConfig, AlpacaInstrumentMapping, AlpacaOptionChainConfig, AlpacaOptionMapping,
-    AlpacaOptionsDecoder, AlpacaOptionsLiveConfig, AlpacaTimeframe, AlpacaTransportLimits,
+    AlpacaIexLiveConfig, AlpacaInstrumentMapping, AlpacaMarketEventSurface,
+    AlpacaOptionChainConfig, AlpacaOptionMapping, AlpacaOptionsDecoder, AlpacaOptionsLiveConfig,
+    AlpacaTimeframe, AlpacaTransportLimits,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -127,7 +134,45 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
     assert_eq!(subscription["trades"][0], "AAPL");
     assert_eq!(subscription["quotes"][0], "AAPL");
     assert_eq!(subscription["statuses"][0], "AAPL");
-    let _decoder = AlpacaIexDecoder::try_new(&iex)?;
+    let mut decoder = AlpacaIexDecoder::try_new(&iex)?;
+    let definition = instrument_definition(
+        instrument(1)?,
+        AssetClass::Equity,
+        mapping_identity.clone(),
+        venue_mapping("iex", "AAPL")?,
+    )?;
+    let mut registry =
+        AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
+            Arc::new(TestAuthorizationSubjectResolver {
+                subject: identifier("alpaca-account-record-test")?,
+            }),
+        )?;
+    let registered = registry.register(iex.metadata().clone(), Timestamp::from_unix_nanos(1))?;
+    let session = registry.begin_session(
+        &registered,
+        SessionId::new(identifier("alpaca-iex-publication-session")?),
+        market_squawk_domain::ConnectionGeneration::new(1)?,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let mut frames = registry.take_raw_frame_factory(&session)?;
+    let frame = frames.try_frame(
+        TransportFrameKind::Text,
+        Bytes::from_static(
+            br#"{"AAPL":{"latestQuote":{"bx":"V","bp":100.00,"bs":1,"ax":"V","ap":100.01,"as":2,"t":"2026-08-31T14:30:00Z"}}}"#,
+        ),
+    )?;
+    let ingested_at = frame.received_at();
+    let validated = session.validate_live_frame(&frame)?;
+    let (live, publication) = decoder
+        .decode_for_publication(&validated, &[definition], ingested_at)?
+        .into_parts();
+    assert!(matches!(live, DecodeOutcome::Data(batch) if batch.observations().len() == 1));
+    assert_eq!(
+        publication
+            .as_ref()
+            .map(|publication| publication.surface()),
+        Some(AlpacaMarketEventSurface::IexBootSnapshot)
+    );
 
     let mut excessive = Vec::new();
     for index in 1..=ALPACA_BASIC_EQUITY_SYMBOL_LIMIT + 1 {
@@ -224,15 +269,13 @@ fn alpaca_basic_surfaces_keep_limits_protocols_and_quality_separate() -> TestRes
             .as_str(),
         "rest-complete-chain-snapshots"
     );
-    assert!(
-        option_chain
-            .metadata()
-            .network_policy()
-            .authorize(
-                "https://data.alpaca.markets/v1beta1/options/snapshots/AAPL?limit=1000&feed=indicative"
-            )
-            .is_ok()
-    );
+    assert!(option_chain
+        .metadata()
+        .network_policy()
+        .authorize(
+            "https://data.alpaca.markets/v1beta1/options/snapshots/AAPL?limit=1000&feed=indicative"
+        )
+        .is_ok());
     assert!(
         option_chain
             .metadata()
@@ -439,6 +482,24 @@ struct DeterministicBarTimeAuthority {
     semantics: BarTimeSemantics,
 }
 
+#[derive(Debug)]
+struct TestAuthorizationSubjectResolver {
+    subject: SourceIdentifier,
+}
+
+impl AuthorizationSubjectResolver for TestAuthorizationSubjectResolver {
+    fn resolve_subject_record(
+        &self,
+        mode: AuthorizationMode,
+        _evidence: EvidenceDigest,
+    ) -> Result<SourceIdentifier, AuthorizationSubjectResolutionError> {
+        if mode != AuthorizationMode::UserAuthorized {
+            return Err(AuthorizationSubjectResolutionError::UnsupportedMode);
+        }
+        Ok(self.subject.clone())
+    }
+}
+
 impl AlpacaHistoricalBarTimeAuthority for DeterministicBarTimeAuthority {
     fn validate_current(&self) -> Result<(), crate::AlpacaError> {
         Ok(())
@@ -482,6 +543,29 @@ fn provider_identity(
         validity: EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
         supersedes: None,
     }))
+}
+
+fn instrument_definition(
+    instrument_id: InstrumentId,
+    asset_class: AssetClass,
+    provider_identity: ProviderIdentityRecord,
+    venue_mapping: VenueMapping,
+) -> TestResult<InstrumentDefinition> {
+    let usd = Currency::try_from("USD")?;
+    Ok(InstrumentDefinition::try_new(InstrumentDefinitionInput {
+        instrument_id,
+        definition_revision: InstrumentDefinitionRevision::try_from(1_u64)?,
+        asset_class,
+        primary_denomination: Denomination::Currency(usd),
+        quote_currency: usd,
+        tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
+        lot_size: LotSize::try_from_decimal(Decimal::ONE)?,
+        contract_multiplier: Decimal::ONE,
+        venue_mappings: vec![venue_mapping],
+        provider_identities: vec![provider_identity],
+        identifiers: Vec::new(),
+        trading_status: TradingStatus::Active,
+    })?)
 }
 
 fn venue_mapping(venue: &str, symbol: &str) -> TestResult<VenueMapping> {

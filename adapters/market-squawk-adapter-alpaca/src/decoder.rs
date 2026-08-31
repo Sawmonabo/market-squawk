@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use chrono::DateTime;
 use market_squawk_domain::{
-    AggressorSide, HaltTransition, IntegrityRule, SourceIdentifier, Timestamp, VenueId,
+    AggressorSide, HaltTransition, InstrumentDefinition, IntegrityRule, SourceIdentifier,
+    Timestamp, VenueId,
 };
 use market_squawk_sources::{
     ControlFrameKind, DecodeInternalError, DecodeOutcome, DecodedControlFrame, DecodedIgnoredFrame,
@@ -23,6 +24,7 @@ use crate::config::{
     ALPACA_BASIC_EQUITY_SYMBOL_LIMIT, AlpacaProviderInstrumentCoordinate, IEX_VENUE,
     INDICATIVE_OPTIONS_VENUE,
 };
+use crate::market_publication::{AlpacaMarketEventSurface, AlpacaPreparedMarketEventPublication};
 use crate::{AlpacaError, AlpacaIexLiveConfig, AlpacaOptionsLiveConfig};
 
 const MAX_MESSAGES_PER_FRAME: usize = market_squawk_sources::MAX_DECODED_EVENTS;
@@ -52,6 +54,31 @@ impl AlpacaIexDecoder {
             DecoderSurface::Iex,
             config.transport_limits().max_frame_bytes(),
         )?))
+    }
+
+    /// Decodes one validated IEX response/stream frame and, for data frames, prepares the exact
+    /// durable canonical/native publication without accepting caller-created events or JSON.
+    ///
+    /// The generic live outcome is returned beside the optional one-use publication so central
+    /// live processing and immutable publication consume the same decoder decision.
+    pub fn decode_for_publication(
+        &mut self,
+        frame: &ValidatedRawMarketFrame<'_>,
+        definitions: &[InstrumentDefinition],
+        ingested_at: Timestamp,
+    ) -> Result<AlpacaMarketDecodeHandoff, DecodeInternalError> {
+        let surface = if self.0.state == SessionState::AwaitingBootSnapshot {
+            AlpacaMarketEventSurface::IexBootSnapshot
+        } else {
+            AlpacaMarketEventSurface::IexStream
+        };
+        self.0.decode_for_publication(
+            frame,
+            TransportFrameKind::Text,
+            surface,
+            definitions,
+            ingested_at,
+        )
     }
 }
 
@@ -95,6 +122,37 @@ impl AlpacaOptionsDecoder {
             DecoderSurface::IndicativeOptions,
             config.transport_limits().max_frame_bytes(),
         )?))
+    }
+
+    /// Decodes one validated indicative-options frame and, for data frames, prepares the exact
+    /// delayed/indicative durable publication without accepting caller-created events or JSON.
+    pub fn decode_for_publication(
+        &mut self,
+        frame: &ValidatedRawMarketFrame<'_>,
+        definitions: &[InstrumentDefinition],
+        ingested_at: Timestamp,
+    ) -> Result<AlpacaMarketDecodeHandoff, DecodeInternalError> {
+        self.0.decode_for_publication(
+            frame,
+            TransportFrameKind::Binary,
+            AlpacaMarketEventSurface::IndicativeOptionsStream,
+            definitions,
+            ingested_at,
+        )
+    }
+}
+
+/// One-use result of a single stateful Alpaca decode at the publication boundary.
+#[derive(Debug)]
+pub struct AlpacaMarketDecodeHandoff {
+    live: DecodeOutcome,
+    publication: Option<AlpacaPreparedMarketEventPublication>,
+}
+
+impl AlpacaMarketDecodeHandoff {
+    /// Consumes the handoff into the generic live result and optional exact prepared publication.
+    pub fn into_parts(self) -> (DecodeOutcome, Option<AlpacaPreparedMarketEventPublication>) {
+        (self.live, self.publication)
     }
 }
 
@@ -302,6 +360,35 @@ impl AlpacaDecoder {
             ));
         }
         self.decode_data(messages, evidence)
+    }
+
+    fn decode_for_publication(
+        &mut self,
+        frame: &ValidatedRawMarketFrame<'_>,
+        expected_transport: TransportFrameKind,
+        surface: AlpacaMarketEventSurface,
+        definitions: &[InstrumentDefinition],
+        ingested_at: Timestamp,
+    ) -> Result<AlpacaMarketDecodeHandoff, DecodeInternalError> {
+        let live = self.decode(frame, expected_transport)?;
+        let publication = match &live {
+            DecodeOutcome::Data(batch) => Some(
+                AlpacaPreparedMarketEventPublication::try_from_decoded(
+                    &self.metadata,
+                    surface,
+                    &self.instruments,
+                    batch,
+                    definitions,
+                    ingested_at,
+                )
+                .map_err(|_| DecodeInternalError::InvariantViolation)?,
+            ),
+            DecodeOutcome::Control(_)
+            | DecodeOutcome::Ignored(_)
+            | DecodeOutcome::Resynchronize(_)
+            | DecodeOutcome::Quarantine(_) => None,
+        };
+        Ok(AlpacaMarketDecodeHandoff { live, publication })
     }
 
     fn decode_boot_snapshot(
