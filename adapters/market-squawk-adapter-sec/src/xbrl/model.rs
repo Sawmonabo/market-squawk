@@ -2172,9 +2172,17 @@ impl ParsedXbrlDocument {
 
 #[cfg(test)]
 mod tests {
+    use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+
+    use bytes::Bytes;
     use cap_std::{ambient_authority, fs::Dir};
+    use market_squawk_domain::{EffectiveInterval, ExactPayloadEvidence};
+    use market_squawk_platform::LocalPaths;
     use market_squawk_sources::{
+        DiscoveryRequest, ExtractionBatch, ExtractionRecord, ExtractionRequest,
         ProviderCapturePageReceipt, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
+        ProviderNativeLineageBatchBuilder, ProviderNativeLineageImplementation,
+        SealedProviderCaptureBinding, SourceObject, SourceObjectCaptureIdentity,
     };
 
     use super::*;
@@ -2454,8 +2462,72 @@ mod tests {
             Dir::open_ambient_dir(&representations_path, ambient_authority())?,
             crate::SecRepresentationLimits::production_defaults(),
         )?);
+        let root_material = unauthorized_root
+            .capture_material()?
+            .ok_or(crate::SecClientError::InvalidCaptureMaterial)?;
+        let root_capture_identity =
+            SourceObjectCaptureIdentity::try_from_capture(root_material.receipt())?;
+        let root_discovery = DiscoveryRequest::try_new(
+            SourceIdentifier::try_from(root_locator.as_str())?,
+            None,
+            NonZeroU16::MIN,
+            Timestamp::from_unix_nanos(1_000),
+        )?;
+        let root_object = SourceObject::try_new_with_capture_identity(
+            sec_source.clone(),
+            sec_revision.clone(),
+            &root_discovery,
+            SourceIdentifier::try_from(root_locator.as_str())?,
+            SourceIdentifier::try_from("application/xhtml+xml")?,
+            ExactPayloadEvidence::from_content_digest(unauthorized_root.evidence()),
+            root_capture_identity,
+            EffectiveInterval::new(observed_at, None)?,
+            None,
+            market_squawk_sources::AvailabilityEvidence::LocalFirstObserved { observed_at },
+            Some(u64::try_from(unauthorized_root.bytes().len())?),
+        )?;
+        let root_request = ExtractionRequest::try_new(
+            root_object,
+            NonZeroU32::MIN,
+            NonZeroU64::new(1_000_000).ok_or("root byte bound")?,
+            Timestamp::from_unix_nanos(1_000),
+        )?;
+        let root_payload = Bytes::copy_from_slice(unauthorized_root.bytes());
+        let root_batch = ExtractionBatch::try_new(
+            &root_request,
+            vec![ExtractionRecord::try_new(
+                &root_request,
+                SourceIdentifier::try_from("sec-filing-root-v1")?,
+                ExactPayloadEvidence::from_content_digest(unauthorized_root.evidence()),
+                observed_at,
+                None,
+                market_squawk_sources::AvailabilityEvidence::LocalFirstObserved { observed_at },
+                SourceIdentifier::try_from("root-r1")?,
+                None,
+                root_payload,
+            )?],
+        )?;
+        let mut native = ProviderNativeLineageBatchBuilder::try_new(
+            ProviderNativeLineageImplementation::SecEdgarV1,
+            &root_batch,
+        )?;
+        native.try_push(&serde_json::json!({"kind": "sec-filing-root-v1"}))?;
+        let root_native_lineage = native.finish()?;
+        let paths = LocalPaths::prepare(temporary.path().join("sealed-root"))?;
+        let sealed_store = paths.sealed_research_journal_store()?;
+        let (root_expectation, root_seal_request) = root_material.into_whole_seal_parts();
+        let root_token = root_expectation
+            .try_rejoin(root_seal_request.seal(&sealed_store)?)?
+            .try_into_whole()?;
+        let sealed_root = SealedProviderCaptureBinding::try_whole(
+            root_token,
+            root_batch,
+            root_native_lineage,
+            vec![0],
+        )?;
         assert!(matches!(
-            crate::extraction::admit_filing_xbrl_root(
+            crate::extraction::admit_filing_xbrl_root_from_sealed_binding(
+                sealed_root,
                 Arc::clone(&store),
                 empty_registry,
                 sec_source.clone(),

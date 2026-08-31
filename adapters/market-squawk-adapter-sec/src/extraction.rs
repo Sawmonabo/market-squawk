@@ -21,9 +21,10 @@ use market_squawk_sources::{
     ExtractionRecord, ExtractionRequest, ExtractionRevisionEvidence, ExtractionRevisionPlan,
     ExtractionSource, ExtractionSourceError, MAX_EXTRACTION_RECORD_BYTES,
     MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES, ObservedProviderOrder, ProviderCaptureMaterial,
-    ProviderCaptureTerminalDisposition, ProviderNativeLineageBatch,
-    ProviderNativeLineageBatchBuilder, ProviderNativeLineageImplementation, SourceError,
-    SourceMetadataProvider, SourceObject, SourceObjectCaptureIdentity,
+    ProviderCaptureScope, ProviderCaptureTerminalDisposition, ProviderNativeLineageBatch,
+    ProviderNativeLineageBatchBuilder, ProviderNativeLineageImplementation,
+    SealedProviderCaptureBinding, SourceError, SourceMetadataProvider, SourceObject,
+    SourceObjectCaptureIdentity,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -82,6 +83,7 @@ struct DiscoveredSecMaterial {
 /// Non-serializable authority proving one filing root belongs to the requested captured
 /// submissions/accession and exactly matches this source's retained representation and raw bytes.
 pub(crate) struct AdmittedFilingXbrlRoot {
+    sealed_root: SealedProviderCaptureBinding,
     filing: SecFilingXbrlCoordinates,
     filing_document: RetrievedSecBytes,
     filing_representation: SecRepresentation,
@@ -317,34 +319,6 @@ impl SecExtractionResult {
 }
 
 impl SecEdgarSource {
-    /// Closes already captured filing evidence into an opaque, one-use XBRL extraction graph.
-    ///
-    /// Network acquisition remains separately bounded by the source client. This transition does
-    /// no network work: it reopens exact retained bytes, validates the accession/document relation,
-    /// admits the code-owned taxonomy set, and binds every response into one ordered graph.
-    pub fn prepare_filing_xbrl_capture(
-        &self,
-        submissions: RetrievedSubmissions,
-        accession: &str,
-        filing_document: RetrievedSecBytes,
-        taxonomy_artifacts: Vec<RetrievedSecBytes>,
-        cancellation: &CancellationToken,
-    ) -> Result<SecFilingXbrlCaptureHandoff, SecClientError> {
-        prepare_filing_xbrl_capture_from_state(
-            self.raw_store(),
-            self.representation_registry(),
-            self.identity_registry(),
-            self.metadata().source_id().clone(),
-            self.metadata().revision().clone(),
-            self.parser_limits(),
-            submissions,
-            accession,
-            filing_document,
-            taxonomy_artifacts,
-            cancellation,
-        )
-    }
-
     /// Discovers one SEC source object together with every exact HTTP body required for raw
     /// publication.
     ///
@@ -556,48 +530,12 @@ impl SecEdgarSource {
     clippy::too_many_arguments,
     reason = "captured filing, source authority, parser bounds, and exact taxonomy bodies remain explicit"
 )]
-pub(crate) fn prepare_filing_xbrl_capture_from_state(
-    raw_store: Arc<RawEvidenceStore>,
-    representation_registry: Arc<SecRepresentationRegistry>,
-    identities: Arc<ProviderIdentityRegistry>,
-    source_id: SourceId,
-    metadata_revision: MetadataRevision,
-    parser_limits: SecParserLimits,
-    submissions: RetrievedSubmissions,
-    accession: &str,
-    filing_document: RetrievedSecBytes,
-    taxonomy_artifacts: Vec<RetrievedSecBytes>,
-    cancellation: &CancellationToken,
-) -> Result<SecFilingXbrlCaptureHandoff, SecClientError> {
-    let admitted_root = admit_filing_xbrl_root(
-        Arc::clone(&raw_store),
-        Arc::clone(&representation_registry),
-        source_id.clone(),
-        metadata_revision.clone(),
-        parser_limits,
-        &submissions,
-        accession,
-        &filing_document,
-        cancellation,
-    )?;
-    prepare_filing_xbrl_capture_from_admitted_root(
-        raw_store,
-        identities,
-        source_id,
-        metadata_revision,
-        parser_limits,
-        submissions,
-        admitted_root,
-        taxonomy_artifacts,
-        cancellation,
-    )
-}
-
 #[allow(
     clippy::too_many_arguments,
     reason = "captured filing, source authority, and parser bounds remain explicit"
 )]
-pub(crate) fn admit_filing_xbrl_root(
+pub(crate) fn admit_filing_xbrl_root_from_sealed_binding(
+    sealed_root: SealedProviderCaptureBinding,
     raw_store: Arc<RawEvidenceStore>,
     representation_registry: Arc<SecRepresentationRegistry>,
     source_id: SourceId,
@@ -608,6 +546,9 @@ pub(crate) fn admit_filing_xbrl_root(
     filing_document: &RetrievedSecBytes,
     cancellation: &CancellationToken,
 ) -> Result<AdmittedFilingXbrlRoot, SecClientError> {
+    sealed_root
+        .validate()
+        .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
     let filing = SecFilingXbrlCoordinates::from_captured_current_submissions(
         submissions,
         accession,
@@ -625,6 +566,30 @@ pub(crate) fn admit_filing_xbrl_root(
     let filing_representation = representation_registry
         .representation_for_source(&source_id, locator.url())?
         .ok_or(SecClientError::InvalidCompositeRepresentation)?;
+    let receipt = filing_document
+        .capture_receipt()
+        .ok_or(SecClientError::InvalidCaptureMaterial)?;
+    let batch = sealed_root.batch();
+    let object = batch.request().object();
+    let record = batch
+        .records()
+        .first()
+        .filter(|_| batch.records().len() == 1)
+        .ok_or(SecClientError::InvalidCompositeRepresentation)?;
+    if sealed_root.scope() != ProviderCaptureScope::Whole
+        || sealed_root.native_lineage().schema().implementation()
+            != ProviderNativeLineageImplementation::SecEdgarV1
+        || sealed_root.capture_evidence() != receipt
+        || object.source_id() != &source_id
+        || object.metadata_revision() != &metadata_revision
+        || object.dataset().as_str() != locator.url()
+        || object.object_id().as_str() != locator.url()
+        || object.evidence().content_digest() != filing_document.evidence()
+        || record.payload().as_ref() != filing_document.bytes().as_ref()
+        || record.evidence().content_digest() != filing_document.evidence()
+    {
+        return Err(SecClientError::InvalidCompositeRepresentation);
+    }
     validate_captured_filing_document(
         &filing,
         &filing_document,
@@ -635,6 +600,7 @@ pub(crate) fn admit_filing_xbrl_root(
         cancellation,
     )?;
     Ok(AdmittedFilingXbrlRoot {
+        sealed_root,
         filing,
         filing_document: filing_document.clone(),
         filing_representation,
@@ -657,10 +623,14 @@ pub(crate) fn prepare_filing_xbrl_capture_from_admitted_root(
     cancellation: &CancellationToken,
 ) -> Result<SecFilingXbrlCaptureHandoff, SecClientError> {
     let AdmittedFilingXbrlRoot {
+        sealed_root,
         filing,
         filing_document,
         filing_representation,
     } = admitted_root;
+    sealed_root
+        .validate()
+        .map_err(|_| SecClientError::InvalidCompositeRepresentation)?;
     let taxonomy = SecXbrlTaxonomyRegistry::code_owned().try_admit_captured(
         Arc::clone(&raw_store),
         &source_id,

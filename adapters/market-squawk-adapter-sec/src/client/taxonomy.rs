@@ -11,6 +11,7 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     ExtractionAuthority, FILING_TAXONOMY_SOURCE_AUTHORITIES, FilingTaxonomyRequestHeaderClass,
     FilingTaxonomySourceAuthority, MAX_PROVIDER_CAPTURE_PAGE_BYTES, SEC_EDGAR_AUTHORITY,
+    SealedProviderCaptureBinding,
 };
 use reqwest::header::{ACCEPT_ENCODING, RETRY_AFTER};
 use sha2::{Digest as _, Sha256};
@@ -428,6 +429,7 @@ impl super::SecEdgarSource {
         submissions: RetrievedSubmissions,
         accession: &str,
         filing_document: RetrievedSecBytes,
+        sealed_root: SealedProviderCaptureBinding,
         deadline: Timestamp,
         cancellation: CancellationToken,
     ) -> Result<SecFilingXbrlCaptureHandoff, SecClientError> {
@@ -445,7 +447,8 @@ impl super::SecEdgarSource {
         let parser_limits = self.parser_limits;
         let admitted_root = self
             .run_validation_blocking(&cancellation, move |worker_token| {
-                crate::extraction::admit_filing_xbrl_root(
+                crate::extraction::admit_filing_xbrl_root_from_sealed_binding(
+                    sealed_root,
                     admission_raw_store,
                     admission_representations,
                     admission_source_id,
