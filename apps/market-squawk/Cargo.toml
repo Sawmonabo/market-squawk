@@ -14,6 +14,9 @@ default = []
 board-installed-fixture = [
     "market-squawk-adapter-federal-reserve/scripted-transport-fixture",
 ]
+bls-installed-fixture = [
+    "market-squawk-adapter-bls/scripted-transport-fixture",
+]
 release-evidence = [
     "dep:memory-stats",
     "dep:tempfile",

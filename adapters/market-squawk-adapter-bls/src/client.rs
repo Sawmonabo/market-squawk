@@ -1,4 +1,10 @@
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+use std::collections::VecDeque;
 use std::sync::Arc;
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+use std::sync::Mutex;
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
@@ -386,7 +392,7 @@ impl BlsHttpClient {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, all(feature = "scripted-transport-fixture", debug_assertions)))]
     pub(crate) fn try_new_with_transport(
         metadata: &SourceMetadata,
         authorization: &BlsAuthorization,
@@ -557,6 +563,195 @@ pub(crate) trait BlsTransport: std::fmt::Debug + Send + Sync {
         timeout: Duration,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<BlsHttpResponse, ExtractionSourceError>>;
+}
+
+/// Debug-only bounded successful BLS response used to exercise the real source pipeline.
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Clone, Debug)]
+pub struct BlsScriptedResponse {
+    body: Bytes,
+    response_received_at: Timestamp,
+    locally_available_at: Timestamp,
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl BlsScriptedResponse {
+    /// Validates one JSON response and its exact receipt/availability clocks.
+    pub fn try_new(
+        body: Bytes,
+        response_received_at: Timestamp,
+        locally_available_at: Timestamp,
+    ) -> Result<Self, BlsSourceError> {
+        if body.is_empty()
+            || body.len() > MAX_RESPONSE_BYTES
+            || response_received_at > locally_available_at
+            || !serde_json::from_slice::<serde_json::Value>(&body)
+                .is_ok_and(|value| value.is_object())
+        {
+            return Err(BlsSourceError::Protocol);
+        }
+        Ok(Self {
+            body,
+            response_received_at,
+            locally_available_at,
+        })
+    }
+}
+
+/// Observed request accounting for the debug-only scripted BLS transport.
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlsScriptedTransportCounters {
+    /// Requests admitted to the scripted HTTP boundary.
+    pub attempts: usize,
+    /// Successful responses returned to the production adapter.
+    pub completed: usize,
+    /// Validated responses not yet consumed.
+    pub remaining: usize,
+}
+
+/// Debug-only FIFO of exact one-shot BLS responses.
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Debug)]
+struct BlsScriptedQueue {
+    responses: Mutex<VecDeque<BlsScriptedResponse>>,
+    attempts: AtomicUsize,
+    completed: AtomicUsize,
+}
+
+/// Debug-only source factory that scripts only the final HTTP exchange.
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Clone, Debug)]
+pub struct BlsScriptedTransportFactory {
+    queue: Arc<BlsScriptedQueue>,
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl BlsScriptedTransportFactory {
+    /// Retains a non-empty bounded FIFO of already validated responses.
+    pub fn try_new(responses: Vec<BlsScriptedResponse>) -> Result<Self, BlsSourceError> {
+        if responses.is_empty() || responses.len() > 64 {
+            return Err(BlsSourceError::InvalidConfiguration);
+        }
+        Ok(Self {
+            queue: Arc::new(BlsScriptedQueue {
+                responses: Mutex::new(responses.into()),
+                attempts: AtomicUsize::new(0),
+                completed: AtomicUsize::new(0),
+            }),
+        })
+    }
+
+    /// Returns request, completion, and unconsumed-response counts without response contents.
+    pub fn counters(&self) -> Result<BlsScriptedTransportCounters, BlsSourceError> {
+        let remaining = self
+            .queue
+            .responses
+            .lock()
+            .map_err(|_| BlsSourceError::Protocol)?
+            .len();
+        Ok(BlsScriptedTransportCounters {
+            attempts: self.queue.attempts.load(Ordering::Relaxed),
+            completed: self.queue.completed.load(Ordering::Relaxed),
+            remaining,
+        })
+    }
+
+    pub(crate) fn transport(&self) -> Arc<dyn BlsTransport> {
+        Arc::new(BlsScriptedTransport {
+            queue: Arc::clone(&self.queue),
+        })
+    }
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+#[derive(Debug)]
+struct BlsScriptedTransport {
+    queue: Arc<BlsScriptedQueue>,
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl BlsTransport for BlsScriptedTransport {
+    fn execute(
+        &self,
+        request: BlsHttpRequest,
+        max_bytes: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<BlsHttpResponse, ExtractionSourceError>> {
+        Box::pin(async move {
+            self.queue.attempts.fetch_add(1, Ordering::Relaxed);
+            if cancellation.is_cancelled() {
+                return Err(ExtractionSourceError::Cancelled);
+            }
+            if timeout.is_zero() || !scripted_request_is_valid(&request) {
+                return Err(SourceError::InvalidProtocolState.into());
+            }
+            let response = self
+                .queue
+                .responses
+                .lock()
+                .map_err(|_| SourceError::InvalidProtocolState)?
+                .pop_front()
+                .ok_or(SourceError::InvalidProtocolState)?;
+            if response.body.len() > max_bytes {
+                return Err(SourceError::FrameTooLarge { max: max_bytes }.into());
+            }
+            self.queue.completed.fetch_add(1, Ordering::Relaxed);
+            Ok(BlsHttpResponse {
+                status: 200,
+                retry_after: None,
+                content_encoding: Some(b"identity".to_vec()),
+                content_type: Some(b"application/json".to_vec()),
+                body: response.body,
+                response_received_at: response.response_received_at,
+                locally_available_at: response.locally_available_at,
+            })
+        })
+    }
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+fn scripted_request_is_valid(request: &BlsHttpRequest) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let common = object
+        .get("seriesid")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|series| {
+            !series.is_empty()
+                && series
+                    .iter()
+                    .all(|series| series.as_str().is_some_and(|series| !series.is_empty()))
+        })
+        && object
+            .get("startyear")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|year| year.len() == 4 && year.bytes().all(|byte| byte.is_ascii_digit()))
+        && object
+            .get("endyear")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|year| year.len() == 4 && year.bytes().all(|byte| byte.is_ascii_digit()));
+    if !common {
+        return false;
+    }
+    match request.url.as_str() {
+        BLS_V1_ENDPOINT => !object.contains_key("registrationkey"),
+        BLS_V2_ENDPOINT => {
+            object
+                .get("registrationkey")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|key| !key.is_empty())
+                && ["catalog", "calculations", "annualaverage", "aspects"]
+                    .iter()
+                    .all(|field| object.get(*field) == Some(&serde_json::Value::Bool(false)))
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug)]

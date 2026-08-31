@@ -12,6 +12,8 @@ mod source;
 
 pub use chunks::{BlsAccessTier, BlsChunkError, BlsRequestChunk, BlsRequestLimits, BlsRequestPlan};
 pub use client::{BlsAuthorization, BlsCredentialRejoin, BlsRegistrationKey, BlsSourceError};
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+pub use client::{BlsScriptedResponse, BlsScriptedTransportCounters, BlsScriptedTransportFactory};
 pub use contract::{
     BLS_DOCTOR_ACTIVATION_TTL_NANOS, BlsActivationCandidate, BlsActivationPlan,
     BlsProviderRateDeclaration, bls_application_provider_budget, bls_provider_rate_declaration,

@@ -210,8 +210,8 @@ impl BlsSource {
         })
     }
 
-    #[cfg(test)]
-    fn try_new_with_transport(
+    #[cfg(any(test, all(feature = "scripted-transport-fixture", debug_assertions)))]
+    pub(crate) fn try_new_with_transport(
         metadata: SourceMetadata,
         config: BlsSourceConfig,
         transport: Arc<dyn crate::client::BlsTransport>,
@@ -227,6 +227,7 @@ impl BlsSource {
             runtime_instance: BlsRuntimeInstanceCapability::new(),
             doctor_capture_authority: Mutex::new(None),
             health: Mutex::new(BlsSourceHealth::new()),
+            #[cfg(test)]
             publication_actions: Mutex::new(VecDeque::new()),
         })
     }
@@ -1032,6 +1033,18 @@ impl BlsSource {
             .flatten();
         drop(registry_to_drop);
         Ok(())
+    }
+}
+
+#[cfg(all(feature = "scripted-transport-fixture", debug_assertions))]
+impl crate::client::BlsScriptedTransportFactory {
+    /// Constructs the real BLS source with only its final HTTP exchange scripted.
+    pub fn production_source(
+        &self,
+        metadata: SourceMetadata,
+        config: BlsSourceConfig,
+    ) -> Result<BlsSource, BlsSourceError> {
+        BlsSource::try_new_with_transport(metadata, config, self.transport())
     }
 }
 

@@ -2,6 +2,7 @@
 
 mod account;
 mod alpaca;
+mod bls;
 pub(crate) mod credentials;
 mod direct;
 mod fred;
@@ -64,6 +65,10 @@ use specs::BlsAdapterConfiguration;
 pub(crate) use account::ProviderAccountRuntimeCurrentness;
 pub use account::{ProviderAccountActivationError, ProviderAccountBinding, ProviderMarketAccount};
 pub use alpaca::{AlpacaBasicAccountActivation, AlpacaBasicActivationError};
+pub(crate) use bls::{
+    MacroProviderPeriodLatestKnownOutput, MacroProviderPeriodLatestKnownRequest,
+    MacroProviderPeriodOperationError,
+};
 pub use direct::{CoinbaseDirectAccountActivation, CoinbaseDirectRuntimeAdmission};
 pub(crate) use fred::{
     FredPublicationActivationError, publish_fred_latest_known, reopen_fred_latest_known,
@@ -301,6 +306,7 @@ pub struct ProviderAdapterActivation {
     app_config: AppConfig,
     provider_rate: ProviderRateAuthority,
     provider_control_root: PathBuf,
+    bls: RwLock<Option<Arc<bls::BlsProductActivation>>>,
     sec_fund: RwLock<Option<Arc<SecFundProductActivation>>>,
     yahoo: RwLock<Option<Arc<yahoo::YahooProductActivation>>>,
     tiingo: RwLock<Option<Arc<tiingo::TiingoProductActivation>>>,
@@ -542,6 +548,7 @@ impl ProviderAdapterActivation {
             app_config,
             provider_rate,
             provider_control_root,
+            bls: RwLock::new(None),
             sec_fund: RwLock::new(None),
             yahoo: RwLock::new(None),
             tiingo: RwLock::new(None),
@@ -567,6 +574,7 @@ impl ProviderAdapterActivation {
             app_config,
             provider_rate,
             provider_control_root,
+            bls: RwLock::new(None),
             sec_fund: RwLock::new(None),
             yahoo: RwLock::new(None),
             tiingo: RwLock::new(None),
@@ -854,6 +862,21 @@ impl ProviderAdapterActivation {
                     retained.take();
                 }
             }
+            if matches!(
+                expected.profile().as_str(),
+                BLS_PUBLIC_SURFACE | BLS_REGISTERED_SURFACE
+            ) {
+                let mut retained = self
+                    .bls
+                    .write()
+                    .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+                if retained
+                    .as_ref()
+                    .is_some_and(|current| current.generation() == expected)
+                {
+                    retained.take();
+                }
+            }
         }
         Ok(())
     }
@@ -1055,7 +1078,10 @@ impl ProviderAdapterActivation {
             .as_mut()
             .ok_or(ProviderAdapterActivationError::SourceBinding)?;
         let profile = lease.surface_id().clone();
-        let specialized_authority = match committed.specialized {
+        let specialized_authority = match committed.specialized.as_ref() {
+            Some(SpecializedReplacementKind::Bls(activation)) => {
+                Some(SpecializedReplacementAuthority::Bls(Arc::clone(activation)))
+            }
             Some(SpecializedReplacementKind::Yahoo) => {
                 let rights =
                     provider_research_rights(&lease, committed.candidate.metadata().source_id())?;
@@ -1098,6 +1124,22 @@ impl ProviderAdapterActivation {
             return Err(ProviderAdapterActivationError::SourceBinding);
         }
         match specialized_authority {
+            Some(SpecializedReplacementAuthority::Bls(activation)) => {
+                if activation.generation() != &generation {
+                    return Err(ProviderAdapterActivationError::SourceBinding);
+                }
+                let mut retained = self
+                    .bls
+                    .write()
+                    .map_err(|_| ProviderAdapterActivationError::SourceBinding)?;
+                if retained
+                    .as_ref()
+                    .is_some_and(|current| current.generation() != committed.expected())
+                {
+                    return Err(ProviderAdapterActivationError::SourceBinding);
+                }
+                *retained = Some(activation);
+            }
             Some(SpecializedReplacementAuthority::Yahoo(authority)) => {
                 *self
                     .yahoo
@@ -1204,21 +1246,25 @@ impl ProviderAdapterActivation {
                     .await?;
                 let authorization = BlsAuthorization::registered_v2(
                     BlsRegistrationKey::try_new(secret.expose_secret().to_owned())?,
-                    candidate.generation_digest()?,
+                    candidate
+                        .secret_reference()
+                        .ok_or(ProviderAdapterActivationError::SourceBinding)?,
                 )?;
                 let rights = provider_research_rights(&lease, metadata.source_id())?;
                 let config = BlsSourceConfig::try_new(authorization, series, start_year, end_year)?;
                 let source = BlsSource::try_new(metadata, config)?;
-                (
-                    self.prepare_runtime_replacement(
+                let (replacement, activation) = self
+                    .prepare_bls_registered_replacement(
                         &lease,
                         expected,
                         candidate.clone(),
                         source,
                         rights,
                     )
-                    .await?,
-                    None,
+                    .await?;
+                (
+                    replacement,
+                    Some(SpecializedReplacementKind::Bls(activation)),
                 )
             }
             ProviderAdapterActivationRequest::Treasury(spec) => {
@@ -1658,9 +1704,6 @@ impl ProviderAdapterActivation {
                     end_year,
                 },
             ) => {
-                let credential_generation_digest =
-                    runtime_generation(&lease, metadata.clone(), rights.clone())?
-                        .generation_digest()?;
                 let secret = self
                     .onboarding
                     .read_secret_for_activation_request(&lease, cancellation)
@@ -1668,7 +1711,9 @@ impl ProviderAdapterActivation {
                 BlsSourceConfig::try_new(
                     BlsAuthorization::registered_v2(
                         BlsRegistrationKey::try_new(secret.expose_secret().to_owned())?,
-                        credential_generation_digest,
+                        lease
+                            .secret_reference()
+                            .ok_or(ProviderAdapterActivationError::SourceBinding)?,
                     )?,
                     series,
                     start_year,
@@ -1678,7 +1723,7 @@ impl ProviderAdapterActivation {
             _ => return Err(ProviderAdapterActivationError::SurfaceMismatch),
         };
         let source = BlsSource::try_new(metadata, config)?;
-        self.register(lease, source, rights)
+        self.register_bls_source(lease, source, rights)
     }
 
     fn restore_bls(
@@ -1699,7 +1744,7 @@ impl ProviderAdapterActivation {
         };
         let rights = provider_research_rights(&lease, metadata.source_id())?;
         let source = BlsSource::try_new(metadata, config)?;
-        self.register(lease, source, rights)
+        self.register_bls_source(lease, source, rights)
     }
 
     fn activate_treasury(
@@ -2173,13 +2218,14 @@ pub(crate) struct CommittedProviderAdapterReplacement {
     specialized: Option<SpecializedReplacementKind>,
 }
 
-#[derive(Clone, Copy, Debug)]
 enum SpecializedReplacementKind {
+    Bls(Arc<bls::BlsProductActivation>),
     Yahoo,
     Tiingo,
 }
 
 enum SpecializedReplacementAuthority {
+    Bls(Arc<bls::BlsProductActivation>),
     Yahoo(Arc<yahoo::YahooProductActivation>),
     Tiingo(Arc<tiingo::TiingoProductActivation>),
 }

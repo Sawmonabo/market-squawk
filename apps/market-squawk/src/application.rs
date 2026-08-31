@@ -99,6 +99,10 @@ pub(crate) use research::{
     TreasuryLatestKnownOperation, TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
     read_macro_feature_vector,
 };
+pub(crate) use research::{
+    BlsLivePublicationError, BlsRegisteredV2LiveComposition, BlsRegisteredV2LiveOutcome,
+    BlsRegisteredV2LiveRequest, BlsRegisteredV2LiveRuntime,
+};
 pub use research::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,
     ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,

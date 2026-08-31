@@ -8,6 +8,10 @@ license.workspace = true
 repository = "https://github.com/Sawmonabo/market-squawk"
 publish = false
 
+[features]
+default = []
+scripted-transport-fixture = []
+
 [dependencies]
 bytes.workspace = true
 chrono.workspace = true

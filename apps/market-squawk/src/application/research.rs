@@ -105,6 +105,10 @@ pub(crate) use ingest::{
     TREASURY_FISCAL_DATA_LATEST_KNOWN_OPERATION, TreasuryApplicationClosure,
     TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest,
 };
+pub(crate) use ingest::{
+    BlsLivePublicationError, BlsRegisteredV2LiveComposition, BlsRegisteredV2LiveOutcome,
+    BlsRegisteredV2LiveRequest, BlsRegisteredV2LiveRuntime,
+};
 pub use ingest::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,
     ProductionResearchIngestCoordinator, ResearchExtractionLimits, ResearchIngestCompositionError,
