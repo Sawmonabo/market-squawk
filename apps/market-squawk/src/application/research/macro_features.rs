@@ -52,10 +52,9 @@ impl MacroFeatureVector {
     /// Maps one complete neutral snapshot into the single code-owned V1 economic order.
     pub(crate) fn try_from_snapshot(snapshot: &MacroContextSnapshot) -> Result<Self, ServiceError> {
         let evidence = snapshot.evidence();
-        let evidence_digest = evidence.digest();
+        let evidence_digest = evidence.consumed_digest();
         if evidence_digest.algorithm() != DigestAlgorithm::Sha256
             || evidence_digest.bytes() == [0; 32]
-            || evidence.parent_manifests().is_empty()
         {
             return Err(ServiceError::InvalidResult);
         }
@@ -139,12 +138,18 @@ impl MacroFeatureVector {
         if retained.iter().any(|retained| !retained) {
             return Err(ServiceError::InvalidResult);
         }
+        if evidence.consumed_parent_manifests().is_empty() {
+            return Err(ServiceError::InvalidResult);
+        }
 
         Ok(Self {
             components: components.into_boxed_slice(),
             knowledge_cutoff: evidence.knowledge_cutoff(),
             effective_date_cutoff: evidence.effective_date_cutoff(),
-            parent_manifests: evidence.parent_manifests().to_vec().into_boxed_slice(),
+            parent_manifests: evidence
+                .consumed_parent_manifests()
+                .to_vec()
+                .into_boxed_slice(),
             evidence_digest,
         })
     }

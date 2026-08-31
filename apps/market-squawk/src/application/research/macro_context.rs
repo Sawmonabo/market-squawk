@@ -1,6 +1,6 @@
 //! Provider-neutral Macro product context over exact canonical point-in-time reads.
 
-use std::{fmt, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Datelike, SecondsFormat, Utc};
 use market_squawk_adapter_federal_reserve::{
@@ -720,6 +720,7 @@ pub(crate) struct MacroContextSelectedObservation {
     indicator_id: &'static str,
     observation: Option<MacroObservation>,
     authority: Option<MacroContextSelectionAuthority>,
+    source_receipt: Option<Arc<MacroContextSourceReceipt>>,
 }
 
 impl MacroContextSelectedObservation {
@@ -728,6 +729,7 @@ impl MacroContextSelectedObservation {
             indicator_id: definition.indicator_id,
             observation: None,
             authority: None,
+            source_receipt: None,
         }
     }
 
@@ -884,6 +886,10 @@ fn product_snapshot(
         .map_err(|_| ServiceError::ResourceExhausted)?;
 
     if let Some(board) = board {
+        let receipt = Arc::new(MacroContextSourceReceipt::try_from_output(
+            MacroContextInternalSource::InterestRates,
+            &board,
+        )?);
         retain_inputs(
             &board,
             cutoffs,
@@ -895,13 +901,15 @@ fn product_snapshot(
             cutoffs,
             &mut observations[..H15_INDICATOR_COUNT],
             &mut selected[..H15_INDICATOR_COUNT],
+            &receipt,
         )?;
-        receipts.push(MacroContextSourceReceipt::try_from_output(
-            MacroContextInternalSource::InterestRates,
-            &board,
-        )?);
+        receipts.push(receipt);
     }
     if let Some(fred) = fred {
+        let receipt = Arc::new(MacroContextSourceReceipt::try_from_output(
+            MacroContextInternalSource::LaborMarket,
+            &fred,
+        )?);
         retain_inputs(
             &fred,
             cutoffs,
@@ -913,11 +921,9 @@ fn product_snapshot(
             cutoffs,
             &mut observations[H15_INDICATOR_COUNT],
             &mut selected[H15_INDICATOR_COUNT],
+            &receipt,
         )?;
-        receipts.push(MacroContextSourceReceipt::try_from_output(
-            MacroContextInternalSource::LaborMarket,
-            &fred,
-        )?);
+        receipts.push(receipt);
     }
     for read in treasury_fiscal {
         if read.surface() != TreasurySurface::FiscalData {
@@ -925,27 +931,29 @@ fn product_snapshot(
         }
         let output = read.output();
         retain_inputs(output, cutoffs, treasury_input_role, &mut inputs)?;
-        receipts.push(MacroContextSourceReceipt::try_from_output(
+        receipts.push(Arc::new(MacroContextSourceReceipt::try_from_output(
             MacroContextInternalSource::FiscalConditions,
             output,
-        )?);
+        )?));
     }
     for read in treasury_daily {
         if read.surface() != TreasurySurface::DailyRatesXml {
             return Err(ServiceError::InvalidResult);
         }
         let output = read.output();
+        let receipt = Arc::new(MacroContextSourceReceipt::try_from_output(
+            MacroContextInternalSource::InterestRates,
+            output,
+        )?);
         retain_inputs(output, cutoffs, treasury_input_role, &mut inputs)?;
         project_treasury_daily(
             output,
             cutoffs,
             &mut observations[..H15_INDICATOR_COUNT],
             &mut selected[..H15_INDICATOR_COUNT],
+            &receipt,
         )?;
-        receipts.push(MacroContextSourceReceipt::try_from_output(
-            MacroContextInternalSource::InterestRates,
-            output,
-        )?);
+        receipts.push(receipt);
     }
 
     let coverage = observations.iter().try_fold(
@@ -1011,7 +1019,7 @@ fn product_snapshot(
         coverage,
         observations,
     };
-    let evidence = MacroContextEvidenceReceipt::try_new(cutoffs, receipts)?;
+    let evidence = MacroContextEvidenceReceipt::try_new(cutoffs, receipts, &selected)?;
     Ok(MacroContextSnapshot {
         dto,
         inputs: inputs.into_boxed_slice(),
@@ -1025,6 +1033,7 @@ fn project_board(
     cutoffs: MacroContextCutoffs,
     target: &mut [MacroContextObservationDto],
     selected: &mut [MacroContextSelectedObservation],
+    source_receipt: &Arc<MacroContextSourceReceipt>,
 ) -> Result<(), ServiceError> {
     if target.len() != H15_INDICATOR_COUNT
         || selected.len() != H15_INDICATOR_COUNT
@@ -1072,6 +1081,7 @@ fn project_board(
                 &series,
                 &expected_unit,
                 MacroContextSelectionAuthority::Board,
+                source_receipt,
                 cutoffs,
             )?;
         }
@@ -1087,6 +1097,7 @@ fn project_fred(
     cutoffs: MacroContextCutoffs,
     target: &mut MacroContextObservationDto,
     selected: &mut MacroContextSelectedObservation,
+    source_receipt: &Arc<MacroContextSourceReceipt>,
 ) -> Result<(), ServiceError> {
     let expected_source =
         SourceId::try_from(FRED_SOURCE_ID).map_err(|_| ServiceError::Unavailable)?;
@@ -1109,6 +1120,7 @@ fn project_fred(
                 &expected_series,
                 &expected_unit,
                 MacroContextSelectionAuthority::Fred,
+                source_receipt,
                 cutoffs,
             )?;
         }
@@ -1122,6 +1134,7 @@ fn project_treasury_daily(
     cutoffs: MacroContextCutoffs,
     target: &mut [MacroContextObservationDto],
     selected: &mut [MacroContextSelectedObservation],
+    source_receipt: &Arc<MacroContextSourceReceipt>,
 ) -> Result<(), ServiceError> {
     if target.len() != H15_INDICATOR_COUNT || selected.len() != H15_INDICATOR_COUNT {
         return Err(ServiceError::InvalidResult);
@@ -1147,6 +1160,7 @@ fn project_treasury_daily(
                 &series,
                 &expected_unit,
                 MacroContextSelectionAuthority::Treasury,
+                source_receipt,
                 cutoffs,
             )?;
         }
@@ -1231,6 +1245,7 @@ fn select_observation(
     expected_series: &SourceIdentifier,
     expected_unit: &SourceIdentifier,
     authority: MacroContextSelectionAuthority,
+    source_receipt: &Arc<MacroContextSourceReceipt>,
     cutoffs: MacroContextCutoffs,
 ) -> Result<(), ServiceError> {
     if target.indicator_id != definition.indicator_id
@@ -1246,18 +1261,26 @@ fn select_observation(
         expected_unit,
         cutoffs,
     )?;
+    if &source_receipt.source_id != expected_source {
+        return Err(ServiceError::InvalidResult);
+    }
     let candidate_rank = selection_rank(observation, authority, cutoffs)?;
-    let replace = match (selected.observation.as_ref(), selected.authority) {
-        (None, None) => true,
-        (Some(current), Some(current_authority)) => {
+    let replace = match (
+        selected.observation.as_ref(),
+        selected.authority,
+        selected.source_receipt.as_ref(),
+    ) {
+        (None, None, None) => true,
+        (Some(current), Some(current_authority), Some(_)) => {
             candidate_rank > selection_rank(current, current_authority, cutoffs)?
         }
-        (None, Some(_)) | (Some(_), None) => return Err(ServiceError::InvalidResult),
+        _ => return Err(ServiceError::InvalidResult),
     };
     if replace {
         *target = projected;
         selected.observation = Some(observation.clone());
         selected.authority = Some(authority);
+        selected.source_receipt = Some(Arc::clone(source_receipt));
     }
     Ok(())
 }
@@ -1471,24 +1494,26 @@ fn coordinate_calendar_date(
 
 /// Opaque exact evidence for one neutral Macro selection.
 ///
-/// Provider-qualified inputs are intentionally retained below transport and product DTOs. The
-/// public internal API exposes only cutoffs, immutable parent generations, and a nonzero digest.
+/// Provider-qualified inputs are intentionally retained below transport and product DTOs.
+/// Consulted generations stay diagnostic-only; consumers receive only generations actually
+/// selected by the neutral product projection and an exact digest of those selections.
 pub(crate) struct MacroContextEvidenceReceipt {
     knowledge_cutoff: Timestamp,
     effective_date_cutoff: CalendarDate,
     evaluated_at: Timestamp,
-    parent_manifests: Box<[DatasetManifestRef]>,
-    digest: EvidenceDigest,
-    sources: Box<[MacroContextSourceReceipt]>,
+    consumed_parent_manifests: Box<[DatasetManifestRef]>,
+    consumed_digest: EvidenceDigest,
+    consulted_sources: Box<[Arc<MacroContextSourceReceipt>]>,
 }
 
 impl MacroContextEvidenceReceipt {
     fn try_new(
         cutoffs: MacroContextCutoffs,
-        mut sources: Vec<MacroContextSourceReceipt>,
+        mut consulted_sources: Vec<Arc<MacroContextSourceReceipt>>,
+        selected: &[MacroContextSelectedObservation],
     ) -> Result<Self, ServiceError> {
-        sources.sort_by(compare_source_receipts);
-        if sources.windows(2).any(|pair| {
+        consulted_sources.sort_by(|left, right| compare_source_receipts(left, right));
+        if consulted_sources.windows(2).any(|pair| {
             pair[0].source == pair[1].source
                 && pair[0].source_id == pair[1].source_id
                 && pair[0].manifest == pair[1].manifest
@@ -1496,12 +1521,39 @@ impl MacroContextEvidenceReceipt {
             return Err(ServiceError::InvalidResult);
         }
 
-        let mut parent_manifests = sources
+        let mut consumed_sources = Vec::new();
+        consumed_sources
+            .try_reserve_exact(selected.len())
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        for selection in selected {
+            match (
+                selection.observation.as_ref(),
+                selection.authority,
+                selection.source_receipt.as_ref(),
+            ) {
+                (None, None, None) => {}
+                (Some(observation), Some(_), Some(receipt)) => {
+                    if observation.context().provenance().source_id() != &receipt.source_id
+                        || !consulted_sources
+                            .iter()
+                            .any(|consulted| Arc::ptr_eq(consulted, receipt))
+                    {
+                        return Err(ServiceError::InvalidResult);
+                    }
+                    consumed_sources.push(Arc::clone(receipt));
+                }
+                _ => return Err(ServiceError::InvalidResult),
+            }
+        }
+        consumed_sources.sort_by(|left, right| compare_source_receipts(left, right));
+        consumed_sources.dedup_by(|left, right| Arc::ptr_eq(left, right));
+
+        let mut consumed_parent_manifests = consumed_sources
             .iter()
             .map(|source| source.manifest.clone())
             .collect::<Vec<_>>();
-        parent_manifests.sort_by(compare_manifest_refs);
-        for pair in parent_manifests.windows(2) {
+        consumed_parent_manifests.sort_by(compare_manifest_refs);
+        for pair in consumed_parent_manifests.windows(2) {
             if pair[0].dataset_id() == pair[1].dataset_id()
                 && pair[0].manifest_version() == pair[1].manifest_version()
                 && pair[0] != pair[1]
@@ -1509,32 +1561,44 @@ impl MacroContextEvidenceReceipt {
                 return Err(ServiceError::InvalidResult);
             }
         }
-        parent_manifests.dedup();
+        consumed_parent_manifests.dedup();
 
         let mut hasher = Sha256::new();
-        hash_text(&mut hasher, "market-squawk/macro-context-evidence/v1");
+        hash_text(
+            &mut hasher,
+            "market-squawk/macro-context-consumed-evidence/v1",
+        );
         hasher.update(cutoffs.knowledge_cutoff.unix_nanos().to_be_bytes());
         hash_text(&mut hasher, &cutoffs.effective_date_cutoff.to_string());
-        hasher.update(cutoffs.evaluated_at.unix_nanos().to_be_bytes());
-        hash_usize(&mut hasher, sources.len());
-        for source in &sources {
-            hasher.update([source.source.digest_tag()]);
-            hash_text(&mut hasher, source.source_id.as_str());
-            hash_manifest(&mut hasher, &source.manifest);
-            hash_digest(&mut hasher, source.object_graph_digest);
-            hash_digest(&mut hasher, source.query_identity);
-            hash_digest(&mut hasher, source.result_digest);
-            hash_digest(&mut hasher, source.selection_digest);
+        hash_usize(&mut hasher, selected.len());
+        for selection in selected {
+            hash_text(&mut hasher, selection.indicator_id);
+            match (
+                selection.observation.as_ref(),
+                selection.authority,
+                selection.source_receipt.as_ref(),
+            ) {
+                (None, None, None) => hasher.update([0]),
+                (Some(observation), Some(authority), Some(receipt)) => {
+                    hasher.update([1, authority.digest_tag()]);
+                    hash_source_receipt(&mut hasher, receipt);
+                    let observation =
+                        serde_json::to_vec(observation).map_err(|_| ServiceError::InvalidResult)?;
+                    hash_bytes(&mut hasher, &observation);
+                }
+                _ => return Err(ServiceError::InvalidResult),
+            }
         }
-        let digest = EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into());
-        require_sha256(digest)?;
+        let consumed_digest =
+            EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into());
+        require_sha256(consumed_digest)?;
         Ok(Self {
             knowledge_cutoff: cutoffs.knowledge_cutoff,
             effective_date_cutoff: cutoffs.effective_date_cutoff,
             evaluated_at: cutoffs.evaluated_at,
-            parent_manifests: parent_manifests.into_boxed_slice(),
-            digest,
-            sources: sources.into_boxed_slice(),
+            consumed_parent_manifests: consumed_parent_manifests.into_boxed_slice(),
+            consumed_digest,
+            consulted_sources: consulted_sources.into_boxed_slice(),
         })
     }
 
@@ -1553,14 +1617,14 @@ impl MacroContextEvidenceReceipt {
         self.evaluated_at
     }
 
-    /// Returns the canonical, duplicate-free immutable input generation set.
-    pub(crate) fn parent_manifests(&self) -> &[DatasetManifestRef] {
-        &self.parent_manifests
+    /// Returns only canonical generations consumed by the neutral selection.
+    pub(crate) fn consumed_parent_manifests(&self) -> &[DatasetManifestRef] {
+        &self.consumed_parent_manifests
     }
 
-    /// Returns a nonzero SHA-256 identity over exact input selections and cutoffs.
-    pub(crate) const fn digest(&self) -> EvidenceDigest {
-        self.digest
+    /// Returns a nonzero SHA-256 identity over exact consumed selections and cutoffs.
+    pub(crate) const fn consumed_digest(&self) -> EvidenceDigest {
+        self.consumed_digest
     }
 }
 
@@ -1568,13 +1632,17 @@ impl fmt::Debug for MacroContextEvidenceReceipt {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("MacroContextEvidenceReceipt")
-            .field("parent_count", &self.parent_manifests.len())
-            .field("source_count", &self.sources.len())
+            .field(
+                "consumed_parent_count",
+                &self.consumed_parent_manifests.len(),
+            )
+            .field("consulted_source_count", &self.consulted_sources.len())
             .field("digest", &"[SHA-256]")
             .finish_non_exhaustive()
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
 struct MacroContextSourceReceipt {
     source: MacroContextInternalSource,
     source_id: SourceId,
@@ -1607,7 +1675,7 @@ impl MacroContextSourceReceipt {
     }
 }
 
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum MacroContextInternalSource {
     InterestRates,
     LaborMarket,
@@ -1620,6 +1688,16 @@ impl MacroContextInternalSource {
             Self::InterestRates => 1,
             Self::LaborMarket => 2,
             Self::FiscalConditions => 3,
+        }
+    }
+}
+
+impl MacroContextSelectionAuthority {
+    const fn digest_tag(self) -> u8 {
+        match self {
+            Self::Treasury => 1,
+            Self::Board => 2,
+            Self::Fred => 3,
         }
     }
 }
@@ -1681,6 +1759,16 @@ fn hash_manifest(hasher: &mut Sha256, manifest: &DatasetManifestRef) {
     hasher.update(manifest.content_hash().bytes());
 }
 
+fn hash_source_receipt(hasher: &mut Sha256, source: &MacroContextSourceReceipt) {
+    hasher.update([source.source.digest_tag()]);
+    hash_text(hasher, source.source_id.as_str());
+    hash_manifest(hasher, &source.manifest);
+    hash_digest(hasher, source.object_graph_digest);
+    hash_digest(hasher, source.query_identity);
+    hash_digest(hasher, source.result_digest);
+    hash_digest(hasher, source.selection_digest);
+}
+
 fn hash_digest(hasher: &mut Sha256, digest: EvidenceDigest) {
     hasher.update([match digest.algorithm() {
         DigestAlgorithm::Sha256 => 1,
@@ -1692,6 +1780,11 @@ fn hash_digest(hasher: &mut Sha256, digest: EvidenceDigest) {
 fn hash_text(hasher: &mut Sha256, value: &str) {
     hasher.update((value.len() as u128).to_be_bytes());
     hasher.update(value.as_bytes());
+}
+
+fn hash_bytes(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u128).to_be_bytes());
+    hasher.update(value);
 }
 
 fn hash_usize(hasher: &mut Sha256, value: usize) {
