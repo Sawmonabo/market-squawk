@@ -4,8 +4,8 @@ use market_squawk_domain::{
     SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{
-    DecodedProviderBatch, DecoderEvidence, ProviderBookSide, ProviderOrderEvent,
-    ProviderOrderEventKind, SegmentedHttpResponseCapture,
+    DecodedProviderBatch, DecoderEvidence, ProviderBookSide, ProviderNativeInstrumentAttestation,
+    ProviderOrderEvent, ProviderOrderEventKind, SegmentedHttpResponseCapture,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -275,8 +275,7 @@ pub(crate) struct CoinbaseMarketHandoffInput {
     pub(crate) channel: CoinbaseMarketChannel,
     pub(crate) native_input_depth: Option<MarketDepth>,
     pub(crate) product: ProviderProduct,
-    pub(crate) configured_instrument: InstrumentId,
-    pub(crate) venue: VenueId,
+    pub(crate) instrument_attestation: Arc<ProviderNativeInstrumentAttestation>,
     pub(crate) request_set_digest: EvidenceDigest,
     pub(crate) subscription_digest: EvidenceDigest,
     pub(crate) subscription_acknowledgement: Option<ExactPayloadEvidence>,
@@ -294,8 +293,7 @@ pub struct CoinbaseMarketHandoffEvidence {
     native_input_depth: Option<MarketDepth>,
     output_depth: Option<MarketDepth>,
     product: ProviderProduct,
-    configured_instrument: InstrumentId,
-    venue: VenueId,
+    instrument_attestation: Arc<ProviderNativeInstrumentAttestation>,
     request_set_digest: EvidenceDigest,
     subscription_digest: EvidenceDigest,
     subscription_acknowledgement: Option<ExactPayloadEvidence>,
@@ -336,13 +334,18 @@ impl CoinbaseMarketHandoffEvidence {
     }
 
     /// Returns the externally configured instrument binding; the adapter never mints it.
-    pub const fn configured_instrument(&self) -> InstrumentId {
-        self.configured_instrument
+    pub fn configured_instrument(&self) -> InstrumentId {
+        self.instrument_attestation.instrument_id()
     }
 
     /// Returns the exact venue identity.
-    pub const fn venue(&self) -> &VenueId {
-        &self.venue
+    pub fn venue(&self) -> &VenueId {
+        self.instrument_attestation.venue_mapping().venue_id()
+    }
+
+    /// Returns the exact durable provider/canonical identity selected before the session.
+    pub fn instrument_attestation(&self) -> &ProviderNativeInstrumentAttestation {
+        self.instrument_attestation.as_ref()
     }
 
     /// Returns SHA-256 over the selected secret-free request set.
@@ -402,9 +405,15 @@ impl CoinbaseMarketHandoff {
         let decoder = typed_batch.evidence();
         if terminal_payload.as_bytes().len() != decoder.frame_bytes()
             || exact_digest(terminal_payload.as_bytes()) != decoder.payload_digest()
+            || input
+                .instrument_attestation
+                .validate_at(decoder.received_at())
+                .is_err()
             || typed_batch.observations().iter().any(|observation| {
-                observation.venue() != &input.venue
-                    || observation.instrument() != input.configured_instrument
+                observation.instrument_attestation() != input.instrument_attestation.as_ref()
+                    || observation.venue()
+                        != input.instrument_attestation.venue_mapping().venue_id()
+                    || observation.instrument() != input.instrument_attestation.instrument_id()
             })
         {
             return Err(CoinbaseMarketHandoffError::EvidenceMismatch);
@@ -458,8 +467,7 @@ impl CoinbaseMarketHandoff {
                 native_input_depth: input.native_input_depth,
                 output_depth,
                 product: input.product,
-                configured_instrument: input.configured_instrument,
-                venue: input.venue,
+                instrument_attestation: input.instrument_attestation,
                 request_set_digest: input.request_set_digest,
                 subscription_digest: input.subscription_digest,
                 subscription_acknowledgement: input.subscription_acknowledgement,
@@ -697,3 +705,4 @@ fn digest_parts<'a>(domain: &[u8], parts: impl IntoIterator<Item = &'a [u8]>) ->
     }
     EvidenceDigest::new(DigestAlgorithm::Sha256, hasher.finalize().into())
 }
+use std::sync::Arc;

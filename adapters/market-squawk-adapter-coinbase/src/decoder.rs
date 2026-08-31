@@ -1,19 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use chrono::DateTime;
 use market_squawk_domain::{
-    AggressorSide, EvidenceDigest, InstrumentId, IntegrityRule, MarketDepth, ProviderProduct,
-    RawCaptureFrameView as _, SourceIdentifier, Timestamp, VenueId,
+    AggressorSide, EvidenceDigest, IntegrityRule, MarketDepth, ProviderProduct,
+    RawCaptureFrameView as _, SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
     ControlFrameKind, DecodeInternalError, DecodeOutcome, DecodedControlFrame, DecodedIgnoredFrame,
     DecodedProviderBatch, DecodedQuarantineAction, DecodedRecoveryAction, DecoderEvidence,
     IgnoredFrameReason, ProviderAggressorEvidence, ProviderBookChange, ProviderBookLevel,
     ProviderBookSide, ProviderChecksumEvidence, ProviderDecimalLexeme,
-    ProviderNormalizedObservation, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
-    ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderTimestampEvidence,
-    QuarantineReason, ResynchronizationReason, SourceMetadata, SourceMetadataProvider,
-    TransportFrameKind, ValidatedRawMarketFrame,
+    ProviderNativeInstrumentAttestation, ProviderNormalizedObservation, ProviderObservationPayload,
+    ProviderPrice, ProviderQuantity, ProviderSequenceEvidence, ProviderSnapshotEvidence,
+    ProviderTimestampEvidence, QuarantineReason, ResynchronizationReason, SourceMetadata,
+    SourceMetadataProvider, TransportFrameKind, ValidatedRawMarketFrame,
 };
 use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -39,8 +40,7 @@ const MAX_HEARTBEAT_TIME_BYTES: usize = 160;
 #[derive(Clone, Debug)]
 pub struct CoinbaseExchangeDecoder {
     metadata: SourceMetadata,
-    instruments: BTreeMap<String, InstrumentId>,
-    venue: VenueId,
+    instruments: BTreeMap<String, Arc<ProviderNativeInstrumentAttestation>>,
     decoder_rule: IntegrityRule,
     timestamp_rule: IntegrityRule,
     sequence_rule: IntegrityRule,
@@ -52,7 +52,7 @@ pub struct CoinbaseExchangeDecoder {
     acknowledgement_complete: bool,
     max_frame_bytes: usize,
     product: ProviderProduct,
-    configured_instrument: InstrumentId,
+    configured_instrument_attestation: Arc<ProviderNativeInstrumentAttestation>,
     request_set_digest: EvidenceDigest,
     subscription_digest: EvidenceDigest,
     last_market_coordinates: Option<CoinbasePublicMarketCoordinates>,
@@ -79,7 +79,7 @@ impl CoinbaseExchangeDecoder {
             .first()
             .ok_or(CoinbaseConfigError::InvalidMappingCount)?;
         let product = mapping.product().clone();
-        let configured_instrument = mapping.instrument();
+        let configured_instrument_attestation = Arc::clone(mapping.shared_instrument_attestation());
         let (request_set_digest, subscription_digest) = public_request_digests(config);
         let live = match config.metadata().protocol_profile() {
             market_squawk_sources::SourceProtocolProfile::Live(profile) => profile,
@@ -134,11 +134,10 @@ impl CoinbaseExchangeDecoder {
                 .map(|mapping| {
                     (
                         mapping.product().as_source_identifier().as_str().to_owned(),
-                        mapping.instrument(),
+                        Arc::clone(mapping.shared_instrument_attestation()),
                     )
                 })
                 .collect(),
-            venue: VenueId::try_from("coinbase-exchange")?,
             decoder_rule: live.decoder_rule().clone(),
             timestamp_rule: live.timestamp_rule().clone(),
             sequence_rule,
@@ -150,7 +149,7 @@ impl CoinbaseExchangeDecoder {
             acknowledgement_complete: false,
             max_frame_bytes: config.transport_limits().max_frame_bytes(),
             product,
-            configured_instrument,
+            configured_instrument_attestation,
             request_set_digest,
             subscription_digest,
             last_market_coordinates: None,
@@ -586,10 +585,13 @@ impl CoinbaseExchangeDecoder {
         ))
     }
 
-    fn instrument(&self, product: &str) -> Result<InstrumentId, QuarantineReason> {
+    fn instrument(
+        &self,
+        product: &str,
+    ) -> Result<Arc<ProviderNativeInstrumentAttestation>, QuarantineReason> {
         self.instruments
             .get(product)
-            .copied()
+            .cloned()
             .ok_or(QuarantineReason::WrongProduct)
     }
 
@@ -599,6 +601,13 @@ impl CoinbaseExchangeDecoder {
             return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
         }
         for input in inputs {
+            if input
+                .instrument_attestation
+                .validate_at(evidence.received_at())
+                .is_err()
+            {
+                return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
+            }
             let source_identifier = match SourceIdentifier::try_from(input.source_identifier) {
                 Ok(identifier) => identifier,
                 Err(_) => {
@@ -611,8 +620,7 @@ impl CoinbaseExchangeDecoder {
             };
             let observation = match ProviderNormalizedObservation::try_new(
                 source_identifier,
-                self.venue.clone(),
-                input.instrument,
+                input.instrument_attestation.as_ref().clone(),
                 input.timestamp,
                 ProviderSequenceEvidence::Unsupported {
                     rule: self.sequence_rule.clone(),
@@ -670,8 +678,7 @@ impl CoinbaseExchangeDecoder {
                         channel: coordinates.channel,
                         native_input_depth: coordinates.depth,
                         product: self.product.clone(),
-                        configured_instrument: self.configured_instrument,
-                        venue: self.venue.clone(),
+                        instrument_attestation: Arc::clone(&self.configured_instrument_attestation),
                         request_set_digest: self.request_set_digest,
                         subscription_digest: self.subscription_digest,
                         subscription_acknowledgement: None,
@@ -705,7 +712,7 @@ impl SourceMetadataProvider for CoinbaseExchangeDecoder {
 
 struct ObservationInput {
     source_identifier: String,
-    instrument: InstrumentId,
+    instrument_attestation: Arc<ProviderNativeInstrumentAttestation>,
     timestamp: ProviderTimestampEvidence,
     snapshot: ProviderSnapshotEvidence,
     payload: ProviderObservationPayload,
@@ -713,14 +720,14 @@ struct ObservationInput {
 
 fn observation_input(
     source_identifier: String,
-    instrument: InstrumentId,
+    instrument_attestation: Arc<ProviderNativeInstrumentAttestation>,
     timestamp: ProviderTimestampEvidence,
     snapshot: ProviderSnapshotEvidence,
     payload: ProviderObservationPayload,
 ) -> ObservationInput {
     ObservationInput {
         source_identifier,
-        instrument,
+        instrument_attestation,
         timestamp,
         snapshot,
         payload,

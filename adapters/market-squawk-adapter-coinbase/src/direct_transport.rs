@@ -129,8 +129,7 @@ impl<'a> CoinbaseDirectBookUpdate<'a> {
                 channel: CoinbaseMarketChannel::Full,
                 native_input_depth: Some(MarketDepth::OrderLevel),
                 product: self.config.product().clone(),
-                configured_instrument: self.config.instrument(),
-                venue: self.config.venue().clone(),
+                instrument_attestation: Arc::clone(self.config.shared_instrument_attestation()),
                 request_set_digest: self.request_set_digest,
                 subscription_digest: self.subscription_request_digest,
                 subscription_acknowledgement: Some(self.subscription_evidence.clone()),
@@ -269,10 +268,13 @@ impl<'a> CoinbaseDirectBookUpdate<'a> {
         }
         .map_err(|_error| CoinbaseDirectPublicationError::InvalidObservation)?;
         let source_identifier = direct_book_identifier(self.sequence, snapshot_receipt)?;
+        self.config
+            .instrument_attestation()
+            .validate_at(decoder_evidence.received_at())
+            .map_err(|_| CoinbaseDirectPublicationError::InvalidObservation)?;
         let observation = ProviderNormalizedObservation::try_new(
             source_identifier,
-            self.config.venue().clone(),
-            self.config.instrument(),
+            self.config.instrument_attestation().clone(),
             ProviderTimestampEvidence::Provided {
                 value: self.source_timestamp,
                 rule: protocol.timestamp_rule().clone(),
@@ -492,10 +494,13 @@ impl<'a> CoinbaseDirectOrderLevelUpdate<'a> {
             snapshot_price_levels(orders, ProviderBookSide::Ask, terms)?,
         )
         .map_err(|_error| CoinbaseDirectPublicationError::InvalidObservation)?;
+        self.config
+            .instrument_attestation()
+            .validate_at(self.snapshot_receipt.received_at())
+            .map_err(|_| CoinbaseDirectPublicationError::InvalidObservation)?;
         let observation = ProviderNormalizedObservation::try_new(
             direct_book_identifier(snapshot_sequence, self.snapshot_receipt)?,
-            self.config.venue().clone(),
-            self.config.instrument(),
+            self.config.instrument_attestation().clone(),
             ProviderTimestampEvidence::Provided {
                 value: snapshot_timestamp,
                 rule: protocol.timestamp_rule().clone(),

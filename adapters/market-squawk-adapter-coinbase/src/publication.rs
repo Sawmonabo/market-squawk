@@ -23,9 +23,10 @@ use market_squawk_sources::{
     ProviderCaptureSealRequest, ProviderCaptureTerminalDisposition,
     ProviderEventMicrobatchMaterial, ProviderEventMicrobatchSealExpectation,
     ProviderEventMicrobatchToken, ProviderMarketEventBatch, ProviderMarketEventNativeLineageBatch,
-    ProviderNativeLineageImplementation, ProviderObservationPayload, ProviderOrderChangeReason,
-    ProviderOrderEventKind, ProviderPublicationBindingKind, ProviderSequenceEvidence,
-    ProviderTimestampEvidence, ProviderWholeCaptureToken, SealedProviderCaptureMaterial,
+    ProviderMarketEventNativeLineageRow, ProviderNativeLineageImplementation,
+    ProviderObservationPayload, ProviderOrderChangeReason, ProviderOrderEventKind,
+    ProviderPublicationBindingKind, ProviderSequenceEvidence, ProviderTimestampEvidence,
+    ProviderWholeCaptureToken, SealedProviderCaptureMaterial,
     SealedProviderCompositeResponseEventBinding, SealedProviderEventMicrobatchBinding,
     SealedProviderEventMicrobatchReceipt, SealedProviderPublicationBinding,
     SealedProviderResponseMarketEventBinding, TransportFrameKind, ValidatedRawMarketFrame,
@@ -1145,7 +1146,10 @@ impl CoinbaseMarketSealRejoin {
                 let response_native = ProviderMarketEventNativeLineageBatch::try_new(
                     ProviderNativeLineageImplementation::CoinbaseExchangeDirectV1,
                     &response_batch,
-                    vec![encode_snapshot_native(&snapshot, &self.evidence)?],
+                    vec![ProviderMarketEventNativeLineageRow::try_new(
+                        self.evidence.instrument_attestation().clone(),
+                        encode_snapshot_native(&snapshot, &self.evidence)?,
+                    )?],
                     Some(self.encode_batch_sidecar(
                         ProviderPublicationBindingKind::CompositeResponseEvent,
                         None,
@@ -1195,7 +1199,14 @@ impl CoinbaseMarketSealRejoin {
         &self,
         rows: Vec<CoinbaseQualifiedPublicRow>,
         omissions: Vec<CoinbaseMarketOmission>,
-    ) -> Result<(Vec<MarketEvent>, Vec<Bytes>, Vec<u16>), CoinbaseMarketPublicationError> {
+    ) -> Result<
+        (
+            Vec<MarketEvent>,
+            Vec<ProviderMarketEventNativeLineageRow>,
+            Vec<u16>,
+        ),
+        CoinbaseMarketPublicationError,
+    > {
         let observations = self.typed_batch.observations();
         let mut covered = BTreeSet::new();
         let mut events = Vec::new();
@@ -1219,11 +1230,9 @@ impl CoinbaseMarketSealRejoin {
                 return Err(CoinbaseMarketPublicationError::CanonicalAlignmentMismatch);
             }
             validate_public_event(&row.event, observation, self)?;
-            native.push(encode_public_native(
-                observation,
-                row.observation_ordinal,
-                &row.event,
-                self,
+            native.push(ProviderMarketEventNativeLineageRow::try_new(
+                observation.instrument_attestation().clone(),
+                encode_public_native(observation, row.observation_ordinal, &row.event, self)?,
             )?);
             events.push(row.event);
             ordinals.push(0);
@@ -1246,7 +1255,14 @@ impl CoinbaseMarketSealRejoin {
         replay: &[CoinbaseDirectReplayPublicationEvidence],
         rows: Vec<CoinbaseQualifiedDirectReplayRow>,
         omissions: Vec<CoinbaseMarketOmission>,
-    ) -> Result<(Vec<MarketEvent>, Vec<Bytes>, Vec<u16>), CoinbaseMarketPublicationError> {
+    ) -> Result<
+        (
+            Vec<MarketEvent>,
+            Vec<ProviderMarketEventNativeLineageRow>,
+            Vec<u16>,
+        ),
+        CoinbaseMarketPublicationError,
+    > {
         let mut covered = BTreeSet::new();
         let mut events = Vec::new();
         let mut native = Vec::new();
@@ -1269,10 +1285,9 @@ impl CoinbaseMarketSealRejoin {
                 return Err(CoinbaseMarketPublicationError::CanonicalAlignmentMismatch);
             }
             validate_direct_replay_event(&row.event, frame, self)?;
-            native.push(encode_direct_native_row(
-                frame,
-                row.replay_frame_ordinal,
-                &row.event,
+            native.push(ProviderMarketEventNativeLineageRow::try_new(
+                self.evidence.instrument_attestation().clone(),
+                encode_direct_native_row(frame, row.replay_frame_ordinal, &row.event)?,
             )?);
             events.push(row.event);
             ordinals.push(row.replay_frame_ordinal);

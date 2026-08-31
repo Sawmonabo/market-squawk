@@ -47,7 +47,6 @@ pub const COINBASE_DIRECT_WEBSOCKET_ENDPOINT: &str = "wss://ws-direct.exchange.c
 pub const COINBASE_DIRECT_VERIFY_ENDPOINT: &str =
     "https://api.exchange.coinbase.com/users/self/verify";
 const COINBASE_REST_ORIGIN: &str = "https://api.exchange.coinbase.com";
-const COINBASE_VENUE: &str = "coinbase-exchange";
 const COINBASE_PROVIDER: &str = "coinbase-exchange";
 const DIRECT_CHANNEL: &str = "full";
 const WEBSOCKET_AUTH_PATH: &str = "/users/self/verify";
@@ -298,7 +297,6 @@ fn direct_memory_product(count: usize, bytes: u64) -> Result<u64, CoinbaseConfig
 pub struct CoinbaseDirectConfig {
     metadata: SourceMetadata,
     mapping: CoinbaseProductMapping,
-    venue: VenueId,
     terms: InstrumentExecutionTerms,
     limits: CoinbaseDirectLimits,
     publication_depth: MarketDepth,
@@ -478,7 +476,11 @@ impl CoinbaseDirectConfig {
             ProviderChannel::new(SourceIdentifier::try_from(DIRECT_CHANNEL)?),
             live_rules,
         )?;
-        let venue = VenueId::try_from(COINBASE_VENUE)?;
+        let venue = mapping
+            .instrument_attestation()
+            .venue_mapping()
+            .venue_id()
+            .clone();
         let coverage = SourceCoverage::try_instrument(
             coverage_evidence,
             effective,
@@ -532,7 +534,6 @@ impl CoinbaseDirectConfig {
         Ok(Self {
             metadata,
             mapping,
-            venue,
             terms,
             limits,
             publication_depth,
@@ -567,13 +568,29 @@ impl CoinbaseDirectConfig {
     }
 
     /// Returns the stable mapped instrument.
-    pub const fn instrument(&self) -> market_squawk_domain::InstrumentId {
+    pub fn instrument(&self) -> market_squawk_domain::InstrumentId {
         self.mapping.instrument()
     }
 
     /// Returns the direct venue bound into coverage and every derived quote.
-    pub const fn venue(&self) -> &VenueId {
-        &self.venue
+    pub fn venue(&self) -> &VenueId {
+        self.mapping
+            .instrument_attestation()
+            .venue_mapping()
+            .venue_id()
+    }
+
+    /// Returns the exact durable provider/canonical identity selected before the session.
+    pub fn instrument_attestation(
+        &self,
+    ) -> &market_squawk_sources::ProviderNativeInstrumentAttestation {
+        self.mapping.instrument_attestation()
+    }
+
+    pub(crate) const fn shared_instrument_attestation(
+        &self,
+    ) -> &std::sync::Arc<market_squawk_sources::ProviderNativeInstrumentAttestation> {
+        self.mapping.shared_instrument_attestation()
     }
 
     /// Returns the immutable instrument terms used for exact Direct normalization.

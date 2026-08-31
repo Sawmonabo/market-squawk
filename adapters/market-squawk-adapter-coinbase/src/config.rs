@@ -1,19 +1,20 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use market_squawk_domain::{
     AssetClass, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
     EffectiveInterval, ExactPayloadEvidence, InstrumentId, IntegrityRule, LiveEventClass,
     MarketDepth, ProviderChannel, ProviderProduct, RevisionBoundPayloadEvidence, RuleVersion,
-    SchemaVersion, SequenceCapability, SnapshotApplicability, SourceId, SourceIdentifier, VenueId,
+    SchemaVersion, SequenceCapability, SnapshotApplicability, SourceId, SourceIdentifier,
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, ChecksumValidationProfile, CoverageTopology,
     FreshnessPolicy, HistoricalCapability, InstrumentCoverage, LiveCoverageDeclaration,
     LiveCoverageRule, LiveProtocolProfile, NetworkAccessPolicy, ProviderBudgetPolicy,
-    ProviderNumericPolicy, SemanticInterpretationProfile, SequenceValidationProfile,
-    SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata, SourceMetadataError,
-    SourceMetadataInput, SourceProtocolProfile,
+    ProviderNativeInstrumentAttestation, ProviderNumericPolicy, SemanticInterpretationProfile,
+    SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
+    SourceMetadataError, SourceMetadataInput, SourceProtocolProfile,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -58,7 +59,7 @@ impl CoinbaseChannel {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoinbaseProductMapping {
     product: ProviderProduct,
-    instrument: InstrumentId,
+    instrument_attestation: Arc<ProviderNativeInstrumentAttestation>,
 }
 
 impl CoinbaseProductMapping {
@@ -69,12 +70,30 @@ impl CoinbaseProductMapping {
     /// Rejects product identifiers outside the bounded Exchange grammar.
     pub fn try_new(
         product: ProviderProduct,
-        instrument: InstrumentId,
+        instrument_attestation: ProviderNativeInstrumentAttestation,
     ) -> Result<Self, CoinbaseConfigError> {
-        validate_product(product.as_source_identifier().as_str())?;
+        let product_value = product.as_source_identifier().as_str();
+        validate_product(product_value)?;
+        if instrument_attestation.venue_mapping().venue_id().as_str() != COINBASE_VENUE
+            || instrument_attestation
+                .provider_key()
+                .provider_instrument_id()
+                .as_str()
+                != product_value
+            || instrument_attestation
+                .venue_mapping()
+                .venue_symbol()
+                .as_str()
+                != product_value
+            || instrument_attestation
+                .validate_at(instrument_attestation.selected_at())
+                .is_err()
+        {
+            return Err(CoinbaseConfigError::InvalidNativeProductAttestation);
+        }
         Ok(Self {
             product,
-            instrument,
+            instrument_attestation: Arc::new(instrument_attestation),
         })
     }
 
@@ -84,8 +103,19 @@ impl CoinbaseProductMapping {
     }
 
     /// Returns the mapped stable internal instrument.
-    pub const fn instrument(&self) -> InstrumentId {
-        self.instrument
+    pub fn instrument(&self) -> InstrumentId {
+        self.instrument_attestation.instrument_id()
+    }
+
+    /// Returns the exact durable provider/canonical identity selected before session construction.
+    pub fn instrument_attestation(&self) -> &ProviderNativeInstrumentAttestation {
+        self.instrument_attestation.as_ref()
+    }
+
+    pub(crate) const fn shared_instrument_attestation(
+        &self,
+    ) -> &Arc<ProviderNativeInstrumentAttestation> {
+        &self.instrument_attestation
     }
 }
 
@@ -180,7 +210,13 @@ impl CoinbaseExchangeConfig {
         validate_mappings(&mappings)?;
         validate_channels(&channels)?;
 
-        let venue = VenueId::try_from(COINBASE_VENUE)?;
+        let venue = mappings
+            .first()
+            .ok_or(CoinbaseConfigError::InvalidMappingCount)?
+            .instrument_attestation()
+            .venue_mapping()
+            .venue_id()
+            .clone();
         let decoder_rule = rule("coinbase-advanced-trade-v1-decoder")?;
         let timestamp_rule = rule("coinbase-advanced-trade-rfc3339-timestamp")?;
         let sequence_rule = rule("coinbase-advanced-trade-envelope-sequence-unbound")?;
@@ -372,7 +408,7 @@ fn validate_mappings(mappings: &[CoinbaseProductMapping]) -> Result<(), Coinbase
         if !products.insert(mapping.product.as_source_identifier().as_str()) {
             return Err(CoinbaseConfigError::DuplicateProduct);
         }
-        if !instruments.insert(mapping.instrument) {
+        if !instruments.insert(mapping.instrument()) {
             return Err(CoinbaseConfigError::DuplicateInstrument);
         }
     }
@@ -421,6 +457,9 @@ pub enum CoinbaseConfigError {
     /// Product identifier violated the Exchange grammar.
     #[error("Coinbase product identifier is invalid")]
     InvalidProduct,
+    /// Durable provider identity, canonical instrument, venue, and provider product diverged.
+    #[error("Coinbase provider-native instrument attestation is inconsistent")]
+    InvalidNativeProductAttestation,
     /// Product mapping count was empty or exceeded the connection ceiling.
     #[error("Coinbase product mapping count is invalid")]
     InvalidMappingCount,
