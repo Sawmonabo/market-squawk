@@ -7,15 +7,17 @@ use market_squawk_runtime::WorkspaceId;
 use market_squawk_services::{
     ProgressDelivery as ServiceProgressDelivery, ProgressError, ProgressSink,
     RequestContext as ServiceRequestContext, RequestId as ServiceRequestId, RequestOrigin,
-    ServiceCapabilities, ServiceError, ServiceErrorClass, ToolAuthorization, ToolDescriptor,
-    ToolServices,
+    ResultEnvelopeProjection, ServiceCapabilities, ServiceError, ServiceErrorClass, ServiceLimits,
+    ToolAuthorization, ToolDescriptor, ToolServices,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, DiscoverResult,
-        ErrorCode, Implementation, InitializeResult, ListToolsResult, NumberOrString,
-        PaginatedRequestParams, ProgressNotificationParam, ProgressToken, ProtocolVersion,
+        ErrorCode, Implementation, InitializeResult, ListResourceTemplatesResult,
+        ListResourcesResult, ListToolsResult, NumberOrString, PaginatedRequestParams,
+        ProgressNotificationParam, ProgressToken, ProtocolVersion, ReadResourceRequestParams,
+        ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
         ServerCapabilities, ServerInfo, Tool,
     },
     service::RequestContext as McpRequestContext,
@@ -25,9 +27,15 @@ use thiserror::Error;
 use crate::{
     AuditCompletion, AuditError, AuditEvent, AuditOperation, AuditResultClass, AuditSink,
     AuthenticatedMcpClient, LocalProcessIdentityClass, McpLimits, MutationAuditBundle,
+    resources::{
+        ProductResource, ProductResourceError, stable_resource_templates, stable_resources,
+        validate_catalog, validate_descriptor,
+    },
 };
 
 const STABLE_PROTOCOLS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
+const MAXIMUM_RESOURCE_BYTES: usize = 64 * 1024;
+const MAXIMUM_RESOURCE_ITEMS: usize = 1_000;
 
 /// Frozen factory for independent stateless MCP request handlers.
 #[derive(Clone)]
@@ -35,6 +43,9 @@ pub struct McpHandlerFactory {
     services: Arc<dyn ToolServices>,
     capabilities: ServiceCapabilities,
     tools: Arc<[Tool]>,
+    resources: Arc<[Resource]>,
+    resource_templates: Arc<[ResourceTemplate]>,
+    resource_limits: ServiceLimits,
     limits: McpLimits,
     audit: Arc<dyn AuditSink>,
     workspace_id: WorkspaceId,
@@ -46,6 +57,8 @@ impl std::fmt::Debug for McpHandlerFactory {
             .debug_struct("McpHandlerFactory")
             .field("capabilities", &self.capabilities)
             .field("tool_count", &self.tools.len())
+            .field("resource_count", &self.resources.len())
+            .field("resource_template_count", &self.resource_templates.len())
             .field("limits", &self.limits)
             .field("audit", &"[AUDIT SINK]")
             .finish_non_exhaustive()
@@ -68,10 +81,24 @@ impl McpHandlerFactory {
         let capabilities = services.capabilities();
         let tools = crate::server::validated_protocol_tools(&capabilities, limits)
             .map_err(|_error| HandlerFactoryError::InvalidComposition)?;
+        validate_catalog(&capabilities)
+            .map_err(|_error| HandlerFactoryError::InvalidComposition)?;
+        let resources = stable_resources();
+        let resource_templates = stable_resource_templates();
+        let resource_bytes = serde_json::to_vec(&(resources.as_ref(), resource_templates.as_ref()))
+            .map_err(|_error| HandlerFactoryError::InvalidComposition)?;
+        if resource_bytes.len() > limits.maximum_frame_bytes() {
+            return Err(HandlerFactoryError::InvalidComposition);
+        }
+        let resource_limits = resource_limits(limits.service_limits())
+            .map_err(|_error| HandlerFactoryError::InvalidComposition)?;
         Ok(Self {
             services,
             capabilities,
             tools,
+            resources,
+            resource_templates,
+            resource_limits,
             limits,
             audit,
             workspace_id,
@@ -83,6 +110,9 @@ impl McpHandlerFactory {
             services: Arc::clone(&self.services),
             capabilities: self.capabilities.clone(),
             tools: Arc::clone(&self.tools),
+            resources: Arc::clone(&self.resources),
+            resource_templates: Arc::clone(&self.resource_templates),
+            resource_limits: self.resource_limits,
             limits: self.limits,
             audit: Arc::clone(&self.audit),
             workspace_id: self.workspace_id,
@@ -108,6 +138,9 @@ pub(crate) struct StatelessMcpHandler {
     services: Arc<dyn ToolServices>,
     capabilities: ServiceCapabilities,
     tools: Arc<[Tool]>,
+    resources: Arc<[Resource]>,
+    resource_templates: Arc<[ResourceTemplate]>,
+    resource_limits: ServiceLimits,
     limits: McpLimits,
     audit: Arc<dyn AuditSink>,
     workspace_id: WorkspaceId,
@@ -294,15 +327,138 @@ impl StatelessMcpHandler {
         }
         Err(service_error(ServiceError::ResourceExhausted))
     }
+
+    async fn read_product_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: McpRequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let authenticated = require_authenticated(&context)?;
+        if request.input_responses.is_some() || request.request_state.is_some() {
+            return Err(McpError::invalid_params(
+                "resource continuation state is not supported",
+                None,
+            ));
+        }
+        let resource = ProductResource::try_from_uri(&request.uri).map_err(resource_error)?;
+        let descriptor = self
+            .capabilities
+            .find(resource.operation())
+            .ok_or_else(|| McpError::internal_error("resource operation is unavailable", None))?;
+        validate_descriptor(descriptor)
+            .map_err(|_error| McpError::internal_error("resource operation is invalid", None))?;
+        let service_request = descriptor.admit(resource.arguments()).map_err(|_error| {
+            McpError::internal_error("resource request mapping is invalid", None)
+        })?;
+        let request_id = service_request_id(&context.id)?;
+        let origin = RequestOrigin::try_new(
+            self.workspace_id.as_uuid(),
+            authenticated.client_id().as_uuid(),
+        )
+        .map_err(|_error| McpError::internal_error("authenticated identity is invalid", None))?;
+        let operation = AuditOperation::ReadResource {
+            name: Arc::from(resource.name()),
+            operation: Arc::from(descriptor.name()),
+            version: Arc::from(descriptor.version()),
+        };
+        self.audit
+            .record(
+                AuditEvent::admitted(
+                    &request_id,
+                    LocalProcessIdentityClass::AuthenticatedInstalledClient,
+                    operation.clone(),
+                    self.resource_limits,
+                    request.uri.as_bytes(),
+                )
+                .map_err(audit_error)?,
+            )
+            .map_err(audit_error)?;
+        let deadline = Instant::now()
+            .checked_add(self.limits.request_timeout())
+            .ok_or_else(|| McpError::internal_error("request deadline is invalid", None))?;
+        let cancellation = context.ct.child_token();
+        let service_context = ServiceRequestContext::new(
+            request_id.clone(),
+            cancellation.clone(),
+            deadline,
+            self.resource_limits,
+        )
+        .with_origin(origin);
+        let service_outcome = tokio::select! {
+            biased;
+            () = context.ct.cancelled() => {
+                cancellation.cancel();
+                Err(ServiceError::Cancelled)
+            }
+            outcome = tokio::time::timeout(
+                self.limits.request_timeout(),
+                self.services.call(service_request, service_context),
+            ) => match outcome {
+                Ok(result) => result,
+                Err(_) => {
+                    cancellation.cancel();
+                    Err(ServiceError::DeadlineExceeded)
+                }
+            }
+        };
+        let rendered = match service_outcome {
+            Ok(result) => self.render_resource_result(resource, descriptor, result),
+            Err(error) => Err(resource_service_error(error)),
+        };
+        let completion = AuditCompletion::new(
+            &request_id,
+            LocalProcessIdentityClass::AuthenticatedInstalledClient,
+            operation,
+            self.resource_limits,
+            b"bounded provider-neutral MCP resource response",
+        )
+        .map_err(audit_error)?;
+        self.audit
+            .reserve_completion(completion)
+            .map_err(audit_error)?
+            .commit(resource_result_class(&rendered))
+            .map_err(audit_error)?;
+        rendered
+    }
+
+    fn render_resource_result(
+        &self,
+        resource: ProductResource,
+        descriptor: &ToolDescriptor,
+        result: market_squawk_services::TypedToolResult,
+    ) -> Result<ReadResourceResponse, McpError> {
+        result
+            .validate_against(self.resource_limits)
+            .and_then(|()| result.validate_for(descriptor))
+            .map_err(|_error| resource_exhausted("resource result is invalid"))?;
+        let projection = descriptor.result_projection();
+        if projection != ResultEnvelopeProjection::ProductV1
+            || result
+                .projected_encoded_bytes(projection, self.resource_limits)
+                .map_err(|_error| resource_exhausted("resource result is invalid"))?
+                > self.resource_limits.maximum_inline_bytes()
+            || result.item_count() > self.resource_limits.maximum_inline_items()
+        {
+            return Err(resource_exhausted("resource result limit exceeded"));
+        }
+        let encoded = serde_json::to_string(&result.into_envelope(projection))
+            .map_err(|_error| McpError::internal_error("resource encoding failed", None))?;
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(encoded, resource.uri()).with_mime_type("application/json"),
+        ])
+        .into())
+    }
 }
 
 impl ServerHandler for StatelessMcpHandler {
     fn get_info(&self) -> ServerInfo {
-        let capabilities = if self.capabilities.has_tools() {
-            ServerCapabilities::builder().enable_tools().build()
-        } else {
-            ServerCapabilities::default()
-        };
+        let mut capabilities = ServerCapabilities::builder().enable_resources().build();
+        if self.capabilities.has_tools() {
+            capabilities = ServerCapabilities::builder()
+                .enable_resources()
+                .enable_tools()
+                .build();
+        }
         InitializeResult::new(capabilities)
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
             .with_server_info(Implementation::new(
@@ -352,6 +508,36 @@ impl ServerHandler for StatelessMcpHandler {
         context: McpRequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         self.execute_tool(request, context).await.map(Into::into)
+    }
+
+    async fn list_resources(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: McpRequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        require_authenticated(&context)?;
+        reject_cursor(request)?;
+        Ok(ListResourcesResult::with_all_items(self.resources.to_vec()))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: McpRequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        require_authenticated(&context)?;
+        reject_cursor(request)?;
+        Ok(ListResourceTemplatesResult::with_all_items(
+            self.resource_templates.to_vec(),
+        ))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: McpRequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        self.read_product_resource(request, context).await
     }
 }
 
@@ -411,6 +597,23 @@ fn reject_cursor(request: Option<PaginatedRequestParams>) -> Result<(), McpError
     } else {
         Ok(())
     }
+}
+
+fn resource_limits(configured: ServiceLimits) -> Result<ServiceLimits, ()> {
+    let maximum_bytes = configured
+        .maximum_inline_bytes()
+        .min(MAXIMUM_RESOURCE_BYTES);
+    let maximum_items = configured
+        .maximum_inline_items()
+        .min(MAXIMUM_RESOURCE_ITEMS);
+    ServiceLimits::try_new(
+        maximum_bytes,
+        maximum_items,
+        maximum_bytes,
+        maximum_items,
+        configured.result_structure(),
+    )
+    .map_err(|_error| ())
 }
 
 fn structured_result(value: serde_json::Value) -> CallToolResult {
@@ -500,6 +703,50 @@ fn protocol_result_class(result: &Result<CallToolResult, McpError>) -> AuditResu
         Err(error) if error.code == ErrorCode(-32_008) => AuditResultClass::DeadlineExceeded,
         Err(error) if error.code == ErrorCode(-32_010) => AuditResultClass::ResourceExhausted,
         Err(_) => AuditResultClass::ServiceRejected,
+    }
+}
+
+fn resource_result_class(result: &Result<ReadResourceResponse, McpError>) -> AuditResultClass {
+    match result {
+        Ok(_) => AuditResultClass::Succeeded,
+        Err(error) if error.code == ErrorCode(-32_800) => AuditResultClass::Cancelled,
+        Err(error) if error.code == ErrorCode(-32_008) => AuditResultClass::DeadlineExceeded,
+        Err(error) if error.code == ErrorCode(-32_010) => AuditResultClass::ResourceExhausted,
+        Err(_) => AuditResultClass::ServiceRejected,
+    }
+}
+
+fn resource_error(error: ProductResourceError) -> McpError {
+    match error {
+        ProductResourceError::InvalidUri => {
+            McpError::invalid_params("resource URI is invalid", None)
+        }
+        ProductResourceError::InvalidComposition => {
+            McpError::internal_error("resource catalog is invalid", None)
+        }
+    }
+}
+
+fn resource_service_error(error: ServiceError) -> McpError {
+    match error.class() {
+        ServiceErrorClass::InvalidRequest => {
+            McpError::invalid_params("resource request is invalid", None)
+        }
+        ServiceErrorClass::NotFound => McpError::resource_not_found("resource was not found", None),
+        ServiceErrorClass::Unauthorized => {
+            McpError::new(ErrorCode(-32_003), "resource is not authorized", None)
+        }
+        ServiceErrorClass::ResourceExhausted | ServiceErrorClass::InvalidResult => {
+            resource_exhausted("resource result limit exceeded")
+        }
+        ServiceErrorClass::Cancelled => cancelled_error(),
+        ServiceErrorClass::DeadlineExceeded => deadline_error(),
+        ServiceErrorClass::Unavailable => {
+            McpError::new(ErrorCode(-32_001), "resource is unavailable", None)
+        }
+        ServiceErrorClass::Internal => {
+            McpError::internal_error("resource operation failed internally", None)
+        }
     }
 }
 

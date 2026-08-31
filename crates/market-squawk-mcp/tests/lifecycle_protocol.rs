@@ -15,17 +15,14 @@ use axum::{
     body::{Body, to_bytes},
     http::{Method, Request, StatusCode, header},
 };
-use market_squawk_jobs::{JobGeneration, JobId};
 use market_squawk_mcp::{
     ArtifactError, ArtifactPublication, ArtifactPublicationContext, ArtifactRead,
     ArtifactReadContext, ArtifactReadRequest, ArtifactReference, ArtifactRepository,
     AuditCompletion, AuditCompletionReservation, AuditError, AuditEvent, AuditPhase, AuditSink,
     AuthenticatedMcpClient, HttpMcpConfig, LocalProcessIdentityClass, McpHandlerFactory,
     McpHttpAuthError, McpHttpAuthenticator, McpHttpService, McpLimitSpec, McpLimits, McpRelayError,
-    McpRelayExchange, McpRelayResponse, McpRelayTransport, McpRelayTransportError,
-    McpResourceDocument, McpResourceError, McpResourceProvider, McpResourceRequest, McpServer,
+    McpRelayExchange, McpRelayResponse, McpRelayTransport, McpRelayTransportError, McpServer,
     McpStdioRelay, MutationAuditBundle, MutationAuditReservation, ServerError, ServerExit,
-    job_resource_uri,
 };
 use market_squawk_runtime::{ClientId, CredentialGeneration, NamedClient, WorkspaceId};
 use market_squawk_services::{
@@ -1235,24 +1232,148 @@ async fn terminal_results_close_delayed_progress_for_normal_and_cancelled_calls(
 }
 
 #[derive(Debug, Default)]
-struct HttpResources;
+struct HttpProductServices {
+    started: Notify,
+    calls: AtomicUsize,
+    resource_calls: Mutex<Vec<(String, serde_json::Map<String, Value>)>>,
+}
+
+const PRODUCT_RESOURCE_OPERATIONS: [&str; 10] = [
+    "Market.GetOverview",
+    "Macro.GetContext",
+    "Model.ListForecasts",
+    "Model.GetForecast",
+    "Model.GetForecastOutcomes",
+    "Analysis.ListProductBacktests",
+    "Analysis.GetProductBacktest",
+    "Decision.ListInvestmentAnalyses",
+    "Decision.GetInvestmentAnalysis",
+    "Decision.GetRecommendationTrackRecord",
+];
+
+fn http_product_schema(operation: &str) -> Value {
+    let property = match operation {
+        "Model.GetForecast" | "Model.GetForecastOutcomes" => Some(("forecastToken", "string")),
+        "Analysis.GetProductBacktest" => Some(("backtestToken", "string")),
+        "Decision.GetInvestmentAnalysis" | "Decision.GetRecommendationTrackRecord" => {
+            Some(("actionToken", "string"))
+        }
+        "Decision.ListInvestmentAnalyses" => Some(("limit", "integer")),
+        _ => None,
+    };
+    match property {
+        Some((name, kind)) => json!({
+            "type":"object",
+            "properties":{name:{"type":kind}},
+            "required":[name],
+            "additionalProperties":false
+        }),
+        None => json!({"type":"object","properties":{},"additionalProperties":false}),
+    }
+}
+
+fn admit_http_product(
+    operation: &str,
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<(), ToolInputError> {
+    let valid = match operation {
+        "Model.GetForecast" | "Model.GetForecastOutcomes" => {
+            canonical_uuid_argument(arguments, "forecastToken")
+        }
+        "Analysis.GetProductBacktest" => canonical_uuid_argument(arguments, "backtestToken"),
+        "Decision.GetInvestmentAnalysis" | "Decision.GetRecommendationTrackRecord" => {
+            canonical_uuid_argument(arguments, "actionToken")
+        }
+        "Decision.ListInvestmentAnalyses" => {
+            arguments.len() == 1
+                && arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|limit| (1..=1_000).contains(&limit))
+        }
+        _ => arguments.is_empty(),
+    };
+    valid.then_some(()).ok_or(ToolInputError::Invalid)
+}
+
+fn canonical_uuid_argument(arguments: &serde_json::Map<String, Value>, name: &str) -> bool {
+    arguments.len() == 1
+        && arguments
+            .get(name)
+            .and_then(Value::as_str)
+            .and_then(|value| {
+                uuid::Uuid::parse_str(value)
+                    .ok()
+                    .map(|token| (value, token))
+            })
+            .is_some_and(|(value, token)| !token.is_nil() && token.to_string() == value)
+}
 
 #[async_trait]
-impl McpResourceProvider for HttpResources {
-    async fn read(
+impl ToolServices for HttpProductServices {
+    fn capabilities(&self) -> ServiceCapabilities {
+        let descriptors = PRODUCT_RESOURCE_OPERATIONS
+            .into_iter()
+            .chain(["Bot.Test", "Market.Wait"])
+            .filter_map(|operation| {
+                ToolDescriptor::try_new(
+                    operation,
+                    "1",
+                    "Read one bounded provider-neutral product result.",
+                    http_product_schema(operation),
+                    read_only_contract(ServiceDomain::Analysis, NO_SCOPE),
+                    ToolEffects::read_only_closed_world(),
+                    move |arguments: &serde_json::Map<String, Value>| {
+                        admit_http_product(operation, arguments)
+                    },
+                )
+                .and_then(|descriptor| {
+                    descriptor.try_into_product_v1(
+                        move |arguments: &serde_json::Map<String, Value>| {
+                            admit_http_product(operation, arguments)
+                        },
+                    )
+                })
+                .ok()
+            })
+            .collect();
+        ServiceCapabilities::try_new(descriptors).unwrap_or_else(|_| ServiceCapabilities::empty())
+    }
+
+    async fn call(
         &self,
-        request: McpResourceRequest,
-        _context: RequestContext,
-    ) -> Result<McpResourceDocument, McpResourceError> {
-        let kind = match request {
-            McpResourceRequest::Service => "service",
-            McpResourceRequest::Workspace => "workspace",
-            McpResourceRequest::Source(_) => "source",
-            McpResourceRequest::Model(_) => "model",
-            McpResourceRequest::Job(_) => "job",
-            McpResourceRequest::Artifact(_) => "artifact",
+        request: TypedToolRequest,
+        context: RequestContext,
+    ) -> Result<TypedToolResult, ServiceError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if request.name() == "Market.Wait" {
+            self.started.notify_one();
+            context.cancellation().cancelled().await;
+            return Err(ServiceError::Cancelled);
+        }
+        let item_count = if request.name() == "Market.GetOverview" {
+            2
+        } else {
+            1
         };
-        McpResourceDocument::try_new(json!({"kind":kind}), 1)
+        if PRODUCT_RESOURCE_OPERATIONS.contains(&request.name()) {
+            self.resource_calls
+                .lock()
+                .map_err(|_| ServiceError::Internal)?
+                .push((request.name().to_owned(), request.arguments().clone()));
+        }
+        let value = if request.name() == "Bot.Test" {
+            json!({"ok":true})
+        } else {
+            json!({"summary":"available","items":["first","second"]})
+        };
+        TypedToolResult::try_new(
+            value,
+            item_count,
+            ToolResultMetadata::complete_not_applicable(),
+            context.limits(),
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -1365,7 +1486,7 @@ async fn stateless_rpc(
 #[tokio::test]
 async fn stateless_http_is_authenticated_bounded_and_has_only_stable_v1_capabilities()
 -> Result<(), Box<dyn Error>> {
-    let services = Arc::new(WaitingService::default());
+    let services = Arc::new(HttpProductServices::default());
     let limits = McpLimits::try_from(McpLimitSpec {
         maximum_frame_bytes: 256 * 1024,
         maximum_body_bytes: 8 * 1024,
@@ -1375,14 +1496,8 @@ async fn stateless_http_is_authenticated_bounded_and_has_only_stable_v1_capabili
     let audit = Arc::new(CollectingAudit::default());
     let workspace_id: WorkspaceId =
         serde_json::from_str("\"00000000-0000-0000-0000-000000000001\"")?;
-    let factory = McpHandlerFactory::try_new(
-        services.clone(),
-        limits,
-        audit.clone(),
-        Arc::new(RejectingArtifacts),
-        Arc::new(HttpResources),
-        workspace_id,
-    )?;
+    let factory =
+        McpHandlerFactory::try_new(services.clone(), limits, audit.clone(), workspace_id)?;
     let authenticator = Arc::new(FixedHttpAuthenticator::try_new()?);
     let http = McpHttpService::new(
         factory,
@@ -1414,14 +1529,68 @@ async fn stateless_http_is_authenticated_bounded_and_has_only_stable_v1_capabili
                 .as_array()
                 .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "Bot.Test"))
         );
-        let resources = stateless_rpc(&http, token, "resources/templates/list", json!({})).await?;
+        let resources = stateless_rpc(&http, token, "resources/list", json!({})).await?;
+        let resource_uris = resources["result"]["resources"]
+            .as_array()
+            .ok_or("resources/list did not return an array")?
+            .iter()
+            .map(|resource| resource["uri"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resource_uris,
+            [
+                Some("market-squawk://market-overview"),
+                Some("market-squawk://economic-context"),
+                Some("market-squawk://forecasts"),
+                Some("market-squawk://backtests"),
+                Some("market-squawk://investment-analyses"),
+            ]
+        );
+        let templates = stateless_rpc(&http, token, "resources/templates/list", json!({})).await?;
+        let template_uris = templates["result"]["resourceTemplates"]
+            .as_array()
+            .ok_or("resources/templates/list did not return an array")?
+            .iter()
+            .map(|template| template["uriTemplate"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            template_uris,
+            [
+                Some("market-squawk://forecasts/{forecast_token}"),
+                Some("market-squawk://forecasts/{forecast_token}/outcomes"),
+                Some("market-squawk://backtests/{backtest_token}"),
+                Some("market-squawk://investment-analyses/{action_token}"),
+                Some("market-squawk://investment-analyses/{action_token}/track-record"),
+            ]
+        );
+        let catalog = format!("{resources}{templates}");
+        for forbidden in [
+            "market-squawk://sources/",
+            "market-squawk://models/",
+            "market-squawk://jobs/",
+            "market-squawk://artifacts/",
+            "market-squawk://workspace",
+            "market-squawk://service",
+        ] {
+            assert!(!catalog.contains(forbidden));
+        }
+        let overview = stateless_rpc(
+            &http,
+            token,
+            "resources/read",
+            json!({"uri":"market-squawk://market-overview"}),
+        )
+        .await?;
+        let overview_document: Value = serde_json::from_str(
+            overview["result"]["contents"][0]["text"]
+                .as_str()
+                .ok_or("resource response did not return its provider-neutral JSON document")?,
+        )?;
+        assert_eq!(overview_document["metadata"]["returnedItems"], 2);
         assert!(
-            resources["result"]["resourceTemplates"]
-                .as_array()
-                .is_some_and(
-                    |templates| templates.iter().any(|template| template["uriTemplate"]
-                        == "market-squawk://jobs/{job_id}/generations/{generation}")
-                )
+            overview_document["metadata"]
+                .get("sourceCoverage")
+                .is_none()
         );
         let read = stateless_rpc(
             &http,
@@ -1615,27 +1784,56 @@ async fn stateless_http_is_authenticated_bounded_and_has_only_stable_v1_capabili
         StatusCode::PAYLOAD_TOO_LARGE
     );
 
-    let job_id: JobId = "00000000-0000-0000-0000-000000000001".parse()?;
-    let job_generation = JobGeneration::try_new(1)?;
-    let job_uri = job_resource_uri(job_id, job_generation);
-    let job = response_json(
+    let forecast_token = "00000000-0000-0000-0000-000000000001";
+    let forecast = response_json(
         http.handle(stateless_request(
             Method::POST,
             Some("beta"),
-            stateless_message("job", "resources/read", json!({"uri":job_uri})),
+            stateless_message(
+                "forecast",
+                "resources/read",
+                json!({"uri":format!("market-squawk://forecasts/{forecast_token}")}),
+            ),
         ))
         .await,
     )
     .await?;
     assert_eq!(
-        job["result"]["contents"][0]["uri"],
-        format!(
-            "market-squawk://jobs/{}/generations/{}",
-            job_id.as_uuid(),
-            job_generation.get()
-        )
+        forecast["result"]["contents"][0]["uri"],
+        format!("market-squawk://forecasts/{forecast_token}")
     );
-    assert_eq!(job["result"]["contents"][0]["mimeType"], "application/json");
+    assert_eq!(
+        forecast["result"]["contents"][0]["mimeType"],
+        "application/json"
+    );
+    for invalid_uri in [
+        "market-squawk://forecasts/00000000-0000-0000-0000-000000000001?latest=true",
+        "market-squawk://jobs/00000000-0000-0000-0000-000000000001",
+        "market-squawk://forecasts/%30%30%30%30%30%30%30%30-0000-0000-0000-000000000001",
+    ] {
+        let rejected = response_json(
+            http.handle(stateless_request(
+                Method::POST,
+                Some("beta"),
+                stateless_message(
+                    "invalid-resource",
+                    "resources/read",
+                    json!({"uri":invalid_uri}),
+                ),
+            ))
+            .await,
+        )
+        .await?;
+        assert_eq!(rejected["error"]["code"], -32602);
+    }
+    let resource_calls = services
+        .resource_calls
+        .lock()
+        .map_err(|_| "resource call log was poisoned")?;
+    assert!(resource_calls.iter().any(|(operation, arguments)| {
+        operation == "Model.GetForecast"
+            && arguments.get("forecastToken") == Some(&json!(forecast_token))
+    }));
     Ok(())
 }
 

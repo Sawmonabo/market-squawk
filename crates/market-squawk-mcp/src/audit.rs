@@ -33,6 +33,15 @@ pub enum AuditOperation {
         /// Exact registered contract version.
         version: Arc<str>,
     },
+    /// One closed provider-neutral product resource read.
+    ReadResource {
+        /// Stable product resource kind without its opaque token.
+        name: Arc<str>,
+        /// Exact registered application operation.
+        operation: Arc<str>,
+        /// Exact registered operation contract version.
+        version: Arc<str>,
+    },
     /// Known notification or unsupported request.
     Other,
 }
