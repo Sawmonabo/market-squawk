@@ -774,8 +774,6 @@ pub enum ProductionKrakenProfileError {
     Metadata(#[from] KrakenMetadataError),
     #[error("Kraken adapter configuration is invalid")]
     Adapter(#[from] KrakenConfigError),
-    #[error("Kraken decoder configuration is invalid")]
-    Decoder(#[from] DecodeError),
     #[error("Kraken production profile evidence could not be encoded")]
     EvidenceSerialization,
     #[error("Kraken production duration exceeds the supported nanosecond range")]
