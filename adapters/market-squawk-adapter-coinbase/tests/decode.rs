@@ -106,6 +106,32 @@ fn official_protocol_fixtures_match_the_pinned_manifest() -> TestResult {
 #[test]
 fn decodes_exact_book_and_trade_evidence_without_promoting_integrity() -> TestResult {
     let source_config = config()?;
+    let decoder = CoinbaseExchangeDecoder::try_new(&source_config)?;
+    assert_eq!(
+        decoder.provider_identity_key().source_id().as_str(),
+        "coinbase-exchange-public"
+    );
+    assert_eq!(
+        decoder
+            .provider_identity_key()
+            .provider_instrument_id()
+            .as_str(),
+        "BTC-USD"
+    );
+    assert_eq!(decoder.venue_symbol().as_str(), "BTC-USD");
+    assert_eq!(
+        decoder.provider_identity_revision(),
+        source_config.metadata().revision()
+    );
+    assert_eq!(
+        decoder.provider_identity_digest(),
+        source_config
+            .metadata()
+            .revision_evidence()
+            .payload_evidence()
+            .content_digest()
+    );
+
     let snapshot_handoff = decode_market(include_bytes!("../fixtures/snapshot.json"))?;
     assert_eq!(
         snapshot_handoff.evidence().feed(),
@@ -163,31 +189,7 @@ fn decodes_exact_book_and_trade_evidence_without_promoting_integrity() -> TestRe
         snapshot_handoff.raw_payload_digest(),
         snapshot_handoff.typed_batch().evidence().payload_digest()
     );
-    let (evidence, _raw_payload, snapshot) = snapshot_handoff.into_parts();
-    assert_eq!(
-        evidence.provider_identity_key().source_id().as_str(),
-        "coinbase-exchange-public"
-    );
-    assert_eq!(
-        evidence
-            .provider_identity_key()
-            .provider_instrument_id()
-            .as_str(),
-        "BTC-USD"
-    );
-    assert_eq!(evidence.venue_symbol().as_str(), "BTC-USD");
-    assert_eq!(
-        evidence.provider_identity_revision(),
-        source_config.metadata().revision()
-    );
-    assert_eq!(
-        evidence.provider_identity_digest(),
-        source_config
-            .metadata()
-            .revision_evidence()
-            .payload_evidence()
-            .content_digest()
-    );
+    let (_evidence, _raw_payload, snapshot) = snapshot_handoff.into_parts();
     let observation = &snapshot.observations()[0];
     assert_eq!(observation.event_class(), LiveEventClass::BookSnapshot);
     assert_eq!(observation.depth(), Some(MarketDepth::PriceLevel));

@@ -1,10 +1,7 @@
-use std::sync::Arc;
-
 use market_squawk_domain::{
     CapturePayload, DigestAlgorithm, EvidenceDigest, ExactPayloadEvidence, InstrumentId,
-    LiveEventClass, MarketDepth, MetadataRevision, PriceTicks, ProviderIdentityKey,
-    ProviderProduct, QuantityLots, SequenceNumber, SourceIdentifier, Timestamp, VenueId,
-    VenueSymbol,
+    LiveEventClass, MarketDepth, PriceTicks, ProviderProduct, QuantityLots, SequenceNumber,
+    SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{
     DecodedProviderBatch, DecoderEvidence, ProviderBookSide, ProviderOrderEvent,
@@ -13,7 +10,6 @@ use market_squawk_sources::{
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::config::CoinbaseNativeProductCoordinate;
 use crate::{COINBASE_DIRECT_VERIFY_ENDPOINT, CoinbaseDirectConfig, CoinbaseExchangeConfig};
 
 /// Coinbase transport profile that produced one typed market-data handoff.
@@ -142,7 +138,6 @@ impl CoinbaseDirectTradeEvidence {
 /// One exact post-snapshot Direct frame with its typed order event and optional native match.
 #[derive(Debug)]
 pub struct CoinbaseDirectReplayFrame {
-    native_coordinate: Arc<CoinbaseNativeProductCoordinate>,
     event: ProviderOrderEvent,
     raw_payload: CapturePayload,
     native_trade: Option<CoinbaseDirectTradeEvidence>,
@@ -150,7 +145,6 @@ pub struct CoinbaseDirectReplayFrame {
 
 impl CoinbaseDirectReplayFrame {
     pub(crate) fn try_new(
-        native_coordinate: Arc<CoinbaseNativeProductCoordinate>,
         event: ProviderOrderEvent,
         raw_payload: CapturePayload,
         native_trade: Option<CoinbaseDirectTradeEvidence>,
@@ -162,17 +156,11 @@ impl CoinbaseDirectReplayFrame {
             .map_err(|_error| CoinbaseMarketHandoffError::StaleAuthority)?;
         if event.wire_bytes() != raw_payload.as_bytes().len()
             || event.evidence().payload_digest() != exact_digest(raw_payload.as_bytes())
-            || event.product() != native_coordinate.product()
-            || event.evidence().binding().source_id()
-                != native_coordinate.provider_identity_key().source_id()
-            || event.evidence().binding().metadata_revision()
-                != native_coordinate.identity_revision()
             || !native_trade_matches_event(native_trade.as_ref(), &event)
         {
             return Err(CoinbaseMarketHandoffError::EvidenceMismatch);
         }
         Ok(Self {
-            native_coordinate,
             event,
             raw_payload,
             native_trade,
@@ -187,30 +175,6 @@ impl CoinbaseDirectReplayFrame {
     /// Returns the already-decoded provider order event.
     pub const fn event(&self) -> &ProviderOrderEvent {
         &self.event
-    }
-
-    /// Returns the source-qualified provider-native identity carried with this replay frame.
-    pub fn provider_identity_key(&self) -> &ProviderIdentityKey {
-        self.native_coordinate.provider_identity_key()
-    }
-
-    /// Returns the exact profile revision that bound this replay coordinate.
-    pub fn provider_identity_revision(&self) -> &MetadataRevision {
-        self.native_coordinate.identity_revision()
-    }
-
-    /// Returns the exact profile digest that bound this replay coordinate.
-    pub fn provider_identity_digest(&self) -> EvidenceDigest {
-        self.native_coordinate.identity_digest()
-    }
-
-    /// Returns the independently validated Coinbase Exchange venue symbol.
-    pub fn venue_symbol(&self) -> &VenueSymbol {
-        self.native_coordinate.venue_symbol()
-    }
-
-    pub(crate) const fn native_coordinate(&self) -> &Arc<CoinbaseNativeProductCoordinate> {
-        &self.native_coordinate
     }
 
     /// Returns decoder evidence bound to the exact frame bytes.
@@ -231,17 +195,11 @@ impl CoinbaseDirectReplayFrame {
     pub(crate) fn into_parts(
         self,
     ) -> (
-        Arc<CoinbaseNativeProductCoordinate>,
         ProviderOrderEvent,
         CapturePayload,
         Option<CoinbaseDirectTradeEvidence>,
     ) {
-        (
-            self.native_coordinate,
-            self.event,
-            self.raw_payload,
-            self.native_trade,
-        )
+        (self.event, self.raw_payload, self.native_trade)
     }
 }
 
@@ -316,7 +274,9 @@ pub(crate) struct CoinbaseMarketHandoffInput {
     pub(crate) feed: CoinbaseMarketFeed,
     pub(crate) channel: CoinbaseMarketChannel,
     pub(crate) native_input_depth: Option<MarketDepth>,
-    pub(crate) native_coordinate: Arc<CoinbaseNativeProductCoordinate>,
+    pub(crate) product: ProviderProduct,
+    pub(crate) configured_instrument: InstrumentId,
+    pub(crate) venue: VenueId,
     pub(crate) request_set_digest: EvidenceDigest,
     pub(crate) subscription_digest: EvidenceDigest,
     pub(crate) subscription_acknowledgement: Option<ExactPayloadEvidence>,
@@ -333,7 +293,9 @@ pub struct CoinbaseMarketHandoffEvidence {
     event_class: LiveEventClass,
     native_input_depth: Option<MarketDepth>,
     output_depth: Option<MarketDepth>,
-    native_coordinate: Arc<CoinbaseNativeProductCoordinate>,
+    product: ProviderProduct,
+    configured_instrument: InstrumentId,
+    venue: VenueId,
     request_set_digest: EvidenceDigest,
     subscription_digest: EvidenceDigest,
     subscription_acknowledgement: Option<ExactPayloadEvidence>,
@@ -369,42 +331,18 @@ impl CoinbaseMarketHandoffEvidence {
     }
 
     /// Returns Coinbase's native product identity.
-    pub fn product(&self) -> &ProviderProduct {
-        self.native_coordinate.product()
+    pub const fn product(&self) -> &ProviderProduct {
+        &self.product
     }
 
     /// Returns the externally configured instrument binding; the adapter never mints it.
-    pub fn configured_instrument(&self) -> InstrumentId {
-        self.native_coordinate.instrument()
+    pub const fn configured_instrument(&self) -> InstrumentId {
+        self.configured_instrument
     }
 
     /// Returns the exact venue identity.
-    pub fn venue(&self) -> &VenueId {
-        self.native_coordinate.venue()
-    }
-
-    /// Returns the source-qualified provider-native identity carried by this handoff.
-    pub fn provider_identity_key(&self) -> &ProviderIdentityKey {
-        self.native_coordinate.provider_identity_key()
-    }
-
-    /// Returns the exact profile revision that bound this handoff coordinate.
-    pub fn provider_identity_revision(&self) -> &MetadataRevision {
-        self.native_coordinate.identity_revision()
-    }
-
-    /// Returns the exact profile digest that bound this handoff coordinate.
-    pub fn provider_identity_digest(&self) -> EvidenceDigest {
-        self.native_coordinate.identity_digest()
-    }
-
-    /// Returns the independently validated Coinbase Exchange venue symbol.
-    pub fn venue_symbol(&self) -> &VenueSymbol {
-        self.native_coordinate.venue_symbol()
-    }
-
-    pub(crate) const fn native_coordinate(&self) -> &Arc<CoinbaseNativeProductCoordinate> {
-        &self.native_coordinate
+    pub const fn venue(&self) -> &VenueId {
+        &self.venue
     }
 
     /// Returns SHA-256 over the selected secret-free request set.
@@ -464,12 +402,9 @@ impl CoinbaseMarketHandoff {
         let decoder = typed_batch.evidence();
         if terminal_payload.as_bytes().len() != decoder.frame_bytes()
             || exact_digest(terminal_payload.as_bytes()) != decoder.payload_digest()
-            || decoder.binding().source_id()
-                != input.native_coordinate.provider_identity_key().source_id()
-            || decoder.binding().metadata_revision() != input.native_coordinate.identity_revision()
             || typed_batch.observations().iter().any(|observation| {
-                observation.venue() != input.native_coordinate.venue()
-                    || observation.instrument() != input.native_coordinate.instrument()
+                observation.venue() != &input.venue
+                    || observation.instrument() != input.configured_instrument
             })
         {
             return Err(CoinbaseMarketHandoffError::EvidenceMismatch);
@@ -522,7 +457,9 @@ impl CoinbaseMarketHandoff {
                 event_class,
                 native_input_depth: input.native_input_depth,
                 output_depth,
-                native_coordinate: input.native_coordinate,
+                product: input.product,
+                configured_instrument: input.configured_instrument,
+                venue: input.venue,
                 request_set_digest: input.request_set_digest,
                 subscription_digest: input.subscription_digest,
                 subscription_acknowledgement: input.subscription_acknowledgement,
@@ -645,9 +582,6 @@ fn validate_direct_initial(
         || !terminal_decoder
             .currentness_lease()
             .shares_authority_with(receipt.currentness_lease())
-        || receipt.binding().source_id()
-            != input.native_coordinate.provider_identity_key().source_id()
-        || receipt.binding().metadata_revision() != input.native_coordinate.identity_revision()
         || input.snapshot_provider_at.is_none()
     {
         return Err(CoinbaseMarketHandoffError::EvidenceMismatch);
@@ -662,9 +596,6 @@ fn validate_direct_initial(
             .currentness_lease()
             .validate_current()
             .map_err(|_error| CoinbaseMarketHandoffError::StaleAuthority)?;
-        if !Arc::ptr_eq(frame.native_coordinate(), &input.native_coordinate) {
-            return Err(CoinbaseMarketHandoffError::EvidenceMismatch);
-        }
         let expected = previous
             .map_or(Ok(expected_first), SequenceNumber::checked_next)
             .map_err(|_error| CoinbaseMarketHandoffError::EvidenceMismatch)?;

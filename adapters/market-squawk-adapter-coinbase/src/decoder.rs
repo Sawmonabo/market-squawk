@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
 use chrono::DateTime;
 use market_squawk_domain::{
@@ -41,7 +40,7 @@ const MAX_HEARTBEAT_TIME_BYTES: usize = 160;
 #[derive(Clone, Debug)]
 pub struct CoinbaseExchangeDecoder {
     metadata: SourceMetadata,
-    coordinate: Arc<CoinbaseNativeProductCoordinate>,
+    coordinate: CoinbaseNativeProductCoordinate,
     decoder_rule: IntegrityRule,
     timestamp_rule: IntegrityRule,
     sequence_rule: IntegrityRule,
@@ -73,7 +72,15 @@ impl CoinbaseExchangeDecoder {
     /// Returns [`CoinbaseConfigError::InvalidProtocolProfile`] if the supplied metadata no longer
     /// exposes the live rules guaranteed by [`CoinbaseExchangeConfig`].
     pub fn try_new(config: &CoinbaseExchangeConfig) -> Result<Self, CoinbaseConfigError> {
-        let coordinate = Arc::clone(config.native_coordinate());
+        let mapping = config
+            .mappings()
+            .first()
+            .ok_or(CoinbaseConfigError::InvalidMappingCount)?;
+        let coordinate = CoinbaseNativeProductCoordinate::try_new(
+            mapping.clone(),
+            config.metadata().source_id().clone(),
+            config.metadata().revision_evidence(),
+        )?;
         coordinate.validate_metadata(config.metadata())?;
         let (request_set_digest, subscription_digest) = public_request_digests(config);
         let live = match config.metadata().protocol_profile() {
@@ -141,22 +148,22 @@ impl CoinbaseExchangeDecoder {
     }
 
     /// Returns the source-qualified provider-native identity selected for this product.
-    pub fn provider_identity_key(&self) -> &market_squawk_domain::ProviderIdentityKey {
+    pub const fn provider_identity_key(&self) -> &market_squawk_domain::ProviderIdentityKey {
         self.coordinate.provider_identity_key()
     }
 
     /// Returns the exact profile revision that bound the selected product coordinate.
-    pub fn provider_identity_revision(&self) -> &market_squawk_domain::MetadataRevision {
+    pub const fn provider_identity_revision(&self) -> &market_squawk_domain::MetadataRevision {
         self.coordinate.identity_revision()
     }
 
     /// Returns the exact profile digest that bound the selected product coordinate.
-    pub fn provider_identity_digest(&self) -> EvidenceDigest {
+    pub const fn provider_identity_digest(&self) -> EvidenceDigest {
         self.coordinate.identity_digest()
     }
 
     /// Returns the independently validated Coinbase Exchange venue symbol.
-    pub fn venue_symbol(&self) -> &market_squawk_domain::VenueSymbol {
+    pub const fn venue_symbol(&self) -> &market_squawk_domain::VenueSymbol {
         self.coordinate.venue_symbol()
     }
 
@@ -595,7 +602,7 @@ impl CoinbaseExchangeDecoder {
     ) -> Result<&CoinbaseNativeProductCoordinate, QuarantineReason> {
         self.coordinate
             .validates_wire_product(product)
-            .then_some(self.coordinate.as_ref())
+            .then_some(&self.coordinate)
             .ok_or(QuarantineReason::WrongProduct)
     }
 
@@ -678,7 +685,9 @@ impl CoinbaseExchangeDecoder {
                         feed: CoinbaseMarketFeed::AdvancedTradePublic,
                         channel: coordinates.channel,
                         native_input_depth: coordinates.depth,
-                        native_coordinate: Arc::clone(&self.coordinate),
+                        product: self.coordinate.product().clone(),
+                        configured_instrument: self.coordinate.instrument(),
+                        venue: self.coordinate.venue().clone(),
                         request_set_digest: self.request_set_digest,
                         subscription_digest: self.subscription_digest,
                         subscription_acknowledgement: None,

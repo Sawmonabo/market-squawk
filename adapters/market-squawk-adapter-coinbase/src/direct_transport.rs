@@ -47,7 +47,6 @@ use self::http::{
     CoinbaseDirectHttpRequest, CoinbaseDirectHttpResponse, CoinbaseDirectHttpTransport,
     CoinbaseDirectHttpTransportError, ReqwestCoinbaseDirectHttpTransport,
 };
-use crate::config::CoinbaseNativeProductCoordinate;
 use crate::direct::CoinbaseDirectSnapshotCoordinates;
 use crate::market_handoff::{
     CoinbaseDirectInitialMarketLineage, CoinbaseDirectReplayFrame, CoinbaseMarketHandoffInput,
@@ -86,10 +85,6 @@ struct CoinbaseDirectBookUpdate<'a> {
 
 impl<'a> CoinbaseDirectBookUpdate<'a> {
     fn try_market_handoff(self) -> Result<CoinbaseMarketHandoff, CoinbaseDirectPublicationError> {
-        let native_coordinate = Arc::clone(self.snapshot_coordinates.native_coordinate());
-        if !Arc::ptr_eq(&native_coordinate, self.config.native_coordinate()) {
-            return Err(CoinbaseDirectPublicationError::EvidenceMismatch);
-        }
         let typed_batch = self.try_typed_batch()?;
         let continuity = match self.previous_published_sequence {
             None if self.publication == CoinbaseDirectPublicationKind::Snapshot => {
@@ -117,7 +112,6 @@ impl<'a> CoinbaseDirectBookUpdate<'a> {
         for frame in self.replay_frames {
             replay.push(
                 CoinbaseDirectReplayFrame::try_new(
-                    frame.native_coordinate,
                     frame.event,
                     frame.raw_payload,
                     frame.native_trade,
@@ -134,7 +128,9 @@ impl<'a> CoinbaseDirectBookUpdate<'a> {
                 feed: CoinbaseMarketFeed::ExchangeDirectFull,
                 channel: CoinbaseMarketChannel::Full,
                 native_input_depth: Some(MarketDepth::OrderLevel),
-                native_coordinate,
+                product: self.config.product().clone(),
+                configured_instrument: self.config.instrument(),
+                venue: self.config.venue().clone(),
                 request_set_digest: self.request_set_digest,
                 subscription_digest: self.subscription_request_digest,
                 subscription_acknowledgement: Some(self.subscription_evidence.clone()),
@@ -305,7 +301,6 @@ impl<'a> CoinbaseDirectBookUpdate<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct CoinbaseDirectOrderLevelUpdate<'a> {
     config: &'a CoinbaseDirectConfig,
-    native_coordinate: &'a Arc<CoinbaseNativeProductCoordinate>,
     subscription_evidence: &'a ExactPayloadEvidence,
     snapshot_receipt: &'a SegmentedHttpResponseReceipt,
     decoder_evidence: &'a DecoderEvidence,
@@ -324,28 +319,28 @@ impl<'a> CoinbaseDirectOrderLevelUpdate<'a> {
     }
 
     /// Returns the exact mapped provider product.
-    pub fn product(self) -> &'a market_squawk_domain::ProviderProduct {
+    pub const fn product(self) -> &'a market_squawk_domain::ProviderProduct {
         self.config.product()
     }
 
     /// Returns the source-qualified provider-native identity carried by this update.
-    pub fn provider_identity_key(self) -> &'a market_squawk_domain::ProviderIdentityKey {
-        self.native_coordinate.provider_identity_key()
+    pub const fn provider_identity_key(self) -> &'a market_squawk_domain::ProviderIdentityKey {
+        self.config.provider_identity_key()
     }
 
     /// Returns the exact profile revision that bound this update's product coordinate.
-    pub fn provider_identity_revision(self) -> &'a market_squawk_domain::MetadataRevision {
-        self.native_coordinate.identity_revision()
+    pub const fn provider_identity_revision(self) -> &'a market_squawk_domain::MetadataRevision {
+        self.config.provider_identity_revision()
     }
 
     /// Returns the exact profile digest that bound this update's product coordinate.
-    pub fn provider_identity_digest(self) -> EvidenceDigest {
-        self.native_coordinate.identity_digest()
+    pub const fn provider_identity_digest(self) -> EvidenceDigest {
+        self.config.provider_identity_digest()
     }
 
     /// Returns the independently validated Coinbase Exchange venue symbol.
-    pub fn venue_symbol(self) -> &'a market_squawk_domain::VenueSymbol {
-        self.native_coordinate.venue_symbol()
+    pub const fn venue_symbol(self) -> &'a market_squawk_domain::VenueSymbol {
+        self.config.venue_symbol()
     }
 
     /// Returns the exact connection generation shared by snapshot and current frame.
@@ -388,8 +383,7 @@ impl<'a> CoinbaseDirectOrderLevelUpdate<'a> {
             .currentness_lease()
             .validate_current()
             .map_err(|_error| CoinbaseDirectOrderLevelPublicationError::StaleAuthority)?;
-        if !Arc::ptr_eq(self.native_coordinate, self.config.native_coordinate())
-            || self.config.publication_depth() != MarketDepth::OrderLevel
+        if self.config.publication_depth() != MarketDepth::OrderLevel
             || self.config.metadata().quality_ceiling() != DataQuality::DirectUnverified
             || !self
                 .decoder_evidence
@@ -674,7 +668,6 @@ impl PublishedBookState {
 
 #[derive(Debug)]
 struct OrderLevelPublicationState {
-    native_coordinate: Arc<CoinbaseNativeProductCoordinate>,
     snapshot: Option<CoinbaseDirectSnapshotCoordinates>,
     snapshot_orders: Vec<ProviderOrderRecord>,
     replay_events: Vec<ProviderOrderEvent>,
@@ -696,7 +689,6 @@ impl OrderLevelPublicationState {
             return Err(CoinbaseDirectSessionError::OrderLevelAllocation);
         }
         Ok(Self {
-            native_coordinate: Arc::clone(config.native_coordinate()),
             snapshot: None,
             snapshot_orders,
             replay_events,
@@ -707,13 +699,9 @@ impl OrderLevelPublicationState {
     fn try_queue(
         &mut self,
         config: &CoinbaseDirectConfig,
-        native_coordinate: &Arc<CoinbaseNativeProductCoordinate>,
         event: ProviderOrderEvent,
     ) -> Result<(), CoinbaseDirectSessionError> {
-        if !Arc::ptr_eq(native_coordinate, &self.native_coordinate)
-            || !Arc::ptr_eq(native_coordinate, config.native_coordinate())
-            || self.replay_events.len() == config.limits().book().max_queue_events()
-        {
+        if self.replay_events.len() == config.limits().book().max_queue_events() {
             return Err(CoinbaseDirectSessionError::OrderLevelState);
         }
         validate_order_level_event(config, &event)
@@ -736,17 +724,14 @@ impl OrderLevelPublicationState {
         coordinates: CoinbaseDirectSnapshotCoordinates,
     ) -> Result<(), CoinbaseDirectSessionError> {
         if self.snapshot.is_some()
-            || !Arc::ptr_eq(coordinates.native_coordinate(), &self.native_coordinate)
-            || !Arc::ptr_eq(coordinates.native_coordinate(), config.native_coordinate())
             || self.snapshot_orders.is_empty()
             || self.snapshot_orders.len() > config.limits().book().max_orders()
         {
             return Err(CoinbaseDirectSessionError::OrderLevelState);
         }
-        let snapshot_sequence = coordinates.sequence;
         self.snapshot = Some(coordinates);
         self.replay_events
-            .retain(|event| event.sequence() > snapshot_sequence);
+            .retain(|event| event.sequence() > coordinates.sequence);
         self.replay_bytes = self
             .replay_events
             .iter()
@@ -1146,7 +1131,6 @@ struct CoinbaseDirectDispatchedHttpResponse {
 
 #[derive(Debug)]
 struct SequencedFrameEvidence {
-    native_coordinate: Arc<CoinbaseNativeProductCoordinate>,
     event: ProviderOrderEvent,
     raw_payload: CapturePayload,
     native_trade: Option<CoinbaseDirectTradeEvidence>,
@@ -1529,7 +1513,7 @@ impl CoinbaseDirectSession {
                 &mut self.book,
                 &mut order_level.snapshot_orders,
             )?;
-            order_level.bind_snapshot(&self.config, coordinates.clone())?;
+            order_level.bind_snapshot(&self.config, coordinates)?;
             coordinates
         } else {
             self.snapshot_decoder
@@ -1973,7 +1957,7 @@ impl CoinbaseDirectSession {
         let decoded = decoded.ok_or(CoinbaseDirectSessionError::Subscription)?;
         match decoded {
             CoinbaseDirectDecodeOutcome::Sequenced(decoded_event) => {
-                let (native_coordinate, event, native_trade) = decoded_event.into_parts();
+                let (event, native_trade) = decoded_event.into_parts();
                 let sequence = event.sequence();
                 let evidence = event.evidence().clone();
                 let retained_event = event.clone();
@@ -1987,7 +1971,7 @@ impl CoinbaseDirectSession {
                         if let (Some(state), Some(order_level_event)) =
                             (self.order_level_state.as_mut(), order_level_event)
                         {
-                            state.try_queue(&self.config, &native_coordinate, order_level_event)?;
+                            state.try_queue(&self.config, order_level_event)?;
                         }
                         true
                     }
@@ -2004,11 +1988,7 @@ impl CoinbaseDirectSession {
                             if let (Some(state), Some(order_level_event)) =
                                 (self.order_level_state.as_mut(), order_level_event)
                             {
-                                state.try_queue(
-                                    &self.config,
-                                    &native_coordinate,
-                                    order_level_event,
-                                )?;
+                                state.try_queue(&self.config, order_level_event)?;
                             }
                             true
                         } else {
@@ -2021,7 +2001,6 @@ impl CoinbaseDirectSession {
                 };
                 if retain_for_replay {
                     self.try_push_replay_frame(SequencedFrameEvidence {
-                        native_coordinate,
                         event: retained_event,
                         raw_payload: retained_payload,
                         native_trade,
@@ -2052,7 +2031,6 @@ impl CoinbaseDirectSession {
     ) -> Result<(), CoinbaseDirectSessionError> {
         let limits = self.config.limits().book();
         if self.replay_frames.len() >= limits.max_queue_events()
-            || !Arc::ptr_eq(&frame.native_coordinate, self.config.native_coordinate())
             || frame.event.wire_bytes() != frame.raw_payload.as_bytes().len()
             || frame.event.evidence().payload_digest() != exact_digest(frame.raw_payload.as_bytes())
         {
@@ -2153,7 +2131,6 @@ impl CoinbaseDirectSession {
             .ok_or(CoinbaseDirectSessionError::Subscription)?;
         let snapshot_coordinates = self
             .snapshot_coordinates
-            .as_ref()
             .ok_or(DirectOrderBookError::SnapshotReceiptRequired)?;
         if let Some(order_level) = self.order_level_state.as_ref() {
             let snapshot_receipt = self
@@ -2165,7 +2142,7 @@ impl CoinbaseDirectSession {
                 .replay_events
                 .last()
                 .ok_or(CoinbaseDirectSessionError::OrderLevelState)?;
-            if order_level.snapshot.as_ref() != Some(snapshot_coordinates)
+            if order_level.snapshot != Some(snapshot_coordinates)
                 || order_level.snapshot_orders.is_empty()
                 || terminal.sequence() != sequence
             {
@@ -2174,7 +2151,6 @@ impl CoinbaseDirectSession {
             output
                 .try_publish_order_level(CoinbaseDirectOrderLevelUpdate {
                     config: &self.config,
-                    native_coordinate: &order_level.native_coordinate,
                     subscription_evidence,
                     snapshot_receipt,
                     decoder_evidence: terminal.evidence(),
@@ -2207,7 +2183,7 @@ impl CoinbaseDirectSession {
             subscription_evidence,
             snapshot_capture,
             replay_frames,
-            snapshot_coordinates: snapshot_coordinates.clone(),
+            snapshot_coordinates,
             previous_published_sequence: None,
             previous: None,
             current: &self.next_published_state,
