@@ -1131,7 +1131,7 @@ impl CensusGeographyCatalog {
         &self.evidence
     }
 
-    /// Returns geography grammar entries in stable summary-level/name order.
+    /// Returns geography grammar entries in stable provider-name/display order.
     pub fn geographies(&self) -> &[CensusGeographyMetadata] {
         &self.geographies
     }
