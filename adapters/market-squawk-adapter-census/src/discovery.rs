@@ -28,8 +28,18 @@ pub enum CensusCatalogFailurePredicate {
     Allocation,
     /// A dataset-array member was not an object.
     EntryObject,
-    /// A dataset entry omitted or malformed its vintage.
-    Vintage,
+    /// A dataset entry omitted its vintage.
+    VintageMissing,
+    /// A dataset entry supplied a null vintage.
+    VintageNull,
+    /// A dataset entry supplied an unrecognized bounded string vintage.
+    VintageStringVocabulary,
+    /// A dataset entry supplied a numeric vintage that was not an unsigned integer.
+    VintageNumberShape,
+    /// A dataset entry supplied an unsigned vintage outside the supported integer range.
+    VintageNumberRange,
+    /// A dataset entry supplied a vintage with an unsupported JSON type.
+    VintageType,
     /// A vintage-scoped catalog returned a different vintage.
     VintageMismatch,
     /// A dataset entry omitted or malformed its route path.
@@ -320,8 +330,7 @@ impl CensusDatasetCatalog {
                     CensusCatalogFailurePredicate::EntryObject,
                 )
             })?;
-            let vintage = required_vintage(entry, "c_vintage")
-                .map_err(catalog_failure(CensusCatalogFailurePredicate::Vintage))?;
+            let vintage = required_vintage_diagnosed(entry, "c_vintage")?;
             if expected_vintage
                 .is_some_and(|expected| vintage != CensusDatasetVintage::Year(expected))
             {
@@ -1100,23 +1109,52 @@ fn bounded_str(value: &Value, limits: CensusParseLimits) -> Result<&str, CensusA
     Ok(value)
 }
 
-fn required_u16(object: &Map<String, Value>, key: &str) -> Result<u16, CensusAdapterError> {
-    let value = object.get(key).ok_or(CensusAdapterError::SchemaDrift)?;
-    let value = value
-        .as_u64()
-        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
-        .ok_or(CensusAdapterError::SchemaDrift)?;
-    u16::try_from(value).map_err(|_| CensusAdapterError::SchemaDrift)
-}
-
-fn required_vintage(
+fn required_vintage_diagnosed(
     object: &Map<String, Value>,
     key: &str,
-) -> Result<CensusDatasetVintage, CensusAdapterError> {
-    if object.get(key).and_then(Value::as_str) == Some("timeseries") {
-        return Ok(CensusDatasetVintage::TimeSeries);
+) -> Result<CensusDatasetVintage, CensusCatalogParseFailure> {
+    let value = object.get(key).ok_or_else(|| {
+        CensusCatalogParseFailure::new(
+            CensusAdapterError::SchemaDrift,
+            CensusCatalogFailurePredicate::VintageMissing,
+        )
+    })?;
+    match value {
+        Value::Null => Err(CensusCatalogParseFailure::new(
+            CensusAdapterError::SchemaDrift,
+            CensusCatalogFailurePredicate::VintageNull,
+        )),
+        Value::String(value) if value == "timeseries" => Ok(CensusDatasetVintage::TimeSeries),
+        Value::String(value) => value
+            .parse::<u16>()
+            .map(CensusDatasetVintage::Year)
+            .map_err(|_| {
+                CensusCatalogParseFailure::new(
+                    CensusAdapterError::SchemaDrift,
+                    CensusCatalogFailurePredicate::VintageStringVocabulary,
+                )
+            }),
+        Value::Number(value) => {
+            let value = value.as_u64().ok_or_else(|| {
+                CensusCatalogParseFailure::new(
+                    CensusAdapterError::SchemaDrift,
+                    CensusCatalogFailurePredicate::VintageNumberShape,
+                )
+            })?;
+            u16::try_from(value)
+                .map(CensusDatasetVintage::Year)
+                .map_err(|_| {
+                    CensusCatalogParseFailure::new(
+                        CensusAdapterError::SchemaDrift,
+                        CensusCatalogFailurePredicate::VintageNumberRange,
+                    )
+                })
+        }
+        Value::Bool(_) | Value::Array(_) | Value::Object(_) => Err(CensusCatalogParseFailure::new(
+            CensusAdapterError::SchemaDrift,
+            CensusCatalogFailurePredicate::VintageType,
+        )),
     }
-    required_u16(object, key).map(CensusDatasetVintage::Year)
 }
 
 fn optional_u64(object: &Map<String, Value>, key: &str) -> Result<Option<u64>, CensusAdapterError> {
