@@ -62,13 +62,12 @@ pub use historical_transport::{
 };
 pub use live::{AlpacaIexLiveSource, AlpacaOptionsLiveSource};
 pub use market_publication::{
-    AlpacaMarketEventPublicationParts, AlpacaMarketEventRecord, AlpacaMarketEventSurface,
-    AlpacaPreparedMarketEventPublication,
+    AlpacaMarketEventRecord, AlpacaMarketEventSurface, AlpacaPreparedMarketEventPublication,
 };
 pub use option_chain::{
     AlpacaOptionChainClient, AlpacaOptionChainContractAuthority,
     AlpacaOptionChainPublicationRequest, AlpacaOptionChainSealRejoin,
-    AlpacaOptionMarketPublicationParts, AlpacaPreparedOptionMarketPublication,
+    AlpacaPreparedOptionMarketPublication,
 };
 
 #[cfg(test)]

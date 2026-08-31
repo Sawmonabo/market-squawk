@@ -3,6 +3,7 @@
 //! Every page remains raw until the common capture store seals the complete terminal page graph.
 //! Canonical option rows are minted only after that physical seal rejoins this provider-local
 //! continuation, and only when every returned contract has exact provider/canonical identity.
+//! The resulting binding carries the closed indicative-options native-lineage implementation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU16;
@@ -25,8 +26,10 @@ use market_squawk_sources::{
     OptionMarketCursorState, OptionMarketRequestFilter, OptionMarketRequestScope,
     OptionMarketRequestScopeInput, ProviderCaptureMaterial, ProviderCapturePageReceipt,
     ProviderCaptureSealExpectation, ProviderCaptureSealRequest, ProviderCaptureSetReceipt,
-    ProviderCaptureTerminalDisposition, ProviderOptionMarketBatch, SealedProviderCaptureMaterial,
-    SharedProviderBudget, apply_http_retry_after,
+    ProviderCaptureTerminalDisposition, ProviderNativeLineageImplementation,
+    ProviderOptionMarketBatch, ProviderOptionMarketNativeLineageBatch,
+    SealedProviderCaptureMaterial, SealedProviderOptionMarketBinding, SharedProviderBudget,
+    apply_http_retry_after,
 };
 use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 use rust_decimal::Decimal;
@@ -333,6 +336,16 @@ pub struct AlpacaOptionChainSealRejoin {
 }
 
 impl AlpacaOptionChainSealRejoin {
+    /// Returns the exact immutable source metadata captured before acquisition.
+    pub const fn metadata(&self) -> &market_squawk_sources::SourceMetadata {
+        &self.metadata
+    }
+
+    /// Returns the exact provider dataset bound to the terminal raw page graph.
+    pub const fn dataset(&self) -> &SourceIdentifier {
+        &self.dataset
+    }
+
     /// Rejoins exact sealed pages, rejects any unmapped returned contract, and prepares canonical
     /// option rows plus native semantics for the common immutable publication boundary.
     pub fn try_rejoin(
@@ -500,49 +513,41 @@ impl std::fmt::Debug for AlpacaOptionChainSealRejoin {
     }
 }
 
-/// Complete provider-local option publication awaiting only its closed shared lineage tag.
+/// Complete provider-local option publication bound to its closed shared lineage tag.
 #[derive(Debug)]
 pub struct AlpacaPreparedOptionMarketPublication {
     parts: AlpacaOptionMarketPublicationParts,
 }
 
 impl AlpacaPreparedOptionMarketPublication {
-    /// Consumes the sole canonical/native/physical option handoff.
-    pub fn into_parts(self) -> AlpacaOptionMarketPublicationParts {
-        self.parts
+    /// Consumes the one-use raw authority into the common immutable option-market binding.
+    pub fn try_into_binding(self) -> Result<SealedProviderOptionMarketBinding, AlpacaError> {
+        let AlpacaOptionMarketPublicationParts {
+            authority,
+            batch,
+            native_rows,
+            native_sidecar,
+            row_pages,
+        } = self.parts;
+        let native = ProviderOptionMarketNativeLineageBatch::try_new(
+            ProviderNativeLineageImplementation::AlpacaIndicativeOptionsV1,
+            &batch,
+            native_rows,
+            native_sidecar,
+        )
+        .map_err(|_| AlpacaError::CaptureMaterial)?;
+        SealedProviderOptionMarketBinding::try_new(authority, batch, native, row_pages)
+            .map_err(|_| AlpacaError::CaptureMaterial)
     }
 }
 
-/// Inputs for `ProviderOptionMarketNativeLineageBatch` and
-/// `SealedProviderOptionMarketBinding`, kept non-cloneable and joined to the raw authority.
 #[derive(Debug)]
-pub struct AlpacaOptionMarketPublicationParts {
+struct AlpacaOptionMarketPublicationParts {
     authority: market_squawk_sources::ProviderWholeCaptureToken,
     batch: ProviderOptionMarketBatch,
     native_rows: Vec<Bytes>,
     native_sidecar: Bytes,
     row_pages: Vec<u16>,
-}
-
-impl AlpacaOptionMarketPublicationParts {
-    /// Consumes every input needed after the shared Alpaca-options lineage tag is installed.
-    pub fn into_parts(
-        self,
-    ) -> (
-        market_squawk_sources::ProviderWholeCaptureToken,
-        ProviderOptionMarketBatch,
-        Vec<Bytes>,
-        Bytes,
-        Vec<u16>,
-    ) {
-        (
-            self.authority,
-            self.batch,
-            self.native_rows,
-            self.native_sidecar,
-            self.row_pages,
-        )
-    }
 }
 
 #[derive(Debug)]

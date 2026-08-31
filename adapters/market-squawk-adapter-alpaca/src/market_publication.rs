@@ -1,18 +1,20 @@
 //! Provider-local preparation for durable Alpaca current-market publications.
 //!
-//! This module deliberately stops immediately before the shared native-lineage implementation
-//! tag. Alpaca IEX and Alpaca indicative options need distinct closed tags in
-//! `market-squawk-sources`; using the existing historical-bar tag would make persisted evidence
-//! lie. The returned parts are otherwise complete and non-cloneable: canonical events, exact
-//! provider-native row semantics, batch semantics, and raw-frame/page ordinals stay joined until
-//! the application consumes them into the shared sealed publication contract.
+//! Distinct closed native-lineage implementations keep free IEX evidence separate from modified,
+//! delayed indicative-option evidence. Canonical events, exact provider-native row semantics,
+//! batch semantics, and raw-frame/page ordinals stay joined until the adapter consumes them into
+//! the shared sealed publication contract.
 
 use bytes::Bytes;
 use market_squawk_domain::{
     DataQuality, EvidenceDigest, LiveEventClass, LiveProvenance, MarketEvent, SourceIdentifier,
     Timestamp,
 };
-use market_squawk_sources::{ProviderMarketEventBatch, SourceMetadata};
+use market_squawk_sources::{
+    ProviderEventMicrobatchToken, ProviderMarketEventBatch, ProviderMarketEventNativeLineageBatch,
+    ProviderNativeLineageImplementation, ProviderWholeCaptureToken,
+    SealedProviderEventMicrobatchBinding, SealedProviderResponseMarketEventBinding, SourceMetadata,
+};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -127,12 +129,11 @@ impl AlpacaMarketEventRecord {
         if !matches!(
             surface,
             AlpacaMarketEventSurface::IexBootSnapshot | AlpacaMarketEventSurface::IexStream
-        ) || records.iter().any(|record| {
-            !config
-                .mappings()
-                .iter()
-                .any(|mapping| mapping.provider_coordinate() == &record.coordinate)
-        }) {
+        ) || !config
+            .mappings()
+            .iter()
+            .any(|candidate| candidate.provider_coordinate() == mapping.provider_coordinate())
+        {
             return Err(AlpacaError::Protocol);
         }
         Self::try_new(
@@ -196,7 +197,7 @@ impl AlpacaMarketEventRecord {
     }
 }
 
-/// Complete provider-local current-event material awaiting only its shared implementation tag.
+/// Complete provider-local current-event material for one closed shared implementation tag.
 #[derive(Debug)]
 pub struct AlpacaPreparedMarketEventPublication {
     surface: AlpacaMarketEventSurface,
@@ -324,35 +325,74 @@ impl AlpacaPreparedMarketEventPublication {
         self.surface
     }
 
-    /// Consumes the non-cloneable provider-local material.
-    ///
-    /// Integration must select the matching closed shared native-lineage implementation and then
-    /// construct either `SealedProviderResponseMarketEventBinding` (boot snapshot) or
-    /// `SealedProviderEventMicrobatchBinding` (stream). No other semantic input is missing.
-    pub fn into_parts(self) -> AlpacaMarketEventPublicationParts {
-        self.parts
+    /// Consumes a sealed boot-response token into the common immutable response-event binding.
+    pub fn try_into_response_binding(
+        self,
+        authority: ProviderWholeCaptureToken,
+    ) -> Result<SealedProviderResponseMarketEventBinding, AlpacaError> {
+        if self.surface != AlpacaMarketEventSurface::IexBootSnapshot {
+            return Err(AlpacaError::Protocol);
+        }
+        let AlpacaMarketEventPublicationParts {
+            batch,
+            native_rows,
+            native_sidecar,
+            capture_ordinals,
+        } = self.parts;
+        let native = ProviderMarketEventNativeLineageBatch::try_new(
+            ProviderNativeLineageImplementation::AlpacaIexMarketDataV1,
+            &batch,
+            native_rows,
+            Some(native_sidecar),
+        )
+        .map_err(|_| AlpacaError::CaptureMaterial)?;
+        SealedProviderResponseMarketEventBinding::try_new(
+            authority,
+            batch,
+            native,
+            capture_ordinals,
+        )
+        .map_err(|_| AlpacaError::CaptureMaterial)
+    }
+
+    /// Consumes a sealed IEX or indicative-options frame batch into the common stream binding.
+    pub fn try_into_event_microbatch_binding(
+        self,
+        authority: ProviderEventMicrobatchToken,
+    ) -> Result<SealedProviderEventMicrobatchBinding, AlpacaError> {
+        let implementation = match self.surface {
+            AlpacaMarketEventSurface::IexStream => {
+                ProviderNativeLineageImplementation::AlpacaIexMarketDataV1
+            }
+            AlpacaMarketEventSurface::IndicativeOptionsStream => {
+                ProviderNativeLineageImplementation::AlpacaIndicativeOptionsV1
+            }
+            AlpacaMarketEventSurface::IexBootSnapshot => return Err(AlpacaError::Protocol),
+        };
+        let AlpacaMarketEventPublicationParts {
+            batch,
+            native_rows,
+            native_sidecar,
+            capture_ordinals,
+        } = self.parts;
+        let native = ProviderMarketEventNativeLineageBatch::try_new(
+            implementation,
+            &batch,
+            native_rows,
+            Some(native_sidecar),
+        )
+        .map_err(|_| AlpacaError::CaptureMaterial)?;
+        SealedProviderEventMicrobatchBinding::try_new(authority, batch, native, capture_ordinals)
+            .map_err(|_| AlpacaError::CaptureMaterial)
     }
 }
 
-/// Non-cloneable handoff to the common sealed current-event publication boundary.
 #[derive(Debug)]
-pub struct AlpacaMarketEventPublicationParts {
+struct AlpacaMarketEventPublicationParts {
     batch: ProviderMarketEventBatch,
     native_rows: Vec<Bytes>,
     native_sidecar: Bytes,
     capture_ordinals: Vec<u16>,
-}
-
-impl AlpacaMarketEventPublicationParts {
-    /// Consumes all provider-local publication inputs without cloning authority-bearing state.
-    pub fn into_parts(self) -> (ProviderMarketEventBatch, Vec<Bytes>, Bytes, Vec<u16>) {
-        (
-            self.batch,
-            self.native_rows,
-            self.native_sidecar,
-            self.capture_ordinals,
-        )
-    }
 }
 
 #[derive(Serialize)]
