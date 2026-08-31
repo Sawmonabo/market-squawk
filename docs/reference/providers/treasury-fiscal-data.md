@@ -90,13 +90,13 @@ publication when available, local received/ingested/availability times, and dura
 | --- | --- |
 | Default page | **VERIFIED PROVIDER FACT:** page **1**, **100 rows** |
 | Provider maximum | **UNVERIFIED ENTITLEMENT/ASSUMPTION:** no maximum page size, request quota/window, concurrency limit, or stable quota-header contract was found |
-| Target safety budget | **APPLICATION POLICY:** at most **1 request/second** through the configured Treasury authority; actual pressure may only lower it |
-| Current repository budget | **APPLICATION POLICY:** the audited built-in profiles currently share `us-treasury` at **100 requests/minute** with concurrency **2** |
+| Target safety budget | **APPLICATION POLICY:** at most **1 request per sliding 1-second window** through the configured Treasury authority; actual pressure may only lower it |
+| Current repository budget | **APPLICATION POLICY:** capability revision **5** shares the provider-only `us-treasury` authority at **1 request per sliding 1-second window** with concurrency **1** |
 
-The current repository budget and the target safety budget are not the same contract. Reconcile the
-shared authority before acceptance; neither value is a provider limit. Admission also accounts for
-response bytes, pages, returned rows, latency, HTTP 429/`Retry-After`, server errors, queue lag, and
-publication pressure. Dataset refreshes and interactive reads outrank broad backfills.
+This conservative shared Market Squawk application policy is not a provider limit. Admission also
+accounts for response bytes, pages, returned rows, latency, HTTP 429/`Retry-After`, server errors,
+queue lag, and publication pressure. Dataset refreshes and interactive reads outrank broad
+backfills.
 
 ## Runtime evidence
 

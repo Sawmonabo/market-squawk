@@ -90,12 +90,12 @@ const TIINGO_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
 };
 const TREASURY_FISCAL_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "treasury.fiscal-data",
-    capability_revision: 4,
+    capability_revision: 5,
     release_state: ProfileReleaseState::Available,
 };
 const TREASURY_DAILY_RATES_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
     surface_id: "treasury.daily-rates-xml",
-    capability_revision: 4,
+    capability_revision: 5,
     release_state: ProfileReleaseState::Available,
 };
 const FEDERAL_RESERVE_BOARD_PROFILE: RegisteredProfileSpec = RegisteredProfileSpec {
@@ -929,6 +929,21 @@ mod tests {
             PROVIDER_SPECS[7].mode,
             ProviderDelegationMode::Credential(CredentialDelegationKind::BlsRegistrationKey)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn treasury_v1_mapping_revisions_match_current_profiles() -> TestResult {
+        let profiles = built_in_provider_profiles()?;
+        for expected in [TREASURY_FISCAL_PROFILE, TREASURY_DAILY_RATES_PROFILE] {
+            let profile = profiles
+                .get(expected.surface_id)
+                .ok_or("selected Treasury provider profile is missing")?;
+            assert_eq!(
+                profile.capability().revision().get(),
+                expected.capability_revision
+            );
+        }
         Ok(())
     }
 

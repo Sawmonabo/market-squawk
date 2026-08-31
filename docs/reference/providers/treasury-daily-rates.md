@@ -80,12 +80,12 @@ ingested times, raw digest, and durable revision.
 | --- | --- |
 | All-history page | **VERIFIED PROVIDER FACT:** page **0** origin, **300-row** default, empty-`<entry>` termination |
 | Provider maximum | **UNVERIFIED ENTITLEMENT/ASSUMPTION:** no numeric request quota, concurrency ceiling, maximum pages, or stable rate/retry-header contract was found |
-| Target safety budget | **APPLICATION POLICY:** at most **1 request/second** through the configured Treasury authority; actual pressure may only lower it |
-| Current repository budget | **APPLICATION POLICY:** the audited built-in profiles currently share `us-treasury` at **100 requests/minute** with concurrency **2** |
+| Target safety budget | **APPLICATION POLICY:** at most **1 request per sliding 1-second window** through the configured Treasury authority; actual pressure may only lower it |
+| Current repository budget | **APPLICATION POLICY:** capability revision **5** shares the provider-only `us-treasury` authority at **1 request per sliding 1-second window** with concurrency **1** |
 
-The current and target application budgets must be reconciled before acceptance; neither is an
-upstream limit. Admission also watches response bytes, entries, duplicate payloads/rows, page order,
-latency, HTTP 429/`Retry-After`, queue lag, parser failures, and write pressure.
+This conservative shared Market Squawk application policy is not an upstream limit. Admission also
+watches response bytes, entries, duplicate payloads/rows, page order, latency, HTTP
+429/`Retry-After`, queue lag, parser failures, and write pressure.
 
 ## Runtime evidence
 
