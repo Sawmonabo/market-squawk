@@ -93,8 +93,8 @@ pub enum CensusGeographyFailurePredicate {
     DuplicateIdentity,
     /// A geography entry malformed its required parent list.
     Requires,
-    /// A geography entry malformed its wildcard parent list.
-    Wildcard,
+    /// A geography entry malformed its wildcard parent list in one exact closed way.
+    Wildcard(CensusGeographyWildcardFailurePredicate),
     /// A geography entry malformed its optional wildcard-parent list.
     OptionalWildcard,
     /// Wildcard metadata referred to a parent outside the entry's required set.
@@ -105,6 +105,29 @@ pub enum CensusGeographyFailurePredicate {
     Closure,
     /// A non-geography request was supplied to the geography-only parser.
     RequestKind,
+}
+
+/// Closed, payload-free shape failure within optional geography wildcard metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CensusGeographyWildcardFailurePredicate {
+    /// The present wildcard field was null.
+    Null,
+    /// The present wildcard field was a bounded string scalar rather than an array.
+    Scalar,
+    /// The wildcard array exceeded the configured column bound.
+    ArrayBound,
+    /// Bounded wildcard-array storage could not be allocated.
+    Allocation,
+    /// A wildcard-array member had a non-string JSON type.
+    MemberType,
+    /// A wildcard-array string exceeded bounds or contained a control character.
+    MemberBound,
+    /// A wildcard-array string was empty.
+    EmptyMember,
+    /// A wildcard-array parent occurred more than once.
+    DuplicateMember,
+    /// The present wildcard field had another unsupported JSON type.
+    Type,
 }
 
 #[derive(Debug)]
@@ -1065,8 +1088,14 @@ impl CensusGeographyCatalog {
             }
             let requires = optional_string_array(entry, "requires", limits)
                 .map_err(geography_failure(CensusGeographyFailurePredicate::Requires))?;
-            let wildcard = optional_string_array(entry, "wildcard", limits)
-                .map_err(geography_failure(CensusGeographyFailurePredicate::Wildcard))?;
+            let wildcard = optional_wildcard_array_diagnosed(entry, limits).map_err(
+                |(source, predicate)| {
+                    CensusGeographyParseFailure::new(
+                        source,
+                        CensusGeographyFailurePredicate::Wildcard(predicate),
+                    )
+                },
+            )?;
             let optional_with_wildcard_for =
                 optional_string_array_or_scalar(entry, "optionalWithWCFor", limits).map_err(
                     geography_failure(CensusGeographyFailurePredicate::OptionalWildcard),
@@ -1400,6 +1429,84 @@ fn optional_string_array(
             return Err(CensusAdapterError::SchemaDrift);
         }
         output.push(value.to_owned());
+    }
+    Ok(output)
+}
+
+fn optional_wildcard_array_diagnosed(
+    object: &Map<String, Value>,
+    limits: CensusParseLimits,
+) -> Result<Vec<String>, (CensusAdapterError, CensusGeographyWildcardFailurePredicate)> {
+    let Some(value) = object.get("wildcard") else {
+        return Ok(Vec::new());
+    };
+    let values = match value {
+        Value::Null => {
+            return Err((
+                CensusAdapterError::SchemaDrift,
+                CensusGeographyWildcardFailurePredicate::Null,
+            ));
+        }
+        Value::String(value) => {
+            if value.len() > limits.max_string_bytes() || value.chars().any(char::is_control) {
+                return Err((
+                    CensusAdapterError::ResourceLimitExceeded,
+                    CensusGeographyWildcardFailurePredicate::MemberBound,
+                ));
+            }
+            return Err((
+                CensusAdapterError::SchemaDrift,
+                CensusGeographyWildcardFailurePredicate::Scalar,
+            ));
+        }
+        Value::Array(values) => values,
+        Value::Bool(_) | Value::Number(_) | Value::Object(_) => {
+            return Err((
+                CensusAdapterError::SchemaDrift,
+                CensusGeographyWildcardFailurePredicate::Type,
+            ));
+        }
+    };
+    if values.len() > limits.max_columns() {
+        return Err((
+            CensusAdapterError::ResourceLimitExceeded,
+            CensusGeographyWildcardFailurePredicate::ArrayBound,
+        ));
+    }
+    let mut output = Vec::new();
+    output.try_reserve_exact(values.len()).map_err(|_| {
+        (
+            CensusAdapterError::ResourceLimitExceeded,
+            CensusGeographyWildcardFailurePredicate::Allocation,
+        )
+    })?;
+    let mut identities = BTreeSet::new();
+    for value in values {
+        let Value::String(value) = value else {
+            return Err((
+                CensusAdapterError::SchemaDrift,
+                CensusGeographyWildcardFailurePredicate::MemberType,
+            ));
+        };
+        if value.len() > limits.max_string_bytes() || value.chars().any(char::is_control) {
+            return Err((
+                CensusAdapterError::ResourceLimitExceeded,
+                CensusGeographyWildcardFailurePredicate::MemberBound,
+            ));
+        }
+        if value.is_empty() {
+            return Err((
+                CensusAdapterError::SchemaDrift,
+                CensusGeographyWildcardFailurePredicate::EmptyMember,
+            ));
+        }
+        if !identities.insert(value.as_str()) {
+            return Err((
+                CensusAdapterError::DuplicateIdentity,
+                CensusGeographyWildcardFailurePredicate::DuplicateMember,
+            ));
+        }
+        output.push(value.clone());
     }
     Ok(output)
 }
