@@ -43,6 +43,7 @@ impl SchwabRestQuoteMarketDataEvidence {
     ) -> Result<Self, SchwabRestQuotePublicationError> {
         if qualification.family() != SchwabMarketDataFamily::Quotes
             || qualification.depth().canonical() != Some(MarketDepth::TopOfBook)
+            || &session_id != qualification.session_identifier()
         {
             return Err(SchwabRestQuotePublicationError::InvalidEvidence);
         }

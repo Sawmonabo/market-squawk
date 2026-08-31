@@ -1137,6 +1137,17 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
         EvidenceDigest::new(DigestAlgorithm::Sha256, [46; 32]),
     )
     .unwrap_or_else(|error| panic!("quote identity: {error}"));
+    let mismatched_quote_session = SourceIdentifier::try_from("schwab-rest-session-mismatch")
+        .unwrap_or_else(|error| panic!("mismatched quote session: {error}"));
+    assert!(matches!(
+        SchwabRestQuoteMarketDataEvidence::try_new(
+            mismatched_quote_session,
+            quote_generation,
+            quote_venue.clone(),
+            quote_qualification.clone(),
+        ),
+        Err(crate::SchwabRestQuotePublicationError::InvalidEvidence)
+    ));
     let quote_market_data = SchwabRestQuoteMarketDataEvidence::try_new(
         quote_session,
         quote_generation,
