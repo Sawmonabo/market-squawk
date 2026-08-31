@@ -323,6 +323,26 @@ impl<'a> CoinbaseDirectOrderLevelUpdate<'a> {
         self.config.product()
     }
 
+    /// Returns the source-qualified provider-native identity carried by this update.
+    pub const fn provider_identity_key(self) -> &'a market_squawk_domain::ProviderIdentityKey {
+        self.config.provider_identity_key()
+    }
+
+    /// Returns the exact profile revision that bound this update's product coordinate.
+    pub const fn provider_identity_revision(self) -> &'a market_squawk_domain::MetadataRevision {
+        self.config.provider_identity_revision()
+    }
+
+    /// Returns the exact profile digest that bound this update's product coordinate.
+    pub const fn provider_identity_digest(self) -> EvidenceDigest {
+        self.config.provider_identity_digest()
+    }
+
+    /// Returns the independently validated Coinbase Exchange venue symbol.
+    pub const fn venue_symbol(self) -> &'a market_squawk_domain::VenueSymbol {
+        self.config.venue_symbol()
+    }
+
     /// Returns the exact connection generation shared by snapshot and current frame.
     pub fn connection_generation(self) -> ConnectionGeneration {
         self.snapshot_receipt.connection_generation()
@@ -526,7 +546,10 @@ fn validate_order_level_event(
     config: &CoinbaseDirectConfig,
     event: &ProviderOrderEvent,
 ) -> Result<(), CoinbaseDirectOrderLevelPublicationError> {
-    if event.product() != config.product()
+    if config
+        .validate_native_product_coordinate(event.product().as_source_identifier().as_str())
+        .is_err()
+        || event.product() != config.product()
         || event.execution_terms() != config.execution_terms()
         || event.evidence().binding().source_id() != config.metadata().source_id()
         || event.evidence().binding().metadata_revision() != config.metadata().revision()

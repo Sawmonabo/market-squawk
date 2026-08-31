@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::DateTime;
 use market_squawk_domain::{
-    AggressorSide, EvidenceDigest, InstrumentId, IntegrityRule, MarketDepth, ProviderProduct,
-    RawCaptureFrameView as _, SourceIdentifier, Timestamp, VenueId,
+    AggressorSide, EvidenceDigest, IntegrityRule, MarketDepth, RawCaptureFrameView as _,
+    SourceIdentifier, Timestamp,
 };
 use market_squawk_sources::{
     ControlFrameKind, DecodeInternalError, DecodeOutcome, DecodedControlFrame, DecodedIgnoredFrame,
@@ -18,6 +18,7 @@ use market_squawk_sources::{
 use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
+use crate::config::CoinbaseNativeProductCoordinate;
 use crate::market_handoff::{
     CoinbaseMarketHandoffInput, CoinbaseMarketRawLineage, public_request_digests,
 };
@@ -39,8 +40,7 @@ const MAX_HEARTBEAT_TIME_BYTES: usize = 160;
 #[derive(Clone, Debug)]
 pub struct CoinbaseExchangeDecoder {
     metadata: SourceMetadata,
-    instruments: BTreeMap<String, InstrumentId>,
-    venue: VenueId,
+    coordinate: CoinbaseNativeProductCoordinate,
     decoder_rule: IntegrityRule,
     timestamp_rule: IntegrityRule,
     sequence_rule: IntegrityRule,
@@ -51,8 +51,6 @@ pub struct CoinbaseExchangeDecoder {
     observed_subscriptions: BTreeMap<String, BTreeSet<String>>,
     acknowledgement_complete: bool,
     max_frame_bytes: usize,
-    product: ProviderProduct,
-    configured_instrument: InstrumentId,
     request_set_digest: EvidenceDigest,
     subscription_digest: EvidenceDigest,
     last_market_coordinates: Option<CoinbasePublicMarketCoordinates>,
@@ -78,8 +76,12 @@ impl CoinbaseExchangeDecoder {
             .mappings()
             .first()
             .ok_or(CoinbaseConfigError::InvalidMappingCount)?;
-        let product = mapping.product().clone();
-        let configured_instrument = mapping.instrument();
+        let coordinate = CoinbaseNativeProductCoordinate::try_new(
+            mapping.clone(),
+            config.metadata().source_id().clone(),
+            config.metadata().revision_evidence(),
+        )?;
+        coordinate.validate_metadata(config.metadata())?;
         let (request_set_digest, subscription_digest) = public_request_digests(config);
         let live = match config.metadata().protocol_profile() {
             market_squawk_sources::SourceProtocolProfile::Live(profile) => profile,
@@ -128,17 +130,7 @@ impl CoinbaseExchangeDecoder {
             .collect();
         Ok(Self {
             metadata: config.metadata().clone(),
-            instruments: config
-                .mappings()
-                .iter()
-                .map(|mapping| {
-                    (
-                        mapping.product().as_source_identifier().as_str().to_owned(),
-                        mapping.instrument(),
-                    )
-                })
-                .collect(),
-            venue: VenueId::try_from("coinbase-exchange")?,
+            coordinate,
             decoder_rule: live.decoder_rule().clone(),
             timestamp_rule: live.timestamp_rule().clone(),
             sequence_rule,
@@ -149,12 +141,30 @@ impl CoinbaseExchangeDecoder {
             observed_subscriptions: BTreeMap::new(),
             acknowledgement_complete: false,
             max_frame_bytes: config.transport_limits().max_frame_bytes(),
-            product,
-            configured_instrument,
             request_set_digest,
             subscription_digest,
             last_market_coordinates: None,
         })
+    }
+
+    /// Returns the source-qualified provider-native identity selected for this product.
+    pub const fn provider_identity_key(&self) -> &market_squawk_domain::ProviderIdentityKey {
+        self.coordinate.provider_identity_key()
+    }
+
+    /// Returns the exact profile revision that bound the selected product coordinate.
+    pub const fn provider_identity_revision(&self) -> &market_squawk_domain::MetadataRevision {
+        self.coordinate.identity_revision()
+    }
+
+    /// Returns the exact profile digest that bound the selected product coordinate.
+    pub const fn provider_identity_digest(&self) -> EvidenceDigest {
+        self.coordinate.identity_digest()
+    }
+
+    /// Returns the independently validated Coinbase Exchange venue symbol.
+    pub const fn venue_symbol(&self) -> &market_squawk_domain::VenueSymbol {
+        self.coordinate.venue_symbol()
     }
 
     fn decode_text(
@@ -232,8 +242,8 @@ impl CoinbaseExchangeDecoder {
             return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
         }
         for (index, event) in wire.events.0.into_iter().enumerate() {
-            let instrument = match self.instrument(&event.product_id) {
-                Ok(instrument) => instrument,
+            let coordinate = match self.coordinate(&event.product_id) {
+                Ok(coordinate) => coordinate,
                 Err(reason) => {
                     return quarantine(evidence, reason, source_code(&event.product_id));
                 }
@@ -323,7 +333,7 @@ impl CoinbaseExchangeDecoder {
             // for this message and therefore owns observation-level freshness.
             observations.push(observation_input(
                 format!("l2-{}-{index}-{}", wire.sequence_num, event.product_id),
-                instrument,
+                coordinate,
                 ProviderTimestampEvidence::Provided {
                     value: envelope_at,
                     rule: self.timestamp_rule.clone(),
@@ -375,8 +385,8 @@ impl CoinbaseExchangeDecoder {
                         None,
                     );
                 }
-                let instrument = match self.instrument(&trade.product_id) {
-                    Ok(instrument) => instrument,
+                let coordinate = match self.coordinate(&trade.product_id) {
+                    Ok(coordinate) => coordinate,
                     Err(reason) => {
                         return quarantine(evidence, reason, source_code(&trade.product_id));
                     }
@@ -426,7 +436,7 @@ impl CoinbaseExchangeDecoder {
                 };
                 observations.push(observation_input(
                     trade.trade_id,
-                    instrument,
+                    coordinate,
                     ProviderTimestampEvidence::Provided {
                         value: timestamp,
                         rule: self.timestamp_rule.clone(),
@@ -586,19 +596,25 @@ impl CoinbaseExchangeDecoder {
         ))
     }
 
-    fn instrument(&self, product: &str) -> Result<InstrumentId, QuarantineReason> {
-        self.instruments
-            .get(product)
-            .copied()
+    fn coordinate(
+        &self,
+        product: &str,
+    ) -> Result<&CoinbaseNativeProductCoordinate, QuarantineReason> {
+        self.coordinate
+            .validates_wire_product(product)
+            .then_some(&self.coordinate)
             .ok_or(QuarantineReason::WrongProduct)
     }
 
-    fn data(&self, evidence: DecoderEvidence, inputs: Vec<ObservationInput>) -> DecodeOutcome {
+    fn data(&self, evidence: DecoderEvidence, inputs: Vec<ObservationInput<'_>>) -> DecodeOutcome {
         let mut observations = Vec::new();
         if observations.try_reserve_exact(inputs.len()).is_err() {
             return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
         }
         for input in inputs {
+            if input.coordinate.validate_metadata(&self.metadata).is_err() {
+                return quarantine(evidence, QuarantineReason::ProtocolInvariantViolation, None);
+            }
             let source_identifier = match SourceIdentifier::try_from(input.source_identifier) {
                 Ok(identifier) => identifier,
                 Err(_) => {
@@ -611,8 +627,8 @@ impl CoinbaseExchangeDecoder {
             };
             let observation = match ProviderNormalizedObservation::try_new(
                 source_identifier,
-                self.venue.clone(),
-                input.instrument,
+                input.coordinate.venue().clone(),
+                input.coordinate.instrument(),
                 input.timestamp,
                 ProviderSequenceEvidence::Unsupported {
                     rule: self.sequence_rule.clone(),
@@ -669,9 +685,9 @@ impl CoinbaseExchangeDecoder {
                         feed: CoinbaseMarketFeed::AdvancedTradePublic,
                         channel: coordinates.channel,
                         native_input_depth: coordinates.depth,
-                        product: self.product.clone(),
-                        configured_instrument: self.configured_instrument,
-                        venue: self.venue.clone(),
+                        product: self.coordinate.product().clone(),
+                        configured_instrument: self.coordinate.instrument(),
+                        venue: self.coordinate.venue().clone(),
                         request_set_digest: self.request_set_digest,
                         subscription_digest: self.subscription_digest,
                         subscription_acknowledgement: None,
@@ -703,9 +719,9 @@ impl SourceMetadataProvider for CoinbaseExchangeDecoder {
     }
 }
 
-struct ObservationInput {
+struct ObservationInput<'a> {
     source_identifier: String,
-    instrument: InstrumentId,
+    coordinate: &'a CoinbaseNativeProductCoordinate,
     timestamp: ProviderTimestampEvidence,
     snapshot: ProviderSnapshotEvidence,
     payload: ProviderObservationPayload,
@@ -713,14 +729,14 @@ struct ObservationInput {
 
 fn observation_input(
     source_identifier: String,
-    instrument: InstrumentId,
+    coordinate: &CoinbaseNativeProductCoordinate,
     timestamp: ProviderTimestampEvidence,
     snapshot: ProviderSnapshotEvidence,
     payload: ProviderObservationPayload,
-) -> ObservationInput {
+) -> ObservationInput<'_> {
     ObservationInput {
         source_identifier,
-        instrument,
+        coordinate,
         timestamp,
         snapshot,
         payload,

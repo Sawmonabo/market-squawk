@@ -3,9 +3,11 @@ use std::time::Duration;
 
 use market_squawk_domain::{
     AssetClass, ChecksumCapability, CoverageDelay, DataQuality, DeliveryEvidence,
-    EffectiveInterval, ExactPayloadEvidence, InstrumentId, IntegrityRule, LiveEventClass,
-    MarketDepth, ProviderChannel, ProviderProduct, RevisionBoundPayloadEvidence, RuleVersion,
+    EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentId, IntegrityRule,
+    LiveEventClass, MarketDepth, MetadataRevision, ProviderChannel, ProviderIdentityKey,
+    ProviderInstrumentId, ProviderProduct, RevisionBoundPayloadEvidence, RuleVersion,
     SchemaVersion, SequenceCapability, SnapshotApplicability, SourceId, SourceIdentifier, VenueId,
+    VenueSymbol,
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, ChecksumValidationProfile, CoverageTopology,
@@ -22,7 +24,7 @@ use thiserror::Error;
 pub const COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT: &str =
     "wss://advanced-trade-ws.coinbase.com";
 const COINBASE_VENUE: &str = "coinbase-exchange";
-const COINBASE_PROVIDER: &str = "coinbase-exchange";
+pub(crate) const COINBASE_PROVIDER: &str = "coinbase-exchange";
 const CONFIGURED_PRODUCTS: &str = "coinbase-advanced-trade-configured-products-v1";
 const CONFIGURED_CHANNELS: &str = "level2+market_trades+heartbeats";
 // Coinbase recommends distributing high-volume products across connections. The live application
@@ -58,6 +60,8 @@ impl CoinbaseChannel {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoinbaseProductMapping {
     product: ProviderProduct,
+    provider_instrument_id: ProviderInstrumentId,
+    venue_symbol: VenueSymbol,
     instrument: InstrumentId,
 }
 
@@ -71,9 +75,11 @@ impl CoinbaseProductMapping {
         product: ProviderProduct,
         instrument: InstrumentId,
     ) -> Result<Self, CoinbaseConfigError> {
-        validate_product(product.as_source_identifier().as_str())?;
+        let (provider_instrument_id, venue_symbol) = native_product_identity(&product)?;
         Ok(Self {
             product,
+            provider_instrument_id,
+            venue_symbol,
             instrument,
         })
     }
@@ -83,9 +89,122 @@ impl CoinbaseProductMapping {
         &self.product
     }
 
+    /// Returns the Coinbase-native product identity within a source namespace.
+    pub const fn provider_instrument_id(&self) -> &ProviderInstrumentId {
+        &self.provider_instrument_id
+    }
+
+    /// Returns the independent Coinbase Exchange venue symbol.
+    pub const fn venue_symbol(&self) -> &VenueSymbol {
+        &self.venue_symbol
+    }
+
     /// Returns the mapped stable internal instrument.
     pub const fn instrument(&self) -> InstrumentId {
         self.instrument
+    }
+}
+
+/// Exact profile revision and provider-native coordinate selected for one configured product.
+///
+/// This adapter-local value carries no registry or canonical-selection authority. It keeps the
+/// provider key, provider-profile revision and digest, venue symbol, and canonical instrument
+/// together so public and Direct decoders cannot reconstruct any coordinate from a diagnostic
+/// message identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoinbaseNativeProductCoordinate {
+    mapping: CoinbaseProductMapping,
+    identity_key: ProviderIdentityKey,
+    identity_revision: MetadataRevision,
+    identity_digest: EvidenceDigest,
+    venue: VenueId,
+}
+
+impl CoinbaseNativeProductCoordinate {
+    pub(crate) fn try_new(
+        mapping: CoinbaseProductMapping,
+        source_id: SourceId,
+        revision_evidence: &RevisionBoundPayloadEvidence,
+    ) -> Result<Self, CoinbaseConfigError> {
+        let venue = VenueId::try_from(COINBASE_VENUE)?;
+        let coordinate = Self {
+            identity_key: ProviderIdentityKey::new(
+                source_id,
+                mapping.provider_instrument_id().clone(),
+            ),
+            mapping,
+            identity_revision: revision_evidence.metadata_revision().clone(),
+            identity_digest: revision_evidence.payload_evidence().content_digest(),
+            venue,
+        };
+        coordinate.validate_static()?;
+        Ok(coordinate)
+    }
+
+    pub(crate) const fn product(&self) -> &ProviderProduct {
+        self.mapping.product()
+    }
+
+    pub(crate) const fn provider_identity_key(&self) -> &ProviderIdentityKey {
+        &self.identity_key
+    }
+
+    pub(crate) const fn identity_revision(&self) -> &MetadataRevision {
+        &self.identity_revision
+    }
+
+    pub(crate) const fn identity_digest(&self) -> EvidenceDigest {
+        self.identity_digest
+    }
+
+    pub(crate) const fn venue(&self) -> &VenueId {
+        &self.venue
+    }
+
+    pub(crate) const fn venue_symbol(&self) -> &VenueSymbol {
+        self.mapping.venue_symbol()
+    }
+
+    pub(crate) const fn instrument(&self) -> InstrumentId {
+        self.mapping.instrument()
+    }
+
+    pub(crate) fn validate_metadata(
+        &self,
+        metadata: &SourceMetadata,
+    ) -> Result<(), CoinbaseConfigError> {
+        self.validate_static()?;
+        if metadata.source_id() != self.provider_identity_key().source_id()
+            || metadata.provider().as_str() != COINBASE_PROVIDER
+            || metadata.revision() != self.identity_revision()
+            || metadata
+                .revision_evidence()
+                .payload_evidence()
+                .content_digest()
+                != self.identity_digest()
+        {
+            return Err(CoinbaseConfigError::InvalidNativeProductCoordinate);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validates_wire_product(&self, product: &str) -> bool {
+        self.product().as_source_identifier().as_str() == product
+            && self
+                .provider_identity_key()
+                .provider_instrument_id()
+                .as_str()
+                == product
+            && self.venue_symbol().as_str() == product
+    }
+
+    fn validate_static(&self) -> Result<(), CoinbaseConfigError> {
+        if self.venue().as_str() != COINBASE_VENUE
+            || !self.validates_wire_product(self.product().as_source_identifier().as_str())
+        {
+            return Err(CoinbaseConfigError::InvalidNativeProductCoordinate);
+        }
+        Ok(())
     }
 }
 
@@ -180,7 +299,16 @@ impl CoinbaseExchangeConfig {
         validate_mappings(&mappings)?;
         validate_channels(&channels)?;
 
-        let venue = VenueId::try_from(COINBASE_VENUE)?;
+        let coordinate = CoinbaseNativeProductCoordinate::try_new(
+            mappings
+                .first()
+                .ok_or(CoinbaseConfigError::InvalidMappingCount)?
+                .clone(),
+            source_id.clone(),
+            &revision_evidence,
+        )?;
+
+        let venue = coordinate.venue().clone();
         let decoder_rule = rule("coinbase-advanced-trade-v1-decoder")?;
         let timestamp_rule = rule("coinbase-advanced-trade-rfc3339-timestamp")?;
         let sequence_rule = rule("coinbase-advanced-trade-envelope-sequence-unbound")?;
@@ -209,16 +337,12 @@ impl CoinbaseExchangeConfig {
                 )?,
             ],
         )?;
-        let instruments = mappings
-            .iter()
-            .map(CoinbaseProductMapping::instrument)
-            .collect::<Vec<_>>();
         let coverage = SourceCoverage::try_instrument(
             coverage_evidence,
             effective,
             vec![AssetClass::Crypto],
             CoverageTopology::single_venue(venue),
-            InstrumentCoverage::enumerated(instruments)?,
+            InstrumentCoverage::enumerated(vec![coordinate.instrument()])?,
             Some(live),
             CoverageDelay::RealTime,
             DeliveryEvidence::Unknown,
@@ -265,6 +389,7 @@ impl CoinbaseExchangeConfig {
                 ProviderNumericPolicy::ExactDecimalLexeme,
             ))),
         ))?;
+        coordinate.validate_metadata(&metadata)?;
         let subscriptions = subscription_payloads(&mappings, &channels)?;
         Ok(Self {
             metadata,
@@ -350,7 +475,10 @@ fn subscription_payloads(
     Ok(payloads.into_boxed_slice())
 }
 
-fn validate_product(value: &str) -> Result<(), CoinbaseConfigError> {
+fn native_product_identity(
+    product: &ProviderProduct,
+) -> Result<(ProviderInstrumentId, VenueSymbol), CoinbaseConfigError> {
+    let value = product.as_source_identifier().as_str();
     if value.is_empty()
         || value.len() > MAX_PRODUCT_BYTES
         || !value
@@ -359,7 +487,13 @@ fn validate_product(value: &str) -> Result<(), CoinbaseConfigError> {
     {
         return Err(CoinbaseConfigError::InvalidProduct);
     }
-    Ok(())
+    let provider_instrument_id = ProviderInstrumentId::try_from(value)?;
+    let venue_symbol =
+        VenueSymbol::try_from(value).map_err(|_error| CoinbaseConfigError::InvalidProduct)?;
+    if provider_instrument_id.as_str() != value || venue_symbol.as_str() != value {
+        return Err(CoinbaseConfigError::InvalidNativeProductCoordinate);
+    }
+    Ok((provider_instrument_id, venue_symbol))
 }
 
 fn validate_mappings(mappings: &[CoinbaseProductMapping]) -> Result<(), CoinbaseConfigError> {
@@ -421,6 +555,9 @@ pub enum CoinbaseConfigError {
     /// Product identifier violated the Exchange grammar.
     #[error("Coinbase product identifier is invalid")]
     InvalidProduct,
+    /// Product, provider identity, profile revision/digest, venue, and venue symbol diverged.
+    #[error("Coinbase provider-native product coordinate is inconsistent")]
+    InvalidNativeProductCoordinate,
     /// Product mapping count was empty or exceeded the connection ceiling.
     #[error("Coinbase product mapping count is invalid")]
     InvalidMappingCount,
