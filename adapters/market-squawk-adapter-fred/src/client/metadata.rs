@@ -7,7 +7,7 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     ApiEndpointRule, ExtractionAuthority, ExtractionSourceError, NetworkPolicyError, PathScope,
     ProviderCaptureMaterial, QueryParameterRule, QuerySensitivity, SourceError,
-    SourceProtocolViolation,
+    SourceMetadataSchemaViolation, SourceProtocolViolation,
 };
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -167,6 +167,7 @@ impl FredSeriesMetadata {
         limits: FredParseLimits,
     ) -> Result<Self, FredSourceError> {
         parse_series_metadata_for_series(bytes, expected_series.as_str(), limits)
+            .map_err(|_| FredSourceError::Protocol)
     }
 }
 
@@ -361,7 +362,11 @@ impl FredSource {
             self.response_limit,
             self.response_limit.min(MAX_METADATA_STRING_BYTES),
         )
-        .map_err(|_| protocol_violation(SourceProtocolViolation::MetadataSchema))?;
+        .map_err(|_| {
+            protocol_violation(SourceProtocolViolation::MetadataSchema(
+                SourceMetadataSchemaViolation::DocumentShape,
+            ))
+        })?;
         let series = parse_series_metadata(&response.body, &dataset_identity, limits)
             .map_err(protocol_violation)?;
         let response_length = u64::try_from(response.body.len())
@@ -392,7 +397,7 @@ fn parse_series_metadata(
     limits: FredParseLimits,
 ) -> Result<FredSeriesMetadata, SourceProtocolViolation> {
     let series = parse_series_metadata_for_series(bytes, dataset.series_id(), limits)
-        .map_err(|_| SourceProtocolViolation::MetadataSchema)?;
+        .map_err(SourceProtocolViolation::MetadataSchema)?;
     if series.realtime_start != dataset.realtime_start()
         || series.realtime_end != dataset.realtime_end()
     {
@@ -405,17 +410,21 @@ fn parse_series_metadata_for_series(
     bytes: &[u8],
     expected_series: &str,
     limits: FredParseLimits,
-) -> Result<FredSeriesMetadata, FredSourceError> {
-    admit_body(bytes, limits).map_err(|_| FredSourceError::Protocol)?;
+) -> Result<FredSeriesMetadata, SourceMetadataSchemaViolation> {
+    admit_body(bytes, limits).map_err(|_| SourceMetadataSchemaViolation::DocumentShape)?;
     let wire: SeriesResponseWire =
-        serde_json::from_slice(bytes).map_err(|_| FredSourceError::Protocol)?;
+        serde_json::from_slice(bytes).map_err(|_| SourceMetadataSchemaViolation::DocumentShape)?;
     if wire.seriess.len() != 1 {
-        return Err(FredSourceError::Protocol);
+        return Err(SourceMetadataSchemaViolation::RecordCardinality);
     }
-    let page_start = parse_date(&wire.realtime_start).map_err(|_| FredSourceError::Protocol)?;
-    let page_end = parse_date(&wire.realtime_end).map_err(|_| FredSourceError::Protocol)?;
+    let page_start = parse_date(&wire.realtime_start)
+        .map_err(|_| SourceMetadataSchemaViolation::PageRecordInterval)?;
+    let page_end = parse_date(&wire.realtime_end)
+        .map_err(|_| SourceMetadataSchemaViolation::PageRecordInterval)?;
     let mut rows = wire.seriess.into_iter();
-    let row = rows.next().ok_or(FredSourceError::Protocol)?;
+    let row = rows
+        .next()
+        .ok_or(SourceMetadataSchemaViolation::RecordCardinality)?;
     let values = [
         row.id.as_str(),
         row.title.as_str(),
@@ -428,24 +437,31 @@ fn parse_series_metadata_for_series(
         row.last_updated.as_str(),
         row.notes.as_deref().unwrap_or_default(),
     ];
-    validate_strings(values, limits).map_err(|_| FredSourceError::Protocol)?;
-    if values[..9].iter().any(|value| value.is_empty()) || !is_valid_last_updated(&row.last_updated)
-    {
-        return Err(FredSourceError::Protocol);
+    validate_strings(values, limits).map_err(|_| SourceMetadataSchemaViolation::RequiredText)?;
+    if values[..9].iter().any(|value| value.is_empty()) {
+        return Err(SourceMetadataSchemaViolation::RequiredText);
     }
-    let series_id = SourceIdentifier::try_from(row.id).map_err(|_| FredSourceError::Protocol)?;
-    let realtime_start = parse_date(&row.realtime_start).map_err(|_| FredSourceError::Protocol)?;
-    let realtime_end = parse_date(&row.realtime_end).map_err(|_| FredSourceError::Protocol)?;
-    let observation_start =
-        parse_date(&row.observation_start).map_err(|_| FredSourceError::Protocol)?;
-    let observation_end =
-        parse_date(&row.observation_end).map_err(|_| FredSourceError::Protocol)?;
-    if series_id.as_str() != expected_series
-        || realtime_start != page_start
-        || realtime_end != page_end
-        || observation_start > observation_end
-    {
-        return Err(FredSourceError::Protocol);
+    if !is_valid_last_updated(&row.last_updated) {
+        return Err(SourceMetadataSchemaViolation::UpdateTimestamp);
+    }
+    let series_id = SourceIdentifier::try_from(row.id)
+        .map_err(|_| SourceMetadataSchemaViolation::RecordIdentity)?;
+    let realtime_start = parse_date(&row.realtime_start)
+        .map_err(|_| SourceMetadataSchemaViolation::PageRecordInterval)?;
+    let realtime_end = parse_date(&row.realtime_end)
+        .map_err(|_| SourceMetadataSchemaViolation::PageRecordInterval)?;
+    let observation_start = parse_date(&row.observation_start)
+        .map_err(|_| SourceMetadataSchemaViolation::ObservationInterval)?;
+    let observation_end = parse_date(&row.observation_end)
+        .map_err(|_| SourceMetadataSchemaViolation::ObservationInterval)?;
+    if series_id.as_str() != expected_series {
+        return Err(SourceMetadataSchemaViolation::RecordIdentity);
+    }
+    if realtime_start != page_start || realtime_end != page_end {
+        return Err(SourceMetadataSchemaViolation::PageRecordInterval);
+    }
+    if observation_start > observation_end {
+        return Err(SourceMetadataSchemaViolation::ObservationInterval);
     }
     Ok(FredSeriesMetadata {
         series_id,

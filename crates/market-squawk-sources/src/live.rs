@@ -514,13 +514,32 @@ pub enum SinkError {
     CaptureIncomplete,
 }
 
+/// Closed payload-free metadata-schema failure retained only by internal diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceMetadataSchemaViolation {
+    /// The bounded response was not the selected document shape.
+    DocumentShape,
+    /// The bounded response did not contain the exact selected record cardinality.
+    RecordCardinality,
+    /// Required bounded text was missing, empty, or outside its admitted limit.
+    RequiredText,
+    /// The selected update timestamp did not match its documented lexical contract.
+    UpdateTimestamp,
+    /// The returned record identity did not bind to the exact request.
+    RecordIdentity,
+    /// Page and record effective intervals were malformed or inconsistent.
+    PageRecordInterval,
+    /// The provider-declared observation interval was malformed.
+    ObservationInterval,
+}
+
 /// Closed payload-free provider-response failure retained only by internal diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceProtocolViolation {
     /// A bounded metadata response declared an unsupported transport encoding.
     MetadataEncoding,
-    /// A bounded metadata response violated its selected schema.
-    MetadataSchema,
+    /// A bounded metadata response violated its selected schema at the retained closed stage.
+    MetadataSchema(SourceMetadataSchemaViolation),
     /// A bounded metadata response did not preserve the requested effective interval.
     MetadataInterval,
     /// A bounded observation response declared an unsupported transport encoding.

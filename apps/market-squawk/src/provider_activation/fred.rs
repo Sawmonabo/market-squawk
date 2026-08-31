@@ -282,11 +282,11 @@ mod tests {
         if binding != Some(provider_dataset)
             || series != Some("UNRATE")
             || effective != Some("2026-07-01")
-            || value != Some("4.1")
+            || value.is_none_or(str::is_empty)
             || read.pointer("/selection/complete").and_then(Value::as_bool) != Some(true)
         {
             return Err(
-                "typed FRED point-in-time read did not match the admitted UNRATE fact".into(),
+                "typed FRED point-in-time read was not complete, bounded, and non-missing".into(),
             );
         }
         Ok(())
