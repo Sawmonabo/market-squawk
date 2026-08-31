@@ -69,6 +69,30 @@ pub enum BlsCredentialRejoin {
 }
 
 impl BlsCredentialRejoin {
+    /// Derives and verifies the secret-free coordinate for one protected registered-v2 key.
+    ///
+    /// The complete opaque [`SecretRef`] is domain-separated before hashing so activation and
+    /// publication can independently rejoin the exact managed-store generation without receiving
+    /// key bytes or accepting a caller-selected digest.
+    pub fn for_registered_v2(credential_reference: &SecretRef) -> Result<Self, BlsSourceError> {
+        let encoded = serde_json::to_vec(credential_reference)
+            .map_err(|_| BlsSourceError::InvalidRegistrationKey)?;
+        let mut digest = Sha256::new();
+        digest.update(b"market-squawk/bls-protected-registration-generation/v1\0");
+        digest.update(
+            u64::try_from(encoded.len())
+                .map_err(|_| BlsSourceError::InvalidRegistrationKey)?
+                .to_be_bytes(),
+        );
+        digest.update(encoded);
+        let rejoin = Self::RegisteredGeneration(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            digest.finalize().into(),
+        ));
+        rejoin.validate()?;
+        Ok(rejoin)
+    }
+
     fn validate(self) -> Result<(), BlsSourceError> {
         match self {
             Self::PublicNoCredential => Ok(()),
@@ -170,10 +194,7 @@ impl BlsAuthorization {
         registration_key: BlsRegistrationKey,
         credential_reference: &SecretRef,
     ) -> Result<Self, BlsSourceError> {
-        let credential_rejoin = BlsCredentialRejoin::RegisteredGeneration(
-            protected_registration_generation_digest(credential_reference)?,
-        );
-        credential_rejoin.validate()?;
+        let credential_rejoin = BlsCredentialRejoin::for_registered_v2(credential_reference)?;
         Ok(Self {
             tier: BlsAccessTier::RegisteredV2,
             registration_key: Some(registration_key),
@@ -226,25 +247,6 @@ impl BlsAuthorization {
             _ => Err(BlsSourceError::InvalidRegistrationKey),
         }
     }
-}
-
-fn protected_registration_generation_digest(
-    credential_reference: &SecretRef,
-) -> Result<EvidenceDigest, BlsSourceError> {
-    let encoded = serde_json::to_vec(credential_reference)
-        .map_err(|_| BlsSourceError::InvalidRegistrationKey)?;
-    let mut digest = Sha256::new();
-    digest.update(b"market-squawk/bls-protected-registration-generation/v1\0");
-    digest.update(
-        u64::try_from(encoded.len())
-            .map_err(|_| BlsSourceError::InvalidRegistrationKey)?
-            .to_be_bytes(),
-    );
-    digest.update(encoded);
-    Ok(EvidenceDigest::new(
-        DigestAlgorithm::Sha256,
-        digest.finalize().into(),
-    ))
 }
 
 impl std::fmt::Debug for BlsAuthorization {
@@ -781,7 +783,10 @@ mod tests {
     };
     use uuid::Uuid;
 
-    use super::{BlsAuthorization, BlsProviderRequest, BlsRegistrationKey, collect_bounded_stream};
+    use super::{
+        BlsAuthorization, BlsCredentialRejoin, BlsProviderRequest, BlsRegistrationKey,
+        collect_bounded_stream,
+    };
 
     #[test]
     fn registered_generation_is_derived_from_the_exact_protected_reference()
@@ -832,6 +837,14 @@ mod tests {
             &second_reference,
         )?;
 
+        assert_eq!(
+            first.credential_rejoin(),
+            BlsCredentialRejoin::for_registered_v2(&first_reference)?,
+        );
+        assert_eq!(
+            second.credential_rejoin(),
+            BlsCredentialRejoin::for_registered_v2(&second_reference)?,
+        );
         assert_ne!(first.credential_rejoin(), second.credential_rejoin());
         Ok(())
     }
