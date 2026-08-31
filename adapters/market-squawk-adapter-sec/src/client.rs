@@ -1228,15 +1228,6 @@ impl SecEdgarSource {
         Arc::clone(&self.raw_store)
     }
 
-    pub(crate) fn retained_representation(
-        &self,
-        locator: &SecObjectLocator,
-    ) -> Result<Option<SecRepresentation>, SecClientError> {
-        self.representation_registry
-            .representation(locator.url())
-            .map_err(Into::into)
-    }
-
     pub(crate) fn identity_registry(&self) -> Arc<ProviderIdentityRegistry> {
         Arc::clone(&self.identities)
     }
