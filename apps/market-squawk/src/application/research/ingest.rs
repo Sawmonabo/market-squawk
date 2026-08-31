@@ -19,6 +19,7 @@ use market_squawk_data::{
 use market_squawk_domain::{
     CompanyIdentityObservation, EvidenceDigest, SourceId, SourceIdentifier, Timestamp,
 };
+use market_squawk_platform::SealedResearchJournalStore;
 use market_squawk_services::{
     RequestContext, ServiceError, ServiceLimits, ToolResultMetadata, TypedToolRequest,
     TypedToolResult,
@@ -1571,6 +1572,58 @@ impl ProductionResearchIngestCoordinator {
         let operation = TreasuryAllHistoryOperationAuthority { source, common };
         operation.common.ensure_live()?;
         Ok(operation)
+    }
+
+    /// Reconstructs one completed Treasury acquisition only through the exact registered source
+    /// generation and the application-owned sealed raw store.
+    pub(super) fn restore_treasury_all_history_completion(
+        &self,
+        generation: &ResearchProviderRuntimeGeneration,
+        provider_dataset: &SourceIdentifier,
+        checkpoint: &[u8],
+        store: &SealedResearchJournalStore,
+    ) -> Result<market_squawk_adapter_treasury::TreasuryAllHistoryAcquisitionCompletion, ServiceError>
+    {
+        let source = {
+            let authority = self
+                .authority
+                .lock()
+                .map_err(|_error| ServiceError::Unavailable)?;
+            let registered = authority
+                .sources
+                .get(generation.profile())
+                .ok_or(ServiceError::NotFound)?;
+            if registered.generation.as_ref() != Some(generation)
+                || registered.metadata != *generation.metadata()
+                || registered.source.metadata() != generation.metadata()
+                || registered.registration.source_id() != generation.metadata().source_id()
+                || registered.registration.revision() != generation.metadata().revision()
+                || !registered
+                    .admission
+                    .admits_generation(generation)
+                    .map_err(|_error| ServiceError::Unavailable)?
+            {
+                return Err(ServiceError::Unavailable);
+            }
+            registered.rights.validate_at(system_timestamp()?)?;
+            let subject = registered
+                .source
+                .rights_subject(provider_dataset)
+                .map_err(|_error| ServiceError::InvalidRequest)?;
+            registered.rights.validate_subject(subject.as_ref())?;
+            let RegisteredTypedSourceCapability::TreasuryAllHistory(source) =
+                registered.typed_capability.clone()
+            else {
+                return Err(ServiceError::Unavailable);
+            };
+            source
+        };
+        let restored = source
+            .restore_all_history_backfill(checkpoint, store)
+            .map_err(|_error| ServiceError::Unavailable)?;
+        restored
+            .acquisition_completion()
+            .map_err(|_error| ServiceError::Unavailable)
     }
 
     async fn acquire_provider_macro_operation_with_registered_capability(

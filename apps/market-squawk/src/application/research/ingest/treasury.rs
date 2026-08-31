@@ -216,7 +216,7 @@ impl TreasuryApplicationClosure {
         {
             let manifest = published_generation.manifest().clone();
             let restart = TreasuryMacroRestartSelector::all_history(manifest.clone())?;
-            restart.verify_for_runtime_generation(self.research.as_ref(), generation)?;
+            restart.verify_for_runtime_generation(self, generation)?;
             return Ok(Some(TreasuryMacroPublicationReceipt { manifest, restart }));
         }
         let receipt = Self::reopen_generation(
@@ -227,7 +227,7 @@ impl TreasuryApplicationClosure {
         )?;
         receipt
             .restart_selector()
-            .verify_for_runtime_generation(self.research.as_ref(), generation)?;
+            .verify_for_runtime_generation(self, generation)?;
         Ok(Some(receipt))
     }
 
@@ -405,7 +405,7 @@ impl TreasuryApplicationClosure {
                 common.cancellation(),
             )
             .await?;
-        let committed = self
+        let Some(committed) = self
             .research
             .analytical()
             .publish_staged_provider_macro_plan(
@@ -414,9 +414,12 @@ impl TreasuryApplicationClosure {
                 common.cancellation().clone(),
                 common.publication_authority(),
             )
-            .await?;
+            .await?
+        else {
+            return Ok(None);
+        };
         let restart = TreasuryMacroRestartSelector::all_history(committed.manifest().clone())?;
-        restart.verify_for_runtime_generation(self.research.as_ref(), generation)?;
+        restart.verify_for_runtime_generation(self, generation)?;
         Ok(Some(TreasuryMacroPublicationReceipt {
             manifest: committed.manifest().clone(),
             restart,
@@ -1146,9 +1149,10 @@ impl TreasuryMacroRestartSelector {
 
     fn verify_for_runtime_generation(
         &self,
-        research: &ResearchService,
+        closure: &TreasuryApplicationClosure,
         generation: &ResearchProviderRuntimeGeneration,
     ) -> Result<PinnedDataset, TreasuryApplicationError> {
+        let research = closure.research.as_ref();
         let expected_source = self.source_id()?;
         if generation.profile().as_str() != self.surface().profile_id()
             || generation.metadata().source_id() != &expected_source
@@ -1176,6 +1180,25 @@ impl TreasuryMacroRestartSelector {
                     return Err(TreasuryApplicationError::RestartInvalid);
                 }
                 validate_all_history_restart(selector, &evidence)?;
+                let completion = closure
+                    .coordinator
+                    .restore_treasury_all_history_completion(
+                        generation,
+                        session.provider_dataset(),
+                        session.checkpoint(),
+                        research.provider_capture_store().as_ref(),
+                    )?;
+                validate_all_history_completion(
+                    &completion,
+                    session.analytical_dataset(),
+                    session.provider_dataset(),
+                    session,
+                )?;
+                if completion.completion_digest()
+                    != evidence.completed().adapter_completion_digest()
+                {
+                    return Err(TreasuryApplicationError::RestartInvalid);
+                }
                 Ok(evidence.pinned().clone())
             }
         }
