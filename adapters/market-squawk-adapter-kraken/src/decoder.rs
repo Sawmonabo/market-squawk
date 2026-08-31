@@ -11,18 +11,19 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     ControlFrameKind, DecodeError, DecodeInternalError, DecodeOutcome, DecodedControlFrame,
     DecodedIgnoredFrame, DecodedProviderBatch, DecodedQuarantineAction, DecodedRecoveryAction,
-    DecoderEvidence, FrameSessionBinding, InstrumentCoverageMembership, MAX_DECODED_EVENTS,
-    MAX_RAW_FRAME_BYTES, ProviderAggressorEvidence, ProviderBookChange, ProviderBookLevel,
-    ProviderBookSide, ProviderChecksumEvidence, ProviderDecimalLexeme,
-    ProviderNormalizedObservation, ProviderObservationPayload, ProviderPrice, ProviderQuantity,
-    ProviderSequenceEvidence, ProviderSnapshotEvidence, ProviderTimestampEvidence,
-    QuarantineReason, ResolvedChecksumValidator, ResynchronizationReason, SourceMetadata,
-    SourceMetadataProvider, SourceProtocolProfile, TransportFrameKind, ValidatedRawMarketFrame,
-    kraken_v2_crc32,
+    DecoderEvidence, FrameSessionBinding, MAX_DECODED_EVENTS, MAX_RAW_FRAME_BYTES,
+    ProviderAggressorEvidence, ProviderBookChange, ProviderBookLevel, ProviderBookSide,
+    ProviderChecksumEvidence, ProviderDecimalLexeme, ProviderNormalizedObservation,
+    ProviderObservationPayload, ProviderPrice, ProviderQuantity, ProviderSequenceEvidence,
+    ProviderSnapshotEvidence, ProviderTimestampEvidence, QuarantineReason, ResynchronizationReason,
+    SourceMetadata, SourceMetadataProvider, SourceProtocolProfile, TransportFrameKind,
+    ValidatedRawMarketFrame, kraken_v2_crc32,
 };
 use rust_decimal::Decimal;
 
-use crate::config::{KrakenChannel, KrakenDepth};
+use crate::config::{
+    KrakenChannel, KrakenDepth, KrakenNativeMarketCoordinates, validate_public_surface,
+};
 use crate::handoff::{
     KrakenConnectionBinding, KrakenControlOrDiscontinuityKind, KrakenGenerationRetirement,
     KrakenInstrumentBinding, KrakenMarketContinuity, KrakenMarketEventHandoff, KrakenProviderText,
@@ -88,6 +89,18 @@ impl KrakenMarketDecoder {
         Self::try_for_channel(metadata, symbol, instrument, KrakenChannel::Book(depth))
     }
 
+    /// Constructs a generation-local book decoder bound to exact provider-native coordinates.
+    ///
+    /// The coordinates must have been validated from this exact source metadata and channel. No
+    /// missing identity is derived from a WebSocket symbol or canonical instrument.
+    pub fn try_new_with_coordinates(
+        metadata: SourceMetadata,
+        coordinates: KrakenNativeMarketCoordinates,
+        depth: KrakenDepth,
+    ) -> Result<Self, DecodeError> {
+        Self::try_for_channel_with_coordinates(metadata, coordinates, KrakenChannel::Book(depth))
+    }
+
     /// Constructs a generation-local trade decoder bound to checksum-unsupported metadata.
     pub fn try_trades(
         metadata: SourceMetadata,
@@ -97,6 +110,14 @@ impl KrakenMarketDecoder {
         Self::try_for_channel(metadata, symbol, instrument, KrakenChannel::Trades)
     }
 
+    /// Constructs a generation-local trade decoder bound to exact provider-native coordinates.
+    pub fn try_trades_with_coordinates(
+        metadata: SourceMetadata,
+        coordinates: KrakenNativeMarketCoordinates,
+    ) -> Result<Self, DecodeError> {
+        Self::try_for_channel_with_coordinates(metadata, coordinates, KrakenChannel::Trades)
+    }
+
     fn try_for_channel(
         metadata: SourceMetadata,
         symbol: impl Into<String>,
@@ -104,58 +125,43 @@ impl KrakenMarketDecoder {
         channel: KrakenChannel,
     ) -> Result<Self, DecodeError> {
         let symbol = symbol.into();
-        if metadata.provider().as_str() != VENUE
-            || metadata.quality_ceiling() != market_squawk_domain::DataQuality::DirectUnverified
-            || metadata.capabilities().sequence()
-                != market_squawk_domain::SequenceCapability::Unsupported
-            || metadata.coverage().instruments().membership(instrument)
-                != InstrumentCoverageMembership::Enumerated
-        {
+        validate_public_surface(&metadata, &symbol, instrument, channel)
+            .map_err(|_| DecodeError::InvalidProviderEvidence)?;
+        Self::from_validated_surface(metadata, symbol, instrument, channel, None)
+    }
+
+    fn try_for_channel_with_coordinates(
+        metadata: SourceMetadata,
+        coordinates: KrakenNativeMarketCoordinates,
+        channel: KrakenChannel,
+    ) -> Result<Self, DecodeError> {
+        let symbol = coordinates.venue_symbol().as_str().to_owned();
+        let instrument = coordinates.instrument();
+        if !coordinates.matches_surface(&metadata, &symbol, instrument, channel) {
             return Err(DecodeError::InvalidProviderEvidence);
         }
-        let venue = VenueId::try_from(VENUE).map_err(|_| DecodeError::InvalidProviderEvidence)?;
-        if !metadata.coverage().topology().is_single_venue()
-            || !metadata.coverage().topology().contains_venue(&venue)
-        {
-            return Err(DecodeError::InvalidProviderEvidence);
-        }
-        let live = metadata
-            .coverage()
-            .live()
-            .ok_or(DecodeError::InvalidProviderEvidence)?;
-        let expected_channel = match channel {
-            KrakenChannel::Book(_) => "book-v2",
-            KrakenChannel::Trades => "trade-v2",
-        };
-        if live.provider_product().as_source_identifier().as_str() != "kraken-spot"
-            || live.provider_channel().as_source_identifier().as_str() != expected_channel
-        {
-            return Err(DecodeError::InvalidProviderEvidence);
-        }
-        let SourceProtocolProfile::Live(profile) = metadata.protocol_profile() else {
-            return Err(DecodeError::InvalidProviderEvidence);
-        };
-        match channel {
-            KrakenChannel::Book(depth) => {
-                ResolvedChecksumValidator::resolve(profile.checksum(), depth.get())
-                    .map_err(|_| DecodeError::InvalidProviderEvidence)?;
-            }
-            KrakenChannel::Trades => {
-                if !matches!(
-                    profile.checksum(),
-                    market_squawk_sources::ChecksumValidationProfile::Unsupported { .. }
-                ) {
-                    return Err(DecodeError::InvalidProviderEvidence);
-                }
-            }
-        }
+        Self::from_validated_surface(metadata, symbol, instrument, channel, Some(coordinates))
+    }
+
+    fn from_validated_surface(
+        metadata: SourceMetadata,
+        symbol: String,
+        instrument: InstrumentId,
+        channel: KrakenChannel,
+        coordinates: Option<KrakenNativeMarketCoordinates>,
+    ) -> Result<Self, DecodeError> {
         let connection = public_connection(&metadata, channel, None)
             .map_err(|_| DecodeError::InvalidProviderEvidence)?;
         let instrument_binding = instrument_binding(&symbol, instrument)
             .map_err(|_| DecodeError::InvalidProviderEvidence)?;
         Ok(Self {
             metadata,
-            decoder: KrakenDecoder::try_for_channel(symbol, instrument, channel)?,
+            decoder: KrakenDecoder::try_for_channel_with_optional_coordinates(
+                symbol,
+                instrument,
+                channel,
+                coordinates,
+            )?,
             connection,
             instrument_binding,
             active_binding: None,
@@ -167,6 +173,11 @@ impl KrakenMarketDecoder {
     /// Returns current generation synchronization state.
     pub const fn state(&self) -> KrakenDecoderState {
         self.decoder.state()
+    }
+
+    /// Returns exact provider-native coordinates when this decoder was identity-bound.
+    pub const fn native_coordinates(&self) -> Option<&KrakenNativeMarketCoordinates> {
+        self.decoder.native_coordinates()
     }
 
     /// Consumes sender-minted proof of the exact public request before any provider frame is
@@ -759,6 +770,7 @@ pub struct KrakenDecoder {
     symbol: String,
     instrument: InstrumentId,
     channel: KrakenChannel,
+    native_coordinates: Option<KrakenNativeMarketCoordinates>,
     state: KrakenDecoderState,
     retirement_reason: Option<KrakenGenerationRetirement>,
     bids: Vec<ProviderBookLevel>,
@@ -777,6 +789,21 @@ impl KrakenDecoder {
         Self::try_for_channel(symbol, instrument, KrakenChannel::Book(depth))
     }
 
+    /// Constructs a book decoder from exact provider-native coordinates.
+    pub fn try_new_with_coordinates(
+        coordinates: KrakenNativeMarketCoordinates,
+        depth: KrakenDepth,
+    ) -> Result<Self, DecodeError> {
+        let symbol = coordinates.venue_symbol().as_str().to_owned();
+        let instrument = coordinates.instrument();
+        Self::try_for_channel_with_optional_coordinates(
+            symbol,
+            instrument,
+            KrakenChannel::Book(depth),
+            Some(coordinates),
+        )
+    }
+
     /// Constructs an exact trade-channel decoder.
     pub fn try_trades(
         symbol: impl Into<String>,
@@ -785,19 +812,56 @@ impl KrakenDecoder {
         Self::try_for_channel(symbol, instrument, KrakenChannel::Trades)
     }
 
+    /// Constructs a trade decoder from exact provider-native coordinates.
+    pub fn try_trades_with_coordinates(
+        coordinates: KrakenNativeMarketCoordinates,
+    ) -> Result<Self, DecodeError> {
+        let symbol = coordinates.venue_symbol().as_str().to_owned();
+        let instrument = coordinates.instrument();
+        Self::try_for_channel_with_optional_coordinates(
+            symbol,
+            instrument,
+            KrakenChannel::Trades,
+            Some(coordinates),
+        )
+    }
+
     fn try_for_channel(
         symbol: impl Into<String>,
         instrument: InstrumentId,
         channel: KrakenChannel,
     ) -> Result<Self, DecodeError> {
+        Self::try_for_channel_with_optional_coordinates(symbol, instrument, channel, None)
+    }
+
+    fn try_for_channel_with_optional_coordinates(
+        symbol: impl Into<String>,
+        instrument: InstrumentId,
+        channel: KrakenChannel,
+        native_coordinates: Option<KrakenNativeMarketCoordinates>,
+    ) -> Result<Self, DecodeError> {
         let symbol = symbol.into();
-        if symbol.is_empty() || symbol.len() > 64 || !symbol.is_ascii() {
+        let coordinates_match = native_coordinates.as_ref().is_none_or(|coordinates| {
+            coordinates.venue().as_str() == VENUE
+                && coordinates.venue_symbol().as_str() == symbol
+                && coordinates.instrument() == instrument
+                && coordinates.channel() == channel
+        });
+        if symbol.is_empty()
+            || symbol.len() > 64
+            || !symbol.is_ascii()
+            || symbol.chars().any(char::is_whitespace)
+        {
             return Err(DecodeError::MalformedPayload);
+        }
+        if !coordinates_match {
+            return Err(DecodeError::InvalidProviderEvidence);
         }
         Ok(Self {
             symbol,
             instrument,
             channel,
+            native_coordinates,
             state: KrakenDecoderState::AwaitingSnapshot,
             retirement_reason: None,
             bids: Vec::new(),
@@ -810,6 +874,11 @@ impl KrakenDecoder {
     /// Returns the generation-local synchronization state.
     pub const fn state(&self) -> KrakenDecoderState {
         self.state
+    }
+
+    /// Returns exact provider-native coordinates when construction was identity-bound.
+    pub const fn native_coordinates(&self) -> Option<&KrakenNativeMarketCoordinates> {
+        self.native_coordinates.as_ref()
     }
 
     /// Returns the checksum of the last committed candidate.
@@ -1012,7 +1081,7 @@ impl KrakenDecoder {
     ) -> Result<ProviderNormalizedObservation, DecodeError> {
         ProviderNormalizedObservation::try_new(
             source_identifier(&format!("book:{}:{}", self.symbol, data.timestamp))?,
-            VenueId::try_from(VENUE).map_err(|_| DecodeError::MalformedPayload)?,
+            self.observation_venue()?,
             self.instrument,
             ProviderTimestampEvidence::Provided {
                 value: timestamp,
@@ -1072,7 +1141,7 @@ impl KrakenDecoder {
             };
             observations.push(ProviderNormalizedObservation::try_new(
                 source_identifier(&trade_id)?,
-                VenueId::try_from(VENUE).map_err(|_| DecodeError::MalformedPayload)?,
+                self.observation_venue()?,
                 self.instrument,
                 ProviderTimestampEvidence::Provided {
                     value: parse_timestamp(trade.timestamp)?,
@@ -1100,6 +1169,20 @@ impl KrakenDecoder {
         }
         self.state = KrakenDecoderState::Healthy;
         Ok(KrakenDecodeOutcome::Market(observations))
+    }
+
+    fn observation_venue(&self) -> Result<VenueId, DecodeError> {
+        match &self.native_coordinates {
+            Some(coordinates)
+                if coordinates.venue_symbol().as_str() == self.symbol
+                    && coordinates.instrument() == self.instrument
+                    && coordinates.channel() == self.channel =>
+            {
+                Ok(coordinates.venue().clone())
+            }
+            Some(_) => Err(DecodeError::InvalidProviderEvidence),
+            None => VenueId::try_from(VENUE).map_err(|_| DecodeError::MalformedPayload),
+        }
     }
 }
 

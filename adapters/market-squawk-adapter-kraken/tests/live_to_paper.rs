@@ -1,7 +1,7 @@
 use market_squawk_adapter_kraken::{
     KRAKEN_BOOK_SEQUENCE_RULE, KRAKEN_QUALIFICATION_POLICY_DIGEST,
-    KRAKEN_QUALIFICATION_POLICY_VERSION, KrakenConfig, KrakenDepth, KrakenMetadataInput,
-    KrakenQualificationPolicy,
+    KRAKEN_QUALIFICATION_POLICY_VERSION, KrakenConfig, KrakenDecodeOutcome, KrakenDecoder,
+    KrakenDepth, KrakenMetadataInput, KrakenQualificationPolicy,
 };
 use market_squawk_adapter_paper::{
     FeeSchedule, PaperAccountBootstrap, PaperExposureValuation, PaperLedger, PaperLedgerConfig,
@@ -11,8 +11,9 @@ use market_squawk_domain::{
     DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, ExecutionEligibility,
     InstrumentDefinitionRevision, InstrumentExecutionTerms, InstrumentId, LotSize,
     MetadataRevision, Money, OrderId, OrderReasonCode, OrderSide, OrderType, PriceTicks,
-    QuantityLots, RevisionBoundPayloadEvidence, RuleVersion, SourceId, SourceIdentifier,
-    StrategyId, TickSize, TimeInForce, Timestamp,
+    ProviderIdentityEvidence, ProviderIdentityRecord, ProviderIdentityRecordInput,
+    ProviderIdentityRegistry, ProviderInstrumentId, QuantityLots, RevisionBoundPayloadEvidence,
+    RuleVersion, SourceId, SourceIdentifier, StrategyId, TickSize, TimeInForce, Timestamp,
 };
 use market_squawk_execution::{
     AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
@@ -23,7 +24,7 @@ use market_squawk_execution::{
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, ChecksumValidationProfile,
-    FreshnessPolicy, ProviderBudgetPolicy, SourceProtocolProfile,
+    DecodeError, FreshnessPolicy, ProviderBudgetPolicy, SourceProtocolProfile,
 };
 use rust_decimal::Decimal;
 use std::collections::BTreeSet;
@@ -77,19 +78,78 @@ fn metadata_binds_the_reviewed_ceiling_and_contains_no_fabricated_sequence()
     assert!(json.contains(KRAKEN_QUALIFICATION_POLICY_DIGEST));
 
     let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
-    let _book_config = KrakenConfig::try_new(
+    let book_config = KrakenConfig::try_new(
         metadata,
         "BTC/USD",
         instrument,
         KrakenDepth::Ten,
         NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
     )?;
-    let _trade_config = KrakenConfig::try_trades(
+    let trade_config = KrakenConfig::try_trades(
         trade_metadata,
         "BTC/USD",
         instrument,
         NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
     )?;
+
+    let provider_identity = kraken_provider_identity(instrument)?;
+    let identities = ProviderIdentityRegistry::try_from_records(vec![provider_identity.clone()])?;
+    let book_coordinates = book_config.try_native_coordinates(&provider_identity, &identities)?;
+    let trade_coordinates = trade_config.try_native_coordinates(&provider_identity, &identities)?;
+    assert_eq!(
+        book_coordinates
+            .provider_identity_key()
+            .provider_instrument_id()
+            .as_str(),
+        "XBTUSD"
+    );
+    assert_eq!(book_coordinates.venue_symbol().as_str(), "BTC/USD");
+    assert_eq!(
+        book_coordinates.provider_identity_revision(),
+        provider_identity.metadata_revision()
+    );
+    assert_eq!(
+        book_coordinates.provider_identity_digest(),
+        provider_identity.evidence().content_digest()
+    );
+    assert_eq!(
+        book_coordinates
+            .provider_product()
+            .as_source_identifier()
+            .as_str(),
+        "kraken-spot"
+    );
+    assert_eq!(
+        book_coordinates
+            .provider_channel()
+            .as_source_identifier()
+            .as_str(),
+        "book-v2"
+    );
+    assert_eq!(
+        trade_coordinates
+            .provider_channel()
+            .as_source_identifier()
+            .as_str(),
+        "trade-v2"
+    );
+    assert!(matches!(
+        KrakenDecoder::try_trades_with_coordinates(book_coordinates.clone()),
+        Err(DecodeError::InvalidProviderEvidence)
+    ));
+
+    let mut decoder =
+        KrakenDecoder::try_new_with_coordinates(book_coordinates.clone(), KrakenDepth::Ten)?;
+    let KrakenDecodeOutcome::Market(observations) =
+        decoder.decode_payload(include_bytes!("../fixtures/official_book_checksum.json"))?
+    else {
+        return Err("official Kraken book snapshot decoded as control traffic".into());
+    };
+    assert_eq!(decoder.native_coordinates(), Some(&book_coordinates));
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].instrument(), instrument);
+    assert_eq!(observations[0].venue(), book_coordinates.venue());
+    let _trade_decoder = KrakenDecoder::try_trades_with_coordinates(trade_coordinates)?;
 
     Ok(())
 }
@@ -264,6 +324,27 @@ fn current_timestamp() -> Result<Timestamp, Box<dyn Error>> {
         .and_then(|value| value.checked_add(i128::from(elapsed.subsec_nanos())))
         .ok_or("system timestamp overflow")?;
     Ok(Timestamp::from_unix_nanos(i64::try_from(nanos)?))
+}
+
+fn kraken_provider_identity(
+    instrument: InstrumentId,
+) -> Result<ProviderIdentityRecord, Box<dyn Error>> {
+    Ok(ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+        instrument_id: instrument,
+        source_id: SourceId::try_from("kraken")?,
+        provider_instrument_id: ProviderInstrumentId::try_from("XBTUSD")?,
+        evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            [4; 32],
+        )),
+        source_timestamp: None,
+        observed_at: Timestamp::from_unix_nanos(1),
+        metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(
+            "kraken-instrument-identity-v1",
+        )?),
+        validity: EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+        supersedes: None,
+    }))
 }
 
 fn metadata_input(trades: bool) -> Result<KrakenMetadataInput, Box<dyn Error>> {
