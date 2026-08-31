@@ -22,6 +22,11 @@ use zeroize::Zeroizing;
 
 use crate::{ConnectionGeneration, ReadOnlyRoute, SchwabAdapterError};
 
+pub(crate) use crate::sensitive::SensitiveBytesOwner;
+#[cfg(test)]
+pub(crate) use crate::sensitive::SensitiveDropAudit;
+#[cfg(test)]
+pub(crate) use http::ReqwestSchwabAuthorizationMaterial;
 pub(crate) use http::SchwabSealedRestResponseParts;
 pub use http::{
     CapturedRestResponse, ExecutedRestResponse, ReqwestSchwabHttpWire, RestExecutionOutcome,
@@ -31,6 +36,8 @@ pub use http::{
     SchwabSealedRawRestCapture, SchwabSealedRestResponse, SchwabUserPreferenceEvidence,
 };
 pub(crate) use streamer::SchwabSealedStreamerCaptureParts;
+#[cfg(test)]
+pub(crate) use streamer::streamer_text_message;
 pub use streamer::{
     InboundStreamerFrame, ProductionSchwabStreamerConnector, RawStreamerFrame,
     RawStreamerFrameKind, SchwabPendingStreamerCapture, SchwabSealedStreamerCapture,

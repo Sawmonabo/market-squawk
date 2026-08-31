@@ -981,10 +981,8 @@ impl SchwabStreamerConnection for TungsteniteSchwabConnection {
         payload: Bytes,
     ) -> Pin<Box<dyn Future<Output = Result<(), SchwabTransportError>> + Send + 'a>> {
         Box::pin(async move {
-            let text =
-                String::from_utf8(payload.to_vec()).map_err(|_| SchwabTransportError::Protocol)?;
             self.socket
-                .send(Message::Text(text.into()))
+                .send(streamer_text_message(payload)?)
                 .await
                 .map_err(map_websocket_error)
         })
@@ -1031,6 +1029,12 @@ impl SchwabStreamerConnection for TungsteniteSchwabConnection {
     ) -> Pin<Box<dyn Future<Output = Result<(), SchwabTransportError>> + Send + 'a>> {
         Box::pin(async move { self.socket.close(None).await.map_err(map_websocket_error) })
     }
+}
+
+pub(crate) fn streamer_text_message(payload: Bytes) -> Result<Message, SchwabTransportError> {
+    let text = tokio_tungstenite::tungstenite::Utf8Bytes::try_from(payload)
+        .map_err(|_| SchwabTransportError::Protocol)?;
+    Ok(Message::Text(text))
 }
 
 /// Normal terminal exit for a run-until-cancelled Streamer owner.
@@ -2083,7 +2087,7 @@ async fn send_request(
             .map_err(|_| SchwabTransportError::Overflow)?,
         dispatched_at: Instant::now(),
     };
-    let bytes = Bytes::copy_from_slice(request.expose_body());
+    let bytes = request.into_shared_body();
     let length = u64::try_from(bytes.len()).map_err(|_| SchwabTransportError::Overflow)?;
     await_operation(connection.send_text(bytes), timeout, cancellation).await?;
     telemetry.record_stream_request(length)?;

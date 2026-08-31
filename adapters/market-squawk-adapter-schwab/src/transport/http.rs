@@ -38,8 +38,8 @@ use crate::{
 
 use super::{
     AccessTokenAdmission, RawRestResponseReceipt, ResponseHeaderEvidence, RestTransportBounds,
-    SchwabCaptureCoordinates, SchwabTransportError, SchwabTransportTelemetry, TransientAccessToken,
-    duration_millis, unix_millis, unix_seconds,
+    SchwabCaptureCoordinates, SchwabTransportError, SchwabTransportTelemetry, SensitiveBytesOwner,
+    TransientAccessToken, duration_millis, unix_millis, unix_seconds,
 };
 
 const USER_AGENT_VALUE: &str = "market-squawk-schwab-read-only/1";
@@ -185,6 +185,48 @@ impl ReqwestSchwabHttpWire {
     }
 }
 
+/// Adapter-owned bearer material transferred into reqwest without copying its allocation.
+pub(crate) struct ReqwestSchwabAuthorizationMaterial {
+    owner: SensitiveBytesOwner,
+}
+
+impl ReqwestSchwabAuthorizationMaterial {
+    pub(crate) fn try_new(bearer: &str) -> Result<Self, SchwabTransportError> {
+        let mut authorization = Zeroizing::new(Vec::new());
+        authorization
+            .try_reserve_exact("Bearer ".len().saturating_add(bearer.len()))
+            .map_err(|_| SchwabTransportError::InvalidToken)?;
+        authorization.extend_from_slice(b"Bearer ");
+        authorization.extend_from_slice(bearer.as_bytes());
+        Ok(Self {
+            owner: SensitiveBytesOwner::new(std::mem::take(&mut *authorization)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.owner.as_bytes()
+    }
+
+    pub(crate) fn into_header(self) -> Result<reqwest::header::HeaderValue, SchwabTransportError> {
+        let mut header = reqwest::header::HeaderValue::from_maybe_shared(self.owner.into_shared())
+            .map_err(|_| SchwabTransportError::InvalidToken)?;
+        header.set_sensitive(true);
+        Ok(header)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_drop_audit(&mut self, audit: super::SensitiveDropAudit) {
+        self.owner.arm_drop_audit(audit);
+    }
+}
+
+impl fmt::Debug for ReqwestSchwabAuthorizationMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReqwestSchwabAuthorizationMaterial([REDACTED])")
+    }
+}
+
 impl SchwabHttpWire for ReqwestSchwabHttpWire {
     fn get<'a>(
         &'a self,
@@ -193,11 +235,8 @@ impl SchwabHttpWire for ReqwestSchwabHttpWire {
         Box<dyn Future<Output = Result<SchwabHttpWireResponse, SchwabTransportError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let mut authorization = Zeroizing::new(String::from("Bearer "));
-            authorization.push_str(request.bearer());
-            let mut authorization = reqwest::header::HeaderValue::from_str(&authorization)
-                .map_err(|_| SchwabTransportError::InvalidToken)?;
-            authorization.set_sensitive(true);
+            let authorization =
+                ReqwestSchwabAuthorizationMaterial::try_new(request.bearer())?.into_header()?;
             let response = self
                 .client
                 .get(request.request().url())

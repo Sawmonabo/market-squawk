@@ -1559,6 +1559,76 @@ async fn oauth_authority_durably_reauthorizes_unusable_token_state() {
     ));
 }
 
+#[test]
+fn bearer_network_handoffs_keep_one_zeroizing_owner_through_completion() {
+    for transport_fails in [false, true] {
+        let rest_audit = crate::transport::SensitiveDropAudit::default();
+        let mut rest =
+            crate::transport::ReqwestSchwabAuthorizationMaterial::try_new("rest-bearer-secret")
+                .unwrap_or_else(|error| panic!("REST bearer material: {error}"));
+        rest.arm_drop_audit(rest_audit.clone());
+        let rest_owner = rest.as_bytes().as_ptr();
+        let header = rest
+            .into_header()
+            .unwrap_or_else(|error| panic!("REST bearer header: {error}"));
+        assert_eq!(header.as_bytes().as_ptr(), rest_owner);
+        let network_header = header.clone();
+        drop(header);
+        assert_eq!(rest_audit.cleared_drops(), 0);
+        let rest_result = if transport_fails {
+            Err(SchwabTransportError::Network)
+        } else {
+            Ok(())
+        };
+        drop(network_header);
+        assert_eq!(rest_audit.cleared_drops(), 1);
+        assert_eq!(rest_audit.uncleared_drops(), 0);
+        assert_eq!(rest_result.is_err(), transport_fails);
+
+        let preference = br#"{
+          "streamerInfo":[{"streamerSocketUrl":"wss://streamer.example.test/ws","schwabClientCustomerId":"customer","schwabClientCorrelId":"correlation","schwabClientChannel":"channel","schwabClientFunctionId":"function"}],
+          "offers":[{"mktDataPermission":"NP","level2Permissions":true}]
+        }"#;
+        let bootstrap = parse_user_preference(preference, bounds())
+            .unwrap_or_else(|error| panic!("Streamer bootstrap: {error}"));
+        let stream_admission = StreamerAdmission::new(admission(), nonzero(4), nonzero(16));
+        let generation = ConnectionGeneration::new(
+            NonZeroU64::new(1).unwrap_or_else(|| panic!("generation must be nonzero")),
+        );
+        let mut controller = DesiredStateController::new(stream_admission);
+        controller
+            .begin_connect(generation)
+            .unwrap_or_else(|error| panic!("begin Streamer connection: {error}"));
+        controller
+            .socket_connected(generation)
+            .unwrap_or_else(|error| panic!("connect Streamer socket: {error}"));
+        let mut login = controller
+            .login_request(bootstrap.value(), "streamer-bearer-secret")
+            .unwrap_or_else(|error| panic!("Streamer login request: {error}"));
+        let streamer_audit = crate::transport::SensitiveDropAudit::default();
+        login.arm_drop_audit(streamer_audit.clone());
+        let streamer_owner = login.expose_body().as_ptr();
+        let payload = login.into_shared_body();
+        assert_eq!(payload.as_ptr(), streamer_owner);
+        let message = crate::transport::streamer_text_message(payload)
+            .unwrap_or_else(|error| panic!("Streamer UTF-8 handoff: {error}"));
+        let tokio_tungstenite::tungstenite::Message::Text(network_text) = message else {
+            panic!("Streamer login must remain a text message");
+        };
+        assert_eq!(network_text.as_bytes().as_ptr(), streamer_owner);
+        assert_eq!(streamer_audit.cleared_drops(), 0);
+        let stream_result = if transport_fails {
+            Err(SchwabTransportError::Network)
+        } else {
+            Ok(())
+        };
+        drop(network_text);
+        assert_eq!(streamer_audit.cleared_drops(), 1);
+        assert_eq!(streamer_audit.uncleared_drops(), 0);
+        assert_eq!(stream_result.is_err(), transport_fails);
+    }
+}
+
 #[tokio::test]
 async fn streamer_microbatch_retains_validated_application_frames_without_token_material() {
     let telemetry = SchwabTransportTelemetry::default();

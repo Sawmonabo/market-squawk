@@ -12,6 +12,9 @@ use crate::rest::{
     NativeFieldEntry, NativeScalar, ParseContext, ParsedNative, ProviderIdentifier,
     parse_json_payload,
 };
+use crate::sensitive::SensitiveBytesOwner;
+#[cfg(test)]
+use crate::sensitive::SensitiveDropAudit;
 use crate::{ParseBounds, RequestAdmission, SchwabAdapterError};
 
 const MAX_BOOTSTRAP_VALUE_BYTES: usize = 4 * 1024;
@@ -523,7 +526,7 @@ impl DesiredStateController {
 
 /// Secret-bearing Streamer request bytes, zeroized on drop and never serializable.
 pub struct TransientStreamerRequest {
-    body: Zeroizing<Vec<u8>>,
+    body: SensitiveBytesOwner,
     service: Option<MarketDataService>,
     command: Box<str>,
     request_id: NonZeroU64,
@@ -614,14 +617,14 @@ impl TransientStreamerRequest {
             return Err(SchwabAdapterError::RequestNotAdmitted);
         }
         Ok(Self {
-            body,
+            body: SensitiveBytesOwner::new(std::mem::take(&mut *body)),
             service,
             command: command.to_owned().into_boxed_str(),
             request_id,
         })
     }
     pub fn expose_body(&self) -> &[u8] {
-        &self.body
+        self.body.as_bytes()
     }
     pub const fn service(&self) -> Option<MarketDataService> {
         self.service
@@ -631,6 +634,13 @@ impl TransientStreamerRequest {
     }
     pub const fn request_id(&self) -> NonZeroU64 {
         self.request_id
+    }
+    pub(crate) fn into_shared_body(self) -> bytes::Bytes {
+        self.body.into_shared()
+    }
+    #[cfg(test)]
+    pub(crate) fn arm_drop_audit(&mut self, audit: SensitiveDropAudit) {
+        self.body.arm_drop_audit(audit);
     }
 }
 impl fmt::Debug for TransientStreamerRequest {

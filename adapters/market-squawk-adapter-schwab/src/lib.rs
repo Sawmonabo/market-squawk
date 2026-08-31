@@ -17,6 +17,7 @@ mod option_publication;
 mod publication;
 mod rest;
 mod rest_quote_publication;
+mod sensitive;
 mod streamer;
 mod streamer_publication;
 mod transport;
