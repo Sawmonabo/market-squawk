@@ -531,21 +531,21 @@ impl ResearchService {
             }
         };
         let store = Arc::clone(&self.provider_captures);
-        let mut worker = tokio::task::spawn_blocking(move || {
+        let mut worker = ProviderCaptureSealWorker::new(tokio::task::spawn_blocking(move || {
             let _permit = permit;
             request.seal(store.as_ref())
-        });
+        }));
+        let join = worker.join()?;
         tokio::select! {
             biased;
             () = cancellation.cancelled() => {
-                reap_provider_capture_seal(worker);
                 Err(ResearchServiceError::Ingest(IngestError::Cancelled))
             }
             () = tokio::time::sleep_until(deadline) => {
-                reap_provider_capture_seal(worker);
                 Err(ResearchServiceError::Ingest(IngestError::DeadlineExceeded))
             }
-            result = &mut worker => {
+            result = join => {
+                worker.disarm();
                 result
                     .map_err(|_error| ResearchServiceError::ProviderCaptureSealWorkerUnavailable)?
                     .map_err(map_provider_capture_seal_error)
@@ -746,6 +746,56 @@ fn reap_provider_capture_seal(
     tokio::spawn(async move {
         let _late_result = worker.await;
     });
+}
+
+/// Drop-safe owner for one blocking capture-seal worker.
+///
+/// Any caller cancellation or outer future drop transfers the worker to the runtime reaper rather
+/// than detaching a still-mutating filesystem operation. A normally joined worker is disarmed only
+/// after Tokio has returned its terminal result.
+struct ProviderCaptureSealWorker {
+    worker: Option<
+        tokio::task::JoinHandle<
+            Result<SealedProviderCaptureMaterial, ProviderCaptureMaterialSealError>,
+        >,
+    >,
+}
+
+impl ProviderCaptureSealWorker {
+    fn new(
+        worker: tokio::task::JoinHandle<
+            Result<SealedProviderCaptureMaterial, ProviderCaptureMaterialSealError>,
+        >,
+    ) -> Self {
+        Self {
+            worker: Some(worker),
+        }
+    }
+
+    fn join(
+        &mut self,
+    ) -> Result<
+        &mut tokio::task::JoinHandle<
+            Result<SealedProviderCaptureMaterial, ProviderCaptureMaterialSealError>,
+        >,
+        ResearchServiceError,
+    > {
+        self.worker
+            .as_mut()
+            .ok_or(ResearchServiceError::ProviderCaptureSealWorkerUnavailable)
+    }
+
+    fn disarm(&mut self) {
+        self.worker = None;
+    }
+}
+
+impl Drop for ProviderCaptureSealWorker {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            reap_provider_capture_seal(worker);
+        }
+    }
 }
 
 /// Research composition, storage, ingestion, or analytical-generation failure.
