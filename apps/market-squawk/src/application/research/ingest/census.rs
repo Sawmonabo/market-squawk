@@ -77,6 +77,7 @@ impl CensusLiveComposition {
     ) -> Result<Self, CensusMacroApplicationError> {
         let plan = source.activation_plan()?;
         if source.metadata() != generation.metadata()
+            || !has_exact_credential_binding(&generation)
             || plan.source_id() != generation.metadata().source_id()
             || plan.metadata_revision() != generation.metadata().revision().as_source_identifier()
             || !generation
@@ -334,6 +335,7 @@ impl CensusMacroApplicationClosure {
         let plan = census.activation_plan()?;
         if census.metadata() != self.generation.metadata()
             || operation.generation() != &self.generation
+            || !has_exact_credential_binding(&self.generation)
             || plan.source_id() != self.generation.metadata().source_id()
             || plan.metadata_revision()
                 != self.generation.metadata().revision().as_source_identifier()
@@ -364,6 +366,12 @@ impl CensusMacroApplicationClosure {
         }
         Ok(())
     }
+}
+
+fn has_exact_credential_binding(generation: &ResearchProviderRuntimeGeneration) -> bool {
+    generation
+        .secret_reference()
+        .is_some_and(|reference| generation.credential_generation() == Some(reference.generation()))
 }
 
 fn census_macro_plan_input(
@@ -640,7 +648,11 @@ mod tests {
         DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, MetadataRevision,
         RevisionBoundPayloadEvidence, SchemaVersion, SequenceCapability, SourceIdentifier,
     };
-    use market_squawk_platform::LocalPaths;
+    use market_squawk_platform::{
+        EncryptedFileSecretStore, LocalPaths, SecretCancellation, SecretGeneration,
+        SecretInteractionPolicy, SecretKey, SecretOperationControl, SecretRef, SecretStore,
+        SecretValue,
+    };
     use market_squawk_services::{JsonStructureLimits, RequestContext, RequestId, ServiceLimits};
     use market_squawk_sources::{
         AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, CoverageDomain,
@@ -659,8 +671,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a configured Census API key and performs one bounded live journey"]
     async fn live_qwi_quarter_seals_publishes_reads_and_reopens() -> TestResult {
-        let api_key = std::env::var("CENSUS_API_KEY")?;
         let temporary = tempfile::tempdir()?;
+        let (api_key, secret_reference) = protected_census_api_key(
+            temporary.path(),
+            SecretValue::new(std::env::var("CENSUS_API_KEY")?)?,
+        )?;
         let paths = LocalPaths::prepare(temporary.path().join("research"))?;
         let now = current_timestamp()?;
         let subject = SourceIdentifier::try_from("census-live-api-key")?;
@@ -668,8 +683,7 @@ mod tests {
         let provider_dataset = contract.dataset_id().clone();
         let config = CensusSourceConfig::try_new([contract], CensusParseLimits::default())?;
         let metadata = source_metadata(now, subject.clone(), &config)?;
-        let source =
-            CensusSource::try_new(metadata.clone(), CensusApiKey::try_new(api_key)?, config)?;
+        let source = CensusSource::try_new(metadata.clone(), api_key, config)?;
         let rights = ResearchRightsAuthority::try_new_scoped(
             metadata.source_id().clone(),
             RightsBasis::reviewed_terms(
@@ -687,8 +701,8 @@ mod tests {
             Uuid::new_v4(),
             ProviderCapabilityRevision::new(1)?,
             digest(4),
-            None,
-            None,
+            Some(secret_reference.generation()),
+            Some(secret_reference),
             now,
             metadata.clone(),
             rights.clone(),
@@ -801,6 +815,34 @@ mod tests {
             restarted.output().observations().len()
         );
         Ok(())
+    }
+
+    fn protected_census_api_key(
+        root: &std::path::Path,
+        api_key: SecretValue,
+    ) -> TestResult<(CensusApiKey, SecretRef)> {
+        let store = EncryptedFileSecretStore::try_open(
+            root.join("secrets"),
+            SecretValue::new("census-live-journey-unlock".to_owned())?,
+        )?;
+        let control = SecretOperationControl::try_new(
+            "census-live-journey",
+            Instant::now() + Duration::from_secs(30),
+            0,
+            SecretInteractionPolicy::Forbid,
+            SecretCancellation::new(),
+        )?;
+        let reference = store.create(
+            &SecretKey::try_new("market-squawk.census", "live-qwi-api-key")?,
+            SecretGeneration::new(1)?,
+            api_key,
+            &control,
+        )?;
+        let loaded = store.read(&reference, &control)?;
+        Ok((
+            CensusApiKey::try_new(loaded.expose_secret().to_owned())?,
+            reference,
+        ))
     }
 
     fn live_qwi_contract() -> TestResult<CensusDatasetContract> {
