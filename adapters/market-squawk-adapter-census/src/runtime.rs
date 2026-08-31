@@ -4,19 +4,21 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     CURRENT_RESEARCH_RECORD_SCHEMA, ExtractionBatch, ExtractionContentIdentity,
-    ExtractionRevisionPlan, ProviderCaptureScope, ProviderCaptureSetReceipt,
+    ExtractionRevisionPlan, MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES,
+    MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES, ProviderCaptureScope, ProviderCaptureSetReceipt,
     ProviderCaptureTerminalDisposition, ProviderNativeLineageBatch,
     ProviderNativeLineageImplementation, ProviderWholeCaptureToken, SealedProviderCaptureBinding,
     SealedProviderCaptureSetReceipt, SourceMetadata, SourceObjectCaptureIdentity,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
     CensusClocks, CensusDataset, CensusDatasetAcquisition, CensusDatasetContract,
-    CensusDoctorReadiness, CensusDoctorReport, CensusDoctorScope, CensusGeographyScope,
-    CensusGeographyValue, CensusPredicateValue, CensusReportedTime, CensusSourceConfig,
-    CensusSourceError, CensusValueState, census_provider_rate_declaration, update_digest_component,
+    CensusDoctorReadiness, CensusDoctorReport, CensusDoctorScope, CensusGeographyReferenceDate,
+    CensusGeographyScope, CensusGeographyValue, CensusPredicateValue, CensusReportedTime,
+    CensusSourceConfig, CensusSourceError, CensusValueState, census_provider_rate_declaration,
+    update_digest_component,
 };
 
 const CENSUS_RUNTIME_SCHEMA_VERSION: u16 = 4;
@@ -302,7 +304,7 @@ fn validate_doctor_capture(
 }
 
 /// Exact role and order of one raw response needed by a Census publication.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "ordinal")]
 pub enum CensusCaptureRole {
     /// One complete ordered graph: public metadata responses followed by credentialed data.
@@ -310,7 +312,7 @@ pub enum CensusCaptureRole {
 }
 
 /// One exact raw-capture dependency that must be sealed before canonical publication.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CensusCaptureBinding {
     ordinal: u32,
@@ -366,7 +368,7 @@ impl CensusCaptureBinding {
 }
 
 /// Full provider identity bound to one ordered canonical macro observation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CensusCanonicalObservationBinding {
     canonical_ordinal: u64,
@@ -376,6 +378,8 @@ pub struct CensusCanonicalObservationBinding {
     concept: Option<String>,
     group: Option<SourceIdentifier>,
     geography: CensusGeographyValue,
+    geography_reference_date: Option<CensusGeographyReferenceDate>,
+    geography_grammar_digest: EvidenceDigest,
     predicates: Box<[CensusPredicateValue]>,
     reported_time: Option<CensusReportedTime>,
     effective_time: ResearchTemporalCoordinate,
@@ -414,6 +418,8 @@ impl CensusCanonicalObservationBinding {
             concept: observation.concept().map(str::to_owned),
             group: observation.group().cloned(),
             geography: observation.geography().clone(),
+            geography_reference_date: observation.geography_reference_date(),
+            geography_grammar_digest: evidence_digest(observation.geography_grammar_digest()),
             predicates: observation.predicates().to_vec().into_boxed_slice(),
             reported_time: observation.reported_time().cloned(),
             effective_time,
@@ -465,6 +471,16 @@ impl CensusCanonicalObservationBinding {
     /// Returns the exact row geography.
     pub const fn geography(&self) -> &CensusGeographyValue {
         &self.geography
+    }
+
+    /// Returns the exact provider geography reference precision retained by discovery metadata.
+    pub const fn geography_reference_date(&self) -> Option<CensusGeographyReferenceDate> {
+        self.geography_reference_date
+    }
+
+    /// Returns the exact admitted geography grammar identity.
+    pub const fn geography_grammar_digest(&self) -> EvidenceDigest {
+        self.geography_grammar_digest
     }
 
     /// Returns the exact non-geographic request predicates.
@@ -544,9 +560,66 @@ impl CensusCanonicalObservationBinding {
     }
 }
 
+/// Exact row-local Census semantics persisted beside one canonical Macro observation.
+///
+/// This is the sole CensusTabularV1 row wire. It deliberately retains the provider's typed
+/// geography reference precision and admitted grammar identity so revision assignment and restart
+/// verification cannot collapse distinct boundary vintages.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CensusNativeObservationSemantics {
+    dataset: CensusDataset,
+    provider_variable: SourceIdentifier,
+    label: String,
+    concept: Option<String>,
+    group: Option<SourceIdentifier>,
+    geography: CensusGeographyValue,
+    geography_reference_date: Option<CensusGeographyReferenceDate>,
+    geography_grammar_digest: EvidenceDigest,
+    predicates: Box<[CensusPredicateValue]>,
+    reported_time: Option<CensusReportedTime>,
+    value_state: CensusValueState,
+}
+
+impl CensusNativeObservationSemantics {
+    pub(crate) fn from_binding(binding: &CensusCanonicalObservationBinding) -> Self {
+        Self {
+            dataset: binding.dataset.clone(),
+            provider_variable: binding.provider_variable.clone(),
+            label: binding.variable_label.clone(),
+            concept: binding.concept.clone(),
+            group: binding.group.clone(),
+            geography: binding.geography.clone(),
+            geography_reference_date: binding.geography_reference_date,
+            geography_grammar_digest: binding.geography_grammar_digest,
+            predicates: binding.predicates.clone(),
+            reported_time: binding.reported_time.clone(),
+            value_state: binding.value_state.clone(),
+        }
+    }
+
+    /// Decodes one bounded catalog-retained CensusTabularV1 row.
+    pub fn try_from_provider_semantics(bytes: &[u8]) -> Result<Self, CensusSourceError> {
+        if bytes.is_empty() || bytes.len() > MAX_PROVIDER_NATIVE_LINEAGE_ROW_BYTES {
+            return Err(CensusSourceError::Protocol);
+        }
+        let semantics =
+            serde_json::from_slice::<Self>(bytes).map_err(|_| CensusSourceError::Protocol)?;
+        if semantics.geography_grammar_digest.bytes() == [0; 32] {
+            return Err(CensusSourceError::Protocol);
+        }
+        Ok(semantics)
+    }
+
+    /// Rejoins persisted row-local semantics to the exact response-wide binding.
+    pub fn matches_binding(&self, binding: &CensusCanonicalObservationBinding) -> bool {
+        self == &Self::from_binding(binding)
+    }
+}
+
 /// All exact raw, native-identity, canonical, and shared-quota evidence required before
 /// publishing one immutable Census generation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CensusPublicationPlan {
     schema_version: u16,
@@ -567,6 +640,17 @@ pub struct CensusPublicationPlan {
 }
 
 impl CensusPublicationPlan {
+    /// Decodes and revalidates one exact catalog-retained provider-semantics sidecar.
+    pub fn try_from_provider_semantics(bytes: &[u8]) -> Result<Self, CensusSourceError> {
+        if bytes.is_empty() || bytes.len() > MAX_PROVIDER_NATIVE_LINEAGE_SIDECAR_BYTES {
+            return Err(CensusSourceError::Protocol);
+        }
+        let plan =
+            serde_json::from_slice::<Self>(bytes).map_err(|_| CensusSourceError::Protocol)?;
+        plan.validate()?;
+        Ok(plan)
+    }
+
     /// Returns source identity.
     pub const fn source_id(&self) -> &SourceId {
         &self.source_id
@@ -575,6 +659,11 @@ impl CensusPublicationPlan {
     /// Returns provider-query dataset identity.
     pub const fn provider_dataset(&self) -> &SourceIdentifier {
         &self.provider_dataset
+    }
+
+    /// Returns the exact source-metadata revision bound to the generation.
+    pub const fn metadata_revision(&self) -> &SourceIdentifier {
+        &self.metadata_revision
     }
 
     /// Returns analytical storage dataset identity.
@@ -881,6 +970,7 @@ fn valid_publication_binding(
         .first()
         .is_some_and(|first| binding.dataset() == first.dataset())
         && binding.geography().scope() != CensusGeographyScope::Unknown
+        && binding.geography_grammar_digest().bytes() != [0; 32]
         && binding.family_digest().algorithm() == DigestAlgorithm::Sha256
         && binding.family_digest().bytes() != [0; 32]
         && binding.content_digest().algorithm() == DigestAlgorithm::Sha256

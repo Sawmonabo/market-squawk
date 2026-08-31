@@ -9,22 +9,25 @@ use std::{
 use futures_util::future::BoxFuture;
 use market_squawk_adapter_census::{
     CENSUS_PROVIDER_SEMANTICS_SCHEMA, CensusDiagnosticFailureClass, CensusDiagnosticJourney,
-    CensusFailureDiagnostic, CensusPublicationCandidate, CensusSource, CensusSourceError,
-    CensusSourceTelemetry,
+    CensusFailureDiagnostic, CensusNativeObservationSemantics, CensusPublicationCandidate,
+    CensusPublicationPlan, CensusSource, CensusSourceError, CensusSourceTelemetry,
 };
 use market_squawk_data::{
     AnalyticalMacroProviderPeriodLatestKnownOutput,
     AnalyticalMacroProviderPeriodLatestKnownRequest, AnalyticalMacroSeriesAllowlist,
-    AnalyticalMacroSourceQualifiedSeries, AnalyticalReadError, DatasetId, IngestError,
-    IngestIdentity, PinnedDataset, ProviderMacroPlanChunkInput, ProviderMacroPlanPublicationInput,
-    ProviderMacroPlanPublicationReceipt, ProviderMacroPlanRestartSelector,
+    AnalyticalMacroSourceQualifiedSeries, AnalyticalReadError, DatasetId, DatasetManifestRef,
+    IngestError, IngestIdentity, PinnedDataset, ProviderMacroPlanChunkInput,
+    ProviderMacroPlanPublicationInput, ProviderMacroPlanPublicationReceipt,
     ProviderMacroPlanSemantics, QueryLimits, SourceOperation,
 };
-use market_squawk_domain::{EvidenceDigest, ResearchPeriod, SourceId, SourceIdentifier, Timestamp};
+use market_squawk_domain::{
+    DigestAlgorithm, EvidenceDigest, ResearchPeriod, SourceId, SourceIdentifier, Timestamp,
+};
 use market_squawk_services::{RequestContext, ServiceError};
 use market_squawk_sources::{
     DiscoveryBatch, DiscoveryRequest, ExtractionAuthority, ExtractionBatch, ExtractionError,
     ExtractionRequest, ExtractionRevisionPlan, ExtractionSource, ExtractionSourceError,
+    PROVIDER_NATIVE_LINEAGE_SCHEMA_VERSION, ProviderCaptureTerminalDisposition,
     ProviderNativeLineageImplementation, SourceError, SourceMetadata, SourceMetadataProvider,
 };
 use thiserror::Error;
@@ -41,6 +44,7 @@ pub(crate) const CENSUS_QUARTERLY_POINT_IN_TIME_OPERATION: &str =
     "Macro.GetCensusQuarterlyPointInTime";
 
 const CENSUS_QUARTER_SCHEME: &str = "census-quarter";
+const CENSUS_NATIVE_IMPLEMENTATION: &str = "census_tabular_v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CensusSealFirstExtractionLimits {
@@ -307,6 +311,7 @@ impl CensusMacroApplicationClosure {
         self.validate_candidate(&candidate, operation)?;
         let observed_at = candidate.plan().prepared_at();
         let source_id = candidate.source_id().clone();
+        let provider_dataset = candidate.provider_dataset().clone();
         let series = candidate
             .plan()
             .observations()
@@ -359,10 +364,12 @@ impl CensusMacroApplicationClosure {
             .await?;
         let restart = CensusRestartSelector::try_reopen(
             self.coordinator.research.as_ref(),
-            receipt.restart_selector(),
-            &source_id,
+            receipt.manifest().clone(),
         )?;
-        if restart.manifest() != receipt.manifest() {
+        if restart.manifest() != receipt.manifest()
+            || restart.source_id() != &source_id
+            || restart.provider_dataset() != &provider_dataset
+        {
             return Err(CensusMacroApplicationError::RestartInvalid);
         }
         Ok(CensusPublicationReceipt {
@@ -508,29 +515,58 @@ impl CensusPublicationReceipt {
 /// Exact atomic Census macro plan reconstructed entirely from the installed catalog.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CensusRestartSelector {
-    selector: ProviderMacroPlanRestartSelector,
+    manifest: DatasetManifestRef,
+    source_id: SourceId,
+    provider_dataset: SourceIdentifier,
+    plan: CensusPublicationPlan,
 }
 
 impl CensusRestartSelector {
     pub(crate) fn try_reopen(
         research: &ResearchService,
-        selector: ProviderMacroPlanRestartSelector,
-        expected_source: &SourceId,
+        manifest: DatasetManifestRef,
     ) -> Result<Self, CensusMacroApplicationError> {
-        if selector.source_id() != expected_source {
-            return Err(CensusMacroApplicationError::RestartInvalid);
-        }
-        let reopened = research
-            .analytical()
-            .verify_provider_macro_plan_restart(&selector)?;
+        let (reopened, plan) = reopen_census_generation(research, &manifest)?;
+        let selector = Self {
+            manifest,
+            source_id: plan.source_id().clone(),
+            provider_dataset: plan.provider_dataset().clone(),
+            plan,
+        };
         if reopened.manifest() != selector.manifest() {
             return Err(CensusMacroApplicationError::RestartInvalid);
         }
-        Ok(Self { selector })
+        Ok(selector)
     }
 
-    pub(crate) const fn manifest(&self) -> &market_squawk_data::DatasetManifestRef {
-        self.selector.manifest()
+    pub(crate) const fn manifest(&self) -> &DatasetManifestRef {
+        &self.manifest
+    }
+
+    pub(crate) const fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    pub(crate) const fn provider_dataset(&self) -> &SourceIdentifier {
+        &self.provider_dataset
+    }
+
+    pub(crate) const fn plan(&self) -> &CensusPublicationPlan {
+        &self.plan
+    }
+
+    fn verify(
+        &self,
+        research: &ResearchService,
+    ) -> Result<PinnedDataset, CensusMacroApplicationError> {
+        let (reopened, plan) = reopen_census_generation(research, &self.manifest)?;
+        if plan != self.plan
+            || plan.source_id() != &self.source_id
+            || plan.provider_dataset() != &self.provider_dataset
+        {
+            return Err(CensusMacroApplicationError::RestartInvalid);
+        }
+        Ok(reopened)
     }
 
     fn validate_quarterly_request(
@@ -538,8 +574,8 @@ impl CensusRestartSelector {
         request: &AnalyticalMacroProviderPeriodLatestKnownRequest,
     ) -> Result<(), CensusMacroApplicationError> {
         let cutoff = request.effective_period_cutoff();
-        if request.manifest() != self.selector.manifest()
-            || request.source_series().source_id() != self.selector.source_id()
+        if request.manifest() != &self.manifest
+            || request.source_series().source_id() != &self.source_id
             || cutoff.scheme().as_str() != CENSUS_QUARTER_SCHEME
             || cutoff.ordinal().get() > 4
             || cutoff.code().as_str() != format!("{:04}-Q{}", cutoff.year(), cutoff.ordinal())
@@ -558,9 +594,7 @@ impl CensusRestartSelector {
         cancellation: CancellationToken,
     ) -> Result<CensusQuarterlyRestartReceipt, CensusMacroApplicationError> {
         self.validate_quarterly_request(&request.analytical)?;
-        let reopened = research
-            .analytical()
-            .verify_provider_macro_plan_restart(&self.selector)?;
+        let reopened = self.verify(research)?;
         let output = research
             .analytical_reader()
             .read_macro_provider_period_latest_known_snapshot(
@@ -570,8 +604,8 @@ impl CensusRestartSelector {
                 cancellation,
             )
             .await?;
-        if output.source_id() != self.selector.source_id()
-            || output.output().manifest() != self.selector.manifest()
+        if output.source_id() != &self.source_id
+            || output.output().manifest() != &self.manifest
             || output.period_scheme().as_str() != CENSUS_QUARTER_SCHEME
             || output.observations().iter().any(|observation| {
                 observation
@@ -588,6 +622,106 @@ impl CensusRestartSelector {
     }
 }
 
+fn reopen_census_generation(
+    research: &ResearchService,
+    manifest: &DatasetManifestRef,
+) -> Result<(PinnedDataset, CensusPublicationPlan), CensusMacroApplicationError> {
+    let owned = research
+        .analytical()
+        .generation_owned_provider_capture_evidence(
+            manifest,
+            research.provider_capture_store().as_ref(),
+        )?;
+    let [object] = owned.objects() else {
+        return Err(CensusMacroApplicationError::RestartInvalid);
+    };
+    let [input] = object.inputs() else {
+        return Err(CensusMacroApplicationError::RestartInvalid);
+    };
+    let evidence = input.binding();
+    let native = evidence.native_lineage();
+    let sidecar = native
+        .batch_sidecar_semantic_payload()
+        .ok_or(CensusMacroApplicationError::RestartInvalid)?;
+    let plan = CensusPublicationPlan::try_from_provider_semantics(sidecar)?;
+    let analytical_dataset = DatasetId::try_from(plan.analytical_dataset().as_str())
+        .map_err(|_error| CensusMacroApplicationError::RestartInvalid)?;
+    let capture = evidence.capture();
+    let [capture_binding] = plan.captures() else {
+        return Err(CensusMacroApplicationError::RestartInvalid);
+    };
+    let last_page = capture
+        .pages()
+        .last()
+        .ok_or(CensusMacroApplicationError::RestartInvalid)?;
+    let row_count = u64::try_from(evidence.record_count())
+        .map_err(|_error| CensusMacroApplicationError::RestartInvalid)?;
+    if owned.pinned().manifest() != manifest
+        || owned.source_id() != plan.source_id()
+        || manifest.dataset_id() != &analytical_dataset
+        || object.publication_ordinal() != 0
+        || owned
+            .pinned()
+            .objects()
+            .get(object.generation_object_ordinal())
+            != Some(object.object())
+        || object.generation_object_ordinal().checked_add(1) != Some(owned.pinned().objects().len())
+        || input.input_ordinal() != 0
+        || input.object_input_ordinal() != 0
+        || object.object().object().row_count() != row_count
+        || capture.source_id() != plan.source_id()
+        || capture.metadata_revision().as_source_identifier() != plan.metadata_revision()
+        || capture.dataset() != plan.provider_dataset()
+        || capture.terminal() != ProviderCaptureTerminalDisposition::CompleteRequestGraph
+        || capture.request_set_identity() != capture_binding.request_digest()
+        || capture.content_digest() != capture_binding.content_digest()
+        || capture.observation_digest() != capture_binding.observation_digest()
+        || capture.total_body_bytes() != capture_binding.response_bytes()
+        || capture.request_graph_components().len() != capture_binding.component_count() as usize
+        || last_page.request_identity() != plan.query_digest()
+        || last_page.body_digest() != plan.data_response_digest()
+        || last_page.received_at() != capture_binding.received_at()
+        || evidence.scope() != "whole"
+        || evidence.layout() != "whole_single_segment"
+        || evidence.component_ordinal().is_some()
+        || evidence.extraction_content_identity() != plan.extraction_content_digest()
+        || evidence.record_count() != plan.observations().len()
+        || evidence.record_count() != evidence.rows().len()
+        || native.implementation() != CENSUS_NATIVE_IMPLEMENTATION
+        || native.version() != PROVIDER_NATIVE_LINEAGE_SCHEMA_VERSION
+        || native.fingerprint().algorithm() != DigestAlgorithm::Sha256
+        || native.fingerprint().bytes() == [0; 32]
+        || native.row_count() != evidence.record_count()
+        || native.batch_digest().algorithm() != DigestAlgorithm::Sha256
+        || native.batch_digest().bytes() == [0; 32]
+        || native
+            .batch_sidecar_semantic_payload_digest()
+            .is_none_or(|digest| {
+                digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32]
+            })
+    {
+        return Err(CensusMacroApplicationError::RestartInvalid);
+    }
+    for (ordinal, (row, binding)) in evidence.rows().iter().zip(plan.observations()).enumerate() {
+        let ordinal =
+            u32::try_from(ordinal).map_err(|_error| CensusMacroApplicationError::RestartInvalid)?;
+        let semantics = CensusNativeObservationSemantics::try_from_provider_semantics(
+            row.native_semantic_payload(),
+        )?;
+        if row.canonical_row_ordinal() != ordinal
+            || binding.canonical_ordinal() != u64::from(ordinal)
+            || row.canonical_row_digest().algorithm() != DigestAlgorithm::Sha256
+            || row.canonical_row_digest().bytes() == [0; 32]
+            || row.native_semantic_digest().algorithm() != DigestAlgorithm::Sha256
+            || row.native_semantic_digest().bytes() == [0; 32]
+            || !semantics.matches_binding(binding)
+        {
+            return Err(CensusMacroApplicationError::RestartInvalid);
+        }
+    }
+    Ok((owned.pinned().clone(), plan))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CensusQuarterlyPointInTimeRequest {
     analytical: AnalyticalMacroProviderPeriodLatestKnownRequest,
@@ -600,12 +734,10 @@ impl CensusQuarterlyPointInTimeRequest {
         knowledge_cutoff: Timestamp,
         effective_period_cutoff: ResearchPeriod,
     ) -> Result<Self, CensusMacroApplicationError> {
-        let source_series = AnalyticalMacroSourceQualifiedSeries::new(
-            selector.selector.source_id().clone(),
-            series_allowlist,
-        );
+        let source_series =
+            AnalyticalMacroSourceQualifiedSeries::new(selector.source_id.clone(), series_allowlist);
         let analytical = AnalyticalMacroProviderPeriodLatestKnownRequest::try_new(
-            selector.selector.manifest().clone(),
+            selector.manifest.clone(),
             source_series,
             knowledge_cutoff,
             effective_period_cutoff,
@@ -859,9 +991,9 @@ mod tests {
     use market_squawk_adapter_census::{
         CensusApiKey, CensusDataQuery, CensusDataset, CensusDatasetContract,
         CensusEffectiveTimePolicy, CensusGeography, CensusGeographyClause, CensusGeographyCode,
-        CensusParseLimits, CensusPredicate, CensusPredicateType, CensusSelection,
-        CensusSourceConfig, CensusTimePoint, CensusTimePredicate, CensusVariableMapping,
-        census_api_endpoint_rules, census_provider_rate_declaration,
+        CensusGeographyReferenceDate, CensusParseLimits, CensusPredicate, CensusPredicateType,
+        CensusSelection, CensusSourceConfig, CensusTimePoint, CensusTimePredicate,
+        CensusVariableMapping, census_api_endpoint_rules, census_provider_rate_declaration,
     };
     use market_squawk_data::{
         AnalyticalMacroSeriesAllowlist, CatalogConfig, CatalogResultLimits, ObjectStoreConfig,
@@ -987,7 +1119,7 @@ mod tests {
         let selector = publication.restart_selector().clone();
         let request = CensusQuarterlyPointInTimeRequest::try_new(
             &selector,
-            allowlist.clone(),
+            allowlist,
             cutoff,
             period.clone(),
         )?;
@@ -1006,8 +1138,6 @@ mod tests {
             publication.receipt().manifest()
         );
         let manifest = publication.receipt().manifest().clone();
-        let plan_selector = selector.selector.clone();
-        let expected_source = metadata.source_id().clone();
 
         drop(first);
         drop(publication);
@@ -1019,8 +1149,28 @@ mod tests {
         drop(research);
 
         let reopened = open_research(&paths)?;
-        let selector =
-            CensusRestartSelector::try_reopen(&reopened, plan_selector, &expected_source)?;
+        let selector = CensusRestartSelector::try_reopen(&reopened, manifest.clone())?;
+        let binding = selector
+            .plan()
+            .observations()
+            .first()
+            .ok_or("missing reopened Census binding")?;
+        assert!(
+            selector.plan().observations().len() == 1
+                && matches!(
+                    binding.geography_reference_date(),
+                    Some(CensusGeographyReferenceDate::Year(_))
+                )
+                && binding.geography_grammar_digest().bytes() != [0; 32]
+        );
+        let allowlist = AnalyticalMacroSeriesAllowlist::try_from_code_owned_identifiers(
+            selector
+                .plan()
+                .observations()
+                .iter()
+                .map(|binding| binding.canonical_series().clone())
+                .collect::<Vec<_>>(),
+        )?;
         let request =
             CensusQuarterlyPointInTimeRequest::try_new(&selector, allowlist, cutoff, period)?;
         let restarted = selector

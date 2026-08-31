@@ -2922,20 +2922,6 @@ fn extraction_output(
     })
 }
 
-#[derive(serde::Serialize)]
-#[serde(deny_unknown_fields)]
-struct CensusNativeLineageRowV1<'a> {
-    dataset: &'a crate::CensusDataset,
-    provider_variable: &'a SourceIdentifier,
-    label: &'a str,
-    concept: Option<&'a str>,
-    group: Option<&'a SourceIdentifier>,
-    geography: &'a crate::CensusGeographyValue,
-    predicates: &'a [crate::CensusPredicateValue],
-    reported_time: Option<&'a crate::CensusReportedTime>,
-    value_state: &'a CensusValueState,
-}
-
 fn census_native_lineage(
     plan: &crate::CensusPublicationPlan,
     batch: &ExtractionBatch,
@@ -2956,17 +2942,9 @@ fn census_native_lineage(
         .map_err(|_| invalid_protocol())?;
     for observation in plan.observations() {
         native_lineage
-            .try_push(&CensusNativeLineageRowV1 {
-                dataset: observation.dataset(),
-                provider_variable: observation.provider_variable(),
-                label: observation.variable_label(),
-                concept: observation.concept(),
-                group: observation.group(),
-                geography: observation.geography(),
-                predicates: observation.predicates(),
-                reported_time: observation.reported_time(),
-                value_state: observation.value_state(),
-            })
+            .try_push(&crate::CensusNativeObservationSemantics::from_binding(
+                observation,
+            ))
             .map_err(|_| invalid_protocol())?;
     }
     native_lineage.finish().map_err(|_| invalid_protocol())

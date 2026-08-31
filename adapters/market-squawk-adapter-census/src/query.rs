@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use market_squawk_domain::SourceIdentifier;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
@@ -77,7 +77,7 @@ impl Default for CensusApplicationPacing {
 }
 
 /// The provider route coordinate for one Census dataset.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CensusDatasetVintage {
     /// A four-digit statistical-product vintage.
@@ -96,7 +96,7 @@ impl CensusDatasetVintage {
 }
 
 /// A validated Census dataset vintage and path.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct CensusDataset {
     vintage: CensusDatasetVintage,
     path: Vec<String>,

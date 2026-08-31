@@ -6,16 +6,16 @@ use std::mem::size_of;
 use market_squawk_domain::{AvailabilityEvidence, CalendarDate, SourceIdentifier, Timestamp};
 use rust_decimal::Decimal;
 use serde::de::{DeserializeSeed, IgnoredAny, SeqAccess, Visitor};
-use serde::{Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::CensusGeographyAdmission;
 use crate::discovery::{CensusPredicateType, CensusVariableCatalog, CensusVariableMetadata};
 use crate::query::{
     CensusDataQuery, CensusGeography, CensusGeographyCode, CensusSelection, CensusTimePoint,
     CensusTimePredicate,
 };
 use crate::{CensusAdapterError, sha256, update_digest_component};
+use crate::{CensusGeographyAdmission, CensusGeographyReferenceDate};
 
 /// Absolute raw + decoded + canonical-output memory ceiling for one Census operation.
 pub const CENSUS_OPERATION_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
@@ -119,7 +119,7 @@ impl Default for CensusParseLimits {
 }
 
 /// Local receipt, decode, ingestion, and conservative availability clocks.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CensusClocks {
     received_at: Timestamp,
     decoded_at: Timestamp,
@@ -191,7 +191,7 @@ impl CensusClocks {
 }
 
 /// A provider-reported observation period without invented timestamp precision.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case", tag = "precision")]
 pub enum CensusReportedTime {
     /// Four-digit year.
@@ -260,7 +260,7 @@ impl CensusReportedTime {
 }
 
 /// One provider-native exact value.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum CensusTypedValue {
     /// Exact integer.
@@ -274,7 +274,7 @@ pub enum CensusTypedValue {
 }
 
 /// One metadata-declared annotation or flag cell.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CensusAnnotation {
     variable: SourceIdentifier,
     raw: String,
@@ -293,7 +293,7 @@ impl CensusAnnotation {
 }
 
 /// Exact missing-value evidence.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CensusMissingReason {
     /// Provider JSON null.
@@ -307,7 +307,7 @@ pub enum CensusMissingReason {
 }
 
 /// One primary value with closed missing, annotation, and invalid states.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
 pub enum CensusValueState {
     /// A typed value with every requested metadata annotation column present and empty.
@@ -341,7 +341,7 @@ pub enum CensusValueState {
 }
 
 /// One retained non-geographic request predicate.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CensusPredicateValue {
     variable: SourceIdentifier,
     predicate_type: CensusPredicateType,
@@ -366,7 +366,7 @@ impl CensusPredicateValue {
 }
 
 /// One exact standard geography component.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct CensusGeographyComponent {
     level: String,
     code: String,
@@ -385,7 +385,7 @@ impl CensusGeographyComponent {
 }
 
 /// Semantic scope of one safely identified provider geography.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CensusGeographyScope {
     /// One exact aggregate coordinate.
@@ -397,7 +397,7 @@ pub enum CensusGeographyScope {
 }
 
 /// Exact provider geography attached to one response row.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum CensusGeographyValue {
     /// Standard `for`/`in` hierarchy.
@@ -530,6 +530,8 @@ pub struct CensusObservation {
     group: Option<SourceIdentifier>,
     value: CensusValueState,
     geography: CensusGeographyValue,
+    geography_reference_date: Option<CensusGeographyReferenceDate>,
+    geography_grammar_digest: [u8; 32],
     predicates: Vec<CensusPredicateValue>,
     reported_time: Option<CensusReportedTime>,
     request_digest: [u8; 32],
@@ -579,6 +581,16 @@ impl CensusObservation {
     /// Returns exact row geography.
     pub const fn geography(&self) -> &CensusGeographyValue {
         &self.geography
+    }
+
+    /// Returns the provider's exact year-only or complete-date geography reference precision.
+    pub const fn geography_reference_date(&self) -> Option<CensusGeographyReferenceDate> {
+        self.geography_reference_date
+    }
+
+    /// Returns the exact metadata-admitted geography grammar identity.
+    pub const fn geography_grammar_digest(&self) -> [u8; 32] {
+        self.geography_grammar_digest
     }
 
     /// Returns retained non-geographic predicate semantics.
@@ -1408,6 +1420,8 @@ struct CensusPageBuilder<'a> {
     response_payload_digest: [u8; 32],
     response_payload_bytes: usize,
     metadata_payload_digest: [u8; 32],
+    geography_reference_date: Option<CensusGeographyReferenceDate>,
+    geography_grammar_digest: [u8; 32],
     header: Vec<SourceIdentifier>,
     header_index: HashMap<String, usize>,
     expected_wire: Vec<SourceIdentifier>,
@@ -1448,6 +1462,10 @@ impl<'a> CensusPageBuilder<'a> {
         header: Vec<SourceIdentifier>,
     ) -> Result<Self, CensusAdapterError> {
         geography_admission.validate_query(query.geography())?;
+        let geography_grammar_digest = geography_admission.grammar_digest();
+        if geography_grammar_digest == [0; 32] {
+            return Err(CensusAdapterError::MetadataMismatch);
+        }
         if header.is_empty() || header.len() > limits.max_columns {
             return Err(CensusAdapterError::ResourceLimitExceeded);
         }
@@ -1579,6 +1597,8 @@ impl<'a> CensusPageBuilder<'a> {
             response_payload_digest,
             response_payload_bytes,
             metadata_payload_digest,
+            geography_reference_date: geography_admission.reference_date(),
+            geography_grammar_digest,
             header,
             header_index,
             expected_wire,
@@ -1728,6 +1748,8 @@ impl<'a> CensusPageBuilder<'a> {
                 variable,
                 &value,
                 &geography,
+                self.geography_reference_date,
+                self.geography_grammar_digest,
                 reported_time.as_ref(),
                 self.metadata_payload_digest,
             )?;
@@ -1740,8 +1762,14 @@ impl<'a> CensusPageBuilder<'a> {
                         variable: variable.clone(),
                     });
             }
-            let family_digest =
-                family_digest(self.query, variable, &geography, reported_time.as_ref())?;
+            let family_digest = family_digest(
+                self.query,
+                variable,
+                &geography,
+                self.geography_reference_date,
+                self.geography_grammar_digest,
+                reported_time.as_ref(),
+            )?;
             let candidate_bytes = conservative_observation_components_bytes(
                 self.query.dataset(),
                 variable,
@@ -1771,6 +1799,8 @@ impl<'a> CensusPageBuilder<'a> {
                 group: variable_metadata.group().cloned(),
                 value,
                 geography: geography.clone(),
+                geography_reference_date: self.geography_reference_date,
+                geography_grammar_digest: self.geography_grammar_digest,
                 predicates: self.predicates.clone(),
                 reported_time: reported_time.clone(),
                 request_digest: self.query.request_digest(),
@@ -2623,11 +2653,19 @@ fn row_digest(
     variable: &SourceIdentifier,
     value: &CensusValueState,
     geography: &CensusGeographyValue,
+    geography_reference_date: Option<CensusGeographyReferenceDate>,
+    geography_grammar_digest: [u8; 32],
     time: Option<&CensusReportedTime>,
     metadata_digest: [u8; 32],
 ) -> Result<[u8; 32], CensusAdapterError> {
-    let payload = serde_json::to_vec(&(value, geography, time))
-        .map_err(|_| CensusAdapterError::SchemaDrift)?;
+    let payload = serde_json::to_vec(&(
+        value,
+        geography,
+        geography_reference_date,
+        geography_grammar_digest,
+        time,
+    ))
+    .map_err(|_| CensusAdapterError::SchemaDrift)?;
     let mut hasher = Sha256::new();
     update_digest_component(&mut hasher, b"market-squawk-census-native-row-v2");
     update_digest_component(&mut hasher, &query.request_digest());
@@ -2641,12 +2679,16 @@ fn family_digest(
     query: &CensusDataQuery,
     variable: &SourceIdentifier,
     geography: &CensusGeographyValue,
+    geography_reference_date: Option<CensusGeographyReferenceDate>,
+    geography_grammar_digest: [u8; 32],
     time: Option<&CensusReportedTime>,
 ) -> Result<[u8; 32], CensusAdapterError> {
     let family = serde_json::to_vec(&(
         query.dataset(),
         variable,
         geography.identity_digest(),
+        geography_reference_date,
+        geography_grammar_digest,
         query.predicates(),
         query.time(),
         time,
@@ -2776,6 +2818,7 @@ mod tests {
                 SourceIdentifier::try_from("040")
                     .map_err(|_| crate::CensusAdapterError::InvalidComponent)?,
             ),
+            reference_date: None,
             requires: Box::new([]),
             wildcard: Some(false),
             optional_with_wildcard_for: Box::new([]),

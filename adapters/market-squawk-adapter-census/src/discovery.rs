@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use market_squawk_domain::{CalendarDate, SourceIdentifier};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::query::{
@@ -504,7 +504,7 @@ impl CensusDatasetCatalog {
 }
 
 /// The provider's variable predicate grammar.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "provider_value")]
 pub enum CensusPredicateType {
     /// String equality/prefix-wildcard predicate and text response value.
@@ -848,7 +848,7 @@ impl CensusGroupCatalog {
 /// Census currently emits either a four-digit reference vintage (for example QWI) or a complete
 /// civil date on other dataset families. Retaining that distinction avoids inventing a day for a
 /// year-only provider value.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CensusGeographyReferenceDate {
     /// Provider supplied only the four-digit reference vintage.
     Year(u16),
@@ -919,6 +919,7 @@ pub enum CensusGeographyAdmission {
     Standard {
         for_level: String,
         geo_level_display: Option<SourceIdentifier>,
+        reference_date: Option<CensusGeographyReferenceDate>,
         requires: Box<[String]>,
         wildcard: Option<bool>,
         optional_with_wildcard_for: Box<[String]>,
@@ -1005,6 +1006,14 @@ impl CensusGeographyAdmission {
             Self::Standard { grammar_digest, .. } | Self::Uniform { grammar_digest } => {
                 *grammar_digest
             }
+        }
+    }
+
+    /// Returns the provider's exact geography reference precision when one entry supplied it.
+    pub const fn reference_date(&self) -> Option<CensusGeographyReferenceDate> {
+        match self {
+            Self::Standard { reference_date, .. } => *reference_date,
+            Self::Uniform { .. } => None,
         }
     }
 }
@@ -1176,6 +1185,7 @@ impl CensusGeographyCatalog {
                 CensusGeographyAdmission::Standard {
                     for_level: entry.name.clone(),
                     geo_level_display: entry.geo_level_display.clone(),
+                    reference_date: entry.reference_date,
                     requires: entry.requires.clone().into_boxed_slice(),
                     wildcard: entry.wildcard,
                     optional_with_wildcard_for: entry

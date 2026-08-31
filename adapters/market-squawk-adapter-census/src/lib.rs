@@ -45,7 +45,8 @@ pub use response::{
 pub use runtime::{
     CENSUS_PROVIDER_SEMANTICS_SCHEMA, CensusActivatedDataset, CensusActivationCandidate,
     CensusActivationPlan, CensusCanonicalObservationBinding, CensusCaptureBinding,
-    CensusCaptureRole, CensusPublicationCandidate, CensusPublicationPlan,
+    CensusCaptureRole, CensusNativeObservationSemantics, CensusPublicationCandidate,
+    CensusPublicationPlan,
 };
 pub use source::{
     CensusAnnotatedMissingRule, CensusAnnotationMatch, CensusCapturedData, CensusCapturedDiscovery,
