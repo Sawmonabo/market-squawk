@@ -22,6 +22,9 @@ use crate::{
 const CENSUS_RUNTIME_SCHEMA_VERSION: u16 = 4;
 const CENSUS_DOCTOR_ACTIVATION_TTL_NANOS: i64 = 86_400_000_000_000;
 
+/// Exact adapter-authored response-wide semantics retained by atomic macro publication.
+pub const CENSUS_PROVIDER_SEMANTICS_SCHEMA: &str = "census-tabular-provider-semantics-v1";
+
 /// One exact configured dataset admitted by a Census activation plan.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]

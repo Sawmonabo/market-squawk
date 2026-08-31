@@ -506,6 +506,21 @@ async fn authorized_transport_samples_processing_clock_after_complete_parse_and_
     )?;
     let publication_candidate =
         CensusPublicationCandidate::try_new(publication_plan, sealed_capture_binding, activation)?;
+    let batch_semantics = publication_candidate
+        .native_lineage()
+        .batch_sidecar()
+        .ok_or("missing Census response-wide semantics")?;
+    let batch_semantics: serde_json::Value =
+        serde_json::from_slice(batch_semantics.semantic_payload())?;
+    assert_eq!(batch_semantics["schema_version"], 4);
+    assert_eq!(
+        batch_semantics["observations"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        batch_semantics["captures"].as_array().map(Vec::len),
+        Some(1)
+    );
     let native_semantics: serde_json::Value = serde_json::from_slice(
         publication_candidate.native_lineage().rows()[0].semantic_payload(),
     )?;

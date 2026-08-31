@@ -2599,6 +2599,12 @@ fn census_native_lineage(
         batch,
     )
     .map_err(|_| invalid_protocol())?;
+    // Response-wide closure (query, metadata, clocks, capture graph, accounting, and canonical
+    // bindings) cannot be reconstructed safely from any one row. Retain the exact validated plan
+    // as the atomic macro publisher's bounded semantic companion.
+    native_lineage
+        .try_set_batch_sidecar(plan)
+        .map_err(|_| invalid_protocol())?;
     for observation in plan.observations() {
         native_lineage
             .try_push(&CensusNativeLineageRowV1 {

@@ -42,9 +42,9 @@ pub use response::{
     CensusTypedValue, CensusValueState,
 };
 pub use runtime::{
-    CensusActivatedDataset, CensusActivationCandidate, CensusActivationPlan,
-    CensusCanonicalObservationBinding, CensusCaptureBinding, CensusCaptureRole,
-    CensusPublicationCandidate, CensusPublicationPlan,
+    CENSUS_PROVIDER_SEMANTICS_SCHEMA, CensusActivatedDataset, CensusActivationCandidate,
+    CensusActivationPlan, CensusCanonicalObservationBinding, CensusCaptureBinding,
+    CensusCaptureRole, CensusPublicationCandidate, CensusPublicationPlan,
 };
 pub use source::{
     CensusAnnotatedMissingRule, CensusAnnotationMatch, CensusCapturedData, CensusCapturedDiscovery,

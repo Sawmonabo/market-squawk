@@ -646,6 +646,15 @@ pub enum CensusCompletenessIssue {
     },
     /// An unrequested, non-geographic header column appeared.
     UnexpectedColumn { column: SourceIdentifier },
+    /// A provider-returned request predicate did not match any exact admitted request value.
+    UnexpectedPredicateValue {
+        /// Provider row number.
+        row_number: usize,
+        /// Exact predicate variable.
+        variable: SourceIdentifier,
+        /// Returned value, or `None` for an absent/null cell.
+        value: Option<String>,
+    },
     /// A standard FIPS geography column was absent.
     MissingGeographyLevel { level: String },
     /// A UCGID response did not return `GEO_ID`, so rows could not be assigned safely.
@@ -741,6 +750,10 @@ pub struct CensusResponseAccounting {
     returned_columns: usize,
     returned_requested_variables: usize,
     missing_requested_variables: usize,
+    requested_predicates: usize,
+    returned_predicate_columns: usize,
+    verified_predicate_values: usize,
+    unexpected_predicate_values: usize,
     requested_geographies: Option<usize>,
     returned_geographies: usize,
     returned_rows: usize,
@@ -782,6 +795,26 @@ impl CensusResponseAccounting {
     /// Returns requested variables absent from the response header.
     pub const fn missing_requested_variables(&self) -> usize {
         self.missing_requested_variables
+    }
+
+    /// Returns exact non-geographic predicates bound into the request.
+    pub const fn requested_predicates(&self) -> usize {
+        self.requested_predicates
+    }
+
+    /// Returns requested predicate columns explicitly echoed by the response family.
+    pub const fn returned_predicate_columns(&self) -> usize {
+        self.returned_predicate_columns
+    }
+
+    /// Returns response predicate cells verified against exact admitted request values.
+    pub const fn verified_predicate_values(&self) -> usize {
+        self.verified_predicate_values
+    }
+
+    /// Returns response predicate cells that contradicted the exact request.
+    pub const fn unexpected_predicate_values(&self) -> usize {
+        self.unexpected_predicate_values
     }
 
     /// Returns exact requested geography cardinality, or `None` when provider expansion is open.
@@ -1390,6 +1423,8 @@ struct CensusPageBuilder<'a> {
     missing_values: usize,
     annotated_values: usize,
     invalid_values: usize,
+    verified_predicate_values: usize,
+    unexpected_predicate_values: usize,
     retained_observation_bytes: usize,
     retained_geography_index_bytes: usize,
     row_identities: HashMap<([u8; 32], Option<CensusReportedTime>), usize>,
@@ -1439,6 +1474,11 @@ impl<'a> CensusPageBuilder<'a> {
             .collect::<BTreeSet<_>>();
         let geography_levels = query.geography().required_response_levels();
         let geography_set = geography_levels.iter().copied().collect::<BTreeSet<_>>();
+        let predicate_set = query
+            .predicates()
+            .iter()
+            .map(|predicate| predicate.variable().as_str())
+            .collect::<BTreeSet<_>>();
         let mut issues = BTreeSet::new();
         for variable in &expected_wire {
             if !header_index.contains_key(variable.as_str()) {
@@ -1488,8 +1528,9 @@ impl<'a> CensusPageBuilder<'a> {
         }
         for column in &header {
             let name = column.as_str();
-            let allowed_context =
-                geography_set.contains(name) || matches!(name, "GEO_ID" | "NAME" | "time");
+            let allowed_context = geography_set.contains(name)
+                || predicate_set.contains(name)
+                || matches!(name, "GEO_ID" | "NAME" | "time");
             if !expected_set.contains(name) && !allowed_context {
                 issues.insert(CensusCompletenessIssue::UnexpectedColumn {
                     column: column.clone(),
@@ -1553,6 +1594,8 @@ impl<'a> CensusPageBuilder<'a> {
             missing_values: 0,
             annotated_values: 0,
             invalid_values: 0,
+            verified_predicate_values: 0,
+            unexpected_predicate_values: 0,
             retained_observation_bytes: 0,
             retained_geography_index_bytes: 0,
             row_identities,
@@ -1563,6 +1606,27 @@ impl<'a> CensusPageBuilder<'a> {
     fn push_row(&mut self, row: Vec<CensusCell>) -> Result<(), CensusAdapterError> {
         self.returned_rows = checked_increment(self.returned_rows)?;
         let row_number = self.returned_rows;
+        for predicate in self.query.predicates() {
+            let Some(index) = self.header_index.get(predicate.variable().as_str()) else {
+                continue;
+            };
+            let value = row[*index].exact_text();
+            if value
+                .as_ref()
+                .is_some_and(|value| predicate.values().contains(value))
+            {
+                self.verified_predicate_values = checked_increment(self.verified_predicate_values)?;
+            } else {
+                self.unexpected_predicate_values =
+                    checked_increment(self.unexpected_predicate_values)?;
+                self.issues
+                    .insert(CensusCompletenessIssue::UnexpectedPredicateValue {
+                        row_number,
+                        variable: predicate.variable().clone(),
+                        value,
+                    });
+            }
+        }
         let Some(geography) = row_geography(
             self.query,
             &self.header_index,
@@ -1797,6 +1861,15 @@ impl<'a> CensusPageBuilder<'a> {
             .len()
             .checked_sub(returned_requested_variables)
             .ok_or(CensusAdapterError::SchemaDrift)?;
+        let returned_predicate_columns = self
+            .query
+            .predicates()
+            .iter()
+            .filter(|predicate| {
+                self.header_index
+                    .contains_key(predicate.variable().as_str())
+            })
+            .count();
         let accounting = CensusResponseAccounting {
             requests: 1,
             requested_primary_variables: self.primary.len(),
@@ -1804,6 +1877,10 @@ impl<'a> CensusPageBuilder<'a> {
             returned_columns: self.header.len(),
             returned_requested_variables,
             missing_requested_variables,
+            requested_predicates: self.query.predicates().len(),
+            returned_predicate_columns,
+            verified_predicate_values: self.verified_predicate_values,
+            unexpected_predicate_values: self.unexpected_predicate_values,
             requested_geographies: requested_geography_count(self.query)?,
             returned_geographies: self.returned_geographies.len(),
             returned_rows: self.returned_rows,
@@ -2047,6 +2124,12 @@ fn completeness_issue_string_bytes(issue: &CensusCompletenessIssue) -> usize {
         | CensusCompletenessIssue::DuplicateEconomicObservation { variable, .. } => {
             variable.as_str().len()
         }
+        CensusCompletenessIssue::UnexpectedPredicateValue {
+            variable, value, ..
+        } => variable
+            .as_str()
+            .len()
+            .saturating_add(value.as_ref().map_or(0, String::len)),
         CensusCompletenessIssue::UnrequestedDeclaredAttribute {
             variable,
             attribute,
