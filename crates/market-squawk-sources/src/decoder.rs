@@ -17,9 +17,15 @@ use crate::authority_time::TrustedReceiptObservation;
 use crate::bounded::BoundedVec;
 use crate::{FrameId, FrameSessionBinding, SourceMetadataProvider, ValidatedRawMarketFrame};
 
+#[path = "decoder/native_identity.rs"]
+mod native_identity;
 #[path = "decoder/outcome.rs"]
 mod outcome;
 
+pub use native_identity::{
+    ProviderNativeInstrumentAttestation, ProviderNativeInstrumentAttestationError,
+    ProviderNativeInstrumentAttestationInput,
+};
 pub use outcome::{
     ControlFrameKind, DecodeInternalError, DecodeOutcome, DecodedControlFrame, DecodedIgnoredFrame,
     DecodedQuarantineAction, DecodedRecoveryAction, IgnoredFrameReason, QuarantineReason,

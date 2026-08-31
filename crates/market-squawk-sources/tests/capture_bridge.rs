@@ -5,7 +5,7 @@ use bytes::Bytes;
 use market_squawk_domain::{
     AggressorSide, CaptureIntegrityState, ConnectionGeneration, InstrumentId, IntegrityRule,
     LiveEventClass, ProviderChannel, ProviderProduct, RuleVersion, SequenceNumber,
-    StreamIntegrityState, Timestamp, VenueId,
+    StreamIntegrityState, Timestamp,
 };
 use market_squawk_platform::{
     CaptureChannelLimits, CaptureProcessInfrastructureLimits, CaptureShutdownStatus,
@@ -22,7 +22,8 @@ use market_squawk_sources::{
 };
 
 use crate::common::{
-    TestResult, direct_metadata, exact_evidence, now_timestamp, source_identifier,
+    TestResult, direct_metadata, exact_evidence, instrument_attestation, now_timestamp,
+    source_identifier,
 };
 
 const TEST_MEMORY_SINK_MAX_RECORDS: usize = 4_096;
@@ -128,8 +129,7 @@ async fn platform_returns_exact_registry_receipt_and_later_degradation_revokes_c
     let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
     let observation = ProviderNormalizedObservation::try_new(
         source_identifier("trade-1")?,
-        VenueId::try_from("coinbase")?,
-        instrument,
+        instrument_attestation("source-a", instrument, observed_at)?,
         ProviderTimestampEvidence::Provided {
             value: frame_at,
             rule: rule("coinbase-timestamp")?,

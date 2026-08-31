@@ -110,8 +110,7 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
     };
     let observation = ProviderNormalizedObservation::try_new(
         source_identifier("trade-1")?,
-        VenueId::try_from("coinbase")?,
-        instrument,
+        crate::common::instrument_attestation("source-a", instrument, health_at)?,
         ProviderTimestampEvidence::Provided {
             value: first_frame_at,
             rule: rule("coinbase-timestamp")?,
@@ -172,8 +171,7 @@ fn current_authority_is_scoped_by_venue_instrument_event_and_depth() -> TestResu
         |instrument: InstrumentId, trade_id: &str, sequence: u64| -> TestResult<_> {
             Ok(ProviderNormalizedObservation::try_new(
                 source_identifier(trade_id)?,
-                VenueId::try_from("coinbase")?,
-                instrument,
+                crate::common::instrument_attestation("source-a", instrument, health_at)?,
                 ProviderTimestampEvidence::Provided {
                     value: current_frame_at,
                     rule: rule("coinbase-timestamp")?,
