@@ -20,9 +20,11 @@ use crate::evidence_store::PublicationCommitTestProbe;
 use storage::{Snapshot, cleanup_old_snapshots, load_latest, persist_snapshot};
 
 const SNAPSHOT_SCHEMA_VERSION: u16 = 1;
-const SNAPSHOT_PREFIX: &str = "sec-representations-v1-";
+const SNAPSHOT_PREFIX: &str = "sec-source-qualified-representations-v1-";
 const SNAPSHOT_SUFFIX: &str = ".json";
-const STAGING_PREFIX: &str = ".sec-representations-";
+const STAGING_PREFIX: &str = ".sec-source-qualified-representations-v1-";
+const SNAPSHOT_CHECKSUM_DOMAIN: &[u8] =
+    b"market-squawk/sec-source-qualified-representation-snapshot/v1";
 const MAX_REPRESENTATIONS: usize = 4_096;
 const MAX_COMMITTED_SNAPSHOTS: usize = 8;
 const RETAINED_SNAPSHOTS: usize = 2;

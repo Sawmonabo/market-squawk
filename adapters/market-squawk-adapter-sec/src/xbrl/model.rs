@@ -2640,6 +2640,63 @@ mod tests {
             Err(crate::SecClientError::Cancelled)
         ));
         assert!(worker_exited.load(Ordering::Acquire));
+
+        // The unreleased V1 snapshot contract is source-qualified at its schema, filename, and
+        // checksum boundaries. Its production writer must be reopenable by the same current
+        // reader without admitting any predecessor format.
+        let restart_path = temporary.path().join("source-qualified-restart");
+        std::fs::create_dir(&restart_path)?;
+        let restart_registry = crate::SecRepresentationRegistry::open(
+            Dir::open_ambient_dir(&restart_path, ambient_authority())?,
+            crate::SecRepresentationLimits::production_defaults(),
+        )?;
+        let restart_locator = "https://xbrl.fasb.org/us-gaap/2025/us-gaap-2025.xsd";
+        let restart_bytes = b"source-qualified-representation";
+        let restart_evidence = store.persist(restart_bytes)?;
+        let restart_source = FASB_XBRL_TAXONOMY_AUTHORITY.canonical_source_id()?;
+        let written = restart_registry.record_source_success_cancellable(
+            &restart_source,
+            restart_locator,
+            restart_evidence,
+            u64::try_from(restart_bytes.len())?,
+            crate::SecHttpValidators::default(),
+            &CancellationToken::new(),
+        )?;
+        drop(restart_registry);
+        let snapshot_name = std::fs::read_dir(&restart_path)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .find_map(|name| {
+                name.into_string()
+                    .ok()
+                    .filter(|name| name.ends_with(".json"))
+            })
+            .ok_or("current representation snapshot")?;
+        let snapshot_bytes = std::fs::read(restart_path.join(&snapshot_name))?;
+        let mut snapshot_checksum = Sha256::new();
+        snapshot_checksum.update(b"market-squawk/sec-source-qualified-representation-snapshot/v1");
+        snapshot_checksum.update(u64::try_from(snapshot_bytes.len())?.to_be_bytes());
+        snapshot_checksum.update(&snapshot_bytes);
+        assert_eq!(
+            snapshot_name,
+            format!(
+                "sec-source-qualified-representations-v1-{generation:020}-{digest:x}.json",
+                generation = 1_u64,
+                digest = snapshot_checksum.finalize(),
+            )
+        );
+        let snapshot: serde_json::Value = serde_json::from_slice(&snapshot_bytes)?;
+        assert_eq!(snapshot["schema_version"], 1);
+        assert_eq!(snapshot["entries"][0]["source_id"], restart_source.as_str());
+        let reopened = crate::SecRepresentationRegistry::open(
+            Dir::open_ambient_dir(&restart_path, ambient_authority())?,
+            crate::SecRepresentationLimits::production_defaults(),
+        )?;
+        assert_eq!(
+            reopened.representation_for_source(&restart_source, restart_locator)?,
+            Some(written)
+        );
         Ok(())
     }
 }
