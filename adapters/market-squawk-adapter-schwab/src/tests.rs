@@ -714,6 +714,15 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
         token_admission,
     )
     .await;
+    let market_data_session = SourceIdentifier::try_from("8d9bc9ee-fca2-4f1d-a077-5104408e3727")
+        .unwrap_or_else(|error| panic!("market-data qualification session: {error}"));
+    let market_data_principal_sha256 = EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        preference
+            .bootstrap()
+            .value()
+            .market_data_principal_sha256(),
+    );
     let start_millis = 1_704_067_200_000;
     let end_millis = 1_704_153_600_000;
     let history_request = PriceHistoryRequest::new(
@@ -926,9 +935,8 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
             SchwabMarketDataFamily::PriceHistory,
             received_at,
             oauth_receipt,
-            SourceIdentifier::try_from("8d9bc9ee-fca2-4f1d-a077-5104408e3727")
-                .unwrap_or_else(|error| panic!("history qualification session: {error}")),
-            EvidenceDigest::new(DigestAlgorithm::Sha256, [80; 32]),
+            market_data_session.clone(),
+            market_data_principal_sha256,
         ),
     )
     .unwrap_or_else(|error| panic!("history market-data evidence: {error}"));
@@ -1056,8 +1064,7 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
             .checked_mul(1_000_000)
             .unwrap_or_else(|| panic!("quote received timestamp overflow")),
     );
-    let quote_session = SourceIdentifier::try_from("schwab-rest-quote-session-1")
-        .unwrap_or_else(|error| panic!("quote session: {error}"));
+    let quote_session = market_data_session.clone();
     let quote_generation = market_squawk_domain::ConnectionGeneration::new(
         sealed_quote.receipt().token_generation().get(),
     )
@@ -1066,10 +1073,12 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
         .unwrap_or_else(|error| panic!("quote instrument: {error}"));
     let quote_venue = VenueId::try_from("schwab-us-equities")
         .unwrap_or_else(|error| panic!("quote venue: {error}"));
-    let quote_qualification = test_market_data_qualification(
+    let quote_qualification = test_market_data_qualification_for_authority(
         SchwabMarketDataFamily::Quotes,
         quote_received_at,
-        sealed_quote.receipt().token_generation(),
+        oauth_receipt,
+        quote_session.clone(),
+        market_data_principal_sha256,
     );
     let quote_product = quote_qualification.provider_product().clone();
     let quote_channel = quote_qualification.provider_channel().clone();
@@ -1212,7 +1221,6 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
             .checked_mul(1_000_000)
             .unwrap_or_else(|| panic!("chain received timestamp overflow")),
     );
-    let chain_token_generation = sealed_chain.receipt().token_generation();
     let chain_outcome = sealed_chain
         .into_option_publication(SchwabRestOptionPublicationRequest::new(
             SchwabRestOptionUnderlyingRequest::new(
@@ -1231,10 +1239,12 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
                     VenueId::try_from("schwab-us-options")
                         .unwrap_or_else(|error| panic!("option venue: {error}")),
                 ),
-                test_market_data_qualification(
+                test_market_data_qualification_for_authority(
                     SchwabMarketDataFamily::OptionChains,
                     chain_received_at,
-                    chain_token_generation,
+                    oauth_receipt,
+                    market_data_session.clone(),
+                    market_data_principal_sha256,
                 ),
                 currency,
             )
@@ -1294,7 +1304,6 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
             .checked_mul(1_000_000)
             .unwrap_or_else(|| panic!("expiration received timestamp overflow")),
     );
-    let expiration_token_generation = sealed_expirations.receipt().token_generation();
     let expiration_outcome = sealed_expirations
         .into_option_publication(SchwabRestOptionPublicationRequest::new(
             SchwabRestOptionUnderlyingRequest::new(
@@ -1308,10 +1317,12 @@ async fn rest_price_history_moves_once_through_sealed_publication_and_excludes_u
                     VenueId::try_from("schwab-us-options")
                         .unwrap_or_else(|error| panic!("expiration venue: {error}")),
                 ),
-                test_market_data_qualification(
+                test_market_data_qualification_for_authority(
                     SchwabMarketDataFamily::ExpirationChains,
                     expiration_received_at,
-                    expiration_token_generation,
+                    oauth_receipt,
+                    market_data_session,
+                    market_data_principal_sha256,
                 ),
                 currency,
             )
@@ -3024,26 +3035,6 @@ fn test_streamer_quote_record_request(
         LotSize::try_from_decimal(rust_decimal::Decimal::ONE)
             .unwrap_or_else(|error| panic!("lot size: {error}")),
         market_evidence,
-    )
-}
-
-fn test_market_data_qualification(
-    family: SchwabMarketDataFamily,
-    response_observed_at: Timestamp,
-    token_generation: AccessTokenGeneration,
-) -> SchwabMarketDataQualification {
-    let credential_authority = SchwabCredentialAuthorityBinding::for_test(
-        SecretGeneration::new(1)
-            .unwrap_or_else(|error| panic!("test application generation: {error}")),
-        91,
-    );
-    test_market_data_qualification_for_authority(
-        family,
-        response_observed_at,
-        SchwabOAuthAuthorityReceipt::for_test(token_generation, credential_authority),
-        SourceIdentifier::try_from("8d9bc9ee-fca2-4f1d-a077-5104408e3727")
-            .unwrap_or_else(|error| panic!("test qualification session: {error}")),
-        EvidenceDigest::new(DigestAlgorithm::Sha256, [80; 32]),
     )
 }
 
