@@ -491,6 +491,10 @@ impl CoinbaseMarketHandoff {
     }
 
     /// Returns the terminal exact provider payload.
+    #[expect(
+        clippy::expect_used,
+        reason = "successful handoff construction proves every closed lineage has a terminal payload"
+    )]
     pub fn raw_payload(&self) -> &CapturePayload {
         self.raw_lineage
             .terminal_payload()

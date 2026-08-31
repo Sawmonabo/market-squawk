@@ -44,6 +44,12 @@ use crate::{
 const PUBLIC_CHANNEL: &str = "level2+market_trades+heartbeats";
 const DIRECT_CHANNEL: &str = "full";
 
+type CoinbaseCanonicalRows = (
+    Vec<MarketEvent>,
+    Vec<ProviderMarketEventNativeLineageRow>,
+    Vec<u16>,
+);
+
 /// Application-supplied capture-owned physical identities for one Coinbase raw handoff.
 ///
 /// The first event identity belongs to the public frame or Direct REST snapshot. Remaining Direct
@@ -63,7 +69,7 @@ impl CoinbaseMarketPhysicalCaptureIdentity {
     ) -> Result<Self, CoinbaseMarketPublicationError> {
         if connection_id == [0; 16]
             || event_ids.is_empty()
-            || event_ids.iter().any(|identity| *identity == [0; 16])
+            || event_ids.contains(&[0; 16])
             || event_ids.iter().collect::<BTreeSet<_>>().len() != event_ids.len()
         {
             return Err(CoinbaseMarketPublicationError::InvalidPhysicalIdentity);
@@ -295,6 +301,10 @@ impl CoinbaseDirectSnapshotSealMaterial {
 
 /// Closed raw material shape for the two distinct Coinbase market-data surfaces.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the closed one-use raw handoff keeps each Coinbase surface explicit and allocation-owned"
+)]
 pub enum CoinbaseMarketSealMaterial {
     AdvancedTrade(CoinbaseEventMicrobatchSealMaterial),
     ExchangeDirect {
@@ -305,6 +315,10 @@ pub enum CoinbaseMarketSealMaterial {
 
 /// Common one-use tokens returned after the application physically seals the exact material.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the closed one-use token handoff keeps the public and Direct seal shapes explicit"
+)]
 pub enum CoinbaseMarketSealedTokens {
     AdvancedTrade(ProviderEventMicrobatchToken),
     ExchangeDirect {
@@ -376,6 +390,10 @@ impl CoinbaseMarketOmission {
 
 /// Already-qualified canonical events for one exact Coinbase surface.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the closed qualification handoff preserves the exact public or Direct payload by value"
+)]
 pub enum CoinbaseQualifiedMarketPublication {
     AdvancedTrade {
         rows: Vec<CoinbaseQualifiedPublicRow>,
@@ -400,6 +418,10 @@ pub enum CoinbaseMarketNonPublicationReason {
 
 /// Qualification decision supplied only by the owning live/application layer.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the one-use qualification outcome owns the exact successful publication payload"
+)]
 pub enum CoinbaseMarketQualificationOutcome {
     Qualified(CoinbaseQualifiedMarketPublication),
     Abstained(CoinbaseMarketNonPublicationReason),
@@ -408,6 +430,10 @@ pub enum CoinbaseMarketQualificationOutcome {
 
 /// Final result after exact physical rejoin and optional canonical qualification.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the one-use sealed outcome owns either exact canonical binding or raw evidence"
+)]
 pub enum CoinbaseSealedMarketPublication {
     Published(SealedProviderPublicationBinding),
     SealedRaw(CoinbaseSealedRawMarketPublication),
@@ -457,6 +483,10 @@ enum CoinbasePublicationRawEvidence {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the internal state machine owns the one-use public seal token until publication"
+)]
 enum CoinbasePublicPublicationState {
     NotApplicable,
     AwaitingSeal {
@@ -1132,7 +1162,7 @@ impl CoinbaseMarketSealRejoin {
                     replay_omissions,
                 },
             ) => {
-                validate_direct_snapshot_event(&initial_snapshot, &self, &snapshot)?;
+                validate_direct_snapshot_event(&initial_snapshot, &self, snapshot)?;
                 let response_batch = ProviderMarketEventBatch::try_new(
                     self.typed_batch.evidence().binding().source_id().clone(),
                     self.typed_batch
@@ -1148,7 +1178,7 @@ impl CoinbaseMarketSealRejoin {
                     &response_batch,
                     vec![ProviderMarketEventNativeLineageRow::try_new(
                         self.evidence.instrument_attestation().clone(),
-                        encode_snapshot_native(&snapshot, &self.evidence)?,
+                        encode_snapshot_native(snapshot, &self.evidence)?,
                     )?],
                     Some(self.encode_batch_sidecar(
                         ProviderPublicationBindingKind::CompositeResponseEvent,
@@ -1162,7 +1192,7 @@ impl CoinbaseMarketSealRejoin {
                     vec![0],
                 )?;
                 let (events, native, ordinals) =
-                    self.direct_replay_rows(&replay, replay_rows, replay_omissions)?;
+                    self.direct_replay_rows(replay, replay_rows, replay_omissions)?;
                 let event_batch = ProviderMarketEventBatch::try_new(
                     self.typed_batch.evidence().binding().source_id().clone(),
                     self.typed_batch
@@ -1199,14 +1229,7 @@ impl CoinbaseMarketSealRejoin {
         &self,
         rows: Vec<CoinbaseQualifiedPublicRow>,
         omissions: Vec<CoinbaseMarketOmission>,
-    ) -> Result<
-        (
-            Vec<MarketEvent>,
-            Vec<ProviderMarketEventNativeLineageRow>,
-            Vec<u16>,
-        ),
-        CoinbaseMarketPublicationError,
-    > {
+    ) -> Result<CoinbaseCanonicalRows, CoinbaseMarketPublicationError> {
         let observations = self.typed_batch.observations();
         let mut covered = BTreeSet::new();
         let mut events = Vec::new();
@@ -1255,14 +1278,7 @@ impl CoinbaseMarketSealRejoin {
         replay: &[CoinbaseDirectReplayPublicationEvidence],
         rows: Vec<CoinbaseQualifiedDirectReplayRow>,
         omissions: Vec<CoinbaseMarketOmission>,
-    ) -> Result<
-        (
-            Vec<MarketEvent>,
-            Vec<ProviderMarketEventNativeLineageRow>,
-            Vec<u16>,
-        ),
-        CoinbaseMarketPublicationError,
-    > {
+    ) -> Result<CoinbaseCanonicalRows, CoinbaseMarketPublicationError> {
         let mut covered = BTreeSet::new();
         let mut events = Vec::new();
         let mut native = Vec::new();
@@ -1438,6 +1454,10 @@ fn validate_public_capture(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "exact event-seal coordinates remain explicit at the trust boundary"
+)]
 fn validate_event_token(
     token: &ProviderEventMicrobatchToken,
     source_id: &SourceId,
