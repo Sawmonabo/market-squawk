@@ -7,6 +7,10 @@ use crate::{BeaDataPage, BeaError, BeaMetadataGeneration, BeaTimePeriod};
 
 const MAX_NOTICE_ID_BYTES: usize = 256;
 
+pub(crate) const BEA_REVISION_STATE: &str = "provider_version_observed_shared_assignment_pending";
+pub(crate) const BEA_CORRECTION_STATE: &str = "no_separate_correction_notice_in_this_acquisition";
+pub(crate) const BEA_SUPERSESSION_STATE: &str = "shared_observed_revision_authority";
+
 /// One exact provider row version prepared for canonical revision admission.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BeaObservedVersion {

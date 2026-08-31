@@ -6,6 +6,7 @@ use market_squawk_domain::{
 use market_squawk_sources::{
     ProviderCaptureMaterial, ProviderCaptureSealExpectation, ProviderCaptureSealRequest,
     ProviderWholeCaptureToken, RejoinedProviderCapture, SealedProviderCaptureMaterial,
+    SealedProviderCaptureSetReceipt,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -266,7 +267,6 @@ impl BeaDoctorReceipt {
         self,
         binding: &BeaSourceBinding,
         sealed: &BeaSealedAcquisitionReceipt,
-        capture_token: ProviderWholeCaptureToken,
     ) -> Result<BeaDoctorAdmissionEvidence, BeaDoctorError> {
         if self.source_binding_digest != binding.binding_digest()
             || self.quota_declaration_digest != binding.quota_declaration_digest()
@@ -357,7 +357,7 @@ impl BeaDoctorReceipt {
             missing_rows: self.missing_rows,
             completeness: self.data_completeness,
             admission_digest,
-            capture_token,
+            sealed_capture: sealed.sealed_capture().clone(),
         })
     }
 
@@ -438,7 +438,7 @@ pub struct BeaDoctorAdmissionEvidence {
     missing_rows: Option<u64>,
     completeness: BeaCompleteness,
     admission_digest: EvidenceDigest,
-    capture_token: ProviderWholeCaptureToken,
+    sealed_capture: SealedProviderCaptureSetReceipt,
 }
 
 impl BeaDoctorAdmissionEvidence {
@@ -456,19 +456,9 @@ impl BeaDoctorAdmissionEvidence {
             || self.quota_declaration_digest != binding.quota_declaration_digest()
             || &self.dataset_id != dataset_id
             || &self.analytical_dataset_id != analytical_dataset_id
-            || self
-                .capture_token
-                .persisted_receipt()
-                .receipt_digest()
-                .bytes()
-                == [0; 32]
-            || self.capture_token.persisted_receipt().capture().source_id() != &self.source_id
-            || self
-                .capture_token
-                .persisted_receipt()
-                .capture()
-                .metadata_revision()
-                != &self.metadata_revision
+            || self.sealed_capture.receipt_digest().bytes() == [0; 32]
+            || self.sealed_capture.capture().source_id() != &self.source_id
+            || self.sealed_capture.capture().metadata_revision() != &self.metadata_revision
         {
             return Err(BeaDoctorError::InvalidAuthority);
         }
@@ -569,6 +559,35 @@ pub struct BeaPendingDoctorSeal {
     expectation: ProviderCaptureSealExpectation,
 }
 
+/// One sealed doctor acquisition with a linear continuation into exactly one publication.
+///
+/// The source may retain the non-secret admission while the whole-capture token remains owned by
+/// the publication built from these same observations. This prevents a doctor run from causing a
+/// second `GetData` request merely to publish its already-sealed data.
+#[derive(Debug)]
+pub struct BeaSealedDoctorRun {
+    admission: BeaDoctorAdmissionEvidence,
+    sealed_acquisition: BeaSealedAcquisitionReceipt,
+    capture_token: ProviderWholeCaptureToken,
+}
+
+impl BeaSealedDoctorRun {
+    /// Drops the one-use publication continuation and retains only process-local admission.
+    pub fn into_admission(self) -> BeaDoctorAdmissionEvidence {
+        self.admission
+    }
+
+    pub(crate) fn into_publication_parts(
+        self,
+    ) -> (
+        BeaDoctorAdmissionEvidence,
+        BeaSealedAcquisitionReceipt,
+        ProviderWholeCaptureToken,
+    ) {
+        (self.admission, self.sealed_acquisition, self.capture_token)
+    }
+}
+
 impl BeaPendingDoctorSeal {
     /// Rejoins only the opaque result produced from this doctor's exact seal request.
     pub fn try_rejoin(
@@ -576,6 +595,16 @@ impl BeaPendingDoctorSeal {
         binding: &BeaSourceBinding,
         sealed: SealedProviderCaptureMaterial,
     ) -> Result<BeaDoctorAdmissionEvidence, BeaDoctorError> {
+        self.try_rejoin_for_publication(binding, sealed)
+            .map(BeaSealedDoctorRun::into_admission)
+    }
+
+    /// Rejoins admission while preserving this exact acquisition for one publication.
+    pub fn try_rejoin_for_publication(
+        self,
+        binding: &BeaSourceBinding,
+        sealed: SealedProviderCaptureMaterial,
+    ) -> Result<BeaSealedDoctorRun, BeaDoctorError> {
         let capture_token = match self
             .expectation
             .try_rejoin(sealed)
@@ -589,8 +618,12 @@ impl BeaPendingDoctorSeal {
         let sealed_acquisition =
             BeaSealedAcquisitionReceipt::try_from_token(self.evidence, &capture_token)
                 .map_err(|_| BeaDoctorError::InvalidEvidence)?;
-        self.receipt
-            .bind_sealed(binding, &sealed_acquisition, capture_token)
+        let admission = self.receipt.bind_sealed(binding, &sealed_acquisition)?;
+        Ok(BeaSealedDoctorRun {
+            admission,
+            sealed_acquisition,
+            capture_token,
+        })
     }
 }
 

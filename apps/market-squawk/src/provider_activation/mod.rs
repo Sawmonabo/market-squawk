@@ -1298,7 +1298,7 @@ impl ProviderAdapterActivation {
                         cancellation.clone(),
                     )
                     .await
-                    .map_err(|_| ProviderAdapterActivationError::Bea)?;
+                    .map_err(map_bea_activation_error)?;
                 (
                     replacement,
                     Some(SpecializedReplacementKind::Bea(activation)),
@@ -1780,7 +1780,7 @@ impl ProviderAdapterActivation {
         let activation = self
             .prepare_bea_regional(lease.clone(), spec, cancellation)
             .await
-            .map_err(|_| ProviderAdapterActivationError::Bea)?;
+            .map_err(map_bea_activation_error)?;
         Ok(ActivatedResearchProvider {
             profile: activation.generation().profile().clone(),
             generation: activation.generation().clone(),
@@ -2416,6 +2416,26 @@ fn require_surface(
         Ok(())
     } else {
         Err(ProviderAdapterActivationError::SurfaceMismatch)
+    }
+}
+
+fn map_bea_activation_error(error: bea::BeaProductError) -> ProviderAdapterActivationError {
+    match error {
+        bea::BeaProductError::Cancelled => ProviderAdapterActivationError::Cancelled,
+        bea::BeaProductError::Onboarding(error) => {
+            ProviderAdapterActivationError::Onboarding(error)
+        }
+        bea::BeaProductError::SetupRequired
+        | bea::BeaProductError::Unavailable
+        | bea::BeaProductError::InvalidOperation
+        | bea::BeaProductError::AuthorityUnavailable
+        | bea::BeaProductError::InvalidReadResult
+        | bea::BeaProductError::Adapter(_)
+        | bea::BeaProductError::Source(_)
+        | bea::BeaProductError::Composition(_)
+        | bea::BeaProductError::Live(_)
+        | bea::BeaProductError::Application(_)
+        | bea::BeaProductError::Query(_) => ProviderAdapterActivationError::Bea,
     }
 }
 

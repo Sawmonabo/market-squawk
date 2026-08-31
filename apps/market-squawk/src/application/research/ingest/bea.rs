@@ -14,8 +14,9 @@ use std::{
 
 use futures_util::future::BoxFuture;
 use market_squawk_adapter_bea::{
-    BeaDoctorAdmissionEvidence, BeaProviderQuotaDeclaration, BeaPublicationCandidate,
-    BeaPublicationError, BeaRequiredSharedSettlement, BeaSource, BeaSourceError,
+    BeaDoctorAdmissionEvidence, BeaDoctorRefreshDisposition, BeaProviderQuotaDeclaration,
+    BeaPublicationCandidate, BeaPublicationError, BeaRequiredSharedSettlement,
+    BeaSealedDiscoveryAdmission, BeaSource, BeaSourceError,
 };
 use market_squawk_data::{
     AnalyticalMacroProviderPeriodLatestKnownOutput,
@@ -59,7 +60,6 @@ pub(crate) struct BeaRegionalLiveRequest {
     seal_deadline: Instant,
     maximum_records: NonZeroU32,
     maximum_canonical_bytes: NonZeroU64,
-    series_allowlist: AnalyticalMacroSeriesAllowlist,
     knowledge_cutoff: Timestamp,
     effective_period_cutoff: ResearchPeriod,
     query_limits: QueryLimits,
@@ -79,7 +79,6 @@ impl BeaRegionalLiveRequest {
         seal_deadline: Instant,
         maximum_records: NonZeroU32,
         maximum_canonical_bytes: NonZeroU64,
-        series_allowlist: AnalyticalMacroSeriesAllowlist,
         knowledge_cutoff: Timestamp,
         effective_period_cutoff: ResearchPeriod,
         query_limits: QueryLimits,
@@ -92,7 +91,6 @@ impl BeaRegionalLiveRequest {
             seal_deadline,
             maximum_records,
             maximum_canonical_bytes,
-            series_allowlist,
             knowledge_cutoff,
             effective_period_cutoff,
             query_limits,
@@ -284,7 +282,8 @@ impl BeaMacroApplicationClosure {
         source: &BeaSource,
         authority: &ExtractionAuthority,
         provider_dataset: &SourceIdentifier,
-        acquisition_deadline: Timestamp,
+        doctor_deadline: Timestamp,
+        publication_deadline: Timestamp,
         seal_deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<BeaDoctorActivationState, BeaMacroApplicationError> {
@@ -298,7 +297,7 @@ impl BeaMacroApplicationClosure {
             .doctor(
                 authority,
                 provider_dataset,
-                acquisition_deadline,
+                doctor_deadline,
                 cancellation.clone(),
             )
             .await?;
@@ -313,15 +312,30 @@ impl BeaMacroApplicationClosure {
             .research
             .seal_provider_capture(seal_request, &raw_seal, seal_deadline)
             .await?;
-        let admission = Arc::new(pending.try_rejoin(source.source_binding(), sealed)?);
+        let sealed = pending.try_rejoin_for_publication(source.source_binding(), sealed)?;
+        let discovery = DiscoveryRequest::try_new(
+            provider_dataset.clone(),
+            None,
+            NonZeroU16::MIN,
+            publication_deadline,
+        )?;
+        let (admission, discovery, refresh) = source.activate_sealed_doctor_for_publication(
+            authority,
+            discovery,
+            sealed,
+            &cancellation,
+        )?;
         if admission.quota_declaration_digest() != quota.declaration_digest()
             || admission.doctor_receipt_digest() != doctor_receipt_digest
         {
             return Err(BeaMacroApplicationError::DoctorAuthorityMismatch);
         }
-        source.activate_doctor(Arc::clone(&admission))?;
         Ok(BeaDoctorActivationState::Available(
-            BeaDoctorActivationDto { admission },
+            BeaDoctorActivationDto {
+                admission,
+                discovery,
+                refresh,
+            },
         ))
     }
 
@@ -438,10 +452,11 @@ pub(crate) struct BeaRegionalLiveRuntime {
 impl BeaRegionalLiveRuntime {
     /// Runs one complete bounded Regional producer-to-consumer journey.
     ///
-    /// Metadata and data requests use only the registry-minted extraction authority. Both the
-    /// doctor graph and the publication graph are physically sealed before they can authorize the
-    /// next transition. Canonicalization remains adapter-owned, so provider publication,
-    /// effective, availability, and receipt clocks pass through unchanged. Success is returned
+    /// Metadata and data requests use only the registry-minted extraction authority. The sealed
+    /// doctor graph is consumed directly as the publication graph, so one bounded provider
+    /// acquisition authorizes exactly one publication. Canonicalization remains adapter-owned, so
+    /// provider publication, effective, availability, and receipt clocks pass through unchanged.
+    /// Success is returned
     /// only after the exact immutable manifest reopens and its provider-period PIT read completes.
     pub(crate) async fn publish_and_read(
         &self,
@@ -474,6 +489,7 @@ impl BeaRegionalLiveRuntime {
                 &operation.extraction(),
                 &request.provider_dataset,
                 doctor_deadline,
+                acquisition_deadline,
                 seal_deadline,
                 cancellation.clone(),
             )
@@ -485,29 +501,9 @@ impl BeaRegionalLiveRuntime {
         {
             return Err(BeaLivePublicationError::SourceGenerationMismatch);
         }
+        let (admission, refresh) = doctor.into_publication_parts();
         operation.ensure_live()?;
         ensure_not_cancelled(&cancellation)?;
-
-        let discovery = DiscoveryRequest::try_new(
-            request.provider_dataset.clone(),
-            None,
-            NonZeroU16::MIN,
-            acquisition_deadline,
-        )?;
-        let discovered = self
-            .source
-            .discover_captured(operation.extraction(), discovery, cancellation.clone())
-            .await?;
-        let (pending_discovery, seal_request) = discovered.into_sealing_parts()?;
-        // The provider response completed before this point. Preserve the exact response graph
-        // even when caller cancellation races the bounded physical seal.
-        let raw_seal = CancellationToken::new();
-        let sealed = self
-            .coordinator
-            .research
-            .seal_provider_capture(seal_request, &raw_seal, seal_deadline)
-            .await?;
-        let admission = pending_discovery.try_rejoin(sealed)?;
         operation.ensure_live()?;
         ensure_not_cancelled(&cancellation)?;
         let object = match admission.batch().objects() {
@@ -541,6 +537,8 @@ impl BeaRegionalLiveRuntime {
         }
         operation.ensure_live()?;
         let publication_digest = prepared.publication_digest();
+        let published_series = prepared.published_series();
+        let series_allowlist = prepared.series_allowlist().clone();
         let observed_at = system_timestamp()?;
         let reservation = reserve_publication(
             self.coordinator.as_ref(),
@@ -567,7 +565,7 @@ impl BeaRegionalLiveRuntime {
 
         let read_request = BeaProviderPeriodLatestKnownRequest::try_new(
             publication.restart_selector(),
-            request.series_allowlist,
+            series_allowlist.clone(),
             request.knowledge_cutoff,
             request.effective_period_cutoff,
         )?;
@@ -590,6 +588,9 @@ impl BeaRegionalLiveRuntime {
         }
         Ok(BeaRegionalLiveOutcome {
             source_binding_digest,
+            doctor_refresh: refresh,
+            published_series,
+            series_allowlist,
             publication_digest,
             publication,
             read,
@@ -618,6 +619,8 @@ struct BeaPreparedRegionalMacroPlan {
     analytical_dataset: DatasetId,
     provider_dataset: SourceIdentifier,
     source_binding_digest: EvidenceDigest,
+    published_series: usize,
+    series_allowlist: AnalyticalMacroSeriesAllowlist,
     publication_input: ProviderMacroPlanPublicationInput,
 }
 
@@ -626,6 +629,19 @@ impl BeaPreparedRegionalMacroPlan {
         candidate: BeaPublicationCandidate,
     ) -> Result<Self, BeaMacroApplicationError> {
         candidate.validate()?;
+        let mut series = candidate
+            .observations()
+            .iter()
+            .map(|observation| observation.observation().series().clone())
+            .collect::<Vec<_>>();
+        series.sort_unstable();
+        series.dedup();
+        let published_series = series.len();
+        // The provider-neutral snapshot contract intentionally bounds one focused read to 32
+        // series. Publication still retains every admitted row from the selected BEA contract.
+        series.truncate(32);
+        let series_allowlist =
+            AnalyticalMacroSeriesAllowlist::try_from_code_owned_identifiers(series)?;
         let coordinates = candidate.rejoin_coordinates().clone();
         let analytical_dataset = DatasetId::try_from(coordinates.analytical_dataset_id().as_str())
             .map_err(|_error| IngestError::InvalidProviderMacroPlan)?;
@@ -644,6 +660,8 @@ impl BeaPreparedRegionalMacroPlan {
             analytical_dataset,
             provider_dataset,
             source_binding_digest,
+            published_series,
+            series_allowlist,
             publication_input,
         })
     }
@@ -667,12 +685,23 @@ impl BeaPreparedRegionalMacroPlan {
     const fn analytical_dataset(&self) -> &DatasetId {
         &self.analytical_dataset
     }
+
+    const fn series_allowlist(&self) -> &AnalyticalMacroSeriesAllowlist {
+        &self.series_allowlist
+    }
+
+    const fn published_series(&self) -> usize {
+        self.published_series
+    }
 }
 
 /// Exact immutable BEA Regional generation and provider-period rows from the live journey.
 #[derive(Debug)]
 pub(crate) struct BeaRegionalLiveOutcome {
     source_binding_digest: EvidenceDigest,
+    doctor_refresh: BeaDoctorRefreshDisposition,
+    published_series: usize,
+    series_allowlist: AnalyticalMacroSeriesAllowlist,
     publication_digest: EvidenceDigest,
     publication: BeaMacroPlanPublication,
     read: BeaProviderPeriodLatestKnownDto,
@@ -682,6 +711,21 @@ impl BeaRegionalLiveOutcome {
     /// Returns the exact non-secret source/configuration/credential/quota binding.
     pub(crate) const fn source_binding_digest(&self) -> EvidenceDigest {
         self.source_binding_digest
+    }
+
+    /// Returns whether metadata admission was reused, activated, expired, or drift-refreshed.
+    pub(crate) const fn doctor_refresh(&self) -> BeaDoctorRefreshDisposition {
+        self.doctor_refresh
+    }
+
+    /// Returns the exact bounded series selection used by the typed restart-safe read.
+    pub(crate) const fn series_allowlist(&self) -> &AnalyticalMacroSeriesAllowlist {
+        &self.series_allowlist
+    }
+
+    /// Returns distinct series retained in the immutable publication before focused read bounds.
+    pub(crate) const fn published_series(&self) -> usize {
+        self.published_series
     }
 
     /// Returns the exact payload identity bound into the persist reservation.
@@ -951,6 +995,8 @@ pub(crate) enum BeaDoctorActivationState {
 #[derive(Debug)]
 pub(crate) struct BeaDoctorActivationDto {
     admission: Arc<BeaDoctorAdmissionEvidence>,
+    discovery: BeaSealedDiscoveryAdmission,
+    refresh: BeaDoctorRefreshDisposition,
 }
 
 impl BeaDoctorActivationDto {
@@ -967,6 +1013,13 @@ impl BeaDoctorActivationDto {
     /// Returns the exact successful page/byte receipt bound to consuming shared settlements.
     pub(crate) fn doctor_receipt_digest(&self) -> EvidenceDigest {
         self.admission.doctor_receipt_digest()
+    }
+
+    /// Consumes the linear sealed observations into their sole publication continuation.
+    pub(crate) fn into_publication_parts(
+        self,
+    ) -> (BeaSealedDiscoveryAdmission, BeaDoctorRefreshDisposition) {
+        (self.discovery, self.refresh)
     }
 }
 

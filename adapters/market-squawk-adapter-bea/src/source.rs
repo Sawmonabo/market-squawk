@@ -43,11 +43,11 @@ use crate::transport::{
 use crate::{
     BEA_API_ENDPOINT, BEA_APPLICATION_ERRORS_PER_MINUTE, BEA_APPLICATION_REQUESTS_PER_MINUTE,
     BEA_APPLICATION_RESPONSE_BYTES_PER_MINUTE, BEA_MINIMUM_REQUEST_INTERVAL, BeaCompleteness,
-    BeaDataPage, BeaDatasetIdentity, BeaDoctorAdmissionEvidence, BeaDoctorRun, BeaError,
-    BeaFrequency, BeaMetadataGeneration, BeaMetadataPage, BeaMetadataRecords, BeaMethod,
+    BeaDataPage, BeaDatasetIdentity, BeaDoctorAdmissionEvidence, BeaDoctorError, BeaDoctorRun,
+    BeaError, BeaFrequency, BeaMetadataGeneration, BeaMetadataPage, BeaMetadataRecords, BeaMethod,
     BeaMissingValue, BeaObservation, BeaObservationValue, BeaParameterDefinition,
     BeaParameterIdentity, BeaParseLimits, BeaProviderQuotaDeclaration, BeaQuery, BeaRequest,
-    BeaSourceBinding, BeaUserId, bea_provider_quota_declaration,
+    BeaSealedDoctorRun, BeaSourceBinding, BeaUserId, bea_provider_quota_declaration,
 };
 
 /// Maximum explicit BEA data-query contracts retained by one adapter instance.
@@ -60,6 +60,19 @@ const BEA_ANALYTICAL_PREFIX: &str = "bea.data-v1.";
 const BEA_JSON_MEDIA_TYPE: &str = "application/json";
 const MAX_RETRY_AFTER_BYTES: usize = 256;
 const BEA_METADATA_DISCOVERY_DAG_SCHEMA: &[u8] = b"market-squawk/bea-metadata-discovery-dag/v2";
+
+/// Why the sealed metadata admission used by one publication changed or was retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BeaDoctorRefreshDisposition {
+    /// No prior admission existed for this exact selected dataset.
+    Activated,
+    /// Current sealed metadata admission was reused; only this publication's observations are new.
+    ReusedCurrent,
+    /// The prior admission reached its exclusive expiry and was replaced explicitly.
+    RefreshedExpired,
+    /// Provider metadata changed and the exact newly sealed generation replaced the predecessor.
+    RefreshedMetadataDrift,
+}
 
 /// One metadata-first BEA data selection admitted by application composition.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1238,6 +1251,114 @@ impl BeaSource {
         Ok(())
     }
 
+    /// Activates or refreshes one sealed metadata admission and reuses the same bounded
+    /// acquisition as this publication's only observation fetch.
+    pub fn activate_sealed_doctor_for_publication(
+        &self,
+        authority: &ExtractionAuthority,
+        request: DiscoveryRequest,
+        sealed: BeaSealedDoctorRun,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        (
+            Arc<BeaDoctorAdmissionEvidence>,
+            crate::BeaSealedDiscoveryAdmission,
+            BeaDoctorRefreshDisposition,
+        ),
+        ExtractionSourceError,
+    > {
+        self.validate_authority(authority)?;
+        if request.effective_at().is_some() || request.max_results() != 1 {
+            return Err(invalid_protocol());
+        }
+        let contract = self
+            .config
+            .contract(request.dataset())
+            .ok_or_else(invalid_protocol)?;
+        let (candidate, sealed_acquisition, capture_token) = sealed.into_publication_parts();
+        let now = system_timestamp().map_err(map_source_error)?;
+        candidate
+            .validate_current(
+                &self.source_binding,
+                contract.dataset_id(),
+                contract.analytical_dataset_id(),
+                now,
+            )
+            .map_err(|_| invalid_protocol())?;
+        if request.deadline() >= candidate.expires_at() {
+            return Err(SourceError::GenerationResynchronizationRequired.into());
+        }
+        if sealed_acquisition.source_id() != self.metadata.source_id()
+            || sealed_acquisition.metadata_revision() != self.metadata.revision()
+            || sealed_acquisition.dataset_id() != request.dataset()
+            || sealed_acquisition.provider_dataset() != contract.provider_dataset()
+            || sealed_acquisition
+                .evidence()
+                .metadata()
+                .generation()
+                .digest()
+                != candidate.metadata_generation().bytes()
+        {
+            return Err(SourceError::GenerationResynchronizationRequired.into());
+        }
+
+        let object = source_object(
+            &self.metadata,
+            &request,
+            contract,
+            sealed_acquisition.evidence().metadata().generation(),
+            sealed_acquisition.evidence().data().capture(),
+        )?;
+        let batch = DiscoveryBatch::try_new(&request, vec![object])?;
+        self.validate_operation_current(authority, request.deadline(), cancellation)?;
+
+        let mut active = self
+            .active_datasets
+            .write()
+            .map_err(|_| invalid_protocol())?;
+        let (admission, disposition) = match active.get(contract.dataset_id()).cloned() {
+            None => {
+                let admission = Arc::new(candidate);
+                active.insert(contract.dataset_id().clone(), Arc::clone(&admission));
+                (admission, BeaDoctorRefreshDisposition::Activated)
+            }
+            Some(current) if current.metadata_generation() != candidate.metadata_generation() => {
+                let admission = Arc::new(candidate);
+                active.insert(contract.dataset_id().clone(), Arc::clone(&admission));
+                (
+                    admission,
+                    BeaDoctorRefreshDisposition::RefreshedMetadataDrift,
+                )
+            }
+            Some(current) => match current.validate_current(
+                &self.source_binding,
+                contract.dataset_id(),
+                contract.analytical_dataset_id(),
+                now,
+            ) {
+                Ok(()) if request.deadline() < current.expires_at() => {
+                    (current, BeaDoctorRefreshDisposition::ReusedCurrent)
+                }
+                Ok(()) | Err(BeaDoctorError::Expired) => {
+                    let admission = Arc::new(candidate);
+                    active.insert(contract.dataset_id().clone(), Arc::clone(&admission));
+                    (admission, BeaDoctorRefreshDisposition::RefreshedExpired)
+                }
+                Err(BeaDoctorError::InvalidAuthority | BeaDoctorError::InvalidEvidence) => {
+                    return Err(invalid_protocol());
+                }
+            },
+        };
+        let discovery = crate::BeaSealedDiscoveryAdmission::from_sealed_doctor(
+            batch,
+            sealed_acquisition,
+            capture_token,
+            admission.admission_digest(),
+            admission.doctor_sealed_graph_digest(),
+        );
+        Ok((admission, discovery, disposition))
+    }
+
     /// Returns the storage-safe analytical identity for a configured provider request.
     pub fn analytical_dataset_identifier(
         &self,
@@ -1516,7 +1637,13 @@ impl BeaSource {
         {
             return Err(SourceError::GenerationResynchronizationRequired.into());
         }
-        let object = source_object(&self.metadata, &request, contract, &acquisition)?;
+        let object = source_object(
+            &self.metadata,
+            &request,
+            contract,
+            acquisition.metadata().generation(),
+            acquisition.data().material().receipt(),
+        )?;
         let batch = DiscoveryBatch::try_new(&request, vec![object])?;
         let completed_at = system_timestamp().map_err(map_source_error)?;
         activation
@@ -2242,10 +2369,9 @@ fn source_object(
     metadata: &SourceMetadata,
     request: &DiscoveryRequest,
     contract: &BeaDatasetContract,
-    acquisition: &BeaDatasetAcquisition,
+    metadata_generation: BeaMetadataGeneration,
+    capture: &ProviderCaptureSetReceipt,
 ) -> Result<SourceObject, ExtractionSourceError> {
-    let data = acquisition.data();
-    let capture = data.material().receipt();
     let received_at = capture
         .pages()
         .first()
@@ -2275,12 +2401,7 @@ fn source_object(
         availability: &availability,
         expected_bytes,
     })?;
-    let object_id = object_id(
-        contract,
-        acquisition.metadata().generation(),
-        capture,
-        lineage_digest,
-    )?;
+    let object_id = object_id(contract, metadata_generation, capture, lineage_digest)?;
     SourceObject::try_new_with_capture_identity(
         metadata.source_id().clone(),
         metadata.revision().clone(),
@@ -2527,6 +2648,9 @@ struct NativeObservationWire<'a> {
     result_attributes: &'a BTreeMap<String, String>,
     production_time: Option<&'a str>,
     observation_digest: String,
+    revision_state: &'static str,
+    correction_state: &'static str,
+    supersession_state: &'static str,
 }
 
 #[derive(Serialize)]
@@ -2640,6 +2764,9 @@ fn native_payload(
         result_attributes: page.result_attributes(),
         production_time: page.production_time().map(|time| time.raw()),
         observation_digest: lower_hex(observation.digest()),
+        revision_state: crate::revision::BEA_REVISION_STATE,
+        correction_state: crate::revision::BEA_CORRECTION_STATE,
+        supersession_state: crate::revision::BEA_SUPERSESSION_STATE,
     };
     serde_json::to_vec(&wire)
         .map(Bytes::from)

@@ -242,6 +242,22 @@ pub struct BeaSealedDiscoveryAdmission {
 }
 
 impl BeaSealedDiscoveryAdmission {
+    pub(crate) fn from_sealed_doctor(
+        discovery_batch: DiscoveryBatch,
+        sealed_acquisition: BeaSealedAcquisitionReceipt,
+        capture_token: ProviderWholeCaptureToken,
+        doctor_admission_digest: EvidenceDigest,
+        doctor_sealed_graph_digest: EvidenceDigest,
+    ) -> Self {
+        Self {
+            discovery_batch,
+            sealed_acquisition,
+            capture_token,
+            doctor_admission_digest,
+            doctor_sealed_graph_digest,
+        }
+    }
+
     /// Returns the exact discovery batch only after its influencing graph has been sealed.
     pub const fn batch(&self) -> &DiscoveryBatch {
         &self.discovery_batch

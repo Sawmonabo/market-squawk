@@ -13,8 +13,8 @@ use std::{
 };
 
 use market_squawk_adapter_bea::{
-    BeaDatasetContract, BeaDatasetIdentity, BeaError, BeaParameterIdentity, BeaParseLimits,
-    BeaSource, BeaSourceConfig, BeaSourceError, BeaUserId,
+    BeaDatasetContract, BeaDatasetIdentity, BeaDoctorRefreshDisposition, BeaError,
+    BeaParameterIdentity, BeaParseLimits, BeaSource, BeaSourceConfig, BeaSourceError, BeaUserId,
 };
 use market_squawk_data::{
     AnalyticalMacroSeriesAllowlist, ProviderMacroPlanRestartSelector, QueryError, QueryLimits,
@@ -41,17 +41,12 @@ pub(crate) const BEA_SURFACE: &str = "bea.api-data";
 const REGIONAL_DATASET: &str = "Regional";
 pub(crate) const BEA_SOURCE_ID: &str = "us-bea";
 const REGIONAL_TABLE: &str = "SAINC1";
-const REGIONAL_LINE_CODE: &str = "3";
-const REGIONAL_GEO_FIPS: &str = "DE";
+const REGIONAL_PERSONAL_INCOME_LINE_CODE: &str = "1";
+const REGIONAL_POPULATION_LINE_CODE: &str = "2";
+const REGIONAL_PER_CAPITA_INCOME_LINE_CODE: &str = "3";
+const REGIONAL_GEO_FIPS: &str = "STATE";
 const REGIONAL_YEAR_SCOPE: &str = "LAST5";
 const BEA_ANNUAL_PERIOD_SCHEME: &str = "bea-annual";
-
-// `GeoFips=DE` returns Delaware state and its regional descendants. The immutable publication
-// retains that complete bounded provider response. This identifier selects only the state row
-// (`GeoFips=10000`) for the fixed product read. It is the adapter's period-independent canonical
-// identity for Regional / SAINC1 / CAINC1-3 / Delaware under canonical-series schema v1.
-const DELAWARE_PER_CAPITA_INCOME_SERIES: &str =
-    "bea-series:2de222290053ee1046f475d708a1b0d617d7d6011f880b47ac5cb7bdeb455790";
 
 const MAXIMUM_PROVIDER_ROWS: u32 = 4_096;
 const MAXIMUM_CANONICAL_BYTES: u64 = 16 * 1_024 * 1_024;
@@ -127,6 +122,9 @@ impl BeaConfiguredEvidence {
 pub(crate) struct BeaReadyEvidence {
     configured: BeaConfiguredEvidence,
     restart_selector: ProviderMacroPlanRestartSelector,
+    doctor_refresh: BeaDoctorRefreshDisposition,
+    published_series: usize,
+    series_allowlist: AnalyticalMacroSeriesAllowlist,
     selection_digest: EvidenceDigest,
     selected_observations: usize,
 }
@@ -138,6 +136,18 @@ impl BeaReadyEvidence {
 
     pub(crate) const fn restart_selector(&self) -> &ProviderMacroPlanRestartSelector {
         &self.restart_selector
+    }
+
+    pub(crate) const fn series_allowlist(&self) -> &AnalyticalMacroSeriesAllowlist {
+        &self.series_allowlist
+    }
+
+    pub(crate) const fn doctor_refresh(&self) -> BeaDoctorRefreshDisposition {
+        self.doctor_refresh
+    }
+
+    pub(crate) const fn published_series(&self) -> usize {
+        self.published_series
     }
 
     pub(crate) const fn selection_digest(&self) -> EvidenceDigest {
@@ -275,6 +285,7 @@ impl BeaRegionalRestartRead {
     /// contacting BEA. The shared reader revalidates the selector against the immutable catalog.
     pub(crate) fn try_new(
         restart_selector: ProviderMacroPlanRestartSelector,
+        series_allowlist: AnalyticalMacroSeriesAllowlist,
         knowledge_cutoff: Timestamp,
         effective_period_cutoff: ResearchPeriod,
         deadline: Instant,
@@ -291,7 +302,7 @@ impl BeaRegionalRestartRead {
         Ok(Self {
             request: BeaProviderPeriodLatestKnownRequest::try_new(
                 restart_selector,
-                fixed_series_allowlist()?,
+                series_allowlist,
                 knowledge_cutoff,
                 effective_period_cutoff,
             )?,
@@ -464,7 +475,6 @@ impl BeaProductActivation {
             seal_deadline,
             NonZeroU32::new(MAXIMUM_PROVIDER_ROWS).ok_or(BeaProductError::InvalidOperation)?,
             NonZeroU64::new(MAXIMUM_CANONICAL_BYTES).ok_or(BeaProductError::InvalidOperation)?,
-            fixed_series_allowlist()?,
             knowledge_cutoff,
             effective_period_cutoff,
             fixed_query_limits()?,
@@ -486,6 +496,9 @@ impl BeaProductActivation {
         let ready = BeaReadyEvidence {
             configured: self.configured.clone(),
             restart_selector,
+            doctor_refresh: outcome.doctor_refresh(),
+            published_series: outcome.published_series(),
+            series_allowlist: outcome.series_allowlist().clone(),
             selection_digest: output.selection_digest(),
             selected_observations: output.observations().len(),
         };
@@ -597,8 +610,10 @@ impl ProviderAdapterActivation {
         spec: &BeaAdapterActivation,
         cancellation: &CancellationToken,
     ) -> Result<(ResearchRightsAuthority, ResearchProviderRuntimeGeneration), BeaProductError> {
-        if cancellation.is_cancelled()
-            || lease.surface_id().as_str() != BEA_SURFACE
+        if cancellation.is_cancelled() {
+            return Err(BeaProductError::Cancelled);
+        }
+        if lease.surface_id().as_str() != BEA_SURFACE
             || lease.generation().is_none()
             || lease.secret_reference().is_none()
             || spec.metadata.source_id().as_str() != BEA_SOURCE_ID
@@ -606,9 +621,10 @@ impl ProviderAdapterActivation {
         {
             return Err(BeaProductError::InvalidOperation);
         }
-        let config = fixed_regional_source_config()?;
-        if config.contracts().len() != 1
-            || config.contracts()[0].dataset_id() != spec.provider_dataset_identifier()
+        if fixed_regional_source_config()?
+            .contracts()
+            .iter()
+            .all(|contract| contract.dataset_id() != spec.provider_dataset_identifier())
         {
             return Err(BeaProductError::InvalidOperation);
         }
@@ -644,7 +660,7 @@ impl ProviderAdapterActivation {
         let source = BeaSource::try_new(
             spec.metadata.clone(),
             user_id,
-            fixed_regional_source_config()?,
+            selected_regional_source_config(&provider_dataset)?,
             generation_digest,
         )?;
         let configured = BeaConfiguredEvidence {
@@ -713,7 +729,7 @@ impl ProviderAdapterActivation {
         }
     }
 
-    /// Executes the only live BEA product operation after revalidating its protected lease.
+    /// Executes the selected BEA Regional product operation after revalidating its protected lease.
     pub(crate) async fn execute_bea_regional(
         &self,
         request: BeaRegionalProductRequest,
@@ -762,11 +778,11 @@ impl ProviderAdapterActivation {
     }
 }
 
-fn fixed_regional_contract() -> Result<BeaDatasetContract, BeaProductError> {
+fn regional_state_income_contract(line_code: &str) -> Result<BeaDatasetContract, BeaProductError> {
     let mut parameters = BTreeMap::new();
     for (name, value) in [
         ("GeoFips", REGIONAL_GEO_FIPS),
-        ("LineCode", REGIONAL_LINE_CODE),
+        ("LineCode", line_code),
         ("TableName", REGIONAL_TABLE),
         ("Year", REGIONAL_YEAR_SCOPE),
     ] {
@@ -779,11 +795,33 @@ fn fixed_regional_contract() -> Result<BeaDatasetContract, BeaProductError> {
     )?)
 }
 
-/// Returns the sole code-owned BEA configuration used by activation metadata and runtime
-/// construction. Callers cannot add datasets, selectors, or parser capacity.
+/// Returns the bounded Settings-selectable BEA Regional state-income universe.
+///
+/// Each exact table/line/geography/period contract is metadata-admitted before `GetData`. This is
+/// intentionally a selected Regional profile, not a claim that every BEA dataset is supported.
 pub(crate) fn fixed_regional_source_config() -> Result<BeaSourceConfig, BeaProductError> {
+    let mut contracts = Vec::new();
+    for line_code in [
+        REGIONAL_PERSONAL_INCOME_LINE_CODE,
+        REGIONAL_POPULATION_LINE_CODE,
+        REGIONAL_PER_CAPITA_INCOME_LINE_CODE,
+    ] {
+        contracts.push(regional_state_income_contract(line_code)?);
+    }
+    Ok(BeaSourceConfig::try_new(contracts, fixed_parse_limits()?)?)
+}
+
+fn selected_regional_source_config(
+    provider_dataset: &SourceIdentifier,
+) -> Result<BeaSourceConfig, BeaProductError> {
+    let contract = fixed_regional_source_config()?
+        .contracts()
+        .iter()
+        .find(|contract| contract.dataset_id() == provider_dataset)
+        .cloned()
+        .ok_or(BeaProductError::InvalidOperation)?;
     Ok(BeaSourceConfig::try_new(
-        vec![fixed_regional_contract()?],
+        vec![contract],
         fixed_parse_limits()?,
     )?)
 }
@@ -797,12 +835,6 @@ fn fixed_parse_limits() -> Result<BeaParseLimits, BeaProductError> {
         MAXIMUM_DIMENSIONS,
         MAXIMUM_NOTES,
     )?)
-}
-
-fn fixed_series_allowlist() -> Result<AnalyticalMacroSeriesAllowlist, BeaProductError> {
-    Ok(AnalyticalMacroSeriesAllowlist::try_from_code_owned(&[
-        DELAWARE_PER_CAPITA_INCOME_SERIES,
-    ])?)
 }
 
 fn fixed_query_limits() -> Result<QueryLimits, BeaProductError> {
@@ -820,6 +852,8 @@ fn fixed_query_limits() -> Result<QueryLimits, BeaProductError> {
 /// Closed BEA product failure. Provider credential material is absent from every variant.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BeaProductError {
+    #[error("BEA activation was cancelled")]
+    Cancelled,
     #[error("BEA Regional setup is required")]
     SetupRequired,
     #[error("the exact BEA Regional runtime is unavailable")]
@@ -885,7 +919,7 @@ mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-    /// One intentionally ignored live proof covers the only code-owned BEA response family and the
+    /// One intentionally ignored live proof covers the bounded Regional response family and the
     /// complete protected setup -> sealed raw -> immutable macro -> PIT -> restart journey. It is
     /// ignored in normal test runs because it requires an operator credential and network access.
     #[tokio::test]
@@ -965,14 +999,10 @@ mod tests {
             .await?;
         let lease = onboarding.commit_prepared_activation(&prepared).await?;
         let metadata = source_metadata(&lease)?;
-        let config = fixed_regional_source_config()?;
-        let provider_dataset = config
-            .contracts()
-            .first()
-            .filter(|_| config.contracts().len() == 1)
-            .ok_or("fixed BEA Regional contract is unavailable")?
-            .dataset_id()
-            .clone();
+        let provider_dataset =
+            regional_state_income_contract(REGIONAL_PER_CAPITA_INCOME_LINE_CODE)?
+                .dataset_id()
+                .clone();
         activation
             .activate_ready_profile(
                 lease.session_id(),
@@ -1003,10 +1033,15 @@ mod tests {
             )
             .await?;
         let restart_selector = outcome.ready().restart_selector().clone();
+        let series_allowlist = outcome.ready().series_allowlist().clone();
         let selection_digest = outcome.ready().selection_digest();
         let selected_observations = outcome.ready().selected_observations();
+        let published_series = outcome.ready().published_series();
+        let doctor_refresh = outcome.ready().doctor_refresh();
         let manifest = restart_selector.manifest().clone();
         assert!(selected_observations > 0);
+        assert!(published_series >= outcome.ready().series_allowlist().series().len());
+        assert_eq!(doctor_refresh, BeaDoctorRefreshDisposition::Activated);
         assert_eq!(restart_selector.source_id().as_str(), BEA_SOURCE_ID);
 
         drop(outcome);
@@ -1029,7 +1064,7 @@ mod tests {
             .read_provider_period_latest_known(
                 BeaProviderPeriodLatestKnownRequest::try_new(
                     restart_selector.clone(),
-                    fixed_series_allowlist()?,
+                    series_allowlist,
                     knowledge_cutoff,
                     period,
                 )?,
@@ -1045,14 +1080,15 @@ mod tests {
         assert_eq!(read.output().selection_digest(), selection_digest);
         assert_eq!(read.output().observations().len(), selected_observations);
         eprintln!(
-            "BEA_LIVE_EVIDENCE source={} dataset={} table={} line={} geography={} period_scope={} canonical_rows={} selected_rows={} manifest_dataset={} manifest_version={} selection={selection_digest:?}",
+            "BEA_LIVE_EVIDENCE source={} dataset={} table={} line={} geography={} period_scope={} canonical_rows={} published_series={} selected_rows={} doctor_refresh={doctor_refresh:?} manifest_dataset={} manifest_version={} selection={selection_digest:?}",
             BEA_SOURCE_ID,
             REGIONAL_DATASET,
             REGIONAL_TABLE,
-            REGIONAL_LINE_CODE,
+            REGIONAL_PER_CAPITA_INCOME_LINE_CODE,
             REGIONAL_GEO_FIPS,
             REGIONAL_YEAR_SCOPE,
             restart_selector.total_rows(),
+            published_series,
             selected_observations,
             manifest.dataset_id().as_str(),
             manifest.manifest_version(),

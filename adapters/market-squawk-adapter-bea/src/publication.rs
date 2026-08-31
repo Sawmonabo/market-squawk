@@ -453,6 +453,9 @@ struct BeaNativeLineageRowV1<'a> {
     unit_multiplier: i16,
     note_references: &'a [String],
     notes: Vec<BeaNativeNoteV1<'a>>,
+    revision_state: &'static str,
+    correction_state: &'static str,
+    supersession_state: &'static str,
 }
 
 #[derive(Serialize)]
@@ -474,6 +477,9 @@ struct BeaNativeLineageBatchV1<'a> {
     returned_rows: u64,
     missing_rows: Option<u64>,
     completeness: &'static str,
+    revision_state: &'static str,
+    correction_state: &'static str,
+    supersession_state: &'static str,
 }
 
 #[derive(Serialize)]
@@ -593,6 +599,9 @@ fn native_lineage(
                 crate::BeaCompleteness::Partial => "partial",
                 crate::BeaCompleteness::ExpectedCountUnknown => "expected_count_unknown",
             },
+            revision_state: crate::revision::BEA_REVISION_STATE,
+            correction_state: crate::revision::BEA_CORRECTION_STATE,
+            supersession_state: crate::revision::BEA_SUPERSESSION_STATE,
         })
         .map_err(|_| BeaPublicationError::InvalidEvidence)?;
     for observation in page.observations() {
@@ -648,6 +657,9 @@ fn native_lineage(
                 unit_multiplier: observation.unit().unit_multiplier(),
                 note_references: observation.note_references(),
                 notes,
+                revision_state: crate::revision::BEA_REVISION_STATE,
+                correction_state: crate::revision::BEA_CORRECTION_STATE,
+                supersession_state: crate::revision::BEA_SUPERSESSION_STATE,
             })
             .map_err(|_| BeaPublicationError::InvalidEvidence)?;
     }
