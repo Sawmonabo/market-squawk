@@ -17,8 +17,8 @@ use market_squawk_modeling::{
     ForecastRequest, ForecastValue, ModelFeatureValue, ModelInput, ResearchForecastBackend,
 };
 use market_squawk_services::{
-    ArtifactError, ArtifactPublicationContext, RequestContext, ServiceError, TypedToolRequest,
-    TypedToolResult,
+    ArtifactError, ArtifactPublicationContext, RequestContext, ServiceError, ServiceLimits,
+    ToolResultMetadata, TypedToolRequest, TypedToolResult,
 };
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
@@ -29,8 +29,8 @@ use super::super::{
     forecast_model_evidence_projection_for_horizon, one_result,
 };
 use super::{
-    ForecastAnalysisEvidence, ForecastApplicationError, ForecastProductIdentity,
-    ForecastProductTarget, ForecastServingEvidence,
+    ForecastAnalysisEvidence, ForecastApplicationError, ForecastCollection,
+    ForecastProductIdentity, ForecastProductTarget, ForecastServingEvidence,
 };
 use crate::application::domain_support::{admitted_result_limits, ensure_request_live};
 
@@ -184,13 +184,12 @@ impl ModelDomainService {
         let limits = admitted_result_limits(request, context)?;
         let maximum =
             NonZeroUsize::new(limits.maximum_result_items()).ok_or(ServiceError::InvalidRequest)?;
-        one_result(
+        collection_result(
             forecasts
                 .list_forecasts(maximum)
                 .await
                 .map_err(map_forecast_error)?,
-            request,
-            context,
+            limits,
         )
     }
 
@@ -204,15 +203,27 @@ impl ModelDomainService {
         let limits = admitted_result_limits(request, context)?;
         let maximum =
             NonZeroUsize::new(limits.maximum_result_items()).ok_or(ServiceError::InvalidRequest)?;
-        one_result(
+        collection_result(
             forecasts
                 .get_forecast_outcomes(vintage, maximum)
                 .await
                 .map_err(map_forecast_error)?,
-            request,
-            context,
+            limits,
         )
     }
+}
+
+fn collection_result(
+    collection: ForecastCollection,
+    limits: ServiceLimits,
+) -> Result<TypedToolResult, ServiceError> {
+    let (content, returned, available) = collection.into_parts();
+    let metadata = if returned < available {
+        ToolResultMetadata::try_truncated_not_applicable(available)?
+    } else {
+        ToolResultMetadata::complete_not_applicable()
+    };
+    TypedToolResult::try_new(content, returned, metadata, limits).map_err(Into::into)
 }
 
 struct ParsedForecastRequest {

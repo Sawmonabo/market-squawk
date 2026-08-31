@@ -1576,6 +1576,34 @@ pub struct ForecastApplicationService {
     limits: ForecastApplicationLimits,
 }
 
+/// Bounded collection content plus the complete logical population count.
+pub(super) struct ForecastCollection {
+    content: Value,
+    returned_items: usize,
+    available_items: usize,
+}
+
+impl ForecastCollection {
+    fn try_new(
+        content: Value,
+        returned_items: usize,
+        available_items: usize,
+    ) -> Result<Self, ForecastApplicationError> {
+        if returned_items > available_items {
+            return Err(ForecastApplicationError::CorruptIndex);
+        }
+        Ok(Self {
+            content,
+            returned_items,
+            available_items,
+        })
+    }
+
+    pub(super) fn into_parts(self) -> (Value, usize, usize) {
+        (self.content, self.returned_items, self.available_items)
+    }
+}
+
 pub(super) struct RetainedForecastBackup {
     pub(super) runtime: RetainedRuntimeBackup,
     pub(super) canonical_index: Box<[u8]>,
@@ -1728,10 +1756,10 @@ impl ForecastApplicationService {
     }
 
     /// Lists newest stored vintages first under the lower caller/storage ceiling.
-    pub async fn list_forecasts(
+    pub(super) async fn list_forecasts(
         &self,
         maximum: NonZeroUsize,
-    ) -> Result<Value, ForecastApplicationError> {
+    ) -> Result<ForecastCollection, ForecastApplicationError> {
         let maximum = maximum.get().min(self.limits.maximum_vintages.get());
         let index = self.index.lock().await;
         let available = index.vintages.len();
@@ -1742,19 +1770,24 @@ impl ForecastApplicationService {
             .take(maximum)
             .map(VintageRecord::product_summary)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(json!({
-            "forecasts": records,
-            "available": available,
-            "truncated": records.len() < available,
-        }))
+        let returned = records.len();
+        ForecastCollection::try_new(
+            json!({
+                "forecasts": records,
+                "available": available,
+                "truncated": returned < available,
+            }),
+            returned,
+            available,
+        )
     }
 
     /// Returns immutable stored outcomes for one exact vintage.
-    pub async fn get_forecast_outcomes(
+    pub(super) async fn get_forecast_outcomes(
         &self,
         token: &str,
         maximum: NonZeroUsize,
-    ) -> Result<Value, ForecastApplicationError> {
+    ) -> Result<ForecastCollection, ForecastApplicationError> {
         let token = Uuid::parse_str(token).map_err(|_| ForecastApplicationError::InvalidRecord)?;
         let index = self.index.lock().await;
         let vintage = product_vintage(&index, token)?;
@@ -1770,12 +1803,17 @@ impl ForecastApplicationService {
             .take(maximum.get().min(self.limits.maximum_outcomes.get()))
             .map(|outcome| vintage.product_outcome(outcome))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(json!({
-            "forecastToken": token,
-            "outcomes": outcomes,
-            "available": available,
-            "truncated": outcomes.len() < available,
-        }))
+        let returned = outcomes.len();
+        ForecastCollection::try_new(
+            json!({
+                "forecastToken": token,
+                "outcomes": outcomes,
+                "available": available,
+                "truncated": returned < available,
+            }),
+            returned,
+            available,
+        )
     }
 
     async fn get_forecast_by_identity(

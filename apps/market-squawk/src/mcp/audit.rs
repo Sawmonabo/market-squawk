@@ -536,6 +536,11 @@ enum AuditOperationRecord<'event> {
         name: &'event str,
         version: &'event str,
     },
+    ReadResource {
+        name: &'event str,
+        operation: &'event str,
+        version: &'event str,
+    },
     Other,
 }
 
@@ -546,6 +551,15 @@ impl<'event> From<&'event AuditOperation> for AuditOperationRecord<'event> {
             AuditOperation::Ping => Self::Ping,
             AuditOperation::ListTools => Self::ListTools,
             AuditOperation::CallTool { name, version } => Self::CallTool { name, version },
+            AuditOperation::ReadResource {
+                name,
+                operation,
+                version,
+            } => Self::ReadResource {
+                name,
+                operation,
+                version,
+            },
             AuditOperation::Other => Self::Other,
         }
     }
