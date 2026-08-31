@@ -1271,8 +1271,9 @@ impl BudgetPermitLease {
 /// RAII concurrency reservation for one request that has not reached transport dispatch.
 ///
 /// Dropping or releasing it consumes no provider request-window capacity. Only
-/// [`BudgetReservation::commit_dispatch`] can produce a [`BudgetPermit`] and an active request
-/// lease.
+/// [`BudgetReservation::commit_dispatch`] or the weighted-response
+/// [`BudgetReservation::commit_dispatch_with_response_bound`] transport seam can produce a
+/// [`BudgetPermit`] and an active request lease.
 pub struct BudgetReservation {
     pub(in crate::policy) allocation: Arc<BudgetAllocation>,
     pub(in crate::policy) runtime_admission: Option<RuntimeOperationAdmission>,

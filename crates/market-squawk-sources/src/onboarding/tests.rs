@@ -1437,6 +1437,7 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
     assert_eq!(sec_budget.requests_per_window(), 2);
     assert_eq!(sec_budget.window_nanos(), 1_000_000_000);
     assert_eq!(sec_budget.max_concurrent(), 1);
+    assert_eq!(sec_budget.weighted_window_count(), 0);
     let hidden_source_ids = [
         FASB_XBRL_TAXONOMY_SOURCE_ID,
         XBRL_US_LEGACY_TAXONOMY_SOURCE_ID,
@@ -1486,6 +1487,35 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
             );
         } else {
             assert_eq!(budget.requests_per_window(), 1);
+            assert_eq!(budget.weighted_window_count(), 2);
+            assert_eq!(
+                budget.weighted_window(0).map(|window| (
+                    window.dimension(),
+                    window.maximum_units(),
+                    window.window_nanos(),
+                    window.semantics(),
+                )),
+                Some((
+                    crate::ProviderRateWeightedDimension::ResponseBytes,
+                    503_316_480,
+                    60_000_000_000,
+                    crate::BudgetWindowSemantics::Sliding,
+                ))
+            );
+            assert_eq!(
+                budget.weighted_window(1).map(|window| (
+                    window.dimension(),
+                    window.maximum_units(),
+                    window.window_nanos(),
+                    window.semantics(),
+                )),
+                Some((
+                    crate::ProviderRateWeightedDimension::ProviderErrors,
+                    10,
+                    60_000_000_000,
+                    crate::BudgetWindowSemantics::Sliding,
+                ))
+            );
             assert_eq!(
                 authority.request_header_class(),
                 FilingTaxonomyRequestHeaderClass::ProductOnlyNoSecContact

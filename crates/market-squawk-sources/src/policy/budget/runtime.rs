@@ -1170,7 +1170,14 @@ impl BudgetReservation {
         self.commit_dispatch_with_claim(crate::ProviderRateDispatchClaim::request_only())
     }
 
-    pub(crate) fn commit_dispatch_with_response_bound(
+    /// Charges every request window and reserves the exact worst-case response capacity required
+    /// by this budget's weighted byte and provider-error windows.
+    ///
+    /// This is the narrow adapter transport seam for policies that govern response dimensions.
+    /// The response bound must come from the already-authorized endpoint policy; this method does
+    /// not mint endpoint, request, store, or settlement authority. Request-only policies retain
+    /// their request-only dispatch claim.
+    pub fn commit_dispatch_with_response_bound(
         self,
         maximum_response_bytes: NonZeroU64,
     ) -> BudgetDispatchDecision {

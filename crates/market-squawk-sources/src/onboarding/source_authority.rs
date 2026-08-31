@@ -12,13 +12,18 @@ use thiserror::Error;
 use url::Url;
 
 use crate::{
-    ApiEndpointRule, BackoffPolicy, BudgetScope, EndpointPolicy, HttpRequestBounds, PathScope,
-    ProviderBudgetPolicy,
+    ApiEndpointRule, BackoffPolicy, BudgetScope, BudgetWindowSemantics, EndpointPolicy,
+    HttpRequestBounds, PathScope, ProviderBudgetPolicy, ProviderBudgetWindow,
+    ProviderRateWeightedDimension, ProviderRateWeightedWindow,
 };
 
 const SECOND_NANOS: u64 = 1_000_000_000;
 const MINUTE_NANOS: u64 = 60 * SECOND_NANOS;
 const MEBIBYTE: u64 = 1024 * 1024;
+const SECONDS_PER_MINUTE: u64 = 60;
+// Conservative application fallback used by the existing shared provider-error window pattern;
+// this is not a publisher claim.
+const TAXONOMY_PROVIDER_ERRORS_PER_MINUTE: u64 = 10;
 const DESCRIPTOR_EVIDENCE_DOMAIN: &[u8] =
     b"market-squawk/sec-filing-source-authority-descriptor/v1";
 const ACTIVATION_EVIDENCE_DOMAIN: &[u8] =
@@ -263,6 +268,7 @@ pub struct FilingTaxonomySourceAuthority {
     max_concurrent: u16,
     max_response_bytes: u64,
     total_timeout_nanos: u64,
+    weighted_taxonomy_response_budget: bool,
 }
 
 impl FilingTaxonomySourceAuthority {
@@ -308,16 +314,58 @@ impl FilingTaxonomySourceAuthority {
         let backoff =
             BackoffPolicy::try_new(nonzero_u64(SECOND_NANOS)?, nonzero_u64(MINUTE_NANOS)?, 0)
                 .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidBudgetPolicy)?;
-        ProviderBudgetPolicy::try_new(
-            scope,
+        let request_windows = [ProviderBudgetWindow::try_new(
             NonZeroU32::new(self.requests_per_second)
                 .ok_or(FilingTaxonomyAuthorityContractError::InvalidBudgetPolicy)?,
             nonzero_u64(SECOND_NANOS)?,
+            BudgetWindowSemantics::Tumbling,
+        )
+        .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidBudgetPolicy)?];
+        let weighted_windows = self
+            .weighted_taxonomy_response_budget
+            .then(|| self.weighted_taxonomy_windows())
+            .transpose()?;
+        let weighted_windows = match &weighted_windows {
+            Some(windows) => windows.as_slice(),
+            None => &[],
+        };
+        ProviderBudgetPolicy::try_new_weighted_conjunctive(
+            scope,
+            &request_windows,
+            weighted_windows,
             NonZeroU16::new(self.max_concurrent)
                 .ok_or(FilingTaxonomyAuthorityContractError::InvalidBudgetPolicy)?,
             backoff,
         )
         .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidBudgetPolicy)
+    }
+
+    fn weighted_taxonomy_windows(
+        self,
+    ) -> Result<[ProviderRateWeightedWindow; 2], FilingTaxonomyAuthorityContractError> {
+        let requests_per_minute = u64::from(self.requests_per_second)
+            .checked_mul(SECONDS_PER_MINUTE)
+            .ok_or(FilingTaxonomyAuthorityContractError::InvalidBudgetPolicy)?;
+        let response_bytes_per_minute = self
+            .max_response_bytes
+            .checked_mul(requests_per_minute)
+            .ok_or(FilingTaxonomyAuthorityContractError::InvalidBudgetPolicy)?;
+        Ok([
+            ProviderRateWeightedWindow::try_new(
+                ProviderRateWeightedDimension::ResponseBytes,
+                nonzero_u64(response_bytes_per_minute)?,
+                nonzero_u64(MINUTE_NANOS)?,
+                BudgetWindowSemantics::Sliding,
+            )
+            .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidBudgetPolicy)?,
+            ProviderRateWeightedWindow::try_new(
+                ProviderRateWeightedDimension::ProviderErrors,
+                nonzero_u64(TAXONOMY_PROVIDER_ERRORS_PER_MINUTE)?,
+                nonzero_u64(MINUTE_NANOS)?,
+                BudgetWindowSemantics::Sliding,
+            )
+            .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidBudgetPolicy)?,
+        ])
     }
 
     /// Returns deterministic evidence for the complete code-owned authority descriptor.
@@ -471,6 +519,7 @@ pub const SEC_EDGAR_AUTHORITY: FilingTaxonomySourceAuthority = FilingTaxonomySou
     max_concurrent: 1,
     max_response_bytes: 1024 * MEBIBYTE,
     total_timeout_nanos: 15 * MINUTE_NANOS,
+    weighted_taxonomy_response_budget: false,
 };
 
 /// FASB-published modern US-GAAP taxonomy component authority.
@@ -487,6 +536,7 @@ pub const FASB_XBRL_TAXONOMY_AUTHORITY: FilingTaxonomySourceAuthority =
         max_concurrent: 1,
         max_response_bytes: 8 * MEBIBYTE,
         total_timeout_nanos: 2 * MINUTE_NANOS,
+        weighted_taxonomy_response_budget: true,
     };
 
 /// XBRL US-published legacy US-GAAP taxonomy component authority.
@@ -503,6 +553,7 @@ pub const XBRL_US_LEGACY_TAXONOMY_AUTHORITY: FilingTaxonomySourceAuthority =
         max_concurrent: 1,
         max_response_bytes: 8 * MEBIBYTE,
         total_timeout_nanos: 2 * MINUTE_NANOS,
+        weighted_taxonomy_response_budget: true,
     };
 
 /// XBRL International standards component authority.
@@ -519,6 +570,7 @@ pub const XBRL_INTERNATIONAL_STANDARDS_AUTHORITY: FilingTaxonomySourceAuthority 
         max_concurrent: 1,
         max_response_bytes: 8 * MEBIBYTE,
         total_timeout_nanos: 2 * MINUTE_NANOS,
+        weighted_taxonomy_response_budget: true,
     };
 
 /// W3C XML Schema standards component authority.
@@ -535,6 +587,7 @@ pub const W3C_XML_SCHEMA_STANDARDS_AUTHORITY: FilingTaxonomySourceAuthority =
         max_concurrent: 1,
         max_response_bytes: 8 * MEBIBYTE,
         total_timeout_nanos: 2 * MINUTE_NANOS,
+        weighted_taxonomy_response_budget: true,
     };
 
 /// Complete bounded set of hidden code-owned filing component authorities.
