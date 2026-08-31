@@ -191,23 +191,41 @@ impl SecEdgarSource {
         cik: &str,
         cancellation: CancellationToken,
     ) -> Result<RetrievedSubmissions, SecClientError> {
+        self.fetch_submissions_with_allocation_authority(
+            authority,
+            cik,
+            cancellation,
+            crate::json::RetainedJsonBudget::new(self.parser_limits),
+        )
+        .await
+    }
+
+    pub(crate) async fn fetch_submissions_with_allocation_authority(
+        &self,
+        authority: &ExtractionAuthority,
+        cik: &str,
+        cancellation: CancellationToken,
+        retained: crate::json::RetainedJsonBudget,
+    ) -> Result<RetrievedSubmissions, SecClientError> {
         self.validate_authority(authority)?;
         let expected_cik = normalized_cik(cik)?;
         let raw = self
-            .retrieve(
+            .retrieve_with_allocation_authority(
                 authority,
                 &SecObjectLocator::submissions(&expected_cik)?,
                 &cancellation,
+                Some(retained.clone()),
             )
             .await?;
         let bytes = raw.bytes().clone();
         let limits = self.parser_limits;
         let document = self
             .run_validation_blocking(&cancellation, move |worker_cancellation| {
-                let document = SubmissionsDocument::parse_with_cancellation(
+                let document = SubmissionsDocument::parse_with_allocation_authority(
                     &bytes,
                     limits,
                     worker_cancellation,
+                    retained,
                 )?;
                 if document.cik().as_str() != expected_cik {
                     return Err(SecClientError::ResponseCikMismatch);
@@ -226,22 +244,40 @@ impl SecEdgarSource {
         name: &str,
         cancellation: CancellationToken,
     ) -> Result<(SubmissionsArchive, RetrievedSecBytes), SecClientError> {
+        self.fetch_submissions_archive_with_allocation_authority(
+            authority,
+            name,
+            cancellation,
+            crate::json::RetainedJsonBudget::new(self.parser_limits),
+        )
+        .await
+    }
+
+    pub(crate) async fn fetch_submissions_archive_with_allocation_authority(
+        &self,
+        authority: &ExtractionAuthority,
+        name: &str,
+        cancellation: CancellationToken,
+        retained: crate::json::RetainedJsonBudget,
+    ) -> Result<(SubmissionsArchive, RetrievedSecBytes), SecClientError> {
         self.validate_authority(authority)?;
         let raw = self
-            .retrieve(
+            .retrieve_with_allocation_authority(
                 authority,
                 &SecObjectLocator::companion(name)?,
                 &cancellation,
+                Some(retained.clone()),
             )
             .await?;
         let bytes = raw.bytes().clone();
         let limits = self.parser_limits;
         let document = self
             .run_validation_blocking(&cancellation, move |worker_cancellation| {
-                SubmissionsDocument::parse_archive_with_cancellation(
+                SubmissionsDocument::parse_archive_with_allocation_authority(
                     &bytes,
                     limits,
                     worker_cancellation,
+                    retained,
                 )
                 .map_err(Into::into)
             })
@@ -257,23 +293,41 @@ impl SecEdgarSource {
         cik: &str,
         cancellation: CancellationToken,
     ) -> Result<RetrievedCompanyFacts, SecClientError> {
+        self.fetch_company_facts_with_allocation_authority(
+            authority,
+            cik,
+            cancellation,
+            crate::json::RetainedJsonBudget::new(self.parser_limits),
+        )
+        .await
+    }
+
+    pub(crate) async fn fetch_company_facts_with_allocation_authority(
+        &self,
+        authority: &ExtractionAuthority,
+        cik: &str,
+        cancellation: CancellationToken,
+        retained: crate::json::RetainedJsonBudget,
+    ) -> Result<RetrievedCompanyFacts, SecClientError> {
         self.validate_authority(authority)?;
         let expected_cik = normalized_cik(cik)?;
         let raw = self
-            .retrieve(
+            .retrieve_with_allocation_authority(
                 authority,
                 &SecObjectLocator::company_facts(&expected_cik)?,
                 &cancellation,
+                Some(retained.clone()),
             )
             .await?;
         let bytes = raw.bytes().clone();
         let limits = self.parser_limits;
         let document = self
             .run_validation_blocking(&cancellation, move |worker_cancellation| {
-                let document = CompanyFactsDocument::parse_with_cancellation(
+                let document = CompanyFactsDocument::parse_with_allocation_authority(
                     &bytes,
                     limits,
                     worker_cancellation,
+                    retained,
                 )?;
                 if document.cik().as_str() != expected_cik {
                     return Err(SecClientError::ResponseCikMismatch);
@@ -895,6 +949,17 @@ impl SecEdgarSource {
         locator: &SecObjectLocator,
         cancellation: &CancellationToken,
     ) -> Result<RetrievedSecBytes, SecClientError> {
+        self.retrieve_with_allocation_authority(authority, locator, cancellation, None)
+            .await
+    }
+
+    async fn retrieve_with_allocation_authority(
+        &self,
+        authority: &ExtractionAuthority,
+        locator: &SecObjectLocator,
+        cancellation: &CancellationToken,
+        retained: Option<crate::json::RetainedJsonBudget>,
+    ) -> Result<RetrievedSecBytes, SecClientError> {
         self.validate_authority(authority)?;
         let request_bounds = self.request_bounds(authority)?;
         let mut current = locator.url().to_owned();
@@ -1008,9 +1073,13 @@ impl SecEdgarSource {
                 .unwrap_or(0)
                 .min(1024 * 1024);
             let mut bytes = Vec::new();
-            bytes
-                .try_reserve(initial_capacity)
-                .map_err(|_| SecClientError::AllocationFailed)?;
+            if let Some(retained) = retained.as_ref() {
+                crate::json::try_reserve_exact_bounded(&mut bytes, initial_capacity, retained)?;
+            } else {
+                bytes
+                    .try_reserve(initial_capacity)
+                    .map_err(|_| SecClientError::AllocationFailed)?;
+            }
             let mut stream = response.bytes_stream();
             loop {
                 in_flight.validate_current()?;
@@ -1048,9 +1117,13 @@ impl SecEdgarSource {
                     self.update_health(SecExtractionHealthState::InvalidResponse, None)?;
                     return Err(SecClientError::ResponseTooLarge);
                 }
-                bytes
-                    .try_reserve(chunk.len())
-                    .map_err(|_| SecClientError::AllocationFailed)?;
+                if let Some(retained) = retained.as_ref() {
+                    crate::json::try_reserve_exact_bounded(&mut bytes, chunk.len(), retained)?;
+                } else {
+                    bytes
+                        .try_reserve(chunk.len())
+                        .map_err(|_| SecClientError::AllocationFailed)?;
+                }
                 bytes.extend_from_slice(&chunk);
             }
             drop(stream);

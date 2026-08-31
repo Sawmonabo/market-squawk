@@ -82,7 +82,17 @@ impl RetrievedSubmissions {
         parser_limits: SecParserLimits,
     ) -> Result<Self, SecClientError> {
         let bounds = SecCompositeBounds::production_defaults();
-        let recent = SubmissionsDocument::parse(recent_bytes, parser_limits)?;
+        let retained = crate::json::RetainedJsonBudget::new(parser_limits);
+        retained.admit_bytes(recent_bytes.len())?;
+        for bytes in archive_bytes {
+            retained.admit_bytes(bytes.len())?;
+        }
+        let recent = SubmissionsDocument::parse_with_allocation_authority(
+            recent_bytes,
+            parser_limits,
+            &CancellationToken::new(),
+            retained.clone(),
+        )?;
         if recent.companions().len() != archive_bytes.len()
             || archive_bytes.len() > usize::from(bounds.max_companion_objects)
         {
@@ -101,13 +111,13 @@ impl RetrievedSubmissions {
             .map_err(|_| SecClientError::CompositeByteLimitExceeded)?;
         ensure_total_bytes(total_bytes, bounds)?;
         let mut archives = Vec::new();
-        archives
-            .try_reserve(archive_bytes.len())
-            .map_err(|_| SecClientError::AllocationFailed)?;
+        crate::json::try_reserve_exact_bounded(&mut archives, archive_bytes.len(), &retained)?;
         let mut evidence_entries = Vec::new();
-        evidence_entries
-            .try_reserve(archive_bytes.len().saturating_add(1))
-            .map_err(|_| SecClientError::AllocationFailed)?;
+        crate::json::try_reserve_exact_bounded(
+            &mut evidence_entries,
+            archive_bytes.len().saturating_add(1),
+            &retained,
+        )?;
         let current_evidence = raw_store.persist(recent_bytes)?;
         evidence_entries.push(OfflineCompositeRepresentation {
             source_name: "current".to_owned(),
@@ -123,7 +133,14 @@ impl RetrievedSubmissions {
                 )
                 .ok_or(SecClientError::CompositeByteLimitExceeded)?;
             ensure_total_bytes(total_bytes, bounds)?;
-            archives.push(SubmissionsDocument::parse_archive(bytes, parser_limits)?);
+            archives.push(
+                SubmissionsDocument::parse_archive_with_allocation_authority(
+                    bytes,
+                    parser_limits,
+                    &CancellationToken::new(),
+                    retained.clone(),
+                )?,
+            );
             evidence_entries.push(OfflineCompositeRepresentation {
                 source_name: companion.name().as_str().to_owned(),
                 evidence: raw_store.persist(bytes)?,
@@ -131,23 +148,31 @@ impl RetrievedSubmissions {
                     .map_err(|_| SecClientError::CompositeByteLimitExceeded)?,
             });
         }
-        let reconciled = reconcile_submissions(&recent, &archives, parser_limits)?;
+        let reconciled = crate::json::reconcile_submissions_with_allocation_authority(
+            &recent,
+            &archives,
+            parser_limits,
+            &CancellationToken::new(),
+            retained.clone(),
+        )?;
         let manifest = OfflineSubmissionsCompositeManifest {
             schema_version: "market-squawk-sec-offline-submissions-composite-v1",
             cik: reconciled.cik().as_str().to_owned(),
             representations: evidence_entries,
         };
         let cancellation = CancellationToken::new();
-        let mut writer = CompositeManifestWriter::new(&cancellation);
+        let mut writer = CompositeManifestWriter::new(&cancellation, retained.clone());
         serde_json::to_writer(&mut writer, &manifest)
             .map_err(|_| SecClientError::CompositeSerialization)?;
         let manifest_bytes = writer.into_inner();
         let manifest_evidence = raw_store.persist(&manifest_bytes)?;
         let received_at = crate::client::system_timestamp()?;
         let mut components = Vec::new();
-        components
-            .try_reserve(archive_bytes.len().saturating_add(1))
-            .map_err(|_| SecClientError::AllocationFailed)?;
+        crate::json::try_reserve_exact_bounded(
+            &mut components,
+            archive_bytes.len().saturating_add(1),
+            &retained,
+        )?;
         components.push(RetrievedSecBytes::offline_import(
             recent_bytes,
             current_evidence,
@@ -374,10 +399,16 @@ impl SecEdgarSource {
         cancellation: CancellationToken,
     ) -> Result<RetrievedSubmissions, SecClientError> {
         self.validate_authority(authority)?;
+        let retained = crate::json::RetainedJsonBudget::new(self.parser_limits());
         let recent_cancellation = cancellation.child_token();
         let remaining = deadline_remaining(deadline)?;
         let recent = tokio::select! {
-            result = self.fetch_submissions(authority, cik, recent_cancellation.clone()) => result?,
+            result = self.fetch_submissions_with_allocation_authority(
+                authority,
+                cik,
+                recent_cancellation.clone(),
+                retained.clone(),
+            ) => result?,
             () = tokio::time::sleep(remaining) => {
                 recent_cancellation.cancel();
                 return Err(SecClientError::DeadlineExceeded);
@@ -401,6 +432,7 @@ impl SecEdgarSource {
             }
         }
 
+        crate::json::admit_document_allocations(&retained, recent.document())?;
         let recent_document = recent.document().clone();
         let mut total_bytes = response_size(recent.raw())?;
         ensure_total_bytes(total_bytes, bounds)?;
@@ -409,23 +441,20 @@ impl SecEdgarSource {
             .checked_add(1)
             .ok_or(SecClientError::CompanionObjectLimitExceeded)?;
         let mut components = Vec::new();
-        components
-            .try_reserve(component_count)
-            .map_err(|_| SecClientError::AllocationFailed)?;
+        crate::json::try_reserve_exact_bounded(&mut components, component_count, &retained)?;
         components.push(recent.raw().clone());
         let mut archives = Vec::<SubmissionsArchive>::new();
-        archives
-            .try_reserve(companions.len())
-            .map_err(|_| SecClientError::AllocationFailed)?;
+        crate::json::try_reserve_exact_bounded(&mut archives, companions.len(), &retained)?;
 
         for companion in companions {
             let attempt_cancellation = cancellation.child_token();
             let remaining = deadline_remaining(deadline)?;
             let (archive, raw) = tokio::select! {
-                result = self.fetch_submissions_archive(
+                result = self.fetch_submissions_archive_with_allocation_authority(
                     authority,
                     companion.name().as_str(),
                     attempt_cancellation.clone(),
+                    retained.clone(),
                 ) => result?,
                 () = tokio::time::sleep(remaining) => {
                     attempt_cancellation.cancel();
@@ -445,23 +474,34 @@ impl SecEdgarSource {
         }
 
         let limits = self.parser_limits();
+        let reconciliation_authority = retained.clone();
         let reconciled = self
             .run_validation_blocking(&cancellation, move |worker_cancellation| {
-                reconcile_submissions_with_cancellation(
+                crate::json::reconcile_submissions_with_allocation_authority(
                     &recent_document,
                     &archives,
                     limits,
                     worker_cancellation,
+                    reconciliation_authority,
                 )
                 .map_err(Into::into)
             })
             .await?;
         self.validate_authority(authority)?;
+        let mut manifest_components = Vec::new();
+        crate::json::try_reserve_exact_bounded(
+            &mut manifest_components,
+            components.len(),
+            &retained,
+        )?;
+        manifest_components.extend(components.iter().cloned());
+        let manifest_cik = crate::json::owned_string_bounded(reconciled.cik().as_str(), &retained)?;
         let manifest_raw = persist_manifest(
             self,
-            reconciled.cik().as_str().to_owned(),
-            components.clone(),
+            manifest_cik,
+            manifest_components,
             &cancellation,
+            retained,
         )
         .await?;
         self.validate_authority(authority)?;
@@ -487,6 +527,8 @@ pub(crate) fn restore_online_submissions(
     {
         return Err(SecClientError::InvalidCompositeRepresentation);
     }
+    let retained = crate::json::RetainedJsonBudget::new(parser_limits);
+    retained.admit_bytes(manifest_bytes.len())?;
     let manifest_limits = SecParserLimits::try_new(
         MAX_COMPOSITE_MANIFEST_BYTES,
         usize::from(MAX_COMPANION_OBJECTS) + 1,
@@ -495,10 +537,11 @@ pub(crate) fn restore_online_submissions(
         256 * 1024,
         1024 * 1024,
     )?;
-    let value = crate::json::parse_bounded_json_with_cancellation(
+    let value = crate::json::parse_bounded_json_with_allocation_authority(
         manifest_bytes,
         manifest_limits,
         cancellation,
+        retained.clone(),
     )?;
     let manifest: OnlineSubmissionsCompositeManifestWire =
         serde_json::from_value(value).map_err(SecParserError::from)?;
@@ -512,6 +555,9 @@ pub(crate) fn restore_online_submissions(
     let mut by_locator = BTreeMap::new();
     for representation in manifest.representations {
         validate_online_representation(&representation, bounds)?;
+        retained.admit_btree_entry::<String, OnlineCompositeRepresentationWire>(
+            representation.locator.capacity(),
+        )?;
         if by_locator
             .insert(representation.locator.clone(), representation)
             .is_some()
@@ -524,9 +570,16 @@ pub(crate) fn restore_online_submissions(
         .ok_or(SecClientError::InvalidCompositeRepresentation)?;
     let mut total_bytes = current.size_bytes;
     ensure_total_bytes(total_bytes, bounds)?;
+    retained.admit_bytes(
+        usize::try_from(current.size_bytes).map_err(|_| SecClientError::ResponseTooLarge)?,
+    )?;
     let current_bytes = read_component(raw_store, &current, cancellation)?;
-    let current_document =
-        SubmissionsDocument::parse_with_cancellation(&current_bytes, parser_limits, cancellation)?;
+    let current_document = SubmissionsDocument::parse_with_allocation_authority(
+        &current_bytes,
+        parser_limits,
+        cancellation,
+        retained.clone(),
+    )?;
     if current_document.cik().as_str() != manifest.cik {
         return Err(SecClientError::InvalidCompositeRepresentation);
     }
@@ -534,15 +587,19 @@ pub(crate) fn restore_online_submissions(
         return Err(SecClientError::CompanionObjectLimitExceeded);
     }
     let mut components = Vec::new();
-    components
-        .try_reserve(current_document.companions().len().saturating_add(1))
-        .map_err(|_| SecClientError::AllocationFailed)?;
+    crate::json::try_reserve_exact_bounded(
+        &mut components,
+        current_document.companions().len().saturating_add(1),
+        &retained,
+    )?;
     let mut available_at = current.first_observed_at;
     components.push(restored_component(current_bytes, current));
     let mut archives = Vec::new();
-    archives
-        .try_reserve(current_document.companions().len())
-        .map_err(|_| SecClientError::AllocationFailed)?;
+    crate::json::try_reserve_exact_bounded(
+        &mut archives,
+        current_document.companions().len(),
+        &retained,
+    )?;
     for companion in current_document.companions() {
         if cancellation.is_cancelled() {
             return Err(SecClientError::Cancelled);
@@ -556,27 +613,37 @@ pub(crate) fn restore_online_submissions(
             .ok_or(SecClientError::CompositeByteLimitExceeded)?;
         ensure_total_bytes(total_bytes, bounds)?;
         available_at = available_at.max(representation.first_observed_at);
+        retained.admit_bytes(
+            usize::try_from(representation.size_bytes)
+                .map_err(|_| SecClientError::ResponseTooLarge)?,
+        )?;
         let bytes = read_component(raw_store, &representation, cancellation)?;
-        archives.push(SubmissionsDocument::parse_archive_with_cancellation(
-            &bytes,
-            parser_limits,
-            cancellation,
-        )?);
+        archives.push(
+            SubmissionsDocument::parse_archive_with_allocation_authority(
+                &bytes,
+                parser_limits,
+                cancellation,
+                retained.clone(),
+            )?,
+        );
         components.push(restored_component(bytes, representation));
     }
     if !by_locator.is_empty() {
         return Err(SecClientError::InvalidCompositeRepresentation);
     }
-    let reconciled = reconcile_submissions_with_cancellation(
+    let reconciled = crate::json::reconcile_submissions_with_allocation_authority(
         &current_document,
         &archives,
         parser_limits,
         cancellation,
+        retained.clone(),
     )?;
     let mut retained_manifest = Vec::new();
-    retained_manifest
-        .try_reserve(manifest_bytes.len())
-        .map_err(|_| SecClientError::AllocationFailed)?;
+    crate::json::try_reserve_exact_bounded(
+        &mut retained_manifest,
+        manifest_bytes.len(),
+        &retained,
+    )?;
     retained_manifest.extend_from_slice(manifest_bytes);
     Ok(RetrievedSubmissions::new(
         reconciled,
@@ -615,9 +682,10 @@ fn read_component(
     raw_store: &RawEvidenceStore,
     representation: &OnlineCompositeRepresentationWire,
     cancellation: &CancellationToken,
-) -> Result<Vec<u8>, SecClientError> {
-    let bytes = raw_store.read_verified_bounded_cancellable(
+) -> Result<Box<[u8]>, SecClientError> {
+    let bytes = raw_store.read_verified_exact_boxed_cancellable(
         &representation.evidence,
+        representation.size_bytes,
         representation.size_bytes,
         cancellation,
     )?;
@@ -628,11 +696,11 @@ fn read_component(
 }
 
 fn restored_component(
-    bytes: Vec<u8>,
+    bytes: Box<[u8]>,
     representation: OnlineCompositeRepresentationWire,
 ) -> RetrievedSecBytes {
     RetrievedSecBytes::restored_online(
-        bytes,
+        bytes.into_vec(),
         representation.evidence,
         representation.first_observed_at,
         representation.locator,
@@ -645,23 +713,24 @@ async fn persist_manifest(
     cik: String,
     components: Vec<RetrievedSecBytes>,
     cancellation: &CancellationToken,
+    retained: crate::json::RetainedJsonBudget,
 ) -> Result<RetrievedSecBytes, SecClientError> {
     let raw_store = source.raw_store();
     source
         .run_blocking(cancellation, move |worker_cancellation| {
             let mut entries = Vec::new();
-            entries
-                .try_reserve(components.len())
-                .map_err(|_| SecClientError::AllocationFailed)?;
+            crate::json::try_reserve_exact_bounded(&mut entries, components.len(), &retained)?;
             let mut available_at: Option<Timestamp> = None;
             for component in components {
                 if worker_cancellation.is_cancelled() {
                     return Err(SecClientError::Cancelled);
                 }
-                let locator = component
-                    .locator()
-                    .ok_or(SecClientError::InvalidCompositeRepresentation)?
-                    .to_owned();
+                let locator = crate::json::owned_string_bounded(
+                    component
+                        .locator()
+                        .ok_or(SecClientError::InvalidCompositeRepresentation)?,
+                    &retained,
+                )?;
                 let retrieval_revision = component
                     .retrieval_revision()
                     .ok_or(SecClientError::InvalidCompositeRepresentation)?;
@@ -684,7 +753,7 @@ async fn persist_manifest(
                 cik,
                 representations: entries,
             };
-            let mut writer = CompositeManifestWriter::new(worker_cancellation);
+            let mut writer = CompositeManifestWriter::new(worker_cancellation, retained.clone());
             if serde_json::to_writer(&mut writer, &manifest).is_err() {
                 return if worker_cancellation.is_cancelled() {
                     Err(SecClientError::Cancelled)
@@ -783,13 +852,15 @@ struct OfflineCompositeRepresentation {
 struct CompositeManifestWriter<'a> {
     bytes: Vec<u8>,
     cancellation: &'a CancellationToken,
+    retained: crate::json::RetainedJsonBudget,
 }
 
 impl<'a> CompositeManifestWriter<'a> {
-    const fn new(cancellation: &'a CancellationToken) -> Self {
+    fn new(cancellation: &'a CancellationToken, retained: crate::json::RetainedJsonBudget) -> Self {
         Self {
             bytes: Vec::new(),
             cancellation,
+            retained,
         }
     }
 
@@ -814,8 +885,7 @@ impl Write for CompositeManifestWriter<'_> {
         if new_len > MAX_COMPOSITE_MANIFEST_BYTES {
             return Err(std::io::Error::other("SEC composite manifest is too large"));
         }
-        self.bytes
-            .try_reserve(buffer.len())
+        crate::json::try_reserve_exact_bounded(&mut self.bytes, buffer.len(), &self.retained)
             .map_err(|_| std::io::Error::other("SEC composite allocation failed"))?;
         self.bytes.extend_from_slice(buffer);
         Ok(buffer.len())

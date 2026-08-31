@@ -384,10 +384,17 @@ impl RetrievedCompanyFacts {
         raw_store: &RawEvidenceStore,
         parser_limits: SecParserLimits,
     ) -> Result<Self, SecClientError> {
+        let retained = crate::json::RetainedJsonBudget::new(parser_limits);
+        retained.admit_bytes(bytes.len())?;
         let evidence = raw_store.persist(bytes)?;
         let received_at = system_timestamp()?;
         Ok(Self {
-            document: CompanyFactsDocument::parse(bytes, parser_limits)?,
+            document: CompanyFactsDocument::parse_with_allocation_authority(
+                bytes,
+                parser_limits,
+                &CancellationToken::new(),
+                retained,
+            )?,
             raw: RetrievedSecBytes::offline_import(bytes, evidence, received_at),
         })
     }
@@ -400,8 +407,14 @@ impl RetrievedCompanyFacts {
         parser_limits: SecParserLimits,
         cancellation: &CancellationToken,
     ) -> Result<Self, SecClientError> {
-        let document =
-            CompanyFactsDocument::parse_with_cancellation(&bytes, parser_limits, cancellation)?;
+        let retained = crate::json::RetainedJsonBudget::new(parser_limits);
+        retained.admit_bytes(bytes.capacity())?;
+        let document = CompanyFactsDocument::parse_with_allocation_authority(
+            &bytes,
+            parser_limits,
+            cancellation,
+            retained,
+        )?;
         Ok(Self {
             document,
             raw: RetrievedSecBytes {
@@ -560,7 +573,9 @@ pub(super) const fn validation_health_for_error(
 ) -> Option<SecExtractionHealthState> {
     match error {
         SecClientError::Cancelled | SecClientError::Parser(SecParserError::Cancelled) => None,
-        SecClientError::Parser(SecParserError::AllocationFailed)
+        SecClientError::Parser(
+            SecParserError::AllocationFailed | SecParserError::AllocationAuthorityPoisoned,
+        )
         | SecClientError::AllocationFailed
         | SecClientError::BlockingAdmissionClosed
         | SecClientError::BlockingWorkerFailed

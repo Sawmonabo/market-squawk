@@ -109,17 +109,31 @@ impl CompanyFactsDocument {
         limits: SecParserLimits,
         cancellation: &CancellationToken,
     ) -> Result<Self, SecParserError> {
-        let (root, mut retained) =
-            parse_bounded_json_with_retained_budget(bytes, limits, cancellation)?;
-        let object = as_object(&root, "company facts root")?;
-        let cik = parse_cik(required(object, "cik")?)?;
-        let entity_name_source = required_string(object, "entityName")?;
-        let entity_name = validated_metadata_text(entity_name_source, MAX_ENTITY_NAME_BYTES)?;
-        retained.admit_bytes(
-            cik.retained_bytes()
-                .checked_add(entity_name.capacity())
-                .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
+        Self::parse_with_allocation_authority(
+            bytes,
+            limits,
+            cancellation,
+            RetainedJsonBudget::new(limits),
+        )
+    }
+
+    pub(crate) fn parse_with_allocation_authority(
+        bytes: &[u8],
+        limits: SecParserLimits,
+        cancellation: &CancellationToken,
+        retained: RetainedJsonBudget,
+    ) -> Result<Self, SecParserError> {
+        let root = parse_bounded_json_with_allocation_authority(
+            bytes,
+            limits,
+            cancellation,
+            retained.clone(),
         )?;
+        let object = as_object(&root, "company facts root")?;
+        let cik = parse_cik_with_allocation_authority(required(object, "cik")?, &retained)?;
+        let entity_name_source = required_string(object, "entityName")?;
+        super::admit_string_allocation(entity_name_source, &retained)?;
+        let entity_name = validated_metadata_text(entity_name_source, MAX_ENTITY_NAME_BYTES)?;
         let taxonomies = as_object(required(object, "facts")?, "facts")?;
         let mut occurrences = Vec::new();
         for (taxonomy, concepts_value) in taxonomies {
@@ -128,16 +142,25 @@ impl CompanyFactsDocument {
             for (concept, concept_value) in as_object(concepts_value, "taxonomy concepts")? {
                 check_parser_cancelled(cancellation)?;
                 validate_component(concept)?;
-                let qualified = SourceIdentifier::try_from(format!("{taxonomy}:{concept}"))?;
-                retained.admit_bytes(qualified.retained_bytes())?;
+                let qualified_len = taxonomy
+                    .len()
+                    .checked_add(1)
+                    .and_then(|length| length.checked_add(concept.len()))
+                    .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
+                retained.admit_bytes(
+                    qualified_len
+                        .checked_next_power_of_two()
+                        .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
+                )?;
+                let qualified_text = format!("{taxonomy}:{concept}");
+                let qualified = SourceIdentifier::try_from(qualified_text)?;
                 let units = as_object(
                     required(as_object(concept_value, "concept")?, "units")?,
                     "concept units",
                 )?;
                 for (unit, facts_value) in units {
                     check_parser_cancelled(cancellation)?;
-                    let unit = SourceIdentifier::try_from(unit.clone())?;
-                    retained.admit_bytes(unit.retained_bytes())?;
+                    let unit = super::source_identifier_bounded(unit, &retained)?;
                     for (source_ordinal, fact_value) in
                         as_array(facts_value, "unit facts")?.iter().enumerate()
                     {
@@ -147,17 +170,22 @@ impl CompanyFactsDocument {
                         }
                         let source_ordinal = u32::try_from(source_ordinal)
                             .map_err(|_| SecParserError::RecordLimitExceeded)?;
+                        retained.admit_bytes(
+                            qualified
+                                .retained_bytes()
+                                .checked_add(unit.retained_bytes())
+                                .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
+                        )?;
                         let occurrence = parse_company_fact(
                             fact_value,
                             qualified.clone(),
                             unit.clone(),
                             source_ordinal,
-                            &mut retained,
+                            &retained,
                         )?;
                         validate_accession_owner(occurrence.accession(), &cik)?;
-                        retained.admit_bytes(company_fact_dynamic_bytes(&occurrence)?)?;
                         if occurrences.len() == occurrences.capacity() {
-                            try_reserve_exact_bounded(&mut occurrences, 1, &mut retained)?;
+                            try_reserve_exact_bounded(&mut occurrences, 1, &retained)?;
                         }
                         occurrences.push(occurrence);
                     }
@@ -192,14 +220,18 @@ fn parse_company_fact(
     concept: SourceIdentifier,
     unit: SourceIdentifier,
     source_ordinal: u32,
-    retained: &mut RetainedJsonBudget,
+    retained: &RetainedJsonBudget,
 ) -> Result<CompanyFactOccurrence, SecParserError> {
     let object = as_object(value, "company fact occurrence")?;
     let lexical = match required(object, "val")? {
-        Value::Number(value) => value.to_string(),
+        Value::Number(value) => {
+            // serde_json's lexical number representation is bounded by the decoded input. Admit
+            // a conservative decimal rendering ceiling before allocating its owned form.
+            retained.admit_bytes(128)?;
+            value.to_string()
+        }
         _ => return Err(SecParserError::NonNumericCompanyFact),
     };
-    retained.admit_bytes(lexical.capacity())?;
     let value = lexical
         .parse::<Decimal>()
         .map_err(|_| SecParserError::InvalidDecimal)?
@@ -216,33 +248,15 @@ fn parse_company_fact(
         unit,
         source_ordinal,
         value,
-        accession: SourceIdentifier::try_from(required_string(object, "accn")?)?,
-        form: SourceIdentifier::try_from(required_string(object, "form")?)?,
+        accession: super::source_identifier_bounded(required_string(object, "accn")?, retained)?,
+        form: super::source_identifier_bounded(required_string(object, "form")?, retained)?,
         filed_on: parse_date(required_string(object, "filed")?)?,
         period: CompanyFactPeriod { start, end },
         frame: optional_string(object, "frame")?
-            .map(SourceIdentifier::try_from)
+            .map(|value| super::source_identifier_bounded(value, retained))
             .transpose()?,
         fiscal_year: parse_optional_fiscal_year(object)?,
-        fiscal_period: parse_optional_fiscal_period(object)?,
-    })
-}
-
-fn company_fact_dynamic_bytes(occurrence: &CompanyFactOccurrence) -> Result<usize, SecParserError> {
-    [
-        Some(occurrence.concept()),
-        Some(occurrence.unit()),
-        Some(occurrence.accession()),
-        Some(occurrence.form()),
-        occurrence.frame(),
-        occurrence.fiscal_period(),
-    ]
-    .into_iter()
-    .flatten()
-    .try_fold(0usize, |total, value| {
-        total
-            .checked_add(value.retained_bytes())
-            .ok_or(SecParserError::RetainedOutputLimitExceeded)
+        fiscal_period: parse_optional_fiscal_period(object, retained)?,
     })
 }
 
@@ -263,12 +277,13 @@ fn parse_optional_fiscal_year(
 
 fn parse_optional_fiscal_period(
     object: &serde_json::Map<String, Value>,
+    retained: &RetainedJsonBudget,
 ) -> Result<Option<SourceIdentifier>, SecParserError> {
     match object.get("fp") {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) => SourceIdentifier::try_from(value.clone())
+        Some(Value::String(value)) => super::source_identifier_bounded(value, retained)
             .map(Some)
-            .map_err(SecParserError::from),
+            .map_err(Into::into),
         Some(_) => Err(SecParserError::WrongType),
     }
 }

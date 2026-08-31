@@ -469,6 +469,56 @@ impl RawEvidenceStore {
         )
     }
 
+    /// Reads one exact known-size object into an exact-length boxed allocation.
+    pub(crate) fn read_verified_exact_boxed_cancellable(
+        &self,
+        evidence: &EvidenceDigest,
+        expected_bytes: u64,
+        max_bytes: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<Box<[u8]>, RawEvidenceError> {
+        check_cancelled(cancellation)?;
+        if expected_bytes == 0 || expected_bytes > max_bytes {
+            return Err(RawEvidenceError::ReadLimitExceeded);
+        }
+        let name = evidence_name(*evidence)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        options.follow(FollowSymlinks::No);
+        let file = self.directory.open_with(&name, &options)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || !self.directory.symlink_metadata(&name)?.is_file()
+            || metadata.len() != expected_bytes
+        {
+            return Err(RawEvidenceError::VerificationFailed);
+        }
+        let length =
+            usize::try_from(expected_bytes).map_err(|_| RawEvidenceError::ReadLimitExceeded)?;
+        let mut bytes = vec![0_u8; length].into_boxed_slice();
+        let mut reader = file.into_std();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            check_cancelled(cancellation)?;
+            let read = reader.read(&mut bytes[offset..])?;
+            if read == 0 {
+                return Err(RawEvidenceError::LengthMismatch);
+            }
+            offset = offset
+                .checked_add(read)
+                .ok_or(RawEvidenceError::ReadLimitExceeded)?;
+        }
+        let mut trailing = [0_u8; 1];
+        if reader.read(&mut trailing)? != 0 {
+            return Err(RawEvidenceError::ReadLimitExceeded);
+        }
+        let actual: [u8; 32] = Sha256::digest(&bytes).into();
+        if actual != evidence.bytes() {
+            return Err(RawEvidenceError::VerificationFailed);
+        }
+        Ok(bytes)
+    }
+
     /// Opens one exact large raw object after streaming size and digest verification.
     ///
     /// The returned descriptor is already positioned at byte zero. It remains a confined file

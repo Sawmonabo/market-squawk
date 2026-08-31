@@ -6,6 +6,7 @@ mod submissions;
 use std::fmt;
 use std::mem::size_of;
 use std::str::FromStr as _;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Datelike as _, NaiveDate, NaiveDateTime};
 use market_squawk_domain::{CalendarDate, SourceIdentifier, Timestamp};
@@ -15,44 +16,75 @@ use serde_json::{Map, Number, Value};
 use tokio_util::sync::CancellationToken;
 
 pub use company_facts::{CompanyFactOccurrence, CompanyFactPeriod, CompanyFactsDocument};
-pub(crate) use submissions::validate_companion_coverage;
 pub use submissions::{
     SecFiling, SecFormerName, SecSubmissionCompanyMetadata, SecSubmissionsCompanion,
     SecTickerExchangePair, SubmissionsArchive, SubmissionsDocument, reconcile_submissions,
     reconcile_submissions_with_cancellation,
 };
+pub(crate) use submissions::{admit_document_allocations, validate_companion_coverage};
 
 /// Allocator-independent ceiling for one balanced-tree node's links, bookkeeping, and alignment.
 /// String and value payloads are charged separately from this per-entry allocation ceiling.
 const BTREE_NODE_OVERHEAD_CEILING: usize = 8 * size_of::<usize>();
 
+#[derive(Clone)]
 pub(crate) struct RetainedJsonBudget {
+    state: Arc<Mutex<RetainedJsonBudgetState>>,
+}
+
+struct RetainedJsonBudgetState {
     admitted: usize,
     limit: usize,
 }
 
 impl RetainedJsonBudget {
-    pub(crate) const fn new(limits: SecParserLimits) -> Self {
+    pub(crate) fn new(limits: SecParserLimits) -> Self {
         Self {
-            admitted: 0,
-            limit: limits.retained_output_bytes(),
+            state: Arc::new(Mutex::new(RetainedJsonBudgetState {
+                admitted: 0,
+                limit: limits.retained_output_bytes(),
+            })),
         }
     }
 
-    pub(crate) fn admit_bytes(&mut self, bytes: usize) -> Result<(), SecParserError> {
-        let admitted = self
+    pub(crate) fn admit_bytes(&self, bytes: usize) -> Result<(), SecParserError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SecParserError::AllocationAuthorityPoisoned)?;
+        let admitted = state
             .admitted
             .checked_add(bytes)
             .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
-        if admitted > self.limit {
+        if admitted > state.limit {
             return Err(SecParserError::RetainedOutputLimitExceeded);
         }
-        self.admitted = admitted;
+        state.admitted = admitted;
         Ok(())
     }
 
-    fn release_bytes(&mut self, bytes: usize) -> Result<(), SecParserError> {
-        self.admitted = self
+    fn reserve_remaining(&self, minimum: usize) -> Result<usize, SecParserError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SecParserError::AllocationAuthorityPoisoned)?;
+        let remaining = state
+            .limit
+            .checked_sub(state.admitted)
+            .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
+        if minimum > remaining {
+            return Err(SecParserError::RetainedOutputLimitExceeded);
+        }
+        state.admitted = state.limit;
+        Ok(remaining)
+    }
+
+    fn release_bytes(&self, bytes: usize) -> Result<(), SecParserError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SecParserError::AllocationAuthorityPoisoned)?;
+        state.admitted = state
             .admitted
             .checked_sub(bytes)
             .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
@@ -60,7 +92,7 @@ impl RetainedJsonBudget {
     }
 
     pub(crate) fn admit_btree_entry<K, V>(
-        &mut self,
+        &self,
         dynamic_bytes: usize,
     ) -> Result<(), SecParserError> {
         let inline = size_of::<K>()
@@ -78,7 +110,7 @@ impl RetainedJsonBudget {
 pub(crate) fn try_reserve_exact_bounded<T>(
     values: &mut Vec<T>,
     additional: usize,
-    retained: &mut RetainedJsonBudget,
+    retained: &RetainedJsonBudget,
 ) -> Result<(), SecParserError> {
     let old_capacity = values.capacity();
     let required = values
@@ -89,48 +121,76 @@ pub(crate) fn try_reserve_exact_bounded<T>(
     let requested_bytes = requested_delta
         .checked_mul(size_of::<T>())
         .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
-    retained.admit_bytes(requested_bytes)?;
+    if requested_bytes == 0 {
+        return Ok(());
+    }
+    // Rust deliberately does not promise the capacity selected by `try_reserve_exact`. Reserve
+    // every still-available byte in the aggregate authority before asking the allocator, then
+    // reconcile downward to its reported capacity. This makes no allocator growth assumption.
+    let admitted_bytes = retained.reserve_remaining(requested_bytes)?;
     if let Err(_error) = values.try_reserve_exact(additional) {
-        retained.release_bytes(requested_bytes)?;
+        retained.release_bytes(admitted_bytes)?;
         return Err(SecParserError::AllocationFailed);
     }
-    let actual_delta = values.capacity().saturating_sub(old_capacity);
-    if actual_delta > requested_delta {
-        retained.admit_bytes(
-            actual_delta
-                .saturating_sub(requested_delta)
-                .checked_mul(size_of::<T>())
-                .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
-        )?;
-    } else if actual_delta < requested_delta {
-        retained.release_bytes(
-            requested_delta
-                .checked_sub(actual_delta)
-                .and_then(|delta| delta.checked_mul(size_of::<T>()))
-                .ok_or(SecParserError::RetainedOutputLimitExceeded)?,
-        )?;
+    let actual_bytes = values
+        .capacity()
+        .saturating_sub(old_capacity)
+        .checked_mul(size_of::<T>())
+        .ok_or(SecParserError::RetainedOutputLimitExceeded)?;
+    if actual_bytes > admitted_bytes {
+        return Err(SecParserError::RetainedOutputLimitExceeded);
+    }
+    if actual_bytes < admitted_bytes {
+        retained.release_bytes(admitted_bytes - actual_bytes)?;
     }
     Ok(())
 }
 
-fn owned_string_bounded(
+pub(crate) fn owned_string_bounded(
     value: &str,
-    retained: &mut RetainedJsonBudget,
+    retained: &RetainedJsonBudget,
 ) -> Result<String, SecParserError> {
     let mut owned = String::new();
-    retained.admit_bytes(value.len())?;
+    if value.is_empty() {
+        return Ok(owned);
+    }
+    let admitted_bytes = retained.reserve_remaining(value.len())?;
     if owned.try_reserve_exact(value.len()).is_err() {
-        retained.release_bytes(value.len())?;
+        retained.release_bytes(admitted_bytes)?;
         return Err(SecParserError::AllocationFailed);
     }
     let capacity = owned.capacity();
-    if capacity > value.len() {
-        retained.admit_bytes(capacity - value.len())?;
-    } else if capacity < value.len() {
-        retained.release_bytes(value.len() - capacity)?;
+    if capacity > admitted_bytes {
+        return Err(SecParserError::RetainedOutputLimitExceeded);
+    }
+    if capacity < admitted_bytes {
+        retained.release_bytes(admitted_bytes - capacity)?;
     }
     owned.push_str(value);
     Ok(owned)
+}
+
+pub(crate) fn admit_string_allocation(
+    value: &str,
+    retained: &RetainedJsonBudget,
+) -> Result<(), SecParserError> {
+    let capacity_ceiling = if value.is_empty() {
+        0
+    } else {
+        value
+            .len()
+            .checked_next_power_of_two()
+            .ok_or(SecParserError::RetainedOutputLimitExceeded)?
+    };
+    retained.admit_bytes(capacity_ceiling)
+}
+
+pub(crate) fn source_identifier_bounded(
+    value: &str,
+    retained: &RetainedJsonBudget,
+) -> Result<SourceIdentifier, SecParserError> {
+    admit_string_allocation(value, retained)?;
+    SourceIdentifier::try_from(value).map_err(Into::into)
 }
 
 /// Production parser ceilings applied before canonical construction.
@@ -221,19 +281,35 @@ pub(crate) fn parse_bounded_json_with_retained_budget(
     limits: SecParserLimits,
     cancellation: &CancellationToken,
 ) -> Result<(Value, RetainedJsonBudget), SecParserError> {
+    let retained = RetainedJsonBudget::new(limits);
+    let value = parse_bounded_json_with_allocation_authority(
+        bytes,
+        limits,
+        cancellation,
+        retained.clone(),
+    )?;
+    Ok((value, retained))
+}
+
+pub(crate) fn parse_bounded_json_with_allocation_authority(
+    bytes: &[u8],
+    limits: SecParserLimits,
+    cancellation: &CancellationToken,
+    retained: RetainedJsonBudget,
+) -> Result<Value, SecParserError> {
     check_parser_cancelled(cancellation)?;
     if bytes.len() > limits.max_decoded_bytes {
         return Err(SecParserError::ByteLimitExceeded);
     }
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let mut budget = JsonBudget::new(limits, cancellation.clone());
+    let mut budget = JsonBudget::new(limits, cancellation.clone(), retained);
     let value = BoundedValueSeed {
         budget: &mut budget,
         depth: 1,
     }
     .deserialize(&mut deserializer)?;
     deserializer.end()?;
-    Ok((value, budget.retained))
+    Ok(value)
 }
 
 struct JsonBudget {
@@ -246,14 +322,18 @@ struct JsonBudget {
 }
 
 impl JsonBudget {
-    fn new(limits: SecParserLimits, cancellation: CancellationToken) -> Self {
+    fn new(
+        limits: SecParserLimits,
+        cancellation: CancellationToken,
+        retained: RetainedJsonBudget,
+    ) -> Self {
         Self {
             limits,
             total_string_bytes: 0,
             nodes: 0,
             max_nodes: limits.max_records.saturating_mul(16),
             cancellation,
-            retained: RetainedJsonBudget::new(limits),
+            retained,
         }
     }
 
@@ -343,7 +423,7 @@ impl Visitor<'_> for BoundedStringVisitor<'_> {
         E: de::Error,
     {
         self.budget.charge_string(value).map_err(E::custom)?;
-        owned_string_bounded(value, &mut self.budget.retained).map_err(E::custom)
+        owned_string_bounded(value, &self.budget.retained).map_err(E::custom)
     }
 
     fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
@@ -397,7 +477,7 @@ impl<'de> Visitor<'de> for BoundedValueVisitor<'_> {
         E: de::Error,
     {
         self.budget.charge_string(value).map_err(E::custom)?;
-        owned_string_bounded(value, &mut self.budget.retained)
+        owned_string_bounded(value, &self.budget.retained)
             .map(Value::String)
             .map_err(E::custom)
     }
@@ -443,14 +523,14 @@ impl<'de> Visitor<'de> for BoundedValueVisitor<'_> {
             .ok_or_else(|| de::Error::custom(SecParserError::DepthLimitExceeded))?;
         let initial = sequence.size_hint().unwrap_or(0).min(1_024);
         let mut values = Vec::new();
-        try_reserve_exact_bounded(&mut values, initial, &mut self.budget.retained)
+        try_reserve_exact_bounded(&mut values, initial, &self.budget.retained)
             .map_err(de::Error::custom)?;
         while let Some(value) = sequence.next_element_seed(BoundedValueSeed {
             budget: self.budget,
             depth: child_depth,
         })? {
             if values.len() == values.capacity() {
-                try_reserve_exact_bounded(&mut values, 1, &mut self.budget.retained)
+                try_reserve_exact_bounded(&mut values, 1, &self.budget.retained)
                     .map_err(de::Error::custom)?;
             }
             values.push(value);
@@ -538,6 +618,25 @@ fn parse_cik(value: &Value) -> Result<SourceIdentifier, SecParserError> {
     if raw.len() > 10 || raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(SecParserError::InvalidCik);
     }
+    Ok(SourceIdentifier::try_from(format!("{raw:0>10}"))?)
+}
+
+fn parse_cik_with_allocation_authority(
+    value: &Value,
+    retained: &RetainedJsonBudget,
+) -> Result<SourceIdentifier, SecParserError> {
+    let raw = match value {
+        Value::String(value) => value.as_str(),
+        Value::Number(value) => {
+            retained.admit_bytes(32)?;
+            return parse_cik(&Value::String(value.to_string()));
+        }
+        _ => return Err(SecParserError::InvalidCik),
+    };
+    if raw.len() > 10 || raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(SecParserError::InvalidCik);
+    }
+    retained.admit_bytes(10)?;
     Ok(SourceIdentifier::try_from(format!("{raw:0>10}"))?)
 }
 
@@ -750,6 +849,7 @@ pub enum SecParserError {
     NodeLimitExceeded,
     ByteCountOverflow,
     AllocationFailed,
+    AllocationAuthorityPoisoned,
     RetainedOutputLimitExceeded,
     DuplicateKey,
     InvalidNumber,

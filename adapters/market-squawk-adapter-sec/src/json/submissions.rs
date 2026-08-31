@@ -214,28 +214,41 @@ impl SubmissionsDocument {
         limits: SecParserLimits,
         cancellation: &CancellationToken,
     ) -> Result<Self, SecParserError> {
-        let (root, mut retained) =
-            parse_bounded_json_with_retained_budget(bytes, limits, cancellation)?;
+        Self::parse_with_allocation_authority(
+            bytes,
+            limits,
+            cancellation,
+            RetainedJsonBudget::new(limits),
+        )
+    }
+
+    pub(crate) fn parse_with_allocation_authority(
+        bytes: &[u8],
+        limits: SecParserLimits,
+        cancellation: &CancellationToken,
+        retained: RetainedJsonBudget,
+    ) -> Result<Self, SecParserError> {
+        let root = parse_bounded_json_with_allocation_authority(
+            bytes,
+            limits,
+            cancellation,
+            retained.clone(),
+        )?;
         let object = as_object(&root, "submissions root")?;
-        let cik = parse_cik(required(object, "cik")?)?;
-        retained.admit_bytes(cik.retained_bytes())?;
-        let company_metadata = parse_company_metadata(object, limits, cancellation, &mut retained)?;
+        let cik = parse_cik_with_allocation_authority(required(object, "cik")?, &retained)?;
+        let company_metadata = parse_company_metadata(object, limits, cancellation, &retained)?;
         let filings_object = as_object(required(object, "filings")?, "filings")?;
         let filings = parse_filing_columns(
             as_object(required(filings_object, "recent")?, "recent filings")?,
             limits,
             cancellation,
-            &mut retained,
+            &retained,
         )?;
         for filing in &filings {
             validate_accession_owner(filing.accession(), &cik)?;
         }
-        let companions = parse_companions(
-            filings_object.get("files"),
-            limits,
-            cancellation,
-            &mut retained,
-        )?;
+        let companions =
+            parse_companions(filings_object.get("files"), limits, cancellation, &retained)?;
         Ok(Self {
             cik,
             company_metadata,
@@ -258,14 +271,32 @@ impl SubmissionsDocument {
         limits: SecParserLimits,
         cancellation: &CancellationToken,
     ) -> Result<SubmissionsArchive, SecParserError> {
-        let (root, mut retained) =
-            parse_bounded_json_with_retained_budget(bytes, limits, cancellation)?;
+        Self::parse_archive_with_allocation_authority(
+            bytes,
+            limits,
+            cancellation,
+            RetainedJsonBudget::new(limits),
+        )
+    }
+
+    pub(crate) fn parse_archive_with_allocation_authority(
+        bytes: &[u8],
+        limits: SecParserLimits,
+        cancellation: &CancellationToken,
+        retained: RetainedJsonBudget,
+    ) -> Result<SubmissionsArchive, SecParserError> {
+        let root = parse_bounded_json_with_allocation_authority(
+            bytes,
+            limits,
+            cancellation,
+            retained.clone(),
+        )?;
         Ok(SubmissionsArchive {
             filings: parse_filing_columns(
                 as_object(&root, "archive root")?,
                 limits,
                 cancellation,
-                &mut retained,
+                &retained,
             )?,
         })
     }
@@ -322,16 +353,32 @@ pub fn reconcile_submissions_with_cancellation(
     limits: SecParserLimits,
     cancellation: &CancellationToken,
 ) -> Result<SubmissionsDocument, SecParserError> {
+    let retained = RetainedJsonBudget::new(limits);
+    admit_document_allocations(&retained, recent)?;
+    for archive in archives {
+        admit_archive_allocations(&retained, archive)?;
+    }
+    reconcile_submissions_with_allocation_authority(
+        recent,
+        archives,
+        limits,
+        cancellation,
+        retained,
+    )
+}
+
+pub(crate) fn reconcile_submissions_with_allocation_authority(
+    recent: &SubmissionsDocument,
+    archives: &[SubmissionsArchive],
+    limits: SecParserLimits,
+    cancellation: &CancellationToken,
+    retained: RetainedJsonBudget,
+) -> Result<SubmissionsDocument, SecParserError> {
     if recent.companions.len() != archives.len() {
         return Err(SecParserError::InvalidCompanionCoverage);
     }
     for (declaration, archive) in recent.companions.iter().zip(archives) {
         validate_companion_coverage(declaration, archive, &recent.cik)?;
-    }
-    let mut retained = RetainedJsonBudget::new(limits);
-    admit_document_allocations(&mut retained, recent)?;
-    for archive in archives {
-        admit_archive_allocations(&mut retained, archive)?;
     }
     let mut filings = BTreeMap::new();
     for filing in recent
@@ -340,7 +387,7 @@ pub fn reconcile_submissions_with_cancellation(
         .chain(archives.iter().flat_map(|archive| archive.filings.iter()))
     {
         check_parser_cancelled(cancellation)?;
-        let accession = filing.accession.as_str().to_owned();
+        let accession = owned_string_bounded(filing.accession.as_str(), &retained)?;
         retained.admit_btree_entry::<String, SecFiling>(
             accession
                 .capacity()
@@ -359,7 +406,7 @@ pub fn reconcile_submissions_with_cancellation(
         }
     }
     let mut reconciled_filings = Vec::new();
-    try_reserve_exact_bounded(&mut reconciled_filings, filings.len(), &mut retained)?;
+    try_reserve_exact_bounded(&mut reconciled_filings, filings.len(), &retained)?;
     reconciled_filings.extend(filings.into_values());
     let mut filings = reconciled_filings;
     filings.sort_by(|left, right| {
@@ -367,15 +414,15 @@ pub fn reconcile_submissions_with_cancellation(
             .cmp(&right.filed_on)
             .then_with(|| left.accession.cmp(&right.accession))
     });
-    let cik = recent.cik.clone();
-    retained.admit_bytes(cik.retained_bytes())?;
-    let company_metadata = recent.company_metadata.clone();
-    admit_company_metadata(&mut retained, &company_metadata)?;
-    let companions = recent.companions.clone();
-    admit_vec_allocation(&mut retained, &companions)?;
-    for companion in &companions {
+    retained.admit_bytes(recent.cik.retained_bytes())?;
+    admit_company_metadata(&retained, &recent.company_metadata)?;
+    admit_vec_allocation(&retained, &recent.companions)?;
+    for companion in &recent.companions {
         retained.admit_bytes(companion.name.retained_bytes())?;
     }
+    let cik = recent.cik.clone();
+    let company_metadata = recent.company_metadata.clone();
+    let companions = recent.companions.clone();
     Ok(SubmissionsDocument {
         cik,
         company_metadata,
@@ -388,7 +435,7 @@ fn parse_company_metadata(
     object: &Map<String, Value>,
     limits: SecParserLimits,
     cancellation: &CancellationToken,
-    retained: &mut RetainedJsonBudget,
+    retained: &RetainedJsonBudget,
 ) -> Result<SecSubmissionCompanyMetadata, SecParserError> {
     let conformed_name =
         validated_metadata_text(required_string(object, "name")?, MAX_COMPANY_NAME_BYTES)?;
@@ -418,7 +465,7 @@ fn parse_former_names(
     value: Option<&Value>,
     limits: SecParserLimits,
     cancellation: &CancellationToken,
-    retained: &mut RetainedJsonBudget,
+    retained: &RetainedJsonBudget,
 ) -> Result<Vec<SecFormerName>, SecParserError> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -467,7 +514,7 @@ fn parse_ticker_exchange_pairs(
     object: &Map<String, Value>,
     limits: SecParserLimits,
     cancellation: &CancellationToken,
-    retained: &mut RetainedJsonBudget,
+    retained: &RetainedJsonBudget,
 ) -> Result<Vec<SecTickerExchangePair>, SecParserError> {
     let tickers = required_array(object, "tickers")?;
     let exchanges = required_array(object, "exchanges")?;
@@ -528,7 +575,7 @@ fn parse_filing_columns(
     object: &Map<String, Value>,
     limits: SecParserLimits,
     cancellation: &CancellationToken,
-    retained: &mut RetainedJsonBudget,
+    retained: &RetainedJsonBudget,
 ) -> Result<Vec<SecFiling>, SecParserError> {
     let accessions = required_array(object, "accessionNumber")?;
     if accessions.len() > limits.max_records {
@@ -591,7 +638,7 @@ fn parse_companions(
     value: Option<&Value>,
     limits: SecParserLimits,
     cancellation: &CancellationToken,
-    retained: &mut RetainedJsonBudget,
+    retained: &RetainedJsonBudget,
 ) -> Result<Vec<SecSubmissionsCompanion>, SecParserError> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -656,7 +703,7 @@ pub(crate) fn validate_companion_coverage(
 }
 
 fn admit_company_metadata(
-    retained: &mut RetainedJsonBudget,
+    retained: &RetainedJsonBudget,
     metadata: &SecSubmissionCompanyMetadata,
 ) -> Result<(), SecParserError> {
     retained.admit_bytes(metadata.conformed_name.capacity())?;
@@ -687,7 +734,7 @@ fn admit_company_metadata(
 }
 
 fn admit_vec_allocation<T>(
-    retained: &mut RetainedJsonBudget,
+    retained: &RetainedJsonBudget,
     values: &Vec<T>,
 ) -> Result<(), SecParserError> {
     retained.admit_bytes(
@@ -699,7 +746,7 @@ fn admit_vec_allocation<T>(
 }
 
 fn admit_archive_allocations(
-    retained: &mut RetainedJsonBudget,
+    retained: &RetainedJsonBudget,
     archive: &SubmissionsArchive,
 ) -> Result<(), SecParserError> {
     admit_vec_allocation(retained, &archive.filings)?;
@@ -709,8 +756,8 @@ fn admit_archive_allocations(
     Ok(())
 }
 
-fn admit_document_allocations(
-    retained: &mut RetainedJsonBudget,
+pub(crate) fn admit_document_allocations(
+    retained: &RetainedJsonBudget,
     document: &SubmissionsDocument,
 ) -> Result<(), SecParserError> {
     retained.admit_bytes(document.cik.retained_bytes())?;
