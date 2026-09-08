@@ -4470,7 +4470,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
- "webbrowser",
  "widestring",
  "win-security-identifier",
  "windows-permissions",

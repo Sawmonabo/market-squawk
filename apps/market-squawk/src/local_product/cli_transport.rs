@@ -311,13 +311,6 @@ async fn source(
             source_filter(provider),
             "source health read",
         ),
-        SourceCommand::Setup {
-            provider, confirm, ..
-        } => (
-            "Source.Setup",
-            json_object(json!({"provider": provider, "confirm": confirm}))?,
-            "source setup opened",
-        ),
         SourceCommand::Discover { provider, dataset } => (
             "Source.ListObjects",
             json_object(json!({

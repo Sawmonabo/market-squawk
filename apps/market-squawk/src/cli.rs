@@ -307,17 +307,6 @@ pub enum SourceCommand {
         /// Optional provider filter.
         provider: Option<String>,
     },
-    /// Start or resume evidence-bound local provider onboarding.
-    Setup {
-        /// Code-owned provider identifier.
-        provider: String,
-        /// Explicit local mutation confirmation.
-        #[arg(long)]
-        confirm: bool,
-        /// Explicitly open the protected browser fallback (never automatic for JSON output).
-        #[arg(long)]
-        open_browser: bool,
-    },
     /// Activate one evidence-bound provider adapter after onboarding verification.
     Activate {
         /// Confined versioned provider-activation request file.

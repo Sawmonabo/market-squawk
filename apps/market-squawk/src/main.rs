@@ -18,7 +18,7 @@ use market_squawk::{
     AppConfig, AppPaths, DiagnosticEngine, DiagnosticEngineSnapshot, LocalProduct,
     cli::{
         Cli, Command, ConfigCommand, McpCommand, OutputFormat, ReleaseCommand,
-        ReleaseEvidenceCommand, ServiceCommand, SourceCommand,
+        ReleaseEvidenceCommand, ServiceCommand,
     },
     doctor,
     local_product::{execute_installed_cli_command, verified_installed_service_program},
@@ -357,23 +357,10 @@ async fn run_product_command(
     output: OutputFormat,
     installation_data_root: Option<&Path>,
 ) -> Result<()> {
-    let opens_onboarding_portal = matches!(
-        &command,
-        Command::Source {
-            command: SourceCommand::Setup {
-                open_browser: true,
-                ..
-            }
-        }
-    ) && !matches!(output, OutputFormat::Json);
     let connector = installed_service_connector(&config, installation_data_root)?;
     let client = connector.connect(NamedClient::Cli, None)?;
     let result = execute_installed_cli_command(&client, command).await?;
-    emit_result(output, result.summary(), result.value())?;
-    if opens_onboarding_portal {
-        open_onboarding_portal(result.value())?;
-    }
-    Ok(())
+    emit_result(output, result.summary(), result.value())
 }
 
 async fn run_service_command(
@@ -578,28 +565,6 @@ async fn reap_service_child(child: &mut std::process::Child, timeout: Duration) 
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-}
-
-fn open_onboarding_portal(result: &serde_json::Value) -> Result<()> {
-    let portal_url = result
-        .pointer("/data/portal/url")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow!("source setup omitted the local portal URL"))?;
-    let parsed =
-        url::Url::parse(portal_url).context("source setup returned an invalid portal URL")?;
-    if parsed.scheme() != "http"
-        || parsed.host_str() != Some("127.0.0.1")
-        || parsed.port().is_none()
-        || parsed.username() != ""
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        anyhow::bail!("source setup returned a portal URL outside the loopback trust boundary");
-    }
-    webbrowser::open(portal_url)
-        .context("could not open the protected provider setup; use the emitted URL")?;
-    Ok(())
 }
 
 async fn run_doctor(config: AppConfig, output: OutputFormat) -> Result<()> {
