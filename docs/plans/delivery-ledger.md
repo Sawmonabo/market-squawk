@@ -56,7 +56,7 @@ comparison policy, not evidence that dual-benchmark production is already comple
   check and native Desktop library check passed on then-frozen WIP; TypeScript also passed.
   Later integration changed that WIP and requires a fresh affected check. These compilation
   results do not establish current rights or complete live workflow acceptance.
-- The current data checkpoint adds cancellable, deadline-bound durable market replay using the
+- Pushed checkpoint `3eedf0d4a80a4592f052749f6613ccfb38cb540c` adds cancellable, deadline-bound durable market replay using the
   existing supervised worker and retained file capabilities; ordinary catalog contention is
   distinct from corruption. Exact raw daily history can supply realized execution/outcome prices,
   preserving its original acquisition clocks and excluding historical signal/training authority.
@@ -64,6 +64,15 @@ comparison policy, not evidence that dual-benchmark production is already comple
   source on 2026-09-08. Root inspected all seven data files and the two application call-site
   updates. No new test case, schema/table, CI or provider call was introduced. Financial workflow,
   corporate-action integration and installed whole-app acceptance remain open.
+- The current platform checkpoint adds separately locked, bounded authority namespaces in the
+  same retained directory. It reuses the existing two-copy writer and recovery path, allowing
+  Desktop to preserve an unsupported profile payload before replacing its active settings.
+  The existing `configuration_security` harness authority-state roundtrip case passed 1/1 on
+  unchanged source (2026-09-08, session 37244). The case now covers namespace isolation,
+  concurrent-lock rejection, retained-directory use after rename and interrupted publication.
+  Root inspected the four platform file changes and updated the existing source-budget error
+  mapping for the new typed invalid-namespace failure. This is scoped macOS persistence evidence;
+  latest native Desktop integration and complete installed shutdown/restart remain unverified.
 - Desktop profile/transport/brief work passed the pinned TypeScript check. Native orchestration,
   actual component policy validation, calibrated forecast production, realistic historical
   backtest evidence, valuation, persisted decision production and complete default/Advanced

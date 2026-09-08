@@ -453,6 +453,7 @@ fn valid_component(value: &str, max: usize) -> bool {
 fn map_state_error(error: LocalAuthorityStateStoreError) -> LocalSecretStoreError {
     match error {
         LocalAuthorityStateStoreError::UnsafeRoot
+        | LocalAuthorityStateStoreError::InvalidNamespace
         | LocalAuthorityStateStoreError::UnsafeFileType
         | LocalAuthorityStateStoreError::SecureRootUnsupported => {
             LocalSecretStoreError::UnsafeStorage

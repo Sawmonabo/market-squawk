@@ -135,6 +135,9 @@ pub enum LocalAuthorityStateStoreError {
     /// The configured root is a symbolic link, reparse point, or non-directory.
     #[error("authority-state root is not a safe directory")]
     UnsafeRoot,
+    /// A namespace is empty, too long, or contains characters outside its bounded filename grammar.
+    #[error("authority-state namespace is not a safe bounded name")]
+    InvalidNamespace,
     /// A reserved authority-state name is not a regular single-link file.
     #[error("authority-state file has an unsafe or ambiguous type")]
     UnsafeFileType,
@@ -211,6 +214,31 @@ impl LocalAuthorityStateStore {
     /// missing or invalid peer before returning.
     pub fn try_open(root: impl AsRef<Path>) -> Result<Self, LocalAuthorityStateStoreError> {
         let (files, lock) = StateFiles::try_open(root.as_ref())?;
+        Self::from_files(files, lock)
+    }
+
+    /// Opens an independently locked authority namespace in this store's retained directory.
+    ///
+    /// Names contain 1–64 lowercase ASCII letters, digits, or hyphens and begin with a letter or
+    /// digit. Namespaces are peers within the same directory, including when opened from another
+    /// namespace; the directory capability is retained and no child directory is created. Windows
+    /// continues to verify the retained root against its recorded path before publication. The
+    /// unnamed authority's filenames remain unchanged. Every namespace uses the same publication, recovery,
+    /// and platform durability contract as the unnamed authority: directory synchronization on
+    /// Unix and the existing synchronized-file/atomic-publication contract on Windows.
+    /// Invalid namespace names return [`LocalAuthorityStateStoreError::InvalidNamespace`].
+    pub fn try_open_namespace(
+        &self,
+        namespace: &str,
+    ) -> Result<Self, LocalAuthorityStateStoreError> {
+        let (files, lock) = self.files.try_open_namespace(namespace)?;
+        Self::from_files(files, lock)
+    }
+
+    fn from_files(
+        files: StateFiles,
+        lock: LifetimeLock,
+    ) -> Result<Self, LocalAuthorityStateStoreError> {
         let store = Self {
             files,
             _lock: lock,

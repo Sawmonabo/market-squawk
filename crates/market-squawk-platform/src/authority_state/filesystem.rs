@@ -1,10 +1,10 @@
 //! Capability-confined root, fixed-slot safety, and platform publication primitives.
 
-use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
+use std::{borrow::Cow, fs};
 
 use cap_fs_ext::{FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
@@ -45,24 +45,68 @@ impl Slot {
             Self::B => Self::A,
         }
     }
+}
 
-    pub(super) const fn file(self) -> &'static str {
-        match self {
-            Self::A => SLOT_A_FILE,
-            Self::B => SLOT_B_FILE,
+struct ReservedNames {
+    slot_a: Cow<'static, str>,
+    slot_b: Cow<'static, str>,
+    temporary_a: Cow<'static, str>,
+    temporary_b: Cow<'static, str>,
+    lock: Cow<'static, str>,
+}
+
+impl ReservedNames {
+    const fn base() -> Self {
+        Self {
+            slot_a: Cow::Borrowed(SLOT_A_FILE),
+            slot_b: Cow::Borrowed(SLOT_B_FILE),
+            temporary_a: Cow::Borrowed(TEMP_A_FILE),
+            temporary_b: Cow::Borrowed(TEMP_B_FILE),
+            lock: Cow::Borrowed(LOCK_FILE),
         }
     }
 
-    const fn temporary(self) -> &'static str {
-        match self {
-            Self::A => TEMP_A_FILE,
-            Self::B => TEMP_B_FILE,
+    fn namespace(namespace: &str) -> Result<Self, LocalAuthorityStateStoreError> {
+        let valid_character = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+        if namespace.is_empty()
+            || namespace.len() > 64
+            || !namespace.bytes().next().is_some_and(valid_character)
+            || !namespace
+                .bytes()
+                .all(|byte| valid_character(byte) || byte == b'-')
+        {
+            return Err(LocalAuthorityStateStoreError::InvalidNamespace);
+        }
+        // The namespace grammar excludes every separator and every dot used by the fixed
+        // suffixes. This prefix therefore cannot overlap another namespace or the base slots.
+        let name = |suffix| Cow::Owned(format!(".authority-namespace-{namespace}--{suffix}"));
+        Ok(Self {
+            slot_a: name(SLOT_A_FILE),
+            slot_b: name(SLOT_B_FILE),
+            temporary_a: name(TEMP_A_FILE),
+            temporary_b: name(TEMP_B_FILE),
+            lock: name(LOCK_FILE),
+        })
+    }
+
+    fn file(&self, slot: Slot) -> &str {
+        match slot {
+            Slot::A => &self.slot_a,
+            Slot::B => &self.slot_b,
+        }
+    }
+
+    fn temporary(&self, slot: Slot) -> &str {
+        match slot {
+            Slot::A => &self.temporary_a,
+            Slot::B => &self.temporary_b,
         }
     }
 }
 
 pub(super) struct StateFiles {
     directory: Dir,
+    names: ReservedNames,
     #[cfg(windows)]
     root_path: PathBuf,
 }
@@ -82,13 +126,47 @@ impl StateFiles {
         root: &Path,
     ) -> Result<(Self, LifetimeLock), LocalAuthorityStateStoreError> {
         let directory = open_root(root)?;
-        reject_unsafe_entry_if_present(&directory, LOCK_FILE)?;
+        #[cfg(windows)]
+        let root_path = fs::canonicalize(root)
+            .map_err(|source| io_error("canonicalize retained authority root", source))?;
+        Self {
+            directory,
+            names: ReservedNames::base(),
+            #[cfg(windows)]
+            root_path,
+        }
+        .acquire()
+    }
+
+    pub(super) fn try_open_namespace(
+        &self,
+        namespace: &str,
+    ) -> Result<(Self, LifetimeLock), LocalAuthorityStateStoreError> {
+        let names = ReservedNames::namespace(namespace)?;
+        let directory = self
+            .directory
+            .try_clone()
+            .map_err(|source| io_error("retain authority namespace directory", source))?;
+        Self {
+            directory,
+            names,
+            #[cfg(windows)]
+            root_path: self.root_path.clone(),
+        }
+        .acquire()
+    }
+
+    fn acquire(self) -> Result<(Self, LifetimeLock), LocalAuthorityStateStoreError> {
+        #[cfg(windows)]
+        self.validate_windows_root_identity()?;
+        reject_unsafe_entry_if_present(&self.directory, &self.names.lock)?;
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         options.follow(FollowSymlinks::No);
         set_private_creation_mode(&mut options);
-        let lock = directory
-            .open_with(LOCK_FILE, &options)
+        let lock = self
+            .directory
+            .open_with(self.names.lock.as_ref(), &options)
             .map_err(|source| io_error("open lock", source))?;
         if !is_unambiguous_regular(
             &lock
@@ -106,32 +184,25 @@ impl StateFiles {
             }
         })?;
         let lock = LifetimeLock(lock);
-        #[cfg(windows)]
-        let root_path = fs::canonicalize(root)
-            .map_err(|source| io_error("canonicalize retained authority root", source))?;
-        let files = Self {
-            directory,
-            #[cfg(windows)]
-            root_path,
-        };
-        files.reconcile_publication_residue()?;
-        for name in [SLOT_A_FILE, SLOT_B_FILE, TEMP_A_FILE, TEMP_B_FILE] {
-            reject_unsafe_entry_if_present(&files.directory, name)?;
+        self.reconcile_publication_residue()?;
+        for slot in [Slot::A, Slot::B] {
+            reject_unsafe_entry_if_present(&self.directory, self.names.file(slot))?;
+            reject_unsafe_entry_if_present(&self.directory, self.names.temporary(slot))?;
         }
-        Ok((files, lock))
+        Ok((self, lock))
     }
 
     pub(super) fn read_slot(
         &self,
         slot: Slot,
     ) -> Result<Option<Zeroizing<Vec<u8>>>, LocalAuthorityStateStoreError> {
-        self.read_bounded_regular(slot.file())
+        self.read_bounded_regular(self.names.file(slot))
             .map(|result| result.map(|file| file.bytes))
     }
 
     fn read_bounded_regular(
         &self,
-        name: &'static str,
+        name: &str,
     ) -> Result<Option<BoundedFile>, LocalAuthorityStateStoreError> {
         let Some(mut file) = open_existing_regular(&self.directory, name)? else {
             return Ok(None);
@@ -174,7 +245,7 @@ impl StateFiles {
     ) -> Result<Option<PublicationResidue>, LocalAuthorityStateStoreError> {
         let mut residue = None;
         for slot in [Slot::A, Slot::B] {
-            let Some(file) = self.read_bounded_regular(slot.temporary())? else {
+            let Some(file) = self.read_bounded_regular(self.names.temporary(slot))? else {
                 continue;
             };
             if residue.is_some() {
@@ -203,7 +274,7 @@ impl StateFiles {
     ) -> Result<(), LocalAuthorityStateStoreError> {
         let observed = self
             .directory
-            .symlink_metadata(residue.slot.temporary())
+            .symlink_metadata(self.names.temporary(residue.slot))
             .map_err(|_| LocalAuthorityStateStoreError::RecoveryRequired)?;
         if !is_unambiguous_regular(&observed)
             || (observed.dev(), observed.ino()) != residue.identity
@@ -211,11 +282,14 @@ impl StateFiles {
             return Err(LocalAuthorityStateStoreError::RecoveryRequired);
         }
         self.directory
-            .remove_file(residue.slot.temporary())
+            .remove_file(self.names.temporary(residue.slot))
             .map_err(|_| LocalAuthorityStateStoreError::RecoveryRequired)?;
         self.synchronize_directory()
             .map_err(|_| LocalAuthorityStateStoreError::RecoveryRequired)?;
-        match self.directory.symlink_metadata(residue.slot.temporary()) {
+        match self
+            .directory
+            .symlink_metadata(self.names.temporary(residue.slot))
+        {
             Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
             Ok(_) | Err(_) => Err(LocalAuthorityStateStoreError::RecoveryRequired),
         }
@@ -234,7 +308,7 @@ impl StateFiles {
         slot: Slot,
         bytes: &[u8],
     ) -> Result<(), LocalAuthorityStateStoreError> {
-        let existed = reject_unsafe_entry_if_present(&self.directory, slot.file())?;
+        let existed = reject_unsafe_entry_if_present(&self.directory, self.names.file(slot))?;
         self.publish_bytes(slot, existed, bytes)
     }
 
@@ -252,7 +326,7 @@ impl StateFiles {
         set_private_creation_mode(&mut options);
         let mut temporary = self
             .directory
-            .open_with(slot.temporary(), &options)
+            .open_with(self.names.temporary(slot), &options)
             .map_err(|source| io_error("create temporary state", source))?;
         temporary
             .write_all(bytes)
@@ -263,14 +337,22 @@ impl StateFiles {
         drop(temporary);
         if existed {
             self.directory
-                .rename(slot.temporary(), &self.directory, slot.file())
+                .rename(
+                    self.names.temporary(slot),
+                    &self.directory,
+                    self.names.file(slot),
+                )
                 .map_err(|source| io_error("replace inactive authority slot", source))?;
         } else {
             self.directory
-                .hard_link(slot.temporary(), &self.directory, slot.file())
+                .hard_link(
+                    self.names.temporary(slot),
+                    &self.directory,
+                    self.names.file(slot),
+                )
                 .map_err(|source| io_error("install new authority slot", source))?;
             self.directory
-                .remove_file(slot.temporary())
+                .remove_file(self.names.temporary(slot))
                 .map_err(|source| io_error("remove linked authority temporary", source))?;
         }
         self.synchronize_directory()
@@ -289,7 +371,7 @@ impl StateFiles {
         options.follow(FollowSymlinks::No);
         let mut temporary = self
             .directory
-            .open_with(slot.temporary(), &options)
+            .open_with(self.names.temporary(slot), &options)
             .map_err(|source| io_error("create fixed temporary state", source))?;
         temporary
             .write_all(bytes)
@@ -300,8 +382,8 @@ impl StateFiles {
         drop(temporary);
 
         self.validate_windows_root_identity()?;
-        let source = self.root_path.join(slot.temporary());
-        let destination = self.root_path.join(slot.file());
+        let source = self.root_path.join(self.names.temporary(slot));
+        let destination = self.root_path.join(self.names.file(slot));
         let publication = if existed {
             match atomicwrites::replace_atomic(&source, &destination) {
                 Ok(()) => Ok(()),
@@ -309,8 +391,11 @@ impl StateFiles {
                     // MoveFileExW cannot always replace a destination that remains open. Rust's
                     // rename adds the FileRenameInfoEx POSIX-semantics fallback on supported
                     // Windows filesystems while this capability handle retains the authority root.
-                    self.directory
-                        .rename(slot.temporary(), &self.directory, slot.file())
+                    self.directory.rename(
+                        self.names.temporary(slot),
+                        &self.directory,
+                        self.names.file(slot),
+                    )
                 }
                 Err(source) => Err(source),
             }
@@ -321,8 +406,11 @@ impl StateFiles {
             return Err(LocalAuthorityStateStoreError::RecoveryRequired);
         }
         self.validate_windows_root_identity()?;
-        if self.directory.symlink_metadata(slot.temporary()).is_ok()
-            || open_existing_regular(&self.directory, slot.file())?.is_none()
+        if self
+            .directory
+            .symlink_metadata(self.names.temporary(slot))
+            .is_ok()
+            || open_existing_regular(&self.directory, self.names.file(slot))?.is_none()
         {
             return Err(LocalAuthorityStateStoreError::RecoveryRequired);
         }
@@ -361,7 +449,7 @@ impl StateFiles {
     }
 
     fn require_temporary_absent(&self, slot: Slot) -> Result<(), LocalAuthorityStateStoreError> {
-        match self.directory.symlink_metadata(slot.temporary()) {
+        match self.directory.symlink_metadata(self.names.temporary(slot)) {
             Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
             Ok(_) => Err(LocalAuthorityStateStoreError::RecoveryRequired),
             Err(source) => Err(io_error("inspect fixed temporary state", source)),
@@ -371,7 +459,7 @@ impl StateFiles {
     #[cfg(unix)]
     fn reconcile_publication_residue(&self) -> Result<(), LocalAuthorityStateStoreError> {
         for slot in [Slot::A, Slot::B] {
-            let temporary = match self.directory.symlink_metadata(slot.temporary()) {
+            let temporary = match self.directory.symlink_metadata(self.names.temporary(slot)) {
                 Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
                 Ok(metadata) => metadata,
                 Err(source) => return Err(io_error("inspect publication residue", source)),
@@ -381,7 +469,7 @@ impl StateFiles {
             }
             let installed = self
                 .directory
-                .symlink_metadata(slot.file())
+                .symlink_metadata(self.names.file(slot))
                 .map_err(|_| LocalAuthorityStateStoreError::UnsafeFileType)?;
             if !temporary.is_file()
                 || !installed.is_file()
@@ -393,13 +481,13 @@ impl StateFiles {
             }
             let identity = (installed.dev(), installed.ino());
             self.directory
-                .remove_file(slot.temporary())
+                .remove_file(self.names.temporary(slot))
                 .map_err(|_| LocalAuthorityStateStoreError::RecoveryRequired)?;
             self.synchronize_directory()
                 .map_err(|_| LocalAuthorityStateStoreError::RecoveryRequired)?;
             let recovered = self
                 .directory
-                .symlink_metadata(slot.file())
+                .symlink_metadata(self.names.file(slot))
                 .map_err(|_| LocalAuthorityStateStoreError::RecoveryRequired)?;
             if !recovered.is_file()
                 || recovered.nlink() != 1
@@ -415,7 +503,7 @@ impl StateFiles {
     fn reconcile_publication_residue(&self) -> Result<(), LocalAuthorityStateStoreError> {
         self.validate_windows_root_identity()?;
         for slot in [Slot::A, Slot::B] {
-            match self.directory.symlink_metadata(slot.temporary()) {
+            match self.directory.symlink_metadata(self.names.temporary(slot)) {
                 Err(source) if source.kind() == io::ErrorKind::NotFound => {}
                 Ok(_) => return Err(LocalAuthorityStateStoreError::UnsafeFileType),
                 Err(source) => return Err(io_error("inspect publication residue", source)),
@@ -552,7 +640,7 @@ const fn is_windows_reparse(_metadata: &fs::Metadata) -> bool {
 
 fn reject_unsafe_entry_if_present(
     directory: &Dir,
-    name: &'static str,
+    name: &str,
 ) -> Result<bool, LocalAuthorityStateStoreError> {
     match directory.symlink_metadata(name) {
         Ok(metadata) if is_unambiguous_regular(&metadata) => Ok(true),
@@ -564,7 +652,7 @@ fn reject_unsafe_entry_if_present(
 
 fn open_existing_regular(
     directory: &Dir,
-    name: &'static str,
+    name: &str,
 ) -> Result<Option<cap_std::fs::File>, LocalAuthorityStateStoreError> {
     if !reject_unsafe_entry_if_present(directory, name)? {
         return Ok(None);

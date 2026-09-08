@@ -61,6 +61,7 @@ fn map_local_store_error(
 
     match error {
         LocalAuthorityStateStoreError::UnsafeRoot
+        | LocalAuthorityStateStoreError::InvalidNamespace
         | LocalAuthorityStateStoreError::UnsafeFileType
         | LocalAuthorityStateStoreError::PayloadTooLarge { .. }
         | LocalAuthorityStateStoreError::EnvelopeTooLarge { .. }
