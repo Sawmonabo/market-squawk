@@ -2971,6 +2971,86 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         Some(u64::MAX)
     );
     assert_eq!(event.rows()[0].source_sequence(), Some(u64::MAX));
+    let cancellation = CancellationToken::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let instrument = market_bar_instrument(1)?;
+    let retained_routes = restarted.provider_market_event_durable_routes(
+        instrument,
+        &[LiveEventClass::Trade],
+        Timestamp::from_unix_nanos(490),
+        Timestamp::from_unix_nanos(i64::MAX),
+        1,
+        deadline,
+        &cancellation,
+    )?;
+    assert_eq!(retained_routes.len(), 1);
+    assert_eq!(retained_routes[0].dataset(), manifest.dataset_id());
+    assert_eq!(retained_routes[0].source_surface(), source.source_id());
+    assert_eq!(retained_routes[0].instrument_id(), instrument);
+    assert_eq!(retained_routes[0].venue_id().as_str(), "iex");
+    for (as_of, knowledge) in [(489, i64::MAX), (490, 500)] {
+        assert!(
+            restarted
+                .provider_market_event_durable_routes(
+                    instrument,
+                    &[LiveEventClass::Trade],
+                    Timestamp::from_unix_nanos(as_of),
+                    Timestamp::from_unix_nanos(knowledge),
+                    1,
+                    deadline,
+                    &cancellation,
+                )?
+                .is_empty()
+        );
+    }
+    assert!(
+        restarted
+            .provider_market_event_durable_routes(
+                instrument,
+                &[LiveEventClass::Trade, LiveEventClass::Trade],
+                Timestamp::from_unix_nanos(490),
+                Timestamp::from_unix_nanos(i64::MAX),
+                1,
+                deadline,
+                &cancellation,
+            )
+            .is_err()
+    );
+    assert!(
+        restarted
+            .retained_source_metadata(
+                source.source_id(),
+                source.revision(),
+                Timestamp::from_unix_nanos(9),
+                deadline,
+                &cancellation,
+            )?
+            .is_none()
+    );
+    let retained_source = restarted
+        .retained_source_metadata(
+            source.source_id(),
+            source.revision(),
+            Timestamp::from_unix_nanos(10),
+            deadline,
+            &cancellation,
+        )?
+        .ok_or("missing exact retained source revision")?;
+    assert_eq!(
+        serde_json::to_vec(&retained_source)?,
+        serde_json::to_vec(&source)?
+    );
+    cancellation.cancel();
+    assert!(matches!(
+        restarted.retained_source_metadata(
+            source.source_id(),
+            source.revision(),
+            Timestamp::from_unix_nanos(10),
+            deadline,
+            &cancellation,
+        ),
+        Err(IngestError::Cancelled)
+    ));
     Ok(())
 }
 

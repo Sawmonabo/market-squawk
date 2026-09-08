@@ -941,6 +941,12 @@ pub enum CatalogError {
     /// The caller's monotonic deadline elapsed while company identities were being read.
     #[error("catalog company-identity read deadline elapsed")]
     CompanyIdentityReadDeadlineExceeded,
+    /// Cancellation was observed while retained market routes or source revisions were read.
+    #[error("catalog market recovery read was cancelled")]
+    MarketRecoveryReadCancelled,
+    /// The caller's monotonic deadline elapsed during retained market recovery reads.
+    #[error("catalog market recovery read deadline elapsed")]
+    MarketRecoveryReadDeadlineExceeded,
     /// An append identity already names different immutable evidence.
     #[error("catalog append identity conflicts with retained evidence")]
     EvidenceConflict,

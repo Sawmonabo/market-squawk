@@ -37,7 +37,7 @@ comparison policy, not evidence that dual-benchmark production is already comple
   compilation. The bounded live attempt made four requests (three successful) and stopped during
   variables metadata acquisition with a transport-class failure whose cause was not retained.
   No QWI publication or restart proof occurred; no retry ran. Its durable live acceptance is open.
-- The shared-data checkpoint in this revision adds atomic terminal-page staging and resumable
+- Pushed shared-data checkpoint `f8cb4f0613f294bdfa8e992cb3b56ad19da9616a` adds atomic terminal-page staging and resumable
   32-page publication groups. The existing critical publication/recovery case passed 1/1 on
   2026-09-08, including interruption, restart, orphan preservation and exact retained rows under
   its unchanged 8 MiB processing cap. The data library check passed. The existing identity receipt
@@ -47,6 +47,14 @@ comparison policy, not evidence that dual-benchmark production is already comple
   publication schema metadata, unnecessary output row groups, and omitted Arrow allocation overhead.
   Treasury application integration and whole-app verification remain open; the processing cap is
   not a measurement of the complete installed application's RAM. No CI ran for this checkpoint.
+- The next shared-data checkpoint adds bounded durable market route discovery and exact retained
+  source metadata revision reads using original event/knowledge cutoffs. It reuses the existing
+  catalog and selection authority without new tables. The existing market publication/restart
+  case passed 1/1, including cutoff exclusion, exact metadata, invalid input and cancellation.
+  Data source fingerprint: `15ea5a6410d0009c92c5c7c8607c3944ab93fc000feeba9f32290488d5951f19`.
+  Root inspected the six-file source/test delta. The combined application check found integration
+  errors in the surrounding WIP; those remain under correction and this data check does not
+  establish application, current rights, Desktop or live workflow acceptance.
 - Desktop profile/transport/brief work passed the pinned TypeScript check. Native orchestration,
   actual component policy validation, calibrated forecast production, realistic historical
   backtest evidence, valuation, persisted decision production and complete default/Advanced

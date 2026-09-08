@@ -11,8 +11,8 @@ use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use market_squawk_domain::{
     CompanyIdentityObservation, DigestAlgorithm, EvidenceDigest, FundEvidenceRecord,
-    FundFilingIdentity, FundSourceLineage, MetadataRevision, ResearchObservation, SourceId,
-    SourceIdentifier, Timestamp,
+    FundFilingIdentity, FundSourceLineage, InstrumentId, LiveEventClass, MetadataRevision,
+    ResearchObservation, SourceId, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::{
     ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
@@ -2043,6 +2043,14 @@ fn map_recovery_manifest_error(error: ManifestCatalogError) -> IngestError {
     }
 }
 
+fn map_market_recovery_catalog_error(error: CatalogError) -> IngestError {
+    match error {
+        CatalogError::MarketRecoveryReadCancelled => IngestError::Cancelled,
+        CatalogError::MarketRecoveryReadDeadlineExceeded => IngestError::DeadlineExceeded,
+        error => IngestError::Catalog(error),
+    }
+}
+
 #[cfg(test)]
 impl QueryArtifactBindTestBarrier {
     pub(crate) async fn wait_until_entered(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -2615,6 +2623,76 @@ impl AnalyticalDataService {
             source_id: owned.source_id,
             objects: objects.into_boxed_slice(),
             receipt_digest: owned.receipt_digest,
+        })
+    }
+
+    /// Discovers bounded durable routes using the original event and knowledge cutoffs.
+    ///
+    /// Routes carry no selected event or source-use authority. Reopen them through the existing
+    /// point-in-time selector, then resolve the selected event's exact retained source revision.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the exact instrument, event classes, original clocks and work bounds stay explicit"
+    )]
+    pub fn provider_market_event_durable_routes(
+        &self,
+        instrument_id: InstrumentId,
+        event_kinds: &[LiveEventClass],
+        as_of_cutoff: Timestamp,
+        knowledge_cutoff: Timestamp,
+        maximum_routes: usize,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<crate::ProviderMarketEventDurableRoute>, IngestError> {
+        self.market_recovery_authority(deadline, cancellation)?
+            .catalog()
+            .provider_market_event_durable_routes(
+                instrument_id,
+                event_kinds,
+                as_of_cutoff,
+                knowledge_cutoff,
+                maximum_routes,
+                deadline,
+                cancellation,
+            )
+            .map_err(map_market_recovery_catalog_error)
+    }
+
+    /// Reopens one exact retained source revision admitted by the original knowledge cutoff.
+    pub fn retained_source_metadata(
+        &self,
+        source_id: &SourceId,
+        metadata_revision: &MetadataRevision,
+        knowledge_cutoff: Timestamp,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<SourceMetadata>, IngestError> {
+        self.market_recovery_authority(deadline, cancellation)?
+            .catalog()
+            .retained_source_metadata(
+                source_id,
+                metadata_revision,
+                knowledge_cutoff,
+                deadline,
+                cancellation,
+            )
+            .map_err(map_market_recovery_catalog_error)
+    }
+
+    fn market_recovery_authority(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MutexGuard<'_, CatalogAuthority>, IngestError> {
+        if cancellation.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(IngestError::DeadlineExceeded);
+        }
+        self.authority.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => IngestError::AuthorityBusy,
+            TryLockError::Poisoned(_) => IngestError::AuthorityLockPoisoned,
         })
     }
 
@@ -5609,6 +5687,9 @@ pub enum IngestError {
     /// The process-owned Task 3 authority lock was poisoned.
     #[error("analytical catalog authority is unavailable")]
     AuthorityLockPoisoned,
+    /// The sole catalog authority is occupied by another bounded operation.
+    #[error("analytical catalog authority is busy")]
+    AuthorityBusy,
     /// The bounded blocking worker required for provider recovery was unavailable.
     #[error("provider-capture recovery worker is unavailable")]
     ProviderCaptureRecoveryWorkerUnavailable,

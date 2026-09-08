@@ -9,6 +9,7 @@ mod evidence;
 mod fair_value;
 mod listing_reference;
 mod market_data_instruments;
+mod market_recovery;
 mod migration_preflight;
 mod observed_revisions;
 mod official_options_reference;
@@ -92,6 +93,7 @@ pub use self::market_data_instruments::{
     MarketDataProviderIdentityQuery, MarketDataProviderIdentityResolution,
     MarketDataProviderIdentityResolutionOutcome, MarketDataProviderIdentitySelection,
 };
+pub use self::market_recovery::ProviderMarketEventDurableRoute;
 pub use self::official_options_reference::{
     MAX_OFFICIAL_OPTIONS_REFERENCE_ALIAS_ASSERTIONS,
     MAX_OFFICIAL_OPTIONS_REFERENCE_ALIAS_RESOLUTIONS,
