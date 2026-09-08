@@ -1110,6 +1110,7 @@ async fn load_durable_route_evidence(
                 reference_at,
                 ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
                 MAXIMUM_DURABLE_EVENT_CANDIDATES,
+                context.deadline(),
                 context.cancellation().clone(),
             )
             .await

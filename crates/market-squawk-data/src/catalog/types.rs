@@ -884,6 +884,9 @@ pub enum CatalogError {
     /// The supplied reservation was not sealed by this open catalog session.
     #[error("catalog ingest reservation is not valid for this session")]
     InvalidReservationCapability,
+    /// Shared composition authority is occupied by another operation.
+    #[error("catalog composition authority is busy")]
+    AuthorityBusy,
     /// Shared composition authority could not be locked.
     #[error("catalog composition authority lock is unavailable")]
     AuthorityLockPoisoned,

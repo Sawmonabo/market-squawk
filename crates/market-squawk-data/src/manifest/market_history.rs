@@ -41,7 +41,6 @@ const ALPACA_HISTORY_ASSET_CLASSES: &str = "equity,fund";
 const ALPACA_HISTORY_VENUE: &str = "iex";
 const ALPACA_HISTORY_FEED: &str = "iex";
 const ALPACA_HISTORY_INTERVAL: &str = "1Day";
-const ALPACA_HISTORY_ADJUSTMENT: &str = "all";
 const ALPACA_HISTORY_TIMESTAMP_BASIS: &str = "period_start";
 const ALPACA_HISTORY_SESSION_KIND: &str = "provider_defined";
 const ALPACA_HISTORY_SESSION_RULESET: &str = "alpaca-v3-iex-utc-range-returned-dates-v2";
@@ -54,19 +53,32 @@ const LATEST_CANONICAL_HISTORY_WINDOW_SELECTION_DOMAIN: &[u8] =
 
 /// Opaque, versioned policy for canonical durable market-history selection.
 ///
-/// V1 resolves only the complete Alpaca Basic/IEX daily adjusted product. Provider, account,
+/// V1 resolves complete Alpaca Basic/IEX daily raw or adjusted products. Provider, account,
 /// symbol, feed, venue, adjustment, timestamp, and session coordinates are code-owned and cannot
 /// be supplied through this value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MarketHistorySelectionPolicy {
     version: u16,
+    adjustment: MarketBarAdjustment,
 }
 
 impl MarketHistorySelectionPolicy {
-    /// Complete daily adjusted history under the sole supported V1 durable policy.
+    /// Complete daily adjusted history under the fixed V1 durable policy.
     pub const COMPLETE_DAILY_ADJUSTED_V1: Self = Self {
         version: ALPACA_HISTORY_SELECTION_POLICY_VERSION,
+        adjustment: MarketBarAdjustment::All,
     };
+
+    /// Complete daily raw history for observed economic outcomes, with unchanged knowledge clocks.
+    pub const COMPLETE_DAILY_RAW_V1: Self = Self {
+        version: ALPACA_HISTORY_SELECTION_POLICY_VERSION,
+        adjustment: MarketBarAdjustment::Raw,
+    };
+
+    /// Returns the exact raw or adjusted product required by this code-owned policy.
+    pub const fn adjustment(self) -> MarketBarAdjustment {
+        self.adjustment
+    }
 
     /// Returns the stable policy version bound into selection evidence.
     pub const fn version(self) -> u16 {
@@ -75,6 +87,10 @@ impl MarketHistorySelectionPolicy {
 
     const fn is_supported(self) -> bool {
         self.version == ALPACA_HISTORY_SELECTION_POLICY_VERSION
+            && matches!(
+                self.adjustment,
+                MarketBarAdjustment::Raw | MarketBarAdjustment::All
+            )
     }
 }
 
@@ -87,7 +103,7 @@ pub struct LatestCanonicalMarketBarHistoryWindowRequest {
 }
 
 impl LatestCanonicalMarketBarHistoryWindowRequest {
-    /// Constructs one latest-window lookup under the code-owned daily adjusted policy.
+    /// Constructs one latest-window lookup under a code-owned complete daily policy.
     ///
     /// # Errors
     ///
@@ -112,7 +128,7 @@ impl LatestCanonicalMarketBarHistoryWindowRequest {
         self.instrument_id
     }
 
-    /// Returns the sole code-owned, versioned selection policy.
+    /// Returns the exact code-owned, versioned selection policy.
     pub const fn selection_policy(self) -> MarketHistorySelectionPolicy {
         self.selection_policy
     }
@@ -509,7 +525,7 @@ impl CanonicalMarketBarHistoryRequest {
         (self.requested_start, self.requested_end)
     }
 
-    /// Returns the sole code-owned, versioned selection policy.
+    /// Returns the exact code-owned, versioned selection policy.
     pub const fn selection_policy(&self) -> MarketHistorySelectionPolicy {
         self.selection_policy
     }
@@ -1051,7 +1067,15 @@ impl MarketBarHistoryPublicationReceipt {
         true
     }
 
-    /// History first observed locally is never admitted to backtests.
+    /// Complete raw bars may supply realized execution/outcome economics after acquisition.
+    ///
+    /// This does not authorize using their prices or volumes as historically known signals.
+    /// Consumers must retain the original acquisition clocks and independently qualify signals.
+    pub const fn realized_outcome_eligible(&self) -> bool {
+        matches!(self.adjustment, MarketBarAdjustment::Raw)
+    }
+
+    /// History first observed locally is never admitted as historical backtest signal evidence.
     pub const fn backtest_eligible(&self) -> bool {
         false
     }
@@ -1174,7 +1198,7 @@ impl CompleteMarketBarHistorySelection {
         &self.receipt
     }
 
-    /// Returns the version of the code-owned Alpaca/IEX daily adjusted-series policy.
+    /// Returns the version of the code-owned Alpaca/IEX complete daily-series policy.
     pub const fn policy_version(&self) -> u16 {
         ALPACA_HISTORY_SELECTION_POLICY_VERSION
     }
@@ -1369,7 +1393,15 @@ fn hash_text(hash: &mut Sha256, value: &str) {
     hash.update(value.as_bytes());
 }
 
-fn history_policy_digest() -> Result<Sha256Digest, ManifestCatalogError> {
+fn history_policy_digest(
+    adjustment: MarketBarAdjustment,
+) -> Result<Sha256Digest, ManifestCatalogError> {
+    if !matches!(
+        adjustment,
+        MarketBarAdjustment::Raw | MarketBarAdjustment::All
+    ) {
+        return Err(ManifestCatalogError::MarketBarHistoryMismatch);
+    }
     let mut hash = Sha256::new();
     hash.update(ALPACA_HISTORY_POLICY_DOMAIN);
     hash.update(ALPACA_HISTORY_SELECTION_POLICY_VERSION.to_be_bytes());
@@ -1379,7 +1411,7 @@ fn history_policy_digest() -> Result<Sha256Digest, ManifestCatalogError> {
         ALPACA_HISTORY_VENUE,
         ALPACA_HISTORY_FEED,
         ALPACA_HISTORY_INTERVAL,
-        ALPACA_HISTORY_ADJUSTMENT,
+        adjustment_name(adjustment),
         ALPACA_HISTORY_TIMESTAMP_BASIS,
         ALPACA_HISTORY_SESSION_KIND,
         ALPACA_HISTORY_SESSION_RULESET,
@@ -2237,7 +2269,7 @@ fn resolve_canonical_market_bar_history_series(
            AND publication.venue_id='iex'
            AND publication.feed='iex'
            AND publication.bar_interval='1Day'
-           AND publication.adjustment='all'
+           AND publication.adjustment=?15
            AND publication.timestamp_basis='period_start'
            AND publication.session_kind='provider_defined'
            AND publication.session_ruleset='alpaca-v3-iex-utc-range-returned-dates-v2'
@@ -2298,6 +2330,7 @@ fn resolve_canonical_market_bar_history_series(
             canonical_schema.fingerprint().as_slice(),
             request.requested_range().0.unix_nanos(),
             request.requested_range().1.unix_nanos(),
+            adjustment_name(request.selection_policy().adjustment()),
         ],
         |row| {
             Ok(StoredCanonicalMarketBarHistorySeries {
@@ -2336,7 +2369,7 @@ fn resolve_canonical_market_bar_history_series(
         || series.venue_id != ALPACA_HISTORY_VENUE
         || series.feed != ALPACA_HISTORY_FEED
         || series.interval != ALPACA_HISTORY_INTERVAL
-        || series.adjustment != ALPACA_HISTORY_ADJUSTMENT
+        || series.adjustment != adjustment_name(request.selection_policy().adjustment())
         || series.timestamp_basis != ALPACA_HISTORY_TIMESTAMP_BASIS
         || series.session_kind != ALPACA_HISTORY_SESSION_KIND
         || series.session_ruleset != ALPACA_HISTORY_SESSION_RULESET
@@ -2366,7 +2399,7 @@ fn resolve_canonical_market_bar_history_series(
             venue_id,
             feed,
             interval,
-            MarketBarAdjustment::All,
+            request.selection_policy().adjustment(),
             BarTimestampBasis::PeriodStart,
             MarketBarSessionKind::ProviderDefined,
             session_ruleset,
@@ -2381,7 +2414,7 @@ fn resolve_canonical_market_bar_history_series(
             venue_id,
             feed,
             interval,
-            MarketBarAdjustment::All,
+            request.selection_policy().adjustment(),
             BarTimestampBasis::PeriodStart,
             MarketBarSessionKind::ProviderDefined,
             session_ruleset,
@@ -2509,7 +2542,7 @@ pub(super) fn select_latest_canonical_market_bar_history_window(
            AND publication.venue_id='iex'
            AND publication.feed='iex'
            AND publication.bar_interval='1Day'
-           AND publication.adjustment='all'
+           AND publication.adjustment=?6
            AND publication.timestamp_basis='period_start'
            AND publication.session_kind='provider_defined'
            AND publication.session_ruleset='alpaca-v3-iex-utc-range-returned-dates-v2'
@@ -2558,6 +2591,7 @@ pub(super) fn select_latest_canonical_market_bar_history_window(
             canonical_schema.name(),
             i64::from(canonical_schema.version().get()),
             canonical_schema.fingerprint().as_slice(),
+            adjustment_name(request.selection_policy().adjustment()),
         ],
         |row| {
             Ok((
@@ -3065,7 +3099,7 @@ pub(super) fn select_complete_market_bar_history(
         return Err(ManifestCatalogError::CorruptCatalog);
     }
     check_operation(deadline, cancellation)?;
-    let policy_digest = history_policy_digest()?;
+    let policy_digest = history_policy_digest(request.adjustment())?;
     let selection_digest =
         history_selection_digest(policy_digest, request, &manifest, publication_digest)?;
     Ok(Some(CompleteMarketBarHistorySelection {
@@ -3426,7 +3460,10 @@ fn receipt_from_wire(
         || wire.venue_id.as_str() != ALPACA_HISTORY_VENUE
         || wire.feed.as_str() != ALPACA_HISTORY_FEED
         || wire.interval.as_str() != ALPACA_HISTORY_INTERVAL
-        || adjustment_name(wire.adjustment) != ALPACA_HISTORY_ADJUSTMENT
+        || !matches!(
+            wire.adjustment,
+            MarketBarAdjustment::Raw | MarketBarAdjustment::All
+        )
         || timestamp_basis_name(wire.timestamp_basis) != ALPACA_HISTORY_TIMESTAMP_BASIS
         || session_kind_name(wire.session_kind) != ALPACA_HISTORY_SESSION_KIND
         || wire.session_ruleset.as_str() != ALPACA_HISTORY_SESSION_RULESET

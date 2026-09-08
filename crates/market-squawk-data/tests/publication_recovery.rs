@@ -2945,7 +2945,7 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         paths.artifacts()?.clone(),
         ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
     )?;
-    let capture_store = paths.sealed_research_journal_store()?;
+    let capture_store = Arc::new(paths.sealed_research_journal_store()?);
     let restarted_selectors = restarted.provider_market_event_publications(&manifest)?;
     assert_eq!(restarted_selectors, selectors);
     let reopened = restarted
@@ -3040,6 +3040,47 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
         serde_json::to_vec(&retained_source)?,
         serde_json::to_vec(&source)?
     );
+    let selection_request = market_squawk_data::ProviderMarketEventPointInTimeRequest::try_exact(
+        manifest.dataset_id().clone(),
+        instrument,
+        retained_routes[0].venue_id().clone(),
+        LiveEventClass::Trade,
+        Timestamp::from_unix_nanos(490),
+        Timestamp::from_unix_nanos(i64::MAX),
+        market_squawk_data::ProviderMarketEventEffectiveTimeBasis::SourceTimestamp,
+        1,
+        manifest.clone(),
+        Some(source.source_id().clone()),
+    )?;
+    let selected = restarted
+        .read_provider_market_event_point_in_time(
+            &selection_request,
+            Arc::clone(&capture_store),
+            deadline,
+            cancellation.clone(),
+        )
+        .await?
+        .ok_or("missing supervised exact market-event selection")?;
+    assert_eq!(selected.sources().len(), 1);
+    restarted
+        .verify_provider_market_event_point_in_time_restart(
+            &selected,
+            Arc::clone(&capture_store),
+            deadline,
+            cancellation.clone(),
+        )
+        .await?;
+    assert!(matches!(
+        restarted
+            .read_provider_market_event_point_in_time(
+                &selection_request,
+                Arc::clone(&capture_store),
+                Instant::now(),
+                cancellation.clone(),
+            )
+            .await,
+        Err(IngestError::DeadlineExceeded)
+    ));
     cancellation.cancel();
     assert!(matches!(
         restarted.retained_source_metadata(
@@ -3049,6 +3090,17 @@ async fn provider_market_event_publication_is_restart_queryable() -> TestResult 
             deadline,
             &cancellation,
         ),
+        Err(IngestError::Cancelled)
+    ));
+    assert!(matches!(
+        restarted
+            .read_provider_market_event_point_in_time(
+                &selection_request,
+                capture_store,
+                deadline,
+                cancellation,
+            )
+            .await,
         Err(IngestError::Cancelled)
     ));
     Ok(())
@@ -3174,6 +3226,7 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
         older_wide.manifest()
     );
     assert!(older_origin_receipt.current_research_eligible());
+    assert!(!older_origin_receipt.realized_outcome_eligible());
     assert!(!older_origin_receipt.point_in_time_eligible());
     assert!(!older_origin_receipt.backtest_eligible());
     assert!(!older_origin_receipt.retrospective_training_eligible());
@@ -3561,6 +3614,111 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
             .is_none(),
         "an unserved fixed window must remain unavailable"
     );
+    let raw_request = CanonicalMarketBarHistoryRequest::try_latest(
+        instrument_id,
+        Timestamp::from_unix_nanos(COMPLETE_HISTORY_FIRST_BAR_NS),
+        Timestamp::from_unix_nanos(COMPLETE_HISTORY_REQUEST_END_NS),
+        MarketHistorySelectionPolicy::COMPLETE_DAILY_RAW_V1,
+        cutoff,
+    )?;
+    assert!(
+        service
+            .analytical_reader()
+            .read_canonical_market_bar_history(
+                raw_request.clone(),
+                Instant::now() + Duration::from_secs(30),
+                CancellationToken::new(),
+            )
+            .await?
+            .is_none(),
+        "adjusted history cannot satisfy a raw outcome request"
+    );
+    let raw = publish_complete_history_fixture(
+        &service,
+        &source,
+        &capture_store,
+        complete_history_capture_fixture_with_adjustment(
+            instrument_id,
+            definition_digest,
+            "alpaca-aapl-iex-daily-raw-history-v1",
+            COMPLETE_HISTORY_FIRST_BAR_NS,
+            COMPLETE_HISTORY_REQUEST_END_NS,
+            &[
+                COMPLETE_HISTORY_FIRST_BAR_NS,
+                COMPLETE_HISTORY_SECOND_BAR_NS,
+            ],
+            COMPLETE_HISTORY_NEWER_RECEIVED_AT_NS + 2 * COMPLETE_HISTORY_DAY_NS,
+            5,
+            MarketBarAdjustment::Raw,
+        )?,
+        "alpaca:paper-iex:complete-daily-history:aapl:raw:v1",
+    )
+    .await?;
+    let raw_selected = service
+        .analytical_reader()
+        .read_canonical_market_bar_history(
+            raw_request,
+            Instant::now() + Duration::from_secs(30),
+            CancellationToken::new(),
+        )
+        .await?
+        .ok_or("missing authentic raw outcome history")?;
+    let raw_receipt = raw_selected.selection().receipt();
+    assert_eq!(raw_receipt.adjustment(), MarketBarAdjustment::Raw);
+    assert!(raw_receipt.realized_outcome_eligible());
+    assert!(!raw_receipt.point_in_time_eligible());
+    assert!(!raw_receipt.backtest_eligible());
+    assert!(!raw_receipt.retrospective_training_eligible());
+    assert_eq!(
+        raw_receipt.knowledge_clocks().1,
+        Timestamp::from_unix_nanos(
+            COMPLETE_HISTORY_NEWER_RECEIVED_AT_NS + 2 * COMPLETE_HISTORY_DAY_NS
+        )
+    );
+    let raw_content_digest = raw_selected.read_receipt().history_content_digest();
+    let raw_bars = raw_selected.bars().to_vec();
+    let raw_manifest = raw.manifest().clone();
+    let raw_exact_request = CanonicalMarketBarHistoryRequest::try_exact(
+        instrument_id,
+        Timestamp::from_unix_nanos(COMPLETE_HISTORY_FIRST_BAR_NS),
+        Timestamp::from_unix_nanos(COMPLETE_HISTORY_REQUEST_END_NS),
+        MarketHistorySelectionPolicy::COMPLETE_DAILY_RAW_V1,
+        cutoff,
+        raw_manifest.clone(),
+    )?;
+    let raw_latest_window = service
+        .analytical_reader()
+        .select_latest_canonical_market_bar_history_window(
+            market_squawk_data::LatestCanonicalMarketBarHistoryWindowRequest::try_new(
+                instrument_id,
+                MarketHistorySelectionPolicy::COMPLETE_DAILY_RAW_V1,
+                cutoff,
+            )?,
+            Instant::now() + Duration::from_secs(30),
+            &CancellationToken::new(),
+        )?
+        .ok_or("missing raw latest-window route")?;
+    assert_eq!(raw_latest_window.exact_request(), &raw_exact_request);
+    let raw_premature = CanonicalMarketBarHistoryRequest::try_latest(
+        instrument_id,
+        Timestamp::from_unix_nanos(COMPLETE_HISTORY_FIRST_BAR_NS),
+        Timestamp::from_unix_nanos(COMPLETE_HISTORY_REQUEST_END_NS),
+        MarketHistorySelectionPolicy::COMPLETE_DAILY_RAW_V1,
+        Timestamp::from_unix_nanos(raw_receipt.published_at().unix_nanos() - 1),
+    )?;
+    assert!(
+        service
+            .analytical_reader()
+            .read_canonical_market_bar_history(
+                raw_premature,
+                Instant::now() + Duration::from_secs(30),
+                CancellationToken::new(),
+            )
+            .await?
+            .is_none()
+    );
+    drop(raw_selected);
+    drop(raw);
     drop(newer_wide);
     drop(short);
     drop(older_wide);
@@ -3618,6 +3776,24 @@ async fn complete_alpaca_history_is_exact_clock_safe_and_restart_selectable() ->
             .generation_owned_provider_capture_evidence(&short_append_manifest, &capture_store,)?,
         expected_short_owned
     );
+
+    let raw_replay = restarted
+        .analytical_reader()
+        .read_canonical_market_bar_history(
+            raw_exact_request,
+            Instant::now() + Duration::from_secs(30),
+            CancellationToken::new(),
+        )
+        .await?
+        .ok_or("raw exact history did not survive restart")?;
+    assert_eq!(raw_replay.selection().pinned().manifest(), &raw_manifest);
+    assert_eq!(
+        raw_replay.read_receipt().history_content_digest(),
+        raw_content_digest
+    );
+    assert_eq!(raw_replay.bars(), raw_bars);
+    assert!(raw_replay.selection().receipt().realized_outcome_eligible());
+    drop(raw_replay);
 
     let ambiguity = rusqlite::Connection::open(location.path())?;
     ambiguity.execute_batch("DROP TRIGGER market_bar_history_publications_immutable_update;")?;
@@ -4859,6 +5035,34 @@ fn complete_history_capture_fixture(
     received_at_ns: i64,
     variant: u8,
 ) -> Result<CompleteHistoryCaptureFixture, Box<dyn Error>> {
+    complete_history_capture_fixture_with_adjustment(
+        instrument_id,
+        instrument_revision_digest,
+        dataset,
+        requested_start_ns,
+        requested_end_ns,
+        expected_provider_timestamps_ns,
+        received_at_ns,
+        variant,
+        MarketBarAdjustment::All,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fixture preserves exact source adjustment with all existing capture coordinates"
+)]
+fn complete_history_capture_fixture_with_adjustment(
+    instrument_id: InstrumentId,
+    instrument_revision_digest: EvidenceDigest,
+    dataset: &str,
+    requested_start_ns: i64,
+    requested_end_ns: i64,
+    expected_provider_timestamps_ns: &[i64],
+    received_at_ns: i64,
+    variant: u8,
+    adjustment: MarketBarAdjustment,
+) -> Result<CompleteHistoryCaptureFixture, Box<dyn Error>> {
     if expected_provider_timestamps_ns.is_empty() || variant == 0 {
         return Err("complete-history fixture requires timestamps and a nonzero variant".into());
     }
@@ -5020,6 +5224,7 @@ fn complete_history_capture_fixture(
             bar_received_at,
             bar_body_digest,
             &source_version,
+            adjustment,
             i64::from(variant)
                 .checked_mul(100)
                 .and_then(|offset| offset.checked_add(i64::try_from(ordinal).ok()?))
@@ -5055,13 +5260,13 @@ fn complete_history_capture_fixture(
             "source_version": source_version,
             "feed": "iex",
             "timeframe": "1Day",
-            "adjustment": "all",
+            "adjustment": match adjustment { MarketBarAdjustment::Raw => "raw", MarketBarAdjustment::All => "all", _ => return Err("unsupported fixture adjustment".into()) },
             "variant": variant,
             "provider_row_ordinal": ordinal,
         }));
     }
     let batch = ExtractionBatch::try_new(&request, records)?;
-    let semantic = complete_history_semantic(
+    let semantic = complete_history_semantic_with_adjustment(
         Timestamp::from_unix_nanos(requested_start_ns),
         Timestamp::from_unix_nanos(requested_end_ns),
         instrument_id,
@@ -5071,6 +5276,7 @@ fn complete_history_capture_fixture(
             .copied()
             .map(Timestamp::from_unix_nanos)
             .collect(),
+        adjustment,
     )?;
     let capture_material = ProviderCaptureMaterial::try_combine_request_graph_with_semantic(
         batch.request().object().source_id().clone(),
@@ -5096,6 +5302,24 @@ fn complete_history_semantic(
     instrument_revision_digest: EvidenceDigest,
     expected_provider_timestamps: Vec<Timestamp>,
 ) -> Result<CompleteMarketBarHistoryV1, Box<dyn Error>> {
+    complete_history_semantic_with_adjustment(
+        requested_start,
+        requested_end,
+        instrument_id,
+        instrument_revision_digest,
+        expected_provider_timestamps,
+        MarketBarAdjustment::All,
+    )
+}
+
+fn complete_history_semantic_with_adjustment(
+    requested_start: Timestamp,
+    requested_end: Timestamp,
+    instrument_id: InstrumentId,
+    instrument_revision_digest: EvidenceDigest,
+    expected_provider_timestamps: Vec<Timestamp>,
+    adjustment: MarketBarAdjustment,
+) -> Result<CompleteMarketBarHistoryV1, Box<dyn Error>> {
     Ok(CompleteMarketBarHistoryV1::try_new(
         requested_start,
         requested_end,
@@ -5106,7 +5330,7 @@ fn complete_history_semantic(
         VenueId::try_from("iex")?,
         SourceIdentifier::try_from("iex")?,
         SourceIdentifier::try_from("1Day")?,
-        MarketBarAdjustment::All,
+        adjustment,
         BarTimestampBasis::PeriodStart,
         MarketBarSessionKind::ProviderDefined,
         SourceIdentifier::try_from("alpaca-v3-iex-utc-range-returned-dates-v2")?,
@@ -5124,6 +5348,7 @@ fn complete_history_market_bar_observation(
     received_at: Timestamp,
     provider_body_digest: EvidenceDigest,
     source_record: &str,
+    adjustment: MarketBarAdjustment,
     ordinal: i64,
 ) -> Result<ResearchObservation, Box<dyn Error>> {
     let ingested_at = Timestamp::from_unix_nanos(
@@ -5182,7 +5407,7 @@ fn complete_history_market_bar_observation(
         SourceIdentifier::try_from("iex")?,
         SourceIdentifier::try_from("1Day")?,
         time_semantics,
-        MarketBarAdjustment::All,
+        adjustment,
         Money::new(Decimal::new(close_cents - 25, 2), currency),
         Money::new(Decimal::new(close_cents + 75, 2), currency),
         Money::new(Decimal::new(close_cents - 100, 2), currency),

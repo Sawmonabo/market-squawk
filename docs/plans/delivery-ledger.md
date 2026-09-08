@@ -47,14 +47,23 @@ comparison policy, not evidence that dual-benchmark production is already comple
   publication schema metadata, unnecessary output row groups, and omitted Arrow allocation overhead.
   Treasury application integration and whole-app verification remain open; the processing cap is
   not a measurement of the complete installed application's RAM. No CI ran for this checkpoint.
-- The next shared-data checkpoint adds bounded durable market route discovery and exact retained
+- Pushed checkpoint `4c6e2a9e887166d7d4978c54284af391019266b8` adds bounded durable market route discovery and exact retained
   source metadata revision reads using original event/knowledge cutoffs. It reuses the existing
   catalog and selection authority without new tables. The existing market publication/restart
   case passed 1/1, including cutoff exclusion, exact metadata, invalid input and cancellation.
   Data source fingerprint: `15ea5a6410d0009c92c5c7c8607c3944ab93fc000feeba9f32290488d5951f19`.
-  Root inspected the six-file source/test delta. The combined application check found integration
-  errors in the surrounding WIP; those remain under correction and this data check does not
-  establish application, current rights, Desktop or live workflow acceptance.
+  Root inspected the six-file source/test delta. The subsequent corrected application library
+  check and native Desktop library check passed on then-frozen WIP; TypeScript also passed.
+  Later integration changed that WIP and requires a fresh affected check. These compilation
+  results do not establish current rights or complete live workflow acceptance.
+- The current data checkpoint adds cancellable, deadline-bound durable market replay using the
+  existing supervised worker and retained file capabilities; ordinary catalog contention is
+  distinct from corruption. Exact raw daily history can supply realized execution/outcome prices,
+  preserving its original acquisition clocks and excluding historical signal/training authority.
+  The existing publication/PIT recovery and complete-history cases each passed 1/1 on frozen data
+  source on 2026-09-08. Root inspected all seven data files and the two application call-site
+  updates. No new test case, schema/table, CI or provider call was introduced. Financial workflow,
+  corporate-action integration and installed whole-app acceptance remain open.
 - Desktop profile/transport/brief work passed the pinned TypeScript check. Native orchestration,
   actual component policy validation, calibrated forecast production, realistic historical
   backtest evidence, valuation, persisted decision production and complete default/Advanced

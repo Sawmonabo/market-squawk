@@ -100,6 +100,39 @@ impl ResearchObjectControl for ProviderCaptureRecoveryControl<'_> {
     }
 }
 
+struct MarketEventReadControl<'a> {
+    deadline: Instant,
+    cancellation: &'a CancellationToken,
+}
+
+impl ResearchObjectControl for MarketEventReadControl<'_> {
+    fn checkpoint(
+        &self,
+        _point: ResearchObjectControlPoint,
+    ) -> Result<(), ResearchObjectControlError> {
+        if self.cancellation.is_cancelled() {
+            Err(ResearchObjectControlError::Cancelled)
+        } else if Instant::now() >= self.deadline {
+            Err(ResearchObjectControlError::DeadlineExceeded)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn check_market_event_read(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), IngestError> {
+    if cancellation.is_cancelled() {
+        Err(IngestError::Cancelled)
+    } else if Instant::now() >= deadline {
+        Err(IngestError::DeadlineExceeded)
+    } else {
+        Ok(())
+    }
+}
+
 /// Exact immutable generation returned after successful reconciliation or commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedDataset {
@@ -2701,7 +2734,22 @@ impl AnalyticalDataService {
         &self,
         manifest: &DatasetManifestRef,
     ) -> Result<Vec<ProviderMarketEventPublicationSelector>, IngestError> {
-        let retained = self.manifests.provider_publication_bindings(manifest)?;
+        self.provider_market_event_publications_inner(manifest, None)
+    }
+
+    fn provider_market_event_publications_inner(
+        &self,
+        manifest: &DatasetManifestRef,
+        control: Option<&MarketEventReadControl<'_>>,
+    ) -> Result<Vec<ProviderMarketEventPublicationSelector>, IngestError> {
+        let retained = match control {
+            Some(control) => self.manifests.provider_publication_bindings_bounded(
+                manifest,
+                control.deadline,
+                control.cancellation,
+            )?,
+            None => self.manifests.provider_publication_bindings(manifest)?,
+        };
         let mut selectors = Vec::new();
         selectors
             .try_reserve_exact(retained.len())
@@ -2765,16 +2813,33 @@ impl AnalyticalDataService {
         selector: ProviderMarketEventPublicationSelector,
         store: &market_squawk_platform::SealedResearchJournalStore,
     ) -> Result<crate::PersistedProviderPublicationEvidence, IngestError> {
+        self.provider_market_event_publication_evidence_inner(manifest, selector, store, None)
+    }
+
+    fn provider_market_event_publication_evidence_inner(
+        &self,
+        manifest: &DatasetManifestRef,
+        selector: ProviderMarketEventPublicationSelector,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+        control: Option<&MarketEventReadControl<'_>>,
+    ) -> Result<crate::PersistedProviderPublicationEvidence, IngestError> {
         if !self
-            .provider_market_event_publications(manifest)?
+            .provider_market_event_publications_inner(manifest, control)?
             .contains(&selector)
         {
             return Err(IngestError::ProviderCaptureRequired);
         }
-        let evidence = self
-            .lock_authority()?
-            .provider_publication_evidence(selector.publication_digest)?
-            .ok_or(IngestError::ProviderCaptureRequired)?;
+        let evidence = {
+            let authority = match control {
+                Some(control) => {
+                    self.market_recovery_authority(control.deadline, control.cancellation)?
+                }
+                None => self.lock_authority()?,
+            };
+            authority
+                .provider_publication_evidence(selector.publication_digest)?
+                .ok_or(IngestError::ProviderCaptureRequired)?
+        };
         evidence.verify_integrity()?;
         if evidence.publication_digest() != selector.publication_digest
             || evidence.publication_kind() != selector.publication_kind.as_str()
@@ -2782,13 +2847,25 @@ impl AnalyticalDataService {
             return Err(IngestError::ProviderCaptureRequired);
         }
         if let Some(response) = evidence.response() {
-            let verified = store.open_verified_claim(response.physical_claim())?;
+            let verified = match control {
+                Some(control) => {
+                    store.open_verified_claim_with_control(response.physical_claim(), control)
+                }
+                None => store.open_verified_claim(response.physical_claim()),
+            }
+            .map_err(map_provider_recovery_store_error)?;
             if verified.receipt().claim() != response.physical_claim() {
                 return Err(IngestError::ProviderCaptureRequired);
             }
         }
         if let Some(event) = evidence.event() {
-            let verified = store.open_verified_claim(event.physical_claim())?;
+            let verified = match control {
+                Some(control) => {
+                    store.open_verified_claim_with_control(event.physical_claim(), control)
+                }
+                None => store.open_verified_claim(event.physical_claim()),
+            }
+            .map_err(map_provider_recovery_store_error)?;
             if verified.receipt().claim() != event.physical_claim() {
                 return Err(IngestError::ProviderCaptureRequired);
             }
@@ -2854,18 +2931,84 @@ impl AnalyticalDataService {
     /// The data layer retains source surfaces separately; provider ranking remains an application
     /// concern. Each selected publication is reopened once from the exact resolved manifest, then
     /// its catalog coordinate, canonical Parquet row, and persisted raw evidence are reconciled.
+    /// All catalog and file work runs in one bounded, supervised worker. Cancellation, deadline,
+    /// and dropping the future cancel its child token; the reaper retains its exact capabilities
+    /// and both admission permits until the worker actually exits.
     pub async fn read_provider_market_event_point_in_time(
         &self,
         request: &crate::ProviderMarketEventPointInTimeRequest,
-        store: &market_squawk_platform::SealedResearchJournalStore,
+        store: Arc<market_squawk_platform::SealedResearchJournalStore>,
+        deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<Option<crate::ProviderMarketEventPointInTimeSelection>, IngestError> {
-        let Some(plan) = self
-            .manifests
-            .select_provider_market_event_candidates(request)?
+        check_market_event_read(deadline, &cancellation)?;
+        let permit = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(IngestError::Cancelled),
+            _ = tokio::time::sleep_until(deadline.into()) => {
+                return Err(IngestError::DeadlineExceeded);
+            }
+            permit = self.objects.acquire_blocking_permit(&cancellation) => permit?,
+        };
+        let reader = Self {
+            authority: Arc::clone(&self.authority),
+            catalog_id: self.catalog_id,
+            manifests: Arc::clone(&self.manifests),
+            objects: Arc::clone(&self.objects),
+            operation_gate: self.operation_gate.clone(),
+        };
+        let request = request.clone();
+        let operation_cancellation = cancellation.child_token();
+        let _cancel_on_drop = operation_cancellation.clone().drop_guard();
+        let worker_cancellation = operation_cancellation.clone();
+        let supervisor = BlockingIoSupervisor::new(operation_cancellation);
+        let mut worker = supervisor
+            .spawn_blocking(move || {
+                let _permit = permit;
+                reader.read_provider_market_event_point_in_time_blocking(
+                    &request,
+                    &store,
+                    deadline,
+                    &worker_cancellation,
+                )
+            })
+            .map_err(|error| match error {
+                BlockingIoAdmissionError::Cancelled => IngestError::Cancelled,
+                BlockingIoAdmissionError::Saturated => {
+                    IngestError::Parquet(ParquetStoreError::BlockingTaskLimitExceeded)
+                }
+                BlockingIoAdmissionError::ReaperUnavailable => {
+                    IngestError::Parquet(ParquetStoreError::BlockingTaskFailed)
+                }
+            })?;
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(IngestError::Cancelled),
+            _ = tokio::time::sleep_until(deadline.into()) => Err(IngestError::DeadlineExceeded),
+            result = &mut worker => {
+                check_market_event_read(deadline, &cancellation)?;
+                result.map_err(|_| IngestError::Parquet(ParquetStoreError::BlockingTaskFailed))?
+            }
+        }
+    }
+
+    fn read_provider_market_event_point_in_time_blocking(
+        &self,
+        request: &crate::ProviderMarketEventPointInTimeRequest,
+        store: &market_squawk_platform::SealedResearchJournalStore,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<crate::ProviderMarketEventPointInTimeSelection>, IngestError> {
+        check_market_event_read(deadline, cancellation)?;
+        let Some(plan) = self.manifests.select_provider_market_event_candidates(
+            request,
+            deadline,
+            cancellation,
+        )?
         else {
             return Ok(None);
         };
+        check_market_event_read(deadline, cancellation)?;
         if plan.candidates.is_empty() {
             return crate::ProviderMarketEventPointInTimeSelection::try_from_reconstructed(
                 request.clone(),
@@ -2875,11 +3018,11 @@ impl AnalyticalDataService {
             .map(Some)
             .map_err(Into::into);
         }
-        let pinned = self.manifests.pinned(&plan.manifest)?;
-        let batches = self
-            .objects
-            .read_pinned_async(&pinned, &cancellation)
-            .await?;
+        let pinned = self
+            .manifests
+            .pinned_bounded(&plan.manifest, deadline, cancellation)?;
+        let batches = self.objects.read_pinned(&pinned, cancellation)?;
+        check_market_event_read(deadline, cancellation)?;
 
         let mut reopened: Vec<(
             ProviderMarketEventPublicationSelector,
@@ -2890,9 +3033,7 @@ impl AnalyticalDataService {
             .try_reserve_exact(plan.candidates.len())
             .map_err(|_| crate::ProviderMarketEventSelectionError::Allocation)?;
         for planned in &plan.candidates {
-            if cancellation.is_cancelled() {
-                return Err(IngestError::Cancelled);
-            }
+            check_market_event_read(deadline, cancellation)?;
             let selector = ProviderMarketEventPublicationSelector {
                 publication_digest: planned.publication.digest(),
                 publication_kind: planned.publication.kind(),
@@ -2903,10 +3044,14 @@ impl AnalyticalDataService {
             {
                 continue;
             }
-            let evidence = Arc::new(self.provider_market_event_publication_evidence(
+            let evidence = Arc::new(self.provider_market_event_publication_evidence_inner(
                 &plan.manifest,
                 selector,
                 store,
+                Some(&MarketEventReadControl {
+                    deadline,
+                    cancellation,
+                }),
             )?);
             let batch =
                 Self::provider_market_event_batch_from_pinned(&batches, selector, &evidence)?;
@@ -2917,11 +3062,9 @@ impl AnalyticalDataService {
         reconstructed
             .try_reserve_exact(plan.candidates.len())
             .map_err(|_| crate::ProviderMarketEventSelectionError::Allocation)?;
-        let authority = self.lock_authority()?;
+        let authority = self.market_recovery_authority(deadline, cancellation)?;
         for planned in &plan.candidates {
-            if cancellation.is_cancelled() {
-                return Err(IngestError::Cancelled);
-            }
+            check_market_event_read(deadline, cancellation)?;
             let selector = ProviderMarketEventPublicationSelector {
                 publication_digest: planned.publication.digest(),
                 publication_kind: planned.publication.kind(),
@@ -2941,6 +3084,7 @@ impl AnalyticalDataService {
             );
         }
         drop(authority);
+        check_market_event_read(deadline, cancellation)?;
         crate::ProviderMarketEventPointInTimeSelection::try_from_reconstructed(
             request.clone(),
             plan,
@@ -2954,12 +3098,13 @@ impl AnalyticalDataService {
     pub async fn verify_provider_market_event_point_in_time_restart(
         &self,
         original: &crate::ProviderMarketEventPointInTimeSelection,
-        store: &market_squawk_platform::SealedResearchJournalStore,
+        store: Arc<market_squawk_platform::SealedResearchJournalStore>,
+        deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<crate::ProviderMarketEventPointInTimeSelection, IngestError> {
         let request = original.exact_restart_request()?;
         let replay = self
-            .read_provider_market_event_point_in_time(&request, store, cancellation)
+            .read_provider_market_event_point_in_time(&request, store, deadline, cancellation)
             .await?
             .ok_or(crate::ProviderMarketEventSelectionError::RestartMismatch)?;
         original.verify_restart_replay(&replay)?;

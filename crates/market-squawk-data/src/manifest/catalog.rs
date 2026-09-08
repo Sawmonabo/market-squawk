@@ -7,7 +7,7 @@ pub(super) mod benchmark_support;
 use std::fmt;
 use std::fmt::Write as _;
 use std::mem::size_of;
-use std::sync::Mutex;
+use std::sync::{Mutex, TryLockError};
 use std::time::Instant;
 
 use market_squawk_domain::{
@@ -383,22 +383,24 @@ impl AnalyticalManifestCatalog {
     pub(crate) fn select_provider_market_event_candidates(
         &self,
         request: &ProviderMarketEventPointInTimeRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<Option<ProviderMarketEventCatalogPlan>, ProviderMarketEventSelectionError> {
-        let connection = self.lock()?;
-        let Some(selected) = selected_provider_market_event_generation(&connection, request)?
-        else {
-            return Ok(None);
-        };
-        let clock = match request.effective_time_basis() {
-            ProviderMarketEventEffectiveTimeBasis::SourceTimestamp => 0_i64,
-            ProviderMarketEventEffectiveTimeBasis::ReceivedAt => 1_i64,
-        };
-        let retrieval_limit = request
-            .maximum_candidates()
-            .checked_add(1)
-            .ok_or(ProviderMarketEventSelectionError::CandidateLimitExceeded)?;
-        let mut statement = connection.prepare(
-            "WITH publication_origin AS (
+        self.read_bounded(deadline, cancellation, |connection| {
+            let Some(selected) = selected_provider_market_event_generation(&connection, request)?
+            else {
+                return Ok(None);
+            };
+            let clock = match request.effective_time_basis() {
+                ProviderMarketEventEffectiveTimeBasis::SourceTimestamp => 0_i64,
+                ProviderMarketEventEffectiveTimeBasis::ReceivedAt => 1_i64,
+            };
+            let retrieval_limit = request
+                .maximum_candidates()
+                .checked_add(1)
+                .ok_or(ProviderMarketEventSelectionError::CandidateLimitExceeded)?;
+            let mut statement = connection.prepare(
+                "WITH publication_origin AS (
                  SELECT publication.publication_digest,
                         MIN(generation.created_at_ns) AS origin_published_at_ns
                  FROM analytical_generation_provider_publication_bindings AS publication
@@ -447,67 +449,68 @@ impl AnalyticalManifestCatalog {
              WHERE effective_at_ns=newest_effective_at_ns
              ORDER BY source_id, publication_digest, publication_row_ordinal
              LIMIT ?10",
-        )?;
-        let instrument = request.instrument_id().as_uuid();
-        let mut rows = statement.query(params![
-            request.dataset().as_str(),
-            selected.generation_sequence,
-            instrument.as_bytes().as_slice(),
-            request.venue_id().as_str(),
-            crate::provider_event_selection::event_kind_name(request.event_kind()),
-            clock,
-            request.as_of_cutoff().unix_nanos(),
-            request.knowledge_cutoff().unix_nanos(),
-            request.exact_source_surface().map(SourceId::as_str),
-            i64::try_from(retrieval_limit).map_err(|_| ManifestCatalogError::CountOverflow)?,
-        ])?;
-        let mut candidates = Vec::new();
-        candidates
-            .try_reserve_exact(request.maximum_candidates())
-            .map_err(|_| ProviderMarketEventSelectionError::Allocation)?;
-        while let Some(row) = rows.next()? {
-            if candidates.len() == request.maximum_candidates() {
-                return Err(ProviderMarketEventSelectionError::CandidateLimitExceeded);
+            )?;
+            let instrument = request.instrument_id().as_uuid();
+            let mut rows = statement.query(params![
+                request.dataset().as_str(),
+                selected.generation_sequence,
+                instrument.as_bytes().as_slice(),
+                request.venue_id().as_str(),
+                crate::provider_event_selection::event_kind_name(request.event_kind()),
+                clock,
+                request.as_of_cutoff().unix_nanos(),
+                request.knowledge_cutoff().unix_nanos(),
+                request.exact_source_surface().map(SourceId::as_str),
+                i64::try_from(retrieval_limit).map_err(|_| ManifestCatalogError::CountOverflow)?,
+            ])?;
+            let mut candidates = Vec::new();
+            candidates
+                .try_reserve_exact(request.maximum_candidates())
+                .map_err(|_| ProviderMarketEventSelectionError::Allocation)?;
+            while let Some(row) = rows.next()? {
+                if candidates.len() == request.maximum_candidates() {
+                    return Err(ProviderMarketEventSelectionError::CandidateLimitExceeded);
+                }
+                let publication_digest = EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    parse_digest(&row.get::<_, Vec<u8>>(0)?)?.bytes(),
+                );
+                let publication_kind =
+                    parse_provider_market_event_publication_kind(&row.get::<_, String>(1)?)?;
+                let publication_row_ordinal = u32::try_from(row.get::<_, i64>(2)?)
+                    .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+                let coordinate_digest = EvidenceDigest::new(
+                    DigestAlgorithm::Sha256,
+                    parse_digest(&row.get::<_, Vec<u8>>(3)?)?.bytes(),
+                );
+                let source_surface = SourceId::try_from(row.get::<_, String>(4)?)
+                    .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
+                candidates.push(ProviderMarketEventCatalogCandidate {
+                    publication: ProviderMarketEventExactPublication::from_catalog(
+                        publication_digest,
+                        publication_kind,
+                    ),
+                    publication_row_ordinal,
+                    coordinate_digest,
+                    source_surface,
+                    effective_at: Timestamp::from_unix_nanos(row.get(5)?),
+                    origin_generation_published_at: Timestamp::from_unix_nanos(row.get(6)?),
+                });
             }
-            let publication_digest = EvidenceDigest::new(
-                DigestAlgorithm::Sha256,
-                parse_digest(&row.get::<_, Vec<u8>>(0)?)?.bytes(),
-            );
-            let publication_kind =
-                parse_provider_market_event_publication_kind(&row.get::<_, String>(1)?)?;
-            let publication_row_ordinal = u32::try_from(row.get::<_, i64>(2)?)
-                .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-            let coordinate_digest = EvidenceDigest::new(
-                DigestAlgorithm::Sha256,
-                parse_digest(&row.get::<_, Vec<u8>>(3)?)?.bytes(),
-            );
-            let source_surface = SourceId::try_from(row.get::<_, String>(4)?)
-                .map_err(|_| ManifestCatalogError::CorruptCatalog)?;
-            candidates.push(ProviderMarketEventCatalogCandidate {
-                publication: ProviderMarketEventExactPublication::from_catalog(
-                    publication_digest,
-                    publication_kind,
-                ),
-                publication_row_ordinal,
-                coordinate_digest,
-                source_surface,
-                effective_at: Timestamp::from_unix_nanos(row.get(5)?),
-                origin_generation_published_at: Timestamp::from_unix_nanos(row.get(6)?),
-            });
-        }
-        let exclusions = provider_market_event_exclusion_counts(
-            &connection,
-            request,
-            selected.generation_sequence,
-            clock,
-        )?;
-        ProviderMarketEventCatalogPlan::try_new(
-            selected.manifest,
-            selected.published_at,
-            candidates,
-            exclusions,
-        )
-        .map(Some)
+            let exclusions = provider_market_event_exclusion_counts(
+                &connection,
+                request,
+                selected.generation_sequence,
+                clock,
+            )?;
+            ProviderMarketEventCatalogPlan::try_new(
+                selected.manifest,
+                selected.published_at,
+                candidates,
+                exclusions,
+            )
+            .map(Some)
+        })
     }
 
     pub(crate) fn provider_publication_bindings(
@@ -515,51 +518,18 @@ impl AnalyticalManifestCatalog {
         manifest: &DatasetManifestRef,
     ) -> Result<Vec<(EvidenceDigest, String)>, ManifestCatalogError> {
         let connection = self.lock()?;
-        let generation_sequence = connection
-            .query_row(
-                "SELECT generation_sequence FROM analytical_generations
-                 WHERE dataset_id=?1 AND manifest_version=?2
-                   AND schema_name=?3 AND schema_version=?4
-                   AND schema_fingerprint=?5 AND content_hash=?6",
-                params![
-                    manifest.dataset_id().as_str(),
-                    to_i64(manifest.manifest_version())?,
-                    manifest.schema().name(),
-                    i64::from(manifest.schema().version().get()),
-                    manifest.schema().fingerprint().as_slice(),
-                    manifest.content_hash().bytes(),
-                ],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .ok_or(ManifestCatalogError::GenerationConflict)?;
-        let mut statement = connection.prepare(
-            "SELECT publication_digest, publication_kind
-             FROM analytical_generation_provider_publication_bindings
-             WHERE generation_sequence=?1 ORDER BY input_ordinal LIMIT ?2",
-        )?;
-        let mut rows = statement.query(params![
-            generation_sequence,
-            i64::try_from(MAX_GENERATION_CAPTURE_INPUTS + 1)
-                .map_err(|_| ManifestCatalogError::CountOverflow)?,
-        ])?;
-        let mut publications = Vec::new();
-        publications
-            .try_reserve_exact(MAX_GENERATION_CAPTURE_INPUTS)
-            .map_err(|_| ManifestCatalogError::CountOverflow)?;
-        while let Some(row) = rows.next()? {
-            if publications.len() == MAX_GENERATION_CAPTURE_INPUTS {
-                return Err(ManifestCatalogError::CaptureInputLimitExceeded {
-                    max: MAX_GENERATION_CAPTURE_INPUTS,
-                });
-            }
-            let digest: Vec<u8> = row.get(0)?;
-            publications.push((
-                EvidenceDigest::new(DigestAlgorithm::Sha256, parse_digest(&digest)?.bytes()),
-                row.get(1)?,
-            ));
-        }
-        Ok(publications)
+        load_provider_publication_bindings(&connection, manifest)
+    }
+
+    pub(crate) fn provider_publication_bindings_bounded(
+        &self,
+        manifest: &DatasetManifestRef,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<(EvidenceDigest, String)>, ManifestCatalogError> {
+        self.read_bounded(deadline, cancellation, |connection| {
+            load_provider_publication_bindings(connection, manifest)
+        })
     }
 
     /// Lists the generation's complete cumulative provider lineage in canonical digest order.
@@ -1784,6 +1754,20 @@ impl AnalyticalManifestCatalog {
         load_pinned(&connection, manifest, self.max_objects_per_generation)
     }
 
+    pub(crate) fn pinned_bounded(
+        &self,
+        manifest: &DatasetManifestRef,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<PinnedDataset, ManifestCatalogError> {
+        self.read_bounded(deadline, cancellation, |connection| {
+            DatasetSchemaRegistry::local()
+                .resolve(manifest.schema())
+                .map_err(|_| ManifestCatalogError::SchemaMismatch)?;
+            load_pinned(connection, manifest, self.max_objects_per_generation)
+        })
+    }
+
     /// Selects only a clock-safe complete market-bar window under one immutable generation.
     pub fn select_complete_market_bar_history(
         &self,
@@ -2354,12 +2338,97 @@ impl AnalyticalManifestCatalog {
         Ok(membership)
     }
 
+    fn read_bounded<T, E>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: impl FnOnce(&Connection) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<ManifestCatalogError>,
+    {
+        check_read_operation(deadline, cancellation)?;
+        let connection = self.connection.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => {
+                ManifestCatalogError::CatalogAuthority(CatalogError::AuthorityBusy)
+            }
+            TryLockError::Poisoned(_) => ManifestCatalogError::LockPoisoned,
+        })?;
+        self.catalog_file
+            .validate_identity()
+            .map_err(ManifestCatalogError::from)?;
+        check_read_operation(deadline, cancellation)?;
+        let token = cancellation.clone();
+        connection
+            .progress_handler(
+                SQLITE_PROGRESS_OPERATIONS,
+                Some(move || token.is_cancelled() || Instant::now() >= deadline),
+            )
+            .map_err(ManifestCatalogError::from)?;
+        let result = operation(&connection);
+        let cleanup = connection.progress_handler::<fn() -> bool>(0, None);
+        check_read_operation(deadline, cancellation)?;
+        cleanup.map_err(ManifestCatalogError::from)?;
+        result
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, ManifestCatalogError> {
         self.catalog_file.validate_identity()?;
         self.connection
             .lock()
             .map_err(|_| ManifestCatalogError::LockPoisoned)
     }
+}
+
+fn load_provider_publication_bindings(
+    connection: &Connection,
+    manifest: &DatasetManifestRef,
+) -> Result<Vec<(EvidenceDigest, String)>, ManifestCatalogError> {
+    let generation_sequence = connection
+        .query_row(
+            "SELECT generation_sequence FROM analytical_generations
+                 WHERE dataset_id=?1 AND manifest_version=?2
+                   AND schema_name=?3 AND schema_version=?4
+                   AND schema_fingerprint=?5 AND content_hash=?6",
+            params![
+                manifest.dataset_id().as_str(),
+                to_i64(manifest.manifest_version())?,
+                manifest.schema().name(),
+                i64::from(manifest.schema().version().get()),
+                manifest.schema().fingerprint().as_slice(),
+                manifest.content_hash().bytes(),
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or(ManifestCatalogError::GenerationConflict)?;
+    let mut statement = connection.prepare(
+        "SELECT publication_digest, publication_kind
+             FROM analytical_generation_provider_publication_bindings
+             WHERE generation_sequence=?1 ORDER BY input_ordinal LIMIT ?2",
+    )?;
+    let mut rows = statement.query(params![
+        generation_sequence,
+        i64::try_from(MAX_GENERATION_CAPTURE_INPUTS + 1)
+            .map_err(|_| ManifestCatalogError::CountOverflow)?,
+    ])?;
+    let mut publications = Vec::new();
+    publications
+        .try_reserve_exact(MAX_GENERATION_CAPTURE_INPUTS)
+        .map_err(|_| ManifestCatalogError::CountOverflow)?;
+    while let Some(row) = rows.next()? {
+        if publications.len() == MAX_GENERATION_CAPTURE_INPUTS {
+            return Err(ManifestCatalogError::CaptureInputLimitExceeded {
+                max: MAX_GENERATION_CAPTURE_INPUTS,
+            });
+        }
+        let digest: Vec<u8> = row.get(0)?;
+        publications.push((
+            EvidenceDigest::new(DigestAlgorithm::Sha256, parse_digest(&digest)?.bytes()),
+            row.get(1)?,
+        ));
+    }
+    Ok(publications)
 }
 
 fn feature_dataset_admissions(

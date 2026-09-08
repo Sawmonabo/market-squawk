@@ -1,6 +1,6 @@
 //! Cloneable least-authority capabilities over the sole analytical catalog writer.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::Instant;
 use std::{collections::BTreeSet, fmt};
 
@@ -197,13 +197,14 @@ impl InstrumentDefinitionReadCapability {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<PinnedInstrumentDefinitions, CatalogError> {
-        self.lock()?.pin_instrument_definitions_bounded(
-            instrument_ids,
-            as_of,
-            limit,
-            deadline,
-            cancellation,
-        )
+        self.lock(deadline, cancellation)?
+            .pin_instrument_definitions_bounded(
+                instrument_ids,
+                as_of,
+                limit,
+                deadline,
+                cancellation,
+            )
     }
 
     /// Returns the newest verified definition for each requested stable identity.
@@ -228,7 +229,7 @@ impl InstrumentDefinitionReadCapability {
         {
             return Err(CatalogError::InvalidLimit);
         }
-        let authority = self.lock()?;
+        let authority = self.lock(deadline, cancellation)?;
         let one = CatalogLimit::new(1)?;
         let mut definitions = Vec::new();
         definitions
@@ -261,14 +262,20 @@ impl InstrumentDefinitionReadCapability {
         cancellation: &CancellationToken,
     ) -> Result<InstrumentSearchPage, CatalogError> {
         let limit = CatalogLimit::new(maximum_instruments)?;
-        self.lock()?
+        self.lock(deadline, cancellation)?
             .search_instruments(query, limit, deadline, cancellation)
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, CatalogAuthority>, CatalogError> {
-        self.authority
-            .lock()
-            .map_err(|_| CatalogError::AuthorityLockPoisoned)
+    fn lock(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MutexGuard<'_, CatalogAuthority>, CatalogError> {
+        check_read(deadline, cancellation)?;
+        self.authority.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => CatalogError::AuthorityBusy,
+            TryLockError::Poisoned(_) => CatalogError::AuthorityLockPoisoned,
+        })
     }
 }
 

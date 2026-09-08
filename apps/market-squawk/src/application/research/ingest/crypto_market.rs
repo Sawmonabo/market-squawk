@@ -808,6 +808,7 @@ impl MarketEventPointInTimeSelector {
         knowledge_cutoff: Timestamp,
         effective_time_basis: ProviderMarketEventEffectiveTimeBasis,
         maximum_candidates: usize,
+        deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<Option<MarketEventPointInTimeReceipt>, MarketEventReadError> {
         let request = ProviderMarketEventPointInTimeRequest::try_latest(
@@ -825,7 +826,7 @@ impl MarketEventPointInTimeSelector {
         let selection = self
             .research
             .analytical()
-            .read_provider_market_event_point_in_time(&request, store.as_ref(), cancellation)
+            .read_provider_market_event_point_in_time(&request, store, deadline, cancellation)
             .await?;
         selection
             .map(|selection| MarketEventPointInTimeReceipt::try_new(self, selection))
@@ -837,6 +838,7 @@ impl MarketEventPointInTimeSelector {
     pub(crate) async fn verify_restart(
         &self,
         original: &MarketEventPointInTimeReceipt,
+        deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<MarketEventPointInTimeReceipt, MarketEventReadError> {
         original.validate_selector(self)?;
@@ -846,7 +848,8 @@ impl MarketEventPointInTimeSelector {
             .analytical()
             .verify_provider_market_event_point_in_time_restart(
                 &original.selection,
-                store.as_ref(),
+                store,
+                deadline,
                 cancellation,
             )
             .await?;

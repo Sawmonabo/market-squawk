@@ -1254,6 +1254,7 @@ impl ParquetObjectStore {
         };
         let object = object.clone();
         let operation_cancellation = cancellation.child_token();
+        let _cancel_on_drop = operation_cancellation.clone().drop_guard();
         let worker_cancellation = operation_cancellation.clone();
         let supervisor = BlockingIoSupervisor::new(operation_cancellation);
         let mut worker = supervisor
@@ -1521,17 +1522,27 @@ impl ParquetObjectStore {
         let dataset = dataset.clone();
         let permit = self.acquire_blocking_permit(cancellation).await?;
         let operation_cancellation = cancellation.child_token();
+        let _cancel_on_drop = operation_cancellation.clone().drop_guard();
         let worker_cancellation = operation_cancellation.clone();
-        let mut worker = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            store.read_pinned(&dataset, &worker_cancellation)
-        });
+        let supervisor = BlockingIoSupervisor::new(operation_cancellation);
+        let mut worker = supervisor
+            .spawn_blocking(move || {
+                let _permit = permit;
+                store.read_pinned(&dataset, &worker_cancellation)
+            })
+            .map_err(|error| match error {
+                BlockingIoAdmissionError::Cancelled => ParquetStoreError::Cancelled,
+                BlockingIoAdmissionError::Saturated => ParquetStoreError::BlockingTaskLimitExceeded,
+                BlockingIoAdmissionError::ReaperUnavailable => {
+                    ParquetStoreError::BlockingTaskFailed
+                }
+            })?;
         tokio::select! {
             result = &mut worker => {
                 result.map_err(|_| ParquetStoreError::BlockingTaskFailed)?
             }
             _ = cancellation.cancelled() => {
-                operation_cancellation.cancel();
+                supervisor.cancel();
                 Err(ParquetStoreError::Cancelled)
             }
         }
@@ -1558,23 +1569,33 @@ impl ParquetObjectStore {
         let dataset = dataset.clone();
         let permit = self.acquire_blocking_permit(cancellation).await?;
         let operation_cancellation = cancellation.child_token();
+        let _cancel_on_drop = operation_cancellation.clone().drop_guard();
         let worker_cancellation = operation_cancellation.clone();
+        let supervisor = BlockingIoSupervisor::new(operation_cancellation);
         let max_rows = u64::try_from(max_rows).map_err(|_| ParquetStoreError::SizeOverflow)?;
-        let mut worker = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            store.read_pinned_with_limits(
-                &dataset,
-                max_rows,
-                max_retained_bytes,
-                &worker_cancellation,
-            )
-        });
+        let mut worker = supervisor
+            .spawn_blocking(move || {
+                let _permit = permit;
+                store.read_pinned_with_limits(
+                    &dataset,
+                    max_rows,
+                    max_retained_bytes,
+                    &worker_cancellation,
+                )
+            })
+            .map_err(|error| match error {
+                BlockingIoAdmissionError::Cancelled => ParquetStoreError::Cancelled,
+                BlockingIoAdmissionError::Saturated => ParquetStoreError::BlockingTaskLimitExceeded,
+                BlockingIoAdmissionError::ReaperUnavailable => {
+                    ParquetStoreError::BlockingTaskFailed
+                }
+            })?;
         tokio::select! {
             result = &mut worker => {
                 result.map_err(|_| ParquetStoreError::BlockingTaskFailed)?
             }
             _ = cancellation.cancelled() => {
-                operation_cancellation.cancel();
+                supervisor.cancel();
                 Err(ParquetStoreError::Cancelled)
             }
         }
@@ -1618,36 +1639,45 @@ impl ParquetObjectStore {
         let pinned = pinned.clone();
         let permit = self.acquire_blocking_permit(cancellation).await?;
         let operation_cancellation = cancellation.child_token();
+        let _cancel_on_drop = operation_cancellation.clone().drop_guard();
         let worker_cancellation = operation_cancellation.clone();
-        let mut worker = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let mut batches = Vec::new();
-            let mut retained_bytes = 0_usize;
-            let rows = store.read_one_pinned_object_with_limits(
-                &pinned,
-                max_retained_bytes,
-                &mut retained_bytes,
-                &mut batches,
-                &worker_cancellation,
-            )?;
-            if rows != pinned.object().row_count() || batches.is_empty() {
-                return Err(ParquetStoreError::ObjectMetadataMismatch);
-            }
-            Ok(batches)
-        });
+        let supervisor = BlockingIoSupervisor::new(operation_cancellation);
+        let mut worker = supervisor
+            .spawn_blocking(move || {
+                let _permit = permit;
+                let mut batches = Vec::new();
+                let mut retained_bytes = 0_usize;
+                let rows = store.read_one_pinned_object_with_limits(
+                    &pinned,
+                    max_retained_bytes,
+                    &mut retained_bytes,
+                    &mut batches,
+                    &worker_cancellation,
+                )?;
+                if rows != pinned.object().row_count() || batches.is_empty() {
+                    return Err(ParquetStoreError::ObjectMetadataMismatch);
+                }
+                Ok(batches)
+            })
+            .map_err(|error| match error {
+                BlockingIoAdmissionError::Cancelled => ParquetStoreError::Cancelled,
+                BlockingIoAdmissionError::Saturated => ParquetStoreError::BlockingTaskLimitExceeded,
+                BlockingIoAdmissionError::ReaperUnavailable => {
+                    ParquetStoreError::BlockingTaskFailed
+                }
+            })?;
         tokio::select! {
             result = &mut worker => {
                 result.map_err(|_| ParquetStoreError::BlockingTaskFailed)?
             }
             _ = cancellation.cancelled() => {
-                operation_cancellation.cancel();
-                worker.await.map_err(|_| ParquetStoreError::BlockingTaskFailed)??;
+                supervisor.cancel();
                 Err(ParquetStoreError::Cancelled)
             }
         }
     }
 
-    async fn acquire_blocking_permit(
+    pub(crate) async fn acquire_blocking_permit(
         &self,
         cancellation: &CancellationToken,
     ) -> Result<OwnedSemaphorePermit, ParquetStoreError> {
