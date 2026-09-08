@@ -23,6 +23,11 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::fund_nav::{
+    CanonicalFundNavReadRequest, CanonicalFundNavSelection, generation_fund_nav_candidate_matches,
+    generation_fund_nav_inputs_match_manifest, insert_generation_fund_nav_inputs,
+    select_canonical_fund_nav,
+};
 use super::market_history::{
     CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,
     CompleteMarketBarHistorySelection, LatestCanonicalMarketBarHistoryWindowRequest,
@@ -35,9 +40,9 @@ use super::market_history::{
 };
 use super::{
     DatasetBuildSpecDigest, DatasetId, DatasetManifestRef, DerivedGenerationCommitAuthority,
-    DerivedGenerationParents, GenerationParent, GenerationParentRelation,
-    MAX_DERIVED_GENERATION_PARENTS, ManifestObject, ManifestPlan, ManifestPlanError,
-    MarketBarHistoryPublicationCandidate, Sha256Digest, compare_manifest_refs,
+    DerivedGenerationParents, FundNavPublicationCandidate, GenerationParent,
+    GenerationParentRelation, MAX_DERIVED_GENERATION_PARENTS, ManifestObject, ManifestPlan,
+    ManifestPlanError, MarketBarHistoryPublicationCandidate, Sha256Digest, compare_manifest_refs,
 };
 use crate::OptionMarketPointInTimeRequest;
 use crate::catalog::exact_catalog_file_binding;
@@ -954,6 +959,7 @@ impl AnalyticalManifestCatalog {
         source_evidence: PublicationSourceEvidence<'_>,
         company_identity: Option<&CompanyIdentityObservation>,
         market_bar_history: Option<&MarketBarHistoryPublicationCandidate>,
+        fund_nav: Option<&FundNavPublicationCandidate>,
     ) -> Result<DatasetManifestRef, ManifestCatalogError> {
         if reservation.catalog_id() != catalog_session_id {
             return Err(ManifestCatalogError::CatalogAuthority(
@@ -1005,6 +1011,7 @@ impl AnalyticalManifestCatalog {
             GenerationKind::Ingest,
             Some(source_input),
             market_bar_history,
+            fund_nav,
             self.max_objects_per_generation,
         )?;
         complete_ingest_in_transaction(
@@ -1083,6 +1090,7 @@ impl AnalyticalManifestCatalog {
             publication.manifest(),
             schema,
             GenerationKind::Compaction,
+            None,
             None,
             None,
             self.max_objects_per_generation,
@@ -1191,6 +1199,7 @@ impl AnalyticalManifestCatalog {
             schema,
             GenerationKind::Ingest,
             Some(source_input),
+            None,
             None,
             self.max_objects_per_generation,
         )?;
@@ -1423,6 +1432,7 @@ impl AnalyticalManifestCatalog {
             schema,
             GenerationKind::Ingest,
             Some(source_input),
+            None,
             None,
             self.max_objects_per_generation,
         )?;
@@ -1685,6 +1695,7 @@ impl AnalyticalManifestCatalog {
                 && generation_capture_inputs_match_manifest(&transaction, &existing)?
                 && generation_publication_inputs_match_manifest(&transaction, &existing)?
                 && generation_market_bar_history_inputs_match_manifest(&transaction, &existing)?
+                && generation_fund_nav_inputs_match_manifest(&transaction, &existing)?
             {
                 transaction.commit()?;
                 return Ok(existing);
@@ -1750,6 +1761,7 @@ impl AnalyticalManifestCatalog {
         propagate_generation_provider_capture_bindings(&transaction, generation_sequence)?;
         propagate_generation_provider_publication_bindings(&transaction, generation_sequence)?;
         propagate_generation_market_bar_history_inputs(&transaction, generation_sequence)?;
+        super::propagate_generation_fund_nav_inputs(&transaction, generation_sequence)?;
         let manifest = DatasetManifestRef::try_new_with_schema(
             plan.dataset_id.clone(),
             version,
@@ -1879,6 +1891,41 @@ impl AnalyticalManifestCatalog {
         result.map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
     }
 
+    /// Selects one provider-neutral Fund NAV family and immutable generation at the cutoff.
+    pub fn select_canonical_fund_nav(
+        &self,
+        request: &CanonicalFundNavReadRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<CanonicalFundNavSelection>, ManifestCatalogError> {
+        check_read_operation(deadline, cancellation)?;
+        let mut connection = self.lock()?;
+        let token = cancellation.clone();
+        connection.progress_handler(
+            SQLITE_PROGRESS_OPERATIONS,
+            Some(move || token.is_cancelled() || Instant::now() >= deadline),
+        )?;
+        let result = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            match select_canonical_fund_nav(
+                &transaction,
+                self.max_objects_per_generation,
+                request,
+                deadline,
+                cancellation,
+            ) {
+                Ok(selection) => {
+                    transaction.commit()?;
+                    Ok(selection)
+                }
+                Err(error) => Err(error),
+            }
+        })();
+        connection.progress_handler::<fn() -> bool>(0, None)?;
+        result.map_err(|error| classify_sqlite_interrupt(error, deadline, cancellation))
+    }
+
     pub(crate) fn market_bar_history_candidate_matches(
         &self,
         manifest: &DatasetManifestRef,
@@ -1886,6 +1933,15 @@ impl AnalyticalManifestCatalog {
     ) -> Result<bool, ManifestCatalogError> {
         let connection = self.lock()?;
         generation_market_bar_history_candidate_matches(&connection, manifest, candidate)
+    }
+
+    pub(crate) fn fund_nav_candidate_matches(
+        &self,
+        manifest: &DatasetManifestRef,
+        candidate: Option<&FundNavPublicationCandidate>,
+    ) -> Result<bool, ManifestCatalogError> {
+        let connection = self.lock()?;
+        generation_fund_nav_candidate_matches(&connection, manifest, candidate)
     }
 
     /// Returns the current generation only as an explicit pin, never as a directory inference.
@@ -3309,12 +3365,18 @@ pub enum ManifestCatalogError {
     /// Typed market-bar history lineage disagrees with rows, capture, or immutable generation.
     #[error("complete market-bar history publication evidence is invalid")]
     MarketBarHistoryMismatch,
+    /// Fund NAV rows, exact provider binding, canonical instrument, clocks or receipt disagree.
+    #[error("Fund NAV publication evidence is invalid or ambiguous")]
+    FundNavPublicationMismatch,
     /// Whole-plan digests, cardinality, capture order, manifest, or durable receipt disagree.
     #[error("complete provider macro-plan publication evidence is invalid")]
     ProviderMacroPlanMismatch,
     /// Transitive complete-history lineage exceeds the fixed generation ceiling.
     #[error("analytical generation exceeds the {max}-market-bar-history input ceiling")]
     MarketBarHistoryInputLimitExceeded { max: usize },
+    /// Transitive Fund NAV publication lineage exceeds the fixed generation ceiling.
+    #[error("analytical generation exceeds the {max}-Fund-NAV input ceiling")]
+    FundNavInputLimitExceeded { max: usize },
     /// Candidate reachability work exceeds the explicit operation ceiling.
     #[error("analytical reference lookup exceeds the {max_candidates}-candidate work ceiling")]
     ReferenceWorkLimitExceeded { max_candidates: usize },
@@ -3420,6 +3482,7 @@ fn commit_generation_in_transaction(
     kind: GenerationKind,
     source_input: Option<&IngestRunRecord>,
     market_bar_history: Option<&MarketBarHistoryPublicationCandidate>,
+    fund_nav: Option<&FundNavPublicationCandidate>,
     max_objects_per_generation: usize,
 ) -> Result<DatasetManifestRef, ManifestCatalogError> {
     if kind == GenerationKind::Derived
@@ -3446,6 +3509,7 @@ fn commit_generation_in_transaction(
                 &existing,
                 market_bar_history,
             )?
+            && generation_fund_nav_candidate_matches(transaction, &existing, fund_nav)?
         {
             return Ok(existing);
         }
@@ -3602,6 +3666,18 @@ fn commit_generation_in_transaction(
         schema,
         source_input,
         market_bar_history,
+    )?;
+    insert_generation_fund_nav_inputs(
+        transaction,
+        generation_sequence,
+        plan,
+        artifacts
+            .last()
+            .ok_or(ManifestCatalogError::AnchorMismatch)?,
+        anchor,
+        schema,
+        source_input,
+        fund_nav,
     )?;
     DatasetManifestRef::try_new_with_schema(
         plan.dataset_id.clone(),
@@ -3841,6 +3917,9 @@ pub(super) fn load_pinned(
         return Err(ManifestCatalogError::CorruptCatalog);
     }
     if !generation_market_bar_history_inputs_match_manifest(connection, reference)? {
+        return Err(ManifestCatalogError::CorruptCatalog);
+    }
+    if !generation_fund_nav_inputs_match_manifest(connection, reference)? {
         return Err(ManifestCatalogError::CorruptCatalog);
     }
     let retrieval_limit = max_objects

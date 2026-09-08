@@ -3504,3 +3504,226 @@ CREATE TRIGGER provider_macro_plan_published_heads_immutable_delete
 BEFORE DELETE ON provider_macro_plan_published_heads BEGIN
     SELECT RAISE(ABORT, 'provider macro-plan published heads cannot be deleted');
 END;
+
+-- Provider-neutral Fund NAV publication authority. Provider coordinates are retained only as
+-- immutable receipt evidence; request-time lookup authority is canonical instrument + schema +
+-- family + versioned neutral policy under an internal knowledge cutoff.
+CREATE TABLE fund_nav_publications (
+    publication_receipt_digest BLOB PRIMARY KEY CHECK (
+        length(publication_receipt_digest) = 32
+        AND publication_receipt_digest <> zeroblob(32)
+    ),
+    receipt_version INTEGER NOT NULL CHECK (receipt_version = 1),
+    origin_generation_sequence INTEGER NOT NULL UNIQUE
+        REFERENCES analytical_generations(generation_sequence),
+    origin_run_id TEXT NOT NULL UNIQUE REFERENCES ingest_runs(run_id),
+    origin_anchor_manifest_id TEXT NOT NULL UNIQUE
+        REFERENCES dataset_manifests(manifest_id),
+    origin_artifact_id TEXT NOT NULL UNIQUE REFERENCES artifacts(artifact_id),
+    origin_object_ordinal INTEGER NOT NULL CHECK (
+        origin_object_ordinal BETWEEN 0 AND 1023
+    ),
+    source_id TEXT NOT NULL REFERENCES sources(source_id),
+    binding_digest BLOB NOT NULL UNIQUE
+        REFERENCES provider_capture_bindings(binding_digest),
+    capture_receipt_digest BLOB NOT NULL UNIQUE CHECK (
+        length(capture_receipt_digest) = 32
+        AND capture_receipt_digest <> zeroblob(32)
+    ),
+    capture_content_digest BLOB NOT NULL CHECK (
+        length(capture_content_digest) = 32
+        AND capture_content_digest <> zeroblob(32)
+    ),
+    capture_observation_digest BLOB NOT NULL CHECK (
+        length(capture_observation_digest) = 32
+        AND capture_observation_digest <> zeroblob(32)
+    ),
+    capture_recorded_at_ns INTEGER NOT NULL,
+    provider_dataset TEXT NOT NULL CHECK (
+        length(CAST(provider_dataset AS BLOB)) BETWEEN 1 AND 512
+    ),
+    instrument_id TEXT NOT NULL
+        REFERENCES market_data_instrument_identities(instrument_id),
+    instrument_revision_digest BLOB NOT NULL
+        REFERENCES market_data_instrument_revisions(revision_digest),
+    provider_instrument_id TEXT NOT NULL CHECK (
+        length(CAST(provider_instrument_id AS BLOB)) BETWEEN 1 AND 256
+    ),
+    provider_product TEXT NOT NULL CHECK (
+        length(CAST(provider_product AS BLOB)) BETWEEN 1 AND 512
+    ),
+    provider_channel TEXT NOT NULL CHECK (
+        length(CAST(provider_channel AS BLOB)) BETWEEN 1 AND 512
+    ),
+    valuation_basis TEXT NOT NULL CHECK (valuation_basis = 'per_share'),
+    currency TEXT NOT NULL CHECK (
+        length(CAST(currency AS BLOB)) BETWEEN 1 AND 16
+    ),
+    source_family_digest BLOB NOT NULL CHECK (
+        length(source_family_digest) = 32
+        AND source_family_digest <> zeroblob(32)
+    ),
+    row_set_digest BLOB NOT NULL CHECK (
+        length(row_set_digest) = 32 AND row_set_digest <> zeroblob(32)
+    ),
+    row_count INTEGER NOT NULL CHECK (row_count BETWEEN 1 AND 100000),
+    first_nav_date TEXT NOT NULL CHECK (
+        length(first_nav_date) = 10 AND date(first_nav_date) = first_nav_date
+    ),
+    last_nav_date TEXT NOT NULL CHECK (
+        length(last_nav_date) = 10
+        AND date(last_nav_date) = last_nav_date
+        AND last_nav_date >= first_nav_date
+    ),
+    max_available_at_ns INTEGER NOT NULL,
+    max_received_at_ns INTEGER NOT NULL,
+    max_ingested_at_ns INTEGER NOT NULL CHECK (
+        max_ingested_at_ns >= max_available_at_ns
+        AND max_ingested_at_ns >= max_received_at_ns
+    ),
+    max_canonical_published_at_ns INTEGER NOT NULL CHECK (
+        max_canonical_published_at_ns >= max_available_at_ns
+        AND max_canonical_published_at_ns >= max_received_at_ns
+        AND max_canonical_published_at_ns >= max_ingested_at_ns
+    ),
+    published_at_ns INTEGER NOT NULL CHECK (
+        published_at_ns >= max_canonical_published_at_ns
+    ),
+    has_preliminary INTEGER NOT NULL CHECK (has_preliminary IN (0, 1)),
+    has_final INTEGER NOT NULL CHECK (has_final IN (0, 1)),
+    has_correction INTEGER NOT NULL CHECK (has_correction IN (0, 1)),
+    receipt_json TEXT NOT NULL CHECK (
+        length(CAST(receipt_json AS BLOB)) BETWEEN 2 AND 4194304
+        AND json_valid(receipt_json)
+    ),
+    FOREIGN KEY (origin_generation_sequence, binding_digest)
+        REFERENCES analytical_generation_provider_capture_bindings(
+            generation_sequence, binding_digest
+        )
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE analytical_generation_fund_nav_inputs (
+    generation_sequence INTEGER NOT NULL
+        REFERENCES analytical_generations(generation_sequence),
+    input_ordinal INTEGER NOT NULL CHECK (input_ordinal BETWEEN 0 AND 4095),
+    publication_receipt_digest BLOB NOT NULL
+        REFERENCES fund_nav_publications(publication_receipt_digest),
+    PRIMARY KEY (generation_sequence, input_ordinal),
+    UNIQUE (generation_sequence, publication_receipt_digest)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX fund_nav_publications_neutral_latest
+ON fund_nav_publications(
+    instrument_id,
+    published_at_ns DESC,
+    origin_generation_sequence DESC,
+    publication_receipt_digest
+);
+
+CREATE INDEX analytical_generation_fund_nav_receipt
+ON analytical_generation_fund_nav_inputs(
+    publication_receipt_digest,
+    generation_sequence
+);
+
+CREATE TRIGGER fund_nav_publications_guarded_insert
+BEFORE INSERT ON fund_nav_publications
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM analytical_generations AS generation
+    JOIN analytical_generation_source_inputs AS source_input
+      ON source_input.generation_sequence = generation.generation_sequence
+    JOIN ingest_runs AS run ON run.run_id = source_input.run_id
+    JOIN dataset_manifests AS manifest
+      ON manifest.manifest_id = generation.anchor_manifest_id
+    JOIN artifacts AS artifact ON artifact.artifact_id = manifest.artifact_id
+    JOIN analytical_generation_objects AS object
+      ON object.dataset_id = generation.dataset_id
+     AND object.manifest_version = generation.manifest_version
+     AND object.ordinal = NEW.origin_object_ordinal
+    JOIN analytical_generation_provider_capture_bindings AS capture_input
+      ON capture_input.generation_sequence = generation.generation_sequence
+     AND capture_input.run_id = run.run_id
+    JOIN provider_capture_bindings AS binding
+      ON binding.binding_digest = capture_input.binding_digest
+    JOIN provider_raw_observations AS capture
+      ON capture.capture_observation_digest = binding.capture_observation_digest
+    JOIN market_data_instrument_revisions AS instrument_revision
+      ON instrument_revision.revision_digest = NEW.instrument_revision_digest
+     AND instrument_revision.instrument_id = NEW.instrument_id
+    WHERE generation.generation_sequence = NEW.origin_generation_sequence
+      AND generation.generation_kind = 'ingest'
+      AND run.run_id = NEW.origin_run_id
+      AND run.state = 'reserved'
+      AND run.operation = 'persist'
+      AND run.source_id = NEW.source_id
+      AND generation.anchor_manifest_id = NEW.origin_anchor_manifest_id
+      AND artifact.artifact_id = NEW.origin_artifact_id
+      AND object.artifact_id = NEW.origin_artifact_id
+      AND object.row_count = NEW.row_count
+      AND capture_input.binding_digest = NEW.binding_digest
+      AND capture_input.source_id = NEW.source_id
+      AND capture.source_id = NEW.source_id
+      AND capture.provider_dataset = NEW.provider_dataset
+      AND capture.capture_content_digest = NEW.capture_content_digest
+      AND capture.capture_observation_digest = NEW.capture_observation_digest
+      AND capture.recorded_at_ns = NEW.capture_recorded_at_ns
+      AND instrument_revision.published_at_ns <= run.requested_at_ns
+      AND generation.created_at_ns = NEW.published_at_ns
+      AND manifest.created_at_ns = NEW.published_at_ns
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Fund NAV publication lineage is invalid');
+END;
+
+CREATE TRIGGER analytical_generation_fund_nav_inputs_guarded_insert
+BEFORE INSERT ON analytical_generation_fund_nav_inputs
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM fund_nav_publications AS publication
+    JOIN analytical_generation_provider_capture_bindings AS capture_input
+      ON capture_input.generation_sequence = NEW.generation_sequence
+     AND capture_input.binding_digest = publication.binding_digest
+    WHERE publication.publication_receipt_digest = NEW.publication_receipt_digest
+      AND publication.origin_generation_sequence = NEW.generation_sequence
+)
+AND NOT EXISTS (
+    SELECT 1
+    FROM analytical_generations AS child
+    JOIN analytical_generation_parents AS edge
+      ON edge.child_dataset_id = child.dataset_id
+     AND edge.child_manifest_version = child.manifest_version
+    JOIN analytical_generation_fund_nav_inputs AS parent_input
+      ON parent_input.generation_sequence = edge.parent_generation_sequence
+    JOIN fund_nav_publications AS publication
+      ON publication.publication_receipt_digest = parent_input.publication_receipt_digest
+    JOIN analytical_generation_provider_capture_bindings AS capture_input
+      ON capture_input.generation_sequence = NEW.generation_sequence
+     AND capture_input.binding_digest = publication.binding_digest
+    WHERE child.generation_sequence = NEW.generation_sequence
+      AND child.generation_kind IN ('ingest', 'compaction', 'derived')
+      AND parent_input.publication_receipt_digest = NEW.publication_receipt_digest
+)
+BEGIN
+    SELECT RAISE(ABORT, 'analytical generation Fund NAV input is invalid');
+END;
+
+CREATE TRIGGER fund_nav_publications_immutable_update
+BEFORE UPDATE ON fund_nav_publications BEGIN
+    SELECT RAISE(ABORT, 'Fund NAV publications are immutable');
+END;
+
+CREATE TRIGGER fund_nav_publications_immutable_delete
+BEFORE DELETE ON fund_nav_publications BEGIN
+    SELECT RAISE(ABORT, 'Fund NAV publications are immutable');
+END;
+
+CREATE TRIGGER analytical_generation_fund_nav_inputs_immutable_update
+BEFORE UPDATE ON analytical_generation_fund_nav_inputs BEGIN
+    SELECT RAISE(ABORT, 'analytical generation Fund NAV inputs are immutable');
+END;
+
+CREATE TRIGGER analytical_generation_fund_nav_inputs_immutable_delete
+BEFORE DELETE ON analytical_generation_fund_nav_inputs BEGIN
+    SELECT RAISE(ABORT, 'analytical generation Fund NAV inputs are immutable');
+END;

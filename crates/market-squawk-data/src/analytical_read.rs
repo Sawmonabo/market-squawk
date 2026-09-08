@@ -36,7 +36,8 @@ use crate::manifest::{
     CatalogGenerationPage,
 };
 use crate::{
-    AnalyticalManifestCatalog, CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,
+    AnalyticalManifestCatalog, CanonicalFundNavReadRequest, CanonicalFundNavSelection,
+    CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,
     CompleteMarketBarHistorySelection, DatasetBuildSpecDigest, DatasetId, DatasetManifestRef,
     DatasetSchemaRegistry, DatasetSplitCounts, FeatureDatasetProductContract, GenerationKind,
     GenerationParent, LatestCanonicalMarketBarHistoryWindowRequest,
@@ -861,7 +862,7 @@ impl AnalyticalFundNavReadLimit {
             .ok_or(AnalyticalReadError::InvalidFundNavLimit)
     }
 
-    const fn get(self) -> u32 {
+    pub(crate) const fn get(self) -> u32 {
         self.0.get()
     }
 }
@@ -1727,6 +1728,25 @@ pub struct AnalyticalFundNavOutput {
     returned_count: usize,
 }
 
+/// Provider-neutral selection evidence plus the output of the existing exact NAV reader.
+#[derive(Debug)]
+pub struct CanonicalFundNavOutput {
+    selection: CanonicalFundNavSelection,
+    output: AnalyticalFundNavOutput,
+}
+
+impl CanonicalFundNavOutput {
+    /// Returns the immutable provider-neutral selection and exact publication receipt.
+    pub const fn selection(&self) -> &CanonicalFundNavSelection {
+        &self.selection
+    }
+
+    /// Returns the existing manifest-pinned typed NAV output.
+    pub const fn output(&self) -> &AnalyticalFundNavOutput {
+        &self.output
+    }
+}
+
 impl AnalyticalFundNavOutput {
     /// Returns the complete exact-manifest request that produced this output.
     pub const fn request(&self) -> &AnalyticalFundNavReadRequest {
@@ -2439,6 +2459,34 @@ impl AnalyticalReadCapability {
             selected_count: decoded.selected_count,
             returned_count: decoded.returned_count,
         })
+    }
+
+    /// Selects a provider-neutral Fund NAV publication and delegates to the current typed reader.
+    ///
+    /// Selection is served entirely from immutable SQLite authority. Parquet is opened only after
+    /// one exact generation has been chosen, and ambiguity returns an error rather than a fallback.
+    pub async fn read_canonical_fund_nav(
+        &self,
+        request: CanonicalFundNavReadRequest,
+        limits: QueryLimits,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<Option<CanonicalFundNavOutput>, AnalyticalReadError> {
+        let Some(selection) =
+            self.manifests
+                .select_canonical_fund_nav(&request, deadline, &cancellation)?
+        else {
+            return Ok(None);
+        };
+        let output = self
+            .read_fund_nav_history(
+                selection.analytical_request().clone(),
+                limits,
+                deadline,
+                cancellation,
+            )
+            .await?;
+        Ok(Some(CanonicalFundNavOutput { selection, output }))
     }
 
     /// Selects the uniquely earliest exact-series completed bar at or after a forecast horizon.

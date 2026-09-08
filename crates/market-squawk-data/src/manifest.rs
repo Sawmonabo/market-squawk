@@ -10,6 +10,7 @@ use thiserror::Error;
 use crate::schema::{DatasetSchemaRef, DatasetSchemaRegistry};
 
 mod catalog;
+mod fund_nav;
 mod market_history;
 
 #[cfg(feature = "release-evidence")]
@@ -25,6 +26,13 @@ pub(crate) use self::catalog::{
     CatalogFeatureDataset, CatalogFeatureDatasetPage, CatalogFeatureDatasetSelection,
     CatalogGenerationPage, propagate_generation_provider_capture_bindings,
     propagate_generation_provider_publication_bindings,
+};
+pub use self::fund_nav::{
+    CanonicalFundNavReadRequest, CanonicalFundNavSelection, FundNavPublicationReceipt,
+    FundNavSelectionPolicy,
+};
+pub(crate) use self::fund_nav::{
+    FundNavPublicationCandidate, propagate_generation_fund_nav_inputs,
 };
 pub use self::market_history::{
     CanonicalMarketBarHistoryRequest, CompleteMarketBarHistoryRequest,

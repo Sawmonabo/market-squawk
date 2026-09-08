@@ -52,7 +52,7 @@ use crate::catalog::{
     MAX_PROVIDER_CAPTURE_PHYSICAL_BYTES, MAX_PROVIDER_CAPTURE_PHYSICAL_CLAIMS,
     PROVIDER_CAPTURE_RECOVERY_ENTRY_BUDGET,
 };
-use crate::manifest::MarketBarHistoryPublicationCandidate;
+use crate::manifest::{FundNavPublicationCandidate, MarketBarHistoryPublicationCandidate};
 use crate::parquet_store::MAX_SCAN_OBJECTS;
 use crate::parquet_store::{ArtifactRootIdentity, QueryArtifactWriterAdmission};
 use crate::query::QueryArtifactMemoryLease;
@@ -3325,6 +3325,7 @@ impl AnalyticalDataService {
             &object,
             None,
             None,
+            None,
         )? {
             return Ok(committed);
         }
@@ -3340,6 +3341,7 @@ impl AnalyticalDataService {
             plan,
             std::slice::from_ref(&published),
             GenerationKind::Compaction,
+            None,
             None,
             None,
             None,
@@ -3437,6 +3439,8 @@ impl AnalyticalDataService {
             &observations,
             provider_binding,
         )?;
+        let fund_nav =
+            FundNavPublicationCandidate::try_from_batch(batch, &observations, provider_binding)?;
         {
             let authority = self.lock_authority()?;
             let run =
@@ -3474,6 +3478,7 @@ impl AnalyticalDataService {
                 &analytical_dataset,
                 company_identity.as_ref(),
                 market_bar_history.as_ref(),
+                fund_nav.as_ref(),
             )? {
                 return Ok(committed);
             }
@@ -3577,6 +3582,7 @@ impl AnalyticalDataService {
             &object,
             company_identity.as_ref(),
             market_bar_history.as_ref(),
+            fund_nav.as_ref(),
         )? {
             return Ok(committed);
         }
@@ -3595,6 +3601,7 @@ impl AnalyticalDataService {
             precommit_authority.as_deref(),
             company_identity.as_ref(),
             market_bar_history.as_ref(),
+            fund_nav.as_ref(),
             match provider_binding {
                 Some(binding) => PublicationSourceEvidence::Provider(
                     binding,
@@ -4506,6 +4513,7 @@ impl AnalyticalDataService {
             Some(precommit_authority.as_ref()),
             None,
             None,
+            None,
             PublicationSourceEvidence::ProviderLogical(
                 &binding,
                 ProviderArtifactInputCoordinate::try_new(0, 0)?,
@@ -4606,6 +4614,7 @@ impl AnalyticalDataService {
             Some(precommit_authority.as_ref()),
             None,
             None,
+            None,
             PublicationSourceEvidence::ProviderEvent(
                 &prepared,
                 ProviderArtifactInputCoordinate::try_new(0, 0)?,
@@ -4691,6 +4700,7 @@ impl AnalyticalDataService {
             std::slice::from_ref(&published),
             GenerationKind::Ingest,
             Some(precommit_authority.as_ref()),
+            None,
             None,
             None,
             PublicationSourceEvidence::ProviderOptionMarket(
@@ -4984,6 +4994,7 @@ impl AnalyticalDataService {
         dataset_id: &DatasetId,
         company_identity: Option<&CompanyIdentityObservation>,
         market_bar_history: Option<&MarketBarHistoryPublicationCandidate>,
+        fund_nav: Option<&FundNavPublicationCandidate>,
     ) -> Result<Option<CommittedDataset>, IngestError> {
         let Some(existing) = self.manifests.for_run(reservation.run_id())? else {
             return match state {
@@ -4996,6 +5007,9 @@ impl AnalyticalDataService {
             || !self
                 .manifests
                 .market_bar_history_candidate_matches(existing.manifest(), market_bar_history)?
+            || !self
+                .manifests
+                .fund_nav_candidate_matches(existing.manifest(), fund_nav)?
         {
             return Err(IngestError::ReplayConflict);
         }
@@ -5071,6 +5085,7 @@ impl AnalyticalDataService {
         object: &ManifestObject,
         company_identity: Option<&CompanyIdentityObservation>,
         market_bar_history: Option<&MarketBarHistoryPublicationCandidate>,
+        fund_nav: Option<&FundNavPublicationCandidate>,
     ) -> Result<Option<CommittedDataset>, IngestError> {
         let Some(existing) = self.manifests.for_run(reservation.run_id())? else {
             return match state {
@@ -5085,6 +5100,9 @@ impl AnalyticalDataService {
             || !self
                 .manifests
                 .market_bar_history_candidate_matches(existing.manifest(), market_bar_history)?
+            || !self
+                .manifests
+                .fund_nav_candidate_matches(existing.manifest(), fund_nav)?
         {
             return Err(IngestError::ReplayConflict);
         }
@@ -5123,6 +5141,7 @@ impl AnalyticalDataService {
         precommit_authority: Option<&dyn IngestPrecommitAuthority>,
         company_identity: Option<&CompanyIdentityObservation>,
         market_bar_history: Option<&MarketBarHistoryPublicationCandidate>,
+        fund_nav: Option<&FundNavPublicationCandidate>,
         source_evidence: PublicationSourceEvidence<'_>,
     ) -> Result<CommittedDataset, IngestError> {
         if run.state() != IngestRunState::Reserved {
@@ -5194,6 +5213,7 @@ impl AnalyticalDataService {
                     source_evidence,
                     company_identity,
                     market_bar_history,
+                    fund_nav,
                 )
                 .map_err(|error| match error {
                     ManifestCatalogError::CatalogAuthority(error) => IngestError::Catalog(error),

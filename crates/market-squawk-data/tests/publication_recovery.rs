@@ -17,10 +17,10 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use market_squawk_data::{
     AnalyticalBackupLimits, AnalyticalBackupLocation, AnalyticalDataService,
-    AnalyticalFundNavReadLimit, AnalyticalFundNavReadRequest, AnalyticalMacroLatestKnownRequest,
-    AnalyticalMacroSeriesAllowlist, AnalyticalManifestCatalog, AnalyticalObservationReadRequest,
-    AnalyticalObservationTemplate, AnalyticalReadError, AnalyticalReadLimit, AnalyticalRestoreMode,
-    AnalyticalRestoreTarget, CanonicalMarketBarHistoryRequest, CatalogAuthority, CatalogConfig,
+    AnalyticalFundNavReadLimit, AnalyticalMacroLatestKnownRequest, AnalyticalMacroSeriesAllowlist,
+    AnalyticalManifestCatalog, AnalyticalObservationReadRequest, AnalyticalObservationTemplate,
+    AnalyticalReadError, AnalyticalReadLimit, AnalyticalRestoreMode, AnalyticalRestoreTarget,
+    CanonicalFundNavReadRequest, CanonicalMarketBarHistoryRequest, CatalogAuthority, CatalogConfig,
     CatalogError, CatalogLimit, CatalogResultLimits, ChronologicalSplitPolicy, CommittedDataset,
     CompactionRequest, ComponentAdjustmentEvidence, ComponentKind, ComponentScope,
     ComponentSelector, ComponentValue, CorporateActionAdjustment, CorporateActionLimits,
@@ -31,7 +31,7 @@ use market_squawk_data::{
     FeatureDatasetProductionError, FeatureDatasetProductionProofV1,
     FeatureDatasetProductionPublicationDisposition, FeatureDatasetProductionPublisher,
     FeatureLabelComponentInput, FeatureLabelComponentSpec, ForecastDatasetReadLimits,
-    FundNavDateRange, IngestError, IngestIdentity, ManifestCatalogError,
+    FundNavDateRange, FundNavSelectionPolicy, IngestError, IngestIdentity, ManifestCatalogError,
     MarketDataInstrumentSynchronization, MarketHistorySelectionPolicy, MissingValuePolicy,
     ObjectStoreConfig, ObservationFamilyKey, ParquetStoreError, PointInTimeLimits,
     PointInTimePolicy, PointInTimeRevisionMode, ProviderMacroPlanChunkInput,
@@ -3373,132 +3373,185 @@ async fn fund_nav_schema_pit_publication_and_restart_remain_one_exact_vertical()
     let directory = tempfile::tempdir()?;
     let paths = LocalPaths::prepare(directory.path().join("fund-nav"))?;
     let location = paths.catalog()?.clone();
-    let authority = CatalogAuthority::open(test_catalog_config(location.clone())?)?;
-    let source = local_source()?;
-    authority.register_source(&source, Timestamp::from_unix_nanos(10))?;
-    let batch = fund_nav_extraction_batch()?;
-    let payload_digest = extraction_provider_payload_digest(&batch);
-    let rights = authority.admit_source_rights(RightsDecisionInput {
-        source_id: source.source_id().clone(),
-        payload_digest,
-        retrieved_at: Timestamp::from_unix_nanos(200),
-        basis: RightsBasis::reviewed_terms("https://example.test/fund-nav-terms/v1", digest(71))?,
-        authorization_evidence: digest(72),
-        authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
-        permitted_operations: vec![SourceOperation::Persist],
-    })?;
-    let reservation = authority.reserve_ingest(
-        &IngestIdentity::try_new(
-            source.source_id().clone(),
-            payload_digest,
-            SourceOperation::Persist,
-            "fund-nav:share-class:2026-08-10:v1",
-        )?,
-        &rights,
+    let catalog_config = test_catalog_config(location.clone())?;
+    let authority = CatalogAuthority::open(catalog_config.clone())?;
+    let instrument = fund_nav_instrument()?;
+    let source = complete_history_source_for(
+        instrument,
+        "fund-nav-provider-a",
+        "fund-nav-provider-a-source-revision-v1",
+        141,
+        142,
     )?;
+    let secondary_source = complete_history_source_for(
+        instrument,
+        "fund-nav-provider-b",
+        "fund-nav-provider-b-source-revision-v1",
+        151,
+        152,
+    )?;
+    authority.register_source(&source, Timestamp::from_unix_nanos(10))?;
+    authority.register_source(&secondary_source, Timestamp::from_unix_nanos(10))?;
     let service = AnalyticalDataService::initialize(
         authority,
         AnalyticalManifestCatalog::open(&location, 8)?,
         paths.artifacts()?.clone(),
         ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
     )?;
-    let committed = service
-        .ingest_with_revision_plan(
-            reservation,
-            DatasetId::try_from(batch.request().object().dataset().as_str())?,
-            batch,
-            fund_nav_revision_plan()?,
-            CancellationToken::new(),
-        )
-        .await?;
-    let manifest = committed.manifest().clone();
-    let parquet = service
-        .object_store()
-        .read_pinned(committed.pinned(), &CancellationToken::new())?;
-    let kinds = parquet
-        .first()
-        .and_then(|batch| batch.column_by_name("observation_kind"))
-        .and_then(|column| column.as_any().downcast_ref::<StringArray>())
-        .ok_or("missing Fund NAV kind projection")?;
-    assert_eq!(
-        kinds.iter().collect::<Vec<_>>(),
-        vec![Some("fund_nav"), Some("fund_nav")]
-    );
-    drop(committed);
+    service
+        .market_data_instrument_synchronization()
+        .synchronize(
+            MarketDataInstrumentSynchronization::try_new(
+                vec![fund_nav_market_data_definition(instrument)?],
+                1,
+            )?,
+            Instant::now() + Duration::from_secs(10),
+            &CancellationToken::new(),
+        )?;
+    let raw_store = paths.sealed_research_journal_store()?;
+    let a = publish_fund_nav_fixture(
+        &service,
+        &source,
+        &raw_store,
+        fund_nav_capture_fixture(
+            instrument,
+            source.source_id().as_str(),
+            "tiingo-fund-nav-dataset",
+            "nav-v1",
+            10_100,
+            120,
+            1,
+        )?,
+        "fund-nav:share-class:a",
+    )
+    .await?;
+    let a_manifest = a.manifest().clone();
+    drop(a);
+    let a_selected = read_fund_nav_fixture(
+        &service,
+        instrument,
+        Timestamp::from_unix_nanos(i64::MAX),
+        Some(&a_manifest),
+    )
+    .await?
+    .ok_or("Fund NAV A was not selected")?;
+    let a_receipt = a_selected.selection().receipt().receipt_digest();
+    let a_published_at = a_selected.selection().receipt().published_at();
+    drop(a_selected);
+
+    let b = publish_fund_nav_fixture(
+        &service,
+        &source,
+        &raw_store,
+        fund_nav_capture_fixture(
+            instrument,
+            source.source_id().as_str(),
+            "tiingo-fund-nav-dataset",
+            "nav-v2",
+            10_125,
+            180,
+            2,
+        )?,
+        "fund-nav:share-class:b",
+    )
+    .await?;
+    let b_manifest = b.manifest().clone();
+    drop(b);
+    let b_selected = read_fund_nav_fixture(
+        &service,
+        instrument,
+        Timestamp::from_unix_nanos(i64::MAX),
+        None,
+    )
+    .await?
+    .ok_or("Fund NAV B was not selected")?;
+    let b_receipt = b_selected.selection().receipt().receipt_digest();
+    let b_published_at = b_selected.selection().receipt().published_at();
+    assert!(b_published_at > a_published_at);
+    assert_eq!(b_selected.selection().pinned().manifest(), &b_manifest);
+    drop(b_selected);
+    let before_b = b_published_at.checked_sub_nanos(1)?;
+    let cutoff_a = read_fund_nav_fixture(&service, instrument, before_b, None)
+        .await?
+        .ok_or("Fund NAV A was not retained at the pre-B cutoff")?;
+    assert_eq!(cutoff_a.selection().receipt().receipt_digest(), a_receipt);
+    assert_eq!(cutoff_a.selection().pinned().manifest(), &a_manifest);
+    drop(cutoff_a);
+
+    let compacted = compact_complete_history_fixture(
+        &service,
+        &source,
+        &b_manifest,
+        "fund-nav:share-class:b:compact",
+        Timestamp::from_unix_nanos(220),
+    )
+    .await?;
+    let compacted_manifest = compacted.manifest().clone();
+    drop(compacted);
     drop(service);
 
     let restarted = AnalyticalDataService::open(
-        CatalogAuthority::open(test_catalog_config(location.clone())?)?,
+        CatalogAuthority::open(catalog_config)?,
         AnalyticalManifestCatalog::open(&location, 8)?,
         paths.artifacts()?.clone(),
         ObjectStoreConfig::try_new(1024 * 1024, 32, Duration::from_secs(60))?,
     )?;
-    let instrument = fund_nav_instrument()?;
-    let reader = restarted.analytical_reader();
-    let query_limits = || {
-        QueryLimits::try_new(
-            16,
-            256 * 1024,
-            16 * 1024 * 1024,
-            1,
-            256,
-            256,
-            Duration::from_secs(10),
-        )
-    };
-    let date = market_squawk_domain::CalendarDate::new(2026, 8, 10)?;
-    let latest = reader
-        .read_fund_nav_history(
-            AnalyticalFundNavReadRequest::try_new(
-                manifest.clone(),
-                instrument,
-                Timestamp::from_unix_nanos(250),
-                Some(FundNavDateRange::try_new(date, date)?),
-                PointInTimeRevisionMode::LatestKnown,
-                AnalyticalFundNavReadLimit::try_new(8)?,
-            )?,
-            query_limits()?,
-            Instant::now() + Duration::from_secs(30),
-            CancellationToken::new(),
-        )
-        .await?;
-    assert_eq!(latest.output().manifest(), &manifest);
-    assert_eq!(latest.observations().len(), 1);
+    let exact_a = read_fund_nav_fixture(
+        &restarted,
+        instrument,
+        Timestamp::from_unix_nanos(i64::MAX),
+        Some(&a_manifest),
+    )
+    .await?
+    .ok_or("exact Fund NAV A was lost after restart")?;
+    assert_eq!(exact_a.selection().receipt().receipt_digest(), a_receipt);
+    assert_eq!(exact_a.selection().pinned().manifest(), &a_manifest);
+    assert_eq!(exact_a.output().observations().len(), 1);
+    drop(exact_a);
+    let latest_b = read_fund_nav_fixture(
+        &restarted,
+        instrument,
+        Timestamp::from_unix_nanos(i64::MAX),
+        None,
+    )
+    .await?
+    .ok_or("latest Fund NAV B was lost after compaction/restart")?;
+    assert_eq!(latest_b.selection().receipt().receipt_digest(), b_receipt);
     assert_eq!(
-        latest.observations()[0].context().time().revision().get(),
-        2
+        latest_b.selection().pinned().manifest(),
+        &compacted_manifest
     );
-    assert_eq!(
-        latest.observations()[0].value(),
-        FundNavValue::Observed(Money::new(
-            Decimal::new(10_125, 2),
-            Currency::try_from("USD")?,
-        ))
-    );
+    drop(latest_b);
 
-    let all_known = reader
-        .read_fund_nav_history(
-            AnalyticalFundNavReadRequest::try_new(
-                manifest,
-                instrument,
-                Timestamp::from_unix_nanos(250),
-                Some(FundNavDateRange::try_new(date, date)?),
-                PointInTimeRevisionMode::AllKnown,
-                AnalyticalFundNavReadLimit::try_new(8)?,
-            )?,
-            query_limits()?,
-            Instant::now() + Duration::from_secs(30),
-            CancellationToken::new(),
-        )
-        .await?;
-    assert_eq!(
-        all_known
-            .observations()
-            .iter()
-            .map(|nav| nav.context().time().revision().get())
-            .collect::<Vec<_>>(),
-        vec![1, 2]
-    );
+    publish_fund_nav_fixture(
+        &restarted,
+        &secondary_source,
+        &raw_store,
+        fund_nav_capture_fixture(
+            instrument,
+            secondary_source.source_id().as_str(),
+            "secondary-fund-nav-dataset",
+            "secondary-v1",
+            10_130,
+            240,
+            3,
+        )?,
+        "fund-nav:share-class:secondary",
+    )
+    .await?;
+    let ambiguous = read_fund_nav_fixture(
+        &restarted,
+        instrument,
+        Timestamp::from_unix_nanos(i64::MAX),
+        None,
+    )
+    .await;
+    assert!(matches!(
+        ambiguous,
+        Err(AnalyticalReadError::Manifest(
+            ManifestCatalogError::FundNavPublicationMismatch
+        ))
+    ));
     Ok(())
 }
 
@@ -4906,7 +4959,7 @@ fn complete_history_source_for(
         SourceCoverage::try_instrument(
             ExactPayloadEvidence::from_content_digest(digest(coverage_digest_byte)),
             effective,
-            vec![AssetClass::Equity],
+            vec![AssetClass::Equity, AssetClass::Fund],
             CoverageTopology::partial_venues(vec![VenueId::try_from("iex")?])?,
             InstrumentCoverage::enumerated(vec![instrument_id])?,
             None,
@@ -5170,103 +5223,295 @@ fn fund_nav_instrument() -> Result<InstrumentId, Box<dyn Error>> {
     )?)
 }
 
-fn fund_nav_extraction_batch() -> Result<ExtractionBatch, Box<dyn Error>> {
+struct FundNavCaptureFixture {
+    batch: ExtractionBatch,
+    capture_material: ProviderCaptureMaterial,
+    revision_plan: ExtractionRevisionPlan,
+    native_row: serde_json::Value,
+    received_at: Timestamp,
+}
+
+fn canonical_fund_nav_request(
+    instrument: InstrumentId,
+    cutoff: Timestamp,
+    exact: Option<&DatasetManifestRef>,
+) -> Result<CanonicalFundNavReadRequest, Box<dyn Error>> {
     let date = market_squawk_domain::CalendarDate::new(2026, 8, 10)?;
-    let published_date = market_squawk_domain::CalendarDate::new(2026, 8, 11)?;
+    let policy = FundNavSelectionPolicy::CANONICAL_V1;
+    Ok(match exact {
+        Some(manifest) => CanonicalFundNavReadRequest::try_exact(
+            instrument,
+            cutoff,
+            Some(FundNavDateRange::try_new(date, date)?),
+            PointInTimeRevisionMode::LatestKnown,
+            AnalyticalFundNavReadLimit::try_new(8)?,
+            policy,
+            manifest.clone(),
+        )?,
+        None => CanonicalFundNavReadRequest::try_latest(
+            instrument,
+            cutoff,
+            Some(FundNavDateRange::try_new(date, date)?),
+            PointInTimeRevisionMode::LatestKnown,
+            AnalyticalFundNavReadLimit::try_new(8)?,
+            policy,
+        )?,
+    })
+}
+
+async fn read_fund_nav_fixture(
+    service: &AnalyticalDataService,
+    instrument: InstrumentId,
+    cutoff: Timestamp,
+    exact: Option<&DatasetManifestRef>,
+) -> Result<Option<market_squawk_data::CanonicalFundNavOutput>, AnalyticalReadError> {
+    let request = canonical_fund_nav_request(instrument, cutoff, exact)
+        .map_err(|_| AnalyticalReadError::InvalidFundNavResult)?;
+    service
+        .analytical_reader()
+        .read_canonical_fund_nav(
+            request,
+            QueryLimits::try_new(
+                16,
+                256 * 1024,
+                64 * 1024 * 1024,
+                1,
+                2_048,
+                2_048,
+                Duration::from_secs(10),
+            )?,
+            Instant::now() + Duration::from_secs(10),
+            CancellationToken::new(),
+        )
+        .await
+}
+
+async fn publish_fund_nav_fixture(
+    service: &AnalyticalDataService,
+    source: &SourceMetadata,
+    raw_store: &SealedResearchJournalStore,
+    fixture: FundNavCaptureFixture,
+    ingest_key: &str,
+) -> Result<CommittedDataset, Box<dyn Error>> {
+    let FundNavCaptureFixture {
+        batch,
+        capture_material,
+        revision_plan,
+        native_row,
+        received_at,
+    } = fixture;
+    let payload_digest = extraction_provider_payload_digest(&batch);
+    let cancellation = CancellationToken::new();
+    let reservation = service
+        .reserve_source_ingest(
+            source,
+            Timestamp::from_unix_nanos(10),
+            RightsDecisionInput {
+                source_id: source.source_id().clone(),
+                payload_digest,
+                retrieved_at: received_at,
+                basis: RightsBasis::reviewed_terms(
+                    "https://example.test/tiingo-fund-nav-terms/v1",
+                    digest(137),
+                )?,
+                authorization_evidence: digest(138),
+                authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+                permitted_operations: vec![SourceOperation::Persist],
+            },
+            &IngestIdentity::try_new(
+                source.source_id().clone(),
+                payload_digest,
+                SourceOperation::Persist,
+                ingest_key,
+            )?,
+            &cancellation,
+        )
+        .await?;
+    let dataset = DatasetId::try_from(batch.request().object().dataset().as_str())?;
+    let (expectation, seal_request) = capture_material.into_whole_seal_parts();
+    let token = expectation
+        .try_rejoin(seal_request.seal(raw_store)?)?
+        .try_into_whole()?;
+    let mut native = ProviderNativeLineageBatchBuilder::try_new(
+        ProviderNativeLineageImplementation::TiingoFundNavV1,
+        &batch,
+    )?;
+    native.try_push(&native_row)?;
+    let native = native.finish()?;
+    let binding = SealedProviderCaptureBinding::try_whole(token, batch, native, vec![0])?;
+    Ok(service
+        .ingest_provider_publication(
+            reservation,
+            dataset,
+            ProviderPublicationInput::try_new(binding, revision_plan)?,
+            cancellation,
+        )
+        .await?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fund_nav_capture_fixture(
+    instrument: InstrumentId,
+    source_id: &str,
+    dataset: &str,
+    source_revision: &str,
+    amount: i64,
+    received_at_ns: i64,
+    variant: u8,
+) -> Result<FundNavCaptureFixture, Box<dyn Error>> {
+    let source_id = SourceId::try_from(source_id)?;
+    let metadata_revision = MetadataRevision::new(SourceIdentifier::try_from(format!(
+        "{}-source-revision-v1",
+        source_id.as_str()
+    ))?);
+    let dataset = SourceIdentifier::try_from(dataset)?;
+    let received_at = Timestamp::from_unix_nanos(received_at_ns);
+    let native_row = serde_json::json!({
+        "ticker": "FUNDX",
+        "date": "2026-08-10",
+        "nav": amount,
+        "source_revision": source_revision,
+        "variant": variant,
+    });
+    let body = Bytes::from(serde_json::to_vec(&native_row)?);
+    let body_digest = EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        Sha256::digest(body.as_ref()).into(),
+    );
+    let capture = ProviderCaptureSetReceipt::try_new(
+        source_id.clone(),
+        metadata_revision.clone(),
+        dataset.clone(),
+        digest(variant.checked_add(160).ok_or("Fund NAV digest overflow")?),
+        ProviderCaptureTerminalDisposition::StandaloneResponse,
+        vec![ProviderCapturePageReceipt::try_new(
+            0,
+            digest(
+                variant
+                    .checked_add(170)
+                    .ok_or("Fund NAV page digest overflow")?,
+            ),
+            None,
+            None,
+            200,
+            u64::try_from(body.len())?,
+            body_digest,
+            received_at,
+        )?],
+    )?;
+    let capture_material = ProviderCaptureMaterial::try_new(
+        capture,
+        vec![RawCaptureRecord::try_new_live(
+            Uuid::from_u128(20_000 + u128::from(variant) * 2),
+            Arc::from(source_id.as_str()),
+            Uuid::from_u128(20_001 + u128::from(variant) * 2),
+            Some(0),
+            None,
+            DateTime::<Utc>::from_timestamp_nanos(received_at.unix_nanos()),
+            body,
+        )?],
+    )?;
     let discovery = DiscoveryRequest::try_new(
-        SourceIdentifier::try_from("fund-nav-fixture")?,
+        dataset.clone(),
         None,
         NonZeroU16::MIN,
-        Timestamp::from_unix_nanos(1_000),
+        Timestamp::from_unix_nanos(received_at_ns + 100),
     )?;
-    let object_evidence = ExactPayloadEvidence::from_content_digest(digest(73));
-    let object = SourceObject::try_new(
-        SourceId::try_from("fred-local-fixture")?,
-        MetadataRevision::new(SourceIdentifier::try_from("revision-1")?),
+    let object = SourceObject::try_new_with_capture_identity(
+        source_id.clone(),
+        metadata_revision,
         &discovery,
-        SourceIdentifier::try_from("fund-nav:share-class:2026-08-10")?,
-        SourceIdentifier::try_from("application-json")?,
-        object_evidence,
-        EffectiveInterval::new(Timestamp::from_unix_nanos(100), None)?,
+        dataset.clone(),
+        SourceIdentifier::try_from("application/json")?,
+        ExactPayloadEvidence::from_content_digest(capture_material.receipt().content_digest()),
+        SourceObjectCaptureIdentity::try_from_capture(capture_material.receipt())?,
+        EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
         None,
-        Some(4096),
+        SourceAvailabilityEvidence::LocalFirstObserved {
+            observed_at: received_at,
+        },
+        Some(capture_material.receipt().total_body_bytes()),
     )?;
     let request = ExtractionRequest::try_new(
         object,
-        NonZeroU32::new(2).ok_or("nonzero Fund NAV record limit")?,
+        NonZeroU32::MIN,
         NonZeroU64::new(1024 * 1024).ok_or("nonzero Fund NAV byte limit")?,
-        Timestamp::from_unix_nanos(1_000),
+        Timestamp::from_unix_nanos(received_at_ns + 100),
     )?;
-    let specifications = [
-        (120_i64, 125_i64, 130_i64, 10_100_i64, "nav-v1", 81_u8),
-        (180_i64, 185_i64, 190_i64, 10_125_i64, "nav-v2", 82_u8),
-    ];
-    let mut records = Vec::new();
-    for (received, ingested, canonical_published, amount, revision, row_digest) in specifications {
-        let observation = fund_nav_observation(
-            date,
-            published_date,
-            received,
-            ingested,
-            canonical_published,
-            amount,
-            revision,
-            row_digest,
-        )?;
-        let payload = serde_json::to_vec(&observation)?;
-        records.push(ExtractionRecord::try_new_with_time(
-            &request,
-            SourceIdentifier::try_from("market-squawk-research-v3")?,
-            ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
-                DigestAlgorithm::Sha256,
-                Sha256::digest(&payload).into(),
-            )),
-            ResearchTemporalCoordinate::calendar_date(date),
-            Some(ResearchTemporalCoordinate::calendar_date(published_date)),
-            SourceAvailabilityEvidence::LocalFirstObserved {
-                observed_at: Timestamp::from_unix_nanos(received),
-            },
-            SourceIdentifier::try_from(revision)?,
-            None,
-            payload.into(),
-        )?);
-    }
-    Ok(ExtractionBatch::try_new(&request, records)?)
+    let date = market_squawk_domain::CalendarDate::new(2026, 8, 10)?;
+    let published_date = market_squawk_domain::CalendarDate::new(2026, 8, 11)?;
+    let observation = fund_nav_observation(
+        instrument,
+        &source_id,
+        received_at,
+        amount,
+        source_revision,
+        body_digest,
+    )?;
+    let payload = serde_json::to_vec(&observation)?;
+    let record = ExtractionRecord::try_new_with_time(
+        &request,
+        SourceIdentifier::try_from("market-squawk-research-v3")?,
+        ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(&payload).into(),
+        )),
+        ResearchTemporalCoordinate::calendar_date(date),
+        Some(ResearchTemporalCoordinate::calendar_date(published_date)),
+        SourceAvailabilityEvidence::LocalFirstObserved {
+            observed_at: received_at,
+        },
+        SourceIdentifier::try_from(source_revision)?,
+        None,
+        payload.into(),
+    )?;
+    let batch = ExtractionBatch::try_new(&request, vec![record])?
+        .try_bind_provider_capture(capture_material.receipt())?;
+    let revision_plan = ExtractionRevisionPlan::try_new_with_native_lineage(vec![
+        ExtractionRevisionEvidence::provider_supplied(
+            source_revision.as_bytes(),
+            ObservedProviderOrder::try_new(
+                ResearchTemporalCoordinate::exact(received_at),
+                source_revision.as_bytes(),
+            )?,
+        )?,
+    ])?;
+    Ok(FundNavCaptureFixture {
+        batch,
+        capture_material,
+        revision_plan,
+        native_row,
+        received_at,
+    })
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the fixture keeps every NAV clock explicit"
-)]
+#[allow(clippy::too_many_arguments)]
 fn fund_nav_observation(
-    nav_date: market_squawk_domain::CalendarDate,
-    published_date: market_squawk_domain::CalendarDate,
-    received: i64,
-    ingested: i64,
-    canonical_published: i64,
+    instrument: InstrumentId,
+    source_id: &SourceId,
+    received_at: Timestamp,
     amount: i64,
     source_revision: &str,
-    row_digest: u8,
+    raw_digest: EvidenceDigest,
 ) -> Result<ResearchObservation, Box<dyn Error>> {
-    let received_at = Timestamp::from_unix_nanos(received);
-    let raw_row = ExactPayloadEvidence::from_content_digest(digest(row_digest));
+    let nav_date = market_squawk_domain::CalendarDate::new(2026, 8, 10)?;
+    let published_date = market_squawk_domain::CalendarDate::new(2026, 8, 11)?;
+    let ingested_at = received_at.checked_add_nanos(1)?;
+    let canonical_published_at = received_at.checked_add_nanos(2)?;
     let context = ResearchContext::new(
         ResearchProvenance::try_new(ResearchProvenanceInput {
-            source_id: SourceId::try_from("fred-local-fixture")?,
-            instrument_id: Some(fund_nav_instrument()?),
+            source_id: source_id.clone(),
+            instrument_id: Some(instrument),
             venue_id: None,
             source_identifier: SourceIdentifier::try_from(format!(
                 "fund-nav:share-class:{nav_date}:{source_revision}"
             ))?,
             source_timestamp: None,
             received_at,
-            ingested_at: Timestamp::from_unix_nanos(ingested),
+            ingested_at,
             quality: DataQuality::DirectVerified,
             payload_reference: PayloadReference::ContentHash(
-                market_squawk_domain::PayloadHash::new(
-                    raw_row.content_digest().algorithm(),
-                    raw_row.content_digest().bytes(),
-                ),
+                market_squawk_domain::PayloadHash::new(raw_digest.algorithm(), raw_digest.bytes()),
             ),
             availability: DomainAvailabilityEvidence::local_first_observed(received_at),
         })?,
@@ -5277,38 +5522,31 @@ fn fund_nav_observation(
             None,
         )?,
     )?;
-    let native_schema = FundNavNativeSchema::new(
-        MetadataRevision::new(SourceIdentifier::try_from("fund-nav-contract-v1")?),
-        ExactPayloadEvidence::from_content_digest(digest(74)),
-        SourceIdentifier::try_from("fund-nav-native-row")?,
-        MetadataRevision::new(SourceIdentifier::try_from("native-v1")?),
-        ExactPayloadEvidence::from_content_digest(digest(75)),
-    );
     let lineage = FundNavLineage::try_new(
-        native_schema,
+        FundNavNativeSchema::new(
+            MetadataRevision::new(SourceIdentifier::try_from("fund-nav-contract-v1")?),
+            ExactPayloadEvidence::from_content_digest(digest(74)),
+            SourceIdentifier::try_from("tiingo-fund-nav-row")?,
+            MetadataRevision::new(SourceIdentifier::try_from("native-v1")?),
+            ExactPayloadEvidence::from_content_digest(digest(75)),
+        ),
         FundNavEntitlementEvidence::Gated {
             generation: NonZeroU64::MIN,
             evidence: digest(76),
         },
         digest(77),
-        ExactPayloadEvidence::from_content_digest(digest(73)),
-        raw_row,
+        ExactPayloadEvidence::from_content_digest(raw_digest),
+        ExactPayloadEvidence::from_content_digest(raw_digest),
         Some(digest(78)),
         digest(79),
         FundNavCompleteness::Complete,
         FundNavDisposition::Returned,
     )?;
-    let revision_evidence = FundNavRevisionEvidence::try_new(
-        Some(SourceIdentifier::try_from(source_revision)?),
-        if source_revision == "nav-v1" {
-            FundNavCorrectionState::Original
-        } else {
-            FundNavCorrectionState::Corrected
-        },
-        FundNavFinality::Final,
-        (source_revision != "nav-v1").then(|| digest(81)),
-        None,
-    )?;
+    let correction = if source_revision == "nav-v1" {
+        FundNavCorrectionState::Original
+    } else {
+        FundNavCorrectionState::Corrected
+    };
     let currency = Currency::try_from("USD")?;
     Ok(ResearchObservation::FundNav(FundNavObservation::try_new(
         FundNavObservationInput {
@@ -5323,28 +5561,64 @@ fn fund_nav_observation(
             valuation_basis: FundNavValuationBasis::PerShare,
             currency,
             value: FundNavValue::Observed(Money::new(Decimal::new(amount, 2), currency)),
-            canonical_published_at: Timestamp::from_unix_nanos(canonical_published),
+            canonical_published_at,
             lineage,
-            revision_evidence,
+            revision_evidence: FundNavRevisionEvidence::try_new(
+                Some(SourceIdentifier::try_from(source_revision)?),
+                correction,
+                FundNavFinality::Final,
+                (correction == FundNavCorrectionState::Corrected).then(|| digest(81)),
+                None,
+            )?,
         },
     )?))
 }
 
-fn fund_nav_revision_plan() -> Result<ExtractionRevisionPlan, Box<dyn Error>> {
-    let evidence = [("nav-v1", 120_i64), ("nav-v2", 180_i64)]
-        .into_iter()
-        .map(|(version, order)| {
-            ExtractionRevisionEvidence::provider_supplied(
-                version.as_bytes(),
-                ObservedProviderOrder::try_new(
-                    ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(order)),
-                    version.as_bytes(),
+fn fund_nav_market_data_definition(
+    instrument: InstrumentId,
+) -> Result<MarketDataInstrumentDefinition, Box<dyn Error>> {
+    let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
+    let provider_identity = |source: &str, revision: &str, byte: u8| {
+        Ok::<_, Box<dyn Error>>(ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+            instrument_id: instrument,
+            source_id: SourceId::try_from(source)?,
+            provider_instrument_id: ProviderInstrumentId::try_from("FUNDX")?,
+            evidence: ProviderIdentityEvidence::from_content_digest(digest(byte)),
+            source_timestamp: Some(Timestamp::from_unix_nanos(1)),
+            observed_at: Timestamp::from_unix_nanos(2),
+            metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(revision)?),
+            validity: effective,
+            supersedes: None,
+        }))
+    };
+    Ok(MarketDataInstrumentDefinition::try_new(
+        MarketDataInstrumentDefinitionInput {
+            instrument_id: instrument,
+            reference_evidence: RevisionBoundPayloadEvidence::new(
+                MetadataRevision::new(SourceIdentifier::try_from("fund-share-class-reference-v1")?),
+                ExactPayloadEvidence::from_content_digest(digest(139)),
+            ),
+            effective_interval: effective,
+            asset_class: AssetClass::Fund,
+            display_name: None,
+            quote_currency: Currency::try_from("USD")?,
+            quote_currency_evidence: ExactPayloadEvidence::from_content_digest(digest(140)),
+            venue_mappings: Vec::new(),
+            provider_identities: vec![
+                provider_identity(
+                    "fund-nav-provider-a",
+                    "tiingo-fundx-provider-identity-v1",
+                    141,
                 )?,
-            )
-            .map_err(Into::into)
-        })
-        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-    Ok(ExtractionRevisionPlan::try_new(evidence)?)
+                provider_identity(
+                    "fund-nav-provider-b",
+                    "secondary-fundx-provider-identity-v1",
+                    142,
+                )?,
+            ],
+            identifiers: Vec::new(),
+        },
+    )?)
 }
 
 fn company_identity(
