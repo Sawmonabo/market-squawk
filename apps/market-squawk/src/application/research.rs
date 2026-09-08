@@ -1722,8 +1722,10 @@ fn map_manifest_error(error: ManifestCatalogError) -> ServiceError {
         ManifestCatalogError::ObjectLimitExceeded { .. }
         | ManifestCatalogError::ReferenceWorkLimitExceeded { .. }
         | ManifestCatalogError::FeatureDatasetCandidateLimitExceeded { .. }
+        | ManifestCatalogError::FundNavInputLimitExceeded { .. }
         | ManifestCatalogError::CountOverflow
         | ManifestCatalogError::AllocationContract => ServiceError::ResourceExhausted,
+        ManifestCatalogError::FundNavPublicationMismatch => ServiceError::InvalidResult,
         ManifestCatalogError::InvalidConfiguration
         | ManifestCatalogError::MigrationMissing
         | ManifestCatalogError::AnchorMismatch

@@ -748,8 +748,12 @@ fn validate_treasury_fiscal_rows(
                 .ok()
                 .is_none_or(|value| value.is_null())
             || row.keys().any(|field| !fred_row_field_allowed(field))
-            || effective < query.first_record_date()
-            || effective > query.last_record_date()
+            || query
+                .first_record_date()
+                .is_some_and(|first| effective < first)
+            || query
+                .last_record_date()
+                .is_some_and(|last| effective > last)
             || !source_identifier.starts_with(&expected_prefix)
             || !treasury_fiscal_revision_matches(source_identifier, effective)
             || provenance.source_id().as_str() != TREASURY_FISCAL_SOURCE_ID

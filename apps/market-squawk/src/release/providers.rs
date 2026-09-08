@@ -834,6 +834,16 @@ async fn exercise_treasury_fiscal_research(
     application: &Application,
     query: &TreasuryFiscalQuery,
 ) -> Result<Vec<ResearchPublicationEvidence>> {
+    // This evidence format proves a bounded query. All-history acceptance requires its
+    // complete publication-plan evidence, never inferred minimum or maximum dates.
+    let (Some(first_record_date), Some(last_record_date)) =
+        (query.first_record_date(), query.last_record_date())
+    else {
+        bail!(
+            "Treasury Fiscal Data bounded release evidence requires both exact date bounds; \
+             all-history queries require complete publication-plan evidence"
+        );
+    };
     let dataset = query
         .dataset()
         .context("Treasury Fiscal Data provider dataset is invalid")?;
@@ -967,8 +977,8 @@ async fn exercise_treasury_fiscal_research(
     publication.temporal_semantics =
         ResearchPublicationTemporalSemantics::TreasuryFiscalEffectiveObservations;
     publication.treasury_fiscal = Some(TreasuryFiscalPublicationEvidence {
-        first_record_date: query.first_record_date(),
-        last_record_date: query.last_record_date(),
+        first_record_date,
+        last_record_date,
         page_size: query.page_size().get(),
         query_digest: lower_hex(query.query_digest()),
         provider_row_count: observations.row_count,
@@ -1908,8 +1918,12 @@ fn validate_treasury_fiscal_query_rows(
                 .ok()
                 .is_none_or(|value| value.is_null())
             || row.keys().any(|field| !research_row_field_allowed(field))
-            || effective < query.first_record_date()
-            || effective > query.last_record_date()
+            || query
+                .first_record_date()
+                .is_some_and(|first| effective < first)
+            || query
+                .last_record_date()
+                .is_some_and(|last| effective > last)
             || !source_identifier.starts_with(&expected_prefix)
             || !treasury_fiscal_revision_matches(source_identifier, effective)
             || provenance.source_id().as_str() != TREASURY_FISCAL_SOURCE_ID

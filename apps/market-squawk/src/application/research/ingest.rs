@@ -3288,7 +3288,9 @@ fn classify_ingest_error(error: IngestError) -> ProviderOperationFailureClass {
         | IngestError::ProviderCaptureRecoveryWorkerUnavailable => {
             ProviderOperationFailureClass::CaptureUnavailable
         }
-        IngestError::AuthorityLockPoisoned => ProviderOperationFailureClass::RuntimeUnavailable,
+        IngestError::AuthorityLockPoisoned | IngestError::AuthorityBusy => {
+            ProviderOperationFailureClass::RuntimeUnavailable
+        }
         IngestError::Plan(_)
         | IngestError::Arrow(_)
         | IngestError::Serialization(_)
