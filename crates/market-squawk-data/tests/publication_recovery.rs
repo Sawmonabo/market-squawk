@@ -1379,7 +1379,6 @@ async fn exercise_staged_macro_terminal_and_finalization_restart() -> TestResult
     let catalog_config = test_catalog_config(location.clone())?;
     let source = local_source()?;
     let authority = CatalogAuthority::open(catalog_config.clone())?;
-    authority.register_source(&source, Timestamp::from_unix_nanos(10))?;
     let object_config = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
     let service = AnalyticalDataService::initialize(
         authority,
@@ -1414,7 +1413,7 @@ async fn exercise_staged_macro_terminal_and_finalization_restart() -> TestResult
         })
     };
     let cancellation = CancellationToken::new();
-    let initial = service.begin_staged_provider_macro_plan(session_input(213)?)?;
+    let initial = service.begin_staged_provider_macro_plan(session_input(213)?, &source)?;
     let probe = rusqlite::Connection::open(location.path())?;
     probe.execute_batch(
         "CREATE TRIGGER reject_terminal_checkpoint BEFORE UPDATE ON provider_macro_plan_sessions
@@ -1493,7 +1492,7 @@ async fn exercise_staged_macro_terminal_and_finalization_restart() -> TestResult
         1
     );
 
-    let mut session = service.begin_staged_provider_macro_plan(session_input(215)?)?;
+    let mut session = service.begin_staged_provider_macro_plan(session_input(215)?, &source)?;
     for ordinal in 0_u16..32 {
         session = service
             .stage_provider_macro_plan_page(

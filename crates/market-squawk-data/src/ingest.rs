@@ -3890,6 +3890,7 @@ impl AnalyticalDataService {
     pub fn begin_staged_provider_macro_plan(
         &self,
         input: ProviderMacroPlanSessionInput,
+        source: &SourceMetadata,
     ) -> Result<ProviderMacroPlanSessionReceipt, IngestError> {
         let ProviderMacroPlanSessionInput {
             analytical_dataset,
@@ -3900,6 +3901,9 @@ impl AnalyticalDataService {
             plan_identity,
             initial_checkpoint,
         } = input;
+        if source.source_id() != &source_id || source.revision() != &metadata_revision {
+            return Err(IngestError::ReservationPayloadMismatch);
+        }
         let initial_checkpoint_digest = EvidenceDigest::new(
             DigestAlgorithm::Sha256,
             Sha256::digest(initial_checkpoint.as_ref()).into(),
@@ -3915,6 +3919,17 @@ impl AnalyticalDataService {
         )?;
         let session_id = key.session_id();
         let authority = self.lock_authority()?;
+        if authority
+            .source(source.source_id())?
+            .as_ref()
+            .is_none_or(|registered| registered != source)
+        {
+            // Staging precedes the final payload-specific ingest reservation. Register the
+            // actual source now so the first acquisition can retain its original checkpoint.
+            let registered_at = system_timestamp()
+                .map_err(|_| IngestError::Catalog(CatalogError::InvalidRecord))?;
+            authority.register_source(source, registered_at)?;
+        }
         authority
             .catalog()
             .begin_provider_macro_plan_session(key, initial_checkpoint)?;
