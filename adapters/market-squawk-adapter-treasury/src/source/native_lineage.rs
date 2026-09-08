@@ -20,9 +20,10 @@ pub(super) enum TreasuryNativeLineagePlan {
     Fiscal {
         dataset: SourceIdentifier,
         source_identity: &'static str,
-        first_record_date: CalendarDate,
-        last_record_date: CalendarDate,
+        first_record_date: Option<CalendarDate>,
+        last_record_date: Option<CalendarDate>,
         page_size: u16,
+        complete_page_chain: bool,
         pages: Vec<FiscalDataPage>,
     },
     Daily {
@@ -39,8 +40,28 @@ impl TreasuryNativeLineagePlan {
             first_record_date: query.first_record_date(),
             last_record_date: query.last_record_date(),
             page_size: query.page_size().get(),
+            complete_page_chain: true,
             pages: Vec::new(),
         }
+    }
+
+    pub(super) fn fiscal_page(
+        dataset: SourceIdentifier,
+        query: &TreasuryFiscalQuery,
+        page: FiscalDataPage,
+    ) -> Result<Self, TreasurySourceError> {
+        if !query.is_all_history() || page.query_digest() != query.query_digest() {
+            return Err(TreasurySourceError::InvalidProtocol);
+        }
+        Ok(Self::Fiscal {
+            dataset,
+            source_identity: query.source_identity(),
+            first_record_date: None,
+            last_record_date: None,
+            page_size: query.page_size().get(),
+            complete_page_chain: false,
+            pages: vec![page],
+        })
     }
 
     pub(super) fn try_push_fiscal_page(
@@ -87,6 +108,7 @@ impl TreasuryNativeLineagePlan {
                 first_record_date,
                 last_record_date,
                 page_size,
+                complete_page_chain,
                 pages,
             } => encode_fiscal(
                 batch,
@@ -95,6 +117,7 @@ impl TreasuryNativeLineagePlan {
                 first_record_date,
                 last_record_date,
                 page_size,
+                complete_page_chain,
                 &pages,
             ),
             Self::Daily { dataset, page } => encode_daily(batch, &dataset, &page),
@@ -110,9 +133,10 @@ fn encode_fiscal(
     batch: &ExtractionBatch,
     dataset: &SourceIdentifier,
     source_identity: &'static str,
-    first_record_date: CalendarDate,
-    last_record_date: CalendarDate,
+    first_record_date: Option<CalendarDate>,
+    last_record_date: Option<CalendarDate>,
     page_size: u16,
+    complete_page_chain: bool,
     pages: &[FiscalDataPage],
 ) -> Result<(ProviderNativeLineageBatch, Vec<u16>), TreasurySourceError> {
     let first_page = pages.first().ok_or(TreasurySourceError::InvalidProtocol)?;
@@ -123,8 +147,9 @@ fn encode_fiscal(
     })?;
     if batch.request().object().dataset() != dataset
         || source_rows != batch.records().len()
-        || pages.len() != first_page.total_pages()
-        || source_rows != first_page.total_count()
+        || (complete_page_chain
+            && (pages.len() != first_page.total_pages() || source_rows != first_page.total_count()))
+        || (!complete_page_chain && (pages.len() != 1 || source_rows == 0))
     {
         return Err(TreasurySourceError::InvalidProtocol);
     }
@@ -156,6 +181,7 @@ fn encode_fiscal(
             first_record_date,
             last_record_date,
             page_size,
+            complete_page_chain,
             schema: FiscalNativeSchemaV1 {
                 labels: first_page.schema().labels(),
                 data_types: first_page.schema().data_types(),
@@ -345,9 +371,10 @@ struct TreasuryFiscalNativeBatchV1<'a> {
     dataset: &'a SourceIdentifier,
     profile: &'static str,
     source_identity: &'static str,
-    first_record_date: CalendarDate,
-    last_record_date: CalendarDate,
+    first_record_date: Option<CalendarDate>,
+    last_record_date: Option<CalendarDate>,
     page_size: u16,
+    complete_page_chain: bool,
     schema: FiscalNativeSchemaV1<'a>,
     pages: &'a [FiscalNativePageV1<'a>],
 }

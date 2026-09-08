@@ -107,7 +107,7 @@ pub enum TreasuryDatasetPeriod {
         /// Selected month.
         month: u8,
     },
-    /// Treasury's zero-based, empty-terminal all-history response chain.
+    /// Complete provider history: zero-based empty-terminal daily XML, or one-based Fiscal JSON.
     AllHistory,
 }
 
@@ -242,13 +242,21 @@ impl TreasuryDatasetCatalog {
                     analytical_dataset: query
                         .analytical_dataset()
                         .map_err(|_| TreasuryVerticalError::InvalidConfiguration)?,
-                    period: TreasuryDatasetPeriod::FiscalDateRange {
-                        first: query.first_record_date(),
-                        last: query.last_record_date(),
-                        page_size: query.page_size().get(),
+                    period: match (query.first_record_date(), query.last_record_date()) {
+                        (Some(first), Some(last)) => TreasuryDatasetPeriod::FiscalDateRange {
+                            first,
+                            last,
+                            page_size: query.page_size().get(),
+                        },
+                        (None, None) => TreasuryDatasetPeriod::AllHistory,
+                        _ => return Err(TreasuryVerticalError::InvalidConfiguration),
                     },
                     query_digest: sha256(query.query_digest()),
-                    publication_mode: TreasuryPublicationMode::CompletePageChain,
+                    publication_mode: if query.is_all_history() {
+                        TreasuryPublicationMode::ResumableBackfill
+                    } else {
+                        TreasuryPublicationMode::CompletePageChain
+                    },
                 };
                 (TreasurySurface::FiscalData, vec![descriptor])
             }

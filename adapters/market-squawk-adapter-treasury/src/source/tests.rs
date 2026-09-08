@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -298,14 +298,17 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
         ])),
         requested_urls: Mutex::new(Vec::new()),
     });
-    let source =
-        TreasurySource::try_new_with_transport(source_metadata.clone(), config, transport)?;
+    let source = Arc::new(TreasurySource::try_new_with_transport(
+        source_metadata.clone(),
+        config,
+        transport,
+    )?);
     let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let registered = registry.register(source_metadata, now)?;
-    let authority = registry.extraction_authority(&registered, &source)?;
+    let authority = registry.extraction_authority(&registered, source.as_ref())?;
     let deadline = now.checked_add_nanos(60_000_000_000)?;
     let temporary = TemporaryDirectory::new();
-    let store = LocalPaths::prepare(temporary.path())?.sealed_research_journal_store()?;
+    let store = Arc::new(LocalPaths::prepare(temporary.path())?.sealed_research_journal_store()?);
 
     let mut backfill = source.start_all_history_backfill(query.dataset())?;
     tokio::time::sleep(TEST_PROVIDER_RATE_SETTLE).await;
@@ -352,7 +355,27 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
     assert!(backfill.acquisition_completion().is_err());
 
     let encoded = backfill.checkpoint().to_json()?;
-    let mut restored = source.restore_all_history_backfill(&encoded, &store)?;
+    let cancelled_restore = CancellationToken::new();
+    cancelled_restore.cancel();
+    assert!(matches!(
+        source
+            .restore_all_history_backfill(
+                &encoded,
+                Arc::clone(&store),
+                Instant::now() + Duration::from_secs(5),
+                &cancelled_restore,
+            )
+            .await,
+        Err(super::TreasurySourceError::Cancelled)
+    ));
+    let mut restored = source
+        .restore_all_history_backfill(
+            &encoded,
+            Arc::clone(&store),
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await?;
     tokio::time::sleep(TEST_PROVIDER_RATE_SETTLE).await;
     let terminal_request = DiscoveryRequest::try_new(
         query.dataset().clone(),
@@ -406,8 +429,13 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
         completion.native_lineage_batch_digests().count(),
         completion.data_page_count()
     );
-    let (reopened, reopened_seal) =
-        source.reopen_all_history_canonical_page(&completion, 0, &store)?;
+    let (reopened, reopened_seal) = source.reopen_all_history_canonical_page(
+        &completion,
+        0,
+        &store,
+        Instant::now() + Duration::from_secs(5),
+        &CancellationToken::new(),
+    )?;
     assert_eq!(&reopened_seal, &completion.sealed_pages()[0]);
     assert_eq!(reopened.content_identity(), first_content_identity);
     reopened.native_lineage().validate(reopened.batch())?;
@@ -421,11 +449,246 @@ async fn all_history_requires_each_raw_page_seal_and_restores_before_terminal() 
     assert!(reopened_ordinals.iter().all(|ordinal| *ordinal == 0));
 
     let completed_checkpoint = restored.checkpoint().to_json()?;
-    let completed = source.restore_all_history_backfill(&completed_checkpoint, &store)?;
+    let completed = source
+        .restore_all_history_backfill(
+            &completed_checkpoint,
+            Arc::clone(&store),
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await?;
     assert_eq!(
         completed.acquisition_completion()?.completion_digest(),
         completion.completion_digest()
     );
+
+    // Hold one actual worker in the existing source slot, then abandon the replay waiter.
+    // A deadline must retain the same handle, and a later drain must report its actual failure.
+    let worker_cancellation = CancellationToken::new();
+    let (release, wait_release) = std::sync::mpsc::sync_channel(1);
+    let (finished, completion_signal) = tokio::sync::oneshot::channel();
+    let worker = std::thread::spawn(move || {
+        wait_release
+            .recv()
+            .map_err(|_| super::TreasurySourceError::RestoreWorkerUnavailable)?;
+        let _finished = finished.send(());
+        Err(super::TreasurySourceError::InvalidBackfillCheckpoint)
+    });
+    *source.all_history_replay.worker.lock().await =
+        Some(super::backfill::RetainedTreasuryReplay {
+            task: Some(worker),
+            completion: completion_signal,
+            cancellation: worker_cancellation.clone(),
+        });
+    {
+        let replay = source.restore_all_history_backfill(
+            &completed_checkpoint,
+            Arc::clone(&store),
+            Instant::now() + Duration::from_secs(5),
+            &cancelled_restore,
+        );
+        // The cancelled request cannot consume the already retained worker.
+        assert!(matches!(
+            replay.await,
+            Err(super::TreasurySourceError::Cancelled)
+        ));
+    }
+    {
+        let cancellation = CancellationToken::new();
+        let mut replay = Box::pin(source.restore_all_history_backfill(
+            &completed_checkpoint,
+            Arc::clone(&store),
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
+        ));
+        assert!(futures_util::poll!(replay.as_mut()).is_pending());
+        drop(replay);
+    }
+    assert!(worker_cancellation.is_cancelled());
+    assert!(source.all_history_replay.worker.lock().await.is_some());
+    assert!(matches!(
+        source.drain_all_history_replay(Instant::now()).await,
+        Err(super::TreasurySourceError::DeadlineExceeded)
+    ));
+    release.send(())?;
+    assert!(matches!(
+        source
+            .drain_all_history_replay(Instant::now() + Duration::from_secs(5))
+            .await,
+        Err(super::TreasurySourceError::InvalidBackfillCheckpoint)
+    ));
+    assert!(source.all_history_replay.worker.lock().await.is_none());
+    source.begin_all_history_replay_shutdown();
+    assert!(matches!(
+        source
+            .restore_all_history_backfill(
+                &completed_checkpoint,
+                Arc::clone(&store),
+                Instant::now() + Duration::from_secs(5),
+                &CancellationToken::new(),
+            )
+            .await,
+        Err(super::TreasurySourceError::Cancelled)
+    ));
+    let joined_on_drop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_finished = Arc::clone(&joined_on_drop);
+    let (release_drop, wait_drop) = std::sync::mpsc::sync_channel(1);
+    let (finished_drop, completed_drop) = tokio::sync::oneshot::channel();
+    let drop_worker = std::thread::spawn(move || {
+        wait_drop
+            .recv()
+            .map_err(|_| super::TreasurySourceError::RestoreWorkerUnavailable)?;
+        worker_finished.store(true, std::sync::atomic::Ordering::Release);
+        let _finished = finished_drop.send(());
+        Err(super::TreasurySourceError::Cancelled)
+    });
+    *source.all_history_replay.worker.lock().await =
+        Some(super::backfill::RetainedTreasuryReplay {
+            task: Some(drop_worker),
+            completion: completed_drop,
+            cancellation: CancellationToken::new(),
+        });
+    release_drop.send(())?;
+    drop(source);
+    assert!(joined_on_drop.load(std::sync::atomic::Ordering::Acquire));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fiscal_all_history_restores_sealed_pages_and_retains_terminal_rows() -> TestResult {
+    let _provider_rate_guard = TEST_PROVIDER_RATE_SERIAL.lock().await;
+    let now = system_timestamp()?;
+    let query = TreasuryFiscalQuery::average_interest_rates_v2_all_history(
+        NonZeroU16::new(1).ok_or("nonzero page size")?,
+    )?;
+    assert!(query.is_all_history());
+    assert!(query.first_record_date().is_none());
+    assert!(query.last_record_date().is_none());
+    assert!(!query.page(1)?.url().contains("filter="));
+    let config = TreasurySourceConfig::average_interest_rates(query);
+    let source_metadata = metadata(now, &config, DataQuality::OfficialDelayed)?;
+    let mut first: serde_json::Value =
+        serde_json::from_slice(include_bytes!("../../fixtures/average_interest_rates.json"))?;
+    first["meta"]["total-count"] = serde_json::json!(2);
+    first["meta"]["total-pages"] = serde_json::json!(2);
+    first["links"]["next"] = serde_json::json!("&page%5Bnumber%5D=2&page%5Bsize%5D=1");
+    first["links"]["last"] = first["links"]["next"].clone();
+    let mut last = first.clone();
+    last["links"]["self"] = first["links"]["next"].clone();
+    last["links"]["prev"] = serde_json::json!("&page%5Bnumber%5D=1&page%5Bsize%5D=1");
+    last["links"]["next"] = serde_json::Value::Null;
+    last["data"][0]["record_date"] = serde_json::json!("2026-07-01");
+    last["data"][0]["src_line_nbr"] = serde_json::json!("2");
+    last["data"][0]["record_fiscal_quarter"] = serde_json::json!("4");
+    last["data"][0]["record_calendar_quarter"] = serde_json::json!("3");
+    last["data"][0]["record_calendar_month"] = serde_json::json!("07");
+    last["data"][0]["record_calendar_day"] = serde_json::json!("01");
+    let mut responses = VecDeque::new();
+    for body in [first, last] {
+        responses.push_back(TreasuryHttpResponse {
+            status: 200,
+            retry_after: None,
+            content_encoding: None,
+            content_type: Some(b"application/json".to_vec()),
+            body: Bytes::from(serde_json::to_vec(&body)?),
+            received_at: now,
+        });
+    }
+    let transport = Arc::new(ScriptedTransport {
+        responses: Mutex::new(responses),
+        requested_urls: Mutex::new(Vec::new()),
+    });
+    let source = Arc::new(TreasurySource::try_new_with_transport(
+        source_metadata.clone(),
+        config,
+        transport.clone(),
+    )?);
+    let dataset = source.dataset_catalog()?.datasets()[0]
+        .provider_dataset()
+        .clone();
+    assert_eq!(
+        dataset.as_str(),
+        "treasury:fiscal-data:average-interest-rates-v2:all"
+    );
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let registered = registry.register(source_metadata, now)?;
+    let authority = registry.extraction_authority(&registered, source.as_ref())?;
+    let temporary = TemporaryDirectory::new();
+    let store = Arc::new(LocalPaths::prepare(temporary.path())?.sealed_research_journal_store()?);
+    let mut backfill = source.start_all_history_backfill(&dataset)?;
+    let mut contents = Vec::new();
+    for number in 1..=2 {
+        assert_eq!(backfill.checkpoint().next_page(), number);
+        tokio::time::sleep(TEST_PROVIDER_RATE_SETTLE).await;
+        let fetched = source
+            .fetch_next_all_history_page(
+                &backfill,
+                authority.clone(),
+                DiscoveryRequest::try_new(
+                    dataset.clone(),
+                    None,
+                    NonZeroU16::new(1).ok_or("nonzero result count")?,
+                    now.checked_add_nanos(60_000_000_000)?,
+                )?,
+                CancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(fetched.terminal(), number == 2);
+        let canonical = fetched
+            .canonical()
+            .ok_or("Fiscal terminal must retain canonical rows")?;
+        assert_eq!(canonical.batch().records().len(), 1);
+        canonical.native_lineage().validate(canonical.batch())?;
+        assert_eq!(canonical.row_capture_page_ordinals(), [0]);
+        contents.push(canonical.content_identity());
+        let (_, capture, admission) = fetched.into_parts();
+        let (expectation, seal_request) = capture.into_whole_seal_parts();
+        let seal = expectation
+            .try_rejoin(seal_request.seal(&store)?)?
+            .try_into_whole()?
+            .persisted_receipt()
+            .clone();
+        backfill.accept_sealed_page(admission, seal)?;
+        let checkpoint = backfill.checkpoint().to_json()?;
+        backfill = source
+            .restore_all_history_backfill(
+                &checkpoint,
+                Arc::clone(&store),
+                Instant::now() + Duration::from_secs(5),
+                &CancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(backfill.acquisition_completion().is_ok(), number == 2);
+    }
+    let completion = backfill.acquisition_completion()?;
+    assert_eq!(completion.response_count(), 2);
+    assert_eq!(completion.data_page_count(), 2);
+    assert_eq!(completion.source_rows(), 2);
+    assert_eq!(completion.canonical_points(), 2);
+    assert_eq!(completion.canonical_series().len(), 1);
+    assert_eq!(completion.data_source_objects().count(), 2);
+    for (ordinal, content) in contents.iter().enumerate() {
+        let (canonical, seal) = source.reopen_all_history_canonical_page(
+            &completion,
+            ordinal,
+            &store,
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )?;
+        assert_eq!(canonical.content_identity(), *content);
+        assert_eq!(seal, completion.sealed_pages()[ordinal]);
+        canonical.native_lineage().validate(canonical.batch())?;
+    }
+    let urls = transport
+        .requested_urls
+        .lock()
+        .map_err(|_| "request log poisoned")?;
+    assert_eq!(
+        urls.len(),
+        2,
+        "restart replay must not reacquire provider responses"
+    );
+    assert!(urls.iter().all(|url| !url.contains("filter=")));
     Ok(())
 }
 

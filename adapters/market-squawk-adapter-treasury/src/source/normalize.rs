@@ -20,6 +20,7 @@ use crate::{
 };
 
 pub(crate) struct CanonicalTreasuryRecord {
+    pub(super) series: SourceIdentifier,
     pub(super) effective: ResearchTemporalCoordinate,
     pub(super) published: Option<ResearchTemporalCoordinate>,
     pub(super) availability: ExtractionAvailabilityEvidence,
@@ -60,6 +61,9 @@ impl CanonicalRecordAdmission {
             .ok()
             .and_then(|fixed| {
                 fixed.checked_add(u64::try_from(record.revision.as_str().len()).ok()?)
+            })
+            .and_then(|retained| {
+                retained.checked_add(u64::try_from(record.series.as_str().len()).ok()?)
             })
             .and_then(|retained| retained.checked_add(u64::try_from(payload_bytes).ok()?))
             .ok_or(TreasurySourceError::InvalidProtocol)?;
@@ -256,6 +260,7 @@ fn canonical_record(
     let context =
         ResearchContext::new(provenance, time).map_err(|_| TreasurySourceError::InvalidProtocol)?;
     let unit = identifier("percent")?;
+    let canonical_series = series.clone();
     let (observation, disposition) = match value {
         CanonicalMacroValue::Observed(value) => (
             MacroObservation::new(context, series, value, unit),
@@ -271,6 +276,7 @@ fn canonical_record(
         .map_err(|_| TreasurySourceError::InvalidProtocol)?;
     let digest: [u8; 32] = Sha256::digest(&payload).into();
     Ok(CanonicalTreasuryRecord {
+        series: canonical_series,
         effective,
         published: published_at.map(ResearchTemporalCoordinate::exact),
         availability: ExtractionAvailabilityEvidence::LocalFirstObserved {

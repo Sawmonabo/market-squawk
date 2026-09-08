@@ -288,7 +288,11 @@ pub(crate) fn fiscal_provider_dataset(
 ) -> Result<SourceIdentifier, TreasurySourceError> {
     SourceIdentifier::try_from(format!(
         "treasury:fiscal-data:average-interest-rates-v2:{}",
-        lower_hex(query.query_digest())
+        if query.is_all_history() {
+            "all".to_owned()
+        } else {
+            lower_hex(query.query_digest())
+        }
     ))
     .map_err(|_| TreasurySourceError::InvalidProtocol)
 }
@@ -298,7 +302,11 @@ pub(crate) fn fiscal_analytical_dataset(
 ) -> Result<SourceIdentifier, TreasurySourceError> {
     SourceIdentifier::try_from(format!(
         "treasury.fiscal-data.average-interest-rates-v2.{}",
-        lower_hex(query.query_digest())
+        if query.is_all_history() {
+            "all".to_owned()
+        } else {
+            lower_hex(query.query_digest())
+        }
     ))
     .map_err(|_| TreasurySourceError::InvalidProtocol)
 }
@@ -563,6 +571,7 @@ pub struct TreasurySource {
     config: TreasurySourceConfig,
     activation: crate::TreasuryActivationIntent,
     client: TreasuryHttpClient,
+    all_history_replay: backfill::TreasuryAllHistoryReplay,
     health: Mutex<TreasurySourceHealth>,
 }
 
@@ -624,6 +633,7 @@ impl TreasurySource {
             config,
             activation,
             client,
+            all_history_replay: backfill::TreasuryAllHistoryReplay::new(),
             health: Mutex::new(TreasurySourceHealth::new()),
         })
     }
@@ -644,6 +654,7 @@ impl TreasurySource {
             config,
             activation,
             client,
+            all_history_replay: backfill::TreasuryAllHistoryReplay::new(),
             health: Mutex::new(TreasurySourceHealth::new()),
         })
     }
@@ -1256,6 +1267,9 @@ impl TreasurySource {
             .dataset(request.object().dataset())
             .cloned()
             .ok_or_else(invalid_protocol)?;
+        if descriptor.publication_mode() == crate::TreasuryPublicationMode::ResumableBackfill {
+            return Err(invalid_protocol());
+        }
         let parsed = ParsedObjectId::parse(request.object().object_id())?;
         let limits = FiscalDataParseLimits::production_defaults();
         let schema =
@@ -1794,6 +1808,8 @@ fn map_adapter_error(error: TreasurySourceError) -> ExtractionSourceError {
         | TreasurySourceError::Protocol(_)
         | TreasurySourceError::Rate(_)
         | TreasurySourceError::HealthUnavailable
+        | TreasurySourceError::RestoreWorkerUnavailable
+        | TreasurySourceError::ReplayStore(_)
         | TreasurySourceError::RevisionAuthority(_) => invalid_protocol(),
         TreasurySourceError::BodyTooLarge => ExtractionSourceError::Source(SourceError::Network),
     }
@@ -1812,7 +1828,7 @@ pub enum TreasurySourceError {
     /// A persisted all-history checkpoint or one of its retained page seals failed validation.
     #[error("Treasury all-history checkpoint is invalid")]
     InvalidBackfillCheckpoint,
-    /// The provider-defined empty terminal response has not yet been durably sealed.
+    /// The provider-defined terminal response has not yet been durably sealed.
     #[error("Treasury all-history backfill is incomplete")]
     BackfillIncomplete,
     /// The page request does not belong to this source's exact query family.
@@ -1833,6 +1849,12 @@ pub enum TreasurySourceError {
     /// Local source-health synchronization is unavailable.
     #[error("Treasury source health is unavailable")]
     HealthUnavailable,
+    /// The bounded retained-page replay worker could not be admitted or joined.
+    #[error("Treasury all-history restore worker is unavailable")]
+    RestoreWorkerUnavailable,
+    /// Exact retained raw journal verification failed during replay.
+    #[error("Treasury retained raw replay failed: {0}")]
+    ReplayStore(#[source] market_squawk_platform::SealedResearchJournalStoreError),
     /// Shared source transport or provider-budget failure.
     #[error("Treasury source failed: {0}")]
     Source(#[from] SourceError),

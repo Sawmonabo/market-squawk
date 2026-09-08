@@ -126,6 +126,7 @@ pub(crate) fn fiscal_chain_framed_evidence<'a>(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ObjectKind {
     FiscalChain,
+    FiscalPage,
     DailyRate,
 }
 
@@ -133,6 +134,7 @@ impl ObjectKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::FiscalChain => "fiscal-chain",
+            Self::FiscalPage => "fiscal-page",
             Self::DailyRate => "daily-rate",
         }
     }
@@ -140,6 +142,7 @@ impl ObjectKind {
     fn parse(value: &str) -> Result<Self, ExtractionSourceError> {
         match value {
             "fiscal-chain" => Ok(Self::FiscalChain),
+            "fiscal-page" => Ok(Self::FiscalPage),
             "daily-rate" => Ok(Self::DailyRate),
             _ => Err(invalid_protocol()),
         }

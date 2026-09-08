@@ -1,41 +1,133 @@
-//! Restart-safe, page-sealed acquisition for Treasury daily-rate all-history feeds.
+//! Restart-safe, page-sealed acquisition for Treasury all-history feeds.
 
+use std::collections::BTreeSet;
 use std::num::{NonZeroU32, NonZeroU64};
+use std::sync::Arc;
+use std::time::Instant;
 
 use market_squawk_domain::{
     DigestAlgorithm, EvidenceDigest, MetadataRevision, SourceId, SourceIdentifier, Timestamp,
 };
-use market_squawk_platform::{SealedResearchJournalSegmentClaim, SealedResearchJournalStore};
+use market_squawk_platform::{
+    ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
+    SealedResearchJournalSegmentClaim, SealedResearchJournalStore, SealedResearchJournalStoreError,
+};
 use market_squawk_sources::{
     CURRENT_RESEARCH_RECORD_SCHEMA, DiscoveryRequest, ExtractionBatch, ExtractionBatchAccumulator,
     ExtractionContentIdentity, ExtractionRecord, ExtractionRequest, ExtractionSourceError,
     MAX_EXTRACTION_BATCH_BYTES, MAX_EXTRACTION_RECORDS, MAX_IN_MEMORY_EXTRACTION_BATCH_BYTES,
     ProviderCaptureMaterial, ProviderCaptureSetReceipt, ProviderCaptureTerminalDisposition,
-    ProviderNativeLineageBatch, SealedProviderCaptureSetReceipt, SourceObject,
+    ProviderNativeLineageBatch, SealedProviderCaptureSetReceipt, SourceMetadata, SourceObject,
 };
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::system_timestamp;
 use crate::vertical::TreasuryExtractionAccountingInput;
 use crate::{
-    FiscalDataParseLimits, TreasuryDailyRatePage, TreasuryDailyRatePaginationTracker,
-    TreasuryDatasetDescriptor, TreasuryDatasetFamily, TreasuryDatasetPeriod,
-    TreasuryExtractionAccounting, TreasuryPublicationMode, TreasurySourceError,
+    FiscalDataPage, FiscalDataParseLimits, TreasuryDailyRatePage, TreasuryDailyRatePageRequest,
+    TreasuryDailyRatePaginationTracker, TreasuryDailyRateQuery, TreasuryDatasetDescriptor,
+    TreasuryDatasetPeriod, TreasuryExtractionAccounting, TreasuryFiscalQuery, TreasuryPageRequest,
+    TreasuryPaginationTracker, TreasuryProtocolError, TreasuryPublicationMode, TreasurySourceError,
+    TreasurySurface,
 };
 
-use super::lineage::{ObjectKind, ParsedObjectId, invalid_protocol, source_object};
+use super::lineage::{ObjectKind, PageIdentity, ParsedObjectId, invalid_protocol, source_object};
 use super::native_lineage::TreasuryNativeLineagePlan;
-use super::normalize::{CanonicalRecordAdmission, canonical_daily_rate_records};
+use super::normalize::{
+    CanonicalRecordAdmission, CanonicalTreasuryRecord, canonical_daily_rate_records,
+    canonical_fiscal_records,
+};
 use super::{TreasurySource, TreasurySourceConfig};
 
-const CHECKPOINT_POLICY_VERSION: &str = "treasury-daily-rate-all-history-checkpoint-v1";
+const CHECKPOINT_POLICY_VERSION: &str = "treasury-all-history-checkpoint-v1";
 const MAX_ALL_HISTORY_PAGES: usize = 1_024;
 const MAX_ALL_HISTORY_RAW_BODY_BYTES: u64 = MAX_EXTRACTION_BATCH_BYTES;
 // The strict five-family schema has at most 28 values per row; 32 leaves explicit additive headroom.
 const MAX_ALL_HISTORY_CANONICAL_POINTS: u64 = 3_200_000;
 const MAX_CHECKPOINT_JSON_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ALL_HISTORY_SERIES: usize = 32;
+// One live MSJ1 frame: worst-case JSON byte/source escaping, envelope, magic and frame header.
+const MAX_REPLAY_SEGMENT_BYTES: u64 = market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGE_BYTES * 4
+    + market_squawk_platform::RawCaptureRecord::MAX_LIVE_SOURCE_BYTES as u64 * 6
+    + 4_096
+    + 12;
+
+/// Exactly one source-owned replay worker. No worker captures this slot or its source.
+pub(super) struct TreasuryAllHistoryReplay {
+    shutdown: CancellationToken,
+    pub(super) worker: AsyncMutex<Option<RetainedTreasuryReplay>>,
+}
+
+impl TreasuryAllHistoryReplay {
+    pub(super) fn new() -> Self {
+        Self {
+            shutdown: CancellationToken::new(),
+            worker: AsyncMutex::new(None),
+        }
+    }
+}
+
+pub(super) struct RetainedTreasuryReplay {
+    pub(super) task:
+        Option<std::thread::JoinHandle<Result<TreasuryAllHistoryBackfill, TreasurySourceError>>>,
+    pub(super) completion: oneshot::Receiver<()>,
+    pub(super) cancellation: CancellationToken,
+}
+
+impl RetainedTreasuryReplay {
+    fn join(&mut self) -> Result<TreasuryAllHistoryBackfill, TreasurySourceError> {
+        self.task
+            .take()
+            .ok_or(TreasurySourceError::RestoreWorkerUnavailable)?
+            .join()
+            .map_err(|_| TreasurySourceError::RestoreWorkerUnavailable)?
+    }
+}
+
+impl Drop for RetainedTreasuryReplay {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if self.task.is_some() {
+            // Normal async shutdown joins first. Owner drop still joins this same worker;
+            // the worker owns only immutable replay inputs and observes controlled raw reads.
+            match self.join() {
+                Ok(_)
+                | Err(TreasurySourceError::Cancelled | TreasurySourceError::DeadlineExceeded) => {}
+                Err(error) => eprintln!("Treasury replay worker failed during owner drop: {error}"),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TreasuryReplayBinding<'a> {
+    metadata: &'a SourceMetadata,
+    config: &'a TreasurySourceConfig,
+    activation: &'a crate::TreasuryActivationIntent,
+}
+
+struct TreasuryReplayControl<'a> {
+    deadline: Instant,
+    cancellation: &'a CancellationToken,
+}
+
+impl ResearchObjectControl for TreasuryReplayControl<'_> {
+    fn checkpoint(
+        &self,
+        _point: ResearchObjectControlPoint,
+    ) -> Result<(), ResearchObjectControlError> {
+        if self.cancellation.is_cancelled() {
+            Err(ResearchObjectControlError::Cancelled)
+        } else if Instant::now() >= self.deadline {
+            Err(ResearchObjectControlError::DeadlineExceeded)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// Persisted, non-authoritative claim for one parsed and durably sealed all-history page.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -50,9 +142,10 @@ struct TreasuryAllHistoryPersistedPage {
     request_digest: EvidenceDigest,
     payload_digest: EvidenceDigest,
     received_at: Timestamp,
-    provider_published_at: Timestamp,
+    provider_published_at: Option<Timestamp>,
     validated_at: Timestamp,
     terminal: bool,
+    canonical_series: Box<[SourceIdentifier]>,
     canonical_content_digest: Option<EvidenceDigest>,
     native_lineage_batch_digest: Option<EvidenceDigest>,
     discovery_request: DiscoveryRequest,
@@ -159,16 +252,17 @@ impl Serialize for TreasuryAllHistoryCheckpoint {
 
 impl TreasuryAllHistoryCheckpoint {
     fn initial(
-        source: &TreasurySource,
+        source: TreasuryReplayBinding<'_>,
         descriptor: TreasuryDatasetDescriptor,
     ) -> Result<Self, TreasurySourceError> {
+        let first_page = first_provider_page(descriptor.surface());
         let mut checkpoint = Self {
             policy_version: CHECKPOINT_POLICY_VERSION,
             source_id: source.metadata.source_id().clone(),
             metadata_revision: source.metadata.revision().clone(),
             descriptor,
             activation_intent_digest: source.activation.intent_digest(),
-            next_page: 0,
+            next_page: first_page,
             accepted_source_rows: 0,
             canonical_points: 0,
             observed_numeric_points: 0,
@@ -195,7 +289,10 @@ impl TreasuryAllHistoryCheckpoint {
         Ok(encoded)
     }
 
-    fn from_json(source: &TreasurySource, encoded: &[u8]) -> Result<Self, TreasurySourceError> {
+    fn from_json(
+        source: TreasuryReplayBinding<'_>,
+        encoded: &[u8],
+    ) -> Result<Self, TreasurySourceError> {
         if encoded.is_empty() || encoded.len() > MAX_CHECKPOINT_JSON_BYTES {
             return Err(TreasurySourceError::InvalidBackfillCheckpoint);
         }
@@ -238,16 +335,13 @@ impl TreasuryAllHistoryCheckpoint {
         if self.policy_version != CHECKPOINT_POLICY_VERSION
             || self.descriptor.period() != TreasuryDatasetPeriod::AllHistory
             || self.descriptor.publication_mode() != TreasuryPublicationMode::ResumableBackfill
-            || !matches!(
-                self.descriptor.family(),
-                TreasuryDatasetFamily::DailyRate(_)
-            )
             || self.activation_intent_digest.algorithm() != DigestAlgorithm::Sha256
             || self.activation_intent_digest.bytes() == [0; 32]
             || self.pages.len() > MAX_ALL_HISTORY_PAGES
             || self.next_page
                 != u64::try_from(self.pages.len())
                     .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?
+                    + first_provider_page(self.descriptor.surface())
             || !within_source_row_limit(self.accepted_source_rows)
             || self.canonical_points > MAX_ALL_HISTORY_CANONICAL_POINTS
             || self
@@ -266,9 +360,13 @@ impl TreasuryAllHistoryCheckpoint {
         let mut first_received_at = None;
         let mut last_received_at = None;
         let mut payloads = Vec::new();
+        let mut series = BTreeSet::new();
         for (expected_page, page) in self.pages.iter().enumerate() {
             let expected_page = u64::try_from(expected_page)
-                .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
+                .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?
+                + first_provider_page(self.descriptor.surface());
+            let has_canonical = page.canonical_points != 0;
+            let daily = self.descriptor.surface() == TreasurySurface::DailyRatesXml;
             if page.page_number != expected_page
                 || page.request_digest.algorithm() != DigestAlgorithm::Sha256
                 || page.payload_digest.algorithm() != DigestAlgorithm::Sha256
@@ -276,17 +374,21 @@ impl TreasuryAllHistoryCheckpoint {
                     digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32]
                 })
                 || page.raw_body_bytes == 0
+                || page.raw_body_bytes > market_squawk_sources::MAX_PROVIDER_CAPTURE_PAGE_BYTES
                 || page.discovery_request.dataset() != self.descriptor.provider_dataset()
                 || page.discovery_request.effective_at().is_some()
                 || page.discovery_request.max_results() != 1
                 || page.received_at > page.discovery_request.deadline()
-                || page.provider_published_at > page.received_at
+                || page
+                    .provider_published_at
+                    .is_some_and(|published| published > page.received_at)
                 || page.validated_at < page.received_at
                 || page.source_object.source_id() != &self.source_id
                 || page.source_object.metadata_revision() != &self.metadata_revision
                 || page.source_object.dataset() != self.descriptor.provider_dataset()
                 || page.source_object.discovery_request_id() != page.discovery_request.request_id()
-                || page.source_object.media_type().as_str() != "application/atom+xml"
+                || page.source_object.media_type().as_str()
+                    != history_media_type(self.descriptor.surface())
                 || page.source_object.capture_identity()
                     != market_squawk_sources::SourceObjectCaptureIdentity::Standalone
                 || page.source_object.evidence().content_digest() != page.payload_digest
@@ -310,7 +412,8 @@ impl TreasuryAllHistoryCheckpoint {
                 || page.capture.pages()[0].body_digest() != page.payload_digest
                 || page.capture.pages()[0].received_at() != page.received_at
                 || page.sealed_segment_claim.as_ref().is_none_or(|claim| {
-                    claim.frames().len() != 1
+                    claim.size_bytes() > MAX_REPLAY_SEGMENT_BYTES
+                        || claim.frames().len() != 1
                         || claim.frames()[0].ordinal() != 0
                         || claim.frames()[0].provider_payload_bytes() != page.raw_body_bytes
                         || claim.frames()[0].provider_payload_digest() != page.payload_digest
@@ -322,23 +425,27 @@ impl TreasuryAllHistoryCheckpoint {
                     .observed_numeric_points
                     .checked_add(page.explicit_missing_points)
                     != Some(page.canonical_points)
-                || (page.terminal
+                || (daily
+                    && page.terminal
                     && (page.returned_source_rows != 0
                         || page.canonical_points != 0
                         || page.observed_numeric_points != 0
                         || page.explicit_missing_points != 0))
-                || (!page.terminal && page.canonical_points < page.returned_source_rows)
-                || page.terminal == page.canonical_content_digest.is_some()
-                || page.terminal == page.native_lineage_batch_digest.is_some()
+                || page.canonical_points < page.returned_source_rows
+                || daily != page.provider_published_at.is_some()
+                || has_canonical != !page.canonical_series.is_empty()
+                || page.canonical_series.len() > MAX_ALL_HISTORY_SERIES
+                || page
+                    .canonical_series
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+                || has_canonical != page.canonical_content_digest.is_some()
+                || has_canonical != page.native_lineage_batch_digest.is_some()
                 || page.canonical_content_digest.is_some_and(|digest| {
-                    page.terminal
-                        || digest.algorithm() != DigestAlgorithm::Sha256
-                        || digest.bytes() == [0; 32]
+                    digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32]
                 })
                 || page.native_lineage_batch_digest.is_some_and(|digest| {
-                    page.terminal
-                        || digest.algorithm() != DigestAlgorithm::Sha256
-                        || digest.bytes() == [0; 32]
+                    digest.algorithm() != DigestAlgorithm::Sha256 || digest.bytes() == [0; 32]
                 })
                 || last_received_at.is_some_and(|previous| page.received_at < previous)
                 || payloads.contains(&page.payload_digest)
@@ -350,7 +457,7 @@ impl TreasuryAllHistoryCheckpoint {
             parsed
                 .verify_request(page.request_digest.bytes())
                 .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
-            if parsed.kind != ObjectKind::DailyRate
+            if parsed.kind != history_object_kind(self.descriptor.surface())
                 || u64::try_from(parsed.page_number).ok() != Some(page.page_number)
                 || parsed.payload_digest != page.payload_digest.bytes()
             {
@@ -374,6 +481,10 @@ impl TreasuryAllHistoryCheckpoint {
             first_received_at.get_or_insert(page.received_at);
             last_received_at = Some(page.received_at);
             payloads.push(page.payload_digest);
+            series.extend(page.canonical_series.iter());
+            if series.len() > MAX_ALL_HISTORY_SERIES {
+                return Err(TreasurySourceError::InvalidBackfillCheckpoint);
+            }
         }
         if source_rows != self.accepted_source_rows
             || canonical_points != self.canonical_points
@@ -420,7 +531,7 @@ impl TreasuryAllHistoryCheckpoint {
         &self.descriptor
     }
 
-    /// Returns the next zero-based provider page that may be requested.
+    /// Returns the next provider page: zero-based daily XML or one-based Fiscal JSON.
     pub const fn next_page(&self) -> u64 {
         self.next_page
     }
@@ -450,7 +561,7 @@ impl TreasuryAllHistoryCheckpoint {
         self.raw_body_bytes
     }
 
-    /// Returns whether the provider-defined empty terminal page has been durably sealed.
+    /// Returns whether the provider-defined terminal page has been durably sealed.
     pub const fn terminal_observed(&self) -> bool {
         self.terminal_observed
     }
@@ -470,7 +581,7 @@ impl TreasuryAllHistoryCheckpoint {
 #[derive(Debug)]
 pub struct TreasuryAllHistoryBackfill {
     checkpoint: TreasuryAllHistoryCheckpoint,
-    tracker: TreasuryDailyRatePaginationTracker,
+    tracker: TreasuryHistoryTracker,
     verified_seals: Vec<SealedProviderCaptureSetReceipt>,
 }
 
@@ -480,7 +591,7 @@ impl TreasuryAllHistoryBackfill {
         &self.checkpoint
     }
 
-    /// Returns a completion receipt only after the empty terminal response was parsed and sealed.
+    /// Returns completion only after the provider-defined terminal response was parsed and sealed.
     pub fn acquisition_completion(
         &self,
     ) -> Result<TreasuryAllHistoryAcquisitionCompletion, TreasurySourceError> {
@@ -589,6 +700,7 @@ pub struct TreasuryAllHistoryCanonicalPage {
     content_identity: ExtractionContentIdentity,
     native_lineage: ProviderNativeLineageBatch,
     row_capture_page_ordinals: Box<[u16]>,
+    canonical_series: Box<[SourceIdentifier]>,
 }
 
 impl TreasuryAllHistoryCanonicalPage {
@@ -646,12 +758,12 @@ pub struct TreasuryAllHistoryFetchedPage {
 }
 
 impl TreasuryAllHistoryFetchedPage {
-    /// Returns `true` only for the empty provider-defined terminal response.
+    /// Returns `true` only for the provider-defined terminal response.
     pub const fn terminal(&self) -> bool {
         self.admission.persisted.terminal
     }
 
-    /// Returns the canonical page; terminal evidence deliberately has no analytical batch.
+    /// Returns canonical rows, including the terminal Fiscal page; empty daily terminals have none.
     pub const fn canonical(&self) -> Option<&TreasuryAllHistoryCanonicalPage> {
         self.canonical.as_ref()
     }
@@ -665,8 +777,8 @@ impl TreasuryAllHistoryFetchedPage {
     ///
     /// The application seals `ProviderCaptureMaterial` first, stages the optional canonical batch,
     /// then passes the seal and admission to `accept_sealed_page` while compare-and-swap persisting
-    /// the resulting checkpoint with the same ingest-stage transition. Terminal pages have no
-    /// canonical batch but still require the identical seal/checkpoint transaction.
+    /// the resulting checkpoint with the same ingest-stage transition. A terminal Fiscal page still
+    /// carries canonical rows; its final staging and completion must be one transaction.
     pub fn into_parts(
         self,
     ) -> (
@@ -684,13 +796,13 @@ pub struct TreasuryAllHistoryPageAdmission {
     base_checkpoint_digest: EvidenceDigest,
     expected_capture: ProviderCaptureSetReceipt,
     persisted: TreasuryAllHistoryPersistedPage,
-    next_tracker: TreasuryDailyRatePaginationTracker,
+    next_tracker: TreasuryHistoryTracker,
 }
 
 /// Authoritative completion proof for a sealed, canonically reproducible acquisition chain.
 ///
 /// This receipt deliberately does not claim that canonical records were durably staged or that an
-/// analytical generation was published. It proves that every raw page, including the empty
+/// analytical generation was published. It proves that every raw page, including the provider
 /// terminal response, can be reopened and normalized to the exact retained content identity. The
 /// application must bind these expectations to its own committed generation authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -759,41 +871,41 @@ impl TreasuryAllHistoryAcquisitionCompletion {
         self.checkpoint.activation_intent_digest
     }
 
-    /// Returns the count of data pages plus the retained empty terminal page.
+    /// Returns the count of all retained provider responses, including terminal evidence.
     pub fn response_count(&self) -> u64 {
-        self.checkpoint.next_page
+        self.checkpoint.next_page - first_provider_page(self.checkpoint.descriptor.surface())
     }
 
-    /// Returns the number of sealed data-bearing pages, excluding terminal evidence.
+    /// Returns the number of sealed data-bearing pages, including the terminal Fiscal page.
     pub fn data_page_count(&self) -> usize {
         self.checkpoint
             .pages
             .iter()
-            .filter(|page| !page.terminal)
+            .filter(|page| page.canonical_content_digest.is_some())
             .count()
     }
 
-    /// Returns the exact source rows accepted across nonterminal pages.
+    /// Returns the exact source rows accepted across data-bearing pages.
     pub const fn source_rows(&self) -> u64 {
         self.checkpoint.accepted_source_rows
     }
 
-    /// Returns the exact canonical scalar count prepared across nonterminal pages.
+    /// Returns the exact canonical scalar count prepared across data-bearing pages.
     pub const fn canonical_points(&self) -> u64 {
         self.checkpoint.canonical_points
     }
 
-    /// Returns the exact observed numeric count prepared across nonterminal pages.
+    /// Returns the exact observed numeric count prepared across data-bearing pages.
     pub const fn observed_numeric_points(&self) -> u64 {
         self.checkpoint.observed_numeric_points
     }
 
-    /// Returns the exact explicit provider-missing count retained across nonterminal pages.
+    /// Returns the exact explicit provider-missing count retained across data-bearing pages.
     pub const fn explicit_missing_points(&self) -> u64 {
         self.checkpoint.explicit_missing_points
     }
 
-    /// Returns checked aggregate provider response bytes including the empty terminal XML body.
+    /// Returns checked aggregate provider response bytes including the terminal response body.
     pub const fn raw_body_bytes(&self) -> u64 {
         self.checkpoint.raw_body_bytes
     }
@@ -830,7 +942,7 @@ impl TreasuryAllHistoryAcquisitionCompletion {
             .filter_map(|page| page.native_lineage_batch_digest)
     }
 
-    /// Returns every exact discovered response object, including the empty terminal response.
+    /// Returns every exact discovered response object, including the terminal response.
     pub fn source_objects(&self) -> impl ExactSizeIterator<Item = &SourceObject> {
         self.checkpoint.pages.iter().map(|page| &page.source_object)
     }
@@ -840,11 +952,11 @@ impl TreasuryAllHistoryAcquisitionCompletion {
         self.checkpoint
             .pages
             .iter()
-            .filter(|page| !page.terminal)
+            .filter(|page| page.canonical_content_digest.is_some())
             .map(|page| &page.source_object)
     }
 
-    /// Returns the retained empty response that proves provider-defined termination.
+    /// Returns the retained response that proves provider-defined termination.
     pub fn terminal_source_object(&self) -> Option<&SourceObject> {
         self.checkpoint
             .pages
@@ -856,6 +968,17 @@ impl TreasuryAllHistoryAcquisitionCompletion {
     /// Returns verified sealed-page receipts for retained-capture catalog admission.
     pub fn sealed_pages(&self) -> &[SealedProviderCaptureSetReceipt] {
         &self.sealed_pages
+    }
+
+    /// Returns the bounded canonical series inventory reproduced from the sealed pages.
+    pub fn canonical_series(&self) -> Vec<SourceIdentifier> {
+        self.checkpoint
+            .pages
+            .iter()
+            .flat_map(|page| page.canonical_series.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     /// Returns the stable completion identity for the verified acquisition chain.
@@ -870,24 +993,61 @@ impl TreasuryAllHistoryAcquisitionCompletion {
 }
 
 impl TreasurySource {
+    fn replay_binding(&self) -> TreasuryReplayBinding<'_> {
+        TreasuryReplayBinding {
+            metadata: &self.metadata,
+            config: &self.config,
+            activation: &self.activation,
+        }
+    }
+
+    /// Closes replay admission before the existing application/source shutdown drain.
+    pub fn begin_all_history_replay_shutdown(&self) {
+        self.all_history_replay.shutdown.cancel();
+    }
+
+    /// Cancels and joins the actual retained replay worker, preserving custody on timeout.
+    /// Replacement may use this after revoking admission without permanently closing the source.
+    pub async fn drain_all_history_replay(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), TreasurySourceError> {
+        let deadline = tokio::time::Instant::from_std(deadline);
+        let mut slot = tokio::time::timeout_at(deadline, self.all_history_replay.worker.lock())
+            .await
+            .map_err(|_| TreasurySourceError::DeadlineExceeded)?;
+        let Some(worker) = slot.as_mut() else {
+            return Ok(());
+        };
+        worker.cancellation.cancel();
+        // The receiver stays in the source's slot when this drain waiter is dropped.
+        let _completion = tokio::time::timeout_at(deadline, &mut worker.completion)
+            .await
+            .map_err(|_| TreasurySourceError::DeadlineExceeded)?;
+        let outcome = worker.join();
+        *slot = None;
+        match outcome {
+            Ok(_) | Err(TreasurySourceError::Cancelled | TreasurySourceError::DeadlineExceeded) => {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Starts a bounded all-history session for one exact owner-authorized configured dataset.
     pub fn start_all_history_backfill(
         &self,
         dataset: &SourceIdentifier,
     ) -> Result<TreasuryAllHistoryBackfill, TreasurySourceError> {
-        let query = all_history_query(self, dataset)?;
+        let query = all_history_query(self.replay_binding(), dataset)?;
         let descriptor = self
             .activation
             .catalog()
             .dataset(dataset)
             .cloned()
             .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)?;
-        let checkpoint = TreasuryAllHistoryCheckpoint::initial(self, descriptor)?;
-        let tracker = TreasuryDailyRatePaginationTracker::try_new(
-            query,
-            MAX_ALL_HISTORY_PAGES,
-            MAX_EXTRACTION_RECORDS,
-        )?;
+        let checkpoint = TreasuryAllHistoryCheckpoint::initial(self.replay_binding(), descriptor)?;
+        let tracker = TreasuryHistoryTracker::new(query)?;
         Ok(TreasuryAllHistoryBackfill {
             checkpoint,
             tracker,
@@ -895,56 +1055,137 @@ impl TreasurySource {
         })
     }
 
-    /// Restores progress only after reopening and reparsing every exact retained raw page.
-    pub fn restore_all_history_backfill(
+    /// Replays sealed pages in the source's single retained worker, using bounded controlled reads.
+    /// Caller drop cancels the worker; normal shutdown and source Drop both join the same handle.
+    pub async fn restore_all_history_backfill(
         &self,
         encoded_checkpoint: &[u8],
-        store: &SealedResearchJournalStore,
+        store: Arc<SealedResearchJournalStore>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<TreasuryAllHistoryBackfill, TreasurySourceError> {
-        let checkpoint = TreasuryAllHistoryCheckpoint::from_json(self, encoded_checkpoint)?;
-        validate_checkpoint_source(self, &checkpoint)?;
-        let query = all_history_query(self, checkpoint.descriptor.provider_dataset())?;
-        let mut tracker = TreasuryDailyRatePaginationTracker::try_new(
-            query,
-            MAX_ALL_HISTORY_PAGES,
-            MAX_EXTRACTION_RECORDS,
-        )?;
-        let limits = FiscalDataParseLimits::production_defaults();
-        let mut verified_seals = Vec::new();
-        verified_seals
-            .try_reserve_exact(checkpoint.pages.len())
-            .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
-        for persisted in &checkpoint.pages {
-            let reopened =
-                reopen_persisted_page(self, &checkpoint.descriptor, persisted, store, limits)?;
-            let terminal = tracker.accept(&reopened.page)?;
-            if terminal != persisted.terminal {
-                return Err(TreasurySourceError::InvalidBackfillCheckpoint);
-            }
-            verified_seals.push(reopened.sealed);
+        ensure_restore_open(deadline, cancellation)?;
+        if encoded_checkpoint.is_empty() || encoded_checkpoint.len() > MAX_CHECKPOINT_JSON_BYTES {
+            return Err(TreasurySourceError::InvalidBackfillCheckpoint);
         }
-        if tracker_terminal_matches_checkpoint(&checkpoint, &verified_seals) {
-            Ok(TreasuryAllHistoryBackfill {
-                checkpoint,
-                tracker,
-                verified_seals,
+        let mut slot = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(TreasurySourceError::Cancelled),
+            () = self.all_history_replay.shutdown.cancelled() => return Err(TreasurySourceError::Cancelled),
+            result = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.all_history_replay.worker.lock(),
+            ) => result.map_err(|_| TreasurySourceError::DeadlineExceeded)?,
+        };
+        if let Some(previous) = slot.as_mut() {
+            // An abandoned caller may leave a worker here. Join it before admitting new input.
+            previous.cancellation.cancel();
+            let _completion = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(TreasurySourceError::Cancelled),
+                result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut previous.completion) =>
+                    result.map_err(|_| TreasurySourceError::DeadlineExceeded)?,
+            };
+            let outcome = previous.join();
+            *slot = None;
+            match outcome {
+                Ok(_)
+                | Err(TreasurySourceError::Cancelled | TreasurySourceError::DeadlineExceeded) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        ensure_restore_open(deadline, cancellation)?;
+        if self.all_history_replay.shutdown.is_cancelled() {
+            return Err(TreasurySourceError::Cancelled);
+        }
+        let mut checkpoint = Vec::new();
+        checkpoint
+            .try_reserve_exact(encoded_checkpoint.len())
+            .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
+        checkpoint.extend_from_slice(encoded_checkpoint);
+        let metadata = self.metadata.clone();
+        let config = self.config.clone();
+        let activation = self.activation.clone();
+        let worker_token = self.all_history_replay.shutdown.child_token();
+        let _cancel_on_drop = worker_token.clone().drop_guard();
+        let cancellation_for_worker = worker_token.clone();
+        let (finished, completion) = oneshot::channel();
+        let task = std::thread::Builder::new()
+            .name("treasury-raw-replay".to_owned())
+            .spawn(move || {
+                let outcome = restore_all_history_backfill_blocking(
+                    TreasuryReplayBinding {
+                        metadata: &metadata,
+                        config: &config,
+                        activation: &activation,
+                    },
+                    &checkpoint,
+                    store.as_ref(),
+                    deadline,
+                    &cancellation_for_worker,
+                );
+                let _completion = finished.send(());
+                outcome
             })
-        } else {
-            Err(TreasurySourceError::InvalidBackfillCheckpoint)
+            .map_err(|_| TreasurySourceError::RestoreWorkerUnavailable)?;
+        *slot = Some(RetainedTreasuryReplay {
+            task: Some(task),
+            completion,
+            cancellation: worker_token,
+        });
+        let worker = slot
+            .as_mut()
+            .ok_or(TreasurySourceError::RestoreWorkerUnavailable)?;
+        let terminal = tokio::select! {
+            result = &mut worker.completion => {
+                let _completion = result;
+                None
+            }
+            () = cancellation.cancelled() => Some(TreasurySourceError::Cancelled),
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) =>
+                Some(TreasurySourceError::DeadlineExceeded),
+        };
+        if terminal.is_some() {
+            worker.cancellation.cancel();
+            let _completion = (&mut worker.completion).await;
+        }
+        // Notification follows all raw replay work. This joins the same thread, including
+        // its final result; there is no later await between joining and clearing custody.
+        let outcome = worker.join();
+        *slot = None;
+        match outcome {
+            Err(error)
+                if !matches!(
+                    error,
+                    TreasurySourceError::Cancelled | TreasurySourceError::DeadlineExceeded
+                ) =>
+            {
+                Err(error)
+            }
+            outcome => {
+                if let Some(terminal) = terminal {
+                    return Err(terminal);
+                }
+                let restored = outcome?;
+                ensure_restore_open(deadline, cancellation)?;
+                Ok(restored)
+            }
         }
     }
 
     /// Reopens one exact data-bearing page from a completed acquisition without network access.
     ///
     /// The returned canonical batch, native lineage, row-to-capture alignment, and verified seal
-    /// are reproduced from the same retained response and validation clock. The empty terminal
-    /// response remains completion evidence and cannot be projected as an analytical page. The
-    /// verified seal is restart evidence, not recreated one-use application publication authority.
+    /// are reproduced from the same retained response and validation clock. An empty daily terminal
+    /// has no analytical page; the final Fiscal page retains its rows. The verified seal is
+    /// restart evidence, not recreated one-use application publication authority.
     pub fn reopen_all_history_canonical_page(
         &self,
         completion: &TreasuryAllHistoryAcquisitionCompletion,
         page_number: usize,
         store: &SealedResearchJournalStore,
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<
         (
             TreasuryAllHistoryCanonicalPage,
@@ -952,7 +1193,8 @@ impl TreasurySource {
         ),
         TreasurySourceError,
     > {
-        validate_checkpoint_source(self, &completion.checkpoint)?;
+        ensure_restore_open(deadline, cancellation)?;
+        validate_checkpoint_source(self.replay_binding(), &completion.checkpoint)?;
         if !completion.checkpoint.terminal_observed
             || completion.sealed_pages.len() != completion.checkpoint.pages.len()
         {
@@ -962,14 +1204,18 @@ impl TreasurySource {
             .checkpoint
             .pages
             .get(page_number)
-            .filter(|page| !page.terminal)
+            .filter(|page| page.canonical_content_digest.is_some())
             .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)?;
         let reopened = reopen_persisted_page(
-            self,
+            self.replay_binding(),
             &completion.checkpoint.descriptor,
             persisted,
             store,
             FiscalDataParseLimits::production_defaults(),
+            &TreasuryReplayControl {
+                deadline,
+                cancellation,
+            },
         )?;
         if completion.sealed_pages.get(page_number) != Some(&reopened.sealed) {
             return Err(TreasurySourceError::InvalidBackfillCheckpoint);
@@ -988,66 +1234,97 @@ impl TreasurySource {
         discovery: DiscoveryRequest,
         cancellation: CancellationToken,
     ) -> Result<TreasuryAllHistoryFetchedPage, ExtractionSourceError> {
-        validate_checkpoint_source(self, &backfill.checkpoint).map_err(|_| invalid_protocol())?;
+        validate_checkpoint_source(self.replay_binding(), &backfill.checkpoint)
+            .map_err(|_| invalid_protocol())?;
         if backfill.checkpoint.terminal_observed
             || backfill.verified_seals.len() != backfill.checkpoint.pages.len()
+            || backfill.checkpoint.pages.len() >= MAX_ALL_HISTORY_PAGES
             || discovery.effective_at().is_some()
             || discovery.dataset() != backfill.checkpoint.descriptor.provider_dataset()
             || discovery.max_results() != 1
         {
             return Err(invalid_protocol());
         }
-        let query = all_history_query(self, discovery.dataset()).map_err(|_| invalid_protocol())?;
+        let query = all_history_query(self.replay_binding(), discovery.dataset())
+            .map_err(|_| invalid_protocol())?;
         let page_number =
             usize::try_from(backfill.checkpoint.next_page).map_err(|_| invalid_protocol())?;
         let page_request = query.page(page_number).map_err(|_| invalid_protocol())?;
-        let retrieved = self
-            .fetch_daily_rate_page_with_budget_wait(
-                &authority,
-                &page_request,
-                FiscalDataParseLimits::production_defaults(),
-                discovery.deadline(),
-                &cancellation,
-            )
-            .await?;
+        let (received_at, payload, page, capture) = match &page_request {
+            TreasuryHistoryRequest::Daily(request) => {
+                let (received_at, payload, page, capture) = self
+                    .fetch_daily_rate_page_with_budget_wait(
+                        &authority,
+                        request,
+                        FiscalDataParseLimits::production_defaults(),
+                        discovery.deadline(),
+                        &cancellation,
+                    )
+                    .await?
+                    .into_parts();
+                (
+                    received_at,
+                    payload,
+                    TreasuryHistoryPage::Daily(page),
+                    capture,
+                )
+            }
+            TreasuryHistoryRequest::Fiscal(request) => {
+                let (received_at, payload, page, capture) = self
+                    .fetch_fiscal_page_with_budget_wait(
+                        &authority,
+                        request,
+                        FiscalDataParseLimits::production_defaults(),
+                        discovery.deadline(),
+                        &cancellation,
+                    )
+                    .await?
+                    .into_parts();
+                (
+                    received_at,
+                    payload,
+                    TreasuryHistoryPage::Fiscal(page),
+                    capture,
+                )
+            }
+        };
         let mut next_tracker = backfill.tracker.clone();
-        let terminal = next_tracker
-            .accept(retrieved.page())
-            .map_err(|_| invalid_protocol())?;
+        let terminal = next_tracker.accept(&page).map_err(|_| invalid_protocol())?;
         let validated_at = system_timestamp().map_err(super::map_adapter_error)?;
-        if retrieved.page().feed_published_at() > retrieved.received_at()
-            || validated_at < retrieved.received_at()
+        if page
+            .provider_published_at()
+            .is_some_and(|published| published > received_at)
+            || validated_at < received_at
         {
             return Err(invalid_protocol());
         }
-        let source_rows = retrieved.page().observations().len();
-        let raw_body_bytes =
-            u64::try_from(retrieved.exact_payload().len()).map_err(|_| invalid_protocol())?;
+        let source_rows = page.source_rows();
+        let raw_body_bytes = u64::try_from(payload.len()).map_err(|_| invalid_protocol())?;
         let object = source_object(
             &self.metadata,
             &discovery,
             &page_request,
-            retrieved.exact_payload(),
-            retrieved.received_at(),
-            "application/atom+xml",
-            ObjectKind::DailyRate,
+            &payload,
+            received_at,
+            history_media_type(backfill.checkpoint.descriptor.surface()),
+            history_object_kind(backfill.checkpoint.descriptor.surface()),
         )?;
-        let expected_capture = retrieved.capture_material().receipt().clone();
-        let canonical = if terminal {
-            if source_rows != 0 {
+        let expected_capture = capture.receipt().clone();
+        let canonical = if source_rows == 0 {
+            if !terminal {
                 return Err(invalid_protocol());
             }
             None
         } else {
             Some(prepare_canonical_page(
-                self,
+                self.replay_binding(),
                 CanonicalPagePreparation {
                     descriptor: &backfill.checkpoint.descriptor,
                     object: object.clone(),
-                    page: retrieved.page(),
-                    received_at: retrieved.received_at(),
+                    page: &page,
+                    received_at,
                     validated_at,
-                    raw_body_bytes: retrieved.exact_payload().len(),
+                    raw_body_bytes: payload.len(),
                     deadline: discovery.deadline(),
                     capture: &expected_capture,
                 },
@@ -1104,11 +1381,15 @@ impl TreasurySource {
             explicit_missing_points,
             raw_body_bytes,
             request_digest: sha256(page_request.request_digest()),
-            payload_digest: sha256(retrieved.page().response_payload_digest()),
-            received_at: retrieved.received_at(),
-            provider_published_at: retrieved.page().feed_published_at(),
+            payload_digest: sha256(page.response_payload_digest()),
+            received_at,
+            provider_published_at: page.provider_published_at(),
             validated_at,
             terminal,
+            canonical_series: canonical
+                .as_ref()
+                .map(|page| page.canonical_series.clone())
+                .unwrap_or_default(),
             canonical_content_digest: canonical
                 .as_ref()
                 .map(|page| page.content_identity.digest()),
@@ -1121,7 +1402,6 @@ impl TreasurySource {
             sealed_segment_claim: None,
             sealed_receipt_digest: None,
         };
-        let (_, _, _, capture) = retrieved.into_parts();
         Ok(TreasuryAllHistoryFetchedPage {
             canonical,
             capture,
@@ -1138,7 +1418,7 @@ impl TreasurySource {
 struct CanonicalPagePreparation<'a> {
     descriptor: &'a TreasuryDatasetDescriptor,
     object: SourceObject,
-    page: &'a TreasuryDailyRatePage,
+    page: &'a TreasuryHistoryPage,
     received_at: Timestamp,
     validated_at: Timestamp,
     raw_body_bytes: usize,
@@ -1147,7 +1427,7 @@ struct CanonicalPagePreparation<'a> {
 }
 
 fn prepare_canonical_page(
-    source: &TreasurySource,
+    source: TreasuryReplayBinding<'_>,
     input: CanonicalPagePreparation<'_>,
 ) -> Result<TreasuryAllHistoryCanonicalPage, ExtractionSourceError> {
     let CanonicalPagePreparation {
@@ -1170,10 +1450,31 @@ fn prepare_canonical_page(
         .map_err(|_| invalid_protocol())?;
     let mut canonical_admission = CanonicalRecordAdmission::new();
     let mut batch = ExtractionBatchAccumulator::try_new(&request)?;
-    for record in canonical_daily_rate_records(&source.metadata, page, received_at, validated_at) {
+    let mut series = BTreeSet::new();
+    let records: Box<
+        dyn Iterator<Item = Result<CanonicalTreasuryRecord, TreasurySourceError>> + '_,
+    > = match page {
+        TreasuryHistoryPage::Daily(page) => Box::new(canonical_daily_rate_records(
+            source.metadata,
+            page,
+            received_at,
+            validated_at,
+        )),
+        TreasuryHistoryPage::Fiscal(page) => Box::new(canonical_fiscal_records(
+            source.metadata,
+            page,
+            received_at,
+            validated_at,
+        )),
+    };
+    for record in records {
         let record = canonical_admission
             .admit(record.map_err(super::map_adapter_error)?)
             .map_err(super::map_adapter_error)?;
+        series.insert(record.series.clone());
+        if series.len() > MAX_ALL_HISTORY_SERIES {
+            return Err(invalid_protocol());
+        }
         batch.push(ExtractionRecord::try_new_with_time(
             &request,
             schema.clone(),
@@ -1192,7 +1493,7 @@ fn prepare_canonical_page(
     let accounting = TreasuryExtractionAccounting::try_new(TreasuryExtractionAccountingInput {
         descriptor: descriptor.clone(),
         terminal_page_count: 1,
-        aggregate_source_rows: page.observations().len(),
+        aggregate_source_rows: page.source_rows(),
         aggregate_canonical_points: canonical_points,
         aggregate_observed_numeric_points: observed_numeric_points,
         aggregate_explicit_missing_points: explicit_missing_points,
@@ -1202,15 +1503,29 @@ fn prepare_canonical_page(
         request_set_digest: page.request_digest(),
         source_object_payload_digest: page.response_payload_digest(),
         terminal_received_at: received_at,
-        provider_published_at: Some(page.feed_published_at()),
-        terminal_for_query: false,
+        provider_published_at: page.provider_published_at(),
+        terminal_for_query: page.is_terminal(),
     })
     .map_err(|_| invalid_protocol())?;
     let batch = batch.finish()?.try_bind_provider_capture(capture)?;
     let content_identity = ExtractionContentIdentity::try_from_batch(&batch)?;
-    let native_plan =
-        TreasuryNativeLineagePlan::try_daily(descriptor.provider_dataset().clone(), page.clone())
-            .map_err(super::map_adapter_error)?;
+    let native_plan = match page {
+        TreasuryHistoryPage::Daily(page) => TreasuryNativeLineagePlan::try_daily(
+            descriptor.provider_dataset().clone(),
+            page.clone(),
+        ),
+        TreasuryHistoryPage::Fiscal(page) => {
+            let TreasurySourceConfig::AverageInterestRates(query) = source.config else {
+                return Err(invalid_protocol());
+            };
+            TreasuryNativeLineagePlan::fiscal_page(
+                descriptor.provider_dataset().clone(),
+                query,
+                page.clone(),
+            )
+        }
+    }
+    .map_err(super::map_adapter_error)?;
     let (native_lineage, row_capture_page_ordinals) = native_plan
         .try_encode(&batch)
         .map_err(super::map_adapter_error)?;
@@ -1228,29 +1543,100 @@ fn prepare_canonical_page(
         content_identity,
         native_lineage,
         row_capture_page_ordinals: row_capture_page_ordinals.into_boxed_slice(),
+        canonical_series: series.into_iter().collect::<Vec<_>>().into_boxed_slice(),
     })
 }
 
 struct ReopenedAllHistoryPage {
-    page: TreasuryDailyRatePage,
+    page: TreasuryHistoryPage,
     sealed: SealedProviderCaptureSetReceipt,
     canonical: Option<TreasuryAllHistoryCanonicalPage>,
 }
 
+fn restore_all_history_backfill_blocking(
+    source: TreasuryReplayBinding<'_>,
+    encoded_checkpoint: &[u8],
+    store: &SealedResearchJournalStore,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<TreasuryAllHistoryBackfill, TreasurySourceError> {
+    ensure_restore_open(deadline, cancellation)?;
+    let checkpoint = TreasuryAllHistoryCheckpoint::from_json(source, encoded_checkpoint)?;
+    validate_checkpoint_source(source, &checkpoint)?;
+    let query = all_history_query(source, checkpoint.descriptor.provider_dataset())?;
+    let mut tracker = TreasuryHistoryTracker::new(query)?;
+    let limits = FiscalDataParseLimits::production_defaults();
+    let control = TreasuryReplayControl {
+        deadline,
+        cancellation,
+    };
+    let mut verified_seals = Vec::new();
+    verified_seals
+        .try_reserve_exact(checkpoint.pages.len())
+        .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
+    for persisted in &checkpoint.pages {
+        ensure_restore_open(deadline, cancellation)?;
+        let reopened = reopen_persisted_page(
+            source,
+            &checkpoint.descriptor,
+            persisted,
+            store,
+            limits,
+            &control,
+        )?;
+        ensure_restore_open(deadline, cancellation)?;
+        if tracker.accept(&reopened.page)? != persisted.terminal {
+            return Err(TreasurySourceError::InvalidBackfillCheckpoint);
+        }
+        verified_seals.push(reopened.sealed);
+    }
+    ensure_restore_open(deadline, cancellation)?;
+    if !tracker_terminal_matches_checkpoint(&checkpoint, &verified_seals) {
+        return Err(TreasurySourceError::InvalidBackfillCheckpoint);
+    }
+    Ok(TreasuryAllHistoryBackfill {
+        checkpoint,
+        tracker,
+        verified_seals,
+    })
+}
+
+fn ensure_restore_open(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), TreasurySourceError> {
+    if cancellation.is_cancelled() {
+        Err(TreasurySourceError::Cancelled)
+    } else if Instant::now() >= deadline {
+        Err(TreasurySourceError::DeadlineExceeded)
+    } else {
+        Ok(())
+    }
+}
+
 fn reopen_persisted_page(
-    source: &TreasurySource,
+    source: TreasuryReplayBinding<'_>,
     descriptor: &TreasuryDatasetDescriptor,
     persisted: &TreasuryAllHistoryPersistedPage,
     store: &SealedResearchJournalStore,
     limits: FiscalDataParseLimits,
+    control: &TreasuryReplayControl<'_>,
 ) -> Result<ReopenedAllHistoryPage, TreasurySourceError> {
     let claim = persisted
         .sealed_segment_claim
         .as_ref()
         .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)?;
     let segment = store
-        .open_verified_claim(claim)
-        .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
+        .open_verified_claim_with_control(claim, control)
+        .map_err(|error| match error {
+            SealedResearchJournalStoreError::ObjectControl(
+                ResearchObjectControlError::Cancelled,
+            ) => TreasurySourceError::Cancelled,
+            SealedResearchJournalStoreError::ObjectControl(
+                ResearchObjectControlError::DeadlineExceeded,
+            ) => TreasurySourceError::DeadlineExceeded,
+            error => TreasurySourceError::ReplayStore(error),
+        })?;
     let sealed = SealedProviderCaptureSetReceipt::try_bind(
         persisted.capture.clone(),
         segment.receipt().clone(),
@@ -1268,22 +1654,24 @@ fn reopen_persisted_page(
         .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
     let request = query.page(page_number)?;
     let raw = &segment.records()[0];
-    let page = TreasuryDailyRatePage::parse(raw.payload(), &request, limits)?;
+    ensure_restore_open(control.deadline, control.cancellation)?;
+    let page = request.parse(raw.payload(), limits)?;
+    ensure_restore_open(control.deadline, control.cancellation)?;
     validate_replayed_page(persisted, &page)?;
     let expected_object = source_object(
-        &source.metadata,
+        source.metadata,
         &persisted.discovery_request,
         &request,
         raw.payload(),
         persisted.received_at,
-        "application/atom+xml",
-        ObjectKind::DailyRate,
+        history_media_type(descriptor.surface()),
+        history_object_kind(descriptor.surface()),
     )
     .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
     if expected_object != persisted.source_object {
         return Err(TreasurySourceError::InvalidBackfillCheckpoint);
     }
-    let canonical = if persisted.terminal {
+    let canonical = if page.source_rows() == 0 {
         if persisted.canonical_content_digest.is_some()
             || persisted.native_lineage_batch_digest.is_some()
         {
@@ -1305,7 +1693,8 @@ fn reopen_persisted_page(
             },
         )
         .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
-        if Some(canonical.content_identity().digest()) != persisted.canonical_content_digest
+        if canonical.canonical_series != persisted.canonical_series
+            || Some(canonical.content_identity().digest()) != persisted.canonical_content_digest
             || u64::try_from(canonical.content_identity().record_count()).ok()
                 != Some(persisted.canonical_points)
             || Some(canonical.native_lineage().batch_digest())
@@ -1319,6 +1708,7 @@ fn reopen_persisted_page(
         }
         Some(canonical)
     };
+    ensure_restore_open(control.deadline, control.cancellation)?;
     Ok(ReopenedAllHistoryPage {
         page,
         sealed,
@@ -1327,7 +1717,7 @@ fn reopen_persisted_page(
 }
 
 fn validate_checkpoint_source(
-    source: &TreasurySource,
+    source: TreasuryReplayBinding<'_>,
     checkpoint: &TreasuryAllHistoryCheckpoint,
 ) -> Result<(), TreasurySourceError> {
     checkpoint.validate_structure()?;
@@ -1346,23 +1736,29 @@ fn validate_checkpoint_source(
 }
 
 fn all_history_query<'a>(
-    source: &'a TreasurySource,
+    source: TreasuryReplayBinding<'a>,
     dataset: &SourceIdentifier,
-) -> Result<&'a crate::TreasuryDailyRateQuery, TreasurySourceError> {
-    let TreasurySourceConfig::DailyRates(config) = &source.config else {
-        return Err(TreasurySourceError::InvalidBackfillCheckpoint);
-    };
-    config
-        .query(dataset)
-        .filter(|query| query.is_all_history())
-        .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)
+) -> Result<TreasuryHistoryQuery<'a>, TreasurySourceError> {
+    match source.config {
+        TreasurySourceConfig::DailyRates(config) => config
+            .query(dataset)
+            .filter(|query| query.is_all_history())
+            .map(TreasuryHistoryQuery::Daily),
+        TreasurySourceConfig::AverageInterestRates(query)
+            if query.is_all_history() && source.activation.catalog().dataset(dataset).is_some() =>
+        {
+            Some(TreasuryHistoryQuery::Fiscal(query))
+        }
+        _ => None,
+    }
+    .ok_or(TreasurySourceError::InvalidBackfillCheckpoint)
 }
 
 fn validate_replayed_page(
     persisted: &TreasuryAllHistoryPersistedPage,
-    page: &TreasuryDailyRatePage,
+    page: &TreasuryHistoryPage,
 ) -> Result<(), TreasurySourceError> {
-    let source_rows = u64::try_from(page.observations().len())
+    let source_rows = u64::try_from(page.source_rows())
         .map_err(|_| TreasurySourceError::InvalidBackfillCheckpoint)?;
     if u64::try_from(page.page_number()).ok() != Some(persisted.page_number)
         || source_rows != persisted.returned_source_rows
@@ -1370,20 +1766,172 @@ fn validate_replayed_page(
             .observed_numeric_points
             .checked_add(persisted.explicit_missing_points)
             != Some(persisted.canonical_points)
-        || (page.is_terminal()
-            && (persisted.canonical_points != 0
-                || persisted.observed_numeric_points != 0
-                || persisted.explicit_missing_points != 0))
+        || (source_rows == 0 && persisted.canonical_points != 0)
         || sha256(page.request_digest()) != persisted.request_digest
         || sha256(page.response_payload_digest()) != persisted.payload_digest
-        || page.feed_published_at() != persisted.provider_published_at
-        || persisted.provider_published_at > persisted.received_at
+        || page.provider_published_at() != persisted.provider_published_at
+        || persisted
+            .provider_published_at
+            .is_some_and(|published| published > persisted.received_at)
         || persisted.validated_at < persisted.received_at
         || page.is_terminal() != persisted.terminal
     {
         return Err(TreasurySourceError::InvalidBackfillCheckpoint);
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum TreasuryHistoryQuery<'a> {
+    Daily(&'a TreasuryDailyRateQuery),
+    Fiscal(&'a TreasuryFiscalQuery),
+}
+impl TreasuryHistoryQuery<'_> {
+    fn page(self, number: usize) -> Result<TreasuryHistoryRequest, TreasuryProtocolError> {
+        match self {
+            Self::Daily(query) => query.page(number).map(TreasuryHistoryRequest::Daily),
+            Self::Fiscal(query) => query.page(number).map(TreasuryHistoryRequest::Fiscal),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum TreasuryHistoryTracker {
+    Daily(TreasuryDailyRatePaginationTracker),
+    Fiscal(TreasuryPaginationTracker),
+}
+impl TreasuryHistoryTracker {
+    fn new(query: TreasuryHistoryQuery<'_>) -> Result<Self, TreasuryProtocolError> {
+        match query {
+            TreasuryHistoryQuery::Daily(query) => TreasuryDailyRatePaginationTracker::try_new(
+                query,
+                MAX_ALL_HISTORY_PAGES,
+                MAX_EXTRACTION_RECORDS,
+            )
+            .map(Self::Daily),
+            TreasuryHistoryQuery::Fiscal(query) => TreasuryPaginationTracker::try_new(
+                query,
+                MAX_ALL_HISTORY_PAGES,
+                MAX_EXTRACTION_RECORDS,
+            )
+            .map(Self::Fiscal),
+        }
+    }
+    fn accept(&mut self, page: &TreasuryHistoryPage) -> Result<bool, TreasuryProtocolError> {
+        match (self, page) {
+            (Self::Daily(tracker), TreasuryHistoryPage::Daily(page)) => tracker.accept(page),
+            (Self::Fiscal(tracker), TreasuryHistoryPage::Fiscal(page)) => tracker.accept(page),
+            _ => Err(TreasuryProtocolError::QueryBindingMismatch),
+        }
+    }
+}
+
+enum TreasuryHistoryRequest {
+    Daily(TreasuryDailyRatePageRequest),
+    Fiscal(TreasuryPageRequest),
+}
+impl PageIdentity for TreasuryHistoryRequest {
+    fn url(&self) -> &str {
+        match self {
+            Self::Daily(page) => page.url(),
+            Self::Fiscal(page) => page.url(),
+        }
+    }
+    fn page_number(&self) -> usize {
+        match self {
+            Self::Daily(page) => page.page_number(),
+            Self::Fiscal(page) => page.page_number(),
+        }
+    }
+    fn request_digest(&self) -> [u8; 32] {
+        match self {
+            Self::Daily(page) => page.request_digest(),
+            Self::Fiscal(page) => page.request_digest(),
+        }
+    }
+}
+impl TreasuryHistoryRequest {
+    fn parse(
+        &self,
+        payload: &[u8],
+        limits: FiscalDataParseLimits,
+    ) -> Result<TreasuryHistoryPage, TreasuryProtocolError> {
+        match self {
+            Self::Daily(request) => TreasuryDailyRatePage::parse(payload, request, limits)
+                .map(TreasuryHistoryPage::Daily),
+            Self::Fiscal(request) => {
+                FiscalDataPage::parse(payload, request, limits).map(TreasuryHistoryPage::Fiscal)
+            }
+        }
+    }
+}
+
+enum TreasuryHistoryPage {
+    Daily(TreasuryDailyRatePage),
+    Fiscal(FiscalDataPage),
+}
+impl TreasuryHistoryPage {
+    fn page_number(&self) -> usize {
+        match self {
+            Self::Daily(page) => page.page_number(),
+            Self::Fiscal(page) => page.page_number(),
+        }
+    }
+    fn query_digest(&self) -> [u8; 32] {
+        match self {
+            Self::Daily(page) => page.query_digest(),
+            Self::Fiscal(page) => page.query_digest(),
+        }
+    }
+    fn request_digest(&self) -> [u8; 32] {
+        match self {
+            Self::Daily(page) => page.request_digest(),
+            Self::Fiscal(page) => page.request_digest(),
+        }
+    }
+    fn response_payload_digest(&self) -> [u8; 32] {
+        match self {
+            Self::Daily(page) => page.response_payload_digest(),
+            Self::Fiscal(page) => page.response_payload_digest(),
+        }
+    }
+    fn source_rows(&self) -> usize {
+        match self {
+            Self::Daily(page) => page.observations().len(),
+            Self::Fiscal(page) => page.records().len(),
+        }
+    }
+    fn provider_published_at(&self) -> Option<Timestamp> {
+        match self {
+            Self::Daily(page) => Some(page.feed_published_at()),
+            Self::Fiscal(_) => None,
+        }
+    }
+    fn is_terminal(&self) -> bool {
+        match self {
+            Self::Daily(page) => page.is_terminal(),
+            Self::Fiscal(page) => page.next_page_token().is_none(),
+        }
+    }
+}
+
+const fn first_provider_page(surface: TreasurySurface) -> u64 {
+    match surface {
+        TreasurySurface::DailyRatesXml => 0,
+        TreasurySurface::FiscalData => 1,
+    }
+}
+const fn history_media_type(surface: TreasurySurface) -> &'static str {
+    match surface {
+        TreasurySurface::DailyRatesXml => "application/atom+xml",
+        TreasurySurface::FiscalData => "application/json",
+    }
+}
+const fn history_object_kind(surface: TreasurySurface) -> ObjectKind {
+    match surface {
+        TreasurySurface::DailyRatesXml => ObjectKind::DailyRate,
+        TreasurySurface::FiscalData => ObjectKind::FiscalPage,
+    }
 }
 
 fn tracker_terminal_matches_checkpoint(
