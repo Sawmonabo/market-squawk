@@ -838,10 +838,16 @@ impl ProviderMacroPlanTerminal {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompletedProviderMacroPlanReceipt {
     session: ProviderMacroPlanSessionReceipt,
+    adapter_completion_digest: EvidenceDigest,
     publication_digest: EvidenceDigest,
 }
 
 impl CompletedProviderMacroPlanReceipt {
+    /// Returns the exact source-adapter terminal completion identity retained by this plan.
+    pub const fn adapter_completion_digest(&self) -> EvidenceDigest {
+        self.adapter_completion_digest
+    }
+
     pub const fn publication_digest(&self) -> EvidenceDigest {
         self.publication_digest
     }
@@ -2207,6 +2213,21 @@ impl AnalyticalDataService {
     /// Returns a cloneable immutable manifest and fixed-template observation read capability.
     pub fn analytical_reader(&self) -> crate::AnalyticalReadCapability {
         crate::AnalyticalReadCapability::new(Arc::clone(&self.manifests), Arc::clone(&self.objects))
+    }
+
+    /// Authorizes exact manifest lineage through this service's existing rights authority.
+    pub fn authorize_research_use(
+        &self,
+        request: crate::ResearchUseRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::AuthorizedResearchUse, crate::ResearchUseCatalogError> {
+        if cancellation.is_cancelled() {
+            return Err(crate::ResearchUseCatalogError::Cancelled);
+        }
+        self.authority
+            .try_lock()
+            .map_err(|_| CatalogError::AuthorityLockPoisoned)?
+            .authorize_research_use(request, cancellation)
     }
 
     /// Returns exact-origin SEC research reads over this service's durable authorities.
@@ -3699,6 +3720,48 @@ impl AnalyticalDataService {
         page: ProviderMacroPlanStagedPage,
         cancellation: CancellationToken,
     ) -> Result<ProviderMacroPlanSessionReceipt, IngestError> {
+        self.stage_provider_macro_plan_page_inner(expected, page, cancellation, None)
+            .await
+    }
+
+    /// Atomically retains a terminal data page and completes its exact successor checkpoint.
+    pub async fn complete_staged_provider_macro_plan_page(
+        &self,
+        expected: &ProviderMacroPlanSessionReceipt,
+        page: ProviderMacroPlanStagedPage,
+        adapter_completion_digest: EvidenceDigest,
+        cancellation: CancellationToken,
+    ) -> Result<CompletedProviderMacroPlanReceipt, IngestError> {
+        if adapter_completion_digest.algorithm() != DigestAlgorithm::Sha256
+            || adapter_completion_digest.bytes() == [0; 32]
+        {
+            return Err(IngestError::InvalidProviderMacroPlan);
+        }
+        let retained = self
+            .stage_provider_macro_plan_page_inner(
+                expected,
+                page,
+                cancellation,
+                Some(adapter_completion_digest),
+            )
+            .await?;
+        let completed = self.recover_completed_provider_macro_plan(expected.session_id())?;
+        if !retained.is_complete()
+            || completed.session() != &retained
+            || completed.adapter_completion_digest() != adapter_completion_digest
+        {
+            return Err(IngestError::ReplayConflict);
+        }
+        Ok(completed)
+    }
+
+    async fn stage_provider_macro_plan_page_inner(
+        &self,
+        expected: &ProviderMacroPlanSessionReceipt,
+        page: ProviderMacroPlanStagedPage,
+        cancellation: CancellationToken,
+        adapter_completion_digest: Option<EvidenceDigest>,
+    ) -> Result<ProviderMacroPlanSessionReceipt, IngestError> {
         if expected.is_complete() {
             return Err(IngestError::InvalidProviderMacroPlan);
         }
@@ -3784,11 +3847,15 @@ impl AnalyticalDataService {
             prepared,
             object,
         )?;
+        if cancellation.is_cancelled() {
+            return Err(IngestError::Cancelled);
+        }
         let authority = self.lock_authority()?;
         let coordinate = authority.catalog().stage_provider_macro_plan_page(
             expected.coordinate()?,
             successor_checkpoint,
             staged,
+            adapter_completion_digest,
         )?;
         let recovery = authority
             .catalog()
@@ -3850,14 +3917,16 @@ impl AnalyticalDataService {
         completed_provider_macro_plan_receipt(&completed)
     }
 
-    /// Streams bounded staged-page groups into one atomic multi-artifact analytical generation.
+    /// Finalizes at most one bounded page group, then publishes the entire generation atomically.
+    ///
+    /// `None` retains progress without a visible manifest; resume with the same reservation.
     pub async fn publish_staged_provider_macro_plan(
         &self,
         reservation: IngestReservation,
         completed: CompletedProviderMacroPlanReceipt,
         cancellation: CancellationToken,
         precommit_authority: Arc<dyn IngestPrecommitAuthority>,
-    ) -> Result<StagedProviderMacroPlanPublicationReceipt, IngestError> {
+    ) -> Result<Option<StagedProviderMacroPlanPublicationReceipt>, IngestError> {
         precommit_authority.validate_precommit()?;
         let exact = self.recover_completed_provider_macro_plan(completed.session.session_id())?;
         if exact != completed {
@@ -3891,7 +3960,7 @@ impl AnalyticalDataService {
                 catalog_receipt_digest: projection.catalog_receipt_digest(),
             };
             self.verify_staged_provider_macro_plan_restart(&receipt.restart_selector())?;
-            return Ok(receipt);
+            return Ok(Some(receipt));
         }
         if run_state != IngestRunState::Reserved {
             return Err(IngestError::TerminalRun);
@@ -3899,18 +3968,23 @@ impl AnalyticalDataService {
         let schema = crate::DatasetSchemaRegistry::local()
             .canonical_research_observations()
             .map_err(ArrowConversionError::from)?;
-        let arrow_schema = crate::DatasetSchemaRegistry::local()
-            .resolve(&schema)
-            .map_err(ArrowConversionError::from)?;
         self.manifests
             .validate_append_schema(completed.session.analytical_dataset(), &schema)?;
         let dataset_name =
             SourceIdentifier::try_from(completed.session.analytical_dataset().as_str())
                 .map_err(|_| IngestError::InvalidDataset)?;
+        let arrow_schema =
+            crate::schema::research_schema(&dataset_name, completed.publication_digest)
+                .map_err(ArrowConversionError::from)?;
         let expected_head = self.manifests.provider_macro_plan_published_head(
             completed.session.analytical_dataset(),
             completed.session.source_id(),
             completed.session.provider_dataset(),
+        )?;
+        let staged = ProviderMacroPlanPublicationCommit::try_new(
+            completed.session.coordinate()?,
+            completed.publication_digest,
+            expected_head,
         )?;
         let _operation = self
             .operation_gate
@@ -3918,80 +3992,83 @@ impl AnalyticalDataService {
             .await
             .ok_or(IngestError::Cancelled)?;
         let publication = self.objects.begin_publication(&cancellation).await?;
-        let mut published = Vec::new();
-        let mut objects = Vec::new();
-        let mut capture_coordinates = Vec::new();
-        let mut first_ordinal = 0_u16;
-        let mut published_rows = 0_u64;
-        loop {
+        let mut progress = {
+            let authority = self.lock_authority()?;
+            authority
+                .catalog()
+                .begin_provider_macro_plan_finalization(reservation.run_id(), &staged)?
+        };
+        if progress.next_page_ordinal() < completed.session.data_page_count() {
             let group = {
                 let authority = self.lock_authority()?;
                 authority
                     .catalog()
                     .provider_macro_plan_replay_object_group(
                         completed.session.session_id(),
-                        first_ordinal,
+                        progress.next_page_ordinal(),
                     )?
             };
-            if group.first_ordinal() != first_ordinal || group.pages().is_empty() {
+            if group.first_ordinal() != progress.next_page_ordinal() || group.pages().is_empty() {
                 return Err(IngestError::ReplayConflict);
             }
-            let output_ordinal = published.len();
-            let lineage = group.lineage_digest(
-                completed.publication_digest,
-                completed.session.plan_identity,
-                completed.session.source_generation_digest,
-                output_ordinal,
-            )?;
             let mut inputs = Vec::new();
             inputs
                 .try_reserve_exact(group.pages().len())
                 .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
             let mut group_rows = 0_u64;
             for (local_ordinal, page) in group.pages().iter().enumerate() {
-                if usize::from(page.page_ordinal()) != capture_coordinates.len() {
+                if usize::from(page.page_ordinal())
+                    != usize::from(group.first_ordinal()) + local_ordinal
+                {
                     return Err(IngestError::ReplayConflict);
                 }
                 group_rows = group_rows
                     .checked_add(page.object().row_count())
                     .ok_or(IngestError::InvalidProviderMacroPlan)?;
                 inputs.push(page.object().published_object()?);
-                capture_coordinates.push(ProviderArtifactInputCoordinate::try_new(
-                    output_ordinal,
-                    local_ordinal,
-                )?);
             }
-            let published_object = self
+            let published = self
                 .objects
                 .publish_replayed_objects_under_lease(
                     inputs,
+                    completed.session.provider_dataset().clone(),
                     Arc::clone(&arrow_schema),
                     group_rows,
                     &cancellation,
                     &publication,
                 )
                 .await?;
-            published_rows = published_rows
-                .checked_add(published_object.row_count())
-                .ok_or(IngestError::InvalidProviderMacroPlan)?;
-            objects.push(ManifestObject::try_new(
-                published_object.content_hash(),
-                published_object.row_count(),
-                published_object.size_bytes(),
-                Sha256Digest::new(lineage.bytes()),
-            )?);
-            published.push(published_object);
-            let Some(next) = group.next_ordinal() else {
-                break;
+            if cancellation.is_cancelled() {
+                return Err(IngestError::Cancelled);
+            }
+            precommit_authority.validate_precommit()?;
+            progress = {
+                let authority = self.lock_authority()?;
+                authority
+                    .catalog()
+                    .retain_provider_macro_plan_finalized_group(
+                        reservation.run_id(),
+                        &staged,
+                        &group,
+                        &published,
+                    )?
             };
-            if next <= first_ordinal {
+            if progress.next_page_ordinal()
+                != group
+                    .next_ordinal()
+                    .unwrap_or(completed.session.data_page_count())
+            {
                 return Err(IngestError::ReplayConflict);
             }
-            first_ordinal = next;
+            if progress.next_page_ordinal() < completed.session.data_page_count() {
+                return Ok(None);
+            }
         }
         if cancellation.is_cancelled()
-            || capture_coordinates.len() != usize::from(completed.session.data_page_count())
-            || published_rows != completed.session.analytical_row_count()
+            || progress.next_page_ordinal() != completed.session.data_page_count()
+            || progress.finalized_rows() != completed.session.analytical_row_count()
+            || progress.run_id() != reservation.run_id()
+            || progress.staged() != &staged
         {
             return Err(if cancellation.is_cancelled() {
                 IngestError::Cancelled
@@ -3999,28 +4076,55 @@ impl AnalyticalDataService {
                 IngestError::InvalidProviderMacroPlan
             });
         }
+        let mut objects = Vec::new();
+        let mut capture_coordinates = Vec::new();
+        let mut artifacts = Vec::new();
+        objects
+            .try_reserve_exact(progress.groups().len())
+            .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
+        artifacts
+            .try_reserve_exact(progress.groups().len())
+            .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
+        capture_coordinates
+            .try_reserve_exact(usize::from(completed.session.data_page_count()))
+            .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
+        for group in progress.groups() {
+            let output_ordinal = usize::from(group.output_ordinal());
+            if output_ordinal != objects.len()
+                || usize::from(group.first_page_ordinal()) != capture_coordinates.len()
+            {
+                return Err(IngestError::ReplayConflict);
+            }
+            for local_ordinal in 0..usize::from(group.page_count()) {
+                capture_coordinates.push(ProviderArtifactInputCoordinate::try_new(
+                    output_ordinal,
+                    local_ordinal,
+                )?);
+            }
+            let published_object = group.object().published_object()?;
+            objects.push(ManifestObject::try_new(
+                published_object.content_hash(),
+                published_object.row_count(),
+                published_object.size_bytes(),
+                Sha256Digest::new(group.object().lineage_digest().bytes()),
+            )?);
+            artifacts.push(ArtifactRecord::try_new(
+                published_object.relative_reference(),
+                published_object.content_hash().evidence(),
+                published_object.size_bytes(),
+                published_object
+                    .created_at()
+                    .max(reservation.requested_at()),
+            )?);
+        }
+        if capture_coordinates.len() != usize::from(completed.session.data_page_count()) {
+            return Err(IngestError::InvalidProviderMacroPlan);
+        }
         let plan = self.manifests.preview_append(
             completed.session.analytical_dataset().clone(),
             &schema,
             objects,
         )?;
-        let staged = ProviderMacroPlanPublicationCommit::try_new(
-            completed.session.coordinate()?,
-            completed.publication_digest,
-            expected_head,
-        )?;
-        let mut artifacts = Vec::new();
-        artifacts
-            .try_reserve_exact(published.len())
-            .map_err(|_| IngestError::InvalidProviderMacroPlan)?;
-        for object in &published {
-            artifacts.push(ArtifactRecord::try_new(
-                object.relative_reference(),
-                object.content_hash().evidence(),
-                object.size_bytes(),
-                object.created_at().max(reservation.requested_at()),
-            )?);
-        }
         let final_artifact = artifacts
             .last()
             .ok_or(IngestError::InvalidProviderMacroPlan)?;
@@ -4067,7 +4171,7 @@ impl AnalyticalDataService {
             catalog_receipt_digest,
         };
         self.verify_staged_provider_macro_plan_restart(&receipt.restart_selector())?;
-        Ok(receipt)
+        Ok(Some(receipt))
     }
 
     /// Reopens only the exact manifest and reconstructs all plan evidence from durable state.
@@ -5293,6 +5397,7 @@ fn completed_provider_macro_plan_receipt(
         return Err(IngestError::ReplayConflict);
     }
     Ok(CompletedProviderMacroPlanReceipt {
+        adapter_completion_digest: completed.adapter_completion_digest(),
         session: ProviderMacroPlanSessionReceipt {
             session_id: key.session_id(),
             analytical_dataset: key.analytical_dataset().clone(),

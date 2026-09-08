@@ -49,7 +49,12 @@ pub use self::company_security::{
     CompanySecurityIdentityRecord, CompanySecurityIdentitySelection,
     CompanySecurityIdentitySelectionReceipt, CompanySecurityLinkPublicationCapability,
     CompanySecurityLinkPublicationDisposition, CompanySecurityLinkPublicationReceipt,
-    CompanySecuritySelectionReceiptEntry, MAX_COMPANY_SECURITY_SELECTION_ROWS,
+    CompanySecuritySelectionReceiptEntry, IndustryClassificationCode,
+    IndustryClassificationDisposition, IndustryClassificationExclusionReason,
+    IndustryClassificationReceiptEntry, IndustryClassificationRecord, IndustryClassificationScheme,
+    IndustryClassificationSelection, IndustryClassificationSelectionReceipt,
+    IndustryClassificationVersion, IndustryCohortCompleteness, IndustryCohortExclusion,
+    IndustryCohortSelection, IndustryCohortSelectionReceipt, MAX_COMPANY_SECURITY_SELECTION_ROWS,
     SecFundamentalIdentityAvailability, SecFundamentalIdentityQuery,
     SecFundamentalIdentitySelection,
 };

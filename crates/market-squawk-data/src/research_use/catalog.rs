@@ -256,6 +256,14 @@ impl AuthorizedResearchUse {
         self.permit.expires_at()
     }
 
+    /// Consumes this authorization into its existing one-use calculation permit.
+    ///
+    /// The permit remains process-local, non-cloneable, and non-serializable. Callers must bind
+    /// their selected inputs to `graph()` before consuming the authorization.
+    pub fn into_permit(self) -> ResearchUsePermit {
+        self.permit
+    }
+
     /// Consumes the capability into one canonical, independently rights-bound publication.
     pub fn prepare_derived_publication(
         self,

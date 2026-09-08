@@ -177,6 +177,8 @@ impl Catalog {
                  + (SELECT COUNT(*) FROM provider_macro_plan_sessions)
                  + (SELECT COUNT(*) FROM provider_macro_plan_staged_pages)
                  + (SELECT COUNT(*) FROM provider_macro_plan_terminal_completions)
+                 + (SELECT COUNT(*) FROM provider_macro_plan_finalizations)
+                 + (SELECT COUNT(*) FROM provider_macro_plan_finalized_groups)
                  + (SELECT COUNT(*) FROM provider_macro_plan_publications)
                  + (SELECT COUNT(*) FROM provider_macro_plan_published_heads)
                  + (SELECT COUNT(*) FROM provider_response_market_event_bindings)

@@ -1,24 +1,34 @@
 # Market Squawk Delivery Ledger
 
-Last updated: 2026-09-07
+Last updated: 2026-09-08
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
 evidence; it does not replace the README capability truth or the canonical release plan.
 
-## Current execution handoff — 2026-09-07
+## Current execution handoff — 2026-09-08
 
 The owner resumed the full V1 owner-test goal after the accepted recovery audit. The independent
 backup verified 57/57 checksums at resumption and remains preserved. The dependency and exclusive
 file ownership wave is retained in `.agents/tmp/resume-2026-09-07/wave-1.md`. No main/release merge,
 public release, brokerage execution, or routine CI/CD is authorized by this implementation wave.
 
+The owner approved **SPY as the main scorecard, with VTI alongside it** on 2026-09-08. Both comparisons
+must be fixed before historical evaluation; SPY determines the headline comparison and VTI supplies
+the broader U.S. market comparison. A strategy cannot choose the more flattering benchmark after its
+results are known. This choice grants no purchase or execution authority. Exact canonical identity,
+source history, dividends/splits, costs and chronological evidence remain mandatory implementation
+requirements. The selected funds are the [SPDR S&P 500 ETF Trust](https://www.ssga.com/us/en/individual/etfs/state-street-spdr-sp-500-etf-trust-spy)
+(ISIN US78462F1030) and [Vanguard's VTI total U.S. market fund](https://advisors.vanguard.com/investments/products/vti/vanguard-morningstar-total-stock-market-etf)
+(CUSIP 922908769), checked against official issuer descriptions on 2026-09-08. This is an approved
+comparison policy, not evidence that dual-benchmark production is already complete.
+
 - Canonical Fund NAV publication/recovery checkpoint
   `a41aa6ba85195d776252b132b7991c0993b3a730` is pushed on
   `feature/v1-installed-product-experience` and reported on PR #43. It reconciles the interrupted
   atomic publication, schema hash, extraction-record binding and immutable selection. Existing
   data library compilation and the single existing NAV recovery case passed before commit.
-- The next shared data delta adds current-date NAV selection without reading older Parquet rows,
+- Pushed checkpoint `60b4f9c4e22ffdac82137430a6fc614ca6531530` adds current-date NAV selection without reading older Parquet rows,
   preserves cancellation/deadline/limit errors, and reads an exact selected provider definition at
   its original cutoffs. The existing catalog identity/restart case and NAV publication/recovery
   case each passed 1/1 before commit. These are scoped implementation checks, not clean whole-app
@@ -27,6 +37,16 @@ public release, brokerage execution, or routine CI/CD is authorized by this impl
   compilation. The bounded live attempt made four requests (three successful) and stopped during
   variables metadata acquisition with a transport-class failure whose cause was not retained.
   No QWI publication or restart proof occurred; no retry ran. Its durable live acceptance is open.
+- The shared-data checkpoint in this revision adds atomic terminal-page staging and resumable
+  32-page publication groups. The existing critical publication/recovery case passed 1/1 on
+  2026-09-08, including interruption, restart, orphan preservation and exact retained rows under
+  its unchanged 8 MiB processing cap. The data library check passed. The existing identity receipt
+  case also passed 1/1. Final data source fingerprint:
+  `6d755996f62205ab800151729f1b08801628e50878e4fe6aa9cf563de48a331a`.
+  Real failures corrected during this work were the restore table inventory ceiling, source versus
+  publication schema metadata, unnecessary output row groups, and omitted Arrow allocation overhead.
+  Treasury application integration and whole-app verification remain open; the processing cap is
+  not a measurement of the complete installed application's RAM. No CI ran for this checkpoint.
 - Desktop profile/transport/brief work passed the pinned TypeScript check. Native orchestration,
   actual component policy validation, calibrated forecast production, realistic historical
   backtest evidence, valuation, persisted decision production and complete default/Advanced

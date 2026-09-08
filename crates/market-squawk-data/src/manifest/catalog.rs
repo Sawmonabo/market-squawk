@@ -3704,7 +3704,7 @@ fn append_reference_membership(
     let query_capacity = candidates
         .len()
         .checked_mul(24)
-        .and_then(|value| value.checked_add(1_280))
+        .and_then(|value| value.checked_add(5_120))
         .ok_or(ManifestCatalogError::CountOverflow)?;
     let mut query = String::new();
     query
@@ -3745,6 +3745,46 @@ fn append_reference_membership(
                   AND NOT EXISTS(
                       SELECT 1 FROM provider_macro_plan_publications AS publication
                       WHERE publication.session_id=staged.session_id
+                  )
+            ) OR EXISTS(
+                SELECT 1
+                FROM provider_macro_plan_finalized_groups AS finalized
+                JOIN provider_macro_plan_finalizations AS finalization USING (session_id)
+                JOIN provider_macro_plan_sessions AS session USING (session_id)
+                JOIN ingest_runs AS run ON run.run_id=finalization.run_id
+                WHERE finalized.object_content_hash=candidates.content_hash
+                  AND session.state='complete'
+                  AND run.state='reserved'
+                  AND run.operation='persist'
+                  AND run.source_id=session.source_id
+                  AND run.payload_digest=finalization.publication_digest
+                  AND NOT EXISTS(
+                      SELECT 1 FROM provider_macro_plan_publications AS publication
+                      WHERE publication.session_id=finalization.session_id
+                  )
+                  AND (
+                      (finalization.predecessor_publication_digest IS NULL
+                          AND NOT EXISTS(
+                              SELECT 1 FROM provider_macro_plan_published_heads AS head
+                              WHERE head.analytical_dataset=session.analytical_dataset
+                                AND head.source_id=session.source_id
+                                AND head.provider_dataset=session.provider_dataset
+                          ))
+                      OR EXISTS(
+                          SELECT 1 FROM provider_macro_plan_published_heads AS head
+                          WHERE head.analytical_dataset=session.analytical_dataset
+                            AND head.source_id=session.source_id
+                            AND head.provider_dataset=session.provider_dataset
+                            AND head.publication_digest=
+                                finalization.predecessor_publication_digest
+                            AND head.analytical_dataset=
+                                finalization.predecessor_manifest_dataset_id
+                            AND head.manifest_version=finalization.predecessor_manifest_version
+                            AND head.completed_checkpoint_version=
+                                finalization.predecessor_checkpoint_version
+                            AND head.completed_checkpoint_digest=
+                                finalization.predecessor_checkpoint_digest
+                      )
                   )
             )
          FROM candidates ORDER BY candidate_ordinal"

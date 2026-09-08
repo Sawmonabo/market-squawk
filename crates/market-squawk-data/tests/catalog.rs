@@ -1459,6 +1459,44 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
         selected.receipt().effective_at(),
         relationship.record().published_at()
     );
+    let instrument_selected = relationship_reader.instrument_company_as_of(
+        instrument_id,
+        company.source_id(),
+        company.surface(),
+        relationship.record().published_at(),
+        CommonEquitySuitability::SuitableIssuerCommonEquity,
+        deadline(),
+        &cancellation,
+    )?;
+    for receipt in [
+        before.receipt(),
+        selected.receipt(),
+        instrument_selected.receipt(),
+    ] {
+        let bytes = receipt.canonical_bytes()?;
+        assert_eq!(
+            market_squawk_data::CompanySecurityIdentitySelectionReceipt::from_canonical_bytes(
+                &bytes
+            )?,
+            *receipt
+        );
+        let encoded_query = serde_json::to_vec(&receipt.query_digest())?;
+        let query_start = bytes
+            .windows(encoded_query.len())
+            .position(|value| value == encoded_query.as_slice())
+            .ok_or(CatalogError::InvalidRecord)?;
+        let mut corrupted = bytes.clone();
+        drop(corrupted.splice(
+            query_start..query_start + encoded_query.len(),
+            serde_json::to_vec(&digest(5))?,
+        ));
+        assert!(
+            market_squawk_data::CompanySecurityIdentitySelectionReceipt::from_canonical_bytes(
+                &corrupted
+            )
+            .is_err()
+        );
+    }
     let sec_identity_query = SecFundamentalIdentityQuery::try_new(
         company.source_id().clone(),
         company.provider_company_id().clone(),

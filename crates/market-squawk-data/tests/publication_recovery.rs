@@ -35,14 +35,14 @@ use market_squawk_data::{
     ManifestCatalogError, MarketDataInstrumentSynchronization, MarketHistorySelectionPolicy,
     MissingValuePolicy, ObjectStoreConfig, ObservationFamilyKey, ParquetStoreError,
     PointInTimeLimits, PointInTimePolicy, PointInTimeRevisionMode, ProviderMacroPlanChunkInput,
-    ProviderMacroPlanPublicationInput, ProviderMacroPlanSemantics,
-    ProviderMarketEventPublicationKind, ProviderPublicationInput, PythonDatasetCatalogError,
-    QueryArtifactReservationInput, QueryError, QueryLimits, QueryRequest, QueryResult,
-    ResearchArrowBatch, ResearchIngestService, ResearchQueryEngine, ResearchUse,
-    ResearchUseGrantInput, ResearchUseLimits, ResearchUseRequest, ResearchUseSet, RightsBasis,
-    RightsDecisionInput, SecResearchDisposition, SecResearchFamily, SecResearchReadError,
-    SecResearchReadRequest, Sha256Digest, SourceOperation, UniverseId, UniverseLimits,
-    UniverseMembership, extraction_provider_payload_digest,
+    ProviderMacroPlanPublicationInput, ProviderMacroPlanSemantics, ProviderMacroPlanSessionInput,
+    ProviderMacroPlanStagedPage, ProviderMarketEventPublicationKind, ProviderPublicationInput,
+    PythonDatasetCatalogError, QueryArtifactReservationInput, QueryError, QueryLimits,
+    QueryRequest, QueryResult, ResearchArrowBatch, ResearchIngestService, ResearchQueryEngine,
+    ResearchUse, ResearchUseGrantInput, ResearchUseLimits, ResearchUseRequest, ResearchUseSet,
+    RightsBasis, RightsDecisionInput, SecResearchDisposition, SecResearchFamily,
+    SecResearchReadError, SecResearchReadRequest, Sha256Digest, SourceOperation, UniverseId,
+    UniverseLimits, UniverseMembership, extraction_provider_payload_digest,
     provider_market_event_publication_digest,
 };
 use market_squawk_domain::{
@@ -1365,8 +1365,243 @@ async fn rights_bound_ingest_replays_generation_and_company_identity() -> TestRe
         std::fs::rename(&held_path, &exact_path)?;
     }
 
+    exercise_staged_macro_terminal_and_finalization_restart().await?;
     exercise_sec_exact_origin_point_in_time_restart().await?;
 
+    Ok(())
+}
+
+// Extends the existing publication/recovery case through the otherwise-uncovered staged path.
+async fn exercise_staged_macro_terminal_and_finalization_restart() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let paths = LocalPaths::prepare(directory.path().join("staged-macro-restart"))?;
+    let location = paths.catalog()?.clone();
+    let catalog_config = test_catalog_config(location.clone())?;
+    let source = local_source()?;
+    let authority = CatalogAuthority::open(catalog_config.clone())?;
+    authority.register_source(&source, Timestamp::from_unix_nanos(10))?;
+    let object_config = ObjectStoreConfig::try_new(8 * 1024 * 1024, 1024, Duration::from_secs(60))?;
+    let service = AnalyticalDataService::initialize(
+        authority,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        paths.artifacts()?.clone(),
+        object_config,
+    )?;
+    let raw_store = paths.sealed_research_journal_store()?;
+    let dataset = DatasetId::try_from("staged-macro-fixture")?;
+    let metadata_revision = MetadataRevision::new(SourceIdentifier::try_from("revision-1")?);
+    let provider_dataset = SourceIdentifier::try_from("gdp-2026q1")?;
+    let session_input = |plan| {
+        ProviderMacroPlanSessionInput::try_new(
+            dataset.clone(),
+            source.source_id().clone(),
+            metadata_revision.clone(),
+            provider_dataset.clone(),
+            digest(212),
+            digest(plan),
+            vec![0, 0].into_boxed_slice(),
+        )
+    };
+    let rights_input = |payload_digest| -> Result<RightsDecisionInput, Box<dyn Error>> {
+        Ok(RightsDecisionInput {
+            source_id: source.source_id().clone(),
+            payload_digest,
+            retrieved_at: Timestamp::from_unix_nanos(300),
+            basis: RightsBasis::reviewed_terms("https://example.test/terms/v1", digest(31))?,
+            authorization_evidence: digest(32),
+            authorization_expires_at: Some(Timestamp::from_unix_nanos(i64::MAX)),
+            permitted_operations: vec![SourceOperation::Persist],
+        })
+    };
+    let cancellation = CancellationToken::new();
+    let initial = service.begin_staged_provider_macro_plan(session_input(213)?)?;
+    let probe = rusqlite::Connection::open(location.path())?;
+    probe.execute_batch(
+        "CREATE TRIGGER reject_terminal_checkpoint BEFORE UPDATE ON provider_macro_plan_sessions
+         WHEN NEW.state='complete' BEGIN SELECT RAISE(ABORT, 'terminal rollback proof'); END;",
+    )?;
+    assert!(
+        service
+            .complete_staged_provider_macro_plan_page(
+                &initial,
+                provider_macro_plan_page_fixture(&raw_store, 50)?.staged(1)?,
+                digest(214),
+                cancellation.clone(),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        service.recover_staged_provider_macro_plan(initial.session_id())?,
+        initial
+    );
+    let partial: (i64, i64, i64, i64) = probe.query_row(
+        "SELECT (SELECT COUNT(*) FROM provider_macro_plan_staged_pages),
+                (SELECT COUNT(*) FROM provider_macro_plan_terminal_completions),
+                (SELECT COUNT(*) FROM provider_capture_bindings),
+                (SELECT COUNT(*) FROM provider_capture_binding_native_lineage)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!(partial, (0, 0, 0, 0));
+    probe.execute_batch("DROP TRIGGER reject_terminal_checkpoint;")?;
+    let first = service
+        .complete_staged_provider_macro_plan_page(
+            &initial,
+            provider_macro_plan_page_fixture(&raw_store, 50)?.staged(1)?,
+            digest(214),
+            cancellation.clone(),
+        )
+        .await?;
+    assert_eq!(
+        (
+            first.session().response_count(),
+            first.session().data_page_count()
+        ),
+        (1, 1)
+    );
+    assert_eq!(first.adapter_completion_digest(), digest(214));
+    let first_identity = IngestIdentity::try_new(
+        source.source_id().clone(),
+        first.publication_digest(),
+        SourceOperation::Persist,
+        "macro:one-page-terminal:v1",
+    )?;
+    let first_reservation = service
+        .reserve_source_ingest(
+            &source,
+            Timestamp::from_unix_nanos(10),
+            rights_input(first.publication_digest())?,
+            &first_identity,
+            &cancellation,
+        )
+        .await?;
+    let first_publication = service
+        .publish_staged_provider_macro_plan(
+            first_reservation,
+            first,
+            cancellation.clone(),
+            Arc::new(AllowProviderEventPublication),
+        )
+        .await?
+        .ok_or("single terminal page did not finalize")?;
+    assert_eq!(
+        service
+            .pinned(first_publication.manifest())?
+            .plan()
+            .row_count(),
+        1
+    );
+
+    let mut session = service.begin_staged_provider_macro_plan(session_input(215)?)?;
+    for ordinal in 0_u16..32 {
+        session = service
+            .stage_provider_macro_plan_page(
+                &session,
+                provider_macro_plan_page_fixture(&raw_store, usize::from(ordinal))?
+                    .staged(ordinal + 1)?,
+                cancellation.clone(),
+            )
+            .await?;
+    }
+    let completed = service
+        .complete_staged_provider_macro_plan_page(
+            &session,
+            provider_macro_plan_page_fixture(&raw_store, 32)?.staged(33)?,
+            digest(216),
+            cancellation.clone(),
+        )
+        .await?;
+    assert_eq!(
+        (
+            completed.session().response_count(),
+            completed.session().data_page_count()
+        ),
+        (33, 33)
+    );
+    let identity = IngestIdentity::try_new(
+        source.source_id().clone(),
+        completed.publication_digest(),
+        SourceOperation::Persist,
+        "macro:33-page-terminal:v1",
+    )?;
+    let reservation = service
+        .reserve_source_ingest(
+            &source,
+            Timestamp::from_unix_nanos(10),
+            rights_input(completed.publication_digest())?,
+            &identity,
+            &cancellation,
+        )
+        .await?;
+    let run_id = reservation.run_id();
+    assert!(
+        service
+            .publish_staged_provider_macro_plan(
+                reservation,
+                completed.clone(),
+                cancellation.clone(),
+                Arc::new(AllowProviderEventPublication),
+            )
+            .await?
+            .is_none()
+    );
+    let progress: (i64, i64, i64, String) = probe.query_row(
+        "SELECT (SELECT COUNT(*) FROM provider_macro_plan_publications),
+                (SELECT COUNT(*) FROM provider_macro_plan_finalized_groups WHERE session_id=?1),
+                (SELECT SUM(page_count) FROM provider_macro_plan_finalized_groups WHERE session_id=?1),
+                (SELECT object_relative_reference FROM provider_macro_plan_finalized_groups WHERE session_id=?1)",
+        [completed.session().session_id().to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!((progress.0, progress.1, progress.2), (1, 1, 32));
+    drop(probe);
+    drop(service);
+    let service = AnalyticalDataService::open(
+        CatalogAuthority::open(catalog_config)?,
+        AnalyticalManifestCatalog::open(&location, 8)?,
+        paths.artifacts()?.clone(),
+        object_config,
+    )?;
+    assert_eq!(
+        service.recover_completed_provider_macro_plan(completed.session().session_id())?,
+        completed
+    );
+    let recovery_now = Timestamp::from_unix_nanos(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?)
+    .checked_add_nanos(61_000_000_000)?;
+    service
+        .recover_orphans(recovery_now, cancellation.clone())
+        .await?;
+    assert!(paths.artifacts()?.root().join(&progress.3).is_file());
+    let reservation = service
+        .reserve_source_ingest(
+            &source,
+            Timestamp::from_unix_nanos(10),
+            rights_input(completed.publication_digest())?,
+            &identity,
+            &cancellation,
+        )
+        .await?;
+    assert_eq!(reservation.run_id(), run_id);
+    let publication = service
+        .publish_staged_provider_macro_plan(
+            reservation,
+            completed.clone(),
+            cancellation.clone(),
+            Arc::new(AllowProviderEventPublication),
+        )
+        .await?
+        .ok_or("final retained page did not publish")?;
+    let recovered =
+        service.verify_staged_provider_macro_plan_restart(&publication.restart_selector())?;
+    assert_eq!(recovered.completed(), &completed);
+    let pinned = service.pinned(publication.manifest())?;
+    assert_eq!(pinned.objects().len(), 3);
+    assert_eq!(pinned.plan().row_count(), 34);
+    let rows = service.object_store().read_pinned(&pinned, &cancellation)?;
+    assert_eq!(captured_extraction_lineages(&rows)?.len(), 34);
     Ok(())
 }
 
@@ -3777,148 +4012,180 @@ fn captured_extraction_lineages(batches: &[RecordBatch]) -> Result<Vec<Vec<u8>>,
     Ok(captured)
 }
 
+struct ProviderMacroPlanPageFixture {
+    candidate_digest: EvidenceDigest,
+    semantics: ProviderMacroPlanSemantics,
+    binding: SealedProviderCaptureBinding,
+    revisions: ExtractionRevisionPlan,
+}
+
+impl ProviderMacroPlanPageFixture {
+    fn staged(self, successor: u16) -> Result<ProviderMacroPlanStagedPage, IngestError> {
+        ProviderMacroPlanStagedPage::try_new(
+            self.candidate_digest,
+            self.semantics,
+            self.binding,
+            self.revisions,
+            successor.to_be_bytes().to_vec().into_boxed_slice(),
+        )
+    }
+}
+
+fn provider_macro_plan_page_fixture(
+    raw_store: &SealedResearchJournalStore,
+    chunk_ordinal: usize,
+) -> Result<ProviderMacroPlanPageFixture, Box<dyn Error>> {
+    let source_id = SourceId::try_from("fred-local-fixture")?;
+    let metadata_revision = MetadataRevision::new(SourceIdentifier::try_from("revision-1")?);
+    let provider_dataset = SourceIdentifier::try_from("gdp-2026q1")?;
+    let received_at = Timestamp::from_unix_nanos(
+        300_i64
+            .checked_add(i64::try_from(chunk_ordinal)?)
+            .ok_or("provider macro capture time overflow")?,
+    );
+    let body = Bytes::from(format!("{{\"chunk\":{chunk_ordinal}}}"));
+    let body_digest = EvidenceDigest::new(
+        DigestAlgorithm::Sha256,
+        Sha256::digest(body.as_ref()).into(),
+    );
+    let capture = ProviderCaptureSetReceipt::try_new(
+        source_id.clone(),
+        metadata_revision.clone(),
+        provider_dataset.clone(),
+        digest(u8::try_from(180 + chunk_ordinal)?),
+        ProviderCaptureTerminalDisposition::StandaloneResponse,
+        vec![ProviderCapturePageReceipt::try_new(
+            0,
+            digest(u8::try_from(190 + chunk_ordinal)?),
+            None,
+            None,
+            200,
+            u64::try_from(body.len())?,
+            body_digest,
+            received_at,
+        )?],
+    )?;
+    let capture_material = ProviderCaptureMaterial::try_new(
+        capture,
+        vec![RawCaptureRecord::try_new_live(
+            Uuid::from_u128(10_000 + u128::try_from(chunk_ordinal)? * 2),
+            Arc::from(source_id.as_str()),
+            Uuid::from_u128(10_001 + u128::try_from(chunk_ordinal)? * 2),
+            Some(0),
+            None,
+            DateTime::<Utc>::from_timestamp_nanos(received_at.unix_nanos()),
+            body,
+        )?],
+    )?;
+    let discovery = DiscoveryRequest::try_new(
+        provider_dataset.clone(),
+        Some(Timestamp::from_unix_nanos(90)),
+        NonZeroU16::MIN,
+        Timestamp::from_unix_nanos(1_000),
+    )?;
+    let object = SourceObject::try_new_with_capture_identity(
+        source_id.clone(),
+        metadata_revision.clone(),
+        &discovery,
+        provider_dataset.clone(),
+        SourceIdentifier::try_from("application-json")?,
+        ExactPayloadEvidence::from_content_digest(capture_material.receipt().content_digest()),
+        SourceObjectCaptureIdentity::try_from_capture(capture_material.receipt())?,
+        EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+        Some(Timestamp::from_unix_nanos(100)),
+        SourceAvailabilityEvidence::Observed {
+            available_at: Timestamp::from_unix_nanos(100),
+            evidence: SourceIdentifier::try_from("fred-release")?,
+        },
+        Some(capture_material.receipt().total_body_bytes()),
+    )?;
+    let request = ExtractionRequest::try_new(
+        object,
+        NonZeroU32::MIN,
+        NonZeroU64::new(1024 * 1024).ok_or("nonzero provider macro byte limit")?,
+        Timestamp::from_unix_nanos(1_000),
+    )?;
+    let payload = serde_json::to_vec(&macro_observation(Some(chunk_ordinal))?)?;
+    let record = ExtractionRecord::try_new(
+        &request,
+        SourceIdentifier::try_from("market-squawk-research-v3")?,
+        ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            Sha256::digest(&payload).into(),
+        )),
+        Timestamp::from_unix_nanos(90),
+        Some(Timestamp::from_unix_nanos(100)),
+        SourceAvailabilityEvidence::Observed {
+            available_at: Timestamp::from_unix_nanos(100),
+            evidence: SourceIdentifier::try_from("fred-release")?,
+        },
+        SourceIdentifier::try_from("revision-1")?,
+        Some(Timestamp::from_unix_nanos(200)),
+        payload.into(),
+    )?;
+    let batch = ExtractionBatch::try_new(&request, vec![record])?
+        .try_bind_provider_capture(capture_material.receipt())?;
+    let (expectation, seal_request) = capture_material.into_whole_seal_parts();
+    let token = expectation
+        .try_rejoin(seal_request.seal(raw_store)?)?
+        .try_into_whole()?;
+    let mut native = ProviderNativeLineageBatchBuilder::try_new(
+        ProviderNativeLineageImplementation::FredAlfredSeriesObservationsV1,
+        &batch,
+    )?;
+    native.try_set_batch_sidecar(&serde_json::json!({
+        "family": "fred_alfred_series_observations",
+        "chunk": chunk_ordinal,
+    }))?;
+    native.try_push(&serde_json::json!({
+        "raw_value": "1234.56",
+        "chunk": chunk_ordinal,
+    }))?;
+    let native = native.finish()?;
+    let sidecar = native
+        .batch_sidecar()
+        .ok_or("provider macro native sidecar is absent")?;
+    let semantics = ProviderMacroPlanSemantics::try_new(
+        SourceIdentifier::try_from("fred-alfred-page-semantics-v1")?,
+        native.schema().fingerprint(),
+        sidecar.semantic_payload_digest(),
+        sidecar.semantic_payload().to_vec().into_boxed_slice(),
+    )?;
+    let binding = SealedProviderCaptureBinding::try_whole(token, batch, native, vec![0])?;
+    let revisions = ExtractionRevisionPlan::try_new_with_native_lineage(vec![
+        ExtractionRevisionEvidence::provider_supplied(
+            b"revision-1",
+            ObservedProviderOrder::try_new(
+                ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(100)),
+                b"revision-1",
+            )?,
+        )?,
+    ])?;
+    Ok(ProviderMacroPlanPageFixture {
+        candidate_digest: digest(u8::try_from(200 + chunk_ordinal)?),
+        semantics,
+        binding,
+        revisions,
+    })
+}
+
 fn provider_macro_plan_input(
     raw_store: &SealedResearchJournalStore,
     analytical_dataset: DatasetId,
 ) -> Result<ProviderMacroPlanPublicationInput, Box<dyn Error>> {
     const CHUNK_COUNT: usize = 3;
-    let source_id = SourceId::try_from("fred-local-fixture")?;
-    let metadata_revision = MetadataRevision::new(SourceIdentifier::try_from("revision-1")?);
-    let provider_dataset = SourceIdentifier::try_from("gdp-2026q1")?;
     let mut chunks = Vec::new();
     chunks.try_reserve_exact(CHUNK_COUNT)?;
     for chunk_ordinal in 0..CHUNK_COUNT {
-        let received_at = Timestamp::from_unix_nanos(
-            300_i64
-                .checked_add(i64::try_from(chunk_ordinal)?)
-                .ok_or("provider macro capture time overflow")?,
-        );
-        let body = Bytes::from(format!("{{\"chunk\":{chunk_ordinal}}}"));
-        let body_digest = EvidenceDigest::new(
-            DigestAlgorithm::Sha256,
-            Sha256::digest(body.as_ref()).into(),
-        );
-        let capture = ProviderCaptureSetReceipt::try_new(
-            source_id.clone(),
-            metadata_revision.clone(),
-            provider_dataset.clone(),
-            digest(u8::try_from(180 + chunk_ordinal)?),
-            ProviderCaptureTerminalDisposition::StandaloneResponse,
-            vec![ProviderCapturePageReceipt::try_new(
-                0,
-                digest(u8::try_from(190 + chunk_ordinal)?),
-                None,
-                None,
-                200,
-                u64::try_from(body.len())?,
-                body_digest,
-                received_at,
-            )?],
-        )?;
-        let capture_material = ProviderCaptureMaterial::try_new(
-            capture,
-            vec![RawCaptureRecord::try_new_live(
-                Uuid::from_u128(10_000 + u128::try_from(chunk_ordinal)? * 2),
-                Arc::from(source_id.as_str()),
-                Uuid::from_u128(10_001 + u128::try_from(chunk_ordinal)? * 2),
-                Some(0),
-                None,
-                DateTime::<Utc>::from_timestamp_nanos(received_at.unix_nanos()),
-                body,
-            )?],
-        )?;
-        let discovery = DiscoveryRequest::try_new(
-            provider_dataset.clone(),
-            Some(Timestamp::from_unix_nanos(90)),
-            NonZeroU16::MIN,
-            Timestamp::from_unix_nanos(1_000),
-        )?;
-        let object = SourceObject::try_new_with_capture_identity(
-            source_id.clone(),
-            metadata_revision.clone(),
-            &discovery,
-            provider_dataset.clone(),
-            SourceIdentifier::try_from("application-json")?,
-            ExactPayloadEvidence::from_content_digest(capture_material.receipt().content_digest()),
-            SourceObjectCaptureIdentity::try_from_capture(capture_material.receipt())?,
-            EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
-            Some(Timestamp::from_unix_nanos(100)),
-            SourceAvailabilityEvidence::Observed {
-                available_at: Timestamp::from_unix_nanos(100),
-                evidence: SourceIdentifier::try_from("fred-release")?,
-            },
-            Some(capture_material.receipt().total_body_bytes()),
-        )?;
-        let request = ExtractionRequest::try_new(
-            object,
-            NonZeroU32::MIN,
-            NonZeroU64::new(1024 * 1024).ok_or("nonzero provider macro byte limit")?,
-            Timestamp::from_unix_nanos(1_000),
-        )?;
-        let payload = serde_json::to_vec(&macro_observation(Some(chunk_ordinal))?)?;
-        let record = ExtractionRecord::try_new(
-            &request,
-            SourceIdentifier::try_from("market-squawk-research-v3")?,
-            ExactPayloadEvidence::from_content_digest(EvidenceDigest::new(
-                DigestAlgorithm::Sha256,
-                Sha256::digest(&payload).into(),
-            )),
-            Timestamp::from_unix_nanos(90),
-            Some(Timestamp::from_unix_nanos(100)),
-            SourceAvailabilityEvidence::Observed {
-                available_at: Timestamp::from_unix_nanos(100),
-                evidence: SourceIdentifier::try_from("fred-release")?,
-            },
-            SourceIdentifier::try_from("revision-1")?,
-            Some(Timestamp::from_unix_nanos(200)),
-            payload.into(),
-        )?;
-        let batch = ExtractionBatch::try_new(&request, vec![record])?
-            .try_bind_provider_capture(capture_material.receipt())?;
-        let (expectation, seal_request) = capture_material.into_whole_seal_parts();
-        let token = expectation
-            .try_rejoin(seal_request.seal(raw_store)?)?
-            .try_into_whole()?;
-        let mut native = ProviderNativeLineageBatchBuilder::try_new(
-            ProviderNativeLineageImplementation::FredAlfredSeriesObservationsV1,
-            &batch,
-        )?;
-        native.try_set_batch_sidecar(&serde_json::json!({
-            "family": "fred_alfred_series_observations",
-            "chunk": chunk_ordinal,
-        }))?;
-        native.try_push(&serde_json::json!({
-            "raw_value": "1234.56",
-            "chunk": chunk_ordinal,
-        }))?;
-        let native = native.finish()?;
-        let sidecar = native
-            .batch_sidecar()
-            .ok_or("provider macro native sidecar is absent")?;
-        let semantics = ProviderMacroPlanSemantics::try_new(
-            SourceIdentifier::try_from("fred-alfred-page-semantics-v1")?,
-            native.schema().fingerprint(),
-            sidecar.semantic_payload_digest(),
-            sidecar.semantic_payload().to_vec().into_boxed_slice(),
-        )?;
-        let binding = SealedProviderCaptureBinding::try_whole(token, batch, native, vec![0])?;
-        let revisions = ExtractionRevisionPlan::try_new_with_native_lineage(vec![
-            ExtractionRevisionEvidence::provider_supplied(
-                b"revision-1",
-                ObservedProviderOrder::try_new(
-                    ResearchTemporalCoordinate::exact(Timestamp::from_unix_nanos(100)),
-                    b"revision-1",
-                )?,
-            )?,
-        ])?;
+        let page = provider_macro_plan_page_fixture(raw_store, chunk_ordinal)?;
         chunks.push(ProviderMacroPlanChunkInput::try_new(
             u16::try_from(chunk_ordinal)?,
             u16::try_from(CHUNK_COUNT)?,
-            digest(u8::try_from(200 + chunk_ordinal)?),
+            page.candidate_digest,
             digest(210),
-            semantics,
-            binding,
-            revisions,
+            page.semantics,
+            page.binding,
+            page.revisions,
         )?);
     }
     Ok(ProviderMacroPlanPublicationInput::try_new(

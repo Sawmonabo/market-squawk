@@ -20,7 +20,7 @@ use crate::{DatasetId, DatasetManifestRef, PublishedObject, Sha256Digest};
 
 pub(crate) const MAX_PROVIDER_MACRO_PLAN_BINDINGS: usize = 4_096;
 pub(crate) const MAX_PROVIDER_MACRO_PLAN_RESPONSES: usize = 1_024;
-pub(crate) const MAX_PROVIDER_MACRO_PLAN_DATA_PAGES: usize = 1_023;
+pub(crate) const MAX_PROVIDER_MACRO_PLAN_DATA_PAGES: usize = 1_024;
 pub(crate) const MAX_PROVIDER_MACRO_PLAN_CHECKPOINT_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_PROVIDER_MACRO_PLAN_SEMANTICS_BYTES: usize = 64 * 1024 * 1024;
 
@@ -40,6 +40,22 @@ const PROVIDER_MACRO_PLAN_REPLAY_GROUP_DOMAIN: &[u8] =
     b"market-squawk/staged-provider-macro-plan/group/v1";
 pub(crate) const PROVIDER_MACRO_PLAN_REPLAY_GROUP_PAGES: usize = 32;
 const PROVIDER_MACRO_PLAN_REPLAY_GROUP_METADATA_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderMacroPlanCompletionKind {
+    CompletionOnly,
+    DataPage,
+}
+
+impl ProviderMacroPlanCompletionKind {
+    fn parse(value: &str) -> Result<Self, CatalogError> {
+        match value {
+            "completion_only" => Ok(Self::CompletionOnly),
+            "data_page" => Ok(Self::DataPage),
+            _ => Err(CatalogError::CorruptCatalog),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderMacroPlanValueKind {
@@ -324,7 +340,7 @@ impl ProviderMacroPlanTerminalInput {
     ) -> Result<Self, CatalogError> {
         require_digest(adapter_completion_digest)?;
         if response_ordinal == 0
-            || usize::from(response_ordinal) > MAX_PROVIDER_MACRO_PLAN_DATA_PAGES
+            || usize::from(response_ordinal) >= MAX_PROVIDER_MACRO_PLAN_RESPONSES
         {
             return Err(CatalogError::InvalidRecord);
         }
@@ -629,6 +645,63 @@ impl ProviderMacroPlanReplayObjectGroup {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderMacroPlanFinalizedGroupEvidence {
+    output_ordinal: u16,
+    first_page_ordinal: u16,
+    page_count: u16,
+    object: ProviderMacroPlanPageObjectEvidence,
+}
+
+impl ProviderMacroPlanFinalizedGroupEvidence {
+    pub(crate) const fn output_ordinal(&self) -> u16 {
+        self.output_ordinal
+    }
+
+    pub(crate) const fn first_page_ordinal(&self) -> u16 {
+        self.first_page_ordinal
+    }
+
+    pub(crate) const fn page_count(&self) -> u16 {
+        self.page_count
+    }
+
+    pub(crate) const fn object(&self) -> &ProviderMacroPlanPageObjectEvidence {
+        &self.object
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderMacroPlanFinalizationProgress {
+    run_id: Uuid,
+    staged: ProviderMacroPlanPublicationCommit,
+    groups: Box<[ProviderMacroPlanFinalizedGroupEvidence]>,
+    next_page_ordinal: u16,
+    finalized_rows: u64,
+}
+
+impl ProviderMacroPlanFinalizationProgress {
+    pub(crate) const fn run_id(&self) -> Uuid {
+        self.run_id
+    }
+
+    pub(crate) const fn staged(&self) -> &ProviderMacroPlanPublicationCommit {
+        &self.staged
+    }
+
+    pub(crate) fn groups(&self) -> &[ProviderMacroPlanFinalizedGroupEvidence] {
+        &self.groups
+    }
+
+    pub(crate) const fn next_page_ordinal(&self) -> u16 {
+        self.next_page_ordinal
+    }
+
+    pub(crate) const fn finalized_rows(&self) -> u64 {
+        self.finalized_rows
+    }
+}
+
 impl Catalog {
     pub(crate) fn begin_provider_macro_plan_session(
         &self,
@@ -718,8 +791,12 @@ impl Catalog {
         expected: ProviderMacroPlanStageCoordinate,
         successor_checkpoint: Box<[u8]>,
         input: ProviderMacroPlanStagedPageInput,
+        adapter_completion_digest: Option<EvidenceDigest>,
     ) -> Result<ProviderMacroPlanStageCoordinate, CatalogError> {
         validate_checkpoint(&successor_checkpoint)?;
+        if let Some(digest) = adapter_completion_digest {
+            require_digest(digest)?;
+        }
         if input.page_ordinal != expected.state_version {
             return Err(CatalogError::ProviderCaptureConflict);
         }
@@ -733,7 +810,9 @@ impl Catalog {
             || input.binding.capture().metadata_revision() != session.key.metadata_revision()
             || input.binding.capture().dataset() != session.key.provider_dataset()
             || usize::from(session.data_page_count) >= MAX_PROVIDER_MACRO_PLAN_BINDINGS
-            || usize::from(session.response_count) >= MAX_PROVIDER_MACRO_PLAN_DATA_PAGES
+            || usize::from(session.response_count) >= MAX_PROVIDER_MACRO_PLAN_RESPONSES
+            || (adapter_completion_digest.is_none()
+                && usize::from(session.response_count) >= MAX_PROVIDER_MACRO_PLAN_RESPONSES - 1)
             || usize::try_from(session.semantics_bytes)
                 .ok()
                 .and_then(|value| value.checked_add(input.semantics.payload.len()))
@@ -781,6 +860,30 @@ impl Catalog {
                 now.unix_nanos(),
             ],
         )?;
+        if let Some(adapter_digest) = adapter_completion_digest {
+            let physical = input.binding.evidence.physical_claims();
+            if physical.len() != 1 {
+                return Err(CatalogError::ProviderCaptureMismatch);
+            }
+            let physical = &physical[0];
+            transaction.execute(
+                "INSERT INTO provider_macro_plan_terminal_completions
+                 (session_id, response_ordinal, completion_kind, adapter_completion_digest,
+                  capture_observation_digest, sealed_capture_receipt_digest, raw_claim_digest,
+                  physical_receipt_digest, completed_at_ns)
+                 VALUES (?1, ?2, 'data_page', ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    expected.session_id.to_string(),
+                    i64::from(input.page_ordinal),
+                    digest_bytes(adapter_digest),
+                    digest_bytes(input.binding.capture_observation_digest()),
+                    digest_bytes(input.binding.evidence.sealed_capture_receipt_digest()),
+                    digest_bytes(physical.raw_claim_digest()),
+                    digest_bytes(physical.claim().physical_receipt_digest()),
+                    now.unix_nanos(),
+                ],
+            )?;
+        }
         let next_version = expected
             .state_version
             .checked_add(1)
@@ -799,7 +902,7 @@ impl Catalog {
              SET state_version=?1, checkpoint_digest=?2, checkpoint_value_id=?3,
                  response_count=response_count+1, data_page_count=data_page_count+1,
                  analytical_row_count=analytical_row_count+?4,
-                 semantics_bytes=semantics_bytes+?5, updated_at_ns=?6
+                 semantics_bytes=semantics_bytes+?5, updated_at_ns=?6, state=?11
              WHERE session_id=?7 AND state='acquiring' AND state_version=?8
                AND checkpoint_digest=?9 AND checkpoint_value_id=?10",
             params![
@@ -813,6 +916,11 @@ impl Catalog {
                 i64::from(expected.state_version),
                 digest_bytes(expected.checkpoint_digest),
                 digest_bytes(session.checkpoint_value_id),
+                if adapter_completion_digest.is_some() {
+                    "complete"
+                } else {
+                    "acquiring"
+                },
             ],
         )?;
         if updated != 1 {
@@ -824,6 +932,9 @@ impl Catalog {
             session.checkpoint_value_id,
             checkpoint_value.value_id,
         )?;
+        if adapter_completion_digest.is_some() {
+            load_completed_session(&transaction, expected.session_id)?;
+        }
         transaction.commit()?;
         Ok(ProviderMacroPlanStageCoordinate {
             session_id: expected.session_id,
@@ -847,6 +958,7 @@ impl Catalog {
         require_exact_acquiring(&session, expected)?;
         let capture = input.completion.capture();
         if session.data_page_count == 0
+            || usize::from(session.response_count) >= MAX_PROVIDER_MACRO_PLAN_RESPONSES
             || input.response_ordinal != session.response_count
             || capture.source_id() != session.key.source_id()
             || capture.metadata_revision() != session.key.metadata_revision()
@@ -858,10 +970,10 @@ impl Catalog {
         retain_provider_macro_plan_completion_capture(&transaction, &input.completion, now)?;
         transaction.execute(
             "INSERT INTO provider_macro_plan_terminal_completions
-             (session_id, response_ordinal, adapter_completion_digest,
+             (session_id, response_ordinal, completion_kind, adapter_completion_digest,
               capture_observation_digest, sealed_capture_receipt_digest, raw_claim_digest,
               physical_receipt_digest, completed_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             VALUES (?1, ?2, 'completion_only', ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 expected.session_id.to_string(),
                 i64::from(input.response_ordinal),
@@ -1037,111 +1149,145 @@ impl Catalog {
         session_id: Uuid,
         first_ordinal: u16,
     ) -> Result<ProviderMacroPlanReplayObjectGroup, CatalogError> {
-        let session = load_completed_session(&self.connection, session_id)?;
-        if first_ordinal >= session.data_page_count {
-            return Err(CatalogError::InvalidRecord);
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT page.page_ordinal, page.candidate_digest, page.binding_digest,
-                    capture.request_set_identity, capture.capture_content_digest,
-                    capture.capture_observation_digest, binding.sealed_capture_receipt_digest,
-                    binding.extraction_content_digest, native.batch_digest,
-                    page.canonical_record_count, page.semantics_schema,
-                    page.semantics_schema_requirement_digest, page.semantics_digest,
-                    page.semantics_payload_digest, page.object_relative_reference,
-                    page.object_content_hash, page.object_size_bytes, page.object_lineage_hash,
-                    page.object_created_at_ns
-             FROM provider_macro_plan_staged_pages AS page
-             JOIN provider_capture_bindings AS binding ON binding.binding_digest=page.binding_digest
-             JOIN provider_raw_observations AS capture
-               ON capture.capture_observation_digest=page.capture_observation_digest
-             JOIN provider_capture_binding_native_lineage AS native
-               ON native.binding_digest=page.binding_digest
-             WHERE page.session_id=?1 AND page.page_ordinal>=?2
-             ORDER BY page.page_ordinal LIMIT ?3",
-        )?;
-        let mut rows = statement.query(params![
-            session_id.to_string(),
-            i64::from(first_ordinal),
-            to_i64(PROVIDER_MACRO_PLAN_REPLAY_GROUP_PAGES + 1)?,
-        ])?;
-        let mut pages = Vec::new();
-        pages
-            .try_reserve_exact(PROVIDER_MACRO_PLAN_REPLAY_GROUP_PAGES)
-            .map_err(|_| CatalogError::Allocation)?;
-        let mut metadata_bytes = 0usize;
-        let mut has_more = false;
-        while let Some(row) = rows.next()? {
-            if pages.len() == PROVIDER_MACRO_PLAN_REPLAY_GROUP_PAGES {
-                has_more = true;
-                break;
-            }
-            let ordinal = parse_u16(row.get(0)?)?;
-            let expected = first_ordinal
-                .checked_add(to_u16(pages.len())?)
-                .ok_or(CatalogError::CorruptCatalog)?;
-            let relative_reference: String = row.get(14)?;
-            metadata_bytes = metadata_bytes
-                .checked_add(relative_reference.len())
-                .and_then(|value| value.checked_add(18 * 32 + 3 * 8))
-                .ok_or(CatalogError::CorruptCatalog)?;
-            if ordinal != expected
-                || metadata_bytes > PROVIDER_MACRO_PLAN_REPLAY_GROUP_METADATA_BYTES
-            {
-                return Err(CatalogError::CorruptCatalog);
-            }
-            let row_count =
-                u64::try_from(row.get::<_, i64>(9)?).map_err(|_| CatalogError::CorruptCatalog)?;
-            let object = ProviderMacroPlanPageObjectEvidence {
-                relative_reference: relative_reference.into_boxed_str(),
-                content_hash: Sha256Digest::new(parse_sha256(&row.get::<_, Vec<u8>>(15)?)?.bytes()),
-                size_bytes: u64::try_from(row.get::<_, i64>(16)?)
-                    .map_err(|_| CatalogError::CorruptCatalog)?,
-                row_count,
-                lineage_digest: parse_sha256(&row.get::<_, Vec<u8>>(17)?)?,
-                created_at: Timestamp::from_unix_nanos(row.get(18)?),
-            };
-            object.published_object()?;
-            let page_identity_digest = replay_page_identity_digest(
-                ordinal,
-                parse_sha256(&row.get::<_, Vec<u8>>(1)?)?,
-                parse_sha256(&row.get::<_, Vec<u8>>(2)?)?,
-                parse_sha256(&row.get::<_, Vec<u8>>(3)?)?,
-                parse_sha256(&row.get::<_, Vec<u8>>(4)?)?,
-                parse_sha256(&row.get::<_, Vec<u8>>(5)?)?,
-                parse_sha256(&row.get::<_, Vec<u8>>(6)?)?,
-                parse_sha256(&row.get::<_, Vec<u8>>(7)?)?,
-                parse_sha256(&row.get::<_, Vec<u8>>(8)?)?,
-                row_count,
-                &row.get::<_, String>(10)?,
-                parse_sha256(&row.get::<_, Vec<u8>>(11)?)?,
-                parse_sha256(&row.get::<_, Vec<u8>>(12)?)?,
-                parse_sha256(&row.get::<_, Vec<u8>>(13)?)?,
-                &object,
-            )?;
-            pages.push(ProviderMacroPlanReplayObjectEvidence {
-                page_ordinal: ordinal,
-                page_identity_digest,
-                object,
-            });
-        }
-        if pages.is_empty() {
-            return Err(CatalogError::CorruptCatalog);
-        }
-        let observed_end = first_ordinal
-            .checked_add(to_u16(pages.len())?)
-            .ok_or(CatalogError::CorruptCatalog)?;
-        let next_ordinal = if has_more { Some(observed_end) } else { None };
-        if observed_end > session.data_page_count
-            || (!has_more && observed_end != session.data_page_count)
-        {
-            return Err(CatalogError::CorruptCatalog);
-        }
-        Ok(ProviderMacroPlanReplayObjectGroup {
+        load_provider_macro_plan_replay_object_group(
+            &self.connection,
+            &load_completed_session(&self.connection, session_id)?,
             first_ordinal,
-            pages: pages.into_boxed_slice(),
-            next_ordinal,
-        })
+        )
+    }
+
+    pub(crate) fn begin_provider_macro_plan_finalization(
+        &self,
+        run_id: Uuid,
+        staged: &ProviderMacroPlanPublicationCommit,
+    ) -> Result<ProviderMacroPlanFinalizationProgress, CatalogError> {
+        let completed = load_completed_session(&self.connection, staged.session.session_id)?;
+        if completed.coordinate != staged.session
+            || completed.publication_digest != staged.publication_digest
+            || load_provider_macro_plan_head(
+                &self.connection,
+                completed.key.analytical_dataset(),
+                completed.key.source_id(),
+                completed.key.provider_dataset(),
+            )? != staged.expected_head
+        {
+            return Err(CatalogError::ProviderCaptureConflict);
+        }
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let now = trusted_catalog_now(&transaction)?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO provider_macro_plan_finalizations
+             (session_id, run_id, publication_digest, predecessor_publication_digest,
+              predecessor_manifest_dataset_id, predecessor_manifest_version,
+              predecessor_checkpoint_version, predecessor_checkpoint_digest, started_at_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                staged.session.session_id.to_string(),
+                run_id.to_string(),
+                digest_bytes(staged.publication_digest),
+                staged
+                    .expected_head
+                    .as_ref()
+                    .map(|head| digest_bytes(head.publication_digest)),
+                staged
+                    .expected_head
+                    .as_ref()
+                    .map(|head| head.manifest_dataset.as_str()),
+                staged
+                    .expected_head
+                    .as_ref()
+                    .map(|head| to_i64(head.manifest_version))
+                    .transpose()?,
+                staged
+                    .expected_head
+                    .as_ref()
+                    .map(|head| i64::from(head.checkpoint_version)),
+                staged
+                    .expected_head
+                    .as_ref()
+                    .map(|head| digest_bytes(head.checkpoint_digest)),
+                now.unix_nanos(),
+            ],
+        )?;
+        transaction.commit()?;
+        let progress = load_provider_macro_plan_finalization_progress(
+            &self.connection,
+            staged.session.session_id,
+        )?;
+        if progress.run_id != run_id || &progress.staged != staged {
+            return Err(CatalogError::ProviderCaptureConflict);
+        }
+        Ok(progress)
+    }
+
+    pub(crate) fn retain_provider_macro_plan_finalized_group(
+        &self,
+        run_id: Uuid,
+        staged: &ProviderMacroPlanPublicationCommit,
+        group: &ProviderMacroPlanReplayObjectGroup,
+        published: &PublishedObject,
+    ) -> Result<ProviderMacroPlanFinalizationProgress, CatalogError> {
+        let progress = load_provider_macro_plan_finalization_progress(
+            &self.connection,
+            staged.session.session_id,
+        )?;
+        if progress.run_id != run_id
+            || &progress.staged != staged
+            || group.first_ordinal != progress.next_page_ordinal
+            || group.pages.is_empty()
+        {
+            return Err(CatalogError::ProviderCaptureConflict);
+        }
+        let exact_group = self.provider_macro_plan_replay_object_group(
+            staged.session.session_id,
+            progress.next_page_ordinal,
+        )?;
+        if &exact_group != group {
+            return Err(CatalogError::ProviderCaptureConflict);
+        }
+        let output_ordinal = to_u16(progress.groups.len())?;
+        let completed = load_completed_session(&self.connection, staged.session.session_id)?;
+        let lineage = group.lineage_digest(
+            staged.publication_digest,
+            completed.key.plan_identity,
+            completed.key.source_generation_digest,
+            usize::from(output_ordinal),
+        )?;
+        let group_rows = group.pages.iter().try_fold(0_u64, |total, page| {
+            total
+                .checked_add(page.object.row_count)
+                .ok_or(CatalogError::InvalidRecord)
+        })?;
+        if published.row_count() != group_rows {
+            return Err(CatalogError::ProviderCaptureMismatch);
+        }
+        let object = ProviderMacroPlanPageObjectEvidence::try_new(published, lineage)?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let now = trusted_catalog_now(&transaction)?;
+        transaction.execute(
+            "INSERT INTO provider_macro_plan_finalized_groups
+             (session_id, output_ordinal, first_page_ordinal, page_count, row_count,
+              object_relative_reference, object_content_hash, object_size_bytes,
+              object_lineage_hash, object_created_at_ns, recorded_at_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                staged.session.session_id.to_string(),
+                i64::from(output_ordinal),
+                i64::from(group.first_ordinal),
+                to_i64(group.pages.len())?,
+                to_i64(group_rows)?,
+                object.relative_reference.as_ref(),
+                object.content_hash.bytes(),
+                to_i64(object.size_bytes)?,
+                digest_bytes(object.lineage_digest),
+                object.created_at.unix_nanos(),
+                now.unix_nanos(),
+            ],
+        )?;
+        transaction.commit()?;
+        load_provider_macro_plan_finalization_progress(&self.connection, staged.session.session_id)
     }
 
     fn provider_macro_plan_storage_chunk_bytes(&self) -> Result<usize, CatalogError> {
@@ -1165,6 +1311,291 @@ struct StoredSession {
     data_page_count: u16,
     analytical_row_count: u64,
     semantics_bytes: u64,
+}
+
+fn load_provider_macro_plan_replay_object_group(
+    connection: &Connection,
+    session: &CompletedProviderMacroPlanSession,
+    first_ordinal: u16,
+) -> Result<ProviderMacroPlanReplayObjectGroup, CatalogError> {
+    let session_id = session.coordinate.session_id;
+    if first_ordinal >= session.data_page_count {
+        return Err(CatalogError::InvalidRecord);
+    }
+    let mut statement = connection.prepare(
+        "SELECT page.page_ordinal, page.candidate_digest, page.binding_digest,
+                capture.request_set_identity, capture.capture_content_digest,
+                capture.capture_observation_digest, binding.sealed_capture_receipt_digest,
+                binding.extraction_content_digest, native.batch_digest,
+                page.canonical_record_count, page.semantics_schema,
+                page.semantics_schema_requirement_digest, page.semantics_digest,
+                page.semantics_payload_digest, page.object_relative_reference,
+                page.object_content_hash, page.object_size_bytes, page.object_lineage_hash,
+                page.object_created_at_ns
+         FROM provider_macro_plan_staged_pages AS page
+         JOIN provider_capture_bindings AS binding ON binding.binding_digest=page.binding_digest
+         JOIN provider_raw_observations AS capture
+           ON capture.capture_observation_digest=page.capture_observation_digest
+         JOIN provider_capture_binding_native_lineage AS native
+           ON native.binding_digest=page.binding_digest
+         WHERE page.session_id=?1 AND page.page_ordinal>=?2
+         ORDER BY page.page_ordinal LIMIT ?3",
+    )?;
+    let mut rows = statement.query(params![
+        session_id.to_string(),
+        i64::from(first_ordinal),
+        to_i64(PROVIDER_MACRO_PLAN_REPLAY_GROUP_PAGES + 1)?,
+    ])?;
+    let mut pages = Vec::new();
+    pages
+        .try_reserve_exact(PROVIDER_MACRO_PLAN_REPLAY_GROUP_PAGES)
+        .map_err(|_| CatalogError::Allocation)?;
+    let mut metadata_bytes = 0usize;
+    let mut has_more = false;
+    while let Some(row) = rows.next()? {
+        if pages.len() == PROVIDER_MACRO_PLAN_REPLAY_GROUP_PAGES {
+            has_more = true;
+            break;
+        }
+        let ordinal = parse_u16(row.get(0)?)?;
+        let expected = first_ordinal
+            .checked_add(to_u16(pages.len())?)
+            .ok_or(CatalogError::CorruptCatalog)?;
+        let relative_reference: String = row.get(14)?;
+        metadata_bytes = metadata_bytes
+            .checked_add(relative_reference.len())
+            .and_then(|value| value.checked_add(18 * 32 + 3 * 8))
+            .ok_or(CatalogError::CorruptCatalog)?;
+        if ordinal != expected || metadata_bytes > PROVIDER_MACRO_PLAN_REPLAY_GROUP_METADATA_BYTES {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let row_count =
+            u64::try_from(row.get::<_, i64>(9)?).map_err(|_| CatalogError::CorruptCatalog)?;
+        let object = ProviderMacroPlanPageObjectEvidence {
+            relative_reference: relative_reference.into_boxed_str(),
+            content_hash: Sha256Digest::new(parse_sha256(&row.get::<_, Vec<u8>>(15)?)?.bytes()),
+            size_bytes: u64::try_from(row.get::<_, i64>(16)?)
+                .map_err(|_| CatalogError::CorruptCatalog)?,
+            row_count,
+            lineage_digest: parse_sha256(&row.get::<_, Vec<u8>>(17)?)?,
+            created_at: Timestamp::from_unix_nanos(row.get(18)?),
+        };
+        object.published_object()?;
+        let page_identity_digest = replay_page_identity_digest(
+            ordinal,
+            parse_sha256(&row.get::<_, Vec<u8>>(1)?)?,
+            parse_sha256(&row.get::<_, Vec<u8>>(2)?)?,
+            parse_sha256(&row.get::<_, Vec<u8>>(3)?)?,
+            parse_sha256(&row.get::<_, Vec<u8>>(4)?)?,
+            parse_sha256(&row.get::<_, Vec<u8>>(5)?)?,
+            parse_sha256(&row.get::<_, Vec<u8>>(6)?)?,
+            parse_sha256(&row.get::<_, Vec<u8>>(7)?)?,
+            parse_sha256(&row.get::<_, Vec<u8>>(8)?)?,
+            row_count,
+            &row.get::<_, String>(10)?,
+            parse_sha256(&row.get::<_, Vec<u8>>(11)?)?,
+            parse_sha256(&row.get::<_, Vec<u8>>(12)?)?,
+            parse_sha256(&row.get::<_, Vec<u8>>(13)?)?,
+            &object,
+        )?;
+        pages.push(ProviderMacroPlanReplayObjectEvidence {
+            page_ordinal: ordinal,
+            page_identity_digest,
+            object,
+        });
+    }
+    if pages.is_empty() {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    let observed_end = first_ordinal
+        .checked_add(to_u16(pages.len())?)
+        .ok_or(CatalogError::CorruptCatalog)?;
+    let next_ordinal = if has_more { Some(observed_end) } else { None };
+    if observed_end > session.data_page_count
+        || (!has_more && observed_end != session.data_page_count)
+    {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    Ok(ProviderMacroPlanReplayObjectGroup {
+        first_ordinal,
+        pages: pages.into_boxed_slice(),
+        next_ordinal,
+    })
+}
+
+fn load_provider_macro_plan_finalization_progress(
+    connection: &Connection,
+    session_id: Uuid,
+) -> Result<ProviderMacroPlanFinalizationProgress, CatalogError> {
+    type HeaderRow = (
+        String,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<Vec<u8>>,
+    );
+    let completed = load_completed_session(connection, session_id)?;
+    let header: HeaderRow = connection
+        .query_row(
+            "SELECT run_id, publication_digest, predecessor_publication_digest,
+                    predecessor_manifest_dataset_id, predecessor_manifest_version,
+                    predecessor_checkpoint_version, predecessor_checkpoint_digest
+             FROM provider_macro_plan_finalizations WHERE session_id=?1",
+            [session_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(CatalogError::ProviderCaptureConflict)?;
+    let run_id = Uuid::parse_str(&header.0).map_err(|_| CatalogError::CorruptCatalog)?;
+    let publication_digest = parse_sha256(&header.1)?;
+    if publication_digest != completed.publication_digest {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    let expected_head = match (&header.2, &header.3, header.4, header.5, &header.6) {
+        (None, None, None, None, None) => None,
+        (
+            Some(publication),
+            Some(dataset),
+            Some(version),
+            Some(checkpoint_version),
+            Some(checkpoint),
+        ) => Some(ProviderMacroPlanPublishedHead {
+            publication_digest: parse_sha256(publication)?,
+            manifest_dataset: DatasetId::try_from(dataset.as_str())
+                .map_err(|_| CatalogError::CorruptCatalog)?,
+            manifest_version: u64::try_from(version).map_err(|_| CatalogError::CorruptCatalog)?,
+            checkpoint_version: parse_u16(checkpoint_version)?,
+            checkpoint_digest: parse_sha256(checkpoint)?,
+        }),
+        _ => return Err(CatalogError::CorruptCatalog),
+    };
+    let staged = ProviderMacroPlanPublicationCommit::try_new(
+        completed.coordinate,
+        publication_digest,
+        expected_head,
+    )?;
+    type GroupRow = (i64, i64, i64, i64, String, Vec<u8>, i64, Vec<u8>, i64);
+    let mut statement = connection.prepare(
+        "SELECT output_ordinal, first_page_ordinal, page_count, row_count,
+                object_relative_reference, object_content_hash, object_size_bytes,
+                object_lineage_hash, object_created_at_ns
+         FROM provider_macro_plan_finalized_groups
+         WHERE session_id=?1 ORDER BY output_ordinal LIMIT 33",
+    )?;
+    let mut rows = statement.query([session_id.to_string()])?;
+    let mut retained: Vec<GroupRow> = Vec::new();
+    retained
+        .try_reserve_exact(
+            MAX_PROVIDER_MACRO_PLAN_DATA_PAGES.div_ceil(PROVIDER_MACRO_PLAN_REPLAY_GROUP_PAGES),
+        )
+        .map_err(|_| CatalogError::Allocation)?;
+    while let Some(row) = rows.next()? {
+        if retained.len()
+            >= MAX_PROVIDER_MACRO_PLAN_DATA_PAGES.div_ceil(PROVIDER_MACRO_PLAN_REPLAY_GROUP_PAGES)
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        retained.push((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+        ));
+    }
+    let maximum_groups =
+        MAX_PROVIDER_MACRO_PLAN_DATA_PAGES.div_ceil(PROVIDER_MACRO_PLAN_REPLAY_GROUP_PAGES);
+    if retained.len() > maximum_groups {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    let retained_count = retained.len();
+    let mut groups = Vec::new();
+    groups
+        .try_reserve_exact(retained_count)
+        .map_err(|_| CatalogError::Allocation)?;
+    let mut next_page_ordinal = 0_u16;
+    let mut finalized_rows = 0_u64;
+    for (index, row) in retained.into_iter().enumerate() {
+        let output_ordinal = parse_u16(row.0)?;
+        let first_page_ordinal = parse_u16(row.1)?;
+        let page_count = parse_u16(row.2)?;
+        let row_count = u64::try_from(row.3).map_err(|_| CatalogError::CorruptCatalog)?;
+        if usize::from(output_ordinal) != index || first_page_ordinal != next_page_ordinal {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        let replay = load_provider_macro_plan_replay_object_group(
+            connection,
+            &completed,
+            first_page_ordinal,
+        )?;
+        let expected_lineage = replay.lineage_digest(
+            publication_digest,
+            completed.key.plan_identity,
+            completed.key.source_generation_digest,
+            index,
+        )?;
+        let expected_rows = replay.pages.iter().try_fold(0_u64, |total, page| {
+            total
+                .checked_add(page.object.row_count)
+                .ok_or(CatalogError::CorruptCatalog)
+        })?;
+        let object = ProviderMacroPlanPageObjectEvidence {
+            relative_reference: row.4.into_boxed_str(),
+            content_hash: Sha256Digest::new(parse_sha256(&row.5)?.bytes()),
+            size_bytes: u64::try_from(row.6).map_err(|_| CatalogError::CorruptCatalog)?,
+            row_count,
+            lineage_digest: parse_sha256(&row.7)?,
+            created_at: Timestamp::from_unix_nanos(row.8),
+        };
+        object.published_object()?;
+        if usize::from(page_count) != replay.pages.len()
+            || row_count != expected_rows
+            || object.lineage_digest != expected_lineage
+            || (replay.next_ordinal.is_none() && index + 1 != retained_count)
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        next_page_ordinal = replay.next_ordinal.unwrap_or(completed.data_page_count);
+        finalized_rows = finalized_rows
+            .checked_add(row_count)
+            .ok_or(CatalogError::CorruptCatalog)?;
+        groups.push(ProviderMacroPlanFinalizedGroupEvidence {
+            output_ordinal,
+            first_page_ordinal,
+            page_count,
+            object,
+        });
+    }
+    if next_page_ordinal > completed.data_page_count
+        || finalized_rows > completed.analytical_row_count
+        || (next_page_ordinal == completed.data_page_count
+            && finalized_rows != completed.analytical_row_count)
+    {
+        return Err(CatalogError::CorruptCatalog);
+    }
+    Ok(ProviderMacroPlanFinalizationProgress {
+        run_id,
+        staged,
+        groups: groups.into_boxed_slice(),
+        next_page_ordinal,
+        finalized_rows,
+    })
 }
 
 fn retire_superseded_checkpoint_value(
@@ -1640,17 +2071,17 @@ fn load_completed_session(
 ) -> Result<CompletedProviderMacroPlanSession, CatalogError> {
     let session = load_session(connection, session_id)?;
     if session.state != "complete"
-        || session.response_count < 2
+        || session.response_count == 0
         || usize::from(session.response_count) > MAX_PROVIDER_MACRO_PLAN_RESPONSES
-        || session.data_page_count + 1 != session.response_count
+        || session.data_page_count == 0
         || session.coordinate.state_version != session.response_count
     {
         return Err(CatalogError::ProviderCaptureConflict);
     }
-    type Terminal = (i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+    type Terminal = (i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, String);
     let terminal: Terminal = connection.query_row(
         "SELECT response_ordinal, adapter_completion_digest, capture_observation_digest,
-                sealed_capture_receipt_digest, raw_claim_digest, physical_receipt_digest
+                sealed_capture_receipt_digest, raw_claim_digest, physical_receipt_digest, completion_kind
          FROM provider_macro_plan_terminal_completions WHERE session_id=?1",
         [session_id.to_string()],
         |row| {
@@ -1661,10 +2092,18 @@ fn load_completed_session(
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
             ))
         },
     )?;
-    if parse_u16(terminal.0)? != session.data_page_count {
+    let completion_kind = ProviderMacroPlanCompletionKind::parse(&terminal.6)?;
+    let expected_data_count = match completion_kind {
+        ProviderMacroPlanCompletionKind::CompletionOnly => session.response_count - 1,
+        ProviderMacroPlanCompletionKind::DataPage => session.response_count,
+    };
+    if parse_u16(terminal.0)? != session.response_count - 1
+        || session.data_page_count != expected_data_count
+    {
         return Err(CatalogError::CorruptCatalog);
     }
     let pages = load_page_identities(connection, session_id)?;
@@ -1689,7 +2128,17 @@ fn load_completed_session(
         [digest_bytes(terminal_capture_observation_digest)],
         |row| row.get(0),
     )?;
+    if completion_kind == ProviderMacroPlanCompletionKind::DataPage {
+        let last = pages.last().ok_or(CatalogError::CorruptCatalog)?;
+        if last.capture_observation_digest != terminal_capture_observation_digest
+            || last.sealed_capture_receipt_digest != terminal_seal_digest
+            || last.capture_request_set_identity != parse_sha256(&terminal_request_set_identity)?
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+    }
     let request_set_identity = request_set_identity(
+        completion_kind,
         &pages,
         parse_sha256(&terminal_request_set_identity)?,
         terminal_capture_observation_digest,
@@ -1721,6 +2170,7 @@ fn load_completed_session(
 }
 
 fn request_set_identity(
+    completion_kind: ProviderMacroPlanCompletionKind,
     pages: &[StoredPageIdentity],
     terminal_request_set_identity: EvidenceDigest,
     terminal_observation_digest: EvidenceDigest,
@@ -1728,6 +2178,10 @@ fn request_set_identity(
 ) -> Result<EvidenceDigest, CatalogError> {
     let mut hash = Sha256::new();
     hash.update(REQUEST_SET_DOMAIN);
+    hash.update([match completion_kind {
+        ProviderMacroPlanCompletionKind::CompletionOnly => 1,
+        ProviderMacroPlanCompletionKind::DataPage => 2,
+    }]);
     hash.update(to_u16(pages.len())?.to_be_bytes());
     for page in pages {
         hash.update(page.ordinal.to_be_bytes());
@@ -1736,10 +2190,12 @@ fn request_set_identity(
         hash.update(page.capture_observation_digest.bytes());
         hash.update(page.sealed_capture_receipt_digest.bytes());
     }
-    hash.update(to_u16(pages.len())?.to_be_bytes());
-    hash.update(terminal_request_set_identity.bytes());
-    hash.update(terminal_observation_digest.bytes());
-    hash.update(terminal_seal_digest.bytes());
+    if completion_kind == ProviderMacroPlanCompletionKind::CompletionOnly {
+        hash.update(to_u16(pages.len())?.to_be_bytes());
+        hash.update(terminal_request_set_identity.bytes());
+        hash.update(terminal_observation_digest.bytes());
+        hash.update(terminal_seal_digest.bytes());
+    }
     Ok(EvidenceDigest::new(
         DigestAlgorithm::Sha256,
         hash.finalize().into(),

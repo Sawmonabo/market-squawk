@@ -5,12 +5,13 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arrow::array::BinaryArray;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
-use market_squawk_domain::Timestamp;
+use market_squawk_domain::{DigestAlgorithm, EvidenceDigest, SourceIdentifier, Timestamp};
 use market_squawk_platform::{ArtifactRoot, PathError};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
@@ -30,8 +31,8 @@ use crate::manifest::{PinnedDataset, PinnedManifestObject, Sha256Digest};
 use crate::publication_coordinator::PublicationLease;
 use crate::query::QueryArtifactMemoryLease;
 use crate::schema::{
-    FEATURE_LABEL_SCHEMA_NAME, FEATURE_LABEL_SCHEMA_VERSION, SCHEMA_NAME_KEY, SCHEMA_VERSION_KEY,
-    decode_hex, encode_hex,
+    FEATURE_LABEL_SCHEMA_NAME, FEATURE_LABEL_SCHEMA_VERSION, REQUEST_DIGEST_KEY, SCHEMA_NAME_KEY,
+    SCHEMA_VERSION_KEY, decode_hex, encode_hex, research_schema,
 };
 
 const OBJECTS: &str = "objects/sha256";
@@ -183,6 +184,7 @@ struct ReplayPublicationAdmission {
     max_decoded_batch_bytes: usize,
     active_writer_bytes: usize,
     metadata_bytes: usize,
+    decoder_metadata_bytes: usize,
     row_groups: usize,
     total_bytes: usize,
 }
@@ -536,6 +538,7 @@ impl ParquetObjectStore {
     pub(crate) async fn publish_replayed_objects_under_lease(
         &self,
         objects: Vec<PublishedObject>,
+        source_dataset: SourceIdentifier,
         target_schema: SchemaRef,
         expected_rows: u64,
         cancellation: &CancellationToken,
@@ -559,6 +562,7 @@ impl ParquetObjectStore {
             let _permit = permit;
             let staged = store.stage_replayed_objects_blocking(
                 &objects,
+                &source_dataset,
                 target_schema,
                 expected_rows,
                 &worker_cancellation,
@@ -828,6 +832,7 @@ impl ParquetObjectStore {
     fn stage_replayed_objects_blocking(
         &self,
         objects: &[PublishedObject],
+        source_dataset: &SourceIdentifier,
         target_schema: SchemaRef,
         expected_rows: u64,
         cancellation: &CancellationToken,
@@ -838,6 +843,7 @@ impl ParquetObjectStore {
         validate_replay_group(objects, expected_rows, self.config.max_staging_bytes)?;
         let admission = self.replay_publication_admission(
             objects,
+            source_dataset,
             &target_schema,
             expected_rows,
             cancellation,
@@ -870,12 +876,8 @@ impl ParquetObjectStore {
                 let _ignored = self.directory.remove_file(&stage);
                 return Err(ParquetStoreError::Cancelled);
             }
-            let (input, metadata) =
-                self.verified_replay_input(object, &target_schema, cancellation)?;
-            if metadata.schema().as_ref() != target_schema.as_ref() {
-                let _ignored = self.directory.remove_file(&stage);
-                return Err(ParquetStoreError::ObjectMetadataMismatch);
-            }
+            let (input, metadata, request_digest) =
+                self.verified_replay_input(object, source_dataset, &target_schema, cancellation)?;
             let mut object_rows = 0_u64;
             for row_group in 0..metadata.metadata().num_row_groups() {
                 let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
@@ -896,12 +898,30 @@ impl ParquetObjectStore {
                         let _ignored = self.directory.remove_file(&stage);
                         return Err(ParquetStoreError::StagingLimitExceeded);
                     }
+                    let row_requests = batch
+                        .column_by_name("request_sha256")
+                        .and_then(|array| array.as_any().downcast_ref::<BinaryArray>())
+                        .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
+                    for row_request in row_requests {
+                        if cancellation.is_cancelled() {
+                            return Err(ParquetStoreError::Cancelled);
+                        }
+                        if row_request != Some(request_digest.as_slice()) {
+                            return Err(ParquetStoreError::ObjectMetadataMismatch);
+                        }
+                    }
                     let normalized =
                         RecordBatch::try_new(Arc::clone(&target_schema), batch.columns().to_vec())?;
-                    writer.flush()?;
+                    if writer
+                        .in_progress_rows()
+                        .checked_add(normalized.num_rows())
+                        .ok_or(ParquetStoreError::SizeOverflow)?
+                        > self.config.max_row_group_rows
+                    {
+                        writer.flush()?;
+                    }
                     validate_replay_peak(&writer, &target_schema, batch_bytes, admission)?;
                     writer.write(&normalized)?;
-                    writer.flush()?;
                     validate_replay_peak(&writer, &target_schema, batch_bytes, admission)?;
                     let rows = u64::try_from(normalized.num_rows())
                         .map_err(|_| ParquetStoreError::SizeOverflow)?;
@@ -926,6 +946,7 @@ impl ParquetObjectStore {
                 ParquetStoreError::ObjectMetadataMismatch
             });
         }
+        writer.flush()?;
         if writer.flushed_row_groups().len() > admission.row_groups
             || replay_writer_retained_bytes(&writer, &target_schema)?
                 > admission
@@ -981,6 +1002,7 @@ impl ParquetObjectStore {
     fn replay_publication_admission(
         &self,
         objects: &[PublishedObject],
+        source_dataset: &SourceIdentifier,
         target_schema: &SchemaRef,
         expected_rows: u64,
         cancellation: &CancellationToken,
@@ -989,8 +1011,12 @@ impl ParquetObjectStore {
         let mut output_row_groups = 0_usize;
         let mut maximum_input_row_groups = 0_usize;
         let mut max_decoded_batch_bytes = 0_usize;
+        let mut active_rows = 0_usize;
+        let mut active_input_bytes = 0_usize;
+        let mut max_writer_input_bytes = 0_usize;
         for object in objects {
-            let (_, metadata) = self.verified_replay_input(object, target_schema, cancellation)?;
+            let (_, metadata, _) =
+                self.verified_replay_input(object, source_dataset, target_schema, cancellation)?;
             let row_groups = metadata.metadata().row_groups();
             if row_groups.is_empty() {
                 return Err(ParquetStoreError::ObjectMetadataMismatch);
@@ -1007,15 +1033,41 @@ impl ParquetObjectStore {
                     .checked_add(rows)
                     .ok_or(ParquetStoreError::SizeOverflow)?;
                 let rows = usize::try_from(rows).map_err(|_| ParquetStoreError::SizeOverflow)?;
-                output_row_groups = output_row_groups
-                    .checked_add(
-                        rows.checked_add(self.config.max_row_group_rows - 1)
-                            .ok_or(ParquetStoreError::SizeOverflow)?
-                            / self.config.max_row_group_rows,
-                    )
-                    .ok_or(ParquetStoreError::SizeOverflow)?;
-                max_decoded_batch_bytes = max_decoded_batch_bytes
-                    .max(replay_row_group_decoded_bytes(row_group, target_schema)?);
+                let batch_bytes = replay_row_group_decoded_bytes(row_group, target_schema)?;
+                max_decoded_batch_bytes = max_decoded_batch_bytes.max(batch_bytes);
+                let mut remaining_rows = rows;
+                while remaining_rows > 0 {
+                    if cancellation.is_cancelled() {
+                        return Err(ParquetStoreError::Cancelled);
+                    }
+                    let batch_rows = remaining_rows.min(self.config.max_row_group_rows);
+                    if active_rows
+                        .checked_add(batch_rows)
+                        .ok_or(ParquetStoreError::SizeOverflow)?
+                        > self.config.max_row_group_rows
+                    {
+                        active_rows = 0;
+                        active_input_bytes = 0;
+                    }
+                    if active_rows == 0 {
+                        output_row_groups = output_row_groups
+                            .checked_add(1)
+                            .ok_or(ParquetStoreError::SizeOverflow)?;
+                    }
+                    active_rows += batch_rows;
+                    // Only the writer accumulates adjacent batches. Each source batch is dropped
+                    // before the next is decoded, and its complete row-group bound is conservative
+                    // even when the reader splits that input row group into smaller batches.
+                    active_input_bytes = active_input_bytes
+                        .checked_add(batch_bytes)
+                        .ok_or(ParquetStoreError::SizeOverflow)?;
+                    max_writer_input_bytes = max_writer_input_bytes.max(active_input_bytes);
+                    if active_rows == self.config.max_row_group_rows {
+                        active_rows = 0;
+                        active_input_bytes = 0;
+                    }
+                    remaining_rows -= batch_rows;
+                }
             }
             if object_rows != object.row_count {
                 return Err(ParquetStoreError::ObjectMetadataMismatch);
@@ -1029,7 +1081,7 @@ impl ParquetObjectStore {
             return Err(ParquetStoreError::ObjectMetadataMismatch);
         }
         let active_writer_bytes =
-            replay_active_writer_bytes(max_decoded_batch_bytes, target_schema.fields().len())?;
+            replay_active_writer_bytes(max_writer_input_bytes, target_schema.fields().len())?;
         let output_metadata_bytes = replay_writer_metadata_bytes(output_row_groups, target_schema)?;
         let decoder_metadata_bytes =
             replay_writer_metadata_bytes(maximum_input_row_groups, target_schema)?;
@@ -1049,6 +1101,7 @@ impl ParquetObjectStore {
             max_decoded_batch_bytes,
             active_writer_bytes,
             metadata_bytes,
+            decoder_metadata_bytes,
             row_groups: output_row_groups,
             total_bytes,
         })
@@ -1057,9 +1110,10 @@ impl ParquetObjectStore {
     fn verified_replay_input(
         &self,
         object: &PublishedObject,
+        source_dataset: &SourceIdentifier,
         target_schema: &SchemaRef,
         cancellation: &CancellationToken,
-    ) -> Result<(File, ArrowReaderMetadata), ParquetStoreError> {
+    ) -> Result<(File, ArrowReaderMetadata, [u8; 32]), ParquetStoreError> {
         if cancellation.is_cancelled() {
             return Err(ParquetStoreError::Cancelled);
         }
@@ -1088,10 +1142,27 @@ impl ParquetObjectStore {
         }
         input.seek(SeekFrom::Start(0))?;
         let reader_metadata = ArrowReaderMetadata::load(&input, Default::default())?;
-        if reader_metadata.schema().as_ref() != target_schema.as_ref() {
+        // The retained object hash binds this exact request metadata. Staged pages retain their
+        // provider dataset and individual request, while the output binds the analytical dataset
+        // and complete publication. Rebind only that metadata, preserving the closed field schema.
+        let request_digest = reader_metadata
+            .schema()
+            .metadata()
+            .get(REQUEST_DIGEST_KEY)
+            .and_then(|value| decode_hex(value))
+            .filter(|digest| *digest != [0; 32])
+            .ok_or(ParquetStoreError::ObjectMetadataMismatch)?;
+        let expected_schema = research_schema(
+            source_dataset,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, request_digest),
+        )
+        .map_err(|_| ParquetStoreError::ObjectMetadataMismatch)?;
+        if reader_metadata.schema().as_ref() != expected_schema.as_ref()
+            || reader_metadata.schema().fields() != target_schema.fields()
+        {
             return Err(ParquetStoreError::ObjectMetadataMismatch);
         }
-        Ok((input, reader_metadata))
+        Ok((input, reader_metadata, request_digest))
     }
 
     fn finalize_staged(
@@ -1697,8 +1768,15 @@ fn replay_row_group_decoded_bytes(
     let cells = rows
         .checked_mul(schema.fields().len())
         .ok_or(ParquetStoreError::SizeOverflow)?;
-    // Staged objects are emitted by the local non-dictionary writer. Two encoded copies plus
-    // offsets, validity, and ArrayRef ownership is a conservative pre-decode Arrow bound.
+    // Staged objects are emitted by the local non-dictionary writer. Two encoded copies cover
+    // data-buffer growth; each cell also reserves offsets and validity. The closed flat schema
+    // uses primitive or byte arrays, each with at most three buffers rounded up to 64 bytes.
+    // ArrayRef ownership alone does not include the retained concrete array headers.
+    let column_overhead = std::mem::size_of::<BinaryArray>()
+        .max(std::mem::size_of::<arrow::array::Decimal128Array>())
+        .checked_add(3 * 64)
+        .and_then(|value| value.checked_add(std::mem::size_of::<arrow::array::ArrayRef>()))
+        .ok_or(ParquetStoreError::SizeOverflow)?;
     encoded
         .checked_mul(2)
         .and_then(|value| {
@@ -1711,7 +1789,7 @@ fn replay_row_group_decoded_bytes(
             schema
                 .fields()
                 .len()
-                .checked_mul(std::mem::size_of::<arrow::array::ArrayRef>())
+                .checked_mul(column_overhead)
                 .and_then(|arrays| value.checked_add(arrays))
         })
         .ok_or(ParquetStoreError::SizeOverflow)
@@ -1777,14 +1855,13 @@ fn validate_replay_peak(
     batch_bytes: usize,
     admission: ReplayPublicationAdmission,
 ) -> Result<(), ParquetStoreError> {
-    let active = replay_active_writer_bytes(batch_bytes, schema.fields().len())?;
     let retained = replay_writer_retained_bytes(writer, schema)?;
     let peak = batch_bytes
-        .checked_add(active)
-        .and_then(|value| value.checked_add(retained))
+        .checked_add(retained)
+        .and_then(|value| value.checked_add(admission.decoder_metadata_bytes))
         .ok_or(ParquetStoreError::SizeOverflow)?;
     if batch_bytes > admission.max_decoded_batch_bytes
-        || active > admission.active_writer_bytes
+        || writer.memory_size() > admission.active_writer_bytes
         || writer.flushed_row_groups().len() > admission.row_groups
         || peak > admission.total_bytes
     {

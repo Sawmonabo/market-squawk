@@ -14,6 +14,7 @@ use market_squawk_domain::{
     MarketDataInstrumentDefinition, SourceId, SourceIdentifier, Timestamp,
 };
 use rusqlite::{Connection, OptionalExtension as _, Row, Transaction, params};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -253,7 +254,8 @@ impl CompanySecurityIdentityRecord {
 }
 
 /// Closed relationship-selection outcome.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CompanySecurityIdentityDisposition {
     /// Exactly one relationship satisfies the query.
     Complete,
@@ -268,7 +270,8 @@ pub enum CompanySecurityIdentityDisposition {
 }
 
 /// Why one latest relationship event did not qualify.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CompanySecurityIdentityExclusionReason {
     NotYetAvailable,
     NotYetEffective,
@@ -299,7 +302,8 @@ impl CompanySecurityIdentityExclusion {
 }
 
 /// Exact coordinates bound into one ordered receipt entry.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompanySecuritySelectionReceiptEntry {
     link_digest: EvidenceDigest,
     event_sequence: u32,
@@ -477,8 +481,27 @@ impl CompanySecuritySelectionReceiptEntry {
 }
 
 /// Canonical point-in-time selection receipt.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CompanySecurityIdentitySelectionReceipt {
+    query_digest: EvidenceDigest,
+    effective_at: Timestamp,
+    knowledge_at: Timestamp,
+    disposition: CompanySecurityIdentityDisposition,
+    ordered_candidates: Box<[CompanySecuritySelectionReceiptEntry]>,
+    ordered_exclusions: Box<
+        [(
+            CompanySecuritySelectionReceiptEntry,
+            CompanySecurityIdentityExclusionReason,
+        )],
+    >,
+    receipt_digest: EvidenceDigest,
+}
+// Value recovery never constructs a catalog selection or a rights capability.
+const MAX_COMPANY_SECURITY_RECEIPT_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredCompanySecuritySelectionReceipt {
     query_digest: EvidenceDigest,
     effective_at: Timestamp,
     knowledge_at: Timestamp,
@@ -494,6 +517,134 @@ pub struct CompanySecurityIdentitySelectionReceipt {
 }
 
 impl CompanySecurityIdentitySelectionReceipt {
+    /// Serializes the complete bounded receipt value, including its existing canonical digest.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, CompanySecurityIdentityCatalogError> {
+        self.validate_value()?;
+        let bytes = serde_json::to_vec(self)?;
+        if bytes.len() > MAX_COMPANY_SECURITY_RECEIPT_BYTES {
+            return Err(CompanySecurityIdentityCatalogError::ResultLimitExceeded);
+        }
+        Ok(bytes)
+    }
+
+    /// Recovers exact receipt values after checking their complete identity and semantics.
+    ///
+    /// This does not reopen catalog authority, select an identity, or issue a research-use permit.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CompanySecurityIdentityCatalogError> {
+        if bytes.is_empty() || bytes.len() > MAX_COMPANY_SECURITY_RECEIPT_BYTES {
+            return Err(CompanySecurityIdentityCatalogError::ResultLimitExceeded);
+        }
+        let stored: StoredCompanySecuritySelectionReceipt = serde_json::from_slice(bytes)?;
+        let receipt = Self {
+            query_digest: stored.query_digest,
+            effective_at: stored.effective_at,
+            knowledge_at: stored.knowledge_at,
+            disposition: stored.disposition,
+            ordered_candidates: stored.ordered_candidates,
+            ordered_exclusions: stored.ordered_exclusions,
+            receipt_digest: stored.receipt_digest,
+        };
+        if receipt.canonical_bytes()? != bytes {
+            return Err(CompanySecurityIdentityCatalogError::CorruptCatalog);
+        }
+        Ok(receipt)
+    }
+
+    fn validate_value(&self) -> Result<(), CompanySecurityIdentityCatalogError> {
+        let candidates = self.ordered_candidates();
+        let exclusions = self.ordered_exclusions();
+        if candidates.len().saturating_add(exclusions.len()) > MAX_COMPANY_SECURITY_SELECTION_ROWS {
+            return Err(CompanySecurityIdentityCatalogError::ResultLimitExceeded);
+        }
+        let digest_matches = |domain| {
+            selection_receipt_digest(
+                domain,
+                self.query_digest,
+                self.effective_at,
+                self.knowledge_at,
+                self.disposition,
+                candidates,
+                exclusions,
+            ) == self.receipt_digest
+        };
+        let instrument_query = digest_matches(INSTRUMENT_COMPANY_SELECTION_RECEIPT_DOMAIN);
+        if !receipt_digest_valid(self.query_digest)
+            || !receipt_digest_valid(self.receipt_digest)
+            || (!instrument_query && !digest_matches(COMPANY_SECURITY_SELECTION_RECEIPT_DOMAIN))
+            || (instrument_query && self.effective_at != self.knowledge_at)
+            || candidates
+                .windows(2)
+                .any(|pair| compare_receipt_keys(&pair[0], &pair[1]) != Ordering::Less)
+            || exclusions
+                .windows(2)
+                .any(|pair| compare_receipt_keys(&pair[0].0, &pair[1].0) != Ordering::Less)
+            || candidates.iter().any(|candidate| {
+                exclusions
+                    .iter()
+                    .any(|(entry, _)| compare_receipt_keys(candidate, entry) == Ordering::Equal)
+            })
+        {
+            return Err(CompanySecurityIdentityCatalogError::CorruptCatalog);
+        }
+        let disposition = selection_disposition(
+            candidates.len(),
+            exclusions.iter().map(|(_, reason)| *reason),
+        );
+        if disposition != self.disposition {
+            return Err(CompanySecurityIdentityCatalogError::CorruptCatalog);
+        }
+        for entry in candidates {
+            validate_receipt_entry(entry, self.effective_at, self.knowledge_at)?;
+            if receipt_early_exclusion(entry, self.effective_at, self.knowledge_at).is_some()
+                || entry.current_company_observation_digest
+                    != Some(entry.linked_company_observation_digest)
+                || entry.current_market_revision_digest != Some(entry.linked_market_revision_digest)
+                || (instrument_query
+                    && entry.common_equity_suitability
+                        != CommonEquitySuitability::SuitableIssuerCommonEquity)
+            {
+                return Err(CompanySecurityIdentityCatalogError::CorruptCatalog);
+            }
+        }
+        for (entry, reason) in exclusions {
+            validate_receipt_entry(entry, self.effective_at, self.knowledge_at)?;
+            let early = receipt_early_exclusion(entry, self.effective_at, self.knowledge_at);
+            let valid = match reason {
+                CompanySecurityIdentityExclusionReason::NotYetAvailable
+                | CompanySecurityIdentityExclusionReason::NotYetEffective
+                | CompanySecurityIdentityExclusionReason::NoLongerEffective => {
+                    early == Some(*reason)
+                }
+                CompanySecurityIdentityExclusionReason::NotSuitableCommonEquity => {
+                    early.is_none()
+                        && entry.common_equity_suitability == CommonEquitySuitability::NotSuitable
+                }
+                CompanySecurityIdentityExclusionReason::AmbiguousCompanyParent => {
+                    early.is_none() && entry.current_company_observation_digest.is_none()
+                }
+                CompanySecurityIdentityExclusionReason::StaleCompanyParent => {
+                    early.is_none()
+                        && entry.current_company_observation_digest
+                            != Some(entry.linked_company_observation_digest)
+                }
+                CompanySecurityIdentityExclusionReason::StaleMarketInstrumentParent => {
+                    early.is_none()
+                        && entry.current_company_observation_digest
+                            == Some(entry.linked_company_observation_digest)
+                        && entry.current_market_revision_digest
+                            != Some(entry.linked_market_revision_digest)
+                }
+                CompanySecurityIdentityExclusionReason::Revoked => {
+                    early.is_none() && entry.previous_link_digest.is_some()
+                }
+            };
+            if !valid {
+                return Err(CompanySecurityIdentityCatalogError::CorruptCatalog);
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the exact query identity.
     pub const fn query_digest(&self) -> EvidenceDigest {
         self.query_digest
@@ -559,24 +710,24 @@ impl CompanySecurityIdentitySelection {
 
 /// Exact classification scheme admitted by the current cohort authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum IndustryClassificationScheme {
+pub enum IndustryClassificationScheme {
     /// United States Securities and Exchange Commission SIC classification.
     SecSic,
 }
 
 /// Exact interpretation revision for an admitted classification scheme.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum IndustryClassificationVersion {
+pub enum IndustryClassificationVersion {
     /// Current SEC-reported SIC field grammar retained by Market Squawk V1.
     SecSicCurrentV1,
 }
 
 /// Canonical code under one exact classification scheme/version.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct IndustryClassificationCode(String);
+pub struct IndustryClassificationCode(String);
 
 impl IndustryClassificationCode {
-    pub(crate) fn try_new(
+    pub fn try_new(
         scheme: IndustryClassificationScheme,
         version: IndustryClassificationVersion,
         value: &str,
@@ -590,14 +741,14 @@ impl IndustryClassificationCode {
         Ok(Self(value.to_owned()))
     }
 
-    pub(crate) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
 /// Closed point-in-time result for one exact company classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum IndustryClassificationDisposition {
+pub enum IndustryClassificationDisposition {
     Complete,
     Unavailable,
     Conflict,
@@ -607,7 +758,7 @@ pub(crate) enum IndustryClassificationDisposition {
 
 /// Why an exact classification observation or cohort member did not qualify.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum IndustryClassificationExclusionReason {
+pub enum IndustryClassificationExclusionReason {
     ObservationUnavailable,
     NotYetAvailable,
     MissingCode,
@@ -619,7 +770,7 @@ pub(crate) enum IndustryClassificationExclusionReason {
 
 /// Exact, source-qualified SEC SIC classification selected at a knowledge cutoff.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct IndustryClassificationRecord {
+pub struct IndustryClassificationRecord {
     scheme: IndustryClassificationScheme,
     version: IndustryClassificationVersion,
     code: IndustryClassificationCode,
@@ -639,59 +790,59 @@ pub(crate) struct IndustryClassificationRecord {
 }
 
 impl IndustryClassificationRecord {
-    pub(crate) const fn scheme(&self) -> IndustryClassificationScheme {
+    pub const fn scheme(&self) -> IndustryClassificationScheme {
         self.scheme
     }
-    pub(crate) const fn version(&self) -> IndustryClassificationVersion {
+    pub const fn version(&self) -> IndustryClassificationVersion {
         self.version
     }
-    pub(crate) const fn code(&self) -> &IndustryClassificationCode {
+    pub const fn code(&self) -> &IndustryClassificationCode {
         &self.code
     }
-    pub(crate) fn source_description(&self) -> Option<&str> {
+    pub fn source_description(&self) -> Option<&str> {
         self.source_description.as_deref()
     }
-    pub(crate) const fn company_source_id(&self) -> &SourceId {
+    pub const fn company_source_id(&self) -> &SourceId {
         &self.company_source_id
     }
-    pub(crate) const fn provider_company_id(&self) -> &SourceIdentifier {
+    pub const fn provider_company_id(&self) -> &SourceIdentifier {
         &self.provider_company_id
     }
-    pub(crate) const fn company_surface(&self) -> CompanyIdentitySurface {
+    pub const fn company_surface(&self) -> CompanyIdentitySurface {
         self.company_surface
     }
-    pub(crate) const fn company_observation_digest(&self) -> EvidenceDigest {
+    pub const fn company_observation_digest(&self) -> EvidenceDigest {
         self.company_observation_digest
     }
-    pub(crate) const fn classification_evidence_digest(&self) -> EvidenceDigest {
+    pub const fn classification_evidence_digest(&self) -> EvidenceDigest {
         self.classification_evidence_digest
     }
-    pub(crate) const fn parent_ingest_evidence_digest(&self) -> EvidenceDigest {
+    pub const fn parent_ingest_evidence_digest(&self) -> EvidenceDigest {
         self.parent_ingest_evidence_digest
     }
-    pub(crate) const fn source_record_reference(&self) -> Option<&SourceIdentifier> {
+    pub const fn source_record_reference(&self) -> Option<&SourceIdentifier> {
         self.source_record_reference.as_ref()
     }
-    pub(crate) const fn source_record_version(&self) -> Option<&SourceIdentifier> {
+    pub const fn source_record_version(&self) -> Option<&SourceIdentifier> {
         self.source_record_version.as_ref()
     }
-    pub(crate) const fn effective_at(&self) -> Timestamp {
+    pub const fn effective_at(&self) -> Timestamp {
         self.effective_at
     }
-    pub(crate) const fn available_at(&self) -> Timestamp {
+    pub const fn available_at(&self) -> Timestamp {
         self.available_at
     }
-    pub(crate) const fn ingested_at(&self) -> Timestamp {
+    pub const fn ingested_at(&self) -> Timestamp {
         self.ingested_at
     }
-    pub(crate) const fn published_at(&self) -> Timestamp {
+    pub const fn published_at(&self) -> Timestamp {
         self.published_at
     }
 }
 
 /// Complete evidence coordinates bound into a classification/cohort receipt.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct IndustryClassificationReceiptEntry {
+pub struct IndustryClassificationReceiptEntry {
     company_observation_digest: EvidenceDigest,
     current_company_observation_digest: Option<EvidenceDigest>,
     company_source_id: SourceId,
@@ -715,7 +866,7 @@ pub(crate) struct IndustryClassificationReceiptEntry {
 
 /// Canonical receipt for one exact company-classification query.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct IndustryClassificationSelectionReceipt {
+pub struct IndustryClassificationSelectionReceipt {
     query_digest: EvidenceDigest,
     knowledge_at: Timestamp,
     disposition: IndustryClassificationDisposition,
@@ -725,63 +876,63 @@ pub(crate) struct IndustryClassificationSelectionReceipt {
 }
 
 impl IndustryClassificationSelectionReceipt {
-    pub(crate) const fn query_digest(&self) -> EvidenceDigest {
+    pub const fn query_digest(&self) -> EvidenceDigest {
         self.query_digest
     }
-    pub(crate) const fn knowledge_at(&self) -> Timestamp {
+    pub const fn knowledge_at(&self) -> Timestamp {
         self.knowledge_at
     }
-    pub(crate) const fn disposition(&self) -> IndustryClassificationDisposition {
+    pub const fn disposition(&self) -> IndustryClassificationDisposition {
         self.disposition
     }
-    pub(crate) const fn considered(&self) -> Option<&IndustryClassificationReceiptEntry> {
+    pub const fn considered(&self) -> Option<&IndustryClassificationReceiptEntry> {
         self.considered.as_ref()
     }
-    pub(crate) const fn exclusion_reason(&self) -> Option<IndustryClassificationExclusionReason> {
+    pub const fn exclusion_reason(&self) -> Option<IndustryClassificationExclusionReason> {
         self.exclusion_reason
     }
-    pub(crate) const fn receipt_digest(&self) -> EvidenceDigest {
+    pub const fn receipt_digest(&self) -> EvidenceDigest {
         self.receipt_digest
     }
 }
 
 /// Exact closed selection for one company observation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct IndustryClassificationSelection {
+pub struct IndustryClassificationSelection {
     disposition: IndustryClassificationDisposition,
     classification: Option<IndustryClassificationRecord>,
     receipt: IndustryClassificationSelectionReceipt,
 }
 
 impl IndustryClassificationSelection {
-    pub(crate) const fn disposition(&self) -> IndustryClassificationDisposition {
+    pub const fn disposition(&self) -> IndustryClassificationDisposition {
         self.disposition
     }
-    pub(crate) const fn classification(&self) -> Option<&IndustryClassificationRecord> {
+    pub const fn classification(&self) -> Option<&IndustryClassificationRecord> {
         self.classification.as_ref()
     }
-    pub(crate) const fn receipt(&self) -> &IndustryClassificationSelectionReceipt {
+    pub const fn receipt(&self) -> &IndustryClassificationSelectionReceipt {
         &self.receipt
     }
 }
 
 /// Whether one bounded cohort receipt covers every exact matching observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum IndustryCohortCompleteness {
+pub enum IndustryCohortCompleteness {
     Complete,
     Truncated,
 }
 
 /// One non-member observation retained with a fail-closed reason.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct IndustryCohortExclusion {
+pub struct IndustryCohortExclusion {
     entry: IndustryClassificationReceiptEntry,
     reason: IndustryClassificationExclusionReason,
 }
 
 /// Canonical bounded reverse-membership receipt.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct IndustryCohortSelectionReceipt {
+pub struct IndustryCohortSelectionReceipt {
     query_digest: EvidenceDigest,
     knowledge_at: Timestamp,
     completeness: IndustryCohortCompleteness,
@@ -795,59 +946,59 @@ pub(crate) struct IndustryCohortSelectionReceipt {
 
 /// Bounded exact members of one SEC SIC cohort at a knowledge cutoff.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct IndustryCohortSelection {
+pub struct IndustryCohortSelection {
     members: Box<[IndustryClassificationRecord]>,
     exclusions: Box<[IndustryCohortExclusion]>,
     receipt: IndustryCohortSelectionReceipt,
 }
 
 impl IndustryCohortSelection {
-    pub(crate) fn members(&self) -> &[IndustryClassificationRecord] {
+    pub fn members(&self) -> &[IndustryClassificationRecord] {
         &self.members
     }
-    pub(crate) fn exclusions(&self) -> &[IndustryCohortExclusion] {
+    pub fn exclusions(&self) -> &[IndustryCohortExclusion] {
         &self.exclusions
     }
-    pub(crate) const fn receipt(&self) -> &IndustryCohortSelectionReceipt {
+    pub const fn receipt(&self) -> &IndustryCohortSelectionReceipt {
         &self.receipt
     }
 }
 
 impl IndustryCohortExclusion {
-    pub(crate) const fn entry(&self) -> &IndustryClassificationReceiptEntry {
+    pub const fn entry(&self) -> &IndustryClassificationReceiptEntry {
         &self.entry
     }
-    pub(crate) const fn reason(&self) -> IndustryClassificationExclusionReason {
+    pub const fn reason(&self) -> IndustryClassificationExclusionReason {
         self.reason
     }
 }
 
 impl IndustryCohortSelectionReceipt {
-    pub(crate) const fn query_digest(&self) -> EvidenceDigest {
+    pub const fn query_digest(&self) -> EvidenceDigest {
         self.query_digest
     }
-    pub(crate) const fn knowledge_at(&self) -> Timestamp {
+    pub const fn knowledge_at(&self) -> Timestamp {
         self.knowledge_at
     }
-    pub(crate) const fn completeness(&self) -> IndustryCohortCompleteness {
+    pub const fn completeness(&self) -> IndustryCohortCompleteness {
         self.completeness
     }
-    pub(crate) const fn scan_truncated(&self) -> bool {
+    pub const fn scan_truncated(&self) -> bool {
         self.scan_truncated
     }
-    pub(crate) const fn member_limit_truncated(&self) -> bool {
+    pub const fn member_limit_truncated(&self) -> bool {
         self.member_limit_truncated
     }
-    pub(crate) const fn scan_boundary_digest(&self) -> Option<EvidenceDigest> {
+    pub const fn scan_boundary_digest(&self) -> Option<EvidenceDigest> {
         self.scan_boundary_digest
     }
-    pub(crate) fn ordered_members(&self) -> &[IndustryClassificationReceiptEntry] {
+    pub fn ordered_members(&self) -> &[IndustryClassificationReceiptEntry] {
         &self.ordered_members
     }
-    pub(crate) fn ordered_exclusions(&self) -> &[IndustryCohortExclusion] {
+    pub fn ordered_exclusions(&self) -> &[IndustryCohortExclusion] {
         &self.ordered_exclusions
     }
-    pub(crate) const fn receipt_digest(&self) -> EvidenceDigest {
+    pub const fn receipt_digest(&self) -> EvidenceDigest {
         self.receipt_digest
     }
 }
@@ -1031,7 +1182,7 @@ impl CompanySecurityIdentityReadCapability {
     ///
     /// This grants classification/cohort identity only. It grants no valuation, model, filing,
     /// market-data, redistribution, or execution right.
-    pub(crate) fn industry_classification_as_of(
+    pub fn industry_classification_as_of(
         &self,
         company_observation_digest: EvidenceDigest,
         company_source_id: &SourceId,
@@ -1059,7 +1210,7 @@ impl CompanySecurityIdentityReadCapability {
     }
 
     /// Selects a bounded exact SEC SIC reverse-membership cohort at a caller cutoff.
-    pub(crate) fn industry_cohort_as_of(
+    pub fn industry_cohort_as_of(
         &self,
         company_source_id: &SourceId,
         company_surface: CompanyIdentitySurface,
@@ -2448,29 +2599,10 @@ fn finish_selection(
     {
         return Err(CompanySecurityIdentityCatalogError::CorruptCatalog);
     }
-    let ambiguous_parent = exclusions.iter().any(|value| {
-        value.reason() == CompanySecurityIdentityExclusionReason::AmbiguousCompanyParent
-    });
-    let disposition = if candidates.len() > 1 || ambiguous_parent {
-        CompanySecurityIdentityDisposition::Conflict
-    } else if candidates.len() == 1 {
-        CompanySecurityIdentityDisposition::Complete
-    } else if exclusions.iter().any(|value| {
-        matches!(
-            value.reason(),
-            CompanySecurityIdentityExclusionReason::StaleCompanyParent
-                | CompanySecurityIdentityExclusionReason::StaleMarketInstrumentParent
-        )
-    }) {
-        CompanySecurityIdentityDisposition::Stale
-    } else if exclusions
-        .iter()
-        .any(|value| value.reason() == CompanySecurityIdentityExclusionReason::Revoked)
-    {
-        CompanySecurityIdentityDisposition::Revoked
-    } else {
-        CompanySecurityIdentityDisposition::Unavailable
-    };
+    let disposition = selection_disposition(
+        candidates.len(),
+        exclusions.iter().map(|value| value.reason()),
+    );
     let receipt_digest = selection_receipt_digest(
         receipt_domain,
         query_digest,
@@ -2495,6 +2627,168 @@ fn finish_selection(
         exclusions: exclusions.into_boxed_slice(),
         receipt,
     })
+}
+
+fn selection_disposition(
+    candidate_count: usize,
+    reasons: impl Iterator<Item = CompanySecurityIdentityExclusionReason> + Clone,
+) -> CompanySecurityIdentityDisposition {
+    use CompanySecurityIdentityExclusionReason as Reason;
+    if candidate_count > 1
+        || reasons
+            .clone()
+            .any(|reason| reason == Reason::AmbiguousCompanyParent)
+    {
+        CompanySecurityIdentityDisposition::Conflict
+    } else if candidate_count == 1 {
+        CompanySecurityIdentityDisposition::Complete
+    } else if reasons.clone().any(|reason| {
+        matches!(
+            reason,
+            Reason::StaleCompanyParent | Reason::StaleMarketInstrumentParent
+        )
+    }) {
+        CompanySecurityIdentityDisposition::Stale
+    } else if reasons.clone().any(|reason| reason == Reason::Revoked) {
+        CompanySecurityIdentityDisposition::Revoked
+    } else {
+        CompanySecurityIdentityDisposition::Unavailable
+    }
+}
+
+fn receipt_digest_valid(digest: EvidenceDigest) -> bool {
+    digest.algorithm() == DigestAlgorithm::Sha256 && digest.bytes() != [0; 32]
+}
+
+fn compare_receipt_keys(
+    left: &CompanySecuritySelectionReceiptEntry,
+    right: &CompanySecuritySelectionReceiptEntry,
+) -> Ordering {
+    left.company_source_id
+        .cmp(&right.company_source_id)
+        .then_with(|| left.provider_company_id.cmp(&right.provider_company_id))
+        .then_with(|| {
+            company_surface_tag(left.company_surface)
+                .cmp(&company_surface_tag(right.company_surface))
+        })
+        .then_with(|| left.instrument_id.cmp(&right.instrument_id))
+}
+
+fn validate_receipt_entry(
+    entry: &CompanySecuritySelectionReceiptEntry,
+    effective_at: Timestamp,
+    knowledge_at: Timestamp,
+) -> Result<(), CompanySecurityIdentityCatalogError> {
+    let valid_optional_digest =
+        |digest: Option<EvidenceDigest>| digest.is_none_or(receipt_digest_valid);
+    let direct_common = entry.security_kind == CompanySecurityKind::CommonEquity
+        && entry.relationship_kind == CompanySecurityRelationshipKind::Issuer;
+    let company_present = entry.current_company_observation_digest.is_some();
+    let market_present = entry.current_market_revision_digest.is_some();
+    if !receipt_digest_valid(entry.link_digest)
+        || !receipt_digest_valid(entry.linked_company_observation_digest)
+        || !receipt_digest_valid(entry.linked_market_revision_digest)
+        || !valid_optional_digest(entry.previous_link_digest)
+        || !valid_optional_digest(entry.current_company_observation_digest)
+        || !valid_optional_digest(entry.current_market_revision_digest)
+        || !(1..=MAX_LINK_EVENTS_PER_RELATIONSHIP as u32).contains(&entry.event_sequence)
+        || (entry.event_sequence == 1) != entry.previous_link_digest.is_none()
+        || entry.instrument_id.as_uuid().is_nil()
+        || (entry.common_equity_suitability == CommonEquitySuitability::SuitableIssuerCommonEquity)
+            != direct_common
+        || entry.rights_entitlement == IdentifierEntitlement::UnknownOrRestricted
+        || entry.company_ingested_at > entry.company_completed_at
+        || entry
+            .company_available_at
+            .is_some_and(|time| time > entry.company_ingested_at)
+        || entry.link_available_at > entry.link_ingested_at
+        || entry.link_ingested_at > entry.link_published_at
+        || entry
+            .effective_end
+            .is_some_and(|end| end <= entry.effective_start)
+        || entry
+            .market_effective_end
+            .is_some_and(|end| end <= entry.market_effective_start)
+        || entry.effective_start < entry.market_effective_start
+        || entry.market_effective_end.is_some_and(|end| {
+            entry
+                .effective_end
+                .is_none_or(|relationship_end| relationship_end > end)
+        })
+        || company_present != entry.current_company_ingested_at.is_some()
+        || company_present != entry.current_company_completed_at.is_some()
+        || company_present != entry.current_company_available_at.is_some()
+        || entry
+            .current_company_ingested_at
+            .zip(entry.current_company_completed_at)
+            .is_some_and(|(ingested, completed)| ingested > completed)
+        || entry
+            .current_company_available_at
+            .zip(entry.current_company_ingested_at)
+            .is_some_and(|(available, ingested)| available > ingested)
+        || entry
+            .current_company_available_at
+            .is_some_and(|time| time > knowledge_at)
+        || entry
+            .current_company_ingested_at
+            .is_some_and(|time| time > knowledge_at)
+        || entry
+            .current_company_completed_at
+            .is_some_and(|time| time > knowledge_at)
+        || entry
+            .current_market_published_at
+            .is_some_and(|time| time > knowledge_at)
+        || entry
+            .current_market_effective_start
+            .is_some_and(|time| time > effective_at)
+        || entry
+            .current_market_effective_end
+            .is_some_and(|time| time <= effective_at)
+        || market_present != entry.current_market_published_at.is_some()
+        || market_present != entry.current_market_effective_start.is_some()
+        || (!market_present && entry.current_market_effective_end.is_some())
+        || entry
+            .current_market_effective_start
+            .zip(entry.current_market_effective_end)
+            .is_some_and(|(start, end)| end <= start)
+        || (entry.current_company_observation_digest
+            == Some(entry.linked_company_observation_digest)
+            && (entry.current_company_available_at != entry.company_available_at
+                || entry.current_company_ingested_at != Some(entry.company_ingested_at)
+                || entry.current_company_completed_at != Some(entry.company_completed_at)))
+        || (entry.current_market_revision_digest == Some(entry.linked_market_revision_digest)
+            && (entry.current_market_published_at != Some(entry.market_published_at)
+                || entry.current_market_effective_start != Some(entry.market_effective_start)
+                || entry.current_market_effective_end != entry.market_effective_end))
+    {
+        return Err(CompanySecurityIdentityCatalogError::CorruptCatalog);
+    }
+    Ok(())
+}
+
+fn receipt_early_exclusion(
+    entry: &CompanySecuritySelectionReceiptEntry,
+    effective_at: Timestamp,
+    knowledge_at: Timestamp,
+) -> Option<CompanySecurityIdentityExclusionReason> {
+    if entry.link_available_at > knowledge_at
+        || entry.link_ingested_at > knowledge_at
+        || entry.link_published_at > knowledge_at
+        || entry
+            .company_available_at
+            .is_none_or(|time| time > knowledge_at)
+        || entry.company_ingested_at > knowledge_at
+        || entry.company_completed_at > knowledge_at
+        || entry.market_published_at > knowledge_at
+    {
+        Some(CompanySecurityIdentityExclusionReason::NotYetAvailable)
+    } else if entry.effective_start > effective_at {
+        Some(CompanySecurityIdentityExclusionReason::NotYetEffective)
+    } else if entry.effective_end.is_some_and(|end| end <= effective_at) {
+        Some(CompanySecurityIdentityExclusionReason::NoLongerEffective)
+    } else {
+        None
+    }
 }
 
 fn compare_relationship_records(
