@@ -28,8 +28,8 @@ pub(crate) use self::catalog::{
     propagate_generation_provider_publication_bindings,
 };
 pub use self::fund_nav::{
-    CanonicalFundNavReadRequest, CanonicalFundNavSelection, FundNavPublicationReceipt,
-    FundNavSelectionPolicy,
+    CanonicalFundNavReadRequest, CanonicalFundNavSelection, FundNavDateSelection,
+    FundNavPublicationReceipt, FundNavSelectionPolicy,
 };
 pub(crate) use self::fund_nav::{
     FundNavPublicationCandidate, propagate_generation_fund_nav_inputs,

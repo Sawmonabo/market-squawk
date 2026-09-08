@@ -1,12 +1,44 @@
 # Market Squawk Delivery Ledger
 
-Last updated: 2026-08-31
+Last updated: 2026-09-07
 
 This is the compact operational handoff required by
 [`project-memory.md`](../project-memory.md). It records integrated work and exact verification
 evidence; it does not replace the README capability truth or the canonical release plan.
 
-## Current execution handoff — 2026-08-31
+## Current execution handoff — 2026-09-07
+
+The owner resumed the full V1 owner-test goal after the accepted recovery audit. The independent
+backup verified 57/57 checksums at resumption and remains preserved. The dependency and exclusive
+file ownership wave is retained in `.agents/tmp/resume-2026-09-07/wave-1.md`. No main/release merge,
+public release, brokerage execution, or routine CI/CD is authorized by this implementation wave.
+
+- Canonical Fund NAV publication/recovery checkpoint
+  `a41aa6ba85195d776252b132b7991c0993b3a730` is pushed on
+  `feature/v1-installed-product-experience` and reported on PR #43. It reconciles the interrupted
+  atomic publication, schema hash, extraction-record binding and immutable selection. Existing
+  data library compilation and the single existing NAV recovery case passed before commit.
+- The next shared data delta adds current-date NAV selection without reading older Parquet rows,
+  preserves cancellation/deadline/limit errors, and reads an exact selected provider definition at
+  its original cutoffs. The existing catalog identity/restart case and NAV publication/recovery
+  case each passed 1/1 before commit. These are scoped implementation checks, not clean whole-app
+  or release approval. Fund product consumer wiring is prepared; neutral dispatch remains open.
+- Census's row-scope correction passed its existing critical parser case and application test
+  compilation. The bounded live attempt made four requests (three successful) and stopped during
+  variables metadata acquisition with a transport-class failure whose cause was not retained.
+  No QWI publication or restart proof occurred; no retry ran. Its durable live acceptance is open.
+- Desktop profile/transport/brief work passed the pinned TypeScript check. Native orchestration,
+  actual component policy validation, calibrated forecast production, realistic historical
+  backtest evidence, valuation, persisted decision production and complete default/Advanced
+  journeys are still being integrated. Provider leaves continue concurrently; adapter reports
+  and focused checks do not establish complete product workflows.
+- Quarter 4 remediation and the unchanged final owner-test/package/installed-restart/resource
+  gate remain open. Measure the complete installed process tree against 500,000,000 bytes under
+  heavy use with all capabilities retained; feasibility remains unproven. No hardware increase
+  or feature reduction has been approved. Preserve active/unique WIP; clean only after verified
+  integration and push establish preservation.
+
+## Historical execution handoff — 2026-08-31
 
 This section supersedes the 2026-08-30 active-state summary below. Historical release and audit
 records remain unchanged as locators.

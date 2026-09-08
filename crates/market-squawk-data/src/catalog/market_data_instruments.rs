@@ -817,6 +817,24 @@ impl MarketDataInstrumentReadCapability {
         ))
     }
 
+    /// Reads the immutable definition established by an exact provider selection.
+    ///
+    /// Reproduces the original source-qualified query and both cutoffs before returning the
+    /// digest-verified definition. A newer definition never substitutes for the selected revision.
+    pub fn read_selected_provider_definition(
+        &self,
+        selection: &MarketDataProviderIdentitySelection,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataInstrumentRecord, MarketDataInstrumentCatalogError> {
+        check_operation(deadline, cancellation)?;
+        selection.verify_integrity()?;
+        self.authority
+            .try_lock()
+            .map_err(|_| MarketDataInstrumentCatalogError::AuthorityUnavailable)?
+            .read_selected_provider_definition(selection, deadline, cancellation)
+    }
+
     /// Replays a source-qualified provider identity read and rejects any evidence/currentness
     /// drift after process restart.
     pub fn verify_provider_identity_restart(
@@ -1283,6 +1301,52 @@ impl CatalogAuthority {
                 outcome,
                 receipt_digest,
             })
+        })();
+        clear_progress_handler(connection)?;
+        classify_operation(result, deadline, cancellation)
+    }
+
+    fn read_selected_provider_definition(
+        &self,
+        selection: &MarketDataProviderIdentitySelection,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketDataInstrumentRecord, MarketDataInstrumentCatalogError> {
+        let replay = self.resolve_market_data_provider_identity(
+            selection.query().clone(),
+            deadline,
+            cancellation,
+        )?;
+        if replay != selection.resolution {
+            return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
+        }
+        let exact = selection.exact_receipt()?;
+        let connection = &self.catalog().connection;
+        install_progress_handler(connection, deadline, cancellation)?;
+        let result = (|| {
+            check_operation(deadline, cancellation)?;
+            let row = connection
+                .query_row(
+                    &format!(
+                        "SELECT {STORED_COLUMNS}
+                         FROM market_data_instrument_revisions AS revisions
+                         WHERE revisions.revision_digest=?1"
+                    ),
+                    [exact.definition_revision_digest().bytes()],
+                    decode_stored_row,
+                )
+                .optional()?
+                .ok_or(MarketDataInstrumentCatalogError::CorruptCatalog)?;
+            charge_row(&row, &mut ResultBudget::new(self.catalog().result_bytes))?;
+            let record = rebuild_record(row)?;
+            if record.definition().instrument_id() != exact.instrument_id()
+                || record.revision_digest() != exact.definition_revision_digest()
+                || record.revision_sequence() != exact.definition_revision_sequence()
+                || record.published_at() != exact.definition_published_at()
+            {
+                return Err(MarketDataInstrumentCatalogError::CorruptCatalog);
+            }
+            Ok(record)
         })();
         clear_progress_handler(connection)?;
         classify_operation(result, deadline, cancellation)

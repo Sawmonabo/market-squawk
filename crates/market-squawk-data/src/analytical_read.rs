@@ -3454,7 +3454,26 @@ async fn decode_fund_nav_history(
     let selection = PointInTimeService::new()
         .select(&pit_request, &candidates, cancellation, deadline)
         .await
-        .map_err(|_| AnalyticalReadError::InvalidFundNavResult)?;
+        .map_err(|error| match error {
+            crate::PointInTimeError::Cancelled => AnalyticalReadError::Query(QueryError::Cancelled),
+            crate::PointInTimeError::DeadlineExceeded => {
+                AnalyticalReadError::Query(QueryError::DeadlineExceeded)
+            }
+            crate::PointInTimeError::CandidateLimitExceeded { limit, .. }
+            | crate::PointInTimeError::FamilyLimitExceeded { limit, .. }
+            | crate::PointInTimeError::ConflictLimitExceeded { limit, .. }
+            | crate::PointInTimeError::ResultRowLimitExceeded { limit, .. } => {
+                AnalyticalReadError::Query(QueryError::RowLimitExceeded {
+                    limit: limit as u64,
+                })
+            }
+            crate::PointInTimeError::RetainedBytesExceeded { limit, .. } => {
+                AnalyticalReadError::Query(QueryError::MemoryLimitExceeded {
+                    limit: limit as u64,
+                })
+            }
+            _ => AnalyticalReadError::InvalidFundNavResult,
+        })?;
     let selected_count = selection.records().len();
     if selected_count > candidates.len() {
         return Err(AnalyticalReadError::InvalidFundNavResult);

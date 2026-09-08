@@ -1880,6 +1880,16 @@ fn repository_instrument_company_security_identity_is_point_in_time_and_parent_b
         )?,
         exact_provider_selection
     );
+    // Reopening an old selection must return its original revision despite later successors
+    // and provider-symbol collisions already retained above.
+    assert_eq!(
+        reader.read_selected_provider_definition(
+            &exact_provider_selection,
+            deadline(),
+            &cancellation,
+        )?,
+        retained
+    );
     Ok(())
 }
 

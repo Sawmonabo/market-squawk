@@ -57,12 +57,21 @@ impl FundNavSelectionPolicy {
     }
 }
 
+/// Calendar selection for a provider-neutral NAV read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FundNavDateSelection {
+    /// Reads the bounded history request, optionally restricted to a calendar range.
+    History(Option<FundNavDateRange>),
+    /// Reads only the greatest eligible NAV date, without scanning older history.
+    Latest,
+}
+
 /// Provider-neutral latest or exact immutable Fund NAV read request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalFundNavReadRequest {
     instrument_id: InstrumentId,
     knowledge_cutoff: Timestamp,
-    date_range: Option<FundNavDateRange>,
+    date_selection: FundNavDateSelection,
     revision_mode: PointInTimeRevisionMode,
     limit: AnalyticalFundNavReadLimit,
     policy: FundNavSelectionPolicy,
@@ -74,7 +83,7 @@ impl CanonicalFundNavReadRequest {
     pub fn try_latest(
         instrument_id: InstrumentId,
         knowledge_cutoff: Timestamp,
-        date_range: Option<FundNavDateRange>,
+        date_selection: FundNavDateSelection,
         revision_mode: PointInTimeRevisionMode,
         limit: AnalyticalFundNavReadLimit,
         policy: FundNavSelectionPolicy,
@@ -82,7 +91,7 @@ impl CanonicalFundNavReadRequest {
         Self::try_new(
             instrument_id,
             knowledge_cutoff,
-            date_range,
+            date_selection,
             revision_mode,
             limit,
             policy,
@@ -94,7 +103,7 @@ impl CanonicalFundNavReadRequest {
     pub fn try_exact(
         instrument_id: InstrumentId,
         knowledge_cutoff: Timestamp,
-        date_range: Option<FundNavDateRange>,
+        date_selection: FundNavDateSelection,
         revision_mode: PointInTimeRevisionMode,
         limit: AnalyticalFundNavReadLimit,
         policy: FundNavSelectionPolicy,
@@ -103,7 +112,7 @@ impl CanonicalFundNavReadRequest {
         Self::try_new(
             instrument_id,
             knowledge_cutoff,
-            date_range,
+            date_selection,
             revision_mode,
             limit,
             policy,
@@ -114,7 +123,7 @@ impl CanonicalFundNavReadRequest {
     fn try_new(
         instrument_id: InstrumentId,
         knowledge_cutoff: Timestamp,
-        date_range: Option<FundNavDateRange>,
+        date_selection: FundNavDateSelection,
         revision_mode: PointInTimeRevisionMode,
         limit: AnalyticalFundNavReadLimit,
         policy: FundNavSelectionPolicy,
@@ -126,7 +135,7 @@ impl CanonicalFundNavReadRequest {
         Ok(Self {
             instrument_id,
             knowledge_cutoff,
-            date_range,
+            date_selection,
             revision_mode,
             limit,
             policy,
@@ -144,9 +153,9 @@ impl CanonicalFundNavReadRequest {
         self.knowledge_cutoff
     }
 
-    /// Returns the optional calendar-precision NAV window delegated to the typed reader.
-    pub const fn date_range(&self) -> Option<FundNavDateRange> {
-        self.date_range
+    /// Returns the requested calendar selection, resolved before the typed history read.
+    pub const fn date_selection(&self) -> FundNavDateSelection {
+        self.date_selection
     }
 
     /// Returns the requested point-in-time revision policy.
@@ -1049,7 +1058,8 @@ pub(super) fn select_canonical_fund_nav(
                AND (?6 IS NULL OR selected_generation.dataset_id=?6)
                AND (?7 IS NULL OR selected_generation.manifest_version=?7)
                AND (?8 IS NULL OR selected_generation.content_hash=?8)
-             ORDER BY publication.published_at_ns DESC,
+             ORDER BY CASE WHEN ?9 THEN publication.last_nav_date END DESC,
+                      publication.published_at_ns DESC,
                       publication.origin_generation_sequence DESC,
                       publication.publication_receipt_digest DESC,
                       selected_generation.created_at_ns DESC,
@@ -1067,6 +1077,7 @@ pub(super) fn select_canonical_fund_nav(
                     .transpose()
                     .map_err(|_| ManifestCatalogError::CountOverflow)?,
                 exact.map(|value| value.content_hash().bytes()),
+                matches!(request.date_selection(), FundNavDateSelection::Latest),
             ],
             |row| {
                 Ok((
@@ -1113,11 +1124,18 @@ pub(super) fn select_canonical_fund_nav(
         request.instrument_id(),
         request.knowledge_cutoff(),
     )?;
+    let date_range = match request.date_selection() {
+        FundNavDateSelection::History(range) => range,
+        FundNavDateSelection::Latest => Some(
+            FundNavDateRange::try_new(receipt.last_nav_date, receipt.last_nav_date)
+                .map_err(|_| ManifestCatalogError::FundNavPublicationMismatch)?,
+        ),
+    };
     let analytical_request = AnalyticalFundNavReadRequest::try_new(
         manifest.clone(),
         request.instrument_id(),
         request.knowledge_cutoff(),
-        request.date_range(),
+        date_range,
         request.revision_mode(),
         request.limit(),
     )
@@ -1415,13 +1433,14 @@ fn selection_digest(
     hash.update(policy_digest.bytes());
     hash_text(&mut hash, &request.instrument_id().to_string())?;
     hash.update(request.knowledge_cutoff().unix_nanos().to_be_bytes());
-    match request.date_range() {
-        Some(range) => {
+    match request.date_selection() {
+        FundNavDateSelection::History(Some(range)) => {
             hash.update([1]);
             hash_text(&mut hash, &range.start().to_string())?;
             hash_text(&mut hash, &range.end().to_string())?;
         }
-        None => hash.update([0]),
+        FundNavDateSelection::History(None) => hash.update([0]),
+        FundNavDateSelection::Latest => hash.update([2]),
     }
     hash.update([match request.revision_mode() {
         PointInTimeRevisionMode::LatestKnown => 0,
