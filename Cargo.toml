@@ -201,7 +201,6 @@ tower = { version = "=0.5.3", default-features = false, features = [
 ] }
 uuid = { version = "1.12", features = ["serde", "v4", "v5"] }
 url = "2.5"
-webbrowser = { version = "=1.2.1", features = ["hardened"] }
 widestring = "=1.2.1"
 win-security-identifier = "=0.2.0"
 windows-permissions = "=0.2.4"
