@@ -393,6 +393,15 @@ pub struct JobTerminalPublicationPermit {
 }
 
 impl JobTerminalPublicationPermit {
+    /// Retains the exact generation fence when a domain write cannot yet be reconciled.
+    ///
+    /// This does not establish publication or completion. The runner must preserve every
+    /// potentially published artifact and return without declaring a terminal outcome. The
+    /// existing authority retains the fence until restart can inspect the original publication.
+    pub fn retain_for_reconciliation(mut self) {
+        self.fence.take();
+    }
+
     /// Seals the permit after the domain authority has durably committed its immutable result.
     ///
     /// An unsealed permit reopens publication when dropped. A sealed permit remains in the
@@ -570,6 +579,8 @@ impl std::fmt::Debug for JobRunContext {
 /// Runner recovery decision made before acquiring execution ownership.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JobRecoveryDisposition {
+    /// Preserve the original generation because its publication outcome remains unknown.
+    ReconciliationRequired,
     /// Start the next generation from an admitted checkpoint.
     ResumeFromCheckpoint,
     /// Start the next generation from the immutable original input.

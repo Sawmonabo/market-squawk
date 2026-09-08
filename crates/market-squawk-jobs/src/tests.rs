@@ -87,6 +87,7 @@ struct PublicationRaceRunner {
     publication_began: AtomicBool,
     result: JobResultReference,
     terminal_error: Option<JobRunError>,
+    publication_unresolved: bool,
 }
 
 #[async_trait]
@@ -121,6 +122,10 @@ impl JobRunner for PublicationRaceRunner {
         self.publication_began.store(true, Ordering::Release);
         self.claimed.notify_one();
         self.release.notified().await;
+        if self.publication_unresolved {
+            permit.retain_for_reconciliation();
+            return Err(JobRunError::Recovery);
+        }
         let published = permit.seal();
         if let Some(error) = self.terminal_error.clone() {
             drop(published);
@@ -130,7 +135,11 @@ impl JobRunner for PublicationRaceRunner {
     }
 
     fn recover(&self, _snapshot: &JobSnapshot) -> JobRecoveryDisposition {
-        JobRecoveryDisposition::MarkInterrupted
+        if self.publication_unresolved {
+            JobRecoveryDisposition::ReconciliationRequired
+        } else {
+            JobRecoveryDisposition::MarkInterrupted
+        }
     }
 }
 
@@ -358,6 +367,7 @@ async fn cancellation_and_publication_have_one_generation_winner() -> Result<(),
         publication_began: AtomicBool::new(false),
         result: result_reference("cancellation-result", 11)?,
         terminal_error: None,
+        publication_unresolved: false,
     });
     let cancellation_authority = JobAuthority::try_new(
         Arc::clone(&cancellation_repository),
@@ -411,6 +421,7 @@ async fn cancellation_and_publication_have_one_generation_winner() -> Result<(),
         publication_began: AtomicBool::new(false),
         result: result_reference("published-result", 12)?,
         terminal_error: None,
+        publication_unresolved: false,
     });
     let publication_authority = JobAuthority::try_new(
         Arc::clone(&publication_repository),
@@ -447,62 +458,86 @@ async fn cancellation_and_publication_have_one_generation_winner() -> Result<(),
         JobShutdownOutcome::Clean,
     );
 
-    let reconciliation_temp = TempDir::new()?;
-    let reconciliation_repository = repository(&reconciliation_temp).await?;
-    let reconciliation_spec = job_spec("sealed-publication-error")?;
-    let sentinel_spec = job_spec("publication-sentinel")?;
-    let (reconciliation_ready, reconciliation_running) = oneshot::channel();
-    let reconciliation_runner = Arc::new(PublicationRaceRunner {
-        kind: reconciliation_spec.kind().clone(),
-        ready: StdMutex::new(Some(reconciliation_ready)),
-        proceed: Notify::new(),
-        claimed: Notify::new(),
-        release: Notify::new(),
-        publication_began: AtomicBool::new(false),
-        result: result_reference("reconciliation-result", 13)?,
-        terminal_error: Some(JobRunError::Failed(JobFailure::new(
-            source("result-shaping")?,
-            source("post-commit-reference-failed")?,
-            false,
-        ))),
-    });
-    let (sentinel_started, sentinel_running) = oneshot::channel();
-    let sentinel_runner = Arc::new(StartSignalRunner {
-        kind: sentinel_spec.kind().clone(),
-        started: StdMutex::new(Some(sentinel_started)),
-    });
-    let reconciliation_authority = JobAuthority::try_new(
-        Arc::clone(&reconciliation_repository),
-        SchedulerLimits::try_new(2, 1, 2, 1)?,
-        vec![
-            JobRunnerRegistration::new(reconciliation_runner.clone(), JobActivityClass::ReadOnly),
-            JobRunnerRegistration::new(sentinel_runner, JobActivityClass::ReadOnly),
-        ],
-    )?;
-    reconciliation_authority.start(&reconciliation_spec).await?;
-    let running = reconciliation_running.await?;
-    reconciliation_runner.proceed.notify_one();
-    reconciliation_runner.claimed.notified().await;
-    reconciliation_authority.start(&sentinel_spec).await?;
-    reconciliation_runner.release.notify_one();
-    sentinel_running.await?;
-    let reconciliation = reconciliation_repository
-        .get(running.id(), running.generation())
-        .await?;
-    assert_eq!(reconciliation.state(), JobState::Running);
-    assert!(reconciliation.terminal_result().is_none());
-    assert!(reconciliation.terminal_failure().is_none());
-    assert!(
-        reconciliation_runner
-            .publication_began
-            .load(Ordering::Acquire)
-    );
-    assert_eq!(
-        reconciliation_authority
-            .shutdown(Timestamp::from_unix_nanos(41), Duration::from_secs(1))
-            .await?,
-        JobShutdownOutcome::Clean,
-    );
+    // Unknown acknowledgment must preserve the same gate without claiming a published result.
+    for publication_unresolved in [false, true] {
+        let reconciliation_temp = TempDir::new()?;
+        let reconciliation_repository = repository(&reconciliation_temp).await?;
+        let reconciliation_spec = job_spec("sealed-publication-error")?;
+        let sentinel_spec = job_spec("publication-sentinel")?;
+        let (reconciliation_ready, reconciliation_running) = oneshot::channel();
+        let reconciliation_runner = Arc::new(PublicationRaceRunner {
+            kind: reconciliation_spec.kind().clone(),
+            ready: StdMutex::new(Some(reconciliation_ready)),
+            proceed: Notify::new(),
+            claimed: Notify::new(),
+            release: Notify::new(),
+            publication_began: AtomicBool::new(false),
+            result: result_reference("reconciliation-result", 13)?,
+            publication_unresolved,
+            terminal_error: Some(JobRunError::Failed(JobFailure::new(
+                source("result-shaping")?,
+                source("post-commit-reference-failed")?,
+                false,
+            ))),
+        });
+        let (sentinel_started, sentinel_running) = oneshot::channel();
+        let sentinel_runner = Arc::new(StartSignalRunner {
+            kind: sentinel_spec.kind().clone(),
+            started: StdMutex::new(Some(sentinel_started)),
+        });
+        let reconciliation_authority = JobAuthority::try_new(
+            Arc::clone(&reconciliation_repository),
+            SchedulerLimits::try_new(2, 1, 2, 1)?,
+            vec![
+                JobRunnerRegistration::new(
+                    reconciliation_runner.clone(),
+                    JobActivityClass::ReadOnly,
+                ),
+                JobRunnerRegistration::new(sentinel_runner, JobActivityClass::ReadOnly),
+            ],
+        )?;
+        reconciliation_authority.start(&reconciliation_spec).await?;
+        let running = reconciliation_running.await?;
+        reconciliation_runner.proceed.notify_one();
+        reconciliation_runner.claimed.notified().await;
+        reconciliation_authority.start(&sentinel_spec).await?;
+        reconciliation_runner.release.notify_one();
+        sentinel_running.await?;
+        let reconciliation = reconciliation_repository
+            .get(running.id(), running.generation())
+            .await?;
+        assert_eq!(reconciliation.state(), JobState::Running);
+        assert!(reconciliation.terminal_result().is_none());
+        assert!(reconciliation.terminal_failure().is_none());
+        assert!(
+            reconciliation_runner
+                .publication_began
+                .load(Ordering::Acquire)
+        );
+        assert_eq!(
+            reconciliation_authority
+                .shutdown(Timestamp::from_unix_nanos(41), Duration::from_secs(1))
+                .await?,
+            JobShutdownOutcome::Clean,
+        );
+        if publication_unresolved {
+            assert!(
+                recover_one(
+                    reconciliation_repository.as_ref(),
+                    reconciliation_runner.as_ref(),
+                    Timestamp::from_unix_nanos(42)
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                reconciliation_repository
+                    .get(running.id(), running.generation())
+                    .await?,
+                reconciliation
+            );
+        }
+    }
     Ok(())
 }
 

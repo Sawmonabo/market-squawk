@@ -152,6 +152,7 @@ async fn apply_recovery_disposition<R: JobRepository + ?Sized>(
     at: Timestamp,
 ) -> Result<JobSnapshot, JobAuthorityError> {
     match disposition {
+        JobRecoveryDisposition::ReconciliationRequired => Err(JobAuthorityError::Repository),
         JobRecoveryDisposition::ResumeFromCheckpoint
         | JobRecoveryDisposition::RetryFromImmutableInput => repository
             .begin_recovery(orphaned, at)
