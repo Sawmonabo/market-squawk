@@ -73,12 +73,22 @@ comparison policy, not evidence that dual-benchmark production is already comple
   Root inspected the four platform file changes and updated the existing source-budget error
   mapping for the new typed invalid-namespace failure. This is scoped macOS persistence evidence;
   latest native Desktop integration and complete installed shutdown/restart remain unverified.
-- The current source-budget checkpoint removes the superseded budget-format decoder, conversion
+- Pushed checkpoint `e80860b2002baf068bafc3f175a0709eb49d049d` removes the superseded budget-format decoder, conversion
   types and its obsolete migration test. The single active bounded canonical representation and
   existing recovery policy remain authoritative. The existing malformed/truncated/noncanonical
   state rejection case passed 1/1 on unchanged source (2026-09-08, session 47370; no warnings).
   Root inspected both file changes and verified their final hashes. No persisted application
   state, provider credentials, backup or source snapshot was rewritten. No new test or CI ran.
+- Current integration compilation corrected the remaining local-file adapter mapping for the
+  typed invalid-namespace error, valuation recovery import/visibility, internal calendar imports,
+  forecast evidence projection and new analytical-error consumers. Application plus PyO3 library
+  compilation passed on the combined WIP (session 73083); native Desktop library compilation
+  passed (session 69999). Existing warning backlog remains. The updated feature publication/reopen
+  case passed 1/1 (30063), proving original evidenced availability separately from later local
+  acquisition, completed-close coordinates and a source-bound feature-only read. Both existing
+  recommendation backtest cases passed (67600), including entry exclusion at the financial target.
+  These are affected integration checks; they do not establish clean exact-head release approval,
+  complete default workflows, installed live restart or the 500 MB resource target.
 - Desktop profile/transport/brief work passed the pinned TypeScript check. Native orchestration,
   actual component policy validation, calibrated forecast production, realistic historical
   backtest evidence, valuation, persisted decision production and complete default/Advanced

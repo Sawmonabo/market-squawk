@@ -366,6 +366,7 @@ fn map_store_error(error: LocalAuthorityStateStoreError) -> FileAdapterError {
             FileAdapterError::RepresentationAuthorityInvalid
         }
         LocalAuthorityStateStoreError::UnsafeRoot
+        | LocalAuthorityStateStoreError::InvalidNamespace
         | LocalAuthorityStateStoreError::UnsafeFileType
         | LocalAuthorityStateStoreError::RecoveryRequired
         | LocalAuthorityStateStoreError::FinalizationPending
